@@ -1,0 +1,218 @@
+---
+name: Map cardinality fullstack proof
+
+"on":
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/map-cardinality-fullstack.yml"
+      - "toolchain.versions.yml"
+      - ".node-version"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "apps/api/**"
+      - "apps/web/package.json"
+      - "apps/web/pnpm-lock.yaml"
+      - "apps/web/playwright*.ts"
+      - "apps/web/scripts/map-cardinality*.mjs"
+      - "apps/web/scripts/web-runtime-evidence.mjs"
+      - "apps/web/src/lib/map/**"
+      - "apps/web/src/routes/map/**"
+      - "apps/web/tests/proofs/map-cardinality*.ts"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/map-cardinality-fullstack.yml"
+      - "toolchain.versions.yml"
+      - ".node-version"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "apps/api/**"
+      - "apps/web/package.json"
+      - "apps/web/pnpm-lock.yaml"
+      - "apps/web/playwright*.ts"
+      - "apps/web/scripts/map-cardinality*.mjs"
+      - "apps/web/scripts/web-runtime-evidence.mjs"
+      - "apps/web/src/lib/map/**"
+      - "apps/web/src/routes/map/**"
+      - "apps/web/tests/proofs/map-cardinality*.ts"
+  workflow_dispatch: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: map-cardinality-fullstack-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-api-browser:
+    name: PostgreSQL → API BBOX → Chromium 1k/10k/100k
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:16@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: commonthing_map_cardinality_fullstack
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d commonthing_map_cardinality_fullstack"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PROOF_DATABASE_NAME: commonthing_map_cardinality_fullstack
+      PROOF_DATABASE_AUTHORITY: postgres://postgres:postgres@127.0.0.1:5432
+      MAP_CARDINALITY_FULLSTACK_API_BASE: http://127.0.0.1:8787
+      HEADLESS: "1"
+      NPM_CONFIG_AUDIT: "false"
+      NPM_CONFIG_FUND: "false"
+      PLAYWRIGHT_HTML_REPORT: playwright-report-cardinality-fullstack
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Bind the exact source revision and proof database
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(git rev-parse HEAD)"
+          database_url="${PROOF_DATABASE_AUTHORITY}/${PROOF_DATABASE_NAME}"
+          [[ "${revision}" =~ ^[0-9a-f]{40}$ ]]
+          printf 'WELTGEWEBE_EXACT_REVISION=%s\n' "${revision}" >> "${GITHUB_ENV}"
+          printf 'GIT_COMMIT_SHA=%s\n' "${revision}" >> "${GITHUB_ENV}"
+          printf 'PROOF_DATABASE_URL=%s\n' "${database_url}" >> "${GITHUB_ENV}"
+          printf 'MAP_CARDINALITY_FULLSTACK_DATABASE_URL=%s\n' \
+            "${database_url}" >> "${GITHUB_ENV}"
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libpq-dev libssl-dev pkg-config postgresql-client
+          psql "${PROOF_DATABASE_URL}" -v ON_ERROR_STOP=1 -Atc \
+            "SELECT current_database(), count(*) FROM pg_catalog.pg_tables WHERE schemaname = 'public';"
+
+      - name: Read Rust version
+        id: rust-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          SED_EXPR="s/^[[:space:]]*rust:[[:space:]]*['\"]?([^'\"#[:space:]]+)['\"]?[[:space:]]*(#.*)?$/\1/p"
+          RUST_VERSION="$(sed -nE "${SED_EXPR}" toolchain.versions.yml | head -n1 | xargs)"
+          test -n "${RUST_VERSION}"
+          printf 'rust_version=%s\n' "${RUST_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag: v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust_version }}
+
+      - name: Build the exact API revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="${WELTGEWEBE_EXACT_REVISION}"
+          build_timestamp="$(git show -s --format=%cI "${revision}")"
+          [[ "${build_timestamp}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$ ]]
+          GIT_COMMIT_SHA="${revision}" \
+            BUILD_TIMESTAMP="${build_timestamp}" \
+            cargo build --locked --release --bin weltgewebe-api
+
+      - name: Start the exact API against the empty proof database
+        shell: bash
+        env:
+          API_BIND: 127.0.0.1:8787
+          WELTGEWEBE_DOMAIN_READ_SOURCE: postgres
+          WELTGEWEBE_API_STARTUP_MIGRATIONS: run
+          WELTGEWEBE_SEARCH_OLLAMA_URL: http://127.0.0.1:9/
+          APP_CONFIG_PATH: ${{ github.workspace }}/configs/app.defaults.yml
+        run: |
+          set -euo pipefail
+          export DATABASE_URL="${PROOF_DATABASE_URL}"
+          API_LOG="${RUNNER_TEMP:?RUNNER_TEMP is required}/map-cardinality-api.log"
+          nohup ./target/release/weltgewebe-api >"${API_LOG}" 2>&1 &
+          echo "$!" > "${RUNNER_TEMP}/map-cardinality-api.pid"
+          ready=0
+          for _ in {1..120}; do
+            if curl -fsS "${MAP_CARDINALITY_FULLSTACK_API_BASE}/health/live" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$(cat "${RUNNER_TEMP}/map-cardinality-api.pid")" 2>/dev/null; then
+              cat "${API_LOG}" >&2
+              exit 1
+            fi
+            sleep 0.5
+          done
+          if [[ "${ready}" -ne 1 ]]; then
+            cat "${API_LOG}" >&2
+            exit 1
+          fi
+          test "$(psql "${PROOF_DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_nodes')" = "0"
+          psql "${PROOF_DATABASE_URL}" -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE map_cardinality_fullstack_proof_guard (
+            id integer PRIMARY KEY CHECK (id = 1),
+            marker text NOT NULL
+          );
+          INSERT INTO map_cardinality_fullstack_proof_guard (id, marker)
+          VALUES (1, 'commonthing-map-cardinality-fullstack-v1');
+          SQL
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b0f76dfb45f55f8421693e4803ac7bb65143bd34 # tag: v6
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858
+        with:
+          node-version-file: ".node-version"
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+
+      - name: Install web dependencies and Chromium
+        working-directory: apps/web
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Validate the fullstack evidence contract
+        working-directory: apps/web
+        run: pnpm test:map-cardinality-fullstack-evidence
+
+      - name: Run the real 1k/10k/100k fullstack proof
+        working-directory: apps/web
+        run: pnpm test:proof:map-cardinality-fullstack
+
+      - name: Upload fullstack evidence and diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
+        with:
+          name: map-cardinality-fullstack-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/proofs/web-runtime/map-cardinality-fullstack.json
+            apps/web/playwright-report-cardinality-fullstack/**
+            apps/web/test-results/**
+            ${{ runner.temp }}/map-cardinality-api.log
+          if-no-files-found: warn
+
+      - name: Stop API
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [[ -f "${RUNNER_TEMP}/map-cardinality-api.pid" ]]; then
+            kill "$(cat "${RUNNER_TEMP}/map-cardinality-api.pid")" 2>/dev/null || true
+          fi
