@@ -227,6 +227,28 @@ function percentile(values: number[], quantile: number): number {
   return sorted[index];
 }
 
+async function installDeterministicBasemapStyle(page: Page): Promise<void> {
+  const emptyStyleBody = JSON.stringify({
+    version: 8,
+    sources: {},
+    layers: [],
+  });
+  for (const pattern of [
+    "**/local-basemap/style.json*",
+    "**/local-basemap/style-dark.json*",
+    "**/local-basemap/style-germany.json*",
+    "**/local-basemap/style-germany-dark.json*",
+  ]) {
+    await page.route(pattern, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: emptyStyleBody,
+      }),
+    );
+  }
+}
+
 async function settleFrames(page: Page, frames: number): Promise<void> {
   await page.evaluate(
     (count) =>
@@ -458,6 +480,7 @@ test("keeps real PostgreSQL → API BBOX → Chromium at 1k/10k/100k inside fixe
     });
     try {
       const page = await context.newPage();
+      await installDeterministicBasemapStyle(page);
       const api = observeRealNodeApi(page);
       const startedAt = performance.now();
       await page.goto("/map", { waitUntil: "domcontentloaded" });

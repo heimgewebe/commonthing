@@ -67,8 +67,8 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
-      PROOF_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/commonthing_map_cardinality_fullstack
-      MAP_CARDINALITY_FULLSTACK_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/commonthing_map_cardinality_fullstack
+      PROOF_DATABASE_NAME: commonthing_map_cardinality_fullstack
+      PROOF_DATABASE_AUTHORITY: postgres://postgres:postgres@127.0.0.1:5432
       MAP_CARDINALITY_FULLSTACK_API_BASE: http://127.0.0.1:8787
       HEADLESS: "1"
       NPM_CONFIG_AUDIT: "false"
@@ -80,14 +80,18 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
-      - name: Bind the exact source revision
+      - name: Bind the exact source revision and proof database
         shell: bash
         run: |
           set -euo pipefail
           revision="$(git rev-parse HEAD)"
+          database_url="${PROOF_DATABASE_AUTHORITY}/${PROOF_DATABASE_NAME}"
           [[ "${revision}" =~ ^[0-9a-f]{40}$ ]]
           printf 'WELTGEWEBE_EXACT_REVISION=%s\n' "${revision}" >> "${GITHUB_ENV}"
           printf 'GIT_COMMIT_SHA=%s\n' "${revision}" >> "${GITHUB_ENV}"
+          printf 'PROOF_DATABASE_URL=%s\n' "${database_url}" >> "${GITHUB_ENV}"
+          printf 'MAP_CARDINALITY_FULLSTACK_DATABASE_URL=%s\n' \
+            "${database_url}" >> "${GITHUB_ENV}"
 
       - name: Install system dependencies
         shell: bash
@@ -114,14 +118,6 @@ jobs:
         with:
           toolchain: ${{ steps.rust-version.outputs.rust_version }}
 
-      - name: Cache cargo target
-        uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca # provenance: untagged
-        with:
-          path: target
-          key: ${{ runner.os }}-map-cardinality-cargo-${{ hashFiles('**/Cargo.lock','**/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-map-cardinality-cargo-
-
       - name: Build the exact API revision
         shell: bash
         run: |
@@ -137,13 +133,13 @@ jobs:
         shell: bash
         env:
           API_BIND: 127.0.0.1:8787
-          DATABASE_URL: ${{ env.PROOF_DATABASE_URL }}
           WELTGEWEBE_DOMAIN_READ_SOURCE: postgres
           WELTGEWEBE_API_STARTUP_MIGRATIONS: run
           WELTGEWEBE_SEARCH_OLLAMA_URL: http://127.0.0.1:9/
           APP_CONFIG_PATH: ${{ github.workspace }}/configs/app.defaults.yml
         run: |
           set -euo pipefail
+          export DATABASE_URL="${PROOF_DATABASE_URL}"
           API_LOG="${RUNNER_TEMP:?RUNNER_TEMP is required}/map-cardinality-api.log"
           nohup ./target/release/weltgewebe-api >"${API_LOG}" 2>&1 &
           echo "$!" > "${RUNNER_TEMP}/map-cardinality-api.pid"

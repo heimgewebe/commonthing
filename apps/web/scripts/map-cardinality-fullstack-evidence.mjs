@@ -305,6 +305,7 @@ export function buildMapCardinalityFullstackEvidence({
       "Deterministic production-shaped nodes are inserted directly into PostgreSQL after the API is already ready, proving viewport reads cannot depend on a startup-only node cache while intentionally excluding production ingestion cost.",
       "Chromium Runtime.getHeapUsage measures JavaScript heap after explicit garbage collection; it does not represent total browser, GPU, tile-cache, or operating-system memory.",
       "Frame-time evidence is requestAnimationFrame cadence on the pinned Chromium/runner class and acts as a regression budget rather than hardware-independent FPS telemetry.",
+      "The proof replaces only the basemap style with a deterministic empty MapLibre style so missing PMTiles cannot gate the node data-path measurement; real basemap delivery is covered by separate basemap proofs.",
     ],
   };
 }

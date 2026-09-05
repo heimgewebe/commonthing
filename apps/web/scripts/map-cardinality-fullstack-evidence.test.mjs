@@ -220,4 +220,5 @@ test("receipt states its measurement limits instead of overclaiming production c
   assert.match(evidence.limitations[0], /loopback/);
   assert.match(evidence.limitations[1], /after the API is already ready/);
   assert.match(evidence.limitations[2], /does not represent total browser/);
+  assert.match(evidence.limitations[4], /basemap style/);
 });
