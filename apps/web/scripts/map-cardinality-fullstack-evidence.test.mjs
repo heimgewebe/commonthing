@@ -6,6 +6,7 @@ import {
   validateMapCardinalityFullstackSample,
 } from "./map-cardinality-fullstack-evidence.mjs";
 import {
+  MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT,
   expectedMapCardinalityItems,
   expectedMapCardinalityPages,
 } from "./map-cardinality-evidence.mjs";
@@ -41,9 +42,9 @@ function sample(cardinality, overrides = {}) {
       48 * 1024 * 1024,
       budget.max_js_heap_used_bytes,
     ),
-    dom_marker_count: cardinality > 1000 ? 0 : 100,
-    native_layer_expected: cardinality > 1000,
-    native_layer_actual: cardinality > 1000,
+    dom_marker_count: items > MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT ? 0 : 100,
+    native_layer_expected: items > MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT,
+    native_layer_actual: items > MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT,
     seeded_after_api_start: true,
     ...overrides,
   };
@@ -72,6 +73,7 @@ test("accepts bounded real fullstack samples for 1k/10k/100k", () => {
       cardinality,
     );
   }
+  assert.equal(MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT, 100);
   assert.equal(build().verdict, "PASS");
 });
 

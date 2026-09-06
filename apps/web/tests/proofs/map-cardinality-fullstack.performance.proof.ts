@@ -52,12 +52,14 @@ const {
 };
 
 const {
+  MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT,
   MAP_CARDINALITY_PAGE_SIZE,
   MAP_CARDINALITY_CLIENT_MAX_ITEMS,
   MAP_CARDINALITY_CLIENT_MAX_PAGES,
   expectedMapCardinalityItems,
   expectedMapCardinalityPages,
 } = cardinalityEvidenceRuntime as unknown as {
+  MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT: number;
   MAP_CARDINALITY_PAGE_SIZE: number;
   MAP_CARDINALITY_CLIENT_MAX_ITEMS: number;
   MAP_CARDINALITY_CLIENT_MAX_PAGES: number;
@@ -455,6 +457,13 @@ test("keeps real PostgreSQL → API BBOX → Chromium at 1k/10k/100k inside fixe
   const sourceRevision = resolveExactSourceRevision();
   assertExactGitCheckout({ revision: sourceRevision });
   expect(MAP_CARDINALITY_PAGE_SIZE).toBe(MAP_CURSOR_PAGE_SIZE);
+  const overlaySource = readFileSync(
+    new URL("../../src/lib/map/overlay/nodes.ts", import.meta.url),
+    "utf8",
+  );
+  expect(overlaySource).toContain(
+    `export const NATIVE_ENTITY_LAYER_MIN_COUNT = ${MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT};`,
+  );
   expect(MAP_CARDINALITY_CLIENT_MAX_PAGES).toBe(MAP_CURSOR_MAX_PAGES);
   expect(MAP_CARDINALITY_CLIENT_MAX_ITEMS).toBe(MAP_CURSOR_MAX_ITEMS);
 
@@ -519,7 +528,8 @@ test("keeps real PostgreSQL → API BBOX → Chromium at 1k/10k/100k inside fixe
 
       const readinessMs = performance.now() - startedAt;
       const domMarkerCount = await page.locator(".map-marker").count();
-      const nativeLayerExpected = expectedItems > MAP_CARDINALITY_PAGE_SIZE;
+      const nativeLayerExpected =
+        expectedItems > MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT;
       const nativeLayerActual = await page.evaluate(() =>
         Boolean(
           (

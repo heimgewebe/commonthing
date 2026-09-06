@@ -276,10 +276,10 @@ afterEach(() => {
 describe("NodesOverlay native dense-entity layer", () => {
   it("moves dense ordinary entities out of DOM markers into one GeoJSON circle layer", () => {
     const { map, overlay } = setup();
-    overlay.update(points(1_001), true);
+    overlay.update(points(101), true);
 
     const source = map.source();
-    expect(source?.data.features).toHaveLength(1_001);
+    expect(source?.data.features).toHaveLength(101);
     expect(map.getLayer(NATIVE_ENTITY_LAYER_ID)).toBeDefined();
     expect(overlay.getActiveMarker("node-0")).toBeUndefined();
     expect(source?.data.features[0]).toMatchObject({
@@ -311,17 +311,18 @@ describe("NodesOverlay native dense-entity layer", () => {
     expect(overlay.getActiveMarker("node-0")).toBeDefined();
   });
 
-  it("keeps the DOM compatibility path through the exact 1,000-entity boundary", () => {
+  it("moves the measured 250-item medium-density viewport onto the native renderer", () => {
     const { map, overlay } = setup();
-    overlay.update(points(1_000), true);
+    overlay.update(points(250), true);
 
-    expect(map.getLayer(NATIVE_ENTITY_LAYER_ID)).toBeUndefined();
-    expect(overlay.getActiveMarker("node-0")).toBeDefined();
+    expect(map.getLayer(NATIVE_ENTITY_LAYER_ID)).toBeDefined();
+    expect(map.source()?.data.features).toHaveLength(250);
+    expect(overlay.getActiveMarker("node-0")).toBeUndefined();
   });
 
-  it("keeps only the selected dense entity as a DOM marker and updates feature-state without retransmitting GeoJSON", () => {
+  it("keeps only the selected medium-density entity as a DOM marker and updates feature-state without retransmitting GeoJSON", () => {
     const { map, overlay } = setup();
-    overlay.update(points(1_001), true);
+    overlay.update(points(250), true);
     const source = map.source()!;
     const beforeSetDataCalls = source.setDataCalls;
 
