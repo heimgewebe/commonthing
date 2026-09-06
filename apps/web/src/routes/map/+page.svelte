@@ -79,7 +79,7 @@
   import {
     nodeViewportContains,
     type NodeViewportBounds,
-  } from "$lib/map/nodeViewport";
+  } from "$lib/map/nodeViewportBounds";
 
   import { currentBasemap } from "$lib/map/config/basemap.current";
   import { resolveBasemapStyle, rewritePmtilesUrl } from "$lib/map/basemap";
