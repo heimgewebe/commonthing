@@ -12,7 +12,7 @@ import {
 export const MAP_CURSOR_PAGE_SIZE = 1000;
 export const MAP_CURSOR_MAX_PAGES = 10;
 export const MAP_CURSOR_MAX_ITEMS = 10_000;
-export const MAP_RESOURCE_LOAD_DEADLINE_MS = 8_000;
+export const MAP_RESOURCE_LOAD_DEADLINE_MS = 10_000;
 
 export type CursorTruncationReason = "page_limit" | "item_limit";
 
