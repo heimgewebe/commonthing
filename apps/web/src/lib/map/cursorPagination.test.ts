@@ -272,6 +272,182 @@ describe("loadMapResources", () => {
     });
   });
 
+  it("times out and aborts one hung resource while preserving the others", async () => {
+    vi.useFakeTimers();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let hungSignal: AbortSignal | undefined;
+      const fetcher = vi.fn(
+        (input: string, init?: RequestInit): Promise<Response> => {
+          const resource = new URL(input, "http://localhost").pathname
+            .split("/")
+            .at(-1)!;
+          if (resource === "accounts") {
+            const signal = init?.signal ?? undefined;
+            hungSignal = signal;
+            return new Promise<Response>((_resolve, reject) => {
+              signal?.addEventListener(
+                "abort",
+                () => reject(new Error("aborted hung resource")),
+                { once: true },
+              );
+            });
+          }
+          return Promise.resolve(
+            page([{ id: `${resource}-1` }], false, null, 1000),
+          );
+        },
+      );
+
+      const pending = loadMapResources(fetcher, "", "cursor", {
+        resourceDeadlineMs: 1_000,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await pending;
+
+      expect(hungSignal?.aborted).toBe(true);
+      expect(result.nodes).toHaveLength(1);
+      expect(result.accounts).toEqual([]);
+      expect(result.edges).toHaveLength(1);
+      expect(result.webgemeindezentren).toHaveLength(1);
+      expect(result.resourceStatus).toEqual([
+        { resource: "nodes", status: "complete", loaded: 1, pages: 1 },
+        {
+          resource: "accounts",
+          status: "failed",
+          error: "Timed out loading accounts after 1000 ms",
+        },
+        { resource: "edges", status: "complete", loaded: 1, pages: 1 },
+        {
+          resource: "webgemeindezentren",
+          status: "complete",
+          loaded: 1,
+          pages: 1,
+        },
+      ]);
+      expect(result.loadState).toBe("partial");
+      expect(result.loadNotice).toContain("Garnrollen");
+    } finally {
+      errorSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("applies the same deadline while a response body is hanging", async () => {
+    vi.useFakeTimers();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let bodySignal: AbortSignal | undefined;
+      let bodyAbortObserved = false;
+      const fetcher = vi.fn(
+        (input: string, init?: RequestInit): Promise<Response> => {
+          const resource = new URL(input, "http://localhost").pathname
+            .split("/")
+            .at(-1)!;
+          if (resource === "edges") {
+            const signal = init?.signal ?? undefined;
+            bodySignal = signal;
+            return Promise.resolve({
+              ok: true,
+              status: 200,
+              json: () =>
+                new Promise<never>((_resolve, reject) => {
+                  signal?.addEventListener(
+                    "abort",
+                    () => {
+                      bodyAbortObserved = true;
+                      reject(new Error("aborted hanging body"));
+                    },
+                    { once: true },
+                  );
+                }),
+            } as unknown as Response);
+          }
+          return Promise.resolve(page([], false, null, 1000));
+        },
+      );
+
+      const pending = loadMapResources(fetcher, "", "cursor", {
+        resourceDeadlineMs: 1_000,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await pending;
+
+      expect(bodySignal?.aborted).toBe(true);
+      expect(bodyAbortObserved).toBe(true);
+      expect(result.resourceStatus[2]).toEqual({
+        resource: "edges",
+        status: "failed",
+        error: "Timed out loading edges after 1000 ms",
+      });
+      expect(result.loadState).toBe("partial");
+    } finally {
+      errorSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds the total resource load across cursor continuation pages", async () => {
+    vi.useFakeTimers();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let nodeCalls = 0;
+      let continuationSignal: AbortSignal | undefined;
+      const fetcher = vi.fn(
+        (input: string, init?: RequestInit): Promise<Response> => {
+          const resource = new URL(input, "http://localhost").pathname
+            .split("/")
+            .at(-1)!;
+          if (resource === "nodes") {
+            nodeCalls += 1;
+            if (nodeCalls === 1) {
+              return Promise.resolve(
+                page([{ id: "node-first-page" }], true, "next", 1000),
+              );
+            }
+            const signal = init?.signal ?? undefined;
+            continuationSignal = signal;
+            return new Promise<Response>((_resolve, reject) => {
+              signal?.addEventListener(
+                "abort",
+                () => reject(new Error("aborted continuation")),
+                { once: true },
+              );
+            });
+          }
+          return Promise.resolve(page([], false, null, 1000));
+        },
+      );
+
+      const pending = loadMapResources(fetcher, "", "cursor", {
+        resourceDeadlineMs: 1_000,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeCalls).toBe(2);
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await pending;
+
+      expect(continuationSignal?.aborted).toBe(true);
+      expect(result.nodes).toEqual([]);
+      expect(result.resourceStatus[0]).toEqual({
+        resource: "nodes",
+        status: "failed",
+        error: "Timed out loading nodes after 1000 ms",
+      });
+      expect(
+        result.resourceStatus
+          .slice(1)
+          .every((status) => status.status === "complete"),
+      ).toBe(true);
+      expect(result.loadState).toBe("partial");
+    } finally {
+      errorSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("loads the built-in static demo endpoints as complete bare arrays", async () => {
     const staticResources: Record<string, unknown[]> = {
       nodes: [{ id: "node-1" }],

@@ -12,6 +12,7 @@ import {
 export const MAP_CURSOR_PAGE_SIZE = 1000;
 export const MAP_CURSOR_MAX_PAGES = 10;
 export const MAP_CURSOR_MAX_ITEMS = 10_000;
+export const MAP_RESOURCE_LOAD_DEADLINE_MS = 10_000;
 
 export type CursorTruncationReason = "page_limit" | "item_limit";
 
@@ -32,6 +33,7 @@ export type CursorPaginationOptions = {
   pageSize?: number;
   maxPages?: number;
   maxItems?: number;
+  signal?: AbortSignal;
 };
 
 export type MapResourceTransport = "cursor" | "static-list";
@@ -40,9 +42,10 @@ export type MapNodeLoadMode = "global" | "viewport";
 export type MapResourceLoadOptions = {
   nodeLoadMode?: MapNodeLoadMode;
   focusedNodeId?: string | null;
+  resourceDeadlineMs?: number;
 };
 
-type FetchLike = (input: string) => Promise<Response>;
+type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 type CursorEnvelope<T> = {
   items: T[];
@@ -57,6 +60,39 @@ export class CursorPaginationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "CursorPaginationError";
+  }
+}
+
+function fetchWithSignal(
+  fetcher: FetchLike,
+  input: string,
+  signal?: AbortSignal,
+): Promise<Response> {
+  return signal ? fetcher(input, { signal }) : fetcher(input);
+}
+
+async function withResourceDeadline<T>(
+  resource: MapResourceName,
+  deadlineMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(
+        new CursorPaginationError(
+          `Timed out loading ${resource} after ${deadlineMs} ms`,
+        ),
+      );
+      controller.abort();
+    }, deadlineMs);
+  });
+
+  try {
+    return await Promise.race([operation(controller.signal), deadline]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
   }
 }
 
@@ -162,7 +198,11 @@ export async function fetchCursorPages<T>(
 
   while (true) {
     const pageNumber = pages + 1;
-    const response = await fetcher(cursorUrl(endpoint, cursor, pageSize));
+    const response = await fetchWithSignal(
+      fetcher,
+      cursorUrl(endpoint, cursor, pageSize),
+      options.signal,
+    );
     if (!response.ok) {
       throw new CursorPaginationError(
         `HTTP ${response.status} while loading page ${pageNumber}`,
@@ -232,8 +272,9 @@ export async function fetchCursorPages<T>(
 async function fetchCompleteStaticList<T>(
   fetcher: FetchLike,
   endpoint: string,
+  signal?: AbortSignal,
 ): Promise<CursorPaginationResult<T>> {
-  const response = await fetcher(endpoint);
+  const response = await fetchWithSignal(fetcher, endpoint, signal);
   if (!response.ok) {
     throw new CursorPaginationError(
       `HTTP ${response.status} while loading static resource`,
@@ -268,9 +309,12 @@ async function fetchFocusedNode(
   fetcher: FetchLike,
   apiUrl: string,
   nodeId: string,
+  signal?: AbortSignal,
 ): Promise<Node | null> {
-  const response = await fetcher(
+  const response = await fetchWithSignal(
+    fetcher,
     `${apiUrl}/api/nodes/${encodeURIComponent(nodeId)}`,
+    signal,
   );
   if (response.status === 404) return null;
   if (!response.ok) {
@@ -306,16 +350,24 @@ export async function loadMapResources(
   options: MapResourceLoadOptions = {},
 ): Promise<MapResourceLoad> {
   const nodeLoadMode = options.nodeLoadMode ?? "global";
+  const resourceDeadlineMs = positiveInteger(
+    options.resourceDeadlineMs ?? MAP_RESOURCE_LOAD_DEADLINE_MS,
+    "resourceDeadlineMs",
+  );
   async function loadResource<T>(
     resource: MapResourceName,
     fallback: T[] = [],
   ): Promise<{ items: T[]; status: MapResourceStatus }> {
     try {
       const endpoint = `${apiUrl}/api/${resource}`;
-      const result =
-        transport === "static-list"
-          ? await fetchCompleteStaticList<T>(fetcher, endpoint)
-          : await fetchCursorPages<T>(fetcher, endpoint);
+      const result = await withResourceDeadline(
+        resource,
+        resourceDeadlineMs,
+        (signal) =>
+          transport === "static-list"
+            ? fetchCompleteStaticList<T>(fetcher, endpoint, signal)
+            : fetchCursorPages<T>(fetcher, endpoint, { signal }),
+      );
       const status: MapResourceStatus =
         result.status === "complete"
           ? {
@@ -351,7 +403,9 @@ export async function loadMapResources(
   }> {
     try {
       const focusedNode = options.focusedNodeId
-        ? await fetchFocusedNode(fetcher, apiUrl, options.focusedNodeId)
+        ? await withResourceDeadline("nodes", resourceDeadlineMs, (signal) =>
+            fetchFocusedNode(fetcher, apiUrl, options.focusedNodeId!, signal),
+          )
         : null;
       const items = focusedNode ? [focusedNode] : [];
       return {

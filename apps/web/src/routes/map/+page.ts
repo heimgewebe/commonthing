@@ -24,7 +24,7 @@ export const load: PageLoad = async ({ fetch, depends, url }) => {
   const focus = parseMapUrlState(url.searchParams).focus;
   const focusedNodeId =
     nodeLoadMode === "viewport" && focus?.type === "node" ? focus.id : null;
-  return loadMapResources((url) => fetch(url), apiUrl, transport, {
+  return loadMapResources(fetch, apiUrl, transport, {
     nodeLoadMode,
     focusedNodeId,
   });
