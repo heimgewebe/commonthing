@@ -286,11 +286,17 @@ async function measureWheelInteraction(
       __mapCardinalityFullstackInteraction?: {
         nextPaintMs: number | null;
         frameDeltas: number[];
+        completion: Promise<void>;
       };
     };
+    let resolveCompletion: (() => void) | null = null;
+    const completion = new Promise<void>((resolve) => {
+      resolveCompletion = resolve;
+    });
     state.__mapCardinalityFullstackInteraction = {
       nextPaintMs: null,
       frameDeltas: [],
+      completion,
     };
     window.addEventListener(
       "wheel",
@@ -298,10 +304,19 @@ async function measureWheelInteraction(
         const startedAt = performance.now();
         const sample = state.__mapCardinalityFullstackInteraction;
         if (!sample) return;
+        const maybeResolve = (): void => {
+          if (
+            typeof sample.nextPaintMs === "number" &&
+            sample.frameDeltas.length >= count
+          ) {
+            resolveCompletion?.();
+          }
+        };
 
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
             sample.nextPaintMs = performance.now() - startedAt;
+            maybeResolve();
           });
         });
 
@@ -310,6 +325,7 @@ async function measureWheelInteraction(
           if (previous !== null) sample.frameDeltas.push(timestamp - previous);
           previous = timestamp;
           if (sample.frameDeltas.length < count) requestAnimationFrame(next);
+          else maybeResolve();
         };
         requestAnimationFrame(next);
       },
@@ -322,35 +338,34 @@ async function measureWheelInteraction(
   if (!box) throw new Error("map canvas bounding box is unavailable");
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await page.mouse.wheel(0, deltaY);
-  await page.waitForFunction(
-    (count) => {
-      const sample = (
-        window as Window & {
-          __mapCardinalityFullstackInteraction?: {
-            nextPaintMs: number | null;
-            frameDeltas: number[];
-          };
-        }
-      ).__mapCardinalityFullstackInteraction;
-      return Boolean(
-        sample &&
-        typeof sample.nextPaintMs === "number" &&
-        sample.frameDeltas.length >= count,
-      );
-    },
-    frameCount,
-    { timeout: 10_000 },
-  );
-  return page.evaluate(() => {
+  return page.evaluate(async () => {
     const sample = (
       window as Window & {
         __mapCardinalityFullstackInteraction?: {
           nextPaintMs: number | null;
           frameDeltas: number[];
+          completion: Promise<void>;
         };
       }
     ).__mapCardinalityFullstackInteraction;
-    if (!sample || typeof sample.nextPaintMs !== "number") {
+    if (!sample) throw new Error("wheel interaction sample missing");
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error("wheel interaction sample timed out")),
+        10_000,
+      );
+      sample.completion.then(
+        () => {
+          clearTimeout(timeout);
+          resolve();
+        },
+        (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
+      );
+    });
+    if (typeof sample.nextPaintMs !== "number") {
       throw new Error("wheel interaction sample missing");
     }
     return {
