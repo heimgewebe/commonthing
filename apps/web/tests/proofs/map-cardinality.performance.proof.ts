@@ -430,6 +430,29 @@ test("keeps 1k/10k/100k map cardinalities inside fixed browser budgets", async (
         native_layer_expected: nativeLayerExpected,
         native_layer_actual: nativeLayerActual,
       });
+
+      if (cardinality === 1000 && nativeLayerExpected) {
+        await page.getByRole("button", { name: "Werkzeuge öffnen" }).click();
+        await page.getByTestId("tool-fan-find").click();
+        const dialog = page.getByRole("dialog", { name: "Finden" });
+        const combobox = page.getByRole("combobox", { name: "Suchbegriff" });
+        const listbox = page.getByRole("listbox", {
+          name: "Kartenobjekte im Ausschnitt",
+        });
+        await expect(dialog).toBeVisible();
+        await expect(combobox).toBeFocused();
+        await expect(listbox).toBeVisible();
+        await expect(listbox.getByRole("option")).toHaveCount(50);
+        await expect(
+          page.getByText("1–50 von 250 Kartenobjekten im Ausschnitt"),
+        ).toBeVisible();
+        await combobox.press("ArrowDown");
+        await combobox.press("Enter");
+        await expect(dialog).toBeHidden();
+        await expect(
+          page.locator('.map-marker[data-selected="true"]'),
+        ).toHaveCount(1);
+      }
     } finally {
       await context.close();
     }

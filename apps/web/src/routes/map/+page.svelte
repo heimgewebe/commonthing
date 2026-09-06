@@ -722,7 +722,11 @@
             north: bounds.getNorth(),
           },
         );
-        if (destroyed || controller.signal.aborted || sequence !== viewportNodeSequence)
+        if (
+          destroyed ||
+          controller.signal.aborted ||
+          sequence !== viewportNodeSequence
+        )
           return;
         viewportNodes = result.items;
         if (!viewportBootstrapReleased) {
@@ -747,7 +751,11 @@
                 reason: result.reason,
               };
       } catch (error) {
-        if (destroyed || controller.signal.aborted || sequence !== viewportNodeSequence)
+        if (
+          destroyed ||
+          controller.signal.aborted ||
+          sequence !== viewportNodeSequence
+        )
           return;
         viewportNodeStatus = {
           resource: "nodes",
@@ -1107,7 +1115,9 @@
   // into the viewport scene. Re-fetching the same node during invalidation must
   // not reopen that handoff after it was already released.
   $effect.pre(() => {
-    const currentBootstrapKey = (data.nodes ?? []).map((node) => node.id).join("\0");
+    const currentBootstrapKey = (data.nodes ?? [])
+      .map((node) => node.id)
+      .join("\0");
     if (currentBootstrapKey === lastViewportBootstrapKey) return;
     lastViewportBootstrapKey = currentBootstrapKey;
     viewportBootstrapReleased = false;
@@ -1156,7 +1166,8 @@
   });
   let effectiveResourceStatus = $derived.by(() => {
     const statuses = data.resourceStatus ?? [];
-    if (data.nodeLoadMode !== "viewport" || !viewportNodeStatus) return statuses;
+    if (data.nodeLoadMode !== "viewport" || !viewportNodeStatus)
+      return statuses;
     return statuses.map((status) =>
       status.resource === "nodes" ? viewportNodeStatus! : status,
     );
@@ -1416,6 +1427,7 @@
     on:retry={retryMapInitialisation}
   />
   <MapRouteOverlays
+    mapEntities={projectedMarkersData ?? []}
     {filteredResults}
     searchStatus={nodeSearchStatus}
     searchMode={nodeSearchMode}

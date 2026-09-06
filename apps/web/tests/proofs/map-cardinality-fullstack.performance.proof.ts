@@ -19,9 +19,15 @@ import * as cardinalityEvidenceRuntime from "../../scripts/map-cardinality-evide
 
 const {
   MAP_CARDINALITY_FULLSTACK_BUDGETS,
+  MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT,
+  MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLES_PER_INTERACTION,
+  MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLE_COUNT,
   buildMapCardinalityFullstackEvidence,
   writeMapCardinalityFullstackEvidence,
 } = fullstackEvidenceRuntime as unknown as {
+  MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT: number;
+  MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLES_PER_INTERACTION: number;
+  MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLE_COUNT: number;
   MAP_CARDINALITY_FULLSTACK_BUDGETS: Record<
     Cardinality,
     {
@@ -85,9 +91,11 @@ type CardinalitySample = {
   bulk_node_request_count: number;
   readiness_ms: number;
   interaction_to_next_paint_ms: number;
+  interaction_sample_count: number;
   api_response_p95_ms: number;
   frame_time_p95_ms: number;
   frame_time_max_ms: number;
+  frame_time_sample_count: number;
   js_heap_used_bytes: number;
   dom_marker_count: number;
   native_layer_expected: boolean;
@@ -268,71 +276,87 @@ async function settleFrames(page: Page, frames: number): Promise<void> {
   );
 }
 
-async function measureFrameCadence(page: Page, frames = 90) {
-  const deltas = await page.evaluate(
-    (count) =>
-      new Promise<number[]>((resolve) => {
-        const values: number[] = [];
-        let previous: number | null = null;
-        const next = (timestamp: number): void => {
-          if (previous !== null) values.push(timestamp - previous);
-          previous = timestamp;
-          if (values.length >= count) {
-            resolve(values);
-            return;
-          }
-          requestAnimationFrame(next);
-        };
-        requestAnimationFrame(next);
-      }),
-    frames,
-  );
-  return {
-    p95: percentile(deltas, 0.95),
-    max: Math.max(...deltas),
-  };
-}
-
-async function measureWheelToNextPaint(page: Page): Promise<number> {
-  await page.evaluate(() => {
+async function measureWheelInteraction(
+  page: Page,
+  deltaY: number,
+  frameCount: number,
+): Promise<{ interactionMs: number; frameDeltas: number[] }> {
+  await page.evaluate((count) => {
     const state = window as Window & {
-      __mapCardinalityFullstackWheelMs?: number | null;
+      __mapCardinalityFullstackInteraction?: {
+        nextPaintMs: number | null;
+        frameDeltas: number[];
+      };
     };
-    state.__mapCardinalityFullstackWheelMs = null;
+    state.__mapCardinalityFullstackInteraction = {
+      nextPaintMs: null,
+      frameDeltas: [],
+    };
     window.addEventListener(
       "wheel",
       () => {
         const startedAt = performance.now();
+        const sample = state.__mapCardinalityFullstackInteraction;
+        if (!sample) return;
+
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
-            state.__mapCardinalityFullstackWheelMs =
-              performance.now() - startedAt;
+            sample.nextPaintMs = performance.now() - startedAt;
           });
         });
+
+        let previous: number | null = null;
+        const next = (timestamp: number): void => {
+          if (previous !== null) sample.frameDeltas.push(timestamp - previous);
+          previous = timestamp;
+          if (sample.frameDeltas.length < count) requestAnimationFrame(next);
+        };
+        requestAnimationFrame(next);
       },
       { once: true, capture: true },
     );
-  });
+  }, frameCount);
+
   const canvas = page.locator("canvas.maplibregl-canvas").first();
   const box = await canvas.boundingBox();
   if (!box) throw new Error("map canvas bounding box is unavailable");
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await page.mouse.wheel(0, -320);
+  await page.mouse.wheel(0, deltaY);
   await page.waitForFunction(
-    () =>
-      typeof (
-        window as Window & { __mapCardinalityFullstackWheelMs?: number | null }
-      ).__mapCardinalityFullstackWheelMs === "number",
-    undefined,
-    { timeout: 5000 },
+    (count) => {
+      const sample = (
+        window as Window & {
+          __mapCardinalityFullstackInteraction?: {
+            nextPaintMs: number | null;
+            frameDeltas: number[];
+          };
+        }
+      ).__mapCardinalityFullstackInteraction;
+      return Boolean(
+        sample &&
+        typeof sample.nextPaintMs === "number" &&
+        sample.frameDeltas.length >= count,
+      );
+    },
+    frameCount,
+    { timeout: 10_000 },
   );
   return page.evaluate(() => {
-    const value = (
-      window as Window & { __mapCardinalityFullstackWheelMs?: number | null }
-    ).__mapCardinalityFullstackWheelMs;
-    if (typeof value !== "number")
-      throw new Error("wheel paint sample missing");
-    return value;
+    const sample = (
+      window as Window & {
+        __mapCardinalityFullstackInteraction?: {
+          nextPaintMs: number | null;
+          frameDeltas: number[];
+        };
+      }
+    ).__mapCardinalityFullstackInteraction;
+    if (!sample || typeof sample.nextPaintMs !== "number") {
+      throw new Error("wheel interaction sample missing");
+    }
+    return {
+      interactionMs: sample.nextPaintMs,
+      frameDeltas: sample.frameDeltas,
+    };
   });
 }
 
@@ -541,20 +565,44 @@ test("keeps real PostgreSQL → API BBOX → Chromium at 1k/10k/100k inside fixe
       );
       expect(nativeLayerActual).toBe(nativeLayerExpected);
 
-      const interactionMs = await measureWheelToNextPaint(page);
-      // Capture frame cadence while the wheel-driven MapLibre animation is
-      // still in flight instead of measuring only the later idle map.
-      const frameCadence = await measureFrameCadence(page, 60);
-      await page.waitForFunction(
-        () => {
-          const map = (
-            window as Window & { __TEST_MAP__?: { isMoving: () => boolean } }
-          ).__TEST_MAP__;
-          return Boolean(map && !map.isMoving());
-        },
-        undefined,
-        { timeout: 10_000 },
+      const interactionSamples: number[] = [];
+      const frameDeltas: number[] = [];
+      for (
+        let index = 0;
+        index < MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT;
+        index += 1
+      ) {
+        const deltaY = index % 2 === 0 ? -320 : 320;
+        const interaction = await measureWheelInteraction(
+          page,
+          deltaY,
+          MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLES_PER_INTERACTION,
+        );
+        interactionSamples.push(interaction.interactionMs);
+        frameDeltas.push(...interaction.frameDeltas);
+        await page.waitForFunction(
+          () => {
+            const map = (
+              window as Window & { __TEST_MAP__?: { isMoving: () => boolean } }
+            ).__TEST_MAP__;
+            return Boolean(map && !map.isMoving());
+          },
+          undefined,
+          { timeout: 10_000 },
+        );
+        await settleFrames(page, 2);
+      }
+      expect(interactionSamples).toHaveLength(
+        MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT,
       );
+      expect(frameDeltas).toHaveLength(
+        MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLE_COUNT,
+      );
+      const interactionMs = Math.max(...interactionSamples);
+      const frameCadence = {
+        p95: percentile(frameDeltas, 0.95),
+        max: Math.max(...frameDeltas),
+      };
       await settleFrames(page, 4);
       const jsHeapUsedBytes = await measureJsHeap(context, page);
       await api.flush();
@@ -590,9 +638,11 @@ test("keeps real PostgreSQL → API BBOX → Chromium at 1k/10k/100k inside fixe
         bulk_node_request_count: finalSnapshot.bulkNodeRequestCount,
         readiness_ms: roundMilliseconds(readinessMs),
         interaction_to_next_paint_ms: roundMilliseconds(interactionMs),
+        interaction_sample_count: interactionSamples.length,
         api_response_p95_ms: roundMilliseconds(finalSnapshot.apiResponseP95Ms),
         frame_time_p95_ms: roundMilliseconds(frameCadence.p95),
         frame_time_max_ms: roundMilliseconds(frameCadence.max),
+        frame_time_sample_count: frameDeltas.length,
         js_heap_used_bytes: Math.round(jsHeapUsedBytes),
         dom_marker_count: domMarkerCount,
         native_layer_expected: nativeLayerExpected,

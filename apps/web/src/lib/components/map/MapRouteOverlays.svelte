@@ -17,6 +17,7 @@
   } from "$lib/components/map/mapRouteEvents";
 
   interface Props {
+    mapEntities?: MapEntityViewModel[];
     filteredResults?: MapEntityViewModel[];
     searchStatus?: NodeSearchStatus;
     searchMode?: string | null;
@@ -30,6 +31,7 @@
   }
 
   let {
+    mapEntities = [],
     filteredResults = [],
     searchStatus = "idle",
     searchMode = null,
@@ -120,6 +122,7 @@
     {/if}
   {:then searchOverlayModule}
     <searchOverlayModule.default
+      {mapEntities}
       {filteredResults}
       {searchStatus}
       {searchMode}

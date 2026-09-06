@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   MAP_CARDINALITY_FULLSTACK_BUDGETS,
+  MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT,
+  MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLE_COUNT,
   buildMapCardinalityFullstackEvidence,
   validateMapCardinalityFullstackSample,
 } from "./map-cardinality-fullstack-evidence.mjs";
@@ -35,9 +37,12 @@ function sample(cardinality, overrides = {}) {
       50,
       budget.interaction_to_next_paint_ms,
     ),
+    interaction_sample_count:
+      MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT,
     api_response_p95_ms: Math.min(25, budget.api_response_p95_ms),
     frame_time_p95_ms: Math.min(20, budget.frame_time_p95_ms),
     frame_time_max_ms: 35,
+    frame_time_sample_count: MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLE_COUNT,
     js_heap_used_bytes: Math.min(
       48 * 1024 * 1024,
       budget.max_js_heap_used_bytes,
@@ -140,6 +145,23 @@ test("new memory, frame and API latency budgets fail closed", () => {
         sample(100000, { api_response_p95_ms: budget.api_response_p95_ms + 1 }),
       ),
     /API p95/,
+  );
+});
+
+test("requires the full interaction and frame sample volume", () => {
+  assert.throws(
+    () =>
+      validateMapCardinalityFullstackSample(
+        sample(100000, { interaction_sample_count: 2 }),
+      ),
+    /interaction sample count/,
+  );
+  assert.throws(
+    () =>
+      validateMapCardinalityFullstackSample(
+        sample(100000, { frame_time_sample_count: 179 }),
+      ),
+    /frame sample count/,
   );
 });
 

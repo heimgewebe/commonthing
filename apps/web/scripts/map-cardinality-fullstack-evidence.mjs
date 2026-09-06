@@ -11,6 +11,12 @@ import {
 
 const MIB = 1024 * 1024;
 
+export const MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT = 3;
+export const MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLES_PER_INTERACTION = 60;
+export const MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLE_COUNT =
+  MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT *
+  MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLES_PER_INTERACTION;
+
 export const MAP_CARDINALITY_FULLSTACK_BUDGETS = Object.freeze({
   1000: Object.freeze({
     readiness_ms: 8000,
@@ -89,6 +95,12 @@ export function validateMapCardinalityFullstackSample(sample) {
   );
   integer(sample.bulk_node_request_count, "sample.bulk_node_request_count", 0);
   integer(sample.dom_marker_count, "sample.dom_marker_count", 0);
+  integer(
+    sample.interaction_sample_count,
+    "sample.interaction_sample_count",
+    1,
+  );
+  integer(sample.frame_time_sample_count, "sample.frame_time_sample_count", 1);
   finite(sample.readiness_ms, "sample.readiness_ms");
   finite(
     sample.interaction_to_next_paint_ms,
@@ -99,6 +111,22 @@ export function validateMapCardinalityFullstackSample(sample) {
   finite(sample.frame_time_max_ms, "sample.frame_time_max_ms");
   finite(sample.js_heap_used_bytes, "sample.js_heap_used_bytes");
 
+  if (
+    sample.interaction_sample_count !==
+    MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT
+  ) {
+    throw new Error(
+      `cardinality ${cardinality}: interaction sample count ${sample.interaction_sample_count} does not match ${MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT}`,
+    );
+  }
+  if (
+    sample.frame_time_sample_count !==
+    MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLE_COUNT
+  ) {
+    throw new Error(
+      `cardinality ${cardinality}: frame sample count ${sample.frame_time_sample_count} does not match ${MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLE_COUNT}`,
+    );
+  }
   if (sample.page_size !== MAP_CARDINALITY_PAGE_SIZE) {
     throw new Error(
       `page size ${sample.page_size} does not match ${MAP_CARDINALITY_PAGE_SIZE}`,
@@ -306,7 +334,7 @@ export function buildMapCardinalityFullstackEvidence({
       "The proof uses the real Rust API and PostgreSQL BBOX/cursor path on loopback; it is a code-path and cardinality proof, not a production-network latency SLO.",
       "Deterministic production-shaped nodes are inserted directly into PostgreSQL after the API is already ready, proving viewport reads cannot depend on a startup-only node cache while intentionally excluding production ingestion cost.",
       "Chromium Runtime.getHeapUsage measures JavaScript heap after explicit garbage collection; it does not represent total browser, GPU, tile-cache, or operating-system memory.",
-      "Frame-time evidence is requestAnimationFrame cadence on the pinned Chromium/runner class and acts as a regression budget rather than hardware-independent FPS telemetry.",
+      `Frame-time evidence aggregates ${MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT} real wheel interactions with ${MAP_CARDINALITY_FULLSTACK_FRAME_SAMPLES_PER_INTERACTION} requestAnimationFrame intervals each on the pinned Chromium/runner class; it is a regression budget rather than hardware-independent FPS telemetry.`,
       "The proof replaces only the basemap style with a deterministic empty MapLibre style so missing PMTiles cannot gate the node data-path measurement; real basemap delivery is covered by separate basemap proofs.",
     ],
   };

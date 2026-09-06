@@ -12,7 +12,10 @@
   import type { NodeSearchStatus } from "$lib/api/search";
   import { restoreTarget } from "$lib/utils/focusManager";
 
+  const MAP_ENTITY_BROWSE_PAGE_SIZE = 50;
+
   interface Props {
+    mapEntities?: MapEntityViewModel[];
     filteredResults?: MapEntityViewModel[];
     searchStatus?: NodeSearchStatus;
     searchMode?: string | null;
@@ -20,6 +23,7 @@
   }
 
   let {
+    mapEntities = [],
     filteredResults = [],
     searchStatus = "idle",
     searchMode = null,
@@ -31,16 +35,31 @@
   let activeIndex = $state(-1);
   let wasOpen = false;
   let showAll = $state(false);
+  let browsePage = $state(0);
   let previousQuery = "";
   let previousResults: MapEntityViewModel[] | undefined;
+  let previousMapEntities: MapEntityViewModel[] | undefined;
 
+  let hasQuery = $derived($searchQuery.trim().length > 0);
+  let browsePageCount = $derived(
+    Math.max(1, Math.ceil(mapEntities.length / MAP_ENTITY_BROWSE_PAGE_SIZE)),
+  );
+  let browseStart = $derived(browsePage * MAP_ENTITY_BROWSE_PAGE_SIZE);
+  let browseResults = $derived(
+    mapEntities.slice(browseStart, browseStart + MAP_ENTITY_BROWSE_PAGE_SIZE),
+  );
   let visibleResults = $derived(
-    showAll ? filteredResults : filteredResults.slice(0, 6),
+    hasQuery
+      ? showAll
+        ? filteredResults
+        : filteredResults.slice(0, 6)
+      : browseResults,
   );
   $effect.pre(() => {
     if ($searchQuery !== previousQuery) {
       previousQuery = $searchQuery;
       showAll = false;
+      browsePage = 0;
       activeIndex = -1;
     }
   });
@@ -49,6 +68,13 @@
       previousResults = filteredResults;
       activeIndex = -1;
       if (filteredResults.length <= 6) showAll = false;
+    }
+  });
+  $effect.pre(() => {
+    if (mapEntities !== previousMapEntities) {
+      previousMapEntities = mapEntities;
+      activeIndex = -1;
+      browsePage = Math.min(browsePage, browsePageCount - 1);
     }
   });
   $effect(() => {
@@ -61,6 +87,7 @@
     } else {
       activeIndex = -1;
       showAll = false;
+      browsePage = 0;
       if (wasOpen) {
         wasOpen = false;
         restoreTarget("search");
@@ -75,6 +102,12 @@
   function onSelect(item: MapEntityViewModel) {
     dispatch("select", item);
     closeSearch();
+  }
+
+  function setBrowsePage(nextPage: number) {
+    browsePage = Math.min(Math.max(nextPage, 0), browsePageCount - 1);
+    activeIndex = -1;
+    void tick().then(() => inputEl?.focus());
   }
   function handleGlobalKeydown(e: KeyboardEvent) {
     if (!$isSearchOpen || e.defaultPrevented || e.repeat) return;
@@ -135,10 +168,12 @@
         type="search"
         maxlength={MAX_SEARCH_QUERY_CHARS}
         placeholder="Gewebe durchsuchen…"
+        role="combobox"
         aria-label="Suchbegriff"
         aria-autocomplete="list"
-        aria-controls={$searchQuery.trim().length > 0 &&
-        visibleResults.length > 0
+        aria-haspopup="listbox"
+        aria-expanded={visibleResults.length > 0}
+        aria-controls={visibleResults.length > 0
           ? "search-results-listbox"
           : undefined}
         aria-activedescendant={activeIndex >= 0 &&
@@ -154,26 +189,27 @@
       >
     </div>
 
-    {#if $searchQuery.trim().length > 0}
-      {#if searchStatus === "loading"}
-        <div class="search-status" role="status" aria-live="polite">
-          Knoten werden sicher auf dem Server gesucht…
-        </div>
-      {/if}
-      {#if searchStatus === "error"}
-        <div class="search-error" role="status" aria-live="polite">
-          Die sichere Knotensuche ist gerade nicht verfügbar. Es wird nicht auf
-          eine lokale Knotensuche zurückgefallen.
-        </div>
-      {/if}
-      {#if searchMode === "lexical_fallback" || searchFallbackReason === "provider_unavailable"}
-        <div class="search-note" role="status">
-          Die semantische Ergänzung ist vorübergehend nicht verfügbar. Die
-          serverseitige lexikalische Suche bleibt aktiv.
-        </div>
-      {/if}
-      {#if visibleResults.length > 0}
-        <div class="result-meta" aria-live="polite">
+    {#if hasQuery && searchStatus === "loading"}
+      <div class="search-status" role="status" aria-live="polite">
+        Knoten werden sicher auf dem Server gesucht…
+      </div>
+    {/if}
+    {#if hasQuery && searchStatus === "error"}
+      <div class="search-error" role="status" aria-live="polite">
+        Die sichere Knotensuche ist gerade nicht verfügbar. Es wird nicht auf
+        eine lokale Knotensuche zurückgefallen.
+      </div>
+    {/if}
+    {#if hasQuery && (searchMode === "lexical_fallback" || searchFallbackReason === "provider_unavailable")}
+      <div class="search-note" role="status">
+        Die semantische Ergänzung ist vorübergehend nicht verfügbar. Die
+        serverseitige lexikalische Suche bleibt aktiv.
+      </div>
+    {/if}
+
+    {#if visibleResults.length > 0}
+      <div class="result-meta" aria-live="polite">
+        {#if hasQuery}
           {#if $activeFilterCount > 0}
             {filteredResults.length === 1
               ? "1 gefilterter Treffer"
@@ -183,60 +219,89 @@
               ? "1 Treffer"
               : `${filteredResults.length} Treffer`}
           {/if}
-        </div>
-        <ul
-          class="results"
-          id="search-results-listbox"
-          role="listbox"
-          aria-label="Suchvorschläge"
-          bind:this={listEl}
-        >
-          {#each visibleResults as result, index}
-            <li
-              id={resultOptionId(result)}
-              class="result-item"
-              role="option"
-              aria-selected={activeIndex === index}
-              class:active={activeIndex === index}
-              onclick={() => onSelect(result)}
-              onkeydown={(e) => {
-                if (e.key === "Enter") onSelect(result);
-              }}
-              onmouseenter={() => (activeIndex = index)}
+        {:else}
+          {browseStart + 1}–{Math.min(
+            browseStart + visibleResults.length,
+            mapEntities.length,
+          )} von {mapEntities.length} Kartenobjekten im Ausschnitt
+        {/if}
+      </div>
+      <ul
+        class="results"
+        id="search-results-listbox"
+        role="listbox"
+        aria-label={hasQuery ? "Suchvorschläge" : "Kartenobjekte im Ausschnitt"}
+        bind:this={listEl}
+      >
+        {#each visibleResults as result, index}
+          <li
+            id={resultOptionId(result)}
+            class="result-item"
+            role="option"
+            aria-selected={activeIndex === index}
+            class:active={activeIndex === index}
+            onclick={() => onSelect(result)}
+            onkeydown={(e) => {
+              if (e.key === "Enter") onSelect(result);
+            }}
+            onmouseenter={() => (activeIndex = index)}
+          >
+            <div class="result-content">
+              <span class="result-title">{result.title}</span>
+              {#if result.summary}<span class="result-summary"
+                  >{result.summary.length > 80
+                    ? result.summary.slice(0, 80) + "…"
+                    : result.summary}</span
+                >{/if}
+            </div>
+            <span class="result-type"
+              >{result.type === "node" ? "Knoten" : "Garnrolle"}</span
             >
-              <div class="result-content">
-                <span class="result-title">{result.title}</span>
-                {#if result.summary}<span class="result-summary"
-                    >{result.summary.length > 80
-                      ? result.summary.slice(0, 80) + "…"
-                      : result.summary}</span
-                  >{/if}
-              </div>
-              <span class="result-type"
-                >{result.type === "node" ? "Knoten" : "Garnrolle"}</span
-              >
-            </li>
-          {/each}
-        </ul>
-        {#if filteredResults.length > 6}
+          </li>
+        {/each}
+      </ul>
+      {#if hasQuery && filteredResults.length > 6}
+        <button
+          type="button"
+          class="show-more"
+          aria-expanded={showAll}
+          onclick={() => {
+            showAll = !showAll;
+            activeIndex = -1;
+          }}
+          >{showAll
+            ? "Weniger Vorschläge"
+            : `Alle ${filteredResults.length} Vorschläge zeigen`}</button
+        >
+      {:else if !hasQuery && browsePageCount > 1}
+        <div
+          class="browse-pagination"
+          role="group"
+          aria-label="Seiten der Kartenobjekte"
+        >
           <button
             type="button"
-            class="show-more"
-            aria-expanded={showAll}
-            onclick={() => {
-              showAll = !showAll;
-              activeIndex = -1;
-            }}
-            >{showAll
-              ? "Weniger Vorschläge"
-              : `Alle ${filteredResults.length} Vorschläge zeigen`}</button
+            disabled={browsePage === 0}
+            aria-label="Vorherige Kartenobjekte"
+            onclick={() => setBrowsePage(browsePage - 1)}>←</button
           >
-        {/if}
-      {:else if searchStatus !== "loading" && searchStatus !== "error"}
-        <div class="no-results" role="status">
-          Keine Treffer für „{$searchQuery}“
+          <span>Seite {browsePage + 1} von {browsePageCount}</span>
+          <button
+            type="button"
+            disabled={browsePage >= browsePageCount - 1}
+            aria-label="Nächste Kartenobjekte"
+            onclick={() => setBrowsePage(browsePage + 1)}>→</button
+          >
         </div>
       {/if}
+    {:else if hasQuery && searchStatus !== "loading" && searchStatus !== "error"}
+      <div class="no-results" role="status">
+        Keine Treffer für „{$searchQuery}“
+      </div>
+    {:else if !hasQuery}
+      <div class="no-results" role="status">
+        Keine Kartenobjekte im aktuellen Ausschnitt.
+      </div>
     {/if}
   </div>
 {/if}
@@ -383,6 +448,32 @@
   .show-more:hover,
   .show-more:focus-visible {
     background: var(--accent-soft);
+  }
+  .browse-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.35rem 0.25rem 0;
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+  .browse-pagination button {
+    min-width: 44px;
+    min-height: 44px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .browse-pagination button:hover:not(:disabled),
+  .browse-pagination button:focus-visible {
+    background: var(--accent-soft);
+  }
+  .browse-pagination button:disabled {
+    cursor: default;
+    opacity: 0.4;
   }
   .no-results {
     padding: 0.8rem 0.5rem 0.35rem;
