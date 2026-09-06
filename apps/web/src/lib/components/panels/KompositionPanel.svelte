@@ -8,6 +8,7 @@
     systemState,
   } from "$lib/stores/uiView";
   import { authStore } from "$lib/auth/store";
+  import { sensitiveSession } from "$lib/auth/sensitiveSession";
   import { createNode, ApiRequestError } from "$lib/api/domainWrites";
   import { combineKnottingTags, type KnottingTopic } from "$lib/knottingTopics";
   import KnottingTopicsSelector from "$lib/components/KnottingTopicsSelector.svelte";
@@ -61,13 +62,25 @@
   }
 
   async function returnToGarnrolleSettings(withLocation: boolean) {
+    formError = null;
     const location = withLocation ? $kompositionDraft?.lngLat : undefined;
     const accountId = $authStore.account_id;
-    if (browser && location && accountId) {
-      sessionStorage.setItem(
+    if (withLocation) {
+      if (!browser || !location || !accountId) {
+        formError =
+          "Der private Kartenanker konnte nicht für die Rückkehr gespeichert werden. Bitte versuche es erneut.";
+        return;
+      }
+      const stored = sensitiveSession.write(
+        accountId,
         `weltgewebe:garnrolle-return-location:${accountId}`,
         JSON.stringify({ lat: location[1], lon: location[0] }),
       );
+      if (!stored) {
+        formError =
+          "Der private Kartenanker konnte im Browser nicht zwischengespeichert werden. Prüfe die Browserspeicher-Einstellungen und versuche es erneut.";
+        return;
+      }
     }
     leaveToNavigation();
     await goto("/settings#meine-garnrolle");
@@ -164,6 +177,9 @@
     </div>
   {:else if placingGarnrolle}
     <div data-testid="garnrolle-placement">
+      {#if formError}
+        <div class="form-error" role="alert">{formError}</div>
+      {/if}
       {#if $kompositionDraft?.lngLat}
         <div class="state-set">
           <p><strong>Privater Kartenanker gewählt</strong></p>
