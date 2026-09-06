@@ -477,7 +477,9 @@ export class NodesOverlay {
     }
     if (markerScaleChanged) {
       this.markerScale = nextMarkerScale;
-      this.syncMapObjectScale();
+      if (!this.nativeLayerEnabled || this.activeMarkers.size > 0) {
+        this.syncMapObjectScale();
+      }
       this.markerScaleInitialized = true;
     }
   }
@@ -721,6 +723,13 @@ export class NodesOverlay {
           );
         }
       } else {
+        if (
+          this.nativeLayerEnabled &&
+          this.activeMarkers.size === 0 &&
+          this.markerScaleInitialized
+        ) {
+          this.syncMapObjectScale();
+        }
         const element = document.createElement("button");
         element.type = "button";
         element.className =

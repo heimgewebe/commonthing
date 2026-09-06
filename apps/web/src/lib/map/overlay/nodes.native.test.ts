@@ -8,6 +8,7 @@ import {
   type MarkerConstructor,
 } from "./nodes";
 import type { WeaveRuntime } from "./weaveRuntime";
+import { getMapMarkerScale } from "$lib/map/markerScale";
 
 class FakeClassList {
   private values = new Set<string>();
@@ -36,12 +37,38 @@ class FakeClassList {
   }
 }
 
+class FakeStyle {
+  borderStyle = "";
+  private values = new Map<string, string>();
+  private priorities = new Map<string, string>();
+
+  setProperty(name: string, value: string, priority = "") {
+    this.values.set(name, value);
+    this.priorities.set(name, priority);
+  }
+
+  getPropertyValue(name: string) {
+    return this.values.get(name) ?? "";
+  }
+
+  getPropertyPriority(name: string) {
+    return this.priorities.get(name) ?? "";
+  }
+
+  removeProperty(name: string) {
+    const previous = this.getPropertyValue(name);
+    this.values.delete(name);
+    this.priorities.delete(name);
+    return previous;
+  }
+}
+
 class FakeElement {
   classList = new FakeClassList();
   dataset: Record<string, string> = {};
   attributes = new Map<string, string>();
   children: FakeElement[] = [];
-  style: { borderStyle: string } = { borderStyle: "" };
+  style = new FakeStyle();
   title = "";
   type = "";
   src = "";
@@ -130,12 +157,27 @@ type Handler = (event: unknown) => void;
 
 class FakeMap {
   styleLoaded = true;
+  readonly container = new FakeElement();
+  private zoom = 13.5;
   private sources = new Map<string, FakeSource>();
   private layers = new Map<string, Record<string, unknown>>();
   private handlers = new Map<string, Set<Handler>>();
   private layerHandlers = new Map<string, Set<Handler>>();
   private featureStates = new Map<string, Record<string, unknown>>();
   readonly hitIds = new Set<string>();
+
+  getContainer() {
+    return this.container as unknown as HTMLElement;
+  }
+
+  getZoom() {
+    return this.zoom;
+  }
+
+  setZoom(zoom: number) {
+    this.zoom = zoom;
+    this.emit("zoom", undefined);
+  }
 
   on(type: string, layerOrHandler: string | Handler, maybeHandler?: Handler) {
     if (typeof layerOrHandler === "string") {
@@ -274,6 +316,21 @@ afterEach(() => {
 });
 
 describe("NodesOverlay native dense-entity layer", () => {
+  it("avoids zoom DOM scale writes until a native selection needs one marker", () => {
+    const { map, overlay } = setup();
+    overlay.update(points(101), true);
+
+    const setProperty = vi.spyOn(map.container.style, "setProperty");
+    map.setZoom(14);
+    expect(setProperty).not.toHaveBeenCalled();
+
+    overlay.updateSelection("node-0");
+    expect(setProperty).toHaveBeenCalledTimes(1);
+    expect(map.container.style.getPropertyValue("--map-object-scale")).toBe(
+      getMapMarkerScale(14).toFixed(3),
+    );
+  });
+
   it("moves dense ordinary entities out of DOM markers into one GeoJSON circle layer", () => {
     const { map, overlay } = setup();
     overlay.update(points(101), true);
