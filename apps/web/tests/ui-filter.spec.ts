@@ -154,7 +154,7 @@ test.describe("Sicht mode", () => {
     const searchOverlay = page.getByTestId("search-overlay");
     await expect(searchOverlay).toBeVisible();
 
-    const searchInput = page.getByRole("searchbox", { name: "Suchbegriff" });
+    const searchInput = page.getByRole("combobox", { name: "Suchbegriff" });
     await expect(searchInput).toBeVisible();
 
     // Search for a node item
@@ -231,7 +231,7 @@ test.describe("Sicht mode", () => {
       .click();
 
     await activateToolFanAction(page, "find");
-    await page.getByRole("searchbox", { name: "Suchbegriff" }).fill("Test");
+    await page.getByRole("combobox", { name: "Suchbegriff" }).fill("Test");
 
     await expect(
       page.getByRole("option", { name: /Test Node 1/ }),
@@ -317,7 +317,7 @@ test.describe("Sicht mode", () => {
     await activateToolFanAction(page, "find");
     await expect(sichtOverlay).not.toBeVisible();
 
-    const searchInput = page.getByRole("searchbox", { name: "Suchbegriff" });
+    const searchInput = page.getByRole("combobox", { name: "Suchbegriff" });
     await expect(searchInput).toBeVisible();
 
     // Search for excluded items should return no results
@@ -371,7 +371,7 @@ test.describe("Sicht mode", () => {
     await activateToolFanAction(page, "find");
     await expect(searchOverlay).toBeVisible();
     await expect(sichtOverlay).not.toBeVisible();
-    const searchInput = page.getByRole("searchbox", { name: "Suchbegriff" });
+    const searchInput = page.getByRole("combobox", { name: "Suchbegriff" });
     await expect(searchInput).toBeFocused();
   });
 

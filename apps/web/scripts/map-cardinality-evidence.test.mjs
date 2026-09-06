@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   MAP_CARDINALITY_BUDGETS,
+  MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT,
   expectedMapCardinalityItems,
   expectedMapCardinalityPages,
   buildMapCardinalityEvidence,
@@ -32,9 +33,17 @@ function sample(cardinality, overrides = {}) {
       50,
       budget.interaction_to_next_paint_ms,
     ),
-    dom_marker_count: cardinality > 1000 ? 0 : 100,
-    native_layer_expected: cardinality > 1000,
-    native_layer_actual: cardinality > 1000,
+    dom_marker_count:
+      expectedMapCardinalityItems(cardinality) >
+      MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT
+        ? 0
+        : 100,
+    native_layer_expected:
+      expectedMapCardinalityItems(cardinality) >
+      MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT,
+    native_layer_actual:
+      expectedMapCardinalityItems(cardinality) >
+      MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT,
     ...overrides,
   };
 }
@@ -46,6 +55,7 @@ test("page and item counts follow the viewport contract instead of global cardin
   assert.equal(expectedMapCardinalityItems(1000), 250);
   assert.equal(expectedMapCardinalityItems(10000), 1500);
   assert.equal(expectedMapCardinalityItems(100000), 1500);
+  assert.equal(MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT, 100);
 });
 
 test("all three source-cardinality budgets accept bounded browser samples", () => {

@@ -35,8 +35,8 @@ export type MarkerConstructor = new (options?: MarkerOptions) => Marker;
 export const MARKER_GEO_ANCHOR = "center" as const;
 const WEAVE_DETAIL_ZOOM = 13.5;
 const MARKER_SCALE_WRITE_EPSILON = 0.001;
-const FULL_DOM_MARKER_LIMIT = 100;
-export const NATIVE_ENTITY_LAYER_MIN_COUNT = 1_000;
+export const NATIVE_ENTITY_LAYER_MIN_COUNT = 100;
+const FULL_DOM_MARKER_LIMIT = NATIVE_ENTITY_LAYER_MIN_COUNT;
 export const NATIVE_ENTITY_SOURCE_ID = "commonthing-map-entities";
 export const NATIVE_ENTITY_LAYER_ID = "commonthing-map-entities-body";
 const NATIVE_ENTITY_DEFAULT_COLOR = "#76523d";
@@ -477,7 +477,9 @@ export class NodesOverlay {
     }
     if (markerScaleChanged) {
       this.markerScale = nextMarkerScale;
-      this.syncMapObjectScale();
+      if (!this.nativeLayerEnabled || this.activeMarkers.size > 0) {
+        this.syncMapObjectScale();
+      }
       this.markerScaleInitialized = true;
     }
   }
@@ -721,6 +723,13 @@ export class NodesOverlay {
           );
         }
       } else {
+        if (
+          this.nativeLayerEnabled &&
+          this.activeMarkers.size === 0 &&
+          this.markerScaleInitialized
+        ) {
+          this.syncMapObjectScale();
+        }
         const element = document.createElement("button");
         element.type = "button";
         element.className =

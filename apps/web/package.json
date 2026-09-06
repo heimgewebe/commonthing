@@ -45,6 +45,7 @@
     "pretest:proof:basemap-real": "cross-env PUBLIC_BASEMAP_MODE=local-sovereign PUBLIC_BASEMAP_VARIANT=regional pnpm run generate:basemap-config",
     "pretest:proof:basemap-germany": "cross-env PUBLIC_BASEMAP_MODE=local-sovereign PUBLIC_BASEMAP_VARIANT=germany pnpm run generate:basemap-config",
     "pretest:proof:web-runtime": "pnpm run generate:basemap-config",
+    "pretest:proof:map-cardinality-fullstack": "pnpm run generate:basemap-config",
     "pretest:unit": "pnpm run generate:client-version && pnpm run generate:basemap-config",
     "test:unit": "vitest run",
     "test:basemap-config": "node --test scripts/generate-basemap-config.test.mjs scripts/basemap-mode-resolve.test.mjs",
@@ -59,6 +60,7 @@
     "test:proof:basemap-real": "cross-env PUBLIC_BASEMAP_MODE=local-sovereign PUBLIC_BASEMAP_VARIANT=regional playwright test --config=playwright.proof.config.ts --reporter=dot,html,junit",
     "test:proof:basemap-germany": "cross-env PUBLIC_BASEMAP_MODE=local-sovereign PUBLIC_BASEMAP_VARIANT=germany playwright test --config=playwright.germany.proof.config.ts --reporter=dot,html,junit",
     "test:proof:web-runtime": "playwright test --config=playwright.performance.config.ts",
+    "test:proof:map-cardinality-fullstack": "playwright test --config=playwright.cardinality-fullstack.config.ts",
     "assert:proof:web-runtime": "node scripts/assert-web-runtime-evidence.mjs",
     "test:report": "playwright show-report",
     "test:ci": "playwright test --reporter=dot,html,junit",
@@ -66,13 +68,14 @@
     "test:setup": "node ./node_modules/@playwright/test/cli.js install --with-deps || true",
     "sync": "node scripts/generate-version.js --client && pnpm run generate:basemap-config && svelte-kit sync",
     "preci": "pnpm run generate:basemap-config",
-    "ci": "node ../../ci/scripts/assert-web-budget.mjs && pnpm test:route-performance-budget && pnpm test:web-runtime-evidence && pnpm test:map-cardinality-evidence && pnpm test:public-web-assets && pnpm test:basemap-config && pnpm lint && pnpm check:ci",
+    "ci": "node ../../ci/scripts/assert-web-budget.mjs && pnpm test:route-performance-budget && pnpm test:web-runtime-evidence && pnpm test:map-cardinality-evidence && pnpm test:map-cardinality-fullstack-evidence && pnpm test:public-web-assets && pnpm test:basemap-config && pnpm lint && pnpm check:ci",
     "dev:cs": "node scripts/generate-version.js --client && pnpm run generate:basemap-config && vite dev --host 0.0.0.0 --port 5173",
     "preview:cs": "vite preview --host 0.0.0.0 --port 4173",
     "generate:client-version": "node scripts/generate-version.js --client",
     "measure:map-start-path": "node scripts/map-start-path-closure.mjs",
     "test:route-performance-budget": "node --test scripts/assert-route-performance-budget.test.mjs scripts/performance-contract.test.mjs scripts/build-profile-contract.test.mjs scripts/map-start-path-closure.test.mjs",
-    "test:map-cardinality-evidence": "node --test scripts/map-cardinality-evidence.test.mjs"
+    "test:map-cardinality-evidence": "node --test scripts/map-cardinality-evidence.test.mjs",
+    "test:map-cardinality-fullstack-evidence": "node --test scripts/map-cardinality-fullstack-evidence.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

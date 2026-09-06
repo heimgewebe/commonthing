@@ -7,15 +7,20 @@ import {
   type CursorTruncationReason,
 } from "./cursorPagination";
 import type { Node } from "./types";
+import {
+  NodeViewportError,
+  nodeViewportBboxes,
+  type NodeViewportBounds,
+} from "./nodeViewportBounds";
+
+export {
+  NodeViewportError,
+  nodeViewportBboxes,
+  nodeViewportContains,
+  type NodeViewportBounds,
+} from "./nodeViewportBounds";
 
 type FetchLike = (input: string) => Promise<Response>;
-
-export type NodeViewportBounds = {
-  west: number;
-  south: number;
-  east: number;
-  north: number;
-};
 
 export type NodeViewportResult =
   | { items: Node[]; status: "complete"; pages: number }
@@ -25,80 +30,6 @@ export type NodeViewportResult =
       pages: number;
       reason: CursorTruncationReason;
     };
-
-export class NodeViewportError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "NodeViewportError";
-  }
-}
-
-function finite(value: number, label: string): number {
-  if (!Number.isFinite(value)) {
-    throw new NodeViewportError(`${label} must be finite`);
-  }
-  return value;
-}
-
-function normalizeLongitude(value: number): number {
-  const normalized = ((((value + 180) % 360) + 360) % 360) - 180;
-  return Object.is(normalized, -0) ? 0 : normalized;
-}
-
-function coordinate(value: number): string {
-  const rounded = Number(value.toFixed(6));
-  return String(Object.is(rounded, -0) ? 0 : rounded);
-}
-
-/**
- * Convert one possibly unwrapped MapLibre viewport into API bboxes.
- * A viewport crossing the antimeridian becomes two ordinary boxes because the
- * existing node API intentionally accepts rectangular min/max bboxes only.
- */
-export function nodeViewportBboxes(bounds: NodeViewportBounds): string[] {
-  const westRaw = finite(bounds.west, "bounds.west");
-  let eastRaw = finite(bounds.east, "bounds.east");
-  const southRaw = finite(bounds.south, "bounds.south");
-  const northRaw = finite(bounds.north, "bounds.north");
-  if (southRaw > northRaw) {
-    throw new NodeViewportError("bounds.south must not exceed bounds.north");
-  }
-  const south = Math.max(-90, southRaw);
-  const north = Math.min(90, northRaw);
-  if (south > north) {
-    throw new NodeViewportError(
-      "viewport is outside the supported latitude range",
-    );
-  }
-  if (
-    westRaw >= -180 &&
-    westRaw <= 180 &&
-    eastRaw >= -180 &&
-    eastRaw <= 180 &&
-    westRaw <= eastRaw
-  ) {
-    return [
-      `${coordinate(westRaw)},${coordinate(south)},${coordinate(eastRaw)},${coordinate(north)}`,
-    ];
-  }
-  while (eastRaw < westRaw) eastRaw += 360;
-  const span = eastRaw - westRaw;
-  if (span >= 360) {
-    return [`-180,${coordinate(south)},180,${coordinate(north)}`];
-  }
-
-  const west = normalizeLongitude(westRaw);
-  const east = normalizeLongitude(eastRaw);
-  if (west <= east) {
-    return [
-      `${coordinate(west)},${coordinate(south)},${coordinate(east)},${coordinate(north)}`,
-    ];
-  }
-  return [
-    `${coordinate(west)},${coordinate(south)},180,${coordinate(north)}`,
-    `-180,${coordinate(south)},${coordinate(east)},${coordinate(north)}`,
-  ];
-}
 
 function endpoint(apiUrl: string, bbox: string): string {
   const params = new URLSearchParams({ bbox });

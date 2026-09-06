@@ -235,7 +235,7 @@ test.describe("Search mode", () => {
     await page.waitForSelector(".map-marker");
     await activateToolFanAction(page, "find");
     await page
-      .getByRole("searchbox", { name: "Suchbegriff" })
+      .getByRole("combobox", { name: "Suchbegriff" })
       .fill("Unauffindbar");
 
     await expect(
@@ -266,7 +266,7 @@ test.describe("Search mode", () => {
     await page.goto("/map");
     await page.waitForSelector(".map-marker");
     await activateToolFanAction(page, "find");
-    const input = page.getByRole("searchbox", { name: "Suchbegriff" });
+    const input = page.getByRole("combobox", { name: "Suchbegriff" });
     await input.fill("Abendliches Stricken");
 
     const options = page.getByRole("option");
@@ -355,7 +355,7 @@ test.describe("Search mode", () => {
 
     await moveSearchTargetOffscreen(page);
     await activateToolFanAction(page, "find");
-    await page.getByRole("searchbox", { name: "Suchbegriff" }).fill("Strick");
+    await page.getByRole("combobox", { name: "Suchbegriff" }).fill("Strick");
 
     const direction = page.getByTestId("search-direction-node-mock-node-1");
     await expect(direction).toBeVisible();

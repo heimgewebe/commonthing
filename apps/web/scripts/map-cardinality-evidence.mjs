@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export const MAP_CARDINALITY_PAGE_SIZE = 1000;
+export const MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT = 100;
 export const MAP_CARDINALITY_CLIENT_MAX_PAGES = 10;
 export const MAP_CARDINALITY_CLIENT_MAX_ITEMS = 10_000;
 export const MAP_CARDINALITY_VIEWPORT_ITEMS = Object.freeze({
@@ -14,7 +15,7 @@ export const MAP_CARDINALITY_BUDGETS = Object.freeze({
   1000: Object.freeze({
     readiness_ms: 5000,
     interaction_to_next_paint_ms: 200,
-    max_dom_markers: 250,
+    max_dom_markers: 1,
     max_api_response_bytes: 500_000,
   }),
   10000: Object.freeze({
@@ -164,7 +165,7 @@ export function validateMapCardinalitySample(sample) {
       `cardinality ${cardinality}: API response bytes ${sample.api_response_bytes} exceeds ${budget.max_api_response_bytes}`,
     );
   }
-  const nativeExpected = expectedItems > MAP_CARDINALITY_PAGE_SIZE;
+  const nativeExpected = expectedItems > MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT;
   if (sample.native_layer_expected !== nativeExpected) {
     throw new Error(
       `cardinality ${cardinality}: native layer expectation is inconsistent`,
@@ -240,6 +241,7 @@ export function buildMapCardinalityEvidence({
     generated_at: generatedAt,
     browser,
     page_size: MAP_CARDINALITY_PAGE_SIZE,
+    native_layer_min_count: MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT,
     client_limits: {
       max_pages: MAP_CARDINALITY_CLIENT_MAX_PAGES,
       max_items: MAP_CARDINALITY_CLIENT_MAX_ITEMS,

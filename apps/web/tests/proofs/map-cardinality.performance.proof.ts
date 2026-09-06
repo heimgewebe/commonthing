@@ -18,6 +18,7 @@ import * as mapCardinalityEvidenceRuntime from "../../scripts/map-cardinality-ev
 
 const {
   MAP_CARDINALITY_BUDGETS,
+  MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT,
   MAP_CARDINALITY_PAGE_SIZE,
   MAP_CARDINALITY_CLIENT_MAX_ITEMS,
   MAP_CARDINALITY_CLIENT_MAX_PAGES,
@@ -35,6 +36,7 @@ const {
       max_api_response_bytes: number;
     }
   >;
+  MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT: number;
   MAP_CARDINALITY_PAGE_SIZE: number;
   MAP_CARDINALITY_CLIENT_MAX_ITEMS: number;
   MAP_CARDINALITY_CLIENT_MAX_PAGES: number;
@@ -316,6 +318,13 @@ test("keeps 1k/10k/100k map cardinalities inside fixed browser budgets", async (
   const sourceRevision = resolveExactSourceRevision();
   assertExactGitCheckout({ revision: sourceRevision });
   expect(MAP_CARDINALITY_PAGE_SIZE).toBe(MAP_CURSOR_PAGE_SIZE);
+  const overlaySource = readFileSync(
+    new URL("../../src/lib/map/overlay/nodes.ts", import.meta.url),
+    "utf8",
+  );
+  expect(overlaySource).toContain(
+    `export const NATIVE_ENTITY_LAYER_MIN_COUNT = ${MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT};`,
+  );
   expect(MAP_CARDINALITY_CLIENT_MAX_PAGES).toBe(MAP_CURSOR_MAX_PAGES);
   expect(MAP_CARDINALITY_CLIENT_MAX_ITEMS).toBe(MAP_CURSOR_MAX_ITEMS);
   const samples: CardinalitySample[] = [];
@@ -358,11 +367,15 @@ test("keeps 1k/10k/100k map cardinalities inside fixed browser budgets", async (
       expect(initialSnapshot.lastResponseHasMore).toBe(false);
       const readinessMs = performance.now() - startedAt;
       const domMarkerCount = await page.locator(".map-marker").count();
-      if (initialSnapshot.loadedItemCount <= MAP_CARDINALITY_PAGE_SIZE) {
+      if (
+        initialSnapshot.loadedItemCount <=
+        MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT
+      ) {
         expect(domMarkerCount).toBeGreaterThan(0);
       }
       const nativeLayerExpected =
-        initialSnapshot.loadedItemCount > MAP_CARDINALITY_PAGE_SIZE;
+        initialSnapshot.loadedItemCount >
+        MAP_CARDINALITY_NATIVE_LAYER_MIN_COUNT;
       const nativeLayerActual = await page.evaluate(() =>
         Boolean(
           (
@@ -417,6 +430,49 @@ test("keeps 1k/10k/100k map cardinalities inside fixed browser budgets", async (
         native_layer_expected: nativeLayerExpected,
         native_layer_actual: nativeLayerActual,
       });
+
+      if (cardinality === 1000 && nativeLayerExpected) {
+        await page.getByRole("button", { name: "Werkzeuge öffnen" }).click();
+        await page.getByTestId("tool-fan-find").click();
+        const dialog = page.getByRole("dialog", { name: "Finden" });
+        const combobox = page.getByRole("combobox", { name: "Suchbegriff" });
+        const browseRegion = page.getByRole("region", {
+          name: "Kartenobjekte im Ausschnitt",
+        });
+        const browseList = browseRegion.getByRole("list", {
+          name: "Kartenobjekte im Ausschnitt",
+        });
+        await expect(dialog).toBeVisible();
+        await expect(combobox).toBeFocused();
+        await expect(browseRegion).toBeVisible();
+        await expect(browseList.getByRole("button")).toHaveCount(50);
+        await expect(
+          page.getByText("1–50 von 250 Kartenobjekten im Ausschnitt"),
+        ).toBeVisible();
+        const nextPage = browseRegion.getByRole("button", {
+          name: "Nächste Kartenobjekte",
+        });
+        for (let pageIndex = 1; pageIndex < 5; pageIndex += 1) {
+          await nextPage.click();
+        }
+        await expect(
+          page.getByText("201–250 von 250 Kartenobjekten im Ausschnitt"),
+        ).toBeVisible();
+        await expect(browseList.getByRole("button")).toHaveCount(50);
+
+        await combobox.focus();
+        await page.keyboard.press("Tab");
+        await page.keyboard.press("Tab");
+        const firstBrowseButton = browseList.getByRole("button").first();
+        await expect(firstBrowseButton).toBeFocused();
+        await page.keyboard.press("Enter");
+        await expect(dialog).toBeHidden();
+        const selectedMarker = page.locator(
+          '.map-marker[data-selected="true"]',
+        );
+        await expect(selectedMarker).toHaveCount(1);
+        await expect(selectedMarker).toHaveAttribute("aria-current", "true");
+      }
     } finally {
       await context.close();
     }

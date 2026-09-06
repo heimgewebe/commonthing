@@ -33,7 +33,7 @@ async function openSearch(page: Page) {
   await page.goto("/map");
   await page.waitForSelector(".map-marker");
   await activateToolFanAction(page, "find");
-  return page.getByRole("searchbox", { name: "Suchbegriff" });
+  return page.getByRole("combobox", { name: "Suchbegriff" });
 }
 
 test.describe("T007 authorized server search contract", () => {

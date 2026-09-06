@@ -1,6 +1,10 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { fetchNodeViewport, nodeViewportBboxes } from "./nodeViewport";
+import {
+  fetchNodeViewport,
+  nodeViewportBboxes,
+  nodeViewportContains,
+} from "./nodeViewport";
 
 function cursorPage(
   items: unknown[],
@@ -49,6 +53,59 @@ describe("nodeViewportBboxes", () => {
     expect(() =>
       nodeViewportBboxes({ west: Number.NaN, south: 0, east: 1, north: 1 }),
     ).toThrow(/finite/);
+  });
+});
+
+describe("nodeViewportContains", () => {
+  it("reuses an ordinary complete coverage for a contained viewport", () => {
+    expect(
+      nodeViewportContains(
+        { west: 9, south: 53, east: 11, north: 55 },
+        { west: 9.5, south: 53.5, east: 10.5, north: 54.5 },
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a viewport that extends beyond complete coverage", () => {
+    expect(
+      nodeViewportContains(
+        { west: 9, south: 53, east: 11, north: 55 },
+        { west: 8.9, south: 53.5, east: 10.5, north: 54.5 },
+      ),
+    ).toBe(false);
+  });
+
+  it("handles contained antimeridian coverage through canonical split boxes", () => {
+    expect(
+      nodeViewportContains(
+        { west: 170, south: -20, east: 190, north: 20 },
+        { west: 175, south: -10, east: 185, north: 10 },
+      ),
+    ).toBe(true);
+  });
+
+  it("lets full-world coverage contain ordinary and antimeridian viewports", () => {
+    const world = { west: -200, south: -100, east: 200, north: 100 };
+    expect(
+      nodeViewportContains(world, { west: 9, south: 53, east: 10, north: 54 }),
+    ).toBe(true);
+    expect(
+      nodeViewportContains(world, {
+        west: 175,
+        south: -10,
+        east: 185,
+        north: 10,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not treat an ordinary bbox as coverage for a crossing viewport", () => {
+    expect(
+      nodeViewportContains(
+        { west: 170, south: -20, east: 180, north: 20 },
+        { west: 175, south: -10, east: 185, north: 10 },
+      ),
+    ).toBe(false);
   });
 });
 
@@ -143,6 +200,18 @@ describe("map route viewport integration", () => {
       /const currentRouteStatus = data\.resourceStatus \?\? null;[\s\S]*requestNodeViewportRefresh\?\.\(\);/,
     );
     expect(pageSource).toContain("new AbortController()");
+    expect(pageSource).toContain(
+      "const refreshNodeViewport = async (force = false)",
+    );
+    expect(pageSource).toMatch(
+      /!force[\s\S]*viewportNodeCoverage !== null[\s\S]*nodeViewportContains\(viewportNodeCoverage, requestBounds\)/,
+    );
+    expect(pageSource).toContain(
+      'result.status === "complete" ? requestBounds : null',
+    );
+    expect(pageSource).toMatch(
+      /requestNodeViewportRefresh = \(\) => \{[\s\S]*refreshNodeViewport\(true\)/,
+    );
     expect(pageSource).toContain("viewportNodeAbortController?.abort();");
     expect(pageSource).toContain("sequence !== viewportNodeSequence");
     expect(pageSource).toContain("viewportBootstrapReleased");
