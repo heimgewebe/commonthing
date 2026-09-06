@@ -444,6 +444,16 @@
     color: var(--text);
     border-bottom: 1px solid var(--panel-border);
   }
+  .browse-section {
+    display: flex;
+    flex: 1 1 auto;
+    min-height: 0;
+    flex-direction: column;
+  }
+  .browse-section .results {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
   .browse-item {
     margin: 0;
     padding: 0;
