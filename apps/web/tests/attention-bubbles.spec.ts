@@ -221,7 +221,7 @@ test.describe("top-left attention bubbles", () => {
     );
     await moveSearchTargetOffscreen(page);
     await activateToolFanAction(page, "find");
-    await page.getByRole("searchbox", { name: "Suchbegriff" }).fill("Strick");
+    await page.getByRole("combobox", { name: "Suchbegriff" }).fill("Strick");
 
     await page.locator('[data-attention-id="direct:geometry"]').click();
     const card = page.getByTestId("attention-card");

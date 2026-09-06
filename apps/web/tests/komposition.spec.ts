@@ -189,13 +189,23 @@ test.describe("Komposition Flow (weber)", () => {
         url.searchParams.has("bbox")
       );
     });
-    const shiftedCenter = await page.evaluate(() => {
+    const shiftedCenter = await page.evaluate((previousCoverage) => {
       const map = (window as any).__TEST_MAP__;
       const center = map.getCenter();
-      const target = { lng: center.lng + 0.02, lat: center.lat };
+      // Coverage reuse intentionally suppresses contained moveend reloads. Move
+      // farther than the previously loaded bbox width so this assertion still
+      // observes a real later viewport refresh.
+      const previousLongitudeSpan = Math.max(
+        0.02,
+        Math.abs(previousCoverage.east - previousCoverage.west),
+      );
+      const target = {
+        lng: center.lng + previousLongitudeSpan * 1.1,
+        lat: center.lat,
+      };
       map.jumpTo({ center: [target.lng, target.lat] });
       return target;
-    });
+    }, boundsBeforeSubmit);
     await shiftedViewportRefresh;
     await page.waitForFunction(() =>
       Boolean(
