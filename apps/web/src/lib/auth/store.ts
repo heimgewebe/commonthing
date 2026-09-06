@@ -1,5 +1,9 @@
 import { get, writable } from "svelte/store";
 import { browser } from "$app/environment";
+import {
+  sensitiveSession,
+  type SensitiveSessionGuard,
+} from "./sensitiveSession";
 
 export type AuthState =
   | "checking"
@@ -22,6 +26,7 @@ export interface AuthStoreOptions {
   isBrowser?: boolean;
   fetcher?: typeof fetch;
   authCheckTimeoutMs?: number;
+  sensitiveSessionGuard?: SensitiveSessionGuard;
 }
 
 const anonymous = (state: AuthState = "unauthenticated"): AuthStatus => ({
@@ -30,29 +35,13 @@ const anonymous = (state: AuthState = "unauthenticated"): AuthStatus => ({
   role: "gast",
 });
 
-const SENSITIVE_SESSION_PREFIXES = [
-  "weltgewebe:garnrolle-draft:",
-  "weltgewebe:garnrolle-return-location:",
-] as const;
-
-function clearSensitiveSession(enabled: boolean, keepAccountId?: string) {
-  if (!enabled || typeof sessionStorage === "undefined") return;
-  for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
-    const key = sessionStorage.key(index);
-    if (!key) continue;
-    const prefix = SENSITIVE_SESSION_PREFIXES.find((value) =>
-      key.startsWith(value),
-    );
-    if (prefix && key !== (keepAccountId ? `${prefix}${keepAccountId}` : "")) {
-      sessionStorage.removeItem(key);
-    }
-  }
-}
-
 export const createAuthStore = (options: AuthStoreOptions = {}) => {
   const isBrowser = options.isBrowser ?? browser;
   const fetcher = options.fetcher ?? fetch;
   const authCheckTimeoutMs = options.authCheckTimeoutMs ?? 5000;
+  const sessionGuard = options.sensitiveSessionGuard ?? sensitiveSession;
+  const manageSensitiveSession =
+    options.sensitiveSessionGuard !== undefined || browser;
   const store = writable<AuthStatus>(
     anonymous(isBrowser ? "checking" : "unauthenticated"),
   );
@@ -62,11 +51,23 @@ export const createAuthStore = (options: AuthStoreOptions = {}) => {
   let pending: Promise<AuthStatus> | undefined;
 
   const publish = (next: AuthStatus, authoritative = false): AuthStatus => {
-    if (authoritative) {
-      clearSensitiveSession(
-        isBrowser,
-        next.authenticated ? next.account_id : undefined,
-      );
+    if (authoritative && isBrowser && manageSensitiveSession) {
+      try {
+        const storageReady = sessionGuard.bindAuthoritativeAccount(
+          next.authenticated && next.account_id ? next.account_id : null,
+        );
+        if (!storageReady) {
+          console.warn(
+            "Sensitive session storage unavailable; private draft access remains blocked.",
+          );
+        }
+      } catch {
+        // Browser-local cleanup is subordinate to the validated server auth
+        // response. Never let storage failure rewrite authenticated truth.
+        console.warn(
+          "Sensitive session cleanup failed; private draft access remains blocked.",
+        );
+      }
     }
     set(next);
     return next;

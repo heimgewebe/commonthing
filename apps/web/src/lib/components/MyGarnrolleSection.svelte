@@ -2,6 +2,7 @@
   import { browser } from "$app/environment";
   import { goto, invalidateAll } from "$app/navigation";
   import { authStore } from "$lib/auth/store";
+  import { sensitiveSession } from "$lib/auth/sensitiveSession";
   import {
     ApiRequestError,
     getOwnGarnrolleProfile,
@@ -100,8 +101,8 @@
 
   function clearStoredPrivateDraft(accountId: string) {
     if (!browser) return;
-    sessionStorage.removeItem(draftStorageKey(accountId));
-    sessionStorage.removeItem(returnLocationStorageKey(accountId));
+    sensitiveSession.remove(accountId, draftStorageKey(accountId));
+    sensitiveSession.remove(accountId, returnLocationStorageKey(accountId));
   }
 
   function invalidateAccountOperations() {
@@ -201,9 +202,10 @@
 
   function returnedMapLocation(accountId: string): Location | null {
     if (!browser) return null;
-    const key = returnLocationStorageKey(accountId);
-    const stored = sessionStorage.getItem(key);
-    sessionStorage.removeItem(key);
+    const stored = sensitiveSession.take(
+      accountId,
+      returnLocationStorageKey(accountId),
+    );
     if (!stored) return null;
     try {
       const value = JSON.parse(stored) as Partial<Location>;
@@ -254,12 +256,15 @@
       applyProfile(profile);
 
       if (browser) {
-        const stored = sessionStorage.getItem(draftStorageKey(accountId));
+        const stored = sensitiveSession.read(
+          accountId,
+          draftStorageKey(accountId),
+        );
         if (stored) {
           try {
             applyDraft(JSON.parse(stored) as Partial<GarnrolleDraft>);
           } catch {
-            sessionStorage.removeItem(draftStorageKey(accountId));
+            sensitiveSession.remove(accountId, draftStorageKey(accountId));
           }
         }
       }
@@ -297,12 +302,18 @@
     }
   }
 
-  function saveDraftForMap() {
-    if (!browser || !activeAccountId) return;
-    sessionStorage.setItem(
+  function saveDraftForMap(): boolean {
+    if (!browser || !activeAccountId) return false;
+    const saved = sensitiveSession.write(
+      activeAccountId,
       draftStorageKey(activeAccountId),
       JSON.stringify(currentDraft()),
     );
+    if (!saved) {
+      profileError =
+        "Privater Entwurf konnte im Browser nicht zwischengespeichert werden. Prüfe die Browserspeicher-Einstellungen und versuche es erneut.";
+    }
+    return saved;
   }
 
   async function chooseMapLocation() {
@@ -310,7 +321,7 @@
     draftMessage = null;
     saveMessage = null;
     profileError = null;
-    saveDraftForMap();
+    if (!saveDraftForMap()) return;
     await goto("/map?compose=garnrolle");
   }
 

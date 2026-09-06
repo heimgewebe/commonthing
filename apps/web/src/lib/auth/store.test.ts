@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("$app/environment", () => ({ browser: false }));
 
 import { createAuthStore } from "./store";
+import type { SensitiveSessionGuard } from "./sensitiveSession";
 
 function authResponse(accountId = "account-a"): Response {
   return new Response(
@@ -21,6 +22,18 @@ function guestResponse(status = 200): Response {
     JSON.stringify({ authenticated: false, account_id: null, role: "gast" }),
     { status, headers: { "Content-Type": "application/json" } },
   );
+}
+
+function storageGuard(
+  bindAuthoritativeAccount: SensitiveSessionGuard["bindAuthoritativeAccount"],
+): SensitiveSessionGuard {
+  return {
+    bindAuthoritativeAccount,
+    read: () => null,
+    write: () => false,
+    remove: () => false,
+    take: () => null,
+  };
 }
 
 describe("authStore", () => {
@@ -285,5 +298,59 @@ describe("authStore", () => {
       state: "unauthenticated",
       authenticated: false,
     });
+  });
+
+  it("keeps validated authenticated truth when sensitive storage cleanup throws", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(authResponse("account-storage-blocked"));
+    const sessionGuard = storageGuard(() => {
+      throw new DOMException("blocked", "SecurityError");
+    });
+    const store = createAuthStore({
+      isBrowser: true,
+      fetcher,
+      sensitiveSessionGuard: sessionGuard,
+    });
+
+    await expect(store.checkAuth()).resolves.toEqual({
+      state: "authenticated",
+      authenticated: true,
+      account_id: "account-storage-blocked",
+      role: "weber",
+    });
+    expect(get(store)).toMatchObject({
+      state: "authenticated",
+      authenticated: true,
+      account_id: "account-storage-blocked",
+    });
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it("accepts validated logout truth even while sensitive cleanup stays blocked", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(authResponse("account-before-storage-failure"))
+      .mockResolvedValueOnce(guestResponse());
+    const sessionGuard = storageGuard(() => false);
+    const store = createAuthStore({
+      isBrowser: true,
+      fetcher,
+      sensitiveSessionGuard: sessionGuard,
+    });
+
+    await store.checkAuth();
+    await store.checkAuth();
+    expect(get(store)).toEqual({
+      state: "unauthenticated",
+      authenticated: false,
+      account_id: undefined,
+      role: "gast",
+    });
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
   });
 });
