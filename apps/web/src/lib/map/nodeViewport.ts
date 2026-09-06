@@ -100,6 +100,45 @@ export function nodeViewportBboxes(bounds: NodeViewportBounds): string[] {
   ];
 }
 
+type CanonicalViewportBbox = {
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+};
+
+function canonicalViewportBboxes(
+  bounds: NodeViewportBounds,
+): CanonicalViewportBbox[] {
+  return nodeViewportBboxes(bounds).map((bbox) => {
+    const [west, south, east, north] = bbox.split(",").map(Number);
+    return { west, south, east, north };
+  });
+}
+
+/**
+ * Return true when a previously complete viewport response fully covers the
+ * requested viewport. Antimeridian/full-world cases reuse the same canonical
+ * split representation as the API request path, so containment cannot diverge
+ * from the actual BBOX semantics.
+ */
+export function nodeViewportContains(
+  coverage: NodeViewportBounds,
+  requested: NodeViewportBounds,
+): boolean {
+  const coverageBboxes = canonicalViewportBboxes(coverage);
+  const requestedBboxes = canonicalViewportBboxes(requested);
+  return requestedBboxes.every((candidate) =>
+    coverageBboxes.some(
+      (available) =>
+        available.west <= candidate.west &&
+        available.south <= candidate.south &&
+        available.east >= candidate.east &&
+        available.north >= candidate.north,
+    ),
+  );
+}
+
 function endpoint(apiUrl: string, bbox: string): string {
   const params = new URLSearchParams({ bbox });
   return `${apiUrl}/api/nodes?${params.toString()}`;

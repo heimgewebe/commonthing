@@ -76,6 +76,10 @@
   } from "$lib/map/contentFilters";
   import { get } from "svelte/store";
   import { knottingTopicTag } from "$lib/knottingTopics";
+  import {
+    nodeViewportContains,
+    type NodeViewportBounds,
+  } from "$lib/map/nodeViewport";
 
   import { currentBasemap } from "$lib/map/config/basemap.current";
   import { resolveBasemapStyle, rewritePmtilesUrl } from "$lib/map/basemap";
@@ -213,6 +217,7 @@
   let searchViewportResizeObserver: ResizeObserver | null = null;
   let viewportNodes: Node[] = $state([]);
   let viewportNodeStatus: MapResourceStatus | null = $state(null);
+  let viewportNodeCoverage: NodeViewportBounds | null = null;
   let viewportNodeAbortController: AbortController | null = null;
   let viewportNodeSequence = 0;
   let requestNodeViewportRefresh: (() => void) | null = null;
@@ -646,6 +651,7 @@
       searchViewportResizeObserver = null;
       viewportNodeAbortController?.abort();
       viewportNodeAbortController = null;
+      viewportNodeCoverage = null;
       viewportNodeSequence += 1;
       requestNodeViewportRefresh = null;
       if (searchDirectionFrame !== null) {
@@ -705,11 +711,26 @@
       mapViewportRevision += 1;
       invalidateSearchViewportGeometry();
     };
-    const refreshNodeViewport = async () => {
+    const refreshNodeViewport = async (force = false) => {
       if (!map || data.nodeLoadMode !== "viewport" || destroyed) return;
       const bounds = map.getBounds();
+      const requestBounds: NodeViewportBounds = {
+        west: bounds.getWest(),
+        south: bounds.getSouth(),
+        east: bounds.getEast(),
+        north: bounds.getNorth(),
+      };
+      if (
+        !force &&
+        viewportNodeAbortController === null &&
+        viewportNodeCoverage !== null &&
+        nodeViewportContains(viewportNodeCoverage, requestBounds)
+      ) {
+        return;
+      }
       const sequence = ++viewportNodeSequence;
       viewportNodeAbortController?.abort();
+      viewportNodeCoverage = null;
       const controller = new AbortController();
       viewportNodeAbortController = controller;
       try {
@@ -717,12 +738,7 @@
         const result = await fetchNodeViewport(
           (url) => fetch(url, { signal: controller.signal }),
           import.meta.env.PUBLIC_GEWEBE_API_BASE ?? "",
-          {
-            west: bounds.getWest(),
-            south: bounds.getSouth(),
-            east: bounds.getEast(),
-            north: bounds.getNorth(),
-          },
+          requestBounds,
         );
         if (
           destroyed ||
@@ -737,6 +753,8 @@
             viewportIds.has(node.id),
           );
         }
+        viewportNodeCoverage =
+          result.status === "complete" ? requestBounds : null;
         viewportNodeStatus =
           result.status === "complete"
             ? {
@@ -759,6 +777,7 @@
           sequence !== viewportNodeSequence
         )
           return;
+        viewportNodeCoverage = null;
         viewportNodeStatus = {
           resource: "nodes",
           status: "failed",
@@ -770,7 +789,7 @@
       }
     };
     requestNodeViewportRefresh = () => {
-      void refreshNodeViewport();
+      void refreshNodeViewport(true);
     };
     const handleNodeViewportMoveEnd = () => {
       mapViewportRevision += 1;
