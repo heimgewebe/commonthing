@@ -436,22 +436,42 @@ test("keeps 1k/10k/100k map cardinalities inside fixed browser budgets", async (
         await page.getByTestId("tool-fan-find").click();
         const dialog = page.getByRole("dialog", { name: "Finden" });
         const combobox = page.getByRole("combobox", { name: "Suchbegriff" });
-        const listbox = page.getByRole("listbox", {
+        const browseRegion = page.getByRole("region", {
+          name: "Kartenobjekte im Ausschnitt",
+        });
+        const browseList = browseRegion.getByRole("list", {
           name: "Kartenobjekte im Ausschnitt",
         });
         await expect(dialog).toBeVisible();
         await expect(combobox).toBeFocused();
-        await expect(listbox).toBeVisible();
-        await expect(listbox.getByRole("option")).toHaveCount(50);
+        await expect(browseRegion).toBeVisible();
+        await expect(browseList.getByRole("button")).toHaveCount(50);
         await expect(
           page.getByText("1–50 von 250 Kartenobjekten im Ausschnitt"),
         ).toBeVisible();
-        await combobox.press("ArrowDown");
-        await combobox.press("Enter");
-        await expect(dialog).toBeHidden();
+        const nextPage = browseRegion.getByRole("button", {
+          name: "Nächste Kartenobjekte",
+        });
+        for (let pageIndex = 1; pageIndex < 5; pageIndex += 1) {
+          await nextPage.click();
+        }
         await expect(
-          page.locator('.map-marker[data-selected="true"]'),
-        ).toHaveCount(1);
+          page.getByText("201–250 von 250 Kartenobjekten im Ausschnitt"),
+        ).toBeVisible();
+        await expect(browseList.getByRole("button")).toHaveCount(50);
+
+        await combobox.focus();
+        await page.keyboard.press("Tab");
+        await page.keyboard.press("Tab");
+        const firstBrowseButton = browseList.getByRole("button").first();
+        await expect(firstBrowseButton).toBeFocused();
+        await page.keyboard.press("Enter");
+        await expect(dialog).toBeHidden();
+        const selectedMarker = page.locator(
+          '.map-marker[data-selected="true"]',
+        );
+        await expect(selectedMarker).toHaveCount(1);
+        await expect(selectedMarker).toHaveAttribute("aria-current", "true");
       }
     } finally {
       await context.close();

@@ -189,6 +189,7 @@
   let mapContainer: HTMLDivElement | null = $state(null);
   let map: MapLibreMap | null = $state(null);
   let mapStyleReady = $state(false);
+  let mapViewportRevision = $state(0);
   let isLoading = $state(true);
   let mapInitFailed = $state(false);
   // True only after MapLibre emitted its first successful `load`.
@@ -701,6 +702,7 @@
       scheduleSearchDirectionIndicators();
     };
     const handleSearchMapResize = () => {
+      mapViewportRevision += 1;
       invalidateSearchViewportGeometry();
     };
     const refreshNodeViewport = async () => {
@@ -771,6 +773,7 @@
       void refreshNodeViewport();
     };
     const handleNodeViewportMoveEnd = () => {
+      mapViewportRevision += 1;
       if (!mapHasLoaded) {
         pendingViewportRefresh = true;
         return;
@@ -1270,6 +1273,16 @@
   let projectedMarkersData = $derived.by(
     () => markerWeaveViews?.visible ?? null,
   );
+  let visibleMapEntities = $derived.by(() => {
+    mapViewportRevision;
+    if (!$isSearchOpen || !showNodes || !map || !projectedMarkersData)
+      return [];
+    const bounds = map.getBounds();
+    return projectedMarkersData.filter(
+      (item) =>
+        hasRenderableMapPosition(item) && bounds.contains([item.lon, item.lat]),
+    );
+  });
   let motionMarkersData = $derived.by(() => markerWeaveViews?.motion ?? null);
   let lineEdges = $derived.by(() =>
     projectedMarkersData
@@ -1427,7 +1440,8 @@
     on:retry={retryMapInitialisation}
   />
   <MapRouteOverlays
-    mapEntities={projectedMarkersData ?? []}
+    mapEntities={visibleMapEntities}
+    selectedEntityId={$selection?.id ?? null}
     {filteredResults}
     searchStatus={nodeSearchStatus}
     searchMode={nodeSearchMode}

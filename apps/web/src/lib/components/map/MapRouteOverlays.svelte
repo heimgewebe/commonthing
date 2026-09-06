@@ -18,6 +18,7 @@
 
   interface Props {
     mapEntities?: MapEntityViewModel[];
+    selectedEntityId?: string | null;
     filteredResults?: MapEntityViewModel[];
     searchStatus?: NodeSearchStatus;
     searchMode?: string | null;
@@ -32,6 +33,7 @@
 
   let {
     mapEntities = [],
+    selectedEntityId = null,
     filteredResults = [],
     searchStatus = "idle",
     searchMode = null,
@@ -123,6 +125,7 @@
   {:then searchOverlayModule}
     <searchOverlayModule.default
       {mapEntities}
+      {selectedEntityId}
       {filteredResults}
       {searchStatus}
       {searchMode}

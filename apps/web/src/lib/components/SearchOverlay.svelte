@@ -16,6 +16,7 @@
 
   interface Props {
     mapEntities?: MapEntityViewModel[];
+    selectedEntityId?: string | null;
     filteredResults?: MapEntityViewModel[];
     searchStatus?: NodeSearchStatus;
     searchMode?: string | null;
@@ -24,6 +25,7 @@
 
   let {
     mapEntities = [],
+    selectedEntityId = null,
     filteredResults = [],
     searchStatus = "idle",
     searchMode = null,
@@ -49,11 +51,7 @@
     mapEntities.slice(browseStart, browseStart + MAP_ENTITY_BROWSE_PAGE_SIZE),
   );
   let visibleResults = $derived(
-    hasQuery
-      ? showAll
-        ? filteredResults
-        : filteredResults.slice(0, 6)
-      : browseResults,
+    hasQuery ? (showAll ? filteredResults : filteredResults.slice(0, 6)) : [],
   );
   $effect.pre(() => {
     if ($searchQuery !== previousQuery) {
@@ -207,30 +205,23 @@
       </div>
     {/if}
 
-    {#if visibleResults.length > 0}
+    {#if hasQuery && visibleResults.length > 0}
       <div class="result-meta" aria-live="polite">
-        {#if hasQuery}
-          {#if $activeFilterCount > 0}
-            {filteredResults.length === 1
-              ? "1 gefilterter Treffer"
-              : `${filteredResults.length} gefilterte Treffer`}
-          {:else}
-            {filteredResults.length === 1
-              ? "1 Treffer"
-              : `${filteredResults.length} Treffer`}
-          {/if}
+        {#if $activeFilterCount > 0}
+          {filteredResults.length === 1
+            ? "1 gefilterter Treffer"
+            : `${filteredResults.length} gefilterte Treffer`}
         {:else}
-          {browseStart + 1}–{Math.min(
-            browseStart + visibleResults.length,
-            mapEntities.length,
-          )} von {mapEntities.length} Kartenobjekten im Ausschnitt
+          {filteredResults.length === 1
+            ? "1 Treffer"
+            : `${filteredResults.length} Treffer`}
         {/if}
       </div>
       <ul
         class="results"
         id="search-results-listbox"
         role="listbox"
-        aria-label={hasQuery ? "Suchvorschläge" : "Kartenobjekte im Ausschnitt"}
+        aria-label="Suchvorschläge"
         bind:this={listEl}
       >
         {#each visibleResults as result, index}
@@ -255,12 +246,16 @@
                 >{/if}
             </div>
             <span class="result-type"
-              >{result.type === "node" ? "Knoten" : "Garnrolle"}</span
+              >{result.type === "node"
+                ? "Knoten"
+                : result.type === "webgemeindezentrum"
+                  ? "Zentrum"
+                  : "Garnrolle"}</span
             >
           </li>
         {/each}
       </ul>
-      {#if hasQuery && filteredResults.length > 6}
+      {#if filteredResults.length > 6}
         <button
           type="button"
           class="show-more"
@@ -273,30 +268,74 @@
             ? "Weniger Vorschläge"
             : `Alle ${filteredResults.length} Vorschläge zeigen`}</button
         >
-      {:else if !hasQuery && browsePageCount > 1}
-        <div
-          class="browse-pagination"
-          role="group"
-          aria-label="Seiten der Kartenobjekte"
-        >
-          <button
-            type="button"
-            disabled={browsePage === 0}
-            aria-label="Vorherige Kartenobjekte"
-            onclick={() => setBrowsePage(browsePage - 1)}>←</button
-          >
-          <span>Seite {browsePage + 1} von {browsePageCount}</span>
-          <button
-            type="button"
-            disabled={browsePage >= browsePageCount - 1}
-            aria-label="Nächste Kartenobjekte"
-            onclick={() => setBrowsePage(browsePage + 1)}>→</button
-          >
-        </div>
       {/if}
     {:else if hasQuery && searchStatus !== "loading" && searchStatus !== "error"}
       <div class="no-results" role="status">
         Keine Treffer für „{$searchQuery}“
+      </div>
+    {:else if !hasQuery && browseResults.length > 0}
+      <div
+        class="browse-section"
+        role="region"
+        aria-label="Kartenobjekte im Ausschnitt"
+      >
+        <div class="result-meta" aria-live="polite">
+          {browseStart + 1}–{Math.min(
+            browseStart + browseResults.length,
+            mapEntities.length,
+          )} von {mapEntities.length} Kartenobjekten im Ausschnitt
+        </div>
+        <ul class="results" aria-label="Kartenobjekte im Ausschnitt">
+          {#each browseResults as result}
+            <li class="browse-item">
+              <button
+                type="button"
+                class="result-item browse-result"
+                aria-current={selectedEntityId === result.id
+                  ? "true"
+                  : undefined}
+                onclick={() => onSelect(result)}
+              >
+                <span class="result-content">
+                  <span class="result-title">{result.title}</span>
+                  {#if result.summary}<span class="result-summary"
+                      >{result.summary.length > 80
+                        ? result.summary.slice(0, 80) + "…"
+                        : result.summary}</span
+                    >{/if}
+                </span>
+                <span class="result-type"
+                  >{result.type === "node"
+                    ? "Knoten"
+                    : result.type === "webgemeindezentrum"
+                      ? "Zentrum"
+                      : "Garnrolle"}</span
+                >
+              </button>
+            </li>
+          {/each}
+        </ul>
+        {#if browsePageCount > 1}
+          <div
+            class="browse-pagination"
+            role="group"
+            aria-label="Seiten der Kartenobjekte"
+          >
+            <button
+              type="button"
+              disabled={browsePage === 0}
+              aria-label="Vorherige Kartenobjekte"
+              onclick={() => setBrowsePage(browsePage - 1)}>←</button
+            >
+            <span>Seite {browsePage + 1} von {browsePageCount}</span>
+            <button
+              type="button"
+              disabled={browsePage >= browsePageCount - 1}
+              aria-label="Nächste Kartenobjekte"
+              onclick={() => setBrowsePage(browsePage + 1)}>→</button
+            >
+          </div>
+        {/if}
       </div>
     {:else if !hasQuery}
       <div class="no-results" role="status">
@@ -404,6 +443,22 @@
     gap: 1rem;
     color: var(--text);
     border-bottom: 1px solid var(--panel-border);
+  }
+  .browse-item {
+    margin: 0;
+    padding: 0;
+  }
+  .browse-result {
+    border: 0;
+    background: transparent;
+    font: inherit;
+  }
+  .browse-result:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .browse-result[aria-current="true"] {
+    background: var(--accent-soft);
   }
   .result-item:hover,
   .result-item.active {
