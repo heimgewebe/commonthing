@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { mockApiResponses, mockListResponse } from "./fixtures/mockApi";
 import { waitForMapReady } from "./fixtures/mapReady";
 
@@ -15,6 +15,112 @@ import { waitForMapReady } from "./fixtures/mapReady";
  * Deterministic mock data is layered on top of {@link mockApiResponses} so the
  * deep-link ids stay stable and readable regardless of demo-data changes.
  */
+
+async function installDeferredViewportFetch(page: Page) {
+  await page.evaluate(() => {
+    const originalFetch = window.fetch.bind(window);
+    const pending: Array<{
+      url: string;
+      aborted: boolean;
+      resolve: (response: Response) => void;
+    }> = [];
+    (window as any).__TEST_VIEWPORT_FETCHES__ = pending;
+    window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl = input instanceof Request ? input.url : String(input);
+      const url = new URL(rawUrl, window.location.origin);
+      if (url.pathname === "/api/nodes" && url.searchParams.has("bbox")) {
+        let resolveResponse!: (response: Response) => void;
+        const response = new Promise<Response>((resolve) => {
+          resolveResponse = resolve;
+        });
+        const entry = {
+          url: url.toString(),
+          aborted: false,
+          resolve: resolveResponse,
+        };
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            entry.aborted = true;
+            const reportAbort = (window as any).__TEST_RECORD_VIEWPORT_ABORT__;
+            if (typeof reportAbort === "function") void reportAbort(entry.url);
+          },
+          { once: true },
+        );
+        pending.push(entry);
+        return response;
+      }
+      return originalFetch(input, init);
+    }) as typeof window.fetch;
+  });
+}
+
+async function waitForDeferredViewportRequests(page: Page, count: number) {
+  await page.waitForFunction(
+    (expected) =>
+      ((window as any).__TEST_VIEWPORT_FETCHES__?.length ?? 0) >= expected,
+    count,
+  );
+}
+
+async function resolveDeferredViewportRequest(
+  page: Page,
+  index: number,
+  node: Record<string, unknown>,
+) {
+  await page.evaluate(
+    ({ requestIndex, item }) => {
+      const entry = (window as any).__TEST_VIEWPORT_FETCHES__?.[requestIndex];
+      if (!entry)
+        throw new Error(`missing deferred viewport request ${requestIndex}`);
+      entry.resolve(
+        new Response(
+          JSON.stringify({
+            items: [item],
+            page: { limit: 1000, next_cursor: null, has_more: false },
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    },
+    { requestIndex: index, item: node },
+  );
+}
+
+async function viewportRaceTargets(page: Page) {
+  return page.evaluate(() => {
+    const map = (window as any).__TEST_MAP__;
+    if (!map) throw new Error("test map unavailable");
+    const bounds = map.getBounds();
+    const center = map.getCenter();
+    const span = Math.max(0.05, Math.abs(bounds.getEast() - bounds.getWest()));
+    return {
+      first: { lng: center.lng + span * 1.25, lat: center.lat },
+      second: { lng: center.lng + span * 2.5, lat: center.lat },
+    };
+  });
+}
+
+async function jumpViewport(page: Page, target: { lng: number; lat: number }) {
+  await page.evaluate(({ lng, lat }) => {
+    const map = (window as any).__TEST_MAP__;
+    if (!map) throw new Error("test map unavailable");
+    map.jumpTo({ center: [lng, lat] });
+  }, target);
+}
+
+async function settleViewportUpdates(page: Page) {
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }),
+  );
+}
+
 test.describe("Map URL addressing", () => {
   test.beforeEach(async ({ page }) => {
     await mockApiResponses(page, {
@@ -251,6 +357,100 @@ test.describe("Map URL addressing", () => {
     await expect(
       page.locator('.map-marker[data-id="stale-initial-node"]'),
     ).toHaveCount(0);
+  });
+
+  test("aborts an older active viewport request and ignores its late response", async ({
+    page,
+  }) => {
+    await page.goto("/map");
+    await waitForMapReady(page);
+    await installDeferredViewportFetch(page);
+    const targets = await viewportRaceTargets(page);
+
+    await jumpViewport(page, targets.first);
+    await waitForDeferredViewportRequests(page, 1);
+    await jumpViewport(page, targets.second);
+    await waitForDeferredViewportRequests(page, 2);
+
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => (window as any).__TEST_VIEWPORT_FETCHES__?.[0]?.aborted,
+        ),
+      )
+      .toBe(true);
+    expect(
+      await page.evaluate(
+        () => (window as any).__TEST_VIEWPORT_FETCHES__?.[1]?.aborted,
+      ),
+    ).toBe(false);
+
+    const freshNode = {
+      id: "latest-active-viewport-node",
+      title: "Latest active viewport",
+      kind: "Event",
+      location: { lat: targets.second.lat, lon: targets.second.lng },
+      summary: "Belongs to the newest active viewport request.",
+      tags: [],
+      modules: [],
+      created_at: "2025-01-01T12:00:00Z",
+      updated_at: "2025-01-01T12:00:00Z",
+    };
+    await resolveDeferredViewportRequest(page, 1, freshNode);
+    await expect(
+      page.locator('.map-marker[data-id="latest-active-viewport-node"]'),
+    ).toHaveCount(1);
+
+    const staleNode = {
+      id: "stale-active-viewport-node",
+      title: "Stale active viewport",
+      kind: "Event",
+      location: { lat: targets.first.lat, lon: targets.first.lng },
+      summary: "Must never overwrite the newer viewport result.",
+      tags: [],
+      modules: [],
+      created_at: "2025-01-01T12:00:00Z",
+      updated_at: "2025-01-01T12:00:00Z",
+    };
+    await resolveDeferredViewportRequest(page, 0, staleNode);
+    await settleViewportUpdates(page);
+
+    await expect(
+      page.locator('.map-marker[data-id="stale-active-viewport-node"]'),
+    ).toHaveCount(0);
+    await expect(
+      page.locator('.map-marker[data-id="latest-active-viewport-node"]'),
+    ).toHaveCount(1);
+  });
+
+  test("aborts an in-flight viewport request when the map route unmounts", async ({
+    page,
+  }) => {
+    const abortedViewportUrls: string[] = [];
+    await page.exposeFunction(
+      "__TEST_RECORD_VIEWPORT_ABORT__",
+      (url: string) => {
+        abortedViewportUrls.push(url);
+      },
+    );
+
+    await page.goto("/map");
+    await waitForMapReady(page);
+    await expect(
+      page.getByRole("link", { name: "Einstellungen öffnen" }),
+    ).toBeVisible();
+    await installDeferredViewportFetch(page);
+    const targets = await viewportRaceTargets(page);
+
+    await jumpViewport(page, targets.first);
+    await waitForDeferredViewportRequests(page, 1);
+    expect(abortedViewportUrls).toEqual([]);
+
+    await page.getByRole("link", { name: "Einstellungen öffnen" }).click();
+    await expect(page).toHaveURL(/\/settings(?:[?#]|$)/);
+    await expect.poll(() => abortedViewportUrls.length).toBe(1);
+    expect(new URL(abortedViewportUrls[0]).pathname).toBe("/api/nodes");
+    expect(new URL(abortedViewportUrls[0]).searchParams.has("bbox")).toBe(true);
   });
 
   test("opens the context panel for a garnrolle focus deep link", async ({
