@@ -397,7 +397,8 @@ async function measureJsHeap(
 }
 
 function observeRealNodeApi(page: Page) {
-  const pending: Promise<void>[] = [];
+  const deferredEvidence: Array<() => Promise<void>> = [];
+  let processedEvidenceCount = 0;
   const loadedIds = new Set<string>();
   const bboxIds = new Set<string>();
   const apiDurations: number[] = [];
@@ -417,7 +418,10 @@ function observeRealNodeApi(page: Page) {
     }
     if (url.pathname !== "/api/nodes") return;
 
-    const task = (async () => {
+    // Keep the timed browser workload observer-free: recording the response
+    // handle is cheap, while body transfer, JSON parsing and ID iteration are
+    // deferred until flush() runs outside the RAF measurement window.
+    deferredEvidence.push(async () => {
       apiRequestCount += 1;
       if (url.searchParams.has("bbox")) bboxScopedRequestCount += 1;
       else bulkNodeRequestCount += 1;
@@ -445,16 +449,19 @@ function observeRealNodeApi(page: Page) {
       }
       lastResponseHasMore =
         !Array.isArray(parsed) && parsed.page?.has_more === true;
-    })();
-    pending.push(task);
+    });
   });
 
   return {
     async flush() {
-      let observed = -1;
-      while (observed !== pending.length) {
-        observed = pending.length;
-        await Promise.all(pending.slice(0, observed));
+      while (processedEvidenceCount < deferredEvidence.length) {
+        const batchEnd = deferredEvidence.length;
+        await Promise.all(
+          deferredEvidence
+            .slice(processedEvidenceCount, batchEnd)
+            .map((collect) => collect()),
+        );
+        processedEvidenceCount = batchEnd;
         await page.waitForTimeout(0);
       }
     },
