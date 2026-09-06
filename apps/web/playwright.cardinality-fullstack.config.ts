@@ -64,6 +64,10 @@ export default defineConfig({
   use: {
     ...baseConfig.use,
     browserName: "chromium",
-    trace: "retain-on-failure",
+    // Tracing records screenshots/DOM snapshots and is deliberately disabled
+    // for this timed benchmark so the observer is not part of the measured
+    // workload. The proof attaches its raw frame vectors after each timed
+    // interaction window instead.
+    trace: "off",
   },
 });

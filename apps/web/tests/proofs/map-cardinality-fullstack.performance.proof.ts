@@ -567,6 +567,12 @@ test("keeps real PostgreSQL → API BBOX → Chromium at 1k/10k/100k inside fixe
 
       const interactionSamples: number[] = [];
       const frameDeltas: number[] = [];
+      const rawInteractionFrames: Array<{
+        index: number;
+        delta_y: number;
+        interaction_to_next_paint_ms: number;
+        frame_deltas_ms: number[];
+      }> = [];
       for (
         let index = 0;
         index < MAP_CARDINALITY_FULLSTACK_INTERACTION_SAMPLE_COUNT;
@@ -580,6 +586,12 @@ test("keeps real PostgreSQL → API BBOX → Chromium at 1k/10k/100k inside fixe
         );
         interactionSamples.push(interaction.interactionMs);
         frameDeltas.push(...interaction.frameDeltas);
+        rawInteractionFrames.push({
+          index,
+          delta_y: deltaY,
+          interaction_to_next_paint_ms: interaction.interactionMs,
+          frame_deltas_ms: [...interaction.frameDeltas],
+        });
         await page.waitForFunction(
           () => {
             const map = (
@@ -603,6 +615,30 @@ test("keeps real PostgreSQL → API BBOX → Chromium at 1k/10k/100k inside fixe
         p95: percentile(frameDeltas, 0.95),
         max: Math.max(...frameDeltas),
       };
+      // Attach the complete, unfiltered timed vectors before any budget
+      // validation can fail. This replaces heavyweight Playwright tracing as
+      // the benchmark diagnostic and makes a red p95 reproducible without
+      // changing which frames count. Attachment happens after measurement.
+      await testInfo.attach(`map-cardinality-fullstack-frames-${cardinality}`, {
+        body: Buffer.from(
+          JSON.stringify(
+            {
+              schema_version: 1,
+              source_revision: sourceRevision,
+              cardinality,
+              trace_recording: "off",
+              interaction_sample_count: interactionSamples.length,
+              frame_sample_count: frameDeltas.length,
+              frame_time_p95_ms: frameCadence.p95,
+              frame_time_max_ms: frameCadence.max,
+              interactions: rawInteractionFrames,
+            },
+            null,
+            2,
+          ),
+        ),
+        contentType: "application/json",
+      });
       await settleFrames(page, 4);
       const jsHeapUsedBytes = await measureJsHeap(context, page);
       await api.flush();
