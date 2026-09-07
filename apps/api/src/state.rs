@@ -122,6 +122,17 @@ enum DomainProjectionFreshness {
     AllowStaleWhileRefreshing,
 }
 
+fn may_defer_local_node_generation_handoff(
+    freshness: DomainProjectionFreshness,
+    node_write_source: crate::config::DomainNodeWriteSource,
+    local_version: i64,
+    observed_version: i64,
+) -> bool {
+    freshness == DomainProjectionFreshness::AllowStaleWhileRefreshing
+        && node_write_source == crate::config::DomainNodeWriteSource::Postgres
+        && local_version.checked_add(1) == Some(observed_version)
+}
+
 impl ApiState {
     pub async fn refresh_domain_projection_if_stale(&self) -> anyhow::Result<()> {
         self.refresh_domain_projection(DomainProjectionFreshness::RequireCurrent)
@@ -129,8 +140,8 @@ impl ApiState {
     }
 
     /// Refresh for a safe read request. If another request already owns the
-    /// reload, this request may keep using the previous *complete* projection
-    /// until that reload atomically swaps the next snapshot into place.
+    /// reload, or an exact +1 local node generation is in its post-commit cache
+    /// handoff, this request may keep using the previous *complete* projection.
     pub async fn refresh_domain_projection_for_read(&self) -> anyhow::Result<()> {
         self.refresh_domain_projection(DomainProjectionFreshness::AllowStaleWhileRefreshing)
             .await
@@ -169,7 +180,32 @@ impl ApiState {
         };
 
         let observed = crate::domain_db::domain_projection_version(pool).await?;
-        if observed == self.domain_projection_version.load(Ordering::Acquire) {
+        let local_version = self.domain_projection_version.load(Ordering::Acquire);
+        if observed == local_version {
+            return Ok(());
+        }
+
+        // A local PostgreSQL node write owns `nodes_persist` across the database
+        // commit, the in-memory cache update, and the exact-generation CAS. A
+        // safe anonymous read can therefore observe committed V+1 in the narrow
+        // handoff window before the process marker reaches V+1. Starting an O(N)
+        // reload there duplicates work the writer is about to account for. Defer
+        // only that exact +1 case while the local handoff is still in flight.
+        // Strict requests never take this path, and larger drift always performs
+        // the normal stable reconciliation.
+        if may_defer_local_node_generation_handoff(
+            freshness,
+            self.config.domain_node_write_source,
+            local_version,
+            observed,
+        ) && self.nodes_persist.try_lock().is_err()
+        {
+            self.metrics.domain_projection_refresh_deferred();
+            tracing::debug!(
+                local_version,
+                observed,
+                "Deferring anonymous projection refresh during local node generation handoff"
+            );
             return Ok(());
         }
 
@@ -256,6 +292,42 @@ impl ApiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_node_generation_handoff_deferral_is_narrow() {
+        use crate::config::DomainNodeWriteSource;
+
+        assert!(may_defer_local_node_generation_handoff(
+            DomainProjectionFreshness::AllowStaleWhileRefreshing,
+            DomainNodeWriteSource::Postgres,
+            41,
+            42,
+        ));
+        assert!(!may_defer_local_node_generation_handoff(
+            DomainProjectionFreshness::RequireCurrent,
+            DomainNodeWriteSource::Postgres,
+            41,
+            42,
+        ));
+        assert!(!may_defer_local_node_generation_handoff(
+            DomainProjectionFreshness::AllowStaleWhileRefreshing,
+            DomainNodeWriteSource::Postgres,
+            41,
+            43,
+        ));
+        assert!(!may_defer_local_node_generation_handoff(
+            DomainProjectionFreshness::AllowStaleWhileRefreshing,
+            DomainNodeWriteSource::Jsonl,
+            41,
+            42,
+        ));
+        assert!(!may_defer_local_node_generation_handoff(
+            DomainProjectionFreshness::AllowStaleWhileRefreshing,
+            DomainNodeWriteSource::Postgres,
+            i64::MAX,
+            i64::MIN,
+        ));
+    }
 
     #[test]
     fn test_ordered_cache_id_lookup() {

@@ -634,6 +634,88 @@ async fn postgres_node_patch_does_not_fast_forward_over_external_generation() ->
     Ok(())
 }
 
+/// A4. The exact post-commit/pre-CAS +1 handoff of a serialized local
+/// PostgreSQL node write must let a safe read keep the existing snapshot rather
+/// than starting a redundant full reload. Authenticated/strict classification is
+/// proven separately by the projection middleware policy test.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn safe_projection_read_defers_exact_local_node_generation_handoff() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("before handoff"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000093").await?;
+
+    // The fixture builder has already loaded NODE_B into the process cache. Bind
+    // its process marker to the current database generation so the next +1 is
+    // exactly the handoff window we want to exercise, without paying for an
+    // unrelated full projection reload in test setup.
+    let local_before = domain_projection_version(&pool).await?;
+    state
+        .domain_projection_version
+        .store(local_before, Ordering::Release);
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("before handoff")
+    );
+
+    // Model the narrow post-commit/pre-CAS window deterministically. The real
+    // PATCH owns this same mutex across commit, cache update and generation CAS.
+    let handoff_guard = state.nodes_persist.lock().await;
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("committed during handoff")
+    .execute(&pool)
+    .await?;
+    let db_after = domain_projection_version(&pool).await?;
+    assert_eq!(db_after, local_before + 1);
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        state.refresh_domain_projection_for_read(),
+    )
+    .await
+    .context("safe projection refresh must not block during exact local +1 handoff")??;
+
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        local_before,
+        "safe read must defer rather than claim or full-reload the in-flight +1 generation"
+    );
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("before handoff"),
+        "deferral must leave the previous snapshot untouched"
+    );
+    let metrics = String::from_utf8(state.metrics.render()?)?;
+    assert!(metrics.contains(r#"domain_projection_events_total{event="refresh_deferred"} 1"#));
+
+    drop(handoff_guard);
+    clean(&pool).await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
 #[serial]

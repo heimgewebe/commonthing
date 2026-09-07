@@ -14,8 +14,9 @@ use crate::{config::DomainReadSource, routes::auth::SESSION_COOKIE_NAME, state::
 /// Keep PostgreSQL-backed requests on one internally consistent process-local
 /// projection. Mutating requests and authenticated requests require the current
 /// committed generation. Anonymous GET/HEAD requests may use the previous complete
-/// generation only while another request is actively rebuilding the next snapshot
-/// outside the request gate. Keeping requests with the canonical session cookie
+/// generation while another request rebuilds the next snapshot, or during the exact
+/// +1 post-commit handoff of a serialized local node write. Keeping requests with
+/// the canonical session cookie
 /// strict is security-sensitive because auth middleware reads account disabled/role
 /// state from this projection after this middleware runs. The read guard remains
 /// held for the full handler so no request can observe a partially replaced
