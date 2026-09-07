@@ -180,7 +180,10 @@ describe("fetchNodeViewport", () => {
   });
 });
 
-describe("map route viewport integration", () => {
+describe("map route viewport architecture guards", () => {
+  // These source-shape assertions protect wiring and lazy-loading boundaries.
+  // They are intentionally not behavioral race/lifecycle proof; those cases
+  // run in Playwright via tests/map-url-state.spec.ts.
   const pageSource = readFileSync(
     new URL("../../routes/map/+page.svelte", import.meta.url),
     "utf8",
