@@ -631,6 +631,12 @@ impl Metrics {
             .with_label_values(&["version"])
             .set(version);
     }
+    pub fn set_domain_projection_version(&self, version: i64) {
+        self.inner
+            .domain_projection_snapshot
+            .with_label_values(&["version"])
+            .set(version);
+    }
     pub fn observe_domain_projection_reload_failure(&self, duration: Duration) {
         self.inner
             .domain_projection_events_total
@@ -897,6 +903,7 @@ mod tests {
             7,
         );
         metrics.observe_domain_projection_reload_failure(Duration::from_millis(25));
+        metrics.set_domain_projection_version(8);
         let rendered = String::from_utf8(metrics.render().expect("render metrics")).expect("utf8");
         for expected in [
             r#"domain_projection_events_total{event="refresh_check"} 1"#,
@@ -911,7 +918,7 @@ mod tests {
             r#"domain_projection_rows_loaded_total{kind="accounts"} 2"#,
             r#"domain_projection_rows_loaded_total{kind="nodes"} 1000"#,
             r#"domain_projection_rows_loaded_total{kind="edges"} 5000"#,
-            r#"domain_projection_snapshot{kind="version"} 7"#,
+            r#"domain_projection_snapshot{kind="version"} 8"#,
         ] {
             assert!(rendered.contains(expected), "missing metric: {expected}");
         }

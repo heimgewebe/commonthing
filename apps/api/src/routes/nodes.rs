@@ -18,11 +18,11 @@ use crate::config::{
     DomainAccountWriteSource, DomainEdgeWriteSource, DomainNodeWriteSource, DomainReadSource,
 };
 use crate::domain_db::{
-    delete_node_with_edges_in_postgres_audited, insert_domain_node_and_faden_with_creator_limit,
-    load_nodes_bbox_after_id_from_postgres, load_nodes_bbox_from_postgres,
-    lock_node_faden_cache_publication, patch_node_in_postgres, replace_node_in_postgres_audited,
-    CreateOperationKey, NodeConversationDeleteEffect, NodeCreateError, NodeFadenCreateError,
-    NodePatchInput, NodeWriteError,
+    delete_node_with_edges_in_postgres_audited, domain_projection_version,
+    insert_domain_node_and_faden_with_creator_limit, load_nodes_bbox_after_id_from_postgres,
+    load_nodes_bbox_from_postgres, lock_node_faden_cache_publication, patch_node_in_postgres,
+    replace_node_in_postgres_audited, CreateOperationKey, NodeConversationDeleteEffect,
+    NodeCreateError, NodeFadenCreateError, NodePatchInput, NodeWriteError,
 };
 use crate::middleware::auth::AuthContext;
 use crate::node_mutation::{
@@ -41,6 +41,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::Ordering;
 use tokio::{
     fs::{File, OpenOptions},
     io::{
@@ -3420,6 +3421,7 @@ async fn patch_node_postgres(
     // be overwritten in the cache by an earlier request that resumes late after commit.
     // This is an in-process coherence guard, not a multi-instance cache invalidation mechanism.
     let _persist_guard = state.nodes_persist.lock().await;
+    let projection_version_before = state.domain_projection_version.load(Ordering::Acquire);
 
     let node = patch_node_in_postgres(pool, id, patch)
         .await
@@ -3457,6 +3459,66 @@ async fn patch_node_postgres(
         .metrics
         .set_nodes_cache_count(cache_guard.len() as i64);
     drop(cache_guard);
+
+    // The domain_nodes outbox trigger increments the global projection version
+    // exactly once for this row update. If PostgreSQL is now precisely V+1, no
+    // other domain mutation raced with this request and the local cache update
+    // above already represents the complete new generation. Fast-forward the
+    // local version marker so the next mutation does not pay for an O(N) reload.
+    // Any larger/unexpected jump is left stale on purpose; the normal refresh
+    // path then reconciles external or concurrent writes.
+    match domain_projection_version(pool).await {
+        Ok(observed_version) => {
+            let expected_version = projection_version_before.checked_add(1);
+            if expected_version == Some(observed_version) {
+                match state.domain_projection_version.compare_exchange(
+                    projection_version_before,
+                    observed_version,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        state
+                            .metrics
+                            .set_domain_projection_version(observed_version);
+                        tracing::debug!(
+                            node_id = %id,
+                            projection_version_before,
+                            projection_version_after = observed_version,
+                            "Fast-forwarded projection version after isolated PostgreSQL node patch"
+                        );
+                    }
+                    Err(current_version) => {
+                        tracing::debug!(
+                            node_id = %id,
+                            projection_version_before,
+                            observed_version,
+                            current_version,
+                            "Skipped projection fast-forward because local generation advanced concurrently"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    node_id = %id,
+                    projection_version_before,
+                    observed_version,
+                    "Skipped projection fast-forward because another domain mutation was observed"
+                );
+            }
+        }
+        Err(error) => {
+            // The PostgreSQL patch is already committed and the local node cache
+            // is updated. Do not turn that successful write into a false 500 just
+            // because the optional fast-forward read failed; leaving the marker
+            // stale makes the next request reconcile through the normal path.
+            tracing::warn!(
+                node_id = %id,
+                error = %error,
+                "Could not verify projection version after committed node patch; leaving projection stale"
+            );
+        }
+    }
 
     tracing::info!(node_id = %id, write_source = "postgres", "Node patch finished");
 

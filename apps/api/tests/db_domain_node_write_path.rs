@@ -30,7 +30,12 @@ use axum::{
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
-use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    ffi::OsString,
+    path::PathBuf,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 use weltgewebe_api::{
@@ -43,9 +48,10 @@ use weltgewebe_api::{
     },
     domain_db::{
         delete_node_with_edges_in_postgres, delete_node_with_edges_in_postgres_audited,
-        insert_domain_node, load_nodes_from_postgres, lock_node_faden_cache_publication,
-        patch_node_in_postgres, replace_node_in_postgres_audited, NodeConversationDeleteEffect,
-        NodeCreateError, NodePatchInput, NodeWriteError,
+        domain_projection_version, insert_domain_node, load_nodes_from_postgres,
+        lock_node_faden_cache_publication, patch_node_in_postgres,
+        replace_node_in_postgres_audited, NodeConversationDeleteEffect, NodeCreateError,
+        NodePatchInput, NodeWriteError,
     },
     governance::delete_guest_account,
     middleware::{
@@ -443,6 +449,186 @@ async fn postgres_node_patch_persists_and_reload_sees_change() -> Result<()> {
         .context("reload nodes")?;
     let node = reloaded.get(NODE_A).expect("node reloaded from postgres");
     assert_eq!(node.info.as_deref(), Some("new info"));
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A2. When the PostgreSQL trigger advances the generation by exactly one for
+/// our own PATCH, the locally updated cache can safely fast-forward the process
+/// marker instead of forcing the next write through a full projection reload.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_node_patch_fast_forwards_exact_local_projection_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, None, None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (app, cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000091").await?;
+    let app = app.layer(from_fn_with_state(
+        state.clone(),
+        ensure_current_domain_projection,
+    ));
+
+    let preload = app
+        .clone()
+        .oneshot(
+            Request::get("/nodes")
+                .header("Host", "localhost")
+                .body(body::Body::empty())?,
+        )
+        .await?;
+    assert_eq!(preload.status(), StatusCode::OK);
+
+    let local_before = state.domain_projection_version.load(Ordering::Acquire);
+    let db_before = domain_projection_version(&pool).await?;
+    assert_eq!(
+        local_before, db_before,
+        "preload must synchronize projection generation"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(patch_node_req(
+            &cookie,
+            NODE_A,
+            r#"{"info": "fast-forwarded"}"#,
+            SEEDED_NODE_ETAG,
+        ))
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let db_after = domain_projection_version(&pool).await?;
+    let local_after = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(
+        db_after,
+        db_before + 1,
+        "one node PATCH must advance the trigger generation once"
+    );
+    assert_eq!(
+        local_after, db_after,
+        "isolated local PATCH must fast-forward the process projection marker"
+    );
+    let metrics = String::from_utf8(state.metrics.render()?)?;
+    assert!(metrics.contains(&format!(
+        "domain_projection_snapshot{{kind=\"version\"}} {db_after}"
+    )));
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A3. A concurrent external domain update makes the observed generation jump
+/// by more than one. The PATCH must then leave the process marker stale so the
+/// ordinary refresh path reconciles the missing external change.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_node_patch_does_not_fast_forward_over_external_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, None, None).await;
+    seed_node(&pool, NODE_B, Some("before external"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (app, cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000092").await?;
+    let app = app.layer(from_fn_with_state(
+        state.clone(),
+        ensure_current_domain_projection,
+    ));
+
+    let preload = app
+        .clone()
+        .oneshot(
+            Request::get("/nodes")
+                .header("Host", "localhost")
+                .body(body::Body::empty())?,
+        )
+        .await?;
+    assert_eq!(preload.status(), StatusCode::OK);
+    let local_before = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(local_before, domain_projection_version(&pool).await?);
+
+    // Hold NODE_A so the API PATCH passes middleware freshness checks and then
+    // blocks inside PostgreSQL. While it is blocked, mutate NODE_B externally.
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT id FROM domain_nodes WHERE id = $1 FOR UPDATE")
+        .bind(NODE_A)
+        .fetch_one(&mut *blocker)
+        .await?;
+
+    let request = patch_node_req(
+        &cookie,
+        NODE_A,
+        r#"{"info": "local after external"}"#,
+        SEEDED_NODE_ETAG,
+    );
+    let patch_app = app.clone();
+    let patch_task = tokio::spawn(async move { patch_app.oneshot(request).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !patch_task.is_finished(),
+        "row lock must hold the API PATCH before the external generation bump"
+    );
+
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("external change")
+    .execute(&pool)
+    .await?;
+    assert_eq!(domain_projection_version(&pool).await?, local_before + 1);
+
+    blocker.commit().await?;
+    let response = patch_task.await??;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let db_after = domain_projection_version(&pool).await?;
+    let local_after_patch = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(db_after, local_before + 2);
+    assert_eq!(
+        local_after_patch, local_before,
+        "PATCH must not fast-forward across an unseen external generation"
+    );
+
+    let refresh = app
+        .clone()
+        .oneshot(
+            Request::get("/nodes")
+                .header("Host", "localhost")
+                .body(body::Body::empty())?,
+        )
+        .await?;
+    assert_eq!(refresh.status(), StatusCode::OK);
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        db_after,
+        "next safe request must reconcile the externally changed generation"
+    );
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("external change")
+    );
 
     clean(&pool).await;
     Ok(())
