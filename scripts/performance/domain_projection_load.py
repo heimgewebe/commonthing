@@ -309,6 +309,15 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
     if retry_delta < 0:
         raise Cq02EvidenceError("API retry log count decreased")
 
+    dropped_iterations = int(
+        k6_value(summary, "dropped_iterations", "count", default=0.0)
+    )
+    if workload == "mixed" and dropped_iterations > 0:
+        raise Cq02EvidenceError(
+            f"k6 dropped {dropped_iterations} scheduled iterations; "
+            "the offered mixed-load rate was not sustained"
+        )
+
     reloads = counter_delta(
         before, after, "domain_projection_events_total", {"event": "reload_success"}
     )
@@ -330,6 +339,7 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             "workload": workload,
             "duration_seconds": cq02.get("duration_seconds"),
             "read_vus": cq02.get("read_vus"),
+            "dropped_iterations": dropped_iterations,
         },
         "requests": {
             "read": trend(

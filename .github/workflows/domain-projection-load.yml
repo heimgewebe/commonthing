@@ -129,9 +129,10 @@ jobs:
               -v session_id="${CQ02_SESSION_ID}" <<'SQL'
           BEGIN;
           -- The generated fixture represents pre-existing state, not 600k live writes.
-          -- Skip user triggers only for this bulk import; measured writes below use them.
-          ALTER TABLE domain_nodes DISABLE TRIGGER USER;
-          ALTER TABLE domain_edges DISABLE TRIGGER USER;
+          -- Suppress only the projection-version/outbox triggers for this bulk import.
+          -- Other product triggers (conversation/search) stay active; measured writes use all triggers.
+          ALTER TABLE domain_nodes DISABLE TRIGGER domain_nodes_outbox;
+          ALTER TABLE domain_edges DISABLE TRIGGER domain_edges_outbox;
 
           INSERT INTO domain_nodes (
               id, kind, title, lat, lon, created_at, updated_at, payload, search_visibility
@@ -146,8 +147,8 @@ jobs:
             FROM weltgewebe_perf.domain_edges
            ORDER BY id;
 
-          ALTER TABLE domain_nodes ENABLE TRIGGER USER;
-          ALTER TABLE domain_edges ENABLE TRIGGER USER;
+          ALTER TABLE domain_nodes ENABLE TRIGGER domain_nodes_outbox;
+          ALTER TABLE domain_edges ENABLE TRIGGER domain_edges_outbox;
 
           INSERT INTO domain_accounts (
               id, kind, title, map_state, role, disabled, webauthn_user_id

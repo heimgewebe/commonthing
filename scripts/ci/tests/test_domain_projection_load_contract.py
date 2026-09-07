@@ -58,7 +58,7 @@ def prometheus(*, after: bool, include_reload: bool = True) -> str:
     return "\n".join(lines) + "\n"
 
 
-def k6_summary(workload: str) -> dict:
+def k6_summary(workload: str, *, dropped_iterations: int = 0) -> dict:
     metrics = {
         "cq02_read_duration_ms": {
             "values": {
@@ -74,6 +74,8 @@ def k6_summary(workload: str) -> dict:
         "cq02_read_failures_total": {"values": {"count": 0}},
         "cq02_503_total": {"values": {"count": 0}},
     }
+    if dropped_iterations:
+        metrics["dropped_iterations"] = {"values": {"count": dropped_iterations}}
     if workload == "mixed":
         metrics["cq02_write_duration_ms"] = {
             "values": {
@@ -167,6 +169,18 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
         self.assertEqual(report["projection"]["reload_successes"], 0)
         self.assertEqual(report["projection"]["timings"]["reload"]["count"], 0)
         self.assertEqual(report["projection"]["version_delta"], 0)
+
+    def test_mixed_report_fails_closed_when_k6_drops_iterations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.make_args(root, "mixed", include_reload=True)
+            (root / "k6_summary.json").write_text(
+                json.dumps(k6_summary("mixed", dropped_iterations=2)), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                Cq02EvidenceError, "offered mixed-load rate was not sustained"
+            ):
+                summarize(args)
 
     def test_commit_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
