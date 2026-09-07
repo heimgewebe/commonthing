@@ -148,11 +148,13 @@ impl ApiState {
             .db_pool
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PostgreSQL domain source has no database pool"))?;
-        let observed = crate::domain_db::domain_projection_version(pool).await?;
-        if observed == self.domain_projection_version.load(Ordering::Acquire) {
-            return Ok(());
-        }
 
+        // Coalesce both the cheap generation check and the expensive reload.
+        // During a full reload, safe readers must not keep hammering PostgreSQL
+        // with one version query per request: that contention made the O(N)
+        // snapshot rebuild several times slower at 100k/500k scale. Strict
+        // requests wait; safe reads immediately use the previous complete
+        // projection while one check/reload owner is active.
         let _reload_guard = match freshness {
             DomainProjectionFreshness::RequireCurrent => self.domain_projection_reload.lock().await,
             DomainProjectionFreshness::AllowStaleWhileRefreshing => {
@@ -166,8 +168,6 @@ impl ApiState {
             }
         };
 
-        // Another request may have completed the refresh while we acquired the
-        // single-flight guard. Recheck before doing the expensive full reload.
         let observed = crate::domain_db::domain_projection_version(pool).await?;
         if observed == self.domain_projection_version.load(Ordering::Acquire) {
             return Ok(());
