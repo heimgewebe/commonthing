@@ -128,6 +128,11 @@ jobs:
               -v account_id="${CQ02_ACCOUNT_ID}" \
               -v session_id="${CQ02_SESSION_ID}" <<'SQL'
           BEGIN;
+          -- The generated fixture represents pre-existing state, not 600k live writes.
+          -- Skip user triggers only for this bulk import; measured writes below use them.
+          ALTER TABLE domain_nodes DISABLE TRIGGER USER;
+          ALTER TABLE domain_edges DISABLE TRIGGER USER;
+
           INSERT INTO domain_nodes (
               id, kind, title, lat, lon, created_at, updated_at, payload, search_visibility
           )
@@ -140,6 +145,9 @@ jobs:
           SELECT id, source_id, target_id, edge_kind, created_at, payload
             FROM weltgewebe_perf.domain_edges
            ORDER BY id;
+
+          ALTER TABLE domain_nodes ENABLE TRIGGER USER;
+          ALTER TABLE domain_edges ENABLE TRIGGER USER;
 
           INSERT INTO domain_accounts (
               id, kind, title, map_state, role, disabled, webauthn_user_id
@@ -156,7 +164,18 @@ jobs:
               clock_timestamp(), clock_timestamp(), clock_timestamp() + interval '2 hours'
           );
           COMMIT;
+          ANALYZE domain_nodes;
+          ANALYZE domain_edges;
           SQL
+
+            local restored_projection_triggers
+            restored_projection_triggers="$(psql "${database_url}" -Atc "
+              SELECT count(*)
+                FROM pg_trigger
+               WHERE tgname IN ('domain_nodes_outbox', 'domain_edges_outbox')
+                 AND tgenabled = 'O'
+            ")"
+            test "${restored_projection_triggers}" = "2"
 
             local manifest_path expected_nodes expected_edges
             manifest_path="${out_dir}/fixture/manifest.json"
