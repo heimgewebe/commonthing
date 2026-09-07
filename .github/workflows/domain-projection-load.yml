@@ -158,9 +158,14 @@ jobs:
           COMMIT;
           SQL
 
-            local expected_nodes expected_edges
-            expected_nodes="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["counts"]["nodes"])' "${out_dir}/fixture/manifest.json")"
-            expected_edges="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["counts"]["edges"])' "${out_dir}/fixture/manifest.json")"
+            local manifest_path expected_nodes expected_edges
+            manifest_path="${out_dir}/fixture/manifest.json"
+            expected_nodes="$(python3 -c \
+              'import json,sys; print(json.load(open(sys.argv[1]))["counts"]["nodes"])' \
+              "${manifest_path}")"
+            expected_edges="$(python3 -c \
+              'import json,sys; print(json.load(open(sys.argv[1]))["counts"]["edges"])' \
+              "${manifest_path}")"
             test "$(psql "${database_url}" -Atc 'SELECT count(*) FROM domain_nodes')" = "${expected_nodes}"
             test "$(psql "${database_url}" -Atc 'SELECT count(*) FROM domain_edges')" = "${expected_edges}"
           }
