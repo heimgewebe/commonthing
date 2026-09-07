@@ -18,6 +18,9 @@ const RUN_ID = __ENV.CQ02_RUN_ID;
 const DURATION_SECONDS = Number(__ENV.CQ02_DURATION_SECONDS || 30);
 const READ_VUS = Number(__ENV.CQ02_READ_VUS || 10);
 const WRITE_MAX_VUS = 4;
+const WRITE_RATE = 1;
+const WRITE_TIME_UNIT = '2s';
+const WRITE_RATE_PER_SECOND = 0.5;
 
 if (!BASE_URL) throw new Error('CQ02_BASE_URL is required');
 if (!PROFILE) throw new Error('CQ02_PROFILE is required');
@@ -63,13 +66,14 @@ const scenarios = {
   },
 };
 if (WORKLOAD === 'mixed') {
-  // Keep the offered write rate fixed at one mutation per second. An open-loop
-  // arrival rate avoids "coordinated omission": if reloads make writes slower,
-  // the stressor must not silently reduce the pressure and hide the slowdown.
+  // Keep the offered rate at one mutation every two seconds. The production
+  // default permits 30 patch/replace mutations per account per minute, so 0.5/s
+  // exercises repeated reloads without benchmarking an unsustainable client rate.
+  // Open-loop arrival still avoids coordinated omission if reloads become slow.
   scenarios.writer = {
     executor: 'constant-arrival-rate',
-    rate: 1,
-    timeUnit: '1s',
+    rate: WRITE_RATE,
+    timeUnit: WRITE_TIME_UNIT,
     duration: `${DURATION_SECONDS}s`,
     preAllocatedVUs: 2,
     maxVUs: WRITE_MAX_VUS,
@@ -177,6 +181,8 @@ export function handleSummary(data) {
       workload: WORKLOAD,
       duration_seconds: DURATION_SECONDS,
       read_vus: READ_VUS,
+      write_rate_per_second:
+        WORKLOAD === 'mixed' ? WRITE_RATE_PER_SECOND : 0,
     },
   });
   return { [outputPath]: JSON.stringify(enriched) };

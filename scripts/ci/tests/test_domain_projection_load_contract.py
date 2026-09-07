@@ -96,6 +96,7 @@ def k6_summary(workload: str, *, dropped_iterations: int = 0) -> dict:
             "workload": workload,
             "duration_seconds": 30,
             "read_vus": 10,
+            "write_rate_per_second": 0.5 if workload == "mixed" else 0,
         },
         "metrics": metrics,
     }
@@ -154,6 +155,7 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
         self.assertEqual(report["dataset"]["nodes"], 1000)
         self.assertEqual(report["requests"]["read"]["p99_ms"], 20)
         self.assertEqual(report["requests"]["write"]["p95_ms"], 40)
+        self.assertEqual(report["scenario"]["write_rate_per_second"], 0.5)
         self.assertEqual(report["projection"]["refresh_checks"], 90)
         self.assertEqual(report["projection"]["reload_successes"], 2)
         self.assertEqual(report["projection"]["stable_snapshot_retries"], 1)

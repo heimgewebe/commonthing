@@ -339,6 +339,7 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             "workload": workload,
             "duration_seconds": cq02.get("duration_seconds"),
             "read_vus": cq02.get("read_vus"),
+            "write_rate_per_second": cq02.get("write_rate_per_second"),
             "dropped_iterations": dropped_iterations,
         },
         "requests": {
