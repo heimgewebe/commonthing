@@ -267,7 +267,7 @@ jobs:
               > "${out_dir}/version-after.txt"
             docker logs "${API_CONTAINER}" > "${out_dir}/api-log-after.txt" 2>&1
 
-            python3 -B scripts/performance/domain_projection_load.py summarize \
+            python3 -B -m scripts.performance.domain_projection_load summarize \
               --expected-head "${EXPECTED_HEAD}" \
               --dataset-manifest "${profile_dir}/fixture/manifest.json" \
               --k6-summary "${out_dir}/k6-summary.json" \
