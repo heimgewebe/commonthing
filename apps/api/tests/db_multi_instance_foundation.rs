@@ -180,6 +180,7 @@ async fn api_state(pool: PgPool, nats: async_nats::Client) -> Result<ApiState> {
         nodes_persist: Arc::new(Mutex::new(())),
         accounts_persist: Arc::new(Mutex::new(())),
         domain_projection_gate: Arc::new(RwLock::new(())),
+        domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         domain_projection_version: Arc::new(AtomicI64::new(version)),
         edges: Arc::new(RwLock::new(edges)),
         rate_limiter: Arc::new(AuthRateLimiter::new_postgres(&cfg, pool.clone())),
@@ -432,6 +433,43 @@ async fn two_instances_and_restart_share_truth_and_event_receipts() -> Result<()
             .expect("node visible on second API instance")
             .title,
         "First title"
+    );
+
+    // Safe reads do not queue behind an already-running O(N) projection reload.
+    // They may continue on the previous complete snapshot, while strict refresh
+    // still catches the new generation once the single-flight owner finishes.
+    sqlx::query("UPDATE domain_nodes SET title = 'Deferred title' WHERE id = $1")
+        .bind(NODE_ID)
+        .execute(&pool)
+        .await?;
+    let reload_guard = state_b.domain_projection_reload.lock().await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        state_b.refresh_domain_projection_for_read(),
+    )
+    .await
+    .expect("safe read refresh must not wait for an active reload")?;
+    assert_eq!(
+        state_b
+            .nodes
+            .read()
+            .await
+            .get(NODE_ID)
+            .expect("previous complete projection remains available")
+            .title,
+        "First title"
+    );
+    drop(reload_guard);
+    state_b.refresh_domain_projection_if_stale().await?;
+    assert_eq!(
+        state_b
+            .nodes
+            .read()
+            .await
+            .get(NODE_ID)
+            .expect("strict refresh catches deferred generation")
+            .title,
+        "Deferred title"
     );
 
     sqlx::query("UPDATE domain_nodes SET title = 'Second title' WHERE id = $1")

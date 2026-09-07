@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -10,10 +10,12 @@ use axum::{
 
 use crate::{config::DomainReadSource, state::ApiState};
 
-/// Ensure every PostgreSQL-backed request observes a process-local projection
-/// from the current committed database generation. The read guard remains held
-/// for the full request so another task cannot replace only part of the
-/// projection while a handler is reading multiple aggregate types.
+/// Keep PostgreSQL-backed requests on one internally consistent process-local
+/// projection. Mutating requests require the current committed generation. Safe
+/// GET/HEAD requests may use the previous complete generation only while another
+/// request is actively rebuilding the next snapshot outside the request gate.
+/// The read guard remains held for the full handler so no request can observe a
+/// partially replaced accounts/nodes/edges projection.
 pub async fn ensure_current_domain_projection(
     State(state): State<ApiState>,
     request: Request,
@@ -23,7 +25,12 @@ pub async fn ensure_current_domain_projection(
         return next.run(request).await;
     }
 
-    if let Err(error) = state.refresh_domain_projection_if_stale().await {
+    let refresh = if matches!(*request.method(), Method::GET | Method::HEAD) {
+        state.refresh_domain_projection_for_read().await
+    } else {
+        state.refresh_domain_projection_if_stale().await
+    };
+    if let Err(error) = refresh {
         state.metrics.domain_projection_refresh_failed();
         tracing::error!(
             event = "domain.projection_refresh_failed",

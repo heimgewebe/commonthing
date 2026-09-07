@@ -382,6 +382,14 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
                     {"event": "refresh_failure"},
                 )
             ),
+            "refresh_deferred": int(
+                counter_delta(
+                    before,
+                    after,
+                    "domain_projection_events_total",
+                    {"event": "refresh_deferred"},
+                )
+            ),
             "reload_successes": int(reloads),
             "reload_failures": int(
                 counter_delta(

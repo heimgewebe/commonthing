@@ -576,6 +576,12 @@ impl Metrics {
             .with_label_values(&["refresh_failure"])
             .inc();
     }
+    pub fn domain_projection_refresh_deferred(&self) {
+        self.inner
+            .domain_projection_events_total
+            .with_label_values(&["refresh_deferred"])
+            .inc();
+    }
     pub fn observe_domain_projection_write_gate_wait(&self, duration: Duration) {
         self.inner
             .domain_projection_duration_seconds
@@ -879,6 +885,7 @@ mod tests {
         let metrics = test_metrics();
         metrics.domain_projection_refresh_check();
         metrics.domain_projection_refresh_failed();
+        metrics.domain_projection_refresh_deferred();
         metrics.observe_domain_projection_write_gate_wait(Duration::from_micros(200));
         metrics.observe_domain_projection_write_gate_hold(Duration::from_millis(20));
         metrics.observe_domain_projection_read_gate_wait(Duration::from_micros(300));
@@ -894,6 +901,7 @@ mod tests {
         for expected in [
             r#"domain_projection_events_total{event="refresh_check"} 1"#,
             r#"domain_projection_events_total{event="refresh_failure"} 1"#,
+            r#"domain_projection_events_total{event="refresh_deferred"} 1"#,
             r#"domain_projection_events_total{event="reload_success"} 1"#,
             r#"domain_projection_events_total{event="reload_failure"} 1"#,
             r#"domain_projection_duration_seconds_count{phase="write_gate_wait"} 1"#,

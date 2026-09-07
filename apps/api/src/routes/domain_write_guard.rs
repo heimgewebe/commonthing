@@ -251,6 +251,7 @@ mod tests {
             nodes_persist: Arc::new(Mutex::new(())),
             accounts_persist: Arc::new(Mutex::new(())),
             domain_projection_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             domain_projection_version: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             edges: Arc::new(RwLock::new(crate::state::OrderedCache::new())),
             rate_limiter,

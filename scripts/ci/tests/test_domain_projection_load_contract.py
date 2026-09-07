@@ -16,6 +16,7 @@ def prometheus(*, after: bool, include_reload: bool = True) -> str:
     if after:
         lines.append('domain_projection_events_total{event="refresh_check"} 100')
         lines.append('domain_projection_events_total{event="refresh_failure"} 0')
+        lines.append('domain_projection_events_total{event="refresh_deferred"} 12')
         if include_reload:
             lines.extend(
                 [
@@ -29,6 +30,7 @@ def prometheus(*, after: bool, include_reload: bool = True) -> str:
     else:
         lines.append('domain_projection_events_total{event="refresh_check"} 10')
         lines.append('domain_projection_events_total{event="refresh_failure"} 0')
+        lines.append('domain_projection_events_total{event="refresh_deferred"} 2')
 
     phases = ["read_gate_wait"]
     if include_reload:
@@ -157,6 +159,7 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
         self.assertEqual(report["requests"]["write"]["p95_ms"], 40)
         self.assertEqual(report["scenario"]["write_rate_per_second"], 0.5)
         self.assertEqual(report["projection"]["refresh_checks"], 90)
+        self.assertEqual(report["projection"]["refresh_deferred"], 10)
         self.assertEqual(report["projection"]["reload_successes"], 2)
         self.assertEqual(report["projection"]["stable_snapshot_retries"], 1)
         self.assertEqual(report["projection"]["rows_loaded_per_reload"]["nodes"], 1000)

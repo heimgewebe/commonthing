@@ -93,10 +93,13 @@ pub struct ApiState {
     /// Serializes account-create persistence (append to JSONL) so concurrent
     /// creates cannot interleave the duplicate-check and the write.
     pub accounts_persist: Arc<Mutex<()>>,
-    /// Blocks projection replacement while PostgreSQL-backed requests are
-    /// reading the process-local projection. Requests share a read guard;
-    /// refreshes take the write guard.
+    /// Blocks only the atomic projection replacement while PostgreSQL-backed
+    /// requests read the process-local projection. Full database reloads happen
+    /// outside this gate so established readers are not frozen by O(N) I/O.
     pub domain_projection_gate: Arc<RwLock<()>>,
+    /// Single-flight guard for PostgreSQL projection reloads. Safe read requests
+    /// may keep using the previous complete snapshot while one reload owns this.
+    pub domain_projection_reload: Arc<Mutex<()>>,
     pub domain_projection_version: Arc<AtomicI64>,
     pub edges: Arc<RwLock<OrderedCache<Edge>>>,
     pub rate_limiter: Arc<AuthRateLimiter>,
@@ -113,8 +116,30 @@ pub struct ApiState {
     pub web_push: Option<Arc<WebPushService>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DomainProjectionFreshness {
+    RequireCurrent,
+    AllowStaleWhileRefreshing,
+}
+
 impl ApiState {
     pub async fn refresh_domain_projection_if_stale(&self) -> anyhow::Result<()> {
+        self.refresh_domain_projection(DomainProjectionFreshness::RequireCurrent)
+            .await
+    }
+
+    /// Refresh for a safe read request. If another request already owns the
+    /// reload, this request may keep using the previous *complete* projection
+    /// until that reload atomically swaps the next snapshot into place.
+    pub async fn refresh_domain_projection_for_read(&self) -> anyhow::Result<()> {
+        self.refresh_domain_projection(DomainProjectionFreshness::AllowStaleWhileRefreshing)
+            .await
+    }
+
+    async fn refresh_domain_projection(
+        &self,
+        freshness: DomainProjectionFreshness,
+    ) -> anyhow::Result<()> {
         if self.config.domain_read_source != crate::config::DomainReadSource::Postgres {
             return Ok(());
         }
@@ -128,63 +153,103 @@ impl ApiState {
             return Ok(());
         }
 
-        let write_gate_wait_started = std::time::Instant::now();
-        let _projection_write = self.domain_projection_gate.write().await;
-        self.metrics
-            .observe_domain_projection_write_gate_wait(write_gate_wait_started.elapsed());
-        let write_gate_hold_started = std::time::Instant::now();
-
-        let observed = match crate::domain_db::domain_projection_version(pool).await {
-            Ok(version) => version,
-            Err(error) => {
-                self.metrics
-                    .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
-                return Err(error);
+        let _reload_guard = match freshness {
+            DomainProjectionFreshness::RequireCurrent => self.domain_projection_reload.lock().await,
+            DomainProjectionFreshness::AllowStaleWhileRefreshing => {
+                match self.domain_projection_reload.try_lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        self.metrics.domain_projection_refresh_deferred();
+                        return Ok(());
+                    }
+                }
             }
         };
+
+        // Another request may have completed the refresh while we acquired the
+        // single-flight guard. Recheck before doing the expensive full reload.
+        let observed = crate::domain_db::domain_projection_version(pool).await?;
         if observed == self.domain_projection_version.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        // A same-process domain write can finish after the stable database load
+        // but before the atomic cache swap. The request read gate excludes such
+        // writes once we acquire the write gate, so recheck the version there and
+        // discard/reload rather than overwriting a newer local cache state.
+        const MAX_SWAP_ATTEMPTS: usize = 5;
+        for attempt in 1..=MAX_SWAP_ATTEMPTS {
+            let reload_started = std::time::Instant::now();
+            let projection =
+                crate::domain_db::load_stable_domain_projection_from_postgres(pool).await;
+            let reload_duration = reload_started.elapsed();
+            let (accounts, nodes, edges, stable_version) = match projection {
+                Ok(projection) => projection,
+                Err(error) => {
+                    self.metrics
+                        .observe_domain_projection_reload_failure(reload_duration);
+                    return Err(error);
+                }
+            };
+
+            let write_gate_wait_started = std::time::Instant::now();
+            let _projection_write = self.domain_projection_gate.write().await;
+            self.metrics
+                .observe_domain_projection_write_gate_wait(write_gate_wait_started.elapsed());
+            let write_gate_hold_started = std::time::Instant::now();
+
+            let latest_version = match crate::domain_db::domain_projection_version(pool).await {
+                Ok(version) => version,
+                Err(error) => {
+                    self.metrics.observe_domain_projection_write_gate_hold(
+                        write_gate_hold_started.elapsed(),
+                    );
+                    return Err(error);
+                }
+            };
+            if latest_version != stable_version {
+                self.metrics
+                    .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
+                tracing::debug!(
+                    attempt,
+                    stable_version,
+                    latest_version,
+                    "Domain projection advanced before cache swap; reloading outside request gate"
+                );
+                if attempt == MAX_SWAP_ATTEMPTS {
+                    anyhow::bail!(
+                        "domain projection advanced before cache swap after {MAX_SWAP_ATTEMPTS} attempts"
+                    );
+                }
+                continue;
+            }
+
+            let account_count = accounts.len();
+            let node_count = nodes.len();
+            let edge_count = edges.len();
+            let mut accounts_guard = self.accounts.write().await;
+            let mut nodes_guard = self.nodes.write().await;
+            let mut edges_guard = self.edges.write().await;
+            *accounts_guard = accounts;
+            *nodes_guard = nodes;
+            *edges_guard = edges;
+            self.metrics.set_nodes_cache_count(nodes_guard.len() as i64);
+            self.metrics.set_edges_cache_count(edges_guard.len() as i64);
+            self.domain_projection_version
+                .store(stable_version, Ordering::Release);
+            self.metrics.observe_domain_projection_reload_success(
+                reload_duration,
+                account_count,
+                node_count,
+                edge_count,
+                stable_version,
+            );
             self.metrics
                 .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
             return Ok(());
         }
 
-        let reload_started = std::time::Instant::now();
-        let projection = crate::domain_db::load_stable_domain_projection_from_postgres(pool).await;
-        let reload_duration = reload_started.elapsed();
-        let (accounts, nodes, edges, stable_version) = match projection {
-            Ok(projection) => projection,
-            Err(error) => {
-                self.metrics
-                    .observe_domain_projection_reload_failure(reload_duration);
-                self.metrics
-                    .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
-                return Err(error);
-            }
-        };
-        let account_count = accounts.len();
-        let node_count = nodes.len();
-        let edge_count = edges.len();
-
-        let mut accounts_guard = self.accounts.write().await;
-        let mut nodes_guard = self.nodes.write().await;
-        let mut edges_guard = self.edges.write().await;
-        *accounts_guard = accounts;
-        *nodes_guard = nodes;
-        *edges_guard = edges;
-        self.metrics.set_nodes_cache_count(nodes_guard.len() as i64);
-        self.metrics.set_edges_cache_count(edges_guard.len() as i64);
-        self.domain_projection_version
-            .store(stable_version, Ordering::Release);
-        self.metrics.observe_domain_projection_reload_success(
-            reload_duration,
-            account_count,
-            node_count,
-            edge_count,
-            stable_version,
-        );
-        self.metrics
-            .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
-        Ok(())
+        unreachable!("bounded projection reload loop always returns")
     }
 }
 

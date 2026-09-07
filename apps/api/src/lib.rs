@@ -267,6 +267,7 @@ pub async fn run() -> anyhow::Result<()> {
     let nodes_persist = Arc::new(tokio::sync::Mutex::new(()));
     let accounts_persist = Arc::new(tokio::sync::Mutex::new(()));
     let domain_projection_gate = Arc::new(tokio::sync::RwLock::new(()));
+    let domain_projection_reload = Arc::new(tokio::sync::Mutex::new(()));
     let domain_projection_version = Arc::new(std::sync::atomic::AtomicI64::new(
         initial_projection_version,
     ));
@@ -355,6 +356,7 @@ pub async fn run() -> anyhow::Result<()> {
         nodes_persist,
         accounts_persist,
         domain_projection_gate,
+        domain_projection_reload,
         domain_projection_version,
         edges,
         rate_limiter,
