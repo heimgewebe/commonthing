@@ -16,26 +16,26 @@ Primary references are exact path matches in canonical documentation surfaces. D
 
 | Metric | Count |
 | --- | ---: |
-| files_total | 51 |
-| files_with_frontmatter | 51 |
+| files_total | 52 |
+| files_with_frontmatter | 52 |
 | files_without_frontmatter | 0 |
-| files_with_status | 51 |
+| files_with_status | 52 |
 | files_missing_status | 0 |
-| files_with_lifecycle_state | 46 |
+| files_with_lifecycle_state | 47 |
 | files_missing_lifecycle_state | 5 |
-| files_with_lifecycle | 45 |
+| files_with_lifecycle | 46 |
 | files_missing_lifecycle | 6 |
-| files_with_owner_task | 47 |
+| files_with_owner_task | 48 |
 | files_missing_owner_task | 4 |
-| files_with_review_after | 31 |
+| files_with_review_after | 32 |
 | files_missing_review_after | 20 |
-| files_primary_referenced | 45 |
+| files_primary_referenced | 46 |
 | files_primary_unreferenced | 6 |
-| files_with_derived_references | 51 |
-| files_with_relations | 51 |
+| files_with_derived_references | 52 |
+| files_with_relations | 52 |
 | truth_contract_migrated | 0 |
 | truth_contract_deprecated | 20 |
-| truth_contract_not_decision_relevant | 31 |
+| truth_contract_not_decision_relevant | 32 |
 | files_with_missing_supersession_target | 0 |
 
 ## Controlled Evidence Surfaces
@@ -94,7 +94,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | --- | ---: |
 | documentation | 1 |
 | reference | 1 |
-| report | 45 |
+| report | 46 |
 | status | 2 |
 | status-matrix | 2 |
 
@@ -122,6 +122,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01.md | report | active | active | proof | AUTH-PG-003 | 2026-09-30 |  | not_decision_relevant | 1 | 4 | 2 |  |  |
 | docs/reports/auth-status-matrix.md | reference | active |  |  |  |  |  | not_decision_relevant | 16 | 5 | 3 | lifecycle, owner_task, review_after, lifecycle_state |  |
 | docs/reports/cost-report.md | report | active | active | generated | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | not_decision_relevant | 1 | 4 | 3 |  |  |
+| docs/reports/cq-02-domain-projection-load.md | report | active | active | proof | WELTGEWEBE-OS-002 | 2027-01-07 |  | not_decision_relevant | 1 | 1 | 8 |  |  |
 | docs/reports/domain-account-email-uniqueness-audit.md | report | deprecated | archived | audit | OPT-ARC-001 |  |  | deprecated | 2 | 5 | 4 | review_after |  |
 | docs/reports/domain-account-write-path-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 6 | 5 | 6 | review_after |  |
 | docs/reports/domain-backfill-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 2 | 5 | 4 | review_after |  |
@@ -131,7 +132,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/domain-edge-reference-audit.md | report | deprecated | archived | audit | OPT-ARC-001 |  |  | deprecated | 3 | 5 | 6 | review_after |  |
 | docs/reports/domain-edge-write-path-proof.md | report | deprecated | superseded | proof | OPT-ARC-001 | 2026-07-16 | docs/reports/domain-edge-faden-lifecycle-proof.md | deprecated | 3 | 7 | 8 |  |  |
 | docs/reports/domain-node-write-path-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 4 | 5 | 6 | review_after |  |
-| docs/reports/domain-postgres-instance-coherence-decision.md | report | active | active | audit | WELTGEWEBE-OS-002 | 2027-01-16 |  | not_decision_relevant | 6 | 6 | 10 |  |  |
+| docs/reports/domain-postgres-instance-coherence-decision.md | report | active | active | audit | WELTGEWEBE-OS-002 | 2027-01-16 |  | not_decision_relevant | 7 | 6 | 13 |  |  |
 | docs/reports/domain-provider-role-finding.md | report | active | active | audit | DEPLOY-DNS-001 | 2026-07-23 |  | not_decision_relevant | 4 | 4 | 3 |  |  |
 | docs/reports/domain-read-path-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 5 | 5 | 5 | review_after |  |
 | docs/reports/domain-runtime-data-source-reconciliation.md | report | active | active | audit | DB-PROOF-001 | 2026-07-18 |  | not_decision_relevant | 1 | 4 | 5 |  |  |
@@ -205,6 +206,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01.md | 2 | relates_to | docs/reports/auth-pg-002-runtime-schema-readiness-heimserver-2026-07-01.md, docs/reports/auth-pg-003-backfill-readiness.md |
 | docs/reports/auth-status-matrix.md | 3 | relates_to | docs/adr/ADR-0006__auth-magic-link-session-passkey.md, docs/adr/ADR-0007__auth-persistence-production-db-path.md, docs/blueprints/auth-roadmap.md |
 | docs/reports/cost-report.md | 3 | relates_to | .github/workflows/cost-report.yml, tools/py/cost/model.csv, tools/py/cost/report.py |
+| docs/reports/cq-02-domain-projection-load.md | 8 | relates_to | .github/workflows/domain-projection-load.yml, apps/api/src/middleware/domain_projection.rs, apps/api/src/routes/nodes.rs, apps/api/src/state.rs, apps/api/tests/db_domain_node_write_path.rs, docs/reports/domain-postgres-instance-coherence-decision.md, scripts/performance/domain_projection_k6.js, scripts/performance/domain_projection_load.py |
 | docs/reports/domain-account-email-uniqueness-audit.md | 4 | relates_to | apps/api/src/auth/accounts.rs, apps/api/src/routes/accounts.rs, docs/blueprints/domain-data-postgres-cutover.md, scripts/docmeta/audit_account_email_uniqueness.py |
 | docs/reports/domain-account-write-path-proof.md | 6 | relates_to | .github/workflows/api.yml, apps/api/tests/db_domain_account_write_path.rs, docs/blueprints/domain-data-postgres-cutover.md, docs/reports/domain-read-path-proof.md, docs/reports/optimierungsstatus.md, docs/tasks/board.md |
 | docs/reports/domain-backfill-proof.md | 4 | relates_to | .github/workflows/api.yml, apps/api/tests/db_domain_backfill.rs, docs/blueprints/domain-data-postgres-cutover.md, docs/tasks/index.json |
@@ -214,7 +216,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/domain-edge-reference-audit.md | 6 | relates_to | apps/api/migrations/20260531000002_create_domain_edges.up.sql, contracts/domain/edge.schema.json, docs/blueprints/domain-data-postgres-cutover.md, docs/reports/opt-arc-001-db-proof-matrix.json, docs/tasks/board.md, scripts/docmeta/audit_domain_edge_references.py |
 | docs/reports/domain-edge-write-path-proof.md | 8 | relates_to, supersedes | docs/blueprints/domain-data-postgres-cutover.md, docs/reports/domain-account-write-path-proof.md, docs/reports/domain-edge-create-semantics-preflight.md, docs/reports/domain-node-write-path-proof.md, docs/reports/domain-read-path-proof.md, docs/reports/optimierungsstatus.md, docs/tasks/board.md, docs/tasks/index.json |
 | docs/reports/domain-node-write-path-proof.md | 6 | relates_to | docs/blueprints/domain-data-postgres-cutover.md, docs/reports/domain-account-write-path-proof.md, docs/reports/domain-read-path-proof.md, docs/reports/optimierungsstatus.md, docs/tasks/board.md, docs/tasks/index.json |
-| docs/reports/domain-postgres-instance-coherence-decision.md | 10 | relates_to | apps/api/migrations/20260716000001_multi_instance_foundation.up.sql, apps/api/src/auth/ephemeral_db.rs, apps/api/src/outbox.rs, apps/api/src/state.rs, apps/api/tests/db_multi_instance_foundation.rs, docs/blueprints/domain-data-postgres-cutover.md, docs/tasks/board.md, docs/tasks/index.json, scripts/guard/domain-multi-instance-guard.sh, scripts/tests/test_domain_multi_instance_guard.sh |
+| docs/reports/domain-postgres-instance-coherence-decision.md | 13 | relates_to | apps/api/migrations/20260716000001_multi_instance_foundation.up.sql, apps/api/src/auth/ephemeral_db.rs, apps/api/src/middleware/domain_projection.rs, apps/api/src/outbox.rs, apps/api/src/routes/nodes.rs, apps/api/src/state.rs, apps/api/tests/db_multi_instance_foundation.rs, docs/blueprints/domain-data-postgres-cutover.md, docs/reports/cq-02-domain-projection-load.md, docs/tasks/board.md, docs/tasks/index.json, scripts/guard/domain-multi-instance-guard.sh, scripts/tests/test_domain_multi_instance_guard.sh |
 | docs/reports/domain-provider-role-finding.md | 3 | relates_to | docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md, docs/runbooks/domain-mail-cutover.md, docs/tasks/board.md |
 | docs/reports/domain-read-path-proof.md | 5 | relates_to | docs/blueprints/domain-data-postgres-cutover.md, docs/reports/domain-account-write-path-proof.md, docs/reports/domain-backfill-proof.md, docs/reports/optimierungsstatus.md, docs/tasks/board.md |
 | docs/reports/domain-runtime-data-source-reconciliation.md | 5 | relates_to | docs/blueprints/domain-data-postgres-cutover.md, docs/reports/domain-edge-reference-audit.md, docs/reports/opt-arc-001-db-proof-matrix.json, docs/tasks/board.md, docs/tasks/index.json |
@@ -342,6 +344,9 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 - `docs/reports/cost-report.md`
   - `docs/tasks/board.md`
 
+- `docs/reports/cq-02-domain-projection-load.md`
+  - `docs/reports/domain-postgres-instance-coherence-decision.md`
+
 - `docs/reports/domain-account-email-uniqueness-audit.md`
   - `docs/proofs/weltgewebe-os-v1-t036-documentation-drift-reconciliation.md`
   - `docs/reports/domain-backfill-proof.md`
@@ -384,6 +389,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
   - `docs/adr/ADR-0010__kubernetes-kanonische-plattform.md`
   - `docs/adr/ADR-0012__ereignisrueckgrat-transactional-outbox.md`
   - `docs/blueprints/domain-data-postgres-cutover.md`
+  - `docs/reports/cq-02-domain-projection-load.md`
   - `docs/reports/kubernetes-platform-foundation-status.md`
   - `docs/reports/weltgewebe-os-foundation-status.md`
   - `docs/tasks/board.md`
@@ -619,6 +625,9 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
   - `docs/_generated/backlinks.md`
   - `docs/_generated/doc-index.md`
   - `docs/_generated/relates-to-audit.md`
+  - `docs/_generated/report-lifecycle.md`
+
+- `docs/reports/cq-02-domain-projection-load.md`
   - `docs/_generated/report-lifecycle.md`
 
 - `docs/reports/domain-account-email-uniqueness-audit.md`
@@ -858,7 +867,7 @@ None.
 | --- | ---: |
 | migrated | 0 |
 | deprecated | 20 |
-| not_decision_relevant | 31 |
+| not_decision_relevant | 32 |
 
 ## Machine-readable truth contract
 
@@ -867,23 +876,23 @@ Schema: `contracts/audit-report-truth.schema.json`
 ```json audit-report-truth.v1
 {
   "coverage": {
-    "checked_items": 70,
+    "checked_items": 71,
     "complete": true,
     "failures": 0,
     "fresh": true,
     "method": "exact",
     "scope": "all Markdown files under docs/reports and all generated/curated control surfaces declared in .wgx/generated-artifacts.yml",
-    "total_items": 70
+    "total_items": 71
   },
   "does_not_establish": [
     "The correctness of claims inside individual reports, runtime use of declared consumers, or deployment truth."
   ],
-  "generated_at": "2026-08-25T06:34:16+02:00",
+  "generated_at": "2026-09-07T22:48:17+02:00",
   "limitations": [
     "The inventory evaluates repository metadata, exact path references and declared control contracts, not runtime behaviour."
   ],
   "schema_version": 1,
-  "source_revision": "09890a20bc43cea7de396ee47469563b9b9f287c",
+  "source_revision": "eb5eae177219c36ad0e922ec0dc1beea9fdb2036",
   "sources": [
     {
       "path": ".wgx/generated-artifacts.yml",
@@ -970,6 +979,10 @@ Schema: `contracts/audit-report-truth.schema.json`
       "sha256": "af871bbceb436e1380e43699e8b1800ebcb7b539d74087451fc7dff41bcdf882"
     },
     {
+      "path": "docs/reports/cq-02-domain-projection-load.md",
+      "sha256": "c3f53cf23105a084eef193b37edaa61e3e81b053cff10315f563f80c6f85ef61"
+    },
+    {
       "path": "docs/reports/domain-account-email-uniqueness-audit.md",
       "sha256": "5c0fdc3f0a8c6d84cd1f1c15d54026c9ed31c5a238a40c0d9bd6b17db90d857f"
     },
@@ -1007,7 +1020,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/domain-postgres-instance-coherence-decision.md",
-      "sha256": "fa0bd6a70398e9d5f9ed7a573032eae7d0ccbc40ebb3aaa6980a96f2eb5a3e0b"
+      "sha256": "52b1a1fc882052701a7e487c89021a27169c81194c4f8e6deb511a41c731ccb9"
     },
     {
       "path": "docs/reports/domain-provider-role-finding.md",

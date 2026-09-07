@@ -16,10 +16,10 @@ This overview is descriptive only. It surfaces lifecycle metadata and validator 
 
 | Metric | Count |
 | --- | ---: |
-| files_scanned | 51 |
-| reports_checked | 45 |
+| files_scanned | 52 |
+| reports_checked | 46 |
 | reports_ignored_non_report | 6 |
-| reports_with_lifecycle_state | 45 |
+| reports_with_lifecycle_state | 46 |
 | reports_missing_lifecycle_state | 0 |
 | findings_total | 0 |
 
@@ -27,7 +27,7 @@ This overview is descriptive only. It surfaces lifecycle metadata and validator 
 
 | lifecycle_state | Count |
 | --- | ---: |
-| active | 26 |
+| active | 27 |
 | deferred | 0 |
 | superseded | 6 |
 | archived | 13 |
@@ -56,6 +56,7 @@ This overview is descriptive only. It surfaces lifecycle metadata and validator 
 | docs/reports/auth-pg-003-runtime-audit-heimserver-2026-07-01.md | active | proof | AUTH-PG-003 | 2026-09-30 |  |
 | docs/reports/auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01.md | active | proof | AUTH-PG-003 | 2026-09-30 |  |
 | docs/reports/cost-report.md | active | generated | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  |
+| docs/reports/cq-02-domain-projection-load.md | active | proof | WELTGEWEBE-OS-002 | 2027-01-07 |  |
 | docs/reports/domain-edge-cache-limit-design.md | active | decision-prep | DOMAIN-PG-003 | 2026-09-29 |  |
 | docs/reports/domain-edge-faden-lifecycle-proof.md | active | proof | OPT-ARC-001 | 2026-10-17 |  |
 | docs/reports/domain-postgres-instance-coherence-decision.md | active | audit | WELTGEWEBE-OS-002 | 2027-01-16 |  |
@@ -143,23 +144,23 @@ Schema: `contracts/audit-report-truth.schema.json`
 ```json audit-report-truth.v1
 {
   "coverage": {
-    "checked_items": 51,
+    "checked_items": 52,
     "complete": true,
     "failures": 0,
     "fresh": true,
     "method": "exact",
     "scope": "all Markdown files discovered under docs/reports",
-    "total_items": 51
+    "total_items": 52
   },
   "does_not_establish": [
     "Runtime health, deployment health, or the correctness of claims inside individual reports."
   ],
-  "generated_at": "2026-08-25T06:34:16+02:00",
+  "generated_at": "2026-09-07T22:48:17+02:00",
   "limitations": [
     "The report reflects repository files only and does not execute product runtime checks."
   ],
   "schema_version": 1,
-  "source_revision": "09890a20bc43cea7de396ee47469563b9b9f287c",
+  "source_revision": "eb5eae177219c36ad0e922ec0dc1beea9fdb2036",
   "sources": [
     {
       "path": "docs/reports/agent-readiness-audit.md",
@@ -242,6 +243,10 @@ Schema: `contracts/audit-report-truth.schema.json`
       "sha256": "af871bbceb436e1380e43699e8b1800ebcb7b539d74087451fc7dff41bcdf882"
     },
     {
+      "path": "docs/reports/cq-02-domain-projection-load.md",
+      "sha256": "c3f53cf23105a084eef193b37edaa61e3e81b053cff10315f563f80c6f85ef61"
+    },
+    {
       "path": "docs/reports/domain-account-email-uniqueness-audit.md",
       "sha256": "5c0fdc3f0a8c6d84cd1f1c15d54026c9ed31c5a238a40c0d9bd6b17db90d857f"
     },
@@ -279,7 +284,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/domain-postgres-instance-coherence-decision.md",
-      "sha256": "fa0bd6a70398e9d5f9ed7a573032eae7d0ccbc40ebb3aaa6980a96f2eb5a3e0b"
+      "sha256": "52b1a1fc882052701a7e487c89021a27169c81194c4f8e6deb511a41c731ccb9"
     },
     {
       "path": "docs/reports/domain-provider-role-finding.md",
