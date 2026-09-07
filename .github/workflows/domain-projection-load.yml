@@ -5,7 +5,9 @@ name: Domain projection mixed load
   pull_request:
     paths:
       - "apps/api/src/state.rs"
+      - "apps/api/src/domain_db.rs"
       - "apps/api/src/middleware/domain_projection.rs"
+      - "apps/api/src/routes/nodes.rs"
       - "apps/api/src/telemetry/mod.rs"
       - "scripts/performance/domain_projection_k6.js"
       - "scripts/performance/domain_projection_load.py"

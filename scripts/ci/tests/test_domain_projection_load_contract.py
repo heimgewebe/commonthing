@@ -9,6 +9,7 @@ from pathlib import Path
 from scripts.performance.domain_projection_load import Cq02EvidenceError, summarize
 
 HEAD = "4940e0c335d9173f31c44e2be5701499149879e4"
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def prometheus(*, after: bool, include_reload: bool = True) -> str:
@@ -105,6 +106,23 @@ def k6_summary(workload: str, *, dropped_iterations: int = 0) -> dict:
 
 
 class DomainProjectionLoadContractTests(unittest.TestCase):
+    def test_workflow_watches_projection_runtime_paths(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/domain-projection-load.yml").read_text(
+            encoding="utf-8"
+        )
+        for path in (
+            "apps/api/src/state.rs",
+            "apps/api/src/domain_db.rs",
+            "apps/api/src/middleware/domain_projection.rs",
+            "apps/api/src/routes/nodes.rs",
+            "apps/api/src/telemetry/mod.rs",
+        ):
+            self.assertIn(
+                f'- "{path}"',
+                workflow,
+                f"CQ-02 load evidence must run when critical projection path {path} changes",
+            )
+
     def make_args(
         self, root: Path, workload: str, *, include_reload: bool
     ) -> Namespace:
