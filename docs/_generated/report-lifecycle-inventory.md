@@ -122,7 +122,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01.md | report | active | active | proof | AUTH-PG-003 | 2026-09-30 |  | not_decision_relevant | 1 | 4 | 2 |  |  |
 | docs/reports/auth-status-matrix.md | reference | active |  |  |  |  |  | not_decision_relevant | 16 | 5 | 3 | lifecycle, owner_task, review_after, lifecycle_state |  |
 | docs/reports/cost-report.md | report | active | active | generated | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | not_decision_relevant | 1 | 4 | 3 |  |  |
-| docs/reports/cq-02-domain-projection-load.md | report | active | active | proof | WELTGEWEBE-OS-002 | 2027-01-07 |  | not_decision_relevant | 1 | 1 | 8 |  |  |
+| docs/reports/cq-02-domain-projection-load.md | report | active | active | proof | WELTGEWEBE-OS-002 | 2027-01-07 |  | not_decision_relevant | 1 | 5 | 8 |  |  |
 | docs/reports/domain-account-email-uniqueness-audit.md | report | deprecated | archived | audit | OPT-ARC-001 |  |  | deprecated | 2 | 5 | 4 | review_after |  |
 | docs/reports/domain-account-write-path-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 6 | 5 | 6 | review_after |  |
 | docs/reports/domain-backfill-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 2 | 5 | 4 | review_after |  |
@@ -628,6 +628,10 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
   - `docs/_generated/report-lifecycle.md`
 
 - `docs/reports/cq-02-domain-projection-load.md`
+  - `docs/_generated/backlinks.md`
+  - `docs/_generated/doc-index.md`
+  - `docs/_generated/relates-to-audit.md`
+  - `docs/_generated/relations-analysis.md`
   - `docs/_generated/report-lifecycle.md`
 
 - `docs/reports/domain-account-email-uniqueness-audit.md`
