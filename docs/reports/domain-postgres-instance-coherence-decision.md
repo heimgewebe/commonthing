@@ -8,7 +8,7 @@ lifecycle: audit
 owner_task: WELTGEWEBE-OS-002
 review_after: 2027-01-16
 created: 2026-06-18
-last_reviewed: 2026-07-16
+last_reviewed: 2026-09-07
 lang: de
 summary: >
   Die frühere Single-Instance-Grenze ist durch einen geprüften PostgreSQL-
@@ -25,6 +25,12 @@ relations:
     target: docs/tasks/board.md
   - type: relates_to
     target: apps/api/src/state.rs
+  - type: relates_to
+    target: apps/api/src/middleware/domain_projection.rs
+  - type: relates_to
+    target: apps/api/src/routes/nodes.rs
+  - type: relates_to
+    target: docs/reports/cq-02-domain-projection-load.md
   - type: relates_to
     target: apps/api/src/auth/ephemeral_db.rs
   - type: relates_to
@@ -56,8 +62,9 @@ Wahrheit:
 
 1. kurzlebige Auth-Zustände und Rate-Limits liegen gemeinsam in PostgreSQL;
 2. Domain-Mutationen erhöhen atomar eine monotone Projektionsgeneration;
-3. jeder PostgreSQL-gestützte Request prüft diese Generation und lädt bei Drift
-   eine stabile vollständige Projektion;
+3. PostgreSQL-gestützte Requests prüfen die Generation; strict-current Requests
+   reconciliieren Drift sofort, während ausschließlich anonyme GET/HEAD-Requests
+   begrenzt die vorherige vollständige Projektion verwenden dürfen;
 4. derselbe Trigger schreibt die versionierte Domain-Mutation in eine
    transaktionale Outbox;
 5. mehrere Relays claimen konkurrierend mit `FOR UPDATE SKIP LOCKED`;
@@ -99,20 +106,51 @@ keinen Mehrinstanzanspruch.
 
 `domain_projection_state.version` wird von denselben PostgreSQL-Triggern erhöht,
 die Outbox-Ereignisse anlegen. Eine API-Instanz speichert nur die zuletzt
-vollständig geladene Generation.
+vollständig verarbeitete Generation. PostgreSQL bleibt die gemeinsame Autorität;
+die Prozessprojektion ist ein Cache mit explizitem Generationenzaun.
 
-Vor jedem PostgreSQL-gestützten API-Request gilt:
+Seit CQ-02 gilt nicht mehr pauschal „bei jeder Drift vor jedem Request Full-Reload“.
+Der Laufzeitvertrag unterscheidet stattdessen drei Fälle:
 
-1. Datenbankgeneration lesen;
-2. bei Gleichheit lokale Projektion weiterverwenden;
-3. bei Abweichung ein exklusives Projektionsgate nehmen;
-4. Accounts, Knoten und Fäden laden;
-5. Generation vor und nach dem Laden vergleichen;
-6. bei überlappender Mutation neu laden;
-7. alle drei Projektionen gemeinsam ersetzen;
-8. während des Handlers ein Lesegate halten.
+1. **Strict-current:** Mutationen sowie Requests mit dem kanonischen
+   `gewebe_session`-Cookie müssen die aktuelle committed Generation sehen. Bei
+   Drift wird die stabile vollständige Projektion reconciliiert, bevor der
+   Handler läuft. Das ist sicherheitsrelevant, weil die nachfolgende
+   Auth-Middleware Account-`disabled` und Rolleninformationen aus der Projection
+   liest.
+2. **Anonyme sichere Reads:** Nur GET/HEAD ohne `gewebe_session` dürfen während
+   eines bereits aktiven Reloads vorübergehend die vorherige **vollständige**
+   Projektion verwenden. Es wird nie eine teilweise geladene Generation
+   veröffentlicht.
+3. **Exakter lokaler Node-PATCH-Handoff:** Ein PostgreSQL-Node-PATCH aktualisiert
+   nach erfolgreichem Commit denselben Node im lokalen Cache. Wenn die globale
+   DB-Version exakt von V auf V+1 gestiegen ist, darf die lokale
+   Projection-Version per CAS ebenfalls V→V+1 fortgeschrieben werden. Im engen
+   Fenster zwischen Commit und diesem CAS darf ein anonymer sicherer Read den
+   redundanten Full-Reload nur dann deferren, wenn `nodes_persist` den lokalen
+   Handoff noch belegt und die Drift exakt +1 ist.
 
-Auch eine niedrigere Generation nach Restore oder PITR löst einen Reload aus.
+Der +1-Pfad ist bewusst eng. Springt die DB-Version um mehr als eine Generation,
+ist der lokale CAS nicht mehr passend oder stammt die Drift von einem externen
+Writer, wird **nicht** blind vorgespult. Der normale stabile Full-Reload bleibt
+dann die Reconciliation. Auch eine niedrigere Generation nach Restore oder PITR
+löst einen Reload aus.
+
+Ein Full-Reload lädt Accounts, Nodes und Edges parallel außerhalb des Request-
+Write-Gates. Eine Generation wird vor und nach dem Laden gelesen; überlappt eine
+Mutation den Load, wird bis zu einem festen Limit erneut geladen. Erst danach
+wird unter dem Projection-Write-Gate die vollständige Generation gemeinsam
+ausgetauscht. Während eines Handlers schützt das Projection-Read-Gate weiterhin
+vor einem partiellen Cache-Swap.
+
+CQ-02 hat diesen Vertrag unter unverändertem Mixed-Load gemessen. Run
+`34159375715` auf dem exakten API-Commit
+`28fd95bb81be89d344d3c8d837c15d64448bb8c8` belegt bei 100.000 Nodes und
+500.000 Edges 16/16 erfolgreiche Writes, Projection-Version 1→17, 0 Write-
+Fehler, 0 dropped iterations und 0 Full-Reloads während des 30-Sekunden-Mixed-
+Fensters. Der detaillierte Messbeleg liegt in
+`docs/reports/cq-02-domain-projection-load.md`.
+
 Direkte `TRUNCATE`- oder andere triggerumgehende Wartung an Domain-Tabellen ist
 außerhalb dieses Laufzeitvertrags und muss mit kontrolliertem Neustart oder
 expliziter Projektionsneubildung verbunden werden.
@@ -179,6 +217,20 @@ Quittung aber nicht.
 
 ## Beweise
 
+CQ-02 ergänzt den bisherigen Mehrinstanzbeweis um reale gemischte Last:
+
+- `.github/workflows/domain-projection-load.yml` misst 1k und 100k jeweils
+  read-heavy und mixed mit 10 Reader-VUs und 0,5 Writes/s;
+- dropped iterations, Write-Fehler oder fehlender Versionsfortschritt sind
+  fail-closed;
+- `apps/api/tests/db_domain_node_write_path.rs` beweist isolierten +1-Fast-
+  Forward, externen/concurrent Drift und den exakten post-commit/pre-CAS-Handoff;
+- die Middleware-Policy hält Session-Requests strict-current.
+
+Der terminale 100k-Mixed-Beweis ist Run `34159375715` auf
+`28fd95bb81be89d344d3c8d837c15d64448bb8c8`; Details und Vergleich zur
+vorherigen 1-Drop-Messung stehen in `docs/reports/cq-02-domain-projection-load.md`.
+
 `apps/api/tests/db_multi_instance_foundation.rs` baut gegen eine isolierte
 PostgreSQL-Datenbank und einen JetStream-Server auf:
 
@@ -234,7 +286,9 @@ den fachlichen Single-Instance-Blocker, nicht alle Betriebsrisiken.
 ## Rückfallregel
 
 Eine Änderung, die wieder prozesslokale Produktionsautorität einführt, den
-Projektionszaun umgeht, Domain-Mutationen ohne Outbox zulässt oder einen
-Konsumenten ohne Idempotenzwirkung hinzufügt, muss den Multi-Instance-Beweis und
-den Guard im selben diffgebundenen Schnitt erweitern. Ein stiller Rückfall auf
-eine einzelne API-Instanz ist keine zulässige Reparatur.
+Projektionszaun umgeht, Session-Requests stale werden lässt, den lokalen +1-
+Fast-Forward über unbekannte Generationen ausweitet, Domain-Mutationen ohne
+Outbox zulässt oder einen Konsumenten ohne Idempotenzwirkung hinzufügt, muss den
+Multi-Instance- und CQ-02-Beweis im selben diffgebundenen Schnitt erweitern. Ein
+stiller Rückfall auf eine einzelne API-Instanz oder das Lockern des Lastvertrags
+ist keine zulässige Reparatur.
