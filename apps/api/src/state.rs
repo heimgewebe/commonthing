@@ -118,6 +118,7 @@ impl ApiState {
         if self.config.domain_read_source != crate::config::DomainReadSource::Postgres {
             return Ok(());
         }
+        self.metrics.domain_projection_refresh_check();
         let pool = self
             .db_pool
             .as_ref()
@@ -127,13 +128,42 @@ impl ApiState {
             return Ok(());
         }
 
+        let write_gate_wait_started = std::time::Instant::now();
         let _projection_write = self.domain_projection_gate.write().await;
-        let observed = crate::domain_db::domain_projection_version(pool).await?;
+        self.metrics
+            .observe_domain_projection_write_gate_wait(write_gate_wait_started.elapsed());
+        let write_gate_hold_started = std::time::Instant::now();
+
+        let observed = match crate::domain_db::domain_projection_version(pool).await {
+            Ok(version) => version,
+            Err(error) => {
+                self.metrics
+                    .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
+                return Err(error);
+            }
+        };
         if observed == self.domain_projection_version.load(Ordering::Acquire) {
+            self.metrics
+                .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
             return Ok(());
         }
-        let (accounts, nodes, edges, stable_version) =
-            crate::domain_db::load_stable_domain_projection_from_postgres(pool).await?;
+
+        let reload_started = std::time::Instant::now();
+        let projection = crate::domain_db::load_stable_domain_projection_from_postgres(pool).await;
+        let reload_duration = reload_started.elapsed();
+        let (accounts, nodes, edges, stable_version) = match projection {
+            Ok(projection) => projection,
+            Err(error) => {
+                self.metrics
+                    .observe_domain_projection_reload_failure(reload_duration);
+                self.metrics
+                    .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
+                return Err(error);
+            }
+        };
+        let account_count = accounts.len();
+        let node_count = nodes.len();
+        let edge_count = edges.len();
 
         let mut accounts_guard = self.accounts.write().await;
         let mut nodes_guard = self.nodes.write().await;
@@ -145,6 +175,15 @@ impl ApiState {
         self.metrics.set_edges_cache_count(edges_guard.len() as i64);
         self.domain_projection_version
             .store(stable_version, Ordering::Release);
+        self.metrics.observe_domain_projection_reload_success(
+            reload_duration,
+            account_count,
+            node_count,
+            edge_count,
+            stable_version,
+        );
+        self.metrics
+            .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
         Ok(())
     }
 }

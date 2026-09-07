@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use axum::{
     extract::{Request, State},
     http::StatusCode,
@@ -22,6 +24,7 @@ pub async fn ensure_current_domain_projection(
     }
 
     if let Err(error) = state.refresh_domain_projection_if_stale().await {
+        state.metrics.domain_projection_refresh_failed();
         tracing::error!(
             event = "domain.projection_refresh_failed",
             error = %error,
@@ -33,6 +36,10 @@ pub async fn ensure_current_domain_projection(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
 
+    let read_gate_wait_started = Instant::now();
     let _projection_read = state.domain_projection_gate.read().await;
+    state
+        .metrics
+        .observe_domain_projection_read_gate_wait(read_gate_wait_started.elapsed());
     next.run(request).await
 }

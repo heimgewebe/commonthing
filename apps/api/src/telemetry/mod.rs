@@ -192,6 +192,10 @@ struct MetricsInner {
     pub node_mutation_admin_bypass_total: IntCounterVec,
     pub node_mutation_jsonl_recovery_total: IntCounterVec,
     pub node_mutation_duration_seconds: HistogramVec,
+    pub domain_projection_events_total: IntCounterVec,
+    pub domain_projection_duration_seconds: HistogramVec,
+    pub domain_projection_rows_loaded_total: IntCounterVec,
+    pub domain_projection_snapshot: IntGaugeVec,
     pub domain_event_worker_up: IntGaugeVec,
     pub domain_event_chain_snapshot_up: IntGauge,
     pub domain_outbox_actionable_pending: IntGauge,
@@ -322,6 +326,38 @@ impl Metrics {
             ]),
             &["operation"],
         )?;
+        let domain_projection_events_total = IntCounterVec::new(
+            Opts::new(
+                "domain_projection_events_total",
+                "Domain projection refresh events with a fixed bounded event label",
+            ),
+            &["event"],
+        )?;
+        let projection_duration_buckets = vec![
+            0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+        ];
+        let domain_projection_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "domain_projection_duration_seconds",
+                "Domain projection gate waits and full reload duration with a fixed bounded phase label",
+            )
+            .buckets(projection_duration_buckets),
+            &["phase"],
+        )?;
+        let domain_projection_rows_loaded_total = IntCounterVec::new(
+            Opts::new(
+                "domain_projection_rows_loaded_total",
+                "Rows loaded by completed domain projection reloads with a fixed aggregate-kind label",
+            ),
+            &["kind"],
+        )?;
+        let domain_projection_snapshot = IntGaugeVec::new(
+            Opts::new(
+                "domain_projection_snapshot",
+                "Current domain projection aggregate row counts and committed version",
+            ),
+            &["kind"],
+        )?;
         let domain_event_worker_up = IntGaugeVec::new(
             Opts::new(
                 "domain_event_worker_up",
@@ -372,6 +408,10 @@ impl Metrics {
         registry.register(Box::new(node_mutation_admin_bypass_total.clone()))?;
         registry.register(Box::new(node_mutation_jsonl_recovery_total.clone()))?;
         registry.register(Box::new(node_mutation_duration_seconds.clone()))?;
+        registry.register(Box::new(domain_projection_events_total.clone()))?;
+        registry.register(Box::new(domain_projection_duration_seconds.clone()))?;
+        registry.register(Box::new(domain_projection_rows_loaded_total.clone()))?;
+        registry.register(Box::new(domain_projection_snapshot.clone()))?;
         registry.register(Box::new(domain_event_worker_up.clone()))?;
         registry.register(Box::new(domain_event_chain_snapshot_up.clone()))?;
         registry.register(Box::new(domain_outbox_actionable_pending.clone()))?;
@@ -409,6 +449,10 @@ impl Metrics {
                 node_mutation_admin_bypass_total,
                 node_mutation_jsonl_recovery_total,
                 node_mutation_duration_seconds,
+                domain_projection_events_total,
+                domain_projection_duration_seconds,
+                domain_projection_rows_loaded_total,
+                domain_projection_snapshot,
                 domain_event_worker_up,
                 domain_event_chain_snapshot_up,
                 domain_outbox_actionable_pending,
@@ -520,6 +564,77 @@ impl Metrics {
             .inc_by(count);
     }
 
+    pub fn domain_projection_refresh_check(&self) {
+        self.inner
+            .domain_projection_events_total
+            .with_label_values(&["refresh_check"])
+            .inc();
+    }
+    pub fn domain_projection_refresh_failed(&self) {
+        self.inner
+            .domain_projection_events_total
+            .with_label_values(&["refresh_failure"])
+            .inc();
+    }
+    pub fn observe_domain_projection_write_gate_wait(&self, duration: Duration) {
+        self.inner
+            .domain_projection_duration_seconds
+            .with_label_values(&["write_gate_wait"])
+            .observe(duration.as_secs_f64());
+    }
+    pub fn observe_domain_projection_write_gate_hold(&self, duration: Duration) {
+        self.inner
+            .domain_projection_duration_seconds
+            .with_label_values(&["write_gate_hold"])
+            .observe(duration.as_secs_f64());
+    }
+    pub fn observe_domain_projection_read_gate_wait(&self, duration: Duration) {
+        self.inner
+            .domain_projection_duration_seconds
+            .with_label_values(&["read_gate_wait"])
+            .observe(duration.as_secs_f64());
+    }
+    pub fn observe_domain_projection_reload_success(
+        &self,
+        duration: Duration,
+        accounts: usize,
+        nodes: usize,
+        edges: usize,
+        version: i64,
+    ) {
+        self.inner
+            .domain_projection_events_total
+            .with_label_values(&["reload_success"])
+            .inc();
+        self.inner
+            .domain_projection_duration_seconds
+            .with_label_values(&["reload"])
+            .observe(duration.as_secs_f64());
+        for (kind, count) in [("accounts", accounts), ("nodes", nodes), ("edges", edges)] {
+            self.inner
+                .domain_projection_rows_loaded_total
+                .with_label_values(&[kind])
+                .inc_by(count as u64);
+            self.inner
+                .domain_projection_snapshot
+                .with_label_values(&[kind])
+                .set(count as i64);
+        }
+        self.inner
+            .domain_projection_snapshot
+            .with_label_values(&["version"])
+            .set(version);
+    }
+    pub fn observe_domain_projection_reload_failure(&self, duration: Duration) {
+        self.inner
+            .domain_projection_events_total
+            .with_label_values(&["reload_failure"])
+            .inc();
+        self.inner
+            .domain_projection_duration_seconds
+            .with_label_values(&["reload"])
+            .observe(duration.as_secs_f64());
+    }
     pub fn set_domain_event_worker_up(&self, worker: DomainEventWorker, up: bool) {
         self.inner
             .domain_event_worker_up
@@ -759,6 +874,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn domain_projection_metrics_are_bounded_and_identifier_free() {
+        let metrics = test_metrics();
+        metrics.domain_projection_refresh_check();
+        metrics.domain_projection_refresh_failed();
+        metrics.observe_domain_projection_write_gate_wait(Duration::from_micros(200));
+        metrics.observe_domain_projection_write_gate_hold(Duration::from_millis(20));
+        metrics.observe_domain_projection_read_gate_wait(Duration::from_micros(300));
+        metrics.observe_domain_projection_reload_success(
+            Duration::from_millis(15),
+            2,
+            1_000,
+            5_000,
+            7,
+        );
+        metrics.observe_domain_projection_reload_failure(Duration::from_millis(25));
+        let rendered = String::from_utf8(metrics.render().expect("render metrics")).expect("utf8");
+        for expected in [
+            r#"domain_projection_events_total{event="refresh_check"} 1"#,
+            r#"domain_projection_events_total{event="refresh_failure"} 1"#,
+            r#"domain_projection_events_total{event="reload_success"} 1"#,
+            r#"domain_projection_events_total{event="reload_failure"} 1"#,
+            r#"domain_projection_duration_seconds_count{phase="write_gate_wait"} 1"#,
+            r#"domain_projection_duration_seconds_count{phase="write_gate_hold"} 1"#,
+            r#"domain_projection_duration_seconds_count{phase="read_gate_wait"} 1"#,
+            r#"domain_projection_duration_seconds_count{phase="reload"} 2"#,
+            r#"domain_projection_rows_loaded_total{kind="accounts"} 2"#,
+            r#"domain_projection_rows_loaded_total{kind="nodes"} 1000"#,
+            r#"domain_projection_rows_loaded_total{kind="edges"} 5000"#,
+            r#"domain_projection_snapshot{kind="version"} 7"#,
+        ] {
+            assert!(rendered.contains(expected), "missing metric: {expected}");
+        }
+        for forbidden in ["account_id=", "node_id=", "edge_id=", "title=", "content="] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
     #[test]
     fn domain_event_health_metrics_are_bounded_and_identifier_free() {
         let metrics = test_metrics();
