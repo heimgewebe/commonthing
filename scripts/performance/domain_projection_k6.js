@@ -8,6 +8,7 @@ import { Counter, Trend } from 'k6/metrics';
 
 const BASE_URL = __ENV.CQ02_BASE_URL;
 const SESSION_ID = __ENV.CQ02_SESSION_ID;
+const WRITE_NODE_ID = __ENV.CQ02_WRITE_NODE_ID;
 const PROFILE = __ENV.CQ02_PROFILE;
 const WORKLOAD = __ENV.CQ02_WORKLOAD;
 const RUN_ID = __ENV.CQ02_RUN_ID;
@@ -25,6 +26,9 @@ if (!RUN_ID || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(RUN_ID)) {
 if (WORKLOAD === 'mixed' && !SESSION_ID) {
   throw new Error('CQ02_SESSION_ID is required for mixed workload');
 }
+if (WORKLOAD === 'mixed' && !WRITE_NODE_ID) {
+  throw new Error('CQ02_WRITE_NODE_ID is required for mixed workload');
+}
 if (!Number.isInteger(DURATION_SECONDS) || DURATION_SECONDS <= 0) {
   throw new Error('CQ02_DURATION_SECONDS must be a positive integer');
 }
@@ -41,7 +45,7 @@ const writeFailures = new Counter('cq02_write_failures_total');
 const status503 = new Counter('cq02_503_total');
 
 http.setResponseCallback(http.expectedStatuses(200));
-const WRITE_RESPONSE_CALLBACK = http.expectedStatuses(200, 201);
+const WRITE_RESPONSE_CALLBACK = http.expectedStatuses(200);
 
 const scenarios = {
   readers: {
@@ -83,27 +87,20 @@ export function readNodes() {
 }
 
 function operationOrdinal() {
-  // __ITER is local to a VU. Combining it with __VU keeps operation IDs unique
-  // when the constant-arrival-rate executor temporarily needs more than one VU.
+  // __ITER is local to a VU. Combining it with __VU keeps each patch payload
+  // distinct when the constant-arrival-rate executor temporarily uses more VUs.
   return (__VU * 100000000 + __ITER) % 1000000000000;
-}
-
-function operationId(ordinal) {
-  return `c0020000-0000-4000-8000-${String(ordinal).padStart(12, '0')}`;
 }
 
 export function writeNode() {
   const ordinal = operationOrdinal();
+  // PATCH keeps the fixture cardinality fixed. POST /nodes also creates an
+  // origin Faden and therefore hits the 500k edge ceiling in the 100k profile
+  // before it can exercise projection reloads.
   const payload = JSON.stringify({
-    title: `CQ02 load node ${ordinal}`,
-    kind: 'Werkstatt',
-    address: 'CQ02 synthetic load address',
-    location: { lat: 53.55, lon: 9.99 },
-    summary: 'Synthetic CQ-02 projection reload measurement node',
-    tags: ['cq02', 'load'],
-    operation_id: operationId(ordinal),
+    info: `Synthetic CQ-02 projection reload measurement ${ordinal}`,
   });
-  const response = http.post(`${BASE_URL}/nodes`, payload, {
+  const response = http.patch(`${BASE_URL}/nodes/${WRITE_NODE_ID}`, payload, {
     headers: {
       'Content-Type': 'application/json',
       Origin: BASE_URL,
@@ -114,9 +111,9 @@ export function writeNode() {
   writeRequests.add(1);
   writeDuration.add(response.timings.duration);
   if (response.status === 503) status503.add(1);
-  if (response.status !== 200 && response.status !== 201) writeFailures.add(1);
+  if (response.status !== 200) writeFailures.add(1);
   check(response, {
-    'node write 200/201': (r) => r.status === 200 || r.status === 201,
+    'node patch 200': (r) => r.status === 200,
   });
 }
 

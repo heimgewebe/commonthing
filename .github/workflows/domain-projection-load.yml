@@ -235,7 +235,14 @@ jobs:
             local profile_dir="${EVIDENCE_ROOT}/${profile}"
             local database_url="postgres://postgres:postgres@127.0.0.1:5432/${db_name}"
             local run_id="cq02-${profile}-${workload}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            local write_node_id=""
             mkdir -p "${out_dir}"
+
+            if [[ "${workload}" == "mixed" ]]; then
+              write_node_id="$(psql "${database_url}" -Atc \
+                'SELECT id FROM domain_nodes ORDER BY id LIMIT 1')"
+              test -n "${write_node_id}"
+            fi
 
             curl -fsS http://127.0.0.1:8787/metrics > "${out_dir}/metrics-before.prom"
             psql "${database_url}" -Atc \
@@ -269,6 +276,7 @@ jobs:
               --volume "${out_dir}:/evidence" \
               --env CQ02_BASE_URL=http://127.0.0.1:8787 \
               --env "CQ02_SESSION_ID=${CQ02_SESSION_ID}" \
+              --env "CQ02_WRITE_NODE_ID=${write_node_id}" \
               --env "CQ02_PROFILE=${profile}" \
               --env "CQ02_WORKLOAD=${workload}" \
               --env "CQ02_RUN_ID=${run_id}" \
@@ -336,6 +344,11 @@ jobs:
                   raise SystemExit(f"{profile}: mixed workload did not produce a domain version change")
               if not mixed["requests"]["write"] or mixed["requests"]["write"]["count"] <= 0:
                   raise SystemExit(f"{profile}: mixed workload did not record writes")
+              if mixed["requests"]["write_failures"] != 0:
+                  raise SystemExit(
+                      f"{profile}: mixed workload had "
+                      f"{mixed['requests']['write_failures']} failed writes"
+                  )
               dropped = (
                   raw_k6.get("metrics", {})
                   .get("dropped_iterations", {})
