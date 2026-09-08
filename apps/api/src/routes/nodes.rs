@@ -3430,7 +3430,7 @@ async fn patch_node_postgres(
             transaction_version.and_then(|transaction_version| {
                 expected_projection_version
                     .filter(|expected| *expected == transaction_version)
-                    .map(|version| state.begin_local_node_patch_projection_handoff(version))
+                    .and_then(|version| state.begin_local_node_patch_projection_handoff(version))
             })
         })
         .await

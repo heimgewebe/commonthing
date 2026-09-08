@@ -36,7 +36,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock};
 use tower::ServiceExt;
 use weltgewebe_api::{
     auth::{
@@ -688,8 +688,8 @@ async fn postgres_node_patch_does_not_fast_forward_over_external_generation() ->
     Ok(())
 }
 
-/// A4. The exact post-commit/pre-CAS +1 handoff of a serialized local
-/// PostgreSQL node write must let a safe read keep the existing snapshot rather
+/// A4. An exact transaction-proven +1 commit/cache handoff of a serialized local
+/// PostgreSQL node PATCH must let a safe read keep the existing snapshot rather
 /// than starting a redundant full reload. Authenticated/strict classification is
 /// proven separately by the projection middleware policy test.
 #[tokio::test]
@@ -727,8 +727,9 @@ async fn safe_projection_read_defers_exact_local_node_generation_handoff() -> Re
         Some("before handoff")
     );
 
-    // Model the narrow post-commit/pre-CAS window deterministically. The real
-    // PATCH owns this same mutex across commit, cache update and generation CAS.
+    // Model the observable commit/cache-publication handoff deterministically.
+    // The real PATCH installs the same marker before COMMIT only after its trigger
+    // has updated and locked the projection-state row in that transaction.
     let handoff_guard = state.nodes_persist.lock().await;
     sqlx::query(
         "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
@@ -739,7 +740,22 @@ async fn safe_projection_read_defers_exact_local_node_generation_handoff() -> Re
     .await?;
     let db_after = domain_projection_version(&pool).await?;
     assert_eq!(db_after, local_before + 1);
-    let projection_handoff = state.begin_local_node_patch_projection_handoff(db_after);
+    let projection_handoff = state
+        .begin_local_node_patch_projection_handoff(db_after)
+        .expect("install exact local projection handoff");
+    assert!(
+        state
+            .begin_local_node_patch_projection_handoff(db_after + 1)
+            .is_none(),
+        "a second handoff must not overwrite the active exact generation"
+    );
+    assert_eq!(
+        state
+            .domain_projection_local_node_patch_handoff
+            .load(Ordering::Acquire),
+        db_after,
+        "failed overlapping handoff installation must leave the active marker intact"
+    );
 
     tokio::time::timeout(
         Duration::from_secs(2),
@@ -806,7 +822,22 @@ async fn strict_projection_refresh_waits_for_exact_local_patch_handoff() -> Resu
     .await?;
     let db_after = domain_projection_version(&pool).await?;
     assert_eq!(db_after, local_before + 1);
-    let projection_handoff = state.begin_local_node_patch_projection_handoff(db_after);
+    let projection_handoff = state
+        .begin_local_node_patch_projection_handoff(db_after)
+        .expect("install exact local projection handoff");
+
+    // Queue a second would-be writer *before* the strict refresh. The strict
+    // request must wait only for the explicit handoff above, not enter the fair
+    // `nodes_persist` queue behind this later writer.
+    let queued_writer_state = state.clone();
+    let (queued_writer_acquired_tx, queued_writer_acquired_rx) = oneshot::channel();
+    let (queued_writer_release_tx, queued_writer_release_rx) = oneshot::channel();
+    let queued_writer = tokio::spawn(async move {
+        let _guard = queued_writer_state.nodes_persist.lock().await;
+        let _ = queued_writer_acquired_tx.send(());
+        let _ = queued_writer_release_rx.await;
+    });
+    tokio::task::yield_now().await;
 
     let strict_state = state.clone();
     let strict_refresh =
@@ -834,10 +865,16 @@ async fn strict_projection_refresh_waits_for_exact_local_patch_handoff() -> Resu
     drop(projection_handoff);
     drop(persist_guard);
 
+    tokio::time::timeout(Duration::from_secs(2), queued_writer_acquired_rx)
+        .await
+        .context("queued writer did not acquire persist mutex after handoff")?
+        .context("queued writer acquisition signal dropped")?;
     tokio::time::timeout(Duration::from_secs(2), strict_refresh)
         .await
-        .context("strict refresh did not resume after local handoff")?
+        .context("strict refresh followed the next writer instead of the observed handoff")?
         .context("strict refresh task failed")??;
+    let _ = queued_writer_release_tx.send(());
+    queued_writer.await.context("queued writer task failed")?;
     let metrics = String::from_utf8(state.metrics.render()?)?;
     assert!(
         !metrics.contains(r#"domain_projection_events_total{event="reload_success"}"#),

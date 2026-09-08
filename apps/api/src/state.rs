@@ -139,8 +139,8 @@ fn is_exact_local_node_patch_handoff(
     local_version.checked_add(1) == Some(observed_version) && handoff_version == observed_version
 }
 
-/// Clears the explicit post-commit marker even when a PATCH future is cancelled
-/// after PostgreSQL commit but before cache publication has completed.
+/// Clears the explicit transaction-proven handoff marker even when a PATCH
+/// future is cancelled after PostgreSQL commit but before cache publication.
 pub struct LocalNodeProjectionHandoffGuard {
     marker: Arc<AtomicI64>,
     expected_version: i64,
@@ -162,16 +162,32 @@ impl ApiState {
     /// Callers must already own `nodes_persist` and may create this guard only
     /// after the PATCH trigger has updated and locked `domain_projection_state`
     /// in the same transaction. The guard must survive COMMIT and cache publish.
+    /// A second concurrent marker is refused rather than overwritten.
     pub fn begin_local_node_patch_projection_handoff(
         &self,
         expected_version: i64,
-    ) -> LocalNodeProjectionHandoffGuard {
+    ) -> Option<LocalNodeProjectionHandoffGuard> {
         debug_assert!(expected_version >= 0);
-        self.domain_projection_local_node_patch_handoff
-            .store(expected_version, Ordering::Release);
-        LocalNodeProjectionHandoffGuard {
-            marker: self.domain_projection_local_node_patch_handoff.clone(),
-            expected_version,
+        match self
+            .domain_projection_local_node_patch_handoff
+            .compare_exchange(
+                NO_LOCAL_NODE_PATCH_HANDOFF,
+                expected_version,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+            Ok(_) => Some(LocalNodeProjectionHandoffGuard {
+                marker: self.domain_projection_local_node_patch_handoff.clone(),
+                expected_version,
+            }),
+            Err(active_version) => {
+                tracing::error!(
+                    expected_version,
+                    active_version,
+                    "Refusing to overwrite an active local node projection handoff"
+                );
+                None
+            }
         }
     }
     pub async fn refresh_domain_projection_if_stale(&self) -> anyhow::Result<()> {
@@ -180,8 +196,8 @@ impl ApiState {
     }
 
     /// Refresh for a safe read request. If another request already owns the
-    /// reload, or an exact +1 local node generation is in its post-commit cache
-    /// handoff, this request may keep using the previous *complete* projection.
+    /// reload, or an exact +1 local node generation is in its commit/cache
+    /// publication handoff, this request may keep using the previous *complete* projection.
     pub async fn refresh_domain_projection_for_read(&self) -> anyhow::Result<()> {
         self.refresh_domain_projection(DomainProjectionFreshness::AllowStaleWhileRefreshing)
             .await
@@ -248,12 +264,26 @@ impl ApiState {
                 }
                 DomainProjectionFreshness::RequireCurrent => {
                     // A strict request must not launch an O(N) reload for a
-                    // generation the local writer is already publishing. Wait
-                    // for the existing serialization guard, then re-check. The
-                    // writer clears the explicit handoff marker before releasing
-                    // `nodes_persist`.
-                    let persist_guard = self.nodes_persist.lock().await;
-                    drop(persist_guard);
+                    // generation the local writer is already publishing. Do not
+                    // queue on `nodes_persist`, though: a second writer may already
+                    // be waiting there and would extend this wait beyond the exact
+                    // handoff we observed. Instead, observe only this marker and
+                    // opportunistically probe the persist mutex until the current
+                    // handoff clears, then re-check the generation.
+                    loop {
+                        if self
+                            .domain_projection_local_node_patch_handoff
+                            .load(Ordering::Acquire)
+                            != observed
+                        {
+                            break;
+                        }
+                        if let Ok(persist_guard) = self.nodes_persist.try_lock() {
+                            drop(persist_guard);
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
                     let observed_after_handoff =
                         crate::domain_db::domain_projection_version(pool).await?;
                     let local_after_handoff =
