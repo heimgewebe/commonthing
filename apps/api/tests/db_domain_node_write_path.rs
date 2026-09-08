@@ -50,8 +50,8 @@ use weltgewebe_api::{
         delete_node_with_edges_in_postgres, delete_node_with_edges_in_postgres_audited,
         domain_projection_version, insert_domain_node, load_nodes_from_postgres,
         lock_node_faden_cache_publication, patch_node_in_postgres,
-        replace_node_in_postgres_audited, NodeConversationDeleteEffect, NodeCreateError,
-        NodePatchInput, NodeWriteError,
+        patch_node_in_postgres_with_projection_precommit, replace_node_in_postgres_audited,
+        NodeConversationDeleteEffect, NodeCreateError, NodePatchInput, NodeWriteError,
     },
     governance::delete_guest_account,
     middleware::{
@@ -524,6 +524,43 @@ async fn postgres_node_patch_fast_forwards_exact_local_projection_generation() -
     assert!(metrics.contains(&format!(
         "domain_projection_snapshot{{kind=\"version\"}} {db_after}"
     )));
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A2b. A semantic no-op performs no UPDATE trigger and therefore must not
+/// manufacture a transaction-proven local projection generation.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_node_noop_patch_has_no_local_projection_handoff() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, Some("unchanged"), None).await;
+    let db_before = domain_projection_version(&pool).await?;
+
+    let (_node, precommit_version) = patch_node_in_postgres_with_projection_precommit(
+        &pool,
+        NODE_A,
+        NodePatchInput {
+            info: Some(Some("unchanged".to_string())),
+            search_visibility: None,
+        },
+        |version| version,
+    )
+    .await?;
+
+    assert_eq!(
+        precommit_version, None,
+        "a no-op patch must not claim a local projection generation"
+    );
+    assert_eq!(
+        domain_projection_version(&pool).await?,
+        db_before,
+        "a no-op patch must not advance the projection generation"
+    );
 
     clean(&pool).await;
     Ok(())

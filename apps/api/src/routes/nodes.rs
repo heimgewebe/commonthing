@@ -20,9 +20,10 @@ use crate::config::{
 use crate::domain_db::{
     delete_node_with_edges_in_postgres_audited, domain_projection_version,
     insert_domain_node_and_faden_with_creator_limit, load_nodes_bbox_after_id_from_postgres,
-    load_nodes_bbox_from_postgres, lock_node_faden_cache_publication, patch_node_in_postgres,
-    replace_node_in_postgres_audited, CreateOperationKey, NodeConversationDeleteEffect,
-    NodeCreateError, NodeFadenCreateError, NodePatchInput, NodeWriteError,
+    load_nodes_bbox_from_postgres, lock_node_faden_cache_publication,
+    patch_node_in_postgres_with_projection_precommit, replace_node_in_postgres_audited,
+    CreateOperationKey, NodeConversationDeleteEffect, NodeCreateError, NodeFadenCreateError,
+    NodePatchInput, NodeWriteError,
 };
 use crate::middleware::auth::AuthContext;
 use crate::node_mutation::{
@@ -3423,7 +3424,15 @@ async fn patch_node_postgres(
     let _persist_guard = state.nodes_persist.lock().await;
     let projection_version_before = state.domain_projection_version.load(Ordering::Acquire);
 
-    let node = patch_node_in_postgres(pool, id, patch)
+    let expected_projection_version = projection_version_before.checked_add(1);
+    let (node, _projection_handoff_guard) =
+        patch_node_in_postgres_with_projection_precommit(pool, id, patch, |transaction_version| {
+            transaction_version.and_then(|transaction_version| {
+                expected_projection_version
+                    .filter(|expected| *expected == transaction_version)
+                    .map(|version| state.begin_local_node_patch_projection_handoff(version))
+            })
+        })
         .await
         .map_err(|e| match e {
             NodeWriteError::NotFound => NodeMutationError::Status(StatusCode::NOT_FOUND),
@@ -3452,14 +3461,6 @@ async fn patch_node_postgres(
                 NodeMutationError::Status(StatusCode::INTERNAL_SERVER_ERROR)
             }
         })?;
-
-    // PostgreSQL commit is complete at this point. From here until cache update
-    // plus generation accounting finishes, an exact V+1 may safely be identified
-    // as this PATCH's local publication handoff. Crucially, the marker is not set
-    // while the transaction is still waiting or executing before commit.
-    let expected_projection_version = projection_version_before.checked_add(1);
-    let _projection_handoff_guard = expected_projection_version
-        .map(|version| state.begin_local_node_patch_projection_handoff(version));
 
     let mut cache_guard = state.nodes.write().await;
     cache_guard.insert(id.to_string(), node.clone());

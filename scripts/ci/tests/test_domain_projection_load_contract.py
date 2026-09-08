@@ -129,6 +129,7 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
         )
         self.assertEqual(workflow.count('--duration-seconds "${sampler_duration_seconds}"'), 2)
         self.assertIn('--env "CQ02_DURATION_SECONDS=${workload_duration_seconds}"', workflow)
+        self.assertIn("--max-reloads 0", workflow)
 
     def make_args(
         self, root: Path, workload: str, *, include_reload: bool
@@ -149,9 +150,8 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
             prometheus(after=True, include_reload=include_reload), encoding="utf-8"
         )
         (root / "version-before.txt").write_text("10\n", encoding="utf-8")
-        (root / "version-after.txt").write_text(
-            "12\n" if include_reload else "10\n", encoding="utf-8"
-        )
+        version_after = 40 if workload == "mixed" else 10
+        (root / "version-after.txt").write_text(f"{version_after}\n", encoding="utf-8")
         (root / "log-before.txt").write_text("startup\n", encoding="utf-8")
         retry = (
             "Domain projection changed during reload; retrying stable snapshot\n"
@@ -161,6 +161,7 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
         (root / "log-after.txt").write_text("startup\n" + retry, encoding="utf-8")
         return Namespace(
             expected_head=HEAD,
+            max_reloads=2 if include_reload else 0,
             dataset_manifest=root / "dataset_manifest.json",
             k6_summary=root / "k6_summary.json",
             metrics_before=root / "before.prom",
@@ -202,6 +203,21 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
         self.assertEqual(report["projection"]["reload_successes"], 0)
         self.assertEqual(report["projection"]["timings"]["reload"]["count"], 0)
         self.assertEqual(report["projection"]["version_delta"], 0)
+
+    def test_current_contract_fails_closed_when_any_full_reload_occurs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.make_args(Path(tmp), "mixed", include_reload=True)
+            args.max_reloads = 0
+            with self.assertRaisesRegex(Cq02EvidenceError, "performed 2 full reloads"):
+                summarize(args)
+
+    def test_mixed_report_fails_closed_when_generation_count_does_not_match_successes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.make_args(root, "mixed", include_reload=False)
+            (root / "version-after.txt").write_text("39\n", encoding="utf-8")
+            with self.assertRaisesRegex(Cq02EvidenceError, "generation accounting is inconsistent"):
+                summarize(args)
 
     def test_mixed_report_fails_closed_when_k6_drops_iterations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

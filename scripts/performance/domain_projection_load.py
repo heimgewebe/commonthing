@@ -366,10 +366,45 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             )
         if version_delta <= 0:
             raise Cq02EvidenceError("mixed workload did not advance the domain projection version")
+        if version_delta != write_successes:
+            raise Cq02EvidenceError(
+                "mixed workload generation accounting is inconsistent: "
+                f"version_delta={version_delta}, successful_patches={write_successes}"
+            )
 
-    reloads = counter_delta(
-        before, after, "domain_projection_events_total", {"event": "reload_success"}
+    reloads = int(
+        counter_delta(
+            before, after, "domain_projection_events_total", {"event": "reload_success"}
+        )
     )
+    refresh_failures = int(
+        counter_delta(
+            before, after, "domain_projection_events_total", {"event": "refresh_failure"}
+        )
+    )
+    reload_failures = int(
+        counter_delta(
+            before, after, "domain_projection_events_total", {"event": "reload_failure"}
+        )
+    )
+    max_reloads = getattr(args, "max_reloads", 0)
+    if not isinstance(max_reloads, int) or isinstance(max_reloads, bool) or max_reloads < 0:
+        raise Cq02EvidenceError("max_reloads must be a non-negative integer")
+    if refresh_failures != 0:
+        raise Cq02EvidenceError(
+            f"projection refresh recorded {refresh_failures} failures"
+        )
+    if reload_failures != 0:
+        raise Cq02EvidenceError(f"projection reload recorded {reload_failures} failures")
+    if reloads > max_reloads:
+        raise Cq02EvidenceError(
+            f"projection performed {reloads} full reloads; allowed maximum is {max_reloads}"
+        )
+    if max_reloads == 0 and retry_delta != 0:
+        raise Cq02EvidenceError(
+            f"projection recorded {retry_delta} stable-snapshot retries despite zero-reload contract"
+        )
+
     report = {
         "schema_version": 1,
         "contract": "cq02-domain-projection-load-evidence-v1",
@@ -412,14 +447,7 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
                     {"event": "refresh_check"},
                 )
             ),
-            "refresh_failures": int(
-                counter_delta(
-                    before,
-                    after,
-                    "domain_projection_events_total",
-                    {"event": "refresh_failure"},
-                )
-            ),
+            "refresh_failures": refresh_failures,
             "refresh_deferred": int(
                 counter_delta(
                     before,
@@ -428,15 +456,8 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
                     {"event": "refresh_deferred"},
                 )
             ),
-            "reload_successes": int(reloads),
-            "reload_failures": int(
-                counter_delta(
-                    before,
-                    after,
-                    "domain_projection_events_total",
-                    {"event": "reload_failure"},
-                )
-            ),
+            "reload_successes": reloads,
+            "reload_failures": reload_failures,
             "stable_snapshot_retries": retry_delta,
             "version_before": version_before,
             "version_after": version_after,
@@ -483,6 +504,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     command = sub.add_parser("summarize")
     command.add_argument("--expected-head", required=True)
+    command.add_argument(
+        "--max-reloads",
+        type=int,
+        default=0,
+        help="maximum full projection reloads allowed in this evidence run (default: 0)",
+    )
     command.add_argument("--dataset-manifest", type=Path, required=True)
     command.add_argument("--k6-summary", type=Path, required=True)
     command.add_argument("--metrics-before", type=Path, required=True)

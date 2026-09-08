@@ -311,6 +311,7 @@ jobs:
 
             python3 -B -m scripts.performance.domain_projection_load summarize \
               --expected-head "${EXPECTED_HEAD}" \
+              --max-reloads 0 \
               --dataset-manifest "${profile_dir}/fixture/manifest.json" \
               --k6-summary "${out_dir}/k6-summary.json" \
               --metrics-before "${out_dir}/metrics-before.prom" \

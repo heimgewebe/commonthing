@@ -100,8 +100,10 @@ pub struct ApiState {
     /// Single-flight guard for PostgreSQL projection reloads. Safe read requests
     /// may keep using the previous complete snapshot while one reload owns this.
     pub domain_projection_reload: Arc<Mutex<()>>,
-    /// Exact V+1 generation currently being published by a committed local
-    /// PostgreSQL node PATCH. -1 means no post-commit handoff is active.
+    /// Exact V+1 generation reserved by a local PostgreSQL node PATCH after
+    /// its trigger updated the transaction-locked projection-state row. The
+    /// marker is installed before COMMIT and remains through cache publication;
+    /// other connections cannot observe that V+1 until COMMIT. -1 means none.
     /// This is deliberately separate from `nodes_persist`: that mutex is also
     /// held before commit and therefore cannot prove that observed drift is ours.
     pub domain_projection_local_node_patch_handoff: Arc<AtomicI64>,
@@ -156,9 +158,10 @@ impl Drop for LocalNodeProjectionHandoffGuard {
 }
 
 impl ApiState {
-    /// Mark only the post-commit/cache-publication phase of an isolated local
-    /// PostgreSQL node PATCH. Callers must already own `nodes_persist` and must
-    /// create this guard only after the database mutation has committed.
+    /// Mark only a transaction-proven exact V+1 local PostgreSQL node PATCH.
+    /// Callers must already own `nodes_persist` and may create this guard only
+    /// after the PATCH trigger has updated and locked `domain_projection_state`
+    /// in the same transaction. The guard must survive COMMIT and cache publish.
     pub fn begin_local_node_patch_projection_handoff(
         &self,
         expected_version: i64,
@@ -224,8 +227,9 @@ impl ApiState {
 
         // `nodes_persist` alone cannot identify this handoff because PostgreSQL
         // mutations also own that mutex before commit. Only the explicit marker,
-        // installed after a local PATCH has committed, may classify exact V+1 as
-        // our own cache-publication window. This prevents an external V+1 from
+        // installed only after the PATCH transaction has itself updated and
+        // locked the projection-state row, may classify exact V+1 as our own
+        // commit/cache-publication window. This prevents an external V+1 from
         // being hidden merely because an unrelated local write is still blocked
         // before commit.
         let handoff_version = self
@@ -238,7 +242,7 @@ impl ApiState {
                     tracing::debug!(
                         local_version,
                         observed,
-                        "Deferring anonymous projection refresh during committed local node PATCH handoff"
+                        "Deferring anonymous projection refresh during transaction-proven local node PATCH handoff"
                     );
                     return Ok(());
                 }
