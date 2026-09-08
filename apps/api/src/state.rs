@@ -239,7 +239,10 @@ impl ApiState {
         // Reclassify after every completed exact local handoff. A second local
         // PATCH can commit the next generation immediately after the first one;
         // falling through after only one recheck would mistake that new exact
-        // handoff for foreign drift and start an unnecessary O(N) reload.
+        // handoff for foreign drift and start an unnecessary O(N) reload. Keep
+        // one timeout budget across the whole chain so sustained local PATCHes
+        // cannot renew the process-wide strict wait one second at a time.
+        let mut strict_handoff_wait_started = None;
         loop {
             let observed = crate::domain_db::domain_projection_version(pool).await?;
 
@@ -255,6 +258,24 @@ impl ApiState {
             let local_version = self.domain_projection_version.load(Ordering::Acquire);
             if observed == local_version {
                 return Ok(());
+            }
+
+            // The DB read happens before the local atomics. A writer can publish
+            // a complete V+1 cache after that query, making the first observation
+            // V while `local_version` is already V+1. Do not mistake that harmless
+            // stale DB read for foreign drift and launch O(N) reconciliation.
+            // Re-read only in this local-ahead case. Equality proves catch-up; a
+            // stable lower DB generation still falls through to reconciliation,
+            // preserving restore/PITR semantics instead of trusting newer cache
+            // state across a genuine database rollback.
+            if observed < local_version {
+                let confirmed_observed = crate::domain_db::domain_projection_version(pool).await?;
+                if confirmed_observed == local_version {
+                    return Ok(());
+                }
+                if confirmed_observed != observed {
+                    continue;
+                }
             }
 
             // `nodes_persist` alone cannot identify this handoff because PostgreSQL
@@ -288,7 +309,8 @@ impl ApiState {
                     // coordinator forever. After the marker clears, restart the
                     // cheap classification so an immediately-following local V+1
                     // handoff receives the same treatment.
-                    let handoff_wait_started = tokio::time::Instant::now();
+                    let handoff_wait_started =
+                        strict_handoff_wait_started.get_or_insert_with(tokio::time::Instant::now);
                     loop {
                         if self
                             .domain_projection_local_node_patch_handoff

@@ -1073,6 +1073,66 @@ async fn strict_projection_refresh_times_out_stuck_local_patch_handoff() -> Resu
     Ok(())
 }
 
+/// A5d. A stable lower database generation must still reconcile rather than
+/// being accepted merely because the process-local generation is numerically
+/// ahead. This protects restore/PITR semantics while the local-ahead fast check
+/// only suppresses reloads when a second DB read has actually caught up.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn strict_projection_refresh_reconciles_stable_lower_database_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, Some("restore baseline"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-00000000009c").await?;
+    state.refresh_domain_projection_if_stale().await?;
+    let db_version = domain_projection_version(&pool).await?;
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        db_version
+    );
+
+    let reload_successes = |rendered: &str| -> u64 {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(r#"domain_projection_events_total{event="reload_success"}"#)
+            })
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let reloads_before = reload_successes(&String::from_utf8(state.metrics.render()?)?);
+
+    state
+        .domain_projection_version
+        .store(db_version + 1, Ordering::Release);
+    state.refresh_domain_projection_if_stale().await?;
+
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        db_version,
+        "stable lower database generation must win over a newer local marker"
+    );
+    let reloads_after = reload_successes(&String::from_utf8(state.metrics.render()?)?);
+    assert_eq!(
+        reloads_after,
+        reloads_before + 1,
+        "stable lower generation must use exactly one normal reconciliation reload"
+    );
+
+    clean(&pool).await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
 #[serial]
