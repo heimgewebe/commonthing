@@ -3425,13 +3425,14 @@ async fn patch_node_postgres(
     let projection_version_before = state.domain_projection_version.load(Ordering::Acquire);
 
     let expected_projection_version = projection_version_before.checked_add(1);
-    let (node, _projection_handoff_guard) =
+    let (node, (transaction_projection_version, _projection_handoff_guard)) =
         patch_node_in_postgres_with_projection_precommit(pool, id, patch, |transaction_version| {
-            transaction_version.and_then(|transaction_version| {
+            let projection_handoff_guard = transaction_version.and_then(|transaction_version| {
                 expected_projection_version
                     .filter(|expected| *expected == transaction_version)
                     .and_then(|version| state.begin_local_node_patch_projection_handoff(version))
-            })
+            });
+            (transaction_version, projection_handoff_guard)
         })
         .await
         .map_err(|e| match e {
@@ -3478,7 +3479,9 @@ async fn patch_node_postgres(
     // path then reconciles external or concurrent writes.
     match domain_projection_version(pool).await {
         Ok(observed_version) => {
-            if expected_projection_version == Some(observed_version) {
+            if transaction_projection_version == Some(observed_version)
+                && expected_projection_version == Some(observed_version)
+            {
                 match state.domain_projection_version.compare_exchange(
                     projection_version_before,
                     observed_version,
@@ -3511,7 +3514,8 @@ async fn patch_node_postgres(
                     node_id = %id,
                     projection_version_before,
                     observed_version,
-                    "Skipped projection fast-forward because another domain mutation was observed"
+                    transaction_projection_version,
+                    "Skipped projection fast-forward because the PATCH did not prove ownership of the observed generation"
                 );
             }
         }

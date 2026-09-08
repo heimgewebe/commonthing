@@ -235,23 +235,31 @@ impl ApiState {
             }
         };
 
-        let observed = crate::domain_db::domain_projection_version(pool).await?;
-        let local_version = self.domain_projection_version.load(Ordering::Acquire);
-        if observed == local_version {
-            return Ok(());
-        }
+        // Reclassify after every completed exact local handoff. A second local
+        // PATCH can commit the next generation immediately after the first one;
+        // falling through after only one recheck would mistake that new exact
+        // handoff for foreign drift and start an unnecessary O(N) reload.
+        loop {
+            let observed = crate::domain_db::domain_projection_version(pool).await?;
+            let local_version = self.domain_projection_version.load(Ordering::Acquire);
+            if observed == local_version {
+                return Ok(());
+            }
 
-        // `nodes_persist` alone cannot identify this handoff because PostgreSQL
-        // mutations also own that mutex before commit. Only the explicit marker,
-        // installed only after the PATCH transaction has itself updated and
-        // locked the projection-state row, may classify exact V+1 as our own
-        // commit/cache-publication window. This prevents an external V+1 from
-        // being hidden merely because an unrelated local write is still blocked
-        // before commit.
-        let handoff_version = self
-            .domain_projection_local_node_patch_handoff
-            .load(Ordering::Acquire);
-        if is_exact_local_node_patch_handoff(local_version, observed, handoff_version) {
+            // `nodes_persist` alone cannot identify this handoff because PostgreSQL
+            // mutations also own that mutex before commit. Only the explicit marker,
+            // installed only after the PATCH transaction has itself updated and
+            // locked the projection-state row, may classify exact V+1 as our own
+            // commit/cache-publication window. This prevents an external V+1 from
+            // being hidden merely because an unrelated local write is still blocked
+            // before commit.
+            let handoff_version = self
+                .domain_projection_local_node_patch_handoff
+                .load(Ordering::Acquire);
+            if !is_exact_local_node_patch_handoff(local_version, observed, handoff_version) {
+                break;
+            }
+
             match freshness {
                 DomainProjectionFreshness::AllowStaleWhileRefreshing => {
                     self.metrics.domain_projection_refresh_deferred();
@@ -269,7 +277,9 @@ impl ApiState {
                     // be waiting there and would extend this wait beyond the exact
                     // handoff we observed. Instead, observe only this marker and
                     // opportunistically probe the persist mutex until the current
-                    // handoff clears, then re-check the generation.
+                    // handoff clears. Then restart the cheap classification from
+                    // current DB/local/marker state so an immediately-following
+                    // local V+1 handoff receives the same treatment.
                     loop {
                         if self
                             .domain_projection_local_node_patch_handoff
@@ -283,13 +293,6 @@ impl ApiState {
                             break;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                    let observed_after_handoff =
-                        crate::domain_db::domain_projection_version(pool).await?;
-                    let local_after_handoff =
-                        self.domain_projection_version.load(Ordering::Acquire);
-                    if observed_after_handoff == local_after_handoff {
-                        return Ok(());
                     }
                 }
             }
