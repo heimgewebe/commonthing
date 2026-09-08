@@ -122,7 +122,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01.md | report | active | active | proof | AUTH-PG-003 | 2026-09-30 |  | not_decision_relevant | 1 | 4 | 2 |  |  |
 | docs/reports/auth-status-matrix.md | reference | active |  |  |  |  |  | not_decision_relevant | 16 | 5 | 3 | lifecycle, owner_task, review_after, lifecycle_state |  |
 | docs/reports/cost-report.md | report | active | active | generated | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | not_decision_relevant | 1 | 4 | 3 |  |  |
-| docs/reports/cq-02-domain-projection-load.md | report | active | active | proof | WELTGEWEBE-OS-002 | 2027-01-07 |  | not_decision_relevant | 1 | 5 | 8 |  |  |
+| docs/reports/cq-02-domain-projection-load.md | report | active | active | proof | WELTGEWEBE-OS-002 | 2027-01-08 |  | not_decision_relevant | 1 | 5 | 9 |  |  |
 | docs/reports/domain-account-email-uniqueness-audit.md | report | deprecated | archived | audit | OPT-ARC-001 |  |  | deprecated | 2 | 5 | 4 | review_after |  |
 | docs/reports/domain-account-write-path-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 6 | 5 | 6 | review_after |  |
 | docs/reports/domain-backfill-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 2 | 5 | 4 | review_after |  |
@@ -206,7 +206,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01.md | 2 | relates_to | docs/reports/auth-pg-002-runtime-schema-readiness-heimserver-2026-07-01.md, docs/reports/auth-pg-003-backfill-readiness.md |
 | docs/reports/auth-status-matrix.md | 3 | relates_to | docs/adr/ADR-0006__auth-magic-link-session-passkey.md, docs/adr/ADR-0007__auth-persistence-production-db-path.md, docs/blueprints/auth-roadmap.md |
 | docs/reports/cost-report.md | 3 | relates_to | .github/workflows/cost-report.yml, tools/py/cost/model.csv, tools/py/cost/report.py |
-| docs/reports/cq-02-domain-projection-load.md | 8 | relates_to | .github/workflows/domain-projection-load.yml, apps/api/src/middleware/domain_projection.rs, apps/api/src/routes/nodes.rs, apps/api/src/state.rs, apps/api/tests/db_domain_node_write_path.rs, docs/reports/domain-postgres-instance-coherence-decision.md, scripts/performance/domain_projection_k6.js, scripts/performance/domain_projection_load.py |
+| docs/reports/cq-02-domain-projection-load.md | 9 | relates_to | .github/workflows/domain-projection-load.yml, apps/api/src/domain_db.rs, apps/api/src/middleware/domain_projection.rs, apps/api/src/routes/nodes.rs, apps/api/src/state.rs, apps/api/tests/db_domain_node_write_path.rs, docs/reports/domain-postgres-instance-coherence-decision.md, scripts/performance/domain_projection_k6.js, scripts/performance/domain_projection_load.py |
 | docs/reports/domain-account-email-uniqueness-audit.md | 4 | relates_to | apps/api/src/auth/accounts.rs, apps/api/src/routes/accounts.rs, docs/blueprints/domain-data-postgres-cutover.md, scripts/docmeta/audit_account_email_uniqueness.py |
 | docs/reports/domain-account-write-path-proof.md | 6 | relates_to | .github/workflows/api.yml, apps/api/tests/db_domain_account_write_path.rs, docs/blueprints/domain-data-postgres-cutover.md, docs/reports/domain-read-path-proof.md, docs/reports/optimierungsstatus.md, docs/tasks/board.md |
 | docs/reports/domain-backfill-proof.md | 4 | relates_to | .github/workflows/api.yml, apps/api/tests/db_domain_backfill.rs, docs/blueprints/domain-data-postgres-cutover.md, docs/tasks/index.json |
@@ -891,12 +891,12 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "The correctness of claims inside individual reports, runtime use of declared consumers, or deployment truth."
   ],
-  "generated_at": "2026-09-07T22:48:17+02:00",
+  "generated_at": "2026-09-08T08:46:18+02:00",
   "limitations": [
     "The inventory evaluates repository metadata, exact path references and declared control contracts, not runtime behaviour."
   ],
   "schema_version": 1,
-  "source_revision": "eb5eae177219c36ad0e922ec0dc1beea9fdb2036",
+  "source_revision": "e1871fe112a8dece84fe485e54e260ca35b48127",
   "sources": [
     {
       "path": ".wgx/generated-artifacts.yml",
@@ -984,7 +984,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/cq-02-domain-projection-load.md",
-      "sha256": "c3f53cf23105a084eef193b37edaa61e3e81b053cff10315f563f80c6f85ef61"
+      "sha256": "b7091c5ed13cc6de1e2fd16b438fb41f11888c2d414b1ae55e976d1d296ff957"
     },
     {
       "path": "docs/reports/domain-account-email-uniqueness-audit.md",
@@ -1024,7 +1024,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/domain-postgres-instance-coherence-decision.md",
-      "sha256": "52b1a1fc882052701a7e487c89021a27169c81194c4f8e6deb511a41c731ccb9"
+      "sha256": "d878803745ee95135c337d8b6d454843338c0884c946536ffc23bd318cfc1f81"
     },
     {
       "path": "docs/reports/domain-provider-role-finding.md",

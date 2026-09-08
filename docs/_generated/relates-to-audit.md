@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 734 |
+| Relationen gesamt | 735 |
 | — depends_on | 33 |
 | — implements | 1 |
-| — relates_to | 678 |
+| — relates_to | 679 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |

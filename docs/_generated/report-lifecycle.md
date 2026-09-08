@@ -56,7 +56,7 @@ This overview is descriptive only. It surfaces lifecycle metadata and validator 
 | docs/reports/auth-pg-003-runtime-audit-heimserver-2026-07-01.md | active | proof | AUTH-PG-003 | 2026-09-30 |  |
 | docs/reports/auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01.md | active | proof | AUTH-PG-003 | 2026-09-30 |  |
 | docs/reports/cost-report.md | active | generated | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  |
-| docs/reports/cq-02-domain-projection-load.md | active | proof | WELTGEWEBE-OS-002 | 2027-01-07 |  |
+| docs/reports/cq-02-domain-projection-load.md | active | proof | WELTGEWEBE-OS-002 | 2027-01-08 |  |
 | docs/reports/domain-edge-cache-limit-design.md | active | decision-prep | DOMAIN-PG-003 | 2026-09-29 |  |
 | docs/reports/domain-edge-faden-lifecycle-proof.md | active | proof | OPT-ARC-001 | 2026-10-17 |  |
 | docs/reports/domain-postgres-instance-coherence-decision.md | active | audit | WELTGEWEBE-OS-002 | 2027-01-16 |  |
@@ -155,12 +155,12 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "Runtime health, deployment health, or the correctness of claims inside individual reports."
   ],
-  "generated_at": "2026-09-07T22:48:17+02:00",
+  "generated_at": "2026-09-08T08:46:18+02:00",
   "limitations": [
     "The report reflects repository files only and does not execute product runtime checks."
   ],
   "schema_version": 1,
-  "source_revision": "eb5eae177219c36ad0e922ec0dc1beea9fdb2036",
+  "source_revision": "e1871fe112a8dece84fe485e54e260ca35b48127",
   "sources": [
     {
       "path": "docs/reports/agent-readiness-audit.md",
@@ -244,7 +244,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/cq-02-domain-projection-load.md",
-      "sha256": "c3f53cf23105a084eef193b37edaa61e3e81b053cff10315f563f80c6f85ef61"
+      "sha256": "b7091c5ed13cc6de1e2fd16b438fb41f11888c2d414b1ae55e976d1d296ff957"
     },
     {
       "path": "docs/reports/domain-account-email-uniqueness-audit.md",
@@ -284,7 +284,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/domain-postgres-instance-coherence-decision.md",
-      "sha256": "52b1a1fc882052701a7e487c89021a27169c81194c4f8e6deb511a41c731ccb9"
+      "sha256": "d878803745ee95135c337d8b6d454843338c0884c946536ffc23bd318cfc1f81"
     },
     {
       "path": "docs/reports/domain-provider-role-finding.md",

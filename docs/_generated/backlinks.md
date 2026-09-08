@@ -95,6 +95,7 @@ Generated automatically. Do not edit.
 
 ## apps/api/src/domain_db.rs
 
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
 - [relates_to] docs/reports/domain-edge-cache-limit-design.md
 
 ## apps/api/src/federation_delivery.rs
