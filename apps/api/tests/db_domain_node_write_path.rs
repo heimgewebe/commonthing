@@ -410,6 +410,11 @@ async fn postgres_node_patch_persists_and_reload_sees_change() -> Result<()> {
     let (app, cookie, state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000001").await?;
 
+    // Production mutations enter through the projection middleware, so the
+    // handler starts from one complete current cache generation. Establish the
+    // same invariant explicitly in this handler-focused test.
+    state.refresh_domain_projection_if_stale().await?;
+
     let res = app
         .clone()
         .oneshot(patch_node_req(
@@ -683,6 +688,111 @@ async fn postgres_node_patch_does_not_fast_forward_over_external_generation() ->
             .and_then(|node| node.info.as_deref()),
         Some("external change")
     );
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A3b. If an unseen external V+1 lands after the process has a current cache but before
+/// our PATCH commits V+2, the PATCH must not publish only its own row into the
+/// old V cache. The previous cache must remain a complete generation until the
+/// ordinary projection reload atomically replaces it.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_node_patch_preserves_complete_cache_across_external_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, None, None).await;
+    seed_node(&pool, NODE_B, Some("before external"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (app, cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-00000000009a").await?;
+
+    // Establish one complete current cache generation without wrapping the PATCH
+    // in projection middleware. This test targets handler cache publication only;
+    // the separate A3/A4 tests cover middleware classification and reconciliation.
+    state.refresh_domain_projection_if_stale().await?;
+    let local_before = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(local_before, domain_projection_version(&pool).await?);
+
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT id FROM domain_nodes WHERE id = $1 FOR UPDATE")
+        .bind(NODE_A)
+        .fetch_one(&mut *blocker)
+        .await?;
+
+    let request = patch_node_req(
+        &cookie,
+        NODE_A,
+        r#"{"info": "local after external"}"#,
+        SEEDED_NODE_ETAG,
+    );
+    let patch_app = app.clone();
+    let patch_task = tokio::spawn(async move { patch_app.oneshot(request).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !patch_task.is_finished(),
+        "row lock must hold the API PATCH before its PostgreSQL write can complete"
+    );
+
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("external change")
+    .execute(&pool)
+    .await?;
+    assert_eq!(domain_projection_version(&pool).await?, local_before + 1);
+
+    blocker.commit().await?;
+    let response = tokio::time::timeout(Duration::from_secs(3), patch_task)
+        .await
+        .context("PATCH did not finish after releasing its row lock")???;
+    assert_eq!(response.status(), StatusCode::OK);
+    let db_after = domain_projection_version(&pool).await?;
+    assert_eq!(db_after, local_before + 2);
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        local_before,
+        "process projection marker must remain on the previous complete generation"
+    );
+
+    {
+        let nodes = state.nodes.read().await;
+        assert_eq!(
+            nodes.get(NODE_A).and_then(|node| node.info.as_deref()),
+            None,
+            "PATCH must not publish its V+2 row into the previous V cache"
+        );
+        assert_eq!(
+            nodes.get(NODE_B).and_then(|node| node.info.as_deref()),
+            Some("before external"),
+            "previous cache must remain internally complete until reconciliation"
+        );
+    }
+
+    state.refresh_domain_projection_if_stale().await?;
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        db_after
+    );
+    let nodes = state.nodes.read().await;
+    assert_eq!(
+        nodes.get(NODE_A).and_then(|node| node.info.as_deref()),
+        Some("local after external")
+    );
+    assert_eq!(
+        nodes.get(NODE_B).and_then(|node| node.info.as_deref()),
+        Some("external change")
+    );
+    drop(nodes);
 
     clean(&pool).await;
     Ok(())

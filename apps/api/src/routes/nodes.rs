@@ -3463,12 +3463,31 @@ async fn patch_node_postgres(
             }
         })?;
 
-    let mut cache_guard = state.nodes.write().await;
-    cache_guard.insert(id.to_string(), node.clone());
-    state
-        .metrics
-        .set_nodes_cache_count(cache_guard.len() as i64);
-    drop(cache_guard);
+    // Publish the single-node cache change only when this transaction itself
+    // proved it created exactly the next local generation. If an external
+    // mutation already advanced PostgreSQL, inserting this node would mix the
+    // new row with older cached rows and destroy the complete-snapshot invariant
+    // that anonymous reads rely on while reconciliation is in flight.
+    let owns_next_projection_generation = matches!(
+        (transaction_projection_version, expected_projection_version),
+        (Some(transaction_version), Some(expected_version))
+            if transaction_version == expected_version
+    );
+    if owns_next_projection_generation {
+        let mut cache_guard = state.nodes.write().await;
+        cache_guard.insert(id.to_string(), node.clone());
+        state
+            .metrics
+            .set_nodes_cache_count(cache_guard.len() as i64);
+        drop(cache_guard);
+    } else {
+        tracing::debug!(
+            node_id = %id,
+            projection_version_before,
+            transaction_projection_version,
+            "Preserved previous complete node cache because the PATCH did not own the next projection generation"
+        );
+    }
 
     // The domain_nodes outbox trigger increments the global projection version
     // exactly once for this row update. If PostgreSQL is now precisely V+1, no
