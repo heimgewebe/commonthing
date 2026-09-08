@@ -155,12 +155,12 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "Runtime health, deployment health, or the correctness of claims inside individual reports."
   ],
-  "generated_at": "2026-09-08T08:46:18+02:00",
+  "generated_at": "2026-09-08T15:02:02+02:00",
   "limitations": [
     "The report reflects repository files only and does not execute product runtime checks."
   ],
   "schema_version": 1,
-  "source_revision": "e1871fe112a8dece84fe485e54e260ca35b48127",
+  "source_revision": "36c29ef5bc427faa37be13dbbd4d3816613ecacf",
   "sources": [
     {
       "path": "docs/reports/agent-readiness-audit.md",
@@ -244,7 +244,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/cq-02-domain-projection-load.md",
-      "sha256": "b7091c5ed13cc6de1e2fd16b438fb41f11888c2d414b1ae55e976d1d296ff957"
+      "sha256": "d3d2e4bfe74458bdab5aa231be7504ab950f5235a90cb459456a1cfbc6a2b4dd"
     },
     {
       "path": "docs/reports/domain-account-email-uniqueness-audit.md",
@@ -284,7 +284,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/domain-postgres-instance-coherence-decision.md",
-      "sha256": "d878803745ee95135c337d8b6d454843338c0884c946536ffc23bd318cfc1f81"
+      "sha256": "f653ada170b68aaa08c0118a4e28895fed087968f95d07784861a931a75f23bf"
     },
     {
       "path": "docs/reports/domain-provider-role-finding.md",
