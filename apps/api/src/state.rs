@@ -240,9 +240,11 @@ impl ApiState {
         // PATCH can commit the next generation immediately after the first one;
         // falling through after only one recheck would mistake that new exact
         // handoff for foreign drift and start an unnecessary O(N) reload. Keep
-        // one timeout budget across the whole chain so sustained local PATCHes
-        // cannot renew the process-wide strict wait one second at a time.
-        let mut strict_handoff_wait_started = None;
+        // one wait budget across the whole chain so sustained local PATCHes cannot
+        // renew the process-wide strict wait one second at a time. Count only time
+        // actually spent waiting on an active marker: PostgreSQL reclassification
+        // round trips between completed handoffs are not writer wait time.
+        let mut strict_handoff_waited = std::time::Duration::ZERO;
         loop {
             let observed = crate::domain_db::domain_projection_version(pool).await?;
 
@@ -309,17 +311,20 @@ impl ApiState {
                     // coordinator forever. After the marker clears, restart the
                     // cheap classification so an immediately-following local V+1
                     // handoff receives the same treatment.
-                    let handoff_wait_started =
-                        strict_handoff_wait_started.get_or_insert_with(tokio::time::Instant::now);
+                    let handoff_wait_started = tokio::time::Instant::now();
                     loop {
                         if self
                             .domain_projection_local_node_patch_handoff
                             .load(Ordering::Acquire)
                             != observed
                         {
+                            strict_handoff_waited = strict_handoff_waited
+                                .saturating_add(handoff_wait_started.elapsed());
                             break;
                         }
-                        if handoff_wait_started.elapsed() >= LOCAL_NODE_PATCH_HANDOFF_WAIT_LIMIT {
+                        if strict_handoff_waited.saturating_add(handoff_wait_started.elapsed())
+                            >= LOCAL_NODE_PATCH_HANDOFF_WAIT_LIMIT
+                        {
                             tracing::warn!(
                                 observed_version = observed,
                                 wait_limit_ms = LOCAL_NODE_PATCH_HANDOFF_WAIT_LIMIT.as_millis(),
