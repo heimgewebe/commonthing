@@ -3988,3 +3988,103 @@ async fn concurrent_distinct_node_replaces_preserve_pool_headroom() -> Result<()
     clean(&pool).await;
     Ok(())
 }
+
+
+/// Final-review regression: a no-op must not adopt an unrelated committed V+1.
+/// The real request passes projection/auth/CSRF middleware before being blocked.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn final_review_noop_patch_must_not_consume_external_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, Some("unchanged"), None).await;
+    seed_node(&pool, NODE_B, Some("before external"), None).await;
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (app, cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000097").await?;
+    let app = app.layer(from_fn_with_state(state.clone(), ensure_current_domain_projection));
+    state.refresh_domain_projection_if_stale().await?;
+    let local_before = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(local_before, domain_projection_version(&pool).await?);
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT id FROM domain_nodes WHERE id = $1 FOR UPDATE")
+        .bind(NODE_A).fetch_one(&mut *blocker).await?;
+    let request = patch_node_req(&cookie, NODE_A, r#"{"info":"unchanged"}"#, SEEDED_NODE_ETAG);
+    let patch_app = app.clone();
+    let patch_task = tokio::spawn(async move { patch_app.oneshot(request).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%domain_nodes%FOR UPDATE%'"
+            ).fetch_one(&pool).await?;
+            if blocked > 0 && state.nodes_persist.try_lock().is_err() { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    }).await.context("PATCH did not reach its pre-commit row-lock wait")??;
+    sqlx::query("UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1")
+        .bind(NODE_B).bind("external change").execute(&pool).await?;
+    assert_eq!(domain_projection_version(&pool).await?, local_before + 1);
+    blocker.commit().await?;
+    let response = tokio::time::timeout(Duration::from_secs(3), patch_task).await???;
+    assert_eq!(response.status(), StatusCode::OK);
+    let local_after_patch = state.domain_projection_version.load(Ordering::Acquire);
+    // This is the same strict refresh used before authenticating subsequent requests.
+    state.refresh_domain_projection_if_stale().await?;
+    let db_after = domain_projection_version(&pool).await?;
+    let local_after_strict = state.domain_projection_version.load(Ordering::Acquire);
+    let cached_info = state.nodes.read().await.get(NODE_B).and_then(|n| n.info.clone());
+    let db_info: String = sqlx::query_scalar("SELECT payload->>'info' FROM domain_nodes WHERE id=$1")
+        .bind(NODE_B).fetch_one(&pool).await?;
+    println!("FINAL_REVIEW_NOOP before={local_before} db_after={db_after} local_after_patch={local_after_patch} local_after_strict={local_after_strict} cached_info={cached_info:?} db_info={db_info:?}");
+    clean(&pool).await;
+    assert_eq!(cached_info.as_deref(), Some(db_info.as_str()),
+        "strict refresh must not accept a falsely current projection after no-op PATCH");
+    Ok(())
+}
+
+/// Final-review contract: a second anonymous request must not queue behind a
+/// snapshot writer that is itself waiting for a stalled in-flight handler.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn final_review_anonymous_reader_during_pending_snapshot_swap() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("before external"), None).await;
+    let (app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000098").await?;
+    let app = app.layer(from_fn_with_state(state.clone(), ensure_current_domain_projection));
+    state.refresh_domain_projection_if_stale().await?;
+    // Exact middleware lock state of a slow handler: it keeps its read gate.
+    let slow_handler = state.domain_projection_gate.read().await;
+    sqlx::query("UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1")
+        .bind(NODE_B).bind("external change").execute(&pool).await?;
+    let owner_state = state.clone();
+    let owner = tokio::spawn(async move { owner_state.refresh_domain_projection_for_read().await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state.domain_projection_gate.try_read().is_err() { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.context("reload owner never queued for the snapshot write gate")?;
+    let request = Request::get("/nodes").header("Host", "localhost").body(body::Body::empty())?;
+    let mut second = tokio::spawn(async move { app.oneshot(request).await });
+    let early = tokio::time::timeout(Duration::from_millis(150), &mut second).await;
+    let blocked = early.is_err();
+    println!("FINAL_REVIEW_ANON blocked_behind_pending_swap={blocked}");
+    drop(slow_handler);
+    tokio::time::timeout(Duration::from_secs(3), owner).await???;
+    if blocked {
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), second).await???.status(), StatusCode::OK);
+    }
+    clean(&pool).await;
+    assert!(!blocked, "parallel anonymous reader queued behind snapshot writer despite refresh deferral");
+    Ok(())
+}
