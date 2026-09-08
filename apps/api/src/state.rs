@@ -130,6 +130,7 @@ enum DomainProjectionFreshness {
 }
 
 const NO_LOCAL_NODE_PATCH_HANDOFF: i64 = -1;
+const LOCAL_NODE_PATCH_HANDOFF_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn is_exact_local_node_patch_handoff(
     local_version: i64,
@@ -241,6 +242,16 @@ impl ApiState {
         // handoff for foreign drift and start an unnecessary O(N) reload.
         loop {
             let observed = crate::domain_db::domain_projection_version(pool).await?;
+
+            // The writer publishes the local projection version before its RAII
+            // guard clears the handoff marker. Read the marker first: if this
+            // acquire observes that clear, the following version load also sees
+            // the preceding publication; if it still sees the active marker, the
+            // exact handoff remains classifiable. Reading these in the opposite
+            // order permits a completed handoff to look like foreign drift.
+            let handoff_version = self
+                .domain_projection_local_node_patch_handoff
+                .load(Ordering::Acquire);
             let local_version = self.domain_projection_version.load(Ordering::Acquire);
             if observed == local_version {
                 return Ok(());
@@ -253,9 +264,6 @@ impl ApiState {
             // commit/cache-publication window. This prevents an external V+1 from
             // being hidden merely because an unrelated local write is still blocked
             // before commit.
-            let handoff_version = self
-                .domain_projection_local_node_patch_handoff
-                .load(Ordering::Acquire);
             if !is_exact_local_node_patch_handoff(local_version, observed, handoff_version) {
                 break;
             }
@@ -272,14 +280,15 @@ impl ApiState {
                 }
                 DomainProjectionFreshness::RequireCurrent => {
                     // A strict request must not launch an O(N) reload for a
-                    // generation the local writer is already publishing. Do not
-                    // queue on `nodes_persist`, though: a second writer may already
-                    // be waiting there and would extend this wait beyond the exact
-                    // handoff we observed. Instead, observe only this marker and
-                    // opportunistically probe the persist mutex until the current
-                    // handoff clears. Then restart the cheap classification from
-                    // current DB/local/marker state so an immediately-following
-                    // local V+1 handoff receives the same treatment.
+                    // generation the local writer is already publishing. The
+                    // explicit marker is the completion signal; `nodes_persist`
+                    // is deliberately irrelevant because later writers may already
+                    // be queued there. Bound this wait so an ambiguously committed
+                    // or otherwise stuck PATCH cannot hold the process-wide reload
+                    // coordinator forever. After the marker clears, restart the
+                    // cheap classification so an immediately-following local V+1
+                    // handoff receives the same treatment.
+                    let handoff_wait_started = tokio::time::Instant::now();
                     loop {
                         if self
                             .domain_projection_local_node_patch_handoff
@@ -288,9 +297,15 @@ impl ApiState {
                         {
                             break;
                         }
-                        if let Ok(persist_guard) = self.nodes_persist.try_lock() {
-                            drop(persist_guard);
-                            break;
+                        if handoff_wait_started.elapsed() >= LOCAL_NODE_PATCH_HANDOFF_WAIT_LIMIT {
+                            tracing::warn!(
+                                observed_version = observed,
+                                wait_limit_ms = LOCAL_NODE_PATCH_HANDOFF_WAIT_LIMIT.as_millis(),
+                                "Timed out waiting for transaction-proven local node PATCH handoff"
+                            );
+                            anyhow::bail!(
+                                "timed out waiting for local node projection handoff generation {observed}"
+                            );
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }

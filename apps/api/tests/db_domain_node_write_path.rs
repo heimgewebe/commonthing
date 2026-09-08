@@ -1004,6 +1004,75 @@ async fn strict_projection_refresh_waits_for_exact_local_patch_handoff() -> Resu
     Ok(())
 }
 
+/// A5c. A strict request must not wait forever when a transaction-proven local
+/// handoff remains visible but its writer never publishes the local cache/version.
+/// The refresh fails closed within the bounded handoff budget and does not start
+/// a speculative O(N) reload while ownership is still explicitly marked.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn strict_projection_refresh_times_out_stuck_local_patch_handoff() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("before stuck handoff"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-00000000009b").await?;
+    let local_before = domain_projection_version(&pool).await?;
+    state
+        .domain_projection_version
+        .store(local_before, Ordering::Release);
+
+    let persist_guard = state.nodes_persist.lock().await;
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("committed but publication stuck")
+    .execute(&pool)
+    .await?;
+    let db_after = domain_projection_version(&pool).await?;
+    assert_eq!(db_after, local_before + 1);
+    let projection_handoff = state
+        .begin_local_node_patch_projection_handoff(db_after)
+        .expect("install exact stuck projection handoff");
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.refresh_domain_projection_if_stale(),
+    )
+    .await
+    .context("strict refresh exceeded the outer stuck-handoff safety budget")?
+    .expect_err("stuck exact local handoff must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("timed out waiting for local node projection handoff generation"),
+        "unexpected stuck-handoff error: {error:#}"
+    );
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        local_before,
+        "timed-out strict refresh must not claim the stuck generation"
+    );
+    let metrics = String::from_utf8(state.metrics.render()?)?;
+    assert!(
+        !metrics.contains(r#"domain_projection_events_total{event="reload_success"}"#),
+        "stuck exact local handoff must fail closed without a speculative full reload"
+    );
+
+    drop(projection_handoff);
+    drop(persist_guard);
+    clean(&pool).await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
 #[serial]
