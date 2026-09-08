@@ -117,11 +117,14 @@ Der Laufzeitvertrag unterscheidet stattdessen drei Fälle:
    normaler Drift wird die stabile vollständige Projektion reconciliiert, bevor
    der Handler läuft. Sieht ein strict Request dagegen exakt einen
    transaktionsgebunden markierten lokalen Node-PATCH-Handoff V→V+1, startet er
-   keinen redundanten O(N)-Reload: Er wartet nur, solange genau dieser Marker
-   aktiv ist, und liest danach DB- und lokale Generation erneut. Er reiht sich
-   dabei nicht hinter spätere Writer auf `nodes_persist` ein. Das ist
-   sicherheitsrelevant, weil die nachfolgende Auth-Middleware Account-`disabled`
-   und Rolleninformationen aus der Projection liest.
+   keinen redundanten O(N)-Reload: Er wartet ausschließlich auf genau diesen
+   Marker. `nodes_persist` ist weder Herkunftsbeweis noch Completion-Signal. Die
+   kumulierte tatsächliche Marker-Wartezeit über unmittelbar folgende lokale
+   Handoffs ist auf 1 Sekunde begrenzt; PostgreSQL-Roundtrips zwischen bereits
+   beendeten Handoffs zählen nicht. Ein festhängender Marker endet fail-closed
+   statt unbegrenzt zu blockieren. Nach Marker-Clear wird billig neu klassifiziert.
+   Das ist sicherheitsrelevant, weil die nachfolgende Auth-Middleware
+   Account-`disabled` und Rolleninformationen aus der Projection liest.
 2. **Anonyme sichere Reads:** Nur GET/HEAD ohne `gewebe_session` dürfen während
    eines bereits aktiven Generation-Checks/Reloads oder beim exakt markierten
    lokalen V+1-Handoff vorübergehend die vorherige **vollständige** Projektion
@@ -132,15 +135,27 @@ Der Laufzeitvertrag unterscheidet stattdessen drei Fälle:
    exakt `local + 1` gelesen hat und dabei die Versionszeile bis COMMIT gesperrt
    hält, darf der Prozess den Handoff per CAS markieren. Der Marker ist damit
    bereits vor Sichtbarkeit des Commits vorhanden, ohne fremdes V+1 als lokal
-   zu klassifizieren. Nach COMMIT werden Node-Cache und lokale Projection-Version
-   veröffentlicht; der RAII-Guard löscht nur seinen eigenen Marker per CAS.
-   Semantische No-op-PATCHes erhalten keinen Handoff-Marker.
+   zu klassifizieren. Nach COMMIT wird der einzelne Node nur dann in den Cache
+   publiziert, wenn die Transaktion nachweislich genau die nächste vollständige
+   Generation selbst erzeugt hat. Die lokale Projection-Version wird vor dem
+   CAS-Clear des RAII-Guards veröffentlicht; beim Refresh wird deshalb der Marker
+   per Acquire vor der lokalen Version gelesen. Semantische No-op-PATCHes erhalten
+   keinen Handoff-Marker.
 
 Der +1-Pfad ist bewusst eng. Springt die DB-Version um mehr als eine Generation,
 ist der lokale CAS nicht mehr passend oder stammt die Drift von einem externen
-Writer, wird **nicht** blind vorgespult. Der normale stabile Full-Reload bleibt
-dann die Reconciliation. Auch eine niedrigere Generation nach Restore oder PITR
-löst einen Reload aus.
+Writer, wird **nicht** blind vorgespult. Existierte externe Drift bereits vor dem
+lokalen PATCH und erzeugt dieser deshalb V+2, bleibt der Prozesscache auf der
+letzten vollständigen Generation; der einzelne lokale Node wird nicht partiell
+hineingemischt.
+
+Umgekehrt kann die erste DB-Abfrage noch V gesehen haben, obwohl der lokale Writer
+anschließend V+1 vollständig publiziert hat. Bei `local_version > observed`
+bestätigt deshalb ein zweiter DB-Read den Catch-up. Nur bei bestätigter Gleichheit
+wird der unnötige O(N)-Reload unterdrückt; eine stabil niedrigere DB-Generation
+fällt in normale Reconciliation und schützt damit den aktuell noch niedrigeren
+Restore/PITR-Fall. Eine echte Restore-Epoch-Identität über wiederverwendbare
+Versionsnummern ist damit nicht bewiesen und bleibt T049.
 
 Ein Full-Reload lädt Accounts, Nodes und Edges parallel außerhalb des Request-
 Write-Gates. Eine Generation wird vor und nach dem Laden gelesen; überlappt eine
@@ -150,17 +165,26 @@ ausgetauscht. Während eines Handlers schützt das Projection-Read-Gate weiterhi
 vor einem partiellen Cache-Swap.
 
 CQ-02 hat den finalen **Single-Instance-Node-PATCH-Vertrag** unter
-unverändertem Mixed-Load gemessen. Run `34191668019` auf dem exakten API-Commit
-`dea155aeb31ce79bef10c1ab9d83dd6348a343d9` belegt bei 100.000 Nodes und
-500.000 Edges 15/15 erfolgreiche PATCHes, Projection-Version 1→16, 0 Write-
-Fehler, 0 HTTP 503, 0 dropped iterations und 0 Full-Reloads während des
-30-Sekunden-Mixed-Fensters. Der Harness lief mit genau einer API-Instanz und
-weist deshalb ausdrücklich `multi_instance_load_proven: false` aus. Der
-detaillierte Messbeleg liegt in `docs/reports/cq-02-domain-projection-load.md`.
+unverändertem Mixed-Load gemessen. Run `34223676110`, Job `102052513492`, auf dem
+exakten API-Commit `9be2048de8f56ee65184cba113016336f6742602` belegt bei
+100.000 Nodes und 500.000 Edges 15/15 erfolgreiche PATCHes, Projection-Version
+1→16, Writer-p95 58,3 ms, 0 Write-/Read-Fehler, 0 HTTP 503, 0 dropped iterations,
+0 Stable-Snapshot-Retries und **0 Full-Reloads** während des 30-Sekunden-Mixed-
+Fensters. Der Harness lief mit genau einer API-Instanz und weist deshalb
+ausdrücklich `multi_instance_load_proven: false` aus. Der detaillierte Messbeleg
+liegt in `docs/reports/cq-02-domain-projection-load.md`.
 
 Direkte `TRUNCATE`- oder andere triggerumgehende Wartung an Domain-Tabellen ist
 außerhalb dieses Laufzeitvertrags und muss mit kontrolliertem Neustart oder
 expliziter Projektionsneubildung verbunden werden.
+
+Die stale-safe Klassifikation ist derzeit absichtlich an das Fehlen des
+kanonischen `gewebe_session`-Cookies gebunden. Eine aktuelle Router-Prüfung fand
+keinen alternativen projection-sensitiven GET/HEAD-Authentifizierungsweg; der
+Magic-Link-GET prüft nur Token-Präsenz und trifft dort keine Rollen-/Account-
+Entscheidung. Würde künftig Bearer- oder ein anderer Auth-Carrier eingeführt, muss
+diese Invariante vor Aktivierung maschinell erweitert werden; der Follow-up ist
+in T049 gebündelt.
 
 ## Gemeinsamer Auth-Zustand
 
@@ -233,15 +257,17 @@ nicht vermischt:
 - der Summarizer ist fail-closed für Drops, Read-/Write-Fehler, HTTP 503,
   Versionsdelta, Refresh-/Reload-Fehler, Stable-Snapshot-Retries und jeden
   Full-Reload (`max_reloads = 0`);
-- `apps/api/tests/db_domain_node_write_path.rs` beweist den isolierten
-  +1-Fast-Forward, externe/concurrent Drift, den transaktionsgebundenen
-  Pre-COMMIT-Handoff, Marker-CAS, No-op-PATCH und strict-Warten nur auf den
-  aktuell beobachteten Handoff;
+- `apps/api/tests/db_domain_node_write_path.rs` beweist in 44/44 direkten
+  PostgreSQL-Tests den isolierten +1-Fast-Forward, externe/concurrent Vor-Drift
+  ohne partielles Cache-Publish, den transaktionsgebundenen Pre-COMMIT-Handoff,
+  Marker-CAS, Marker-before-local Load-Ordering, No-op-PATCH, bounded/fail-closed
+  strict-Warten, den local-ahead DB-Reread sowie Reconciliation einer stabil
+  niedrigeren DB-Generation;
 - die Middleware-Policy hält Session-Requests strict-current.
 
-Der terminale 100k-Mixed-Lastbeweis ist Run `34191668019` auf
-`dea155aeb31ce79bef10c1ab9d83dd6348a343d9`; Details und die vollständige
-Messfolge stehen in `docs/reports/cq-02-domain-projection-load.md`.
+Der terminale 100k-Mixed-Lastbeweis ist Run `34223676110`, Job
+`102052513492`, auf `9be2048de8f56ee65184cba113016336f6742602`; Details und
+die vollständige Messfolge stehen in `docs/reports/cq-02-domain-projection-load.md`.
 
 `apps/api/tests/db_multi_instance_foundation.rs` baut gegen eine isolierte
 PostgreSQL-Datenbank und einen JetStream-Server auf:
