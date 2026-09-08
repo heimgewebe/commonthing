@@ -148,6 +148,7 @@ Generated automatically. Do not edit.
 | reports.auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01 | AUTH-PG-003 Runtime Audit Smoke: wg-pg-proof 2026-07-01 | report | active | docs/reports/auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01.md |
 | reports.auth-status-matrix | Auth Status Matrix | reference | active | docs/reports/auth-status-matrix.md |
 | reports.cost-report | Cost Report | report | active | docs/reports/cost-report.md |
+| reports.cq-02-domain-projection-load | CQ-02 — PostgreSQL Domain Projection Mixed-Load Proof | report | active | docs/reports/cq-02-domain-projection-load.md |
 | reports.domain-account-email-uniqueness-audit | Domain Account E-Mail Uniqueness Audit | report | deprecated | docs/reports/domain-account-email-uniqueness-audit.md |
 | reports.domain-account-write-path-proof | Domain Account Write Path Proof | report | deprecated | docs/reports/domain-account-write-path-proof.md |
 | reports.domain-backfill-proof | Domain Backfill Proof | report | deprecated | docs/reports/domain-backfill-proof.md |

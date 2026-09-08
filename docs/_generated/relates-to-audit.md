@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 723 |
+| Relationen gesamt | 735 |
 | — depends_on | 33 |
 | — implements | 1 |
-| — relates_to | 667 |
+| — relates_to | 679 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |
@@ -32,10 +32,11 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (283 Dokumente):
+**Cluster 1** (289 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
+- `.github/workflows/domain-projection-load.yml`
 - `.github/workflows/opt-arc-001-db-proof-matrix.yml`
 - `.github/workflows/public-login-smtp-readiness.yml`
 - `.github/workflows/reusable-web-check.yml`
@@ -48,6 +49,7 @@ _Keine Lücken erkannt._
 - `apps/api/src/auth/ephemeral_db.rs`
 - `apps/api/src/domain_db.rs`
 - `apps/api/src/governance.rs`
+- `apps/api/src/middleware/domain_projection.rs`
 - `apps/api/src/outbox.rs`
 - `apps/api/src/routes/accounts.rs`
 - `apps/api/src/routes/conversations.rs`
@@ -56,6 +58,7 @@ _Keine Lücken erkannt._
 - `apps/api/src/state.rs`
 - `apps/api/tests/db_domain_account_write_path.rs`
 - `apps/api/tests/db_domain_backfill.rs`
+- `apps/api/tests/db_domain_node_write_path.rs`
 - `apps/api/tests/db_multi_instance_foundation.rs`
 - `apps/web/Caddyfile.container`
 - `apps/web/src/lib/components/governance/ProposalDetail.svelte`
@@ -193,6 +196,7 @@ _Keine Lücken erkannt._
 - `docs/reports/auth-pg-003-runtime-audit-heimserver-2026-07-01.md`
 - `docs/reports/auth-pg-003-runtime-audit-wg-pg-proof-2026-07-01.md`
 - `docs/reports/auth-status-matrix.md`
+- `docs/reports/cq-02-domain-projection-load.md`
 - `docs/reports/domain-account-email-uniqueness-audit.md`
 - `docs/reports/domain-account-write-path-proof.md`
 - `docs/reports/domain-backfill-proof.md`
@@ -315,6 +319,8 @@ _Keine Lücken erkannt._
 - `scripts/ops/reconcile-production-main-vps.sh`
 - `scripts/ops/reconcile_public_login_smtp_env.py`
 - `scripts/ops/resolve_vps_public_bind.py`
+- `scripts/performance/domain_projection_k6.js`
+- `scripts/performance/domain_projection_load.py`
 - `scripts/tests/test_domain_multi_instance_guard.sh`
 - `tests/fixtures/agent/handoff-valid.json`
 
@@ -365,10 +371,13 @@ _Keine Lücken erkannt._
 
 - relates_to → `apps/api/migrations/20260716000001_multi_instance_foundation.up.sql`
 - relates_to → `apps/api/src/auth/ephemeral_db.rs`
+- relates_to → `apps/api/src/middleware/domain_projection.rs`
 - relates_to → `apps/api/src/outbox.rs`
+- relates_to → `apps/api/src/routes/nodes.rs`
 - relates_to → `apps/api/src/state.rs`
 - relates_to → `apps/api/tests/db_multi_instance_foundation.rs`
 - relates_to → `docs/blueprints/domain-data-postgres-cutover.md`
+- relates_to → `docs/reports/cq-02-domain-projection-load.md`
 - relates_to → `docs/tasks/board.md`
 - relates_to → `docs/tasks/index.json`
 - relates_to → `scripts/guard/domain-multi-instance-guard.sh`

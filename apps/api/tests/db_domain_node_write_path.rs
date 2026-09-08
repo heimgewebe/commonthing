@@ -30,8 +30,13 @@ use axum::{
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
-use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
-use tokio::sync::RwLock;
+use std::{
+    ffi::OsString,
+    path::PathBuf,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
+use tokio::sync::{oneshot, RwLock};
 use tower::ServiceExt;
 use weltgewebe_api::{
     auth::{
@@ -43,9 +48,10 @@ use weltgewebe_api::{
     },
     domain_db::{
         delete_node_with_edges_in_postgres, delete_node_with_edges_in_postgres_audited,
-        insert_domain_node, load_nodes_from_postgres, lock_node_faden_cache_publication,
-        patch_node_in_postgres, replace_node_in_postgres_audited, NodeConversationDeleteEffect,
-        NodeCreateError, NodePatchInput, NodeWriteError,
+        domain_projection_version, insert_domain_node, load_nodes_from_postgres,
+        lock_node_faden_cache_publication, patch_node_in_postgres,
+        patch_node_in_postgres_with_projection_precommit, replace_node_in_postgres_audited,
+        NodeConversationDeleteEffect, NodeCreateError, NodePatchInput, NodeWriteError,
     },
     governance::delete_guest_account,
     middleware::{
@@ -319,6 +325,10 @@ async fn postgres_write_app_with_account_source(
         nodes_persist: Arc::new(tokio::sync::Mutex::new(())),
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
         domain_projection_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+        domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        domain_projection_local_node_patch_handoff: std::sync::Arc::new(
+            std::sync::atomic::AtomicI64::new(-1),
+        ),
         domain_projection_version: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         edges: Arc::new(RwLock::new(weltgewebe_api::state::OrderedCache::new())),
         rate_limiter,
@@ -400,6 +410,11 @@ async fn postgres_node_patch_persists_and_reload_sees_change() -> Result<()> {
     let (app, cookie, state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000001").await?;
 
+    // Production mutations enter through the projection middleware, so the
+    // handler starts from one complete current cache generation. Establish the
+    // same invariant explicitly in this handler-focused test.
+    state.refresh_domain_projection_if_stale().await?;
+
     let res = app
         .clone()
         .oneshot(patch_node_req(
@@ -442,6 +457,677 @@ async fn postgres_node_patch_persists_and_reload_sees_change() -> Result<()> {
         .context("reload nodes")?;
     let node = reloaded.get(NODE_A).expect("node reloaded from postgres");
     assert_eq!(node.info.as_deref(), Some("new info"));
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A2. When the PostgreSQL trigger advances the generation by exactly one for
+/// our own PATCH, the locally updated cache can safely fast-forward the process
+/// marker instead of forcing the next write through a full projection reload.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_node_patch_fast_forwards_exact_local_projection_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, None, None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (app, cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000091").await?;
+    let app = app.layer(from_fn_with_state(
+        state.clone(),
+        ensure_current_domain_projection,
+    ));
+
+    let preload = app
+        .clone()
+        .oneshot(
+            Request::get("/nodes")
+                .header("Host", "localhost")
+                .body(body::Body::empty())?,
+        )
+        .await?;
+    assert_eq!(preload.status(), StatusCode::OK);
+
+    let local_before = state.domain_projection_version.load(Ordering::Acquire);
+    let db_before = domain_projection_version(&pool).await?;
+    assert_eq!(
+        local_before, db_before,
+        "preload must synchronize projection generation"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(patch_node_req(
+            &cookie,
+            NODE_A,
+            r#"{"info": "fast-forwarded"}"#,
+            SEEDED_NODE_ETAG,
+        ))
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let db_after = domain_projection_version(&pool).await?;
+    let local_after = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(
+        db_after,
+        db_before + 1,
+        "one node PATCH must advance the trigger generation once"
+    );
+    assert_eq!(
+        local_after, db_after,
+        "isolated local PATCH must fast-forward the process projection marker"
+    );
+    let metrics = String::from_utf8(state.metrics.render()?)?;
+    assert!(metrics.contains(&format!(
+        "domain_projection_snapshot{{kind=\"version\"}} {db_after}"
+    )));
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A2b. A semantic no-op performs no UPDATE trigger and therefore must not
+/// manufacture a transaction-proven local projection generation.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_node_noop_patch_has_no_local_projection_handoff() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, Some("unchanged"), None).await;
+    let db_before = domain_projection_version(&pool).await?;
+
+    let (_node, precommit_version) = patch_node_in_postgres_with_projection_precommit(
+        &pool,
+        NODE_A,
+        NodePatchInput {
+            info: Some(Some("unchanged".to_string())),
+            search_visibility: None,
+        },
+        |version| version,
+    )
+    .await?;
+
+    assert_eq!(
+        precommit_version, None,
+        "a no-op patch must not claim a local projection generation"
+    );
+    assert_eq!(
+        domain_projection_version(&pool).await?,
+        db_before,
+        "a no-op patch must not advance the projection generation"
+    );
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A3. A concurrent external domain update makes the observed generation jump
+/// by more than one. The PATCH must then leave the process marker stale so the
+/// ordinary refresh path reconciles the missing external change.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_node_patch_does_not_fast_forward_over_external_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, None, None).await;
+    seed_node(&pool, NODE_B, Some("before external"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (app, cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000092").await?;
+    let app = app.layer(from_fn_with_state(
+        state.clone(),
+        ensure_current_domain_projection,
+    ));
+
+    let preload = app
+        .clone()
+        .oneshot(
+            Request::get("/nodes")
+                .header("Host", "localhost")
+                .body(body::Body::empty())?,
+        )
+        .await?;
+    assert_eq!(preload.status(), StatusCode::OK);
+    let local_before = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(local_before, domain_projection_version(&pool).await?);
+
+    // Hold NODE_A so the API PATCH passes middleware freshness checks and then
+    // blocks inside PostgreSQL. While it is blocked, mutate NODE_B externally.
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT id FROM domain_nodes WHERE id = $1 FOR UPDATE")
+        .bind(NODE_A)
+        .fetch_one(&mut *blocker)
+        .await?;
+
+    let request = patch_node_req(
+        &cookie,
+        NODE_A,
+        r#"{"info": "local after external"}"#,
+        SEEDED_NODE_ETAG,
+    );
+    let patch_app = app.clone();
+    let patch_task = tokio::spawn(async move { patch_app.oneshot(request).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !patch_task.is_finished(),
+        "row lock must hold the API PATCH before the external generation bump"
+    );
+
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("external change")
+    .execute(&pool)
+    .await?;
+    assert_eq!(domain_projection_version(&pool).await?, local_before + 1);
+
+    // This is the bug-shaped window: the API PATCH owns `nodes_persist` but is
+    // still blocked before its own commit, while an unrelated external writer
+    // already produced V+1. An anonymous read must NOT call this a local handoff
+    // and return the old snapshot. It must wait for coherent reconciliation.
+    let read_app = app.clone();
+    let concurrent_read = tokio::spawn(async move {
+        read_app
+            .oneshot(
+                Request::get("/nodes")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("anonymous read request"),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !concurrent_read.is_finished(),
+        "pre-commit nodes_persist ownership must not misclassify external V+1 as a local handoff"
+    );
+
+    blocker.commit().await?;
+    let response = patch_task.await??;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let db_after = domain_projection_version(&pool).await?;
+    let local_after_patch = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(db_after, local_before + 2);
+    assert_eq!(
+        local_after_patch, local_before,
+        "PATCH must not fast-forward across an unseen external generation"
+    );
+
+    let refresh = concurrent_read.await??;
+    assert_eq!(refresh.status(), StatusCode::OK);
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        db_after,
+        "next safe request must reconcile the externally changed generation"
+    );
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("external change")
+    );
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A3b. If an unseen external V+1 lands after the process has a current cache but before
+/// our PATCH commits V+2, the PATCH must not publish only its own row into the
+/// old V cache. The previous cache must remain a complete generation until the
+/// ordinary projection reload atomically replaces it.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_node_patch_preserves_complete_cache_across_external_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, None, None).await;
+    seed_node(&pool, NODE_B, Some("before external"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (app, cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-00000000009a").await?;
+
+    // Establish one complete current cache generation without wrapping the PATCH
+    // in projection middleware. This test targets handler cache publication only;
+    // the separate A3/A4 tests cover middleware classification and reconciliation.
+    state.refresh_domain_projection_if_stale().await?;
+    let local_before = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(local_before, domain_projection_version(&pool).await?);
+
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT id FROM domain_nodes WHERE id = $1 FOR UPDATE")
+        .bind(NODE_A)
+        .fetch_one(&mut *blocker)
+        .await?;
+
+    let request = patch_node_req(
+        &cookie,
+        NODE_A,
+        r#"{"info": "local after external"}"#,
+        SEEDED_NODE_ETAG,
+    );
+    let patch_app = app.clone();
+    let patch_task = tokio::spawn(async move { patch_app.oneshot(request).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !patch_task.is_finished(),
+        "row lock must hold the API PATCH before its PostgreSQL write can complete"
+    );
+
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("external change")
+    .execute(&pool)
+    .await?;
+    assert_eq!(domain_projection_version(&pool).await?, local_before + 1);
+
+    blocker.commit().await?;
+    let response = tokio::time::timeout(Duration::from_secs(3), patch_task)
+        .await
+        .context("PATCH did not finish after releasing its row lock")???;
+    assert_eq!(response.status(), StatusCode::OK);
+    let db_after = domain_projection_version(&pool).await?;
+    assert_eq!(db_after, local_before + 2);
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        local_before,
+        "process projection marker must remain on the previous complete generation"
+    );
+
+    {
+        let nodes = state.nodes.read().await;
+        assert_eq!(
+            nodes.get(NODE_A).and_then(|node| node.info.as_deref()),
+            None,
+            "PATCH must not publish its V+2 row into the previous V cache"
+        );
+        assert_eq!(
+            nodes.get(NODE_B).and_then(|node| node.info.as_deref()),
+            Some("before external"),
+            "previous cache must remain internally complete until reconciliation"
+        );
+    }
+
+    state.refresh_domain_projection_if_stale().await?;
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        db_after
+    );
+    let nodes = state.nodes.read().await;
+    assert_eq!(
+        nodes.get(NODE_A).and_then(|node| node.info.as_deref()),
+        Some("local after external")
+    );
+    assert_eq!(
+        nodes.get(NODE_B).and_then(|node| node.info.as_deref()),
+        Some("external change")
+    );
+    drop(nodes);
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A4. An exact transaction-proven +1 commit/cache handoff of a serialized local
+/// PostgreSQL node PATCH must let a safe read keep the existing snapshot rather
+/// than starting a redundant full reload. Authenticated/strict classification is
+/// proven separately by the projection middleware policy test.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn safe_projection_read_defers_exact_local_node_generation_handoff() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("before handoff"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000093").await?;
+
+    // The fixture builder has already loaded NODE_B into the process cache. Bind
+    // its process marker to the current database generation so the next +1 is
+    // exactly the handoff window we want to exercise, without paying for an
+    // unrelated full projection reload in test setup.
+    let local_before = domain_projection_version(&pool).await?;
+    state
+        .domain_projection_version
+        .store(local_before, Ordering::Release);
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("before handoff")
+    );
+
+    // Model the observable commit/cache-publication handoff deterministically.
+    // The real PATCH installs the same marker before COMMIT only after its trigger
+    // has updated and locked the projection-state row in that transaction.
+    let handoff_guard = state.nodes_persist.lock().await;
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("committed during handoff")
+    .execute(&pool)
+    .await?;
+    let db_after = domain_projection_version(&pool).await?;
+    assert_eq!(db_after, local_before + 1);
+    let projection_handoff = state
+        .begin_local_node_patch_projection_handoff(db_after)
+        .expect("install exact local projection handoff");
+    assert!(
+        state
+            .begin_local_node_patch_projection_handoff(db_after + 1)
+            .is_none(),
+        "a second handoff must not overwrite the active exact generation"
+    );
+    assert_eq!(
+        state
+            .domain_projection_local_node_patch_handoff
+            .load(Ordering::Acquire),
+        db_after,
+        "failed overlapping handoff installation must leave the active marker intact"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        state.refresh_domain_projection_for_read(),
+    )
+    .await
+    .context("safe projection refresh must not block during exact local +1 handoff")??;
+
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        local_before,
+        "safe read must defer rather than claim or full-reload the in-flight +1 generation"
+    );
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("before handoff"),
+        "deferral must leave the previous snapshot untouched"
+    );
+    let metrics = String::from_utf8(state.metrics.render()?)?;
+    assert!(metrics.contains(r#"domain_projection_events_total{event="refresh_deferred"} 1"#));
+
+    drop(projection_handoff);
+    drop(handoff_guard);
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A5. A strict request that observes the exact committed PATCH handoff waits
+/// for that writer to publish its cache/version instead of starting an O(N)
+/// projection reload for work already completed locally.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn strict_projection_refresh_waits_for_exact_local_patch_handoff() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("before strict handoff"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000094").await?;
+    let local_before = domain_projection_version(&pool).await?;
+    state
+        .domain_projection_version
+        .store(local_before, Ordering::Release);
+
+    let persist_guard = state.nodes_persist.lock().await;
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("strict handoff committed")
+    .execute(&pool)
+    .await?;
+    let db_after = domain_projection_version(&pool).await?;
+    assert_eq!(db_after, local_before + 1);
+    let projection_handoff = state
+        .begin_local_node_patch_projection_handoff(db_after)
+        .expect("install exact local projection handoff");
+
+    // Queue a second would-be writer *before* the strict refresh. The strict
+    // request must wait only for the explicit handoff above, not enter the fair
+    // `nodes_persist` queue behind this later writer.
+    let queued_writer_state = state.clone();
+    let (queued_writer_acquired_tx, queued_writer_acquired_rx) = oneshot::channel();
+    let (queued_writer_release_tx, queued_writer_release_rx) = oneshot::channel();
+    let queued_writer = tokio::spawn(async move {
+        let _guard = queued_writer_state.nodes_persist.lock().await;
+        let _ = queued_writer_acquired_tx.send(());
+        let _ = queued_writer_release_rx.await;
+    });
+    tokio::task::yield_now().await;
+
+    let strict_state = state.clone();
+    let strict_refresh =
+        tokio::spawn(async move { strict_state.refresh_domain_projection_if_stale().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !strict_refresh.is_finished(),
+        "strict refresh must wait for the committed local handoff"
+    );
+
+    let canonical = load_nodes_from_postgres(&pool).await?;
+    let canonical_node = canonical
+        .get(NODE_B)
+        .cloned()
+        .context("canonical node after strict handoff")?;
+    state
+        .nodes
+        .write()
+        .await
+        .insert(NODE_B.to_string(), canonical_node);
+    state
+        .domain_projection_version
+        .store(db_after, Ordering::Release);
+    state.metrics.set_domain_projection_version(db_after);
+    drop(projection_handoff);
+    drop(persist_guard);
+
+    tokio::time::timeout(Duration::from_secs(2), queued_writer_acquired_rx)
+        .await
+        .context("queued writer did not acquire persist mutex after handoff")?
+        .context("queued writer acquisition signal dropped")?;
+    tokio::time::timeout(Duration::from_secs(2), strict_refresh)
+        .await
+        .context("strict refresh followed the next writer instead of the observed handoff")?
+        .context("strict refresh task failed")??;
+    let _ = queued_writer_release_tx.send(());
+    queued_writer.await.context("queued writer task failed")?;
+    let metrics = String::from_utf8(state.metrics.render()?)?;
+    assert!(
+        !metrics.contains(r#"domain_projection_events_total{event="reload_success"}"#),
+        "strict exact +1 handoff must not perform a full projection reload"
+    );
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("strict handoff committed")
+    );
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A5c. A strict request must not wait forever when a transaction-proven local
+/// handoff remains visible but its writer never publishes the local cache/version.
+/// The refresh fails closed within the bounded handoff budget and does not start
+/// a speculative O(N) reload while ownership is still explicitly marked.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn strict_projection_refresh_times_out_stuck_local_patch_handoff() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("before stuck handoff"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-00000000009b").await?;
+    let local_before = domain_projection_version(&pool).await?;
+    state
+        .domain_projection_version
+        .store(local_before, Ordering::Release);
+
+    let persist_guard = state.nodes_persist.lock().await;
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("committed but publication stuck")
+    .execute(&pool)
+    .await?;
+    let db_after = domain_projection_version(&pool).await?;
+    assert_eq!(db_after, local_before + 1);
+    let projection_handoff = state
+        .begin_local_node_patch_projection_handoff(db_after)
+        .expect("install exact stuck projection handoff");
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.refresh_domain_projection_if_stale(),
+    )
+    .await
+    .context("strict refresh exceeded the outer stuck-handoff safety budget")?
+    .expect_err("stuck exact local handoff must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("timed out waiting for local node projection handoff generation"),
+        "unexpected stuck-handoff error: {error:#}"
+    );
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        local_before,
+        "timed-out strict refresh must not claim the stuck generation"
+    );
+    let metrics = String::from_utf8(state.metrics.render()?)?;
+    assert!(
+        !metrics.contains(r#"domain_projection_events_total{event="reload_success"}"#),
+        "stuck exact local handoff must fail closed without a speculative full reload"
+    );
+
+    drop(projection_handoff);
+    drop(persist_guard);
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A5d. A stable lower database generation must still reconcile rather than
+/// being accepted merely because the process-local generation is numerically
+/// ahead. This protects restore/PITR semantics while the local-ahead fast check
+/// only suppresses reloads when a second DB read has actually caught up.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn strict_projection_refresh_reconciles_stable_lower_database_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, Some("restore baseline"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-00000000009c").await?;
+    state.refresh_domain_projection_if_stale().await?;
+    let db_version = domain_projection_version(&pool).await?;
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        db_version
+    );
+
+    let reload_successes = |rendered: &str| -> u64 {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(r#"domain_projection_events_total{event="reload_success"}"#)
+            })
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let reloads_before = reload_successes(&String::from_utf8(state.metrics.render()?)?);
+
+    state
+        .domain_projection_version
+        .store(db_version + 1, Ordering::Release);
+    state.refresh_domain_projection_if_stale().await?;
+
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        db_version,
+        "stable lower database generation must win over a newer local marker"
+    );
+    let reloads_after = reload_successes(&String::from_utf8(state.metrics.render()?)?);
+    assert_eq!(
+        reloads_after,
+        reloads_before + 1,
+        "stable lower generation must use exactly one normal reconciliation reload"
+    );
 
     clean(&pool).await;
     Ok(())
@@ -643,6 +1329,10 @@ async fn postgres_read_jsonl_node_write_is_blocked() -> Result<()> {
         nodes_persist: Arc::new(tokio::sync::Mutex::new(())),
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
         domain_projection_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+        domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        domain_projection_local_node_patch_handoff: std::sync::Arc::new(
+            std::sync::atomic::AtomicI64::new(-1),
+        ),
         domain_projection_version: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         edges: Arc::new(RwLock::new(weltgewebe_api::state::OrderedCache::new())),
         rate_limiter,
@@ -825,6 +1515,10 @@ async fn jsonl_default_node_patch_compiles_and_routes_correctly() -> Result<()> 
         nodes_persist: Arc::new(tokio::sync::Mutex::new(())),
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
         domain_projection_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+        domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        domain_projection_local_node_patch_handoff: std::sync::Arc::new(
+            std::sync::atomic::AtomicI64::new(-1),
+        ),
         domain_projection_version: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         edges: Arc::new(RwLock::new(weltgewebe_api::state::OrderedCache::new())),
         rate_limiter,
@@ -3529,6 +4223,275 @@ async fn concurrent_distinct_node_replaces_preserve_pool_headroom() -> Result<()
     .fetch_one(&pool)
     .await?;
     assert_eq!(updated_count, ids.len() as i64);
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A2c. A semantic no-op cannot claim an unrelated external V+1 as its own
+/// completed projection generation. Otherwise the process marker could become
+/// current while another node remains stale in the in-memory snapshot.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_node_noop_patch_does_not_fast_forward_external_generation() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, Some("unchanged"), None).await;
+    seed_node(&pool, NODE_B, Some("before external"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (app, cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000097").await?;
+    let app = app.layer(from_fn_with_state(
+        state.clone(),
+        ensure_current_domain_projection,
+    ));
+    state.refresh_domain_projection_if_stale().await?;
+    let local_before = state.domain_projection_version.load(Ordering::Acquire);
+    assert_eq!(local_before, domain_projection_version(&pool).await?);
+
+    // Let middleware establish a current snapshot, then hold the target row so
+    // the no-op request owns nodes_persist while still waiting before its UPDATE.
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT id FROM domain_nodes WHERE id = $1 FOR UPDATE")
+        .bind(NODE_A)
+        .fetch_one(&mut *blocker)
+        .await?;
+    let request = patch_node_req(&cookie, NODE_A, r#"{"info":"unchanged"}"#, SEEDED_NODE_ETAG);
+    let patch_app = app.clone();
+    let patch_task = tokio::spawn(async move { patch_app.oneshot(request).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !patch_task.is_finished(),
+        "row lock must keep the no-op request inside its PostgreSQL write path"
+    );
+    assert!(
+        state.nodes_persist.try_lock().is_err(),
+        "blocked PATCH must already own nodes_persist"
+    );
+
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("external change")
+    .execute(&pool)
+    .await?;
+    assert_eq!(domain_projection_version(&pool).await?, local_before + 1);
+
+    blocker.commit().await?;
+    let response = tokio::time::timeout(Duration::from_secs(3), patch_task)
+        .await
+        .context("no-op PATCH did not finish after releasing its row lock")???;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        local_before,
+        "no-op PATCH must not consume a generation it did not create"
+    );
+
+    state.refresh_domain_projection_if_stale().await?;
+    let db_after = domain_projection_version(&pool).await?;
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        db_after,
+        "strict refresh must reconcile the external generation"
+    );
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("external change"),
+        "external node change must be present after strict reconciliation"
+    );
+
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A5b. When a second serialized local PATCH commits immediately after the
+/// first handoff, a strict refresh reclassifies V+2 as another exact local
+/// handoff instead of starting a redundant full snapshot reload.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn strict_projection_refresh_reclassifies_following_local_patch_handoff() -> Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&direct_database_url())
+        .await
+        .context("connect bounded direct PostgreSQL pool")?;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("before handoffs"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000099").await?;
+    let local_before = domain_projection_version(&pool).await?;
+    state
+        .domain_projection_version
+        .store(local_before, Ordering::Release);
+
+    // Handoff A is already committed in PostgreSQL but has not yet published
+    // its cache/version locally.
+    let persist_a = state.nodes_persist.lock().await;
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("handoff A")
+    .execute(&pool)
+    .await?;
+    let version_a = domain_projection_version(&pool).await?;
+    assert_eq!(version_a, local_before + 1);
+    let marker_a = state
+        .begin_local_node_patch_projection_handoff(version_a)
+        .expect("install handoff A marker");
+
+    // Writer B reserves one connection but performs no database mutation until
+    // it has acquired nodes_persist after A. This lets the test later exhaust
+    // the other pool slot and force the strict reader to observe B only after
+    // B's pre-COMMIT marker is installed and its V+2 commit is visible.
+    let b_pool = pool.clone();
+    let b_state = state.clone();
+    let (reserved_tx, reserved_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    let (publish_tx, publish_rx) = oneshot::channel();
+    let writer_b = tokio::spawn(async move {
+        let mut connection = b_pool
+            .acquire()
+            .await
+            .context("reserve writer B connection")?;
+        let _ = reserved_tx.send(());
+        let _persist_b = b_state.nodes_persist.lock().await;
+
+        sqlx::query("BEGIN").execute(&mut *connection).await?;
+        sqlx::query(
+            "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+        )
+        .bind(NODE_B)
+        .bind("handoff B")
+        .execute(&mut *connection)
+        .await?;
+        let version_b: i64 = sqlx::query_scalar(
+            "SELECT version FROM domain_projection_state WHERE singleton = TRUE",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
+        let marker_b = b_state
+            .begin_local_node_patch_projection_handoff(version_b)
+            .context("install handoff B marker")?;
+        sqlx::query("COMMIT").execute(&mut *connection).await?;
+        drop(connection);
+        let _ = committed_tx.send(version_b);
+
+        let _ = publish_rx.await;
+        let mut node = b_state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .cloned()
+            .context("cached node for handoff B publication")?;
+        node.info = Some("handoff B".to_string());
+        b_state.nodes.write().await.insert(NODE_B.to_string(), node);
+        b_state
+            .domain_projection_version
+            .store(version_b, Ordering::Release);
+        b_state.metrics.set_domain_projection_version(version_b);
+        drop(marker_b);
+        Ok::<(), anyhow::Error>(())
+    });
+    tokio::time::timeout(Duration::from_secs(2), reserved_rx)
+        .await
+        .context("writer B did not reserve its connection")?
+        .context("writer B reservation signal dropped")?;
+
+    let strict_state = state.clone();
+    let strict_refresh =
+        tokio::spawn(async move { strict_state.refresh_domain_projection_if_stale().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !strict_refresh.is_finished(),
+        "strict refresh must wait for handoff A"
+    );
+
+    // Writer B owns one pool slot while waiting on nodes_persist. Holding the
+    // second slot means the strict reader cannot perform its post-A version read
+    // until B commits and returns its reserved connection to the pool.
+    let blocker_connection = tokio::time::timeout(Duration::from_secs(2), pool.acquire())
+        .await
+        .context("could not reserve strict-reader blocker connection")??;
+
+    let mut node_a = state
+        .nodes
+        .read()
+        .await
+        .get(NODE_B)
+        .cloned()
+        .context("cached node for handoff A publication")?;
+    node_a.info = Some("handoff A".to_string());
+    state.nodes.write().await.insert(NODE_B.to_string(), node_a);
+    state
+        .domain_projection_version
+        .store(version_a, Ordering::Release);
+    state.metrics.set_domain_projection_version(version_a);
+    drop(marker_a);
+    drop(persist_a);
+
+    let version_b = tokio::time::timeout(Duration::from_secs(3), committed_rx)
+        .await
+        .context("writer B did not commit")?
+        .context("writer B commit signal dropped")?;
+    assert_eq!(version_b, version_a + 1);
+
+    // Give the strict task enough time to observe committed V+2. Correct code
+    // remains in the exact B handoff; the old one-shot classification enters a
+    // full reload here.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = publish_tx.send(());
+    tokio::time::timeout(Duration::from_secs(3), writer_b)
+        .await
+        .context("writer B did not publish")?
+        .context("writer B task failed")??;
+    tokio::time::timeout(Duration::from_secs(3), strict_refresh)
+        .await
+        .context("strict refresh did not finish after handoff B")?
+        .context("strict refresh task failed")??;
+    drop(blocker_connection);
+
+    let metrics = String::from_utf8(state.metrics.render()?)?;
+    assert!(
+        !metrics.contains(r#"domain_projection_events_total{event="reload_success"}"#),
+        "following exact local handoff must be reclassified without a full reload"
+    );
+    assert_eq!(
+        state.domain_projection_version.load(Ordering::Acquire),
+        version_b
+    );
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("handoff B")
+    );
 
     clean(&pool).await;
     Ok(())

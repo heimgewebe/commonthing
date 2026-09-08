@@ -831,6 +831,31 @@ pub async fn patch_node_in_postgres(
     id: &str,
     patch: NodePatchInput,
 ) -> Result<Node, NodeWriteError> {
+    let (node, ()) =
+        patch_node_in_postgres_with_projection_precommit(pool, id, patch, |_| ()).await?;
+    Ok(node)
+}
+
+/// Apply one node patch and expose the transaction-local projection generation
+/// after the row trigger has run but before COMMIT makes that generation visible
+/// to other connections.
+///
+/// `weltgewebe_enqueue_domain_event` increments the singleton
+/// `domain_projection_state` row in the same transaction as the node UPDATE.
+/// Once that UPDATE has completed, this transaction owns the projection-state
+/// row lock until commit. Therefore the callback receives `Some(version)` only
+/// for a real triggered UPDATE and can safely classify an exact local V+1 without
+/// the pre-commit ambiguity of the broader `nodes_persist` mutex or a post-commit
+/// marker gap. A no-op patch receives `None` and proves no local generation.
+pub async fn patch_node_in_postgres_with_projection_precommit<T, F>(
+    pool: &PgPool,
+    id: &str,
+    patch: NodePatchInput,
+    on_projection_precommit: F,
+) -> Result<(Node, T), NodeWriteError>
+where
+    F: FnOnce(Option<i64>) -> T,
+{
     let mut tx = pool.begin().await.map_err(NodeWriteError::Database)?;
 
     let row: Option<NodeRow> = sqlx::query_as(
@@ -942,9 +967,23 @@ pub async fn patch_node_in_postgres(
     ))
     .map_err(NodeWriteError::Mapping)?;
 
+    let projection_version_before_commit = if has_changes {
+        Some(
+            sqlx::query_scalar(
+                "SELECT version FROM domain_projection_state WHERE singleton = TRUE",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(NodeWriteError::Database)?,
+        )
+    } else {
+        None
+    };
+    let precommit = on_projection_precommit(projection_version_before_commit);
+
     tx.commit().await.map_err(NodeWriteError::Database)?;
 
-    Ok(final_node)
+    Ok((final_node, precommit))
 }
 
 pub async fn replace_node_in_postgres(

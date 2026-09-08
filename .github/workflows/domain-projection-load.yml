@@ -1,0 +1,353 @@
+---
+name: Domain projection mixed load
+
+"on":
+  pull_request:
+    paths:
+      - "apps/api/src/state.rs"
+      - "apps/api/src/domain_db.rs"
+      - "apps/api/src/middleware/domain_projection.rs"
+      - "apps/api/src/routes/nodes.rs"
+      - "apps/api/src/telemetry/mod.rs"
+      - "scripts/performance/domain_projection_k6.js"
+      - "scripts/performance/domain_projection_load.py"
+      - "scripts/ci/tests/test_domain_projection_load_contract.py"
+      - ".github/workflows/domain-projection-load.yml"
+  workflow_dispatch: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: domain-projection-load-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cq02:
+    name: CQ-02 PostgreSQL projection load evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      API_IMAGE: cq02-weltgewebe-api:${{ github.event.pull_request.head.sha || github.sha }}
+      API_CONTAINER: cq02-domain-projection-api
+      K6_IMAGE: grafana/k6@sha256:65c920dc067d5e2e00befbf982af6ad6ad0117034e8b1c65817c7975c52d4669
+      CQ02_SESSION_ID: cq02-load-session
+      CQ02_ACCOUNT_ID: 20000000-0000-4000-8000-000000000002
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # tag: v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install PostgreSQL client and verify pinned k6
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          docker pull "${K6_IMAGE}"
+          docker run --rm "${K6_IMAGE}" version
+
+      - name: Verify CQ-02 evidence tooling contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest scripts.ci.tests.test_domain_projection_load_contract -v
+          cargo fmt --all -- --check
+          cargo test --locked -p weltgewebe-api \
+            telemetry::tests::domain_projection_metrics_are_bounded_and_identifier_free -- --exact
+
+      - name: Build the exact API revision once
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMMIT="$(git rev-parse HEAD)"
+          BUILD_TIMESTAMP="$(git show -s --format=%cI "${COMMIT}")"
+          [[ "${COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${BUILD_TIMESTAMP}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$ ]]
+          docker build \
+            --file apps/api/Dockerfile \
+            --tag "${API_IMAGE}" \
+            --build-arg "GIT_COMMIT_SHA=${COMMIT}" \
+            --build-arg "BUILD_TIMESTAMP=${BUILD_TIMESTAMP}" \
+            --build-arg CARGO_BUILD_JOBS=2 \
+            .
+          printf 'commit=%s\n' "${COMMIT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Measure 1k and 100k mixed read/write projection behavior
+        env:
+          EXPECTED_HEAD: ${{ steps.build.outputs.commit }}
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          EVIDENCE_ROOT="${RUNNER_TEMP:?RUNNER_TEMP is required}/cq02-domain-projection"
+          mkdir -p "${EVIDENCE_ROOT}"
+          export PGPASSWORD=postgres
+
+          prepare_database() {
+            local profile="$1"
+            local db_name="$2"
+            local out_dir="${EVIDENCE_ROOT}/${profile}"
+            local database_url="postgres://postgres:postgres@127.0.0.1:5432/${db_name}"
+            mkdir -p "${out_dir}/fixture"
+            createdb -h 127.0.0.1 -U postgres "${db_name}"
+
+            docker run --rm --network host \
+              --env "DATABASE_URL=${database_url}" \
+              --env WELTGEWEBE_API_STARTUP_MIGRATIONS=run \
+              --env WELTGEWEBE_API_MIGRATION_ONLY=1 \
+              "${API_IMAGE}"
+
+            python3 -B scripts/performance/domain_scale.py generate \
+              --profile "${profile}" \
+              --output-dir "${out_dir}/fixture"
+            python3 -B scripts/performance/domain_scale.py render-load \
+              --manifest "${out_dir}/fixture/manifest.json" \
+              --output "${out_dir}/load.sql"
+            psql "${database_url}" -v ON_ERROR_STOP=1 -f "${out_dir}/load.sql"
+
+            psql "${database_url}" -v ON_ERROR_STOP=1 \
+              -v account_id="${CQ02_ACCOUNT_ID}" \
+              -v session_id="${CQ02_SESSION_ID}" <<'SQL'
+          BEGIN;
+          -- The generated fixture represents pre-existing state, not 600k live writes.
+          -- Suppress only the projection-version/outbox triggers for this bulk import.
+          -- Other product triggers (conversation/search) stay active; measured writes use all triggers.
+          ALTER TABLE domain_nodes DISABLE TRIGGER domain_nodes_outbox;
+          ALTER TABLE domain_edges DISABLE TRIGGER domain_edges_outbox;
+
+          INSERT INTO domain_nodes (
+              id, kind, title, lat, lon, created_at, updated_at, payload, search_visibility
+          )
+          SELECT id, kind, title, lat, lon, created_at, updated_at, payload,
+                 CASE WHEN kind = 'Projekt' THEN 'public' ELSE 'hidden' END
+            FROM weltgewebe_perf.domain_nodes
+           ORDER BY id;
+
+          INSERT INTO domain_edges (id, source_id, target_id, edge_kind, created_at, payload)
+          SELECT id, source_id, target_id, edge_kind, created_at, payload
+            FROM weltgewebe_perf.domain_edges
+           ORDER BY id;
+
+          ALTER TABLE domain_nodes ENABLE TRIGGER domain_nodes_outbox;
+          ALTER TABLE domain_edges ENABLE TRIGGER domain_edges_outbox;
+
+          INSERT INTO domain_accounts (
+              id, kind, title, map_state, role, disabled, webauthn_user_id
+          ) VALUES (
+              :'account_id', 'garnrolle', 'CQ02 synthetic load operator',
+              'not_on_map', 'admin', FALSE,
+              '20000000-0000-4000-8000-000000000003'::uuid
+          );
+
+          INSERT INTO sessions (
+              id, account_id, device_id, created_at, last_active, expires_at
+          ) VALUES (
+              :'session_id', :'account_id', 'cq02-load-device',
+              clock_timestamp(), clock_timestamp(), clock_timestamp() + interval '2 hours'
+          );
+          COMMIT;
+          ANALYZE domain_nodes;
+          ANALYZE domain_edges;
+          SQL
+
+            local restored_projection_triggers
+            restored_projection_triggers="$(psql "${database_url}" -Atc "
+              SELECT count(*)
+                FROM pg_trigger
+               WHERE tgname IN ('domain_nodes_outbox', 'domain_edges_outbox')
+                 AND tgenabled = 'O'
+            ")"
+            test "${restored_projection_triggers}" = "2"
+
+            local manifest_path expected_nodes expected_edges
+            manifest_path="${out_dir}/fixture/manifest.json"
+            expected_nodes="$(python3 -c \
+              'import json,sys; print(json.load(open(sys.argv[1]))["counts"]["nodes"])' \
+              "${manifest_path}")"
+            expected_edges="$(python3 -c \
+              'import json,sys; print(json.load(open(sys.argv[1]))["counts"]["edges"])' \
+              "${manifest_path}")"
+            test "$(psql "${database_url}" -Atc 'SELECT count(*) FROM domain_nodes')" = "${expected_nodes}"
+            test "$(psql "${database_url}" -Atc 'SELECT count(*) FROM domain_edges')" = "${expected_edges}"
+          }
+
+          start_api() {
+            local database_url="$1"
+            docker rm -f "${API_CONTAINER}" >/dev/null 2>&1 || true
+            docker run --detach \
+              --name "${API_CONTAINER}" \
+              --network host \
+              --env API_BIND=127.0.0.1:8787 \
+              --env "DATABASE_URL=${database_url}" \
+              --env WELTGEWEBE_DOMAIN_READ_SOURCE=postgres \
+              --env WELTGEWEBE_DOMAIN_ACCOUNT_WRITE_SOURCE=postgres \
+              --env WELTGEWEBE_DOMAIN_NODE_WRITE_SOURCE=postgres \
+              --env WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE=postgres \
+              --env AUTH_COOKIE_SECURE=false \
+              --env WELTGEWEBE_API_STARTUP_MIGRATIONS=verify-applied \
+              "${API_IMAGE}"
+
+            local ready=0
+            for _ in {1..120}; do
+              if curl -fsS http://127.0.0.1:8787/health/live >/dev/null 2>&1; then
+                ready=1
+                break
+              fi
+              if ! docker container inspect "${API_CONTAINER}" --format '{{.State.Running}}' | grep -qx true; then
+                docker logs "${API_CONTAINER}"
+                exit 1
+              fi
+              sleep 1
+            done
+            if [[ "${ready}" -ne 1 ]]; then
+              docker logs "${API_CONTAINER}"
+              exit 1
+            fi
+            curl -fsS http://127.0.0.1:8787/nodes?limit=100 >/dev/null
+            curl -fsS http://127.0.0.1:8787/metrics \
+              | grep -F "commit=\"${EXPECTED_HEAD}\"" >/dev/null
+          }
+
+          measure_workload() {
+            local profile="$1"
+            local db_name="$2"
+            local workload="$3"
+            local out_dir="${EVIDENCE_ROOT}/${profile}/${workload}"
+            local profile_dir="${EVIDENCE_ROOT}/${profile}"
+            local database_url="postgres://postgres:postgres@127.0.0.1:5432/${db_name}"
+            local run_id="cq02-${profile}-${workload}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            local workload_duration_seconds=30
+            local sampler_duration_seconds=$((workload_duration_seconds + 20))
+            local write_node_ids=""
+            mkdir -p "${out_dir}"
+
+            if [[ "${workload}" == "mixed" ]]; then
+              write_node_ids="$(psql "${database_url}" -Atc \
+                "SELECT string_agg(id, ',' ORDER BY id) FROM (
+                   SELECT id FROM domain_nodes ORDER BY id LIMIT 8
+                 ) AS writer_nodes")"
+              if [[ -z "${write_node_ids}" ]]; then
+                echo "CQ-02 fixture did not provide writer node ids" >&2
+                exit 1
+              fi
+              IFS=',' read -r -a writer_node_id_array <<<"${write_node_ids}"
+              if [[ "${#writer_node_id_array[@]}" -ne 8 ]]; then
+                echo "CQ-02 fixture expected 8 writer nodes, got ${#writer_node_id_array[@]}" >&2
+                exit 1
+              fi
+            fi
+
+            curl -fsS http://127.0.0.1:8787/metrics > "${out_dir}/metrics-before.prom"
+            psql "${database_url}" -Atc \
+              'SELECT version FROM domain_projection_state WHERE singleton = TRUE' \
+              > "${out_dir}/version-before.txt"
+            docker logs "${API_CONTAINER}" > "${out_dir}/api-log-before.txt" 2>&1
+
+            python3 -B scripts/performance/container_resource_sampler.py sample \
+              --run-id "${run_id}" \
+              --container-name "${API_CONTAINER}" \
+              --duration-seconds "${sampler_duration_seconds}" \
+              --sample-interval-seconds 1 \
+              --receipt "${out_dir}/resource-receipt.json" \
+              > "${out_dir}/resource-sampler.stdout" &
+            local resource_pid=$!
+
+            python3 -B scripts/performance/postgres_connection_sampler.py sample \
+              --run-id "${run_id}" \
+              --database-container "${POSTGRES_CONTAINER}" \
+              --database-user postgres \
+              --database-name "${db_name}" \
+              --duration-seconds "${sampler_duration_seconds}" \
+              --sample-interval-seconds 1 \
+              --receipt "${out_dir}/postgres-connections.json" \
+              > "${out_dir}/postgres-sampler.stdout" &
+            local postgres_pid=$!
+
+            docker run --rm --network host \
+              --user "$(id -u):$(id -g)" \
+              --volume "${PWD}/scripts/performance:/work:ro" \
+              --volume "${out_dir}:/evidence" \
+              --env CQ02_BASE_URL=http://127.0.0.1:8787 \
+              --env "CQ02_SESSION_ID=${CQ02_SESSION_ID}" \
+              --env "CQ02_WRITE_NODE_IDS=${write_node_ids}" \
+              --env "CQ02_PROFILE=${profile}" \
+              --env "CQ02_WORKLOAD=${workload}" \
+              --env "CQ02_RUN_ID=${run_id}" \
+              --env "CQ02_DURATION_SECONDS=${workload_duration_seconds}" \
+              --env CQ02_READ_VUS=10 \
+              --env CQ02_SUMMARY_PATH=/evidence/k6-summary.json \
+              "${K6_IMAGE}" run /work/domain_projection_k6.js \
+              > "${out_dir}/k6.stdout" 2> "${out_dir}/k6.stderr"
+
+            wait "${resource_pid}"
+            wait "${postgres_pid}"
+
+            curl -fsS http://127.0.0.1:8787/metrics > "${out_dir}/metrics-after.prom"
+            psql "${database_url}" -Atc \
+              'SELECT version FROM domain_projection_state WHERE singleton = TRUE' \
+              > "${out_dir}/version-after.txt"
+            docker logs "${API_CONTAINER}" > "${out_dir}/api-log-after.txt" 2>&1
+
+            python3 -B -m scripts.performance.domain_projection_load summarize \
+              --expected-head "${EXPECTED_HEAD}" \
+              --max-reloads 0 \
+              --dataset-manifest "${profile_dir}/fixture/manifest.json" \
+              --k6-summary "${out_dir}/k6-summary.json" \
+              --metrics-before "${out_dir}/metrics-before.prom" \
+              --metrics-after "${out_dir}/metrics-after.prom" \
+              --version-before "${out_dir}/version-before.txt" \
+              --version-after "${out_dir}/version-after.txt" \
+              --api-log-before "${out_dir}/api-log-before.txt" \
+              --api-log-after "${out_dir}/api-log-after.txt" \
+              --resource-receipt "${out_dir}/resource-receipt.json" \
+              --connection-receipt "${out_dir}/postgres-connections.json" \
+              --output "${out_dir}/report.json"
+          }
+
+          run_profile() {
+            local profile="$1"
+            local db_name="$2"
+            local database_url="postgres://postgres:postgres@127.0.0.1:5432/${db_name}"
+            prepare_database "${profile}" "${db_name}"
+            start_api "${database_url}"
+            measure_workload "${profile}" "${db_name}" read_heavy
+            measure_workload "${profile}" "${db_name}" mixed
+            docker rm -f "${API_CONTAINER}" >/dev/null
+          }
+
+          run_profile smoke cq02_smoke
+          run_profile scale_100k cq02_100k
+
+      - name: Upload CQ-02 projection evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
+        with:
+          name: cq02-domain-projection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cq02-domain-projection
+          if-no-files-found: warn
+
+      - name: Stop measured API container
+        if: ${{ always() }}
+        shell: bash
+        run: docker rm -f "${API_CONTAINER}" >/dev/null 2>&1 || true

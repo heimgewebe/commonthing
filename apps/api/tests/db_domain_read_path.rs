@@ -114,6 +114,10 @@ fn postgres_bbox_route_state(pool: PgPool) -> ApiState {
         nodes_persist: Arc::new(tokio::sync::Mutex::new(())),
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
         domain_projection_gate: Arc::new(RwLock::new(())),
+        domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        domain_projection_local_node_patch_handoff: std::sync::Arc::new(
+            std::sync::atomic::AtomicI64::new(-1),
+        ),
         domain_projection_version: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         edges: Arc::new(RwLock::new(OrderedCache::new())),
         rate_limiter,

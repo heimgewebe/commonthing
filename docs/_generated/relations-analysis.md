@@ -14,13 +14,13 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Dokumente gesamt | 202 |
-| Dokumente mit ausgehenden Relationen | 201 |
-| Dokumente als Ziel referenziert | 152 |
-| Relationen gesamt | 723 |
+| Dokumente gesamt | 203 |
+| Dokumente mit ausgehenden Relationen | 202 |
+| Dokumente als Ziel referenziert | 153 |
+| Relationen gesamt | 735 |
 | — depends_on | 33 |
 | — implements | 1 |
-| — relates_to | 667 |
+| — relates_to | 679 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | Isolierte Dokumente | 0 |
@@ -32,9 +32,10 @@ Generated automatically. Do not edit.
 
 - ⚠️ High outbound count (15): `docs/roadmap.md` — possible over-linking
 - ⚠️ High outbound count (13): `docs/blueprints/domain-data-postgres-cutover.md` — possible over-linking
-- ⚠️ High outbound count (10): `docs/reports/domain-postgres-instance-coherence-decision.md` — possible over-linking
+- ⚠️ High outbound count (13): `docs/reports/domain-postgres-instance-coherence-decision.md` — possible over-linking
 - ⚠️ High outbound count (10): `docs/runbooks/README.md` — possible over-linking
 - ⚠️ High outbound count (9): `docs/blueprints/blueprint-agent-safety-control-layer.md` — possible over-linking
+- ⚠️ High outbound count (9): `docs/reports/cq-02-domain-projection-load.md` — possible over-linking
 - ⚠️ High outbound count (9): `docs/runbooks/db-recovery.md` — possible over-linking
 - ⚠️ High outbound count (8): `docs/reference/agent-operability-fixture-matrix.md` — possible over-linking
 - ⚠️ High outbound count (8): `docs/reports/domain-edge-write-path-proof.md` — possible over-linking
@@ -61,9 +62,10 @@ _Keine Zyklen gefunden._
 
 - `docs/roadmap.md` — 15 ausgehende Relationen
 - `docs/blueprints/domain-data-postgres-cutover.md` — 13 ausgehende Relationen
-- `docs/reports/domain-postgres-instance-coherence-decision.md` — 10 ausgehende Relationen
+- `docs/reports/domain-postgres-instance-coherence-decision.md` — 13 ausgehende Relationen
 - `docs/runbooks/README.md` — 10 ausgehende Relationen
 - `docs/blueprints/blueprint-agent-safety-control-layer.md` — 9 ausgehende Relationen
+- `docs/reports/cq-02-domain-projection-load.md` — 9 ausgehende Relationen
 - `docs/runbooks/db-recovery.md` — 9 ausgehende Relationen
 - `docs/reference/agent-operability-fixture-matrix.md` — 8 ausgehende Relationen
 - `docs/reports/domain-edge-write-path-proof.md` — 8 ausgehende Relationen

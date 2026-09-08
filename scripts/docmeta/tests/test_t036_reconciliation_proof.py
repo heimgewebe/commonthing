@@ -99,8 +99,9 @@ class T036ReconciliationProofTests(unittest.TestCase):
         for filename in ARCHIVED_BY_T036:
             self.assertNotIn(filename, active.split("## Active Reports", 1)[1])
             self.assertIn(filename, archived_and_after)
-        self.assertIn("| active | 26 |", text)
-        self.assertIn("| archived | 13 |", text)
+        # T036 owns the exact archival identities above, not the global number
+        # of active/archived reports. Unrelated later reports must not invalidate
+        # this historical reconciliation proof merely by changing those totals.
         self.assertIn("| findings_total | 0 |", text)
 
 

@@ -35,6 +35,10 @@ Generated automatically. Do not edit.
 
 - [relates_to] docs/reports/cost-report.md
 
+## .github/workflows/domain-projection-load.yml
+
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
+
 ## .github/workflows/opt-arc-001-db-proof-matrix.yml
 
 - [relates_to] docs/reports/github-actions-node24-readiness.md
@@ -91,6 +95,7 @@ Generated automatically. Do not edit.
 
 ## apps/api/src/domain_db.rs
 
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
 - [relates_to] docs/reports/domain-edge-cache-limit-design.md
 
 ## apps/api/src/federation_delivery.rs
@@ -100,6 +105,11 @@ Generated automatically. Do not edit.
 ## apps/api/src/governance.rs
 
 - [relates_to] docs/reports/weltgewebe-os-v1-t018-conversation-convergence-plan.md
+
+## apps/api/src/middleware/domain_projection.rs
+
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
+- [relates_to] docs/reports/domain-postgres-instance-coherence-decision.md
 
 ## apps/api/src/outbox.rs
 
@@ -122,10 +132,13 @@ Generated automatically. Do not edit.
 ## apps/api/src/routes/nodes.rs
 
 - [relates_to] docs/blueprints/domain-data-postgres-cutover.md
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
+- [relates_to] docs/reports/domain-postgres-instance-coherence-decision.md
 
 ## apps/api/src/state.rs
 
 - [relates_to] docs/blueprints/domain-data-postgres-cutover.md
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
 - [relates_to] docs/reports/domain-postgres-instance-coherence-decision.md
 
 ## apps/api/tests/db_domain_account_write_path.rs
@@ -135,6 +148,10 @@ Generated automatically. Do not edit.
 ## apps/api/tests/db_domain_backfill.rs
 
 - [relates_to] docs/reports/domain-backfill-proof.md
+
+## apps/api/tests/db_domain_node_write_path.rs
+
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
 
 ## apps/api/tests/db_multi_instance_foundation.rs
 
@@ -831,6 +848,10 @@ Generated automatically. Do not edit.
 - [relates_to] docs/reports/passkey-register-verify-prep.md
 - [depends_on] docs/roadmap.md
 
+## docs/reports/cq-02-domain-projection-load.md
+
+- [relates_to] docs/reports/domain-postgres-instance-coherence-decision.md
+
 ## docs/reports/domain-account-write-path-proof.md
 
 - [relates_to] docs/blueprints/domain-data-postgres-cutover.md
@@ -866,6 +887,7 @@ Generated automatically. Do not edit.
 - [relates_to] docs/adr/ADR-0010__kubernetes-kanonische-plattform.md
 - [relates_to] docs/adr/ADR-0012__ereignisrueckgrat-transactional-outbox.md
 - [relates_to] docs/blueprints/domain-data-postgres-cutover.md
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
 - [relates_to] docs/reports/kubernetes-platform-foundation-status.md
 - [relates_to] docs/reports/weltgewebe-os-foundation-status.md
 
@@ -1471,6 +1493,14 @@ Generated automatically. Do not edit.
 ## scripts/ops/resolve_vps_public_bind.py
 
 - [relates_to] docs/deploy/vps.md
+
+## scripts/performance/domain_projection_k6.js
+
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
+
+## scripts/performance/domain_projection_load.py
+
+- [relates_to] docs/reports/cq-02-domain-projection-load.md
 
 ## scripts/platform/ha_reference.py
 
