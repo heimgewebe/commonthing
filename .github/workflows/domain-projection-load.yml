@@ -237,6 +237,8 @@ jobs:
             local profile_dir="${EVIDENCE_ROOT}/${profile}"
             local database_url="postgres://postgres:postgres@127.0.0.1:5432/${db_name}"
             local run_id="cq02-${profile}-${workload}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            local workload_duration_seconds=30
+            local sampler_duration_seconds=$((workload_duration_seconds + 20))
             local write_node_ids=""
             mkdir -p "${out_dir}"
 
@@ -245,7 +247,15 @@ jobs:
                 "SELECT string_agg(id, ',' ORDER BY id) FROM (
                    SELECT id FROM domain_nodes ORDER BY id LIMIT 8
                  ) AS writer_nodes")"
-              test "$(awk -F, '{print NF}' <<<"${write_node_ids}")" -eq 8
+              if [[ -z "${write_node_ids}" ]]; then
+                echo "CQ-02 fixture did not provide writer node ids" >&2
+                exit 1
+              fi
+              IFS=',' read -r -a writer_node_id_array <<<"${write_node_ids}"
+              if [[ "${#writer_node_id_array[@]}" -ne 8 ]]; then
+                echo "CQ-02 fixture expected 8 writer nodes, got ${#writer_node_id_array[@]}" >&2
+                exit 1
+              fi
             fi
 
             curl -fsS http://127.0.0.1:8787/metrics > "${out_dir}/metrics-before.prom"
@@ -257,7 +267,7 @@ jobs:
             python3 -B scripts/performance/container_resource_sampler.py sample \
               --run-id "${run_id}" \
               --container-name "${API_CONTAINER}" \
-              --duration-seconds 32 \
+              --duration-seconds "${sampler_duration_seconds}" \
               --sample-interval-seconds 1 \
               --receipt "${out_dir}/resource-receipt.json" \
               > "${out_dir}/resource-sampler.stdout" &
@@ -268,7 +278,7 @@ jobs:
               --database-container "${POSTGRES_CONTAINER}" \
               --database-user postgres \
               --database-name "${db_name}" \
-              --duration-seconds 32 \
+              --duration-seconds "${sampler_duration_seconds}" \
               --sample-interval-seconds 1 \
               --receipt "${out_dir}/postgres-connections.json" \
               > "${out_dir}/postgres-sampler.stdout" &
@@ -284,7 +294,7 @@ jobs:
               --env "CQ02_PROFILE=${profile}" \
               --env "CQ02_WORKLOAD=${workload}" \
               --env "CQ02_RUN_ID=${run_id}" \
-              --env CQ02_DURATION_SECONDS=30 \
+              --env "CQ02_DURATION_SECONDS=${workload_duration_seconds}" \
               --env CQ02_READ_VUS=10 \
               --env CQ02_SUMMARY_PATH=/evidence/k6-summary.json \
               "${K6_IMAGE}" run /work/domain_projection_k6.js \
@@ -327,41 +337,6 @@ jobs:
 
           run_profile smoke cq02_smoke
           run_profile scale_100k cq02_100k
-
-      - name: Validate stressor actually changed domain generations
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          root = Path(os.environ["RUNNER_TEMP"]) / "cq02-domain-projection"
-          for profile in ("smoke", "scale_100k"):
-              read = json.loads((root / profile / "read_heavy" / "report.json").read_text())
-              mixed = json.loads((root / profile / "mixed" / "report.json").read_text())
-              raw_k6 = json.loads((root / profile / "mixed" / "k6-summary.json").read_text())
-              if read["projection"]["version_delta"] != 0:
-                  raise SystemExit(f"{profile}: read-heavy workload had an uncontrolled domain writer")
-              if mixed["projection"]["version_delta"] <= 0:
-                  raise SystemExit(f"{profile}: mixed workload did not produce a domain version change")
-              if not mixed["requests"]["write"] or mixed["requests"]["write"]["count"] <= 0:
-                  raise SystemExit(f"{profile}: mixed workload did not record writes")
-              if mixed["requests"]["write_failures"] != 0:
-                  raise SystemExit(
-                      f"{profile}: mixed workload had "
-                      f"{mixed['requests']['write_failures']} failed writes"
-                  )
-              dropped = (
-                  raw_k6.get("metrics", {})
-                  .get("dropped_iterations", {})
-                  .get("values", {})
-                  .get("count", 0)
-              )
-              if dropped:
-                  print(f"{profile}: k6 dropped_iterations={dropped}")
-          PY
 
       - name: Upload CQ-02 projection evidence
         if: ${{ always() }}

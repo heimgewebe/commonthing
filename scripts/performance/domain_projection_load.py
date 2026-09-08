@@ -312,11 +312,60 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
     dropped_iterations = int(
         k6_value(summary, "dropped_iterations", "count", default=0.0)
     )
-    if workload == "mixed" and dropped_iterations > 0:
+    if dropped_iterations > 0:
         raise Cq02EvidenceError(
             f"k6 dropped {dropped_iterations} scheduled iterations; "
-            "the offered mixed-load rate was not sustained"
+            "the offered load was not sustained"
         )
+
+    read_stats = trend(
+        summary,
+        "cq02_read_duration_ms",
+        "cq02_read_requests_total",
+        required=True,
+    )
+    write_stats = trend(
+        summary,
+        "cq02_write_duration_ms",
+        "cq02_write_requests_total",
+        required=workload == "mixed",
+    )
+    read_failures = int(
+        k6_value(summary, "cq02_read_failures_total", "count", default=0.0)
+    )
+    write_failures = int(
+        k6_value(summary, "cq02_write_failures_total", "count", default=0.0)
+    )
+    write_successes = int(
+        k6_value(summary, "cq02_write_successes_total", "count", default=0.0)
+    )
+    status_503 = int(k6_value(summary, "cq02_503_total", "count", default=0.0))
+    version_delta = version_after - version_before
+
+    if read_failures != 0:
+        raise Cq02EvidenceError(f"k6 recorded {read_failures} failed reads")
+    if status_503 != 0:
+        raise Cq02EvidenceError(f"k6 recorded {status_503} HTTP 503 responses")
+    if workload == "read_heavy":
+        if version_delta != 0:
+            raise Cq02EvidenceError(
+                "read-heavy workload observed an uncontrolled domain version change"
+            )
+    else:
+        if write_stats is None or int(write_stats["count"]) <= 0:
+            raise Cq02EvidenceError("mixed workload recorded no logical write attempts")
+        write_attempts = int(write_stats["count"])
+        if write_failures != 0:
+            raise Cq02EvidenceError(f"mixed workload recorded {write_failures} failed writes")
+        if write_successes <= 0:
+            raise Cq02EvidenceError("mixed workload recorded no successful PATCH writes")
+        if write_successes + write_failures != write_attempts:
+            raise Cq02EvidenceError(
+                "mixed workload write accounting is inconsistent: "
+                f"attempts={write_attempts}, successes={write_successes}, failures={write_failures}"
+            )
+        if version_delta <= 0:
+            raise Cq02EvidenceError("mixed workload did not advance the domain projection version")
 
     reloads = counter_delta(
         before, after, "domain_projection_events_total", {"event": "reload_success"}
@@ -327,6 +376,10 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
         "revision": {
             "expected_head": args.expected_head,
             "measured_api_commit": after_commit,
+        },
+        "claim_scope": {
+            "api_instances": 1,
+            "multi_instance_load_proven": False,
         },
         "dataset": {
             "profile": profile,
@@ -343,27 +396,12 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             "dropped_iterations": dropped_iterations,
         },
         "requests": {
-            "read": trend(
-                summary,
-                "cq02_read_duration_ms",
-                "cq02_read_requests_total",
-                required=True,
-            ),
-            "write": trend(
-                summary,
-                "cq02_write_duration_ms",
-                "cq02_write_requests_total",
-                required=workload == "mixed",
-            ),
-            "read_failures": int(
-                k6_value(summary, "cq02_read_failures_total", "count", default=0.0)
-            ),
-            "write_failures": int(
-                k6_value(summary, "cq02_write_failures_total", "count", default=0.0)
-            ),
-            "status_503": int(
-                k6_value(summary, "cq02_503_total", "count", default=0.0)
-            ),
+            "read": read_stats,
+            "write": write_stats,
+            "read_failures": read_failures,
+            "write_failures": write_failures,
+            "write_successes": write_successes,
+            "status_503": status_503,
         },
         "projection": {
             "refresh_checks": int(
@@ -402,7 +440,7 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             "stable_snapshot_retries": retry_delta,
             "version_before": version_before,
             "version_after": version_after,
-            "version_delta": version_after - version_before,
+            "version_delta": version_delta,
             "rows_loaded": {
                 kind: int(
                     counter_delta(

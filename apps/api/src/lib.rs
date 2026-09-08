@@ -260,6 +260,12 @@ pub async fn run() -> anyhow::Result<()> {
             (accounts, nodes, edges, version)
         }
     };
+    metrics.set_domain_projection_snapshot(
+        accounts_store.len(),
+        nodes_cache.len(),
+        edges_cache.len(),
+        initial_projection_version,
+    );
     let accounts = Arc::new(tokio::sync::RwLock::new(accounts_store));
 
     metrics.set_nodes_cache_count(nodes_cache.len() as i64);
@@ -268,6 +274,8 @@ pub async fn run() -> anyhow::Result<()> {
     let accounts_persist = Arc::new(tokio::sync::Mutex::new(()));
     let domain_projection_gate = Arc::new(tokio::sync::RwLock::new(()));
     let domain_projection_reload = Arc::new(tokio::sync::Mutex::new(()));
+    let domain_projection_local_node_patch_handoff =
+        Arc::new(std::sync::atomic::AtomicI64::new(-1));
     let domain_projection_version = Arc::new(std::sync::atomic::AtomicI64::new(
         initial_projection_version,
     ));
@@ -357,6 +365,7 @@ pub async fn run() -> anyhow::Result<()> {
         accounts_persist,
         domain_projection_gate,
         domain_projection_reload,
+        domain_projection_local_node_patch_handoff,
         domain_projection_version,
         edges,
         rate_limiter,

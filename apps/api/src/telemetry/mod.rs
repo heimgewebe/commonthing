@@ -335,6 +335,7 @@ impl Metrics {
         )?;
         let projection_duration_buckets = vec![
             0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            10.0, 15.0, 30.0,
         ];
         let domain_projection_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -621,15 +622,23 @@ impl Metrics {
                 .domain_projection_rows_loaded_total
                 .with_label_values(&[kind])
                 .inc_by(count as u64);
+        }
+        self.set_domain_projection_snapshot(accounts, nodes, edges, version);
+    }
+    pub fn set_domain_projection_snapshot(
+        &self,
+        accounts: usize,
+        nodes: usize,
+        edges: usize,
+        version: i64,
+    ) {
+        for (kind, count) in [("accounts", accounts), ("nodes", nodes), ("edges", edges)] {
             self.inner
                 .domain_projection_snapshot
                 .with_label_values(&[kind])
                 .set(count as i64);
         }
-        self.inner
-            .domain_projection_snapshot
-            .with_label_values(&["version"])
-            .set(version);
+        self.set_domain_projection_version(version);
     }
     pub fn set_domain_projection_version(&self, version: i64) {
         self.inner

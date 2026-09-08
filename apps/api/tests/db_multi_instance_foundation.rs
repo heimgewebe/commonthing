@@ -181,6 +181,9 @@ async fn api_state(pool: PgPool, nats: async_nats::Client) -> Result<ApiState> {
         accounts_persist: Arc::new(Mutex::new(())),
         domain_projection_gate: Arc::new(RwLock::new(())),
         domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        domain_projection_local_node_patch_handoff: std::sync::Arc::new(
+            std::sync::atomic::AtomicI64::new(-1),
+        ),
         domain_projection_version: Arc::new(AtomicI64::new(version)),
         edges: Arc::new(RwLock::new(edges)),
         rate_limiter: Arc::new(AuthRateLimiter::new_postgres(&cfg, pool.clone())),

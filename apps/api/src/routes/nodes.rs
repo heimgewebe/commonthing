@@ -3453,6 +3453,14 @@ async fn patch_node_postgres(
             }
         })?;
 
+    // PostgreSQL commit is complete at this point. From here until cache update
+    // plus generation accounting finishes, an exact V+1 may safely be identified
+    // as this PATCH's local publication handoff. Crucially, the marker is not set
+    // while the transaction is still waiting or executing before commit.
+    let expected_projection_version = projection_version_before.checked_add(1);
+    let _projection_handoff_guard = expected_projection_version
+        .map(|version| state.begin_local_node_patch_projection_handoff(version));
+
     let mut cache_guard = state.nodes.write().await;
     cache_guard.insert(id.to_string(), node.clone());
     state
@@ -3469,8 +3477,7 @@ async fn patch_node_postgres(
     // path then reconciles external or concurrent writes.
     match domain_projection_version(pool).await {
         Ok(observed_version) => {
-            let expected_version = projection_version_before.checked_add(1);
-            if expected_version == Some(observed_version) {
+            if expected_projection_version == Some(observed_version) {
                 match state.domain_projection_version.compare_exchange(
                     projection_version_before,
                     observed_version,

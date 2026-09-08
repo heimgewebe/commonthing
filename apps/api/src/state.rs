@@ -100,6 +100,11 @@ pub struct ApiState {
     /// Single-flight guard for PostgreSQL projection reloads. Safe read requests
     /// may keep using the previous complete snapshot while one reload owns this.
     pub domain_projection_reload: Arc<Mutex<()>>,
+    /// Exact V+1 generation currently being published by a committed local
+    /// PostgreSQL node PATCH. -1 means no post-commit handoff is active.
+    /// This is deliberately separate from `nodes_persist`: that mutex is also
+    /// held before commit and therefore cannot prove that observed drift is ours.
+    pub domain_projection_local_node_patch_handoff: Arc<AtomicI64>,
     pub domain_projection_version: Arc<AtomicI64>,
     pub edges: Arc<RwLock<OrderedCache<Edge>>>,
     pub rate_limiter: Arc<AuthRateLimiter>,
@@ -122,18 +127,50 @@ enum DomainProjectionFreshness {
     AllowStaleWhileRefreshing,
 }
 
-fn may_defer_local_node_generation_handoff(
-    freshness: DomainProjectionFreshness,
-    node_write_source: crate::config::DomainNodeWriteSource,
+const NO_LOCAL_NODE_PATCH_HANDOFF: i64 = -1;
+
+fn is_exact_local_node_patch_handoff(
     local_version: i64,
     observed_version: i64,
+    handoff_version: i64,
 ) -> bool {
-    freshness == DomainProjectionFreshness::AllowStaleWhileRefreshing
-        && node_write_source == crate::config::DomainNodeWriteSource::Postgres
-        && local_version.checked_add(1) == Some(observed_version)
+    local_version.checked_add(1) == Some(observed_version) && handoff_version == observed_version
+}
+
+/// Clears the explicit post-commit marker even when a PATCH future is cancelled
+/// after PostgreSQL commit but before cache publication has completed.
+pub struct LocalNodeProjectionHandoffGuard {
+    marker: Arc<AtomicI64>,
+    expected_version: i64,
+}
+
+impl Drop for LocalNodeProjectionHandoffGuard {
+    fn drop(&mut self) {
+        let _ = self.marker.compare_exchange(
+            self.expected_version,
+            NO_LOCAL_NODE_PATCH_HANDOFF,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 impl ApiState {
+    /// Mark only the post-commit/cache-publication phase of an isolated local
+    /// PostgreSQL node PATCH. Callers must already own `nodes_persist` and must
+    /// create this guard only after the database mutation has committed.
+    pub fn begin_local_node_patch_projection_handoff(
+        &self,
+        expected_version: i64,
+    ) -> LocalNodeProjectionHandoffGuard {
+        debug_assert!(expected_version >= 0);
+        self.domain_projection_local_node_patch_handoff
+            .store(expected_version, Ordering::Release);
+        LocalNodeProjectionHandoffGuard {
+            marker: self.domain_projection_local_node_patch_handoff.clone(),
+            expected_version,
+        }
+    }
     pub async fn refresh_domain_projection_if_stale(&self) -> anyhow::Result<()> {
         self.refresh_domain_projection(DomainProjectionFreshness::RequireCurrent)
             .await
@@ -185,28 +222,43 @@ impl ApiState {
             return Ok(());
         }
 
-        // A local PostgreSQL node write owns `nodes_persist` across the database
-        // commit, the in-memory cache update, and the exact-generation CAS. A
-        // safe anonymous read can therefore observe committed V+1 in the narrow
-        // handoff window before the process marker reaches V+1. Starting an O(N)
-        // reload there duplicates work the writer is about to account for. Defer
-        // only that exact +1 case while the local handoff is still in flight.
-        // Strict requests never take this path, and larger drift always performs
-        // the normal stable reconciliation.
-        if may_defer_local_node_generation_handoff(
-            freshness,
-            self.config.domain_node_write_source,
-            local_version,
-            observed,
-        ) && self.nodes_persist.try_lock().is_err()
-        {
-            self.metrics.domain_projection_refresh_deferred();
-            tracing::debug!(
-                local_version,
-                observed,
-                "Deferring anonymous projection refresh during local node generation handoff"
-            );
-            return Ok(());
+        // `nodes_persist` alone cannot identify this handoff because PostgreSQL
+        // mutations also own that mutex before commit. Only the explicit marker,
+        // installed after a local PATCH has committed, may classify exact V+1 as
+        // our own cache-publication window. This prevents an external V+1 from
+        // being hidden merely because an unrelated local write is still blocked
+        // before commit.
+        let handoff_version = self
+            .domain_projection_local_node_patch_handoff
+            .load(Ordering::Acquire);
+        if is_exact_local_node_patch_handoff(local_version, observed, handoff_version) {
+            match freshness {
+                DomainProjectionFreshness::AllowStaleWhileRefreshing => {
+                    self.metrics.domain_projection_refresh_deferred();
+                    tracing::debug!(
+                        local_version,
+                        observed,
+                        "Deferring anonymous projection refresh during committed local node PATCH handoff"
+                    );
+                    return Ok(());
+                }
+                DomainProjectionFreshness::RequireCurrent => {
+                    // A strict request must not launch an O(N) reload for a
+                    // generation the local writer is already publishing. Wait
+                    // for the existing serialization guard, then re-check. The
+                    // writer clears the explicit handoff marker before releasing
+                    // `nodes_persist`.
+                    let persist_guard = self.nodes_persist.lock().await;
+                    drop(persist_guard);
+                    let observed_after_handoff =
+                        crate::domain_db::domain_projection_version(pool).await?;
+                    let local_after_handoff =
+                        self.domain_projection_version.load(Ordering::Acquire);
+                    if observed_after_handoff == local_after_handoff {
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         // A same-process domain write can finish after the stable database load
@@ -295,36 +347,13 @@ mod tests {
 
     #[test]
     fn local_node_generation_handoff_deferral_is_narrow() {
-        use crate::config::DomainNodeWriteSource;
-
-        assert!(may_defer_local_node_generation_handoff(
-            DomainProjectionFreshness::AllowStaleWhileRefreshing,
-            DomainNodeWriteSource::Postgres,
-            41,
-            42,
-        ));
-        assert!(!may_defer_local_node_generation_handoff(
-            DomainProjectionFreshness::RequireCurrent,
-            DomainNodeWriteSource::Postgres,
-            41,
-            42,
-        ));
-        assert!(!may_defer_local_node_generation_handoff(
-            DomainProjectionFreshness::AllowStaleWhileRefreshing,
-            DomainNodeWriteSource::Postgres,
-            41,
-            43,
-        ));
-        assert!(!may_defer_local_node_generation_handoff(
-            DomainProjectionFreshness::AllowStaleWhileRefreshing,
-            DomainNodeWriteSource::Jsonl,
-            41,
-            42,
-        ));
-        assert!(!may_defer_local_node_generation_handoff(
-            DomainProjectionFreshness::AllowStaleWhileRefreshing,
-            DomainNodeWriteSource::Postgres,
+        assert!(is_exact_local_node_patch_handoff(41, 42, 42));
+        assert!(!is_exact_local_node_patch_handoff(41, 42, -1));
+        assert!(!is_exact_local_node_patch_handoff(41, 43, 42));
+        assert!(!is_exact_local_node_patch_handoff(41, 42, 43));
+        assert!(!is_exact_local_node_patch_handoff(
             i64::MAX,
+            i64::MIN,
             i64::MIN,
         ));
     }

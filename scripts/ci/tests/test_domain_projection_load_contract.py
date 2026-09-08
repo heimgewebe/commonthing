@@ -91,6 +91,7 @@ def k6_summary(workload: str, *, dropped_iterations: int = 0) -> dict:
             }
         }
         metrics["cq02_write_requests_total"] = {"values": {"count": 30}}
+        metrics["cq02_write_successes_total"] = {"values": {"count": 30}}
         metrics["cq02_write_failures_total"] = {"values": {"count": 0}}
     return {
         "cq02": {
@@ -122,6 +123,12 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
                 workflow,
                 f"CQ-02 load evidence must run when critical projection path {path} changes",
             )
+        self.assertIn("local workload_duration_seconds=30", workflow)
+        self.assertIn(
+            "local sampler_duration_seconds=$((workload_duration_seconds + 20))", workflow
+        )
+        self.assertEqual(workflow.count('--duration-seconds "${sampler_duration_seconds}"'), 2)
+        self.assertIn('--env "CQ02_DURATION_SECONDS=${workload_duration_seconds}"', workflow)
 
     def make_args(
         self, root: Path, workload: str, *, include_reload: bool
@@ -175,6 +182,9 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
         self.assertEqual(report["dataset"]["nodes"], 1000)
         self.assertEqual(report["requests"]["read"]["p99_ms"], 20)
         self.assertEqual(report["requests"]["write"]["p95_ms"], 40)
+        self.assertEqual(report["requests"]["write_successes"], 30)
+        self.assertEqual(report["claim_scope"]["api_instances"], 1)
+        self.assertFalse(report["claim_scope"]["multi_instance_load_proven"])
         self.assertEqual(report["scenario"]["write_rate_per_second"], 0.5)
         self.assertEqual(report["projection"]["refresh_checks"], 90)
         self.assertEqual(report["projection"]["refresh_deferred"], 10)
@@ -201,8 +211,57 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
                 json.dumps(k6_summary("mixed", dropped_iterations=2)), encoding="utf-8"
             )
             with self.assertRaisesRegex(
-                Cq02EvidenceError, "offered mixed-load rate was not sustained"
+                Cq02EvidenceError, "offered load was not sustained"
             ):
+                summarize(args)
+
+    def test_read_heavy_report_also_fails_closed_when_k6_drops_iterations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.make_args(root, "read_heavy", include_reload=False)
+            (root / "k6_summary.json").write_text(
+                json.dumps(k6_summary("read_heavy", dropped_iterations=1)), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(Cq02EvidenceError, "offered load was not sustained"):
+                summarize(args)
+
+    def test_mixed_report_fails_closed_when_success_accounting_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.make_args(root, "mixed", include_reload=True)
+            summary = k6_summary("mixed")
+            summary["metrics"].pop("cq02_write_successes_total")
+            (root / "k6_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            with self.assertRaisesRegex(Cq02EvidenceError, "no successful PATCH writes"):
+                summarize(args)
+
+    def test_mixed_report_fails_closed_on_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.make_args(root, "mixed", include_reload=True)
+            summary = k6_summary("mixed")
+            summary["metrics"]["cq02_write_successes_total"]["values"]["count"] = 29
+            summary["metrics"]["cq02_write_failures_total"]["values"]["count"] = 1
+            (root / "k6_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            with self.assertRaisesRegex(Cq02EvidenceError, "recorded 1 failed writes"):
+                summarize(args)
+
+    def test_report_fails_closed_on_http_503(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.make_args(root, "read_heavy", include_reload=False)
+            summary = k6_summary("read_heavy")
+            summary["metrics"]["cq02_503_total"]["values"]["count"] = 1
+            (root / "k6_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            with self.assertRaisesRegex(Cq02EvidenceError, "recorded 1 HTTP 503 responses"):
+                summarize(args)
+
+    def test_read_heavy_report_fails_closed_on_version_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.make_args(root, "read_heavy", include_reload=False)
+            (root / "version-after.txt").write_text("11\n", encoding="utf-8")
+            with self.assertRaisesRegex(Cq02EvidenceError, "uncontrolled domain version change"):
                 summarize(args)
 
     def test_commit_mismatch_fails_closed(self) -> None:

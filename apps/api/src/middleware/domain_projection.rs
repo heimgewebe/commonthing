@@ -18,7 +18,9 @@ use crate::{config::DomainReadSource, routes::auth::SESSION_COOKIE_NAME, state::
 /// +1 post-commit handoff of a serialized local node write. Keeping requests with
 /// the canonical session cookie
 /// strict is security-sensitive because auth middleware reads account disabled/role
-/// state from this projection after this middleware runs. The read guard remains
+/// state from this projection after this middleware runs. Canonical request
+/// authentication is currently cookie-only; adding any other inbound auth scheme
+/// requires updating this classifier before that scheme can be enabled. The read guard remains
 /// held for the full handler so no request can observe a partially replaced
 /// accounts/nodes/edges projection.
 fn may_use_previous_projection(method: &Method, has_session_cookie: bool) -> bool {

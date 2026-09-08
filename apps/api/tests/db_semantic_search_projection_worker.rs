@@ -2009,6 +2009,9 @@ async fn t006_search_api_against_postgres_projections() {
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
         domain_projection_gate: Arc::new(tokio::sync::RwLock::new(())),
         domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        domain_projection_local_node_patch_handoff: std::sync::Arc::new(
+            std::sync::atomic::AtomicI64::new(-1),
+        ),
         domain_projection_version: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         edges: Arc::new(tokio::sync::RwLock::new(
             weltgewebe_api::state::OrderedCache::new(),

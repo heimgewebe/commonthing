@@ -49,6 +49,7 @@ const readDuration = new Trend('cq02_read_duration_ms', true);
 const writeDuration = new Trend('cq02_write_duration_ms', true);
 const readRequests = new Counter('cq02_read_requests_total');
 const writeRequests = new Counter('cq02_write_requests_total');
+const writeSuccesses = new Counter('cq02_write_successes_total');
 const readFailures = new Counter('cq02_read_failures_total');
 const writeFailures = new Counter('cq02_write_failures_total');
 const status503 = new Counter('cq02_503_total');
@@ -168,6 +169,7 @@ export function writeNode() {
     return;
   }
 
+  writeSuccesses.add(1);
   writeDuration.add(Date.now() - startedAtMs);
   check(response, { 'node patch 200': () => true });
 }

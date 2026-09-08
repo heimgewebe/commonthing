@@ -326,6 +326,9 @@ async fn postgres_write_app_with_account_source(
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
         domain_projection_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
         domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        domain_projection_local_node_patch_handoff: std::sync::Arc::new(
+            std::sync::atomic::AtomicI64::new(-1),
+        ),
         domain_projection_version: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         edges: Arc::new(RwLock::new(weltgewebe_api::state::OrderedCache::new())),
         rate_limiter,
@@ -594,6 +597,27 @@ async fn postgres_node_patch_does_not_fast_forward_over_external_generation() ->
     .await?;
     assert_eq!(domain_projection_version(&pool).await?, local_before + 1);
 
+    // This is the bug-shaped window: the API PATCH owns `nodes_persist` but is
+    // still blocked before its own commit, while an unrelated external writer
+    // already produced V+1. An anonymous read must NOT call this a local handoff
+    // and return the old snapshot. It must wait for coherent reconciliation.
+    let read_app = app.clone();
+    let concurrent_read = tokio::spawn(async move {
+        read_app
+            .oneshot(
+                Request::get("/nodes")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("anonymous read request"),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !concurrent_read.is_finished(),
+        "pre-commit nodes_persist ownership must not misclassify external V+1 as a local handoff"
+    );
+
     blocker.commit().await?;
     let response = patch_task.await??;
     assert_eq!(response.status(), StatusCode::OK);
@@ -606,14 +630,7 @@ async fn postgres_node_patch_does_not_fast_forward_over_external_generation() ->
         "PATCH must not fast-forward across an unseen external generation"
     );
 
-    let refresh = app
-        .clone()
-        .oneshot(
-            Request::get("/nodes")
-                .header("Host", "localhost")
-                .body(body::Body::empty())?,
-        )
-        .await?;
+    let refresh = concurrent_read.await??;
     assert_eq!(refresh.status(), StatusCode::OK);
     assert_eq!(
         state.domain_projection_version.load(Ordering::Acquire),
@@ -685,6 +702,7 @@ async fn safe_projection_read_defers_exact_local_node_generation_handoff() -> Re
     .await?;
     let db_after = domain_projection_version(&pool).await?;
     assert_eq!(db_after, local_before + 1);
+    let projection_handoff = state.begin_local_node_patch_projection_handoff(db_after);
 
     tokio::time::timeout(
         Duration::from_secs(2),
@@ -711,7 +729,93 @@ async fn safe_projection_read_defers_exact_local_node_generation_handoff() -> Re
     let metrics = String::from_utf8(state.metrics.render()?)?;
     assert!(metrics.contains(r#"domain_projection_events_total{event="refresh_deferred"} 1"#));
 
+    drop(projection_handoff);
     drop(handoff_guard);
+    clean(&pool).await;
+    Ok(())
+}
+
+/// A5. A strict request that observes the exact committed PATCH handoff waits
+/// for that writer to publish its cache/version instead of starting an O(N)
+/// projection reload for work already completed locally.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn strict_projection_refresh_waits_for_exact_local_patch_handoff() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("before strict handoff"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_app, _cookie, state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000094").await?;
+    let local_before = domain_projection_version(&pool).await?;
+    state
+        .domain_projection_version
+        .store(local_before, Ordering::Release);
+
+    let persist_guard = state.nodes_persist.lock().await;
+    sqlx::query(
+        "UPDATE domain_nodes SET payload = jsonb_set(payload, '{info}', to_jsonb($2::text), TRUE), updated_at = NOW() WHERE id = $1",
+    )
+    .bind(NODE_B)
+    .bind("strict handoff committed")
+    .execute(&pool)
+    .await?;
+    let db_after = domain_projection_version(&pool).await?;
+    assert_eq!(db_after, local_before + 1);
+    let projection_handoff = state.begin_local_node_patch_projection_handoff(db_after);
+
+    let strict_state = state.clone();
+    let strict_refresh =
+        tokio::spawn(async move { strict_state.refresh_domain_projection_if_stale().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !strict_refresh.is_finished(),
+        "strict refresh must wait for the committed local handoff"
+    );
+
+    let canonical = load_nodes_from_postgres(&pool).await?;
+    let canonical_node = canonical
+        .get(NODE_B)
+        .cloned()
+        .context("canonical node after strict handoff")?;
+    state
+        .nodes
+        .write()
+        .await
+        .insert(NODE_B.to_string(), canonical_node);
+    state
+        .domain_projection_version
+        .store(db_after, Ordering::Release);
+    state.metrics.set_domain_projection_version(db_after);
+    drop(projection_handoff);
+    drop(persist_guard);
+
+    tokio::time::timeout(Duration::from_secs(2), strict_refresh)
+        .await
+        .context("strict refresh did not resume after local handoff")?
+        .context("strict refresh task failed")??;
+    let metrics = String::from_utf8(state.metrics.render()?)?;
+    assert!(
+        !metrics.contains(r#"domain_projection_events_total{event="reload_success"}"#),
+        "strict exact +1 handoff must not perform a full projection reload"
+    );
+    assert_eq!(
+        state
+            .nodes
+            .read()
+            .await
+            .get(NODE_B)
+            .and_then(|node| node.info.as_deref()),
+        Some("strict handoff committed")
+    );
+
     clean(&pool).await;
     Ok(())
 }
@@ -913,6 +1017,9 @@ async fn postgres_read_jsonl_node_write_is_blocked() -> Result<()> {
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
         domain_projection_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
         domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        domain_projection_local_node_patch_handoff: std::sync::Arc::new(
+            std::sync::atomic::AtomicI64::new(-1),
+        ),
         domain_projection_version: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         edges: Arc::new(RwLock::new(weltgewebe_api::state::OrderedCache::new())),
         rate_limiter,
@@ -1096,6 +1203,9 @@ async fn jsonl_default_node_patch_compiles_and_routes_correctly() -> Result<()> 
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
         domain_projection_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
         domain_projection_reload: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        domain_projection_local_node_patch_handoff: std::sync::Arc::new(
+            std::sync::atomic::AtomicI64::new(-1),
+        ),
         domain_projection_version: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         edges: Arc::new(RwLock::new(weltgewebe_api::state::OrderedCache::new())),
         rate_limiter,
