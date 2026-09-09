@@ -2,10 +2,10 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicI64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::{
     auth::{
@@ -130,7 +130,82 @@ enum DomainProjectionFreshness {
 }
 
 const NO_LOCAL_NODE_PATCH_HANDOFF: i64 = -1;
-const LOCAL_NODE_PATCH_HANDOFF_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+const DOMAIN_PROJECTION_CLASSIFICATION_LIMIT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+const MAX_DOMAIN_PROJECTION_CLASSIFICATION_ATTEMPTS: usize = 64;
+
+fn local_node_patch_handoff_notify() -> &'static Notify {
+    static NOTIFY: OnceLock<Notify> = OnceLock::new();
+    NOTIFY.get_or_init(Notify::new)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DomainProjectionClassificationBudget {
+    deadline: tokio::time::Instant,
+    attempts_remaining: usize,
+}
+
+impl DomainProjectionClassificationBudget {
+    fn new() -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + DOMAIN_PROJECTION_CLASSIFICATION_LIMIT,
+            attempts_remaining: MAX_DOMAIN_PROJECTION_CLASSIFICATION_ATTEMPTS,
+        }
+    }
+
+    fn try_begin_attempt(&mut self) -> bool {
+        if self.attempts_remaining == 0 || tokio::time::Instant::now() >= self.deadline {
+            return false;
+        }
+        self.attempts_remaining -= 1;
+        true
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+}
+
+async fn domain_projection_version_before_deadline(
+    pool: &PgPool,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<i64> {
+    match tokio::time::timeout_at(deadline, crate::domain_db::domain_projection_version(pool)).await
+    {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("timed out classifying domain projection freshness"),
+    }
+}
+
+async fn wait_for_local_node_patch_handoff_completion(
+    marker: &AtomicI64,
+    observed_version: i64,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    loop {
+        if marker.load(Ordering::Acquire) != observed_version {
+            return Ok(());
+        }
+
+        // `notified()` is not registered until it is first polled/enabled. Pin
+        // and enable it before the second marker read so a concurrent clear
+        // cannot be lost between checking the marker and starting to wait.
+        let notified = local_node_patch_handoff_notify().notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+        if marker.load(Ordering::Acquire) != observed_version {
+            return Ok(());
+        }
+
+        // Notify is only the bell. After every wake-up the atomic marker is read
+        // again at the top of the loop and remains the sole source of truth.
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            anyhow::bail!(
+                "timed out waiting for local node projection handoff generation {observed_version}"
+            );
+        }
+    }
+}
 
 fn is_exact_local_node_patch_handoff(
     local_version: i64,
@@ -155,6 +230,9 @@ impl Drop for LocalNodeProjectionHandoffGuard {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        // A wake-up carries no state. Waiters always re-read the atomic marker,
+        // so notifying after a failed CAS is a harmless spurious wake-up.
+        local_node_patch_handoff_notify().notify_waiters();
     }
 }
 
@@ -236,17 +314,24 @@ impl ApiState {
             }
         };
 
-        // Reclassify after every completed exact local handoff. A second local
-        // PATCH can commit the next generation immediately after the first one;
-        // falling through after only one recheck would mistake that new exact
-        // handoff for foreign drift and start an unnecessary O(N) reload. Keep
-        // one wait budget across the whole chain so sustained local PATCHes cannot
-        // renew the process-wide strict wait one second at a time. Count only time
-        // actually spent waiting on an active marker: PostgreSQL reclassification
-        // round trips between completed handoffs are not writer wait time.
-        let mut strict_handoff_waited = std::time::Duration::ZERO;
+        // Reclassify after every completed exact local handoff. The whole cheap
+        // classification phase gets one cumulative deadline plus an explicit
+        // iteration cap: DB re-reads, repeated generation changes and marker waits
+        // cannot hold the single-flight reload coordinator indefinitely.
+        let mut classification_budget = DomainProjectionClassificationBudget::new();
         loop {
-            let observed = crate::domain_db::domain_projection_version(pool).await?;
+            if !classification_budget.try_begin_attempt() {
+                tracing::warn!(
+                    classification_limit_ms = DOMAIN_PROJECTION_CLASSIFICATION_LIMIT.as_millis(),
+                    max_attempts = MAX_DOMAIN_PROJECTION_CLASSIFICATION_ATTEMPTS,
+                    "Domain projection freshness classification budget exhausted"
+                );
+                anyhow::bail!("domain projection freshness classification budget exhausted");
+            }
+
+            let observed =
+                domain_projection_version_before_deadline(pool, classification_budget.deadline())
+                    .await?;
 
             // The writer publishes the local projection version before its RAII
             // guard clears the handoff marker. Read the marker first: if this
@@ -271,7 +356,11 @@ impl ApiState {
             // preserving restore/PITR semantics instead of trusting newer cache
             // state across a genuine database rollback.
             if observed < local_version {
-                let confirmed_observed = crate::domain_db::domain_projection_version(pool).await?;
+                let confirmed_observed = domain_projection_version_before_deadline(
+                    pool,
+                    classification_budget.deadline(),
+                )
+                .await?;
                 if confirmed_observed == local_version {
                     return Ok(());
                 }
@@ -303,38 +392,24 @@ impl ApiState {
                 }
                 DomainProjectionFreshness::RequireCurrent => {
                     // A strict request must not launch an O(N) reload for a
-                    // generation the local writer is already publishing. The
-                    // explicit marker is the completion signal; `nodes_persist`
-                    // is deliberately irrelevant because later writers may already
-                    // be queued there. Bound this wait so an ambiguously committed
-                    // or otherwise stuck PATCH cannot hold the process-wide reload
-                    // coordinator forever. After the marker clears, restart the
-                    // cheap classification so an immediately-following local V+1
-                    // handoff receives the same treatment.
-                    let handoff_wait_started = tokio::time::Instant::now();
-                    loop {
-                        if self
-                            .domain_projection_local_node_patch_handoff
-                            .load(Ordering::Acquire)
-                            != observed
-                        {
-                            strict_handoff_waited = strict_handoff_waited
-                                .saturating_add(handoff_wait_started.elapsed());
-                            break;
-                        }
-                        if strict_handoff_waited.saturating_add(handoff_wait_started.elapsed())
-                            >= LOCAL_NODE_PATCH_HANDOFF_WAIT_LIMIT
-                        {
-                            tracing::warn!(
-                                observed_version = observed,
-                                wait_limit_ms = LOCAL_NODE_PATCH_HANDOFF_WAIT_LIMIT.as_millis(),
-                                "Timed out waiting for transaction-proven local node PATCH handoff"
-                            );
-                            anyhow::bail!(
-                                "timed out waiting for local node projection handoff generation {observed}"
-                            );
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    // generation the local writer is already publishing. Notify is
+                    // only the wake-up signal; the explicit marker remains the truth.
+                    // This wait shares the same deadline as every DB re-read above.
+                    if let Err(error) = wait_for_local_node_patch_handoff_completion(
+                        &self.domain_projection_local_node_patch_handoff,
+                        observed,
+                        classification_budget.deadline(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            observed_version = observed,
+                            classification_limit_ms =
+                                DOMAIN_PROJECTION_CLASSIFICATION_LIMIT.as_millis(),
+                            error = %error,
+                            "Timed out waiting for transaction-proven local node PATCH handoff"
+                        );
+                        return Err(error);
                     }
                 }
             }
@@ -423,6 +498,142 @@ impl ApiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classification_budget_bounds_repeated_generation_changes() {
+        let mut budget = DomainProjectionClassificationBudget::new();
+        let generations =
+            (0..=(MAX_DOMAIN_PROJECTION_CLASSIFICATION_ATTEMPTS as i64 + 1)).collect::<Vec<_>>();
+        let mut attempts = 0usize;
+
+        for pair in generations.windows(2) {
+            if !budget.try_begin_attempt() {
+                break;
+            }
+            assert_ne!(pair[0], pair[1]);
+            attempts += 1;
+        }
+
+        assert_eq!(attempts, MAX_DOMAIN_PROJECTION_CLASSIFICATION_ATTEMPTS);
+        assert!(!budget.try_begin_attempt());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn classification_budget_counts_elapsed_time_cumulatively() {
+        let mut budget = DomainProjectionClassificationBudget::new();
+        assert!(budget.try_begin_attempt());
+
+        tokio::time::advance(DOMAIN_PROJECTION_CLASSIFICATION_LIMIT).await;
+
+        assert!(!budget.try_begin_attempt());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handoff_guard_drop_wakes_registered_waiter_without_polling() {
+        let marker = Arc::new(AtomicI64::new(42));
+        let guard = LocalNodeProjectionHandoffGuard {
+            marker: marker.clone(),
+            expected_version: 42,
+        };
+        let waiter_marker = marker.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_local_node_patch_handoff_completion(
+                &waiter_marker,
+                42,
+                tokio::time::Instant::now() + DOMAIN_PROJECTION_CLASSIFICATION_LIMIT,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        drop(guard);
+        tokio::task::yield_now().await;
+
+        waiter.await.expect("waiter task").expect("handoff wake");
+        assert_eq!(marker.load(Ordering::Acquire), NO_LOCAL_NODE_PATCH_HANDOFF);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handoff_clear_before_waiter_registration_is_not_lost() {
+        let marker = Arc::new(AtomicI64::new(42));
+        let guard = LocalNodeProjectionHandoffGuard {
+            marker: marker.clone(),
+            expected_version: 42,
+        };
+        let waiter_marker = marker.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_local_node_patch_handoff_completion(
+                &waiter_marker,
+                42,
+                tokio::time::Instant::now() + DOMAIN_PROJECTION_CLASSIFICATION_LIMIT,
+            )
+            .await
+        });
+
+        // `spawn` does not synchronously poll the future. Clear + notify before
+        // yielding so the waiter starts only after the wake-up already happened.
+        drop(guard);
+        tokio::task::yield_now().await;
+
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("marker recheck after early wake");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spurious_notify_does_not_complete_an_active_handoff() {
+        let marker = Arc::new(AtomicI64::new(42));
+        let waiter_marker = marker.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_local_node_patch_handoff_completion(
+                &waiter_marker,
+                42,
+                tokio::time::Instant::now() + DOMAIN_PROJECTION_CLASSIFICATION_LIMIT,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        local_node_patch_handoff_notify().notify_waiters();
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        marker.store(NO_LOCAL_NODE_PATCH_HANDOFF, Ordering::Release);
+        local_node_patch_handoff_notify().notify_waiters();
+        tokio::task::yield_now().await;
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("real marker clear");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handoff_wait_timeout_remains_fail_closed() {
+        let marker = Arc::new(AtomicI64::new(42));
+        let waiter_marker = marker.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_local_node_patch_handoff_completion(
+                &waiter_marker,
+                42,
+                tokio::time::Instant::now() + DOMAIN_PROJECTION_CLASSIFICATION_LIMIT,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(DOMAIN_PROJECTION_CLASSIFICATION_LIMIT).await;
+        tokio::task::yield_now().await;
+
+        let error = waiter
+            .await
+            .expect("waiter task")
+            .expect_err("stuck marker must fail closed");
+        assert!(error
+            .to_string()
+            .contains("timed out waiting for local node projection handoff generation 42"));
+    }
 
     #[test]
     fn local_node_generation_handoff_deferral_is_narrow() {

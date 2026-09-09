@@ -8,7 +8,7 @@ lifecycle: audit
 owner_task: WELTGEWEBE-OS-002
 review_after: 2027-01-16
 created: 2026-06-18
-last_reviewed: 2026-09-08
+last_reviewed: 2026-09-09
 lang: de
 summary: >
   Die frühere Single-Instance-Grenze ist durch einen geprüften PostgreSQL-
@@ -117,14 +117,15 @@ Der Laufzeitvertrag unterscheidet stattdessen drei Fälle:
    normaler Drift wird die stabile vollständige Projektion reconciliiert, bevor
    der Handler läuft. Sieht ein strict Request dagegen exakt einen
    transaktionsgebunden markierten lokalen Node-PATCH-Handoff V→V+1, startet er
-   keinen redundanten O(N)-Reload: Er wartet ausschließlich auf genau diesen
-   Marker. `nodes_persist` ist weder Herkunftsbeweis noch Completion-Signal. Die
-   kumulierte tatsächliche Marker-Wartezeit über unmittelbar folgende lokale
-   Handoffs ist auf 1 Sekunde begrenzt; PostgreSQL-Roundtrips zwischen bereits
-   beendeten Handoffs zählen nicht. Ein festhängender Marker endet fail-closed
-   statt unbegrenzt zu blockieren. Nach Marker-Clear wird billig neu klassifiziert.
-   Das ist sicherheitsrelevant, weil die nachfolgende Auth-Middleware
-   Account-`disabled` und Rolleninformationen aus der Projection liest.
+   keinen redundanten O(N)-Reload. `nodes_persist` ist weder Herkunftsbeweis noch
+   Completion-Signal. Der Request wartet per `tokio::sync::Notify`, prüft aber
+   vor und nach jeder Weckung erneut den atomaren Marker; Notify trägt selbst
+   keinen Zustand. DB-Abfragen, erneute Klassifikationsrunden und Handoff-Warten
+   teilen ein einziges kumulatives 1-Sekunden-Budget plus explizites
+   Iterationslimit. Ein festhängender oder dauerhaft wechselnder Zustand endet
+   fail-closed statt den Single-Flight-Koordinator unbegrenzt zu halten. Das ist
+   sicherheitsrelevant, weil die nachfolgende Auth-Middleware Account-`disabled`
+   und Rolleninformationen aus der Projection liest.
 2. **Anonyme sichere Reads:** Nur GET/HEAD ohne `gewebe_session` dürfen während
    eines bereits aktiven Generation-Checks/Reloads oder beim exakt markierten
    lokalen V+1-Handoff vorübergehend die vorherige **vollständige** Projektion
@@ -136,9 +137,12 @@ Der Laufzeitvertrag unterscheidet stattdessen drei Fälle:
    hält, darf der Prozess den Handoff per CAS markieren. Der Marker ist damit
    bereits vor Sichtbarkeit des Commits vorhanden, ohne fremdes V+1 als lokal
    zu klassifizieren. Nach COMMIT wird der einzelne Node nur dann in den Cache
-   publiziert, wenn die Transaktion nachweislich genau die nächste vollständige
-   Generation selbst erzeugt hat. Die lokale Projection-Version wird vor dem
-   CAS-Clear des RAII-Guards veröffentlicht; beim Refresh wird deshalb der Marker
+   publiziert und die lokale Projection-Version nur dann fast-forwarded, wenn
+   die Transaktion nachweislich genau die nächste vollständige Generation selbst
+   erzeugt **und den zugehörigen Handoff-Guard tatsächlich erworben** hat. Ein
+   passender Versionswert ohne Guard ist kein Ownership-Beweis. Die lokale
+   Projection-Version wird vor dem CAS-Clear des RAII-Guards veröffentlicht;
+   beim Refresh wird deshalb der Marker
    per Acquire vor der lokalen Version gelesen. Semantische No-op-PATCHes erhalten
    keinen Handoff-Marker.
 
@@ -164,12 +168,13 @@ wird unter dem Projection-Write-Gate die vollständige Generation gemeinsam
 ausgetauscht. Während eines Handlers schützt das Projection-Read-Gate weiterhin
 vor einem partiellen Cache-Swap.
 
-CQ-02 hat den finalen **Single-Instance-Node-PATCH-Vertrag** unter
-unverändertem Mixed-Load gemessen. Run `34223676110`, Job `102052513492`, auf dem
-exakten API-Commit `9be2048de8f56ee65184cba113016336f6742602` belegt bei
-100.000 Nodes und 500.000 Edges 15/15 erfolgreiche PATCHes, Projection-Version
-1→16, Writer-p95 58,3 ms, 0 Write-/Read-Fehler, 0 HTTP 503, 0 dropped iterations,
-0 Stable-Snapshot-Retries und **0 Full-Reloads** während des 30-Sekunden-Mixed-
+CQ-02 hat den **Single-Instance-Node-PATCH-Vertrag** nach dem
+Liveness-Nachfolger erneut unter unverändertem Mixed-Load gemessen. Run
+`34328529159`, Job `102391380221`, auf dem exakten API-Commit
+`b4b154e5fa6ba39824088978417489a89e9f9794` belegt bei 100.000 Nodes und
+500.000 Edges 15/15 erfolgreiche PATCHes, Projection-Version 1→16, Writer-p95
+70,5 ms, 0 Write-/Read-Fehler, 0 HTTP 503, 0 dropped iterations, 0
+Stable-Snapshot-Retries und **0 Full-Reloads** während des 30-Sekunden-Mixed-
 Fensters. Der Harness lief mit genau einer API-Instanz und weist deshalb
 ausdrücklich `multi_instance_load_proven: false` aus. Der detaillierte Messbeleg
 liegt in `docs/reports/cq-02-domain-projection-load.md`.
@@ -257,17 +262,19 @@ nicht vermischt:
 - der Summarizer ist fail-closed für Drops, Read-/Write-Fehler, HTTP 503,
   Versionsdelta, Refresh-/Reload-Fehler, Stable-Snapshot-Retries und jeden
   Full-Reload (`max_reloads = 0`);
-- `apps/api/tests/db_domain_node_write_path.rs` beweist in 44/44 direkten
-  PostgreSQL-Tests den isolierten +1-Fast-Forward, externe/concurrent Vor-Drift
-  ohne partielles Cache-Publish, den transaktionsgebundenen Pre-COMMIT-Handoff,
-  Marker-CAS, Marker-before-local Load-Ordering, No-op-PATCH, bounded/fail-closed
-  strict-Warten, den local-ahead DB-Reread sowie Reconciliation einer stabil
-  niedrigeren DB-Generation;
+- der CQ-02-Nachfolger ergänzt gezielte Unit-Regressionen für Guard-Ownership,
+  kumulatives Zeit-/Iterationsbudget sowie lost-wakeup-sicheres Notify-Warten.
+  Der direkte PostgreSQL-Node-Write-Lauf ist 43/44 grün; der einzige rote
+  Guest-Exit-Test (503 statt 403) scheitert auf frischer DB identisch auf dem
+  unveränderten Merge-Commit `2beeb8e575ec83c0c8bdbb569997ef10dfd39249`
+  und ist damit als vorbestehender Baseline-Fehler, nicht als CQ-02-Regression,
+  eingegrenzt;
 - die Middleware-Policy hält Session-Requests strict-current.
 
-Der terminale 100k-Mixed-Lastbeweis ist Run `34223676110`, Job
-`102052513492`, auf `9be2048de8f56ee65184cba113016336f6742602`; Details und
-die vollständige Messfolge stehen in `docs/reports/cq-02-domain-projection-load.md`.
+Der aktuelle 100k-Mixed-Lastbeweis des CQ-02-Nachfolgers ist Run
+`34328529159`, Job `102391380221`, auf
+`b4b154e5fa6ba39824088978417489a89e9f9794`; Details und die vollständige
+Messfolge stehen in `docs/reports/cq-02-domain-projection-load.md`.
 
 `apps/api/tests/db_multi_instance_foundation.rs` baut gegen eine isolierte
 PostgreSQL-Datenbank und einen JetStream-Server auf:

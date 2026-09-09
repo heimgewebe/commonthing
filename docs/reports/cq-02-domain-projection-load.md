@@ -8,16 +8,17 @@ lifecycle: proof
 owner_task: WELTGEWEBE-OS-002
 canonicality: evidence
 created: 2026-09-07
-last_reviewed: 2026-09-08
+last_reviewed: 2026-09-09
 review_after: 2027-01-08
 lang: de
 summary: >
   Messgebundener CQ-02-Abschluss für die PostgreSQL-Domain-Projektion. Der
   unveränderte 1k/100k-Mixed-Load-Vertrag belegt auf API-Commit
-  9be2048de8f56ee65184cba113016336f6742602 bei 100.000 Nodes und
+  b4b154e5fa6ba39824088978417489a89e9f9794 bei 100.000 Nodes und
   500.000 Edges 15/15 erfolgreiche PATCHes, 0 dropped iterations, 0 HTTP 503
-  und 0 Full-Reloads. Der lokale V→V+1-Handoff ist transaktionsgebunden vor
-  COMMIT markiert; Session-Requests und Mutationen bleiben strict-current.
+  und 0 Full-Reloads. Cache-Publish und Fast-Forward verlangen einen wirklich
+  erworbenen Handoff-Guard; die gesamte Klassifikation teilt ein 1-s-Budget,
+  und Notify ersetzt 1-ms-Polling, während der Marker alleinige Wahrheit bleibt.
 relations:
   - type: relates_to
     target: docs/reports/domain-postgres-instance-coherence-decision.md
@@ -58,28 +59,30 @@ Die finale Lösung bleibt schmal:
    während eines bereits laufenden Generation-Checks/Reloads die vorherige
    **vollständige** Projektion weiterverwenden;
 2. ein isolierter lokaler PostgreSQL-Node-PATCH darf genau eine nachgewiesene
-   Generation V→V+1 lokal fast-forwarden;
+   Generation V→V+1 nur dann lokal publizieren und fast-forwarden, wenn der
+   transaktionsgebundene Handoff-Guard tatsächlich erworben wurde;
 3. dieser lokale Handoff wird nicht aus `nodes_persist` abgeleitet, sondern
    **innerhalb derselben PostgreSQL-Transaktion** nach dem Node-UPDATE/Trigger und
    vor COMMIT markiert, solange die Transaktion die Projektionsversionszeile
    gesperrt hält;
 4. ein strict-current Request, der exakt diesen lokalen V+1-Handoff sieht,
-   wartet ausschließlich auf **diesen Marker**. Die kumulierte tatsächliche
-   Marker-Wartezeit ist auf 1 Sekunde begrenzt; danach wird fail-closed abgebrochen.
-   Nach Marker-Clear werden DB-, Marker- und lokale Generation neu klassifiziert,
-   ohne redundanten O(N)-Reload.
+   wartet auf eine `Notify`-Weckung und prüft danach erneut den Marker. Der
+   Marker bleibt die alleinige Zustandswahrheit. DB-Abfragen, erneute
+   Klassifikationsrunden und Handoff-Warten teilen ein einziges kumulatives
+   1-Sekunden-Budget plus explizites Iterationslimit; bei Erschöpfung endet der
+   Pfad fail-closed statt den Single-Flight-Koordinator unbegrenzt zu halten.
 
 Externe oder mehrfache Drift wird nicht verdeckt. Session-Requests und Mutationen
 bleiben strict-current.
 
 ## Exakte Evidence-Bindung
 
-Terminaler CQ-02-Lastvertrag:
+Aktueller CQ-02-Nachfolger-Lastvertrag:
 
-- GitHub Actions Run: `34223676110`
-- Job: `102052513492`
+- GitHub Actions Run: `34328529159`
+- Job: `102391380221`
 - gemessener API-Commit:
-  `9be2048de8f56ee65184cba113016336f6742602`
+  `b4b154e5fa6ba39824088978417489a89e9f9794`
 - Workflow: `.github/workflows/domain-projection-load.yml`
 - Dataset `scale_100k`: 100.000 Nodes / 500.000 Edges
 - Mixed-Dauer: 30 Sekunden
@@ -102,7 +105,7 @@ Der Summarizer ist fail-closed. Ein CQ-02-Lauf wird rot bei:
 
 Wenn dieser Bericht in einem späteren docs-only Commit liegt, ist der Docs-Commit
 **nicht** der gemessene Runtime-Code. Die Messwahrheit bleibt an
-`9be2048de8f56ee65184cba113016336f6742602` gebunden.
+`b4b154e5fa6ba39824088978417489a89e9f9794` gebunden.
 
 ## Messpfad
 
@@ -149,6 +152,7 @@ Die Entwicklung ist absichtlich als Messfolge erhalten:
 | `22d2eea…` | 34218911401 | CQ-02-Vertrag grün | — | 0 | Marker-before-local Load-Ordering + 1-s-Timeout bei festhängendem Handoff |
 | `af8b5198…` | 34221412242 | **16/16, 0 Drops** | **148,75 ms** | **0** | stale DB read bei lokal bereits publiziertem V+1 wird billig bestätigt; Restore-Regression ergänzt |
 | `9be2048d…` | 34223676110 | **15/15, 0 Drops** | **58,3 ms** | **0** | finaler Runtime-Head: maximal 1 s kumulierte tatsächliche Marker-Wartezeit |
+| `b4b154e5…` | 34328529159 | **15/15, 0 Drops** | **70,5 ms** | **0** | CQ-02-Nachfolger: Guard-Ownership bindet Publish/Fast-Forward; gesamte Klassifikation 1 s budgetiert; Notify statt 1-ms-Polling |
 
 Der zwischenzeitliche Run `34187986270` war besonders wichtig: Er war unter
 dem damaligen Harness formal grün, obwohl vier Full-Reloads und Writer-Tails im
@@ -185,9 +189,12 @@ semantischer No-op-PATCH liefert `None` und beansprucht keine lokale Generation.
 
 Ist `transaction_version == local + 1`, versucht der Prozess per
 `compare_exchange(NO_HANDOFF, expected)` genau diesen Handoff zu markieren. Ein
-bereits aktiver Marker wird **nicht überschrieben**. Der RAII-Guard bleibt über
-COMMIT, Cache-Publikation und den lokalen Versions-Fast-Forward bestehen; sein
-`Drop` löscht nur den von ihm selbst erwarteten Marker per CAS.
+bereits aktiver Marker wird **nicht überschrieben**. Erst ein tatsächlich
+erworbener RAII-Guard beweist Ownership der nächsten lokalen Generation; ohne
+Guard werden weder der einzelne Node in den Cache publiziert noch die lokale
+Projektionsversion fast-forwarded. Der Guard bleibt über COMMIT, Cache-Publikation
+und den lokalen Versions-Fast-Forward bestehen; sein `Drop` löscht nur den von
+ihm selbst erwarteten Marker per CAS und weckt anschließend wartende Requests.
 
 Damit existiert weder das alte „Mutex gehalten = unser V+1“-Problem noch das
 spätere Scheduler-Fenster „COMMIT sichtbar, Marker noch -1“.
@@ -211,26 +218,31 @@ beide Situationen und ist deshalb **keine reine Reload-Alarmmetrik**.
 
 Mutationen und Requests mit `gewebe_session` sind strict-current. Sehen sie exakt
 den markierten lokalen V+1-Handoff, starten sie nicht spekulativ einen
-Full-Reload. Sie halten den bestehenden Single-Flight-Koordinator und warten nur,
-solange **genau der beobachtete Handoff-Marker** aktiv ist. `nodes_persist` wird
-weder als Herkunftsbeweis noch als Completion-Signal verwendet.
+Full-Reload. Sie halten den bestehenden Single-Flight-Koordinator und warten auf
+eine `tokio::sync::Notify`-Weckung. `Notify` ist ausschließlich die Klingel:
+vor dem Warten, nach der Registrierung und nach jeder Weckung wird der atomare
+Handoff-Marker erneut geprüft; er bleibt die alleinige Zustandswahrheit. Das
+verhindert verlorene Weckungen, ohne einen zweiten Wahrheitskanal einzuführen.
+`nodes_persist` wird weder als Herkunftsbeweis noch als Completion-Signal verwendet.
 
-Die Wartezeit ist liveness-bounded: Über eine Kette unmittelbar folgender lokaler
-Handoffs werden höchstens 1 Sekunde **tatsächlicher Marker-Wartezeit** kumuliert.
-PostgreSQL-Roundtrips zwischen bereits abgeschlossenen Handoffs zählen nicht in
-dieses Budget. Bleibt ein Marker hängen, endet der strict Refresh fail-closed mit
-einem Fehler statt unbegrenzt zu blockieren oder unter behaupteter Ownership
-spekulativ voll zu laden. Nach jedem Marker-Clear startet die billige
-Klassifikation erneut.
+Die gesamte billige Klassifikationsphase ist liveness-bounded. Sie erhält genau
+ein kumulatives 1-Sekunden-Deadline-Budget plus ein explizites Iterationslimit.
+In dieses Budget fallen die PostgreSQL-Versionsabfragen, erneute
+Klassifikationsrunden bei sich verändernden Generationen und das Warten auf einen
+aktiven lokalen Handoff. Kein Teil darf sich durch einen neuen Schleifendurchlauf
+ein frisches Sekundenbudget verschaffen. Ist die Deadline oder das
+Iterationsbudget erschöpft, endet der strict Refresh fail-closed statt den
+Single-Flight-Koordinator unbegrenzt zu halten.
 
 Für die Handoff-Ende-Klassifikation wird der Marker per Acquire **vor** der
 lokalen Projection-Version geladen. Der Writer publiziert die lokale Version
 vor dem CAS-Clear des RAII-Guards. Wer das Clear beobachtet, muss deshalb beim
 anschließenden Versionsload auch die vorangegangene Veröffentlichung sehen.
 
-Die Regressionen stellen sowohl einen wartenden zweiten Writer als auch einen
-absichtlich festhängenden Marker nach. Der erste darf das Warten auf Handoff A
-nicht verlängern; der zweite muss innerhalb der 1-s-Grenze fail-closed enden.
+Die neuen Regressionen beweisen zusätzlich: Guard-loser V+1-Besitz ist kein
+Publish-/Fast-Forward-Recht; ein vor Registrierung gelöschter Marker geht nicht
+als Wake-up verloren; eine spurious Notify-Weckung beendet keinen aktiven
+Handoff; und ein festhängender Marker bleibt bounded/fail-closed.
 
 ### 5. Externe Drift und lokale Ahead-Races bleiben konservativ
 
@@ -276,11 +288,13 @@ Weitere Invarianten:
 - kein blindes Vorspulen über externe Drift;
 - der lokale Marker ist single-owner per CAS;
 - No-op-PATCHes beanspruchen keine Generation;
-- Fast-Forward nur bei exakt einer erwarteten Node-PATCH-Generation;
-- Single-Node-Cache-Publish nur, wenn die lokale Transaktion die komplette nächste
-  Generation tatsächlich selbst beweist;
+- Fast-Forward nur bei exakt einer erwarteten Node-PATCH-Generation **und**
+  tatsächlich erworbenem Handoff-Guard;
+- Single-Node-Cache-Publish nur unter derselben Guard-Ownership; ein passender
+  Versionswert ohne Guard reicht ausdrücklich nicht;
 - Marker wird beim Refresh vor der lokalen Version gelesen;
-- strict Handoff-Warten ist markergebunden und auf 1 s tatsächliche Wartezeit begrenzt;
+- die gesamte strict Klassifikation teilt ein kumulatives 1-s-Budget; Notify
+  ersetzt Polling, während der Marker alleinige Wahrheit bleibt;
 - ein Fehler beim optionalen Post-Commit-Versionsreadback macht einen bereits
   committed PATCH nicht nachträglich zum falschen HTTP 500;
 - die Projection-Duration-Histogramme reichen bis 30 s und können die historisch
@@ -291,12 +305,12 @@ Weitere Invarianten:
 
 ### Smoke read-heavy
 
-- Reads: 184.475
-- Ø 1,509 ms
-- p50 1,290 ms
-- p95 3,296 ms
-- p99 5,062 ms
-- max 44,938 ms
+- Reads: 157.630
+- Ø 1,749 ms
+- p50 1,470 ms
+- p95 3,885 ms
+- p99 6,061 ms
+- max 43,868 ms
 - Read-Fehler: 0
 - HTTP 503: 0
 - dropped iterations: 0
@@ -306,23 +320,23 @@ Weitere Invarianten:
 
 Reads:
 
-- 189.958
-- Ø 1,459 ms
-- p50 1,253 ms
-- p95 3,179 ms
-- p99 4,805 ms
-- max 23,674 ms
+- 162.569
+- Ø 1,691 ms
+- p50 1,437 ms
+- p95 3,700 ms
+- p99 5,664 ms
+- max 22,960 ms
 - Read-Fehler: 0
 - HTTP 503: 0
 
 Writes:
 
 - 16/16 erfolgreich
-- Ø 36,313 ms
-- p50 35 ms
-- p95 51,25 ms
-- p99 51,85 ms
-- max 52 ms
+- Ø 46,063 ms
+- p50 41 ms
+- p95 83 ms
+- p99 95 ms
+- max 98 ms
 - Write-Fehler: 0
 - dropped iterations: 0
 
@@ -336,41 +350,41 @@ Projection:
 ### 100k read-heavy
 
 - 100.000 Nodes / 500.000 Edges
-- Reads: 185.393
-- Ø 1,498 ms
-- p50 1,285 ms
-- p95 3,249 ms
-- p99 4,989 ms
-- max 43,184 ms
+- Reads: 164.980
+- Ø 1,672 ms
+- p50 1,433 ms
+- p95 3,622 ms
+- p99 5,558 ms
+- max 26,014 ms
 - Read-Fehler: 0
 - HTTP 503: 0
 - dropped iterations: 0
 - Full-Reloads: 0
-- API Peak Memory: 595.381.453 Bytes
-- API Peak CPU: 212,72 %
+- API Peak Memory: 597.268.890 Bytes
+- API Peak CPU: 207,03 %
 - max. PostgreSQL-Verbindungen: 12
 
-### 100k mixed — terminaler CQ-02-Beweis
+### 100k mixed — terminaler CQ-02-Nachfolger-Beweis
 
 Reads:
 
-- **186.655**
-- Ø **1,485 ms**
-- p50 1,275 ms
-- p95 **3,209 ms**
-- p99 **4,825 ms**
-- max 26,474 ms
+- **160.230**
+- Ø **1,723 ms**
+- p50 1,464 ms
+- p95 **3,770 ms**
+- p99 **5,674 ms**
+- max 24,073 ms
 - Read-Fehler: 0
 - HTTP 503: 0
 
 Writes:
 
 - **15/15 erfolgreich**
-- Ø **35,8 ms**
-- p50 32 ms
-- p95 **58,3 ms**
-- p99 75,66 ms
-- max **80 ms**
+- Ø **46,333 ms**
+- p50 43 ms
+- p95 **70,5 ms**
+- p99 73,3 ms
+- max **74 ms**
 - Write-Fehler: 0
 - **dropped iterations: 0**
 
@@ -385,35 +399,49 @@ Projection:
 
 Ressourcen:
 
-- API Peak Memory: 596.744.602 Bytes
-- API Peak CPU: 212,91 %
+- API Peak Memory: 598.632.038 Bytes
+- API Peak CPU: 209,55 %
 - max. PostgreSQL-Verbindungen: 11
 
 ## Regressionsevidence
 
-Auf dem finalen Runtime-Head bestanden lokal und in der PR-CI:
+Auf `b4b154e5fa6ba39824088978417489a89e9f9794` wurden für den Nachfolger
+gezielt ausgeführt:
 
-- API-Lib-Tests: 555 PASS, 0 failed, 10 bewusst ignoriert;
-- direkter PostgreSQL-Node-Write-Vertrag: **44/44 PASS**;
-- Clippy mit `-D warnings`;
-- Rustfmt und `git diff --check`;
-- CQ-02-Harness-Vertrag einschließlich negativer Fail-Closed-Fälle;
-- PostgreSQL-Integrationssuite und direkter Node-Write-Pfad in GitHub Actions;
-- Auth-/Governance-Proofs und CodeQL.
+- `cargo test -p weltgewebe-api state::tests:: -- --nocapture`: **11/11 PASS**;
+- Guard-Ownership-Regression in `routes::nodes`: **1/1 PASS**;
+- `cargo check --locked -p weltgewebe-api --all-targets`: PASS;
+- `cargo fmt --all -- --check` und `git diff --check`: PASS;
+- CQ-02-Harness-Vertrag: PASS;
+- Repo-Structure-, Docs-Relations- und Coverage-Guard: PASS;
+- Generated-Files-Guard: rot auf zwei bereits auf unverändertem `main` stale
+  generierten Report-Lifecycle-Dateien; derselbe Fehler wurde auf sauberem
+  `2beeb8e575ec83c0c8bdbb569997ef10dfd39249` reproduziert und ist daher kein
+  CQ-02-Nachfolger-Regressionseffekt. Direkte Edits unter `docs/_generated/`
+  bleiben verboten.
 
-Die Node-Write-Regressionen beweisen insbesondere:
+Der direkte PostgreSQL-Node-Write-Lauf ergab **43/44 PASS**. Der einzige rote
+Test `postgres_guest_exit_completes_under_projection_middleware` erhielt 503
+statt 403. Derselbe einzelne Test scheitert auf einer frischen Datenbank auch
+auf dem unveränderten Merge-Commit `2beeb8e575ec83c0c8bdbb569997ef10dfd39249`
+mit exakt demselben 503→403-Mismatch. Damit ist der Fehler als vorbestehender,
+außerhalb dieses CQ-02-Slices liegender Baseline-Fehler belegt; die Handoff-,
+No-op-, External-Drift-, Strict-Refresh- und Fast-Forward-Regressionen sind grün.
 
-- exakter lokaler +1-Fast-Forward;
-- externe/concurrent Drift wird nicht fast-forwarded;
-- anonymer safe read defert nur beim expliziten lokalen Handoff;
-- strict refresh wartet auf den aktuellen Handoff statt O(N) zu laden;
-- ein bereits wartender zweiter Writer verlängert diesen strict-Handoff nicht;
-- ein zweiter Handoff-Marker überschreibt den aktiven Marker nicht;
-- ein festhängender exakter Handoff endet bounded/fail-closed statt unendlich zu warten;
-- externe Vor-Drift verhindert partielles Single-Node-Publish in eine alte Generation;
-- ein lokal bereits publiziertes V+1 nach stale DB-Read löst keinen unnötigen Reload aus;
-- eine stabil niedrigere DB-Generation erzwingt Reconciliation;
-- ein No-op-PATCH erhält keinen lokalen Generationsmarker.
+Die neuen Regressionen beweisen insbesondere:
+
+- Cache-Publish und Fast-Forward verlangen den tatsächlich erworbenen Guard;
+- die Klassifikationsschleife ist sowohl zeitlich kumulativ als auch über eine
+  explizite Versuchszahl begrenzt;
+- Notify ersetzt 1-ms-Polling ohne verlorene Weckung;
+- spurious Notify-Weckungen ändern keine Wahrheit, weil der Marker erneut geprüft wird;
+- ein festhängender Marker endet bounded/fail-closed;
+- die bisherigen CQ-02-Invarianten zu exaktem +1, externer Drift, No-op-PATCH,
+  local-ahead DB-Reread und stabil niedriger Restore-Generation bleiben erhalten.
+
+Der reale Workflow-Run `34328529159` baut exakt denselben Commit und führt Smoke
+sowie `scale_100k` jeweils read-heavy und mixed mit `--max-reloads 0` aus. Alle
+vier Summaries sind grün.
 
 ## Bewusste Grenzen
 
