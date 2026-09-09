@@ -2347,14 +2347,82 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                         "pending_active_commit": pending,
                     },
                 ),
-                mock.patch.object(staging, "require_clean_commit", return_value=different),
+                mock.patch.object(staging, "require_clean_commit") as clean_commit,
                 mock.patch.object(staging, "load_promotion_receipt") as promotion,
                 mock.patch.object(staging.reference, "normalize_owned_cluster_repository") as normalize,
             ):
                 with self.assertRaisesRegex(staging.StagingCellError, "exact pending app commit"):
                     staging.command_activate(args)
+        clean_commit.assert_not_called()
         promotion.assert_not_called()
         normalize.assert_not_called()
+
+    def test_activation_recovery_same_pending_commit_does_not_recheck_moving_public_main(self) -> None:
+        bootstrap = "1" * 40
+        pending = "2" * 40
+        owner = "owner-a"
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=pending,
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-pending-main-advance-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(
+                    staging,
+                    "load_cell_receipt",
+                    return_value={
+                        "schema_version": 1,
+                        "cluster": staging.DEFAULT_CLUSTER,
+                        "owner_id": owner,
+                        "bootstrap_commit": bootstrap,
+                        "status": "app-activation-in-progress",
+                        "pending_active_commit": pending,
+                    },
+                ),
+                mock.patch.object(staging, "require_clean_commit", return_value=pending) as clean_commit,
+                mock.patch.object(
+                    staging,
+                    "load_promotion_receipt",
+                    side_effect=staging.StagingCellError("stop-after-commit-check"),
+                ),
+            ):
+                with self.assertRaisesRegex(staging.StagingCellError, "stop-after-commit-check"):
+                    staging.command_activate(args)
+        clean_commit.assert_called_once_with(
+            pending,
+            require_public_main=False,
+        )
+
+    def test_external_database_and_runtime_secrets_use_server_side_apply(self) -> None:
+        material = {
+            "database_user": "weltgewebe",
+            "database_name": "weltgewebe",
+            "database_password": "password-value",
+        }
+        with (
+            mock.patch.object(
+                staging,
+                "load_or_create_secret_material",
+                return_value=(material, "a" * 64),
+            ),
+            mock.patch.object(staging, "apply_yaml") as namespace_apply,
+            mock.patch.object(staging, "apply_yaml_server_side") as secret_apply,
+        ):
+            result = staging.inject_external_secrets("kubectl", Path("/unused"))
+        namespace_apply.assert_called_once()
+        secret_apply.assert_called_once()
+        self.assertEqual(
+            secret_apply.call_args.kwargs["field_manager"],
+            "weltgewebe-staging-secrets",
+        )
+        documents = secret_apply.call_args.args[1]
+        self.assertEqual({doc["kind"] for doc in documents}, {"Secret"})
+        self.assertNotIn(material["database_password"], json.dumps(result))
 
     def test_activate_public_output_redacts_promotion_details(self) -> None:
         result = {

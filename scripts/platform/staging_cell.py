@@ -1000,7 +1000,7 @@ def inject_external_secrets(kubectl: str, root: Path) -> dict[str, str]:
     runtime_database_url = database_url(material)
     annotations = {SECRET_SOURCE_ANNOTATION: source_sha}
     apply_yaml(kubectl, [namespace(DATA_NAMESPACE), namespace(APP_NAMESPACE)])
-    apply_yaml(
+    apply_yaml_server_side(
         kubectl,
         [
             {
@@ -1030,6 +1030,7 @@ def inject_external_secrets(kubectl: str, root: Path) -> dict[str, str]:
                 "stringData": {"database-url": runtime_database_url},
             },
         ],
+        field_manager="weltgewebe-staging-secrets",
     )
     return {"source_sha256": source_sha, "required_keys": ["database-url"]}
 
@@ -1900,16 +1901,24 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
     if args.owner_id != owner_id:
         raise StagingCellError("--owner-id does not match the persisted cluster owner")
     reference.validate_ownership_binding(bootstrap_commit, owner_id)
-    commit = require_clean_commit(args.source_commit)
     pending_commit = str(cell.get("pending_active_commit") or "")
-    if (
-        cell.get("status") == "app-activation-in-progress"
-        and pending_commit
-        and pending_commit != commit
-    ):
-        raise StagingCellError(
-            "activation recovery must resume the exact pending app commit"
+    activation_in_progress = cell.get("status") == "app-activation-in-progress"
+    if activation_in_progress:
+        if (
+            len(pending_commit) != 40
+            or any(ch not in "0123456789abcdef" for ch in pending_commit)
+        ):
+            raise StagingCellError("activation recovery has no canonical pending app commit")
+        if args.source_commit != pending_commit:
+            raise StagingCellError(
+                "activation recovery must resume the exact pending app commit"
+            )
+        commit = require_clean_commit(
+            args.source_commit,
+            require_public_main=False,
         )
+    else:
+        commit = require_clean_commit(args.source_commit)
     promotion = load_promotion_receipt(root, commit)
     registry_material, registry_source_sha = load_registry_pull_material(root)
     registry_pull_access = verify_ghcr_pull_access(registry_material, promotion)

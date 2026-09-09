@@ -105,7 +105,9 @@ durch die im Promotion-Receipt gebundenen unveränderlichen Digests. Vor der ers
 Clusteränderung schreibt `activate` ein nicht-geheimes
 `app-activation-in-progress`-Receipt. Ein Abbruch bleibt dadurch in `status` als
 degradiert sichtbar, und ein Wiederanlauf darf nur exakt denselben pending Commit
-fortsetzen.
+fortsetzen. Dieser bereits vor der ersten Clusteränderung geprüfte Commit darf zur
+Recovery weiterverwendet werden, auch wenn Public `main` inzwischen fortgeschritten
+ist; ein anderer Commit bleibt verboten.
 
 PostgreSQL und NATS verwenden statische, klassenlose und vorgebundene HostPath-PVs
 mit `Retain`. Persistente Daten werden ausschließlich in den ersten Kind-Worker
@@ -134,7 +136,9 @@ der Controller prüft damit beide exakten promoted Digests **vor** der ersten
 Cluster-Mutation und injiziert anschließend ein server-side-applied
 `kubernetes.io/dockerconfigjson`-Secret. Im Receipt bleiben nur Quell- und
 Dockerconfig-Hashes, Secretname und Registry; der Credentialwert wird nicht
-protokolliert oder in Git/Argumentlisten übernommen.
+protokolliert oder in Git/Argumentlisten übernommen. Auch Datenbank- und
+Runtime-Secret werden serverseitig angewandt, damit ihre Klarwerte nicht als
+`kubectl.kubernetes.io/last-applied-configuration` dupliziert werden.
 
 Nach dem Apply fordert jedes `up` über Flux' kanonische
 `reconcile.fluxcd.io/requestedAt`-Annotation zuerst eine neue Source-Reconciliation
