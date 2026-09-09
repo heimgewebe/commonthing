@@ -159,6 +159,18 @@ class StagingImagePromotionWorkflowTests(unittest.TestCase):
                     run.index(f'touch "build/staging-image-digests/{directory}/'),
                 )
 
+    def test_buildx_attestation_inspection_matches_pinned_input_shapes(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(text.count("{{json .Provenance.SLSA}}"), 2)
+        self.assertEqual(text.count("{{json .Image}}"), 2)
+        self.assertEqual(text.count("{{json .SBOM}}"), 2)
+        self.assertEqual(text.count("index .Provenance"), 1)
+        self.assertEqual(text.count(").SLSA}}"), 1)
+        self.assertEqual(text.count("index .Image"), 1)
+        self.assertEqual(text.count("index .SBOM"), 1)
+        self.assertNotIn("jq -e '.SLSA'", text)
+        self.assertNotIn("index .SLSA", text)
+
     def test_protected_main_is_revalidated_before_native_build_and_promotion(
         self,
     ) -> None:
