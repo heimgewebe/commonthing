@@ -155,12 +155,12 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "Runtime health, deployment health, or the correctness of claims inside individual reports."
   ],
-  "generated_at": "2026-09-09T12:28:41+02:00",
+  "generated_at": "2026-09-09T14:01:21+02:00",
   "limitations": [
     "The report reflects repository files only and does not execute product runtime checks."
   ],
   "schema_version": 1,
-  "source_revision": "30b4e3743a957c4f0e8538e6ffc69798093ddf67",
+  "source_revision": "babe2ba2842d55c380bf40b84a12d2835e8e2202",
   "sources": [
     {
       "path": "docs/reports/agent-readiness-audit.md",
