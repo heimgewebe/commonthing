@@ -71,12 +71,12 @@ function matchesContentType(
 }
 
 function matchesTopics(
-  topics: ReadonlySet<KnottingTopic>,
+  topics: readonly KnottingTopic[],
   selected: ReadonlySet<KnottingTopic>,
 ): boolean {
   if (selected.size === 0) return true;
-  for (const topic of selected) {
-    if (topics.has(topic)) return true;
+  for (const topic of topics) {
+    if (selected.has(topic)) return true;
   }
   return false;
 }
@@ -87,7 +87,7 @@ export function matchesMapContentFilters(
 ): boolean {
   return (
     matchesContentType(getMapContentType(entity), filters.contentTypes) &&
-    matchesTopics(new Set(getMapContentTopics(entity)), filters.topics)
+    matchesTopics(getMapContentTopics(entity), filters.topics)
   );
 }
 
@@ -109,33 +109,32 @@ export function evaluateMapContentFilters(
     contentTypeCounts.set(contentType, 0);
   }
   for (const topic of filters.topics) topicCounts.set(topic, 0);
-  const evaluated = entities.map((entity) => {
-    const contentType = getMapContentType(entity);
-    const topics = new Set(getMapContentTopics(entity));
-    contentTypeCounts.set(contentType, 0);
-    for (const topic of topics) topicCounts.set(topic, 0);
-    return { entity, contentType, topics };
-  });
 
   const visible: MapEntityViewModel[] = [];
   let allTopicsCount = 0;
-  for (const item of evaluated) {
-    const typeMatches = matchesContentType(
-      item.contentType,
-      filters.contentTypes,
-    );
-    const topicsMatch = matchesTopics(item.topics, filters.topics);
+  for (const entity of entities) {
+    const contentType = getMapContentType(entity);
+    const topics = getMapContentTopics(entity);
+    if (!contentTypeCounts.has(contentType)) {
+      contentTypeCounts.set(contentType, 0);
+    }
+    for (const topic of topics) {
+      if (!topicCounts.has(topic)) topicCounts.set(topic, 0);
+    }
 
-    if (typeMatches && topicsMatch) visible.push(item.entity);
+    const typeMatches = matchesContentType(contentType, filters.contentTypes);
+    const topicsMatch = matchesTopics(topics, filters.topics);
+
+    if (typeMatches && topicsMatch) visible.push(entity);
     if (typeMatches) allTopicsCount += 1;
     if (topicsMatch) {
       contentTypeCounts.set(
-        item.contentType,
-        (contentTypeCounts.get(item.contentType) ?? 0) + 1,
+        contentType,
+        (contentTypeCounts.get(contentType) ?? 0) + 1,
       );
     }
     if (typeMatches) {
-      for (const topic of item.topics) {
+      for (const topic of topics) {
         topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
       }
     }
