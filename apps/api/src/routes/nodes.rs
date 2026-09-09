@@ -3403,6 +3403,19 @@ pub async fn patch_node(
     patch_node_jsonl(state, id, payload).await
 }
 
+fn node_patch_owns_next_projection_generation(
+    transaction_projection_version: Option<i64>,
+    expected_projection_version: Option<i64>,
+    handoff_guard_acquired: bool,
+) -> bool {
+    handoff_guard_acquired
+        && matches!(
+            (transaction_projection_version, expected_projection_version),
+            (Some(transaction_version), Some(expected_version))
+                if transaction_version == expected_version
+        )
+}
+
 async fn patch_node_postgres(
     state: &ApiState,
     id: &str,
@@ -3425,7 +3438,7 @@ async fn patch_node_postgres(
     let projection_version_before = state.domain_projection_version.load(Ordering::Acquire);
 
     let expected_projection_version = projection_version_before.checked_add(1);
-    let (node, (transaction_projection_version, _projection_handoff_guard)) =
+    let (node, (transaction_projection_version, projection_handoff_guard)) =
         patch_node_in_postgres_with_projection_precommit(pool, id, patch, |transaction_version| {
             let projection_handoff_guard = transaction_version.and_then(|transaction_version| {
                 expected_projection_version
@@ -3468,10 +3481,10 @@ async fn patch_node_postgres(
     // mutation already advanced PostgreSQL, inserting this node would mix the
     // new row with older cached rows and destroy the complete-snapshot invariant
     // that anonymous reads rely on while reconciliation is in flight.
-    let owns_next_projection_generation = matches!(
-        (transaction_projection_version, expected_projection_version),
-        (Some(transaction_version), Some(expected_version))
-            if transaction_version == expected_version
+    let owns_next_projection_generation = node_patch_owns_next_projection_generation(
+        transaction_projection_version,
+        expected_projection_version,
+        projection_handoff_guard.is_some(),
     );
     if owns_next_projection_generation {
         let mut cache_guard = state.nodes.write().await;
@@ -3498,8 +3511,8 @@ async fn patch_node_postgres(
     // path then reconciles external or concurrent writes.
     match domain_projection_version(pool).await {
         Ok(observed_version) => {
-            if transaction_projection_version == Some(observed_version)
-                && expected_projection_version == Some(observed_version)
+            if owns_next_projection_generation
+                && transaction_projection_version == Some(observed_version)
             {
                 match state.domain_projection_version.compare_exchange(
                     projection_version_before,
@@ -3550,6 +3563,8 @@ async fn patch_node_postgres(
             );
         }
     }
+
+    drop(projection_handoff_guard);
 
     tracing::info!(node_id = %id, write_source = "postgres", "Node patch finished");
 
@@ -3906,6 +3921,30 @@ pub async fn list_nodes(
             .cloned()
             .collect();
         Ok(Json(ListResponse::Legacy(out)))
+    }
+}
+
+#[cfg(test)]
+mod postgres_node_patch_projection_ownership_tests {
+    use super::node_patch_owns_next_projection_generation;
+
+    #[test]
+    fn exact_v_plus_one_requires_the_acquired_handoff_guard() {
+        assert!(!node_patch_owns_next_projection_generation(
+            Some(42),
+            Some(42),
+            false,
+        ));
+        assert!(node_patch_owns_next_projection_generation(
+            Some(42),
+            Some(42),
+            true,
+        ));
+        assert!(!node_patch_owns_next_projection_generation(
+            Some(43),
+            Some(42),
+            true,
+        ));
     }
 }
 
