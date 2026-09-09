@@ -87,10 +87,25 @@ Clustererzeugung erzeugt bzw. validiert. Anschließend bindet ein
 `bootstrap-in-progress`-Receipt Owner, exakten Commit und Secretquellen-Hash,
 bevor Kind erzeugt wird. Dadurch bleiben auch abgebrochene Bootstraps
 wiederaufnehmbar oder über `down --owner-id <id>` kontrolliert abbaubar. Ein
-späteres `up` nach `down` bleibt am Receipt-Commit und am ursprünglichen Owner
-gebunden; ein stilles Umbinden an ein inzwischen weitergelaufenes `main` ist
-verboten. Ein Commitwechsel benötigt einen getrennten, ausdrücklich geprüften
-Upgrade-/Recovery-Pfad.
+späteres `up` nach `down` bleibt am Bootstrap-Commit und am ursprünglichen Owner
+gebunden; ein stilles Umbinden des Datenpfads an ein inzwischen weitergelaufenes
+`main` ist verboten. Sobald eine App-Aktivierung läuft oder erfolgreich
+abgeschlossen ist, verweigert `up` fail-closed eine Rückschreibung auf den
+Bootstrap-Zustand; Wiederherstellung einer aktivierten Zelle bleibt ein eigener,
+ausdrücklich geprüfter Recovery-Pfad.
+
+Ein **App-Release** ist davon getrennt: `activate --owner-id <id>
+--source-commit <sha>` akzeptiert nur einen exakten aktuellen Public-`main`-Commit
+mit passendem Staging-Image-Promotion-Receipt. PostgreSQL/NATS und ihre
+`weltgewebe-staging-source`-/Data-Kustomization bleiben dabei am Bootstrap-Commit.
+Für die App wird eine eigene commitgebundene GitRepository-Quelle
+`weltgewebe-staging-app-source` angelegt. Die statische Staging-Überlagerung behält
+weiter `promotion-required`; erst die Laufzeit-Kustomization ersetzt API und Web
+durch die im Promotion-Receipt gebundenen unveränderlichen Digests. Vor der ersten
+Clusteränderung schreibt `activate` ein nicht-geheimes
+`app-activation-in-progress`-Receipt. Ein Abbruch bleibt dadurch in `status` als
+degradiert sichtbar, und ein Wiederanlauf darf nur exakt denselben pending Commit
+fortsetzen.
 
 PostgreSQL und NATS verwenden statische, klassenlose und vorgebundene HostPath-PVs
 mit `Retain`. Persistente Daten werden ausschließlich in den ersten Kind-Worker
@@ -111,7 +126,15 @@ mit `app.kubernetes.io/name=weltgewebe-api` im exakten Namespace
 `weltgewebe-staging`. Die frühere namespaceweite Freigabe über das Legacy-Label
 `weltgewebe.net/data-client` ist für diese Staging-Datenpfade nicht maßgeblich.
 Neue Secret-Binding-Metadaten verwenden gemäß Naming-Policy den kanonischen
-Schlüssel `commonthing.net/external-secret-source-sha256`.
+Schlüssel `commonthing.net/external-secret-source-sha256`. Für private GHCR-Images
+verlangt `activate` zusätzlich die externe, nicht von Git erzeugte Datei
+`~/.local/state/weltgewebe/staging-cell/secrets/staging-registry.json` als
+owner-private Datei mit Modus `0600`. Sie enthält ausschließlich den Pull-Zugang;
+der Controller prüft damit beide exakten promoted Digests **vor** der ersten
+Cluster-Mutation und injiziert anschließend ein server-side-applied
+`kubernetes.io/dockerconfigjson`-Secret. Im Receipt bleiben nur Quell- und
+Dockerconfig-Hashes, Secretname und Registry; der Credentialwert wird nicht
+protokolliert oder in Git/Argumentlisten übernommen.
 
 Nach dem Apply fordert jedes `up` über Flux' kanonische
 `reconcile.fluxcd.io/requestedAt`-Annotation zuerst eine neue Source-Reconciliation
@@ -127,9 +150,12 @@ bereiten und aktualisierten Replikas melden. `status` verwendet dieselben
 Live-Workload-Schranken und degradiert bei fehlenden, stale oder nicht verfügbaren
 Ressourcen statt einen früheren Ready-Zustand fortzuschreiben.
 
-Die Staging-Zelle etabliert weiterhin weder Image-Promotion noch App-/Gateway-
-Aktivierung, Delete-to-Prove, NATS-Authentisierung/TLS oder einen
-Produktions-Kubernetes-Cutover. Diese Grenzen sind getrennt zu beweisen.
+Die Staging-Zelle kann damit eine erfolgreich promovierte API/Web-Version
+staging-only aktivieren und deren App-Source, Kustomization, Workloads, exakte
+Image-Digests sowie Registry-Secret-Bindung live zurücklesen. Sie etabliert
+weiterhin **keinen** Gateway-/DNS-/TLS-Außenbeweis, kein Delete-to-Prove, keine
+NATS-Authentisierung/TLS und keinen Produktions-Kubernetes-Cutover. Diese Grenzen
+sind getrennt zu beweisen.
 
 ## Beweise
 

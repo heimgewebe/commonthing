@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATE_ROOT = Path.home() / ".local/state/weltgewebe/staging-cell"
 DEFAULT_CLUSTER = "weltgewebe-staging"
 SOURCE_NAME = "weltgewebe-staging-source"
+APP_SOURCE_NAME = "weltgewebe-staging-app-source"
 DATA_KUSTOMIZATION = "weltgewebe-staging-data"
 APP_KUSTOMIZATION = "weltgewebe-staging-app"
 DATA_NAMESPACE = "weltgewebe-data"
@@ -598,7 +599,6 @@ def load_or_create_secret_material(root: Path) -> tuple[dict[str, str], str]:
     return {key: str(payload[key]) for key in required}, source_sha
 
 
-
 def load_registry_pull_material(root: Path) -> tuple[dict[str, str], str]:
     path = root / "secrets/staging-registry.json"
     try:
@@ -652,6 +652,25 @@ def registry_dockerconfig_json(material: dict[str, str]) -> str:
     )
 
 
+class _NoRegistryRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req,
+        fp,
+        code,
+        msg,
+        headers,
+        newurl,
+    ):
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+def registry_urlopen(request: urllib.request.Request):
+    opener = urllib.request.build_opener(_NoRegistryRedirectHandler())
+    return opener.open(request, timeout=15)
+
+
 def verify_ghcr_pull_access(
     material: dict[str, str], promotion: dict[str, Any]
 ) -> dict[str, bool]:
@@ -684,7 +703,7 @@ def verify_ghcr_pull_access(
             headers={"Authorization": f"Basic {basic}"},
         )
         try:
-            with urllib.request.urlopen(token_request, timeout=15) as response:
+            with registry_urlopen(token_request) as response:
                 token_payload = json.loads(response.read().decode("utf-8"))
             bearer = token_payload.get("token") or token_payload.get("access_token")
             if not isinstance(bearer, str) or not bearer:
@@ -705,7 +724,7 @@ def verify_ghcr_pull_access(
                 },
                 method="HEAD",
             )
-            with urllib.request.urlopen(manifest_request, timeout=15) as response:
+            with registry_urlopen(manifest_request) as response:
                 observed_digest = response.headers.get("Docker-Content-Digest")
         except (
             OSError,
@@ -726,7 +745,10 @@ def verify_ghcr_pull_access(
 
 
 def registry_secret_document_matches(
-    document: dict[str, Any], *, source_sha: str, expected_config: str
+    document: dict[str, Any],
+    *,
+    source_sha: str,
+    expected_config_sha256: str,
 ) -> bool:
     metadata = document.get("metadata") if isinstance(document, dict) else None
     annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
@@ -736,6 +758,7 @@ def registry_secret_document_matches(
         or metadata.get("namespace") != APP_NAMESPACE
         or not isinstance(annotations, dict)
         or annotations.get(REGISTRY_SOURCE_ANNOTATION) != source_sha
+        or "kubectl.kubernetes.io/last-applied-configuration" in annotations
         or document.get("type") != "kubernetes.io/dockerconfigjson"
     ):
         return False
@@ -749,7 +772,7 @@ def registry_secret_document_matches(
         observed = base64.b64decode(encoded, validate=True)
     except (ValueError, TypeError):
         return False
-    return hmac.compare_digest(observed, expected_config.encode("utf-8"))
+    return hmac.compare_digest(sha256_bytes(observed), expected_config_sha256)
 
 
 def inject_registry_pull_secret(
@@ -762,7 +785,8 @@ def inject_registry_pull_secret(
     if material is None or source_sha is None:
         material, source_sha = load_registry_pull_material(root)
     config = registry_dockerconfig_json(material)
-    apply_yaml(
+    config_sha256 = sha256_bytes(config.encode("utf-8"))
+    apply_yaml_server_side(
         kubectl,
         {
             "apiVersion": "v1",
@@ -773,20 +797,29 @@ def inject_registry_pull_secret(
                 "annotations": {REGISTRY_SOURCE_ANNOTATION: source_sha},
             },
             "type": "kubernetes.io/dockerconfigjson",
-            "stringData": {".dockerconfigjson": config},
+            "data": {
+                ".dockerconfigjson": base64.b64encode(
+                    config.encode("utf-8")
+                ).decode("ascii")
+            },
         },
+        field_manager="weltgewebe-staging-registry",
     )
     return {
         "source_sha256": source_sha,
+        "config_sha256": config_sha256,
         "secret_name": REGISTRY_SECRET,
         "registry": GHCR_REGISTRY,
     }
 
 
-def verify_registry_pull_secret_binding(kubectl: str, root: Path) -> dict[str, Any]:
+def verify_registry_pull_secret_binding(
+    kubectl: str,
+    *,
+    expected_source_sha: str,
+    expected_config_sha256: str,
+) -> dict[str, Any]:
     try:
-        material, source_sha = load_registry_pull_material(root)
-        expected_config = registry_dockerconfig_json(material)
         document = json.loads(
             output(
                 [
@@ -803,16 +836,17 @@ def verify_registry_pull_secret_binding(kubectl: str, root: Path) -> dict[str, A
         )
         ready = registry_secret_document_matches(
             document,
-            source_sha=source_sha,
-            expected_config=expected_config,
+            source_sha=expected_source_sha,
+            expected_config_sha256=expected_config_sha256,
         )
-    except (
-        StagingCellError,
-        subprocess.CalledProcessError,
-        json.JSONDecodeError,
-    ):
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
         return {"ready": False}
-    return {"ready": ready, "source_sha256": source_sha if ready else None}
+    return {
+        "ready": ready,
+        "source_sha256": expected_source_sha if ready else None,
+        "config_sha256": expected_config_sha256 if ready else None,
+    }
+
 
 def database_url(material: dict[str, str]) -> str:
     encoded_user = urllib.parse.quote(material["database_user"], safe="")
@@ -919,6 +953,30 @@ def apply_yaml(kubectl: str, documents: list[dict[str, Any]] | dict[str, Any]) -
     docs = documents if isinstance(documents, list) else [documents]
     body = yaml.safe_dump_all(docs, sort_keys=False, explicit_start=True)
     run([kubectl, "apply", "-f", "-"], input_text=body, timeout=120)
+
+
+def apply_yaml_server_side(
+    kubectl: str,
+    documents: list[dict[str, Any]] | dict[str, Any],
+    *,
+    field_manager: str,
+) -> None:
+    if not field_manager or any(character.isspace() for character in field_manager):
+        raise StagingCellError("server-side apply field manager is invalid")
+    docs = documents if isinstance(documents, list) else [documents]
+    body = yaml.safe_dump_all(docs, sort_keys=False, explicit_start=True)
+    run(
+        [
+            kubectl,
+            "apply",
+            "--server-side",
+            f"--field-manager={field_manager}",
+            "-f",
+            "-",
+        ],
+        input_text=body,
+        timeout=120,
+    )
 
 
 def namespace(name: str) -> dict[str, Any]:
@@ -1357,6 +1415,28 @@ def reconcile_data(kubectl: str, commit: str) -> str:
     return requested_at
 
 
+def require_bootstrap_data_current(kubectl: str, commit: str) -> dict[str, dict[str, Any]]:
+    states = {
+        "source": flux_resource_current_state(
+            kubectl, "gitrepository", SOURCE_NAME, commit
+        ),
+        "data": flux_resource_current_state(
+            kubectl, "kustomization", DATA_KUSTOMIZATION, commit
+        ),
+    }
+    unhealthy = {
+        name: state
+        for name, state in states.items()
+        if state.get("ready") != "True" or state.get("matches_commit") is not True
+    }
+    if unhealthy:
+        raise StagingCellError(
+            "staging bootstrap data plane is not current; refusing app activation: "
+            f"{unhealthy!r}"
+        )
+    return states
+
+
 def deployment_ready_state(kubectl: str, namespace: str, name: str) -> str:
     raw = output(
         [
@@ -1504,6 +1584,21 @@ def load_promotion_receipt(root: Path, commit: str) -> dict[str, Any]:
     }
 
 
+def app_source_document(commit: str) -> dict[str, Any]:
+    if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
+        raise StagingCellError("app source commit must be canonical 40-hex")
+    return {
+        "apiVersion": "source.toolkit.fluxcd.io/v1",
+        "kind": "GitRepository",
+        "metadata": {"name": APP_SOURCE_NAME, "namespace": "flux-system"},
+        "spec": {
+            "interval": "1m",
+            "url": PUBLIC_REPOSITORY,
+            "ref": {"commit": commit},
+        },
+    }
+
+
 def app_kustomization_document(commit: str, promotion: dict[str, Any]) -> dict[str, Any]:
     images = promotion.get("images") if isinstance(promotion, dict) else None
     if not isinstance(images, dict):
@@ -1542,7 +1637,7 @@ def app_kustomization_document(commit: str, promotion: dict[str, Any]) -> dict[s
             "prune": True,
             "wait": True,
             "dependsOn": [{"name": DATA_KUSTOMIZATION}],
-            "sourceRef": {"kind": "GitRepository", "name": SOURCE_NAME},
+            "sourceRef": {"kind": "GitRepository", "name": APP_SOURCE_NAME},
             "path": "./platform/apps/weltgewebe/overlays/staging",
             "patches": patches,
             "healthChecks": [
@@ -1560,6 +1655,14 @@ def app_kustomization_document(commit: str, promotion: dict[str, Any]) -> dict[s
 
 def reconcile_app(kubectl: str, commit: str) -> str:
     requested_at = f"staging-app-{time.time_ns()}"
+    request_flux_reconcile(kubectl, "gitrepository", APP_SOURCE_NAME, requested_at)
+    wait_flux_resource_current(
+        kubectl,
+        "gitrepository",
+        APP_SOURCE_NAME,
+        commit,
+        requested_at=requested_at,
+    )
     request_flux_reconcile(kubectl, "kustomization", APP_KUSTOMIZATION, requested_at)
     wait_flux_resource_current(
         kubectl,
@@ -1641,6 +1744,16 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
         persisted_owner = str(cell.get("owner_id") or "")
         if owner_id != persisted_owner:
             raise StagingCellError("--owner-id does not match the persisted cluster owner")
+        if (
+            cell.get("app_activation") is True
+            or cell.get("status") == "app-activation-in-progress"
+            or bool(cell.get("active_commit"))
+            or bool(cell.get("pending_active_commit"))
+        ):
+            raise StagingCellError(
+                "up cannot rewrite an activated or activating staging cell; "
+                "use activate or an explicit recovery path"
+            )
 
     _, source_sha = load_or_create_secret_material(root)
 
@@ -1788,9 +1901,40 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         raise StagingCellError("--owner-id does not match the persisted cluster owner")
     reference.validate_ownership_binding(bootstrap_commit, owner_id)
     commit = require_clean_commit(args.source_commit)
+    pending_commit = str(cell.get("pending_active_commit") or "")
+    if (
+        cell.get("status") == "app-activation-in-progress"
+        and pending_commit
+        and pending_commit != commit
+    ):
+        raise StagingCellError(
+            "activation recovery must resume the exact pending app commit"
+        )
     promotion = load_promotion_receipt(root, commit)
     registry_material, registry_source_sha = load_registry_pull_material(root)
     registry_pull_access = verify_ghcr_pull_access(registry_material, promotion)
+    require_bootstrap_data_current(kubectl, bootstrap_commit)
+    pending_config_sha256 = sha256_bytes(
+        registry_dockerconfig_json(registry_material).encode("utf-8")
+    )
+    activation_in_progress = {
+        **cell,
+        "status": "app-activation-in-progress",
+        "pending_active_commit": commit,
+        "pending_image_promotion": {
+            "source_commit": commit,
+            "receipt_sha256": promotion["receipt_sha256"],
+            "images": promotion["images"],
+        },
+        "pending_registry_pull_secret": {
+            "source_sha256": registry_source_sha,
+            "config_sha256": pending_config_sha256,
+            "secret_name": REGISTRY_SECRET,
+            "registry": GHCR_REGISTRY,
+        },
+        "production_changed": False,
+    }
+    write_cell_receipt(root, activation_in_progress)
     reference.normalize_owned_cluster_repository(
         kind,
         args.cluster,
@@ -1804,10 +1948,14 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         material=registry_material,
         source_sha=registry_source_sha,
     )
-    apply_yaml(kubectl, flux_documents(commit))
-    reconcile_data(kubectl, commit)
-    apply_yaml(kubectl, app_kustomization_document(commit, promotion))
+    if registry_secret_receipt.get("config_sha256") != pending_config_sha256:
+        raise StagingCellError("staging registry Secret hash drifted after preflight")
+    apply_yaml(
+        kubectl,
+        [app_source_document(commit), app_kustomization_document(commit, promotion)],
+    )
     reconcile_app(kubectl, commit)
+    require_bootstrap_data_current(kubectl, bootstrap_commit)
     workloads = app_live_health(kubectl)
     unhealthy = {name: state for name, state in workloads.items() if state != "True"}
     if unhealthy:
@@ -1819,7 +1967,11 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
             "staging app deployment images differ from promotion receipt: "
             f"expected={expected_images!r} observed={references!r}"
         )
-    registry_binding = verify_registry_pull_secret_binding(kubectl, root)
+    registry_binding = verify_registry_pull_secret_binding(
+        kubectl,
+        expected_source_sha=registry_secret_receipt["source_sha256"],
+        expected_config_sha256=registry_secret_receipt["config_sha256"],
+    )
     if registry_binding.get("ready") is not True:
         raise StagingCellError("staging registry pull Secret binding is not ready")
     promotion_state = {
@@ -1828,11 +1980,23 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         "receipt_sha256": promotion["receipt_sha256"],
         "images": references,
     }
+    terminal_cell = {
+        key: value
+        for key, value in cell.items()
+        if key
+        not in {
+            "pending_active_commit",
+            "pending_image_promotion",
+            "pending_registry_pull_secret",
+        }
+    }
     updated = {
-        **cell,
+        **terminal_cell,
         "status": "app-ready-gateway-pending",
         "active_commit": commit,
         "gitops_source_commit": commit,
+        "data_source_commit": bootstrap_commit,
+        "app_source_commit": commit,
         "external_secret": secret_receipt,
         "registry_pull_secret": registry_secret_receipt,
         "registry_pull_access": registry_pull_access,
@@ -1926,7 +2090,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
             "jsonpath={.status.artifact.revision}",
         ]
     ) or "missing"
-    source_matches_commit = flux_revision_matches_commit(source_revision, active_commit)
+    source_matches_commit = flux_revision_matches_commit(source_revision, bootstrap_commit)
     source_health_raw = output(
         [
             kubectl,
@@ -1987,7 +2151,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         else:
             data_ready = data_ready_status or "missing"
         data_revision = data_revision or "missing"
-        data_matches_commit = flux_revision_matches_commit(data_revision, active_commit)
+        data_matches_commit = flux_revision_matches_commit(data_revision, bootstrap_commit)
     pvcs = {
         pvc: output(
             [
@@ -2029,16 +2193,44 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
     infrastructure_ready = base_ready and all(
         value == "True" for value in live_workloads.values()
     )
+    activation_in_progress = owner.get("status") == "app-activation-in-progress"
+    pending_active_commit = str(owner.get("pending_active_commit") or "")
     activated = owner.get("app_activation") is True
     app_workloads = {name: "unchecked" for name in APP_DEPLOYMENTS}
     image_references: dict[str, str] = {}
     expected_images: dict[str, str] = {}
     registry_pull_secret = {"ready": False}
+    app_source_state = {
+        "ready": "unchecked",
+        "revision": "missing",
+        "matches_commit": False,
+    }
+    app_kustomization_state = {
+        "ready": "unchecked",
+        "revision": "missing",
+        "matches_commit": False,
+    }
     if activated and infrastructure_ready:
         try:
+            app_source_state = flux_resource_current_state(
+                kubectl, "gitrepository", APP_SOURCE_NAME, active_commit
+            )
+            app_kustomization_state = flux_resource_current_state(
+                kubectl, "kustomization", APP_KUSTOMIZATION, active_commit
+            )
             app_workloads = app_live_health(kubectl)
             image_references = app_image_references(kubectl)
-            registry_pull_secret = verify_registry_pull_secret_binding(kubectl, root)
+            registry_receipt = owner.get("registry_pull_secret")
+            if isinstance(registry_receipt, dict):
+                registry_pull_secret = verify_registry_pull_secret_binding(
+                    kubectl,
+                    expected_source_sha=str(
+                        registry_receipt.get("source_sha256") or ""
+                    ),
+                    expected_config_sha256=str(
+                        registry_receipt.get("config_sha256") or ""
+                    ),
+                )
         except (StagingCellError, subprocess.CalledProcessError):
             app_workloads = {name: "missing" for name in APP_DEPLOYMENTS}
         promotion = owner.get("image_promotion")
@@ -2049,13 +2241,17 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
     app_ready = (
         not activated
         or (
-            all(value == "True" for value in app_workloads.values())
+            app_source_state.get("ready") == "True"
+            and app_source_state.get("matches_commit") is True
+            and app_kustomization_state.get("ready") == "True"
+            and app_kustomization_state.get("matches_commit") is True
+            and all(value == "True" for value in app_workloads.values())
             and registry_pull_secret.get("ready") is True
             and bool(expected_images)
             and image_references == expected_images
         )
     )
-    ready = infrastructure_ready and app_ready
+    ready = infrastructure_ready and app_ready and not activation_in_progress
     promotion_state = (
         owner.get("image_promotion")
         if activated and isinstance(owner.get("image_promotion"), dict)
@@ -2078,9 +2274,17 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         "external_secret": external_secret,
         "live_workloads": live_workloads,
         "image_promotion": promotion_state,
+        "activation_in_progress": activation_in_progress,
+        "pending_active_commit": pending_active_commit,
         "app_activation": activated,
         "app_workloads": app_workloads,
         "app_image_references": image_references,
+        "app_source_revision": app_source_state.get("revision"),
+        "app_source_matches_commit": app_source_state.get("matches_commit") is True,
+        "app_kustomization_revision": app_kustomization_state.get("revision"),
+        "app_kustomization_matches_commit": (
+            app_kustomization_state.get("matches_commit") is True
+        ),
         "registry_pull_secret_ready": registry_pull_secret.get("ready") is True,
         "production_changed": False,
     }
@@ -2379,7 +2583,22 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
                         name: str(live.get(name) or "unchecked")
                         for name in LIVE_DEPLOYMENTS
                     },
+                    "activation_in_progress": bool(
+                        result.get("activation_in_progress")
+                    ),
+                    "pending_active_commit": str(
+                        result.get("pending_active_commit") or ""
+                    ),
                     "app_activation": bool(result.get("app_activation")),
+                    "registry_pull_secret_ready": bool(
+                        result.get("registry_pull_secret_ready")
+                    ),
+                    "app_source_matches_commit": bool(
+                        result.get("app_source_matches_commit")
+                    ),
+                    "app_kustomization_matches_commit": bool(
+                        result.get("app_kustomization_matches_commit")
+                    ),
                     "app_workloads": {
                         name: str(
                             (result.get("app_workloads") or {}).get(name) or "unchecked"

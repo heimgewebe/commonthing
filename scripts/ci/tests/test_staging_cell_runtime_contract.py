@@ -1743,7 +1743,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             FakeResponse(digest=web_digest),
         ]
         with mock.patch.object(
-            staging.urllib.request, "urlopen", side_effect=responses
+            staging, "registry_urlopen", side_effect=responses
         ) as urlopen:
             result = staging.verify_ghcr_pull_access(material, promotion)
         self.assertEqual(result, {"api": True, "web": True})
@@ -1769,7 +1769,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             FakeResponse(digest="sha256:" + "c" * 64),
         ]
         with mock.patch.object(
-            staging.urllib.request, "urlopen", side_effect=bad_responses
+            staging, "registry_urlopen", side_effect=bad_responses
         ):
             with self.assertRaisesRegex(
                 staging.StagingCellError, "digest mismatch"
@@ -1795,15 +1795,33 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 ".dockerconfigjson": base64.b64encode(config.encode("utf-8")).decode("ascii")
             },
         }
+        config_sha256 = staging.sha256_bytes(config.encode("utf-8"))
         self.assertTrue(
             staging.registry_secret_document_matches(
-                document, source_sha=source_sha, expected_config=config
+                document,
+                source_sha=source_sha,
+                expected_config_sha256=config_sha256,
             )
+        )
+        document["metadata"]["annotations"][
+            "kubectl.kubernetes.io/last-applied-configuration"
+        ] = "credential-copy"
+        self.assertFalse(
+            staging.registry_secret_document_matches(
+                document,
+                source_sha=source_sha,
+                expected_config_sha256=config_sha256,
+            )
+        )
+        document["metadata"]["annotations"].pop(
+            "kubectl.kubernetes.io/last-applied-configuration"
         )
         document["metadata"]["annotations"][staging.REGISTRY_SOURCE_ANNOTATION] = "8" * 64
         self.assertFalse(
             staging.registry_secret_document_matches(
-                document, source_sha=source_sha, expected_config=config
+                document,
+                source_sha=source_sha,
+                expected_config_sha256=config_sha256,
             )
         )
 
@@ -1880,7 +1898,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         document = staging.app_kustomization_document(commit, promotion)
         spec = document["spec"]
         self.assertEqual(spec["path"], "./platform/apps/weltgewebe/overlays/staging")
-        self.assertEqual(spec["sourceRef"]["name"], staging.SOURCE_NAME)
+        source = staging.app_source_document(commit)
+        self.assertEqual(source["metadata"]["name"], staging.APP_SOURCE_NAME)
+        self.assertEqual(source["spec"]["ref"]["commit"], commit)
+        self.assertEqual(spec["sourceRef"]["name"], staging.APP_SOURCE_NAME)
+        data_documents = staging.flux_documents("a" * 40)
+        self.assertEqual(
+            data_documents[1]["spec"]["sourceRef"]["name"], staging.SOURCE_NAME
+        )
+        self.assertNotEqual(staging.SOURCE_NAME, staging.APP_SOURCE_NAME)
         self.assertEqual(spec["dependsOn"], [{"name": staging.DATA_KUSTOMIZATION}])
         self.assertEqual(len(spec["patches"]), 2)
         rendered = "\n".join(item["patch"] for item in spec["patches"])
@@ -1909,6 +1935,14 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "receipt_sha256": "c" * 64,
             "images": {"api": api, "web": web},
         }
+        registry_material = {
+            "registry": staging.GHCR_REGISTRY,
+            "username": "registry-user",
+            "token": "registry-token",
+        }
+        registry_config_sha = staging.sha256_bytes(
+            staging.registry_dockerconfig_json(registry_material).encode("utf-8")
+        )
         with tempfile.TemporaryDirectory(prefix="staging-activate-") as tmp_name:
             root = Path(tmp_name)
             with (
@@ -1935,14 +1969,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(
                     staging,
                     "load_registry_pull_material",
-                    return_value=(
-                        {
-                            "registry": staging.GHCR_REGISTRY,
-                            "username": "registry-user",
-                            "token": "registry-token",
-                        },
-                        "e" * 64,
-                    ),
+                    return_value=(registry_material, "e" * 64),
                 ) as load_registry,
                 mock.patch.object(
                     staging,
@@ -1962,12 +1989,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     "inject_registry_pull_secret",
                     return_value={
                         "source_sha256": "e" * 64,
+                        "config_sha256": registry_config_sha,
                         "secret_name": staging.REGISTRY_SECRET,
                         "registry": staging.GHCR_REGISTRY,
                     },
                 ) as inject_registry,
                 mock.patch.object(staging, "apply_yaml") as apply_yaml,
-                mock.patch.object(staging, "reconcile_data") as reconcile_data,
+                mock.patch.object(
+                    staging, "require_bootstrap_data_current", return_value={}
+                ) as require_data,
                 mock.patch.object(staging, "reconcile_app") as reconcile_app,
                 mock.patch.object(
                     staging, "app_live_health", return_value={"api": "True", "web": "True"}
@@ -1978,8 +2008,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(
                     staging,
                     "verify_registry_pull_secret_binding",
-                    return_value={"ready": True, "source_sha256": "e" * 64},
-                ),
+                    return_value={
+                        "ready": True,
+                        "source_sha256": "e" * 64,
+                        "config_sha256": registry_config_sha,
+                    },
+                ) as verify_registry_binding,
                 mock.patch.object(
                     staging, "write_cell_receipt", return_value="/receipt.json"
                 ) as write_receipt,
@@ -1994,20 +2028,333 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             expected_owner_id=owner,
         )
         inject_registry.assert_called_once()
-        reconcile_data.assert_called_once_with("kubectl", active)
+        self.assertEqual(require_data.call_count, 2)
+        for call in require_data.call_args_list:
+            self.assertEqual(call.args, ("kubectl", bootstrap))
         reconcile_app.assert_called_once_with("kubectl", active)
-        self.assertEqual(apply_yaml.call_count, 2)
-        app_document = apply_yaml.call_args_list[1].args[1]
-        self.assertEqual(app_document["metadata"]["name"], staging.APP_KUSTOMIZATION)
+        apply_yaml.assert_called_once()
+        app_documents = apply_yaml.call_args.args[1]
+        self.assertEqual(len(app_documents), 2)
+        self.assertEqual(app_documents[0]["metadata"]["name"], staging.APP_SOURCE_NAME)
+        self.assertEqual(app_documents[0]["spec"]["ref"]["commit"], active)
+        self.assertEqual(app_documents[1]["metadata"]["name"], staging.APP_KUSTOMIZATION)
+        verify_registry_binding.assert_called_once_with(
+            "kubectl",
+            expected_source_sha="e" * 64,
+            expected_config_sha256=registry_config_sha,
+        )
         self.assertTrue(result["app_activation"])
         self.assertFalse(result["production_changed"])
         self.assertEqual(result["active_commit"], active)
-        stored = write_receipt.call_args.args[1]
+        self.assertEqual(write_receipt.call_count, 2)
+        pending = write_receipt.call_args_list[0].args[1]
+        self.assertEqual(pending["status"], "app-activation-in-progress")
+        self.assertEqual(pending["pending_active_commit"], active)
+        self.assertEqual(
+            pending["pending_registry_pull_secret"]["config_sha256"],
+            registry_config_sha,
+        )
+        self.assertEqual(
+            pending["pending_image_promotion"]["receipt_sha256"], "c" * 64
+        )
+        stored = write_receipt.call_args_list[-1].args[1]
         self.assertEqual(stored["bootstrap_commit"], bootstrap)
         self.assertEqual(stored["active_commit"], active)
+        self.assertEqual(stored["data_source_commit"], bootstrap)
+        self.assertEqual(stored["app_source_commit"], active)
+        self.assertNotIn("pending_active_commit", stored)
+        self.assertNotIn("pending_image_promotion", stored)
+        self.assertNotIn("pending_registry_pull_secret", stored)
         self.assertEqual(stored["image_promotion"]["images"], {"api": api, "web": web})
         self.assertEqual(stored["registry_pull_secret"]["secret_name"], staging.REGISTRY_SECRET)
         self.assertNotIn("token", json.dumps(stored["registry_pull_secret"]))
+
+    def test_up_refuses_to_rewrite_activated_cell_before_release_mutation(self) -> None:
+        owner = "owner-a"
+        bootstrap = "7" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=None,
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-up-activated-") as tmp_name:
+            root = Path(tmp_name)
+            (root / "receipts").mkdir(parents=True)
+            (root / "receipts/cell-bootstrap.json").write_text("{}\n", encoding="utf-8")
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "ensure_directory_durable"),
+                mock.patch.object(staging.os, "chmod"),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(
+                    staging.reference,
+                    "clusters",
+                    return_value=[staging.DEFAULT_CLUSTER],
+                ),
+                mock.patch.object(
+                    staging,
+                    "load_cell_receipt",
+                    return_value={
+                        "schema_version": 1,
+                        "cluster": staging.DEFAULT_CLUSTER,
+                        "owner_id": owner,
+                        "bootstrap_commit": bootstrap,
+                        "active_commit": "8" * 40,
+                        "app_activation": True,
+                    },
+                ),
+                mock.patch.object(staging, "require_clean_commit") as clean_commit,
+                mock.patch.object(staging, "apply_yaml") as apply_yaml,
+                mock.patch.object(staging, "write_cell_receipt") as write_receipt,
+            ):
+                with self.assertRaisesRegex(staging.StagingCellError, "activated or activating"):
+                    staging.command_up(args)
+        clean_commit.assert_not_called()
+        apply_yaml.assert_not_called()
+        write_receipt.assert_not_called()
+
+    def test_registry_secret_injection_uses_server_side_apply_and_persists_only_hashes(self) -> None:
+        material = {
+            "registry": staging.GHCR_REGISTRY,
+            "username": "registry-user",
+            "token": "registry-token",
+        }
+        source_sha = "9" * 64
+        with mock.patch.object(staging, "apply_yaml_server_side") as server_apply:
+            result = staging.inject_registry_pull_secret(
+                "kubectl",
+                Path("/unused"),
+                material=material,
+                source_sha=source_sha,
+            )
+        server_apply.assert_called_once()
+        self.assertEqual(server_apply.call_args.kwargs["field_manager"], "weltgewebe-staging-registry")
+        document = server_apply.call_args.args[1]
+        self.assertIn(".dockerconfigjson", document["data"])
+        decoded = base64.b64decode(document["data"][".dockerconfigjson"], validate=True)
+        self.assertEqual(
+            staging.sha256_bytes(decoded),
+            result["config_sha256"],
+        )
+        self.assertEqual(result["source_sha256"], source_sha)
+        self.assertEqual(len(result["config_sha256"]), 64)
+        self.assertNotIn(material["token"], json.dumps(result))
+
+    def test_server_side_secret_apply_never_requests_last_applied_annotation(self) -> None:
+        with mock.patch.object(staging, "run") as run:
+            staging.apply_yaml_server_side(
+                "kubectl",
+                {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {"name": "proof", "namespace": staging.APP_NAMESPACE},
+                    "type": "Opaque",
+                    "stringData": {"value": "sensitive"},
+                },
+                field_manager="weltgewebe-staging-registry",
+            )
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ["kubectl", "apply"])
+        self.assertIn("--server-side", argv)
+        self.assertIn("--field-manager=weltgewebe-staging-registry", argv)
+        self.assertNotIn("--save-config", argv)
+
+    def test_registry_redirect_handler_refuses_all_redirects(self) -> None:
+        handler = staging._NoRegistryRedirectHandler()
+        request = staging.urllib.request.Request("https://ghcr.io/token")
+        self.assertIsNone(
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "redirect",
+                {},
+                "https://example.invalid/other",
+            )
+        )
+
+    def test_activated_status_does_not_require_registry_pat_file(self) -> None:
+        owner = "owner-a"
+        bootstrap = "5" * 40
+        active = "6" * 40
+        source_sha = "a" * 64
+        config_sha = "b" * 64
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER)
+        live = {name: "True" for name in staging.LIVE_DEPLOYMENTS}
+        app_live = {name: "True" for name in staging.APP_DEPLOYMENTS}
+        images = {
+            "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "c" * 64,
+            "web": "ghcr.io/heimgewebe/commonthing-web@sha256:" + "d" * 64,
+        }
+        with tempfile.TemporaryDirectory(prefix="staging-activated-status-") as tmp_name:
+            root = Path(tmp_name)
+            self._write_bound_receipt(root, owner=owner, commit=bootstrap)
+            receipt_path = root / "receipts/cell-bootstrap.json"
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            payload.update(
+                {
+                    "active_commit": active,
+                    "app_activation": True,
+                    "image_promotion": {"images": images},
+                    "registry_pull_secret": {
+                        "source_sha256": source_sha,
+                        "config_sha256": config_sha,
+                        "secret_name": staging.REGISTRY_SECRET,
+                        "registry": staging.GHCR_REGISTRY,
+                    },
+                }
+            )
+            receipt_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "clusters", return_value=[staging.DEFAULT_CLUSTER]),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(
+                    staging,
+                    "output",
+                    side_effect=[
+                        f"main@sha1:{bootstrap}",
+                        "1|1|True",
+                        f"1|1|True|main@sha1:{bootstrap}",
+                        "Bound",
+                        "Bound",
+                    ],
+                ),
+                mock.patch.object(
+                    staging,
+                    "verify_external_secret_binding",
+                    return_value={"database": True, "runtime": True, "ready": True},
+                ),
+                mock.patch.object(staging, "staging_live_health", return_value=live),
+                mock.patch.object(
+                    staging,
+                    "flux_resource_current_state",
+                    side_effect=[
+                        {"ready": "True", "revision": f"sha1:{active}", "matches_commit": True},
+                        {"ready": "True", "revision": f"sha1:{active}", "matches_commit": True},
+                    ],
+                ),
+                mock.patch.object(staging, "app_live_health", return_value=app_live),
+                mock.patch.object(staging, "app_image_references", return_value=images),
+                mock.patch.object(
+                    staging,
+                    "verify_registry_pull_secret_binding",
+                    return_value={
+                        "ready": True,
+                        "source_sha256": source_sha,
+                        "config_sha256": config_sha,
+                    },
+                ) as verify_registry,
+                mock.patch.object(staging, "load_registry_pull_material") as load_registry,
+            ):
+                result = staging.command_status(args)
+        load_registry.assert_not_called()
+        verify_registry.assert_called_once_with(
+            "kubectl",
+            expected_source_sha=source_sha,
+            expected_config_sha256=config_sha,
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["app_source_matches_commit"])
+        self.assertTrue(result["app_kustomization_matches_commit"])
+        self.assertTrue(result["registry_pull_secret_ready"])
+
+    def test_status_degrades_while_app_activation_is_in_progress(self) -> None:
+        owner = "owner-a"
+        bootstrap = "5" * 40
+        pending = "6" * 40
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER)
+        live = {name: "True" for name in staging.LIVE_DEPLOYMENTS}
+        with tempfile.TemporaryDirectory(prefix="staging-pending-status-") as tmp_name:
+            root = Path(tmp_name)
+            self._write_bound_receipt(root, owner=owner, commit=bootstrap)
+            receipt_path = root / "receipts/cell-bootstrap.json"
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            payload.update(
+                {
+                    "status": "app-activation-in-progress",
+                    "pending_active_commit": pending,
+                    "app_activation": False,
+                }
+            )
+            receipt_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "clusters", return_value=[staging.DEFAULT_CLUSTER]),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(
+                    staging,
+                    "output",
+                    side_effect=[
+                        f"main@sha1:{bootstrap}",
+                        "1|1|True",
+                        f"1|1|True|main@sha1:{bootstrap}",
+                        "Bound",
+                        "Bound",
+                    ],
+                ),
+                mock.patch.object(
+                    staging,
+                    "verify_external_secret_binding",
+                    return_value={"database": True, "runtime": True, "ready": True},
+                ),
+                mock.patch.object(staging, "staging_live_health", return_value=live),
+                mock.patch.object(
+                    staging, "image_promotion_state", return_value={"status": "blocked"}
+                ),
+            ):
+                result = staging.command_status(args)
+        self.assertEqual(result["status"], "degraded")
+        self.assertTrue(result["activation_in_progress"])
+        self.assertEqual(result["pending_active_commit"], pending)
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            staging.emit_public_success("status", result)
+        public = json.loads(stream.getvalue())
+        self.assertTrue(public["activation_in_progress"])
+        self.assertEqual(public["pending_active_commit"], pending)
+
+    def test_activation_recovery_rejects_a_different_pending_commit_before_mutation(self) -> None:
+        bootstrap = "1" * 40
+        pending = "2" * 40
+        different = "3" * 40
+        owner = "owner-a"
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=different,
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-pending-resume-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(
+                    staging,
+                    "load_cell_receipt",
+                    return_value={
+                        "schema_version": 1,
+                        "cluster": staging.DEFAULT_CLUSTER,
+                        "owner_id": owner,
+                        "bootstrap_commit": bootstrap,
+                        "status": "app-activation-in-progress",
+                        "pending_active_commit": pending,
+                    },
+                ),
+                mock.patch.object(staging, "require_clean_commit", return_value=different),
+                mock.patch.object(staging, "load_promotion_receipt") as promotion,
+                mock.patch.object(staging.reference, "normalize_owned_cluster_repository") as normalize,
+            ):
+                with self.assertRaisesRegex(staging.StagingCellError, "exact pending app commit"):
+                    staging.command_activate(args)
+        promotion.assert_not_called()
+        normalize.assert_not_called()
 
     def test_activate_public_output_redacts_promotion_details(self) -> None:
         result = {
@@ -2061,9 +2408,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     staging,
                     "output",
                     side_effect=[
-                        f"main@sha1:{active}",
+                        f"main@sha1:{bootstrap}",
                         "1|1|True",
-                        f"1|1|True|main@sha1:{active}",
+                        f"1|1|True|main@sha1:{bootstrap}",
                         "Bound",
                         "Bound",
                     ],
