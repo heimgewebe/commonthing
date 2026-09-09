@@ -15,7 +15,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -28,18 +30,26 @@ DEFAULT_STATE_ROOT = Path.home() / ".local/state/weltgewebe/staging-cell"
 DEFAULT_CLUSTER = "weltgewebe-staging"
 SOURCE_NAME = "weltgewebe-staging-source"
 DATA_KUSTOMIZATION = "weltgewebe-staging-data"
+APP_KUSTOMIZATION = "weltgewebe-staging-app"
 DATA_NAMESPACE = "weltgewebe-data"
 APP_NAMESPACE = "weltgewebe-staging"
 DATABASE_SECRET = "weltgewebe-staging-database"
 RUNTIME_SECRET = "weltgewebe-runtime"
+REGISTRY_SECRET = "weltgewebe-staging-registry"
+GHCR_REGISTRY = "ghcr.io"
 LIVE_DEPLOYMENTS = {
     "postgres": (DATA_NAMESPACE, "postgres"),
     "nats": (DATA_NAMESPACE, "nats"),
     "source-controller": ("flux-system", "source-controller"),
     "kustomize-controller": ("flux-system", "kustomize-controller"),
 }
+APP_DEPLOYMENTS = {
+    "api": (APP_NAMESPACE, "weltgewebe-api"),
+    "web": (APP_NAMESPACE, "weltgewebe-web"),
+}
 PUBLIC_REPOSITORY = "https://github.com/heimgewebe/commonthing"
 SECRET_SOURCE_ANNOTATION = "commonthing.net/external-secret-source-sha256"
+REGISTRY_SOURCE_ANNOTATION = "commonthing.net/registry-secret-source-sha256"
 DATA_KUSTOMIZATION_TIMEOUT = "8m"
 DATA_KUSTOMIZATION_TIMEOUT_SECONDS = 8 * 60.0
 PVC_BIND_TIMEOUT_SECONDS = 45.0
@@ -447,6 +457,15 @@ def require_receipt_cluster(cell: dict[str, Any], cluster: str) -> None:
         )
 
 
+def cell_active_commit(cell: dict[str, Any]) -> str:
+    bootstrap = str(cell.get("bootstrap_commit") or "")
+    active = str(cell.get("active_commit") or bootstrap)
+    for label, value in (("bootstrap_commit", bootstrap), ("active_commit", active)):
+        if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+            raise StagingCellError(f"cell receipt has no canonical {label}")
+    return active
+
+
 def recorded_secret_source_sha(root: Path) -> str | None:
     receipt_path = root / "receipts/cell-bootstrap.json"
     if not receipt_path.exists():
@@ -578,6 +597,222 @@ def load_or_create_secret_material(root: Path) -> tuple[dict[str, str], str]:
         )
     return {key: str(payload[key]) for key in required}, source_sha
 
+
+
+def load_registry_pull_material(root: Path) -> tuple[dict[str, str], str]:
+    path = root / "secrets/staging-registry.json"
+    try:
+        linked = path.lstat()
+    except OSError as error:
+        raise StagingCellError(
+            "staging registry credential source is missing; provide an owner-private external "
+            "read:packages credential at secrets/staging-registry.json"
+        ) from error
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or stat.S_IMODE(linked.st_mode) != 0o600
+    ):
+        raise StagingCellError(
+            "staging registry credential source must be an owner-owned mode-0600 regular file"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeError) as error:
+        raise StagingCellError("staging registry credential source is malformed") from error
+    required = ("registry", "username", "token")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("registry") != GHCR_REGISTRY
+        or any(
+            not isinstance(payload.get(key), str)
+            or not payload[key]
+            or any(character in payload[key] for character in "\r\n\x00")
+            for key in required
+        )
+    ):
+        raise StagingCellError("staging registry credential source is malformed")
+    return {key: str(payload[key]) for key in required}, sha256_file(path)
+
+
+def registry_dockerconfig_json(material: dict[str, str]) -> str:
+    if material.get("registry") != GHCR_REGISTRY:
+        raise StagingCellError("staging registry credential targets an unexpected registry")
+    username = material.get("username") or ""
+    token = material.get("token") or ""
+    if not username or not token:
+        raise StagingCellError("staging registry credential is incomplete")
+    auth = base64.b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+    return json.dumps(
+        {"auths": {GHCR_REGISTRY: {"auth": auth}}},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def verify_ghcr_pull_access(
+    material: dict[str, str], promotion: dict[str, Any]
+) -> dict[str, bool]:
+    username = material.get("username") or ""
+    token = material.get("token") or ""
+    if material.get("registry") != GHCR_REGISTRY or not username or not token:
+        raise StagingCellError("staging registry credential is incomplete")
+    images = promotion.get("images") if isinstance(promotion, dict) else None
+    if not isinstance(images, dict):
+        raise StagingCellError("promotion evidence has no verified images")
+    basic = base64.b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+    verified: dict[str, bool] = {}
+    for label in ("api", "web"):
+        reference_value = images.get(label)
+        if not isinstance(reference_value, str) or "@sha256:" not in reference_value:
+            raise StagingCellError(f"verified {label} image is not digest-bound")
+        prefix = f"{GHCR_REGISTRY}/"
+        if not reference_value.startswith(prefix):
+            raise StagingCellError(f"verified {label} image targets an unexpected registry")
+        repository, digest = reference_value[len(prefix):].rsplit("@", 1)
+        canonical_image_digest(digest, label=label)
+        query = urllib.parse.urlencode(
+            {
+                "service": GHCR_REGISTRY,
+                "scope": f"repository:{repository}:pull",
+            }
+        )
+        token_request = urllib.request.Request(
+            f"https://{GHCR_REGISTRY}/token?{query}",
+            headers={"Authorization": f"Basic {basic}"},
+        )
+        try:
+            with urllib.request.urlopen(token_request, timeout=15) as response:
+                token_payload = json.loads(response.read().decode("utf-8"))
+            bearer = token_payload.get("token") or token_payload.get("access_token")
+            if not isinstance(bearer, str) or not bearer:
+                raise StagingCellError(
+                    f"registry pull preflight returned no bearer token for {label}"
+                )
+            manifest_request = urllib.request.Request(
+                f"https://{GHCR_REGISTRY}/v2/{repository}/manifests/{digest}",
+                headers={
+                    "Authorization": f"Bearer {bearer}",
+                    "Accept": ", ".join(
+                        (
+                            "application/vnd.oci.image.index.v1+json",
+                            "application/vnd.docker.distribution.manifest.list.v2+json",
+                            "application/vnd.oci.image.manifest.v1+json",
+                        )
+                    ),
+                },
+                method="HEAD",
+            )
+            with urllib.request.urlopen(manifest_request, timeout=15) as response:
+                observed_digest = response.headers.get("Docker-Content-Digest")
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+        ) as error:
+            raise StagingCellError(
+                f"registry pull preflight failed for promoted {label} image"
+            ) from error
+        if observed_digest != digest:
+            raise StagingCellError(
+                f"registry pull preflight digest mismatch for promoted {label} image"
+            )
+        verified[label] = True
+    return verified
+
+
+def registry_secret_document_matches(
+    document: dict[str, Any], *, source_sha: str, expected_config: str
+) -> bool:
+    metadata = document.get("metadata") if isinstance(document, dict) else None
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != REGISTRY_SECRET
+        or metadata.get("namespace") != APP_NAMESPACE
+        or not isinstance(annotations, dict)
+        or annotations.get(REGISTRY_SOURCE_ANNOTATION) != source_sha
+        or document.get("type") != "kubernetes.io/dockerconfigjson"
+    ):
+        return False
+    data = document.get("data")
+    if not isinstance(data, dict):
+        return False
+    encoded = data.get(".dockerconfigjson")
+    if not isinstance(encoded, str):
+        return False
+    try:
+        observed = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(observed, expected_config.encode("utf-8"))
+
+
+def inject_registry_pull_secret(
+    kubectl: str,
+    root: Path,
+    *,
+    material: dict[str, str] | None = None,
+    source_sha: str | None = None,
+) -> dict[str, str]:
+    if material is None or source_sha is None:
+        material, source_sha = load_registry_pull_material(root)
+    config = registry_dockerconfig_json(material)
+    apply_yaml(
+        kubectl,
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": REGISTRY_SECRET,
+                "namespace": APP_NAMESPACE,
+                "annotations": {REGISTRY_SOURCE_ANNOTATION: source_sha},
+            },
+            "type": "kubernetes.io/dockerconfigjson",
+            "stringData": {".dockerconfigjson": config},
+        },
+    )
+    return {
+        "source_sha256": source_sha,
+        "secret_name": REGISTRY_SECRET,
+        "registry": GHCR_REGISTRY,
+    }
+
+
+def verify_registry_pull_secret_binding(kubectl: str, root: Path) -> dict[str, Any]:
+    try:
+        material, source_sha = load_registry_pull_material(root)
+        expected_config = registry_dockerconfig_json(material)
+        document = json.loads(
+            output(
+                [
+                    kubectl,
+                    "-n",
+                    APP_NAMESPACE,
+                    "get",
+                    "secret",
+                    REGISTRY_SECRET,
+                    "-o",
+                    "json",
+                ]
+            )
+        )
+        ready = registry_secret_document_matches(
+            document,
+            source_sha=source_sha,
+            expected_config=expected_config,
+        )
+    except (
+        StagingCellError,
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+    ):
+        return {"ready": False}
+    return {"ready": ready, "source_sha256": source_sha if ready else None}
 
 def database_url(material: dict[str, str]) -> str:
     encoded_user = urllib.parse.quote(material["database_user"], safe="")
@@ -1189,6 +1424,176 @@ def image_promotion_state() -> dict[str, Any]:
     }
 
 
+def canonical_image_digest(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.startswith("sha256:"):
+        raise StagingCellError(f"promotion receipt {label} digest is not sha256-bound")
+    digest = value.removeprefix("sha256:")
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise StagingCellError(f"promotion receipt {label} digest is malformed")
+    return value
+
+
+def load_promotion_receipt(root: Path, commit: str) -> dict[str, Any]:
+    if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
+        raise StagingCellError("promotion commit must be canonical 40-hex")
+    directory = root / "promotion" / commit
+    path = directory / "receipt.json"
+    if directory.is_symlink() or not directory.is_dir():
+        raise StagingCellError("promotion receipt directory is missing or unsafe")
+    try:
+        linked = path.lstat()
+    except OSError as error:
+        raise StagingCellError("promotion receipt is missing or unreadable") from error
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or stat.S_IMODE(linked.st_mode) & 0o077
+    ):
+        raise StagingCellError("promotion receipt must be an owner-private regular file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StagingCellError("promotion receipt is malformed") from error
+    if not isinstance(payload, dict):
+        raise StagingCellError("promotion receipt is not an object")
+    expected = {
+        "schema_version": 1,
+        "status": "pass",
+        "scope": "staging-only",
+        "source_commit": commit,
+        "repository": "heimgewebe/commonthing",
+        "image_identity": "digest-authoritative",
+        "production_activation": False,
+    }
+    mismatched = {
+        key: {"expected": value, "observed": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatched:
+        raise StagingCellError(
+            "promotion receipt identity mismatch: "
+            + json.dumps(mismatched, sort_keys=True)
+        )
+    images = payload.get("images")
+    if not isinstance(images, dict):
+        raise StagingCellError("promotion receipt has no image map")
+    result_images: dict[str, str] = {}
+    for label, canonical in (
+        ("api", "ghcr.io/heimgewebe/commonthing-api"),
+        ("web", "ghcr.io/heimgewebe/commonthing-web"),
+    ):
+        image = images.get(label)
+        if not isinstance(image, dict) or image.get("canonical") != canonical:
+            raise StagingCellError(f"promotion receipt {label} image identity mismatch")
+        digest = canonical_image_digest(image.get("digest"), label=label)
+        reference_value = f"{canonical}@{digest}"
+        if image.get("canonical_reference") != reference_value:
+            raise StagingCellError(
+                f"promotion receipt {label} canonical reference does not match digest"
+            )
+        result_images[label] = reference_value
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "source_commit": commit,
+        "receipt_path": str(path),
+        "receipt_sha256": sha256_file(path),
+        "images": result_images,
+    }
+
+
+def app_kustomization_document(commit: str, promotion: dict[str, Any]) -> dict[str, Any]:
+    images = promotion.get("images") if isinstance(promotion, dict) else None
+    if not isinstance(images, dict):
+        raise StagingCellError("promotion evidence has no verified images")
+    patches = []
+    for label, deployment in (("api", "weltgewebe-api"), ("web", "weltgewebe-web")):
+        image = images.get(label)
+        if not isinstance(image, str) or "@sha256:" not in image:
+            raise StagingCellError(f"verified {label} image is not digest-bound")
+        patches.append({
+            "target": {"kind": "Deployment", "name": deployment},
+            "patch": yaml.safe_dump(
+                [
+                    {
+                        "op": "replace",
+                        "path": "/spec/template/spec/containers/0/image",
+                        "value": image,
+                    },
+                    {
+                        "op": "add",
+                        "path": "/spec/template/spec/imagePullSecrets",
+                        "value": [{"name": REGISTRY_SECRET}],
+                    },
+                ],
+                sort_keys=False,
+            ),
+        })
+    return {
+        "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+        "kind": "Kustomization",
+        "metadata": {"name": APP_KUSTOMIZATION, "namespace": "flux-system"},
+        "spec": {
+            "interval": "2m",
+            "retryInterval": "20s",
+            "timeout": "8m",
+            "prune": True,
+            "wait": True,
+            "dependsOn": [{"name": DATA_KUSTOMIZATION}],
+            "sourceRef": {"kind": "GitRepository", "name": SOURCE_NAME},
+            "path": "./platform/apps/weltgewebe/overlays/staging",
+            "patches": patches,
+            "healthChecks": [
+                {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": deployment,
+                    "namespace": APP_NAMESPACE,
+                }
+                for deployment in ("weltgewebe-api", "weltgewebe-web")
+            ],
+        },
+    }
+
+
+def reconcile_app(kubectl: str, commit: str) -> str:
+    requested_at = f"staging-app-{time.time_ns()}"
+    request_flux_reconcile(kubectl, "kustomization", APP_KUSTOMIZATION, requested_at)
+    wait_flux_resource_current(
+        kubectl,
+        "kustomization",
+        APP_KUSTOMIZATION,
+        commit,
+        requested_at=requested_at,
+    )
+    return requested_at
+
+
+def app_live_health(kubectl: str) -> dict[str, str]:
+    return {
+        label: deployment_ready_state(kubectl, namespace, name)
+        for label, (namespace, name) in APP_DEPLOYMENTS.items()
+    }
+
+
+def app_image_references(kubectl: str) -> dict[str, str]:
+    return {
+        label: output([
+            kubectl,
+            "-n",
+            namespace,
+            "get",
+            "deployment",
+            name,
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].image}",
+        ])
+        for label, (namespace, name) in APP_DEPLOYMENTS.items()
+    }
+
+
 def write_cell_receipt(root: Path, payload: dict[str, Any]) -> str:
     path = root / "receipts/cell-bootstrap.json"
     atomic_json(path, payload, mode=0o600)
@@ -1363,6 +1768,103 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_activate(args: argparse.Namespace) -> dict[str, Any]:
+    require_singleton_cluster(args.cluster)
+    reference.validate_owner_id(args.owner_id)
+    root = state_root(getattr(args, "state_root", None))
+    configure_reference_paths(root)
+    receipt = load_tool_receipt(
+        root, required_tools=("kind", "kubectl"), required_artifacts=()
+    )
+    kind = receipt["tools"]["kind"]
+    kubectl = receipt["tools"]["kubectl"]
+    cell = load_cell_receipt(root)
+    require_receipt_cluster(cell, args.cluster)
+    bootstrap_commit = str(cell.get("bootstrap_commit") or "")
+    owner_id = str(cell.get("owner_id") or "")
+    if args.owner_id != owner_id:
+        raise StagingCellError("--owner-id does not match the persisted cluster owner")
+    reference.validate_ownership_binding(bootstrap_commit, owner_id)
+    commit = require_clean_commit(args.source_commit)
+    promotion = load_promotion_receipt(root, commit)
+    registry_material, registry_source_sha = load_registry_pull_material(root)
+    registry_pull_access = verify_ghcr_pull_access(registry_material, promotion)
+    reference.normalize_owned_cluster_repository(
+        kind,
+        args.cluster,
+        expected_commit=bootstrap_commit,
+        expected_owner_id=owner_id,
+    )
+    secret_receipt = inject_external_secrets(kubectl, root)
+    registry_secret_receipt = inject_registry_pull_secret(
+        kubectl,
+        root,
+        material=registry_material,
+        source_sha=registry_source_sha,
+    )
+    apply_yaml(kubectl, flux_documents(commit))
+    reconcile_data(kubectl, commit)
+    apply_yaml(kubectl, app_kustomization_document(commit, promotion))
+    reconcile_app(kubectl, commit)
+    workloads = app_live_health(kubectl)
+    unhealthy = {name: state for name, state in workloads.items() if state != "True"}
+    if unhealthy:
+        raise StagingCellError(f"staging app workloads are not live: {unhealthy!r}")
+    references = app_image_references(kubectl)
+    expected_images = promotion["images"]
+    if references != expected_images:
+        raise StagingCellError(
+            "staging app deployment images differ from promotion receipt: "
+            f"expected={expected_images!r} observed={references!r}"
+        )
+    registry_binding = verify_registry_pull_secret_binding(kubectl, root)
+    if registry_binding.get("ready") is not True:
+        raise StagingCellError("staging registry pull Secret binding is not ready")
+    promotion_state = {
+        "status": "pass",
+        "source_commit": commit,
+        "receipt_sha256": promotion["receipt_sha256"],
+        "images": references,
+    }
+    updated = {
+        **cell,
+        "status": "app-ready-gateway-pending",
+        "active_commit": commit,
+        "gitops_source_commit": commit,
+        "external_secret": secret_receipt,
+        "registry_pull_secret": registry_secret_receipt,
+        "registry_pull_access": registry_pull_access,
+        "image_promotion": promotion_state,
+        "app_activation": True,
+        "app_workloads": workloads,
+        "production_changed": False,
+        "does_not_establish": [
+            "staging gateway proof",
+            "staging DNS/TLS proof",
+            "delete-to-prove",
+            "production Kubernetes cutover",
+        ],
+    }
+    receipt_path = write_cell_receipt(root, updated)
+    return {
+        "schema_version": 1,
+        "status": "app-ready-gateway-pending",
+        "cluster": args.cluster,
+        "owner_id": owner_id,
+        "bootstrap_commit": bootstrap_commit,
+        "active_commit": commit,
+        "image_promotion": promotion_state,
+        "app_activation": True,
+        "app_workloads": workloads,
+        "external_secret": public_external_secret_state(),
+        "registry_pull_secret_ready": True,
+        "production_changed": False,
+        "receipt_path": receipt_path,
+    }
+
+
 @reference_output_routed
 def command_status(args: argparse.Namespace) -> dict[str, Any]:
     require_singleton_cluster(args.cluster)
@@ -1382,7 +1884,8 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
     kubectl = receipt["tools"]["kubectl"]
     owner = load_cell_receipt(root)
     require_receipt_cluster(owner, args.cluster)
-    commit = str(owner.get("bootstrap_commit") or "")
+    bootstrap_commit = str(owner.get("bootstrap_commit") or "")
+    active_commit = cell_active_commit(owner)
     owner_id = str(owner.get("owner_id") or "")
     if args.cluster not in reference.clusters(kind):
         return {
@@ -1390,13 +1893,14 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
             "status": "cluster-absent-state-preserved",
             "cluster": args.cluster,
             "owner_id": owner_id,
-            "bootstrap_commit": commit,
+            "bootstrap_commit": bootstrap_commit,
+            "active_commit": active_commit,
             "production_changed": False,
         }
     reference.require_owned_cluster(
         kind,
         args.cluster,
-        expected_commit=commit,
+        expected_commit=bootstrap_commit,
         expected_owner_id=owner_id,
     )
     if owner.get("status") == "bootstrap-in-progress":
@@ -1405,7 +1909,8 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
             "status": "bootstrap-in-progress",
             "cluster": args.cluster,
             "owner_id": owner_id,
-            "bootstrap_commit": commit,
+            "bootstrap_commit": bootstrap_commit,
+            "active_commit": active_commit,
             "production_changed": False,
         }
     source_revision = output(
@@ -1421,7 +1926,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
             "jsonpath={.status.artifact.revision}",
         ]
     ) or "missing"
-    source_matches_commit = flux_revision_matches_commit(source_revision, commit)
+    source_matches_commit = flux_revision_matches_commit(source_revision, active_commit)
     source_health_raw = output(
         [
             kubectl,
@@ -1482,7 +1987,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         else:
             data_ready = data_ready_status or "missing"
         data_revision = data_revision or "missing"
-        data_matches_commit = flux_revision_matches_commit(data_revision, commit)
+        data_matches_commit = flux_revision_matches_commit(data_revision, active_commit)
     pvcs = {
         pvc: output(
             [
@@ -1521,13 +2026,48 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
             live_workloads = staging_live_health(kubectl)
         except (StagingCellError, subprocess.CalledProcessError):
             live_workloads = {name: "missing" for name in LIVE_DEPLOYMENTS}
-    ready = base_ready and all(value == "True" for value in live_workloads.values())
+    infrastructure_ready = base_ready and all(
+        value == "True" for value in live_workloads.values()
+    )
+    activated = owner.get("app_activation") is True
+    app_workloads = {name: "unchecked" for name in APP_DEPLOYMENTS}
+    image_references: dict[str, str] = {}
+    expected_images: dict[str, str] = {}
+    registry_pull_secret = {"ready": False}
+    if activated and infrastructure_ready:
+        try:
+            app_workloads = app_live_health(kubectl)
+            image_references = app_image_references(kubectl)
+            registry_pull_secret = verify_registry_pull_secret_binding(kubectl, root)
+        except (StagingCellError, subprocess.CalledProcessError):
+            app_workloads = {name: "missing" for name in APP_DEPLOYMENTS}
+        promotion = owner.get("image_promotion")
+        if isinstance(promotion, dict) and isinstance(promotion.get("images"), dict):
+            expected_images = {
+                str(key): str(value) for key, value in promotion["images"].items()
+            }
+    app_ready = (
+        not activated
+        or (
+            all(value == "True" for value in app_workloads.values())
+            and registry_pull_secret.get("ready") is True
+            and bool(expected_images)
+            and image_references == expected_images
+        )
+    )
+    ready = infrastructure_ready and app_ready
+    promotion_state = (
+        owner.get("image_promotion")
+        if activated and isinstance(owner.get("image_promotion"), dict)
+        else image_promotion_state()
+    )
     return {
         "schema_version": 1,
         "status": "ready" if ready else "degraded",
         "cluster": args.cluster,
         "owner_id": owner_id,
-        "bootstrap_commit": commit,
+        "bootstrap_commit": bootstrap_commit,
+        "active_commit": active_commit,
         "source_revision": source_revision,
         "source_matches_commit": source_matches_commit,
         "source_ready": source_ready,
@@ -1537,8 +2077,11 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         "pvcs": pvcs,
         "external_secret": external_secret,
         "live_workloads": live_workloads,
-        "image_promotion": image_promotion_state(),
-        "app_activation": False,
+        "image_promotion": promotion_state,
+        "app_activation": activated,
+        "app_workloads": app_workloads,
+        "app_image_references": image_references,
+        "registry_pull_secret_ready": registry_pull_secret.get("ready") is True,
         "production_changed": False,
     }
 
@@ -1758,6 +2301,10 @@ def parser() -> argparse.ArgumentParser:
     up.set_defaults(cluster=DEFAULT_CLUSTER)
     up.add_argument("--owner-id", required=True)
     up.add_argument("--source-commit")
+    activate = sub.add_parser("activate")
+    activate.set_defaults(cluster=DEFAULT_CLUSTER)
+    activate.add_argument("--owner-id", required=True)
+    activate.add_argument("--source-commit", required=True)
     status = sub.add_parser("status")
     status.set_defaults(cluster=DEFAULT_CLUSTER)
     down = sub.add_parser("down")
@@ -1773,6 +2320,19 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
             '{"command":"up","schema_version":1,'
             '"status":"infrastructure-ready-image-promotion-blocked"}'
         )
+        return
+    if command == "activate":
+        safe = {
+            "command": "activate",
+            "schema_version": 1,
+            "status": str(result.get("status") or "degraded"),
+            "cluster": str(result.get("cluster") or DEFAULT_CLUSTER),
+            "bootstrap_commit": str(result.get("bootstrap_commit") or ""),
+            "active_commit": str(result.get("active_commit") or ""),
+            "app_activation": bool(result.get("app_activation")),
+            "production_changed": bool(result.get("production_changed")),
+        }
+        print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
         return
     if command == "status":
         status = str(result.get("status") or "degraded")
@@ -1797,6 +2357,7 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
             safe.update(
                 {
                     "bootstrap_commit": str(result.get("bootstrap_commit") or ""),
+                    "active_commit": str(result.get("active_commit") or ""),
                     "source_revision": str(result.get("source_revision") or ""),
                     "source_matches_commit": bool(result.get("source_matches_commit")),
                     "source_ready": result.get("source_ready") == "True",
@@ -1817,6 +2378,13 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
                     "live_workloads": {
                         name: str(live.get(name) or "unchecked")
                         for name in LIVE_DEPLOYMENTS
+                    },
+                    "app_activation": bool(result.get("app_activation")),
+                    "app_workloads": {
+                        name: str(
+                            (result.get("app_workloads") or {}).get(name) or "unchecked"
+                        )
+                        for name in APP_DEPLOYMENTS
                     },
                 }
             )
@@ -1843,6 +2411,8 @@ def main() -> int:
     try:
         if args.command == "up":
             result = command_up(args)
+        elif args.command == "activate":
+            result = command_activate(args)
         elif args.command == "status":
             result = command_status(args)
         elif args.command == "down":

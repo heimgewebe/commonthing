@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import subprocess
@@ -1505,6 +1506,590 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             pgdata.mkdir(parents=True)
             with mock.patch.object(staging.os, "scandir", side_effect=PermissionError):
                 self.assertTrue(staging.retained_postgres_state_exists(root))
+
+
+    def test_cluster_repository_binding_accepts_legacy_worktree_of_same_repo(self) -> None:
+        commit = "a" * 40
+        owner = "owner-proof"
+        with tempfile.TemporaryDirectory(prefix="staging-marker-repo-") as tmp_name:
+            legacy = Path(tmp_name) / "legacy-worktree"
+            legacy.mkdir()
+            marker = {
+                "schema_version": 2,
+                "cluster": "proof",
+                "repository": str(legacy),
+                "commit": commit,
+                "owner_id": owner,
+            }
+            with mock.patch.object(
+                staging.reference,
+                "repository_common_dir",
+                return_value="/repo/commonthing/.git",
+            ):
+                staging.reference._require_marker_binding(
+                    marker,
+                    "proof",
+                    expected_commit=commit,
+                    expected_owner_id=owner,
+                )
+
+    def test_cluster_repository_binding_rejects_different_repo(self) -> None:
+        commit = "a" * 40
+        owner = "owner-proof"
+        with tempfile.TemporaryDirectory(prefix="staging-marker-foreign-") as tmp_name:
+            legacy = Path(tmp_name) / "foreign-worktree"
+            legacy.mkdir()
+            marker = {
+                "schema_version": 2,
+                "cluster": "proof",
+                "repository": str(legacy),
+                "commit": commit,
+                "owner_id": owner,
+            }
+
+            def common_dir(root=staging.reference.ROOT):
+                return (
+                    "/repo/commonthing/.git"
+                    if Path(root) == staging.reference.ROOT
+                    else "/repo/foreign/.git"
+                )
+
+            with mock.patch.object(
+                staging.reference, "repository_common_dir", side_effect=common_dir
+            ):
+                with self.assertRaisesRegex(
+                    staging.reference.ProofError, "exact owner binding"
+                ):
+                    staging.reference._require_marker_binding(
+                        marker,
+                        "proof",
+                        expected_commit=commit,
+                        expected_owner_id=owner,
+                    )
+
+    def test_cluster_repository_normalization_preserves_owner_and_bootstrap(self) -> None:
+        commit = "b" * 40
+        owner = "owner-proof"
+        with tempfile.TemporaryDirectory(prefix="staging-marker-normalize-") as tmp_name:
+            root = Path(tmp_name)
+            markers = root / "markers"
+            markers.mkdir()
+            legacy = root / "legacy-worktree"
+            legacy.mkdir()
+            original_markers = staging.reference.MARKERS
+            staging.reference.MARKERS = markers
+            try:
+                marker_path = staging.reference.marker_path("proof")
+                marker_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 2,
+                            "cluster": "proof",
+                            "repository": str(legacy),
+                            "commit": commit,
+                            "owner_id": owner,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                def common_dir(path=staging.reference.ROOT):
+                    del path
+                    return "/repo/commonthing/.git"
+
+                with (
+                    mock.patch.object(staging.reference, "clusters", return_value={"proof"}),
+                    mock.patch.object(
+                        staging.reference, "repository_common_dir", side_effect=common_dir
+                    ),
+                    mock.patch.object(staging.reference, "configure_cluster_access"),
+                ):
+                    result = staging.reference.normalize_owned_cluster_repository(
+                        "kind",
+                        "proof",
+                        expected_commit=commit,
+                        expected_owner_id=owner,
+                    )
+                stored = json.loads(marker_path.read_text(encoding="utf-8"))
+                self.assertEqual(result["repository"], "/repo/commonthing/.git")
+                self.assertEqual(stored["repository"], "/repo/commonthing/.git")
+                self.assertEqual(stored["commit"], commit)
+                self.assertEqual(stored["owner_id"], owner)
+            finally:
+                staging.reference.MARKERS = original_markers
+
+    def test_active_commit_defaults_to_bootstrap_and_validates_override(self) -> None:
+        bootstrap = "c" * 40
+        active = "d" * 40
+        self.assertEqual(
+            staging.cell_active_commit({"bootstrap_commit": bootstrap}), bootstrap
+        )
+        self.assertEqual(
+            staging.cell_active_commit(
+                {"bootstrap_commit": bootstrap, "active_commit": active}
+            ),
+            active,
+        )
+        with self.assertRaisesRegex(staging.StagingCellError, "active_commit"):
+            staging.cell_active_commit(
+                {"bootstrap_commit": bootstrap, "active_commit": "not-a-commit"}
+            )
+
+    def test_promotion_receipt_binds_commit_and_digest_images(self) -> None:
+        commit = "e" * 40
+        api_digest = "sha256:" + "1" * 64
+        web_digest = "sha256:" + "2" * 64
+        with tempfile.TemporaryDirectory(prefix="staging-promotion-") as tmp_name:
+            root = Path(tmp_name)
+            directory = root / "promotion" / commit
+            directory.mkdir(parents=True)
+            receipt = directory / "receipt.json"
+            payload = {
+                "schema_version": 1,
+                "status": "pass",
+                "scope": "staging-only",
+                "source_commit": commit,
+                "repository": "heimgewebe/commonthing",
+                "image_identity": "digest-authoritative",
+                "production_activation": False,
+                "images": {
+                    "api": {
+                        "canonical": "ghcr.io/heimgewebe/commonthing-api",
+                        "digest": api_digest,
+                        "canonical_reference": "ghcr.io/heimgewebe/commonthing-api@" + api_digest,
+                    },
+                    "web": {
+                        "canonical": "ghcr.io/heimgewebe/commonthing-web",
+                        "digest": web_digest,
+                        "canonical_reference": "ghcr.io/heimgewebe/commonthing-web@" + web_digest,
+                    },
+                },
+            }
+            receipt.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            receipt.chmod(0o600)
+            result = staging.load_promotion_receipt(root, commit)
+            self.assertEqual(result["source_commit"], commit)
+            self.assertEqual(
+                result["images"]["api"],
+                "ghcr.io/heimgewebe/commonthing-api@" + api_digest,
+            )
+            self.assertEqual(
+                result["images"]["web"],
+                "ghcr.io/heimgewebe/commonthing-web@" + web_digest,
+            )
+            payload["production_activation"] = True
+            receipt.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            receipt.chmod(0o600)
+            with self.assertRaisesRegex(staging.StagingCellError, "identity mismatch"):
+                staging.load_promotion_receipt(root, commit)
+
+    def test_registry_pull_material_is_external_owner_private_and_never_created(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="staging-registry-source-") as tmp_name:
+            root = Path(tmp_name)
+            with self.assertRaisesRegex(staging.StagingCellError, "credential source is missing"):
+                staging.load_registry_pull_material(root)
+            path = root / "secrets/staging-registry.json"
+            path.parent.mkdir(parents=True)
+            payload = {
+                "schema_version": 1,
+                "registry": staging.GHCR_REGISTRY,
+                "username": "registry-user",
+                "token": "token-value",
+            }
+            path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            path.chmod(0o600)
+            material, source_sha = staging.load_registry_pull_material(root)
+            self.assertEqual(material, {key: str(payload[key]) for key in ("registry", "username", "token")})
+            self.assertEqual(source_sha, staging.sha256_file(path))
+            path.chmod(0o640)
+            with self.assertRaisesRegex(staging.StagingCellError, "mode-0600"):
+                staging.load_registry_pull_material(root)
+
+    def test_registry_pull_preflight_checks_exact_promoted_digests(self) -> None:
+        api_digest = "sha256:" + "a" * 64
+        web_digest = "sha256:" + "b" * 64
+        promotion = {
+            "images": {
+                "api": "ghcr.io/heimgewebe/commonthing-api@" + api_digest,
+                "web": "ghcr.io/heimgewebe/commonthing-web@" + web_digest,
+            }
+        }
+        material = {
+            "registry": staging.GHCR_REGISTRY,
+            "username": "registry-user",
+            "token": "registry-token",
+        }
+
+        class FakeResponse:
+            def __init__(self, *, payload: dict | None = None, digest: str | None = None):
+                self._payload = payload
+                self.headers = {} if digest is None else {"Docker-Content-Digest": digest}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                del exc_type, exc, tb
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps(self._payload or {}).encode("utf-8")
+
+        responses = [
+            FakeResponse(payload={"token": "bearer-api"}),
+            FakeResponse(digest=api_digest),
+            FakeResponse(payload={"token": "bearer-web"}),
+            FakeResponse(digest=web_digest),
+        ]
+        with mock.patch.object(
+            staging.urllib.request, "urlopen", side_effect=responses
+        ) as urlopen:
+            result = staging.verify_ghcr_pull_access(material, promotion)
+        self.assertEqual(result, {"api": True, "web": True})
+        self.assertEqual(urlopen.call_count, 4)
+        requests = [call.args[0] for call in urlopen.call_args_list]
+        self.assertIn(
+            "scope=repository%3Aheimgewebe%2Fcommonthing-api%3Apull",
+            requests[0].full_url,
+        )
+        self.assertEqual(requests[1].get_method(), "HEAD")
+        self.assertTrue(requests[1].full_url.endswith("/manifests/" + api_digest))
+        self.assertIn(
+            "scope=repository%3Aheimgewebe%2Fcommonthing-web%3Apull",
+            requests[2].full_url,
+        )
+        self.assertEqual(requests[3].get_method(), "HEAD")
+        self.assertTrue(requests[3].full_url.endswith("/manifests/" + web_digest))
+        joined = " ".join(request.full_url for request in requests)
+        self.assertNotIn(material["token"], joined)
+
+        bad_responses = [
+            FakeResponse(payload={"token": "bearer-api"}),
+            FakeResponse(digest="sha256:" + "c" * 64),
+        ]
+        with mock.patch.object(
+            staging.urllib.request, "urlopen", side_effect=bad_responses
+        ):
+            with self.assertRaisesRegex(
+                staging.StagingCellError, "digest mismatch"
+            ):
+                staging.verify_ghcr_pull_access(material, promotion)
+
+    def test_registry_secret_binding_compares_exact_external_source(self) -> None:
+        material = {
+            "registry": staging.GHCR_REGISTRY,
+            "username": "registry-user",
+            "token": "token-value",
+        }
+        config = staging.registry_dockerconfig_json(material)
+        source_sha = "9" * 64
+        document = {
+            "metadata": {
+                "name": staging.REGISTRY_SECRET,
+                "namespace": staging.APP_NAMESPACE,
+                "annotations": {staging.REGISTRY_SOURCE_ANNOTATION: source_sha},
+            },
+            "type": "kubernetes.io/dockerconfigjson",
+            "data": {
+                ".dockerconfigjson": base64.b64encode(config.encode("utf-8")).decode("ascii")
+            },
+        }
+        self.assertTrue(
+            staging.registry_secret_document_matches(
+                document, source_sha=source_sha, expected_config=config
+            )
+        )
+        document["metadata"]["annotations"][staging.REGISTRY_SOURCE_ANNOTATION] = "8" * 64
+        self.assertFalse(
+            staging.registry_secret_document_matches(
+                document, source_sha=source_sha, expected_config=config
+            )
+        )
+
+    def test_activate_registry_preflight_fails_before_cluster_mutation(self) -> None:
+        bootstrap = "1" * 40
+        active = "2" * 40
+        owner = "owner-a"
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=active,
+        )
+        promotion = {
+            "source_commit": active,
+            "receipt_sha256": "c" * 64,
+            "images": {
+                "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "a" * 64,
+                "web": "ghcr.io/heimgewebe/commonthing-web@sha256:" + "b" * 64,
+            },
+        }
+        with tempfile.TemporaryDirectory(prefix="staging-registry-preflight-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(
+                    staging,
+                    "load_cell_receipt",
+                    return_value={
+                        "schema_version": 1,
+                        "cluster": staging.DEFAULT_CLUSTER,
+                        "owner_id": owner,
+                        "bootstrap_commit": bootstrap,
+                    },
+                ),
+                mock.patch.object(staging, "require_clean_commit", return_value=active),
+                mock.patch.object(staging, "load_promotion_receipt", return_value=promotion),
+                mock.patch.object(
+                    staging,
+                    "load_registry_pull_material",
+                    return_value=(
+                        {
+                            "registry": staging.GHCR_REGISTRY,
+                            "username": "registry-user",
+                            "token": "bad-token",
+                        },
+                        "e" * 64,
+                    ),
+                ),
+                mock.patch.object(
+                    staging,
+                    "verify_ghcr_pull_access",
+                    side_effect=staging.StagingCellError("registry pull preflight failed"),
+                ),
+                mock.patch.object(
+                    staging.reference, "normalize_owned_cluster_repository"
+                ) as normalize,
+                mock.patch.object(staging, "inject_external_secrets") as inject_external,
+            ):
+                with self.assertRaisesRegex(staging.StagingCellError, "registry pull preflight"):
+                    staging.command_activate(args)
+        normalize.assert_not_called()
+        inject_external.assert_not_called()
+
+    def test_app_kustomization_uses_runtime_digest_patches(self) -> None:
+        commit = "f" * 40
+        promotion = {
+            "images": {
+                "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "3" * 64,
+                "web": "ghcr.io/heimgewebe/commonthing-web@sha256:" + "4" * 64,
+            }
+        }
+        document = staging.app_kustomization_document(commit, promotion)
+        spec = document["spec"]
+        self.assertEqual(spec["path"], "./platform/apps/weltgewebe/overlays/staging")
+        self.assertEqual(spec["sourceRef"]["name"], staging.SOURCE_NAME)
+        self.assertEqual(spec["dependsOn"], [{"name": staging.DATA_KUSTOMIZATION}])
+        self.assertEqual(len(spec["patches"]), 2)
+        rendered = "\n".join(item["patch"] for item in spec["patches"])
+        self.assertIn(promotion["images"]["api"], rendered)
+        self.assertIn(promotion["images"]["web"], rendered)
+        self.assertIn("imagePullSecrets", rendered)
+        self.assertIn(staging.REGISTRY_SECRET, rendered)
+        static_overlay = (
+            ROOT / "platform/apps/weltgewebe/overlays/staging/kustomization.yaml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("promotion-required", static_overlay)
+
+    def test_activate_uses_bootstrap_for_ownership_and_active_commit_for_flux(self) -> None:
+        bootstrap = "1" * 40
+        active = "2" * 40
+        owner = "owner-a"
+        api = "ghcr.io/heimgewebe/commonthing-api@sha256:" + "a" * 64
+        web = "ghcr.io/heimgewebe/commonthing-web@sha256:" + "b" * 64
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=active,
+        )
+        promotion = {
+            "source_commit": active,
+            "receipt_sha256": "c" * 64,
+            "images": {"api": api, "web": web},
+        }
+        with tempfile.TemporaryDirectory(prefix="staging-activate-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(
+                    staging,
+                    "load_cell_receipt",
+                    return_value={
+                        "schema_version": 1,
+                        "cluster": staging.DEFAULT_CLUSTER,
+                        "owner_id": owner,
+                        "bootstrap_commit": bootstrap,
+                        "external_secret": {"source_sha256": "d" * 64},
+                    },
+                ),
+                mock.patch.object(staging, "require_clean_commit", return_value=active),
+                mock.patch.object(
+                    staging, "load_promotion_receipt", return_value=promotion
+                ),
+                mock.patch.object(
+                    staging,
+                    "load_registry_pull_material",
+                    return_value=(
+                        {
+                            "registry": staging.GHCR_REGISTRY,
+                            "username": "registry-user",
+                            "token": "registry-token",
+                        },
+                        "e" * 64,
+                    ),
+                ) as load_registry,
+                mock.patch.object(
+                    staging,
+                    "verify_ghcr_pull_access",
+                    return_value={"api": True, "web": True},
+                ) as verify_pull,
+                mock.patch.object(
+                    staging.reference, "normalize_owned_cluster_repository"
+                ) as normalize,
+                mock.patch.object(
+                    staging,
+                    "inject_external_secrets",
+                    return_value={"source_sha256": "d" * 64},
+                ),
+                mock.patch.object(
+                    staging,
+                    "inject_registry_pull_secret",
+                    return_value={
+                        "source_sha256": "e" * 64,
+                        "secret_name": staging.REGISTRY_SECRET,
+                        "registry": staging.GHCR_REGISTRY,
+                    },
+                ) as inject_registry,
+                mock.patch.object(staging, "apply_yaml") as apply_yaml,
+                mock.patch.object(staging, "reconcile_data") as reconcile_data,
+                mock.patch.object(staging, "reconcile_app") as reconcile_app,
+                mock.patch.object(
+                    staging, "app_live_health", return_value={"api": "True", "web": "True"}
+                ),
+                mock.patch.object(
+                    staging, "app_image_references", return_value={"api": api, "web": web}
+                ),
+                mock.patch.object(
+                    staging,
+                    "verify_registry_pull_secret_binding",
+                    return_value={"ready": True, "source_sha256": "e" * 64},
+                ),
+                mock.patch.object(
+                    staging, "write_cell_receipt", return_value="/receipt.json"
+                ) as write_receipt,
+            ):
+                result = staging.command_activate(args)
+        load_registry.assert_called_once_with(root)
+        verify_pull.assert_called_once()
+        normalize.assert_called_once_with(
+            "kind",
+            staging.DEFAULT_CLUSTER,
+            expected_commit=bootstrap,
+            expected_owner_id=owner,
+        )
+        inject_registry.assert_called_once()
+        reconcile_data.assert_called_once_with("kubectl", active)
+        reconcile_app.assert_called_once_with("kubectl", active)
+        self.assertEqual(apply_yaml.call_count, 2)
+        app_document = apply_yaml.call_args_list[1].args[1]
+        self.assertEqual(app_document["metadata"]["name"], staging.APP_KUSTOMIZATION)
+        self.assertTrue(result["app_activation"])
+        self.assertFalse(result["production_changed"])
+        self.assertEqual(result["active_commit"], active)
+        stored = write_receipt.call_args.args[1]
+        self.assertEqual(stored["bootstrap_commit"], bootstrap)
+        self.assertEqual(stored["active_commit"], active)
+        self.assertEqual(stored["image_promotion"]["images"], {"api": api, "web": web})
+        self.assertEqual(stored["registry_pull_secret"]["secret_name"], staging.REGISTRY_SECRET)
+        self.assertNotIn("token", json.dumps(stored["registry_pull_secret"]))
+
+    def test_activate_public_output_redacts_promotion_details(self) -> None:
+        result = {
+            "status": "app-ready-gateway-pending",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "bootstrap_commit": "a" * 40,
+            "active_commit": "b" * 40,
+            "app_activation": True,
+            "production_changed": False,
+            "image_promotion": {"images": {"api": "secret-looking-image"}},
+            "external_secret": {"source_sha256": "secret-looking-hash"},
+        }
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            staging.emit_public_success("activate", result)
+        payload = json.loads(stream.getvalue())
+        self.assertTrue(payload["app_activation"])
+        self.assertFalse(payload["production_changed"])
+        self.assertNotIn("image_promotion", payload)
+        self.assertNotIn("external_secret", payload)
+
+
+    def test_status_uses_active_commit_but_bootstrap_commit_for_cluster_ownership(self) -> None:
+        owner = "owner-a"
+        bootstrap = "5" * 40
+        active = "6" * 40
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER)
+        live = {name: "True" for name in staging.LIVE_DEPLOYMENTS}
+        with tempfile.TemporaryDirectory(prefix="staging-active-status-") as tmp_name:
+            root = Path(tmp_name)
+            self._write_bound_receipt(root, owner=owner, commit=bootstrap)
+            receipt_path = root / "receipts/cell-bootstrap.json"
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            payload["active_commit"] = active
+            receipt_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(
+                    staging.reference,
+                    "clusters",
+                    return_value=[staging.DEFAULT_CLUSTER],
+                ),
+                mock.patch.object(
+                    staging.reference, "require_owned_cluster"
+                ) as require_owned,
+                mock.patch.object(
+                    staging,
+                    "output",
+                    side_effect=[
+                        f"main@sha1:{active}",
+                        "1|1|True",
+                        f"1|1|True|main@sha1:{active}",
+                        "Bound",
+                        "Bound",
+                    ],
+                ),
+                mock.patch.object(
+                    staging,
+                    "verify_external_secret_binding",
+                    return_value={"database": True, "runtime": True, "ready": True},
+                ),
+                mock.patch.object(staging, "staging_live_health", return_value=live),
+                mock.patch.object(
+                    staging, "image_promotion_state", return_value={"status": "blocked"}
+                ),
+            ):
+                result = staging.command_status(args)
+        require_owned.assert_called_once_with(
+            "kind",
+            staging.DEFAULT_CLUSTER,
+            expected_commit=bootstrap,
+            expected_owner_id=owner,
+        )
+        self.assertEqual(result["bootstrap_commit"], bootstrap)
+        self.assertEqual(result["active_commit"], active)
+        self.assertTrue(result["source_matches_commit"])
+        self.assertTrue(result["data_matches_commit"])
+        self.assertEqual(result["status"], "ready")
 
 
 if __name__ == "__main__":

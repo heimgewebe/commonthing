@@ -458,6 +458,78 @@ def validate_ownership_binding(commit: str, owner_id: str) -> None:
     validate_owner_id(owner_id)
 
 
+def repository_common_dir(root: Path = ROOT) -> str:
+    try:
+        candidate = root.resolve(strict=True)
+    except OSError as error:
+        raise ProofError(f"repository path is unavailable: {root}") from error
+    control = candidate / ".git"
+    if control.is_symlink():
+        raise ProofError(f"repository Git control path is a symlink: {control}")
+    if control.is_dir():
+        common = control
+    elif control.is_file():
+        try:
+            raw = control.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as error:
+            raise ProofError(f"repository Git control file is unreadable: {control}") from error
+        prefix = "gitdir: "
+        if not raw.startswith(prefix) or not raw[len(prefix):].strip():
+            raise ProofError(f"repository Git control file is malformed: {control}")
+        gitdir = Path(raw[len(prefix):].strip())
+        if not gitdir.is_absolute():
+            gitdir = candidate / gitdir
+        try:
+            gitdir = gitdir.resolve(strict=True)
+        except OSError as error:
+            raise ProofError(f"repository Git directory is unavailable: {gitdir}") from error
+        commondir_file = gitdir / "commondir"
+        if commondir_file.is_symlink():
+            raise ProofError(f"repository Git commondir is a symlink: {commondir_file}")
+        if commondir_file.is_file():
+            try:
+                raw_common = commondir_file.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError) as error:
+                raise ProofError(
+                    f"repository Git commondir is unreadable: {commondir_file}"
+                ) from error
+            if not raw_common:
+                raise ProofError(f"repository Git commondir is empty: {commondir_file}")
+            common = Path(raw_common)
+            if not common.is_absolute():
+                common = gitdir / common
+        else:
+            common = gitdir
+    else:
+        raise ProofError(f"repository Git control path is missing: {control}")
+    try:
+        resolved = common.resolve(strict=True)
+    except OSError as error:
+        raise ProofError(
+            f"Git common directory for repository {candidate} is unavailable"
+        ) from error
+    if not resolved.is_dir():
+        raise ProofError(
+            f"Git common directory for repository {candidate} is not a directory"
+        )
+    return str(resolved)
+
+
+def repository_binding_matches(observed: Any) -> bool:
+    if not isinstance(observed, str) or not observed:
+        return False
+    expected = repository_common_dir(ROOT)
+    if observed == expected:
+        return True
+    candidate = Path(observed)
+    if not candidate.is_absolute() or not candidate.exists():
+        return False
+    try:
+        return repository_common_dir(candidate) == expected
+    except ProofError:
+        return False
+
+
 @contextmanager
 def cluster_ownership_lock(name: str):
     MARKERS.mkdir(parents=True, exist_ok=True)
@@ -494,7 +566,6 @@ def _require_marker_binding(
     expected = {
         "schema_version": 2,
         "cluster": name,
-        "repository": str(ROOT),
         "commit": expected_commit,
         "owner_id": expected_owner_id,
     }
@@ -503,6 +574,13 @@ def _require_marker_binding(
         for key, value in expected.items()
         if data.get(key) != value
     }
+    observed_repository = data.get("repository")
+    expected_repository = repository_common_dir(ROOT)
+    if not repository_binding_matches(observed_repository):
+        mismatched["repository"] = {
+            "expected": expected_repository,
+            "observed": observed_repository,
+        }
     if mismatched:
         raise ProofError(
             f"cluster {name!r} ownership marker does not match exact owner binding: "
@@ -535,6 +613,31 @@ def require_owned_cluster(
             expected_commit=expected_commit,
             expected_owner_id=expected_owner_id,
         )
+    configure_cluster_access(kind, name)
+    return data
+
+
+def normalize_owned_cluster_repository(
+    kind: str,
+    name: str,
+    *,
+    expected_commit: str,
+    expected_owner_id: str,
+) -> dict[str, Any]:
+    with cluster_ownership_lock(name):
+        if name not in clusters(kind):
+            raise ProofError(f"owned cluster {name!r} is absent")
+        data = _read_marker(name)
+        _require_marker_binding(
+            data,
+            name,
+            expected_commit=expected_commit,
+            expected_owner_id=expected_owner_id,
+        )
+        stable_repository = repository_common_dir(ROOT)
+        if data.get("repository") != stable_repository:
+            data = {**data, "repository": stable_repository}
+            write_json_atomic(marker_path(name), data)
     configure_cluster_access(kind, name)
     return data
 
@@ -594,7 +697,7 @@ def _write_marker_locked(name: str, commit: str, owner_id: str) -> None:
     payload = {
         "schema_version": 2,
         "cluster": name,
-        "repository": str(ROOT),
+        "repository": repository_common_dir(ROOT),
         "commit": commit,
         "owner_id": owner_id,
         "pid": os.getpid(),
