@@ -125,13 +125,13 @@ jobs:
           ref="$API_CANONICAL@$digest"
           expected_source="https://github.com/${GITHUB_REPOSITORY}"
           docker buildx imagetools inspect "$ref" \
-            --format "{{json (index .SLSA \"$PLATFORM\")}}" \
+            --format "{{json .Provenance.SLSA}}" \
             > build/staging-image-verification/api-slsa.json
           docker buildx imagetools inspect "$ref" \
-            --format "{{json (index .Image \"$PLATFORM\")}}" \
+            --format "{{json .Image}}" \
             > build/staging-image-verification/api-image.json
           docker buildx imagetools inspect "$ref" \
-            --format "{{json (index .SBOM \"$PLATFORM\")}}" \
+            --format "{{json .SBOM}}" \
             > build/staging-image-verification/api-sbom.json
           python3 scripts/ci/verify_staging_image_attestation.py attestation \
             --slsa-file build/staging-image-verification/api-slsa.json \
@@ -164,13 +164,13 @@ jobs:
           ref="$WEB_CANONICAL@$digest"
           expected_source="https://github.com/${GITHUB_REPOSITORY}"
           docker buildx imagetools inspect "$ref" \
-            --format "{{json (index .SLSA \"$PLATFORM\")}}" \
+            --format "{{json .Provenance.SLSA}}" \
             > build/staging-image-verification/web-slsa.json
           docker buildx imagetools inspect "$ref" \
-            --format "{{json (index .Image \"$PLATFORM\")}}" \
+            --format "{{json .Image}}" \
             > build/staging-image-verification/web-image.json
           docker buildx imagetools inspect "$ref" \
-            --format "{{json (index .SBOM \"$PLATFORM\")}}" \
+            --format "{{json .SBOM}}" \
             > build/staging-image-verification/web-sbom.json
           python3 scripts/ci/verify_staging_image_attestation.py attestation \
             --slsa-file build/staging-image-verification/web-slsa.json \
@@ -346,7 +346,7 @@ jobs:
             for platform in linux/amd64 linux/arm64; do
               local arch="${platform#linux/}"
               docker buildx imagetools inspect "$ref" \
-                --format "{{json (index .SLSA \"$platform\")}}" \
+                --format "{{json (index .Provenance \"$platform\").SLSA}}" \
                 > "build/staging-image-promotion/${prefix}-${arch}-slsa.json"
               docker buildx imagetools inspect "$ref" \
                 --format "{{json (index .Image \"$platform\")}}" \
