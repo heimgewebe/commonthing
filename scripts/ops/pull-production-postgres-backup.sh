@@ -12,7 +12,7 @@ require_cmd sha256sum
 require_cmd awk
 require_cmd find
 
-REMOTE_HOST="${REMOTE_HOST:-wg-prod-1}"
+REMOTE_HOST="${REMOTE_HOST:-commonserver}"
 REMOTE_BACKUP_DIR="${REMOTE_BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-weltgewebe-postgres}"
 DEST_DIR="${DEST_DIR:-${HOME:?HOME must be set}/merges/weltgewebe-production-backups}"
