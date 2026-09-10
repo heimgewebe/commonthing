@@ -12,7 +12,7 @@ owner_task: DOCMETA-REPORT-LIFECYCLE-001
 last_reviewed: 2026-07-13
 review_after: 2026-08-12
 evidence_required_for_live_claims:
-  - exact Git commit and image tag on wg-prod-1
+  - exact Git commit and image tag on commonserver
   - rendered Compose/env source
   - API health/readiness
   - PostgreSQL domain source flags
