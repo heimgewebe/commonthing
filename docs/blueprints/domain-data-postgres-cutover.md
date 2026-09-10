@@ -46,8 +46,11 @@ OPT-ARC-001 ist nicht einfach „PostgreSQL verwenden“. Es geht um einen
 kontrollierten Persistenzvertrag für die Domänendaten `nodes`, `edges` und
 `accounts`.
 
-Der belegte Repository- und Produktionsvertrag nach der Remediation vom
-2026-07-12:
+Der PostgreSQL-Produktionsvertrag wurde am 2026-07-12 auf dem damals
+`wg-prod-1` genannten Produktionshost belegt. Seit dem Identitäts-Cutover vom
+2026-09-10 heißt derselbe Host kanonisch `commonserver`. Ein frischer
+Live-Readback vom 2026-09-10 bestätigt dort alle vier Domain-Read/Write-Schalter
+mit dem Wert `postgres`. Der aktuelle Repository- und Produktionsvertrag lautet:
 
 - PostgreSQL-Domain-Tabellen und Migrationen für nodes, edges und accounts existieren.
 - `commonserver` ist in Compose, Runtime-Dokumentation und `.env.prod.example`

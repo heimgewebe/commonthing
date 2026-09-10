@@ -145,7 +145,20 @@ anschließend in das entfernte Restic-Repository und liest einen Sentinel aus
 dem exakten Snapshot zurück.
 
 Systemd auf `heim-pc` wird nicht direkt aus einem beweglichen Checkout
-kopiert. Stattdessen installiert der folgende Befehl das Pullskript unter einem
+kopiert. Vor jeder (Re-)Aktivierung muss `commonserver` auf `heim-pc` als
+kanonisches SSH-Ziel funktionieren; damit kann die Hostumbenennung den täglichen
+Off-Host-Pull nicht still unterbrechen:
+
+```bash
+getent hosts commonserver
+ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver sudo -n true
+```
+
+Der Readback vom 2026-09-10 hat beide Prüfungen erfolgreich bestanden.
+`REMOTE_HOST` bleibt als expliziter Kompatibilitäts-Override erhalten; der
+Default und neue Installationen verwenden `commonserver`.
+
+Anschließend installiert der folgende Befehl das Pullskript unter einem
 unveränderlichen, vollständigen Git-Commit, erzeugt daraus die User-Unit, legt
 den schreibbaren Zielpfad vor dem Sandboxstart an und aktiviert den Timer:
 
