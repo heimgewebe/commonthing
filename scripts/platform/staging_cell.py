@@ -1971,11 +1971,82 @@ def apply_migration_network_isolation(kubectl: str) -> dict[str, Any]:
     }
 
 
-def migration_job_spec_sha256(document: dict[str, Any]) -> str:
+def canonical_migration_job_spec(document: dict[str, Any]) -> dict[str, Any]:
     spec = document.get("spec") if isinstance(document, dict) else None
     if not isinstance(spec, dict):
         raise StagingCellError("staging migration Job has no canonical spec")
-    canonical = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    canonical = json.loads(json.dumps(spec))
+    metadata = document.get("metadata") if isinstance(document, dict) else None
+    uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    job_name = metadata.get("name") if isinstance(metadata, dict) else None
+
+    # Kubernetes 1.36 defaults and Job-controller identity fields are added by
+    # the API server. Strip only the exact values the live staging API server
+    # injects; any changed or additional execution field remains hash-visible.
+    for key, default in (
+        ("completionMode", "NonIndexed"),
+        ("completions", 1),
+        ("manualSelector", False),
+        ("parallelism", 1),
+        ("podReplacementPolicy", "TerminatingOrFailed"),
+        ("suspend", False),
+    ):
+        if canonical.get(key) == default:
+            canonical.pop(key)
+    selector = canonical.get("selector")
+    if (
+        isinstance(uid, str)
+        and uid
+        and selector
+        == {"matchLabels": {"batch.kubernetes.io/controller-uid": uid}}
+    ):
+        canonical.pop("selector")
+
+    template = canonical.get("template")
+    template_metadata = template.get("metadata") if isinstance(template, dict) else None
+    template_labels = (
+        template_metadata.get("labels") if isinstance(template_metadata, dict) else None
+    )
+    if isinstance(template_labels, dict) and isinstance(uid, str) and uid:
+        generated_labels = {
+            "batch.kubernetes.io/controller-uid": uid,
+            "batch.kubernetes.io/job-name": job_name,
+            "controller-uid": uid,
+            "job-name": job_name,
+        }
+        for key, expected in generated_labels.items():
+            if expected is not None and template_labels.get(key) == expected:
+                template_labels.pop(key)
+
+    pod_spec = template.get("spec") if isinstance(template, dict) else None
+    if isinstance(pod_spec, dict):
+        for key, default in (
+            ("dnsPolicy", "ClusterFirst"),
+            ("schedulerName", "default-scheduler"),
+            ("terminationGracePeriodSeconds", 30),
+        ):
+            if pod_spec.get(key) == default:
+                pod_spec.pop(key)
+        containers = pod_spec.get("containers")
+        if isinstance(containers, list):
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                for key, default in (
+                    ("terminationMessagePath", "/dev/termination-log"),
+                    ("terminationMessagePolicy", "File"),
+                ):
+                    if container.get(key) == default:
+                        container.pop(key)
+    return canonical
+
+
+def migration_job_spec_sha256(document: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        canonical_migration_job_spec(document),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return sha256_bytes(canonical)
 
 
@@ -2022,6 +2093,7 @@ def require_staging_migration_job_matches(
         if isinstance(desired_annotations, dict)
         else None
     )
+    observed_spec_sha = migration_job_spec_sha256(observed)
     matches = (
         isinstance(metadata, dict)
         and metadata.get("name") == plan["job_name"]
@@ -2032,6 +2104,7 @@ def require_staging_migration_job_matches(
         == plan["receipt_sha256"]
         and isinstance(expected_spec_sha, str)
         and annotations.get(MIGRATION_SPEC_ANNOTATION) == expected_spec_sha
+        and hmac.compare_digest(observed_spec_sha, expected_spec_sha)
         and isinstance(containers, list)
         and len(containers) == 1
         and isinstance(containers[0], dict)

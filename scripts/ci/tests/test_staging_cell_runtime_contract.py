@@ -2229,6 +2229,139 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         self.assertNotIn("password", json.dumps(document).lower())
 
+    def test_staging_migration_spec_hash_normalizes_live_kubernetes_defaults(self) -> None:
+        commit = "2" * 40
+        promotion = {
+            "source_commit": commit,
+            "receipt_sha256": "c" * 64,
+            "images": {
+                "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "a" * 64,
+                "web": "ghcr.io/heimgewebe/commonthing-web@sha256:" + "b" * 64,
+            },
+        }
+        desired = staging.migration_job_document(commit, promotion)
+        observed = json.loads(json.dumps(desired))
+        uid = "0b8a2c51-dec8-4846-8948-7ff096aa3d6d"
+        observed["metadata"]["uid"] = uid
+        spec = observed["spec"]
+        spec.update(
+            {
+                "completionMode": "NonIndexed",
+                "completions": 1,
+                "manualSelector": False,
+                "parallelism": 1,
+                "podReplacementPolicy": "TerminatingOrFailed",
+                "selector": {
+                    "matchLabels": {"batch.kubernetes.io/controller-uid": uid}
+                },
+                "suspend": False,
+            }
+        )
+        labels = spec["template"]["metadata"]["labels"]
+        labels.update(
+            {
+                "batch.kubernetes.io/controller-uid": uid,
+                "batch.kubernetes.io/job-name": desired["metadata"]["name"],
+                "controller-uid": uid,
+                "job-name": desired["metadata"]["name"],
+            }
+        )
+        pod_spec = spec["template"]["spec"]
+        pod_spec.update(
+            {
+                "dnsPolicy": "ClusterFirst",
+                "schedulerName": "default-scheduler",
+                "terminationGracePeriodSeconds": 30,
+            }
+        )
+        pod_spec["containers"][0].update(
+            {
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+            }
+        )
+        self.assertEqual(
+            staging.migration_job_spec_sha256(observed),
+            staging.migration_job_spec_sha256(desired),
+        )
+
+    def test_staging_migration_rejects_spoofed_completed_job_spec_drift(self) -> None:
+        commit = "2" * 40
+        promotion = {
+            "source_commit": commit,
+            "receipt_sha256": "c" * 64,
+            "images": {
+                "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "a" * 64,
+                "web": "ghcr.io/heimgewebe/commonthing-web@sha256:" + "b" * 64,
+            },
+        }
+        desired = staging.migration_job_document(commit, promotion)
+        plan = staging.migration_plan(commit, promotion)
+
+        def changed_command(document: dict[str, object]) -> None:
+            document["spec"]["template"]["spec"]["containers"][0]["command"] = ["false"]
+
+        def changed_env(document: dict[str, object]) -> None:
+            env = document["spec"]["template"]["spec"]["containers"][0]["env"]
+            next(
+                item
+                for item in env
+                if item.get("name") == "WELTGEWEBE_API_MIGRATION_ONLY"
+            )["value"] = "0"
+
+        def changed_secret(document: dict[str, object]) -> None:
+            env = document["spec"]["template"]["spec"]["containers"][0]["env"]
+            next(item for item in env if item.get("name") == "DATABASE_URL")[
+                "valueFrom"
+            ]["secretKeyRef"]["name"] = "other-runtime"
+
+        def changed_readiness_gate(document: dict[str, object]) -> None:
+            document["spec"]["template"]["spec"]["readinessGates"] = []
+
+        for label, mutate in (
+            ("command", changed_command),
+            ("env", changed_env),
+            ("secret", changed_secret),
+            ("readiness-gate", changed_readiness_gate),
+        ):
+            with self.subTest(label=label):
+                observed = json.loads(json.dumps(desired))
+                mutate(observed)
+                observed["status"] = {
+                    "conditions": [{"type": "Complete", "status": "True"}]
+                }
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "refusing automatic replacement"
+                ):
+                    staging.require_staging_migration_job_matches(
+                        observed, desired, plan
+                    )
+
+    def test_staging_migration_never_deletes_failed_job_with_spoofed_spec_hash(self) -> None:
+        commit = "2" * 40
+        promotion = {
+            "source_commit": commit,
+            "receipt_sha256": "c" * 64,
+            "images": {
+                "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "a" * 64,
+                "web": "ghcr.io/heimgewebe/commonthing-web@sha256:" + "b" * 64,
+            },
+        }
+        failed = staging.migration_job_document(commit, promotion)
+        failed["spec"]["template"]["spec"]["containers"][0]["command"] = ["false"]
+        failed["status"] = {"conditions": [{"type": "Failed", "status": "True"}]}
+        with (
+            mock.patch.object(staging, "output", return_value=json.dumps(failed)),
+            mock.patch.object(staging, "apply_yaml_server_side") as apply_server_side,
+            mock.patch.object(staging, "run") as run,
+        ):
+            with self.assertRaisesRegex(
+                staging.StagingCellError, "refusing automatic replacement"
+            ):
+                staging.run_staging_migration("kubectl", commit, promotion)
+        apply_server_side.assert_not_called()
+        run.assert_not_called()
+
     def test_staging_migration_waits_for_complete_exact_job_readback(self) -> None:
         commit = "2" * 40
         promotion = {
