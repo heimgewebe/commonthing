@@ -292,6 +292,16 @@ def lifecycle_mutation_locked(function):
     return wrapped
 
 
+def legacy_lifecycle_mutation_locked(function):
+    @wraps(function)
+    def wrapped(args: argparse.Namespace) -> dict[str, Any]:
+        legacy_root = LEGACY_STATE_ROOT.resolve()
+        with lifecycle_lock(legacy_root):
+            return function(args)
+
+    return wrapped
+
+
 def configure_reference_paths(root: Path) -> None:
     reference.CACHE = root
     reference.MARKERS = root / "clusters"
@@ -760,9 +770,13 @@ def load_legacy_state_migration(root: Path, *, owner_id: str) -> dict[str, Any]:
         ):
             raise StagingCellError(f"{field} differs from migrated legacy evidence")
     promotion_manifest = payload.get("promotion_manifest")
-    if promotion_manifest != _tree_manifest(
-        root / "promotion", label="migrated promotion receipts"
-    ):
+    migrated_promotion = root / "promotion"
+    observed_promotion_manifest = (
+        _tree_manifest(migrated_promotion, label="migrated promotion receipts")
+        if migrated_promotion.exists() or migrated_promotion.is_symlink()
+        else {}
+    )
+    if promotion_manifest != observed_promotion_manifest:
         raise StagingCellError(
             "migrated promotion receipts differ from migration receipt"
         )
@@ -906,7 +920,12 @@ def _require_prepared_legacy_state_migration(
         (legacy_root / "promotion", "legacy promotion receipts"),
         (root / "promotion", "prepared migrated promotion receipts"),
     ):
-        if promotion_manifest != _tree_manifest(path, label=label):
+        observed_manifest = (
+            _tree_manifest(path, label=label)
+            if path.exists() or path.is_symlink()
+            else {}
+        )
+        if promotion_manifest != observed_manifest:
             raise StagingCellError(
                 "prepared legacy-state migration promotion evidence drift"
             )
@@ -997,6 +1016,7 @@ def _resume_prepared_legacy_state_migration(
 
 @lifecycle_mutation_locked
 @reference_output_routed
+@legacy_lifecycle_mutation_locked
 def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
     require_singleton_cluster(args.cluster)
     owner_id = args.owner_id
@@ -1085,8 +1105,10 @@ def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     legacy_promotion = legacy_root / "promotion"
-    promotion_preflight = _tree_manifest(
-        legacy_promotion, label="legacy promotion receipts"
+    promotion_preflight = (
+        _tree_manifest(legacy_promotion, label="legacy promotion receipts")
+        if legacy_promotion.exists() or legacy_promotion.is_symlink()
+        else None
     )
     legacy_receipts = legacy_root / "receipts"
     receipts_preflight = _tree_manifest(legacy_receipts, label="legacy cell receipts")
@@ -1113,9 +1135,12 @@ def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
 
     # Revalidate the preflight snapshot after cluster shutdown and before any
     # copy/move. An unexpected concurrent filesystem write aborts the cutover.
-    if promotion_preflight != _tree_manifest(
-        legacy_promotion, label="legacy promotion receipts"
-    ):
+    promotion_after_shutdown = (
+        _tree_manifest(legacy_promotion, label="legacy promotion receipts")
+        if legacy_promotion.exists() or legacy_promotion.is_symlink()
+        else None
+    )
+    if promotion_preflight != promotion_after_shutdown:
         raise StagingCellError(
             "legacy promotion receipts changed during cluster shutdown"
         )
@@ -1144,10 +1169,12 @@ def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
     copied_paths: list[Path] = []
     target_data = root / "data"
     try:
-        promotion_manifest = _copy_tree_exact(
-            legacy_promotion, root / "promotion", label="promotion receipts"
-        )
-        copied_paths.append(root / "promotion")
+        promotion_manifest: dict[str, dict[str, Any]] = {}
+        if promotion_preflight is not None:
+            promotion_manifest = _copy_tree_exact(
+                legacy_promotion, root / "promotion", label="promotion receipts"
+            )
+            copied_paths.append(root / "promotion")
 
         ensure_directory_durable(root / "secrets", mode=0o700)
         copied_paths.append(root / "secrets")
@@ -2420,6 +2447,9 @@ def migration_network_policy_documents() -> list[dict[str, Any]]:
             isolated["spec"]["podSelector"]["matchLabels"][
                 "app.kubernetes.io/name"
             ] = "commonthing-api"
+            isolated["spec"]["egress"][0]["to"][0]["namespaceSelector"]["matchLabels"][
+                "kubernetes.io/metadata.name"
+            ] = DATA_NAMESPACE
         documents.append(isolated)
     return documents
 
