@@ -145,5 +145,40 @@ class CommonThingNamingGuardTests(unittest.TestCase):
         self.assertIn('repos/${GITHUB_REPOSITORY}/git/ref/heads/main', workflow)
 
 
+    def test_staging_runtime_technical_identity_is_commonthing(self) -> None:
+        controller = (REPO / "scripts/platform/staging_cell.py").read_text(encoding="utf-8")
+        for binding in (
+            'DEFAULT_STATE_ROOT = Path.home() / ".local/state/commonthing/staging-cell"',
+            'DEFAULT_CLUSTER = "commonthing-staging"',
+            'DATA_NAMESPACE = "commonthing-data"',
+            'APP_NAMESPACE = "commonthing-staging"',
+            'SOURCE_NAME = "commonthing-staging-source"',
+            'APP_SOURCE_NAME = "commonthing-staging-app-source"',
+            'DATA_KUSTOMIZATION = "commonthing-staging-data"',
+            'APP_KUSTOMIZATION = "commonthing-staging-app"',
+            'DATABASE_SECRET = "commonthing-staging-database"',
+            'RUNTIME_SECRET = "commonthing-runtime"',
+            'REGISTRY_SECRET = "commonthing-staging-registry"',
+        ):
+            self.assertIn(binding, controller)
+        self.assertIn(
+            'LEGACY_STATE_ROOT = Path.home() / ".local/state/weltgewebe/staging-cell"',
+            controller,
+        )
+        for relative in (
+            "platform/clusters/staging/kind.yaml",
+            "platform/clusters/staging/data/namespace.yaml",
+            "platform/clusters/staging/data/persistent-volumes.yaml",
+            "platform/clusters/staging/data/postgres.yaml",
+            "platform/clusters/staging/data/nats.yaml",
+            "platform/clusters/staging/data/network-policy.yaml",
+            "platform/apps/weltgewebe/overlays/staging/namespace.yaml",
+            "platform/apps/weltgewebe/overlays/staging/kustomization.yaml",
+        ):
+            value = (REPO / relative).read_text(encoding="utf-8")
+            self.assertNotIn("weltgewebe-staging", value, relative)
+            self.assertNotIn("/var/local/weltgewebe-staging", value, relative)
+
+
 if __name__ == "__main__":
     unittest.main()

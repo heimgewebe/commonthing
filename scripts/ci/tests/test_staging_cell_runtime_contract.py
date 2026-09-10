@@ -177,8 +177,8 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             for document in documents
         }
         for volume, claim in (
-            ("weltgewebe-staging-postgres", "postgres-data"),
-            ("weltgewebe-staging-nats", "nats-data"),
+            ("commonthing-staging-postgres", "postgres-data"),
+            ("commonthing-staging-nats", "nats-data"),
         ):
             pv = by_kind_name[("PersistentVolume", volume)]
             pvc = by_kind_name[("PersistentVolumeClaim", claim)]
@@ -224,7 +224,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 peer["podSelector"]["matchLabels"],
-                {"app.kubernetes.io/name": "weltgewebe-api"},
+                {"app.kubernetes.io/name": "commonthing-api"},
             )
             self.assertEqual(ingress[0]["ports"], [{"port": port, "protocol": "TCP"}])
         self.assertNotIn("allow-app-data-access", policies)
@@ -299,7 +299,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertEqual(node["role"], "worker")
         self.assertEqual(len(mounts), 1)
         self.assertEqual(mounts[0]["hostPath"], "__COMMONTHING_STAGING_DATA_ROOT__")
-        self.assertEqual(mounts[0]["containerPath"], "/var/local/weltgewebe-staging")
+        self.assertEqual(mounts[0]["containerPath"], "/var/local/commonthing-staging")
         self.assertFalse(mounts[0]["readOnly"])
 
     def test_apply_yaml_emits_native_multi_document_stream(self) -> None:
@@ -399,7 +399,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(staging, "require_clean_commit") as commit_mock,
                 mock.patch.object(staging.reference, "create_kind_cluster") as create_mock,
             ):
-                with self.assertRaisesRegex(staging.StagingCellError, "without a bootstrap receipt"):
+                with self.assertRaisesRegex(staging.StagingCellError, "legacy-state migration receipt"):
                     staging.command_up(args)
         commit_mock.assert_not_called()
         create_mock.assert_not_called()
@@ -1388,7 +1388,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     mounts = (
                         [
                             {
-                                "Destination": "/var/local/weltgewebe-staging",
+                                "Destination": "/var/local/commonthing-staging",
                                 "Source": expected_source,
                                 "RW": True,
                             }
@@ -1437,7 +1437,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     mounts = (
                         [
                             {
-                                "Destination": "/var/local/weltgewebe-staging",
+                                "Destination": "/var/local/commonthing-staging",
                                 "Source": expected_source,
                                 "RW": True,
                             }
@@ -1493,7 +1493,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 ) as create_mock,
             ):
                 with self.assertRaisesRegex(
-                    staging.StagingCellError, "without a bootstrap receipt"
+                    staging.StagingCellError, "legacy-state migration receipt"
                 ):
                     staging.command_up(args)
         commit_mock.assert_not_called()
@@ -1907,7 +1907,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertEqual(allow_dns["spec"]["policyTypes"], ["Egress"])
         self.assertEqual(
             allow_data["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
-            "weltgewebe-api",
+            "commonthing-api",
         )
         self.assertEqual(
             {entry["port"] for rule in allow_data["spec"]["egress"] for entry in rule["ports"]},
@@ -2211,7 +2211,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         pod_spec = document["spec"]["template"]["spec"]
         self.assertEqual(
             document["spec"]["template"]["metadata"]["labels"]["app.kubernetes.io/name"],
-            "weltgewebe-api",
+            "commonthing-api",
         )
         self.assertEqual(
             pod_spec["readinessGates"],
@@ -2386,7 +2386,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         apply_server_side.assert_called_once()
         self.assertEqual(
             apply_server_side.call_args.kwargs["field_manager"],
-            "weltgewebe-staging-migration",
+            "commonthing-staging-migration",
         )
         wait_argv = run.call_args.args[0]
         self.assertIn("--for=condition=Complete", wait_argv)
@@ -2499,12 +2499,26 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         self.assertNotEqual(staging.SOURCE_NAME, staging.APP_SOURCE_NAME)
         self.assertEqual(spec["dependsOn"], [{"name": staging.DATA_KUSTOMIZATION}])
-        self.assertEqual(len(spec["patches"]), 2)
+        targets = {
+            (item["target"]["kind"], item["target"]["name"])
+            for item in spec["patches"]
+        }
+        self.assertIn(("Deployment", "weltgewebe-api"), targets)
+        self.assertIn(("Deployment", "weltgewebe-web"), targets)
+        self.assertIn(("Service", "weltgewebe-api"), targets)
+        self.assertIn(("Service", "weltgewebe-web"), targets)
         rendered = "\n".join(item["patch"] for item in spec["patches"])
         self.assertIn(promotion["images"]["api"], rendered)
         self.assertIn(promotion["images"]["web"], rendered)
+        self.assertIn("commonthing-api", rendered)
+        self.assertIn("commonthing-web", rendered)
+        self.assertIn("nats://nats.commonthing-data.svc.cluster.local:4222", rendered)
         self.assertIn("imagePullSecrets", rendered)
         self.assertIn(staging.REGISTRY_SECRET, rendered)
+        self.assertEqual(
+            {item["name"] for item in spec["healthChecks"]},
+            {"commonthing-api", "commonthing-web"},
+        )
         static_overlay = (
             ROOT / "platform/apps/weltgewebe/overlays/staging/kustomization.yaml"
         ).read_text(encoding="utf-8")
@@ -2815,7 +2829,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 source_sha=source_sha,
             )
         server_apply.assert_called_once()
-        self.assertEqual(server_apply.call_args.kwargs["field_manager"], "weltgewebe-staging-registry")
+        self.assertEqual(server_apply.call_args.kwargs["field_manager"], "commonthing-staging-registry")
         document = server_apply.call_args.args[1]
         self.assertIn(".dockerconfigjson", document["data"])
         decoded = base64.b64decode(document["data"][".dockerconfigjson"], validate=True)
@@ -2838,12 +2852,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     "type": "Opaque",
                     "stringData": {"value": "sensitive"},
                 },
-                field_manager="weltgewebe-staging-registry",
+                field_manager="proof-manager",
             )
         argv = run.call_args.args[0]
         self.assertEqual(argv[:2], ["kubectl", "apply"])
         self.assertIn("--server-side", argv)
-        self.assertIn("--field-manager=weltgewebe-staging-registry", argv)
+        self.assertIn("--field-manager=proof-manager", argv)
         self.assertNotIn("--save-config", argv)
 
     def test_registry_redirect_handler_refuses_all_redirects(self) -> None:
@@ -3329,7 +3343,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         secret_apply.assert_called_once()
         self.assertEqual(
             secret_apply.call_args.kwargs["field_manager"],
-            "weltgewebe-staging-secrets",
+            "commonthing-staging-secrets",
         )
         documents = secret_apply.call_args.args[1]
         self.assertEqual({doc["kind"] for doc in documents}, {"Secret"})
@@ -3416,6 +3430,148 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertTrue(result["source_matches_commit"])
         self.assertTrue(result["data_matches_commit"])
         self.assertEqual(result["status"], "ready")
+
+
+    def _write_legacy_cutover_fixture(
+        self, legacy: Path, *, owner: str, commit: str
+    ) -> dict[str, object]:
+        # The real controller deliberately creates/binds the secret before any
+        # retained PostgreSQL state exists. Mirror that safety invariant here.
+        _, source_sha = staging.load_or_create_secret_material(legacy)
+        (legacy / "data/postgres").mkdir(parents=True)
+        (legacy / "data/nats").mkdir(parents=True)
+        (legacy / "data/postgres/PG_VERSION").write_text("17\n", encoding="utf-8")
+        (legacy / "data/nats/jetstream.marker").write_bytes(b"nats-retained-state")
+        staging.write_cell_receipt(
+            legacy,
+            {
+                "schema_version": 1,
+                "status": "infrastructure-ready-image-promotion-blocked",
+                "cluster": staging.LEGACY_CLUSTER,
+                "owner_id": owner,
+                "bootstrap_commit": commit,
+                "external_secret": {
+                    "source_sha256": source_sha,
+                    "required_keys": ["database-url"],
+                },
+                "app_activation": False,
+                "production_changed": False,
+            },
+        )
+        tool_receipt = legacy / "toolchain/receipt.json"
+        tool_receipt.parent.mkdir(parents=True)
+        tool_receipt.write_text('{"legacy":"absolute-path-bound"}\n', encoding="utf-8")
+        tool_receipt.chmod(0o600)
+        promotion = legacy / f"promotion/{commit}/receipt.json"
+        promotion.parent.mkdir(parents=True)
+        promotion.write_bytes(b'{"status":"pass","immutable":"yes"}\n')
+        return {
+            "source_sha": source_sha,
+            "runtime_secret": (legacy / "secrets/staging-runtime.json").read_bytes(),
+            "cell_receipt": (legacy / "receipts/cell-bootstrap.json").read_bytes(),
+            "tool_receipt": tool_receipt.read_bytes(),
+            "promotion": promotion.read_bytes(),
+            "postgres_inode": (legacy / "data/postgres").stat().st_ino,
+            "nats_inode": (legacy / "data/nats").stat().st_ino,
+        }
+
+    def test_legacy_state_cutover_stops_owned_cluster_and_preserves_data_evidence(self) -> None:
+        owner = "owner-cutover"
+        commit = "7" * 40
+        with tempfile.TemporaryDirectory(prefix="staging-legacy-cutover-") as tmp_name:
+            temp = Path(tmp_name)
+            legacy = temp / "legacy/staging-cell"
+            canonical = temp / "commonthing/staging-cell"
+            legacy.mkdir(parents=True)
+            evidence = self._write_legacy_cutover_fixture(legacy, owner=owner, commit=commit)
+            clusters = mock.Mock(side_effect=[[staging.LEGACY_CLUSTER], []])
+            with (
+                mock.patch.object(staging, "LEGACY_STATE_ROOT", legacy),
+                mock.patch.object(staging, "state_root", return_value=canonical),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "load_tool_receipt", return_value={"tools": {"kind": "kind"}}),
+                mock.patch.object(staging.reference, "clusters", clusters),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging.reference, "delete_owned_cluster_if_present") as delete_owned,
+            ):
+                result = staging.command_migrate_legacy_state(
+                    argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+                )
+                loaded = staging.load_legacy_state_migration(canonical, owner_id=owner)
+            delete_owned.assert_called_once_with(
+                "kind",
+                staging.LEGACY_CLUSTER,
+                expected_commit=commit,
+                expected_owner_id=owner,
+            )
+            self.assertEqual(result["status"], "legacy-state-adopted")
+            self.assertFalse(result["production_changed"])
+            self.assertTrue(loaded["legacy_cluster_deleted"])
+            self.assertFalse((legacy / "data").exists())
+            self.assertEqual((canonical / "data/postgres").stat().st_ino, evidence["postgres_inode"])
+            self.assertEqual((canonical / "data/nats").stat().st_ino, evidence["nats_inode"])
+            self.assertEqual((canonical / "secrets/staging-runtime.json").read_bytes(), evidence["runtime_secret"])
+            self.assertEqual((canonical / "secrets/staging-runtime.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((canonical / f"promotion/{commit}/receipt.json").read_bytes(), evidence["promotion"])
+            self.assertEqual((canonical / "legacy-evidence/receipts/cell-bootstrap.json").read_bytes(), evidence["cell_receipt"])
+            self.assertEqual((canonical / "legacy-evidence/toolchain/receipt.json").read_bytes(), evidence["tool_receipt"])
+            self.assertFalse((canonical / "toolchain").exists())
+
+    def test_legacy_state_cutover_refuses_activated_cell_before_cluster_delete(self) -> None:
+        owner = "owner-cutover"
+        commit = "8" * 40
+        with tempfile.TemporaryDirectory(prefix="staging-legacy-activated-") as tmp_name:
+            temp = Path(tmp_name)
+            legacy = temp / "legacy/staging-cell"
+            canonical = temp / "commonthing/staging-cell"
+            legacy.mkdir(parents=True)
+            self._write_legacy_cutover_fixture(legacy, owner=owner, commit=commit)
+            cell_path = legacy / "receipts/cell-bootstrap.json"
+            payload = json.loads(cell_path.read_text(encoding="utf-8"))
+            payload["app_activation"] = True
+            staging.atomic_json(cell_path, payload)
+            with (
+                mock.patch.object(staging, "LEGACY_STATE_ROOT", legacy),
+                mock.patch.object(staging, "state_root", return_value=canonical),
+                mock.patch.object(staging.reference, "delete_owned_cluster_if_present") as delete_owned,
+            ):
+                with self.assertRaisesRegex(staging.StagingCellError, "requires an unactivated legacy cell"):
+                    staging.command_migrate_legacy_state(
+                        argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+                    )
+            delete_owned.assert_not_called()
+            self.assertTrue((legacy / "data/postgres/PG_VERSION").exists())
+            self.assertFalse((canonical / "data").exists())
+
+    def test_migrated_registry_secret_requires_exact_receipt_binding(self) -> None:
+        owner = "owner-cutover"
+        commit = "9" * 40
+        with tempfile.TemporaryDirectory(prefix="staging-registry-binding-") as tmp_name:
+            temp = Path(tmp_name)
+            legacy = temp / "legacy/staging-cell"
+            canonical = temp / "commonthing/staging-cell"
+            legacy.mkdir(parents=True)
+            self._write_legacy_cutover_fixture(legacy, owner=owner, commit=commit)
+            registry = legacy / "secrets/staging-registry.json"
+            registry.write_bytes(b'{"registry":"ghcr.io","username":"u","token":"t"}\n')
+            registry.chmod(0o600)
+            with (
+                mock.patch.object(staging, "LEGACY_STATE_ROOT", legacy),
+                mock.patch.object(staging, "state_root", return_value=canonical),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "load_tool_receipt", return_value={"tools": {"kind": "kind"}}),
+                mock.patch.object(staging.reference, "clusters", side_effect=[[staging.LEGACY_CLUSTER], []]),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging.reference, "delete_owned_cluster_if_present"),
+            ):
+                staging.command_migrate_legacy_state(
+                    argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+                )
+                registry_target = canonical / "secrets/staging-registry.json"
+                registry_target.write_bytes(registry_target.read_bytes() + b"tamper")
+                registry_target.chmod(0o600)
+                with self.assertRaisesRegex(staging.StagingCellError, "registry secret differs"):
+                    staging.load_legacy_state_migration(canonical, owner_id=owner)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: nats
-  namespace: weltgewebe-data
+  namespace: commonthing-data
   labels:
     app.kubernetes.io/name: nats
     app.kubernetes.io/component: data
@@ -30,7 +30,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       nodeSelector:
-        kubernetes.io/hostname: weltgewebe-staging-worker
+        kubernetes.io/hostname: commonthing-staging-worker
       containers:
         - name: nats
           image: nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
@@ -85,7 +85,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: nats
-  namespace: weltgewebe-data
+  namespace: commonthing-data
 spec:
   selector:
     app.kubernetes.io/name: nats

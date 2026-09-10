@@ -66,21 +66,52 @@ verifies_with:
 ## Persistente Staging-Zelle
 
 `scripts/platform/staging_cell.py` verwaltet genau eine owner- und commitgebundene
-Staging-Zelle namens `weltgewebe-staging`. Der öffentliche CLI-Vertrag bietet
-bewusst keinen frei wählbaren Cluster- oder State-Root: der Zustand liegt unter
-`~/.local/state/weltgewebe/staging-cell`, und der Clustername ist fest.
+Staging-Zelle namens `commonthing-staging`. Der öffentliche CLI-Vertrag bietet
+bewusst keinen frei wählbaren Cluster- oder State-Root: der kanonische Zustand
+liegt unter `~/.local/state/commonthing/staging-cell`. Technische Kubernetes-Namen
+der lokalen Staging-Laufzeit verwenden `commonthing-*`.
 
-Vor dem ersten `up` müssen die in `platform/toolchain.lock.json` gepinnten
-Werkzeuge und Drittartefakte exakt in den T084-Toolchain-Cache installiert werden:
+Vor dem ersten neuen `up` werden die in `platform/toolchain.lock.json` gepinnten
+Werkzeuge und Drittartefakte exakt im kanonischen Cache installiert:
 
 ```bash
-export WELTGEWEBE_STAGING_OWNER_ID="owner-t084-staging"
-uv run --project tools/py --locked python scripts/platform/bootstrap_tools.py --cache "$HOME/.local/state/weltgewebe/staging-cell/toolchain"
-uv run --project tools/py --locked python scripts/platform/staging_cell.py up --owner-id "$WELTGEWEBE_STAGING_OWNER_ID"
+export COMMONTHING_STAGING_OWNER_ID="owner-t084-staging"
+uv run --project tools/py --locked python scripts/platform/bootstrap_tools.py --cache "$HOME/.local/state/commonthing/staging-cell/toolchain"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py up --owner-id "$COMMONTHING_STAGING_OWNER_ID"
 ```
 
 `bootstrap_tools.py` schreibt dabei das von `staging_cell.py` verlangte
 `toolchain/receipt.json`; ein anderer Cachepfad wird fail-closed abgewiesen.
+
+### Einmaliger Cutover einer bestehenden Legacy-Zelle
+
+Eine vorhandene, noch nicht aktivierte Legacy-Zelle unter
+`~/.local/state/weltgewebe/staging-cell` wird **nicht** durch einen Fallback oder
+Symlink weiterbenutzt. Der einmalige Befehl
+
+```bash
+uv run --project tools/py --locked python scripts/platform/staging_cell.py migrate-legacy-state --owner-id "$COMMONTHING_STAGING_OWNER_ID"
+```
+
+prüft den alten Cell-Receipt und Owner, verweigert aktivierte oder mehrdeutige
+Zustände, löscht nur den exakt gebundenen alten Kind-Cluster `weltgewebe-staging`
+und verifiziert dessen Abwesenheit. Erst danach wird `data/` auf demselben
+Dateisystem atomar in den kanonischen State-Root verschoben. Dadurch bleiben
+Inodes, UID/GID und Dateimodi von PostgreSQL und NATS erhalten. Promotion-Receipts
+und private Secrets werden bytegleich übernommen und nach SHA-256 verifiziert;
+Secrets müssen reguläre owner-eigene Dateien mit Modus `0600` sein. Die alten
+Cell-/Toolchain-Receipts werden unverändert unter `legacy-evidence/` erhalten. Der
+alte Toolchain-Receipt wird **nicht** als aktive Toolchain übernommen, weil er
+absolute Legacy-Pfade bindet. Anschließend ist die Toolchain im neuen State-Root
+neu zu bootstrappen und `up` zu starten.
+
+Vor dem Daten-Move hält ein erhaltenes Legacy-Receipt den Bootstrap-Commit fest;
+damit ist der alte Cluster rekonstruierbar. Vor dem ersten Schreibzugriff des
+neuen Clusters kann `data/` außerdem per umgekehrtem Same-Filesystem-Rename in
+den Legacy-Root zurückgeführt werden. Ein erfolgreicher Migrations-Receipt bindet
+beide Roots, beide Clusteridentitäten, Owner, alte Receipt-Hashes, Secret-Hashes,
+Promotion-Dateien und die Inode-/Ownership-Identität der Daten. Kein normaler
+Controllerpfad fällt still auf den alten Root zurück.
 
 Beim ersten `up --owner-id <id>` wird die externe Secretquelle vor jeder
 Clustererzeugung erzeugt bzw. validiert. Anschließend bindet ein
@@ -91,114 +122,62 @@ späteres `up` nach `down` bleibt am Bootstrap-Commit und am ursprünglichen Own
 gebunden; ein stilles Umbinden des Datenpfads an ein inzwischen weitergelaufenes
 `main` ist verboten. Sobald eine App-Aktivierung läuft oder erfolgreich
 abgeschlossen ist, verweigert `up` fail-closed eine Rückschreibung auf den
-Bootstrap-Zustand; Wiederherstellung einer aktivierten Zelle bleibt ein eigener,
-ausdrücklich geprüfter Recovery-Pfad.
+Bootstrap-Zustand.
 
 Ein **App-Release** ist davon getrennt: `activate --owner-id <id>
 --source-commit <sha>` akzeptiert nur einen exakten aktuellen Public-`main`-Commit
 mit passendem Staging-Image-Promotion-Receipt. PostgreSQL/NATS und ihre
-`weltgewebe-staging-source`-/Data-Kustomization bleiben dabei am Bootstrap-Commit.
-Für die App wird eine eigene commitgebundene GitRepository-Quelle
-`weltgewebe-staging-app-source` angelegt. Die statische Staging-Überlagerung behält
-weiter `promotion-required`; erst die Laufzeit-Kustomization ersetzt API und Web
-durch die im Promotion-Receipt gebundenen unveränderlichen Digests.
+`commonthing-staging-source`-/Data-Kustomization bleiben dabei am Bootstrap-Commit.
+Für die App wird `commonthing-staging-app-source` angelegt. Die statische
+Staging-Überlagerung behält `promotion-required`; die Laufzeit-Kustomization bindet
+API und Web an die promovierten Digests und transformiert die effektiven
+Staging-Objekte auf `commonthing-api`/`commonthing-web`. Der Repo-Pfad
+`platform/apps/weltgewebe` bleibt vorläufig nur als gemeinsame Source-Layout-
+Kompatibilität mit Produktion bestehen; er ist keine kanonische Runtimeidentität.
 
-Vor dem ersten Kubernetes-Read validiert `activate` den exakten Owner- und
-Bootstrap-Marker und setzt die dedizierte Kubeconfig der `weltgewebe-staging`-Zelle;
-ein zufällig aktiver fremder Kubernetes-Kontext kann dadurch nicht als Staging
-geprüft werden. Nach Commit-, Promotion- und Registry-Preflight schreibt der
-Controller vor der ersten Clusteränderung ein nicht-geheimes
-`app-activation-in-progress`-Receipt. Es bindet den pending Commit, den exakten
-Promotion-Receipt-Hash, beide Image-Digests, den geplanten Migration-Job und die
-Registry-Secret-Hashes. Ein Abbruch bleibt dadurch in `status` als degradiert
-sichtbar. Ein Wiederanlauf darf nur denselben pending Commit, exakt dieselbe
-Promotion-Evidenz **und** dieselben gespeicherten Registry-Secret-Hashes fortsetzen;
-ein ausgetauschtes Receipt, andere Images oder rotierte Credentials werden vor jeder
-Recovery-Wirkung abgewiesen. Der bereits vor der ersten Clusteränderung
-geprüfte Commit darf zur Recovery weiterverwendet werden, auch wenn Public `main`
-inzwischen fortgeschritten ist; ein anderer Commit bleibt verboten.
+Vor dem ersten Kubernetes-Read validiert `activate` den Owner- und
+Bootstrap-Marker und setzt die dedizierte Kubeconfig der `commonthing-staging`-Zelle.
+Nach Commit-, Promotion- und Registry-Preflight schreibt der Controller vor der
+ersten Clusteränderung ein nicht-geheimes `app-activation-in-progress`-Receipt.
+Ein Wiederanlauf darf nur denselben pending Commit, dieselbe Promotion-Evidenz und
+dieselben gespeicherten Registry-Secret-Hashes fortsetzen.
 
-Nach Secret- und Registry-Injektion wendet `activate` zunächst exakt die bereits
-versionierten App-Regeln `default-deny`, `allow-dns` und
-`allow-api-data-egress` im Staging-Namespace an. Danach bindet der Controller die
-drei Live-Objekte an ihre Kubernetes-UIDs und wartet begrenzt, bis **jeder** Ready
-Cilium-Agent auf **jedem** Staging-Knoten genau diese UID-gebundenen Policies in
-seinem lokalen Policy-Repository führt. Knoten-/Agent-Inventur, Policy-Reads und
-Polling teilen dabei ein einziges 45-Sekunden-Gesamtbudget; jeder Unteraufruf wird
-auf das jeweils verbleibende Restbudget begrenzt und ein erst nach Ablauf
-beobachteter Erfolg wird verworfen. Fehlt Agentabdeckung oder Policy-Evidenz oder
-ist das Gesamtbudget erschöpft, endet die Aktivierung fail-closed, bevor der
-Migrations-Pod erzeugt wird. Damit
-besitzt bereits der erste Migrations-Pod vor seinem Start dieselbe
-Default-Deny-/DNS-/Daten-Egress-Grenze wie die spätere API; die vollständige App-
-Kustomization übernimmt dieselben Regeln anschließend dauerhaft über Flux. Erst
-danach führt `activate` vor dem normalen App-Rollout einen einmaligen
-Kubernetes-Migration-Job aus. Der Job verwendet exakt den im Promotion-Receipt
-gebundenen API-Digest, `WELTGEWEBE_API_MIGRATION_ONLY=1` und
-`WELTGEWEBE_API_STARTUP_MIGRATIONS=run`; `DATABASE_URL` kommt ausschließlich aus
-dem extern injizierten Runtime-Secret. Seine Identität bindet Commit,
-Promotion-Receipt und API-Digest. Ein bereits erfolgreich abgeschlossener, exakt
-gebundener Job wird beim Wiederanlauf wiederverwendet. Ein exakt gebundener
-`Failed=True`-Job wird kontrolliert gelöscht und neu erzeugt; ein Job mit abweichender
-Release- oder Spec-Bindung wird niemals automatisch ersetzt. Erst ein
-`Complete=True`-Readback desselben Jobs schaltet den API/Web-Rollout frei. Die normalen API-Pods bleiben auf
-`verify-applied` und starten daher nur, wenn die eingebettete Migrationshistorie
-bereits vollständig angewandt ist. Der Migrations-Pod teilt nur für den bereits
-bootstrapgebundenen PostgreSQL-NetworkPolicy-Zugang die API-Netzwerkidentität; eine
-nie erfüllte Readiness-Gate-Bedingung hält ihn aus den Service-Endpunkten heraus.
+Nach Secret- und Registry-Injektion wendet `activate` `default-deny`, `allow-dns`
+und `allow-api-data-egress` im Staging-Namespace an und wartet auf den Cilium-
+Policy-Beweis. Danach läuft der einmalige, digestgebundene Migrations-Job. Die
+Anwendungsvariablen `WELTGEWEBE_API_MIGRATION_ONLY` und
+`WELTGEWEBE_API_STARTUP_MIGRATIONS` bleiben bewusst Anwendungs-/Protokollvertrag;
+sie werden durch diesen Runtime-Namenscutover nicht umbenannt.
 
 PostgreSQL und NATS verwenden statische, klassenlose und vorgebundene HostPath-PVs
-mit `Retain`. Persistente Daten werden ausschließlich in den ersten Kind-Worker
-`weltgewebe-staging-worker` gemountet. PV-Node-Affinity und Pod-NodeSelector
-erzwingen denselben Daten-Worker. Das ist bewusst **kein HA-Failover**: bei
-Node-Ausfall bleibt der Datendienst lieber unavailable, statt ohne externes
-Fencing einen zweiten Schreiber auf dieselben Dateien zu starten.
+`commonthing-staging-postgres` und `commonthing-staging-nats` mit `Retain`. Die
+Daten werden ausschließlich in `commonthing-staging-worker` unter
+`/var/local/commonthing-staging` gemountet. PV-Node-Affinity und Pod-NodeSelector
+erzwingen denselben Daten-Worker. Das ist bewusst kein HA-Failover.
 
-Volume-Rechte werden nur für leere Volume-Wurzeln initialisiert. Ein gesundes
-oder bereits befülltes Datenverzeichnis wird bei erneutem `up` ausschließlich
-geprüft; rekursive `chown`-/`chmod`-Änderungen über laufende oder erhaltene Daten
-sind verboten. `fsGroupChangePolicy: OnRootMismatch` begrenzt zusätzlich
-unbeabsichtigte rekursive Rechtearbeit durch Kubernetes.
+Die interne PostgreSQL-Datenbank und der Datenbankbenutzer `weltgewebe` bleiben
+beim Cutover als persistierte Datenkompatibilität unverändert; ihre Umbenennung
+wäre eine eigene, transaktionale Datenmigration und ist keine Voraussetzung für
+eine kanonische Staging-Runtimeidentität. Ebenso bleiben `weltgewebe.net/*`-Keys
+als bestehender Anwendungs-/Protokollvertrag bestehen.
 
-Die Data-NetworkPolicies erlauben PostgreSQL (`5432`) und NATS (`4222`) nur Pods
-mit `app.kubernetes.io/name=weltgewebe-api` im exakten Namespace
-<!-- commonthing-naming: legacy -->
-`weltgewebe-staging`. Die frühere namespaceweite Freigabe über das Legacy-Label
-`weltgewebe.net/data-client` ist für diese Staging-Datenpfade nicht maßgeblich.
-Neue Secret-Binding-Metadaten verwenden gemäß Naming-Policy den kanonischen
-Schlüssel `commonthing.net/external-secret-source-sha256`. Für private GHCR-Images
-verlangt `activate` zusätzlich die externe, nicht von Git erzeugte Datei
-`~/.local/state/weltgewebe/staging-cell/secrets/staging-registry.json` als
-owner-private Datei mit Modus `0600`. Sie enthält ausschließlich den Pull-Zugang;
-der Controller prüft damit beide exakten promoted Digests **vor** der ersten
-Cluster-Mutation und injiziert anschließend ein server-side-applied
-`kubernetes.io/dockerconfigjson`-Secret. Im Receipt bleiben nur Quell- und
-Dockerconfig-Hashes, Secretname und Registry; der Credentialwert wird nicht
-protokolliert oder in Git/Argumentlisten übernommen. Auch Datenbank- und
-Runtime-Secret werden serverseitig angewandt, damit ihre Klarwerte nicht als
-`kubectl.kubernetes.io/last-applied-configuration` dupliziert werden.
+Die Data-NetworkPolicies erlauben PostgreSQL (`5432`) und NATS (`4222`) nur
+`commonthing-api`-Pods im exakten Namespace `commonthing-staging`. Neue
+Secret-Binding-Metadaten verwenden `commonthing.net/external-secret-source-sha256`.
+Für private GHCR-Images verlangt `activate` zusätzlich die externe Datei
+`~/.local/state/commonthing/staging-cell/secrets/staging-registry.json` als
+owner-private Datei mit Modus `0600`. Der Credentialwert wird weder protokolliert
+noch in Git, Argumentlisten oder Receipts übernommen. Fehlt der echte
+`read:packages`-Credential, bleibt die Zelle gesund und aktivierungsbereit; das
+Registry-Gate wird nicht umgangen.
 
-Nach dem Apply fordert jedes `up` über Flux' kanonische
-`reconcile.fluxcd.io/requestedAt`-Annotation zuerst eine neue Source-Reconciliation
-an und akzeptiert sie erst, wenn `status.lastHandledReconcileAt`, aktuelle Generation
-und exakte Receipt-Revision übereinstimmen. Danach wird mit demselben eindeutigen
-Token die Daten-Kustomization angestoßen. PVC-Sichtbarkeit und -Bindung bleiben im
-gemeinsamen 8-Minuten-Kustomization-Budget; sobald beide Claims sichtbar sind, gilt
-weiterhin der 45-Sekunden-Bindefehler. Erst danach muss die Kustomization denselben
-Reconcile-Token, aktuelle Generation, `Ready=True` und die exakte angewandte
-Receipt-Revision melden. Zusätzlich müssen PostgreSQL, NATS, `source-controller` und
-`kustomize-controller` als aktuelle Deployments die gewünschten verfügbaren,
-bereiten und aktualisierten Replikas melden. `status` verwendet dieselben
-Live-Workload-Schranken und degradiert bei fehlenden, stale oder nicht verfügbaren
-Ressourcen statt einen früheren Ready-Zustand fortzuschreiben.
-
-Die Staging-Zelle kann damit eine erfolgreich promovierte API/Web-Version
-staging-only migrieren und aktivieren. Der Cell-Receipt hält den erfolgreichen,
-commit-/promotion-/digestgebundenen Migrations-Readback fest; `status` prüft die
-weiterlebenden App-Source-, Kustomization-, Workload-, Image- und
-Registry-Secret-Bindungen. Sie etabliert weiterhin **keinen**
+Nach dem Apply erzwingt `up` weiterhin exakte Flux-Revisionen, gebundene PVCs und
+gesunde PostgreSQL-, NATS-, `source-controller`- und `kustomize-controller`-
+Deployments. `status` prüft denselben Livezustand. Der Cell-Receipt hält erfolgreiche
+Migration-/Aktivierungsbeweise fest; Produktion bleibt unverändert
+(`production_changed=false`). Die Zelle etabliert weiterhin keinen
 Gateway-/DNS-/TLS-Außenbeweis, kein Delete-to-Prove, keine NATS-Authentisierung/TLS
-und keinen Produktions-Kubernetes-Cutover. Diese Grenzen sind getrennt zu beweisen.
+und keinen Produktions-Kubernetes-Cutover.
 
 ## Beweise
 
