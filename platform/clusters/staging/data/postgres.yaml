@@ -3,7 +3,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: postgres
-  namespace: weltgewebe-data
+  namespace: commonthing-data
   labels:
     app.kubernetes.io/name: postgres
     app.kubernetes.io/component: data
@@ -30,7 +30,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       nodeSelector:
-        kubernetes.io/hostname: weltgewebe-staging-worker
+        kubernetes.io/hostname: commonthing-staging-worker
       containers:
         - name: postgres
           image: postgres:16@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
@@ -39,17 +39,17 @@ spec:
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
-                  name: weltgewebe-staging-database
+                  name: commonthing-staging-database
                   key: username
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: weltgewebe-staging-database
+                  name: commonthing-staging-database
                   key: password
             - name: POSTGRES_DB
               valueFrom:
                 secretKeyRef:
-                  name: weltgewebe-staging-database
+                  name: commonthing-staging-database
                   key: database
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
@@ -113,7 +113,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: postgres
-  namespace: weltgewebe-data
+  namespace: commonthing-data
 spec:
   selector:
     app.kubernetes.io/name: postgres

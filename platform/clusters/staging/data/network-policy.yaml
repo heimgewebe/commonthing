@@ -3,7 +3,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: default-deny
-  namespace: weltgewebe-data
+  namespace: commonthing-data
 spec:
   podSelector: {}
   policyTypes: ["Ingress", "Egress"]
@@ -12,7 +12,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-app-postgres-access
-  namespace: weltgewebe-data
+  namespace: commonthing-data
 spec:
   podSelector:
     matchLabels:
@@ -22,10 +22,10 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: weltgewebe-staging
+              kubernetes.io/metadata.name: commonthing-staging
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: weltgewebe-api
+              app.kubernetes.io/name: commonthing-api
       ports:
         - port: 5432
           protocol: TCP
@@ -34,7 +34,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-app-nats-access
-  namespace: weltgewebe-data
+  namespace: commonthing-data
 spec:
   podSelector:
     matchLabels:
@@ -44,10 +44,10 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: weltgewebe-staging
+              kubernetes.io/metadata.name: commonthing-staging
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: weltgewebe-api
+              app.kubernetes.io/name: commonthing-api
       ports:
         - port: 4222
           protocol: TCP
@@ -56,7 +56,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-dns
-  namespace: weltgewebe-data
+  namespace: commonthing-data
 spec:
   podSelector: {}
   policyTypes: ["Egress"]

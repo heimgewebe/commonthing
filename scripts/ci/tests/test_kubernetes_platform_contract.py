@@ -87,13 +87,13 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         readme = (ROOT / "platform/README.md").read_text(encoding="utf-8")
         bootstrap = (
             'uv run --project tools/py --locked python scripts/platform/bootstrap_tools.py '
-            '--cache "$HOME/.local/state/weltgewebe/staging-cell/toolchain"'
+            '--cache "$HOME/.local/state/commonthing/staging-cell/toolchain"'
         )
         up = (
             'uv run --project tools/py --locked python scripts/platform/staging_cell.py '
-            'up --owner-id "$WELTGEWEBE_STAGING_OWNER_ID"'
+            'up --owner-id "$COMMONTHING_STAGING_OWNER_ID"'
         )
-        self.assertIn('export WELTGEWEBE_STAGING_OWNER_ID="owner-t084-staging"', readme)
+        self.assertIn('export COMMONTHING_STAGING_OWNER_ID="owner-t084-staging"', readme)
         self.assertIn(bootstrap, readme)
         self.assertIn(up, readme)
         self.assertLess(readme.index(bootstrap), readme.index(up))

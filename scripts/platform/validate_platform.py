@@ -622,7 +622,7 @@ def _assert_staging_cell_contract() -> None:
     if len(cluster_docs) != 1:
         raise ContractError("staging kind config must contain exactly one Cluster")
     cluster = cluster_docs[0]
-    if cluster.get("kind") != "Cluster" or cluster.get("name") != "weltgewebe-staging":
+    if cluster.get("kind") != "Cluster" or cluster.get("name") != "commonthing-staging":
         raise ContractError("staging kind cluster identity is invalid")
     nodes = cluster.get("nodes")
     if not isinstance(nodes, list) or len(nodes) != 3:
@@ -632,7 +632,7 @@ def _assert_staging_cell_contract() -> None:
         raise ContractError("staging kind node-role contract drift")
 
     expected_host = "__COMMONTHING_STAGING_DATA_ROOT__"
-    expected_container = "/var/local/weltgewebe-staging"
+    expected_container = "/var/local/commonthing-staging"
     for index, node in enumerate(nodes):
         mounts = node.get("extraMounts", []) if isinstance(node, dict) else []
         if index != 1:
@@ -666,12 +666,12 @@ def _assert_staging_cell_contract() -> None:
         if d.get("kind") == "PersistentVolumeClaim"
     }
     expected_pvs = {
-        "weltgewebe-staging-postgres": (
-            "/var/local/weltgewebe-staging/postgres",
+        "commonthing-staging-postgres": (
+            "/var/local/commonthing-staging/postgres",
             "postgres-data",
         ),
-        "weltgewebe-staging-nats": (
-            "/var/local/weltgewebe-staging/nats",
+        "commonthing-staging-nats": (
+            "/var/local/commonthing-staging/nats",
             "nats-data",
         ),
     }
@@ -687,7 +687,7 @@ def _assert_staging_cell_contract() -> None:
                         {
                             "key": "kubernetes.io/hostname",
                             "operator": "In",
-                            "values": ["weltgewebe-staging-worker"],
+                            "values": ["commonthing-staging-worker"],
                         }
                     ]
                 }
@@ -726,7 +726,7 @@ def _assert_staging_cell_contract() -> None:
             )
         pod_spec = deployment_spec.get("template", {}).get("spec", {})
         if pod_spec.get("nodeSelector") != {
-            "kubernetes.io/hostname": "weltgewebe-staging-worker"
+            "kubernetes.io/hostname": "commonthing-staging-worker"
         }:
             raise ContractError(f"staging {name} must be pinned to the dedicated data worker")
         if pod_spec.get("securityContext", {}).get("fsGroupChangePolicy") != "OnRootMismatch":
@@ -747,7 +747,7 @@ def _assert_staging_cell_contract() -> None:
     env = {item.get("name"): item for item in postgres.get("env", []) if isinstance(item, dict)}
     for name, key in (("POSTGRES_USER", "username"), ("POSTGRES_PASSWORD", "password"), ("POSTGRES_DB", "database")):
         ref = env.get(name, {}).get("valueFrom", {}).get("secretKeyRef", {})
-        if ref.get("name") != "weltgewebe-staging-database" or ref.get("key") != key:
+        if ref.get("name") != "commonthing-staging-database" or ref.get("key") != key:
             raise ContractError(f"staging postgres {name} must come from external Secret binding")
     startup = postgres.get("startupProbe", {})
     if int(startup.get("failureThreshold", 0)) * int(startup.get("periodSeconds", 0)) < 300:
@@ -784,11 +784,11 @@ def _assert_staging_cell_contract() -> None:
                     {
                         "namespaceSelector": {
                             "matchLabels": {
-                                "kubernetes.io/metadata.name": "weltgewebe-staging"
+                                "kubernetes.io/metadata.name": "commonthing-staging"
                             }
                         },
                         "podSelector": {
-                            "matchLabels": {"app.kubernetes.io/name": "weltgewebe-api"}
+                            "matchLabels": {"app.kubernetes.io/name": "commonthing-api"}
                         },
                     }
                 ],
