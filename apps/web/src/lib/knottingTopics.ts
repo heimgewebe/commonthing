@@ -117,8 +117,7 @@ export function splitKnottingTags(values: readonly string[]): {
   }
 
   topics.sort(
-    (left, right) =>
-      (topicOrder.get(left) ?? 0) - (topicOrder.get(right) ?? 0),
+    (left, right) => (topicOrder.get(left) ?? 0) - (topicOrder.get(right) ?? 0),
   );
   return { topics, keywords };
 }
