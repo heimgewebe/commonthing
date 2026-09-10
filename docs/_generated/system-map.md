@@ -25,7 +25,7 @@ Source: scripts/docmeta/generate_system_map.py
 
 |id|path|role|organ|status|last_reviewed|depends_on|verifies_with|missing_scripts|
 |---|---|---|---|---|---|---|---|---|
-|platform.readme|platform/README.md|norm|ops|canonical|2026-08-30||scripts/platform/kind_reference.py, scripts/platform/validate_platform.py||
+|platform.readme|platform/README.md|norm|ops|canonical|2026-09-10||scripts/platform/kind_reference.py, scripts/platform/validate_platform.py||
 
 ## Zone: policy
 

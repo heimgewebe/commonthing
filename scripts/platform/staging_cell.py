@@ -15,7 +15,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -27,19 +29,34 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATE_ROOT = Path.home() / ".local/state/weltgewebe/staging-cell"
 DEFAULT_CLUSTER = "weltgewebe-staging"
 SOURCE_NAME = "weltgewebe-staging-source"
+APP_SOURCE_NAME = "weltgewebe-staging-app-source"
 DATA_KUSTOMIZATION = "weltgewebe-staging-data"
+APP_KUSTOMIZATION = "weltgewebe-staging-app"
+MIGRATION_JOB_PREFIX = "weltgewebe-staging-migration"
+MIGRATION_TEMPLATE = ROOT / "platform/apps/weltgewebe/migration/ha/job.yaml"
+MIGRATION_TIMEOUT_SECONDS = 8 * 60
+MIGRATION_SPEC_ANNOTATION = "commonthing.net/migration-spec-sha256"
+CILIUM_POLICY_ENFORCEMENT_TIMEOUT_SECONDS = 45.0
+CILIUM_POLICY_ENFORCEMENT_POLL_SECONDS = 1.0
 DATA_NAMESPACE = "weltgewebe-data"
 APP_NAMESPACE = "weltgewebe-staging"
 DATABASE_SECRET = "weltgewebe-staging-database"
 RUNTIME_SECRET = "weltgewebe-runtime"
+REGISTRY_SECRET = "weltgewebe-staging-registry"
+GHCR_REGISTRY = "ghcr.io"
 LIVE_DEPLOYMENTS = {
     "postgres": (DATA_NAMESPACE, "postgres"),
     "nats": (DATA_NAMESPACE, "nats"),
     "source-controller": ("flux-system", "source-controller"),
     "kustomize-controller": ("flux-system", "kustomize-controller"),
 }
+APP_DEPLOYMENTS = {
+    "api": (APP_NAMESPACE, "weltgewebe-api"),
+    "web": (APP_NAMESPACE, "weltgewebe-web"),
+}
 PUBLIC_REPOSITORY = "https://github.com/heimgewebe/commonthing"
 SECRET_SOURCE_ANNOTATION = "commonthing.net/external-secret-source-sha256"
+REGISTRY_SOURCE_ANNOTATION = "commonthing.net/registry-secret-source-sha256"
 DATA_KUSTOMIZATION_TIMEOUT = "8m"
 DATA_KUSTOMIZATION_TIMEOUT_SECONDS = 8 * 60.0
 PVC_BIND_TIMEOUT_SECONDS = 45.0
@@ -75,7 +92,7 @@ def run(
     *,
     input_text: str | None = None,
     capture: bool = False,
-    timeout: int | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     print("+ external command [arguments redacted]", file=sys.stderr, flush=True)
     kwargs: dict[str, Any] = {"capture_output": True} if capture else {"stdout": sys.stderr}
@@ -90,7 +107,7 @@ def run(
     )
 
 
-def output(argv: list[str], *, timeout: int | None = None) -> str:
+def output(argv: list[str], *, timeout: float | None = None) -> str:
     return run(argv, capture=True, timeout=timeout).stdout.strip()
 
 
@@ -447,6 +464,15 @@ def require_receipt_cluster(cell: dict[str, Any], cluster: str) -> None:
         )
 
 
+def cell_active_commit(cell: dict[str, Any]) -> str:
+    bootstrap = str(cell.get("bootstrap_commit") or "")
+    active = str(cell.get("active_commit") or bootstrap)
+    for label, value in (("bootstrap_commit", bootstrap), ("active_commit", active)):
+        if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+            raise StagingCellError(f"cell receipt has no canonical {label}")
+    return active
+
+
 def recorded_secret_source_sha(root: Path) -> str | None:
     receipt_path = root / "receipts/cell-bootstrap.json"
     if not receipt_path.exists():
@@ -579,6 +605,255 @@ def load_or_create_secret_material(root: Path) -> tuple[dict[str, str], str]:
     return {key: str(payload[key]) for key in required}, source_sha
 
 
+def load_registry_pull_material(root: Path) -> tuple[dict[str, str], str]:
+    path = root / "secrets/staging-registry.json"
+    try:
+        linked = path.lstat()
+    except OSError as error:
+        raise StagingCellError(
+            "staging registry credential source is missing; provide an owner-private external "
+            "read:packages credential at secrets/staging-registry.json"
+        ) from error
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or stat.S_IMODE(linked.st_mode) != 0o600
+    ):
+        raise StagingCellError(
+            "staging registry credential source must be an owner-owned mode-0600 regular file"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeError) as error:
+        raise StagingCellError("staging registry credential source is malformed") from error
+    required = ("registry", "username", "token")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("registry") != GHCR_REGISTRY
+        or any(
+            not isinstance(payload.get(key), str)
+            or not payload[key]
+            or any(character in payload[key] for character in "\r\n\x00")
+            for key in required
+        )
+    ):
+        raise StagingCellError("staging registry credential source is malformed")
+    return {key: str(payload[key]) for key in required}, sha256_file(path)
+
+
+def registry_dockerconfig_json(material: dict[str, str]) -> str:
+    if material.get("registry") != GHCR_REGISTRY:
+        raise StagingCellError("staging registry credential targets an unexpected registry")
+    username = material.get("username") or ""
+    token = material.get("token") or ""
+    if not username or not token:
+        raise StagingCellError("staging registry credential is incomplete")
+    auth = base64.b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+    return json.dumps(
+        {"auths": {GHCR_REGISTRY: {"auth": auth}}},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+class _NoRegistryRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req,
+        fp,
+        code,
+        msg,
+        headers,
+        newurl,
+    ):
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+def registry_urlopen(request: urllib.request.Request):
+    opener = urllib.request.build_opener(_NoRegistryRedirectHandler())
+    return opener.open(request, timeout=15)
+
+
+def verify_ghcr_pull_access(
+    material: dict[str, str], promotion: dict[str, Any]
+) -> dict[str, bool]:
+    username = material.get("username") or ""
+    token = material.get("token") or ""
+    if material.get("registry") != GHCR_REGISTRY or not username or not token:
+        raise StagingCellError("staging registry credential is incomplete")
+    images = promotion.get("images") if isinstance(promotion, dict) else None
+    if not isinstance(images, dict):
+        raise StagingCellError("promotion evidence has no verified images")
+    basic = base64.b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+    verified: dict[str, bool] = {}
+    for label in ("api", "web"):
+        reference_value = images.get(label)
+        if not isinstance(reference_value, str) or "@sha256:" not in reference_value:
+            raise StagingCellError(f"verified {label} image is not digest-bound")
+        prefix = f"{GHCR_REGISTRY}/"
+        if not reference_value.startswith(prefix):
+            raise StagingCellError(f"verified {label} image targets an unexpected registry")
+        repository, digest = reference_value[len(prefix):].rsplit("@", 1)
+        canonical_image_digest(digest, label=label)
+        query = urllib.parse.urlencode(
+            {
+                "service": GHCR_REGISTRY,
+                "scope": f"repository:{repository}:pull",
+            }
+        )
+        token_request = urllib.request.Request(
+            f"https://{GHCR_REGISTRY}/token?{query}",
+            headers={"Authorization": f"Basic {basic}"},
+        )
+        try:
+            with registry_urlopen(token_request) as response:
+                token_payload = json.loads(response.read().decode("utf-8"))
+            bearer = token_payload.get("token") or token_payload.get("access_token")
+            if not isinstance(bearer, str) or not bearer:
+                raise StagingCellError(
+                    f"registry pull preflight returned no bearer token for {label}"
+                )
+            manifest_request = urllib.request.Request(
+                f"https://{GHCR_REGISTRY}/v2/{repository}/manifests/{digest}",
+                headers={
+                    "Authorization": f"Bearer {bearer}",
+                    "Accept": ", ".join(
+                        (
+                            "application/vnd.oci.image.index.v1+json",
+                            "application/vnd.docker.distribution.manifest.list.v2+json",
+                            "application/vnd.oci.image.manifest.v1+json",
+                        )
+                    ),
+                },
+                method="HEAD",
+            )
+            with registry_urlopen(manifest_request) as response:
+                observed_digest = response.headers.get("Docker-Content-Digest")
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+        ) as error:
+            raise StagingCellError(
+                f"registry pull preflight failed for promoted {label} image"
+            ) from error
+        if observed_digest != digest:
+            raise StagingCellError(
+                f"registry pull preflight digest mismatch for promoted {label} image"
+            )
+        verified[label] = True
+    return verified
+
+
+def registry_secret_document_matches(
+    document: dict[str, Any],
+    *,
+    source_sha: str,
+    expected_config_sha256: str,
+) -> bool:
+    metadata = document.get("metadata") if isinstance(document, dict) else None
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != REGISTRY_SECRET
+        or metadata.get("namespace") != APP_NAMESPACE
+        or not isinstance(annotations, dict)
+        or annotations.get(REGISTRY_SOURCE_ANNOTATION) != source_sha
+        or "kubectl.kubernetes.io/last-applied-configuration" in annotations
+        or document.get("type") != "kubernetes.io/dockerconfigjson"
+    ):
+        return False
+    data = document.get("data")
+    if not isinstance(data, dict):
+        return False
+    encoded = data.get(".dockerconfigjson")
+    if not isinstance(encoded, str):
+        return False
+    try:
+        observed = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(sha256_bytes(observed), expected_config_sha256)
+
+
+def inject_registry_pull_secret(
+    kubectl: str,
+    root: Path,
+    *,
+    material: dict[str, str] | None = None,
+    source_sha: str | None = None,
+) -> dict[str, str]:
+    if material is None or source_sha is None:
+        material, source_sha = load_registry_pull_material(root)
+    config = registry_dockerconfig_json(material)
+    config_sha256 = sha256_bytes(config.encode("utf-8"))
+    apply_yaml_server_side(
+        kubectl,
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": REGISTRY_SECRET,
+                "namespace": APP_NAMESPACE,
+                "annotations": {REGISTRY_SOURCE_ANNOTATION: source_sha},
+            },
+            "type": "kubernetes.io/dockerconfigjson",
+            "data": {
+                ".dockerconfigjson": base64.b64encode(
+                    config.encode("utf-8")
+                ).decode("ascii")
+            },
+        },
+        field_manager="weltgewebe-staging-registry",
+    )
+    return {
+        "source_sha256": source_sha,
+        "config_sha256": config_sha256,
+        "secret_name": REGISTRY_SECRET,
+        "registry": GHCR_REGISTRY,
+    }
+
+
+def verify_registry_pull_secret_binding(
+    kubectl: str,
+    *,
+    expected_source_sha: str,
+    expected_config_sha256: str,
+) -> dict[str, Any]:
+    try:
+        document = json.loads(
+            output(
+                [
+                    kubectl,
+                    "-n",
+                    APP_NAMESPACE,
+                    "get",
+                    "secret",
+                    REGISTRY_SECRET,
+                    "-o",
+                    "json",
+                ]
+            )
+        )
+        ready = registry_secret_document_matches(
+            document,
+            source_sha=expected_source_sha,
+            expected_config_sha256=expected_config_sha256,
+        )
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return {"ready": False}
+    return {
+        "ready": ready,
+        "source_sha256": expected_source_sha if ready else None,
+        "config_sha256": expected_config_sha256 if ready else None,
+    }
+
+
 def database_url(material: dict[str, str]) -> str:
     encoded_user = urllib.parse.quote(material["database_user"], safe="")
     encoded_password = urllib.parse.quote(material["database_password"], safe="")
@@ -686,6 +961,30 @@ def apply_yaml(kubectl: str, documents: list[dict[str, Any]] | dict[str, Any]) -
     run([kubectl, "apply", "-f", "-"], input_text=body, timeout=120)
 
 
+def apply_yaml_server_side(
+    kubectl: str,
+    documents: list[dict[str, Any]] | dict[str, Any],
+    *,
+    field_manager: str,
+) -> None:
+    if not field_manager or any(character.isspace() for character in field_manager):
+        raise StagingCellError("server-side apply field manager is invalid")
+    docs = documents if isinstance(documents, list) else [documents]
+    body = yaml.safe_dump_all(docs, sort_keys=False, explicit_start=True)
+    run(
+        [
+            kubectl,
+            "apply",
+            "--server-side",
+            f"--field-manager={field_manager}",
+            "-f",
+            "-",
+        ],
+        input_text=body,
+        timeout=120,
+    )
+
+
 def namespace(name: str) -> dict[str, Any]:
     labels = {
         "pod-security.kubernetes.io/enforce": "restricted",
@@ -707,7 +1006,7 @@ def inject_external_secrets(kubectl: str, root: Path) -> dict[str, str]:
     runtime_database_url = database_url(material)
     annotations = {SECRET_SOURCE_ANNOTATION: source_sha}
     apply_yaml(kubectl, [namespace(DATA_NAMESPACE), namespace(APP_NAMESPACE)])
-    apply_yaml(
+    apply_yaml_server_side(
         kubectl,
         [
             {
@@ -737,6 +1036,7 @@ def inject_external_secrets(kubectl: str, root: Path) -> dict[str, str]:
                 "stringData": {"database-url": runtime_database_url},
             },
         ],
+        field_manager="weltgewebe-staging-secrets",
     )
     return {"source_sha256": source_sha, "required_keys": ["database-url"]}
 
@@ -1122,6 +1422,28 @@ def reconcile_data(kubectl: str, commit: str) -> str:
     return requested_at
 
 
+def require_bootstrap_data_current(kubectl: str, commit: str) -> dict[str, dict[str, Any]]:
+    states = {
+        "source": flux_resource_current_state(
+            kubectl, "gitrepository", SOURCE_NAME, commit
+        ),
+        "data": flux_resource_current_state(
+            kubectl, "kustomization", DATA_KUSTOMIZATION, commit
+        ),
+    }
+    unhealthy = {
+        name: state
+        for name, state in states.items()
+        if state.get("ready") != "True" or state.get("matches_commit") is not True
+    }
+    if unhealthy:
+        raise StagingCellError(
+            "staging bootstrap data plane is not current; refusing app activation: "
+            f"{unhealthy!r}"
+        )
+    return states
+
+
 def deployment_ready_state(kubectl: str, namespace: str, name: str) -> str:
     raw = output(
         [
@@ -1189,6 +1511,876 @@ def image_promotion_state() -> dict[str, Any]:
     }
 
 
+def canonical_image_digest(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.startswith("sha256:"):
+        raise StagingCellError(f"promotion receipt {label} digest is not sha256-bound")
+    digest = value.removeprefix("sha256:")
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise StagingCellError(f"promotion receipt {label} digest is malformed")
+    return value
+
+
+def load_promotion_receipt(root: Path, commit: str) -> dict[str, Any]:
+    if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
+        raise StagingCellError("promotion commit must be canonical 40-hex")
+    directory = root / "promotion" / commit
+    path = directory / "receipt.json"
+    if directory.is_symlink() or not directory.is_dir():
+        raise StagingCellError("promotion receipt directory is missing or unsafe")
+    try:
+        linked = path.lstat()
+    except OSError as error:
+        raise StagingCellError("promotion receipt is missing or unreadable") from error
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or stat.S_IMODE(linked.st_mode) & 0o077
+    ):
+        raise StagingCellError("promotion receipt must be an owner-private regular file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StagingCellError("promotion receipt is malformed") from error
+    if not isinstance(payload, dict):
+        raise StagingCellError("promotion receipt is not an object")
+    expected = {
+        "schema_version": 1,
+        "status": "pass",
+        "scope": "staging-only",
+        "source_commit": commit,
+        "repository": "heimgewebe/commonthing",
+        "image_identity": "digest-authoritative",
+        "production_activation": False,
+    }
+    mismatched = {
+        key: {"expected": value, "observed": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatched:
+        raise StagingCellError(
+            "promotion receipt identity mismatch: "
+            + json.dumps(mismatched, sort_keys=True)
+        )
+    images = payload.get("images")
+    if not isinstance(images, dict):
+        raise StagingCellError("promotion receipt has no image map")
+    result_images: dict[str, str] = {}
+    for label, canonical in (
+        ("api", "ghcr.io/heimgewebe/commonthing-api"),
+        ("web", "ghcr.io/heimgewebe/commonthing-web"),
+    ):
+        image = images.get(label)
+        if not isinstance(image, dict) or image.get("canonical") != canonical:
+            raise StagingCellError(f"promotion receipt {label} image identity mismatch")
+        digest = canonical_image_digest(image.get("digest"), label=label)
+        reference_value = f"{canonical}@{digest}"
+        if image.get("canonical_reference") != reference_value:
+            raise StagingCellError(
+                f"promotion receipt {label} canonical reference does not match digest"
+            )
+        result_images[label] = reference_value
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "source_commit": commit,
+        "receipt_path": str(path),
+        "receipt_sha256": sha256_file(path),
+        "images": result_images,
+    }
+
+
+def migration_plan(commit: str, promotion: dict[str, Any]) -> dict[str, str]:
+    if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
+        raise StagingCellError("migration source commit must be canonical 40-hex")
+    receipt_sha = promotion.get("receipt_sha256") if isinstance(promotion, dict) else None
+    if (
+        not isinstance(receipt_sha, str)
+        or len(receipt_sha) != 64
+        or any(ch not in "0123456789abcdef" for ch in receipt_sha)
+    ):
+        raise StagingCellError("promotion evidence has no canonical receipt hash")
+    images = promotion.get("images") if isinstance(promotion, dict) else None
+    api_image = images.get("api") if isinstance(images, dict) else None
+    prefix = "ghcr.io/heimgewebe/commonthing-api@"
+    if not isinstance(api_image, str) or not api_image.startswith(prefix):
+        raise StagingCellError("promotion evidence has no canonical API image")
+    digest = api_image[len(prefix):]
+    canonical_image_digest(digest, label="api")
+    digest_hex = digest.removeprefix("sha256:")
+    job_name = f"{MIGRATION_JOB_PREFIX}-{commit[:10]}-{digest_hex[:12]}"
+    if len(job_name) > 63:
+        raise StagingCellError("staging migration Job name exceeds Kubernetes limits")
+    return {
+        "job_name": job_name,
+        "source_commit": commit,
+        "receipt_sha256": receipt_sha,
+        "api_image": api_image,
+    }
+
+
+def require_pending_promotion_matches(
+    cell: dict[str, Any], commit: str, promotion: dict[str, Any]
+) -> dict[str, str]:
+    pending = cell.get("pending_image_promotion")
+    expected = {
+        "source_commit": commit,
+        "receipt_sha256": promotion.get("receipt_sha256"),
+        "images": promotion.get("images"),
+    }
+    if not isinstance(pending, dict) or pending != expected:
+        raise StagingCellError(
+            "activation recovery promotion evidence differs from the exact pending release"
+        )
+    plan = migration_plan(commit, promotion)
+    if cell.get("pending_migration") != plan:
+        raise StagingCellError(
+            "activation recovery migration evidence differs from the exact pending release"
+        )
+    return plan
+
+
+def require_pending_registry_matches(
+    cell: dict[str, Any],
+    *,
+    source_sha: str,
+    config_sha256: str,
+) -> dict[str, str]:
+    expected = {
+        "source_sha256": source_sha,
+        "config_sha256": config_sha256,
+        "secret_name": REGISTRY_SECRET,
+        "registry": GHCR_REGISTRY,
+    }
+    pending = cell.get("pending_registry_pull_secret")
+    if not isinstance(pending, dict) or pending != expected:
+        raise StagingCellError(
+            "activation recovery registry credential differs from the exact pending release"
+        )
+    return expected
+
+
+def migration_network_policy_documents() -> list[dict[str, Any]]:
+    expected = (
+        ("default-deny", ROOT / "platform/apps/weltgewebe/base/network-policy-default-deny.yaml"),
+        ("allow-dns", ROOT / "platform/apps/weltgewebe/base/network-policy-dns.yaml"),
+        ("allow-api-data-egress", ROOT / "platform/apps/weltgewebe/base/network-policy-api-data-egress.yaml"),
+    )
+    documents: list[dict[str, Any]] = []
+    for expected_name, path in expected:
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError) as error:
+            raise StagingCellError(
+                f"cannot load staging migration NetworkPolicy {expected_name!r}"
+            ) from error
+        metadata = document.get("metadata") if isinstance(document, dict) else None
+        if (
+            not isinstance(document, dict)
+            or document.get("apiVersion") != "networking.k8s.io/v1"
+            or document.get("kind") != "NetworkPolicy"
+            or not isinstance(metadata, dict)
+            or metadata.get("name") != expected_name
+        ):
+            raise StagingCellError(
+                f"staging migration NetworkPolicy {expected_name!r} is malformed"
+            )
+        isolated = json.loads(json.dumps(document))
+        isolated["metadata"]["namespace"] = APP_NAMESPACE
+        documents.append(isolated)
+    return documents
+
+
+def _load_json_object(raw: str, *, label: str) -> dict[str, Any]:
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise StagingCellError(f"{label} returned malformed JSON") from error
+    if not isinstance(document, dict):
+        raise StagingCellError(f"{label} did not return a JSON object")
+    return document
+
+
+def migration_network_policy_bindings(
+    kubectl: str, names: list[str]
+) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for name in names:
+        document = _load_json_object(
+            output(
+                [
+                    kubectl,
+                    "-n",
+                    APP_NAMESPACE,
+                    "get",
+                    "networkpolicy",
+                    name,
+                    "-o",
+                    "json",
+                ]
+            ),
+            label=f"staging migration NetworkPolicy {name!r}",
+        )
+        metadata = document.get("metadata")
+        observed_name = metadata.get("name") if isinstance(metadata, dict) else None
+        namespace_name = metadata.get("namespace") if isinstance(metadata, dict) else None
+        uid = metadata.get("uid") if isinstance(metadata, dict) else None
+        if (
+            observed_name != name
+            or namespace_name != APP_NAMESPACE
+            or not isinstance(uid, str)
+            or not uid
+            or len(uid) > 128
+        ):
+            raise StagingCellError(
+                f"staging migration NetworkPolicy {name!r} has no exact live UID binding"
+            )
+        bindings[name] = uid
+    return bindings
+
+
+def _remaining_cilium_policy_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise StagingCellError(
+            "Cilium policy enforcement exceeded the bounded activation deadline"
+        )
+    return min(30.0, remaining)
+
+
+def ready_cilium_agents(
+    kubectl: str, *, deadline: float | None = None
+) -> list[tuple[str, str]]:
+    node_timeout = (
+        30.0 if deadline is None else _remaining_cilium_policy_timeout(deadline)
+    )
+    nodes = _load_json_object(
+        output([kubectl, "get", "nodes", "-o", "json"], timeout=node_timeout),
+        label="staging node inventory",
+    ).get("items")
+    if not isinstance(nodes, list):
+        raise StagingCellError("staging node inventory has no item list")
+    node_names = {
+        str(metadata.get("name"))
+        for node in nodes
+        if isinstance(node, dict)
+        and isinstance((metadata := node.get("metadata")), dict)
+        and isinstance(metadata.get("name"), str)
+        and metadata.get("name")
+    }
+    if not node_names or len(node_names) != len(nodes):
+        raise StagingCellError("staging node inventory is incomplete")
+
+    pod_timeout = (
+        30.0 if deadline is None else _remaining_cilium_policy_timeout(deadline)
+    )
+    pod_document = _load_json_object(
+        output(
+            [
+                kubectl,
+                "-n",
+                "kube-system",
+                "get",
+                "pods",
+                "-l",
+                "k8s-app=cilium",
+                "-o",
+                "json",
+            ],
+            timeout=pod_timeout,
+        ),
+        label="Cilium agent inventory",
+    )
+    pods = pod_document.get("items")
+    if not isinstance(pods, list):
+        raise StagingCellError("Cilium agent inventory has no item list")
+    agents: dict[str, str] = {}
+    for pod in pods:
+        if not isinstance(pod, dict):
+            continue
+        metadata = pod.get("metadata")
+        spec = pod.get("spec")
+        status = pod.get("status")
+        pod_name = metadata.get("name") if isinstance(metadata, dict) else None
+        node_name = spec.get("nodeName") if isinstance(spec, dict) else None
+        conditions = status.get("conditions") if isinstance(status, dict) else None
+        ready = bool(
+            isinstance(conditions, list)
+            and any(
+                isinstance(condition, dict)
+                and condition.get("type") == "Ready"
+                and condition.get("status") == "True"
+                for condition in conditions
+            )
+        )
+        if (
+            not isinstance(pod_name, str)
+            or not pod_name
+            or not isinstance(node_name, str)
+            or node_name not in node_names
+            or not isinstance(status, dict)
+            or status.get("phase") != "Running"
+            or not ready
+        ):
+            continue
+        if node_name in agents:
+            raise StagingCellError(
+                f"multiple Ready Cilium agents observed for staging node {node_name!r}"
+            )
+        agents[node_name] = pod_name
+    if set(agents) != node_names:
+        raise StagingCellError(
+            "staging Cilium agent coverage is incomplete; refusing migration pod creation"
+        )
+    return sorted(agents.items())
+
+
+def parse_cilium_policy_repository(raw: str) -> tuple[list[dict[str, Any]], int]:
+    text = raw.lstrip()
+    try:
+        payload, offset = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError as error:
+        raise StagingCellError("Cilium policy repository returned malformed JSON") from error
+    if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+        raise StagingCellError("Cilium policy repository is not a JSON rule list")
+    trailer = text[offset:].strip()
+    prefix = "Revision:"
+    if not trailer.startswith(prefix):
+        raise StagingCellError("Cilium policy repository has no revision trailer")
+    revision_text = trailer[len(prefix):].strip()
+    if not revision_text.isdigit():
+        raise StagingCellError("Cilium policy repository revision is malformed")
+    return payload, int(revision_text)
+
+
+def cilium_network_policy_bindings(raw: str) -> tuple[set[tuple[str, str, str]], int]:
+    policies, revision = parse_cilium_policy_repository(raw)
+    bindings: set[tuple[str, str, str]] = set()
+    for policy in policies:
+        labels = policy.get("Labels")
+        if not isinstance(labels, list):
+            continue
+        mapped = {
+            str(label.get("key")): str(label.get("value"))
+            for label in labels
+            if isinstance(label, dict)
+            and label.get("source") == "k8s"
+            and isinstance(label.get("key"), str)
+            and isinstance(label.get("value"), str)
+        }
+        if mapped.get("io.cilium.k8s.policy.derived-from") != "NetworkPolicy":
+            continue
+        name = mapped.get("io.cilium.k8s.policy.name")
+        namespace_name = mapped.get("io.cilium.k8s.policy.namespace")
+        uid = mapped.get("io.cilium.k8s.policy.uid")
+        if name and namespace_name and uid:
+            bindings.add((name, namespace_name, uid))
+    return bindings, revision
+
+
+def wait_migration_network_policy_enforcement(
+    kubectl: str,
+    policy_uids: dict[str, str],
+    *,
+    timeout_seconds: float = CILIUM_POLICY_ENFORCEMENT_TIMEOUT_SECONDS,
+    poll_seconds: float = CILIUM_POLICY_ENFORCEMENT_POLL_SECONDS,
+) -> dict[str, Any]:
+    if not policy_uids:
+        raise StagingCellError("staging migration NetworkPolicy bindings are empty")
+    expected = {
+        (name, APP_NAMESPACE, uid) for name, uid in policy_uids.items()
+    }
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    last_missing: dict[str, list[str]] = {}
+    while True:
+        try:
+            agents = ready_cilium_agents(kubectl, deadline=deadline)
+        except subprocess.TimeoutExpired as error:
+            raise StagingCellError(
+                "Cilium agent inventory exceeded the bounded activation deadline"
+            ) from error
+        last_missing = {}
+        revisions: list[int] = []
+        for node_name, pod_name in agents:
+            command_timeout = _remaining_cilium_policy_timeout(deadline)
+            try:
+                raw = output(
+                    [
+                        kubectl,
+                        "-n",
+                        "kube-system",
+                        "exec",
+                        pod_name,
+                        "-c",
+                        "cilium-agent",
+                        "--",
+                        "cilium-dbg",
+                        "policy",
+                        "get",
+                    ],
+                    timeout=command_timeout,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise StagingCellError(
+                    "Cilium policy read exceeded the bounded activation deadline"
+                ) from error
+            observed, revision = cilium_network_policy_bindings(raw)
+            if time.monotonic() > deadline:
+                raise StagingCellError(
+                    "Cilium policy enforcement exceeded the bounded activation deadline"
+                )
+            revisions.append(revision)
+            missing = expected - observed
+            if missing:
+                last_missing[node_name] = sorted(name for name, _, _ in missing)
+        now = time.monotonic()
+        if now > deadline:
+            raise StagingCellError(
+                "Cilium policy enforcement exceeded the bounded activation deadline"
+            )
+        if not last_missing:
+            return {
+                "processed": True,
+                "cilium_agent_count": len(agents),
+                "minimum_policy_revision": min(revisions),
+            }
+        remaining = deadline - now
+        if remaining <= 0:
+            break
+        delay = min(max(0.0, poll_seconds), remaining)
+        if delay > 0:
+            time.sleep(delay)
+    missing_names = sorted({name for names in last_missing.values() for name in names})
+    raise StagingCellError(
+        "Cilium did not process all staging migration NetworkPolicies before the bounded deadline: "
+        f"missing={missing_names!r}"
+    )
+
+
+def apply_migration_network_isolation(kubectl: str) -> dict[str, Any]:
+    documents = migration_network_policy_documents()
+    apply_yaml(kubectl, documents)
+    names = [str(document["metadata"]["name"]) for document in documents]
+    policy_uids = migration_network_policy_bindings(kubectl, names)
+    enforcement = wait_migration_network_policy_enforcement(kubectl, policy_uids)
+    return {
+        "policy_names": names,
+        "policy_uids": policy_uids,
+        **enforcement,
+    }
+
+
+def canonical_migration_job_spec(document: dict[str, Any]) -> dict[str, Any]:
+    spec = document.get("spec") if isinstance(document, dict) else None
+    if not isinstance(spec, dict):
+        raise StagingCellError("staging migration Job has no canonical spec")
+    canonical = json.loads(json.dumps(spec))
+    metadata = document.get("metadata") if isinstance(document, dict) else None
+    uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    job_name = metadata.get("name") if isinstance(metadata, dict) else None
+
+    # Kubernetes 1.36 defaults and Job-controller identity fields are added by
+    # the API server. Strip only the exact values the live staging API server
+    # injects; any changed or additional execution field remains hash-visible.
+    for key, default in (
+        ("completionMode", "NonIndexed"),
+        ("completions", 1),
+        ("manualSelector", False),
+        ("parallelism", 1),
+        ("podReplacementPolicy", "TerminatingOrFailed"),
+        ("suspend", False),
+    ):
+        if canonical.get(key) == default:
+            canonical.pop(key)
+    selector = canonical.get("selector")
+    if (
+        isinstance(uid, str)
+        and uid
+        and selector
+        == {"matchLabels": {"batch.kubernetes.io/controller-uid": uid}}
+    ):
+        canonical.pop("selector")
+
+    template = canonical.get("template")
+    template_metadata = template.get("metadata") if isinstance(template, dict) else None
+    template_labels = (
+        template_metadata.get("labels") if isinstance(template_metadata, dict) else None
+    )
+    if isinstance(template_labels, dict) and isinstance(uid, str) and uid:
+        generated_labels = {
+            "batch.kubernetes.io/controller-uid": uid,
+            "batch.kubernetes.io/job-name": job_name,
+            "controller-uid": uid,
+            "job-name": job_name,
+        }
+        for key, expected in generated_labels.items():
+            if expected is not None and template_labels.get(key) == expected:
+                template_labels.pop(key)
+
+    pod_spec = template.get("spec") if isinstance(template, dict) else None
+    if isinstance(pod_spec, dict):
+        for key, default in (
+            ("dnsPolicy", "ClusterFirst"),
+            ("schedulerName", "default-scheduler"),
+            ("terminationGracePeriodSeconds", 30),
+        ):
+            if pod_spec.get(key) == default:
+                pod_spec.pop(key)
+        containers = pod_spec.get("containers")
+        if isinstance(containers, list):
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                for key, default in (
+                    ("terminationMessagePath", "/dev/termination-log"),
+                    ("terminationMessagePolicy", "File"),
+                ):
+                    if container.get(key) == default:
+                        container.pop(key)
+    return canonical
+
+
+def migration_job_spec_sha256(document: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        canonical_migration_job_spec(document),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256_bytes(canonical)
+
+
+def read_staging_migration_job(
+    kubectl: str, job_name: str
+) -> dict[str, Any] | None:
+    raw = output(
+        [
+            kubectl,
+            "-n",
+            APP_NAMESPACE,
+            "get",
+            "job",
+            job_name,
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ]
+    )
+    if not raw:
+        return None
+    return _load_json_object(raw, label="staging migration Job")
+
+
+def require_staging_migration_job_matches(
+    observed: dict[str, Any],
+    desired: dict[str, Any],
+    plan: dict[str, str],
+) -> str:
+    metadata = observed.get("metadata") if isinstance(observed, dict) else None
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    desired_metadata = desired.get("metadata") if isinstance(desired, dict) else None
+    desired_annotations = (
+        desired_metadata.get("annotations") if isinstance(desired_metadata, dict) else None
+    )
+    pod_spec = (
+        observed.get("spec", {}).get("template", {}).get("spec", {})
+        if isinstance(observed, dict)
+        else {}
+    )
+    containers = pod_spec.get("containers") if isinstance(pod_spec, dict) else None
+    expected_spec_sha = (
+        desired_annotations.get(MIGRATION_SPEC_ANNOTATION)
+        if isinstance(desired_annotations, dict)
+        else None
+    )
+    observed_spec_sha = migration_job_spec_sha256(observed)
+    matches = (
+        isinstance(metadata, dict)
+        and metadata.get("name") == plan["job_name"]
+        and metadata.get("namespace") == APP_NAMESPACE
+        and isinstance(annotations, dict)
+        and annotations.get("commonthing.net/source-commit") == plan["source_commit"]
+        and annotations.get("commonthing.net/promotion-receipt-sha256")
+        == plan["receipt_sha256"]
+        and isinstance(expected_spec_sha, str)
+        and annotations.get(MIGRATION_SPEC_ANNOTATION) == expected_spec_sha
+        and hmac.compare_digest(observed_spec_sha, expected_spec_sha)
+        and isinstance(containers, list)
+        and len(containers) == 1
+        and isinstance(containers[0], dict)
+        and containers[0].get("image") == plan["api_image"]
+    )
+    if not matches:
+        raise StagingCellError(
+            "existing staging migration Job does not match the promoted release; "
+            "refusing automatic replacement"
+        )
+    conditions = observed.get("status", {}).get("conditions", [])
+    complete = any(
+        isinstance(condition, dict)
+        and condition.get("type") == "Complete"
+        and condition.get("status") == "True"
+        for condition in conditions
+    )
+    failed = any(
+        isinstance(condition, dict)
+        and condition.get("type") == "Failed"
+        and condition.get("status") == "True"
+        for condition in conditions
+    )
+    if complete and failed:
+        raise StagingCellError("staging migration Job has contradictory terminal conditions")
+    if complete:
+        return "complete"
+    if failed:
+        return "failed"
+    return "active"
+
+
+def migration_job_document(commit: str, promotion: dict[str, Any]) -> dict[str, Any]:
+    plan = migration_plan(commit, promotion)
+    try:
+        template = yaml.safe_load(MIGRATION_TEMPLATE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        raise StagingCellError("cannot load canonical staging migration Job template") from error
+    if not isinstance(template, dict) or template.get("kind") != "Job":
+        raise StagingCellError("canonical staging migration template is not a Job")
+    document = json.loads(json.dumps(template))
+    metadata = document.setdefault("metadata", {})
+    metadata["name"] = plan["job_name"]
+    metadata["namespace"] = APP_NAMESPACE
+    metadata["annotations"] = {
+        "commonthing.net/source-commit": commit,
+        "commonthing.net/promotion-receipt-sha256": plan["receipt_sha256"],
+    }
+    spec = document.get("spec")
+    if not isinstance(spec, dict):
+        raise StagingCellError("canonical staging migration template has no Job spec")
+    spec["ttlSecondsAfterFinished"] = 3600
+    pod_template = spec.get("template")
+    pod_metadata = pod_template.get("metadata") if isinstance(pod_template, dict) else None
+    pod_spec = pod_template.get("spec") if isinstance(pod_template, dict) else None
+    if not isinstance(pod_metadata, dict) or not isinstance(pod_spec, dict):
+        raise StagingCellError("canonical staging migration template has no Pod template")
+    labels = pod_metadata.setdefault("labels", {})
+    labels["app.kubernetes.io/name"] = "weltgewebe-api"
+    labels["app.kubernetes.io/component"] = "database-migration"
+    pod_spec["imagePullSecrets"] = [{"name": REGISTRY_SECRET}]
+    # The migration pod deliberately shares the API network identity so the
+    # bootstrap-pinned data NetworkPolicy admits PostgreSQL. This readiness
+    # gate keeps the one-shot pod out of the API Service while it is running.
+    pod_spec["readinessGates"] = [
+        {"conditionType": "commonthing.net/migration-not-service"}
+    ]
+    containers = pod_spec.get("containers")
+    if not isinstance(containers, list) or len(containers) != 1 or not isinstance(containers[0], dict):
+        raise StagingCellError("canonical staging migration template must have one container")
+    container = containers[0]
+    container["image"] = plan["api_image"]
+    container["imagePullPolicy"] = "IfNotPresent"
+    env = container.get("env")
+    if not isinstance(env, list):
+        raise StagingCellError("canonical staging migration template has no environment")
+    environment = {
+        item.get("name"): item
+        for item in env
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    database_url = environment.get("DATABASE_URL")
+    if not isinstance(database_url, dict):
+        raise StagingCellError("canonical staging migration template has no DATABASE_URL")
+    database_url.pop("value", None)
+    database_url["valueFrom"] = {
+        "secretKeyRef": {"name": RUNTIME_SECRET, "key": "database-url"}
+    }
+    for name, value in (
+        ("WELTGEWEBE_API_MIGRATION_ONLY", "1"),
+        ("WELTGEWEBE_API_STARTUP_MIGRATIONS", "run"),
+    ):
+        item = environment.get(name)
+        if not isinstance(item, dict):
+            raise StagingCellError(f"canonical staging migration template has no {name}")
+        item.pop("valueFrom", None)
+        item["value"] = value
+    metadata["annotations"][MIGRATION_SPEC_ANNOTATION] = migration_job_spec_sha256(
+        document
+    )
+    return document
+
+
+def run_staging_migration(
+    kubectl: str, commit: str, promotion: dict[str, Any]
+) -> dict[str, Any]:
+    plan = migration_plan(commit, promotion)
+    document = migration_job_document(commit, promotion)
+    existing = read_staging_migration_job(kubectl, plan["job_name"])
+    if existing is not None:
+        existing_state = require_staging_migration_job_matches(existing, document, plan)
+        if existing_state == "complete":
+            return {**plan, "complete": True}
+        if existing_state == "failed":
+            run(
+                [
+                    kubectl,
+                    "-n",
+                    APP_NAMESPACE,
+                    "delete",
+                    "job",
+                    plan["job_name"],
+                    "--cascade=foreground",
+                    "--wait=true",
+                    "--timeout=60s",
+                ],
+                timeout=75,
+            )
+            if read_staging_migration_job(kubectl, plan["job_name"]) is not None:
+                raise StagingCellError(
+                    "failed staging migration Job still exists after bounded deletion"
+                )
+            existing = None
+
+    if existing is None:
+        apply_yaml_server_side(
+            kubectl,
+            document,
+            field_manager="weltgewebe-staging-migration",
+        )
+
+    run(
+        [
+            kubectl,
+            "-n",
+            APP_NAMESPACE,
+            "wait",
+            "--for=condition=Complete",
+            f"job/{plan['job_name']}",
+            f"--timeout={int(MIGRATION_TIMEOUT_SECONDS)}s",
+        ],
+        timeout=int(MIGRATION_TIMEOUT_SECONDS + 30),
+    )
+    observed = read_staging_migration_job(kubectl, plan["job_name"])
+    if observed is None:
+        raise StagingCellError("staging migration Job disappeared before final readback")
+    if require_staging_migration_job_matches(observed, document, plan) != "complete":
+        raise StagingCellError(
+            "staging migration Job readback does not match the promoted release"
+        )
+    return {**plan, "complete": True}
+
+
+def app_source_document(commit: str) -> dict[str, Any]:
+    if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
+        raise StagingCellError("app source commit must be canonical 40-hex")
+    return {
+        "apiVersion": "source.toolkit.fluxcd.io/v1",
+        "kind": "GitRepository",
+        "metadata": {"name": APP_SOURCE_NAME, "namespace": "flux-system"},
+        "spec": {
+            "interval": "1m",
+            "url": PUBLIC_REPOSITORY,
+            "ref": {"commit": commit},
+        },
+    }
+
+
+def app_kustomization_document(commit: str, promotion: dict[str, Any]) -> dict[str, Any]:
+    images = promotion.get("images") if isinstance(promotion, dict) else None
+    if not isinstance(images, dict):
+        raise StagingCellError("promotion evidence has no verified images")
+    patches = []
+    for label, deployment in (("api", "weltgewebe-api"), ("web", "weltgewebe-web")):
+        image = images.get(label)
+        if not isinstance(image, str) or "@sha256:" not in image:
+            raise StagingCellError(f"verified {label} image is not digest-bound")
+        patches.append({
+            "target": {"kind": "Deployment", "name": deployment},
+            "patch": yaml.safe_dump(
+                [
+                    {
+                        "op": "replace",
+                        "path": "/spec/template/spec/containers/0/image",
+                        "value": image,
+                    },
+                    {
+                        "op": "add",
+                        "path": "/spec/template/spec/imagePullSecrets",
+                        "value": [{"name": REGISTRY_SECRET}],
+                    },
+                ],
+                sort_keys=False,
+            ),
+        })
+    return {
+        "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+        "kind": "Kustomization",
+        "metadata": {"name": APP_KUSTOMIZATION, "namespace": "flux-system"},
+        "spec": {
+            "interval": "2m",
+            "retryInterval": "20s",
+            "timeout": "8m",
+            "prune": True,
+            "wait": True,
+            "dependsOn": [{"name": DATA_KUSTOMIZATION}],
+            "sourceRef": {"kind": "GitRepository", "name": APP_SOURCE_NAME},
+            "path": "./platform/apps/weltgewebe/overlays/staging",
+            "patches": patches,
+            "healthChecks": [
+                {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": deployment,
+                    "namespace": APP_NAMESPACE,
+                }
+                for deployment in ("weltgewebe-api", "weltgewebe-web")
+            ],
+        },
+    }
+
+
+def reconcile_app(kubectl: str, commit: str) -> str:
+    requested_at = f"staging-app-{time.time_ns()}"
+    request_flux_reconcile(kubectl, "gitrepository", APP_SOURCE_NAME, requested_at)
+    wait_flux_resource_current(
+        kubectl,
+        "gitrepository",
+        APP_SOURCE_NAME,
+        commit,
+        requested_at=requested_at,
+    )
+    request_flux_reconcile(kubectl, "kustomization", APP_KUSTOMIZATION, requested_at)
+    wait_flux_resource_current(
+        kubectl,
+        "kustomization",
+        APP_KUSTOMIZATION,
+        commit,
+        requested_at=requested_at,
+    )
+    return requested_at
+
+
+def app_live_health(kubectl: str) -> dict[str, str]:
+    return {
+        label: deployment_ready_state(kubectl, namespace, name)
+        for label, (namespace, name) in APP_DEPLOYMENTS.items()
+    }
+
+
+def app_image_references(kubectl: str) -> dict[str, str]:
+    return {
+        label: output([
+            kubectl,
+            "-n",
+            namespace,
+            "get",
+            "deployment",
+            name,
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].image}",
+        ])
+        for label, (namespace, name) in APP_DEPLOYMENTS.items()
+    }
+
+
 def write_cell_receipt(root: Path, payload: dict[str, Any]) -> str:
     path = root / "receipts/cell-bootstrap.json"
     atomic_json(path, payload, mode=0o600)
@@ -1236,6 +2428,16 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
         persisted_owner = str(cell.get("owner_id") or "")
         if owner_id != persisted_owner:
             raise StagingCellError("--owner-id does not match the persisted cluster owner")
+        if (
+            cell.get("app_activation") is True
+            or cell.get("status") == "app-activation-in-progress"
+            or bool(cell.get("active_commit"))
+            or bool(cell.get("pending_active_commit"))
+        ):
+            raise StagingCellError(
+                "up cannot rewrite an activated or activating staging cell; "
+                "use activate or an explicit recovery path"
+            )
 
     _, source_sha = load_or_create_secret_material(root)
 
@@ -1363,6 +2565,185 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_activate(args: argparse.Namespace) -> dict[str, Any]:
+    require_singleton_cluster(args.cluster)
+    reference.validate_owner_id(args.owner_id)
+    root = state_root(getattr(args, "state_root", None))
+    configure_reference_paths(root)
+    receipt = load_tool_receipt(
+        root, required_tools=("kind", "kubectl"), required_artifacts=()
+    )
+    kind = receipt["tools"]["kind"]
+    kubectl = receipt["tools"]["kubectl"]
+    cell = load_cell_receipt(root)
+    require_receipt_cluster(cell, args.cluster)
+    bootstrap_commit = str(cell.get("bootstrap_commit") or "")
+    owner_id = str(cell.get("owner_id") or "")
+    if args.owner_id != owner_id:
+        raise StagingCellError("--owner-id does not match the persisted cluster owner")
+    reference.validate_ownership_binding(bootstrap_commit, owner_id)
+    pending_commit = str(cell.get("pending_active_commit") or "")
+    activation_in_progress = cell.get("status") == "app-activation-in-progress"
+    if activation_in_progress:
+        if (
+            len(pending_commit) != 40
+            or any(ch not in "0123456789abcdef" for ch in pending_commit)
+        ):
+            raise StagingCellError("activation recovery has no canonical pending app commit")
+        if args.source_commit != pending_commit:
+            raise StagingCellError(
+                "activation recovery must resume the exact pending app commit"
+            )
+        promotion = load_promotion_receipt(root, pending_commit)
+        migration_plan_value = require_pending_promotion_matches(
+            cell, pending_commit, promotion
+        )
+        commit = require_clean_commit(
+            args.source_commit,
+            require_public_main=False,
+        )
+    else:
+        commit = require_clean_commit(args.source_commit)
+        promotion = load_promotion_receipt(root, commit)
+        migration_plan_value = migration_plan(commit, promotion)
+
+    registry_material, registry_source_sha = load_registry_pull_material(root)
+    pending_config_sha256 = sha256_bytes(
+        registry_dockerconfig_json(registry_material).encode("utf-8")
+    )
+    if activation_in_progress:
+        require_pending_registry_matches(
+            cell,
+            source_sha=registry_source_sha,
+            config_sha256=pending_config_sha256,
+        )
+    registry_pull_access = verify_ghcr_pull_access(registry_material, promotion)
+
+    # Establish the owned staging kubeconfig before the first kubectl preflight.
+    # This is read-only with respect to the cluster and prevents an ambient
+    # KUBECONFIG from making us inspect the wrong cluster.
+    reference.require_owned_cluster(
+        kind,
+        args.cluster,
+        expected_commit=bootstrap_commit,
+        expected_owner_id=owner_id,
+    )
+    require_bootstrap_data_current(kubectl, bootstrap_commit)
+
+    if not activation_in_progress:
+        pending_state = {
+            **cell,
+            "status": "app-activation-in-progress",
+            "pending_active_commit": commit,
+            "pending_image_promotion": {
+                "source_commit": commit,
+                "receipt_sha256": promotion["receipt_sha256"],
+                "images": promotion["images"],
+            },
+            "pending_migration": migration_plan_value,
+            "pending_registry_pull_secret": {
+                "source_sha256": registry_source_sha,
+                "config_sha256": pending_config_sha256,
+                "secret_name": REGISTRY_SECRET,
+                "registry": GHCR_REGISTRY,
+            },
+            "production_changed": False,
+        }
+        write_cell_receipt(root, pending_state)
+
+    reference.normalize_owned_cluster_repository(
+        kind,
+        args.cluster,
+        expected_commit=bootstrap_commit,
+        expected_owner_id=owner_id,
+    )
+    secret_receipt = inject_external_secrets(kubectl, root)
+    registry_secret_receipt = inject_registry_pull_secret(
+        kubectl,
+        root,
+        material=registry_material,
+        source_sha=registry_source_sha,
+    )
+    if registry_secret_receipt.get("config_sha256") != pending_config_sha256:
+        raise StagingCellError("staging registry Secret hash drifted after preflight")
+
+    migration_network_policies = apply_migration_network_isolation(kubectl)
+    migration_receipt = run_staging_migration(kubectl, commit, promotion)
+    if migration_receipt != {**migration_plan_value, "complete": True}:
+        raise StagingCellError("staging migration evidence drifted from pending release")
+
+    apply_yaml(
+        kubectl,
+        [app_source_document(commit), app_kustomization_document(commit, promotion)],
+    )
+    reconcile_app(kubectl, commit)
+    require_bootstrap_data_current(kubectl, bootstrap_commit)
+    workloads = app_live_health(kubectl)
+    unhealthy = {name: state for name, state in workloads.items() if state != "True"}
+    if unhealthy:
+        raise StagingCellError(f"staging app workloads are not live: {unhealthy!r}")
+    references = app_image_references(kubectl)
+    expected_images = promotion["images"]
+    if references != expected_images:
+        raise StagingCellError(
+            "staging app deployment images differ from promotion receipt: "
+            f"expected={expected_images!r} observed={references!r}"
+        )
+    registry_binding = verify_registry_pull_secret_binding(
+        kubectl,
+        expected_source_sha=registry_secret_receipt["source_sha256"],
+        expected_config_sha256=registry_secret_receipt["config_sha256"],
+    )
+    if registry_binding.get("ready") is not True:
+        raise StagingCellError("staging registry pull Secret binding is not ready")
+    promotion_state = {
+        "status": "pass",
+        "source_commit": commit,
+        "receipt_sha256": promotion["receipt_sha256"],
+        "images": references,
+    }
+    terminal_cell = {
+        key: value
+        for key, value in cell.items()
+        if key
+        not in {
+            "pending_active_commit",
+            "pending_image_promotion",
+            "pending_migration",
+            "pending_registry_pull_secret",
+        }
+    }
+    updated = {
+        **terminal_cell,
+        "status": "app-ready-gateway-pending",
+        "active_commit": commit,
+        "gitops_source_commit": commit,
+        "data_source_commit": bootstrap_commit,
+        "app_source_commit": commit,
+        "external_secret": secret_receipt,
+        "registry_pull_secret": registry_secret_receipt,
+        "registry_pull_access": registry_pull_access,
+        "migration": {
+            **migration_receipt,
+            "network_isolation": migration_network_policies,
+        },
+        "image_promotion": promotion_state,
+        "app_activation": True,
+        "app_workloads": workloads,
+        "production_changed": False,
+        "does_not_establish": [
+            "staging gateway proof",
+            "staging DNS/TLS proof",
+            "delete-to-prove",
+            "production Kubernetes cutover",
+        ],
+    }
+    receipt_path = write_cell_receipt(root, updated)
+    return {**updated, "receipt_path": receipt_path}
+
+
 @reference_output_routed
 def command_status(args: argparse.Namespace) -> dict[str, Any]:
     require_singleton_cluster(args.cluster)
@@ -1382,7 +2763,8 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
     kubectl = receipt["tools"]["kubectl"]
     owner = load_cell_receipt(root)
     require_receipt_cluster(owner, args.cluster)
-    commit = str(owner.get("bootstrap_commit") or "")
+    bootstrap_commit = str(owner.get("bootstrap_commit") or "")
+    active_commit = cell_active_commit(owner)
     owner_id = str(owner.get("owner_id") or "")
     if args.cluster not in reference.clusters(kind):
         return {
@@ -1390,13 +2772,14 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
             "status": "cluster-absent-state-preserved",
             "cluster": args.cluster,
             "owner_id": owner_id,
-            "bootstrap_commit": commit,
+            "bootstrap_commit": bootstrap_commit,
+            "active_commit": active_commit,
             "production_changed": False,
         }
     reference.require_owned_cluster(
         kind,
         args.cluster,
-        expected_commit=commit,
+        expected_commit=bootstrap_commit,
         expected_owner_id=owner_id,
     )
     if owner.get("status") == "bootstrap-in-progress":
@@ -1405,7 +2788,8 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
             "status": "bootstrap-in-progress",
             "cluster": args.cluster,
             "owner_id": owner_id,
-            "bootstrap_commit": commit,
+            "bootstrap_commit": bootstrap_commit,
+            "active_commit": active_commit,
             "production_changed": False,
         }
     source_revision = output(
@@ -1421,7 +2805,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
             "jsonpath={.status.artifact.revision}",
         ]
     ) or "missing"
-    source_matches_commit = flux_revision_matches_commit(source_revision, commit)
+    source_matches_commit = flux_revision_matches_commit(source_revision, bootstrap_commit)
     source_health_raw = output(
         [
             kubectl,
@@ -1482,7 +2866,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         else:
             data_ready = data_ready_status or "missing"
         data_revision = data_revision or "missing"
-        data_matches_commit = flux_revision_matches_commit(data_revision, commit)
+        data_matches_commit = flux_revision_matches_commit(data_revision, bootstrap_commit)
     pvcs = {
         pvc: output(
             [
@@ -1521,13 +2905,80 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
             live_workloads = staging_live_health(kubectl)
         except (StagingCellError, subprocess.CalledProcessError):
             live_workloads = {name: "missing" for name in LIVE_DEPLOYMENTS}
-    ready = base_ready and all(value == "True" for value in live_workloads.values())
+    infrastructure_ready = base_ready and all(
+        value == "True" for value in live_workloads.values()
+    )
+    activation_in_progress = owner.get("status") == "app-activation-in-progress"
+    pending_active_commit = str(owner.get("pending_active_commit") or "")
+    activated = owner.get("app_activation") is True
+    app_workloads = {name: "unchecked" for name in APP_DEPLOYMENTS}
+    image_references: dict[str, str] = {}
+    expected_images: dict[str, str] = {}
+    registry_pull_secret = {"ready": False}
+    app_source_state = {
+        "ready": "unchecked",
+        "revision": "missing",
+        "matches_commit": False,
+    }
+    app_kustomization_state = {
+        "ready": "unchecked",
+        "revision": "missing",
+        "matches_commit": False,
+    }
+    if activated and infrastructure_ready:
+        try:
+            app_source_state = flux_resource_current_state(
+                kubectl, "gitrepository", APP_SOURCE_NAME, active_commit
+            )
+            app_kustomization_state = flux_resource_current_state(
+                kubectl, "kustomization", APP_KUSTOMIZATION, active_commit
+            )
+            app_workloads = app_live_health(kubectl)
+            image_references = app_image_references(kubectl)
+            registry_receipt = owner.get("registry_pull_secret")
+            if isinstance(registry_receipt, dict):
+                registry_pull_secret = verify_registry_pull_secret_binding(
+                    kubectl,
+                    expected_source_sha=str(
+                        registry_receipt.get("source_sha256") or ""
+                    ),
+                    expected_config_sha256=str(
+                        registry_receipt.get("config_sha256") or ""
+                    ),
+                )
+        except (StagingCellError, subprocess.CalledProcessError):
+            app_workloads = {name: "missing" for name in APP_DEPLOYMENTS}
+        promotion = owner.get("image_promotion")
+        if isinstance(promotion, dict) and isinstance(promotion.get("images"), dict):
+            expected_images = {
+                str(key): str(value) for key, value in promotion["images"].items()
+            }
+    app_ready = (
+        not activated
+        or (
+            app_source_state.get("ready") == "True"
+            and app_source_state.get("matches_commit") is True
+            and app_kustomization_state.get("ready") == "True"
+            and app_kustomization_state.get("matches_commit") is True
+            and all(value == "True" for value in app_workloads.values())
+            and registry_pull_secret.get("ready") is True
+            and bool(expected_images)
+            and image_references == expected_images
+        )
+    )
+    ready = infrastructure_ready and app_ready and not activation_in_progress
+    promotion_state = (
+        owner.get("image_promotion")
+        if activated and isinstance(owner.get("image_promotion"), dict)
+        else image_promotion_state()
+    )
     return {
         "schema_version": 1,
         "status": "ready" if ready else "degraded",
         "cluster": args.cluster,
         "owner_id": owner_id,
-        "bootstrap_commit": commit,
+        "bootstrap_commit": bootstrap_commit,
+        "active_commit": active_commit,
         "source_revision": source_revision,
         "source_matches_commit": source_matches_commit,
         "source_ready": source_ready,
@@ -1537,8 +2988,19 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         "pvcs": pvcs,
         "external_secret": external_secret,
         "live_workloads": live_workloads,
-        "image_promotion": image_promotion_state(),
-        "app_activation": False,
+        "image_promotion": promotion_state,
+        "activation_in_progress": activation_in_progress,
+        "pending_active_commit": pending_active_commit,
+        "app_activation": activated,
+        "app_workloads": app_workloads,
+        "app_image_references": image_references,
+        "app_source_revision": app_source_state.get("revision"),
+        "app_source_matches_commit": app_source_state.get("matches_commit") is True,
+        "app_kustomization_revision": app_kustomization_state.get("revision"),
+        "app_kustomization_matches_commit": (
+            app_kustomization_state.get("matches_commit") is True
+        ),
+        "registry_pull_secret_ready": registry_pull_secret.get("ready") is True,
         "production_changed": False,
     }
 
@@ -1758,6 +3220,10 @@ def parser() -> argparse.ArgumentParser:
     up.set_defaults(cluster=DEFAULT_CLUSTER)
     up.add_argument("--owner-id", required=True)
     up.add_argument("--source-commit")
+    activate = sub.add_parser("activate")
+    activate.set_defaults(cluster=DEFAULT_CLUSTER)
+    activate.add_argument("--owner-id", required=True)
+    activate.add_argument("--source-commit", required=True)
     status = sub.add_parser("status")
     status.set_defaults(cluster=DEFAULT_CLUSTER)
     down = sub.add_parser("down")
@@ -1773,6 +3239,19 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
             '{"command":"up","schema_version":1,'
             '"status":"infrastructure-ready-image-promotion-blocked"}'
         )
+        return
+    if command == "activate":
+        safe = {
+            "command": "activate",
+            "schema_version": 1,
+            "status": str(result.get("status") or "degraded"),
+            "cluster": str(result.get("cluster") or DEFAULT_CLUSTER),
+            "bootstrap_commit": str(result.get("bootstrap_commit") or ""),
+            "active_commit": str(result.get("active_commit") or ""),
+            "app_activation": bool(result.get("app_activation")),
+            "production_changed": bool(result.get("production_changed")),
+        }
+        print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
         return
     if command == "status":
         status = str(result.get("status") or "degraded")
@@ -1797,6 +3276,7 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
             safe.update(
                 {
                     "bootstrap_commit": str(result.get("bootstrap_commit") or ""),
+                    "active_commit": str(result.get("active_commit") or ""),
                     "source_revision": str(result.get("source_revision") or ""),
                     "source_matches_commit": bool(result.get("source_matches_commit")),
                     "source_ready": result.get("source_ready") == "True",
@@ -1817,6 +3297,28 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
                     "live_workloads": {
                         name: str(live.get(name) or "unchecked")
                         for name in LIVE_DEPLOYMENTS
+                    },
+                    "activation_in_progress": bool(
+                        result.get("activation_in_progress")
+                    ),
+                    "pending_active_commit": str(
+                        result.get("pending_active_commit") or ""
+                    ),
+                    "app_activation": bool(result.get("app_activation")),
+                    "registry_pull_secret_ready": bool(
+                        result.get("registry_pull_secret_ready")
+                    ),
+                    "app_source_matches_commit": bool(
+                        result.get("app_source_matches_commit")
+                    ),
+                    "app_kustomization_matches_commit": bool(
+                        result.get("app_kustomization_matches_commit")
+                    ),
+                    "app_workloads": {
+                        name: str(
+                            (result.get("app_workloads") or {}).get(name) or "unchecked"
+                        )
+                        for name in APP_DEPLOYMENTS
                     },
                 }
             )
@@ -1843,6 +3345,8 @@ def main() -> int:
     try:
         if args.command == "up":
             result = command_up(args)
+        elif args.command == "activate":
+            result = command_activate(args)
         elif args.command == "status":
             result = command_status(args)
         elif args.command == "down":
