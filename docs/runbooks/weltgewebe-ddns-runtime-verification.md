@@ -21,7 +21,7 @@ relations:
 
 Der DDNS-Dienst ist stillgelegt; dieses Runbook bleibt aktiv. Es prüft, dass der
 frühere Heimberry-Schreibpfad weiterhin inaktiv und fail-closed ist, während die
-öffentliche Weltgewebe-Runtime auf `commonserver` läuft.
+öffentliche commonThing-Runtime auf `commonserver` läuft.
 
 Die versionierte Härtung ist an Commit
 `heimgewebe/heimserver@15dfbd6cc1c8899ec030ac6666464db4bc132c71`
