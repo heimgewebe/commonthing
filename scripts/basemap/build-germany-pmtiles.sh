@@ -256,10 +256,30 @@ download_verified_auxiliary() {
     rm -f -- "$partial"
     echo ">> Downloading pinned $label source..."
     if [[ "$DOWNLOADER" == "wget" ]]; then
-      wget -qO "$partial" "$url" || fail "$label download failed: $url"
+      if wget --tries=5 --waitretry=3 --retry-connrefused --timeout=30 -nv \
+        -O "$partial" "$url"; then
+        :
+      else
+        download_rc=$?
+        case "$download_rc" in
+          4) fail "$label download network/timeout failure after bounded retries: $url" ;;
+          8) fail "$label download HTTP/server failure after bounded retries: $url" ;;
+          *) fail "$label download failed after bounded retries (wget exit $download_rc): $url" ;;
+        esac
+      fi
     else
-      curl -fL --retry 3 --retry-delay 5 -o "$partial" "$url" ||
-        fail "$label download failed: $url"
+      if curl -fL --retry 4 --retry-delay 3 --retry-all-errors \
+        --connect-timeout 30 --speed-limit 1024 --speed-time 30 \
+        -o "$partial" "$url"; then
+        :
+      else
+        download_rc=$?
+        case "$download_rc" in
+          22) fail "$label download HTTP failure after bounded retries: $url" ;;
+          28) fail "$label download timeout/stall failure after bounded retries: $url" ;;
+          *) fail "$label download failed after bounded retries (curl exit $download_rc): $url" ;;
+        esac
+      fi
     fi
     [[ -s "$partial" ]] || fail "$label download produced an empty file"
     if [[ -e "$target" || -L "$target" ]]; then

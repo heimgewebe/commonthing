@@ -479,6 +479,45 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
         self.assertIn("\nPY\n    rm -f", receipt_function)
         self.assertNotIn("python3 << 'PY' || {", receipt_function)
 
+    def test_germany_builder_bounds_auxiliary_download_retries_and_timeouts(self) -> None:
+        builder = BUILD_SCRIPT.read_text(encoding="utf-8")
+        function_start = builder.index("download_verified_auxiliary() {")
+        function_end = builder.index("LAKE_CENTERLINES_PATH=", function_start)
+        auxiliary_download = builder[function_start:function_end]
+
+        for marker in (
+            "wget --tries=5",
+            "--waitretry=3",
+            "--retry-connrefused",
+            "--timeout=30",
+            "-nv",
+        ):
+            self.assertIn(marker, auxiliary_download)
+        self.assertNotIn("wget -q", auxiliary_download)
+        for marker in (
+            "curl -fL",
+            "--retry 4",
+            "--retry-delay 3",
+            "--retry-all-errors",
+            "--connect-timeout 30",
+            "--speed-limit 1024",
+            "--speed-time 30",
+        ):
+            self.assertIn(marker, auxiliary_download)
+        self.assertNotIn("--max-time", auxiliary_download)
+        for diagnostic in (
+            "network/timeout failure after bounded retries",
+            "HTTP/server failure after bounded retries",
+            "HTTP failure after bounded retries",
+            "timeout/stall failure after bounded retries",
+            "checksum mismatch",
+        ):
+            self.assertIn(diagnostic, auxiliary_download)
+        self.assertLess(
+            auxiliary_download.index('if [[ ! -e "$target" ]]'),
+            auxiliary_download.index("wget --tries=5"),
+        )
+
     def test_germany_builder_pins_and_binds_auxiliary_sources(self) -> None:
         builder = BUILD_SCRIPT.read_text(encoding="utf-8")
         for marker in (
