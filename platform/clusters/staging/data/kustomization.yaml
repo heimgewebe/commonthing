@@ -9,6 +9,6 @@ resources:
   - nats.yaml
 labels:
   - pairs:
-      app.kubernetes.io/part-of: weltgewebe
+      app.kubernetes.io/part-of: commonthing
       app.kubernetes.io/managed-by: flux
       commonthing.net/environment: staging

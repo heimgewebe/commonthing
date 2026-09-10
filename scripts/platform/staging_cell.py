@@ -10,6 +10,7 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,23 +27,28 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_STATE_ROOT = Path.home() / ".local/state/weltgewebe/staging-cell"
-DEFAULT_CLUSTER = "weltgewebe-staging"
-SOURCE_NAME = "weltgewebe-staging-source"
-APP_SOURCE_NAME = "weltgewebe-staging-app-source"
-DATA_KUSTOMIZATION = "weltgewebe-staging-data"
-APP_KUSTOMIZATION = "weltgewebe-staging-app"
-MIGRATION_JOB_PREFIX = "weltgewebe-staging-migration"
+DEFAULT_STATE_ROOT = Path.home() / ".local/state/commonthing/staging-cell"
+LEGACY_STATE_ROOT = Path.home() / ".local/state/weltgewebe/staging-cell"
+DEFAULT_CLUSTER = "commonthing-staging"
+LEGACY_CLUSTER = "weltgewebe-staging"
+LEGACY_MIGRATION_RECEIPT = "receipts/legacy-state-migration.json"
+LEGACY_MIGRATION_PREPARED_STATUS = "legacy-state-data-move-prepared"
+LEGACY_MIGRATION_ADOPTED_STATUS = "legacy-state-adopted"
+SOURCE_NAME = "commonthing-staging-source"
+APP_SOURCE_NAME = "commonthing-staging-app-source"
+DATA_KUSTOMIZATION = "commonthing-staging-data"
+APP_KUSTOMIZATION = "commonthing-staging-app"
+MIGRATION_JOB_PREFIX = "commonthing-staging-migration"
 MIGRATION_TEMPLATE = ROOT / "platform/apps/weltgewebe/migration/ha/job.yaml"
 MIGRATION_TIMEOUT_SECONDS = 8 * 60
 MIGRATION_SPEC_ANNOTATION = "commonthing.net/migration-spec-sha256"
 CILIUM_POLICY_ENFORCEMENT_TIMEOUT_SECONDS = 45.0
 CILIUM_POLICY_ENFORCEMENT_POLL_SECONDS = 1.0
-DATA_NAMESPACE = "weltgewebe-data"
-APP_NAMESPACE = "weltgewebe-staging"
-DATABASE_SECRET = "weltgewebe-staging-database"
-RUNTIME_SECRET = "weltgewebe-runtime"
-REGISTRY_SECRET = "weltgewebe-staging-registry"
+DATA_NAMESPACE = "commonthing-data"
+APP_NAMESPACE = "commonthing-staging"
+DATABASE_SECRET = "commonthing-staging-database"
+RUNTIME_SECRET = "commonthing-runtime"
+REGISTRY_SECRET = "commonthing-staging-registry"
 GHCR_REGISTRY = "ghcr.io"
 LIVE_DEPLOYMENTS = {
     "postgres": (DATA_NAMESPACE, "postgres"),
@@ -51,8 +57,8 @@ LIVE_DEPLOYMENTS = {
     "kustomize-controller": ("flux-system", "kustomize-controller"),
 }
 APP_DEPLOYMENTS = {
-    "api": (APP_NAMESPACE, "weltgewebe-api"),
-    "web": (APP_NAMESPACE, "weltgewebe-web"),
+    "api": (APP_NAMESPACE, "commonthing-api"),
+    "web": (APP_NAMESPACE, "commonthing-web"),
 }
 PUBLIC_REPOSITORY = "https://github.com/heimgewebe/commonthing"
 SECRET_SOURCE_ANNOTATION = "commonthing.net/external-secret-source-sha256"
@@ -195,6 +201,29 @@ def atomic_text(path: Path, text: str, *, mode: int = 0o600) -> None:
         with handle:
             os.fchmod(handle.fileno(), mode)
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, mode)
+        fsync_directory(path.parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+
+
+def atomic_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
+    ensure_directory_durable(path.parent)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        handle = os.fdopen(fd, "wb")
+        fd = -1
+        with handle:
+            os.fchmod(handle.fileno(), mode)
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
@@ -522,6 +551,705 @@ def retained_staging_data_exists(root: Path) -> bool:
     )
 
 
+
+def _real_directory_identity(path: Path, *, label: str) -> dict[str, int]:
+    try:
+        linked = path.lstat()
+    except OSError as error:
+        raise StagingCellError(f"{label} is missing or unreadable") from error
+    if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
+        raise StagingCellError(f"{label} must be a real directory")
+    return {
+        "device": linked.st_dev,
+        "inode": linked.st_ino,
+        "uid": linked.st_uid,
+        "gid": linked.st_gid,
+        "mode": stat.S_IMODE(linked.st_mode),
+    }
+
+
+def _private_regular_file(path: Path, *, label: str) -> os.stat_result:
+    try:
+        linked = path.lstat()
+    except OSError as error:
+        raise StagingCellError(f"{label} is missing or unreadable") from error
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or stat.S_IMODE(linked.st_mode) != 0o600
+    ):
+        raise StagingCellError(f"{label} must be an owner-owned mode-0600 regular file")
+    return linked
+
+
+def _tree_manifest(root: Path, *, label: str) -> dict[str, dict[str, Any]]:
+    _real_directory_identity(root, label=label)
+    result: dict[str, dict[str, Any]] = {}
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in [*directory_names, *file_names]:
+            path = current_path / name
+            linked = path.lstat()
+            relative = path.relative_to(root).as_posix()
+            if stat.S_ISLNK(linked.st_mode):
+                raise StagingCellError(f"{label} contains a symlink: {relative}")
+            if stat.S_ISDIR(linked.st_mode):
+                result[relative] = {
+                    "type": "directory",
+                    "mode": stat.S_IMODE(linked.st_mode),
+                    "uid": linked.st_uid,
+                    "gid": linked.st_gid,
+                }
+            elif stat.S_ISREG(linked.st_mode):
+                result[relative] = {
+                    "type": "file",
+                    "sha256": sha256_file(path),
+                    "mode": stat.S_IMODE(linked.st_mode),
+                    "uid": linked.st_uid,
+                    "gid": linked.st_gid,
+                }
+            else:
+                raise StagingCellError(
+                    f"{label} contains an unsupported filesystem object: {relative}"
+                )
+    return dict(sorted(result.items()))
+
+
+def _copy_private_file_exact(source: Path, target: Path, *, label: str) -> str:
+    _private_regular_file(source, label=label)
+    payload = source.read_bytes()
+    source_sha = sha256_bytes(payload)
+    atomic_bytes(target, payload, mode=0o600)
+    _private_regular_file(target, label=f"copied {label}")
+    if not hmac.compare_digest(sha256_file(target), source_sha):
+        raise StagingCellError(f"copied {label} digest mismatch")
+    return source_sha
+
+
+def _fsync_tree(root: Path, *, label: str) -> None:
+    directories = [root]
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        directories.extend(current_path / name for name in directory_names)
+        for name in file_names:
+            path = current_path / name
+            flags = os.O_RDONLY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(path, flags)
+            try:
+                opened = os.fstat(fd)
+                linked = os.stat(path, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_dev != linked.st_dev
+                    or opened.st_ino != linked.st_ino
+                ):
+                    raise StagingCellError(f"{label} contains an unsafe copied file")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    for directory in sorted(
+        directories, key=lambda item: len(item.parts), reverse=True
+    ):
+        fsync_directory(directory)
+    fsync_directory(root.parent)
+
+
+def _copy_tree_exact(
+    source: Path, target: Path, *, label: str
+) -> dict[str, dict[str, Any]]:
+    source_manifest = _tree_manifest(source, label=label)
+    if target.exists():
+        raise StagingCellError(f"target {label} already exists")
+    shutil.copytree(source, target, copy_function=shutil.copy2)
+    target_manifest = _tree_manifest(target, label=f"copied {label}")
+    if target_manifest != source_manifest:
+        raise StagingCellError(f"copied {label} differs from the legacy source")
+    _fsync_tree(target, label=f"copied {label}")
+    return source_manifest
+
+
+def _legacy_migration_receipt_path(root: Path) -> Path:
+    return root / LEGACY_MIGRATION_RECEIPT
+
+
+def _read_legacy_state_migration_receipt(root: Path) -> dict[str, Any]:
+    path = _legacy_migration_receipt_path(root)
+    _private_regular_file(path, label="legacy-state migration receipt")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StagingCellError("legacy-state migration receipt is malformed") from error
+    if not isinstance(payload, dict):
+        raise StagingCellError("legacy-state migration receipt is malformed")
+    return payload
+
+
+def load_legacy_state_migration(root: Path, *, owner_id: str) -> dict[str, Any]:
+    payload = _read_legacy_state_migration_receipt(root)
+    expected = {
+        "schema_version": 1,
+        "status": LEGACY_MIGRATION_ADOPTED_STATUS,
+        "source_root": str(LEGACY_STATE_ROOT.resolve()),
+        "target_root": str(root.resolve()),
+        "source_cluster": LEGACY_CLUSTER,
+        "target_cluster": DEFAULT_CLUSTER,
+        "owner_id": owner_id,
+        "toolchain_copied": False,
+        "production_changed": False,
+    }
+    mismatched = {
+        key: {"expected": value, "observed": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatched:
+        raise StagingCellError(
+            "legacy-state migration receipt identity mismatch: "
+            + json.dumps(mismatched, sort_keys=True)
+        )
+    data_identity = payload.get("data_identity")
+    if not isinstance(data_identity, dict):
+        raise StagingCellError("legacy-state migration receipt has no data identity")
+    for name in ("postgres", "nats"):
+        recorded = data_identity.get(name)
+        observed = _real_directory_identity(
+            root / "data" / name, label=f"retained {name} data"
+        )
+        if recorded != observed:
+            raise StagingCellError(
+                f"retained {name} data identity differs from migration receipt"
+            )
+    runtime_secret = root / "secrets/staging-runtime.json"
+    _private_regular_file(runtime_secret, label="migrated runtime secret")
+    secret_sha = payload.get("runtime_secret_sha256")
+    if not isinstance(secret_sha, str) or not hmac.compare_digest(
+        sha256_file(runtime_secret), secret_sha
+    ):
+        raise StagingCellError("migrated runtime secret differs from migration receipt")
+    registry_secret = root / "secrets/staging-registry.json"
+    registry_sha = payload.get("registry_secret_sha256")
+    if registry_sha is None:
+        if registry_secret.exists():
+            raise StagingCellError(
+                "migrated registry secret exists without migration-receipt binding"
+            )
+    else:
+        _private_regular_file(registry_secret, label="migrated registry secret")
+        if not isinstance(registry_sha, str) or not hmac.compare_digest(
+            sha256_file(registry_secret), registry_sha
+        ):
+            raise StagingCellError(
+                "migrated registry secret differs from migration receipt"
+            )
+    for field, evidence_path in (
+        (
+            "legacy_cell_receipt_sha256",
+            root / "legacy-evidence/receipts/cell-bootstrap.json",
+        ),
+        (
+            "legacy_toolchain_receipt_sha256",
+            root / "legacy-evidence/toolchain/receipt.json",
+        ),
+    ):
+        recorded_sha = payload.get(field)
+        if not isinstance(recorded_sha, str) or not hmac.compare_digest(
+            sha256_file(evidence_path), recorded_sha
+        ):
+            raise StagingCellError(f"{field} differs from migrated legacy evidence")
+    promotion_manifest = payload.get("promotion_manifest")
+    if promotion_manifest != _tree_manifest(
+        root / "promotion", label="migrated promotion receipts"
+    ):
+        raise StagingCellError(
+            "migrated promotion receipts differ from migration receipt"
+        )
+    legacy_evidence_manifest = payload.get("legacy_evidence_manifest")
+    if legacy_evidence_manifest != _tree_manifest(
+        root / "legacy-evidence", label="migrated legacy evidence"
+    ):
+        raise StagingCellError(
+            "migrated legacy evidence differs from migration receipt"
+        )
+    return payload
+
+
+def _legacy_migration_public_result(root: Path) -> dict[str, Any]:
+    receipt_path = _legacy_migration_receipt_path(root)
+    return {
+        "schema_version": 1,
+        "status": LEGACY_MIGRATION_ADOPTED_STATUS,
+        "cluster": DEFAULT_CLUSTER,
+        "toolchain_regeneration_required": not (
+            root / "toolchain/receipt.json"
+        ).is_file(),
+        "production_changed": False,
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": sha256_file(receipt_path),
+    }
+
+
+def _rename_legacy_data_for_cutover(source: Path, target: Path) -> None:
+    source.rename(target)
+    fsync_directory(source.parent)
+    fsync_directory(target.parent)
+
+
+def _require_prepared_legacy_state_migration(
+    root: Path, legacy_root: Path, *, owner_id: str, payload: dict[str, Any]
+) -> str:
+    expected = {
+        "schema_version": 1,
+        "status": LEGACY_MIGRATION_PREPARED_STATUS,
+        "source_root": str(legacy_root),
+        "target_root": str(root.resolve()),
+        "source_cluster": LEGACY_CLUSTER,
+        "target_cluster": DEFAULT_CLUSTER,
+        "owner_id": owner_id,
+        "toolchain_copied": False,
+        "production_changed": False,
+    }
+    mismatched = {
+        key: {"expected": value, "observed": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatched:
+        raise StagingCellError(
+            "prepared legacy-state migration identity mismatch: "
+            + json.dumps(mismatched, sort_keys=True)
+        )
+
+    _real_directory_identity(legacy_root, label="legacy staging state root")
+    legacy_cell = load_cell_receipt(legacy_root)
+    if legacy_cell.get("cluster") != LEGACY_CLUSTER:
+        raise StagingCellError(
+            "prepared legacy-state migration source receipt has wrong cluster"
+        )
+    if str(legacy_cell.get("owner_id") or "") != owner_id:
+        raise StagingCellError(
+            "prepared legacy-state migration owner differs from legacy cell"
+        )
+    if (
+        legacy_cell.get("app_activation") is True
+        or legacy_cell.get("status") == "app-activation-in-progress"
+        or bool(legacy_cell.get("active_commit"))
+        or bool(legacy_cell.get("pending_active_commit"))
+    ):
+        raise StagingCellError(
+            "prepared legacy-state migration source became activated"
+        )
+    legacy_commit = str(legacy_cell.get("bootstrap_commit") or "")
+    if payload.get("legacy_bootstrap_commit") != legacy_commit:
+        raise StagingCellError("prepared legacy-state migration bootstrap commit drift")
+    reference.validate_ownership_binding(legacy_commit, owner_id)
+
+    legacy_cell_path = legacy_root / "receipts/cell-bootstrap.json"
+    if payload.get("legacy_cell_receipt_sha256") != sha256_file(legacy_cell_path):
+        raise StagingCellError("prepared legacy-state migration cell receipt changed")
+    legacy_tool_receipt = legacy_root / "toolchain/receipt.json"
+    _private_regular_file(legacy_tool_receipt, label="legacy toolchain receipt")
+    if payload.get("legacy_toolchain_receipt_sha256") != sha256_file(
+        legacy_tool_receipt
+    ):
+        raise StagingCellError(
+            "prepared legacy-state migration toolchain receipt changed"
+        )
+
+    runtime_sha = payload.get("runtime_secret_sha256")
+    legacy_runtime = legacy_root / "secrets/staging-runtime.json"
+    migrated_runtime = root / "secrets/staging-runtime.json"
+    for path, label in (
+        (legacy_runtime, "legacy runtime secret"),
+        (migrated_runtime, "prepared migrated runtime secret"),
+    ):
+        _private_regular_file(path, label=label)
+        if not isinstance(runtime_sha, str) or not hmac.compare_digest(
+            sha256_file(path), runtime_sha
+        ):
+            raise StagingCellError(
+                "prepared legacy-state migration runtime secret drift"
+            )
+    source_sha = recorded_secret_source_sha(legacy_root)
+    if source_sha is None or not hmac.compare_digest(source_sha, runtime_sha):
+        raise StagingCellError(
+            "prepared legacy-state migration runtime secret lost receipt binding"
+        )
+
+    registry_sha = payload.get("registry_secret_sha256")
+    legacy_registry = legacy_root / "secrets/staging-registry.json"
+    migrated_registry = root / "secrets/staging-registry.json"
+    if registry_sha is None:
+        if legacy_registry.exists() or migrated_registry.exists():
+            raise StagingCellError(
+                "prepared legacy-state migration gained an unbound registry secret"
+            )
+    else:
+        if not isinstance(registry_sha, str):
+            raise StagingCellError(
+                "prepared legacy-state migration registry hash is malformed"
+            )
+        for path, label in (
+            (legacy_registry, "legacy registry secret"),
+            (migrated_registry, "prepared migrated registry secret"),
+        ):
+            _private_regular_file(path, label=label)
+            if not hmac.compare_digest(sha256_file(path), registry_sha):
+                raise StagingCellError(
+                    "prepared legacy-state migration registry secret drift"
+                )
+
+    promotion_manifest = payload.get("promotion_manifest")
+    for path, label in (
+        (legacy_root / "promotion", "legacy promotion receipts"),
+        (root / "promotion", "prepared migrated promotion receipts"),
+    ):
+        if promotion_manifest != _tree_manifest(path, label=label):
+            raise StagingCellError(
+                "prepared legacy-state migration promotion evidence drift"
+            )
+    legacy_receipts_manifest = payload.get("legacy_receipts_manifest")
+    if legacy_receipts_manifest != _tree_manifest(
+        legacy_root / "receipts", label="legacy cell receipts"
+    ):
+        raise StagingCellError("prepared legacy-state migration source receipts drift")
+    if payload.get("legacy_evidence_manifest") != _tree_manifest(
+        root / "legacy-evidence", label="prepared migrated legacy evidence"
+    ):
+        raise StagingCellError("prepared legacy-state migration copied evidence drift")
+
+    legacy_toolchain = load_tool_receipt(
+        legacy_root, required_tools=("kind",), required_artifacts=()
+    )
+    configure_reference_paths(legacy_root)
+    try:
+        if LEGACY_CLUSTER in reference.clusters(legacy_toolchain["tools"]["kind"]):
+            raise StagingCellError(
+                "legacy staging cluster reappeared during prepared migration recovery"
+            )
+    finally:
+        configure_reference_paths(root)
+
+    legacy_data = legacy_root / "data"
+    target_data = root / "data"
+    legacy_exists = legacy_data.exists() or legacy_data.is_symlink()
+    target_exists = target_data.exists() or target_data.is_symlink()
+    if legacy_exists == target_exists:
+        raise StagingCellError(
+            "prepared legacy-state migration requires data in exactly one state root"
+        )
+    data_root = target_data if target_exists else legacy_data
+    data_identity = payload.get("data_identity")
+    if not isinstance(data_identity, dict):
+        raise StagingCellError("prepared legacy-state migration has no data identity")
+    for name in ("postgres", "nats"):
+        if data_identity.get(name) != _real_directory_identity(
+            data_root / name, label=f"prepared retained {name} data"
+        ):
+            raise StagingCellError(f"prepared retained {name} data identity drift")
+    return "canonical" if target_exists else "legacy"
+
+
+def _finalize_prepared_legacy_state_migration(
+    root: Path, *, owner_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    data_identity = payload.get("data_identity")
+    if not isinstance(data_identity, dict):
+        raise StagingCellError("prepared legacy-state migration has no data identity")
+    for name in ("postgres", "nats"):
+        if data_identity.get(name) != _real_directory_identity(
+            root / "data" / name, label=f"migrated retained {name} data"
+        ):
+            raise StagingCellError(
+                f"migrated retained {name} data identity drift before final receipt"
+            )
+    terminal = {
+        **payload,
+        "status": LEGACY_MIGRATION_ADOPTED_STATUS,
+        "rollback": {
+            "legacy_cluster_absent": True,
+            "legacy_cluster_recreatable_from_preserved_commit_and_evidence": True,
+            "same_filesystem_rename": True,
+            "reverse_data_rename_possible_before_canonical_cluster_writes": True,
+        },
+    }
+    atomic_json(_legacy_migration_receipt_path(root), terminal, mode=0o600)
+    validated = load_legacy_state_migration(root, owner_id=owner_id)
+    if validated != terminal:
+        raise StagingCellError("legacy-state migration receipt readback mismatch")
+    return _legacy_migration_public_result(root)
+
+
+def _resume_prepared_legacy_state_migration(
+    root: Path, legacy_root: Path, *, owner_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    data_location = _require_prepared_legacy_state_migration(
+        root, legacy_root, owner_id=owner_id, payload=payload
+    )
+    if data_location == "legacy":
+        _rename_legacy_data_for_cutover(legacy_root / "data", root / "data")
+    return _finalize_prepared_legacy_state_migration(
+        root, owner_id=owner_id, payload=payload
+    )
+
+
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
+    require_singleton_cluster(args.cluster)
+    owner_id = args.owner_id
+    reference.validate_owner_id(owner_id)
+    root = state_root(getattr(args, "state_root", None))
+    legacy_root = LEGACY_STATE_ROOT.resolve()
+    if legacy_root == root:
+        raise StagingCellError("legacy and canonical state roots must differ")
+
+    migration_path = _legacy_migration_receipt_path(root)
+    if migration_path.exists() or migration_path.is_symlink():
+        migration = _read_legacy_state_migration_receipt(root)
+        status = migration.get("status")
+        if status == LEGACY_MIGRATION_ADOPTED_STATUS:
+            load_legacy_state_migration(root, owner_id=owner_id)
+            return _legacy_migration_public_result(root)
+        if status == LEGACY_MIGRATION_PREPARED_STATUS:
+            return _resume_prepared_legacy_state_migration(
+                root, legacy_root, owner_id=owner_id, payload=migration
+            )
+        raise StagingCellError(
+            f"legacy-state migration receipt has unsupported status: {status!r}"
+        )
+
+    _real_directory_identity(legacy_root, label="legacy staging state root")
+
+    unexpected_target_entries = sorted(
+        path.name for path in root.iterdir() if path.name != "lifecycle.lock"
+    )
+    if unexpected_target_entries:
+        raise StagingCellError(
+            "canonical staging state root is not empty before legacy adoption: "
+            f"{unexpected_target_entries!r}"
+        )
+
+    legacy_cell = load_cell_receipt(legacy_root)
+    if legacy_cell.get("cluster") != LEGACY_CLUSTER:
+        raise StagingCellError(
+            "legacy cell receipt is not bound to the legacy staging cluster"
+        )
+    if str(legacy_cell.get("owner_id") or "") != owner_id:
+        raise StagingCellError("--owner-id does not match the legacy staging owner")
+    if (
+        legacy_cell.get("app_activation") is True
+        or legacy_cell.get("status") == "app-activation-in-progress"
+        or bool(legacy_cell.get("active_commit"))
+        or bool(legacy_cell.get("pending_active_commit"))
+    ):
+        raise StagingCellError(
+            "legacy-state adoption requires an unactivated legacy cell"
+        )
+
+    # Preflight every retained byte and ownership binding before deleting the
+    # legacy cluster. Cluster destruction is the first irreversible-looking
+    # step, so rollback evidence must already be complete at this point.
+    legacy_toolchain = load_tool_receipt(
+        legacy_root, required_tools=("kind",), required_artifacts=()
+    )
+    legacy_commit = str(legacy_cell.get("bootstrap_commit") or "")
+    reference.validate_ownership_binding(legacy_commit, owner_id)
+
+    legacy_secret = legacy_root / "secrets/staging-runtime.json"
+    _private_regular_file(legacy_secret, label="legacy runtime secret")
+    legacy_source_sha = recorded_secret_source_sha(legacy_root)
+    if legacy_source_sha is None or not hmac.compare_digest(
+        sha256_file(legacy_secret), legacy_source_sha
+    ):
+        raise StagingCellError(
+            "legacy runtime secret is not bound to the legacy cell receipt"
+        )
+    legacy_registry = legacy_root / "secrets/staging-registry.json"
+    if legacy_registry.exists():
+        _private_regular_file(legacy_registry, label="legacy registry secret")
+
+    legacy_data = legacy_root / "data"
+    _real_directory_identity(legacy_data, label="legacy staging data root")
+    data_identity = {
+        name: _real_directory_identity(
+            legacy_data / name, label=f"legacy retained {name} data"
+        )
+        for name in ("postgres", "nats")
+    }
+    if legacy_data.parent.stat().st_dev != root.stat().st_dev:
+        raise StagingCellError(
+            "legacy and canonical state roots are on different filesystems; refusing non-atomic data copy"
+        )
+
+    legacy_promotion = legacy_root / "promotion"
+    promotion_preflight = _tree_manifest(
+        legacy_promotion, label="legacy promotion receipts"
+    )
+    legacy_receipts = legacy_root / "receipts"
+    receipts_preflight = _tree_manifest(legacy_receipts, label="legacy cell receipts")
+    legacy_tool_receipt = legacy_root / "toolchain/receipt.json"
+    _private_regular_file(legacy_tool_receipt, label="legacy toolchain receipt")
+    tool_receipt_preflight_sha = sha256_file(legacy_tool_receipt)
+
+    configure_reference_paths(legacy_root)
+    try:
+        kind = legacy_toolchain["tools"]["kind"]
+        legacy_cluster_present = LEGACY_CLUSTER in reference.clusters(kind)
+        reference.delete_owned_cluster_if_present(
+            kind,
+            LEGACY_CLUSTER,
+            expected_commit=legacy_commit,
+            expected_owner_id=owner_id,
+        )
+        if LEGACY_CLUSTER in reference.clusters(kind):
+            raise StagingCellError(
+                "legacy staging cluster still exists after controlled shutdown"
+            )
+    finally:
+        configure_reference_paths(root)
+
+    # Revalidate the preflight snapshot after cluster shutdown and before any
+    # copy/move. An unexpected concurrent filesystem write aborts the cutover.
+    if promotion_preflight != _tree_manifest(
+        legacy_promotion, label="legacy promotion receipts"
+    ):
+        raise StagingCellError(
+            "legacy promotion receipts changed during cluster shutdown"
+        )
+    if receipts_preflight != _tree_manifest(
+        legacy_receipts, label="legacy cell receipts"
+    ):
+        raise StagingCellError("legacy cell receipts changed during cluster shutdown")
+    if not hmac.compare_digest(
+        sha256_file(legacy_tool_receipt), tool_receipt_preflight_sha
+    ):
+        raise StagingCellError(
+            "legacy toolchain receipt changed during cluster shutdown"
+        )
+    for name, identity in data_identity.items():
+        if (
+            _real_directory_identity(
+                legacy_data / name, label=f"legacy retained {name} data"
+            )
+            != identity
+        ):
+            raise StagingCellError(
+                f"legacy retained {name} data identity changed during cluster shutdown"
+            )
+
+    moved_data = False
+    copied_paths: list[Path] = []
+    target_data = root / "data"
+    try:
+        promotion_manifest = _copy_tree_exact(
+            legacy_promotion, root / "promotion", label="promotion receipts"
+        )
+        copied_paths.append(root / "promotion")
+
+        ensure_directory_durable(root / "secrets", mode=0o700)
+        copied_paths.append(root / "secrets")
+        runtime_secret_sha = _copy_private_file_exact(
+            legacy_secret,
+            root / "secrets/staging-runtime.json",
+            label="runtime secret",
+        )
+        registry_secret_sha: str | None = None
+        if legacy_registry.exists():
+            registry_secret_sha = _copy_private_file_exact(
+                legacy_registry,
+                root / "secrets/staging-registry.json",
+                label="registry secret",
+            )
+
+        evidence_root = root / "legacy-evidence"
+        ensure_directory_durable(evidence_root, mode=0o700)
+        copied_paths.append(evidence_root)
+        _copy_tree_exact(
+            legacy_receipts,
+            evidence_root / "receipts",
+            label="legacy cell receipts",
+        )
+        ensure_directory_durable(evidence_root / "toolchain", mode=0o700)
+        _copy_private_file_exact(
+            legacy_tool_receipt,
+            evidence_root / "toolchain/receipt.json",
+            label="legacy toolchain receipt",
+        )
+        legacy_evidence_manifest = _tree_manifest(
+            evidence_root, label="legacy evidence"
+        )
+
+        prepared: dict[str, Any] = {
+            "schema_version": 1,
+            "status": LEGACY_MIGRATION_PREPARED_STATUS,
+            "source_root": str(legacy_root),
+            "target_root": str(root.resolve()),
+            "source_cluster": LEGACY_CLUSTER,
+            "target_cluster": DEFAULT_CLUSTER,
+            "owner_id": owner_id,
+            "legacy_cell_receipt_sha256": sha256_file(
+                legacy_root / "receipts/cell-bootstrap.json"
+            ),
+            "legacy_toolchain_receipt_sha256": sha256_file(legacy_tool_receipt),
+            "legacy_bootstrap_commit": str(legacy_cell.get("bootstrap_commit") or ""),
+            "runtime_secret_sha256": runtime_secret_sha,
+            "promotion_manifest": promotion_manifest,
+            "legacy_receipts_manifest": receipts_preflight,
+            "legacy_evidence_manifest": legacy_evidence_manifest,
+            "data_identity": data_identity,
+            "toolchain_copied": False,
+            "toolchain_action": "regenerate-under-canonical-state-root",
+            "legacy_cluster_deleted": legacy_cluster_present,
+            "production_changed": False,
+        }
+        if registry_secret_sha is not None:
+            prepared["registry_secret_sha256"] = registry_secret_sha
+        receipt_path = _legacy_migration_receipt_path(root)
+        atomic_json(receipt_path, prepared, mode=0o600)
+        if _read_legacy_state_migration_receipt(root) != prepared:
+            raise StagingCellError(
+                "prepared legacy-state migration receipt readback mismatch"
+            )
+
+        _rename_legacy_data_for_cutover(legacy_data, target_data)
+        moved_data = True
+        observed_data_identity = {
+            name: _real_directory_identity(
+                target_data / name, label=f"migrated retained {name} data"
+            )
+            for name in ("postgres", "nats")
+        }
+        if observed_data_identity != data_identity:
+            raise StagingCellError(
+                "retained staging data identity changed during state-root migration"
+            )
+
+        _finalize_prepared_legacy_state_migration(
+            root, owner_id=owner_id, payload=prepared
+        )
+    except Exception:
+        if moved_data and target_data.exists() and not legacy_data.exists():
+            target_data.rename(legacy_data)
+            fsync_directory(root)
+            fsync_directory(legacy_root)
+        receipts_dir = root / "receipts"
+        if (
+            receipts_dir.exists()
+            and receipts_dir.is_dir()
+            and not receipts_dir.is_symlink()
+        ):
+            shutil.rmtree(receipts_dir)
+        for path in reversed(copied_paths):
+            if path.exists() and path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+        raise
+
+    return _legacy_migration_public_result(root)
+
+
 def render_kind_config(root: Path) -> Path:
     template_path = ROOT / "platform/clusters/staging/kind.yaml"
     document = yaml.safe_load(template_path.read_text(encoding="utf-8"))
@@ -550,7 +1278,7 @@ def render_kind_config(root: Path) -> Path:
         mount = mounts[0]
         if mount.get("hostPath") != placeholder:
             raise StagingCellError("staging data worker hostPath template drift")
-        if mount.get("containerPath") != "/var/local/weltgewebe-staging":
+        if mount.get("containerPath") != "/var/local/commonthing-staging":
             raise StagingCellError("staging data worker containerPath drift")
         if mount.get("readOnly") is not False:
             raise StagingCellError("staging data worker persistent mount must be writable")
@@ -809,7 +1537,7 @@ def inject_registry_pull_secret(
                 ).decode("ascii")
             },
         },
-        field_manager="weltgewebe-staging-registry",
+        field_manager="commonthing-staging-registry",
     )
     return {
         "source_sha256": source_sha,
@@ -1036,7 +1764,7 @@ def inject_external_secrets(kubectl: str, root: Path) -> dict[str, str]:
                 "stringData": {"database-url": runtime_database_url},
             },
         ],
-        field_manager="weltgewebe-staging-secrets",
+        field_manager="commonthing-staging-secrets",
     )
     return {"source_sha256": source_sha, "required_keys": ["database-url"]}
 
@@ -1073,7 +1801,7 @@ def prepare_volume_permissions(kind: str, cluster: str, root: Path) -> None:
             mount
             for mount in mounts
             if isinstance(mount, dict)
-            and mount.get("Destination") == "/var/local/weltgewebe-staging"
+            and mount.get("Destination") == "/var/local/commonthing-staging"
         ]
         if node == data_node:
             if (
@@ -1090,8 +1818,8 @@ def prepare_volume_permissions(kind: str, cluster: str, root: Path) -> None:
             )
 
     for volume_path, identity in (
-        ("/var/local/weltgewebe-staging/postgres", "999:999"),
-        ("/var/local/weltgewebe-staging/nats", "1000:1000"),
+        ("/var/local/commonthing-staging/postgres", "999:999"),
+        ("/var/local/commonthing-staging/nats", "1000:1000"),
     ):
         run(["docker", "exec", data_node, "mkdir", "-p", volume_path], timeout=30)
         observed = output(
@@ -1688,6 +2416,10 @@ def migration_network_policy_documents() -> list[dict[str, Any]]:
             )
         isolated = json.loads(json.dumps(document))
         isolated["metadata"]["namespace"] = APP_NAMESPACE
+        if expected_name == "allow-api-data-egress":
+            isolated["spec"]["podSelector"]["matchLabels"][
+                "app.kubernetes.io/name"
+            ] = "commonthing-api"
         documents.append(isolated)
     return documents
 
@@ -2163,7 +2895,7 @@ def migration_job_document(commit: str, promotion: dict[str, Any]) -> dict[str, 
     if not isinstance(pod_metadata, dict) or not isinstance(pod_spec, dict):
         raise StagingCellError("canonical staging migration template has no Pod template")
     labels = pod_metadata.setdefault("labels", {})
-    labels["app.kubernetes.io/name"] = "weltgewebe-api"
+    labels["app.kubernetes.io/name"] = "commonthing-api"
     labels["app.kubernetes.io/component"] = "database-migration"
     pod_spec["imagePullSecrets"] = [{"name": REGISTRY_SECRET}]
     # The migration pod deliberately shares the API network identity so the
@@ -2243,7 +2975,7 @@ def run_staging_migration(
         apply_yaml_server_side(
             kubectl,
             document,
-            field_manager="weltgewebe-staging-migration",
+            field_manager="commonthing-staging-migration",
         )
 
     run(
@@ -2287,29 +3019,115 @@ def app_kustomization_document(commit: str, promotion: dict[str, Any]) -> dict[s
     images = promotion.get("images") if isinstance(promotion, dict) else None
     if not isinstance(images, dict):
         raise StagingCellError("promotion evidence has no verified images")
-    patches = []
-    for label, deployment in (("api", "weltgewebe-api"), ("web", "weltgewebe-web")):
+    verified_images: dict[str, str] = {}
+    for label in ("api", "web"):
         image = images.get(label)
         if not isinstance(image, str) or "@sha256:" not in image:
             raise StagingCellError(f"verified {label} image is not digest-bound")
-        patches.append({
-            "target": {"kind": "Deployment", "name": deployment},
-            "patch": yaml.safe_dump(
-                [
-                    {
-                        "op": "replace",
-                        "path": "/spec/template/spec/containers/0/image",
-                        "value": image,
-                    },
-                    {
-                        "op": "add",
-                        "path": "/spec/template/spec/imagePullSecrets",
-                        "value": [{"name": REGISTRY_SECRET}],
-                    },
-                ],
-                sort_keys=False,
-            ),
-        })
+        verified_images[label] = image
+
+    # commonthing-naming: legacy
+    # The shared base still carries production-compatible Weltgewebe object names.
+    # Flux applies this staging-only transform after rendering, so the live staging
+    # runtime is commonthing-* without mutating production object identities.
+    patches: list[dict[str, Any]] = []
+
+    def json_patch(kind: str, name: str, operations: list[dict[str, Any]]) -> None:
+        patches.append(
+            {
+                "target": {"kind": kind, "name": name},
+                "patch": yaml.safe_dump(operations, sort_keys=False),
+            }
+        )
+
+    json_patch(
+        "Deployment",
+        "weltgewebe-api",
+        [
+            {"op": "replace", "path": "/metadata/name", "value": "commonthing-api"},
+            {"op": "replace", "path": "/metadata/labels/app.kubernetes.io~1name", "value": "commonthing-api"},
+            {"op": "replace", "path": "/spec/selector/matchLabels/app.kubernetes.io~1name", "value": "commonthing-api"},
+            {"op": "replace", "path": "/spec/template/metadata/labels/app.kubernetes.io~1name", "value": "commonthing-api"},
+            {"op": "replace", "path": "/spec/template/spec/serviceAccountName", "value": "commonthing-api"},
+            {"op": "replace", "path": "/spec/template/spec/topologySpreadConstraints/0/labelSelector/matchLabels/app.kubernetes.io~1name", "value": "commonthing-api"},
+            {"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": verified_images["api"]},
+            {"op": "replace", "path": "/spec/template/spec/containers/0/envFrom/0/configMapRef/name", "value": RUNTIME_SECRET},
+            {"op": "replace", "path": "/spec/template/spec/containers/0/env/0/valueFrom/secretKeyRef/name", "value": RUNTIME_SECRET},
+            {"op": "replace", "path": "/spec/template/spec/containers/0/env/1/valueFrom/secretKeyRef/name", "value": RUNTIME_SECRET},
+            {"op": "add", "path": "/spec/template/spec/imagePullSecrets", "value": [{"name": REGISTRY_SECRET}]},
+        ],
+    )
+    json_patch(
+        "Deployment",
+        "weltgewebe-web",
+        [
+            {"op": "replace", "path": "/metadata/name", "value": "commonthing-web"},
+            {"op": "replace", "path": "/metadata/labels/app.kubernetes.io~1name", "value": "commonthing-web"},
+            {"op": "replace", "path": "/spec/selector/matchLabels/app.kubernetes.io~1name", "value": "commonthing-web"},
+            {"op": "replace", "path": "/spec/template/metadata/labels/app.kubernetes.io~1name", "value": "commonthing-web"},
+            {"op": "replace", "path": "/spec/template/spec/serviceAccountName", "value": "commonthing-web"},
+            {"op": "replace", "path": "/spec/template/spec/topologySpreadConstraints/0/labelSelector/matchLabels/app.kubernetes.io~1name", "value": "commonthing-web"},
+            {"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": verified_images["web"]},
+            {"op": "add", "path": "/spec/template/spec/imagePullSecrets", "value": [{"name": REGISTRY_SECRET}]},
+        ],
+    )
+    for kind in ("Service", "PodDisruptionBudget"):
+        for old_name, new_name in (
+            ("weltgewebe-api", "commonthing-api"),
+            ("weltgewebe-web", "commonthing-web"),
+        ):
+            selector_path = (
+                "/spec/selector/app.kubernetes.io~1name"
+                if kind == "Service"
+                else "/spec/selector/matchLabels/app.kubernetes.io~1name"
+            )
+            operations = [
+                {"op": "replace", "path": "/metadata/name", "value": new_name},
+                {"op": "replace", "path": selector_path, "value": new_name},
+            ]
+            if kind == "Service":
+                operations.insert(
+                    1,
+                    {"op": "replace", "path": "/metadata/labels/app.kubernetes.io~1name", "value": new_name},
+                )
+            json_patch(kind, old_name, operations)
+    for old_name, new_name in (
+        ("weltgewebe-api", "commonthing-api"),
+        ("weltgewebe-web", "commonthing-web"),
+    ):
+        json_patch(
+            "ServiceAccount",
+            old_name,
+            [
+                {"op": "replace", "path": "/metadata/name", "value": new_name},
+                {"op": "replace", "path": "/metadata/labels/app.kubernetes.io~1name", "value": new_name},
+            ],
+        )
+    json_patch(
+        "ConfigMap",
+        "weltgewebe-runtime",
+        [
+            {"op": "replace", "path": "/metadata/name", "value": RUNTIME_SECRET},
+            {"op": "replace", "path": "/metadata/labels/app.kubernetes.io~1name", "value": "commonthing-api"},
+            {"op": "replace", "path": "/data/NATS_URL", "value": "nats://nats.commonthing-data.svc.cluster.local:4222"},
+            {"op": "replace", "path": "/data/OTEL_SERVICE_NAME", "value": "commonthing-api"},
+        ],
+    )
+    json_patch(
+        "NetworkPolicy",
+        "allow-api-data-egress",
+        [
+            {"op": "replace", "path": "/spec/podSelector/matchLabels/app.kubernetes.io~1name", "value": "commonthing-api"},
+            {"op": "replace", "path": "/spec/egress/0/to/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name", "value": DATA_NAMESPACE},
+        ],
+    )
+    json_patch(
+        "CiliumNetworkPolicy",
+        "allow-cilium-gateway",
+        [
+            {"op": "replace", "path": "/spec/endpointSelector/matchExpressions/0/values", "value": ["commonthing-api", "commonthing-web"]},
+        ],
+    )
     return {
         "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
         "kind": "Kustomization",
@@ -2322,6 +3140,9 @@ def app_kustomization_document(commit: str, promotion: dict[str, Any]) -> dict[s
             "wait": True,
             "dependsOn": [{"name": DATA_KUSTOMIZATION}],
             "sourceRef": {"kind": "GitRepository", "name": APP_SOURCE_NAME},
+            # Source-layout compatibility only: the shared app tree still serves
+            # production. Effective Staging object identity is rewritten below to
+            # commonthing-* without changing production manifests.
             "path": "./platform/apps/weltgewebe/overlays/staging",
             "patches": patches,
             "healthChecks": [
@@ -2331,7 +3152,7 @@ def app_kustomization_document(commit: str, promotion: dict[str, Any]) -> dict[s
                     "name": deployment,
                     "namespace": APP_NAMESPACE,
                 }
-                for deployment in ("weltgewebe-api", "weltgewebe-web")
+                for deployment in ("commonthing-api", "commonthing-web")
             ],
         },
     }
@@ -2415,14 +3236,13 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
     existing = args.cluster in reference.clusters(kind)
     cell_path = root / "receipts/cell-bootstrap.json"
     cell = load_cell_receipt(root) if cell_path.exists() else None
+    legacy_migration: dict[str, Any] | None = None
     if existing and cell is None:
         raise StagingCellError(
             "staging cluster exists without a bootstrap receipt; refusing unbound recovery"
         )
     if cell is None and retained_staging_data_exists(root):
-        raise StagingCellError(
-            "retained staging data exists without a bootstrap receipt; explicit recovery is required"
-        )
+        legacy_migration = load_legacy_state_migration(root, owner_id=owner_id)
     if cell is not None:
         require_receipt_cluster(cell, args.cluster)
         persisted_owner = str(cell.get("owner_id") or "")
@@ -2461,22 +3281,26 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
         created = False
     else:
         if cell is None:
-            write_cell_receipt(
-                root,
-                {
-                    "schema_version": 1,
-                    "status": "bootstrap-in-progress",
-                    "cluster": args.cluster,
-                    "owner_id": owner_id,
-                    "bootstrap_commit": commit,
-                    "public_source": PUBLIC_REPOSITORY,
-                    "external_secret": {
-                        "source_sha256": source_sha,
-                        "required_keys": ["database-url"],
-                    },
-                    "production_changed": False,
+            bootstrap_payload: dict[str, Any] = {
+                "schema_version": 1,
+                "status": "bootstrap-in-progress",
+                "cluster": args.cluster,
+                "owner_id": owner_id,
+                "bootstrap_commit": commit,
+                "public_source": PUBLIC_REPOSITORY,
+                "external_secret": {
+                    "source_sha256": source_sha,
+                    "required_keys": ["database-url"],
                 },
-            )
+                "production_changed": False,
+            }
+            if legacy_migration is not None:
+                bootstrap_payload["legacy_state_migration"] = {
+                    "receipt_sha256": sha256_file(_legacy_migration_receipt_path(root)),
+                    "source_cluster": LEGACY_CLUSTER,
+                    "legacy_bootstrap_commit": legacy_migration["legacy_bootstrap_commit"],
+                }
+            write_cell_receipt(root, bootstrap_payload)
         rendered_kind_config = render_kind_config(root)
         reference.create_kind_cluster(
             kind,
@@ -2556,6 +3380,12 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
             "production Kubernetes cutover",
         ],
     }
+    if legacy_migration is not None:
+        base_result["legacy_state_migration"] = {
+            "receipt_sha256": sha256_file(_legacy_migration_receipt_path(root)),
+            "source_cluster": LEGACY_CLUSTER,
+            "legacy_bootstrap_commit": legacy_migration["legacy_bootstrap_commit"],
+        }
     private_result = {**base_result, "external_secret": secret_receipt}
     receipt_path = write_cell_receipt(root, private_result)
     return {
@@ -3229,6 +4059,9 @@ def parser() -> argparse.ArgumentParser:
     down = sub.add_parser("down")
     down.set_defaults(cluster=DEFAULT_CLUSTER)
     down.add_argument("--owner-id", required=True)
+    migrate = sub.add_parser("migrate-legacy-state")
+    migrate.set_defaults(cluster=DEFAULT_CLUSTER)
+    migrate.add_argument("--owner-id", required=True)
     sub.add_parser("self-check")
     return p
 
@@ -3337,6 +4170,19 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
         }
         print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
         return
+    if command == "migrate-legacy-state":
+        safe = {
+            "command": "migrate-legacy-state",
+            "schema_version": 1,
+            "status": str(result.get("status") or "legacy-state-adopted"),
+            "cluster": str(result.get("cluster") or DEFAULT_CLUSTER),
+            "toolchain_regeneration_required": bool(
+                result.get("toolchain_regeneration_required")
+            ),
+            "production_changed": bool(result.get("production_changed")),
+        }
+        print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
+        return
     print('{"command":"self-check","schema_version":1,"status":"pass"}')
 
 
@@ -3351,6 +4197,8 @@ def main() -> int:
             result = command_status(args)
         elif args.command == "down":
             result = command_down(args)
+        elif args.command == "migrate-legacy-state":
+            result = command_migrate_legacy_state(args)
         else:
             result = command_self_check()
         emit_public_success(args.command, result)

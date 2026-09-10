@@ -1,7 +1,7 @@
 ---
 apiVersion: kind.x-k8s.io/v1alpha4
 kind: Cluster
-name: weltgewebe-staging
+name: commonthing-staging
 networking:
   disableDefaultCNI: true
   kubeProxyMode: none
@@ -10,6 +10,6 @@ nodes:
   - role: worker
     extraMounts:
       - hostPath: __COMMONTHING_STAGING_DATA_ROOT__
-        containerPath: /var/local/weltgewebe-staging
+        containerPath: /var/local/commonthing-staging
         readOnly: false
   - role: worker
