@@ -920,7 +920,12 @@ def _require_prepared_legacy_state_migration(
         (legacy_root / "promotion", "legacy promotion receipts"),
         (root / "promotion", "prepared migrated promotion receipts"),
     ):
-        if promotion_manifest != _tree_manifest(path, label=label):
+        observed_manifest = (
+            _tree_manifest(path, label=label)
+            if path.exists() or path.is_symlink()
+            else {}
+        )
+        if promotion_manifest != observed_manifest:
             raise StagingCellError(
                 "prepared legacy-state migration promotion evidence drift"
             )
