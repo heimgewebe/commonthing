@@ -2742,6 +2742,7 @@ def app_kustomization_document(commit: str, promotion: dict[str, Any]) -> dict[s
             raise StagingCellError(f"verified {label} image is not digest-bound")
         verified_images[label] = image
 
+    # commonthing-naming: legacy
     # The shared base still carries production-compatible Weltgewebe object names.
     # Flux applies this staging-only transform after rendering, so the live staging
     # runtime is commonthing-* without mutating production object identities.

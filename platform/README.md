@@ -158,8 +158,9 @@ erzwingen denselben Daten-Worker. Das ist bewusst kein HA-Failover.
 Die interne PostgreSQL-Datenbank und der Datenbankbenutzer `weltgewebe` bleiben
 beim Cutover als persistierte Datenkompatibilität unverändert; ihre Umbenennung
 wäre eine eigene, transaktionale Datenmigration und ist keine Voraussetzung für
-eine kanonische Staging-Runtimeidentität. Ebenso bleiben `weltgewebe.net/*`-Keys
-als bestehender Anwendungs-/Protokollvertrag bestehen.
+eine kanonische Staging-Runtimeidentität.
+<!-- commonthing-naming: legacy -->
+Ebenso bleiben `weltgewebe.net/*`-Keys als bestehender Anwendungs-/Protokollvertrag bestehen.
 
 Die Data-NetworkPolicies erlauben PostgreSQL (`5432`) und NATS (`4222`) nur
 `commonthing-api`-Pods im exakten Namespace `commonthing-staging`. Neue
