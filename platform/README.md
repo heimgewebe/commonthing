@@ -119,8 +119,12 @@ inzwischen fortgeschritten ist; ein anderer Commit bleibt verboten.
 
 Nach Secret- und Registry-Injektion wendet `activate` zunächst exakt die bereits
 versionierten App-Regeln `default-deny`, `allow-dns` und
-`allow-api-data-egress` im Staging-Namespace an und liest ihre Existenz zurück.
-Damit besitzt bereits der erste Migrations-Pod vor seinem Start dieselbe
+`allow-api-data-egress` im Staging-Namespace an. Danach bindet der Controller die
+drei Live-Objekte an ihre Kubernetes-UIDs und wartet begrenzt, bis **jeder** Ready
+Cilium-Agent auf **jedem** Staging-Knoten genau diese UID-gebundenen Policies in
+seinem lokalen Policy-Repository führt. Fehlt Agentabdeckung oder Policy-Evidenz,
+endet die Aktivierung fail-closed, bevor der Migrations-Pod erzeugt wird. Damit
+besitzt bereits der erste Migrations-Pod vor seinem Start dieselbe
 Default-Deny-/DNS-/Daten-Egress-Grenze wie die spätere API; die vollständige App-
 Kustomization übernimmt dieselben Regeln anschließend dauerhaft über Flux. Erst
 danach führt `activate` vor dem normalen App-Rollout einen einmaligen

@@ -35,6 +35,8 @@ APP_KUSTOMIZATION = "weltgewebe-staging-app"
 MIGRATION_JOB_PREFIX = "weltgewebe-staging-migration"
 MIGRATION_TEMPLATE = ROOT / "platform/apps/weltgewebe/migration/ha/job.yaml"
 MIGRATION_TIMEOUT_SECONDS = 8 * 60
+CILIUM_POLICY_ENFORCEMENT_TIMEOUT_SECONDS = 45.0
+CILIUM_POLICY_ENFORCEMENT_POLL_SECONDS = 1.0
 DATA_NAMESPACE = "weltgewebe-data"
 APP_NAMESPACE = "weltgewebe-staging"
 DATABASE_SECRET = "weltgewebe-staging-database"
@@ -1669,28 +1671,242 @@ def migration_network_policy_documents() -> list[dict[str, Any]]:
     return documents
 
 
-def apply_migration_network_isolation(kubectl: str) -> list[str]:
-    documents = migration_network_policy_documents()
-    apply_yaml(kubectl, documents)
-    names = [str(document["metadata"]["name"]) for document in documents]
+def _load_json_object(raw: str, *, label: str) -> dict[str, Any]:
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise StagingCellError(f"{label} returned malformed JSON") from error
+    if not isinstance(document, dict):
+        raise StagingCellError(f"{label} did not return a JSON object")
+    return document
+
+
+def migration_network_policy_bindings(
+    kubectl: str, names: list[str]
+) -> dict[str, str]:
+    bindings: dict[str, str] = {}
     for name in names:
-        observed = output(
+        document = _load_json_object(
+            output(
+                [
+                    kubectl,
+                    "-n",
+                    APP_NAMESPACE,
+                    "get",
+                    "networkpolicy",
+                    name,
+                    "-o",
+                    "json",
+                ]
+            ),
+            label=f"staging migration NetworkPolicy {name!r}",
+        )
+        metadata = document.get("metadata")
+        observed_name = metadata.get("name") if isinstance(metadata, dict) else None
+        namespace_name = metadata.get("namespace") if isinstance(metadata, dict) else None
+        uid = metadata.get("uid") if isinstance(metadata, dict) else None
+        if (
+            observed_name != name
+            or namespace_name != APP_NAMESPACE
+            or not isinstance(uid, str)
+            or not uid
+            or len(uid) > 128
+        ):
+            raise StagingCellError(
+                f"staging migration NetworkPolicy {name!r} has no exact live UID binding"
+            )
+        bindings[name] = uid
+    return bindings
+
+
+def ready_cilium_agents(kubectl: str) -> list[tuple[str, str]]:
+    nodes = _load_json_object(
+        output([kubectl, "get", "nodes", "-o", "json"]),
+        label="staging node inventory",
+    ).get("items")
+    if not isinstance(nodes, list):
+        raise StagingCellError("staging node inventory has no item list")
+    node_names = {
+        str(metadata.get("name"))
+        for node in nodes
+        if isinstance(node, dict)
+        and isinstance((metadata := node.get("metadata")), dict)
+        and isinstance(metadata.get("name"), str)
+        and metadata.get("name")
+    }
+    if not node_names or len(node_names) != len(nodes):
+        raise StagingCellError("staging node inventory is incomplete")
+
+    pod_document = _load_json_object(
+        output(
             [
                 kubectl,
                 "-n",
-                APP_NAMESPACE,
+                "kube-system",
                 "get",
-                "networkpolicy",
-                name,
+                "pods",
+                "-l",
+                "k8s-app=cilium",
                 "-o",
-                "jsonpath={.metadata.name}",
+                "json",
             ]
-        )
-        if observed != name:
-            raise StagingCellError(
-                f"staging migration NetworkPolicy {name!r} is not readable after apply"
+        ),
+        label="Cilium agent inventory",
+    )
+    pods = pod_document.get("items")
+    if not isinstance(pods, list):
+        raise StagingCellError("Cilium agent inventory has no item list")
+    agents: dict[str, str] = {}
+    for pod in pods:
+        if not isinstance(pod, dict):
+            continue
+        metadata = pod.get("metadata")
+        spec = pod.get("spec")
+        status = pod.get("status")
+        pod_name = metadata.get("name") if isinstance(metadata, dict) else None
+        node_name = spec.get("nodeName") if isinstance(spec, dict) else None
+        conditions = status.get("conditions") if isinstance(status, dict) else None
+        ready = bool(
+            isinstance(conditions, list)
+            and any(
+                isinstance(condition, dict)
+                and condition.get("type") == "Ready"
+                and condition.get("status") == "True"
+                for condition in conditions
             )
-    return names
+        )
+        if (
+            not isinstance(pod_name, str)
+            or not pod_name
+            or not isinstance(node_name, str)
+            or node_name not in node_names
+            or not isinstance(status, dict)
+            or status.get("phase") != "Running"
+            or not ready
+        ):
+            continue
+        if node_name in agents:
+            raise StagingCellError(
+                f"multiple Ready Cilium agents observed for staging node {node_name!r}"
+            )
+        agents[node_name] = pod_name
+    if set(agents) != node_names:
+        raise StagingCellError(
+            "staging Cilium agent coverage is incomplete; refusing migration pod creation"
+        )
+    return sorted(agents.items())
+
+
+def parse_cilium_policy_repository(raw: str) -> tuple[list[dict[str, Any]], int]:
+    text = raw.lstrip()
+    try:
+        payload, offset = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError as error:
+        raise StagingCellError("Cilium policy repository returned malformed JSON") from error
+    if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+        raise StagingCellError("Cilium policy repository is not a JSON rule list")
+    trailer = text[offset:].strip()
+    prefix = "Revision:"
+    if not trailer.startswith(prefix):
+        raise StagingCellError("Cilium policy repository has no revision trailer")
+    revision_text = trailer[len(prefix):].strip()
+    if not revision_text.isdigit():
+        raise StagingCellError("Cilium policy repository revision is malformed")
+    return payload, int(revision_text)
+
+
+def cilium_network_policy_bindings(raw: str) -> tuple[set[tuple[str, str, str]], int]:
+    policies, revision = parse_cilium_policy_repository(raw)
+    bindings: set[tuple[str, str, str]] = set()
+    for policy in policies:
+        labels = policy.get("Labels")
+        if not isinstance(labels, list):
+            continue
+        mapped = {
+            str(label.get("key")): str(label.get("value"))
+            for label in labels
+            if isinstance(label, dict)
+            and label.get("source") == "k8s"
+            and isinstance(label.get("key"), str)
+            and isinstance(label.get("value"), str)
+        }
+        if mapped.get("io.cilium.k8s.policy.derived-from") != "NetworkPolicy":
+            continue
+        name = mapped.get("io.cilium.k8s.policy.name")
+        namespace_name = mapped.get("io.cilium.k8s.policy.namespace")
+        uid = mapped.get("io.cilium.k8s.policy.uid")
+        if name and namespace_name and uid:
+            bindings.add((name, namespace_name, uid))
+    return bindings, revision
+
+
+def wait_migration_network_policy_enforcement(
+    kubectl: str,
+    policy_uids: dict[str, str],
+    *,
+    timeout_seconds: float = CILIUM_POLICY_ENFORCEMENT_TIMEOUT_SECONDS,
+    poll_seconds: float = CILIUM_POLICY_ENFORCEMENT_POLL_SECONDS,
+) -> dict[str, Any]:
+    if not policy_uids:
+        raise StagingCellError("staging migration NetworkPolicy bindings are empty")
+    expected = {
+        (name, APP_NAMESPACE, uid) for name, uid in policy_uids.items()
+    }
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    last_missing: dict[str, list[str]] = {}
+    while True:
+        agents = ready_cilium_agents(kubectl)
+        last_missing = {}
+        revisions: list[int] = []
+        for node_name, pod_name in agents:
+            raw = output(
+                [
+                    kubectl,
+                    "-n",
+                    "kube-system",
+                    "exec",
+                    pod_name,
+                    "-c",
+                    "cilium-agent",
+                    "--",
+                    "cilium-dbg",
+                    "policy",
+                    "get",
+                ],
+                timeout=30,
+            )
+            observed, revision = cilium_network_policy_bindings(raw)
+            revisions.append(revision)
+            missing = expected - observed
+            if missing:
+                last_missing[node_name] = sorted(name for name, _, _ in missing)
+        if not last_missing:
+            return {
+                "processed": True,
+                "cilium_agent_count": len(agents),
+                "minimum_policy_revision": min(revisions),
+            }
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(max(0.0, poll_seconds))
+    missing_names = sorted({name for names in last_missing.values() for name in names})
+    raise StagingCellError(
+        "Cilium did not process all staging migration NetworkPolicies before the bounded deadline: "
+        f"missing={missing_names!r}"
+    )
+
+
+def apply_migration_network_isolation(kubectl: str) -> dict[str, Any]:
+    documents = migration_network_policy_documents()
+    apply_yaml(kubectl, documents)
+    names = [str(document["metadata"]["name"]) for document in documents]
+    policy_uids = migration_network_policy_bindings(kubectl, names)
+    enforcement = wait_migration_network_policy_enforcement(kubectl, policy_uids)
+    return {
+        "policy_names": names,
+        "policy_uids": policy_uids,
+        **enforcement,
+    }
 
 
 def migration_job_document(commit: str, promotion: dict[str, Any]) -> dict[str, Any]:
@@ -2279,7 +2495,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         "registry_pull_access": registry_pull_access,
         "migration": {
             **migration_receipt,
-            "network_policies": migration_network_policies,
+            "network_isolation": migration_network_policies,
         },
         "image_promotion": promotion_state,
         "app_activation": True,

@@ -1889,8 +1889,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
 
     def test_staging_migration_network_isolation_reuses_exact_app_policies(self) -> None:
         documents = staging.migration_network_policy_documents()
+        names = [document["metadata"]["name"] for document in documents]
         self.assertEqual(
-            [document["metadata"]["name"] for document in documents],
+            names,
             ["default-deny", "allow-dns", "allow-api-data-egress"],
         )
         self.assertTrue(
@@ -1912,15 +1913,181 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             {entry["port"] for rule in allow_data["spec"]["egress"] for entry in rule["ports"]},
             {5432, 4222},
         )
-        names = [document["metadata"]["name"] for document in documents]
+        policy_uids = {name: f"uid-{index}" for index, name in enumerate(names)}
+        policy_documents = [
+            json.dumps(
+                {
+                    "metadata": {
+                        "name": name,
+                        "namespace": staging.APP_NAMESPACE,
+                        "uid": policy_uids[name],
+                    }
+                }
+            )
+            for name in names
+        ]
         with (
             mock.patch.object(staging, "apply_yaml") as apply_yaml,
-            mock.patch.object(staging, "output", side_effect=names) as output,
+            mock.patch.object(staging, "output", side_effect=policy_documents),
+            mock.patch.object(
+                staging,
+                "wait_migration_network_policy_enforcement",
+                return_value={
+                    "processed": True,
+                    "cilium_agent_count": 3,
+                    "minimum_policy_revision": 11,
+                },
+            ) as wait_enforcement,
         ):
             result = staging.apply_migration_network_isolation("kubectl")
-        self.assertEqual(result, names)
         apply_yaml.assert_called_once_with("kubectl", documents)
-        self.assertEqual(output.call_count, 3)
+        wait_enforcement.assert_called_once_with("kubectl", policy_uids)
+        self.assertEqual(result["policy_names"], names)
+        self.assertEqual(result["policy_uids"], policy_uids)
+        self.assertTrue(result["processed"])
+        self.assertEqual(result["cilium_agent_count"], 3)
+        self.assertEqual(result["minimum_policy_revision"], 11)
+
+    def test_cilium_policy_repository_binds_exact_networkpolicy_uid(self) -> None:
+        raw = json.dumps(
+            [
+                {
+                    "Labels": [
+                        {
+                            "key": "io.cilium.k8s.policy.derived-from",
+                            "value": "NetworkPolicy",
+                            "source": "k8s",
+                        },
+                        {
+                            "key": "io.cilium.k8s.policy.name",
+                            "value": "default-deny",
+                            "source": "k8s",
+                        },
+                        {
+                            "key": "io.cilium.k8s.policy.namespace",
+                            "value": staging.APP_NAMESPACE,
+                            "source": "k8s",
+                        },
+                        {
+                            "key": "io.cilium.k8s.policy.uid",
+                            "value": "uid-default-deny",
+                            "source": "k8s",
+                        },
+                    ]
+                }
+            ]
+        ) + "\nRevision: 12"
+        bindings, revision = staging.cilium_network_policy_bindings(raw)
+        self.assertEqual(
+            bindings,
+            {("default-deny", staging.APP_NAMESPACE, "uid-default-deny")},
+        )
+        self.assertEqual(revision, 12)
+
+    def test_cilium_agent_inventory_requires_ready_agent_on_every_node(self) -> None:
+        nodes = json.dumps(
+            {
+                "items": [
+                    {"metadata": {"name": "node-a"}},
+                    {"metadata": {"name": "node-b"}},
+                ]
+            }
+        )
+        pods = json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"name": "cilium-a"},
+                        "spec": {"nodeName": "node-a"},
+                        "status": {
+                            "phase": "Running",
+                            "conditions": [{"type": "Ready", "status": "True"}],
+                        },
+                    }
+                ]
+            }
+        )
+        with mock.patch.object(staging, "output", side_effect=[nodes, pods]):
+            with self.assertRaisesRegex(staging.StagingCellError, "coverage is incomplete"):
+                staging.ready_cilium_agents("kubectl")
+
+    def test_cilium_policy_wait_requires_exact_uid_on_every_ready_agent(self) -> None:
+        expected = {
+            "default-deny": "uid-default",
+            "allow-dns": "uid-dns",
+            "allow-api-data-egress": "uid-data",
+        }
+        rules = []
+        for name, uid in expected.items():
+            rules.append(
+                {
+                    "Labels": [
+                        {
+                            "key": "io.cilium.k8s.policy.derived-from",
+                            "value": "NetworkPolicy",
+                            "source": "k8s",
+                        },
+                        {
+                            "key": "io.cilium.k8s.policy.name",
+                            "value": name,
+                            "source": "k8s",
+                        },
+                        {
+                            "key": "io.cilium.k8s.policy.namespace",
+                            "value": staging.APP_NAMESPACE,
+                            "source": "k8s",
+                        },
+                        {
+                            "key": "io.cilium.k8s.policy.uid",
+                            "value": uid,
+                            "source": "k8s",
+                        },
+                    ]
+                }
+            )
+        raw_a = json.dumps(rules) + "\nRevision: 20"
+        raw_b = json.dumps(rules) + "\nRevision: 19"
+        with (
+            mock.patch.object(
+                staging,
+                "ready_cilium_agents",
+                return_value=[("node-a", "cilium-a"), ("node-b", "cilium-b")],
+            ),
+            mock.patch.object(staging, "output", side_effect=[raw_a, raw_b]) as output,
+        ):
+            result = staging.wait_migration_network_policy_enforcement(
+                "kubectl", expected, timeout_seconds=0.0, poll_seconds=0.0
+            )
+        self.assertTrue(result["processed"])
+        self.assertEqual(result["cilium_agent_count"], 2)
+        self.assertEqual(result["minimum_policy_revision"], 19)
+        self.assertEqual(output.call_count, 2)
+        for call in output.call_args_list:
+            argv = call.args[0]
+            self.assertEqual(argv[1:3], ["-n", "kube-system"])
+            self.assertIn("cilium-dbg", argv)
+            self.assertEqual(argv[-2:], ["policy", "get"])
+            self.assertEqual(call.kwargs["timeout"], 30)
+
+    def test_cilium_policy_wait_fails_closed_when_exact_uid_is_not_processed(self) -> None:
+        with (
+            mock.patch.object(
+                staging,
+                "ready_cilium_agents",
+                return_value=[("node-a", "cilium-a")],
+            ),
+            mock.patch.object(staging, "output", return_value="[]\nRevision: 3"),
+            mock.patch.object(staging.time, "monotonic", side_effect=[10.0, 10.0]),
+            mock.patch.object(staging.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(staging.StagingCellError, "did not process"):
+                staging.wait_migration_network_policy_enforcement(
+                    "kubectl",
+                    {"default-deny": "uid-default-deny"},
+                    timeout_seconds=0.0,
+                    poll_seconds=0.0,
+                )
+        sleep.assert_not_called()
 
     def test_staging_migration_job_is_bound_to_promoted_api_digest(self) -> None:
         commit = "2" * 40
@@ -2131,7 +2298,21 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                         "apply_migration_network_isolation",
                         side_effect=lambda kubectl: (
                             activation_order.append("network"),
-                            ["default-deny", "allow-dns", "allow-api-data-egress"],
+                            {
+                                "policy_names": [
+                                    "default-deny",
+                                    "allow-dns",
+                                    "allow-api-data-egress",
+                                ],
+                                "policy_uids": {
+                                    "default-deny": "uid-default-deny",
+                                    "allow-dns": "uid-allow-dns",
+                                    "allow-api-data-egress": "uid-allow-api-data-egress",
+                                },
+                                "processed": True,
+                                "cilium_agent_count": 3,
+                                "minimum_policy_revision": 12,
+                            },
                         )[-1],
                     )
                 )
@@ -2243,8 +2424,13 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("pending_registry_pull_secret", stored)
         self.assertTrue(stored["migration"]["complete"])
         self.assertEqual(
-            stored["migration"]["network_policies"],
+            stored["migration"]["network_isolation"]["policy_names"],
             ["default-deny", "allow-dns", "allow-api-data-egress"],
+        )
+        self.assertTrue(stored["migration"]["network_isolation"]["processed"])
+        self.assertEqual(
+            stored["migration"]["network_isolation"]["cilium_agent_count"],
+            3,
         )
         self.assertEqual(stored["image_promotion"]["images"], {"api": api, "web": web})
         self.assertEqual(stored["registry_pull_secret"]["secret_name"], staging.REGISTRY_SECRET)
