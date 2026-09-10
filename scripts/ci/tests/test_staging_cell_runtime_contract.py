@@ -4,6 +4,7 @@ import argparse
 import base64
 import io
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1910,6 +1911,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "commonthing-api",
         )
         self.assertEqual(
+            allow_data["spec"]["egress"][0]["to"][0]["namespaceSelector"]["matchLabels"][
+                "kubernetes.io/metadata.name"
+            ],
+            staging.DATA_NAMESPACE,
+        )
+        self.assertEqual(
             {entry["port"] for rule in allow_data["spec"]["egress"] for entry in rule["ports"]},
             {5432, 4222},
         )
@@ -3474,6 +3481,62 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "postgres_inode": (legacy / "data/postgres").stat().st_ino,
             "nats_inode": (legacy / "data/nats").stat().st_ino,
         }
+
+    def test_legacy_state_cutover_holds_legacy_lifecycle_lock(self) -> None:
+        owner = "owner-cutover"
+        with tempfile.TemporaryDirectory(prefix="staging-legacy-lock-") as tmp_name:
+            temp = Path(tmp_name)
+            legacy = temp / "legacy/staging-cell"
+            canonical = temp / "commonthing/staging-cell"
+            legacy.mkdir(parents=True)
+            with (
+                mock.patch.object(staging, "LEGACY_STATE_ROOT", legacy),
+                mock.patch.object(staging, "state_root", return_value=canonical),
+            ):
+                with staging.lifecycle_lock(legacy):
+                    with self.assertRaisesRegex(
+                        staging.StagingCellError,
+                        "another staging lifecycle mutation is already in progress",
+                    ):
+                        staging.command_migrate_legacy_state(
+                            argparse.Namespace(
+                                cluster=staging.DEFAULT_CLUSTER, owner_id=owner
+                            )
+                        )
+
+    def test_legacy_state_cutover_allows_missing_promotion_receipts(self) -> None:
+        owner = "owner-cutover"
+        commit = "6" * 40
+        with tempfile.TemporaryDirectory(prefix="staging-legacy-no-promotion-") as tmp_name:
+            temp = Path(tmp_name)
+            legacy = temp / "legacy/staging-cell"
+            canonical = temp / "commonthing/staging-cell"
+            legacy.mkdir(parents=True)
+            self._write_legacy_cutover_fixture(legacy, owner=owner, commit=commit)
+            shutil.rmtree(legacy / "promotion")
+            clusters = mock.Mock(side_effect=[[staging.LEGACY_CLUSTER], []])
+            with (
+                mock.patch.object(staging, "LEGACY_STATE_ROOT", legacy),
+                mock.patch.object(staging, "state_root", return_value=canonical),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging,
+                    "load_tool_receipt",
+                    return_value={"tools": {"kind": "kind"}},
+                ),
+                mock.patch.object(staging.reference, "clusters", clusters),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging.reference, "delete_owned_cluster_if_present"),
+            ):
+                result = staging.command_migrate_legacy_state(
+                    argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+                )
+                loaded = staging.load_legacy_state_migration(
+                    canonical, owner_id=owner
+                )
+            self.assertEqual(result["status"], staging.LEGACY_MIGRATION_ADOPTED_STATUS)
+            self.assertEqual(loaded["promotion_manifest"], {})
+            self.assertFalse((canonical / "promotion").exists())
 
     def test_legacy_state_cutover_stops_owned_cluster_and_preserves_data_evidence(self) -> None:
         owner = "owner-cutover"
