@@ -1638,6 +1638,61 @@ def require_pending_promotion_matches(
     return plan
 
 
+def migration_network_policy_documents() -> list[dict[str, Any]]:
+    expected = (
+        ("default-deny", ROOT / "platform/apps/weltgewebe/base/network-policy-default-deny.yaml"),
+        ("allow-dns", ROOT / "platform/apps/weltgewebe/base/network-policy-dns.yaml"),
+        ("allow-api-data-egress", ROOT / "platform/apps/weltgewebe/base/network-policy-api-data-egress.yaml"),
+    )
+    documents: list[dict[str, Any]] = []
+    for expected_name, path in expected:
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError) as error:
+            raise StagingCellError(
+                f"cannot load staging migration NetworkPolicy {expected_name!r}"
+            ) from error
+        metadata = document.get("metadata") if isinstance(document, dict) else None
+        if (
+            not isinstance(document, dict)
+            or document.get("apiVersion") != "networking.k8s.io/v1"
+            or document.get("kind") != "NetworkPolicy"
+            or not isinstance(metadata, dict)
+            or metadata.get("name") != expected_name
+        ):
+            raise StagingCellError(
+                f"staging migration NetworkPolicy {expected_name!r} is malformed"
+            )
+        isolated = json.loads(json.dumps(document))
+        isolated["metadata"]["namespace"] = APP_NAMESPACE
+        documents.append(isolated)
+    return documents
+
+
+def apply_migration_network_isolation(kubectl: str) -> list[str]:
+    documents = migration_network_policy_documents()
+    apply_yaml(kubectl, documents)
+    names = [str(document["metadata"]["name"]) for document in documents]
+    for name in names:
+        observed = output(
+            [
+                kubectl,
+                "-n",
+                APP_NAMESPACE,
+                "get",
+                "networkpolicy",
+                name,
+                "-o",
+                "jsonpath={.metadata.name}",
+            ]
+        )
+        if observed != name:
+            raise StagingCellError(
+                f"staging migration NetworkPolicy {name!r} is not readable after apply"
+            )
+    return names
+
+
 def migration_job_document(commit: str, promotion: dict[str, Any]) -> dict[str, Any]:
     plan = migration_plan(commit, promotion)
     try:
@@ -2166,6 +2221,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
     if registry_secret_receipt.get("config_sha256") != pending_config_sha256:
         raise StagingCellError("staging registry Secret hash drifted after preflight")
 
+    migration_network_policies = apply_migration_network_isolation(kubectl)
     migration_receipt = run_staging_migration(kubectl, commit, promotion)
     if migration_receipt != {**migration_plan_value, "complete": True}:
         raise StagingCellError("staging migration evidence drifted from pending release")
@@ -2221,7 +2277,10 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         "external_secret": secret_receipt,
         "registry_pull_secret": registry_secret_receipt,
         "registry_pull_access": registry_pull_access,
-        "migration": migration_receipt,
+        "migration": {
+            **migration_receipt,
+            "network_policies": migration_network_policies,
+        },
         "image_promotion": promotion_state,
         "app_activation": True,
         "app_workloads": workloads,

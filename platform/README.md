@@ -117,9 +117,15 @@ vor jeder Recovery-Wirkung abgewiesen. Der bereits vor der ersten Clusteränderu
 geprüfte Commit darf zur Recovery weiterverwendet werden, auch wenn Public `main`
 inzwischen fortgeschritten ist; ein anderer Commit bleibt verboten.
 
-Nach Secret- und Registry-Injektion führt `activate` vor dem normalen App-Rollout
-einen einmaligen Kubernetes-Migration-Job aus. Der Job verwendet exakt den im
-Promotion-Receipt gebundenen API-Digest, `WELTGEWEBE_API_MIGRATION_ONLY=1` und
+Nach Secret- und Registry-Injektion wendet `activate` zunächst exakt die bereits
+versionierten App-Regeln `default-deny`, `allow-dns` und
+`allow-api-data-egress` im Staging-Namespace an und liest ihre Existenz zurück.
+Damit besitzt bereits der erste Migrations-Pod vor seinem Start dieselbe
+Default-Deny-/DNS-/Daten-Egress-Grenze wie die spätere API; die vollständige App-
+Kustomization übernimmt dieselben Regeln anschließend dauerhaft über Flux. Erst
+danach führt `activate` vor dem normalen App-Rollout einen einmaligen
+Kubernetes-Migration-Job aus. Der Job verwendet exakt den im Promotion-Receipt
+gebundenen API-Digest, `WELTGEWEBE_API_MIGRATION_ONLY=1` und
 `WELTGEWEBE_API_STARTUP_MIGRATIONS=run`; `DATABASE_URL` kommt ausschließlich aus
 dem extern injizierten Runtime-Secret. Seine Identität bindet Commit,
 Promotion-Receipt und API-Digest. Erst ein `Complete=True`-Readback desselben Jobs

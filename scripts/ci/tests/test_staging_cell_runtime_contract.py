@@ -1887,6 +1887,41 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         normalize.assert_not_called()
         inject_external.assert_not_called()
 
+    def test_staging_migration_network_isolation_reuses_exact_app_policies(self) -> None:
+        documents = staging.migration_network_policy_documents()
+        self.assertEqual(
+            [document["metadata"]["name"] for document in documents],
+            ["default-deny", "allow-dns", "allow-api-data-egress"],
+        )
+        self.assertTrue(
+            all(
+                document["apiVersion"] == "networking.k8s.io/v1"
+                and document["kind"] == "NetworkPolicy"
+                and document["metadata"]["namespace"] == staging.APP_NAMESPACE
+                for document in documents
+            )
+        )
+        default_deny, allow_dns, allow_data = documents
+        self.assertEqual(set(default_deny["spec"]["policyTypes"]), {"Ingress", "Egress"})
+        self.assertEqual(allow_dns["spec"]["policyTypes"], ["Egress"])
+        self.assertEqual(
+            allow_data["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+            "weltgewebe-api",
+        )
+        self.assertEqual(
+            {entry["port"] for rule in allow_data["spec"]["egress"] for entry in rule["ports"]},
+            {5432, 4222},
+        )
+        names = [document["metadata"]["name"] for document in documents]
+        with (
+            mock.patch.object(staging, "apply_yaml") as apply_yaml,
+            mock.patch.object(staging, "output", side_effect=names) as output,
+        ):
+            result = staging.apply_migration_network_isolation("kubectl")
+        self.assertEqual(result, names)
+        apply_yaml.assert_called_once_with("kubectl", documents)
+        self.assertEqual(output.call_count, 3)
+
     def test_staging_migration_job_is_bound_to_promoted_api_digest(self) -> None:
         commit = "2" * 40
         promotion = {
@@ -2013,6 +2048,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         registry_config_sha = staging.sha256_bytes(
             staging.registry_dockerconfig_json(registry_material).encode("utf-8")
         )
+        activation_order: list[str] = []
         with tempfile.TemporaryDirectory(prefix="staging-activate-") as tmp_name:
             root = Path(tmp_name)
             with ExitStack() as stack:
@@ -2089,14 +2125,27 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                         staging, "require_bootstrap_data_current", return_value={}
                     )
                 )
+                apply_network = stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "apply_migration_network_isolation",
+                        side_effect=lambda kubectl: (
+                            activation_order.append("network"),
+                            ["default-deny", "allow-dns", "allow-api-data-egress"],
+                        )[-1],
+                    )
+                )
                 run_migration = stack.enter_context(
                     mock.patch.object(
                         staging,
                         "run_staging_migration",
-                        return_value={
-                            **staging.migration_plan(active, promotion),
-                            "complete": True,
-                        },
+                        side_effect=lambda kubectl, commit, receipt: (
+                            activation_order.append("migration"),
+                            {
+                                **staging.migration_plan(active, promotion),
+                                "complete": True,
+                            },
+                        )[-1],
                     )
                 )
                 reconcile_app = stack.enter_context(
@@ -2151,7 +2200,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertEqual(require_data.call_count, 2)
         for call in require_data.call_args_list:
             self.assertEqual(call.args, ("kubectl", bootstrap))
+        apply_network.assert_called_once_with("kubectl")
         run_migration.assert_called_once_with("kubectl", active, promotion)
+        self.assertEqual(activation_order, ["network", "migration"])
         reconcile_app.assert_called_once_with("kubectl", active)
         apply_yaml.assert_called_once()
         app_documents = apply_yaml.call_args.args[1]
@@ -2191,6 +2242,10 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("pending_migration", stored)
         self.assertNotIn("pending_registry_pull_secret", stored)
         self.assertTrue(stored["migration"]["complete"])
+        self.assertEqual(
+            stored["migration"]["network_policies"],
+            ["default-deny", "allow-dns", "allow-api-data-egress"],
+        )
         self.assertEqual(stored["image_promotion"]["images"], {"api": api, "web": web})
         self.assertEqual(stored["registry_pull_secret"]["secret_name"], staging.REGISTRY_SECRET)
         self.assertNotIn("token", json.dumps(stored["registry_pull_secret"]))
