@@ -9,7 +9,7 @@ canonicality: normative
 lifecycle_state: active
 owner: ops
 review_after: 2026-09-30
-last_reviewed: 2026-08-30
+last_reviewed: 2026-09-10
 depends_on: []
 relations:
   - type: relates_to
@@ -55,7 +55,7 @@ verifies_with:
 
 - Keine Secret-Objekte oder Secretwerte werden versioniert.
 - Local und CI verwenden für Datenzelle und lokale App eine deterministische, ausdrücklich öffentliche Test-Fixture als ConfigMap; sie ist kein Produktionsgeheimnis.
-- Der Referenzrunner verwendet für Local/CI einen deklarativen Migration-only-Job mit öffentlicher ConfigMap-Fixture. Staging und Produktion bleiben durch den externen Secret- und Image-Promotionsvertrag blockiert.
+- Der Referenzrunner verwendet für Local/CI einen deklarativen Migration-only-Job mit öffentlicher ConfigMap-Fixture. Die persistente Staging-Zelle führt denselben Migrationsmodus ausschließlich mit dem exakt promovierten API-Digest und externem Staging-Secret aus; Produktion bleibt separat freigabepflichtig.
 - Staging und Production benötigen einen externen, auditierten Secretpfad.
 - Eigene Container laufen ohne Root, ohne Service-Account-Token, ohne Privilege Escalation und mit Default-Deny-Netzpolitik.
 - Der Referenzrunner übernimmt oder löscht niemals einen bereits vorhandenen Cluster.
@@ -101,13 +101,33 @@ mit passendem Staging-Image-Promotion-Receipt. PostgreSQL/NATS und ihre
 Für die App wird eine eigene commitgebundene GitRepository-Quelle
 `weltgewebe-staging-app-source` angelegt. Die statische Staging-Überlagerung behält
 weiter `promotion-required`; erst die Laufzeit-Kustomization ersetzt API und Web
-durch die im Promotion-Receipt gebundenen unveränderlichen Digests. Vor der ersten
-Clusteränderung schreibt `activate` ein nicht-geheimes
-`app-activation-in-progress`-Receipt. Ein Abbruch bleibt dadurch in `status` als
-degradiert sichtbar, und ein Wiederanlauf darf nur exakt denselben pending Commit
-fortsetzen. Dieser bereits vor der ersten Clusteränderung geprüfte Commit darf zur
-Recovery weiterverwendet werden, auch wenn Public `main` inzwischen fortgeschritten
-ist; ein anderer Commit bleibt verboten.
+durch die im Promotion-Receipt gebundenen unveränderlichen Digests.
+
+Vor dem ersten Kubernetes-Read validiert `activate` den exakten Owner- und
+Bootstrap-Marker und setzt die dedizierte Kubeconfig der `weltgewebe-staging`-Zelle;
+ein zufällig aktiver fremder Kubernetes-Kontext kann dadurch nicht als Staging
+geprüft werden. Nach Commit-, Promotion- und Registry-Preflight schreibt der
+Controller vor der ersten Clusteränderung ein nicht-geheimes
+`app-activation-in-progress`-Receipt. Es bindet den pending Commit, den exakten
+Promotion-Receipt-Hash, beide Image-Digests, den geplanten Migration-Job und die
+Registry-Secret-Hashes. Ein Abbruch bleibt dadurch in `status` als degradiert
+sichtbar. Ein Wiederanlauf darf nur denselben pending Commit **und** exakt dieselbe
+Promotion-Evidenz fortsetzen; ein ausgetauschtes Receipt oder andere Images werden
+vor jeder Recovery-Wirkung abgewiesen. Der bereits vor der ersten Clusteränderung
+geprüfte Commit darf zur Recovery weiterverwendet werden, auch wenn Public `main`
+inzwischen fortgeschritten ist; ein anderer Commit bleibt verboten.
+
+Nach Secret- und Registry-Injektion führt `activate` vor dem normalen App-Rollout
+einen einmaligen Kubernetes-Migration-Job aus. Der Job verwendet exakt den im
+Promotion-Receipt gebundenen API-Digest, `WELTGEWEBE_API_MIGRATION_ONLY=1` und
+`WELTGEWEBE_API_STARTUP_MIGRATIONS=run`; `DATABASE_URL` kommt ausschließlich aus
+dem extern injizierten Runtime-Secret. Seine Identität bindet Commit,
+Promotion-Receipt und API-Digest. Erst ein `Complete=True`-Readback desselben Jobs
+schaltet den API/Web-Rollout frei. Die normalen API-Pods bleiben auf
+`verify-applied` und starten daher nur, wenn die eingebettete Migrationshistorie
+bereits vollständig angewandt ist. Der Migrations-Pod teilt nur für den bereits
+bootstrapgebundenen PostgreSQL-NetworkPolicy-Zugang die API-Netzwerkidentität; eine
+nie erfüllte Readiness-Gate-Bedingung hält ihn aus den Service-Endpunkten heraus.
 
 PostgreSQL und NATS verwenden statische, klassenlose und vorgebundene HostPath-PVs
 mit `Retain`. Persistente Daten werden ausschließlich in den ersten Kind-Worker
@@ -155,11 +175,12 @@ Live-Workload-Schranken und degradiert bei fehlenden, stale oder nicht verfügba
 Ressourcen statt einen früheren Ready-Zustand fortzuschreiben.
 
 Die Staging-Zelle kann damit eine erfolgreich promovierte API/Web-Version
-staging-only aktivieren und deren App-Source, Kustomization, Workloads, exakte
-Image-Digests sowie Registry-Secret-Bindung live zurücklesen. Sie etabliert
-weiterhin **keinen** Gateway-/DNS-/TLS-Außenbeweis, kein Delete-to-Prove, keine
-NATS-Authentisierung/TLS und keinen Produktions-Kubernetes-Cutover. Diese Grenzen
-sind getrennt zu beweisen.
+staging-only migrieren und aktivieren. Der Cell-Receipt hält den erfolgreichen,
+commit-/promotion-/digestgebundenen Migrations-Readback fest; `status` prüft die
+weiterlebenden App-Source-, Kustomization-, Workload-, Image- und
+Registry-Secret-Bindungen. Sie etabliert weiterhin **keinen**
+Gateway-/DNS-/TLS-Außenbeweis, kein Delete-to-Prove, keine NATS-Authentisierung/TLS
+und keinen Produktions-Kubernetes-Cutover. Diese Grenzen sind getrennt zu beweisen.
 
 ## Beweise
 

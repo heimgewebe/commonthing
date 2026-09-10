@@ -32,6 +32,9 @@ SOURCE_NAME = "weltgewebe-staging-source"
 APP_SOURCE_NAME = "weltgewebe-staging-app-source"
 DATA_KUSTOMIZATION = "weltgewebe-staging-data"
 APP_KUSTOMIZATION = "weltgewebe-staging-app"
+MIGRATION_JOB_PREFIX = "weltgewebe-staging-migration"
+MIGRATION_TEMPLATE = ROOT / "platform/apps/weltgewebe/migration/ha/job.yaml"
+MIGRATION_TIMEOUT_SECONDS = 8 * 60
 DATA_NAMESPACE = "weltgewebe-data"
 APP_NAMESPACE = "weltgewebe-staging"
 DATABASE_SECRET = "weltgewebe-staging-database"
@@ -1585,6 +1588,189 @@ def load_promotion_receipt(root: Path, commit: str) -> dict[str, Any]:
     }
 
 
+def migration_plan(commit: str, promotion: dict[str, Any]) -> dict[str, str]:
+    if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
+        raise StagingCellError("migration source commit must be canonical 40-hex")
+    receipt_sha = promotion.get("receipt_sha256") if isinstance(promotion, dict) else None
+    if (
+        not isinstance(receipt_sha, str)
+        or len(receipt_sha) != 64
+        or any(ch not in "0123456789abcdef" for ch in receipt_sha)
+    ):
+        raise StagingCellError("promotion evidence has no canonical receipt hash")
+    images = promotion.get("images") if isinstance(promotion, dict) else None
+    api_image = images.get("api") if isinstance(images, dict) else None
+    prefix = "ghcr.io/heimgewebe/commonthing-api@"
+    if not isinstance(api_image, str) or not api_image.startswith(prefix):
+        raise StagingCellError("promotion evidence has no canonical API image")
+    digest = api_image[len(prefix):]
+    canonical_image_digest(digest, label="api")
+    digest_hex = digest.removeprefix("sha256:")
+    job_name = f"{MIGRATION_JOB_PREFIX}-{commit[:10]}-{digest_hex[:12]}"
+    if len(job_name) > 63:
+        raise StagingCellError("staging migration Job name exceeds Kubernetes limits")
+    return {
+        "job_name": job_name,
+        "source_commit": commit,
+        "receipt_sha256": receipt_sha,
+        "api_image": api_image,
+    }
+
+
+def require_pending_promotion_matches(
+    cell: dict[str, Any], commit: str, promotion: dict[str, Any]
+) -> dict[str, str]:
+    pending = cell.get("pending_image_promotion")
+    expected = {
+        "source_commit": commit,
+        "receipt_sha256": promotion.get("receipt_sha256"),
+        "images": promotion.get("images"),
+    }
+    if not isinstance(pending, dict) or pending != expected:
+        raise StagingCellError(
+            "activation recovery promotion evidence differs from the exact pending release"
+        )
+    plan = migration_plan(commit, promotion)
+    if cell.get("pending_migration") != plan:
+        raise StagingCellError(
+            "activation recovery migration evidence differs from the exact pending release"
+        )
+    return plan
+
+
+def migration_job_document(commit: str, promotion: dict[str, Any]) -> dict[str, Any]:
+    plan = migration_plan(commit, promotion)
+    try:
+        template = yaml.safe_load(MIGRATION_TEMPLATE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        raise StagingCellError("cannot load canonical staging migration Job template") from error
+    if not isinstance(template, dict) or template.get("kind") != "Job":
+        raise StagingCellError("canonical staging migration template is not a Job")
+    document = json.loads(json.dumps(template))
+    metadata = document.setdefault("metadata", {})
+    metadata["name"] = plan["job_name"]
+    metadata["namespace"] = APP_NAMESPACE
+    metadata["annotations"] = {
+        "commonthing.net/source-commit": commit,
+        "commonthing.net/promotion-receipt-sha256": plan["receipt_sha256"],
+    }
+    spec = document.get("spec")
+    if not isinstance(spec, dict):
+        raise StagingCellError("canonical staging migration template has no Job spec")
+    spec["ttlSecondsAfterFinished"] = 3600
+    pod_template = spec.get("template")
+    pod_metadata = pod_template.get("metadata") if isinstance(pod_template, dict) else None
+    pod_spec = pod_template.get("spec") if isinstance(pod_template, dict) else None
+    if not isinstance(pod_metadata, dict) or not isinstance(pod_spec, dict):
+        raise StagingCellError("canonical staging migration template has no Pod template")
+    labels = pod_metadata.setdefault("labels", {})
+    labels["app.kubernetes.io/name"] = "weltgewebe-api"
+    labels["app.kubernetes.io/component"] = "database-migration"
+    pod_spec["imagePullSecrets"] = [{"name": REGISTRY_SECRET}]
+    # The migration pod deliberately shares the API network identity so the
+    # bootstrap-pinned data NetworkPolicy admits PostgreSQL. This readiness
+    # gate keeps the one-shot pod out of the API Service while it is running.
+    pod_spec["readinessGates"] = [
+        {"conditionType": "commonthing.net/migration-not-service"}
+    ]
+    containers = pod_spec.get("containers")
+    if not isinstance(containers, list) or len(containers) != 1 or not isinstance(containers[0], dict):
+        raise StagingCellError("canonical staging migration template must have one container")
+    container = containers[0]
+    container["image"] = plan["api_image"]
+    container["imagePullPolicy"] = "IfNotPresent"
+    env = container.get("env")
+    if not isinstance(env, list):
+        raise StagingCellError("canonical staging migration template has no environment")
+    environment = {
+        item.get("name"): item
+        for item in env
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    database_url = environment.get("DATABASE_URL")
+    if not isinstance(database_url, dict):
+        raise StagingCellError("canonical staging migration template has no DATABASE_URL")
+    database_url.pop("value", None)
+    database_url["valueFrom"] = {
+        "secretKeyRef": {"name": RUNTIME_SECRET, "key": "database-url"}
+    }
+    for name, value in (
+        ("WELTGEWEBE_API_MIGRATION_ONLY", "1"),
+        ("WELTGEWEBE_API_STARTUP_MIGRATIONS", "run"),
+    ):
+        item = environment.get(name)
+        if not isinstance(item, dict):
+            raise StagingCellError(f"canonical staging migration template has no {name}")
+        item.pop("valueFrom", None)
+        item["value"] = value
+    return document
+
+
+def run_staging_migration(
+    kubectl: str, commit: str, promotion: dict[str, Any]
+) -> dict[str, Any]:
+    plan = migration_plan(commit, promotion)
+    document = migration_job_document(commit, promotion)
+    apply_yaml_server_side(
+        kubectl,
+        document,
+        field_manager="weltgewebe-staging-migration",
+    )
+    run(
+        [
+            kubectl,
+            "-n",
+            APP_NAMESPACE,
+            "wait",
+            "--for=condition=Complete",
+            f"job/{plan['job_name']}",
+            f"--timeout={int(MIGRATION_TIMEOUT_SECONDS)}s",
+        ],
+        timeout=int(MIGRATION_TIMEOUT_SECONDS + 30),
+    )
+    observed = json.loads(
+        output(
+            [
+                kubectl,
+                "-n",
+                APP_NAMESPACE,
+                "get",
+                "job",
+                plan["job_name"],
+                "-o",
+                "json",
+            ]
+        )
+    )
+    metadata = observed.get("metadata") if isinstance(observed, dict) else None
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    pod_spec = (
+        observed.get("spec", {}).get("template", {}).get("spec", {})
+        if isinstance(observed, dict)
+        else {}
+    )
+    containers = pod_spec.get("containers") if isinstance(pod_spec, dict) else None
+    conditions = observed.get("status", {}).get("conditions", []) if isinstance(observed, dict) else []
+    complete = any(
+        isinstance(condition, dict)
+        and condition.get("type") == "Complete"
+        and condition.get("status") == "True"
+        for condition in conditions
+    )
+    if (
+        not isinstance(annotations, dict)
+        or annotations.get("commonthing.net/source-commit") != commit
+        or annotations.get("commonthing.net/promotion-receipt-sha256") != plan["receipt_sha256"]
+        or not isinstance(containers, list)
+        or len(containers) != 1
+        or not isinstance(containers[0], dict)
+        or containers[0].get("image") != plan["api_image"]
+        or not complete
+    ):
+        raise StagingCellError("staging migration Job readback does not match the promoted release")
+    return {**plan, "complete": True}
+
+
 def app_source_document(commit: str) -> dict[str, Any]:
     if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
         raise StagingCellError("app source commit must be canonical 40-hex")
@@ -1913,37 +2099,57 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
             raise StagingCellError(
                 "activation recovery must resume the exact pending app commit"
             )
+        promotion = load_promotion_receipt(root, pending_commit)
+        migration_plan_value = require_pending_promotion_matches(
+            cell, pending_commit, promotion
+        )
         commit = require_clean_commit(
             args.source_commit,
             require_public_main=False,
         )
     else:
         commit = require_clean_commit(args.source_commit)
-    promotion = load_promotion_receipt(root, commit)
+        promotion = load_promotion_receipt(root, commit)
+        migration_plan_value = migration_plan(commit, promotion)
+
     registry_material, registry_source_sha = load_registry_pull_material(root)
     registry_pull_access = verify_ghcr_pull_access(registry_material, promotion)
-    require_bootstrap_data_current(kubectl, bootstrap_commit)
     pending_config_sha256 = sha256_bytes(
         registry_dockerconfig_json(registry_material).encode("utf-8")
     )
-    activation_in_progress = {
-        **cell,
-        "status": "app-activation-in-progress",
-        "pending_active_commit": commit,
-        "pending_image_promotion": {
-            "source_commit": commit,
-            "receipt_sha256": promotion["receipt_sha256"],
-            "images": promotion["images"],
-        },
-        "pending_registry_pull_secret": {
-            "source_sha256": registry_source_sha,
-            "config_sha256": pending_config_sha256,
-            "secret_name": REGISTRY_SECRET,
-            "registry": GHCR_REGISTRY,
-        },
-        "production_changed": False,
-    }
-    write_cell_receipt(root, activation_in_progress)
+
+    # Establish the owned staging kubeconfig before the first kubectl preflight.
+    # This is read-only with respect to the cluster and prevents an ambient
+    # KUBECONFIG from making us inspect the wrong cluster.
+    reference.require_owned_cluster(
+        kind,
+        args.cluster,
+        expected_commit=bootstrap_commit,
+        expected_owner_id=owner_id,
+    )
+    require_bootstrap_data_current(kubectl, bootstrap_commit)
+
+    if not activation_in_progress:
+        pending_state = {
+            **cell,
+            "status": "app-activation-in-progress",
+            "pending_active_commit": commit,
+            "pending_image_promotion": {
+                "source_commit": commit,
+                "receipt_sha256": promotion["receipt_sha256"],
+                "images": promotion["images"],
+            },
+            "pending_migration": migration_plan_value,
+            "pending_registry_pull_secret": {
+                "source_sha256": registry_source_sha,
+                "config_sha256": pending_config_sha256,
+                "secret_name": REGISTRY_SECRET,
+                "registry": GHCR_REGISTRY,
+            },
+            "production_changed": False,
+        }
+        write_cell_receipt(root, pending_state)
+
     reference.normalize_owned_cluster_repository(
         kind,
         args.cluster,
@@ -1959,6 +2165,11 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
     )
     if registry_secret_receipt.get("config_sha256") != pending_config_sha256:
         raise StagingCellError("staging registry Secret hash drifted after preflight")
+
+    migration_receipt = run_staging_migration(kubectl, commit, promotion)
+    if migration_receipt != {**migration_plan_value, "complete": True}:
+        raise StagingCellError("staging migration evidence drifted from pending release")
+
     apply_yaml(
         kubectl,
         [app_source_document(commit), app_kustomization_document(commit, promotion)],
@@ -1996,6 +2207,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         not in {
             "pending_active_commit",
             "pending_image_promotion",
+            "pending_migration",
             "pending_registry_pull_secret",
         }
     }
@@ -2009,6 +2221,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         "external_secret": secret_receipt,
         "registry_pull_secret": registry_secret_receipt,
         "registry_pull_access": registry_pull_access,
+        "migration": migration_receipt,
         "image_promotion": promotion_state,
         "app_activation": True,
         "app_workloads": workloads,
@@ -2021,21 +2234,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         ],
     }
     receipt_path = write_cell_receipt(root, updated)
-    return {
-        "schema_version": 1,
-        "status": "app-ready-gateway-pending",
-        "cluster": args.cluster,
-        "owner_id": owner_id,
-        "bootstrap_commit": bootstrap_commit,
-        "active_commit": commit,
-        "image_promotion": promotion_state,
-        "app_activation": True,
-        "app_workloads": workloads,
-        "external_secret": public_external_secret_state(),
-        "registry_pull_secret_ready": True,
-        "production_changed": False,
-        "receipt_path": receipt_path,
-    }
+    return {**updated, "receipt_path": receipt_path}
 
 
 @reference_output_routed
