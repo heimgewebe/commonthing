@@ -3504,6 +3504,33 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                             )
                         )
 
+    def test_legacy_state_cutover_reserves_absent_legacy_root(self) -> None:
+        owner = "owner-cutover"
+        with tempfile.TemporaryDirectory(prefix="staging-legacy-lock-reserve-") as tmp_name:
+            temp = Path(tmp_name)
+            legacy = temp / "legacy/staging-cell"
+            canonical = temp / "commonthing/staging-cell"
+            with (
+                mock.patch.object(staging, "LEGACY_STATE_ROOT", legacy),
+                mock.patch.object(staging, "state_root", return_value=canonical),
+                mock.patch.object(
+                    staging, "lifecycle_lock", wraps=staging.lifecycle_lock
+                ) as lifecycle,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "cell bootstrap receipt is missing",
+                ):
+                    staging.command_migrate_legacy_state(
+                        argparse.Namespace(
+                            cluster=staging.DEFAULT_CLUSTER, owner_id=owner
+                        )
+                    )
+            self.assertEqual(
+                [call.args[0] for call in lifecycle.call_args_list],
+                [canonical, legacy.resolve()],
+            )
+
     def test_legacy_state_cutover_allows_missing_promotion_receipts(self) -> None:
         owner = "owner-cutover"
         commit = "6" * 40

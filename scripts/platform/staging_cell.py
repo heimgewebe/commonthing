@@ -296,8 +296,6 @@ def legacy_lifecycle_mutation_locked(function):
     @wraps(function)
     def wrapped(args: argparse.Namespace) -> dict[str, Any]:
         legacy_root = LEGACY_STATE_ROOT.resolve()
-        if not legacy_root.exists() or legacy_root.is_symlink():
-            return function(args)
         with lifecycle_lock(legacy_root):
             return function(args)
 
