@@ -91,7 +91,7 @@ def run(
     *,
     input_text: str | None = None,
     capture: bool = False,
-    timeout: int | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     print("+ external command [arguments redacted]", file=sys.stderr, flush=True)
     kwargs: dict[str, Any] = {"capture_output": True} if capture else {"stdout": sys.stderr}
@@ -106,7 +106,7 @@ def run(
     )
 
 
-def output(argv: list[str], *, timeout: int | None = None) -> str:
+def output(argv: list[str], *, timeout: float | None = None) -> str:
     return run(argv, capture=True, timeout=timeout).stdout.strip()
 
 
@@ -1719,9 +1719,23 @@ def migration_network_policy_bindings(
     return bindings
 
 
-def ready_cilium_agents(kubectl: str) -> list[tuple[str, str]]:
+def _remaining_cilium_policy_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise StagingCellError(
+            "Cilium policy enforcement exceeded the bounded activation deadline"
+        )
+    return min(30.0, remaining)
+
+
+def ready_cilium_agents(
+    kubectl: str, *, deadline: float | None = None
+) -> list[tuple[str, str]]:
+    node_timeout = (
+        30.0 if deadline is None else _remaining_cilium_policy_timeout(deadline)
+    )
     nodes = _load_json_object(
-        output([kubectl, "get", "nodes", "-o", "json"]),
+        output([kubectl, "get", "nodes", "-o", "json"], timeout=node_timeout),
         label="staging node inventory",
     ).get("items")
     if not isinstance(nodes, list):
@@ -1737,6 +1751,9 @@ def ready_cilium_agents(kubectl: str) -> list[tuple[str, str]]:
     if not node_names or len(node_names) != len(nodes):
         raise StagingCellError("staging node inventory is incomplete")
 
+    pod_timeout = (
+        30.0 if deadline is None else _remaining_cilium_policy_timeout(deadline)
+    )
     pod_document = _load_json_object(
         output(
             [
@@ -1749,7 +1766,8 @@ def ready_cilium_agents(kubectl: str) -> list[tuple[str, str]]:
                 "k8s-app=cilium",
                 "-o",
                 "json",
-            ]
+            ],
+            timeout=pod_timeout,
         ),
         label="Cilium agent inventory",
     )
@@ -1855,40 +1873,63 @@ def wait_migration_network_policy_enforcement(
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     last_missing: dict[str, list[str]] = {}
     while True:
-        agents = ready_cilium_agents(kubectl)
+        try:
+            agents = ready_cilium_agents(kubectl, deadline=deadline)
+        except subprocess.TimeoutExpired as error:
+            raise StagingCellError(
+                "Cilium agent inventory exceeded the bounded activation deadline"
+            ) from error
         last_missing = {}
         revisions: list[int] = []
         for node_name, pod_name in agents:
-            raw = output(
-                [
-                    kubectl,
-                    "-n",
-                    "kube-system",
-                    "exec",
-                    pod_name,
-                    "-c",
-                    "cilium-agent",
-                    "--",
-                    "cilium-dbg",
-                    "policy",
-                    "get",
-                ],
-                timeout=30,
-            )
+            command_timeout = _remaining_cilium_policy_timeout(deadline)
+            try:
+                raw = output(
+                    [
+                        kubectl,
+                        "-n",
+                        "kube-system",
+                        "exec",
+                        pod_name,
+                        "-c",
+                        "cilium-agent",
+                        "--",
+                        "cilium-dbg",
+                        "policy",
+                        "get",
+                    ],
+                    timeout=command_timeout,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise StagingCellError(
+                    "Cilium policy read exceeded the bounded activation deadline"
+                ) from error
             observed, revision = cilium_network_policy_bindings(raw)
+            if time.monotonic() > deadline:
+                raise StagingCellError(
+                    "Cilium policy enforcement exceeded the bounded activation deadline"
+                )
             revisions.append(revision)
             missing = expected - observed
             if missing:
                 last_missing[node_name] = sorted(name for name, _, _ in missing)
+        now = time.monotonic()
+        if now > deadline:
+            raise StagingCellError(
+                "Cilium policy enforcement exceeded the bounded activation deadline"
+            )
         if not last_missing:
             return {
                 "processed": True,
                 "cilium_agent_count": len(agents),
                 "minimum_policy_revision": min(revisions),
             }
-        if time.monotonic() >= deadline:
+        remaining = deadline - now
+        if remaining <= 0:
             break
-        time.sleep(max(0.0, poll_seconds))
+        delay = min(max(0.0, poll_seconds), remaining)
+        if delay > 0:
+            time.sleep(delay)
     missing_names = sorted({name for names in last_missing.values() for name in names})
     raise StagingCellError(
         "Cilium did not process all staging migration NetworkPolicies before the bounded deadline: "

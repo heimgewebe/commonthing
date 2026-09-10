@@ -122,8 +122,12 @@ versionierten App-Regeln `default-deny`, `allow-dns` und
 `allow-api-data-egress` im Staging-Namespace an. Danach bindet der Controller die
 drei Live-Objekte an ihre Kubernetes-UIDs und wartet begrenzt, bis **jeder** Ready
 Cilium-Agent auf **jedem** Staging-Knoten genau diese UID-gebundenen Policies in
-seinem lokalen Policy-Repository führt. Fehlt Agentabdeckung oder Policy-Evidenz,
-endet die Aktivierung fail-closed, bevor der Migrations-Pod erzeugt wird. Damit
+seinem lokalen Policy-Repository führt. Knoten-/Agent-Inventur, Policy-Reads und
+Polling teilen dabei ein einziges 45-Sekunden-Gesamtbudget; jeder Unteraufruf wird
+auf das jeweils verbleibende Restbudget begrenzt und ein erst nach Ablauf
+beobachteter Erfolg wird verworfen. Fehlt Agentabdeckung oder Policy-Evidenz oder
+ist das Gesamtbudget erschöpft, endet die Aktivierung fail-closed, bevor der
+Migrations-Pod erzeugt wird. Damit
 besitzt bereits der erste Migrations-Pod vor seinem Start dieselbe
 Default-Deny-/DNS-/Daten-Egress-Grenze wie die spätere API; die vollständige App-
 Kustomization übernimmt dieselben Regeln anschließend dauerhaft über Flux. Erst

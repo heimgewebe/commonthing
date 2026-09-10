@@ -2054,9 +2054,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 return_value=[("node-a", "cilium-a"), ("node-b", "cilium-b")],
             ),
             mock.patch.object(staging, "output", side_effect=[raw_a, raw_b]) as output,
+            mock.patch.object(
+                staging.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 1.0, 2.0, 2.0]
+            ),
         ):
             result = staging.wait_migration_network_policy_enforcement(
-                "kubectl", expected, timeout_seconds=0.0, poll_seconds=0.0
+                "kubectl", expected, timeout_seconds=45.0, poll_seconds=0.0
             )
         self.assertTrue(result["processed"])
         self.assertEqual(result["cilium_agent_count"], 2)
@@ -2067,7 +2070,98 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             self.assertEqual(argv[1:3], ["-n", "kube-system"])
             self.assertIn("cilium-dbg", argv)
             self.assertEqual(argv[-2:], ["policy", "get"])
-            self.assertEqual(call.kwargs["timeout"], 30)
+            self.assertEqual(call.kwargs["timeout"], 30.0)
+
+    def test_cilium_inventory_reads_share_the_remaining_deadline(self) -> None:
+        clock = {"now": 0.0}
+        nodes = json.dumps({"items": [{"metadata": {"name": "node-a"}}]})
+        pods = json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"name": "cilium-a"},
+                        "spec": {"nodeName": "node-a"},
+                        "status": {
+                            "phase": "Running",
+                            "conditions": [{"type": "Ready", "status": "True"}],
+                        },
+                    }
+                ]
+            }
+        )
+
+        def read_inventory(*args: object, **kwargs: object) -> str:
+            clock["now"] += 20.0
+            return nodes if clock["now"] == 20.0 else pods
+
+        with (
+            mock.patch.object(staging.time, "monotonic", side_effect=lambda: clock["now"]),
+            mock.patch.object(staging, "output", side_effect=read_inventory) as output,
+        ):
+            agents = staging.ready_cilium_agents("kubectl", deadline=45.0)
+        self.assertEqual(agents, [("node-a", "cilium-a")])
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in output.call_args_list],
+            [30.0, 25.0],
+        )
+
+    def test_cilium_policy_wait_rejects_success_observed_after_total_deadline(self) -> None:
+        policy_uids = {"default-deny": "uid-default"}
+        rules = [
+            {
+                "Labels": [
+                    {
+                        "key": "io.cilium.k8s.policy.derived-from",
+                        "value": "NetworkPolicy",
+                        "source": "k8s",
+                    },
+                    {
+                        "key": "io.cilium.k8s.policy.name",
+                        "value": "default-deny",
+                        "source": "k8s",
+                    },
+                    {
+                        "key": "io.cilium.k8s.policy.namespace",
+                        "value": staging.APP_NAMESPACE,
+                        "source": "k8s",
+                    },
+                    {
+                        "key": "io.cilium.k8s.policy.uid",
+                        "value": "uid-default",
+                        "source": "k8s",
+                    },
+                ]
+            }
+        ]
+        raw = json.dumps(rules) + "\nRevision: 12"
+        clock = {"now": 0.0}
+
+        def slow_policy_read(*args: object, **kwargs: object) -> str:
+            clock["now"] += 20.0
+            return raw
+
+        with (
+            mock.patch.object(staging.time, "monotonic", side_effect=lambda: clock["now"]),
+            mock.patch.object(
+                staging,
+                "ready_cilium_agents",
+                return_value=[
+                    ("node-a", "cilium-a"),
+                    ("node-b", "cilium-b"),
+                    ("node-c", "cilium-c"),
+                ],
+            ),
+            mock.patch.object(staging, "output", side_effect=slow_policy_read) as output,
+        ):
+            with self.assertRaisesRegex(staging.StagingCellError, "bounded activation deadline"):
+                staging.wait_migration_network_policy_enforcement(
+                    "kubectl", policy_uids, timeout_seconds=45.0, poll_seconds=0.0
+                )
+        self.assertEqual(clock["now"], 60.0)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in output.call_args_list],
+            [30.0, 25.0, 5.0],
+        )
 
     def test_cilium_policy_wait_fails_closed_when_exact_uid_is_not_processed(self) -> None:
         with (
@@ -2077,14 +2171,16 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 return_value=[("node-a", "cilium-a")],
             ),
             mock.patch.object(staging, "output", return_value="[]\nRevision: 3"),
-            mock.patch.object(staging.time, "monotonic", side_effect=[10.0, 10.0]),
+            mock.patch.object(
+                staging.time, "monotonic", side_effect=[10.0, 10.0, 10.0, 10.0, 11.0]
+            ),
             mock.patch.object(staging.time, "sleep") as sleep,
         ):
-            with self.assertRaisesRegex(staging.StagingCellError, "did not process"):
+            with self.assertRaisesRegex(staging.StagingCellError, "bounded activation deadline"):
                 staging.wait_migration_network_policy_enforcement(
                     "kubectl",
                     {"default-deny": "uid-default-deny"},
-                    timeout_seconds=0.0,
+                    timeout_seconds=1.0,
                     poll_seconds=0.0,
                 )
         sleep.assert_not_called()
