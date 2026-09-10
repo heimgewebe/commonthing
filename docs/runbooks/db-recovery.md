@@ -150,11 +150,21 @@ kanonisches SSH-Ziel funktionieren; damit kann die Hostumbenennung den tägliche
 Off-Host-Pull nicht still unterbrechen:
 
 ```bash
+backup_dir=/var/backups/weltgewebe/postgres
 getent hosts commonserver
-ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver sudo -n true
+latest="$(ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
+  "sudo -n find '$backup_dir' -maxdepth 1 -type f -name 'weltgewebe-postgres-*.sql.gz' -printf '%f\\n' | sort | tail -n1")"
+[[ "$latest" == weltgewebe-postgres-*.sql.gz ]]
+manifest="${latest%.sql.gz}.sha256.manifest"
+ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
+  "sudo -n cat -- '$backup_dir/$manifest'" > /dev/null
 ```
 
-Der Readback vom 2026-09-10 hat beide Prüfungen erfolgreich bestanden.
+Damit werden genau die beiden verpflichtenden privilegierten Leseoperationen
+(`find` und `cat`) geprüft, die auch der Pull verwendet; ein allgemeines
+`sudo -n true` reicht bei befehlsbezogenen Sudoers-Regeln nicht aus. Der
+Readback vom 2026-09-10 hat DNS/SSH sowie diese `find`-/`cat`-Prüfung
+erfolgreich bestanden.
 `REMOTE_HOST` bleibt als expliziter Kompatibilitäts-Override erhalten; der
 Default und neue Installationen verwenden `commonserver`.
 
