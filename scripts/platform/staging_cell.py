@@ -35,6 +35,7 @@ APP_KUSTOMIZATION = "weltgewebe-staging-app"
 MIGRATION_JOB_PREFIX = "weltgewebe-staging-migration"
 MIGRATION_TEMPLATE = ROOT / "platform/apps/weltgewebe/migration/ha/job.yaml"
 MIGRATION_TIMEOUT_SECONDS = 8 * 60
+MIGRATION_SPEC_ANNOTATION = "commonthing.net/migration-spec-sha256"
 CILIUM_POLICY_ENFORCEMENT_TIMEOUT_SECONDS = 45.0
 CILIUM_POLICY_ENFORCEMENT_POLL_SECONDS = 1.0
 DATA_NAMESPACE = "weltgewebe-data"
@@ -1640,6 +1641,26 @@ def require_pending_promotion_matches(
     return plan
 
 
+def require_pending_registry_matches(
+    cell: dict[str, Any],
+    *,
+    source_sha: str,
+    config_sha256: str,
+) -> dict[str, str]:
+    expected = {
+        "source_sha256": source_sha,
+        "config_sha256": config_sha256,
+        "secret_name": REGISTRY_SECRET,
+        "registry": GHCR_REGISTRY,
+    }
+    pending = cell.get("pending_registry_pull_secret")
+    if not isinstance(pending, dict) or pending != expected:
+        raise StagingCellError(
+            "activation recovery registry credential differs from the exact pending release"
+        )
+    return expected
+
+
 def migration_network_policy_documents() -> list[dict[str, Any]]:
     expected = (
         ("default-deny", ROOT / "platform/apps/weltgewebe/base/network-policy-default-deny.yaml"),
@@ -1950,6 +1971,99 @@ def apply_migration_network_isolation(kubectl: str) -> dict[str, Any]:
     }
 
 
+def migration_job_spec_sha256(document: dict[str, Any]) -> str:
+    spec = document.get("spec") if isinstance(document, dict) else None
+    if not isinstance(spec, dict):
+        raise StagingCellError("staging migration Job has no canonical spec")
+    canonical = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256_bytes(canonical)
+
+
+def read_staging_migration_job(
+    kubectl: str, job_name: str
+) -> dict[str, Any] | None:
+    raw = output(
+        [
+            kubectl,
+            "-n",
+            APP_NAMESPACE,
+            "get",
+            "job",
+            job_name,
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ]
+    )
+    if not raw:
+        return None
+    return _load_json_object(raw, label="staging migration Job")
+
+
+def require_staging_migration_job_matches(
+    observed: dict[str, Any],
+    desired: dict[str, Any],
+    plan: dict[str, str],
+) -> str:
+    metadata = observed.get("metadata") if isinstance(observed, dict) else None
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    desired_metadata = desired.get("metadata") if isinstance(desired, dict) else None
+    desired_annotations = (
+        desired_metadata.get("annotations") if isinstance(desired_metadata, dict) else None
+    )
+    pod_spec = (
+        observed.get("spec", {}).get("template", {}).get("spec", {})
+        if isinstance(observed, dict)
+        else {}
+    )
+    containers = pod_spec.get("containers") if isinstance(pod_spec, dict) else None
+    expected_spec_sha = (
+        desired_annotations.get(MIGRATION_SPEC_ANNOTATION)
+        if isinstance(desired_annotations, dict)
+        else None
+    )
+    matches = (
+        isinstance(metadata, dict)
+        and metadata.get("name") == plan["job_name"]
+        and metadata.get("namespace") == APP_NAMESPACE
+        and isinstance(annotations, dict)
+        and annotations.get("commonthing.net/source-commit") == plan["source_commit"]
+        and annotations.get("commonthing.net/promotion-receipt-sha256")
+        == plan["receipt_sha256"]
+        and isinstance(expected_spec_sha, str)
+        and annotations.get(MIGRATION_SPEC_ANNOTATION) == expected_spec_sha
+        and isinstance(containers, list)
+        and len(containers) == 1
+        and isinstance(containers[0], dict)
+        and containers[0].get("image") == plan["api_image"]
+    )
+    if not matches:
+        raise StagingCellError(
+            "existing staging migration Job does not match the promoted release; "
+            "refusing automatic replacement"
+        )
+    conditions = observed.get("status", {}).get("conditions", [])
+    complete = any(
+        isinstance(condition, dict)
+        and condition.get("type") == "Complete"
+        and condition.get("status") == "True"
+        for condition in conditions
+    )
+    failed = any(
+        isinstance(condition, dict)
+        and condition.get("type") == "Failed"
+        and condition.get("status") == "True"
+        for condition in conditions
+    )
+    if complete and failed:
+        raise StagingCellError("staging migration Job has contradictory terminal conditions")
+    if complete:
+        return "complete"
+    if failed:
+        return "failed"
+    return "active"
+
+
 def migration_job_document(commit: str, promotion: dict[str, Any]) -> dict[str, Any]:
     plan = migration_plan(commit, promotion)
     try:
@@ -2015,6 +2129,9 @@ def migration_job_document(commit: str, promotion: dict[str, Any]) -> dict[str, 
             raise StagingCellError(f"canonical staging migration template has no {name}")
         item.pop("valueFrom", None)
         item["value"] = value
+    metadata["annotations"][MIGRATION_SPEC_ANNOTATION] = migration_job_spec_sha256(
+        document
+    )
     return document
 
 
@@ -2023,11 +2140,39 @@ def run_staging_migration(
 ) -> dict[str, Any]:
     plan = migration_plan(commit, promotion)
     document = migration_job_document(commit, promotion)
-    apply_yaml_server_side(
-        kubectl,
-        document,
-        field_manager="weltgewebe-staging-migration",
-    )
+    existing = read_staging_migration_job(kubectl, plan["job_name"])
+    if existing is not None:
+        existing_state = require_staging_migration_job_matches(existing, document, plan)
+        if existing_state == "complete":
+            return {**plan, "complete": True}
+        if existing_state == "failed":
+            run(
+                [
+                    kubectl,
+                    "-n",
+                    APP_NAMESPACE,
+                    "delete",
+                    "job",
+                    plan["job_name"],
+                    "--cascade=foreground",
+                    "--wait=true",
+                    "--timeout=60s",
+                ],
+                timeout=75,
+            )
+            if read_staging_migration_job(kubectl, plan["job_name"]) is not None:
+                raise StagingCellError(
+                    "failed staging migration Job still exists after bounded deletion"
+                )
+            existing = None
+
+    if existing is None:
+        apply_yaml_server_side(
+            kubectl,
+            document,
+            field_manager="weltgewebe-staging-migration",
+        )
+
     run(
         [
             kubectl,
@@ -2040,46 +2185,13 @@ def run_staging_migration(
         ],
         timeout=int(MIGRATION_TIMEOUT_SECONDS + 30),
     )
-    observed = json.loads(
-        output(
-            [
-                kubectl,
-                "-n",
-                APP_NAMESPACE,
-                "get",
-                "job",
-                plan["job_name"],
-                "-o",
-                "json",
-            ]
+    observed = read_staging_migration_job(kubectl, plan["job_name"])
+    if observed is None:
+        raise StagingCellError("staging migration Job disappeared before final readback")
+    if require_staging_migration_job_matches(observed, document, plan) != "complete":
+        raise StagingCellError(
+            "staging migration Job readback does not match the promoted release"
         )
-    )
-    metadata = observed.get("metadata") if isinstance(observed, dict) else None
-    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
-    pod_spec = (
-        observed.get("spec", {}).get("template", {}).get("spec", {})
-        if isinstance(observed, dict)
-        else {}
-    )
-    containers = pod_spec.get("containers") if isinstance(pod_spec, dict) else None
-    conditions = observed.get("status", {}).get("conditions", []) if isinstance(observed, dict) else []
-    complete = any(
-        isinstance(condition, dict)
-        and condition.get("type") == "Complete"
-        and condition.get("status") == "True"
-        for condition in conditions
-    )
-    if (
-        not isinstance(annotations, dict)
-        or annotations.get("commonthing.net/source-commit") != commit
-        or annotations.get("commonthing.net/promotion-receipt-sha256") != plan["receipt_sha256"]
-        or not isinstance(containers, list)
-        or len(containers) != 1
-        or not isinstance(containers[0], dict)
-        or containers[0].get("image") != plan["api_image"]
-        or not complete
-    ):
-        raise StagingCellError("staging migration Job readback does not match the promoted release")
     return {**plan, "complete": True}
 
 
@@ -2425,10 +2537,16 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         migration_plan_value = migration_plan(commit, promotion)
 
     registry_material, registry_source_sha = load_registry_pull_material(root)
-    registry_pull_access = verify_ghcr_pull_access(registry_material, promotion)
     pending_config_sha256 = sha256_bytes(
         registry_dockerconfig_json(registry_material).encode("utf-8")
     )
+    if activation_in_progress:
+        require_pending_registry_matches(
+            cell,
+            source_sha=registry_source_sha,
+            config_sha256=pending_config_sha256,
+        )
+    registry_pull_access = verify_ghcr_pull_access(registry_material, promotion)
 
     # Establish the owned staging kubeconfig before the first kubectl preflight.
     # This is read-only with respect to the cluster and prevents an ambient

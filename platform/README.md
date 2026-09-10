@@ -111,9 +111,10 @@ Controller vor der ersten Clusteränderung ein nicht-geheimes
 `app-activation-in-progress`-Receipt. Es bindet den pending Commit, den exakten
 Promotion-Receipt-Hash, beide Image-Digests, den geplanten Migration-Job und die
 Registry-Secret-Hashes. Ein Abbruch bleibt dadurch in `status` als degradiert
-sichtbar. Ein Wiederanlauf darf nur denselben pending Commit **und** exakt dieselbe
-Promotion-Evidenz fortsetzen; ein ausgetauschtes Receipt oder andere Images werden
-vor jeder Recovery-Wirkung abgewiesen. Der bereits vor der ersten Clusteränderung
+sichtbar. Ein Wiederanlauf darf nur denselben pending Commit, exakt dieselbe
+Promotion-Evidenz **und** dieselben gespeicherten Registry-Secret-Hashes fortsetzen;
+ein ausgetauschtes Receipt, andere Images oder rotierte Credentials werden vor jeder
+Recovery-Wirkung abgewiesen. Der bereits vor der ersten Clusteränderung
 geprüfte Commit darf zur Recovery weiterverwendet werden, auch wenn Public `main`
 inzwischen fortgeschritten ist; ein anderer Commit bleibt verboten.
 
@@ -136,8 +137,11 @@ Kubernetes-Migration-Job aus. Der Job verwendet exakt den im Promotion-Receipt
 gebundenen API-Digest, `WELTGEWEBE_API_MIGRATION_ONLY=1` und
 `WELTGEWEBE_API_STARTUP_MIGRATIONS=run`; `DATABASE_URL` kommt ausschließlich aus
 dem extern injizierten Runtime-Secret. Seine Identität bindet Commit,
-Promotion-Receipt und API-Digest. Erst ein `Complete=True`-Readback desselben Jobs
-schaltet den API/Web-Rollout frei. Die normalen API-Pods bleiben auf
+Promotion-Receipt und API-Digest. Ein bereits erfolgreich abgeschlossener, exakt
+gebundener Job wird beim Wiederanlauf wiederverwendet. Ein exakt gebundener
+`Failed=True`-Job wird kontrolliert gelöscht und neu erzeugt; ein Job mit abweichender
+Release- oder Spec-Bindung wird niemals automatisch ersetzt. Erst ein
+`Complete=True`-Readback desselben Jobs schaltet den API/Web-Rollout frei. Die normalen API-Pods bleiben auf
 `verify-applied` und starten daher nur, wenn die eingebettete Migrationshistorie
 bereits vollständig angewandt ist. Der Migrations-Pod teilt nur für den bereits
 bootstrapgebundenen PostgreSQL-NetworkPolicy-Zugang die API-Netzwerkidentität; eine
