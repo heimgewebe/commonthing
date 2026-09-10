@@ -21,8 +21,8 @@ Generated automatically. Do not edit.
 | claim-agent-safe-008 | docs/claims/registry.yml | claims[id=CLAIM-AGENT-SAFE-008] | partial | docs-mechanik | 2026-06-27 | 7 items |
 | claim-domain-garnrolle-001 | docs/claims/registry.yml | claims[id=CLAIM-DOMAIN-GARNROLLE-001] | partial | product-domain | 2026-07-11 | 4 items |
 | claim-map-truth-001 | docs/claims/registry.yml | claims[id=CLAIM-MAP-TRUTH-001] | partial | product-map | 2026-07-11 | 5 items |
-| claim-runtime-live-prod-001 | docs/claims/registry.yml | claims[id=CLAIM-RUNTIME-LIVE-PROD-001] | stale | runtime | 2026-07-12 | 4 items |
-| claim-runtime-prod-postgres-001 | docs/claims/registry.yml | claims[id=CLAIM-RUNTIME-PROD-POSTGRES-001] | partial | runtime | 2026-07-12 | 6 items |
+| claim-runtime-live-prod-001 | docs/claims/registry.yml | claims[id=CLAIM-RUNTIME-LIVE-PROD-001] | partial | runtime | 2026-09-10 | 5 items |
+| claim-runtime-prod-postgres-001 | docs/claims/registry.yml | claims[id=CLAIM-RUNTIME-PROD-POSTGRES-001] | partial | runtime | 2026-09-10 | 7 items |
 | claim-ui-state-001 | docs/claims/registry.yml | claims[id=CLAIM-UI-STATE-001] | partial | product-ui | 2026-07-11 | 4 items |
 | claim-ui-surface-001 | docs/claims/registry.yml | claims[id=CLAIM-UI-SURFACE-001] | partial | product-ui | 2026-07-11 | 5 items |
 
@@ -237,9 +237,9 @@ Does not prove:
 
 - Entry: `claim-runtime-live-prod-001`
 - Locator: `claims[id=CLAIM-RUNTIME-LIVE-PROD-001]`
-- Status: `stale`
+- Status: `partial`
 - Owner: `runtime`
-- Last verified: `2026-07-12`
+- Last verified: `2026-09-10`
 
 Evidence:
 
@@ -247,6 +247,7 @@ Evidence:
 | ---- | ------ |
 | `file` | `docs/reports/map-status.md` |
 | `file` | `runtime/README.md` |
+| `file` | `docs/deploy/CHANGELOG.md` |
 | `file` | `scripts/docmeta/validate_doc_freshness_registry.py` |
 | `file` | `scripts/docmeta/freshness_scope_policy.yml` |
 
@@ -260,7 +261,7 @@ Does not prove:
 - Locator: `claims[id=CLAIM-RUNTIME-PROD-POSTGRES-001]`
 - Status: `partial`
 - Owner: `runtime`
-- Last verified: `2026-07-12`
+- Last verified: `2026-09-10`
 
 Evidence:
 
@@ -268,6 +269,7 @@ Evidence:
 | ---- | ------ |
 | `file` | `README.md` |
 | `file` | `runtime/README.md` |
+| `file` | `docs/deploy/CHANGELOG.md` |
 | `file` | `infra/compose/compose.prod.yml` |
 | `file` | `.env.prod.example` |
 | `file` | `scripts/guard/compose-image-guard.sh` |
