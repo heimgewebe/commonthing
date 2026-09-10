@@ -3517,6 +3517,93 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             self.assertEqual((canonical / "legacy-evidence/toolchain/receipt.json").read_bytes(), evidence["tool_receipt"])
             self.assertFalse((canonical / "toolchain").exists())
 
+    def test_legacy_state_cutover_resumes_after_hard_crash_post_data_rename(
+        self,
+    ) -> None:
+        owner = "owner-cutover"
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory(
+            prefix="staging-legacy-crash-resume-"
+        ) as tmp_name:
+            temp = Path(tmp_name)
+            legacy = temp / "legacy/staging-cell"
+            canonical = temp / "commonthing/staging-cell"
+            legacy.mkdir(parents=True)
+            evidence = self._write_legacy_cutover_fixture(
+                legacy, owner=owner, commit=commit
+            )
+            clusters = mock.Mock(side_effect=[[staging.LEGACY_CLUSTER], [], []])
+
+            def hard_crash_after_rename(source: Path, target: Path) -> None:
+                source.rename(target)
+                raise SystemExit("synthetic hard crash after retained-data rename")
+
+            with (
+                mock.patch.object(staging, "LEGACY_STATE_ROOT", legacy),
+                mock.patch.object(staging, "state_root", return_value=canonical),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging,
+                    "load_tool_receipt",
+                    return_value={"tools": {"kind": "kind"}},
+                ),
+                mock.patch.object(staging.reference, "clusters", clusters),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging.reference, "delete_owned_cluster_if_present"),
+                mock.patch.object(
+                    staging,
+                    "_rename_legacy_data_for_cutover",
+                    side_effect=hard_crash_after_rename,
+                ),
+            ):
+                with self.assertRaisesRegex(SystemExit, "synthetic hard crash"):
+                    staging.command_migrate_legacy_state(
+                        argparse.Namespace(
+                            cluster=staging.DEFAULT_CLUSTER, owner_id=owner
+                        )
+                    )
+
+            pending = json.loads(
+                (canonical / staging.LEGACY_MIGRATION_RECEIPT).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                pending["status"], staging.LEGACY_MIGRATION_PREPARED_STATUS
+            )
+            self.assertFalse((legacy / "data").exists())
+            self.assertEqual(
+                (canonical / "data/postgres").stat().st_ino, evidence["postgres_inode"]
+            )
+            self.assertEqual(
+                (canonical / "data/nats").stat().st_ino, evidence["nats_inode"]
+            )
+
+            with (
+                mock.patch.object(staging, "LEGACY_STATE_ROOT", legacy),
+                mock.patch.object(staging, "state_root", return_value=canonical),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging,
+                    "load_tool_receipt",
+                    return_value={"tools": {"kind": "kind"}},
+                ),
+                mock.patch.object(staging.reference, "clusters", clusters),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+            ):
+                resumed = staging.command_migrate_legacy_state(
+                    argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+                )
+                loaded = staging.load_legacy_state_migration(canonical, owner_id=owner)
+                repeated = staging.command_migrate_legacy_state(
+                    argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+                )
+
+            self.assertEqual(resumed["status"], staging.LEGACY_MIGRATION_ADOPTED_STATUS)
+            self.assertEqual(loaded["status"], staging.LEGACY_MIGRATION_ADOPTED_STATUS)
+            self.assertEqual(repeated["receipt_sha256"], resumed["receipt_sha256"])
+            self.assertFalse(resumed["production_changed"])
+
     def test_legacy_state_cutover_refuses_activated_cell_before_cluster_delete(self) -> None:
         owner = "owner-cutover"
         commit = "8" * 40

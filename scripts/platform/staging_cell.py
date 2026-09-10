@@ -32,6 +32,8 @@ LEGACY_STATE_ROOT = Path.home() / ".local/state/weltgewebe/staging-cell"
 DEFAULT_CLUSTER = "commonthing-staging"
 LEGACY_CLUSTER = "weltgewebe-staging"
 LEGACY_MIGRATION_RECEIPT = "receipts/legacy-state-migration.json"
+LEGACY_MIGRATION_PREPARED_STATUS = "legacy-state-data-move-prepared"
+LEGACY_MIGRATION_ADOPTED_STATUS = "legacy-state-adopted"
 SOURCE_NAME = "commonthing-staging-source"
 APP_SOURCE_NAME = "commonthing-staging-app-source"
 DATA_KUSTOMIZATION = "commonthing-staging-data"
@@ -625,7 +627,39 @@ def _copy_private_file_exact(source: Path, target: Path, *, label: str) -> str:
     return source_sha
 
 
-def _copy_tree_exact(source: Path, target: Path, *, label: str) -> dict[str, dict[str, Any]]:
+def _fsync_tree(root: Path, *, label: str) -> None:
+    directories = [root]
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        directories.extend(current_path / name for name in directory_names)
+        for name in file_names:
+            path = current_path / name
+            flags = os.O_RDONLY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(path, flags)
+            try:
+                opened = os.fstat(fd)
+                linked = os.stat(path, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_dev != linked.st_dev
+                    or opened.st_ino != linked.st_ino
+                ):
+                    raise StagingCellError(f"{label} contains an unsafe copied file")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    for directory in sorted(
+        directories, key=lambda item: len(item.parts), reverse=True
+    ):
+        fsync_directory(directory)
+    fsync_directory(root.parent)
+
+
+def _copy_tree_exact(
+    source: Path, target: Path, *, label: str
+) -> dict[str, dict[str, Any]]:
     source_manifest = _tree_manifest(source, label=label)
     if target.exists():
         raise StagingCellError(f"target {label} already exists")
@@ -633,6 +667,7 @@ def _copy_tree_exact(source: Path, target: Path, *, label: str) -> dict[str, dic
     target_manifest = _tree_manifest(target, label=f"copied {label}")
     if target_manifest != source_manifest:
         raise StagingCellError(f"copied {label} differs from the legacy source")
+    _fsync_tree(target, label=f"copied {label}")
     return source_manifest
 
 
@@ -640,7 +675,7 @@ def _legacy_migration_receipt_path(root: Path) -> Path:
     return root / LEGACY_MIGRATION_RECEIPT
 
 
-def load_legacy_state_migration(root: Path, *, owner_id: str) -> dict[str, Any]:
+def _read_legacy_state_migration_receipt(root: Path) -> dict[str, Any]:
     path = _legacy_migration_receipt_path(root)
     _private_regular_file(path, label="legacy-state migration receipt")
     try:
@@ -649,9 +684,14 @@ def load_legacy_state_migration(root: Path, *, owner_id: str) -> dict[str, Any]:
         raise StagingCellError("legacy-state migration receipt is malformed") from error
     if not isinstance(payload, dict):
         raise StagingCellError("legacy-state migration receipt is malformed")
+    return payload
+
+
+def load_legacy_state_migration(root: Path, *, owner_id: str) -> dict[str, Any]:
+    payload = _read_legacy_state_migration_receipt(root)
     expected = {
         "schema_version": 1,
-        "status": "legacy-state-adopted",
+        "status": LEGACY_MIGRATION_ADOPTED_STATUS,
         "source_root": str(LEGACY_STATE_ROOT.resolve()),
         "target_root": str(root.resolve()),
         "source_cluster": LEGACY_CLUSTER,
@@ -705,8 +745,14 @@ def load_legacy_state_migration(root: Path, *, owner_id: str) -> dict[str, Any]:
                 "migrated registry secret differs from migration receipt"
             )
     for field, evidence_path in (
-        ("legacy_cell_receipt_sha256", root / "legacy-evidence/receipts/cell-bootstrap.json"),
-        ("legacy_toolchain_receipt_sha256", root / "legacy-evidence/toolchain/receipt.json"),
+        (
+            "legacy_cell_receipt_sha256",
+            root / "legacy-evidence/receipts/cell-bootstrap.json",
+        ),
+        (
+            "legacy_toolchain_receipt_sha256",
+            root / "legacy-evidence/toolchain/receipt.json",
+        ),
     ):
         recorded_sha = payload.get(field)
         if not isinstance(recorded_sha, str) or not hmac.compare_digest(
@@ -717,13 +763,236 @@ def load_legacy_state_migration(root: Path, *, owner_id: str) -> dict[str, Any]:
     if promotion_manifest != _tree_manifest(
         root / "promotion", label="migrated promotion receipts"
     ):
-        raise StagingCellError("migrated promotion receipts differ from migration receipt")
+        raise StagingCellError(
+            "migrated promotion receipts differ from migration receipt"
+        )
     legacy_evidence_manifest = payload.get("legacy_evidence_manifest")
     if legacy_evidence_manifest != _tree_manifest(
         root / "legacy-evidence", label="migrated legacy evidence"
     ):
-        raise StagingCellError("migrated legacy evidence differs from migration receipt")
+        raise StagingCellError(
+            "migrated legacy evidence differs from migration receipt"
+        )
     return payload
+
+
+def _legacy_migration_public_result(root: Path) -> dict[str, Any]:
+    receipt_path = _legacy_migration_receipt_path(root)
+    return {
+        "schema_version": 1,
+        "status": LEGACY_MIGRATION_ADOPTED_STATUS,
+        "cluster": DEFAULT_CLUSTER,
+        "toolchain_regeneration_required": not (
+            root / "toolchain/receipt.json"
+        ).is_file(),
+        "production_changed": False,
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": sha256_file(receipt_path),
+    }
+
+
+def _rename_legacy_data_for_cutover(source: Path, target: Path) -> None:
+    source.rename(target)
+    fsync_directory(source.parent)
+    fsync_directory(target.parent)
+
+
+def _require_prepared_legacy_state_migration(
+    root: Path, legacy_root: Path, *, owner_id: str, payload: dict[str, Any]
+) -> str:
+    expected = {
+        "schema_version": 1,
+        "status": LEGACY_MIGRATION_PREPARED_STATUS,
+        "source_root": str(legacy_root),
+        "target_root": str(root.resolve()),
+        "source_cluster": LEGACY_CLUSTER,
+        "target_cluster": DEFAULT_CLUSTER,
+        "owner_id": owner_id,
+        "toolchain_copied": False,
+        "production_changed": False,
+    }
+    mismatched = {
+        key: {"expected": value, "observed": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatched:
+        raise StagingCellError(
+            "prepared legacy-state migration identity mismatch: "
+            + json.dumps(mismatched, sort_keys=True)
+        )
+
+    _real_directory_identity(legacy_root, label="legacy staging state root")
+    legacy_cell = load_cell_receipt(legacy_root)
+    if legacy_cell.get("cluster") != LEGACY_CLUSTER:
+        raise StagingCellError(
+            "prepared legacy-state migration source receipt has wrong cluster"
+        )
+    if str(legacy_cell.get("owner_id") or "") != owner_id:
+        raise StagingCellError(
+            "prepared legacy-state migration owner differs from legacy cell"
+        )
+    if (
+        legacy_cell.get("app_activation") is True
+        or legacy_cell.get("status") == "app-activation-in-progress"
+        or bool(legacy_cell.get("active_commit"))
+        or bool(legacy_cell.get("pending_active_commit"))
+    ):
+        raise StagingCellError(
+            "prepared legacy-state migration source became activated"
+        )
+    legacy_commit = str(legacy_cell.get("bootstrap_commit") or "")
+    if payload.get("legacy_bootstrap_commit") != legacy_commit:
+        raise StagingCellError("prepared legacy-state migration bootstrap commit drift")
+    reference.validate_ownership_binding(legacy_commit, owner_id)
+
+    legacy_cell_path = legacy_root / "receipts/cell-bootstrap.json"
+    if payload.get("legacy_cell_receipt_sha256") != sha256_file(legacy_cell_path):
+        raise StagingCellError("prepared legacy-state migration cell receipt changed")
+    legacy_tool_receipt = legacy_root / "toolchain/receipt.json"
+    _private_regular_file(legacy_tool_receipt, label="legacy toolchain receipt")
+    if payload.get("legacy_toolchain_receipt_sha256") != sha256_file(
+        legacy_tool_receipt
+    ):
+        raise StagingCellError(
+            "prepared legacy-state migration toolchain receipt changed"
+        )
+
+    runtime_sha = payload.get("runtime_secret_sha256")
+    legacy_runtime = legacy_root / "secrets/staging-runtime.json"
+    migrated_runtime = root / "secrets/staging-runtime.json"
+    for path, label in (
+        (legacy_runtime, "legacy runtime secret"),
+        (migrated_runtime, "prepared migrated runtime secret"),
+    ):
+        _private_regular_file(path, label=label)
+        if not isinstance(runtime_sha, str) or not hmac.compare_digest(
+            sha256_file(path), runtime_sha
+        ):
+            raise StagingCellError(
+                "prepared legacy-state migration runtime secret drift"
+            )
+    source_sha = recorded_secret_source_sha(legacy_root)
+    if source_sha is None or not hmac.compare_digest(source_sha, runtime_sha):
+        raise StagingCellError(
+            "prepared legacy-state migration runtime secret lost receipt binding"
+        )
+
+    registry_sha = payload.get("registry_secret_sha256")
+    legacy_registry = legacy_root / "secrets/staging-registry.json"
+    migrated_registry = root / "secrets/staging-registry.json"
+    if registry_sha is None:
+        if legacy_registry.exists() or migrated_registry.exists():
+            raise StagingCellError(
+                "prepared legacy-state migration gained an unbound registry secret"
+            )
+    else:
+        if not isinstance(registry_sha, str):
+            raise StagingCellError(
+                "prepared legacy-state migration registry hash is malformed"
+            )
+        for path, label in (
+            (legacy_registry, "legacy registry secret"),
+            (migrated_registry, "prepared migrated registry secret"),
+        ):
+            _private_regular_file(path, label=label)
+            if not hmac.compare_digest(sha256_file(path), registry_sha):
+                raise StagingCellError(
+                    "prepared legacy-state migration registry secret drift"
+                )
+
+    promotion_manifest = payload.get("promotion_manifest")
+    for path, label in (
+        (legacy_root / "promotion", "legacy promotion receipts"),
+        (root / "promotion", "prepared migrated promotion receipts"),
+    ):
+        if promotion_manifest != _tree_manifest(path, label=label):
+            raise StagingCellError(
+                "prepared legacy-state migration promotion evidence drift"
+            )
+    legacy_receipts_manifest = payload.get("legacy_receipts_manifest")
+    if legacy_receipts_manifest != _tree_manifest(
+        legacy_root / "receipts", label="legacy cell receipts"
+    ):
+        raise StagingCellError("prepared legacy-state migration source receipts drift")
+    if payload.get("legacy_evidence_manifest") != _tree_manifest(
+        root / "legacy-evidence", label="prepared migrated legacy evidence"
+    ):
+        raise StagingCellError("prepared legacy-state migration copied evidence drift")
+
+    legacy_toolchain = load_tool_receipt(
+        legacy_root, required_tools=("kind",), required_artifacts=()
+    )
+    configure_reference_paths(legacy_root)
+    try:
+        if LEGACY_CLUSTER in reference.clusters(legacy_toolchain["tools"]["kind"]):
+            raise StagingCellError(
+                "legacy staging cluster reappeared during prepared migration recovery"
+            )
+    finally:
+        configure_reference_paths(root)
+
+    legacy_data = legacy_root / "data"
+    target_data = root / "data"
+    legacy_exists = legacy_data.exists() or legacy_data.is_symlink()
+    target_exists = target_data.exists() or target_data.is_symlink()
+    if legacy_exists == target_exists:
+        raise StagingCellError(
+            "prepared legacy-state migration requires data in exactly one state root"
+        )
+    data_root = target_data if target_exists else legacy_data
+    data_identity = payload.get("data_identity")
+    if not isinstance(data_identity, dict):
+        raise StagingCellError("prepared legacy-state migration has no data identity")
+    for name in ("postgres", "nats"):
+        if data_identity.get(name) != _real_directory_identity(
+            data_root / name, label=f"prepared retained {name} data"
+        ):
+            raise StagingCellError(f"prepared retained {name} data identity drift")
+    return "canonical" if target_exists else "legacy"
+
+
+def _finalize_prepared_legacy_state_migration(
+    root: Path, *, owner_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    data_identity = payload.get("data_identity")
+    if not isinstance(data_identity, dict):
+        raise StagingCellError("prepared legacy-state migration has no data identity")
+    for name in ("postgres", "nats"):
+        if data_identity.get(name) != _real_directory_identity(
+            root / "data" / name, label=f"migrated retained {name} data"
+        ):
+            raise StagingCellError(
+                f"migrated retained {name} data identity drift before final receipt"
+            )
+    terminal = {
+        **payload,
+        "status": LEGACY_MIGRATION_ADOPTED_STATUS,
+        "rollback": {
+            "legacy_cluster_absent": True,
+            "legacy_cluster_recreatable_from_preserved_commit_and_evidence": True,
+            "same_filesystem_rename": True,
+            "reverse_data_rename_possible_before_canonical_cluster_writes": True,
+        },
+    }
+    atomic_json(_legacy_migration_receipt_path(root), terminal, mode=0o600)
+    validated = load_legacy_state_migration(root, owner_id=owner_id)
+    if validated != terminal:
+        raise StagingCellError("legacy-state migration receipt readback mismatch")
+    return _legacy_migration_public_result(root)
+
+
+def _resume_prepared_legacy_state_migration(
+    root: Path, legacy_root: Path, *, owner_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    data_location = _require_prepared_legacy_state_migration(
+        root, legacy_root, owner_id=owner_id, payload=payload
+    )
+    if data_location == "legacy":
+        _rename_legacy_data_for_cutover(legacy_root / "data", root / "data")
+    return _finalize_prepared_legacy_state_migration(
+        root, owner_id=owner_id, payload=payload
+    )
 
 
 @lifecycle_mutation_locked
@@ -736,6 +1005,22 @@ def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
     legacy_root = LEGACY_STATE_ROOT.resolve()
     if legacy_root == root:
         raise StagingCellError("legacy and canonical state roots must differ")
+
+    migration_path = _legacy_migration_receipt_path(root)
+    if migration_path.exists() or migration_path.is_symlink():
+        migration = _read_legacy_state_migration_receipt(root)
+        status = migration.get("status")
+        if status == LEGACY_MIGRATION_ADOPTED_STATUS:
+            load_legacy_state_migration(root, owner_id=owner_id)
+            return _legacy_migration_public_result(root)
+        if status == LEGACY_MIGRATION_PREPARED_STATUS:
+            return _resume_prepared_legacy_state_migration(
+                root, legacy_root, owner_id=owner_id, payload=migration
+            )
+        raise StagingCellError(
+            f"legacy-state migration receipt has unsupported status: {status!r}"
+        )
+
     _real_directory_identity(legacy_root, label="legacy staging state root")
 
     unexpected_target_entries = sorted(
@@ -804,9 +1089,7 @@ def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
         legacy_promotion, label="legacy promotion receipts"
     )
     legacy_receipts = legacy_root / "receipts"
-    receipts_preflight = _tree_manifest(
-        legacy_receipts, label="legacy cell receipts"
-    )
+    receipts_preflight = _tree_manifest(legacy_receipts, label="legacy cell receipts")
     legacy_tool_receipt = legacy_root / "toolchain/receipt.json"
     _private_regular_file(legacy_tool_receipt, label="legacy toolchain receipt")
     tool_receipt_preflight_sha = sha256_file(legacy_tool_receipt)
@@ -833,7 +1116,9 @@ def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
     if promotion_preflight != _tree_manifest(
         legacy_promotion, label="legacy promotion receipts"
     ):
-        raise StagingCellError("legacy promotion receipts changed during cluster shutdown")
+        raise StagingCellError(
+            "legacy promotion receipts changed during cluster shutdown"
+        )
     if receipts_preflight != _tree_manifest(
         legacy_receipts, label="legacy cell receipts"
     ):
@@ -841,11 +1126,16 @@ def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
     if not hmac.compare_digest(
         sha256_file(legacy_tool_receipt), tool_receipt_preflight_sha
     ):
-        raise StagingCellError("legacy toolchain receipt changed during cluster shutdown")
+        raise StagingCellError(
+            "legacy toolchain receipt changed during cluster shutdown"
+        )
     for name, identity in data_identity.items():
-        if _real_directory_identity(
-            legacy_data / name, label=f"legacy retained {name} data"
-        ) != identity:
+        if (
+            _real_directory_identity(
+                legacy_data / name, label=f"legacy retained {name} data"
+            )
+            != identity
+        ):
             raise StagingCellError(
                 f"legacy retained {name} data identity changed during cluster shutdown"
             )
@@ -892,24 +1182,9 @@ def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
             evidence_root, label="legacy evidence"
         )
 
-        legacy_data.rename(target_data)
-        moved_data = True
-        fsync_directory(legacy_root)
-        fsync_directory(root)
-        observed_data_identity = {
-            name: _real_directory_identity(
-                target_data / name, label=f"migrated retained {name} data"
-            )
-            for name in ("postgres", "nats")
-        }
-        if observed_data_identity != data_identity:
-            raise StagingCellError(
-                "retained staging data identity changed during state-root migration"
-            )
-
-        payload: dict[str, Any] = {
+        prepared: dict[str, Any] = {
             "schema_version": 1,
-            "status": "legacy-state-adopted",
+            "status": LEGACY_MIGRATION_PREPARED_STATUS,
             "source_root": str(legacy_root),
             "target_root": str(root.resolve()),
             "source_cluster": LEGACY_CLUSTER,
@@ -922,48 +1197,57 @@ def command_migrate_legacy_state(args: argparse.Namespace) -> dict[str, Any]:
             "legacy_bootstrap_commit": str(legacy_cell.get("bootstrap_commit") or ""),
             "runtime_secret_sha256": runtime_secret_sha,
             "promotion_manifest": promotion_manifest,
+            "legacy_receipts_manifest": receipts_preflight,
             "legacy_evidence_manifest": legacy_evidence_manifest,
             "data_identity": data_identity,
             "toolchain_copied": False,
             "toolchain_action": "regenerate-under-canonical-state-root",
             "legacy_cluster_deleted": legacy_cluster_present,
-            "rollback": {
-                "legacy_cluster_absent": True,
-                "legacy_cluster_recreatable_from_preserved_commit_and_evidence": True,
-                "same_filesystem_rename": True,
-                "reverse_data_rename_possible_before_canonical_cluster_writes": True,
-            },
             "production_changed": False,
         }
         if registry_secret_sha is not None:
-            payload["registry_secret_sha256"] = registry_secret_sha
+            prepared["registry_secret_sha256"] = registry_secret_sha
         receipt_path = _legacy_migration_receipt_path(root)
-        atomic_json(receipt_path, payload, mode=0o600)
-        validated = load_legacy_state_migration(root, owner_id=owner_id)
-        if validated != payload:
-            raise StagingCellError("legacy-state migration receipt readback mismatch")
+        atomic_json(receipt_path, prepared, mode=0o600)
+        if _read_legacy_state_migration_receipt(root) != prepared:
+            raise StagingCellError(
+                "prepared legacy-state migration receipt readback mismatch"
+            )
+
+        _rename_legacy_data_for_cutover(legacy_data, target_data)
+        moved_data = True
+        observed_data_identity = {
+            name: _real_directory_identity(
+                target_data / name, label=f"migrated retained {name} data"
+            )
+            for name in ("postgres", "nats")
+        }
+        if observed_data_identity != data_identity:
+            raise StagingCellError(
+                "retained staging data identity changed during state-root migration"
+            )
+
+        _finalize_prepared_legacy_state_migration(
+            root, owner_id=owner_id, payload=prepared
+        )
     except Exception:
         if moved_data and target_data.exists() and not legacy_data.exists():
             target_data.rename(legacy_data)
             fsync_directory(root)
             fsync_directory(legacy_root)
         receipts_dir = root / "receipts"
-        if receipts_dir.exists() and receipts_dir.is_dir() and not receipts_dir.is_symlink():
+        if (
+            receipts_dir.exists()
+            and receipts_dir.is_dir()
+            and not receipts_dir.is_symlink()
+        ):
             shutil.rmtree(receipts_dir)
         for path in reversed(copied_paths):
             if path.exists() and path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path)
         raise
 
-    return {
-        "schema_version": 1,
-        "status": "legacy-state-adopted",
-        "cluster": DEFAULT_CLUSTER,
-        "toolchain_regeneration_required": True,
-        "production_changed": False,
-        "receipt_path": str(_legacy_migration_receipt_path(root)),
-        "receipt_sha256": sha256_file(_legacy_migration_receipt_path(root)),
-    }
+    return _legacy_migration_public_result(root)
 
 
 def render_kind_config(root: Path) -> Path:
