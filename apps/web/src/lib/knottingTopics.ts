@@ -99,27 +99,27 @@ export function splitKnottingTags(values: readonly string[]): {
   topics: KnottingTopic[];
   keywords: string[];
 } {
-  const normalized: string[] = [];
   const seen = new Set<string>();
+  const topics: KnottingTopic[] = [];
+  const keywords: string[] = [];
+
   for (const value of values) {
     const tag = normalizeTag(value);
     if (!tag || seen.has(tag)) continue;
     seen.add(tag);
-    normalized.push(tag);
+
+    const topic = knottingTopicForTag(tag);
+    if (topic && topics.length < MAX_KNOTTING_TOPICS) {
+      topics.push(topic);
+    } else {
+      keywords.push(tag);
+    }
   }
 
-  const selected: KnottingTopic[] = [];
-  const selectedTopicTags = new Set<string>();
-  for (const tag of normalized) {
-    const topic = knottingTopicForTag(tag);
-    if (!topic || selected.length >= MAX_KNOTTING_TOPICS) continue;
-    const controlledTag = knottingTopicTag(topic);
-    if (selectedTopicTags.has(controlledTag)) continue;
-    selected.push(topic);
-    selectedTopicTags.add(controlledTag);
-  }
-  const topics = canonicalizeKnottingTopics(selected);
-  const keywords = normalized.filter((tag) => !selectedTopicTags.has(tag));
+  topics.sort(
+    (left, right) =>
+      (topicOrder.get(left) ?? 0) - (topicOrder.get(right) ?? 0),
+  );
   return { topics, keywords };
 }
 
