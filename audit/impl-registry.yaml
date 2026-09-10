@@ -300,6 +300,17 @@ implementations:
       - scripts/tests/test_postgres_backup_restore_contract.sh
       - .github/workflows/ci.yml
 
+  - id: impl.ops.postgres-offhost-backup-pull
+    path: scripts/ops/pull-production-postgres-backup.sh
+    impl_type: workflow
+    status: active
+    criticality: high
+    evidence_level: test
+    documented_by:
+      - docs/runbooks/db-recovery.md
+    verified_by:
+      - scripts/tests/test_offhost_backup_pull_contract.sh
+
   - id: impl.ops.web-artifact-install
     path: scripts/ops/install-web-artifact.sh
     impl_type: workflow
