@@ -256,7 +256,8 @@ download_verified_auxiliary() {
     rm -f -- "$partial"
     echo ">> Downloading pinned $label source..."
     if [[ "$DOWNLOADER" == "wget" ]]; then
-      if wget --tries=5 --waitretry=3 --retry-connrefused --timeout=30 -nv \
+      if wget --tries=5 --waitretry=3 --retry-connrefused \
+        --retry-on-http-error=429,500,502,503,504 --timeout=30 -nv \
         -O "$partial" "$url"; then
         :
       else

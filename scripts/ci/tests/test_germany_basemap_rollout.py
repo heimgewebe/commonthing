@@ -489,6 +489,7 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
             "wget --tries=5",
             "--waitretry=3",
             "--retry-connrefused",
+            "--retry-on-http-error=429,500,502,503,504",
             "--timeout=30",
             "-nv",
         ):
