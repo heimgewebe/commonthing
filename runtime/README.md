@@ -32,7 +32,7 @@ Containern, Health-Endpunkten, Migrationen und Logs.
 
 ## Kanonischer Produktionspfad
 
-Der öffentliche Zielpfad ist `wg-prod-1` gemäß
+Der öffentliche Zielpfad ist `commonserver` gemäß
 [`docs/deploy/vps.md`](../docs/deploy/vps.md). Der historische Heimserverpfad ist
 kein Produktionsziel mehr, bleibt aber als Referenzvertrag dokumentiert.
 
@@ -51,7 +51,7 @@ müssen an diesen Pfad delegieren.
 |---|---|---|
 | lokal/core | `compose.core.yml` | Web, API, Caddy, PostgreSQL und PgBouncer für Entwicklung/Integration |
 | produktiv | `compose.prod.yml` | API, Caddy, PostgreSQL und NATS |
-| VPS | `compose.prod.yml` + `compose.vps.override.yml` | öffentlicher Frontdoor auf `wg-prod-1` |
+| VPS | `compose.prod.yml` + `compose.vps.override.yml` | öffentlicher Frontdoor auf `commonserver` |
 | Beobachtung | `compose.observ.yml` | optionale Monitoringkomponenten |
 | SMTP | `compose.smtp.override.yml` | explizite Mailkonfiguration ohne Secretwerte im Repository |
 
@@ -61,7 +61,7 @@ Compose-Modell, nicht aus dieser Tabelle allein.
 ## Webbereitstellung
 
 Die Webanwendung ist ein statischer SvelteKit-Build. Caddy kann zu einem
-lokalen Build-Artefakt unter `/srv/weltgewebe-web` routen. Für `wg-prod-1` ist
+lokalen Build-Artefakt unter `/srv/weltgewebe-web` routen. Für `commonserver` ist
 dieser statische interne Caddy-Pfad der kanonische Produktionspfad; externe
 Web-Upstreams sind Vorschau-/Legacy-Flächen und keine Produktionswahrheit.
 Der Deployvertrag verlangt eine konkrete Buildkennung über
@@ -69,7 +69,7 @@ Der Deployvertrag verlangt eine konkrete Buildkennung über
 
 ## Domänenquellen
 
-| Schalter | lokaler Default | Produktionswert `wg-prod-1` | Bedeutung |
+| Schalter | lokaler Default | Produktionswert `commonserver` | Bedeutung |
 |---|---|---|
 | `WELTGEWEBE_DOMAIN_READ_SOURCE` | `jsonl` | `postgres` | Quelle für Accounts/Garnrollen, Knoten und Fäden |
 | `WELTGEWEBE_DOMAIN_ACCOUNT_WRITE_SOURCE` | `jsonl` | `postgres` | Account-/Garnrollen-Erzeugung und Account-Mutationen |

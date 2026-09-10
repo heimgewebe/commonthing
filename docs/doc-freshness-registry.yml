@@ -254,7 +254,7 @@ entries:
     doc: docs/claims/registry.yml
     locator: claims[id=CLAIM-RUNTIME-PROD-POSTGRES-001]
     claim: >-
-      wg-prod-1 nutzt PostgreSQL als Datenwahrheit; Liveaussagen brauchen
+      commonserver nutzt PostgreSQL als Datenwahrheit; Liveaussagen brauchen
       datierte Runtime-Evidence.
     status: partial
     owner: runtime
@@ -277,7 +277,7 @@ entries:
     doc: docs/claims/registry.yml
     locator: claims[id=CLAIM-RUNTIME-LIVE-PROD-001]
     claim: >-
-      Liveaussagen zu wg-prod-1 brauchen datierte Runtime-Evidence und
+      Liveaussagen zu commonserver brauchen datierte Runtime-Evidence und
       veralten sonst.
     status: stale
     owner: runtime

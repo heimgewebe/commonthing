@@ -62,7 +62,7 @@ werden.
 
 - Docker und Docker Compose
 - Caddy als Frontdoor und Reverse Proxy
-- VPS-Ziel `wg-prod-1`
+- VPS-Ziel `commonserver`
 - statische interne Caddy-Auslieferung von `apps/web/build`
 - Cloudflare- und Vercel-Status als zusätzliche Build-/Vorschaubelege
 

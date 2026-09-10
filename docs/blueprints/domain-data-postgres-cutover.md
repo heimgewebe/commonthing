@@ -50,7 +50,7 @@ Der belegte Repository- und Produktionsvertrag nach der Remediation vom
 2026-07-12:
 
 - PostgreSQL-Domain-Tabellen und Migrationen für nodes, edges und accounts existieren.
-- `wg-prod-1` ist in Compose, Runtime-Dokumentation und `.env.prod.example`
+- `commonserver` ist in Compose, Runtime-Dokumentation und `.env.prod.example`
   auf PostgreSQL als Lese- und Schreibwahrheit für Accounts/Garnrollen,
   Knoten und Fäden ausgerichtet.
 - JSONL bleibt lokaler Default für Rückwärtskompatibilität und ein
@@ -71,7 +71,7 @@ Der belegte Repository- und Produktionsvertrag nach der Remediation vom
 - Lokale Runtime-Caches bestehen weiter.
 - Sessions und Passkey-Credentials gehören im Produktionspfad ebenfalls zur
   PostgreSQL-Datensicherung und Restore-Prüfung.
-- Frische Liveaussagen über `wg-prod-1` brauchen weiterhin Runtime-Evidence
+- Frische Liveaussagen über `commonserver` brauchen weiterhin Runtime-Evidence
   mit Datum; diese Blaupause schreibt keine Runtimewerte zeitlos fest.
 
 Diese Blaupause ordnet deshalb nicht mehr einen offenen Produktions-Cutover,
@@ -345,7 +345,7 @@ Weiter erforderlich:
     Account-/Role-/invalid-Type-Kollisionen.
   - JSONL: recoverbare Journal-/Backup-Transaktion über `demo.nodes.jsonl`
     und `demo.edges.jsonl`, inklusive Recovery vor Startup-Load.
-- Runtime-Smoke für vollständigen PostgreSQL-Domain-Betrieb auf `wg-prod-1`
+- Runtime-Smoke für vollständigen PostgreSQL-Domain-Betrieb auf `commonserver`
 - Multi-Instance-/Cache-Kohärenz-Proof, falls horizontale Skalierung
   erlaubt werden soll
 - E-Mail-Unique-Proof

@@ -406,7 +406,7 @@
       "id": "CLAIM-RUNTIME-PROD-POSTGRES-001",
       "status": "established",
       "subject": "RUNTIME-PROD-POSTGRES",
-      "statement": "wg-prod-1 nutzt PostgreSQL als Datenwahrheit; Liveaussagen brauchen datierte Runtime-Evidence.",
+      "statement": "commonserver nutzt PostgreSQL als Datenwahrheit; Liveaussagen brauchen datierte Runtime-Evidence.",
       "evidence": [
         {
           "path": "README.md",
@@ -443,7 +443,7 @@
       "id": "CLAIM-RUNTIME-LIVE-PROD-001",
       "status": "established",
       "subject": "RUNTIME-LIVE-PROD",
-      "statement": "Liveaussagen zu wg-prod-1 brauchen datierte Runtime-Evidence und veralten sonst.",
+      "statement": "Liveaussagen zu commonserver brauchen datierte Runtime-Evidence und veralten sonst.",
       "evidence": [
         {
           "path": "docs/reports/map-status.md",

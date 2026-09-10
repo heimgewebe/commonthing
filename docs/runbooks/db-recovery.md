@@ -48,7 +48,7 @@ JSONL ist nur lokaler, historischer, Import-/Export- oder ausdrücklich
 freigegebener Rückfallpfad. Ein JSONL-Export ersetzt kein aktuelles
 PostgreSQL-Backup.
 
-## 2. Automatischer Backupvertrag auf `wg-prod-1`
+## 2. Automatischer Backupvertrag auf `commonserver`
 
 Kanonisches Skript:
 

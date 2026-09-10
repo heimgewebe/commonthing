@@ -21,7 +21,7 @@ relations:
 
 Der DDNS-Dienst ist stillgelegt; dieses Runbook bleibt aktiv. Es prüft, dass der
 frühere Heimberry-Schreibpfad weiterhin inaktiv und fail-closed ist, während die
-öffentliche Weltgewebe-Runtime auf `wg-prod-1` läuft.
+öffentliche Weltgewebe-Runtime auf `commonserver` läuft.
 
 Die versionierte Härtung ist an Commit
 `heimgewebe/heimserver@15dfbd6cc1c8899ec030ac6666464db4bc132c71`
@@ -31,7 +31,7 @@ Sollvertrag, nicht den fortdauernden Livezustand.
 
 ## Beweisquellen
 
-1. `runtime/README.md` und `docs/deploy/vps.md` weisen `wg-prod-1` als
+1. `runtime/README.md` und `docs/deploy/vps.md` weisen `commonserver` als
    kanonischen Produktionspfad aus.
 2. Die erwartete VPS-Adresse stammt aus einer aktuellen, freigegebenen
    Deployment-Identität oder einem Deployment-Receipt. Sie darf nicht aus den
@@ -57,7 +57,7 @@ Sollvertrag, nicht den fortdauernden Livezustand.
 ```bash
 set -euo pipefail
 
-: "${EXPECTED_VPS_A:?set from the approved wg-prod-1 deployment identity}"
+: "${EXPECTED_VPS_A:?set from the approved commonserver deployment identity}"
 : "${RETIRED_SINCE:?set to the evidenced retirement timestamp}"
 
 expected_nameservers=(ns.inwx.de ns2.inwx.de ns3.inwx.eu)
