@@ -119,16 +119,18 @@ else
 fi
 
 if command -v wget > /dev/null 2>&1 &&
-  [[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]]; then
+  [[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]] &&
+  command -v timeout > /dev/null 2>&1 &&
+  [[ "$(timeout --help 2>&1)" == *"--kill-after"* ]]; then
   DOWNLOADER="wget"
 elif command -v curl > /dev/null 2>&1 &&
   [[ "$(curl --help all 2>&1)" == *"--retry-all-errors"* ]] &&
   [[ "$(curl --help all 2>&1)" == *"--retry-max-time"* ]]; then
   DOWNLOADER="curl"
+elif command -v wget > /dev/null 2>&1; then
+  fail "wget lacks required --retry-on-http-error/overall-deadline timeout support and curl is unavailable or lacks required --retry-all-errors/--retry-max-time support"
 elif command -v curl > /dev/null 2>&1; then
   fail "curl lacks required --retry-all-errors/--retry-max-time support"
-elif command -v wget > /dev/null 2>&1; then
-  fail "wget lacks required --retry-on-http-error support and curl is unavailable"
 else
   fail "wget or curl is required"
 fi
@@ -263,13 +265,15 @@ download_verified_auxiliary() {
     rm -f -- "$partial"
     echo ">> Downloading pinned $label source..."
     if [[ "$DOWNLOADER" == "wget" ]]; then
-      if wget --tries=5 --waitretry=3 --retry-connrefused \
+      if timeout --kill-after=5s 900s wget --tries=5 --waitretry=3 \
+        --retry-connrefused \
         --retry-on-http-error=429,500,502,503,504 --timeout=30 -nv \
         -O "$partial" "$url"; then
         :
       else
         download_rc=$?
         case "$download_rc" in
+          124 | 137) fail "$label download overall deadline exceeded after bounded retries: $url" ;;
           4) fail "$label download network/timeout failure after bounded retries: $url" ;;
           8) fail "$label download HTTP/server failure after bounded retries: $url" ;;
           *) fail "$label download failed after bounded retries (wget exit $download_rc): $url" ;;

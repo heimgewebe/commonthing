@@ -479,7 +479,7 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
         self.assertIn("\nPY\n    rm -f", receipt_function)
         self.assertNotIn("python3 << 'PY' || {", receipt_function)
 
-    def test_germany_builder_falls_back_when_wget_lacks_http_retry_support(self) -> None:
+    def test_germany_builder_falls_back_when_wget_lacks_retry_or_deadline_support(self) -> None:
         builder = BUILD_SCRIPT.read_text(encoding="utf-8")
         selector_start = builder.index("if command -v wget > /dev/null 2>&1 &&")
         selector_end = builder.index('mkdir -p "$BASEMAP_DIR"', selector_start)
@@ -487,6 +487,11 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
 
         self.assertIn(
             '[[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]]',
+            selector,
+        )
+        self.assertIn('command -v timeout > /dev/null 2>&1', selector)
+        self.assertIn(
+            '[[ "$(timeout --help 2>&1)" == *"--kill-after"* ]]',
             selector,
         )
         self.assertIn('DOWNLOADER="wget"', selector)
@@ -499,7 +504,7 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
             selector,
         )
         self.assertIn(
-            "wget lacks required --retry-on-http-error support and curl is unavailable",
+            "wget lacks required --retry-on-http-error/overall-deadline timeout support and curl is unavailable or lacks required --retry-all-errors/--retry-max-time support",
             selector,
         )
 
@@ -510,6 +515,7 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
         auxiliary_download = builder[function_start:function_end]
 
         for marker in (
+            "timeout --kill-after=5s 900s wget",
             "wget --tries=5",
             "--waitretry=3",
             "--retry-connrefused",
@@ -536,6 +542,7 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
             "HTTP/server failure after bounded retries",
             "HTTP failure after bounded retries",
             "timeout/stall failure after bounded retries",
+            "overall deadline exceeded after bounded retries",
             "checksum mismatch",
         ):
             self.assertIn(diagnostic, auxiliary_download)
