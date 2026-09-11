@@ -445,6 +445,74 @@ async fn nodes_patch_info_lifecycle() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn nodes_patch_legacy_null_visibility_stays_public_across_cache_and_restart(
+) -> anyhow::Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let nodes_path = in_dir.join("demo.nodes.jsonl");
+    write_lines(
+        &nodes_path,
+        &[
+            r#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old","search_visibility":null}"#,
+        ],
+    );
+
+    let (app, cookie, _state, _env) = app_with_account(
+        &in_dir,
+        weber_account("cccccccc-cccc-4ccc-8ccc-000000000001"),
+    )
+    .await;
+
+    let initial = app
+        .clone()
+        .oneshot(Request::get("/nodes/n1").body(body::Body::empty())?)
+        .await?;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial_body = body::to_bytes(initial.into_body(), usize::MAX).await?;
+    let initial_node: serde_json::Value = serde_json::from_slice(&initial_body)?;
+    assert_eq!(initial_node["search_visibility"], "public");
+    let etag = node_etag(&initial_node);
+
+    let patch = Request::patch("/nodes/n1")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .header("Host", "localhost")
+        .header("Origin", "http://localhost")
+        .header("If-Match", etag)
+        .body(body::Body::from(r#"{"info":"New"}"#))?;
+    let patched = app.clone().oneshot(patch).await?;
+    assert_eq!(patched.status(), StatusCode::OK);
+    let patched_body = body::to_bytes(patched.into_body(), usize::MAX).await?;
+    let patched_node: serde_json::Value = serde_json::from_slice(&patched_body)?;
+    assert_eq!(patched_node["info"], "New");
+    assert_eq!(patched_node["search_visibility"], "public");
+
+    let cached = app
+        .oneshot(Request::get("/nodes/n1").body(body::Body::empty())?)
+        .await?;
+    let cached_body = body::to_bytes(cached.into_body(), usize::MAX).await?;
+    let cached_node: serde_json::Value = serde_json::from_slice(&cached_body)?;
+    assert_eq!(cached_node["search_visibility"], "public");
+
+    let persisted: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&nodes_path)?.trim())?;
+    assert!(persisted["search_visibility"].is_null());
+
+    let restarted = weltgewebe_api::routes::nodes::load_nodes().await?;
+    assert_eq!(
+        restarted
+            .get("n1")
+            .context("node must reload")?
+            .search_visibility
+            .as_str(),
+        "public"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn nodes_patch_rejects_oversized_info_without_side_effects() -> anyhow::Result<()> {
     const INFO_MAX_LEN: usize = 20_000;
     let tmp = make_tmp_dir();

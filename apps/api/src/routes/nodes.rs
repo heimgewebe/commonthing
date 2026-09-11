@@ -3766,9 +3766,12 @@ async fn patch_node_jsonl(
                     v["updated_at"] = Value::String(now);
                 }
 
-                // Map to Node and fail hard if mapping fails.
-                // Ensures we never persist changes without a valid Node response.
-                let node = map_json_to_node(&v).ok_or(NodeMutationError::Status(StatusCode::INTERNAL_SERVER_ERROR))?;
+                // Re-project through the same NodeDto contract as startup. This keeps
+                // legacy values such as `search_visibility: null` semantically
+                // identical in the response/cache and after a restart.
+                let node: Node = serde_json::from_value::<NodeDto>(v.clone())
+                    .map_err(|_| NodeMutationError::Status(StatusCode::INTERNAL_SERVER_ERROR))?
+                    .into();
 
                 // Security/Consistency: Ensure the ID hasn't been changed via the update.
                 if node.id != id {
