@@ -406,7 +406,7 @@
       "id": "CLAIM-RUNTIME-PROD-POSTGRES-001",
       "status": "established",
       "subject": "RUNTIME-PROD-POSTGRES",
-      "statement": "wg-prod-1 nutzt PostgreSQL als Datenwahrheit; Liveaussagen brauchen datierte Runtime-Evidence.",
+      "statement": "commonserver nutzt PostgreSQL als Datenwahrheit; Liveaussagen brauchen datierte Runtime-Evidence.",
       "evidence": [
         {
           "path": "README.md",
@@ -414,6 +414,10 @@
         },
         {
           "path": "runtime/README.md",
+          "kind": "documentation"
+        },
+        {
+          "path": "docs/deploy/CHANGELOG.md",
           "kind": "documentation"
         },
         {
@@ -437,13 +441,13 @@
         "bash scripts/tests/test_repo_contract_guards.sh"
       ],
       "owner": "runtime",
-      "updated": "2026-07-12"
+      "updated": "2026-09-10"
     },
     {
       "id": "CLAIM-RUNTIME-LIVE-PROD-001",
       "status": "established",
       "subject": "RUNTIME-LIVE-PROD",
-      "statement": "Liveaussagen zu wg-prod-1 brauchen datierte Runtime-Evidence und veralten sonst.",
+      "statement": "Liveaussagen zu commonserver brauchen datierte Runtime-Evidence und veralten sonst.",
       "evidence": [
         {
           "path": "docs/reports/map-status.md",
@@ -451,6 +455,10 @@
         },
         {
           "path": "runtime/README.md",
+          "kind": "documentation"
+        },
+        {
+          "path": "docs/deploy/CHANGELOG.md",
           "kind": "documentation"
         },
         {
@@ -466,7 +474,7 @@
         "python3 -m scripts.docmeta.validate_doc_freshness_registry"
       ],
       "owner": "runtime",
-      "updated": "2026-07-12"
+      "updated": "2026-09-10"
     }
   ]
 }

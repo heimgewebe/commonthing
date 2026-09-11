@@ -25,7 +25,7 @@ zu einem **self-hosted Heimserver-Deployment mit edge-caddy**.
 > **Historische DNS-Phase**
 > Dieses Dokument beschreibt den historischen Schritt von Netlify zu IONOS.
 > Der heutige Zustand von `weltgewebe.net` nutzt INWX und den kanonischen
-> Public-VPS-Pfad `wg-prod-1`. Der frühere Heimberry-DDNS-Schreibpfad ist
+> Public-VPS-Pfad `commonserver`. Der frühere Heimberry-DDNS-Schreibpfad ist
 > stillgelegt; die Nebendomains sind DNS-seitig noch offen.
 >
 > Die aktuelle Prüfanweisung für die Stilllegung steht in

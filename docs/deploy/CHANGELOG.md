@@ -10,6 +10,37 @@ relations:
 ---
 # Deployment-Änderungsprotokoll
 
+## 2026-09-10 - Produktionshost zu `commonserver` kanonisieren
+
+**Geänderte Bereiche:**
+
+- kanonische Produktionshost-Identität und Deployment-/Recovery-Dokumentation;
+- `.env.prod.example`;
+- täglicher Off-Host-PostgreSQL-Pull auf `heim-pc`.
+
+**Beschreibung:**
+
+Der bisherige Hostname `wg-prod-1` bleibt in datierten historischen Belegen als
+damalige Identität erhalten. Für aktuelle Betriebsverträge heißt derselbe
+Produktionshost künftig `commonserver`. Der Default des Off-Host-Backup-Pulls
+folgt dieser Identität; `REMOTE_HOST` bleibt als expliziter
+Kompatibilitäts-Override bestehen.
+
+**Produktionswirkung:**
+
+Die laufende Produktion wurde durch diesen Repository-Patch nicht neu
+deployt. Ein Readback am 2026-09-10 bestätigte `commonserver` als Hostnamen,
+Batch-SSH inklusive `sudo -n` vom Pull-Host sowie alle vier Domain-Read/Write-
+Quellen der laufenden API mit `postgres`. Vor einer Neuinstallation des
+Off-Host-Timers verlangt das Recovery-Runbook denselben SSH-Preflight.
+
+**Prüfung:**
+
+Naming Guard, Repository-/Dokument-Guards, Core-/Shell-Tests und der
+Off-Host-Backup-Vertrag werden auf dem PR-Head geprüft. Datierte Juli-Claims
+und Runtime-Belege werden nicht rückwirkend auf den neuen Hostnamen
+umgeschrieben.
+
 ## 2026-08-02 - Erste Ortsweberei mit Webgemeindezentrum im Hammer Park verankern
 
 **Geänderte Bereiche:**

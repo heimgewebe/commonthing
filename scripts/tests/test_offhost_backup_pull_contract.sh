@@ -29,12 +29,13 @@ cmd="${cmd//sudo -n /}"
 exec bash -c "$cmd"
 FAKE
 chmod +x "$bin/ssh"
-PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST=test-host REMOTE_BACKUP_DIR="$remote" DEST_DIR="$dest" \
+PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST='' REMOTE_BACKUP_DIR="$remote" DEST_DIR="$dest" \
   scripts/ops/pull-production-postgres-backup.sh
 [[ -f "$dest/$file" ]]
 [[ -f "$dest/${file%.sql.gz}.sha256.manifest" ]]
 [[ -f "$dest/${file%.sql.gz}.restore-proof" ]]
 grep -qx 'result=ok' "$dest/latest-pull.receipt"
+grep -qx 'remote_host=commonserver' "$dest/latest-pull.receipt"
 [[ "$(stat -c %a "$dest/$file")" == 600 ]]
 
 # A manifest mismatch must fail and must not overwrite the verified copy.
