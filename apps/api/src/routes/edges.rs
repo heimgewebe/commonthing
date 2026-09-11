@@ -1026,11 +1026,11 @@ struct EdgePersistenceStatus {
 
 /// Scan the persisted edges file once before an append. Cache-limit accounting
 /// follows [`load_edges`] for parseable edges that could ever be active (matching
-/// [`edge_is_permanently_unreachable`]). This legacy persistence scan still skips
-/// unparseable records so it can preserve and inspect pre-existing files without
-/// rewriting them; unlike this scan, the canonical startup loader now rejects
-/// corrupt records. A final unterminated line is still read. The whole file is scanned — also
-/// beyond the limit — so duplicate ids and an earlier operation result in an
+/// [`edge_is_permanently_unreachable`]). The scan is strict about JSON and `Edge`
+/// projection for the same reason as startup: a create must never append to a
+/// canonical file that the next restart would reject. The scan remains read-only
+/// and preserves every existing byte. A final unterminated line is still read.
+/// The whole file is scanned — also beyond the limit — so duplicate ids and an earlier operation result in an
 /// unmaterialized suffix remain detectable regardless of lifecycle validity:
 /// an id must never be reusable just because the record that first claimed
 /// it later became lifecycle-invalid or fell out of cache capacity. A
@@ -1058,31 +1058,34 @@ async fn inspect_edge_persistence_for_create(
     let mut lines_read = 0usize;
     let mut duplicate_id = false;
     let mut existing_operation = None;
+    let mut line_number = 0usize;
 
     while let Some(line) = lines.next_line().await? {
-        let value: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            // This legacy persistence scan preserves unparseable records instead of
-            // granting them cache semantics or rewriting them.
-            Err(_) => continue,
-        };
+        line_number += 1;
+        let value: Value = serde_json::from_str(&line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid edge JSONL at {} line {line_number}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
 
         let operation_matches = operation.is_some_and(|operation| {
             value.get(CREATE_ACTOR_KEY).and_then(Value::as_str) == Some(operation.actor_id.as_str())
                 && value.get(CREATE_OPERATION_KEY).and_then(Value::as_str)
                     == Some(operation.operation_id.as_str())
         });
-        let edge: Edge = match serde_json::from_value(value) {
-            Ok(edge) => edge,
-            Err(error) if operation_matches => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("idempotent edge record cannot be projected: {error}"),
-                ));
-            }
-            // Preserve this legacy persistence scan's tolerance for malformed records.
-            Err(_) => continue,
-        };
+        let edge: Edge = serde_json::from_value(value).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid edge JSONL at {} line {line_number}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
 
         // Duplicate-id and operation-replay detection must see every
         // parseable line regardless of lifecycle validity: an id must stay

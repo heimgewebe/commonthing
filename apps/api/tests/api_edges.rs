@@ -1405,6 +1405,48 @@ async fn post_edges_does_not_update_cache_when_append_fails() -> Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn post_edges_rejects_corrupt_existing_jsonl_after_startup() -> Result<()> {
+    for corrupt_line in [
+        r#"{broken_json"#,
+        r#"{"id":"missing-required-edge-fields"}"#,
+    ] {
+        let tmp = make_tmp_dir();
+        let in_dir = tmp.path().join("in");
+        fs::create_dir_all(&in_dir)?;
+        let edges_path = in_dir.join("demo.edges.jsonl");
+        let _env = set_gewebe_in_dir(&in_dir);
+
+        // Start from a valid empty source, then model external/manual corruption
+        // after startup. The pre-append scan must reject anything the next
+        // strict startup would reject instead of extending the corrupt file.
+        let (app, cookie, state) = app_with_session(Role::Weber, DomainReadSource::Jsonl).await?;
+        fs::write(&edges_path, corrupt_line)?;
+        let before = fs::read(&edges_path)?;
+
+        let res = app
+            .oneshot(post_edges(Some(&cookie), &valid_create_body()))
+            .await?;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = read_text_body(res).await?;
+        assert!(text.contains("failed to persist edge"), "body: {text}");
+
+        assert_eq!(
+            fs::read(&edges_path)?,
+            before,
+            "corrupt source must stay byte-identical"
+        );
+        assert_eq!(
+            state.edges.read().await.len(),
+            0,
+            "failed create must not populate cache"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn post_edges_preserves_jsonl_boundary_after_unterminated_existing_record() -> Result<()> {
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");
