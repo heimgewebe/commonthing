@@ -150,21 +150,31 @@ kanonisches SSH-Ziel funktionieren; damit kann die Hostumbenennung den tägliche
 Off-Host-Pull nicht still unterbrechen:
 
 ```bash
+set -euo pipefail
 backup_dir=/var/backups/weltgewebe/postgres
-getent hosts commonserver
-latest="$(ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-  "sudo -n find '$backup_dir' -maxdepth 1 -type f -name 'weltgewebe-postgres-*.sql.gz' -printf '%f\\n' | sort | tail -n1")"
-[[ "$latest" == weltgewebe-postgres-*.sql.gz ]]
+getent hosts commonserver > /dev/null
+latest="$(
+  ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
+    "sudo -n find '$backup_dir' -maxdepth 1 -type f -name 'weltgewebe-postgres-*.sql.gz' -printf '%f\\n'" |
+    sort |
+    tail -n1
+)"
+if [[ "$latest" != weltgewebe-postgres-*.sql.gz ]]; then
+  printf 'Kein PostgreSQL-Backup auf commonserver gefunden.\n' >&2
+  exit 1
+fi
 manifest="${latest%.sql.gz}.sha256.manifest"
 ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
   "sudo -n cat -- '$backup_dir/$manifest'" > /dev/null
 ```
 
 Damit werden genau die beiden verpflichtenden privilegierten Leseoperationen
-(`find` und `cat`) geprüft, die auch der Pull verwendet; ein allgemeines
-`sudo -n true` reicht bei befehlsbezogenen Sudoers-Regeln nicht aus. Der
-Readback vom 2026-09-10 hat DNS/SSH sowie diese `find`-/`cat`-Prüfung
-erfolgreich bestanden.
+(`find` und `cat`) geprüft, die auch der Pull verwendet. `set -euo pipefail`
+sorgt zusätzlich dafür, dass ein fehlgeschlagenes SSH/`sudo find` nicht durch
+das nachgeschaltete `sort`/`tail` verdeckt wird; ein leerer oder unerwarteter
+Dateiname bricht explizit ab. Ein allgemeines `sudo -n true` reicht bei
+befehlsbezogenen Sudoers-Regeln nicht aus. Der Readback vom 2026-09-10 hat
+DNS/SSH sowie diese `find`-/`cat`-Prüfung erfolgreich bestanden.
 `REMOTE_HOST` bleibt als expliziter Kompatibilitäts-Override erhalten; der
 Default und neue Installationen verwenden `commonserver`.
 
