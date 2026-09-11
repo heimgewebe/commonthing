@@ -71,7 +71,7 @@ async fn test_state() -> Result<ApiState> {
     let rate_limiter = Arc::new(AuthRateLimiter::new(&config));
 
     // Load edges from file (environment variable must be set before calling this)
-    let edges = weltgewebe_api::routes::edges::load_edges().await;
+    let edges = weltgewebe_api::routes::edges::load_edges().await?;
 
     Ok(ApiState {
         db_pool: None,
@@ -114,6 +114,59 @@ fn make_tmp_dir() -> tempfile::TempDir {
 fn write_lines(path: &PathBuf, lines: &[&str]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, lines.join("\n")).unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn edges_load_rejects_malformed_json_instead_of_returning_a_partial_cache() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let edges_path = in_dir.join("demo.edges.jsonl");
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    write_lines(
+        &edges_path,
+        &[
+            r#"{"id":"e1","source_id":"n1","target_id":"n2","edge_kind":"reference"}"#,
+            r#"{broken_json"#,
+            r#"{"id":"e2","source_id":"n2","target_id":"n3","edge_kind":"reference"}"#,
+        ],
+    );
+
+    let error = match weltgewebe_api::routes::edges::load_edges().await {
+        Ok(_) => panic!("malformed canonical edge JSONL must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let message = error.to_string();
+    assert!(message.contains("demo.edges.jsonl"), "message: {message}");
+    assert!(message.contains("line 2"), "message: {message}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn edges_load_rejects_invalid_utf8_instead_of_treating_it_as_eof() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let edges_path = in_dir.join("demo.edges.jsonl");
+    let _env = set_gewebe_in_dir(&in_dir);
+    fs::create_dir_all(&in_dir)?;
+
+    let mut bytes =
+        br#"{"id":"e1","source_id":"n1","target_id":"n2","edge_kind":"reference"}"#.to_vec();
+    bytes.extend_from_slice(b"\n");
+    bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+    fs::write(&edges_path, bytes)?;
+
+    let error = match weltgewebe_api::routes::edges::load_edges().await {
+        Ok(_) => panic!("invalid UTF-8 in canonical edge JSONL must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -1300,11 +1353,12 @@ async fn post_edges_does_not_update_cache_when_append_fails() -> Result<()> {
     let edges_path = in_dir.join("demo.edges.jsonl");
     let _env = set_gewebe_in_dir(&in_dir);
 
-    // Make the append fail portably: the JSONL path exists as a *directory*,
-    // so opening it as a file for append errors out.
-    fs::create_dir_all(&edges_path)?;
-
     let (app, cookie, state) = app_with_session(Role::Weber, DomainReadSource::Jsonl).await?;
+
+    // Make the append fail only after a valid empty startup: the JSONL path
+    // becomes a directory, so opening it as a file for append errors out.
+    // A directory at startup is now correctly rejected by the strict loader.
+    fs::create_dir_all(&edges_path)?;
 
     let res = app
         .oneshot(post_edges(Some(&cookie), &valid_create_body()))

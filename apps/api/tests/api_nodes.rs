@@ -99,7 +99,7 @@ async fn test_state() -> Result<ApiState> {
         step_up_tokens: weltgewebe_api::auth::step_up_tokens::StepUpTokenStore::new(),
         accounts: Arc::new(RwLock::new(AccountStore::new())),
         nodes: Arc::new(tokio::sync::RwLock::new(
-            weltgewebe_api::routes::nodes::load_nodes().await,
+            weltgewebe_api::routes::nodes::load_nodes().await?,
         )),
         nodes_persist: Arc::new(tokio::sync::Mutex::new(())),
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
@@ -530,10 +530,9 @@ async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Res
     fs::create_dir_all(&in_dir)?;
 
     let valid_line = br#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info","updated_at":"2026-01-01T00:00:00Z"}"#;
-    let mut original = valid_line.to_vec();
-    original.extend_from_slice(b"\n");
-    original.extend_from_slice(&[0xff, 0xfe, b'\n']);
-    fs::write(&nodes_path, &original)?;
+    let mut startup_bytes = valid_line.to_vec();
+    startup_bytes.extend_from_slice(b"\n");
+    fs::write(&nodes_path, &startup_bytes)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
     let mut account_map = AccountStore::new();
@@ -556,6 +555,13 @@ async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Res
 
     let mut state = test_state().await?;
     state.accounts = Arc::new(RwLock::new(account_map));
+
+    // Corrupt the canonical file only after a valid startup. This keeps the
+    // test focused on the PATCH rewrite path while the startup loader itself
+    // remains strict.
+    let mut original = startup_bytes;
+    original.extend_from_slice(&[0xff, 0xfe, b'\n']);
+    fs::write(&nodes_path, &original)?;
     let session = create_session(&state, "cccccccc-cccc-4ccc-8ccc-000000000001", None).await;
     let cookie = format!("gewebe_session={}", session.id);
     let app = Router::new()
@@ -936,7 +942,6 @@ async fn nodes_robustness_with_dirty_data() -> anyhow::Result<()> {
             r#"{"id": "n4", "kind": "Dirty Title", "title": true, "location": {"lat": 52.5, "lon": 13.4}}"#,
             r#"{"id": "n5", "kind": "Dirty Info", "title": "Dirty Info", "info": {"foo": "bar"}, "location": {"lat": 52.5, "lon": 13.4}}"#,
             r#"{"id": "n6", "title": "Dirty Tags", "tags": ["clean", 123, null, "also-clean"], "location": {"lat": 52.5, "lon": 13.4}}"#,
-            r#"{broken_json"#, // Malformed JSON line -> should be skipped
         ],
     )
     .await;
@@ -1281,7 +1286,7 @@ async fn nodes_post_creates_persists_and_reloads() -> anyhow::Result<()> {
     }
 
     // Simulated restart: reload from JSONL alone reconstructs the node.
-    let reloaded = weltgewebe_api::routes::nodes::load_nodes().await;
+    let reloaded = weltgewebe_api::routes::nodes::load_nodes().await?;
     let node = reloaded.get(&id).expect("node must reload after restart");
     assert_eq!(node.title, "New Node");
     assert_eq!(

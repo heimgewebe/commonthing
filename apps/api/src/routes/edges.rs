@@ -443,36 +443,35 @@ pub(crate) fn max_edges_cache_limit() -> usize {
     }
 }
 
-pub async fn load_edges() -> OrderedCache<Edge> {
+pub async fn load_edges() -> std::io::Result<OrderedCache<Edge>> {
     let start = std::time::Instant::now();
     let path = edges_path();
     let file = match File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(
-                ?path,
-                ?e,
-                "Failed to open edges file, returning empty cache"
-            );
-            return OrderedCache::new();
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OrderedCache::new());
         }
+        Err(error) => return Err(error),
     };
     let mut lines = BufReader::new(file).lines();
     let mut edges = OrderedCache::new();
     let mut records_read = 0;
     let mut duplicates_count = 0;
+    let mut line_number = 0usize;
 
     let max_edges = max_edges_cache_limit();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let edge: Edge = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                // Secure logging: avoid logging full payload, just length and error
-                tracing::warn!(error = %e, line_len = line.len(), "failed to parse edge JSON");
-                continue;
-            }
-        };
+    while let Some(line) = lines.next_line().await? {
+        line_number += 1;
+        let edge: Edge = serde_json::from_str(&line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid edge JSONL at {} line {line_number}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
 
         if !edge_has_valid_faden_metadata(&edge) {
             tracing::warn!(
@@ -517,7 +516,7 @@ pub async fn load_edges() -> OrderedCache<Edge> {
         ?path,
         "Loaded edges into memory cache"
     );
-    edges
+    Ok(edges)
 }
 
 pub async fn list_edges(
@@ -1010,10 +1009,8 @@ fn edge_matches_create(edge: &Edge, expected: &edge_create::ValidatedCreateEdge)
 /// Outcome of inspecting the persisted edges file before a create.
 #[derive(Debug, Clone)]
 struct EdgePersistenceStatus {
-    /// The file already holds at least `max_edges_cache_limit()` lines, so an
-    /// appended record would land on a line index [`load_edges`] never
-    /// materializes after a restart (the loader truncates by *lines read*,
-    /// not by parsed edges — blank or corrupt lines consume slots too).
+    /// The file already holds at least `max_edges_cache_limit()` cache-admissible
+    /// edges, so another appended edge would not be materialized after restart.
     cache_limit_reached: bool,
     /// The id already exists somewhere in the persistence source, even when
     /// it is not in the in-memory cache (e.g. in a suffix the loader
@@ -1023,11 +1020,12 @@ struct EdgePersistenceStatus {
     existing_operation: Option<Edge>,
 }
 
-/// Scan the persisted edges file once before an append, mirroring
-/// [`load_edges`] semantics: a line counts toward the cache limit only if it
-/// parses into an edge that could ever be active (matching
-/// [`edge_is_permanently_unreachable`]); unparseable lines are skipped, and a
-/// final unterminated line is still read. The whole file is scanned — also
+/// Scan the persisted edges file once before an append. Cache-limit accounting
+/// follows [`load_edges`] for parseable edges that could ever be active (matching
+/// [`edge_is_permanently_unreachable`]). This legacy persistence scan still skips
+/// unparseable records so it can preserve and inspect pre-existing files without
+/// rewriting them; unlike this scan, the canonical startup loader now rejects
+/// corrupt records. A final unterminated line is still read. The whole file is scanned — also
 /// beyond the limit — so duplicate ids and an earlier operation result in an
 /// unmaterialized suffix remain detectable regardless of lifecycle validity:
 /// an id must never be reusable just because the record that first claimed
@@ -1060,8 +1058,8 @@ async fn inspect_edge_persistence_for_create(
     while let Some(line) = lines.next_line().await? {
         let value: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
-            // The loader skips unparseable lines; mirror that instead of
-            // introducing a harder failure mode here.
+            // This legacy persistence scan preserves unparseable records instead of
+            // granting them cache semantics or rewriting them.
             Err(_) => continue,
         };
 
@@ -1078,7 +1076,7 @@ async fn inspect_edge_persistence_for_create(
                     format!("idempotent edge record cannot be projected: {error}"),
                 ));
             }
-            // Preserve the loader's historical tolerance for malformed lines.
+            // Preserve this legacy persistence scan's tolerance for malformed records.
             Err(_) => continue,
         };
 

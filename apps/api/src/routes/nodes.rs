@@ -652,37 +652,32 @@ pub(crate) fn map_json_to_node(v: &Value) -> Option<Node> {
 /// - `patch_node` updates both the file (for durability) and this cache (for consistency).
 /// - External modifications to the nodes file (e.g. via deployment or manual edit)
 ///   will NOT be detected until the API process is restarted.
-pub async fn load_nodes() -> OrderedCache<Node> {
-    // The application startup path must complete or reject pending node-delete
-    // recovery before any domain cache is loaded. Keeping recovery out of this
-    // infallible loader prevents a recovery error from being logged and then
-    // silently flattened into a partial cache.
+pub async fn load_nodes() -> std::io::Result<OrderedCache<Node>> {
     let start = std::time::Instant::now();
     let path = nodes_path();
     let file = match File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(
-                ?path,
-                ?e,
-                "Failed to open nodes file, returning empty cache"
-            );
-            return OrderedCache::new();
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OrderedCache::new());
         }
+        Err(error) => return Err(error),
     };
     let mut lines = BufReader::new(file).lines();
     let mut nodes = OrderedCache::new();
     let mut duplicates_count = 0;
-    let mut skipped_count = 0;
+    let mut line_number = 0usize;
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let dto: NodeDto = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                skipped_count += 1;
-                continue;
-            }
-        };
+    while let Some(line) = lines.next_line().await? {
+        line_number += 1;
+        let dto: NodeDto = serde_json::from_str(&line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid node JSONL at {} line {line_number}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
         let node: Node = dto.into();
         if nodes.insert(node.id.clone(), node) {
             // Last-write-wins: Overwrite existing node
@@ -696,25 +691,15 @@ pub async fn load_nodes() -> OrderedCache<Node> {
         .map(|m| m.len())
         .unwrap_or(0);
 
-    if skipped_count > 0 {
-        tracing::warn!(
-            event = "nodes.load.skipped",
-            skipped_count,
-            ?path,
-            "Skipped nodes due to parse errors during load"
-        );
-    }
-
     tracing::info!(
         count = nodes.len(),
         duplicates_count,
-        skipped_count,
         load_ms,
         file_size_bytes,
         ?path,
         "Loaded nodes into memory cache"
     );
-    nodes
+    Ok(nodes)
 }
 
 pub async fn get_node(
