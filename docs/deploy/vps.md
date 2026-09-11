@@ -21,7 +21,7 @@ relations:
 # VPS Deployment Runbook
 
 Dieses Runbook beschreibt den kanonischen Public-Produktionspfad für commonThing unter `commonthing.net`.
-Der VPS `wg-prod-1` stellt API, Datenbank, NATS und den Caddy-Frontdoor bereit. Das
+Der VPS `commonserver` stellt API, Datenbank, NATS und den Caddy-Frontdoor bereit. Das
 Frontend wird im VPS-Checkout gebaut und vom Stack-internen Caddy unter der
 Domain ausgeliefert.
 

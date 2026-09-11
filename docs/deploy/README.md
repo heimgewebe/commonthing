@@ -23,12 +23,12 @@ relations:
 Dieses Dokument beschreibt den **kanonischen Deployment-Stand** von Weltgewebe.
 Es ist normativ. Abweichungen davon gelten als Drift.
 
-**Aktuelle Produktion:** `wg-prod-1` über den Public-VPS-Pfad. Der historische
+**Aktuelle Produktion:** `commonserver` über den Public-VPS-Pfad. Der historische
 Heimserver-Pfad ist retired/deprecated und kein Produktionsziel mehr.
 
 **Weitere Dokumente:**
 
-- [VPS-Deployment](vps.md) – kanonisches Produktionsrunbook für `wg-prod-1`
+- [VPS-Deployment](vps.md) – kanonisches Produktionsrunbook für `commonserver`
 - [Domain-/Providerarchitektur und historischer DDNS-Pfad](domain-mail-migration-ionos-to-inwx-mailbox-brevo.md) – Providerstand, stillgelegter Heimberry-Schreibpfad und Runtime-Beweisgrenze
 - [Sekundäre Domain-Webflächen](secondary-domain-web-surfaces.md) – Artefakt- und Handoff-Vertrag für die Weltweberei-Informationsfläche und den späteren Heimserver-Edge (keine öffentliche Einsatzbereitschaft)
 - [Deployment-Änderungsprotokoll](./CHANGELOG.md) – Infrastrukturänderungen und deren Auswirkungen

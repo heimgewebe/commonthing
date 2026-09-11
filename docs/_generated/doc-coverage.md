@@ -19,4 +19,4 @@ Generated automatically. Do not edit.
 | Platform | 100% | 2 | 2 |
 | Schema | 100% | 1 | 1 |
 | Service | 100% | 9 | 9 |
-| Workflow | 100% | 7 | 7 |
+| Workflow | 100% | 8 | 8 |

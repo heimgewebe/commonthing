@@ -3,7 +3,7 @@ id: deploy.vps-migration-safe-runtime-smoke
 title: VPS Migration-Safe Runtime Smoke
 doc_type: runbook
 status: draft
-summary: Bounded wg-prod-1 runtime smoke path that may start the real API only after proving verify-applied startup migration mode.
+summary: Bounded commonserver runtime smoke path that may start the real API only after proving verify-applied startup migration mode.
 relations:
   - type: relates_to
     target: docs/deploy/vps-http-smoke.md
@@ -35,7 +35,7 @@ route shape and must not start the production API process.
 
 Use this runbook only when all of the following are true:
 
-- a fresh operator decision permits a bounded runtime smoke on `wg-prod-1`
+- a fresh operator decision permits a bounded runtime smoke on `commonserver`
 - the selected repo commit is explicit
 - starting the real API is necessary for the evidence
 - database migrations are outside scope
@@ -169,7 +169,7 @@ value other than `verify-applied`, or the API service sets the key in
 
 ## DB migration-history preflight
 
-Before any further bounded runtime attempt on `wg-prod-1`, run the DB history
+Before any further bounded runtime attempt on `commonserver`, run the DB history
 shape preflight against the already-running PostgreSQL container:
 
 ```bash

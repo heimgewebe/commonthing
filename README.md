@@ -13,11 +13,11 @@ Datenbankmigrationen, Compose-Profile, Caddy-Konfiguration und Betriebswerkzeuge
 - **API:** Rust, Axum und Tokio.
 - **Authentifizierung:** Magic Links, Passkeys und profilweit persistente
   HTTP-only-Sitzungscookies.
-- **Domänendaten:** Im belegten Produktionspfad `wg-prod-1` ist PostgreSQL die
+- **Domänendaten:** Im belegten Produktionspfad `commonserver` ist PostgreSQL die
   Lese- und Schreibwahrheit für Accounts/Garnrollen, Knoten und Fäden. JSONL
   bleibt nur lokaler, Legacy- oder expliziter Rollback-/Importpfad.
 - **Betrieb:** Docker Compose und Caddy; der öffentliche Produktionspfad ist
-  `wg-prod-1` mit statischer interner Caddy-Auslieferung des Web-Builds.
+  `commonserver` mit statischer interner Caddy-Auslieferung des Web-Builds.
 - **Produktfluss:** Anmeldung, persistente Garnrolle, Knoten und zugehöriger
   Faden sind als PostgreSQL-Produktionsfluss belegt. Offene Arbeit betrifft
   Skalierung, Referenzintegrität, wiederholte Geräteabnahme und weitere
