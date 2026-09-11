@@ -479,6 +479,24 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
         self.assertIn("\nPY\n    rm -f", receipt_function)
         self.assertNotIn("python3 << 'PY' || {", receipt_function)
 
+    def test_germany_builder_falls_back_when_wget_lacks_http_retry_support(self) -> None:
+        builder = BUILD_SCRIPT.read_text(encoding="utf-8")
+        selector_start = builder.index("if command -v wget > /dev/null 2>&1 &&")
+        selector_end = builder.index('mkdir -p "$BASEMAP_DIR"', selector_start)
+        selector = builder[selector_start:selector_end]
+
+        self.assertIn(
+            '[[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]]',
+            selector,
+        )
+        self.assertIn('DOWNLOADER="wget"', selector)
+        self.assertIn('elif command -v curl > /dev/null 2>&1; then', selector)
+        self.assertIn('DOWNLOADER="curl"', selector)
+        self.assertIn(
+            "wget lacks required --retry-on-http-error support and curl is unavailable",
+            selector,
+        )
+
     def test_germany_builder_bounds_auxiliary_download_retries_and_timeouts(self) -> None:
         builder = BUILD_SCRIPT.read_text(encoding="utf-8")
         function_start = builder.index("download_verified_auxiliary() {")

@@ -118,10 +118,13 @@ else
   fail "sha256sum or shasum is required"
 fi
 
-if command -v wget > /dev/null 2>&1; then
+if command -v wget > /dev/null 2>&1 &&
+  [[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]]; then
   DOWNLOADER="wget"
 elif command -v curl > /dev/null 2>&1; then
   DOWNLOADER="curl"
+elif command -v wget > /dev/null 2>&1; then
+  fail "wget lacks required --retry-on-http-error support and curl is unavailable"
 else
   fail "wget or curl is required"
 fi
