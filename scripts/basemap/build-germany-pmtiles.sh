@@ -118,19 +118,31 @@ else
   fail "sha256sum or shasum is required"
 fi
 
-DOWNLOADER=""
+OSM_DOWNLOADER=""
+AUXILIARY_DOWNLOADER=""
 
-select_downloader() {
-  [[ -n "$DOWNLOADER" ]] && return 0
+select_osm_downloader() {
+  [[ -n "$OSM_DOWNLOADER" ]] && return 0
+  if command -v wget > /dev/null 2>&1; then
+    OSM_DOWNLOADER="wget"
+  elif command -v curl > /dev/null 2>&1; then
+    OSM_DOWNLOADER="curl"
+  else
+    fail "wget or curl is required"
+  fi
+}
+
+select_auxiliary_downloader() {
+  [[ -n "$AUXILIARY_DOWNLOADER" ]] && return 0
   if command -v wget > /dev/null 2>&1 &&
     [[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]] &&
     command -v timeout > /dev/null 2>&1 &&
     [[ "$(timeout --help 2>&1)" == *"--kill-after"* ]]; then
-    DOWNLOADER="wget"
+    AUXILIARY_DOWNLOADER="wget"
   elif command -v curl > /dev/null 2>&1 &&
     [[ "$(curl --help all 2>&1)" == *"--retry-all-errors"* ]] &&
     [[ "$(curl --help all 2>&1)" == *"--retry-max-time"* ]]; then
-    DOWNLOADER="curl"
+    AUXILIARY_DOWNLOADER="curl"
   elif command -v wget > /dev/null 2>&1; then
     fail "wget lacks required --retry-on-http-error/overall-deadline timeout support and curl is unavailable or lacks required --retry-all-errors/--retry-max-time support"
   elif command -v curl > /dev/null 2>&1; then
@@ -226,10 +238,10 @@ for immutable_output in "$FINAL_PMTILES_PATH" "$FINAL_BUILD_RECEIPT_PATH" "$FINA
 done
 
 if [[ ! -f "$OSM_FILE" ]]; then
-  select_downloader
+  select_osm_downloader
   PARTIAL_INPUT_PATH="$BASEMAP_DIR/.${OSM_FILE}.partial.$$"
   echo ">> Downloading pinned Germany OSM snapshot..."
-  if [[ "$DOWNLOADER" == "wget" ]]; then
+  if [[ "$OSM_DOWNLOADER" == "wget" ]]; then
     wget -qO "$PARTIAL_INPUT_PATH" "$OSM_URL" ||
       fail "download failed: $OSM_URL"
   else
@@ -266,12 +278,12 @@ download_verified_auxiliary() {
   [[ ! -L "$target" ]] || fail "$label cache path must not be a symlink: $target"
 
   if [[ ! -e "$target" ]]; then
-    select_downloader
+    select_auxiliary_downloader
     partial="${target}.partial.$$"
     PARTIAL_AUXILIARY_PATHS+=("$partial")
     rm -f -- "$partial"
     echo ">> Downloading pinned $label source..."
-    if [[ "$DOWNLOADER" == "wget" ]]; then
+    if [[ "$AUXILIARY_DOWNLOADER" == "wget" ]]; then
       if timeout --kill-after=5s 900s wget --tries=5 --waitretry=3 \
         --retry-connrefused \
         --retry-on-http-error=429,500,502,503,504 --timeout=30 -nv \
