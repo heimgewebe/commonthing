@@ -521,9 +521,9 @@ async fn nodes_patch_rejects_oversized_info_without_side_effects() -> anyhow::Re
     Ok(())
 }
 
-#[tokio::test]
-#[serial]
-async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Result<()> {
+async fn assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(
+    corruption: &[u8],
+) -> anyhow::Result<()> {
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");
     let nodes_path = in_dir.join("demo.nodes.jsonl");
@@ -560,7 +560,7 @@ async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Res
     // test focused on the PATCH rewrite path while the startup loader itself
     // remains strict.
     let mut original = startup_bytes;
-    original.extend_from_slice(&[0xff, 0xfe, b'\n']);
+    original.extend_from_slice(corruption);
     fs::write(&nodes_path, &original)?;
     let session = create_session(&state, "cccccccc-cccc-4ccc-8ccc-000000000001", None).await;
     let cookie = format!("gewebe_session={}", session.id);
@@ -615,6 +615,19 @@ async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Res
     );
 
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Result<()> {
+    assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(&[0xff, 0xfe, b'\n']).await
+}
+
+#[tokio::test]
+#[serial]
+async fn nodes_patch_unprojectable_retained_record_keeps_canonical_jsonl_unchanged(
+) -> anyhow::Result<()> {
+    assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(b"{\"id\":\"bad\"}\n").await
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@ use super::{
     },
     edges::{
         edge_create_persist_lock, edge_references_node_for_delete,
-        edge_value_references_node_for_delete, EdgeEndpointCollisionEvidence,
+        edge_value_references_node_for_delete, Edge, EdgeEndpointCollisionEvidence,
     },
     health::{ensure_jsonl_size, load_policy_limits, PolicyLimits},
     query::{
@@ -364,24 +364,6 @@ mod node_patch_validation_tests {
     }
 }
 
-/// Lightweight struct for fast-path ID checking during node rewrites.
-///
-/// Used to check if a line matches the target node ID without fully parsing
-/// the entire JSON `Value`. This avoids full deserialization for non-matching
-/// lines during PATCH, PUT and DELETE preparation and keeps memory usage O(1).
-#[derive(Deserialize)]
-struct IdOnly {
-    id: Option<String>,
-}
-
-fn jsonl_line_has_id(line: &str, target_id: &str) -> bool {
-    serde_json::from_str::<IdOnly>(line)
-        .ok()
-        .and_then(|record| record.id)
-        .as_deref()
-        == Some(target_id)
-}
-
 #[derive(Deserialize)]
 struct LocationDto {
     #[serde(deserialize_with = "deserialize_f64_or_string")]
@@ -417,6 +399,18 @@ struct NodeDto {
     #[serde(default, deserialize_with = "deserialize_opt_string_loose")]
     address: Option<String>,
     location: LocationDto,
+}
+
+fn parse_node_jsonl_dto(line: &str, path: &FsPath, line_number: usize) -> std::io::Result<NodeDto> {
+    serde_json::from_str(line).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "invalid node JSONL at {} line {line_number}: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn deserialize_opt_string_loose<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -669,15 +663,7 @@ pub async fn load_nodes() -> std::io::Result<OrderedCache<Node>> {
 
     while let Some(line) = lines.next_line().await? {
         line_number += 1;
-        let dto: NodeDto = serde_json::from_str(&line).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "invalid node JSONL at {} line {line_number}: {error}",
-                    path.display()
-                ),
-            )
-        })?;
+        let dto = parse_node_jsonl_dto(&line, &path, line_number)?;
         let node: Node = dto.into();
         if nodes.insert(node.id.clone(), node) {
             // Last-write-wins: Overwrite existing node
@@ -2381,8 +2367,20 @@ mod node_record_tests {
         });
         let first_line = serde_json::to_string(&record).expect("node record");
         let maximum_bytes = 1024 * 1024;
-        let filler_len = maximum_bytes - first_line.len() - 2;
-        let original = format!("{first_line}\n{}\n", "x".repeat(filler_len));
+        let empty_filler_line = serde_json::to_string(&json!({
+            "id": "filler-node",
+            "location": {"lat": 0.0, "lon": 0.0},
+            "info": ""
+        }))
+        .expect("empty filler node");
+        let filler_len = maximum_bytes - first_line.len() - empty_filler_line.len() - 2;
+        let filler_line = serde_json::to_string(&json!({
+            "id": "filler-node",
+            "location": {"lat": 0.0, "lon": 0.0},
+            "info": "x".repeat(filler_len)
+        }))
+        .expect("filler node");
+        let original = format!("{first_line}\n{filler_line}\n");
         fs::write(nodes_path(), original.as_bytes()).expect("write boundary nodes");
         assert_eq!(original.len(), maximum_bytes);
         let mut node = map_json_to_node(&record).expect("node projection");
@@ -2395,6 +2393,89 @@ mod node_record_tests {
         assert_eq!(
             fs::read(nodes_path()).expect("canonical nodes remain readable"),
             original.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn jsonl_node_replace_rejects_unprojectable_retained_record() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let in_dir = tmp.path().join("in");
+        fs::create_dir_all(&in_dir).expect("create input directory");
+        let policy = tmp.path().join("limits.yaml");
+        fs::write(&policy, "max_nodes_jsonl_mb: 1\nmax_edges_jsonl_mb: 1\n")
+            .expect("write limits policy");
+        let _policy = EnvGuard::set(
+            "POLICY_LIMITS_PATH",
+            policy.to_str().expect("UTF-8 policy path"),
+        );
+        let _data = EnvGuard::set("GEWEBE_IN_DIR", in_dir.to_str().expect("UTF-8 input path"));
+
+        let target = json!({
+            "id": "target-node",
+            "kind": "Ort",
+            "title": "Vorher",
+            "location": {"lat": 53.5, "lon": 10.0}
+        });
+        let target_line = serde_json::to_string(&target).expect("target node");
+        let original = format!("{target_line}\n{{\"id\":\"bad\"}}\n");
+        fs::write(nodes_path(), original.as_bytes()).expect("write nodes");
+        let mut node = map_json_to_node(&target).expect("target projection");
+        node.title = "Nachher".to_string();
+
+        let error = replace_node_jsonl(&node)
+            .await
+            .expect_err("rewrite must reject retained record startup cannot project");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(nodes_path()).expect("canonical nodes"),
+            original.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn jsonl_delete_rewrites_reject_unprojectable_retained_records() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let in_dir = tmp.path().join("in");
+        fs::create_dir_all(&in_dir).expect("create input directory");
+        let _data = EnvGuard::set("GEWEBE_IN_DIR", in_dir.to_str().expect("UTF-8 input path"));
+
+        let target = json!({
+            "id": "target-node",
+            "kind": "Ort",
+            "title": "Target",
+            "location": {"lat": 53.5, "lon": 10.0}
+        });
+        let target_line = serde_json::to_string(&target).expect("target node");
+        let original_nodes = format!("{target_line}\n{{\"id\":\"bad\"}}\n");
+        fs::write(nodes_path(), original_nodes.as_bytes()).expect("write nodes");
+        let node_tmp = in_dir.join("nodes-delete.tmp");
+
+        let node_error = prepare_node_delete_tmp(&nodes_path(), &node_tmp, "target-node")
+            .await
+            .expect_err("node delete rewrite must reject unprojectable retained node");
+        assert_eq!(node_error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(nodes_path()).expect("canonical nodes"),
+            original_nodes.as_bytes()
+        );
+
+        let invalid_edge = b"{\"id\":\"bad\"}\n";
+        fs::write(edges_path(), invalid_edge).expect("write invalid edge");
+        let edge_tmp = in_dir.join("edges-delete.tmp");
+        let edge_error = prepare_edge_delete_tmp(
+            &edges_path(),
+            &edge_tmp,
+            "target-node",
+            EdgeEndpointCollisionEvidence::default(),
+        )
+        .await
+        .expect_err("edge delete rewrite must reject edge startup cannot project");
+        assert_eq!(edge_error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(edges_path()).expect("canonical edges"),
+            invalid_edge
         );
     }
 
@@ -2437,9 +2518,12 @@ async fn replace_node_jsonl(node: &Node) -> std::io::Result<bool> {
             .await?;
         let mut writer = BufWriter::new(tmp_file);
         let mut replaced = false;
+        let mut line_number = 0usize;
         while let Some(line) = lines.next_line().await? {
+            line_number += 1;
+            let dto = parse_node_jsonl_dto(&line, &path, line_number)?;
             let mut output = line.clone();
-            if jsonl_line_has_id(&line, &node.id) {
+            if dto.id == node.id {
                 let mut value = serde_json::from_str::<Value>(&line)
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
                 set_node_record_fields(&mut value, node)?;
@@ -2830,10 +2914,12 @@ async fn prepare_node_delete_tmp(
         .await?;
     let mut writer = BufWriter::new(tmp_file);
     let mut deleted = false;
+    let mut line_number = 0usize;
 
     while let Some(line) = lines.next_line().await? {
-        let matches = jsonl_line_has_id(&line, node_id);
-        if matches {
+        line_number += 1;
+        let dto = parse_node_jsonl_dto(&line, source_path, line_number)?;
+        if dto.id == node_id {
             deleted = true;
             continue;
         }
@@ -2879,6 +2965,12 @@ async fn prepare_edge_delete_tmp(
             line_number += 1;
             let value = serde_json::from_str::<Value>(&line).map_err(|error| {
                 io_invalid_data(format!("invalid edge JSONL at line {line_number}: {error}"))
+            })?;
+            serde_json::from_value::<Edge>(value.clone()).map_err(|error| {
+                io_invalid_data(format!(
+                    "invalid edge JSONL at {} line {line_number}: {error}",
+                    source_path.display()
+                ))
             })?;
             if edge_value_references_node_for_delete(&value, node_id, evidence)? {
                 let edge_id = value.get("id").and_then(Value::as_str).ok_or_else(|| {
@@ -3616,23 +3708,22 @@ async fn patch_node_jsonl(
         let mut writer = BufWriter::new(tmp_file);
         let mut found_node: Option<Node> = None;
         let mut updated = false;
+        let mut line_number = 0usize;
 
         while let Some(line) = lines
             .next_line()
             .await
             .map_err(|_| NodeMutationError::Status(StatusCode::INTERNAL_SERVER_ERROR))?
         {
-            // Optimization: check ID without parsing full Value
-            let should_update = match serde_json::from_str::<IdOnly>(&line) {
-                Ok(obj) => obj.id.as_deref() == Some(id.as_str()),
-                Err(_) => return Err(NodeMutationError::Status(StatusCode::INTERNAL_SERVER_ERROR)),
-            };
+            line_number += 1;
+            let dto = parse_node_jsonl_dto(&line, &path, line_number)
+                .map_err(|_| NodeMutationError::Status(StatusCode::INTERNAL_SERVER_ERROR))?;
+            let should_update = dto.id == id;
 
             if should_update {
+                let current_projection: Node = dto.into();
                 let mut v: Value =
                     serde_json::from_str(&line).map_err(|_| NodeMutationError::Status(StatusCode::INTERNAL_SERVER_ERROR))?;
-                let current_projection = map_json_to_node(&v)
-                    .ok_or(NodeMutationError::Status(StatusCode::INTERNAL_SERVER_ERROR))?;
 
                 // Compare the public node projection, not just raw JSON shape:
                 // legacy rows without an explicit visibility already mean
