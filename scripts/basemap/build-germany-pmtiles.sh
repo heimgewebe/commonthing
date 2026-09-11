@@ -270,7 +270,8 @@ download_verified_auxiliary() {
       fi
     else
       if curl -fL --retry 4 --retry-delay 3 --retry-all-errors \
-        --connect-timeout 30 --speed-limit 1024 --speed-time 30 \
+        --retry-max-time 120 --connect-timeout 30 \
+        --speed-limit 1024 --speed-time 30 \
         -o "$partial" "$url"; then
         :
       else

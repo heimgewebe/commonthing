@@ -500,6 +500,7 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
             "--retry 4",
             "--retry-delay 3",
             "--retry-all-errors",
+            "--retry-max-time 120",
             "--connect-timeout 30",
             "--speed-limit 1024",
             "--speed-time 30",
