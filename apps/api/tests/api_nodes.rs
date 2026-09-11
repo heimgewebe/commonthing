@@ -523,6 +523,96 @@ async fn nodes_patch_rejects_oversized_info_without_side_effects() -> anyhow::Re
 
 #[tokio::test]
 #[serial]
+async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let nodes_path = in_dir.join("demo.nodes.jsonl");
+    fs::create_dir_all(&in_dir)?;
+
+    let valid_line = br#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info","updated_at":"2026-01-01T00:00:00Z"}"#;
+    let mut original = valid_line.to_vec();
+    original.extend_from_slice(b"\n");
+    original.extend_from_slice(&[0xff, 0xfe, b'\n']);
+    fs::write(&nodes_path, &original)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let mut account_map = AccountStore::new();
+    account_map.insert(AccountInternal {
+        public: AccountPublic {
+            id: "cccccccc-cccc-4ccc-8ccc-000000000001".to_string(),
+            kind: "garnrolle".to_string(),
+            title: "Weber".to_string(),
+            summary: None,
+            public_pos: None,
+            map_state: weltgewebe_api::routes::accounts::GarnrolleMapState::NotOnMap,
+            radius_m: 0,
+            disabled: false,
+            tags: vec![],
+        },
+        role: Role::Weber,
+        email: Some("cccccccc-cccc-4ccc-8ccc-000000000001@example.com".to_string()),
+        webauthn_user_id: uuid::Uuid::new_v4(),
+    });
+
+    let mut state = test_state().await?;
+    state.accounts = Arc::new(RwLock::new(account_map));
+    let session = create_session(&state, "cccccccc-cccc-4ccc-8ccc-000000000001", None).await;
+    let cookie = format!("gewebe_session={}", session.id);
+    let app = Router::new()
+        .merge(api_router())
+        .layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state.clone());
+
+    let current = app
+        .clone()
+        .oneshot(Request::get("/nodes/n1").body(body::Body::empty())?)
+        .await?;
+    assert_eq!(current.status(), StatusCode::OK);
+    let current_body = body::to_bytes(current.into_body(), usize::MAX).await?;
+    let current_node: serde_json::Value = serde_json::from_slice(&current_body)?;
+    let etag = node_etag(&current_node);
+
+    let response = app
+        .oneshot(
+            Request::patch("/nodes/n1")
+                .header("Content-Type", "application/json")
+                .header("Cookie", cookie)
+                .header("Host", "localhost")
+                .header("Origin", "http://localhost")
+                .header("If-Match", etag)
+                .body(body::Body::from(r#"{"info":"New Info"}"#))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert_eq!(fs::read(&nodes_path)?, original);
+    let cached_info = state
+        .nodes
+        .read()
+        .await
+        .get("n1")
+        .and_then(|node| node.info.clone());
+    assert_eq!(cached_info.as_deref(), Some("Old Info"));
+    assert_eq!(
+        fs::read_dir(&in_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("demo.nodes.jsonl.tmp.")
+            })
+            .count(),
+        0,
+        "failed PATCH must remove its temporary rewrite file"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn postgres_read_source_blocks_node_patch_without_persisting() -> anyhow::Result<()> {
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");

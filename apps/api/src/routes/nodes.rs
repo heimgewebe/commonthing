@@ -3619,7 +3619,11 @@ async fn patch_node_jsonl(
         let mut found_node: Option<Node> = None;
         let mut updated = false;
 
-        while let Ok(Some(line)) = lines.next_line().await {
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|_| NodeMutationError::Status(StatusCode::INTERNAL_SERVER_ERROR))?
+        {
             // Optimization: check ID without parsing full Value
             let should_update = match serde_json::from_str::<IdOnly>(&line) {
                 Ok(obj) => obj.id.as_deref() == Some(id.as_str()),
