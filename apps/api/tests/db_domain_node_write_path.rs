@@ -1497,7 +1497,7 @@ async fn jsonl_default_node_patch_compiles_and_routes_correctly() -> Result<()> 
     accounts.insert(admin_operator("writepath-node-admin-6"));
     let rate_limiter = Arc::new(AuthRateLimiter::new(&config));
 
-    let nodes = weltgewebe_api::routes::nodes::load_nodes().await;
+    let nodes = weltgewebe_api::routes::nodes::load_nodes().await?;
 
     let state = ApiState {
         db_pool: None,

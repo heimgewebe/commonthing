@@ -600,10 +600,14 @@ async fn jsonl_postgres_legacy_list_order_gap_diagnostic() {
     .expect("insert accounts");
 
     // 3. Execute Loaders
-    let jsonl_nodes = weltgewebe_api::routes::nodes::load_nodes().await;
+    let jsonl_nodes = weltgewebe_api::routes::nodes::load_nodes()
+        .await
+        .expect("load canonical JSONL nodes");
     let pg_nodes = load_nodes_from_postgres(&pool).await.unwrap();
 
-    let jsonl_edges = weltgewebe_api::routes::edges::load_edges().await;
+    let jsonl_edges = weltgewebe_api::routes::edges::load_edges()
+        .await
+        .expect("load canonical JSONL edges");
     let pg_edges = load_edges_from_postgres(&pool).await.unwrap();
 
     let jsonl_accounts = weltgewebe_api::routes::accounts::load_all_accounts()

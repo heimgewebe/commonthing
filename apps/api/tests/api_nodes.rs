@@ -99,7 +99,7 @@ async fn test_state() -> Result<ApiState> {
         step_up_tokens: weltgewebe_api::auth::step_up_tokens::StepUpTokenStore::new(),
         accounts: Arc::new(RwLock::new(AccountStore::new())),
         nodes: Arc::new(tokio::sync::RwLock::new(
-            weltgewebe_api::routes::nodes::load_nodes().await,
+            weltgewebe_api::routes::nodes::load_nodes().await?,
         )),
         nodes_persist: Arc::new(tokio::sync::Mutex::new(())),
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),
@@ -445,6 +445,74 @@ async fn nodes_patch_info_lifecycle() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn nodes_patch_legacy_null_visibility_stays_public_across_cache_and_restart(
+) -> anyhow::Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let nodes_path = in_dir.join("demo.nodes.jsonl");
+    write_lines(
+        &nodes_path,
+        &[
+            r#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old","search_visibility":null}"#,
+        ],
+    );
+
+    let (app, cookie, _state, _env) = app_with_account(
+        &in_dir,
+        weber_account("cccccccc-cccc-4ccc-8ccc-000000000001"),
+    )
+    .await;
+
+    let initial = app
+        .clone()
+        .oneshot(Request::get("/nodes/n1").body(body::Body::empty())?)
+        .await?;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial_body = body::to_bytes(initial.into_body(), usize::MAX).await?;
+    let initial_node: serde_json::Value = serde_json::from_slice(&initial_body)?;
+    assert_eq!(initial_node["search_visibility"], "public");
+    let etag = node_etag(&initial_node);
+
+    let patch = Request::patch("/nodes/n1")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .header("Host", "localhost")
+        .header("Origin", "http://localhost")
+        .header("If-Match", etag)
+        .body(body::Body::from(r#"{"info":"New"}"#))?;
+    let patched = app.clone().oneshot(patch).await?;
+    assert_eq!(patched.status(), StatusCode::OK);
+    let patched_body = body::to_bytes(patched.into_body(), usize::MAX).await?;
+    let patched_node: serde_json::Value = serde_json::from_slice(&patched_body)?;
+    assert_eq!(patched_node["info"], "New");
+    assert_eq!(patched_node["search_visibility"], "public");
+
+    let cached = app
+        .oneshot(Request::get("/nodes/n1").body(body::Body::empty())?)
+        .await?;
+    let cached_body = body::to_bytes(cached.into_body(), usize::MAX).await?;
+    let cached_node: serde_json::Value = serde_json::from_slice(&cached_body)?;
+    assert_eq!(cached_node["search_visibility"], "public");
+
+    let persisted: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&nodes_path)?.trim())?;
+    assert!(persisted["search_visibility"].is_null());
+
+    let restarted = weltgewebe_api::routes::nodes::load_nodes().await?;
+    assert_eq!(
+        restarted
+            .get("n1")
+            .context("node must reload")?
+            .search_visibility
+            .as_str(),
+        "public"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn nodes_patch_rejects_oversized_info_without_side_effects() -> anyhow::Result<()> {
     const INFO_MAX_LEN: usize = 20_000;
     let tmp = make_tmp_dir();
@@ -521,19 +589,18 @@ async fn nodes_patch_rejects_oversized_info_without_side_effects() -> anyhow::Re
     Ok(())
 }
 
-#[tokio::test]
-#[serial]
-async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Result<()> {
+async fn assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(
+    corruption: &[u8],
+) -> anyhow::Result<()> {
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");
     let nodes_path = in_dir.join("demo.nodes.jsonl");
     fs::create_dir_all(&in_dir)?;
 
     let valid_line = br#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info","updated_at":"2026-01-01T00:00:00Z"}"#;
-    let mut original = valid_line.to_vec();
-    original.extend_from_slice(b"\n");
-    original.extend_from_slice(&[0xff, 0xfe, b'\n']);
-    fs::write(&nodes_path, &original)?;
+    let mut startup_bytes = valid_line.to_vec();
+    startup_bytes.extend_from_slice(b"\n");
+    fs::write(&nodes_path, &startup_bytes)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
     let mut account_map = AccountStore::new();
@@ -556,6 +623,13 @@ async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Res
 
     let mut state = test_state().await?;
     state.accounts = Arc::new(RwLock::new(account_map));
+
+    // Corrupt the canonical file only after a valid startup. This keeps the
+    // test focused on the PATCH rewrite path while the startup loader itself
+    // remains strict.
+    let mut original = startup_bytes;
+    original.extend_from_slice(corruption);
+    fs::write(&nodes_path, &original)?;
     let session = create_session(&state, "cccccccc-cccc-4ccc-8ccc-000000000001", None).await;
     let cookie = format!("gewebe_session={}", session.id);
     let app = Router::new()
@@ -609,6 +683,19 @@ async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Res
     );
 
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Result<()> {
+    assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(&[0xff, 0xfe, b'\n']).await
+}
+
+#[tokio::test]
+#[serial]
+async fn nodes_patch_unprojectable_retained_record_keeps_canonical_jsonl_unchanged(
+) -> anyhow::Result<()> {
+    assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(b"{\"id\":\"bad\"}\n").await
 }
 
 #[tokio::test]
@@ -936,7 +1023,6 @@ async fn nodes_robustness_with_dirty_data() -> anyhow::Result<()> {
             r#"{"id": "n4", "kind": "Dirty Title", "title": true, "location": {"lat": 52.5, "lon": 13.4}}"#,
             r#"{"id": "n5", "kind": "Dirty Info", "title": "Dirty Info", "info": {"foo": "bar"}, "location": {"lat": 52.5, "lon": 13.4}}"#,
             r#"{"id": "n6", "title": "Dirty Tags", "tags": ["clean", 123, null, "also-clean"], "location": {"lat": 52.5, "lon": 13.4}}"#,
-            r#"{broken_json"#, // Malformed JSON line -> should be skipped
         ],
     )
     .await;
@@ -1281,7 +1367,7 @@ async fn nodes_post_creates_persists_and_reloads() -> anyhow::Result<()> {
     }
 
     // Simulated restart: reload from JSONL alone reconstructs the node.
-    let reloaded = weltgewebe_api::routes::nodes::load_nodes().await;
+    let reloaded = weltgewebe_api::routes::nodes::load_nodes().await?;
     let node = reloaded.get(&id).expect("node must reload after restart");
     assert_eq!(node.title, "New Node");
     assert_eq!(
@@ -1289,6 +1375,53 @@ async fn nodes_post_creates_persists_and_reloads() -> anyhow::Result<()> {
         Some("Musterstraße 1, 12345 Musterstadt")
     );
     assert_eq!(node.tags, vec!["a".to_string(), "b".to_string()]);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn nodes_post_rejects_corrupt_existing_jsonl_after_startup() -> anyhow::Result<()> {
+    for corrupt_line in [
+        r#"{broken_json"#,
+        r#"{"id":"missing-required-node-fields"}"#,
+    ] {
+        let tmp = make_tmp_dir();
+        let in_dir = tmp.path().join("in");
+        std::fs::create_dir_all(&in_dir)?;
+
+        let (app, cookie, state, _env) = app_with_account(
+            &in_dir,
+            weber_account("cccccccc-cccc-4ccc-8ccc-000000000001"),
+        )
+        .await;
+        let nodes_path = in_dir.join("demo.nodes.jsonl");
+        fs::write(&nodes_path, corrupt_line)?;
+        let before = fs::read(&nodes_path)?;
+        let request_body = r#"{"title":"New Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.55,"lon":9.99},"operation_id":"10000000-0000-0000-0000-000000000099"}"#;
+
+        let res = app
+            .oneshot(post_node_req(Some(&cookie), request_body))
+            .await?;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let response = body::to_bytes(res.into_body(), usize::MAX).await?;
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.contains("failed to inspect node create operation"),
+            "body: {text}"
+        );
+
+        assert_eq!(
+            fs::read(&nodes_path)?,
+            before,
+            "corrupt source must stay byte-identical"
+        );
+        assert_eq!(
+            state.nodes.read().await.len(),
+            0,
+            "failed create must not populate cache"
+        );
+    }
 
     Ok(())
 }

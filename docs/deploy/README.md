@@ -202,8 +202,10 @@ Produktions-Compose-Vertrag `infra/compose/compose.prod.yml` setzt dagegen Lesen
 und alle vorhandenen Domänenschreibpfade gemeinsam auf `postgres`. Ein laufender
 Serverzustand muss zusätzlich durch Runtime-Evidence belegt werden.
 
-- **MAX_EDGES_CACHE**: Obergrenze der beim Start geladenen Edges (Default `500000`).
-  Bei Erreichen wird die Datei nicht weiter gelesen und eine Warnung geloggt.
+- **MAX_EDGES_CACHE**: Obergrenze der beim Start im Speicher gehaltenen Edges
+  (Default `500000`). Bei Erreichen werden keine weiteren Edges gecacht und eine
+  Warnung geloggt; die restliche kanonische JSONL-Datei wird weiterhin vollständig
+  gelesen und validiert, damit Korruption hinter der Cache-Grenze den Start stoppt.
 - **policies/limits.yaml / max_nodes_jsonl_mb**: maximale resultierende Größe
   für kanonische JSONL-Knoten-Appends und -Rewrites. Der Grenzfall ist erlaubt;
   ein zusätzliches Byte wird vor dem kanonischen Commit abgewiesen.
