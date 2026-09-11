@@ -118,22 +118,27 @@ else
   fail "sha256sum or shasum is required"
 fi
 
-if command -v wget > /dev/null 2>&1 &&
-  [[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]] &&
-  command -v timeout > /dev/null 2>&1 &&
-  [[ "$(timeout --help 2>&1)" == *"--kill-after"* ]]; then
-  DOWNLOADER="wget"
-elif command -v curl > /dev/null 2>&1 &&
-  [[ "$(curl --help all 2>&1)" == *"--retry-all-errors"* ]] &&
-  [[ "$(curl --help all 2>&1)" == *"--retry-max-time"* ]]; then
-  DOWNLOADER="curl"
-elif command -v wget > /dev/null 2>&1; then
-  fail "wget lacks required --retry-on-http-error/overall-deadline timeout support and curl is unavailable or lacks required --retry-all-errors/--retry-max-time support"
-elif command -v curl > /dev/null 2>&1; then
-  fail "curl lacks required --retry-all-errors/--retry-max-time support"
-else
-  fail "wget or curl is required"
-fi
+DOWNLOADER=""
+
+select_downloader() {
+  [[ -n "$DOWNLOADER" ]] && return 0
+  if command -v wget > /dev/null 2>&1 &&
+    [[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]] &&
+    command -v timeout > /dev/null 2>&1 &&
+    [[ "$(timeout --help 2>&1)" == *"--kill-after"* ]]; then
+    DOWNLOADER="wget"
+  elif command -v curl > /dev/null 2>&1 &&
+    [[ "$(curl --help all 2>&1)" == *"--retry-all-errors"* ]] &&
+    [[ "$(curl --help all 2>&1)" == *"--retry-max-time"* ]]; then
+    DOWNLOADER="curl"
+  elif command -v wget > /dev/null 2>&1; then
+    fail "wget lacks required --retry-on-http-error/overall-deadline timeout support and curl is unavailable or lacks required --retry-all-errors/--retry-max-time support"
+  elif command -v curl > /dev/null 2>&1; then
+    fail "curl lacks required --retry-all-errors/--retry-max-time support"
+  else
+    fail "wget or curl is required"
+  fi
+}
 
 mkdir -p "$BASEMAP_DIR"
 BASEMAP_DIR="$(cd "$BASEMAP_DIR" > /dev/null 2>&1 && pwd)"
@@ -221,6 +226,7 @@ for immutable_output in "$FINAL_PMTILES_PATH" "$FINAL_BUILD_RECEIPT_PATH" "$FINA
 done
 
 if [[ ! -f "$OSM_FILE" ]]; then
+  select_downloader
   PARTIAL_INPUT_PATH="$BASEMAP_DIR/.${OSM_FILE}.partial.$$"
   echo ">> Downloading pinned Germany OSM snapshot..."
   if [[ "$DOWNLOADER" == "wget" ]]; then
@@ -260,6 +266,7 @@ download_verified_auxiliary() {
   [[ ! -L "$target" ]] || fail "$label cache path must not be a symlink: $target"
 
   if [[ ! -e "$target" ]]; then
+    select_downloader
     partial="${target}.partial.$$"
     PARTIAL_AUXILIARY_PATHS+=("$partial")
     rm -f -- "$partial"

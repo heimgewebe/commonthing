@@ -481,7 +481,7 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
 
     def test_germany_builder_falls_back_when_wget_lacks_retry_or_deadline_support(self) -> None:
         builder = BUILD_SCRIPT.read_text(encoding="utf-8")
-        selector_start = builder.index("if command -v wget > /dev/null 2>&1 &&")
+        selector_start = builder.index("select_downloader() {")
         selector_end = builder.index('mkdir -p "$BASEMAP_DIR"', selector_start)
         selector = builder[selector_start:selector_end]
 
@@ -507,6 +507,25 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
             "wget lacks required --retry-on-http-error/overall-deadline timeout support and curl is unavailable or lacks required --retry-all-errors/--retry-max-time support",
             selector,
         )
+
+    def test_germany_builder_defers_downloader_probe_until_download_is_needed(self) -> None:
+        builder = BUILD_SCRIPT.read_text(encoding="utf-8")
+        selector_start = builder.index("select_downloader() {")
+        selector_end = builder.index('mkdir -p "$BASEMAP_DIR"', selector_start)
+        osm_missing = builder.index('if [[ ! -f "$OSM_FILE" ]]; then')
+        osm_select = builder.index("  select_downloader", selector_end)
+        osm_use = builder.index('if [[ "$DOWNLOADER" == "wget" ]]', osm_select)
+        auxiliary_start = builder.index("download_verified_auxiliary() {")
+        auxiliary_missing = builder.index('if [[ ! -e "$target" ]]; then', auxiliary_start)
+        auxiliary_select = builder.index("    select_downloader", auxiliary_missing)
+        auxiliary_use = builder.index('if [[ "$DOWNLOADER" == "wget" ]]', auxiliary_select)
+
+        self.assertLess(selector_end, osm_missing)
+        self.assertLess(osm_missing, osm_select)
+        self.assertLess(osm_select, osm_use)
+        self.assertLess(auxiliary_missing, auxiliary_select)
+        self.assertLess(auxiliary_select, auxiliary_use)
+        self.assertEqual(builder.count("  select_downloader\n"), 2)
 
     def test_germany_builder_bounds_auxiliary_download_retries_and_timeouts(self) -> None:
         builder = BUILD_SCRIPT.read_text(encoding="utf-8")
