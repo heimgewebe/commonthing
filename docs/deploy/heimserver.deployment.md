@@ -15,7 +15,7 @@ relations:
 
 > [!WARNING]
 > Der Heimserver ist kein aktives Produktionsziel mehr. Kanonische Produktion
-> ist `wg-prod-1` über den Public-VPS-Pfad. Dieses Dokument bleibt nur als
+> ist `commonserver` über den Public-VPS-Pfad. Dieses Dokument bleibt nur als
 > historischer/Legacy-Kontext erhalten.
 
 # Weltgewebe – Deployment Runbook (Heimserver)

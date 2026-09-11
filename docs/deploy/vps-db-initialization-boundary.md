@@ -3,7 +3,7 @@ id: deploy.vps-db-initialization-boundary
 title: VPS DB Initialization Boundary
 doc_type: runbook
 status: active
-summary: Decision and evidence boundary for initializing or repairing wg-prod-1 PostgreSQL outside the no-migration smoke scope.
+summary: Decision and evidence boundary for initializing or repairing commonserver PostgreSQL outside the no-migration smoke scope.
 relations:
   - type: relates_to
     target: docs/deploy/vps-migration-safe-runtime-smoke.md
@@ -12,7 +12,7 @@ relations:
 ---
 # VPS DB Initialization Boundary
 
-This runbook defines the decision boundary for `wg-prod-1` database
+This runbook defines the decision boundary for `commonserver` database
 initialization or repair after the DB-history preflight blocks #1348.
 
 GitHub tracking context: #1348 is the DNS-free VPS HTTP smoke issue and #1359 is
@@ -77,7 +77,7 @@ Do not:
 Before any approved DB initialization or repair window, record:
 
 - timestamp
-- host identity, expected `wg-prod-1`
+- host identity, expected `commonserver`
 - selected repo commit
 - current `/opt/weltgewebe` worktree state, without secret output
 - DB-history preflight JSON payload

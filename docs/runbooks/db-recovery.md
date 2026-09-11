@@ -48,7 +48,7 @@ JSONL ist nur lokaler, historischer, Import-/Export- oder ausdrücklich
 freigegebener Rückfallpfad. Ein JSONL-Export ersetzt kein aktuelles
 PostgreSQL-Backup.
 
-## 2. Automatischer Backupvertrag auf `wg-prod-1`
+## 2. Automatischer Backupvertrag auf `commonserver`
 
 Kanonisches Skript:
 
@@ -145,7 +145,40 @@ anschließend in das entfernte Restic-Repository und liest einen Sentinel aus
 dem exakten Snapshot zurück.
 
 Systemd auf `heim-pc` wird nicht direkt aus einem beweglichen Checkout
-kopiert. Stattdessen installiert der folgende Befehl das Pullskript unter einem
+kopiert. Vor jeder (Re-)Aktivierung muss `commonserver` auf `heim-pc` als
+kanonisches SSH-Ziel funktionieren; damit kann die Hostumbenennung den täglichen
+Off-Host-Pull nicht still unterbrechen:
+
+```bash
+set -euo pipefail
+backup_dir=/var/backups/weltgewebe/postgres
+getent hosts commonserver > /dev/null
+latest="$(
+  ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
+    "sudo -n find '$backup_dir' -maxdepth 1 -type f -name 'weltgewebe-postgres-*.sql.gz' -printf '%f\\n'" |
+    sort |
+    tail -n1
+)"
+if [[ "$latest" != weltgewebe-postgres-*.sql.gz ]]; then
+  printf 'Kein PostgreSQL-Backup auf commonserver gefunden.\n' >&2
+  exit 1
+fi
+manifest="${latest%.sql.gz}.sha256.manifest"
+ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
+  "sudo -n cat -- '$backup_dir/$manifest'" > /dev/null
+```
+
+Damit werden genau die beiden verpflichtenden privilegierten Leseoperationen
+(`find` und `cat`) geprüft, die auch der Pull verwendet. `set -euo pipefail`
+sorgt zusätzlich dafür, dass ein fehlgeschlagenes SSH/`sudo find` nicht durch
+das nachgeschaltete `sort`/`tail` verdeckt wird; ein leerer oder unerwarteter
+Dateiname bricht explizit ab. Ein allgemeines `sudo -n true` reicht bei
+befehlsbezogenen Sudoers-Regeln nicht aus. Der Readback vom 2026-09-10 hat
+DNS/SSH sowie diese `find`-/`cat`-Prüfung erfolgreich bestanden.
+`REMOTE_HOST` bleibt als expliziter Kompatibilitäts-Override erhalten; der
+Default und neue Installationen verwenden `commonserver`.
+
+Anschließend installiert der folgende Befehl das Pullskript unter einem
 unveränderlichen, vollständigen Git-Commit, erzeugt daraus die User-Unit, legt
 den schreibbaren Zielpfad vor dem Sandboxstart an und aktiviert den Timer:
 

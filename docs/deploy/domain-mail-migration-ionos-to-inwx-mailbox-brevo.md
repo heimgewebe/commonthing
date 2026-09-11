@@ -116,7 +116,7 @@ anwendungsseitig erzeugten Magic-Link-Mail sowie menschlicher Outbound von
 
 ## 4. DNS- und historischer DDNS-Pfad
 
-Der kanonische öffentliche Produktionspfad ist `wg-prod-1` gemäß
+Der kanonische öffentliche Produktionspfad ist `commonserver` gemäß
 `runtime/README.md` und `docs/deploy/vps.md`. Die A-Records für
 `commonthing.net`, `www.commonthing.net`, `weltgewebe.net`,
 `www.weltgewebe.net` und `api.weltgewebe.net` müssen auf den ausdrücklich
@@ -152,7 +152,7 @@ Freigabe des DNS-Zielbilds und frische Ende-zu-Ende-Belege.
 
 Ein vollständiger aktueller Runtime-Nachweis erfordert separat:
 
-1. `runtime/README.md`, `docs/deploy/vps.md` und eine aktuelle Deployment-Identität weisen `wg-prod-1` sowie die unabhängig bestimmte erwartete VPS-Adresse aus,
+1. `runtime/README.md`, `docs/deploy/vps.md` und eine aktuelle Deployment-Identität weisen `commonserver` sowie die unabhängig bestimmte erwartete VPS-Adresse aus,
 2. die jeweils autoritativen Nameserver liefern für alle fünf Public-Hosts genau diesen erwarteten VPS-A-Record,
 3. öffentliches HTTPS liefert commonThing am neuen Apex, permanente URI-erhaltende Redirects für beide `www`- und beide Legacy-Hosts sowie die API am erhaltenen API-Host,
 4. die kanonischen API-Health-Pfade antworten erfolgreich,

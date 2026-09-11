@@ -33,7 +33,7 @@ relations:
 
 ### weltgewebe.net
 
-- **Web/API**: Betriebsfähig über den kanonischen Public-VPS-Pfad `wg-prod-1`. Der frühere Heimberry-DDNS-Schreibpfad ist stillgelegt.
+- **Web/API**: Betriebsfähig über den kanonischen Public-VPS-Pfad `commonserver`. Der frühere Heimberry-DDNS-Schreibpfad ist stillgelegt.
 - **Mail (Human)**: mailbox.org. (Betriebsfähig).
 - **Mail (Technical Login)**: Brevo (`noreply@login.weltgewebe.net`). (Betriebsfähig).
 

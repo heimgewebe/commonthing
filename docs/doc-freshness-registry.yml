@@ -254,16 +254,18 @@ entries:
     doc: docs/claims/registry.yml
     locator: claims[id=CLAIM-RUNTIME-PROD-POSTGRES-001]
     claim: >-
-      wg-prod-1 nutzt PostgreSQL als Datenwahrheit; Liveaussagen brauchen
+      commonserver nutzt PostgreSQL als Datenwahrheit; Liveaussagen brauchen
       datierte Runtime-Evidence.
     status: partial
     owner: runtime
-    last_verified: "2026-07-12"
+    last_verified: "2026-09-10"
     evidence:
       - kind: file
         target: README.md
       - kind: file
         target: runtime/README.md
+      - kind: file
+        target: docs/deploy/CHANGELOG.md
       - kind: file
         target: infra/compose/compose.prod.yml
       - kind: file
@@ -277,16 +279,18 @@ entries:
     doc: docs/claims/registry.yml
     locator: claims[id=CLAIM-RUNTIME-LIVE-PROD-001]
     claim: >-
-      Liveaussagen zu wg-prod-1 brauchen datierte Runtime-Evidence und
+      Liveaussagen zu commonserver brauchen datierte Runtime-Evidence und
       veralten sonst.
-    status: stale
+    status: partial
     owner: runtime
-    last_verified: "2026-07-12"
+    last_verified: "2026-09-10"
     evidence:
       - kind: file
         target: docs/reports/map-status.md
       - kind: file
         target: runtime/README.md
+      - kind: file
+        target: docs/deploy/CHANGELOG.md
       - kind: file
         target: scripts/docmeta/validate_doc_freshness_registry.py
       - kind: file

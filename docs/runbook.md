@@ -133,7 +133,7 @@ darf den Produktionscheckout nicht verschmutzen.
 
 ## 3. Datenquellen und Migrationen
 
-Im belegten Produktionspfad `wg-prod-1` ist PostgreSQL die Lese- und
+Im belegten Produktionspfad `commonserver` ist PostgreSQL die Lese- und
 Schreibwahrheit für Accounts/Garnrollen, Knoten und Fäden. JSONL bleibt für
 lokale Entwicklung, Legacy-Daten, Import/Export und explizite Rollbacks
 erhalten, ist aber keine offene Produktions-Cutover-Behauptung mehr. Vor jeder

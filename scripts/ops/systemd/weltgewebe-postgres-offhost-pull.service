@@ -1,5 +1,5 @@
 [Unit]
-Description=Pull and verify latest Weltgewebe PostgreSQL backup from wg-prod-1
+Description=Pull and verify latest commonThing PostgreSQL backup from commonserver
 After=network-online.target
 Wants=network-online.target
 
