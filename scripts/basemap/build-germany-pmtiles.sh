@@ -121,8 +121,12 @@ fi
 if command -v wget > /dev/null 2>&1 &&
   [[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]]; then
   DOWNLOADER="wget"
-elif command -v curl > /dev/null 2>&1; then
+elif command -v curl > /dev/null 2>&1 &&
+  [[ "$(curl --help all 2>&1)" == *"--retry-all-errors"* ]] &&
+  [[ "$(curl --help all 2>&1)" == *"--retry-max-time"* ]]; then
   DOWNLOADER="curl"
+elif command -v curl > /dev/null 2>&1; then
+  fail "curl lacks required --retry-all-errors/--retry-max-time support"
 elif command -v wget > /dev/null 2>&1; then
   fail "wget lacks required --retry-on-http-error support and curl is unavailable"
 else

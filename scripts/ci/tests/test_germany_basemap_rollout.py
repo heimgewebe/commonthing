@@ -490,8 +490,14 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
             selector,
         )
         self.assertIn('DOWNLOADER="wget"', selector)
-        self.assertIn('elif command -v curl > /dev/null 2>&1; then', selector)
+        self.assertIn('elif command -v curl > /dev/null 2>&1 &&', selector)
+        self.assertIn('[[ "$(curl --help all 2>&1)" == *"--retry-all-errors"* ]]', selector)
+        self.assertIn('[[ "$(curl --help all 2>&1)" == *"--retry-max-time"* ]]', selector)
         self.assertIn('DOWNLOADER="curl"', selector)
+        self.assertIn(
+            "curl lacks required --retry-all-errors/--retry-max-time support",
+            selector,
+        )
         self.assertIn(
             "wget lacks required --retry-on-http-error support and curl is unavailable",
             selector,
