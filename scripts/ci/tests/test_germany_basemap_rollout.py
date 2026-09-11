@@ -479,6 +479,111 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
         self.assertIn("\nPY\n    rm -f", receipt_function)
         self.assertNotIn("python3 << 'PY' || {", receipt_function)
 
+    def test_germany_builder_falls_back_when_wget_lacks_retry_or_deadline_support(self) -> None:
+        builder = BUILD_SCRIPT.read_text(encoding="utf-8")
+        selector_start = builder.index("select_auxiliary_downloader() {")
+        selector_end = builder.index('mkdir -p "$BASEMAP_DIR"', selector_start)
+        selector = builder[selector_start:selector_end]
+
+        self.assertIn(
+            '[[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]]',
+            selector,
+        )
+        self.assertIn('command -v timeout > /dev/null 2>&1', selector)
+        self.assertIn(
+            '[[ "$(timeout --help 2>&1)" == *"--kill-after"* ]]',
+            selector,
+        )
+        self.assertIn('AUXILIARY_DOWNLOADER="wget"', selector)
+        self.assertIn('elif command -v curl > /dev/null 2>&1 &&', selector)
+        self.assertIn('[[ "$(curl --help all 2>&1)" == *"--retry-all-errors"* ]]', selector)
+        self.assertIn('[[ "$(curl --help all 2>&1)" == *"--retry-max-time"* ]]', selector)
+        self.assertIn('AUXILIARY_DOWNLOADER="curl"', selector)
+        self.assertIn(
+            "curl lacks required --retry-all-errors/--retry-max-time support",
+            selector,
+        )
+        self.assertIn(
+            "wget lacks required --retry-on-http-error/overall-deadline timeout support and curl is unavailable or lacks required --retry-all-errors/--retry-max-time support",
+            selector,
+        )
+
+    def test_germany_builder_uses_baseline_downloader_for_missing_osm_snapshot(self) -> None:
+        builder = BUILD_SCRIPT.read_text(encoding="utf-8")
+        selector_start = builder.index("select_osm_downloader() {")
+        selector_end = builder.index("select_auxiliary_downloader() {", selector_start)
+        selector = builder[selector_start:selector_end]
+
+        self.assertIn("command -v wget > /dev/null 2>&1", selector)
+        self.assertIn("command -v curl > /dev/null 2>&1", selector)
+        self.assertIn('OSM_DOWNLOADER="wget"', selector)
+        self.assertIn('OSM_DOWNLOADER="curl"', selector)
+        self.assertNotIn("--retry-on-http-error", selector)
+        self.assertNotIn("--retry-all-errors", selector)
+        self.assertNotIn("command -v timeout", selector)
+
+    def test_germany_builder_defers_downloader_probe_until_download_is_needed(self) -> None:
+        builder = BUILD_SCRIPT.read_text(encoding="utf-8")
+        selector_end = builder.index('mkdir -p "$BASEMAP_DIR"')
+        osm_missing = builder.index('if [[ ! -f "$OSM_FILE" ]]; then')
+        osm_select = builder.index("  select_osm_downloader", selector_end)
+        osm_use = builder.index('if [[ "$OSM_DOWNLOADER" == "wget" ]]', osm_select)
+        auxiliary_start = builder.index("download_verified_auxiliary() {")
+        auxiliary_missing = builder.index('if [[ ! -e "$target" ]]; then', auxiliary_start)
+        auxiliary_select = builder.index("    select_auxiliary_downloader", auxiliary_missing)
+        auxiliary_use = builder.index('if [[ "$AUXILIARY_DOWNLOADER" == "wget" ]]', auxiliary_select)
+
+        self.assertLess(selector_end, osm_missing)
+        self.assertLess(osm_missing, osm_select)
+        self.assertLess(osm_select, osm_use)
+        self.assertLess(auxiliary_missing, auxiliary_select)
+        self.assertLess(auxiliary_select, auxiliary_use)
+        self.assertEqual(builder.count("  select_osm_downloader\n"), 1)
+        self.assertEqual(builder.count("  select_auxiliary_downloader\n"), 1)
+
+    def test_germany_builder_bounds_auxiliary_download_retries_and_timeouts(self) -> None:
+        builder = BUILD_SCRIPT.read_text(encoding="utf-8")
+        function_start = builder.index("download_verified_auxiliary() {")
+        function_end = builder.index("LAKE_CENTERLINES_PATH=", function_start)
+        auxiliary_download = builder[function_start:function_end]
+
+        for marker in (
+            "timeout --kill-after=5s 900s wget",
+            "wget --tries=5",
+            "--waitretry=3",
+            "--retry-connrefused",
+            "--retry-on-http-error=429,500,502,503,504",
+            "--timeout=30",
+            "-nv",
+        ):
+            self.assertIn(marker, auxiliary_download)
+        self.assertNotIn("wget -q", auxiliary_download)
+        for marker in (
+            "curl -fL",
+            "--retry 4",
+            "--retry-delay 3",
+            "--retry-all-errors",
+            "--retry-max-time 120",
+            "--connect-timeout 30",
+            "--max-time 180",
+            "--speed-limit 1024",
+            "--speed-time 30",
+        ):
+            self.assertIn(marker, auxiliary_download)
+        for diagnostic in (
+            "network/timeout failure after bounded retries",
+            "HTTP/server failure after bounded retries",
+            "HTTP failure after bounded retries",
+            "timeout/stall failure after bounded retries",
+            "overall deadline exceeded after bounded retries",
+            "checksum mismatch",
+        ):
+            self.assertIn(diagnostic, auxiliary_download)
+        self.assertLess(
+            auxiliary_download.index('if [[ ! -e "$target" ]]'),
+            auxiliary_download.index("wget --tries=5"),
+        )
+
     def test_germany_builder_pins_and_binds_auxiliary_sources(self) -> None:
         builder = BUILD_SCRIPT.read_text(encoding="utf-8")
         for marker in (

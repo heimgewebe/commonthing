@@ -118,13 +118,39 @@ else
   fail "sha256sum or shasum is required"
 fi
 
-if command -v wget > /dev/null 2>&1; then
-  DOWNLOADER="wget"
-elif command -v curl > /dev/null 2>&1; then
-  DOWNLOADER="curl"
-else
-  fail "wget or curl is required"
-fi
+OSM_DOWNLOADER=""
+AUXILIARY_DOWNLOADER=""
+
+select_osm_downloader() {
+  [[ -n "$OSM_DOWNLOADER" ]] && return 0
+  if command -v wget > /dev/null 2>&1; then
+    OSM_DOWNLOADER="wget"
+  elif command -v curl > /dev/null 2>&1; then
+    OSM_DOWNLOADER="curl"
+  else
+    fail "wget or curl is required"
+  fi
+}
+
+select_auxiliary_downloader() {
+  [[ -n "$AUXILIARY_DOWNLOADER" ]] && return 0
+  if command -v wget > /dev/null 2>&1 &&
+    [[ "$(wget --help 2>&1)" == *"--retry-on-http-error"* ]] &&
+    command -v timeout > /dev/null 2>&1 &&
+    [[ "$(timeout --help 2>&1)" == *"--kill-after"* ]]; then
+    AUXILIARY_DOWNLOADER="wget"
+  elif command -v curl > /dev/null 2>&1 &&
+    [[ "$(curl --help all 2>&1)" == *"--retry-all-errors"* ]] &&
+    [[ "$(curl --help all 2>&1)" == *"--retry-max-time"* ]]; then
+    AUXILIARY_DOWNLOADER="curl"
+  elif command -v wget > /dev/null 2>&1; then
+    fail "wget lacks required --retry-on-http-error/overall-deadline timeout support and curl is unavailable or lacks required --retry-all-errors/--retry-max-time support"
+  elif command -v curl > /dev/null 2>&1; then
+    fail "curl lacks required --retry-all-errors/--retry-max-time support"
+  else
+    fail "wget or curl is required"
+  fi
+}
 
 mkdir -p "$BASEMAP_DIR"
 BASEMAP_DIR="$(cd "$BASEMAP_DIR" > /dev/null 2>&1 && pwd)"
@@ -212,9 +238,10 @@ for immutable_output in "$FINAL_PMTILES_PATH" "$FINAL_BUILD_RECEIPT_PATH" "$FINA
 done
 
 if [[ ! -f "$OSM_FILE" ]]; then
+  select_osm_downloader
   PARTIAL_INPUT_PATH="$BASEMAP_DIR/.${OSM_FILE}.partial.$$"
   echo ">> Downloading pinned Germany OSM snapshot..."
-  if [[ "$DOWNLOADER" == "wget" ]]; then
+  if [[ "$OSM_DOWNLOADER" == "wget" ]]; then
     wget -qO "$PARTIAL_INPUT_PATH" "$OSM_URL" ||
       fail "download failed: $OSM_URL"
   else
@@ -251,15 +278,40 @@ download_verified_auxiliary() {
   [[ ! -L "$target" ]] || fail "$label cache path must not be a symlink: $target"
 
   if [[ ! -e "$target" ]]; then
+    select_auxiliary_downloader
     partial="${target}.partial.$$"
     PARTIAL_AUXILIARY_PATHS+=("$partial")
     rm -f -- "$partial"
     echo ">> Downloading pinned $label source..."
-    if [[ "$DOWNLOADER" == "wget" ]]; then
-      wget -qO "$partial" "$url" || fail "$label download failed: $url"
+    if [[ "$AUXILIARY_DOWNLOADER" == "wget" ]]; then
+      if timeout --kill-after=5s 900s wget --tries=5 --waitretry=3 \
+        --retry-connrefused \
+        --retry-on-http-error=429,500,502,503,504 --timeout=30 -nv \
+        -O "$partial" "$url"; then
+        :
+      else
+        download_rc=$?
+        case "$download_rc" in
+          124 | 137) fail "$label download overall deadline exceeded after bounded retries: $url" ;;
+          4) fail "$label download network/timeout failure after bounded retries: $url" ;;
+          8) fail "$label download HTTP/server failure after bounded retries: $url" ;;
+          *) fail "$label download failed after bounded retries (wget exit $download_rc): $url" ;;
+        esac
+      fi
     else
-      curl -fL --retry 3 --retry-delay 5 -o "$partial" "$url" ||
-        fail "$label download failed: $url"
+      if curl -fL --retry 4 --retry-delay 3 --retry-all-errors \
+        --retry-max-time 120 --connect-timeout 30 --max-time 180 \
+        --speed-limit 1024 --speed-time 30 \
+        -o "$partial" "$url"; then
+        :
+      else
+        download_rc=$?
+        case "$download_rc" in
+          22) fail "$label download HTTP failure after bounded retries: $url" ;;
+          28) fail "$label download timeout/stall failure after bounded retries: $url" ;;
+          *) fail "$label download failed after bounded retries (curl exit $download_rc): $url" ;;
+        esac
+      fi
     fi
     [[ -s "$partial" ]] || fail "$label download produced an empty file"
     if [[ -e "$target" || -L "$target" ]]; then
