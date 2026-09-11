@@ -532,11 +532,11 @@ class GermanyBasemapRolloutTest(unittest.TestCase):
             "--retry-all-errors",
             "--retry-max-time 120",
             "--connect-timeout 30",
+            "--max-time 180",
             "--speed-limit 1024",
             "--speed-time 30",
         ):
             self.assertIn(marker, auxiliary_download)
-        self.assertNotIn("--max-time", auxiliary_download)
         for diagnostic in (
             "network/timeout failure after bounded retries",
             "HTTP/server failure after bounded retries",
