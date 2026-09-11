@@ -458,6 +458,7 @@ pub async fn load_edges() -> std::io::Result<OrderedCache<Edge>> {
     let mut records_read = 0;
     let mut duplicates_count = 0;
     let mut line_number = 0usize;
+    let mut cache_limit_warned = false;
 
     let max_edges = max_edges_cache_limit();
 
@@ -494,12 +495,15 @@ pub async fn load_edges() -> std::io::Result<OrderedCache<Edge>> {
         }
 
         if records_read >= max_edges {
-            tracing::warn!(
-                ?path,
-                max_edges,
-                "Edges cache limit reached, truncating load"
-            );
-            break;
+            if !cache_limit_warned {
+                tracing::warn!(
+                    ?path,
+                    max_edges,
+                    "Edges cache limit reached; validating remaining records without caching them"
+                );
+                cache_limit_warned = true;
+            }
+            continue;
         }
         records_read += 1;
 

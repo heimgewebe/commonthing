@@ -147,6 +147,36 @@ async fn edges_load_rejects_malformed_json_instead_of_returning_a_partial_cache(
 
 #[tokio::test]
 #[serial]
+async fn edges_load_validates_corrupt_suffix_after_cache_limit() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let edges_path = in_dir.join("demo.edges.jsonl");
+    let _env = set_gewebe_in_dir(&in_dir);
+    let _limit = EnvGuard::set("MAX_EDGES_CACHE", "1");
+
+    write_lines(
+        &edges_path,
+        &[
+            r#"{"id":"e1","source_id":"n1","target_id":"n2","edge_kind":"reference"}"#,
+            r#"{"id":"e2","source_id":"n2","target_id":"n3","edge_kind":"reference"}"#,
+            r#"{broken_json"#,
+        ],
+    );
+
+    let error = match weltgewebe_api::routes::edges::load_edges().await {
+        Ok(_) => panic!("corrupt canonical edge JSONL suffix must fail closed after cache limit"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let message = error.to_string();
+    assert!(message.contains("demo.edges.jsonl"), "message: {message}");
+    assert!(message.contains("line 3"), "message: {message}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn edges_load_rejects_invalid_utf8_instead_of_treating_it_as_eof() -> Result<()> {
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");
