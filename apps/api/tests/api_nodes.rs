@@ -1300,6 +1300,53 @@ async fn nodes_post_creates_persists_and_reloads() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn nodes_post_rejects_corrupt_existing_jsonl_after_startup() -> anyhow::Result<()> {
+    for corrupt_line in [
+        r#"{broken_json"#,
+        r#"{"id":"missing-required-node-fields"}"#,
+    ] {
+        let tmp = make_tmp_dir();
+        let in_dir = tmp.path().join("in");
+        std::fs::create_dir_all(&in_dir)?;
+
+        let (app, cookie, state, _env) = app_with_account(
+            &in_dir,
+            weber_account("cccccccc-cccc-4ccc-8ccc-000000000001"),
+        )
+        .await;
+        let nodes_path = in_dir.join("demo.nodes.jsonl");
+        fs::write(&nodes_path, corrupt_line)?;
+        let before = fs::read(&nodes_path)?;
+        let request_body = r#"{"title":"New Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.55,"lon":9.99},"operation_id":"10000000-0000-0000-0000-000000000099"}"#;
+
+        let res = app
+            .oneshot(post_node_req(Some(&cookie), request_body))
+            .await?;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let response = body::to_bytes(res.into_body(), usize::MAX).await?;
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.contains("failed to inspect node create operation"),
+            "body: {text}"
+        );
+
+        assert_eq!(
+            fs::read(&nodes_path)?,
+            before,
+            "corrupt source must stay byte-identical"
+        );
+        assert_eq!(
+            state.nodes.read().await.len(),
+            0,
+            "failed create must not populate cache"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn nodes_post_replays_same_operation_without_second_write() -> anyhow::Result<()> {
     const OPERATION_ID: &str = "10000000-0000-0000-0000-000000000001";
     let tmp = make_tmp_dir();

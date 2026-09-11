@@ -808,8 +808,20 @@ fn add_create_operation_metadata(record: &mut Value, operation: Option<&CreateOp
     );
 }
 
+#[derive(Deserialize)]
+struct NodeOperationRecord {
+    #[serde(flatten)]
+    node: NodeDto,
+    #[serde(default, rename = "_create_actor_id")]
+    actor_id: Option<Value>,
+    #[serde(default, rename = "_create_operation_id")]
+    operation_id: Option<Value>,
+}
+
 /// Find an earlier durable JSONL result for one account-scoped operation.
-/// Unknown metadata remains invisible to the public `Node` projection.
+/// Every record is validated through the same `NodeDto` contract as startup,
+/// so a create cannot extend a canonical file that the next restart rejects.
+/// Operation metadata remains invisible to the public `Node` projection.
 async fn find_node_by_operation(operation: &CreateOperationKey) -> std::io::Result<Option<Node>> {
     let path = nodes_path();
     let file = match File::open(&path).await {
@@ -819,14 +831,21 @@ async fn find_node_by_operation(operation: &CreateOperationKey) -> std::io::Resu
     };
     let mut lines = BufReader::new(file).lines();
     let mut found = None;
+    let mut line_number = 0usize;
     while let Some(line) = lines.next_line().await? {
-        let value: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let actor_matches = value.get(CREATE_ACTOR_KEY).and_then(Value::as_str)
-            == Some(operation.actor_id.as_str());
-        let operation_matches = value.get(CREATE_OPERATION_KEY).and_then(Value::as_str)
+        line_number += 1;
+        let record: NodeOperationRecord = serde_json::from_str(&line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid node JSONL at {} line {line_number}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        let actor_matches =
+            record.actor_id.as_ref().and_then(Value::as_str) == Some(operation.actor_id.as_str());
+        let operation_matches = record.operation_id.as_ref().and_then(Value::as_str)
             == Some(operation.operation_id.as_str());
         if !actor_matches || !operation_matches {
             continue;
@@ -837,13 +856,7 @@ async fn find_node_by_operation(operation: &CreateOperationKey) -> std::io::Resu
                 "duplicate node create operation metadata",
             ));
         }
-        let node = map_json_to_node(&value).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "idempotent node record cannot be projected",
-            )
-        })?;
-        found = Some(node);
+        found = Some(record.node.into());
     }
     Ok(found)
 }
