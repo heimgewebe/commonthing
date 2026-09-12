@@ -22,12 +22,13 @@ class TestCheckPlanningOwnership(unittest.TestCase):
             key: (value.copy() if isinstance(value, dict) else list(value) if isinstance(value, list) else value)
             for key, value in legacy._DEFAULT_CONFIG.items()
         }
+        self.config["legacy_fallback_paths"] = []
 
         os.makedirs(os.path.join(self.repo_root, "docs/tasks"), exist_ok=True)
         os.makedirs(os.path.join(self.repo_root, "docs/blueprints"), exist_ok=True)
         self.write_file("docs/tasks/index.json", "{}")
         self.write_file("docs/tasks/board.md", "")
-        self.write_file("docs/roadmap.md", "")
+        self.write_file("docs/roadmap.md", "---\nstatus: archived\n---\n")
 
     def tearDown(self):
         self.root_patcher.stop()
@@ -137,6 +138,7 @@ class TestCheckPlanningOwnership(unittest.TestCase):
         )
 
     def test_legacy_index_registration_remains_accepted_during_migration(self):
+        self.config["legacy_fallback_paths"] = ["docs/blueprints/legacy.md"]
         self.write_file(
             "docs/tasks/index.json",
             json.dumps(
@@ -156,6 +158,30 @@ class TestCheckPlanningOwnership(unittest.TestCase):
         )
         self.assertEqual(self.run_checks(), [])
 
+    def test_new_local_registration_cannot_grow_legacy_inventory(self):
+        self.write_file(
+            "docs/tasks/index.json",
+            json.dumps({"tasks": [{"id": "NEW-LOCAL", "evidence": ["docs/blueprints/new.md"]}]}),
+        )
+        self.write_file(
+            "docs/blueprints/new.md",
+            "---\nstatus: active\n---\nBody\n",
+        )
+        findings = self.run_checks()
+        self.assertEqual([finding["code"] for finding in findings], ["UNOWNED_PLANNING_ARTIFACT"])
+
+    def test_missing_or_malformed_legacy_inventory_fails_closed(self):
+        self.config.pop("legacy_fallback_paths")
+        self.assertEqual(
+            [finding["code"] for finding in self.run_checks()],
+            ["LEGACY_FALLBACK_CONFIG_INVALID"],
+        )
+        self.config["legacy_fallback_paths"] = "docs/blueprints/legacy.md"
+        self.assertEqual(
+            [finding["code"] for finding in self.run_checks()],
+            ["LEGACY_FALLBACK_CONFIG_INVALID"],
+        )
+
     def test_missing_legacy_control_file_does_not_block_fully_external_plan(self):
         os.remove(os.path.join(self.repo_root, "docs/tasks/board.md"))
         self.write_file(
@@ -165,6 +191,7 @@ class TestCheckPlanningOwnership(unittest.TestCase):
         self.assertEqual(self.run_checks(), [])
 
     def test_missing_legacy_control_file_is_reported_when_plan_needs_fallback(self):
+        self.config["legacy_fallback_paths"] = ["docs/blueprints/unowned.md"]
         os.remove(os.path.join(self.repo_root, "docs/tasks/board.md"))
         self.write_file(
             "docs/blueprints/unowned.md",

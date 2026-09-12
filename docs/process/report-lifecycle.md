@@ -189,7 +189,8 @@ vorkommen. Der DocMeta-Status beschreibt die allgemeine Dokumentgültigkeit;
 
 - **lifecycle**: Report-Klasse oder Lifecycle-Rolle.
 - **owner_task**: verantwortlicher Task, Vorhaben, Kontrollpunkt oder Prozess.
-  - bevorzugt registrierte Task-ID,
+  - für neue operative Arbeit bevorzugt eine kanonische externe `BUREAU-*`-Task-ID,
+  - historische lokale IDs bleiben während der Migration über die unten genannten Repo-Quellen auflösbar,
   - abgeschlossene Tasks dürfen Proof- oder Audit-Reports weiter besitzen,
   - keine Pseudo-Task-ID nur zur Befüllung des Feldes,
   - unbelegte Eigentümerschaft bleibt als Leerstelle sichtbar.
@@ -217,12 +218,16 @@ Das Feld `owner_task` referenziert eine stabile Arbeits- oder Prozess-ID für de
 
 Das Feld `owner` hingegen kann eine Rolle, Gruppe oder organisatorische Zuständigkeit bezeichnen. Beide Felder sind strikt getrennt und nicht austauschbar. Ein Eintrag wie `owner: docs-mechanik` macht `docs-mechanik` nicht automatisch zu einer gültigen `owner_task`-ID.
 
-### Normative Registrierungsquellen
+### Normative Registrierungsquellen und externe Bureau-Ownership
 
-Die initialen normativen Quellen zur Registrierung einer gültigen `owner_task`-ID sind:
+Für historische lokale `owner_task`-IDs bleiben während der Migration diese Repo-Quellen normativ:
 
-- `docs/tasks/index.json`: Registriert strukturierte Task-Control-IDs.
+- `docs/tasks/index.json`: Registriert historische strukturierte Task-Control-IDs.
 - `docs/reports/optimierungsstatus.md`: Die kanonische menschliche Wahrheitsquelle für OPT-IDs.
+
+Für kanonische `BUREAU-*`-IDs liegt die Task-Wahrheit dagegen **außerhalb dieses Repositories** bei Bureau. Eine solche ID muss fachlich einen realen Bureau-Task bezeichnen; Commonthing prüft jedoch nur die wohlgeformte Namespace-Bindung und spiegelt weder Existenz noch Status, Queue, Claims oder Priorität in `docs/tasks/index.json` oder die OPT-Matrix. Live-Auflösung und Statusprüfung gehören an die Bureau-/Operatorgrenze. Ein syntaktisch gültiges `BUREAU-*` ist deshalb im Repo eine externe Referenz, aber für sich allein kein Existenz- oder Statusbeweis.
+
+Diese Trennung ist absichtlich: Würde Commonthing Bureau-Tasks lokal nachregistrieren oder ihren Status nachführen, entstünde erneut eine zweite Arbeitswahrheit.
 
 ### Maschinenlesbare Lookup-Fläche
 
@@ -253,10 +258,10 @@ Nicht als aufgelöst gelten:
 - `TBD`, `none`, `null`
 - `pending`, `pending-namespace`
 - `docs-mechanik` oder andere freie Rollenbezeichnungen
-- Bloß präfixförmig plausible IDs
-- Unregistrierte Kontrollpunkte
+- Bloß präfixförmig plausible **lokale** IDs
+- Unregistrierte lokale Kontrollpunkte
 
-Insbesondere IDs wie `MAP-PROOF-001` oder `MAP-PROOF-002` sind erst gültige Owner, wenn sie in einer zugelassenen normativen Quelle registriert wurden. Eine Präfix-Allowlist als Ersatz für die explizite Registrierung ist unzulässig.
+Insbesondere lokale IDs wie `MAP-PROOF-001` oder `MAP-PROOF-002` sind erst gültige Owner, wenn sie in einer zugelassenen lokalen normativen Quelle registriert wurden. Für `BUREAU-*` gilt stattdessen die externe Authority-Grenze oben: der Präfix ist nur die maschinenlesbare Referenzklasse und kein Beweis, dass der referenzierte Task tatsächlich existiert.
 
 ### Künftige Erweiterbarkeit
 

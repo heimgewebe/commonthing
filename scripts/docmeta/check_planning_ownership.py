@@ -68,7 +68,22 @@ def run_checks(config=None):
     registered_paths, control_errors = legacy.get_registered_paths(config)
     artifacts = legacy.get_all_planning_artifacts(config)
     findings = []
-    legacy_gap_present = False
+
+    legacy_paths_raw = config.get("legacy_fallback_paths")
+    if (
+        not isinstance(legacy_paths_raw, list)
+        or any(not isinstance(path, str) or not path for path in legacy_paths_raw)
+        or len(set(legacy_paths_raw)) != len(legacy_paths_raw)
+    ):
+        return [{
+            "code": "LEGACY_FALLBACK_CONFIG_INVALID",
+            "path": "scripts/docmeta/planning_registration.yml",
+            "reason": "legacy_fallback_paths must be an explicit unique list of repository paths.",
+            "suggestion": "Declare the finite migration inventory; do not infer or auto-grow it from board/index/roadmap.",
+            "source": "planning-ownership",
+        }]
+    legacy_paths = set(legacy_paths_raw)
+    legacy_dependency_present = False
 
     terminal = set(
         config.get("terminal_statuses", legacy._DEFAULT_CONFIG["terminal_statuses"])
@@ -97,32 +112,33 @@ def run_checks(config=None):
             continue
         if _is_external_owner_task(_owner_task(text)):
             continue
-        if legacy.is_registered(rel_path, registered_paths, meta, relations, config):
-            continue
+        if rel_path in legacy_paths:
+            legacy_dependency_present = True
+            if legacy.is_registered(rel_path, registered_paths, meta, relations, config):
+                continue
 
-        legacy_gap_present = True
         findings.append(
             {
                 "code": "UNOWNED_PLANNING_ARTIFACT",
                 "path": rel_path,
                 "reason": (
                     "Active planning artifact has neither a canonical external BUREAU-* "
-                    "owner_task binding nor a legacy task-control/roadmap registration."
+                    "owner_task binding nor an allowlisted legacy migration registration."
                 ),
                 "suggestion": (
                     "Add a canonical BUREAU-* frontmatter owner_task binding (preferred; "
                     "work authority stays external). During migration only, the existing "
                     "docs/tasks board/index or docs/roadmap registration remains accepted "
-                    "as a compatibility fallback."
+                    "only for paths already listed in legacy_fallback_paths."
                 ),
                 "source": "planning-ownership",
             }
         )
 
-    # A broken compatibility source matters only while an active artifact still needs
-    # the fallback. Once every active artifact carries external ownership, deletion of
-    # board/index/roadmap can proceed without this guard re-promoting them to authority.
-    if legacy_gap_present and control_errors:
+    # Compatibility sources are required only while a currently active, non-external
+    # artifact belongs to the explicit migration inventory. New registrations cannot
+    # enlarge that inventory and therefore cannot grow the shadow control plane.
+    if legacy_dependency_present and control_errors:
         findings = _legacy_control_findings(control_errors) + findings
 
     return findings

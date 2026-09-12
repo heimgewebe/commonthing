@@ -34,6 +34,30 @@ terminal_statuses:
   - archived
   - deferred
 
+# Shrink-only migration inventory. Only these pre-existing active artifacts may
+# still satisfy planning ownership through the repo-local registration fallback.
+# New paths must use canonical external BUREAU-* owner_task bindings.
+legacy_fallback_paths:
+  - docs/blueprints/agent-operability-blaupause.md
+  - docs/blueprints/auth-persistence-runtime-proof.md
+  - docs/blueprints/auth-roadmap.md
+  - docs/blueprints/blueprint-agent-safety-control-layer.md
+  - docs/blueprints/doc-structure-task-control-examples.md
+  - docs/blueprints/doc-structure-task-control-roadmap.md
+  - docs/blueprints/doc-structure-task-control.md
+  - docs/blueprints/domain-data-postgres-cutover.md
+  - docs/blueprints/domain-scale-foundation.md
+  - docs/blueprints/map-blaupause.md
+  - docs/blueprints/versionierungs-blaupause.md
+  - docs/blueprints/versionierungs-statusgrundlage.md
+  - docs/blueprints/weltgewebe-os-masterplan.md
+  - docs/reports/auth-status-matrix.md
+  - docs/reports/kubernetes-platform-foundation-status.md
+  - docs/reports/map-status.md
+  - docs/reports/optimierungsstatus.md
+  - docs/reports/weltgewebe-os-foundation-status.md
+  - docs/roadmap.md
+
 registration_sources:
   task_index: docs/tasks/index.json
   board: docs/tasks/board.md

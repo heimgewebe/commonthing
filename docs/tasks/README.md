@@ -42,16 +42,18 @@ Status, Queue, Claims oder Priorität des referenzierten Tasks werden nicht noch
 Repo nachgebaut.
 
 Bereits bestehende Planungsartefakte dürfen während der Migration weiterhin über
-`docs/tasks/index.json`, `docs/tasks/board.md` oder `docs/roadmap.md` registriert sein.
-Dieser Legacy-Pfad ist ein Kompatibilitätsfallback, kein Muster für neue Planung. Der
-CI-Guard `scripts.docmeta.check_planning_ownership` akzeptiert daher:
+`docs/tasks/index.json`, `docs/tasks/board.md` oder `docs/roadmap.md` registriert sein,
+**aber nur**, wenn ihr Pfad bereits in `legacy_fallback_paths` in
+`scripts/docmeta/planning_registration.yml` steht. Diese endliche Liste ist die
+Shrink-only-Migrationsmenge; neue Pfade dürfen sie nicht durch eine zusätzliche lokale
+Registrierung vergrößern. Der CI-Guard `scripts.docmeta.check_planning_ownership` akzeptiert daher:
 
 1. terminale Planungsartefakte ohne aktive Ownership;
 2. aktive Planungsartefakte mit kanonischem `BUREAU-*`-`owner_task` als bevorzugten Pfad;
-3. bestehende lokale Registrierung als vorübergehenden Legacy-Fallback.
+3. nur allowlistete Altartefakte mit vorhandener lokaler Registrierung als vorübergehenden Legacy-Fallback.
 
-Damit wächst die repo-lokale Schattensteuerung nicht weiter, ohne historische Artefakte
-in einem Big-Bang migrieren zu müssen.
+Damit kann die repo-lokale Schattensteuerung nur schrumpfen: Ein Altpfad wird entweder
+archiviert oder extern gebunden und anschließend aus `legacy_fallback_paths` entfernt.
 
 ## Rollenklärung der Artefakte
 
@@ -76,8 +78,9 @@ in einem Big-Bang migrieren zu müssen.
 ## Curation-Status
 
 Solange `curation: "manual_phase2_seed"` gesetzt ist, darf `index.json` für seine
-bestehenden Legacy-Einträge manuell gepflegt werden. Neue operative Arbeit soll daraus
-aber keine Pflicht zur Doppelregistrierung ableiten.
+bestehenden Legacy-Einträge manuell gepflegt werden. Diese Pflege darf jedoch keine
+neuen Planungsartefakte legitimieren: Nur `legacy_fallback_paths` definiert den noch
+zulässigen Altbestand.
 
 Der in TASK-CTL-003 eingeführte `generate_task_index.py --check` bleibt ein reiner
 Drift-Prüfmechanismus ohne Schreibzugriff. Er schützt den noch vorhandenen Legacy-Bestand,
