@@ -29,14 +29,14 @@ commonthing bleibt Autorität für Produktcode, Produktwissen und repo-spezifisc
 
 ## Planning-Ownership-Ratchet
 
-Aktive Planungsartefakte sollen ihre Arbeit künftig direkt über ein nicht-leeres
-`owner_task` im Frontmatter binden, zum Beispiel:
+Aktive Planungsartefakte sollen ihre Arbeit künftig direkt über ein wohlgeformtes
+`BUREAU-*`-`owner_task` im Frontmatter binden, zum Beispiel:
 
 ```yaml
 owner_task: BUREAU-COMMONTHING-...
 ```
 
-`owner_task` ist ein Verweis auf die externe Arbeitsautorität, keine lokale Kopie ihres
+`BUREAU-*`-`owner_task` ist ein Verweis auf die externe Arbeitsautorität, keine lokale Kopie ihres
 Status. commonthing prüft deshalb nur, dass die Bindung explizit vorhanden ist; Existenz,
 Status, Queue, Claims oder Priorität des referenzierten Tasks werden nicht noch einmal im
 Repo nachgebaut.
@@ -47,7 +47,7 @@ Dieser Legacy-Pfad ist ein Kompatibilitätsfallback, kein Muster für neue Planu
 CI-Guard `scripts.docmeta.check_planning_ownership` akzeptiert daher:
 
 1. terminale Planungsartefakte ohne aktive Ownership;
-2. aktive Planungsartefakte mit explizitem `owner_task` als bevorzugten Pfad;
+2. aktive Planungsartefakte mit kanonischem `BUREAU-*`-`owner_task` als bevorzugten Pfad;
 3. bestehende lokale Registrierung als vorübergehenden Legacy-Fallback.
 
 Damit wächst die repo-lokale Schattensteuerung nicht weiter, ohne historische Artefakte
@@ -66,7 +66,7 @@ in einem Big-Bang migrieren zu müssen.
 ## Wahrheitsklärung
 
 - `docs/reports/optimierungsstatus.md` bleibt die kanonische menschliche Wahrheitsquelle für die dort dokumentierten OPT-IDs und deren belegten Status.
-- `docs/tasks/index.json` ist ein historisch gewachsener, kuratierter Task-Control-Index. Er ist keine vollständige Task-Wahrheit und keine Voraussetzung für neue Planung mit explizitem `owner_task`.
+- `docs/tasks/index.json` ist ein historisch gewachsener, kuratierter Task-Control-Index. Er ist keine vollständige Task-Wahrheit und keine Voraussetzung für neue Planung mit kanonischem `BUREAU-*`-`owner_task`.
 - Bureau-/externe Task-Zustände werden nicht in `index.json` gespiegelt. `owner_task` ist nur die Bindung an diese externe Autorität.
 - `docs/reports/optimierungsstatus.json` ist ein maschinenlesbarer Zwilling und dient als Lookup-Fläche. Es besitzt keinen eigenen Wahrheitsstatus.
 - Kein Status in `index.json` oder `optimierungsstatus.json` darf dem Markdown widersprechen.
@@ -113,8 +113,8 @@ den Validator.
 python3 -m scripts.docmeta.check_planning_ownership --mode strict
 ```
 
-Der Check verlangt für aktive Planung entweder die bevorzugte explizite `owner_task`-
-Bindung oder, während der Migration, eine vorhandene Legacy-Registrierung. Terminale
+Der Check verlangt für aktive Planung entweder die bevorzugte kanonische `BUREAU-*`-
+`owner_task`-Bindung oder, während der Migration, eine vorhandene Legacy-Registrierung. Terminale
 Planungsdokumente benötigen keine aktive Ownership.
 
 ## Legacy-Drift-Check
@@ -125,7 +125,7 @@ python3 -m scripts.docmeta.generate_task_index --check
 
 Der Check vergleicht den noch vorhandenen Legacy-Bestand aus `board.md`, `index.json` und
 `docs/reports/optimierungsstatus.json`. Er bleibt vorerst bestehen, bis die von ihm
-geschützten aktiven Planungsartefakte auf explizite externe Ownership migriert sind.
+geschützten aktiven Planungsartefakte auf kanonische externe Ownership migriert sind.
 
 Beide Prüfungen laufen im CI über `.github/workflows/task-index.yml`. Keine davon darf
 aus dem Repository eine zweite operative Task-Wahrheit machen.

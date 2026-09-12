@@ -45,5 +45,7 @@ jobs:
         run: python3 -m scripts.docmeta.generate_task_index --check
       - name: Check agent entrypoint / roadmap sync
         run: python3 -m scripts.docmeta.agent_entrypoint_smoke
+      - name: Test planning ownership ratchet
+        run: python3 -m unittest scripts.docmeta.tests.test_check_planning_ownership -v
       - name: Check planning ownership ratchet (strict)
         run: python3 -m scripts.docmeta.check_planning_ownership --mode strict

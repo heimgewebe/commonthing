@@ -1,12 +1,12 @@
 """Planning ownership ratchet.
 
-Active planning artifacts should bind directly to a work owner with a non-empty
-``owner_task`` frontmatter field. Existing task-control/roadmap registrations
-remain accepted as a migration-only compatibility fallback.
+Active planning artifacts should bind directly to the external Bureau work plane with a
+canonical ``BUREAU-*`` ``owner_task`` frontmatter field. Existing task-control/roadmap
+registrations remain accepted as a migration-only compatibility fallback.
 
-The legacy registration checker is intentionally reused instead of copied. This
-keeps historical board/index semantics stable while allowing new planning work
-to stop growing the repository-local shadow control plane.
+The legacy registration checker is intentionally reused instead of copied. This keeps
+historical board/index semantics stable while allowing new planning work to stop growing
+the repository-local shadow control plane.
 """
 
 from __future__ import annotations
@@ -18,11 +18,14 @@ import sys
 
 from scripts.docmeta import check_planning_registration as legacy
 
-_OWNER_TASK_RE = re.compile(r"^owner_task:\s*(.*?)\s*$", re.MULTILINE)
+# Deliberately horizontal whitespace only. ``\s`` would also consume newlines and could
+# turn an empty ``owner_task:`` into the following frontmatter key.
+_OWNER_TASK_RE = re.compile(r"^owner_task:[ \t]*(.*?)[ \t]*\r?$", re.MULTILINE)
+_EXTERNAL_OWNER_TASK_RE = re.compile(r"^BUREAU-[A-Za-z0-9._:-]+$")
 
 
 def _owner_task(text: str) -> str | None:
-    """Return the explicit owner_task value from frontmatter, if non-empty."""
+    """Return the top-level owner_task scalar from frontmatter, if non-empty."""
     if not text or not text.startswith("---"):
         return None
     parts = text.split("\n---", 1)
@@ -35,28 +38,37 @@ def _owner_task(text: str) -> str | None:
     return value or None
 
 
+def _is_external_owner_task(value: str | None) -> bool:
+    """True only for the explicit Bureau-owned external task namespace."""
+    return value is not None and _EXTERNAL_OWNER_TASK_RE.fullmatch(value) is not None
+
+
+def _legacy_control_findings(control_errors):
+    """Project legacy control errors only while an active artifact needs the fallback."""
+    return [
+        {
+            "code": code,
+            "path": path,
+            "reason": reason,
+            "suggestion": (
+                "Keep this legacy compatibility source readable only while remaining "
+                "active planning artifacts still depend on local registration."
+            ),
+            "source": "planning-ownership",
+        }
+        for code, path, reason in control_errors
+    ]
+
+
 def run_checks(config=None):
-    """Check explicit planning ownership with legacy registration fallback."""
+    """Check explicit Bureau ownership with legacy registration fallback."""
     if config is None:
         config, _ = legacy.load_config()
 
     registered_paths, control_errors = legacy.get_registered_paths(config)
     artifacts = legacy.get_all_planning_artifacts(config)
     findings = []
-
-    # Compatibility control files still need to be readable while any existing
-    # planning artifacts depend on them. A later migration slice can remove
-    # these checks once all active artifacts have explicit owner_task bindings.
-    for code, path, reason in control_errors:
-        findings.append(
-            {
-                "code": code,
-                "path": path,
-                "reason": reason,
-                "suggestion": "Keep the legacy compatibility source readable until its remaining planning artifacts have explicit owner_task bindings.",
-                "source": "planning-ownership",
-            }
-        )
+    legacy_gap_present = False
 
     terminal = set(
         config.get("terminal_statuses", legacy._DEFAULT_CONFIG["terminal_statuses"])
@@ -83,23 +95,35 @@ def run_checks(config=None):
             continue
         if meta.get("status") in terminal:
             continue
-        if _owner_task(text) is not None:
+        if _is_external_owner_task(_owner_task(text)):
             continue
         if legacy.is_registered(rel_path, registered_paths, meta, relations, config):
             continue
 
+        legacy_gap_present = True
         findings.append(
             {
                 "code": "UNOWNED_PLANNING_ARTIFACT",
                 "path": rel_path,
-                "reason": "Active planning artifact has neither an explicit owner_task binding nor a legacy task-control/roadmap registration.",
+                "reason": (
+                    "Active planning artifact has neither a canonical external BUREAU-* "
+                    "owner_task binding nor a legacy task-control/roadmap registration."
+                ),
                 "suggestion": (
-                    "Add a non-empty frontmatter owner_task binding (preferred; work authority stays external). "
-                    "During migration only, the existing docs/tasks board/index or docs/roadmap registration remains accepted as a compatibility fallback."
+                    "Add a canonical BUREAU-* frontmatter owner_task binding (preferred; "
+                    "work authority stays external). During migration only, the existing "
+                    "docs/tasks board/index or docs/roadmap registration remains accepted "
+                    "as a compatibility fallback."
                 ),
                 "source": "planning-ownership",
             }
         )
+
+    # A broken compatibility source matters only while an active artifact still needs
+    # the fallback. Once every active artifact carries external ownership, deletion of
+    # board/index/roadmap can proceed without this guard re-promoting them to authority.
+    if legacy_gap_present and control_errors:
+        findings = _legacy_control_findings(control_errors) + findings
 
     return findings
 
@@ -122,7 +146,9 @@ def _emit_text(findings, mode):
 
 
 def _emit_json(findings, mode):
-    ordered = sorted(findings, key=lambda item: (item.get("path", ""), item.get("code", "")))
+    ordered = sorted(
+        findings, key=lambda item: (item.get("path", ""), item.get("code", ""))
+    )
     print(
         json.dumps(
             {
@@ -148,7 +174,9 @@ def main(argv=None):
         default="report",
         help="report (default, exit 0), warn (GH annotations, exit 0), strict (exit 1 on findings).",
     )
-    parser.add_argument("--strict", action="store_true", help="Alias for --mode strict.")
+    parser.add_argument(
+        "--strict", action="store_true", help="Alias for --mode strict."
+    )
     parser.add_argument(
         "--format",
         dest="fmt",

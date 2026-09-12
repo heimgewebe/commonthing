@@ -18,6 +18,10 @@ class TestCheckPlanningOwnership(unittest.TestCase):
             self.repo_root,
         )
         self.root_patcher.start()
+        self.config = {
+            key: (value.copy() if isinstance(value, dict) else list(value) if isinstance(value, list) else value)
+            for key, value in legacy._DEFAULT_CONFIG.items()
+        }
 
         os.makedirs(os.path.join(self.repo_root, "docs/tasks"), exist_ok=True)
         os.makedirs(os.path.join(self.repo_root, "docs/blueprints"), exist_ok=True)
@@ -35,31 +39,60 @@ class TestCheckPlanningOwnership(unittest.TestCase):
         with open(full_path, "w", encoding="utf-8") as handle:
             handle.write(content)
 
-    def test_explicit_owner_task_passes_without_local_registration(self):
+    def run_checks(self):
+        return ownership.run_checks(self.config)
+
+    def test_external_bureau_owner_passes_without_local_registration(self):
         self.write_file(
             "docs/blueprints/owned.md",
             "---\nstatus: active\nowner_task: BUREAU-COMMONTHING-123\n---\nBody\n",
         )
+        self.assertEqual(self.run_checks(), [])
 
-        self.assertEqual(ownership.run_checks(), [])
-
-    def test_quoted_owner_task_passes(self):
+    def test_quoted_external_bureau_owner_passes(self):
         self.write_file(
             "docs/blueprints/owned.md",
             "---\nstatus: active\nowner_task: 'BUREAU-COMMONTHING-123'\n---\nBody\n",
         )
+        self.assertEqual(self.run_checks(), [])
 
-        self.assertEqual(ownership.run_checks(), [])
+    def test_crlf_external_bureau_owner_passes(self):
+        self.write_file(
+            "docs/blueprints/owned.md",
+            "---\r\nstatus: active\r\nowner_task: BUREAU-COMMONTHING-123\r\n---\r\nBody\r\n",
+        )
+        self.assertEqual(self.run_checks(), [])
 
     def test_empty_owner_task_does_not_count_as_ownership(self):
         self.write_file(
             "docs/blueprints/unowned.md",
             "---\nstatus: active\nowner_task:\n---\nBody\n",
         )
-
-        findings = ownership.run_checks()
         self.assertEqual(
-            [finding["code"] for finding in findings],
+            [finding["code"] for finding in self.run_checks()],
+            ["UNOWNED_PLANNING_ARTIFACT"],
+        )
+
+    def test_empty_owner_task_followed_by_key_does_not_swallow_next_line(self):
+        self.write_file(
+            "docs/blueprints/unowned.md",
+            "---\nowner_task:\ntitle: Still not an owner\nstatus: active\n---\nBody\n",
+        )
+        self.assertIsNone(ownership._owner_task(
+            "---\nowner_task:\ntitle: Still not an owner\nstatus: active\n---\nBody\n"
+        ))
+        self.assertEqual(
+            [finding["code"] for finding in self.run_checks()],
+            ["UNOWNED_PLANNING_ARTIFACT"],
+        )
+
+    def test_owner_task_sequence_does_not_count_as_scalar_ownership(self):
+        self.write_file(
+            "docs/blueprints/unowned.md",
+            "---\nstatus: active\nowner_task:\n  - BUREAU-COMMONTHING-123\n---\nBody\n",
+        )
+        self.assertEqual(
+            [finding["code"] for finding in self.run_checks()],
             ["UNOWNED_PLANNING_ARTIFACT"],
         )
 
@@ -68,10 +101,38 @@ class TestCheckPlanningOwnership(unittest.TestCase):
             "docs/blueprints/unowned.md",
             "---\nstatus: active\n---\nowner_task: BUREAU-COMMONTHING-123\n",
         )
-
-        findings = ownership.run_checks()
         self.assertEqual(
-            [finding["code"] for finding in findings],
+            [finding["code"] for finding in self.run_checks()],
+            ["UNOWNED_PLANNING_ARTIFACT"],
+        )
+
+    def test_local_style_owner_without_legacy_registration_is_not_external(self):
+        self.write_file(
+            "docs/blueprints/unowned.md",
+            "---\nstatus: active\nowner_task: WELTGEWEBE-OS-001\n---\nBody\n",
+        )
+        self.assertEqual(
+            [finding["code"] for finding in self.run_checks()],
+            ["UNOWNED_PLANNING_ARTIFACT"],
+        )
+
+    def test_malformed_bureau_owner_does_not_count_as_external(self):
+        self.write_file(
+            "docs/blueprints/unowned.md",
+            "---\nstatus: active\nowner_task: BUREAU-T001 invalid\n---\nBody\n",
+        )
+        self.assertEqual(
+            [finding["code"] for finding in self.run_checks()],
+            ["UNOWNED_PLANNING_ARTIFACT"],
+        )
+
+    def test_comment_placeholder_does_not_count_as_external(self):
+        self.write_file(
+            "docs/blueprints/unowned.md",
+            "---\nstatus: active\nowner_task: # TODO\n---\nBody\n",
+        )
+        self.assertEqual(
+            [finding["code"] for finding in self.run_checks()],
             ["UNOWNED_PLANNING_ARTIFACT"],
         )
 
@@ -93,15 +154,33 @@ class TestCheckPlanningOwnership(unittest.TestCase):
             "docs/blueprints/legacy.md",
             "---\nstatus: active\n---\nBody\n",
         )
+        self.assertEqual(self.run_checks(), [])
 
-        self.assertEqual(ownership.run_checks(), [])
+    def test_missing_legacy_control_file_does_not_block_fully_external_plan(self):
+        os.remove(os.path.join(self.repo_root, "docs/tasks/board.md"))
+        self.write_file(
+            "docs/blueprints/owned.md",
+            "---\nstatus: active\nowner_task: BUREAU-COMMONTHING-123\n---\nBody\n",
+        )
+        self.assertEqual(self.run_checks(), [])
+
+    def test_missing_legacy_control_file_is_reported_when_plan_needs_fallback(self):
+        os.remove(os.path.join(self.repo_root, "docs/tasks/board.md"))
+        self.write_file(
+            "docs/blueprints/unowned.md",
+            "---\nstatus: active\n---\nBody\n",
+        )
+        findings = self.run_checks()
+        self.assertEqual(
+            {finding["code"] for finding in findings},
+            {"CONTROL_FILE_MISSING", "UNOWNED_PLANNING_ARTIFACT"},
+        )
 
     def test_unowned_unregistered_active_plan_is_reported(self):
         self.write_file(
             "docs/blueprints/unowned.md", "---\nstatus: active\n---\nBody\n"
         )
-
-        findings = ownership.run_checks()
+        findings = self.run_checks()
         matching = [
             finding
             for finding in findings
@@ -109,31 +188,32 @@ class TestCheckPlanningOwnership(unittest.TestCase):
         ]
         self.assertEqual(len(matching), 1)
         self.assertEqual(matching[0]["path"], "docs/blueprints/unowned.md")
-        self.assertIn("owner_task", matching[0]["suggestion"])
+        self.assertIn("BUREAU-", matching[0]["suggestion"])
 
     def test_terminal_plan_needs_no_owner(self):
         self.write_file(
             "docs/blueprints/archived.md",
             "---\nstatus: archived\n---\nBody\n",
         )
+        self.assertEqual(self.run_checks(), [])
 
-        self.assertEqual(ownership.run_checks(), [])
-
-    def test_strict_mode_blocks_only_real_ownership_findings(self):
+    def test_strict_mode_blocks_unowned_and_accepts_external_owner(self):
         self.write_file(
             "docs/blueprints/unowned.md",
             "---\nstatus: active\n---\nBody\n",
         )
-        with patch("sys.stderr", new_callable=io.StringIO):
-            exit_code = ownership.main(["--mode", "strict"])
+        with patch.object(ownership.legacy, "load_config", return_value=(self.config, None)):
+            with patch("sys.stderr", new_callable=io.StringIO):
+                exit_code = ownership.main(["--mode", "strict"])
         self.assertEqual(exit_code, 1)
 
         self.write_file(
             "docs/blueprints/unowned.md",
             "---\nstatus: active\nowner_task: BUREAU-COMMONTHING-123\n---\nBody\n",
         )
-        with patch("sys.stdout", new_callable=io.StringIO):
-            exit_code = ownership.main(["--mode", "strict"])
+        with patch.object(ownership.legacy, "load_config", return_value=(self.config, None)):
+            with patch("sys.stdout", new_callable=io.StringIO):
+                exit_code = ownership.main(["--mode", "strict"])
         self.assertEqual(exit_code, 0)
 
 
