@@ -244,8 +244,12 @@ pub async fn run() -> anyhow::Result<()> {
                 routes::accounts::load_all_accounts()
                     .await
                     .context("failed to load canonical JSONL accounts")?,
-                routes::nodes::load_nodes().await,
-                routes::edges::load_edges().await,
+                routes::nodes::load_nodes()
+                    .await
+                    .context("failed to load canonical JSONL nodes")?,
+                routes::edges::load_edges()
+                    .await
+                    .context("failed to load canonical JSONL edges")?,
                 0,
             )
         }

@@ -112,7 +112,7 @@ async fn state_for_role_with_mutation_limits(
         step_up_tokens: weltgewebe_api::auth::step_up_tokens::StepUpTokenStore::new(),
         accounts: Arc::new(RwLock::new(accounts)),
         nodes: Arc::new(RwLock::new(
-            weltgewebe_api::routes::nodes::load_nodes().await,
+            weltgewebe_api::routes::nodes::load_nodes().await?,
         )),
         nodes_persist: Arc::new(tokio::sync::Mutex::new(())),
         accounts_persist: Arc::new(tokio::sync::Mutex::new(())),

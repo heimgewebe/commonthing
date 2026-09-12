@@ -71,7 +71,7 @@ async fn test_state() -> Result<ApiState> {
     let rate_limiter = Arc::new(AuthRateLimiter::new(&config));
 
     // Load edges from file (environment variable must be set before calling this)
-    let edges = weltgewebe_api::routes::edges::load_edges().await;
+    let edges = weltgewebe_api::routes::edges::load_edges().await?;
 
     Ok(ApiState {
         db_pool: None,
@@ -114,6 +114,89 @@ fn make_tmp_dir() -> tempfile::TempDir {
 fn write_lines(path: &PathBuf, lines: &[&str]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, lines.join("\n")).unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn edges_load_rejects_malformed_json_instead_of_returning_a_partial_cache() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let edges_path = in_dir.join("demo.edges.jsonl");
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    write_lines(
+        &edges_path,
+        &[
+            r#"{"id":"e1","source_id":"n1","target_id":"n2","edge_kind":"reference"}"#,
+            r#"{broken_json"#,
+            r#"{"id":"e2","source_id":"n2","target_id":"n3","edge_kind":"reference"}"#,
+        ],
+    );
+
+    let error = match weltgewebe_api::routes::edges::load_edges().await {
+        Ok(_) => panic!("malformed canonical edge JSONL must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let message = error.to_string();
+    assert!(message.contains("demo.edges.jsonl"), "message: {message}");
+    assert!(message.contains("line 2"), "message: {message}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn edges_load_validates_corrupt_suffix_after_cache_limit() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let edges_path = in_dir.join("demo.edges.jsonl");
+    let _env = set_gewebe_in_dir(&in_dir);
+    let _limit = EnvGuard::set("MAX_EDGES_CACHE", "1");
+
+    write_lines(
+        &edges_path,
+        &[
+            r#"{"id":"e1","source_id":"n1","target_id":"n2","edge_kind":"reference"}"#,
+            r#"{"id":"e2","source_id":"n2","target_id":"n3","edge_kind":"reference"}"#,
+            r#"{broken_json"#,
+        ],
+    );
+
+    let error = match weltgewebe_api::routes::edges::load_edges().await {
+        Ok(_) => panic!("corrupt canonical edge JSONL suffix must fail closed after cache limit"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let message = error.to_string();
+    assert!(message.contains("demo.edges.jsonl"), "message: {message}");
+    assert!(message.contains("line 3"), "message: {message}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn edges_load_rejects_invalid_utf8_instead_of_treating_it_as_eof() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let edges_path = in_dir.join("demo.edges.jsonl");
+    let _env = set_gewebe_in_dir(&in_dir);
+    fs::create_dir_all(&in_dir)?;
+
+    let mut bytes =
+        br#"{"id":"e1","source_id":"n1","target_id":"n2","edge_kind":"reference"}"#.to_vec();
+    bytes.extend_from_slice(b"\n");
+    bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+    fs::write(&edges_path, bytes)?;
+
+    let error = match weltgewebe_api::routes::edges::load_edges().await {
+        Ok(_) => panic!("invalid UTF-8 in canonical edge JSONL must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -1300,11 +1383,12 @@ async fn post_edges_does_not_update_cache_when_append_fails() -> Result<()> {
     let edges_path = in_dir.join("demo.edges.jsonl");
     let _env = set_gewebe_in_dir(&in_dir);
 
-    // Make the append fail portably: the JSONL path exists as a *directory*,
-    // so opening it as a file for append errors out.
-    fs::create_dir_all(&edges_path)?;
-
     let (app, cookie, state) = app_with_session(Role::Weber, DomainReadSource::Jsonl).await?;
+
+    // Make the append fail only after a valid empty startup: the JSONL path
+    // becomes a directory, so opening it as a file for append errors out.
+    // A directory at startup is now correctly rejected by the strict loader.
+    fs::create_dir_all(&edges_path)?;
 
     let res = app
         .oneshot(post_edges(Some(&cookie), &valid_create_body()))
@@ -1315,6 +1399,48 @@ async fn post_edges_does_not_update_cache_when_append_fails() -> Result<()> {
 
     // Failed persistence must never leave a phantom edge in memory.
     assert_eq!(state.edges.read().await.len(), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn post_edges_rejects_corrupt_existing_jsonl_after_startup() -> Result<()> {
+    for corrupt_line in [
+        r#"{broken_json"#,
+        r#"{"id":"missing-required-edge-fields"}"#,
+    ] {
+        let tmp = make_tmp_dir();
+        let in_dir = tmp.path().join("in");
+        fs::create_dir_all(&in_dir)?;
+        let edges_path = in_dir.join("demo.edges.jsonl");
+        let _env = set_gewebe_in_dir(&in_dir);
+
+        // Start from a valid empty source, then model external/manual corruption
+        // after startup. The pre-append scan must reject anything the next
+        // strict startup would reject instead of extending the corrupt file.
+        let (app, cookie, state) = app_with_session(Role::Weber, DomainReadSource::Jsonl).await?;
+        fs::write(&edges_path, corrupt_line)?;
+        let before = fs::read(&edges_path)?;
+
+        let res = app
+            .oneshot(post_edges(Some(&cookie), &valid_create_body()))
+            .await?;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = read_text_body(res).await?;
+        assert!(text.contains("failed to persist edge"), "body: {text}");
+
+        assert_eq!(
+            fs::read(&edges_path)?,
+            before,
+            "corrupt source must stay byte-identical"
+        );
+        assert_eq!(
+            state.edges.read().await.len(),
+            0,
+            "failed create must not populate cache"
+        );
+    }
 
     Ok(())
 }

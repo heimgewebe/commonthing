@@ -569,7 +569,7 @@ async fn account_details_skip_jsonl_creation_without_original_timestamp() -> Res
         ),
     )?;
 
-    let loaded_nodes = nodes::load_nodes().await;
+    let loaded_nodes = nodes::load_nodes().await?;
     let loaded = loaded_nodes.get(NODE_ID).context("legacy node must load")?;
     assert_eq!(
         loaded.created_at, UPDATED_AT,
