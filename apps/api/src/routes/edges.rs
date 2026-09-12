@@ -16,7 +16,7 @@ use crate::utils::edges_path;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Extension, Json,
+    Json,
 };
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1227,23 +1227,29 @@ fn edge_create_error_message(err: &edge_create::EdgeCreateValidationError) -> St
 /// requires the PostgreSQL read source): `insert_domain_edge` retains the
 /// serialized table-lock transaction, operation lookup, duplicate precheck,
 /// cache-limit count and final INSERT. No dual-write or fallback exists.
-pub async fn create_edge(
-    State(state): State<ApiState>,
-    Extension(auth): Extension<AuthContext>,
-    Json(payload): Json<Value>,
+/// Ensure one internal derived-Faden projection.
+///
+/// This is a domain primitive, not an Axum handler: callers pass already
+/// extracted state, authentication context, and payload explicitly. It is
+/// public only so the integration suite can exercise the exact persistence
+/// contract through a test-only adapter; the production router does not mount it.
+pub async fn ensure_derived_faden(
+    state: ApiState,
+    auth: AuthContext,
+    payload: Value,
 ) -> Result<(StatusCode, Json<Edge>), (StatusCode, String)> {
-    project_edge(state, auth, payload, FadenProjectionMode::EnsureOnly).await
+    project_derived_faden(state, auth, payload, FadenProjectionMode::EnsureOnly).await
 }
 
-pub(crate) async fn reactivate_edge(
-    State(state): State<ApiState>,
-    Extension(auth): Extension<AuthContext>,
-    Json(payload): Json<Value>,
+pub(crate) async fn reactivate_derived_faden(
+    state: ApiState,
+    auth: AuthContext,
+    payload: Value,
 ) -> Result<(StatusCode, Json<Edge>), (StatusCode, String)> {
-    project_edge(state, auth, payload, FadenProjectionMode::Reactivate).await
+    project_derived_faden(state, auth, payload, FadenProjectionMode::Reactivate).await
 }
 
-async fn project_edge(
+async fn project_derived_faden(
     state: ApiState,
     auth: AuthContext,
     payload: Value,

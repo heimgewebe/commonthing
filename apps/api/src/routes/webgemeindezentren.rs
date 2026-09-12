@@ -6,7 +6,7 @@ use crate::{middleware::auth::AuthContext, routes::nodes::Location, state::ApiSt
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Extension, Json,
+    Json,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
@@ -535,16 +535,10 @@ async fn project_webgemeindezentrum_activity_faden(
 
     let projection = match projection_mode {
         super::edges::FadenProjectionMode::EnsureOnly => {
-            super::edges::create_edge(State(state.clone()), Extension(auth.clone()), Json(payload))
-                .await
+            super::edges::ensure_derived_faden(state.clone(), auth.clone(), payload).await
         }
         super::edges::FadenProjectionMode::Reactivate => {
-            super::edges::reactivate_edge(
-                State(state.clone()),
-                Extension(auth.clone()),
-                Json(payload),
-            )
-            .await
+            super::edges::reactivate_derived_faden(state.clone(), auth.clone(), payload).await
         }
     }
     .map(|_| ())
