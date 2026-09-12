@@ -176,9 +176,47 @@ Nach dem Apply erzwingt `up` weiterhin exakte Flux-Revisionen, gebundene PVCs un
 gesunde PostgreSQL-, NATS-, `source-controller`- und `kustomize-controller`-
 Deployments. `status` prüft denselben Livezustand. Der Cell-Receipt hält erfolgreiche
 Migration-/Aktivierungsbeweise fest; Produktion bleibt unverändert
-(`production_changed=false`). Die Zelle etabliert weiterhin keinen
+(`production_changed=false`). Die App-Aktivierung allein etabliert keinen
 Gateway-/DNS-/TLS-Außenbeweis, kein Delete-to-Prove, keine NATS-Authentisierung/TLS
 und keinen Produktions-Kubernetes-Cutover.
+
+### Begrenzter Staging-HTTP-Gateway-Beweis
+
+```bash
+uv run --project tools/py --locked python scripts/platform/staging_cell.py prove-gateway --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit <exact-active-app-commit>
+```
+
+Der Befehl verlangt den gespeicherten Owner, eine abgeschlossene App-Aktivierung,
+deren exakten aktiven Commit und unveränderte Promotion-Evidenz. Der saubere
+Runner-Checkout darf einen neueren lokalen Implementierungscommit enthalten;
+dieser wird getrennt im Receipt festgehalten. `activate` behält sein exaktes
+Public-Main-/Promotion-Gate unverändert.
+
+Nur `clusters/staging/gateway/` wird gerendert und serverseitig validiert/angewandt:
+Gateway und HTTPRoute `commonthing-staging` im gleichnamigen App-Namespace sowie
+ein ausschließlich auf dessen Cilium-Service begrenzter Einadresspool
+`commonthing-staging-gateway` (`172.30.84.1`). Der private VIP wird gegen belegte
+Serviceadressen, andere Pools, Pod- und kind-Netze geprüft; L2/BGP-Ankündigungen
+werden nicht eingerichtet. Der gemeinsame Legacy-Gateway-Pfad wird nicht benutzt.
+HTTP auf Port 80 routet `/health` und `/api` unverändert an `commonthing-api:8080`,
+`/` an `commonthing-web:8080`. Es gibt weder Hostnamen noch TLS-Referenzen.
+
+Ein Lifecycle-Lock serialisiert den Beweis. Vor dem Apply persistiert
+`gateway-proof-in-progress` Owner, aktiven Commit und Manifest-Hash; Wiederanläufe
+müssen genau diese Bindung erfüllen. Vorhandene Ressourcen ohne passenden Owner
+werden nicht übernommen. Erst aktuelle `Programmed`-/`Accepted`-/`ResolvedRefs`-
+Conditions und erfolgreiche Requests aus dem kind-Node-Netz auf `/health/live`,
+`/` und `/api/nodes` erlauben `gateway-ready`. Die HTTP-Semantik stammt aus
+`kind_reference.probe_gateway_http`, einschließlich JSON-Listenprüfung und
+Hash des ersten KiB der Webantwort (kein vollständiger Web-Body-Hash).
+
+`receipts/gateway-proof.json` ist privat (`0600`) und bindet Owner, Bootstrap-,
+App- und Runner-Commit, Manifest-Hash, Ressourcen-UIDs/Generationen/Spec-Hashes,
+Service, VIP, Port, Probe-Node und Antwort-Hashes. Der Cell-Receipt bindet wiederum
+diesen Receipt-Hash. `status` meldet `gateway_ready` nur bei weiterhin passender
+App-/Receipt-/Ressourcenbindung; dies ist ein gespeicherter HTTP-Beweis mit aktuellem
+Ressourcenreadback, kein erneuter HTTP-Probe. DNS, TLS, externer Load Balancer,
+Delete-to-Prove und Produktionscutover bleiben ausdrücklich unbelegt.
 
 ## Beweise
 

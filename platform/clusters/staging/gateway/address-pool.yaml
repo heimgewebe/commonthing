@@ -1,0 +1,13 @@
+# Private kind-node listener proof only; no L2/BGP advertisement or public LB.
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: commonthing-staging-gateway
+spec:
+  blocks:
+    - start: 172.30.84.1
+      stop: 172.30.84.1
+  serviceSelector:
+    matchLabels:
+      io.kubernetes.service.namespace: commonthing-staging
+      gateway.networking.k8s.io/gateway-name: commonthing-staging

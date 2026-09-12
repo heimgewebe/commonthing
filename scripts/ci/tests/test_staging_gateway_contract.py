@@ -1,0 +1,368 @@
+from __future__ import annotations
+
+import argparse
+import copy
+import stat
+import tempfile
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest import mock
+
+import yaml
+
+from scripts.platform import staging_cell as staging
+
+REAL_OBSERVATION = staging.staging_gateway_observation
+REAL_DOCUMENTS = staging.staging_gateway_documents
+
+
+class StagingGatewayTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cell = {
+            "schema_version": 1,
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": "test:t084",
+            "bootstrap_commit": "a" * 40,
+            "active_commit": "b" * 40,
+            "app_activation": True,
+            "status": "app-ready-gateway-pending",
+            "image_promotion": {
+                "source_commit": "b" * 40,
+                "images": {"api": "api@sha256:abc", "web": "web@sha256:def"},
+                "receipt_sha256": "c" * 64,
+            },
+        }
+        staging.write_cell_receipt(self.root, self.cell)
+        self.args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id="test:t084",
+            source_commit="b" * 40,
+        )
+        self.docs = [
+            yaml.safe_load(
+                (staging.ROOT / "platform/clusters/staging/gateway" / name).read_text()
+            )
+            for name in ("gateway.yaml", "httproute.yaml", "address-pool.yaml")
+        ]
+        self.observed = {
+            "resources": [{"uid": "gateway-uid"}],
+            "service": {"uid": "service-uid"},
+            "address": staging.GATEWAY_VIP,
+            "listener_port": 80,
+        }
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.mocks = {}
+        patches = {
+            "state_root": self.root,
+            "configure_reference_paths": None,
+            "require_clean_commit": "d" * 40,
+            "load_promotion_receipt": self.cell["image_promotion"],
+            "load_tool_receipt": {
+                "tools": {
+                    "kind": "kind",
+                    "kubectl": "kubectl",
+                    "kustomize": "kustomize",
+                }
+            },
+            "require_gateway_app_current": None,
+            "staging_gateway_documents": self.docs,
+            "require_gateway_address_available": None,
+            "staging_gateway_observation": self.observed,
+            "run": None,
+        }
+        for name, value in patches.items():
+            self.mocks[name] = self.stack.enter_context(
+                mock.patch.object(staging, name, return_value=value)
+            )
+        self.mocks["staging_gateway_documents"].side_effect = lambda _: copy.deepcopy(
+            self.docs
+        )
+        self.owned = self.stack.enter_context(
+            mock.patch.object(staging.reference, "require_owned_cluster")
+        )
+        self.probe = self.stack.enter_context(
+            mock.patch.object(
+                staging.reference,
+                "probe_gateway_http",
+                return_value=(
+                    "kind-worker",
+                    staging.GATEWAY_VIP,
+                    b"ok",
+                    b"<html>",
+                    b"[]",
+                ),
+            )
+        )
+        self.get = self.stack.enter_context(
+            mock.patch.object(staging, "gateway_get", side_effect=self.get_resource)
+        )
+
+    def get_resource(self, kubectl, kind, name, namespace=""):
+        if kind == "GatewayClass":
+            return {
+                "metadata": {"generation": 1},
+                "spec": {"controllerName": "io.cilium/gateway-controller"},
+                "status": {
+                    "conditions": [
+                        {"type": "Accepted", "status": "True", "observedGeneration": 1}
+                    ]
+                },
+            }
+        return {}
+
+    def test_manifests_only_http_canonical_staging_backends_and_scoped_pool(self):
+        gateway, route, pool = self.docs
+        self.assertEqual(
+            gateway["spec"],
+            {
+                "gatewayClassName": "cilium",
+                "listeners": [
+                    {
+                        "name": "http",
+                        "protocol": "HTTP",
+                        "port": 80,
+                        "allowedRoutes": {"namespaces": {"from": "Same"}},
+                    }
+                ],
+            },
+        )
+        self.assertEqual(
+            route["spec"]["parentRefs"],
+            [
+                {
+                    "name": staging.GATEWAY_NAME,
+                    "namespace": staging.APP_NAMESPACE,
+                    "sectionName": "http",
+                }
+            ],
+        )
+        self.assertEqual(
+            [rule["backendRefs"] for rule in route["spec"]["rules"]],
+            [
+                [{"name": "commonthing-api", "port": 8080}],
+                [{"name": "commonthing-web", "port": 8080}],
+            ],
+        )
+        self.assertEqual(
+            pool["spec"]["serviceSelector"]["matchLabels"],
+            {
+                "io.kubernetes.service.namespace": staging.APP_NAMESPACE,
+                "gateway.networking.k8s.io/gateway-name": staging.GATEWAY_NAME,
+            },
+        )
+        self.assertNotIn("hostnames", route["spec"])
+
+    def test_success_receipt_private_bound_and_idempotent(self):
+        for _ in range(2):
+            result = staging.command_prove_gateway(self.args)
+            self.assertEqual(result["status"], "gateway-ready")
+            self.assertEqual(result["active_commit"], self.cell["active_commit"])
+            self.assertEqual(result["owner_id"], self.args.owner_id)
+            self.assertEqual(result["resources"], self.observed["resources"])
+            self.assertEqual(result["api_nodes_sha256"], staging.sha256_bytes(b"[]"))
+            self.assertEqual(result["does_not_establish"], staging.GATEWAY_LIMITS)
+        path = self.root / "receipts/gateway-proof.json"
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        cell = staging.load_cell_receipt(self.root)
+        self.assertNotIn("pending_gateway", cell)
+        self.assertEqual(
+            cell["gateway_proof"]["receipt_sha256"], staging.sha256_file(path)
+        )
+        calls = self.mocks["run"].call_args_list
+        self.assertEqual(len(calls), 4)
+        self.assertIn("--dry-run=server", calls[0].args[0])
+        self.assertNotIn("--dry-run=server", calls[1].args[0])
+        for call in calls:
+            applied = list(yaml.safe_load_all(call.kwargs["input_text"]))
+            self.assertEqual(
+                {d["kind"] for d in applied}, {d[0] for d in staging.GATEWAY_RESOURCES}
+            )
+        self.probe.assert_called_with(
+            "kind", staging.DEFAULT_CLUSTER, [staging.GATEWAY_VIP], 80
+        )
+
+    def test_owner_commit_pending_activation_and_promotion_fail_before_apply(self):
+        variants = [
+            {"owner_id": "another:owner"},
+            {"active_commit": "e" * 40},
+            {"app_activation": False},
+            {"pending_active_commit": "b" * 40},
+            {"status": "app-activation-in-progress"},
+            {"image_promotion": {}},
+        ]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                staging.write_cell_receipt(self.root, {**self.cell, **variant})
+                with self.assertRaises(staging.StagingCellError):
+                    staging.command_prove_gateway(self.args)
+                self.mocks["run"].assert_not_called()
+
+    def test_failure_and_same_input_recovery(self):
+        self.probe.side_effect = staging.reference.ProofError("unreachable")
+        with self.assertRaises(staging.reference.ProofError):
+            staging.command_prove_gateway(self.args)
+        pending = staging.load_cell_receipt(self.root)
+        self.assertEqual(pending["status"], "gateway-proof-in-progress")
+        self.assertNotIn("gateway_proof", pending)
+        self.assertFalse((self.root / "receipts/gateway-proof.json").exists())
+        self.probe.side_effect = None
+        staging.command_prove_gateway(self.args)
+        self.assertEqual(
+            staging.load_cell_receipt(self.root)["status"], "gateway-ready"
+        )
+
+    def test_changed_pending_manifest_refused(self):
+        staging.write_cell_receipt(
+            self.root,
+            {**self.cell, "status": "gateway-proof-in-progress", "pending_gateway": {}},
+        )
+        with self.assertRaisesRegex(staging.StagingCellError, "recovery"):
+            staging.command_prove_gateway(self.args)
+        self.mocks["run"].assert_not_called()
+
+    def test_foreign_resource_not_adopted(self):
+        self.get.side_effect = lambda k, kind, n, ns="": (
+            self.get_resource(k, kind, n, ns)
+            if kind == "GatewayClass"
+            else {"metadata": {"uid": "foreign"}}
+        )
+        with self.assertRaisesRegex(staging.StagingCellError, "adopt"):
+            staging.command_prove_gateway(self.args)
+        self.mocks["run"].assert_not_called()
+
+    def test_changed_resources_during_probe_fail(self):
+        self.mocks["staging_gateway_observation"].side_effect = [
+            self.observed,
+            {**self.observed, "resources": []},
+        ]
+        with self.assertRaisesRegex(staging.StagingCellError, "changed"):
+            staging.command_prove_gateway(self.args)
+        self.assertEqual(
+            staging.load_cell_receipt(self.root)["status"], "gateway-proof-in-progress"
+        )
+
+    def test_status_refuses_changed_receipt_resource_or_active_commit(self):
+        staging.command_prove_gateway(self.args)
+        cell = staging.load_cell_receipt(self.root)
+        self.assertTrue(staging.gateway_receipt_current(self.root, cell, "kubectl"))
+        self.assertFalse(
+            staging.gateway_receipt_current(
+                self.root, {**cell, "active_commit": "e" * 40}, "kubectl"
+            )
+        )
+        self.mocks["staging_gateway_observation"].return_value = {
+            **self.observed,
+            "resources": [],
+        }
+        self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
+        (self.root / "receipts/gateway-proof.json").write_text("{}")
+        self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
+
+    def test_conditions_require_current_generation(self):
+        doc = self.get_resource("kubectl", "GatewayClass", "cilium")
+        self.assertTrue(staging.current_condition(doc, "Accepted"))
+        doc["metadata"]["generation"] = 2
+        self.assertFalse(staging.current_condition(doc, "Accepted"))
+
+    def test_lock_excludes_other_mutations(self):
+        with staging.lifecycle_lock(self.root):
+            with self.assertRaisesRegex(
+                staging.StagingCellError, "already in progress"
+            ):
+                staging.command_prove_gateway(self.args)
+        self.mocks["run"].assert_not_called()
+
+    def test_observation_rejects_stale_wrong_parent_and_missing_address(self):
+        # Exercise the actual readback validator, not the command's observation stub.
+        documents = copy.deepcopy(self.docs)
+        for document in documents:
+            document["metadata"].update(uid=document["kind"], generation=2)
+        gateway, route, pool = documents
+        gateway["status"] = {
+            "conditions": [
+                {"type": "Programmed", "status": "True", "observedGeneration": 2}
+            ],
+            "addresses": [{"type": "IPAddress", "value": staging.GATEWAY_VIP}],
+        }
+        route["status"] = {
+            "parents": [
+                {
+                    "controllerName": "io.cilium/gateway-controller",
+                    "parentRef": {
+                        "name": staging.GATEWAY_NAME,
+                        "namespace": staging.APP_NAMESPACE,
+                        "sectionName": "http",
+                    },
+                    "conditions": [
+                        {"type": name, "status": "True", "observedGeneration": 2}
+                        for name in ("Accepted", "ResolvedRefs")
+                    ],
+                }
+            ]
+        }
+        service = {
+            "metadata": {
+                "name": "cilium-gateway-commonthing-staging",
+                "uid": "svc",
+                "labels": {
+                    "gateway.networking.k8s.io/gateway-name": staging.GATEWAY_NAME
+                },
+            },
+            "spec": {"type": "LoadBalancer", "ports": [{"port": 80}]},
+            "status": {"loadBalancer": {"ingress": [{"ip": staging.GATEWAY_VIP}]}},
+        }
+        lookup = {document["kind"]: document for document in documents}
+        lookup["Service"] = service
+        self.get.side_effect = lambda k, kind, n, ns="": lookup[kind]
+        observed = REAL_OBSERVATION("kubectl")
+        self.assertEqual(len(observed["resources"]), 3)
+        self.assertEqual(observed["resources"][0]["uid"], "Gateway")
+        for mutate in (
+            lambda: gateway["status"]["conditions"][0].update(observedGeneration=1),
+            lambda: route["status"]["parents"][0]["parentRef"].update(
+                sectionName="other"
+            ),
+            lambda: route["status"]["parents"][0]["conditions"][1].update(
+                status="False"
+            ),
+            lambda: gateway["status"].update(addresses=[]),
+        ):
+            saved = copy.deepcopy(lookup)
+            mutate()
+            with self.assertRaises(staging.StagingCellError):
+                REAL_OBSERVATION("kubectl")
+            for kind in lookup:
+                lookup[kind].clear()
+                lookup[kind].update(saved[kind])
+
+    def test_render_rejects_extra_resources(self):
+        with mock.patch.object(
+            staging,
+            "output",
+            return_value=yaml.safe_dump_all(
+                self.docs + [{"kind": "Secret", "metadata": {"name": "forbidden"}}]
+            ),
+        ):
+            with self.assertRaisesRegex(staging.StagingCellError, "allowlist"):
+                REAL_DOCUMENTS("kustomize")
+
+    def test_cli_requires_owner_and_exact_source(self):
+        parsed = staging.parser().parse_args(
+            [
+                "prove-gateway",
+                "--owner-id",
+                self.args.owner_id,
+                "--source-commit",
+                self.args.source_commit,
+            ]
+        )
+        self.assertEqual(parsed.cluster, staging.DEFAULT_CLUSTER)
+
+
+if __name__ == "__main__":
+    unittest.main()
