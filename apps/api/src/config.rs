@@ -196,19 +196,20 @@ impl DomainAccountWriteSource {
     }
 }
 
-/// Selects where internal derived-Faden projections are persisted.
+/// Selects how internal derived-Faden projections may persist.
 ///
-/// OPT-ARC-001 Phase E-C: this is a deliberately narrow gate. It governs the
-/// edge-create write path **only** — account writes, node writes, step-up email
-/// persistence and WebAuthn user-id writeback are out of scope and remain
-/// unchanged. JSONL remains the default. PostgreSQL is opt-in via
-/// `WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE` or the `domain_edge_write_source`
-/// config-file key, and additionally requires `domain_read_source=postgres`
-/// (validated at config load) plus a live pool (validated at startup).
+/// After the PostgreSQL cutover, JSONL is a read-only fallback for runtime
+/// configuration. `ReadOnly` is therefore the default; PostgreSQL is the only
+/// configurable durable edge-write source. `Jsonl` remains temporarily as an
+/// internal legacy/test value so the old persistence helpers stay
+/// characterizable until their own removal slice. Successful runtime config
+/// validation rejects that legacy value.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum DomainEdgeWriteSource {
     #[default]
+    #[serde(alias = "readonly", alias = "read-only", alias = "none")]
+    ReadOnly,
     #[serde(alias = "file", alias = "files")]
     Jsonl,
     #[serde(alias = "pg", alias = "db")]
@@ -218,10 +219,11 @@ pub enum DomainEdgeWriteSource {
 impl DomainEdgeWriteSource {
     fn parse_env_value(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "read_only" | "readonly" | "read-only" | "none" => Ok(Self::ReadOnly),
             "jsonl" | "file" | "files" => Ok(Self::Jsonl),
             "postgres" | "pg" | "db" => Ok(Self::Postgres),
             other => anyhow::bail!(
-                "invalid WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE value '{other}'; expected one of: jsonl, file, files, postgres, pg, db"
+                "invalid WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE value '{other}'; expected one of: read_only, readonly, read-only, none, postgres, pg, db"
             ),
         }
     }
@@ -352,8 +354,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub domain_node_write_source: DomainNodeWriteSource,
 
-    /// Edge-create write source (JSONL default, PostgreSQL opt-in).
-    /// Governs the internal derived-Faden projection writer; no public edge mutation route exists.
+    /// Edge-create write source (read-only default, PostgreSQL opt-in).
+    /// Governs `POST /edges` and internal derived-Faden lifecycle projections.
+    /// The legacy `Jsonl` value is retained only for internal persistence tests
+    /// and is rejected by normal runtime configuration validation.
     #[serde(default)]
     pub domain_edge_write_source: DomainEdgeWriteSource,
 
@@ -829,6 +833,18 @@ impl AppConfig {
                 "domain_node_write_source=postgres requires domain_read_source=postgres \
                  (set WELTGEWEBE_DOMAIN_READ_SOURCE=postgres). Writing node patches to \
                  PostgreSQL while reading from JSONL would create restart-invisible writes."
+            );
+        }
+
+        // Post-cutover runtime contract: JSONL edge writes are retired. Keep
+        // the enum value temporarily for direct legacy-persistence tests, but
+        // never allow a successfully loaded application configuration to
+        // activate it.
+        if self.domain_edge_write_source == DomainEdgeWriteSource::Jsonl {
+            anyhow::bail!(
+                "domain_edge_write_source=jsonl is retired after the PostgreSQL cutover; \
+                 use domain_edge_write_source=read_only for JSONL fallback reads or postgres \
+                 together with domain_read_source=postgres for durable edge writes"
             );
         }
 
@@ -1450,8 +1466,26 @@ max_guest_owned_nodes: 1000
             DomainAccountWriteSource::Jsonl
         );
         assert_eq!(cfg.domain_node_write_source, DomainNodeWriteSource::Jsonl);
-        assert_eq!(cfg.domain_edge_write_source, DomainEdgeWriteSource::Jsonl);
+        assert_eq!(
+            cfg.domain_edge_write_source,
+            DomainEdgeWriteSource::ReadOnly
+        );
 
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn domain_edge_write_source_jsonl_yaml_is_rejected_as_retired() -> Result<()> {
+        let _write = EnvGuard::unset("WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE");
+        let error = AppConfig::load_from_str(
+            "max_guest_owned_nodes: 1000\ndomain_edge_write_source: jsonl\n",
+        )
+        .expect_err("runtime config file must not reactivate legacy JSONL edge writes");
+
+        assert!(error
+            .to_string()
+            .contains("domain_edge_write_source=jsonl is retired"));
         Ok(())
     }
 
@@ -2422,7 +2456,7 @@ max_guest_owned_nodes: 1000
 
     #[test]
     #[serial]
-    fn domain_edge_write_source_defaults_to_jsonl() -> Result<()> {
+    fn domain_edge_write_source_defaults_to_read_only() -> Result<()> {
         let file = NamedTempFile::new()?;
         std::fs::write(file.path(), YAML)?;
         let _read = EnvGuard::unset("WELTGEWEBE_DOMAIN_READ_SOURCE");
@@ -2430,7 +2464,10 @@ max_guest_owned_nodes: 1000
 
         let cfg = AppConfig::load_from_path(file.path())?;
 
-        assert_eq!(cfg.domain_edge_write_source, DomainEdgeWriteSource::Jsonl);
+        assert_eq!(
+            cfg.domain_edge_write_source,
+            DomainEdgeWriteSource::ReadOnly
+        );
         Ok(())
     }
 
@@ -2444,21 +2481,44 @@ max_guest_owned_nodes: 1000
 
         let cfg = AppConfig::load_from_path(file.path())?;
 
-        assert_eq!(cfg.domain_edge_write_source, DomainEdgeWriteSource::Jsonl);
+        assert_eq!(
+            cfg.domain_edge_write_source,
+            DomainEdgeWriteSource::ReadOnly
+        );
         Ok(())
     }
 
     #[test]
     #[serial]
-    fn domain_edge_write_source_jsonl_env_is_accepted() -> Result<()> {
+    fn domain_edge_write_source_read_only_env_is_accepted() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        std::fs::write(file.path(), YAML)?;
+        let _read = EnvGuard::unset("WELTGEWEBE_DOMAIN_READ_SOURCE");
+        let _write = EnvGuard::set("WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE", "read_only");
+
+        let cfg = AppConfig::load_from_path(file.path())?;
+
+        assert_eq!(
+            cfg.domain_edge_write_source,
+            DomainEdgeWriteSource::ReadOnly
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn domain_edge_write_source_jsonl_env_is_rejected_as_retired() -> Result<()> {
         let file = NamedTempFile::new()?;
         std::fs::write(file.path(), YAML)?;
         let _read = EnvGuard::unset("WELTGEWEBE_DOMAIN_READ_SOURCE");
         let _write = EnvGuard::set("WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE", "jsonl");
 
-        let cfg = AppConfig::load_from_path(file.path())?;
+        let error = AppConfig::load_from_path(file.path())
+            .expect_err("runtime config must not reactivate legacy JSONL edge writes");
 
-        assert_eq!(cfg.domain_edge_write_source, DomainEdgeWriteSource::Jsonl);
+        assert!(error
+            .to_string()
+            .contains("domain_edge_write_source=jsonl is retired"));
         Ok(())
     }
 
@@ -2513,18 +2573,19 @@ max_guest_owned_nodes: 1000
 
     #[test]
     #[serial]
-    fn domain_edge_write_jsonl_with_postgres_read_is_accepted() -> Result<()> {
-        // Config-level: postgres read + jsonl edge write loads fine; the
-        // route-level guard (not the config) blocks the actual create with 409.
+    fn domain_edge_write_read_only_with_postgres_read_is_accepted() -> Result<()> {
         let file = NamedTempFile::new()?;
         std::fs::write(file.path(), YAML)?;
         let _read = EnvGuard::set("WELTGEWEBE_DOMAIN_READ_SOURCE", "postgres");
-        let _write = EnvGuard::set("WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE", "jsonl");
+        let _write = EnvGuard::set("WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE", "read_only");
 
         let cfg = AppConfig::load_from_path(file.path())?;
 
         assert_eq!(cfg.domain_read_source, DomainReadSource::Postgres);
-        assert_eq!(cfg.domain_edge_write_source, DomainEdgeWriteSource::Jsonl);
+        assert_eq!(
+            cfg.domain_edge_write_source,
+            DomainEdgeWriteSource::ReadOnly
+        );
         Ok(())
     }
 

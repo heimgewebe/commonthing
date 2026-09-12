@@ -152,8 +152,15 @@ pub async fn run() -> anyhow::Result<()> {
                 "Faden projection source: PostgreSQL (internal Webungsaktion projection)."
             );
         }
+        DomainEdgeWriteSource::ReadOnly => {
+            tracing::info!(
+                "Faden projection source: read-only; JSONL fallback reads remain available."
+            );
+        }
         DomainEdgeWriteSource::Jsonl => {
-            tracing::info!("Faden projection source: JSONL (default internal projection).");
+            tracing::warn!(
+                "Faden projection source: legacy JSONL writer; normal runtime configuration rejects this state."
+            );
         }
     }
 

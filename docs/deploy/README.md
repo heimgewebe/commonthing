@@ -224,8 +224,9 @@ Serverzustand muss zusätzlich durch Runtime-Evidence belegt werden.
 - **WELTGEWEBE_DOMAIN_NODE_WRITE_SOURCE**: lokal `jsonl`, Produktion `postgres`.
   `postgres` persistiert `POST /nodes` und `PATCH /nodes/{id}` in
   `domain_nodes`.
-- **WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE**: lokal `jsonl`, Produktion `postgres`.
-  `postgres` persistiert `POST /edges` in `domain_edges`.
+- **WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE**: lokal `read_only`, Produktion `postgres`.
+  `read_only` lässt JSONL-Fäden als Fallback lesbar, blockiert aber neue
+  Fadenpersistenz. `postgres` persistiert `POST /edges` in `domain_edges`.
 - **WELTGEWEBE_PASSKEY_CREDENTIAL_SOURCE**: lokaler In-Memory-Default,
   Produktion `postgres`. `postgres` persistiert Credentials und Signaturzähler
   in `passkey_credentials`.

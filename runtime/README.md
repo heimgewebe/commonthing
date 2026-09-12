@@ -74,11 +74,13 @@ Der Deployvertrag verlangt eine konkrete Buildkennung über
 | `WELTGEWEBE_DOMAIN_READ_SOURCE` | `jsonl` | `postgres` | Quelle für Accounts/Garnrollen, Knoten und Fäden |
 | `WELTGEWEBE_DOMAIN_ACCOUNT_WRITE_SOURCE` | `jsonl` | `postgres` | Account-/Garnrollen-Erzeugung und Account-Mutationen |
 | `WELTGEWEBE_DOMAIN_NODE_WRITE_SOURCE` | `jsonl` | `postgres` | Knotenänderungen |
-| `WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE` | `jsonl` | `postgres` | Fadenerzeugung |
+| `WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE` | `read_only` | `postgres` | Fadenerzeugung |
 
-Die lokalen Defaults bleiben aus Rückwärtskompatibilität JSONL. In Produktion
-ist PostgreSQL jedoch die Lese- und Schreibwahrheit; JSONL ist dort kein offener
-Cutover-Blocker, sondern nur Legacy-/Rollback-/Importmaterial. Jeder
+Lokale Reads sowie die noch nicht abgebauten Account-/Node-Schreibpfade bleiben
+vorerst aus Rückwärtskompatibilität JSONL. Die Fadenprojektion ist lokal dagegen
+standardmäßig `read_only`: JSONL kann gelesen werden, neue Fäden werden dort
+nicht mehr persistiert. In Produktion ist PostgreSQL die Lese- und
+Schreibwahrheit; JSONL ist dort nur Legacy-/Rollback-/Importmaterial. Jeder
 PostgreSQL-Schreibpfad verlangt auch `domain_read_source=postgres` und einen
 verfügbaren Pool. Ungültige Kombinationen führen zu einem Konfigurations- oder
 Startfehler.

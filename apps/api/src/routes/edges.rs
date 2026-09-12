@@ -1,4 +1,6 @@
-use super::domain_write_guard::reject_edge_create_unless_writable;
+use super::domain_write_guard::{
+    reject_edge_create_unless_writable, write_source_read_only_conflict,
+};
 use super::health::{ensure_jsonl_size, load_policy_limits};
 use super::query::{
     cursor_page, parse_cursor_params, parse_usize_param, validate_cursor_limit, ListResponse,
@@ -1221,12 +1223,13 @@ fn edge_create_error_message(err: &edge_create::EdgeCreateValidationError) -> St
 /// new durable write returns 201; an identical operation replay returns the
 /// existing edge with 200. Failed writes never leave a phantom cache entry.
 ///
-/// JSONL (default): one serialized file scan checks operation replay,
-/// duplicate id and cache-limit materializability before a durable append.
-/// PostgreSQL (opt-in via `WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE=postgres`,
-/// requires the PostgreSQL read source): `insert_domain_edge` retains the
-/// serialized table-lock transaction, operation lookup, duplicate precheck,
-/// cache-limit count and final INSERT. No dual-write or fallback exists.
+/// Runtime default is read-only: JSONL may still be loaded as fallback data,
+/// but derived Fäden are not persisted until PostgreSQL is selected explicitly.
+/// The JSONL append/rewrite arm remains temporarily for direct legacy
+/// persistence tests; successful runtime configuration cannot activate it.
+/// PostgreSQL (`WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE=postgres`, requiring the
+/// PostgreSQL read source) is the only configurable durable writer. No
+/// dual-write or fallback exists.
 pub async fn create_edge(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
@@ -1344,6 +1347,9 @@ async fn project_edge(
     // Exactly one configured persistence source is used; there is no
     // JSONL/PostgreSQL dual-write or fallback.
     match state.config.domain_edge_write_source {
+        DomainEdgeWriteSource::ReadOnly => {
+            return Err(write_source_read_only_conflict());
+        }
         DomainEdgeWriteSource::Jsonl => {
             // One lock covers operation lookup, duplicate/limit inspection and
             // append, so concurrent retries cannot both write.

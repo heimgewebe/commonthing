@@ -1344,6 +1344,49 @@ async fn post_edges_blocks_postgres_read_source() -> Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn post_edges_read_only_source_rejects_without_jsonl_or_cache_side_effects() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let edges_path = in_dir.join("demo.edges.jsonl");
+    let _env = set_gewebe_in_dir(&in_dir);
+    write_lines(
+        &edges_path,
+        &[r#"{"id":"e1","source_id":"n1","target_id":"n2","edge_kind":"reference"}"#],
+    );
+    let before = fs::read(&edges_path)?;
+
+    let (app, cookie, state) = app_with_session_and_edge_write(
+        Role::Weber,
+        DomainReadSource::Jsonl,
+        weltgewebe_api::config::DomainEdgeWriteSource::ReadOnly,
+    )
+    .await?;
+    assert_eq!(state.edges.read().await.len(), 1);
+
+    let res = app
+        .oneshot(post_edges(Some(&cookie), &valid_create_body()))
+        .await?;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let text = read_text_body(res).await?;
+    assert!(
+        text.contains("DOMAIN_WRITE_SOURCE_READ_ONLY"),
+        "body: {text}"
+    );
+
+    assert_eq!(
+        fs::read(&edges_path)?,
+        before,
+        "read-only create must not rewrite JSONL"
+    );
+    let edges = state.edges.read().await;
+    assert_eq!(edges.len(), 1, "read-only create must not mutate the cache");
+    assert!(edges.get("e1").is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn post_edges_rejects_invalid_jsonl_read_postgres_write_config() -> Result<()> {
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");

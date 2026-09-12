@@ -27,12 +27,12 @@ class ProductionDomainTruthDocsTest(unittest.TestCase):
             with self.subTest(required=phrase):
                 self.assertIn(phrase, self.compose_prod)
 
-    def test_local_example_deliberately_keeps_jsonl_domain_defaults(self) -> None:
+    def test_local_example_keeps_jsonl_reads_but_retires_edge_writes(self) -> None:
         required = [
             "WELTGEWEBE_DOMAIN_READ_SOURCE=jsonl",
             "WELTGEWEBE_DOMAIN_ACCOUNT_WRITE_SOURCE=jsonl",
             "WELTGEWEBE_DOMAIN_NODE_WRITE_SOURCE=jsonl",
-            "WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE=jsonl",
+            "WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE=read_only",
         ]
         for phrase in required:
             with self.subTest(required=phrase):
@@ -43,6 +43,10 @@ class ProductionDomainTruthDocsTest(unittest.TestCase):
         self.assertIn("Produktionsvertrag", self.data_model)
         self.assertIn("keine Aussage über die Produktionsarchitektur", self.data_model)
         self.assertIn("lokal `jsonl`, Produktion `postgres`", self.deploy_readme)
+        self.assertIn(
+            "WELTGEWEBE_DOMAIN_EDGE_WRITE_SOURCE**: lokal `read_only`, Produktion `postgres`",
+            self.deploy_readme,
+        )
         self.assertIn("Produktionsvertrag nutzt PostgreSQL", self.orientation)
         self.assertIn("Liveaussagen brauchen datierte Runtime-Evidence", self.orientation)
 

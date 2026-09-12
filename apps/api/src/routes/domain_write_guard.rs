@@ -11,6 +11,10 @@ pub(super) const DOMAIN_READ_SOURCE_READ_ONLY: &str = "DOMAIN_READ_SOURCE_READ_O
 pub(super) const DOMAIN_READ_SOURCE_READ_ONLY_MESSAGE: &str =
     "Domain mutation is blocked because WELTGEWEBE_DOMAIN_READ_SOURCE=postgres but the matching write source is not postgres; align the read and write source before retrying.";
 
+pub(super) const DOMAIN_WRITE_SOURCE_READ_ONLY: &str = "DOMAIN_WRITE_SOURCE_READ_ONLY";
+pub(super) const DOMAIN_WRITE_SOURCE_READ_ONLY_MESSAGE: &str =
+    "Domain mutation is blocked because the configured write source is read-only; configure the matching write source as postgres before retrying.";
+
 pub(super) const INVALID_DOMAIN_WRITE_CONFIG: &str = "INVALID_DOMAIN_WRITE_CONFIG";
 const INVALID_DOMAIN_WRITE_CONFIG_MESSAGE: &str =
     "domain_account_write_source=postgres requires domain_read_source=postgres";
@@ -28,6 +32,13 @@ fn read_only_conflict() -> (StatusCode, String) {
     )
 }
 
+pub(super) fn write_source_read_only_conflict() -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        format!("{DOMAIN_WRITE_SOURCE_READ_ONLY}: {DOMAIN_WRITE_SOURCE_READ_ONLY_MESSAGE}"),
+    )
+}
+
 fn invalid_write_config() -> (StatusCode, String) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -38,10 +49,12 @@ fn invalid_write_config() -> (StatusCode, String) {
 /// Edge-create write gate (OPT-ARC-001 Phase E-C).
 ///
 /// Behaviour matrix:
-/// - JSONL read + JSONL edge write: allow (JSONL append path).
+/// - Any read source + read-only edge write: reject with 409 before persistence.
+/// - JSONL read + legacy JSONL edge write: allow only for direct internal tests;
+///   normal runtime configuration rejects this legacy write source.
 /// - Postgres read + Postgres edge write: allow (PostgreSQL insert path).
-/// - Postgres read + JSONL edge write: reject — appending to JSONL under a
-///   PostgreSQL read source would persist writes that vanish after a restart.
+/// - Postgres read + legacy JSONL edge write: reject — appending to JSONL under
+///   a PostgreSQL read source would persist writes that vanish after a restart.
 /// - JSONL read + Postgres edge write: reject defensively (config load also
 ///   forbids this); tests and internal code may construct `ApiState` manually.
 pub(super) fn reject_edge_create_unless_writable(
@@ -54,6 +67,10 @@ pub(super) fn reject_edge_create_unless_writable(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{INVALID_DOMAIN_WRITE_CONFIG}: {INVALID_EDGE_WRITE_CONFIG_MESSAGE}"),
         ));
+    }
+
+    if state.config.domain_edge_write_source == DomainEdgeWriteSource::ReadOnly {
+        return Err(write_source_read_only_conflict());
     }
 
     if state.config.domain_read_source == DomainReadSource::Postgres
@@ -368,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres_read_jsonl_edge_write_rejects_read_only() {
+    fn postgres_read_legacy_jsonl_edge_write_rejects_read_source_mismatch() {
         let state = test_state_with_edge_write(
             DomainReadSource::Postgres,
             DomainAccountWriteSource::Postgres,
@@ -378,6 +395,32 @@ mod tests {
         let err = reject_edge_create_unless_writable(&state).unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert!(err.1.contains(DOMAIN_READ_SOURCE_READ_ONLY));
+    }
+
+    #[test]
+    fn jsonl_read_read_only_edge_write_rejects_before_persistence() {
+        let state = test_state_with_edge_write(
+            DomainReadSource::Jsonl,
+            DomainAccountWriteSource::Jsonl,
+            DomainNodeWriteSource::Jsonl,
+            DomainEdgeWriteSource::ReadOnly,
+        );
+        let err = reject_edge_create_unless_writable(&state).unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains(DOMAIN_WRITE_SOURCE_READ_ONLY));
+    }
+
+    #[test]
+    fn postgres_read_read_only_edge_write_rejects_before_persistence() {
+        let state = test_state_with_edge_write(
+            DomainReadSource::Postgres,
+            DomainAccountWriteSource::Postgres,
+            DomainNodeWriteSource::Postgres,
+            DomainEdgeWriteSource::ReadOnly,
+        );
+        let err = reject_edge_create_unless_writable(&state).unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains(DOMAIN_WRITE_SOURCE_READ_ONLY));
     }
 
     #[test]
