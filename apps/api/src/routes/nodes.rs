@@ -1191,16 +1191,10 @@ async fn ensure_node_faden_with_operation_id(
 
     match projection.mode {
         super::edges::FadenProjectionMode::EnsureOnly => {
-            super::edges::create_edge(State(state.clone()), Extension(auth.clone()), Json(payload))
-                .await
+            super::edges::ensure_derived_faden(state.clone(), auth.clone(), payload).await
         }
         super::edges::FadenProjectionMode::Reactivate => {
-            super::edges::reactivate_edge(
-                State(state.clone()),
-                Extension(auth.clone()),
-                Json(payload),
-            )
-            .await
+            super::edges::reactivate_derived_faden(state.clone(), auth.clone(), payload).await
         }
     }
     .map(|_| ())

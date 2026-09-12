@@ -26,10 +26,11 @@ mod support;
 use anyhow::{Context, Result};
 use axum::{
     body,
+    extract::State,
     http::{Request, StatusCode},
     middleware::{from_fn, from_fn_with_state},
     routing::post,
-    Router,
+    Extension, Json, Router,
 };
 use serial_test::serial;
 use sqlx::PgPool;
@@ -47,13 +48,24 @@ use weltgewebe_api::{
         load_nodes_from_postgres,
     },
     middleware::{auth::auth_middleware, authz::require_write, csrf::require_csrf},
-    routes::{api_router, edges::create_edge},
+    routes::{
+        api_router,
+        edges::{ensure_derived_faden, Edge},
+    },
     state::ApiState,
     telemetry::{BuildInfo, Metrics},
 };
 
 mod helpers;
 use helpers::{read_account_details, set_gewebe_in_dir, test_node};
+
+async fn derived_faden_test_adapter(
+    State(state): State<ApiState>,
+    Extension(auth): Extension<weltgewebe_api::middleware::auth::AuthContext>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<Edge>), (StatusCode, String)> {
+    ensure_derived_faden(state, auth, payload).await
+}
 
 fn direct_database_url() -> String {
     let url = std::env::var("DATABASE_URL")
@@ -256,7 +268,7 @@ async fn edge_write_app(
         .merge(api_router())
         .route(
             "/__test/derived-edges",
-            post(create_edge).route_layer(from_fn(require_write)),
+            post(derived_faden_test_adapter).route_layer(from_fn(require_write)),
         )
         .layer(from_fn_with_state(state.clone(), auth_middleware))
         .layer(axum::middleware::from_fn(require_csrf))

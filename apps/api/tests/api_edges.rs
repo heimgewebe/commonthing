@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use axum::{
     body,
+    extract::State,
     http::{Request, StatusCode},
     middleware::{from_fn, from_fn_with_state},
     routing::post,
-    Router,
+    Extension, Json, Router,
 };
 use serial_test::serial;
 mod helpers;
@@ -22,7 +23,7 @@ use weltgewebe_api::{
     routes::{
         accounts::{AccountInternal, AccountPublic, GarnrolleMapState},
         api_router,
-        edges::create_edge,
+        edges::{ensure_derived_faden, Edge},
     },
     state::ApiState,
     telemetry::{BuildInfo, Metrics},
@@ -114,6 +115,28 @@ fn make_tmp_dir() -> tempfile::TempDir {
 fn write_lines(path: &PathBuf, lines: &[&str]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, lines.join("\n")).unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn public_edges_route_rejects_post_with_method_not_allowed() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let state = test_state().await?;
+    let app = Router::new().merge(api_router()).with_state(state);
+    let response = app
+        .oneshot(
+            Request::post("/edges")
+                .header("Content-Type", "application/json")
+                .body(body::Body::from("{}"))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    Ok(())
 }
 
 #[tokio::test]
@@ -604,6 +627,14 @@ async fn app_with_session_and_edge_write(
     .await
 }
 
+async fn derived_faden_test_adapter(
+    State(state): State<ApiState>,
+    Extension(auth): Extension<weltgewebe_api::middleware::auth::AuthContext>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<Edge>), (StatusCode, String)> {
+    ensure_derived_faden(state, auth, payload).await
+}
+
 async fn app_with_session_for_account(
     account_id: &str,
     role: Role,
@@ -629,7 +660,7 @@ async fn app_with_session_for_account(
         .merge(api_router())
         .route(
             "/__test/derived-edges",
-            post(create_edge).route_layer(from_fn(require_write)),
+            post(derived_faden_test_adapter).route_layer(from_fn(require_write)),
         )
         .layer(from_fn_with_state(state.clone(), auth_middleware))
         .layer(axum::middleware::from_fn(require_csrf))
