@@ -3492,10 +3492,11 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         expected_owner_id=owner_id,
     )
     require_bootstrap_data_current(kubectl, bootstrap_commit)
+    retire_gateway_before_activation(kubectl, root, cell, owner_id)
 
     if not activation_in_progress:
         pending_state = {
-            **cell,
+            **without_gateway_state(cell),
             "status": "app-activation-in-progress",
             "pending_active_commit": commit,
             "pending_image_promotion": {
@@ -3567,7 +3568,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
     }
     terminal_cell = {
         key: value
-        for key, value in cell.items()
+        for key, value in without_gateway_state(cell).items()
         if key
         not in {
             "pending_active_commit",
@@ -3575,8 +3576,6 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
             "pending_migration",
             "pending_registry_pull_secret",
         }
-        and key != "gateway"
-        and not key.startswith(("gateway_", "pending_gateway"))
     }
     updated = {
         **terminal_cell,
@@ -3613,6 +3612,78 @@ GATEWAY_RESOURCES = (
     ("Gateway", APP_NAMESPACE, GATEWAY_NAME),
     ("HTTPRoute", APP_NAMESPACE, GATEWAY_NAME),
 )
+
+
+def without_gateway_state(cell: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in cell.items()
+        if key != "gateway" and not key.startswith(("gateway_", "pending_gateway"))
+    }
+
+
+def retire_gateway_before_activation(
+    kubectl: str, root: Path, cell: dict[str, Any], owner_id: str
+) -> None:
+    active_commit = str(cell.get("active_commit") or "")
+    observed: list[tuple[str, str, str]] = []
+    for kind, namespace, name in GATEWAY_RESOURCES:
+        document = gateway_get(kubectl, kind, name, namespace)
+        if not document:
+            continue
+        annotations = document.get("metadata", {}).get("annotations", {})
+        if (
+            len(active_commit) != 40
+            or any(ch not in "0123456789abcdef" for ch in active_commit)
+            or annotations.get("commonthing.net/gateway-owner-id") != owner_id
+            or annotations.get("commonthing.net/gateway-active-commit") != active_commit
+        ):
+            raise StagingCellError(
+                "refusing to retire a staging gateway resource without the current owner/app binding"
+            )
+        observed.append((kind, namespace, name))
+
+    service_name = f"cilium-gateway-{GATEWAY_NAME}"
+    service_before = gateway_get(kubectl, "Service", service_name, APP_NAMESPACE)
+    if service_before and not observed:
+        raise StagingCellError(
+            "refusing app activation while an orphan staging gateway Service remains"
+        )
+
+    for kind, namespace, name in reversed(observed):
+        run(
+            [
+                kubectl,
+                "-n",
+                namespace,
+                "delete",
+                kind,
+                name,
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout=120s",
+            ]
+        )
+
+    if observed:
+        deadline = time.monotonic() + 120
+        while True:
+            remaining = [
+                gateway_get(kubectl, kind, name, namespace)
+                for kind, namespace, name in GATEWAY_RESOURCES
+            ]
+            service = gateway_get(kubectl, "Service", service_name, APP_NAMESPACE)
+            if not any(remaining) and not service:
+                break
+            if time.monotonic() >= deadline:
+                raise StagingCellError(
+                    "staging gateway did not retire before app activation"
+                )
+            time.sleep(2)
+
+    proof_path = root / "receipts/gateway-proof.json"
+    if proof_path.exists() or proof_path.is_symlink():
+        proof_path.unlink()
 
 
 def gateway_get(kubectl: str, kind: str, name: str, namespace: str = "") -> dict:

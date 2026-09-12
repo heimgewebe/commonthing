@@ -2639,6 +2639,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                         staging, "require_bootstrap_data_current", return_value={}
                     )
                 )
+                retire_gateway = stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "retire_gateway_before_activation",
+                        side_effect=lambda kubectl, root, cell, owner_id: activation_order.append(
+                            "gateway-retired"
+                        ),
+                    )
+                )
                 apply_network = stack.enter_context(
                     mock.patch.object(
                         staging,
@@ -2730,7 +2739,11 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             self.assertEqual(call.args, ("kubectl", bootstrap))
         apply_network.assert_called_once_with("kubectl")
         run_migration.assert_called_once_with("kubectl", active, promotion)
-        self.assertEqual(activation_order, ["network", "migration"])
+        retire_gateway.assert_called_once()
+        self.assertEqual(retire_gateway.call_args.args[0], "kubectl")
+        self.assertEqual(retire_gateway.call_args.args[1], root)
+        self.assertEqual(retire_gateway.call_args.args[3], owner)
+        self.assertEqual(activation_order, ["gateway-retired", "network", "migration"])
         reconcile_app.assert_called_once_with("kubectl", active)
         apply_yaml.assert_called_once()
         app_documents = apply_yaml.call_args.args[1]

@@ -448,6 +448,86 @@ class StagingGatewayTests(unittest.TestCase):
         self.mocks["staging_gateway_observation"].return_value = changed
         self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
 
+    def test_retire_gateway_before_activation_removes_bound_route_gateway_and_receipt(self):
+        annotations = {
+            "commonthing.net/gateway-owner-id": self.cell["owner_id"],
+            "commonthing.net/gateway-active-commit": self.cell["active_commit"],
+        }
+        state = {
+            ("Gateway", staging.APP_NAMESPACE, staging.GATEWAY_NAME): {
+                "metadata": {"annotations": annotations, "uid": "gateway-uid"}
+            },
+            ("HTTPRoute", staging.APP_NAMESPACE, staging.GATEWAY_NAME): {
+                "metadata": {"annotations": annotations, "uid": "route-uid"}
+            },
+            (
+                "Service",
+                staging.APP_NAMESPACE,
+                f"cilium-gateway-{staging.GATEWAY_NAME}",
+            ): {"metadata": {"uid": "service-uid"}},
+        }
+
+        def get_resource(kubectl, kind, name, namespace=""):
+            return copy.deepcopy(state.get((kind, namespace, name), {}))
+
+        def delete_resource(argv, **kwargs):
+            self.assertEqual(argv[3], "delete")
+            identity = (argv[4], argv[2], argv[5])
+            state.pop(identity, None)
+            if argv[4] == "Gateway":
+                state.pop(
+                    (
+                        "Service",
+                        staging.APP_NAMESPACE,
+                        f"cilium-gateway-{staging.GATEWAY_NAME}",
+                    ),
+                    None,
+                )
+
+        self.get.side_effect = get_resource
+        self.mocks["run"].side_effect = delete_resource
+        receipt = self.root / "receipts/gateway-proof.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text("{}\n", encoding="utf-8")
+
+        staging.retire_gateway_before_activation(
+            "kubectl", self.root, self.cell, self.cell["owner_id"]
+        )
+
+        self.assertFalse(receipt.exists())
+        deleted_kinds = [call.args[0][4] for call in self.mocks["run"].call_args_list]
+        self.assertEqual(deleted_kinds, ["HTTPRoute", "Gateway"])
+        self.assertEqual(state, {})
+
+    def test_retire_gateway_before_activation_refuses_orphan_service(self):
+        self.get.side_effect = lambda kubectl, kind, name, namespace="": (
+            {"metadata": {"uid": "orphan-service"}} if kind == "Service" else {}
+        )
+        with self.assertRaisesRegex(staging.StagingCellError, "orphan"):
+            staging.retire_gateway_before_activation(
+                "kubectl", self.root, self.cell, self.cell["owner_id"]
+            )
+        self.mocks["run"].assert_not_called()
+
+    def test_retire_gateway_before_activation_refuses_foreign_binding(self):
+        self.get.side_effect = lambda kubectl, kind, name, namespace="": (
+            {
+                "metadata": {
+                    "annotations": {
+                        "commonthing.net/gateway-owner-id": "foreign-owner",
+                        "commonthing.net/gateway-active-commit": self.cell["active_commit"],
+                    }
+                }
+            }
+            if kind == "Gateway"
+            else {}
+        )
+        with self.assertRaisesRegex(staging.StagingCellError, "refusing to retire"):
+            staging.retire_gateway_before_activation(
+                "kubectl", self.root, self.cell, self.cell["owner_id"]
+            )
+        self.mocks["run"].assert_not_called()
+
     def test_cli_requires_owner_and_exact_source(self):
         parsed = staging.parser().parse_args(
             [

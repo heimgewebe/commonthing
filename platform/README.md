@@ -191,8 +191,10 @@ deren exakten aktiven Commit und unveränderte Promotion-Evidenz. Der saubere
 Implementierungscheckout muss mit `--source-commit`, dem aktiven App-Commit und
 dem aktuellen geschützten Public-Main-Commit übereinstimmen. Nach dem Merge gilt:
 neue exakte Main-Promotion → `activate` → `prove-gateway`. Jede neue App-Aktivierung
-löscht beim Übergang zu `app-ready-gateway-pending` gespeicherte Gateway-Bindungen
-und Proof-Zustände; ein früherer Gateway-Beweis gilt damit nicht für die neue App.
+retiriert vor Migration und Rollout ein vorhandenes, exakt an Owner und bisherigen
+App-Commit gebundenes Gateway/HTTPRoute-Paar und wartet auf das Verschwinden des
+erzeugten Cilium-Service. Danach werden gespeicherte Gateway-Bindungen und
+Proof-Zustände verworfen; ein früherer Gateway-Beweis gilt damit nicht für die neue App.
 
 Nur `clusters/staging/gateway/` wird gerendert und serverseitig validiert/angewandt:
 Genau Gateway und HTTPRoute `commonthing-staging` im gleichnamigen App-Namespace.
