@@ -444,6 +444,44 @@ status: active
         findings = _validate_report(path, fm, self.tmp_root)
         self.assertIn("invalid_owner_task", [f.code for f in findings])
 
+    def test_bureau_owner_task_remains_external_when_local_registry_exists(self) -> None:
+        task_index = self.tmp_root / "docs" / "tasks" / "index.json"
+        task_index.parent.mkdir(parents=True, exist_ok=True)
+        task_index.write_text('{"tasks":[{"id":"OPT-ARC-001","status":"obsolete"}]}', encoding="utf-8")
+        fm = {
+            "id": "reports.example",
+            "title": "Example",
+            "doc_type": "report",
+            "status": "active",
+            "lifecycle_state": "active",
+            "lifecycle": "audit",
+            "owner_task": "BUREAU-COMMONTHING-V1-T001",
+            "review_after": "2026-07-13",
+        }
+        path = self.tmp_root / "docs" / "reports" / "example.md"
+        findings = _validate_report(path, fm, self.tmp_root)
+        codes = [f.code for f in findings]
+        self.assertNotIn("invalid_owner_task", codes)
+        self.assertNotIn("invalid_owner_status", codes)
+
+    def test_malformed_bureau_owner_task_does_not_bypass_local_resolution(self) -> None:
+        task_index = self.tmp_root / "docs" / "tasks" / "index.json"
+        task_index.parent.mkdir(parents=True, exist_ok=True)
+        task_index.write_text('{"tasks":[{"id":"OPT-ARC-001"}]}', encoding="utf-8")
+        fm = {
+            "id": "reports.example",
+            "title": "Example",
+            "doc_type": "report",
+            "status": "active",
+            "lifecycle_state": "active",
+            "lifecycle": "audit",
+            "owner_task": "BUREAU-T001 invalid",
+            "review_after": "2026-07-13",
+        }
+        path = self.tmp_root / "docs" / "reports" / "example.md"
+        findings = _validate_report(path, fm, self.tmp_root)
+        self.assertIn("invalid_owner_task", [f.code for f in findings])
+
     def test_owner_task_resolves_from_task_index(self) -> None:
         task_index = self.tmp_root / "docs" / "tasks" / "index.json"
         task_index.parent.mkdir(parents=True, exist_ok=True)

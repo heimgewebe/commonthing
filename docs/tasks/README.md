@@ -4,8 +4,8 @@ title: Task-Control – Einstieg
 doc_type: guide
 status: active
 summary: >
-  Einstieg in die Task-Control-Schicht von Weltgewebe.
-  Erklärt Zweck, Rollenklärung und Grenzen der Artefakte in docs/tasks/.
+  Einstieg in die historische Task-Control-Kompatibilität von commonthing.
+  Erklärt externe Arbeitsautorität, owner_task-Bindung und die Grenzen von docs/tasks/.
 relations:
   - type: depends_on
     target: docs/reports/optimierungsstatus.md
@@ -19,75 +19,116 @@ relations:
 
 ## Zweck
 
-`docs/tasks/` ist die Arbeitssteuerungs-Schicht von Weltgewebe.
-Sie ergänzt die Statusmatrizen in `docs/reports/`, ist aber keine zweite Wahrheitsschicht.
+`docs/tasks/` ist eine repository-lokale Kompatibilitäts- und Evidenzschicht für
+historische Arbeitssteuerung. Sie ist keine zweite Wahrheitsschicht und nicht die
+operative Arbeitsautorität.
+
+Operative Arbeit wird außerhalb des Produkt-Repositories koordiniert. Für die aktuelle
+Operator-Architektur ist Bureau die Arbeits-/Task-Autorität; Grabowski führt Arbeit aus.
+commonthing bleibt Autorität für Produktcode, Produktwissen und repo-spezifische Verträge.
+
+## Planning-Ownership-Ratchet
+
+Aktive Planungsartefakte sollen ihre Arbeit künftig direkt über ein wohlgeformtes
+`BUREAU-*`-`owner_task` im Frontmatter binden, zum Beispiel:
+
+```yaml
+owner_task: BUREAU-COMMONTHING-...
+```
+
+`BUREAU-*`-`owner_task` ist ein Verweis auf die externe Arbeitsautorität, keine lokale Kopie ihres
+Status. commonthing prüft deshalb nur, dass die Bindung explizit vorhanden ist; Existenz,
+Status, Queue, Claims oder Priorität des referenzierten Tasks werden nicht noch einmal im
+Repo nachgebaut.
+
+Bereits bestehende Planungsartefakte dürfen während der Migration weiterhin über
+`docs/tasks/index.json`, `docs/tasks/board.md` oder `docs/roadmap.md` registriert sein,
+**aber nur**, wenn ihr Pfad bereits in `legacy_fallback_paths` in
+`scripts/docmeta/planning_registration.yml` steht. Diese endliche Liste ist die
+Shrink-only-Migrationsmenge; neue Pfade dürfen sie nicht durch eine zusätzliche lokale
+Registrierung vergrößern. Der CI-Guard `scripts.docmeta.check_planning_ownership` akzeptiert daher:
+
+1. terminale Planungsartefakte ohne aktive Ownership;
+2. aktive Planungsartefakte mit kanonischem `BUREAU-*`-`owner_task` als bevorzugten Pfad;
+3. nur allowlistete Altartefakte mit vorhandener lokaler Registrierung als vorübergehenden Legacy-Fallback.
+
+Damit kann die repo-lokale Schattensteuerung nur schrumpfen: Ein Altpfad wird entweder
+archiviert oder extern gebunden und anschließend aus `legacy_fallback_paths` entfernt.
 
 ## Rollenklärung der Artefakte
 
 | Datei | Rolle | Schreibstatus |
 |---|---|---|
-| `docs/tasks/board.md` | Menschliche Arbeitskarte (aktive Prioritäten, Blocker, nächste PR-Kandidaten) | Manuell gepflegt |
-| `docs/tasks/index.json` | Maschinenlesbarer Task-Index (Seed: manuell) | Manuell bis Generator eingeführt |
-| `docs/tasks/schema.json` | Validierungsvertrag für `index.json` | Änderungen nur mit begründetem PR |
-| `docs/reports/optimierungsstatus.md` | Belegte menschliche Statusmatrix | Maßgeblich für Wahrheitsgehalt |
+| `docs/tasks/board.md` | Historische/menschliche Arbeitskarte; Legacy-Kompatibilität | Manuell gepflegt, nicht bevorzugte Ownership |
+| `docs/tasks/index.json` | Kuratierter Legacy-Task-Index (`manual_phase2_seed`) | Manuell; keine neue operative Arbeitsautorität |
+| `docs/tasks/schema.json` | Validierungsvertrag für den Legacy-Index | Änderungen nur mit begründetem PR |
+| `docs/reports/optimierungsstatus.md` | Belegte menschliche Statusmatrix | Maßgeblich für den dokumentierten Wahrheitsgehalt |
 | `docs/reports/optimierungsstatus.json` | Maschinenlesbarer Zwilling der Statusmatrix | Kein eigenständiger Statusträger |
 
 ## Wahrheitsklärung
 
-- `docs/reports/optimierungsstatus.md` ist die kanonische menschliche Wahrheitsquelle für OPT-IDs und deren Status.
-- `docs/tasks/index.json` ist eine strukturierte Task-Control-Fläche und normative Registrierungsquelle für dort eingetragene IDs. Es ist jedoch keine vollständige Wahrheit für alle OPT-IDs und kein Ersatz für OPT-Markdown.
-- `docs/reports/optimierungsstatus.json` ist ein maschinenlesbarer Zwilling und dient als Lookup-Fläche. Es besitzt keinen eigenen Wahrheitsstatus. Eine vollständige Parität zum Markdown ist Voraussetzung für eine spätere alleinige maschinelle Nutzung.
+- `docs/reports/optimierungsstatus.md` bleibt die kanonische menschliche Wahrheitsquelle für die dort dokumentierten OPT-IDs und deren belegten Status.
+- `docs/tasks/index.json` ist ein historisch gewachsener, kuratierter Task-Control-Index. Er ist keine vollständige Task-Wahrheit und keine Voraussetzung für neue Planung mit kanonischem `BUREAU-*`-`owner_task`.
+- Bureau-/externe Task-Zustände werden nicht in `index.json` gespiegelt. `owner_task` ist nur die Bindung an diese externe Autorität.
+- `docs/reports/optimierungsstatus.json` ist ein maschinenlesbarer Zwilling und dient als Lookup-Fläche. Es besitzt keinen eigenen Wahrheitsstatus.
 - Kein Status in `index.json` oder `optimierungsstatus.json` darf dem Markdown widersprechen.
 - `done` gilt nicht ohne reproduzierbaren Evidenz-Eintrag in der Statusmatrix.
 - Stille Statusupgrades sind verboten.
 
 ## Curation-Status
 
-Solange `curation: "manual_phase2_seed"` gesetzt ist, darf `index.json` manuell
-gepflegt werden. Sobald ein echter Generator (mit Schreibzugriff) eingeführt wird, muss der
-Schreibstatus neu bewertet und in `CONTRIBUTING.md` dokumentiert werden.
+Solange `curation: "manual_phase2_seed"` gesetzt ist, darf `index.json` für seine
+bestehenden Legacy-Einträge manuell gepflegt werden. Diese Pflege darf jedoch keine
+neuen Planungsartefakte legitimieren: Nur `legacy_fallback_paths` definiert den noch
+zulässigen Altbestand.
 
-Der in TASK-CTL-003 eingeführte `generate_task_index.py --check` ist ein reiner
-Drift-Prüfmechanismus ohne Schreibzugriff und ändert den manuellen Pflegestatus nicht.
-Automatische Generierung und Bot-PRs bleiben eine spätere Entscheidung.
+Der in TASK-CTL-003 eingeführte `generate_task_index.py --check` bleibt ein reiner
+Drift-Prüfmechanismus ohne Schreibzugriff. Er schützt den noch vorhandenen Legacy-Bestand,
+macht diesen Bestand aber nicht zur Arbeitsautorität.
 
 ## Phase-Stand
 
 | Phase | Artefakte | Status |
 |---|---|---|
-| Phase 2 | `docs/tasks/*`, `docs/reports/optimierungsstatus.json`, Validator | **Vorhanden** |
+| Phase 2 | `docs/tasks/*`, `docs/reports/optimierungsstatus.json`, Validator | **Legacy-Kompatibilität vorhanden** |
+| Ownership-Ratchet | `owner_task`, `check_planning_ownership`, CI | **Aktiv** — externe Ownership bevorzugt, Legacy-Fallback bleibt |
 | Phase 3 | `.github/ISSUE_TEMPLATE/*`, `.github/pull_request_template.md` | **Zurückgestellt** — kein belegter Mehrwert gegenüber freien PR-Bodies |
-| Phase 4 | `scripts/docmeta/generate_task_index.py`, CI-Guard | **In Arbeit** — Check-Modus + CI-Guard vorhanden, CI-Lauf-Nachweis ausstehend (TASK-CTL-003) |
-| Phase 5 | `audit/impl-registry.yaml`-Ausbau | Geplant |
+| Legacy-Drift | `scripts/docmeta/generate_task_index.py`, CI-Guard | **Übergang** — schützt bestehenden Seed, erzeugt keine neue Wahrheit |
 
 ## GitHub-Arbeitsobjekte
 
-Issue Forms, PR-Template und Release-Konfiguration sind aktuell zurückgestellt. Sie sind keine Voraussetzung für die Task-Control-Schicht.
+Issue Forms, PR-Template und Release-Konfiguration sind keine Voraussetzung für die
+Arbeitssteuerung. GitHub-Metadaten ersetzen weder Bureau-Ownership noch belastbare
+Produkt-/Runtime-Evidenz.
 
-Begründung: Der aktuelle Engpass ist nicht fehlende Formularstruktur, sondern Drift-Gefahr zwischen Task-Board, Task-Index, Optimierungsstatus und Evidenz. Der nächste operative Schritt ist daher `TASK-CTL-003`: Task-Index-Generator und CI-Guard.
-
-Wiederaufnahme ist sinnvoll, wenn externe Beitragende ohne Projekteinblick aktiv werden, PR-Bodies wiederholt Task-/Evidenzbezüge verlieren oder der Release-Prozess stabil genug für Release-Labels ist.
-
-## Validator
+## Validator des Legacy-Index
 
 ```bash
 python3 -m scripts.docmeta.validate_task_index docs/tasks/index.json
 ```
 
-Exit 0 bei Erfolg, 1 bei Validierungsfehlern.
-Keine stillen Fixes, kein Schreiben durch den Validator.
+Exit 0 bei Erfolg, 1 bei Validierungsfehlern. Keine stillen Fixes, kein Schreiben durch
+den Validator.
 
-## Drift-Check
+## Planning-Ownership-Check
+
+```bash
+python3 -m scripts.docmeta.check_planning_ownership --mode strict
+```
+
+Der Check verlangt für aktive Planung entweder die bevorzugte kanonische `BUREAU-*`-
+`owner_task`-Bindung oder, während der Migration, eine vorhandene Legacy-Registrierung. Terminale
+Planungsdokumente benötigen keine aktive Ownership.
+
+## Legacy-Drift-Check
 
 ```bash
 python3 -m scripts.docmeta.generate_task_index --check
 ```
 
-Vergleicht `board.md`, `index.json` und `docs/reports/optimierungsstatus.json` auf Drift:
-Aktive Board-Tasks, Blocker oder PR-Kandidaten ohne Index-Eintrag; `open`/`partial` Tasks mit `high`/`medium` Priorität ohne Board-Sichtbarkeit; `done` ohne Evidenz;
-High-Priority ohne Akzeptanzkriterium; nicht existierende Evidenz-/Doku-Pfade;
-`docs/_generated/*` als Schreibziel; sowie Statuswidersprüche zur Optimierungsstatus-Matrix.
+Der Check vergleicht den noch vorhandenen Legacy-Bestand aus `board.md`, `index.json` und
+`docs/reports/optimierungsstatus.json`. Er bleibt vorerst bestehen, bis die von ihm
+geschützten aktiven Planungsartefakte auf kanonische externe Ownership migriert sind.
 
-Exit 0 ohne Drift, sonst 1. Reiner Prüfmechanismus, keine neue Wahrheitsschicht: Im
-`--check`-Modus werden keine Dateien geschrieben. Läuft im CI über
-`.github/workflows/task-index.yml`.
+Beide Prüfungen laufen im CI über `.github/workflows/task-index.yml`. Keine davon darf
+aus dem Repository eine zweite operative Task-Wahrheit machen.

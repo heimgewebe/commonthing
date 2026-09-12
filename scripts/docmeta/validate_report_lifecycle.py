@@ -31,6 +31,7 @@ ACTIVE_OWNER_LIFECYCLE_STATES = frozenset(("active", "deferred"))
 TERMINAL_OWNER_STATUSES = frozenset(("contradicted", "obsolete"))
 ISO_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 OPT_STATUS_ID_RE = re.compile(r"\|\s*(OPT-[A-Z0-9-]+)\s*\|")
+BUREAU_OWNER_TASK_RE = re.compile(r"^BUREAU-[A-Za-z0-9._:-]+$")
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,11 @@ def _superseded_by_target_exists(value: str, root: Path) -> bool:
     if target.is_absolute() or ".." in target.parts:
         return False
     return (root / target).is_file()
+
+
+def _is_external_owner_task(value: str) -> bool:
+    """Return whether owner_task delegates authority to the external Bureau task plane."""
+    return BUREAU_OWNER_TASK_RE.fullmatch(value) is not None
 
 
 def _registered_owner_tasks(root: Path) -> set[str] | None:
@@ -307,9 +313,11 @@ def _validate_report(path: Path, frontmatter: dict[str, object], root: Path) -> 
         ))
 
     owner_task = _string_value(frontmatter.get("owner_task")).strip()
+    external_owner_task = _is_external_owner_task(owner_task)
     registered_owner_tasks = _registered_owner_tasks(root)
     if (
         owner_task
+        and not external_owner_task
         and registered_owner_tasks is not None
         and owner_task not in registered_owner_tasks
     ):
@@ -318,9 +326,12 @@ def _validate_report(path: Path, frontmatter: dict[str, object], root: Path) -> 
             code="invalid_owner_task",
             severity="warn",
             field="owner_task",
-            message="owner_task must resolve in docs/tasks/index.json or docs/reports/optimierungsstatus.md",
+            message=(
+                "owner_task must resolve in docs/tasks/index.json or "
+                "docs/reports/optimierungsstatus.md, or use a canonical BUREAU-* external task id"
+            ),
         ))
-    else:
+    elif not external_owner_task:
         owner_status_finding = _owner_status_finding(
             rel_path=rel_path,
             owner_task=owner_task,
