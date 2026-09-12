@@ -188,16 +188,21 @@ uv run --project tools/py --locked python scripts/platform/staging_cell.py prove
 
 Der Befehl verlangt den gespeicherten Owner, eine abgeschlossene App-Aktivierung,
 deren exakten aktiven Commit und unveränderte Promotion-Evidenz. Der saubere
-Runner-Checkout darf einen neueren lokalen Implementierungscommit enthalten;
-dieser wird getrennt im Receipt festgehalten. `activate` behält sein exaktes
-Public-Main-/Promotion-Gate unverändert.
+Implementierungscheckout muss mit `--source-commit`, dem aktiven App-Commit und
+dem aktuellen geschützten Public-Main-Commit übereinstimmen. Nach dem Merge gilt:
+neue exakte Main-Promotion → `activate` → `prove-gateway`. Jede neue App-Aktivierung
+löscht beim Übergang zu `app-ready-gateway-pending` gespeicherte Gateway-Bindungen
+und Proof-Zustände; ein früherer Gateway-Beweis gilt damit nicht für die neue App.
 
 Nur `clusters/staging/gateway/` wird gerendert und serverseitig validiert/angewandt:
-Gateway und HTTPRoute `commonthing-staging` im gleichnamigen App-Namespace sowie
-ein ausschließlich auf dessen Cilium-Service begrenzter Einadresspool
-`commonthing-staging-gateway` (`172.30.84.1`). Der private VIP wird gegen belegte
-Serviceadressen, andere Pools, Pod- und kind-Netze geprüft; L2/BGP-Ankündigungen
-werden nicht eingerichtet. Der gemeinsame Legacy-Gateway-Pfad wird nicht benutzt.
+Genau Gateway und HTTPRoute `commonthing-staging` im gleichnamigen App-Namespace.
+Die aktuellen IP-Adressen des programmierten Gateways und die Ingress-IP-Adressen
+des erzeugten Cilium-LoadBalancer-Service müssen als vollständige Mengen
+übereinstimmen. Der Service muss über seine Owner-Referenz an die aktuelle
+Gateway-UID und über Port 80 an den HTTP-Listener gebunden sein. Alle beobachteten
+Adressen werden als Kandidaten an den kind-Node-HTTP-Probe übergeben. Ein statischer
+Adresspool wird nicht angelegt; NodeIPAM-Adressen sind kein externer LB-Beweis.
+Der gemeinsame Legacy-Gateway-Pfad wird nicht benutzt.
 HTTP auf Port 80 routet `/health` und `/api` unverändert an `commonthing-api:8080`,
 `/` an `commonthing-web:8080`. Es gibt weder Hostnamen noch TLS-Referenzen.
 
@@ -212,7 +217,8 @@ Hash des ersten KiB der Webantwort (kein vollständiger Web-Body-Hash).
 
 `receipts/gateway-proof.json` ist privat (`0600`) und bindet Owner, Bootstrap-,
 App- und Runner-Commit, Manifest-Hash, Ressourcen-UIDs/Generationen/Spec-Hashes,
-Service, VIP, Port, Probe-Node und Antwort-Hashes. Der Cell-Receipt bindet wiederum
+Service, alle beobachteten Gateway-/Service-Adressen, die erfolgreiche ausgewählte
+Adresse, Port, Probe-Node und Antwort-Hashes. Der Cell-Receipt bindet wiederum
 diesen Receipt-Hash. `status` meldet `gateway_ready` nur bei weiterhin passender
 App-/Receipt-/Ressourcenbindung; dies ist ein gespeicherter HTTP-Beweis mit aktuellem
 Ressourcenreadback, kein erneuter HTTP-Probe. DNS, TLS, externer Load Balancer,

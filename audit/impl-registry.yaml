@@ -377,19 +377,6 @@ implementations:
       - .github/workflows/kubernetes-platform.yml
 
 
-  - id: impl.platform.staging-gateway
-    path: platform/clusters/staging/gateway
-    impl_type: platform
-    status: active
-    criticality: high
-    evidence_level: ci
-    documented_by:
-      - platform/README.md
-    verified_by:
-      - scripts/platform/staging_cell.py
-      - scripts/ci/tests/test_staging_gateway_contract.py
-
-
   - id: impl.api.migration-only
     path: apps/api/src/lib.rs
     impl_type: service

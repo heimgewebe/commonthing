@@ -2575,6 +2575,13 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                             "cluster": staging.DEFAULT_CLUSTER,
                             "owner_id": owner,
                             "bootstrap_commit": bootstrap,
+                            "status": "gateway-ready",
+                            "active_commit": "0" * 40,
+                            "pending_gateway": {"active_commit": "0" * 40},
+                            "gateway_proof": {"receipt_sha256": "f" * 64},
+                            "gateway_ready": True,
+                            "gateway_phase": "gateway-ready",
+                            "gateway": {"address": "172.20.0.3"},
                             "external_secret": {"source_sha256": "d" * 64},
                         },
                     )
@@ -2762,6 +2769,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("pending_image_promotion", stored)
         self.assertNotIn("pending_migration", stored)
         self.assertNotIn("pending_registry_pull_secret", stored)
+        self.assertEqual(stored["status"], "app-ready-gateway-pending")
+        for key in (
+            "pending_gateway", "gateway_proof", "gateway_ready", "gateway_phase", "gateway"
+        ):
+            self.assertNotIn(key, stored)
+            self.assertNotIn(key, result)
         self.assertTrue(stored["migration"]["complete"])
         self.assertEqual(
             stored["migration"]["network_isolation"]["policy_names"],

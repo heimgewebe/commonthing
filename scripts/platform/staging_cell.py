@@ -7,6 +7,7 @@ import errno
 import fcntl
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -3574,6 +3575,8 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
             "pending_migration",
             "pending_registry_pull_secret",
         }
+        and key != "gateway"
+        and not key.startswith(("gateway_", "pending_gateway"))
     }
     updated = {
         **terminal_cell,
@@ -3605,13 +3608,10 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
 
 
 GATEWAY_NAME = "commonthing-staging"
-GATEWAY_POOL = "commonthing-staging-gateway"
-GATEWAY_VIP = "172.30.84.1"
 GATEWAY_LIMITS = ["DNS", "TLS", "external-LB", "Delete-to-Prove", "production cutover"]
 GATEWAY_RESOURCES = (
     ("Gateway", APP_NAMESPACE, GATEWAY_NAME),
     ("HTTPRoute", APP_NAMESPACE, GATEWAY_NAME),
-    ("CiliumLoadBalancerIPPool", "", GATEWAY_POOL),
 )
 
 
@@ -3677,11 +3677,26 @@ def gateway_resource_binding(document: dict) -> dict:
     }
 
 
+def gateway_ip_addresses(entries: list, key: str, *, gateway: bool = False) -> list[str]:
+    addresses = set()
+    for entry in entries:
+        value = entry.get(key)
+        if (gateway and entry.get("type", "IPAddress") != "IPAddress") or not value:
+            raise StagingCellError("staging gateway requires IP addresses only")
+        try:
+            addresses.add(str(ipaddress.ip_address(value)))
+        except ValueError as exc:
+            raise StagingCellError("staging gateway has an invalid IP address") from exc
+    if not addresses:
+        raise StagingCellError("staging gateway has no current IP addresses")
+    return sorted(addresses)
+
+
 def staging_gateway_observation(kubectl: str) -> dict:
     documents = [
         gateway_get(kubectl, kind, name, ns) for kind, ns, name in GATEWAY_RESOURCES
     ]
-    gateway, route, pool = documents
+    gateway, route = documents
     if not current_condition(gateway, "Programmed"):
         raise StagingCellError("staging Gateway is not currently Programmed")
     parents = [
@@ -3702,11 +3717,9 @@ def staging_gateway_observation(kubectl: str) -> dict:
         raise StagingCellError(
             "staging HTTPRoute lacks current Accepted/ResolvedRefs for its Cilium listener"
         )
-    addresses = gateway.get("status", {}).get("addresses", [])
-    if {"type": "IPAddress", "value": GATEWAY_VIP} not in addresses:
-        raise StagingCellError(
-            "staging Gateway has no expected private listener address"
-        )
+    gateway_addresses = gateway_ip_addresses(
+        gateway.get("status", {}).get("addresses", []), "value", gateway=True
+    )
     service = gateway_get(
         kubectl, "Service", f"cilium-gateway-{GATEWAY_NAME}", APP_NAMESPACE
     )
@@ -3720,16 +3733,25 @@ def staging_gateway_observation(kubectl: str) -> dict:
             port.get("port") == 80 and port.get("protocol", "TCP") == "TCP"
             for port in service.get("spec", {}).get("ports", [])
         )
+        or service.get("metadata", {}).get("namespace") != APP_NAMESPACE
+        or not service.get("metadata", {}).get("uid")
         or not any(
-            entry.get("ip") == GATEWAY_VIP
-            for entry in service.get("status", {})
-            .get("loadBalancer", {})
-            .get("ingress", [])
+            owner.get("apiVersion") == "gateway.networking.k8s.io/v1"
+            and owner.get("kind") == "Gateway"
+            and owner.get("name") == GATEWAY_NAME
+            and owner.get("uid") == gateway.get("metadata", {}).get("uid")
+            and owner.get("uid")
+            for owner in service.get("metadata", {}).get("ownerReferences", [])
         )
     ):
         raise StagingCellError(
-            "staging Cilium Service does not bind the listener and private VIP"
+            "staging Cilium Service does not bind the current Gateway and HTTP listener"
         )
+    service_addresses = gateway_ip_addresses(
+        service.get("status", {}).get("loadBalancer", {}).get("ingress", []), "ip"
+    )
+    if gateway_addresses != service_addresses:
+        raise StagingCellError("staging Gateway and Service IP addresses differ")
     return {
         "resources": [gateway_resource_binding(doc) for doc in documents],
         "service": {
@@ -3739,7 +3761,8 @@ def staging_gateway_observation(kubectl: str) -> dict:
                 json.dumps(service["spec"], sort_keys=True).encode()
             ),
         },
-        "address": GATEWAY_VIP,
+        "gateway_addresses": gateway_addresses,
+        "service_addresses": service_addresses,
         "listener_port": 80,
     }
 
@@ -3761,58 +3784,6 @@ def require_gateway_app_current(kubectl: str, cell: dict, promotion: dict) -> No
         or app_image_references(kubectl) != promotion["images"]
     ):
         raise StagingCellError("gateway proof requires healthy promoted app images")
-
-
-def require_gateway_address_available(kubectl: str) -> None:
-    # The private VIP is only a BPF listener address, never advertised externally.
-    import ipaddress
-
-    vip = ipaddress.ip_address(GATEWAY_VIP)
-    networks = json.loads(output(["docker", "network", "inspect", "kind"]))
-    for network in networks:
-        for config in network.get("IPAM", {}).get("Config", []):
-            if config.get("Subnet") and vip in ipaddress.ip_network(config["Subnet"]):
-                raise StagingCellError("staging gateway VIP overlaps the kind network")
-    nodes = json.loads(output([kubectl, "get", "nodes", "-o", "json"]))
-    for node in nodes.get("items", []):
-        for cidr in node.get("spec", {}).get("podCIDRs", []):
-            if vip in ipaddress.ip_network(cidr):
-                raise StagingCellError("staging gateway VIP overlaps a pod network")
-    pools = json.loads(
-        output([kubectl, "get", "ciliumloadbalancerippools", "-o", "json"])
-    )
-    for pool in pools.get("items", []):
-        if pool.get("metadata", {}).get("name") == GATEWAY_POOL:
-            continue
-        for block in pool.get("spec", {}).get("blocks", []):
-            if (block.get("cidr") and vip in ipaddress.ip_network(block["cidr"])) or (
-                block.get("start")
-                and ipaddress.ip_address(block["start"])
-                <= vip
-                <= ipaddress.ip_address(block.get("stop", block["start"]))
-            ):
-                raise StagingCellError(
-                    "staging gateway VIP overlaps another address pool"
-                )
-    services = json.loads(output([kubectl, "get", "services", "-A", "-o", "json"]))
-    for service in services.get("items", []):
-        meta = service.get("metadata", {})
-        if (
-            meta.get("namespace") == APP_NAMESPACE
-            and meta.get("name") == f"cilium-gateway-{GATEWAY_NAME}"
-        ):
-            continue
-        addresses = service.get("spec", {}).get("clusterIPs", []) + service.get(
-            "spec", {}
-        ).get("externalIPs", [])
-        addresses += [
-            item.get("ip")
-            for item in service.get("status", {})
-            .get("loadBalancer", {})
-            .get("ingress", [])
-        ]
-        if GATEWAY_VIP in addresses:
-            raise StagingCellError("staging gateway VIP is used by another Service")
 
 
 @lifecycle_mutation_locked
@@ -3838,7 +3809,11 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
         }
     ):
         raise StagingCellError("gateway proof requires completed app activation")
-    implementation_commit = require_clean_commit(None, require_public_main=False)
+    implementation_commit = require_clean_commit(args.source_commit)
+    if implementation_commit != commit:
+        raise StagingCellError(
+            "gateway implementation commit must equal the active app commit"
+        )
     promotion = load_promotion_receipt(root, commit)
     recorded = cell.get("image_promotion", {})
     if (
@@ -3901,7 +3876,6 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
                 "refusing to adopt a staging gateway resource without its persisted owner"
             )
         meta["annotations"] = {**meta.get("annotations", {}), **annotations}
-    require_gateway_address_available(kubectl)
     rendered = yaml.safe_dump_all(documents, sort_keys=False)
     run(
         [
@@ -3943,8 +3917,10 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
                 raise
             time.sleep(2)
     node, address, health, web, api_nodes = reference.probe_gateway_http(
-        tools["kind"], args.cluster, [observed["address"]], observed["listener_port"]
+        tools["kind"], args.cluster, observed["gateway_addresses"], observed["listener_port"]
     )
+    if address not in observed["gateway_addresses"]:
+        raise StagingCellError("HTTP proof selected an unobserved Gateway address")
     require_gateway_app_current(kubectl, cell, promotion)
     if staging_gateway_observation(kubectl) != observed:
         raise StagingCellError("gateway resources changed during HTTP proof")
@@ -3998,9 +3974,11 @@ def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
             for key in ("owner_id", "cluster", "bootstrap_commit", "active_commit")
         ):
             return False
-        return all(
-            receipt.get(key) == value
-            for key, value in staging_gateway_observation(kubectl).items()
+        observed = staging_gateway_observation(kubectl)
+        return (
+            receipt.get("implementation_commit") == cell_active_commit(cell)
+            and receipt.get("address") in observed["gateway_addresses"]
+            and all(receipt.get(key) == value for key, value in observed.items())
         )
     except (OSError, ValueError, StagingCellError, subprocess.CalledProcessError):
         return False
