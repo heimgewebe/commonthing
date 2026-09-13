@@ -3873,12 +3873,28 @@ def route_targets_staging_gateway(route: dict) -> bool:
     )
 
 
-def require_single_staging_gateway_route(kubectl: str, route: dict) -> None:
-    attached = [
+def staging_gateway_routes(kubectl: str) -> list[dict]:
+    return [
         candidate
         for candidate in gateway_list(kubectl, "HTTPRoute", APP_NAMESPACE)
         if route_targets_staging_gateway(candidate)
     ]
+
+
+def require_no_shadow_staging_gateway_routes(kubectl: str) -> None:
+    shadows = [
+        route
+        for route in staging_gateway_routes(kubectl)
+        if route.get("metadata", {}).get("name") != GATEWAY_NAME
+    ]
+    if shadows:
+        raise StagingCellError(
+            "refusing to apply staging Gateway while another HTTPRoute targets it"
+        )
+
+
+def require_single_staging_gateway_route(kubectl: str, route: dict) -> None:
+    attached = staging_gateway_routes(kubectl)
     if (
         len(attached) != 1
         or attached[0].get("metadata", {}).get("name") != GATEWAY_NAME
@@ -4092,6 +4108,7 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
                     "refusing to adopt a staging gateway resource without its exact owner/app/manifest binding"
                 )
         meta["annotations"] = {**meta.get("annotations", {}), **annotations}
+    require_no_shadow_staging_gateway_routes(kubectl)
     rendered = yaml.safe_dump_all(documents, sort_keys=False, explicit_start=True)
     run(
         [

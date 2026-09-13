@@ -282,6 +282,19 @@ class StagingGatewayTests(unittest.TestCase):
             staging.command_prove_gateway(self.args)
         self.mocks["run"].assert_not_called()
 
+    def test_shadow_route_is_rejected_before_any_gateway_apply(self):
+        shadow = copy.deepcopy(self.docs[1])
+        shadow["metadata"]["name"] = "shadow"
+        self.mocks["gateway_list"].return_value = [shadow]
+        with self.assertRaisesRegex(staging.StagingCellError, "another HTTPRoute"):
+            staging.command_prove_gateway(self.args)
+        self.mocks["run"].assert_not_called()
+        self.probe.assert_not_called()
+        self.assertEqual(
+            staging.load_cell_receipt(self.root)["status"],
+            "app-ready-gateway-pending",
+        )
+
     def test_recovery_requires_full_existing_resource_binding(self):
         staging.write_cell_receipt(
             self.root,
