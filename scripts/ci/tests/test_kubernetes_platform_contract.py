@@ -2874,10 +2874,57 @@ spec:
                         expected_commit=commit,
                         expected_owner_id=owner,
                     )
-                creator_live.assert_called_once_with(creation_token)
+                self.assertEqual(creator_live.call_count, 2)
+                creator_live.assert_has_calls(
+                    [mock.call(creation_token), mock.call(creation_token)]
+                )
                 self.assertTrue(cleared)
                 self.assertFalse(self.reference.marker_path("proof").exists())
                 self.assertFalse(self.reference.kubeconfig_path("proof").exists())
+            finally:
+                self.reference.MARKERS = original_markers
+                self.reference.KUBECONFIGS = original_kubeconfigs
+
+    def test_reference_stale_reservation_cleanup_requires_stable_quiescence(
+        self,
+    ) -> None:
+        commit = "a" * 40
+        owner = "owner-stale-reservation"
+        creation_token = "3" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_markers = self.reference.MARKERS
+            original_kubeconfigs = self.reference.KUBECONFIGS
+            self.reference.MARKERS = root / "clusters"
+            self.reference.KUBECONFIGS = root / "kubeconfigs"
+            try:
+                with self.reference.cluster_ownership_lock("proof"):
+                    self.reference._write_marker_locked(
+                        "proof", commit, owner, creation_token=creation_token
+                    )
+                with (
+                    mock.patch.object(self.reference, "clusters", return_value=set()),
+                    mock.patch.object(
+                        self.reference,
+                        "_reservation_creator_is_live",
+                        side_effect=[False, True],
+                    ) as creator_live,
+                    mock.patch.object(self.reference.time, "sleep") as sleep,
+                ):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "original Kind creator is still running"
+                    ):
+                        self.reference.clear_stale_cluster_reservation(
+                            "kind",
+                            "proof",
+                            expected_commit=commit,
+                            expected_owner_id=owner,
+                        )
+                self.assertEqual(creator_live.call_count, 2)
+                sleep.assert_called_once_with(
+                    self.reference.KIND_CREATOR_QUIET_SECONDS
+                )
+                self.assertTrue(self.reference.marker_path("proof").exists())
             finally:
                 self.reference.MARKERS = original_markers
                 self.reference.KUBECONFIGS = original_kubeconfigs

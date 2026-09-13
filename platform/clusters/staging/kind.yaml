@@ -9,7 +9,10 @@ nodes:
   - role: control-plane
   - role: worker
     extraMounts:
-      - hostPath: __COMMONTHING_STAGING_DATA_ROOT__
-        containerPath: /var/local/commonthing-staging
+      - hostPath: __COMMONTHING_STAGING_POSTGRES_ROOT__
+        containerPath: /var/local/commonthing-staging/postgres
+        readOnly: false
+      - hostPath: __COMMONTHING_STAGING_NATS_ROOT__
+        containerPath: /var/local/commonthing-staging/nats
         readOnly: false
   - role: worker

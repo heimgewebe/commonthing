@@ -632,8 +632,16 @@ def _assert_staging_cell_contract() -> None:
     if roles != ["control-plane", "worker", "worker"]:
         raise ContractError("staging kind node-role contract drift")
 
-    expected_host = "__COMMONTHING_STAGING_DATA_ROOT__"
-    expected_container = "/var/local/commonthing-staging"
+    expected_mounts = [
+        (
+            "__COMMONTHING_STAGING_POSTGRES_ROOT__",
+            "/var/local/commonthing-staging/postgres",
+        ),
+        (
+            "__COMMONTHING_STAGING_NATS_ROOT__",
+            "/var/local/commonthing-staging/nats",
+        ),
+    ]
     for index, node in enumerate(nodes):
         mounts = node.get("extraMounts", []) if isinstance(node, dict) else []
         if index != 1:
@@ -642,13 +650,19 @@ def _assert_staging_cell_contract() -> None:
                     f"staging non-data node {index} must not expose retained host storage"
                 )
             continue
-        if not isinstance(mounts, list) or len(mounts) != 1:
-            raise ContractError("staging data worker must bind exactly one persistent host mount")
-        mount = mounts[0]
-        if mount.get("hostPath") != expected_host or mount.get("containerPath") != expected_container:
+        if not isinstance(mounts, list) or len(mounts) != len(expected_mounts):
+            raise ContractError(
+                "staging data worker must bind exactly the PostgreSQL and NATS retained mounts"
+            )
+        observed_mounts = [
+            (mount.get("hostPath"), mount.get("containerPath"))
+            for mount in mounts
+            if isinstance(mount, dict)
+        ]
+        if observed_mounts != expected_mounts:
             raise ContractError("staging data-worker persistent host mount drift")
-        if mount.get("readOnly") is not False:
-            raise ContractError("staging data-worker persistent host mount must be writable")
+        if any(mount.get("readOnly") is not False for mount in mounts):
+            raise ContractError("staging data-worker persistent host mounts must be writable")
 
     data_root = PLATFORM / "clusters/staging/data"
     documents = [

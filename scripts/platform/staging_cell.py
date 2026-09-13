@@ -104,6 +104,7 @@ def run(
     input_text: str | None = None,
     capture: bool = False,
     timeout: float | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     print("+ external command [arguments redacted]", file=sys.stderr, flush=True)
     kwargs: dict[str, Any] = {"capture_output": True} if capture else {"stdout": sys.stderr}
@@ -114,6 +115,7 @@ def run(
         input=input_text,
         check=True,
         timeout=timeout,
+        env=env,
         **kwargs,
     )
 
@@ -1293,8 +1295,27 @@ def render_kind_config(root: Path) -> Path:
     roles = [node.get("role") if isinstance(node, dict) else None for node in nodes]
     if roles != ["control-plane", "worker", "worker"]:
         raise StagingCellError("staging kind template node roles drift")
-    data_root = str((root / "data").resolve())
-    placeholder = "__COMMONTHING_STAGING_DATA_ROOT__"
+
+    retained_mounts = (
+        (
+            "__COMMONTHING_STAGING_POSTGRES_ROOT__",
+            root / "data/postgres",
+            "/var/local/commonthing-staging/postgres",
+        ),
+        (
+            "__COMMONTHING_STAGING_NATS_ROOT__",
+            root / "data/nats",
+            "/var/local/commonthing-staging/nats",
+        ),
+    )
+    for _, host_path, _ in retained_mounts:
+        host_path.mkdir(parents=True, exist_ok=True)
+        linked = host_path.lstat()
+        if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
+            raise StagingCellError(
+                f"staging retained host path must be a real directory: {host_path}"
+            )
+
     for index, node in enumerate(nodes):
         mounts = node.get("extraMounts", []) if isinstance(node, dict) else []
         if index != 1:
@@ -1303,23 +1324,26 @@ def render_kind_config(root: Path) -> Path:
                     f"staging kind node {index} must not mount persistent data"
                 )
             continue
-        if not isinstance(mounts, list) or len(mounts) != 1:
+        if not isinstance(mounts, list) or len(mounts) != len(retained_mounts):
             raise StagingCellError(
-                "staging data worker must bind exactly one persistent host mount"
+                "staging data worker must bind exactly the PostgreSQL and NATS retained mounts"
             )
-        mount = mounts[0]
-        if mount.get("hostPath") != placeholder:
-            raise StagingCellError("staging data worker hostPath template drift")
-        if mount.get("containerPath") != "/var/local/commonthing-staging":
-            raise StagingCellError("staging data worker containerPath drift")
-        if mount.get("readOnly") is not False:
-            raise StagingCellError("staging data worker persistent mount must be writable")
-        mount["hostPath"] = data_root
+        for mount, (placeholder, host_path, container_path) in zip(
+            mounts, retained_mounts, strict=True
+        ):
+            if mount.get("hostPath") != placeholder:
+                raise StagingCellError("staging data worker hostPath template drift")
+            if mount.get("containerPath") != container_path:
+                raise StagingCellError("staging data worker containerPath drift")
+            if mount.get("readOnly") is not False:
+                raise StagingCellError(
+                    "staging data worker persistent mount must be writable"
+                )
+            mount["hostPath"] = str(host_path.resolve())
     rendered = yaml.safe_dump(document, sort_keys=False)
     path = root / "generated/kind.yaml"
     atomic_text(path, rendered, mode=0o600)
     return path
-
 
 def load_or_create_secret_material(root: Path) -> tuple[dict[str, str], str]:
     path = root / "secrets/staging-runtime.json"
@@ -1805,7 +1829,13 @@ def public_external_secret_state() -> dict[str, Any]:
     return {"bound": True, "required_keys": ["database-url"]}
 
 
-def prepare_volume_permissions(kind: str, cluster: str, root: Path) -> None:
+def _retained_mount_node(
+    kind: str,
+    cluster: str,
+    root: Path,
+    *,
+    require_split: bool,
+) -> str:
     nodes = reference.kind_nodes(kind, cluster)
     if len(nodes) != 3:
         raise StagingCellError(
@@ -1817,7 +1847,20 @@ def prepare_volume_permissions(kind: str, cluster: str, root: Path) -> None:
             f"staging data worker {data_node!r} is missing from kind nodes {nodes!r}"
         )
 
-    expected_source = str((root / "data").resolve())
+    retained_destinations = {
+        "/var/local/commonthing-staging",
+        "/var/local/commonthing-staging/postgres",
+        "/var/local/commonthing-staging/nats",
+    }
+    parent_expected = {
+        "/var/local/commonthing-staging": str((root / "data").resolve())
+    }
+    split_expected = {
+        "/var/local/commonthing-staging/postgres": str(
+            (root / "data/postgres").resolve()
+        ),
+        "/var/local/commonthing-staging/nats": str((root / "data/nats").resolve()),
+    }
     for node in nodes:
         raw_mounts = output(
             ["docker", "inspect", "--format", "{{json .Mounts}}", node],
@@ -1829,26 +1872,51 @@ def prepare_volume_permissions(kind: str, cluster: str, root: Path) -> None:
             raise StagingCellError(
                 f"cannot inspect staging kind mount topology for node {node!r}"
             ) from error
-        data_mounts = [
+        if not isinstance(mounts, list):
+            raise StagingCellError(
+                f"cannot inspect staging kind mount topology for node {node!r}"
+            )
+        retained = [
             mount
             for mount in mounts
             if isinstance(mount, dict)
-            and mount.get("Destination") == "/var/local/commonthing-staging"
+            and mount.get("Destination") in retained_destinations
         ]
-        if node == data_node:
-            if (
-                len(data_mounts) != 1
-                or data_mounts[0].get("Source") != expected_source
-                or data_mounts[0].get("RW") is not True
-            ):
+        if node != data_node:
+            if retained:
                 raise StagingCellError(
-                    "staging data worker does not expose the exact writable retained host mount"
+                    f"staging non-data node {node!r} unexpectedly exposes retained host storage"
                 )
-        elif data_mounts:
-            raise StagingCellError(
-                f"staging non-data node {node!r} unexpectedly exposes retained host storage"
-            )
+            continue
 
+        if any(mount.get("RW") is not True for mount in retained):
+            raise StagingCellError(
+                "staging data worker retained host storage must be writable"
+            )
+        observed = {
+            str(mount.get("Destination")): str(mount.get("Source"))
+            for mount in retained
+        }
+        if len(observed) != len(retained):
+            raise StagingCellError(
+                "staging data worker has duplicate retained host mount destinations"
+            )
+        if require_split:
+            if observed != split_expected:
+                raise StagingCellError(
+                    "staging data worker does not expose the exact split retained host mounts"
+                )
+        elif observed not in (parent_expected, split_expected):
+            raise StagingCellError(
+                "staging data worker does not expose an accepted retained host mount topology"
+            )
+    return data_node
+
+
+def prepare_volume_permissions(kind: str, cluster: str, root: Path) -> None:
+    data_node = _retained_mount_node(
+        kind, cluster, root, require_split=True
+    )
     for volume_path, identity in (
         ("/var/local/commonthing-staging/postgres", "999:999"),
         ("/var/local/commonthing-staging/nats", "1000:1000"),
@@ -1895,7 +1963,228 @@ def prepare_volume_permissions(kind: str, cluster: str, root: Path) -> None:
             )
 
 
-def flux_documents(commit: str) -> list[dict[str, Any]]:
+def _mounted_retained_data_anchors(
+    kind: str,
+    cluster: str,
+    root: Path,
+    *,
+    require_split: bool,
+) -> dict[str, dict[str, Any]]:
+    data_node = _retained_mount_node(
+        kind, cluster, root, require_split=require_split
+    )
+    identity = _retained_data_identity(root, include_content=False)
+    for name in ("postgres", "nats"):
+        volume_path = f"/var/local/commonthing-staging/{name}"
+        observed = output(
+            [
+                "docker",
+                "exec",
+                data_node,
+                "stat",
+                "-c",
+                "%d:%i:%u:%g:%a",
+                volume_path,
+            ],
+            timeout=30,
+        )
+        fields = observed.split(":")
+        if len(fields) != 5:
+            raise StagingCellError(
+                f"cannot parse mounted retained {name} directory identity"
+            )
+        try:
+            mounted = {
+                "device": int(fields[0]),
+                "inode": int(fields[1]),
+                "uid": int(fields[2]),
+                "gid": int(fields[3]),
+                "mode": int(fields[4], 8),
+            }
+        except ValueError as error:
+            raise StagingCellError(
+                f"cannot parse mounted retained {name} directory identity"
+            ) from error
+        for field in ("device", "inode", "uid", "gid", "mode"):
+            if mounted[field] != identity[name][field]:
+                raise StagingCellError(
+                    f"mounted retained {name} directory is not the verified host directory"
+                )
+    return identity
+
+
+def _mounted_retained_data_identity(
+    kind: str,
+    cluster: str,
+    root: Path,
+    *,
+    durable: bool,
+    require_split: bool,
+) -> dict[str, dict[str, Any]]:
+    identity = _mounted_retained_data_anchors(
+        kind, cluster, root, require_split=require_split
+    )
+    data_node = data_node_name(cluster)
+    if durable:
+        run(["docker", "exec", data_node, "sync"], timeout=120)
+
+    fingerprint_script = (
+        "set -euo pipefail\n"
+        "volume=\"$1\"\n"
+        "if [ ! -d \"$volume\" ] || [ -L \"$volume\" ]; then exit 41; fi\n"
+        "if find -P \"$volume\" -mindepth 1 \\( -type l -o \\( ! -type f ! -type d \\) \\) -print -quit | grep -q .; then exit 42; fi\n"
+        "LC_ALL=C tar --sort=name --format=gnu --numeric-owner --owner=0 --group=0 --mtime=@0 -cf - -C \"$volume\" . | sha256sum | awk '{print $1}'\n"
+    )
+    for name in ("postgres", "nats"):
+        volume_path = f"/var/local/commonthing-staging/{name}"
+        try:
+            tree_sha = output(
+                [
+                    "docker",
+                    "exec",
+                    data_node,
+                    "bash",
+                    "-ceu",
+                    fingerprint_script,
+                    "bash",
+                    volume_path,
+                ],
+                timeout=300,
+            )
+        except subprocess.CalledProcessError as error:
+            raise StagingCellError(
+                f"cannot fingerprint mounted retained {name} data safely"
+            ) from error
+        identity[name]["tree_sha256"] = _canonical_sha256(
+            tree_sha, label=f"mounted retained {name} tree hash"
+        )
+    return identity
+
+
+def _set_data_reconciliation_suspended(kubectl: str, *, suspended: bool) -> None:
+    expected = "true" if suspended else "false"
+    run(
+        [
+            kubectl,
+            "patch",
+            "kustomization",
+            DATA_KUSTOMIZATION,
+            "-n",
+            "flux-system",
+            "--type=merge",
+            "-p",
+            json.dumps({"spec": {"suspend": suspended}}, separators=(",", ":")),
+        ],
+        timeout=60,
+    )
+    observed = output(
+        [
+            kubectl,
+            "get",
+            "kustomization",
+            DATA_KUSTOMIZATION,
+            "-n",
+            "flux-system",
+            "-o",
+            "jsonpath={.spec.suspend}",
+        ],
+        timeout=30,
+    )
+    if observed != expected:
+        state = "suspend" if suspended else "resume"
+        raise StagingCellError(
+            f"staging data reconciliation did not {state} as requested"
+        )
+
+
+def _quiesce_retained_data(kubectl: str) -> None:
+    _set_data_reconciliation_suspended(kubectl, suspended=True)
+    run(
+        [
+            kubectl,
+            "scale",
+            "deployment/postgres",
+            "deployment/nats",
+            "-n",
+            DATA_NAMESPACE,
+            "--replicas=0",
+        ],
+        timeout=60,
+    )
+    deadline = time.monotonic() + 120.0
+    while True:
+        remaining: list[str] = []
+        for name in ("postgres", "nats"):
+            pods = output(
+                [
+                    kubectl,
+                    "get",
+                    "pods",
+                    "-n",
+                    DATA_NAMESPACE,
+                    "-l",
+                    f"app.kubernetes.io/name={name}",
+                    "-o",
+                    "name",
+                ],
+                timeout=30,
+            )
+            if pods:
+                remaining.append(name)
+        if not remaining:
+            break
+        if time.monotonic() >= deadline:
+            raise StagingCellError(
+                f"staging data workloads did not quiesce before down: {remaining!r}"
+            )
+        time.sleep(1.0)
+    for name in ("postgres", "nats"):
+        replicas = output(
+            [
+                kubectl,
+                "get",
+                "deployment",
+                name,
+                "-n",
+                DATA_NAMESPACE,
+                "-o",
+                "jsonpath={.spec.replicas}",
+            ],
+            timeout=30,
+        )
+        if replicas != "0":
+            raise StagingCellError(
+                f"staging data deployment {name!r} is not quiescent before down"
+            )
+
+def flux_documents(
+    commit: str, *, suspend_data: bool = False
+) -> list[dict[str, Any]]:
+    data_spec: dict[str, Any] = {
+        "interval": "2m",
+        "retryInterval": "20s",
+        "timeout": DATA_KUSTOMIZATION_TIMEOUT,
+        "prune": True,
+        "wait": True,
+        "sourceRef": {"kind": "GitRepository", "name": SOURCE_NAME},
+        "path": "./platform/clusters/staging/data",
+        "healthChecks": [
+            {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": "postgres",
+                "namespace": DATA_NAMESPACE,
+            },
+            {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": "nats",
+                "namespace": DATA_NAMESPACE,
+            },
+        ],
+    }
+    if suspend_data:
+        data_spec["suspend"] = True
     return [
         {
             "apiVersion": "source.toolkit.fluxcd.io/v1",
@@ -1911,32 +2200,9 @@ def flux_documents(commit: str) -> list[dict[str, Any]]:
             "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
             "kind": "Kustomization",
             "metadata": {"name": DATA_KUSTOMIZATION, "namespace": "flux-system"},
-            "spec": {
-                "interval": "2m",
-                "retryInterval": "20s",
-                "timeout": DATA_KUSTOMIZATION_TIMEOUT,
-                "prune": True,
-                "wait": True,
-                "sourceRef": {"kind": "GitRepository", "name": SOURCE_NAME},
-                "path": "./platform/clusters/staging/data",
-                "healthChecks": [
-                    {
-                        "apiVersion": "apps/v1",
-                        "kind": "Deployment",
-                        "name": "postgres",
-                        "namespace": DATA_NAMESPACE,
-                    },
-                    {
-                        "apiVersion": "apps/v1",
-                        "kind": "Deployment",
-                        "name": "nats",
-                        "namespace": DATA_NAMESPACE,
-                    },
-                ],
-            },
+            "spec": data_spec,
         },
     ]
-
 
 def pvc_phase_snapshot(kubectl: str) -> dict[str, str]:
     pvcs = ("postgres-data", "nats-data")
@@ -4818,6 +5084,23 @@ def _same_retained_data_anchors(
     )
 
 
+def _require_durable_retained_fingerprint(
+    identity: dict[str, dict[str, Any]], *, label: str
+) -> None:
+    for name in ("postgres", "nats"):
+        observed = identity.get(name)
+        if not isinstance(observed, dict):
+            raise StagingCellError(f"{label} has no {name} identity")
+        for field in ("device", "inode", "uid", "gid", "mode"):
+            value = observed.get(field)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise StagingCellError(f"{label} has invalid {name} {field}")
+        _canonical_sha256(
+            observed.get("tree_sha256"),
+            label=f"{label} {name} tree hash",
+        )
+
+
 def _down_receipt_binding(
     cell: dict[str, Any],
     cell_sha: str,
@@ -4890,25 +5173,23 @@ def load_delete_to_prove_down_receipt(
         retained_data_identity, dict
     ):
         raise StagingCellError("staging down receipt has no retained data identity")
+    _require_durable_retained_fingerprint(
+        pre_delete_data_identity, label="staging pre-delete data identity"
+    )
     if not _same_retained_data_anchors(
         pre_delete_data_identity, retained_data_identity
     ):
         raise StagingCellError(
             "retained staging data directory anchor changed during cluster deletion"
         )
-    observed_data_identity = _retained_data_identity(
-        root, include_content=require_retained_data_match
-    )
-    if require_retained_data_match:
-        if retained_data_identity != observed_data_identity:
-            raise StagingCellError(
-                "retained staging data identity differs from the post-delete receipt"
-            )
-    elif not _same_retained_data_anchors(
-        retained_data_identity, observed_data_identity
-    ):
+    # After deletion there is deliberately no new content baseline.  We only
+    # prove that the same retained host directories remain present.  Content is
+    # re-checked from the actual rebuilt mounts before data reconciliation starts.
+    observed_data_identity = _retained_data_identity(root, include_content=False)
+    if not _same_retained_data_anchors(retained_data_identity, observed_data_identity):
+        phase = "before rebuild" if require_retained_data_match else "after rebuild"
         raise StagingCellError(
-            "retained staging data directory anchor changed after rebuild"
+            f"retained staging data directory anchor changed {phase}"
         )
     image_promotion = payload.get("image_promotion")
     if not isinstance(image_promotion, dict):
@@ -4964,14 +5245,76 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         if gateway_binding.get("active_commit") != cell_active_commit(cell):
             raise StagingCellError("staging gateway proof active commit changed before down")
 
-    pre_delete_data_identity = (
-        _retained_data_identity(root, include_content=False) if activated else None
-    )
     image_promotion = (
         _exact_cell_promotion(root, cell, cell_active_commit(cell))
         if activated
         else None
     )
+    kind = receipt["tools"]["kind"]
+    kubectl = receipt.get("tools", {}).get("kubectl")
+    if activated and (not isinstance(kubectl, str) or not kubectl):
+        raise StagingCellError("activated staging down requires kubectl from the tool receipt")
+    path = root / CELL_DOWN_RECEIPT
+    cluster_present = args.cluster in reference.clusters(kind)
+    cluster_was_present = cluster_present
+    started_at_unix = int(time.time())
+    previous: dict[str, Any] | None = None
+    previous_status = ""
+    if path.exists() or path.is_symlink():
+        previous = _private_json_receipt(path, label="staging down receipt")
+        previous_status = str(previous.get("status") or "")
+        if previous_status not in {
+            "cluster-delete-in-progress",
+            "cluster-deleted-state-preserved",
+            "cluster-absent-state-preserved",
+        }:
+            raise StagingCellError("staging down receipt has an unexpected status")
+
+    pre_delete_data_identity: dict[str, dict[str, Any]] | None = None
+    if activated:
+        if previous is not None:
+            previous_pre_delete = previous.get("pre_delete_data_identity")
+            if not isinstance(previous_pre_delete, dict):
+                raise StagingCellError(
+                    "staging down receipt lost its durable pre-delete data identity"
+                )
+            _require_durable_retained_fingerprint(
+                previous_pre_delete, label="pending staging pre-delete data identity"
+            )
+            pre_delete_data_identity = previous_pre_delete
+        elif not cluster_present:
+            raise StagingCellError(
+                "activated staging cannot establish a pre-delete data baseline after the cluster is absent"
+            )
+
+        if previous_status == "cluster-delete-in-progress" and not cluster_present:
+            observed_anchors = _retained_data_identity(root, include_content=False)
+            if not _same_retained_data_anchors(
+                pre_delete_data_identity, observed_anchors
+            ):
+                raise StagingCellError(
+                    "pending staging down receipt lost its retained data directory anchors"
+                )
+        elif previous_status not in {
+            "cluster-deleted-state-preserved",
+            "cluster-absent-state-preserved",
+        }:
+            assert isinstance(kubectl, str)
+            _quiesce_retained_data(kubectl)
+            current_pre_delete = _mounted_retained_data_identity(
+                kind,
+                args.cluster,
+                root,
+                durable=True,
+                require_split=False,
+            )
+            if pre_delete_data_identity is None:
+                pre_delete_data_identity = current_pre_delete
+            elif pre_delete_data_identity != current_pre_delete:
+                raise StagingCellError(
+                    "pending staging down receipt no longer matches the durable quiescent data fingerprint"
+                )
+
     binding = _down_receipt_binding(
         cell,
         cell_sha,
@@ -4979,89 +5322,82 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         data_identity=pre_delete_data_identity,
         image_promotion=image_promotion,
     )
-    kind = receipt["tools"]["kind"]
-    path = root / CELL_DOWN_RECEIPT
-    cluster_present = args.cluster in reference.clusters(kind)
-    cluster_was_present = cluster_present
-    started_at_unix = int(time.time())
-    if path.exists() or path.is_symlink():
-        previous = _private_json_receipt(path, label="staging down receipt")
-        previous_status = previous.get("status")
-        if previous_status == "cluster-delete-in-progress":
-            previous_pre_delete = previous.get("pre_delete_data_identity")
-            current_pre_delete = binding.get("pre_delete_data_identity")
-            static_binding = {
-                key: value
-                for key, value in binding.items()
-                if key != "pre_delete_data_identity"
-            }
+
+    if previous is not None:
+        if previous_status in {
+            "cluster-deleted-state-preserved",
+            "cluster-absent-state-preserved",
+        }:
+            if any(previous.get(key) != value for key, value in binding.items()):
+                raise StagingCellError(
+                    "previous delete-to-prove recovery cycle must be retired before a new down cycle"
+                )
+        else:
             _require_receipt_binding(
-                previous, static_binding, label="pending staging down receipt"
+                previous, binding, label="pending staging down receipt"
             )
-            if activated:
-                if not isinstance(previous_pre_delete, dict) or not isinstance(
-                    current_pre_delete, dict
-                ) or not _same_retained_data_anchors(
-                    previous_pre_delete, current_pre_delete
-                ):
-                    raise StagingCellError(
-                        "pending staging down receipt lost its retained data directory anchors"
-                    )
-                binding["pre_delete_data_identity"] = previous_pre_delete
+        if previous_status == "cluster-delete-in-progress":
             if not isinstance(previous.get("cluster_was_present"), bool):
-                raise StagingCellError("pending staging down receipt lacks cluster presence evidence")
+                raise StagingCellError(
+                    "pending staging down receipt lacks cluster presence evidence"
+                )
             cluster_was_present = bool(previous["cluster_was_present"])
             started_at_unix = int(previous.get("started_at_unix") or 0)
             if started_at_unix <= 0:
-                raise StagingCellError("pending staging down receipt lacks a valid start time")
-        elif previous_status in {"cluster-deleted-state-preserved", "cluster-absent-state-preserved"}:
-            terminal_binding = {
-                key: value
-                for key, value in binding.items()
-                if key != "pre_delete_data_identity"
-            }
-            previous_same_cycle = all(
-                previous.get(key) == value for key, value in terminal_binding.items()
-            )
-            if previous_same_cycle:
-                if activated:
-                    retained_identity = previous.get("retained_data_identity")
-                    if not isinstance(retained_identity, dict) or (
-                        retained_identity != _retained_data_identity(root)
-                    ):
-                        raise StagingCellError(
-                            "terminal staging down receipt lost its retained data identity"
-                        )
-                if cluster_present:
-                    raise StagingCellError(
-                        "staging down receipt is already terminal but the same bound cluster exists; refusing ambiguous reuse"
-                    )
-                return {**previous, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
-            raise StagingCellError(
-                "previous delete-to-prove recovery cycle must be retired before a new down cycle"
-            )
+                raise StagingCellError(
+                    "pending staging down receipt lacks a valid start time"
+                )
         else:
-            raise StagingCellError("staging down receipt has an unexpected status")
+            if activated:
+                retained_identity = previous.get("retained_data_identity")
+                if not isinstance(retained_identity, dict):
+                    raise StagingCellError(
+                        "terminal staging down receipt lost its retained data identity"
+                    )
+                observed_anchors = _retained_data_identity(root, include_content=False)
+                if not _same_retained_data_anchors(
+                    retained_identity, observed_anchors
+                ):
+                    raise StagingCellError(
+                        "terminal staging down receipt lost its retained data directory anchors"
+                    )
+            if cluster_present:
+                raise StagingCellError(
+                    "staging down receipt is already terminal but the same bound cluster exists; refusing ambiguous reuse"
+                )
+            return {
+                **previous,
+                "receipt_path": str(path),
+                "receipt_sha256": sha256_file(path),
+            }
 
-    pending = {
-        **binding,
-        "status": "cluster-delete-in-progress",
-        "cluster_was_present": cluster_was_present,
-        "started_at_unix": started_at_unix,
-    }
-    atomic_json(path, pending)
+    # For activated delete-to-prove, this durable receipt is the point of no
+    # return: the quiescent Data-Node fingerprint exists on disk before delete.
+    # Unactivated teardown does not need a data baseline and can remain retry-safe
+    # without writing a misleading pre-delete receipt.
+    if activated and previous is None:
+        pending = {
+            **binding,
+            "status": "cluster-delete-in-progress",
+            "cluster_was_present": cluster_was_present,
+            "started_at_unix": started_at_unix,
+        }
+        atomic_json(path, pending)
+
     reference.delete_owned_cluster_if_present(
         kind,
         args.cluster,
         expected_commit=commit,
         expected_owner_id=owner_id,
     )
-    retained_data_identity = _retained_data_identity(root) if activated else None
+    retained_data_identity = (
+        _retained_data_identity(root, include_content=False) if activated else None
+    )
     if activated and (
-        not isinstance(binding.get("pre_delete_data_identity"), dict)
+        not isinstance(pre_delete_data_identity, dict)
         or not isinstance(retained_data_identity, dict)
         or not _same_retained_data_anchors(
-            binding["pre_delete_data_identity"], retained_data_identity
+            pre_delete_data_identity, retained_data_identity
         )
     ):
         raise StagingCellError(
@@ -5199,20 +5535,32 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
             "delete-to-prove rebuild implementation must equal the active app commit"
         )
     promotion = _exact_cell_promotion(root, cell, active_commit)
-    down = load_delete_to_prove_down_receipt(root, cell, require_current_cell_match=True)
+    down = load_delete_to_prove_down_receipt(
+        root, cell, require_current_cell_match=True
+    )
     if down.get("image_promotion") != promotion:
         raise StagingCellError(
             "promotion evidence differs from the pre-delete release"
         )
-    if down.get("retained_data_identity") != _retained_data_identity(root):
+    observed_host_anchors = _retained_data_identity(root, include_content=False)
+    retained_after_delete = down.get("retained_data_identity")
+    if not isinstance(retained_after_delete, dict) or not _same_retained_data_anchors(
+        retained_after_delete, observed_host_anchors
+    ):
         raise StagingCellError(
-            "retained staging data identity differs from the post-delete receipt"
+            "retained staging data directory anchor differs from the down receipt"
         )
 
     _, secret_sha = load_or_create_secret_material(root)
-    external = cell.get("external_secret") if isinstance(cell.get("external_secret"), dict) else {}
+    external = (
+        cell.get("external_secret")
+        if isinstance(cell.get("external_secret"), dict)
+        else {}
+    )
     if external.get("source_sha256") != secret_sha:
-        raise StagingCellError("retained runtime secret differs from the pre-delete cell receipt")
+        raise StagingCellError(
+            "retained runtime secret differs from the pre-delete cell receipt"
+        )
     registry_material, registry_source_sha = load_registry_pull_material(root)
     registry_binding = (
         cell.get("registry_pull_secret")
@@ -5220,21 +5568,30 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
         else {}
     )
     if registry_binding.get("source_sha256") != registry_source_sha:
-        raise StagingCellError("retained registry secret differs from the pre-delete cell receipt")
+        raise StagingCellError(
+            "retained registry secret differs from the pre-delete cell receipt"
+        )
     expected_registry_config = sha256_bytes(
         registry_dockerconfig_json(registry_material).encode("utf-8")
     )
     if registry_binding.get("config_sha256") != expected_registry_config:
-        raise StagingCellError("retained registry config differs from the pre-delete cell receipt")
+        raise StagingCellError(
+            "retained registry config differs from the pre-delete cell receipt"
+        )
 
     binding = _rebuild_receipt_binding(cell, down, implementation_commit)
     rebuild_path = root / CELL_REBUILD_RECEIPT
     existing_rebuild: dict[str, Any] | None = None
     if rebuild_path.exists() or rebuild_path.is_symlink():
-        existing_rebuild = _private_json_receipt(rebuild_path, label="staging rebuild receipt")
-        _require_receipt_binding(existing_rebuild, binding, label="staging rebuild receipt")
+        existing_rebuild = _private_json_receipt(
+            rebuild_path, label="staging rebuild receipt"
+        )
+        _require_receipt_binding(
+            existing_rebuild, binding, label="staging rebuild receipt"
+        )
         if existing_rebuild.get("status") not in {
             "rebuild-in-progress",
+            "retained-mount-verified-data-reconcile-authorized",
             "infrastructure-rebuilt-app-reactivation-required",
         }:
             raise StagingCellError("staging rebuild receipt has an unexpected status")
@@ -5250,21 +5607,32 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
         )
     if (
         existing_rebuild is not None
-        and existing_rebuild.get("status") == "infrastructure-rebuilt-app-reactivation-required"
+        and existing_rebuild.get("status")
+        in {
+            "retained-mount-verified-data-reconcile-authorized",
+            "infrastructure-rebuilt-app-reactivation-required",
+        }
         and not cluster_present
     ):
         raise StagingCellError(
-            "completed staging rebuild lost its cluster; refusing to create a second cluster under the same recovery receipt"
+            "staging rebuild lost its already mount-verified cluster; refusing to create a second cluster under the same recovery receipt"
         )
-    if existing_rebuild is None:
+
+    started_at_unix = int(time.time())
+    if existing_rebuild is not None:
+        started_at_unix = int(existing_rebuild.get("started_at_unix") or 0)
+        if started_at_unix <= 0:
+            raise StagingCellError("staging rebuild receipt lacks a valid start time")
+    else:
         atomic_json(
             rebuild_path,
             {
                 **binding,
                 "status": "rebuild-in-progress",
-                "started_at_unix": int(time.time()),
+                "started_at_unix": started_at_unix,
             },
         )
+
     if cluster_present:
         reference.require_owned_cluster(
             kind,
@@ -5272,7 +5640,10 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
             expected_commit=bootstrap_commit,
             expected_owner_id=owner_id,
         )
-        created = False
+        created = bool(
+            existing_rebuild is not None
+            and existing_rebuild.get("cluster_created") is True
+        )
     else:
         if existing_rebuild is not None:
             reference.clear_stale_cluster_reservation(
@@ -5292,14 +5663,103 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
             timeout=900,
         )
         created = True
+        cluster_present = True
+
+    current_status = (
+        str(existing_rebuild.get("status") or "")
+        if existing_rebuild is not None
+        else "rebuild-in-progress"
+    )
+    pre_delete_identity = down.get("pre_delete_data_identity")
+    if not isinstance(pre_delete_identity, dict):
+        raise StagingCellError("staging down receipt lost its pre-delete data identity")
+    _require_durable_retained_fingerprint(
+        pre_delete_identity, label="staging pre-delete data identity"
+    )
+
+    if current_status == "infrastructure-rebuilt-app-reactivation-required":
+        retained_mount_identity = existing_rebuild.get("retained_mount_identity")
+        if not isinstance(retained_mount_identity, dict):
+            raise StagingCellError(
+                "completed staging rebuild lost its retained mount proof"
+            )
+        mounted_anchors = _mounted_retained_data_anchors(
+            kind, args.cluster, root, require_split=True
+        )
+        if not _same_retained_data_anchors(
+            retained_mount_identity, mounted_anchors
+        ) or not _same_retained_data_anchors(pre_delete_identity, mounted_anchors):
+            raise StagingCellError(
+                "completed staging rebuild no longer exposes the proven retained mounts"
+            )
+        live_workloads = staging_live_health(kubectl)
+        unhealthy = {
+            name: state for name, state in live_workloads.items() if state != "True"
+        }
+        if unhealthy:
+            raise StagingCellError(
+                f"rebuilt staging infrastructure is not live: {unhealthy!r}"
+            )
+        return {
+            **existing_rebuild,
+            "receipt_path": str(rebuild_path),
+            "receipt_sha256": sha256_file(rebuild_path),
+        }
 
     prepare_volume_permissions(kind, args.cluster, root)
+    if current_status == "rebuild-in-progress":
+        retained_mount_identity = _mounted_retained_data_identity(
+            kind,
+            args.cluster,
+            root,
+            durable=False,
+            require_split=True,
+        )
+        if retained_mount_identity != pre_delete_identity:
+            raise StagingCellError(
+                "rebuilt staging retained mount content differs from the durable pre-delete fingerprint"
+            )
+        mount_authorized = {
+            **binding,
+            "status": "retained-mount-verified-data-reconcile-authorized",
+            "cluster_created": created,
+            "retained_mount_identity": retained_mount_identity,
+            "started_at_unix": started_at_unix,
+            "mount_verified_at_unix": int(time.time()),
+        }
+        atomic_json(rebuild_path, mount_authorized)
+        existing_rebuild = mount_authorized
+    else:
+        assert existing_rebuild is not None
+        retained_mount_identity = existing_rebuild.get("retained_mount_identity")
+        if not isinstance(retained_mount_identity, dict):
+            raise StagingCellError(
+                "mount-authorized staging rebuild lost its retained mount proof"
+            )
+        mounted_anchors = _mounted_retained_data_anchors(
+            kind, args.cluster, root, require_split=True
+        )
+        if not _same_retained_data_anchors(
+            retained_mount_identity, mounted_anchors
+        ) or not _same_retained_data_anchors(pre_delete_identity, mounted_anchors):
+            raise StagingCellError(
+                "mount-authorized staging rebuild no longer exposes the proven retained mounts"
+            )
+        created = existing_rebuild.get("cluster_created") is True
+
     api_server_host = reference.control_plane_address(args.cluster)
     reference.install_platform_components(
         kubectl, flux, helm, tool_receipt["artifacts"], api_server_host
     )
     run(
-        [kubectl, "wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5m"],
+        [
+            kubectl,
+            "wait",
+            "--for=condition=Ready",
+            "nodes",
+            "--all",
+            "--timeout=5m",
+        ],
         timeout=360,
     )
     secret_receipt = inject_external_secrets(kubectl, root)
@@ -5310,17 +5770,39 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
         source_sha=registry_source_sha,
     )
     if secret_receipt.get("source_sha256") != secret_sha:
-        raise StagingCellError("rebuilt runtime Secret source hash drifted during injection")
+        raise StagingCellError(
+            "rebuilt runtime Secret source hash drifted during injection"
+        )
     if registry_receipt.get("source_sha256") != registry_source_sha:
-        raise StagingCellError("rebuilt registry Secret source hash drifted during injection")
+        raise StagingCellError(
+            "rebuilt registry Secret source hash drifted during injection"
+        )
     if registry_receipt.get("config_sha256") != expected_registry_config:
-        raise StagingCellError("rebuilt registry Secret config hash drifted during injection")
-    apply_yaml(kubectl, flux_documents(bootstrap_commit))
+        raise StagingCellError(
+            "rebuilt registry Secret config hash drifted during injection"
+        )
+
+    # The new data Kustomization is born suspended, so installing Flux cannot
+    # race the retained-mount proof by starting PostgreSQL or NATS early.
+    apply_yaml(
+        kubectl,
+        flux_documents(bootstrap_commit, suspend_data=True),
+    )
+    _set_data_reconciliation_suspended(kubectl, suspended=True)
+
+    # At this point the mount proof is already durable.  Resuming reconciliation
+    # may legitimately change database contents, so later retries compare only
+    # the stable physical mount anchors rather than the pre-start tree hash.
+    _set_data_reconciliation_suspended(kubectl, suspended=False)
     reconcile_data(kubectl, bootstrap_commit)
     live_workloads = staging_live_health(kubectl)
-    unhealthy = {name: state for name, state in live_workloads.items() if state != "True"}
+    unhealthy = {
+        name: state for name, state in live_workloads.items() if state != "True"
+    }
     if unhealthy:
-        raise StagingCellError(f"rebuilt staging infrastructure is not live: {unhealthy!r}")
+        raise StagingCellError(
+            f"rebuilt staging infrastructure is not live: {unhealthy!r}"
+        )
     node_names = output([kubectl, "get", "nodes", "-o", "name"]).splitlines()
     if len(node_names) != 3:
         raise StagingCellError(
@@ -5330,10 +5812,12 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
         **binding,
         "status": "infrastructure-rebuilt-app-reactivation-required",
         "cluster_created": created,
+        "retained_mount_identity": retained_mount_identity,
         "node_count": len(node_names),
         "live_workloads": live_workloads,
         "external_secret_source_sha256": secret_receipt["source_sha256"],
         "registry_secret_source_sha256": registry_receipt["source_sha256"],
+        "started_at_unix": started_at_unix,
         "completed_at_unix": int(time.time()),
     }
     atomic_json(rebuild_path, result)
@@ -5568,15 +6052,18 @@ def command_self_check() -> dict[str, Any]:
 
         rendered_path = render_kind_config(root)
         rendered = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
-        expected = str((root / "data").resolve())
+        expected = [
+            str((root / "data/postgres").resolve()),
+            str((root / "data/nats").resolve()),
+        ]
         observed = [
             mount.get("hostPath")
             for node in rendered.get("nodes", [])
             for mount in node.get("extraMounts", [])
         ]
-        if observed != [expected]:
+        if observed != expected:
             raise StagingCellError(
-                "self-check rendered kind data-worker mount does not bind the state root"
+                "self-check rendered kind data-worker mounts do not bind the exact retained roots"
             )
     return {
         "schema_version": 1,
@@ -5589,7 +6076,7 @@ def command_self_check() -> dict[str, Any]:
             "retained-secret-rotation-fail-closed",
             "injected-secret-integrity",
             "public-secret-output-redaction",
-            "single-data-worker-kind-render",
+            "split-data-worker-kind-render",
         ],
     }
 

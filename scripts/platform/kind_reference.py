@@ -52,6 +52,7 @@ TRANSIENT_KIND_CREATE_MARKERS = (
     "gateway timeout",
 )
 KIND_CREATE_RESERVATION_ENV = "COMMONTHING_KIND_CREATE_RESERVATION"
+KIND_CREATOR_QUIET_SECONDS = 0.25
 GATEWAY_API_ARTIFACTS = (
     "gateway_api_gatewayclasses",
     "gateway_api_gateways",
@@ -791,10 +792,9 @@ def cluster_creation_reservation(
                 rollback_error = error
             if rollback_error is None:
                 try:
-                    if _reservation_creator_is_live(creation_token):
-                        rollback_error = ProofError(
-                            "cluster creator process remains live after creation failure"
-                        )
+                    _require_stable_creator_quiescence(
+                        kind, name, creation_token
+                    )
                 except Exception as error:
                     rollback_error = error
             if rollback_error is None:
@@ -911,6 +911,26 @@ def _reservation_creator_is_live(creation_token: str) -> bool:
     return False
 
 
+def _require_stable_creator_quiescence(
+    kind: str,
+    name: str,
+    creation_token: str,
+) -> None:
+    for observation in range(2):
+        if _reservation_creator_is_live(creation_token):
+            raise ProofError(
+                f"refusing creator-quiescence proof for cluster {name!r}: "
+                "original Kind creator is still running"
+            )
+        if name in clusters(kind):
+            raise ProofError(
+                f"refusing creator-quiescence proof for cluster {name!r}: "
+                "cluster became visible during the quiet interval"
+            )
+        if observation == 0:
+            time.sleep(KIND_CREATOR_QUIET_SECONDS)
+
+
 def clear_stale_cluster_reservation(
     kind: str,
     name: str,
@@ -947,16 +967,7 @@ def clear_stale_cluster_reservation(
                 f"refusing stale reservation cleanup for cluster {name!r}: "
                 "creator quiescence token is missing"
             )
-        if _reservation_creator_is_live(creation_token):
-            raise ProofError(
-                f"refusing stale reservation cleanup for cluster {name!r}: "
-                "original Kind creator is still running"
-            )
-        if name in clusters(kind):
-            raise ProofError(
-                f"refusing stale reservation cleanup for cluster {name!r}: "
-                "cluster became visible during creator-quiescence proof"
-            )
+        _require_stable_creator_quiescence(kind, name, creation_token)
         _remove_cluster_state_files_durably(name)
         return True
 
