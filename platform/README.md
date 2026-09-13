@@ -139,12 +139,28 @@ Cluster beim ersten Löschversuch tatsächlich vorhanden war und der finale
 
 Danach rekonstruiert `rebuild` ausschließlich die Infrastruktur aus dem erhaltenen
 State-Root. Es verlangt denselben Owner, denselben Bootstrap-Commit, denselben
-aktiven Public-`main`-Commit, das passende Promotion-Receipt, unveränderte private
-Runtime-/Registry-Secrets und die erhaltenen PostgreSQL-/NATS-Daten. Beim ersten
-Recovery-Lauf muss der alte Cluster nachweislich abwesend sein. Ein vor der
-Clustererzeugung geschriebenes `cell-rebuild.json` macht auch diesen Schritt
-wiederaufnehmbar. `rebuild` stellt Kind, Cilium/Flux, Secrets und die persistente
-Datenebene wieder her, aktiviert die App aber absichtlich noch nicht.
+aktiven Public-`main`-Commit, **dieselbe Promotion-Receipt-Identität samt denselben
+Image-Digests**, unveränderte private Runtime-/Registry-Secrets und dieselben
+persistenten PostgreSQL-/NATS-Verzeichnisanker. `down` bindet dafür zunächst die
+Verzeichnisidentität vor dem Löschen und nach erfolgreichem Cluster-Shutdown noch
+einmal die exakte erhaltene Identität. `rebuild` verlangt diese Post-Delete-Identität
+vor dem ersten erneuten Mount; nach dem Wiederanlauf dürfen die Datenbanken wieder
+schreiben, solange der physische Verzeichnisanker unverändert bleibt.
+
+Beim ersten Recovery-Lauf muss der alte Cluster nachweislich abwesend sein. Ein vor
+der Clustererzeugung geschriebenes `cell-rebuild.json` macht auch diesen Schritt
+wiederaufnehmbar. Bleibt nach einem Prozessabbruch nur die exakt an Owner und
+Bootstrap-Commit gebundene Kind-Erzeugungsreservierung zurück, darf `rebuild` diese
+**nur bei weiterhin abwesendem Cluster** entfernen und die Erzeugung wiederholen;
+fremde Reservierungen oder ein bereits sichtbarer Cluster bleiben fail-closed.
+`rebuild` stellt Kind, Cilium/Flux, Secrets und die persistente Datenebene wieder her,
+aktiviert die App aber absichtlich noch nicht.
+
+Eine bereits aktivierte Zelle darf für Delete-to-Prove nur aus `gateway-ready`
+heruntergefahren werden. Solange `cell-down.json`, `cell-rebuild.json` oder ein
+finales `delete-to-prove.json` den bestehenden Zyklus belegen, wird kein zweiter
+Destruktivzyklus mit neuer Receipt-Identität darübergeschrieben. Eine spätere
+Mehrfachausführung braucht daher einen eigenen, expliziten Receipt-Rotationsvertrag.
 
 Der vollständige Beweisablauf ist damit:
 

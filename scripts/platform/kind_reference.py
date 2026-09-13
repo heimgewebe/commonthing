@@ -856,6 +856,36 @@ def delete_owned_cluster_if_present(
         return False
 
 
+def clear_stale_cluster_reservation(
+    kind: str,
+    name: str,
+    *,
+    expected_commit: str,
+    expected_owner_id: str,
+) -> bool:
+    """Clear only an exact-bound creation reservation for an absent cluster.
+
+    This is narrower than cluster deletion: if Kind can already observe the
+    cluster, recovery must use the normal owned-cluster path instead.
+    """
+    with cluster_ownership_lock(name):
+        if name in clusters(kind):
+            raise ProofError(
+                f"refusing stale reservation cleanup for cluster {name!r}: cluster exists"
+            )
+        if not os.path.lexists(marker_path(name)):
+            return False
+        data = _read_marker(name)
+        _require_marker_binding(
+            data,
+            name,
+            expected_commit=expected_commit,
+            expected_owner_id=expected_owner_id,
+        )
+        _remove_cluster_state_files_durably(name)
+        return True
+
+
 def _kind_create_error_detail(error: BaseException) -> str:
     if isinstance(error, subprocess.CalledProcessError):
         return "\n".join(

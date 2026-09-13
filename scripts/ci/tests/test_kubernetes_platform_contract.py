@@ -2801,6 +2801,70 @@ spec:
                 self.reference.MARKERS = original_markers
                 self.reference.KUBECONFIGS = original_kubeconfigs
 
+    def test_reference_clears_only_exact_stale_creation_reservation(self) -> None:
+        commit = "a" * 40
+        owner = "owner-stale-reservation"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markers = root / "clusters"
+            kubeconfigs = root / "kubeconfigs"
+            original_markers = self.reference.MARKERS
+            original_kubeconfigs = self.reference.KUBECONFIGS
+            self.reference.MARKERS = markers
+            self.reference.KUBECONFIGS = kubeconfigs
+            try:
+                self.reference.write_marker("proof", commit, owner)
+                self.reference.kubeconfig_path("proof").parent.mkdir(parents=True, exist_ok=True)
+                self.reference.kubeconfig_path("proof").write_text("apiVersion: v1\n", encoding="utf-8")
+                with mock.patch.object(self.reference, "clusters", return_value=set()):
+                    cleared = self.reference.clear_stale_cluster_reservation(
+                        "kind",
+                        "proof",
+                        expected_commit=commit,
+                        expected_owner_id=owner,
+                    )
+                self.assertTrue(cleared)
+                self.assertFalse(self.reference.marker_path("proof").exists())
+                self.assertFalse(self.reference.kubeconfig_path("proof").exists())
+            finally:
+                self.reference.MARKERS = original_markers
+                self.reference.KUBECONFIGS = original_kubeconfigs
+
+    def test_reference_stale_reservation_cleanup_refuses_live_or_foreign_state(self) -> None:
+        commit = "a" * 40
+        owner = "owner-stale-reservation"
+        with tempfile.TemporaryDirectory() as tmp:
+            original = self.reference.MARKERS
+            self.reference.MARKERS = Path(tmp)
+            try:
+                self.reference.write_marker("proof", commit, owner)
+                with mock.patch.object(
+                    self.reference, "clusters", return_value={"proof"}
+                ):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "cluster exists"
+                    ):
+                        self.reference.clear_stale_cluster_reservation(
+                            "kind",
+                            "proof",
+                            expected_commit=commit,
+                            expected_owner_id=owner,
+                        )
+                self.assertTrue(self.reference.marker_path("proof").exists())
+                with mock.patch.object(self.reference, "clusters", return_value=set()):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "exact owner binding"
+                    ):
+                        self.reference.clear_stale_cluster_reservation(
+                            "kind",
+                            "proof",
+                            expected_commit=commit,
+                            expected_owner_id="different-owner",
+                        )
+                self.assertTrue(self.reference.marker_path("proof").exists())
+            finally:
+                self.reference.MARKERS = original
+
     def test_reference_refuses_cluster_without_marker_in_if_present_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             original = self.reference.MARKERS

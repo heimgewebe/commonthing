@@ -4670,8 +4670,61 @@ def _canonical_sha256(value: Any, *, label: str) -> str:
     return digest
 
 
-def _down_receipt_binding(cell: dict[str, Any], cell_sha: str, gateway_sha: str) -> dict[str, Any]:
-    return {
+def _exact_cell_promotion(root: Path, cell: dict[str, Any], commit: str) -> dict[str, Any]:
+    promotion = load_promotion_receipt(root, commit)
+    expected = {
+        "status": "pass",
+        "source_commit": commit,
+        "receipt_sha256": promotion["receipt_sha256"],
+        "images": promotion["images"],
+    }
+    if cell.get("image_promotion") != expected:
+        raise StagingCellError(
+            "promotion evidence differs from the active app receipt"
+        )
+    return expected
+
+
+def _retained_data_identity(root: Path) -> dict[str, dict[str, int]]:
+    identity: dict[str, dict[str, int]] = {}
+    for name in ("postgres", "nats"):
+        if not retained_data_directory_exists(root, name):
+            raise StagingCellError(
+                "delete-to-prove requires retained PostgreSQL and NATS data"
+            )
+        path = root / "data" / name
+        stable = _real_directory_identity(path, label=f"retained {name} data")
+        linked = path.lstat()
+        identity[name] = {
+            **stable,
+            "size": linked.st_size,
+            "mtime_ns": linked.st_mtime_ns,
+            "ctime_ns": linked.st_ctime_ns,
+        }
+    return identity
+
+
+def _same_retained_data_anchors(
+    before: dict[str, dict[str, int]], after: dict[str, dict[str, int]]
+) -> bool:
+    anchor_fields = ("device", "inode", "uid", "gid", "mode")
+    return all(
+        isinstance(before.get(name), dict)
+        and isinstance(after.get(name), dict)
+        and all(before[name].get(field) == after[name].get(field) for field in anchor_fields)
+        for name in ("postgres", "nats")
+    )
+
+
+def _down_receipt_binding(
+    cell: dict[str, Any],
+    cell_sha: str,
+    gateway_sha: str,
+    *,
+    data_identity: dict[str, dict[str, int]] | None = None,
+    image_promotion: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "schema_version": 1,
         "cluster": cell.get("cluster"),
         "owner_id": cell.get("owner_id"),
@@ -4684,6 +4737,14 @@ def _down_receipt_binding(cell: dict[str, Any], cell_sha: str, gateway_sha: str)
         "state_preserved": ["data", "secrets", "toolchain", "receipts"],
         "production_changed": False,
     }
+    if cell.get("app_activation") is True:
+        if data_identity is None or image_promotion is None:
+            raise StagingCellError(
+                "activated staging down requires exact data and promotion evidence"
+            )
+        result["pre_delete_data_identity"] = data_identity
+        result["image_promotion"] = image_promotion
+    return result
 
 
 def _require_receipt_binding(payload: dict[str, Any], expected: dict[str, Any], *, label: str) -> None:
@@ -4697,6 +4758,7 @@ def load_delete_to_prove_down_receipt(
     cell: dict[str, Any],
     *,
     require_current_cell_match: bool,
+    require_retained_data_match: bool = True,
 ) -> dict[str, Any]:
     path = root / CELL_DOWN_RECEIPT
     payload = _private_json_receipt(path, label="staging down receipt")
@@ -4720,6 +4782,38 @@ def load_delete_to_prove_down_receipt(
         payload.get("gateway_proof_receipt_sha256"),
         label="staging down gateway proof receipt hash",
     )
+    pre_delete_data_identity = payload.get("pre_delete_data_identity")
+    retained_data_identity = payload.get("retained_data_identity")
+    if not isinstance(pre_delete_data_identity, dict) or not isinstance(
+        retained_data_identity, dict
+    ):
+        raise StagingCellError("staging down receipt has no retained data identity")
+    if not _same_retained_data_anchors(
+        pre_delete_data_identity, retained_data_identity
+    ):
+        raise StagingCellError(
+            "retained staging data directory anchor changed during cluster deletion"
+        )
+    observed_data_identity = _retained_data_identity(root)
+    if require_retained_data_match:
+        if retained_data_identity != observed_data_identity:
+            raise StagingCellError(
+                "retained staging data identity differs from the post-delete receipt"
+            )
+    elif not _same_retained_data_anchors(
+        retained_data_identity, observed_data_identity
+    ):
+        raise StagingCellError(
+            "retained staging data directory anchor changed after rebuild"
+        )
+    image_promotion = payload.get("image_promotion")
+    if not isinstance(image_promotion, dict):
+        raise StagingCellError("staging down receipt has no image promotion identity")
+    current_promotion = _exact_cell_promotion(root, cell, cell_active_commit(cell))
+    if image_promotion != current_promotion:
+        raise StagingCellError(
+            "promotion evidence differs from the pre-delete release"
+        )
     if require_current_cell_match and cell_sha != sha256_file(root / "receipts/cell-bootstrap.json"):
         raise StagingCellError("staging cell receipt changed after down; refusing rebuild")
     return {**payload, "receipt_sha256": sha256_file(path)}
@@ -4743,6 +4837,18 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
 
     cell_path = root / "receipts/cell-bootstrap.json"
     cell_sha = sha256_file(cell_path)
+    activated = cell.get("app_activation") is True
+    if activated and cell.get("status") != "gateway-ready":
+        raise StagingCellError(
+            "activated staging may be downed for delete-to-prove only from gateway-ready"
+        )
+    if not (root / CELL_DOWN_RECEIPT).exists() and (
+        (root / CELL_REBUILD_RECEIPT).exists()
+        or (root / DELETE_TO_PROVE_RECEIPT).exists()
+    ):
+        raise StagingCellError(
+            "previous delete-to-prove recovery receipts must be retired before a new down cycle"
+        )
     gateway_sha = ""
     gateway_binding = cell.get("gateway_proof")
     if isinstance(gateway_binding, dict):
@@ -4754,7 +4860,19 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         if gateway_binding.get("active_commit") != cell_active_commit(cell):
             raise StagingCellError("staging gateway proof active commit changed before down")
 
-    binding = _down_receipt_binding(cell, cell_sha, gateway_sha)
+    pre_delete_data_identity = _retained_data_identity(root) if activated else None
+    image_promotion = (
+        _exact_cell_promotion(root, cell, cell_active_commit(cell))
+        if activated
+        else None
+    )
+    binding = _down_receipt_binding(
+        cell,
+        cell_sha,
+        gateway_sha,
+        data_identity=pre_delete_data_identity,
+        image_promotion=image_promotion,
+    )
     kind = receipt["tools"]["kind"]
     path = root / CELL_DOWN_RECEIPT
     cluster_present = args.cluster in reference.clusters(kind)
@@ -4764,7 +4882,26 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         previous = _private_json_receipt(path, label="staging down receipt")
         previous_status = previous.get("status")
         if previous_status == "cluster-delete-in-progress":
-            _require_receipt_binding(previous, binding, label="pending staging down receipt")
+            previous_pre_delete = previous.get("pre_delete_data_identity")
+            current_pre_delete = binding.get("pre_delete_data_identity")
+            static_binding = {
+                key: value
+                for key, value in binding.items()
+                if key != "pre_delete_data_identity"
+            }
+            _require_receipt_binding(
+                previous, static_binding, label="pending staging down receipt"
+            )
+            if activated:
+                if not isinstance(previous_pre_delete, dict) or not isinstance(
+                    current_pre_delete, dict
+                ) or not _same_retained_data_anchors(
+                    previous_pre_delete, current_pre_delete
+                ):
+                    raise StagingCellError(
+                        "pending staging down receipt lost its retained data directory anchors"
+                    )
+                binding["pre_delete_data_identity"] = previous_pre_delete
             if not isinstance(previous.get("cluster_was_present"), bool):
                 raise StagingCellError("pending staging down receipt lacks cluster presence evidence")
             cluster_was_present = bool(previous["cluster_was_present"])
@@ -4772,17 +4909,31 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
             if started_at_unix <= 0:
                 raise StagingCellError("pending staging down receipt lacks a valid start time")
         elif previous_status in {"cluster-deleted-state-preserved", "cluster-absent-state-preserved"}:
-            previous_same_cycle = all(previous.get(key) == value for key, value in binding.items())
+            terminal_binding = {
+                key: value
+                for key, value in binding.items()
+                if key != "pre_delete_data_identity"
+            }
+            previous_same_cycle = all(
+                previous.get(key) == value for key, value in terminal_binding.items()
+            )
             if previous_same_cycle:
+                if activated:
+                    retained_identity = previous.get("retained_data_identity")
+                    if not isinstance(retained_identity, dict) or (
+                        retained_identity != _retained_data_identity(root)
+                    ):
+                        raise StagingCellError(
+                            "terminal staging down receipt lost its retained data identity"
+                        )
                 if cluster_present:
                     raise StagingCellError(
                         "staging down receipt is already terminal but the same bound cluster exists; refusing ambiguous reuse"
                     )
                 return {**previous, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
-            if not cluster_present:
-                raise StagingCellError(
-                    "a different staging down cycle already exists while the cluster is absent; refusing overwrite"
-                )
+            raise StagingCellError(
+                "previous delete-to-prove recovery cycle must be retired before a new down cycle"
+            )
         else:
             raise StagingCellError("staging down receipt has an unexpected status")
 
@@ -4799,8 +4950,24 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         expected_commit=commit,
         expected_owner_id=owner_id,
     )
+    retained_data_identity = _retained_data_identity(root) if activated else None
+    if activated and (
+        not isinstance(binding.get("pre_delete_data_identity"), dict)
+        or not isinstance(retained_data_identity, dict)
+        or not _same_retained_data_anchors(
+            binding["pre_delete_data_identity"], retained_data_identity
+        )
+    ):
+        raise StagingCellError(
+            "retained staging data directory anchor changed during cluster deletion"
+        )
     result = {
         **binding,
+        **(
+            {"retained_data_identity": retained_data_identity}
+            if activated
+            else {}
+        ),
         "status": (
             "cluster-deleted-state-preserved"
             if cluster_was_present
@@ -4830,6 +4997,9 @@ def _rebuild_receipt_binding(
         "implementation_commit": source_commit,
         "pre_delete_cell_receipt_sha256": down["cell_receipt_sha256"],
         "pre_delete_gateway_proof_receipt_sha256": down["gateway_proof_receipt_sha256"],
+        "image_promotion": down["image_promotion"],
+        "pre_delete_data_identity": down["pre_delete_data_identity"],
+        "retained_data_identity": down["retained_data_identity"],
         "down_receipt_sha256": down["receipt_sha256"],
         "production_changed": False,
     }
@@ -4860,10 +5030,16 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
         raise StagingCellError(
             "delete-to-prove rebuild implementation must equal the active app commit"
         )
-    load_promotion_receipt(root, active_commit)
+    promotion = _exact_cell_promotion(root, cell, active_commit)
     down = load_delete_to_prove_down_receipt(root, cell, require_current_cell_match=True)
-    if not all(retained_data_directory_exists(root, name) for name in ("postgres", "nats")):
-        raise StagingCellError("delete-to-prove rebuild requires retained PostgreSQL and NATS data")
+    if down.get("image_promotion") != promotion:
+        raise StagingCellError(
+            "promotion evidence differs from the pre-delete release"
+        )
+    if down.get("retained_data_identity") != _retained_data_identity(root):
+        raise StagingCellError(
+            "retained staging data identity differs from the post-delete receipt"
+        )
 
     _, secret_sha = load_or_create_secret_material(root)
     external = cell.get("external_secret") if isinstance(cell.get("external_secret"), dict) else {}
@@ -4930,6 +5106,13 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
         )
         created = False
     else:
+        if existing_rebuild is not None:
+            reference.clear_stale_cluster_reservation(
+                kind,
+                args.cluster,
+                expected_commit=bootstrap_commit,
+                expected_owner_id=owner_id,
+            )
         rendered_kind_config = render_kind_config(root)
         reference.create_kind_cluster(
             kind,
@@ -5031,7 +5214,12 @@ def command_prove_delete_to_prove(args: argparse.Namespace) -> dict[str, Any]:
     if not gateway_receipt_current(root, cell, kubectl):
         raise StagingCellError("delete-to-prove proof requires the current live gateway receipt")
 
-    down = load_delete_to_prove_down_receipt(root, cell, require_current_cell_match=False)
+    down = load_delete_to_prove_down_receipt(
+        root,
+        cell,
+        require_current_cell_match=False,
+        require_retained_data_match=False,
+    )
     rebuild_path = root / CELL_REBUILD_RECEIPT
     rebuild = _private_json_receipt(rebuild_path, label="staging rebuild receipt")
     expected_rebuild = _rebuild_receipt_binding(cell, down, implementation_commit)
