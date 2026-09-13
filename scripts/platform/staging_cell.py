@@ -3736,6 +3736,7 @@ def gateway_resource_binding(document: dict) -> dict:
     metadata = document.get("metadata", {})
     if not metadata.get("uid") or not metadata.get("generation"):
         raise StagingCellError("gateway resource lacks UID/generation")
+    annotations = metadata.get("annotations", {})
     return {
         "kind": document["kind"],
         "namespace": metadata.get("namespace", ""),
@@ -3745,7 +3746,24 @@ def gateway_resource_binding(document: dict) -> dict:
         "spec_sha256": sha256_bytes(
             json.dumps(document["spec"], sort_keys=True).encode()
         ),
+        "gateway_binding": {
+            "owner_id": annotations.get("commonthing.net/gateway-owner-id"),
+            "active_commit": annotations.get("commonthing.net/gateway-active-commit"),
+            "manifest_sha256": annotations.get(
+                "commonthing.net/gateway-manifest-sha256"
+            ),
+        },
     }
+
+
+def require_gateway_observation_binding(observed: dict, binding: dict) -> None:
+    resources = observed.get("resources", [])
+    if not resources or any(
+        resource.get("gateway_binding") != binding for resource in resources
+    ):
+        raise StagingCellError(
+            "staging gateway resources lost their exact owner/app/manifest binding"
+        )
 
 
 def gateway_ip_addresses(entries: list, key: str, *, gateway: bool = False) -> list[str]:
@@ -3987,6 +4005,7 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
             if time.monotonic() >= deadline:
                 raise
             time.sleep(2)
+    require_gateway_observation_binding(observed, binding)
     node, address, health, web, api_nodes = reference.probe_gateway_http(
         tools["kind"], args.cluster, observed["gateway_addresses"], observed["listener_port"]
     )
@@ -4046,6 +4065,12 @@ def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
         ):
             return False
         observed = staging_gateway_observation(kubectl)
+        expected_binding = {
+            "owner_id": receipt.get("owner_id"),
+            "active_commit": receipt.get("active_commit"),
+            "manifest_sha256": receipt.get("manifest_sha256"),
+        }
+        require_gateway_observation_binding(observed, expected_binding)
         return (
             receipt.get("implementation_commit") == cell_active_commit(cell)
             and receipt.get("address") in observed["gateway_addresses"]

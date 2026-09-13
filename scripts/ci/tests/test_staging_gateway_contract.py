@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import stat
 import tempfile
 import unittest
@@ -50,8 +51,18 @@ class StagingGatewayTests(unittest.TestCase):
             )
             for name in ("gateway.yaml", "httproute.yaml")
         ]
+        self.binding = {
+            "owner_id": self.cell["owner_id"],
+            "active_commit": self.cell["active_commit"],
+            "manifest_sha256": staging.sha256_bytes(
+                json.dumps(self.docs, sort_keys=True).encode()
+            ),
+        }
         self.observed = {
-            "resources": [{"uid": "gateway-uid"}],
+            "resources": [
+                {"uid": "gateway-uid", "gateway_binding": self.binding},
+                {"uid": "route-uid", "gateway_binding": self.binding},
+            ],
             "service": {"uid": "service-uid"},
             "gateway_addresses": ADDRESSES,
             "service_addresses": ADDRESSES,
@@ -289,7 +300,17 @@ class StagingGatewayTests(unittest.TestCase):
         # Exercise the actual readback validator, not the command's observation stub.
         documents = copy.deepcopy(self.docs)
         for document in documents:
-            document["metadata"].update(uid=document["kind"], generation=2)
+            document["metadata"].update(
+                uid=document["kind"],
+                generation=2,
+                annotations={
+                    "commonthing.net/gateway-owner-id": self.binding["owner_id"],
+                    "commonthing.net/gateway-active-commit": self.binding["active_commit"],
+                    "commonthing.net/gateway-manifest-sha256": self.binding[
+                        "manifest_sha256"
+                    ],
+                },
+            )
         gateway, route = documents
         gateway["status"] = {
             "conditions": [
@@ -341,6 +362,12 @@ class StagingGatewayTests(unittest.TestCase):
         observed = REAL_OBSERVATION("kubectl")
         self.assertEqual(len(observed["resources"]), 2)
         self.assertEqual(observed["resources"][0]["uid"], "Gateway")
+        self.assertTrue(
+            all(
+                resource["gateway_binding"] == self.binding
+                for resource in observed["resources"]
+            )
+        )
         self.assertEqual(observed["gateway_addresses"], ADDRESSES)
         self.assertEqual(observed["service_addresses"], ADDRESSES)
         for mutate in (
@@ -426,6 +453,22 @@ class StagingGatewayTests(unittest.TestCase):
             self.assertFalse(
                 staging.gateway_receipt_current(self.root, cell, "kubectl")
             )
+
+    def test_status_rejects_gateway_binding_annotation_drift(self):
+        staging.command_prove_gateway(self.args)
+        cell = staging.load_cell_receipt(self.root)
+        changed = copy.deepcopy(self.observed)
+        changed["resources"][0]["gateway_binding"]["owner_id"] = "foreign-owner"
+        self.mocks["staging_gateway_observation"].return_value = changed
+        self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
+
+    def test_proof_rejects_live_gateway_binding_drift(self):
+        changed = copy.deepcopy(self.observed)
+        changed["resources"][0]["gateway_binding"]["active_commit"] = "d" * 40
+        self.mocks["staging_gateway_observation"].return_value = changed
+        with self.assertRaisesRegex(staging.StagingCellError, "exact owner/app/manifest"):
+            staging.command_prove_gateway(self.args)
+        self.probe.assert_not_called()
 
     def test_selected_address_must_be_observed(self):
         self.probe.return_value = ("worker", "172.20.0.99", b"ok", b"html", b"[]")
