@@ -176,9 +176,55 @@ Nach dem Apply erzwingt `up` weiterhin exakte Flux-Revisionen, gebundene PVCs un
 gesunde PostgreSQL-, NATS-, `source-controller`- und `kustomize-controller`-
 Deployments. `status` prüft denselben Livezustand. Der Cell-Receipt hält erfolgreiche
 Migration-/Aktivierungsbeweise fest; Produktion bleibt unverändert
-(`production_changed=false`). Die Zelle etabliert weiterhin keinen
+(`production_changed=false`). Die App-Aktivierung allein etabliert keinen
 Gateway-/DNS-/TLS-Außenbeweis, kein Delete-to-Prove, keine NATS-Authentisierung/TLS
 und keinen Produktions-Kubernetes-Cutover.
+
+### Begrenzter Staging-HTTP-Gateway-Beweis
+
+```bash
+uv run --project tools/py --locked python scripts/platform/staging_cell.py prove-gateway --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit <exact-active-app-commit>
+```
+
+Der Befehl verlangt den gespeicherten Owner, eine abgeschlossene App-Aktivierung,
+deren exakten aktiven Commit und unveränderte Promotion-Evidenz. Der saubere
+Implementierungscheckout muss mit `--source-commit`, dem aktiven App-Commit und
+dem aktuellen geschützten Public-Main-Commit übereinstimmen. Nach dem Merge gilt:
+neue exakte Main-Promotion → `activate` → `prove-gateway`. Jede neue App-Aktivierung
+retiriert vor Migration und Rollout ein vorhandenes, exakt an Owner und bisherigen
+App-Commit gebundenes Gateway/HTTPRoute-Paar und wartet auf das Verschwinden des
+erzeugten Cilium-Service. Danach werden gespeicherte Gateway-Bindungen und
+Proof-Zustände verworfen; ein früherer Gateway-Beweis gilt damit nicht für die neue App.
+
+Nur `clusters/staging/gateway/` wird gerendert und serverseitig validiert/angewandt:
+Genau Gateway und HTTPRoute `commonthing-staging` im gleichnamigen App-Namespace.
+Die aktuellen IP-Adressen des programmierten Gateways und die Ingress-IP-Adressen
+des erzeugten Cilium-LoadBalancer-Service müssen als vollständige Mengen
+übereinstimmen. Der Service muss über seine Owner-Referenz an die aktuelle
+Gateway-UID und über Port 80 an den HTTP-Listener gebunden sein. Alle beobachteten
+Adressen werden als Kandidaten an den kind-Node-HTTP-Probe übergeben. Ein statischer
+Adresspool wird nicht angelegt; NodeIPAM-Adressen sind kein externer LB-Beweis.
+Der gemeinsame Legacy-Gateway-Pfad wird nicht benutzt.
+HTTP auf Port 80 routet `/health` und `/api` unverändert an `commonthing-api:8080`,
+`/` an `commonthing-web:8080`. Es gibt weder Hostnamen noch TLS-Referenzen.
+
+Ein Lifecycle-Lock serialisiert den Beweis. Vor dem Apply persistiert
+`gateway-proof-in-progress` Owner, aktiven Commit und Manifest-Hash; Wiederanläufe
+müssen genau diese Bindung erfüllen. Vorhandene Ressourcen ohne passenden Owner
+werden nicht übernommen. Erst aktuelle `Programmed`-/`Accepted`-/`ResolvedRefs`-
+Conditions und erfolgreiche Requests aus dem kind-Node-Netz auf `/health/live`,
+`/` und `/api/nodes` erlauben `gateway-ready`. Die HTTP-Semantik stammt aus
+`kind_reference.probe_gateway_http`, einschließlich JSON-Listenprüfung und
+Hash des ersten KiB der Webantwort (kein vollständiger Web-Body-Hash).
+
+`receipts/gateway-proof.json` ist privat (`0600`) und bindet Owner, Bootstrap-,
+App- und Runner-Commit, Manifest-Hash, Ressourcen-UIDs/Generationen/Spec-Hashes,
+Service, alle beobachteten Gateway-/Service-Adressen, die erfolgreiche ausgewählte
+Adresse, Port, Probe-Node und Antwort-Hashes. Der Cell-Receipt bindet wiederum
+diesen Receipt-Hash. `status` meldet `gateway_ready` nur bei weiterhin passender
+App-/Receipt-/Ressourcenbindung; dies ist ein gespeicherter HTTP-Beweis mit aktuellem
+Ressourcenreadback, kein erneuter HTTP-Probe. DNS, TLS, externer Load Balancer,
+Delete-to-Prove und Produktionscutover bleiben ausdrücklich unbelegt.
 
 ## Beweise
 

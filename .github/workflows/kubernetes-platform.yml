@@ -27,6 +27,7 @@ permissions:
       - "scripts/security/**"
       - "scripts/ci/tests/test_kubernetes_platform_contract.py"
       - "scripts/ci/tests/test_staging_cell_runtime_contract.py"
+      - "scripts/ci/tests/test_staging_gateway_contract.py"
       - "scripts/ci/tests/test_two_operator_cell_pilot.py"
       - "scripts/ci/tests/test_trivy_rendered_manifests.py"
       - "scripts/ci/tests/test_kubernetes_ha_contract.py"
@@ -87,6 +88,7 @@ jobs:
           uv run --project tools/py --locked python -m unittest
           scripts.ci.tests.test_kubernetes_platform_contract
           scripts.ci.tests.test_staging_cell_runtime_contract
+          scripts.ci.tests.test_staging_gateway_contract
           scripts.ci.tests.test_two_operator_cell_pilot
           scripts.ci.tests.test_kubernetes_ha_contract
           scripts.ci.tests.test_trivy_rendered_manifests

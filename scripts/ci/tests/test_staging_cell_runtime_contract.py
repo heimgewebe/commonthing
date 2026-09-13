@@ -2556,6 +2556,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             staging.registry_dockerconfig_json(registry_material).encode("utf-8")
         )
         activation_order: list[str] = []
+        durability_order: list[str] = []
         with tempfile.TemporaryDirectory(prefix="staging-activate-") as tmp_name:
             root = Path(tmp_name)
             with ExitStack() as stack:
@@ -2575,6 +2576,13 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                             "cluster": staging.DEFAULT_CLUSTER,
                             "owner_id": owner,
                             "bootstrap_commit": bootstrap,
+                            "status": "gateway-ready",
+                            "active_commit": "0" * 40,
+                            "pending_gateway": {"active_commit": "0" * 40},
+                            "gateway_proof": {"receipt_sha256": "f" * 64},
+                            "gateway_ready": True,
+                            "gateway_phase": "gateway-ready",
+                            "gateway": {"address": "172.20.0.3"},
                             "external_secret": {"source_sha256": "d" * 64},
                         },
                     )
@@ -2630,6 +2638,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 require_data = stack.enter_context(
                     mock.patch.object(
                         staging, "require_bootstrap_data_current", return_value={}
+                    )
+                )
+                retire_gateway = stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "retire_gateway_before_activation",
+                        side_effect=lambda kubectl, root, cell, owner_id: activation_order.append(
+                            "gateway-retired"
+                        ),
                     )
                 )
                 apply_network = stack.enter_context(
@@ -2699,7 +2716,19 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 )
                 write_receipt = stack.enter_context(
                     mock.patch.object(
-                        staging, "write_cell_receipt", return_value="/receipt.json"
+                        staging,
+                        "write_cell_receipt",
+                        side_effect=lambda root_arg, payload: (
+                            durability_order.append(f"write:{payload['status']}"),
+                            "/receipt.json",
+                        )[-1],
+                    )
+                )
+                discard_gateway_receipt = stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "discard_retired_gateway_receipt",
+                        side_effect=lambda root_arg: durability_order.append("discard"),
                     )
                 )
                 result = staging.command_activate(args)
@@ -2723,7 +2752,20 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             self.assertEqual(call.args, ("kubectl", bootstrap))
         apply_network.assert_called_once_with("kubectl")
         run_migration.assert_called_once_with("kubectl", active, promotion)
-        self.assertEqual(activation_order, ["network", "migration"])
+        retire_gateway.assert_called_once()
+        self.assertEqual(retire_gateway.call_args.args[0], "kubectl")
+        self.assertEqual(retire_gateway.call_args.args[1], root)
+        self.assertEqual(retire_gateway.call_args.args[3], owner)
+        self.assertEqual(activation_order, ["gateway-retired", "network", "migration"])
+        self.assertEqual(
+            durability_order,
+            [
+                "write:app-activation-in-progress",
+                "discard",
+                "write:app-ready-gateway-pending",
+            ],
+        )
+        discard_gateway_receipt.assert_called_once_with(root)
         reconcile_app.assert_called_once_with("kubectl", active)
         apply_yaml.assert_called_once()
         app_documents = apply_yaml.call_args.args[1]
@@ -2762,6 +2804,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("pending_image_promotion", stored)
         self.assertNotIn("pending_migration", stored)
         self.assertNotIn("pending_registry_pull_secret", stored)
+        self.assertEqual(stored["status"], "app-ready-gateway-pending")
+        for key in (
+            "pending_gateway", "gateway_proof", "gateway_ready", "gateway_phase", "gateway"
+        ):
+            self.assertNotIn(key, stored)
+            self.assertNotIn(key, result)
         self.assertTrue(stored["migration"]["complete"])
         self.assertEqual(
             stored["migration"]["network_isolation"]["policy_names"],

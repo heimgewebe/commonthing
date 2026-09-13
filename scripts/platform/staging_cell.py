@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import errno
 import fcntl
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -3491,10 +3493,11 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         expected_owner_id=owner_id,
     )
     require_bootstrap_data_current(kubectl, bootstrap_commit)
+    retire_gateway_before_activation(kubectl, root, cell, owner_id)
 
     if not activation_in_progress:
         pending_state = {
-            **cell,
+            **without_gateway_state(cell),
             "status": "app-activation-in-progress",
             "pending_active_commit": commit,
             "pending_image_promotion": {
@@ -3512,6 +3515,10 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
             "production_changed": False,
         }
         write_cell_receipt(root, pending_state)
+
+    # Only discard the old proof after the durable activation state no longer
+    # depends on it. An interruption before this point can safely retry retirement.
+    discard_retired_gateway_receipt(root)
 
     reference.normalize_owned_cluster_repository(
         kind,
@@ -3566,7 +3573,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
     }
     terminal_cell = {
         key: value
-        for key, value in cell.items()
+        for key, value in without_gateway_state(cell).items()
         if key
         not in {
             "pending_active_commit",
@@ -3602,6 +3609,779 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
     }
     receipt_path = write_cell_receipt(root, updated)
     return {**updated, "receipt_path": receipt_path}
+
+
+GATEWAY_NAME = "commonthing-staging"
+GATEWAY_LIMITS = ["DNS", "TLS", "external-LB", "Delete-to-Prove", "production cutover"]
+GATEWAY_OWNER_ANNOTATION = "commonthing.net/gateway-owner-id"
+GATEWAY_ACTIVE_COMMIT_ANNOTATION = "commonthing.net/gateway-active-commit"
+GATEWAY_MANIFEST_SHA256_ANNOTATION = "commonthing.net/gateway-manifest-sha256"
+GATEWAY_BINDING_ANNOTATIONS = {
+    "owner_id": GATEWAY_OWNER_ANNOTATION,
+    "active_commit": GATEWAY_ACTIVE_COMMIT_ANNOTATION,
+    "manifest_sha256": GATEWAY_MANIFEST_SHA256_ANNOTATION,
+}
+GATEWAY_SERVICE_LABEL = "gateway.networking.k8s.io/gateway-name"
+GATEWAY_RESOURCES = (
+    ("Gateway", APP_NAMESPACE, GATEWAY_NAME),
+    ("HTTPRoute", APP_NAMESPACE, GATEWAY_NAME),
+)
+
+
+def without_gateway_state(cell: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in cell.items()
+        if key != "gateway" and not key.startswith(("gateway_", "pending_gateway"))
+    }
+
+
+def gateway_receipt_service_identity(
+    root: Path, cell: dict[str, Any]
+) -> tuple[str, str] | None:
+    binding = cell.get("gateway_proof")
+    if not isinstance(binding, dict):
+        return None
+    path = root / "receipts/gateway-proof.json"
+    if (
+        path.is_symlink()
+        or not path.exists()
+        or stat.S_IMODE(path.stat().st_mode) != 0o600
+        or binding.get("active_commit") != cell_active_commit(cell)
+        or binding.get("receipt_sha256") != sha256_file(path)
+    ):
+        raise StagingCellError("staging gateway proof receipt is invalid during retirement")
+    try:
+        receipt = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise StagingCellError(
+            "staging gateway proof receipt is unreadable during retirement"
+        ) from error
+    if (
+        receipt.get("owner_id") != cell.get("owner_id")
+        or receipt.get("active_commit") != cell_active_commit(cell)
+    ):
+        raise StagingCellError(
+            "staging gateway proof receipt lost its owner/app binding during retirement"
+        )
+    service = receipt.get("service")
+    if not isinstance(service, dict):
+        raise StagingCellError("staging gateway proof receipt lacks Service identity")
+    name = str(service.get("name") or "")
+    uid = str(service.get("uid") or "")
+    if not name or not uid:
+        raise StagingCellError("staging gateway proof receipt has invalid Service identity")
+    return name, uid
+
+
+def gateway_service_owned_by(service: dict, gateway_uid: str) -> bool:
+    return bool(gateway_uid) and any(
+        owner.get("apiVersion") == "gateway.networking.k8s.io/v1"
+        and owner.get("kind") == "Gateway"
+        and owner.get("name") == GATEWAY_NAME
+        and owner.get("uid") == gateway_uid
+        for owner in service.get("metadata", {}).get("ownerReferences", [])
+    )
+
+
+def retire_gateway_before_activation(
+    kubectl: str, root: Path, cell: dict[str, Any], owner_id: str
+) -> None:
+    active_commit = str(cell.get("active_commit") or "")
+    observed: list[tuple[str, str, str]] = []
+    gateway_uid = ""
+    for kind, namespace, name in GATEWAY_RESOURCES:
+        document = gateway_get(kubectl, kind, name, namespace)
+        if not document:
+            continue
+        annotations = document.get("metadata", {}).get("annotations", {})
+        if (
+            len(active_commit) != 40
+            or any(ch not in "0123456789abcdef" for ch in active_commit)
+            or annotations.get(GATEWAY_OWNER_ANNOTATION) != owner_id
+            or annotations.get(GATEWAY_ACTIVE_COMMIT_ANNOTATION) != active_commit
+        ):
+            raise StagingCellError(
+                "refusing to retire a staging gateway resource without the current owner/app binding"
+            )
+        if kind == "Gateway":
+            gateway_uid = str(document.get("metadata", {}).get("uid") or "")
+            if not gateway_uid:
+                raise StagingCellError("staging Gateway lacks UID during retirement")
+        observed.append((kind, namespace, name))
+
+    labeled_services = gateway_list(
+        kubectl,
+        "Service",
+        APP_NAMESPACE,
+        label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
+    )
+    tracked_services = set()
+    receipt_service = gateway_receipt_service_identity(root, cell)
+    if receipt_service is not None:
+        tracked_services.add(receipt_service)
+    if gateway_uid:
+        all_services = gateway_list(kubectl, "Service", APP_NAMESPACE)
+        owned_services = [
+            service
+            for service in all_services
+            if gateway_service_owned_by(service, gateway_uid)
+        ]
+        if any(
+            not gateway_service_owned_by(service, gateway_uid)
+            for service in labeled_services
+        ):
+            raise StagingCellError(
+                "refusing app activation while a mislabeled staging gateway Service remains"
+            )
+        for service in owned_services:
+            metadata = service.get("metadata", {})
+            name = str(metadata.get("name") or "")
+            uid = str(metadata.get("uid") or "")
+            if not name or not uid:
+                raise StagingCellError(
+                    "staging gateway Service lacks stable name/UID identity"
+                )
+            tracked_services.add((name, uid))
+    elif labeled_services and receipt_service is None:
+        raise StagingCellError(
+            "refusing app activation while an orphan staging gateway Service remains"
+        )
+
+    for kind, namespace, name in reversed(observed):
+        run(
+            [
+                kubectl,
+                "-n",
+                namespace,
+                "delete",
+                kind,
+                name,
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout=120s",
+            ]
+        )
+
+    if observed or tracked_services:
+        deadline = time.monotonic() + 120
+        while True:
+            remaining = [
+                gateway_get(kubectl, kind, name, namespace)
+                for kind, namespace, name in GATEWAY_RESOURCES
+            ]
+            tracked_remaining = []
+            for name, uid in tracked_services:
+                service = gateway_get(kubectl, "Service", name, APP_NAMESPACE)
+                if not service:
+                    continue
+                if service.get("metadata", {}).get("uid") != uid:
+                    raise StagingCellError(
+                        "staging gateway Service identity changed during retirement"
+                    )
+                tracked_remaining.append(service)
+            labeled_remaining = gateway_list(
+                kubectl,
+                "Service",
+                APP_NAMESPACE,
+                label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
+            )
+            if not any(remaining) and not tracked_remaining and not labeled_remaining:
+                break
+            if time.monotonic() >= deadline:
+                raise StagingCellError(
+                    "staging gateway did not retire before app activation"
+                )
+            time.sleep(2)
+
+
+def discard_retired_gateway_receipt(root: Path) -> None:
+    (root / "receipts/gateway-proof.json").unlink(missing_ok=True)
+
+
+def gateway_get(kubectl: str, kind: str, name: str, namespace: str = "") -> dict:
+    scope = ["-n", namespace] if namespace else []
+    raw = output(
+        [kubectl, *scope, "get", kind, name, "--ignore-not-found", "-o", "json"]
+    )
+    return json.loads(raw) if raw else {}
+
+
+def gateway_list(
+    kubectl: str,
+    kind: str,
+    namespace: str = "",
+    *,
+    label_selector: str | None = None,
+) -> list[dict]:
+    scope = ["-n", namespace] if namespace else []
+    argv = [kubectl, *scope, "get", kind]
+    if label_selector:
+        argv.extend(["-l", label_selector])
+    raw = output([*argv, "-o", "json"])
+    payload = json.loads(raw) if raw else {"items": []}
+    items = payload.get("items")
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise StagingCellError(f"staging {kind} inventory is malformed")
+    return items
+
+
+def current_condition(
+    document: dict, condition: str, conditions: list | None = None
+) -> bool:
+    generation = document.get("metadata", {}).get("generation")
+    return generation is not None and any(
+        item.get("type") == condition
+        and item.get("status") == "True"
+        and item.get("observedGeneration") == generation
+        for item in (
+            conditions
+            if conditions is not None
+            else document.get("status", {}).get("conditions", [])
+        )
+    )
+
+
+def staging_gateway_documents(kustomize: str) -> list[dict]:
+    rendered = output(
+        [kustomize, "build", str(ROOT / "platform/clusters/staging/gateway")]
+    )
+    documents = [doc for doc in yaml.safe_load_all(rendered) if doc]
+    identities = [
+        (
+            doc.get("kind"),
+            doc.get("metadata", {}).get("namespace", ""),
+            doc.get("metadata", {}).get("name"),
+        )
+        for doc in documents
+    ]
+    if len(identities) != len(GATEWAY_RESOURCES) or set(identities) != set(
+        GATEWAY_RESOURCES
+    ):
+        raise StagingCellError(
+            "staging gateway render escaped its exact resource allowlist"
+        )
+    return documents
+
+
+def gateway_annotation_binding(document: dict) -> dict[str, Any]:
+    annotations = document.get("metadata", {}).get("annotations", {})
+    return {
+        key: annotations.get(annotation)
+        for key, annotation in GATEWAY_BINDING_ANNOTATIONS.items()
+    }
+
+
+def gateway_annotations(binding: dict[str, Any]) -> dict[str, str]:
+    if set(binding) != set(GATEWAY_BINDING_ANNOTATIONS) or any(
+        not isinstance(binding.get(key), str) or not binding[key]
+        for key in GATEWAY_BINDING_ANNOTATIONS
+    ):
+        raise StagingCellError("staging gateway binding fields are invalid")
+    return {
+        annotation: binding[key]
+        for key, annotation in GATEWAY_BINDING_ANNOTATIONS.items()
+    }
+
+
+def gateway_routing_contract(document: dict) -> dict[str, Any]:
+    kind = document.get("kind")
+    if kind not in {"Gateway", "HTTPRoute"}:
+        raise StagingCellError("unexpected resource in staging gateway routing contract")
+    namespace = document.get("metadata", {}).get("namespace", APP_NAMESPACE)
+    spec = document.get("spec", {})
+    if kind == "Gateway":
+        listeners = []
+        for listener in spec.get("listeners", []):
+            allowed = listener.get("allowedRoutes", {})
+            namespaces = allowed.get("namespaces", {})
+            listeners.append(
+                {
+                    "name": listener.get("name"),
+                    "protocol": listener.get("protocol"),
+                    "port": listener.get("port"),
+                    "hostname": listener.get("hostname"),
+                    "tls": copy.deepcopy(listener.get("tls")),
+                    "allowedRoutes": {
+                        "namespaces": {
+                            "from": namespaces.get("from", "Same"),
+                            "selector": copy.deepcopy(namespaces.get("selector")),
+                        },
+                        "kinds": (
+                            [
+                                {
+                                    "group": route_kind.get(
+                                        "group", "gateway.networking.k8s.io"
+                                    ),
+                                    "kind": route_kind.get("kind"),
+                                }
+                                for route_kind in allowed.get("kinds", [])
+                            ]
+                            if "kinds" in allowed
+                            else None
+                        ),
+                    },
+                }
+            )
+        return {
+            "gatewayClassName": spec.get("gatewayClassName"),
+            "addresses": copy.deepcopy(spec.get("addresses", [])),
+            "listeners": listeners,
+            "infrastructure": copy.deepcopy(spec.get("infrastructure")),
+        }
+
+    parent_refs = []
+    for parent in spec.get("parentRefs", []):
+        normalized = copy.deepcopy(parent)
+        normalized.setdefault("group", "gateway.networking.k8s.io")
+        normalized.setdefault("kind", "Gateway")
+        normalized.setdefault("namespace", namespace)
+        parent_refs.append(normalized)
+    rules = []
+    for rule in spec.get("rules", []):
+        matches = copy.deepcopy(rule.get("matches", []))
+        for match in matches:
+            if "path" in match:
+                match["path"].setdefault("type", "PathPrefix")
+                match["path"].setdefault("value", "/")
+        backends = []
+        for backend in rule.get("backendRefs", []):
+            normalized = copy.deepcopy(backend)
+            normalized.setdefault("group", "")
+            normalized.setdefault("kind", "Service")
+            normalized.setdefault("namespace", namespace)
+            normalized.setdefault("weight", 1)
+            backends.append(normalized)
+        rules.append(
+            {
+                "matches": matches,
+                "filters": copy.deepcopy(rule.get("filters", [])),
+                "backendRefs": backends,
+                "timeouts": copy.deepcopy(rule.get("timeouts")),
+            }
+        )
+    return {
+        "hostnames": copy.deepcopy(spec.get("hostnames", [])),
+        "parentRefs": parent_refs,
+        "rules": rules,
+    }
+
+
+def gateway_resource_binding(document: dict) -> dict:
+    metadata = document.get("metadata", {})
+    if not metadata.get("uid") or not metadata.get("generation"):
+        raise StagingCellError("gateway resource lacks UID/generation")
+    return {
+        "kind": document["kind"],
+        "namespace": metadata.get("namespace", ""),
+        "name": metadata["name"],
+        "uid": metadata["uid"],
+        "generation": metadata["generation"],
+        "spec_sha256": sha256_bytes(
+            json.dumps(document["spec"], sort_keys=True).encode()
+        ),
+        "routing_contract": gateway_routing_contract(document),
+        "gateway_binding": gateway_annotation_binding(document),
+    }
+
+
+def require_gateway_observation_binding(observed: dict, binding: dict) -> None:
+    resources = observed.get("resources", [])
+    if not resources or any(
+        resource.get("gateway_binding") != binding for resource in resources
+    ):
+        raise StagingCellError(
+            "staging gateway resources lost their exact owner/app/manifest binding"
+        )
+
+
+def require_gateway_desired_contract(observed: dict, documents: list[dict]) -> None:
+    desired = {
+        (
+            document.get("kind"),
+            document.get("metadata", {}).get("namespace", ""),
+            document.get("metadata", {}).get("name"),
+        ): gateway_routing_contract(document)
+        for document in documents
+    }
+    live = {
+        (
+            resource.get("kind"),
+            resource.get("namespace", ""),
+            resource.get("name"),
+        ): resource.get("routing_contract")
+        for resource in observed.get("resources", [])
+    }
+    if live != desired:
+        raise StagingCellError(
+            "staging gateway live routing contract differs from the rendered manifests"
+        )
+
+
+def route_targets_staging_gateway(route: dict) -> bool:
+    namespace = route.get("metadata", {}).get("namespace", APP_NAMESPACE)
+    return any(
+        parent.get("group", "gateway.networking.k8s.io")
+        == "gateway.networking.k8s.io"
+        and parent.get("kind", "Gateway") == "Gateway"
+        and parent.get("namespace", namespace) == APP_NAMESPACE
+        and parent.get("name") == GATEWAY_NAME
+        for parent in route.get("spec", {}).get("parentRefs", [])
+    )
+
+
+def staging_gateway_routes(kubectl: str) -> list[dict]:
+    return [
+        candidate
+        for candidate in gateway_list(kubectl, "HTTPRoute", APP_NAMESPACE)
+        if route_targets_staging_gateway(candidate)
+    ]
+
+
+def require_no_shadow_staging_gateway_routes(kubectl: str) -> None:
+    shadows = [
+        route
+        for route in staging_gateway_routes(kubectl)
+        if route.get("metadata", {}).get("name") != GATEWAY_NAME
+    ]
+    if shadows:
+        raise StagingCellError(
+            "refusing to apply staging Gateway while another HTTPRoute targets it"
+        )
+
+
+def require_single_staging_gateway_route(kubectl: str, route: dict) -> None:
+    attached = staging_gateway_routes(kubectl)
+    if (
+        len(attached) != 1
+        or attached[0].get("metadata", {}).get("name") != GATEWAY_NAME
+        or attached[0].get("metadata", {}).get("uid")
+        != route.get("metadata", {}).get("uid")
+    ):
+        raise StagingCellError(
+            "staging Gateway must have exactly its one owner-bound HTTPRoute"
+        )
+
+
+def gateway_ip_addresses(entries: list, key: str, *, gateway: bool = False) -> list[str]:
+    addresses = set()
+    for entry in entries:
+        value = entry.get(key)
+        if (gateway and entry.get("type", "IPAddress") != "IPAddress") or not value:
+            raise StagingCellError("staging gateway requires IP addresses only")
+        try:
+            addresses.add(str(ipaddress.ip_address(value)))
+        except ValueError as exc:
+            raise StagingCellError("staging gateway has an invalid IP address") from exc
+    if not addresses:
+        raise StagingCellError("staging gateway has no current IP addresses")
+    return sorted(addresses)
+
+
+def staging_gateway_observation(kubectl: str) -> dict:
+    documents = [
+        gateway_get(kubectl, kind, name, ns) for kind, ns, name in GATEWAY_RESOURCES
+    ]
+    gateway, route = documents
+    if not current_condition(gateway, "Programmed"):
+        raise StagingCellError("staging Gateway is not currently Programmed")
+    parents = [
+        parent
+        for parent in route.get("status", {}).get("parents", [])
+        if parent.get("controllerName") == "io.cilium/gateway-controller"
+        and parent.get("parentRef", {}).get("name") == GATEWAY_NAME
+        and parent.get("parentRef", {}).get("namespace", APP_NAMESPACE) == APP_NAMESPACE
+        and parent.get("parentRef", {}).get("sectionName") == "http"
+    ]
+    if not any(
+        all(
+            current_condition(route, condition, parent.get("conditions", []))
+            for condition in ("Accepted", "ResolvedRefs")
+        )
+        for parent in parents
+    ):
+        raise StagingCellError(
+            "staging HTTPRoute lacks current Accepted/ResolvedRefs for its Cilium listener"
+        )
+    require_single_staging_gateway_route(kubectl, route)
+    gateway_addresses = gateway_ip_addresses(
+        gateway.get("status", {}).get("addresses", []), "value", gateway=True
+    )
+    services = gateway_list(
+        kubectl,
+        "Service",
+        APP_NAMESPACE,
+        label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
+    )
+    if len(services) != 1:
+        raise StagingCellError(
+            "staging Gateway requires exactly one Cilium LoadBalancer Service"
+        )
+    service = services[0]
+    if (
+        service.get("metadata", {}).get("labels", {}).get(GATEWAY_SERVICE_LABEL)
+        != GATEWAY_NAME
+        or service.get("spec", {}).get("type") != "LoadBalancer"
+        or not any(
+            port.get("port") == 80 and port.get("protocol", "TCP") == "TCP"
+            for port in service.get("spec", {}).get("ports", [])
+        )
+        or service.get("metadata", {}).get("namespace") != APP_NAMESPACE
+        or not service.get("metadata", {}).get("uid")
+        or not any(
+            owner.get("apiVersion") == "gateway.networking.k8s.io/v1"
+            and owner.get("kind") == "Gateway"
+            and owner.get("name") == GATEWAY_NAME
+            and owner.get("uid") == gateway.get("metadata", {}).get("uid")
+            and owner.get("uid")
+            for owner in service.get("metadata", {}).get("ownerReferences", [])
+        )
+    ):
+        raise StagingCellError(
+            "staging Cilium Service does not bind the current Gateway and HTTP listener"
+        )
+    service_addresses = gateway_ip_addresses(
+        service.get("status", {}).get("loadBalancer", {}).get("ingress", []), "ip"
+    )
+    if gateway_addresses != service_addresses:
+        raise StagingCellError("staging Gateway and Service IP addresses differ")
+    return {
+        "resources": [gateway_resource_binding(doc) for doc in documents],
+        "service": {
+            "name": service["metadata"]["name"],
+            "uid": service["metadata"]["uid"],
+            "spec_sha256": sha256_bytes(
+                json.dumps(service["spec"], sort_keys=True).encode()
+            ),
+        },
+        "gateway_addresses": gateway_addresses,
+        "service_addresses": service_addresses,
+        "listener_port": 80,
+    }
+
+
+def require_gateway_app_current(kubectl: str, cell: dict, promotion: dict) -> None:
+    commit = cell_active_commit(cell)
+    require_bootstrap_data_current(kubectl, cell["bootstrap_commit"])
+    for kind, name in (
+        ("gitrepository", APP_SOURCE_NAME),
+        ("kustomization", APP_KUSTOMIZATION),
+    ):
+        state = flux_resource_current_state(kubectl, kind, name, commit)
+        if state.get("ready") != "True" or state.get("matches_commit") is not True:
+            raise StagingCellError(
+                "gateway proof requires the exact active app Flux revision"
+            )
+    if (
+        app_live_health(kubectl) != {name: "True" for name in APP_DEPLOYMENTS}
+        or app_image_references(kubectl) != promotion["images"]
+    ):
+        raise StagingCellError("gateway proof requires healthy promoted app images")
+
+
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
+    root = state_root(getattr(args, "state_root", None))
+    configure_reference_paths(root)
+    cell = load_cell_receipt(root)
+    require_receipt_cluster(cell, args.cluster)
+    if args.owner_id != cell.get("owner_id"):
+        raise StagingCellError("--owner-id does not match the persisted cluster owner")
+    commit = cell_active_commit(cell)
+    if args.source_commit != commit:
+        raise StagingCellError("gateway proof requires the exact active app commit")
+    if (
+        cell.get("app_activation") is not True
+        or cell.get("pending_active_commit")
+        or cell.get("status")
+        not in {
+            "app-ready-gateway-pending",
+            "gateway-proof-in-progress",
+            "gateway-ready",
+        }
+    ):
+        raise StagingCellError("gateway proof requires completed app activation")
+    implementation_commit = require_clean_commit(args.source_commit)
+    if implementation_commit != commit:
+        raise StagingCellError(
+            "gateway implementation commit must equal the active app commit"
+        )
+    promotion = load_promotion_receipt(root, commit)
+    recorded = cell.get("image_promotion", {})
+    if (
+        recorded.get("source_commit") != commit
+        or recorded.get("images") != promotion["images"]
+        or recorded.get("receipt_sha256") != promotion["receipt_sha256"]
+    ):
+        raise StagingCellError(
+            "gateway proof promotion differs from the active app receipt"
+        )
+    tools = load_tool_receipt(
+        root, required_tools=("kind", "kubectl", "kustomize"), required_artifacts=()
+    )["tools"]
+    kubectl = tools["kubectl"]
+    reference.require_owned_cluster(
+        tools["kind"],
+        args.cluster,
+        expected_commit=cell["bootstrap_commit"],
+        expected_owner_id=args.owner_id,
+    )
+    require_gateway_app_current(kubectl, cell, promotion)
+    gateway_class = gateway_get(kubectl, "GatewayClass", "cilium")
+    if gateway_class.get("spec", {}).get(
+        "controllerName"
+    ) != "io.cilium/gateway-controller" or not current_condition(
+        gateway_class, "Accepted"
+    ):
+        raise StagingCellError("Cilium GatewayClass is not currently Accepted")
+    documents = staging_gateway_documents(tools["kustomize"])
+    manifest_sha = sha256_bytes(json.dumps(documents, sort_keys=True).encode())
+    binding = {
+        "owner_id": args.owner_id,
+        "active_commit": commit,
+        "manifest_sha256": manifest_sha,
+    }
+    if (
+        cell.get("status") == "gateway-proof-in-progress"
+        and cell.get("pending_gateway") != binding
+    ):
+        raise StagingCellError(
+            "gateway recovery requires the exact pending owner/commit/manifests"
+        )
+    annotations = gateway_annotations(binding)
+    for document in documents:
+        meta = document["metadata"]
+        existing = gateway_get(
+            kubectl, document["kind"], meta["name"], meta.get("namespace", "")
+        )
+        if existing:
+            if cell.get("status") == "app-ready-gateway-pending":
+                raise StagingCellError(
+                    "fresh gateway proof refuses a pre-existing staging gateway resource"
+                )
+            if gateway_annotation_binding(existing) != binding:
+                raise StagingCellError(
+                    "refusing to adopt a staging gateway resource without its exact owner/app/manifest binding"
+                )
+        meta["annotations"] = {**meta.get("annotations", {}), **annotations}
+    require_no_shadow_staging_gateway_routes(kubectl)
+    rendered = yaml.safe_dump_all(documents, sort_keys=False, explicit_start=True)
+    run(
+        [
+            kubectl,
+            "apply",
+            "--server-side",
+            "--dry-run=server",
+            "--field-manager=commonthing-staging-gateway",
+            "-f",
+            "-",
+        ],
+        input_text=rendered,
+        timeout=120,
+    )
+    pending = {
+        **cell,
+        "status": "gateway-proof-in-progress",
+        "pending_gateway": binding,
+    }
+    pending.pop("gateway_proof", None)
+    write_cell_receipt(root, pending)
+    run(
+        [
+            kubectl,
+            "apply",
+            "--server-side",
+            "--field-manager=commonthing-staging-gateway",
+            "-f",
+            "-",
+        ],
+        input_text=rendered,
+        timeout=120,
+    )
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            observed = staging_gateway_observation(kubectl)
+            break
+        except StagingCellError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
+    require_gateway_observation_binding(observed, binding)
+    require_gateway_desired_contract(observed, documents)
+    node, address, health, web, api_nodes = reference.probe_gateway_http(
+        tools["kind"], args.cluster, observed["gateway_addresses"], observed["listener_port"]
+    )
+    if address not in observed["gateway_addresses"]:
+        raise StagingCellError("HTTP proof selected an unobserved Gateway address")
+    require_gateway_app_current(kubectl, cell, promotion)
+    if staging_gateway_observation(kubectl) != observed:
+        raise StagingCellError("gateway resources changed during HTTP proof")
+    result = {
+        "schema_version": 1,
+        "status": "gateway-ready",
+        "cluster": args.cluster,
+        **binding,
+        "bootstrap_commit": cell["bootstrap_commit"],
+        "implementation_commit": implementation_commit,
+        **observed,
+        "probe_node": node,
+        "address": address,
+        "probe_network": "kind-node",
+        "app_activation": True,
+        "health_sha256": sha256_bytes(health),
+        "web_prefix_sha256": sha256_bytes(web),
+        "web_prefix_bytes": len(web),
+        "api_nodes_sha256": sha256_bytes(api_nodes),
+        "does_not_establish": GATEWAY_LIMITS,
+        "production_changed": False,
+    }
+    path = root / "receipts/gateway-proof.json"
+    atomic_json(path, result)
+    updated = {
+        **pending,
+        "status": "gateway-ready",
+        "does_not_establish": GATEWAY_LIMITS,
+        "gateway_proof": {"active_commit": commit, "receipt_sha256": sha256_file(path)},
+    }
+    updated.pop("pending_gateway", None)
+    write_cell_receipt(root, updated)
+    return result
+
+
+def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
+    if cell.get("status") != "gateway-ready":
+        return False
+    try:
+        path = root / "receipts/gateway-proof.json"
+        if path.is_symlink() or stat.S_IMODE(path.stat().st_mode) != 0o600:
+            return False
+        binding = cell.get("gateway_proof", {})
+        if binding.get("active_commit") != cell_active_commit(cell) or binding.get(
+            "receipt_sha256"
+        ) != sha256_file(path):
+            return False
+        receipt = json.loads(path.read_text())
+        if any(
+            receipt.get(key) != cell.get(key)
+            for key in ("owner_id", "cluster", "bootstrap_commit", "active_commit")
+        ):
+            return False
+        observed = staging_gateway_observation(kubectl)
+        expected_binding = {
+            "owner_id": receipt.get("owner_id"),
+            "active_commit": receipt.get("active_commit"),
+            "manifest_sha256": receipt.get("manifest_sha256"),
+        }
+        require_gateway_observation_binding(observed, expected_binding)
+        return (
+            receipt.get("implementation_commit") == cell_active_commit(cell)
+            and receipt.get("address") in observed["gateway_addresses"]
+            and all(receipt.get(key) == value for key, value in observed.items())
+        )
+    except (OSError, ValueError, StagingCellError, subprocess.CalledProcessError):
+        return False
 
 
 @reference_output_routed
@@ -3827,6 +4607,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         )
     )
     ready = infrastructure_ready and app_ready and not activation_in_progress
+    gateway_ready = ready and gateway_receipt_current(root, owner, kubectl)
     promotion_state = (
         owner.get("image_promotion")
         if activated and isinstance(owner.get("image_promotion"), dict)
@@ -3835,6 +4616,9 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "status": "ready" if ready else "degraded",
+        "gateway_ready": gateway_ready,
+        "gateway_phase": "gateway-ready" if gateway_ready else "gateway-pending",
+        "does_not_establish": GATEWAY_LIMITS,
         "cluster": args.cluster,
         "owner_id": owner_id,
         "bootstrap_commit": bootstrap_commit,
@@ -4084,6 +4868,10 @@ def parser() -> argparse.ArgumentParser:
     activate.set_defaults(cluster=DEFAULT_CLUSTER)
     activate.add_argument("--owner-id", required=True)
     activate.add_argument("--source-commit", required=True)
+    gateway = sub.add_parser("prove-gateway")
+    gateway.set_defaults(cluster=DEFAULT_CLUSTER)
+    gateway.add_argument("--owner-id", required=True)
+    gateway.add_argument("--source-commit", required=True)
     status = sub.add_parser("status")
     status.set_defaults(cluster=DEFAULT_CLUSTER)
     down = sub.add_parser("down")
@@ -4103,9 +4891,9 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
             '"status":"infrastructure-ready-image-promotion-blocked"}'
         )
         return
-    if command == "activate":
+    if command in {"activate", "prove-gateway"}:
         safe = {
-            "command": "activate",
+            "command": command,
             "schema_version": 1,
             "status": str(result.get("status") or "degraded"),
             "cluster": str(result.get("cluster") or DEFAULT_CLUSTER),
@@ -4114,6 +4902,8 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
             "app_activation": bool(result.get("app_activation")),
             "production_changed": bool(result.get("production_changed")),
         }
+        if command == "prove-gateway":
+            safe["does_not_establish"] = GATEWAY_LIMITS
         print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
         return
     if command == "status":
@@ -4167,6 +4957,8 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
                     "pending_active_commit": str(
                         result.get("pending_active_commit") or ""
                     ),
+                    "gateway_ready": bool(result.get("gateway_ready")),
+                    "does_not_establish": GATEWAY_LIMITS,
                     "app_activation": bool(result.get("app_activation")),
                     "registry_pull_secret_ready": bool(
                         result.get("registry_pull_secret_ready")
@@ -4223,6 +5015,8 @@ def main() -> int:
             result = command_up(args)
         elif args.command == "activate":
             result = command_activate(args)
+        elif args.command == "prove-gateway":
+            result = command_prove_gateway(args)
         elif args.command == "status":
             result = command_status(args)
         elif args.command == "down":

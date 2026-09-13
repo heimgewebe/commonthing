@@ -372,6 +372,7 @@ implementations:
     verified_by:
       - scripts/platform/validate_platform.py
       - scripts/ci/tests/test_staging_cell_runtime_contract.py
+      - scripts/ci/tests/test_staging_gateway_contract.py
       - scripts/ci/tests/test_kubernetes_platform_contract.py
       - .github/workflows/kubernetes-platform.yml
 
