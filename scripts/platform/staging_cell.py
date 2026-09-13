@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import errno
 import fcntl
 import hashlib
@@ -3608,6 +3609,15 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
 
 GATEWAY_NAME = "commonthing-staging"
 GATEWAY_LIMITS = ["DNS", "TLS", "external-LB", "Delete-to-Prove", "production cutover"]
+GATEWAY_OWNER_ANNOTATION = "commonthing.net/gateway-owner-id"
+GATEWAY_ACTIVE_COMMIT_ANNOTATION = "commonthing.net/gateway-active-commit"
+GATEWAY_MANIFEST_SHA256_ANNOTATION = "commonthing.net/gateway-manifest-sha256"
+GATEWAY_BINDING_ANNOTATIONS = {
+    "owner_id": GATEWAY_OWNER_ANNOTATION,
+    "active_commit": GATEWAY_ACTIVE_COMMIT_ANNOTATION,
+    "manifest_sha256": GATEWAY_MANIFEST_SHA256_ANNOTATION,
+}
+GATEWAY_SERVICE_LABEL = "gateway.networking.k8s.io/gateway-name"
 GATEWAY_RESOURCES = (
     ("Gateway", APP_NAMESPACE, GATEWAY_NAME),
     ("HTTPRoute", APP_NAMESPACE, GATEWAY_NAME),
@@ -3635,17 +3645,21 @@ def retire_gateway_before_activation(
         if (
             len(active_commit) != 40
             or any(ch not in "0123456789abcdef" for ch in active_commit)
-            or annotations.get("commonthing.net/gateway-owner-id") != owner_id
-            or annotations.get("commonthing.net/gateway-active-commit") != active_commit
+            or annotations.get(GATEWAY_OWNER_ANNOTATION) != owner_id
+            or annotations.get(GATEWAY_ACTIVE_COMMIT_ANNOTATION) != active_commit
         ):
             raise StagingCellError(
                 "refusing to retire a staging gateway resource without the current owner/app binding"
             )
         observed.append((kind, namespace, name))
 
-    service_name = f"cilium-gateway-{GATEWAY_NAME}"
-    service_before = gateway_get(kubectl, "Service", service_name, APP_NAMESPACE)
-    if service_before and not observed:
+    services_before = gateway_list(
+        kubectl,
+        "Service",
+        APP_NAMESPACE,
+        label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
+    )
+    if services_before and not observed:
         raise StagingCellError(
             "refusing app activation while an orphan staging gateway Service remains"
         )
@@ -3672,8 +3686,13 @@ def retire_gateway_before_activation(
                 gateway_get(kubectl, kind, name, namespace)
                 for kind, namespace, name in GATEWAY_RESOURCES
             ]
-            service = gateway_get(kubectl, "Service", service_name, APP_NAMESPACE)
-            if not any(remaining) and not service:
+            services = gateway_list(
+                kubectl,
+                "Service",
+                APP_NAMESPACE,
+                label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
+            )
+            if not any(remaining) and not services:
                 break
             if time.monotonic() >= deadline:
                 raise StagingCellError(
@@ -3692,6 +3711,25 @@ def gateway_get(kubectl: str, kind: str, name: str, namespace: str = "") -> dict
         [kubectl, *scope, "get", kind, name, "--ignore-not-found", "-o", "json"]
     )
     return json.loads(raw) if raw else {}
+
+
+def gateway_list(
+    kubectl: str,
+    kind: str,
+    namespace: str = "",
+    *,
+    label_selector: str | None = None,
+) -> list[dict]:
+    scope = ["-n", namespace] if namespace else []
+    argv = [kubectl, *scope, "get", kind]
+    if label_selector:
+        argv.extend(["-l", label_selector])
+    raw = output([*argv, "-o", "json"])
+    payload = json.loads(raw) if raw else {"items": []}
+    items = payload.get("items")
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise StagingCellError(f"staging {kind} inventory is malformed")
+    return items
 
 
 def current_condition(
@@ -3732,11 +3770,50 @@ def staging_gateway_documents(kustomize: str) -> list[dict]:
     return documents
 
 
+def gateway_annotation_binding(document: dict) -> dict[str, Any]:
+    annotations = document.get("metadata", {}).get("annotations", {})
+    return {
+        key: annotations.get(annotation)
+        for key, annotation in GATEWAY_BINDING_ANNOTATIONS.items()
+    }
+
+
+def gateway_annotations(binding: dict[str, Any]) -> dict[str, str]:
+    if set(binding) != set(GATEWAY_BINDING_ANNOTATIONS) or any(
+        not isinstance(binding.get(key), str) or not binding[key]
+        for key in GATEWAY_BINDING_ANNOTATIONS
+    ):
+        raise StagingCellError("staging gateway binding fields are invalid")
+    return {
+        annotation: binding[key]
+        for key, annotation in GATEWAY_BINDING_ANNOTATIONS.items()
+    }
+
+
+def gateway_routing_contract(document: dict) -> dict[str, Any]:
+    kind = document.get("kind")
+    if kind not in {"Gateway", "HTTPRoute"}:
+        raise StagingCellError("unexpected resource in staging gateway routing contract")
+    namespace = document.get("metadata", {}).get("namespace", APP_NAMESPACE)
+    spec = copy.deepcopy(document.get("spec", {}))
+    if kind == "HTTPRoute":
+        for parent in spec.get("parentRefs", []):
+            parent.setdefault("group", "gateway.networking.k8s.io")
+            parent.setdefault("kind", "Gateway")
+            parent.setdefault("namespace", namespace)
+        for rule in spec.get("rules", []):
+            for backend in rule.get("backendRefs", []):
+                backend.setdefault("group", "")
+                backend.setdefault("kind", "Service")
+                backend.setdefault("namespace", namespace)
+                backend.setdefault("weight", 1)
+    return spec
+
+
 def gateway_resource_binding(document: dict) -> dict:
     metadata = document.get("metadata", {})
     if not metadata.get("uid") or not metadata.get("generation"):
         raise StagingCellError("gateway resource lacks UID/generation")
-    annotations = metadata.get("annotations", {})
     return {
         "kind": document["kind"],
         "namespace": metadata.get("namespace", ""),
@@ -3746,13 +3823,8 @@ def gateway_resource_binding(document: dict) -> dict:
         "spec_sha256": sha256_bytes(
             json.dumps(document["spec"], sort_keys=True).encode()
         ),
-        "gateway_binding": {
-            "owner_id": annotations.get("commonthing.net/gateway-owner-id"),
-            "active_commit": annotations.get("commonthing.net/gateway-active-commit"),
-            "manifest_sha256": annotations.get(
-                "commonthing.net/gateway-manifest-sha256"
-            ),
-        },
+        "routing_contract": gateway_routing_contract(document),
+        "gateway_binding": gateway_annotation_binding(document),
     }
 
 
@@ -3763,6 +3835,58 @@ def require_gateway_observation_binding(observed: dict, binding: dict) -> None:
     ):
         raise StagingCellError(
             "staging gateway resources lost their exact owner/app/manifest binding"
+        )
+
+
+def require_gateway_desired_contract(observed: dict, documents: list[dict]) -> None:
+    desired = {
+        (
+            document.get("kind"),
+            document.get("metadata", {}).get("namespace", ""),
+            document.get("metadata", {}).get("name"),
+        ): gateway_routing_contract(document)
+        for document in documents
+    }
+    live = {
+        (
+            resource.get("kind"),
+            resource.get("namespace", ""),
+            resource.get("name"),
+        ): resource.get("routing_contract")
+        for resource in observed.get("resources", [])
+    }
+    if live != desired:
+        raise StagingCellError(
+            "staging gateway live routing contract differs from the rendered manifests"
+        )
+
+
+def route_targets_staging_gateway(route: dict) -> bool:
+    namespace = route.get("metadata", {}).get("namespace", APP_NAMESPACE)
+    return any(
+        parent.get("group", "gateway.networking.k8s.io")
+        == "gateway.networking.k8s.io"
+        and parent.get("kind", "Gateway") == "Gateway"
+        and parent.get("namespace", namespace) == APP_NAMESPACE
+        and parent.get("name") == GATEWAY_NAME
+        for parent in route.get("spec", {}).get("parentRefs", [])
+    )
+
+
+def require_single_staging_gateway_route(kubectl: str, route: dict) -> None:
+    attached = [
+        candidate
+        for candidate in gateway_list(kubectl, "HTTPRoute", APP_NAMESPACE)
+        if route_targets_staging_gateway(candidate)
+    ]
+    if (
+        len(attached) != 1
+        or attached[0].get("metadata", {}).get("name") != GATEWAY_NAME
+        or attached[0].get("metadata", {}).get("uid")
+        != route.get("metadata", {}).get("uid")
+    ):
+        raise StagingCellError(
+            "staging Gateway must have exactly its one owner-bound HTTPRoute"
         )
 
 
@@ -3806,16 +3930,23 @@ def staging_gateway_observation(kubectl: str) -> dict:
         raise StagingCellError(
             "staging HTTPRoute lacks current Accepted/ResolvedRefs for its Cilium listener"
         )
+    require_single_staging_gateway_route(kubectl, route)
     gateway_addresses = gateway_ip_addresses(
         gateway.get("status", {}).get("addresses", []), "value", gateway=True
     )
-    service = gateway_get(
-        kubectl, "Service", f"cilium-gateway-{GATEWAY_NAME}", APP_NAMESPACE
+    services = gateway_list(
+        kubectl,
+        "Service",
+        APP_NAMESPACE,
+        label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
     )
+    if len(services) != 1:
+        raise StagingCellError(
+            "staging Gateway requires exactly one Cilium LoadBalancer Service"
+        )
+    service = services[0]
     if (
-        service.get("metadata", {})
-        .get("labels", {})
-        .get("gateway.networking.k8s.io/gateway-name")
+        service.get("metadata", {}).get("labels", {}).get(GATEWAY_SERVICE_LABEL)
         != GATEWAY_NAME
         or service.get("spec", {}).get("type") != "LoadBalancer"
         or not any(
@@ -3945,27 +4076,23 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
         raise StagingCellError(
             "gateway recovery requires the exact pending owner/commit/manifests"
         )
-    annotations = {
-        f"commonthing.net/gateway-{key.replace('_', '-')}": value
-        for key, value in binding.items()
-    }
+    annotations = gateway_annotations(binding)
     for document in documents:
         meta = document["metadata"]
         existing = gateway_get(
             kubectl, document["kind"], meta["name"], meta.get("namespace", "")
         )
-        if (
-            existing
-            and existing.get("metadata", {})
-            .get("annotations", {})
-            .get("commonthing.net/gateway-owner-id")
-            != args.owner_id
-        ):
-            raise StagingCellError(
-                "refusing to adopt a staging gateway resource without its persisted owner"
-            )
+        if existing:
+            if cell.get("status") == "app-ready-gateway-pending":
+                raise StagingCellError(
+                    "fresh gateway proof refuses a pre-existing staging gateway resource"
+                )
+            if gateway_annotation_binding(existing) != binding:
+                raise StagingCellError(
+                    "refusing to adopt a staging gateway resource without its exact owner/app/manifest binding"
+                )
         meta["annotations"] = {**meta.get("annotations", {}), **annotations}
-    rendered = yaml.safe_dump_all(documents, sort_keys=False)
+    rendered = yaml.safe_dump_all(documents, sort_keys=False, explicit_start=True)
     run(
         [
             kubectl,
@@ -3977,6 +4104,7 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
             "-",
         ],
         input_text=rendered,
+        timeout=120,
     )
     pending = {
         **cell,
@@ -3995,6 +4123,7 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
             "-",
         ],
         input_text=rendered,
+        timeout=120,
     )
     deadline = time.monotonic() + 120
     while True:
@@ -4006,6 +4135,7 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
                 raise
             time.sleep(2)
     require_gateway_observation_binding(observed, binding)
+    require_gateway_desired_contract(observed, documents)
     node, address, health, web, api_nodes = reference.probe_gateway_http(
         tools["kind"], args.cluster, observed["gateway_addresses"], observed["listener_port"]
     )

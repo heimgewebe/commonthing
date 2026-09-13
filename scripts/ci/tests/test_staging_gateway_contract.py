@@ -60,8 +60,15 @@ class StagingGatewayTests(unittest.TestCase):
         }
         self.observed = {
             "resources": [
-                {"uid": "gateway-uid", "gateway_binding": self.binding},
-                {"uid": "route-uid", "gateway_binding": self.binding},
+                {
+                    "kind": document["kind"],
+                    "namespace": document["metadata"]["namespace"],
+                    "name": document["metadata"]["name"],
+                    "uid": f"{document['kind']}-uid",
+                    "gateway_binding": self.binding,
+                    "routing_contract": staging.gateway_routing_contract(document),
+                }
+                for document in self.docs
             ],
             "service": {"uid": "service-uid"},
             "gateway_addresses": ADDRESSES,
@@ -86,6 +93,7 @@ class StagingGatewayTests(unittest.TestCase):
             "require_gateway_app_current": None,
             "staging_gateway_documents": self.docs,
             "staging_gateway_observation": self.observed,
+            "gateway_list": [],
             "run": None,
         }
         for name, value in patches.items():
@@ -199,10 +207,25 @@ class StagingGatewayTests(unittest.TestCase):
         self.assertIn("--dry-run=server", calls[0].args[0])
         self.assertNotIn("--dry-run=server", calls[1].args[0])
         for call in calls:
+            self.assertTrue(call.kwargs["input_text"].startswith("---\n"))
+            self.assertEqual(call.kwargs["timeout"], 120)
             applied = list(yaml.safe_load_all(call.kwargs["input_text"]))
             self.assertEqual(
                 {d["kind"] for d in applied}, {d[0] for d in staging.GATEWAY_RESOURCES}
             )
+            for document in applied:
+                self.assertEqual(
+                    document["metadata"]["annotations"],
+                    {
+                        staging.GATEWAY_OWNER_ANNOTATION: self.binding["owner_id"],
+                        staging.GATEWAY_ACTIVE_COMMIT_ANNOTATION: self.binding[
+                            "active_commit"
+                        ],
+                        staging.GATEWAY_MANIFEST_SHA256_ANNOTATION: self.binding[
+                            "manifest_sha256"
+                        ],
+                    },
+                )
         self.probe.assert_called_with("kind", staging.DEFAULT_CLUSTER, ADDRESSES, 80)
 
     def test_owner_commit_pending_activation_and_promotion_fail_before_apply(self):
@@ -244,15 +267,49 @@ class StagingGatewayTests(unittest.TestCase):
             staging.command_prove_gateway(self.args)
         self.mocks["run"].assert_not_called()
 
-    def test_foreign_resource_not_adopted(self):
+    def test_fresh_proof_refuses_any_preexisting_resource(self):
         self.get.side_effect = lambda k, kind, n, ns="": (
             self.get_resource(k, kind, n, ns)
             if kind == "GatewayClass"
-            else {"metadata": {"uid": "foreign"}}
+            else {
+                "metadata": {
+                    "uid": "leftover",
+                    "annotations": staging.gateway_annotations(self.binding),
+                }
+            }
         )
-        with self.assertRaisesRegex(staging.StagingCellError, "adopt"):
+        with self.assertRaisesRegex(staging.StagingCellError, "pre-existing"):
             staging.command_prove_gateway(self.args)
         self.mocks["run"].assert_not_called()
+
+    def test_recovery_requires_full_existing_resource_binding(self):
+        staging.write_cell_receipt(
+            self.root,
+            {
+                **self.cell,
+                "status": "gateway-proof-in-progress",
+                "pending_gateway": self.binding,
+            },
+        )
+        existing = {
+            "metadata": {
+                "uid": "existing",
+                "annotations": staging.gateway_annotations(self.binding),
+            }
+        }
+        self.get.side_effect = lambda k, kind, n, ns="": (
+            self.get_resource(k, kind, n, ns) if kind == "GatewayClass" else existing
+        )
+        staging.command_prove_gateway(self.args)
+        changed = copy.deepcopy(existing)
+        changed["metadata"]["annotations"][
+            staging.GATEWAY_MANIFEST_SHA256_ANNOTATION
+        ] = "d" * 64
+        self.get.side_effect = lambda k, kind, n, ns="": (
+            self.get_resource(k, kind, n, ns) if kind == "GatewayClass" else changed
+        )
+        with self.assertRaisesRegex(staging.StagingCellError, "exact owner/app/manifest"):
+            staging.command_prove_gateway(self.args)
 
     def test_changed_resources_during_probe_fail(self):
         self.mocks["staging_gateway_observation"].side_effect = [
@@ -357,8 +414,10 @@ class StagingGatewayTests(unittest.TestCase):
             },
         }
         lookup = {document["kind"]: document for document in documents}
-        lookup["Service"] = service
         self.get.side_effect = lambda k, kind, n, ns="": lookup[kind]
+        self.mocks["gateway_list"].side_effect = lambda k, kind, ns="", **kwargs: (
+            [route] if kind == "HTTPRoute" else [service]
+        )
         observed = REAL_OBSERVATION("kubectl")
         self.assertEqual(len(observed["resources"]), 2)
         self.assertEqual(observed["resources"][0]["uid"], "Gateway")
@@ -370,6 +429,7 @@ class StagingGatewayTests(unittest.TestCase):
         )
         self.assertEqual(observed["gateway_addresses"], ADDRESSES)
         self.assertEqual(observed["service_addresses"], ADDRESSES)
+        self.assertEqual(observed["service"]["name"], "cilium-gateway-commonthing-staging")
         for mutate in (
             lambda: service["metadata"]["ownerReferences"][0].update(uid="old-gateway"),
             lambda: service["metadata"].update(ownerReferences=[]),
@@ -394,12 +454,112 @@ class StagingGatewayTests(unittest.TestCase):
             lambda: gateway["status"].update(addresses=[]),
         ):
             saved = copy.deepcopy(lookup)
+            saved_service = copy.deepcopy(service)
             mutate()
             with self.assertRaises(staging.StagingCellError):
                 REAL_OBSERVATION("kubectl")
             for kind in lookup:
                 lookup[kind].clear()
                 lookup[kind].update(saved[kind])
+            service.clear()
+            service.update(saved_service)
+
+    def test_observation_rejects_extra_attached_route_and_duplicate_service(self):
+        route = copy.deepcopy(self.docs[1])
+        route["metadata"]["uid"] = "route-uid"
+        extra = copy.deepcopy(route)
+        extra["metadata"].update(name="shadow", uid="shadow-uid")
+        with self.assertRaisesRegex(staging.StagingCellError, "exactly its one"):
+            with mock.patch.object(
+                staging, "gateway_list", return_value=[route, extra]
+            ):
+                staging.require_single_staging_gateway_route("kubectl", route)
+
+        with self.assertRaisesRegex(staging.StagingCellError, "exactly one Cilium"):
+            self._real_observation_with_inventory(service_count=2)
+
+    def _real_observation_with_inventory(self, *, service_count: int = 1):
+        documents = copy.deepcopy(self.docs)
+        for document in documents:
+            document["metadata"].update(
+                uid=f"{document['kind']}-uid",
+                generation=2,
+                annotations=staging.gateway_annotations(self.binding),
+            )
+        gateway, route = documents
+        gateway["status"] = {
+            "conditions": [
+                {"type": "Programmed", "status": "True", "observedGeneration": 2}
+            ],
+            "addresses": [{"type": "IPAddress", "value": ip} for ip in ADDRESSES],
+        }
+        route["status"] = {
+            "parents": [
+                {
+                    "controllerName": "io.cilium/gateway-controller",
+                    "parentRef": {
+                        "name": staging.GATEWAY_NAME,
+                        "namespace": staging.APP_NAMESPACE,
+                        "sectionName": "http",
+                    },
+                    "conditions": [
+                        {"type": name, "status": "True", "observedGeneration": 2}
+                        for name in ("Accepted", "ResolvedRefs")
+                    ],
+                }
+            ]
+        }
+        service = {
+            "metadata": {
+                "name": "controller-chosen-name",
+                "uid": "svc",
+                "namespace": staging.APP_NAMESPACE,
+                "ownerReferences": [
+                    {
+                        "apiVersion": "gateway.networking.k8s.io/v1",
+                        "kind": "Gateway",
+                        "name": staging.GATEWAY_NAME,
+                        "uid": "Gateway-uid",
+                    }
+                ],
+                "labels": {staging.GATEWAY_SERVICE_LABEL: staging.GATEWAY_NAME},
+            },
+            "spec": {"type": "LoadBalancer", "ports": [{"port": 80}]},
+            "status": {
+                "loadBalancer": {"ingress": [{"ip": ip} for ip in ADDRESSES]}
+            },
+        }
+        services = [copy.deepcopy(service) for _ in range(service_count)]
+        for index, item in enumerate(services):
+            item["metadata"]["uid"] = f"svc-{index}"
+        lookup = {document["kind"]: document for document in documents}
+        self.get.side_effect = lambda k, kind, n, ns="": lookup[kind]
+        self.mocks["gateway_list"].side_effect = lambda k, kind, ns="", **kwargs: (
+            [route] if kind == "HTTPRoute" else services
+        )
+        return REAL_OBSERVATION("kubectl")
+
+    def test_observation_discovers_service_by_gateway_label_not_name(self):
+        observed = self._real_observation_with_inventory()
+        self.assertEqual(observed["service"]["name"], "controller-chosen-name")
+
+    def test_desired_contract_normalizes_gateway_api_reference_defaults(self):
+        desired = copy.deepcopy(self.docs[1])
+        live = copy.deepcopy(desired)
+        parent = live["spec"]["parentRefs"][0]
+        parent.update(group="gateway.networking.k8s.io", kind="Gateway")
+        for rule in live["spec"]["rules"]:
+            for backend in rule["backendRefs"]:
+                backend.update(
+                    group="",
+                    kind="Service",
+                    namespace=staging.APP_NAMESPACE,
+                    weight=1,
+                )
+        self.assertEqual(
+            staging.gateway_routing_contract(desired),
+            staging.gateway_routing_contract(live),
+        )
 
     def test_render_rejects_extra_resources(self):
         with mock.patch.object(
@@ -470,6 +630,16 @@ class StagingGatewayTests(unittest.TestCase):
             staging.command_prove_gateway(self.args)
         self.probe.assert_not_called()
 
+    def test_proof_rejects_live_routing_contract_drift(self):
+        changed = copy.deepcopy(self.observed)
+        changed["resources"][1]["routing_contract"]["rules"][0]["backendRefs"][0][
+            "port"
+        ] = 9090
+        self.mocks["staging_gateway_observation"].return_value = changed
+        with self.assertRaisesRegex(staging.StagingCellError, "routing contract"):
+            staging.command_prove_gateway(self.args)
+        self.probe.assert_not_called()
+
     def test_selected_address_must_be_observed(self):
         self.probe.return_value = ("worker", "172.20.0.99", b"ok", b"html", b"[]")
         with self.assertRaisesRegex(staging.StagingCellError, "unobserved"):
@@ -528,6 +698,11 @@ class StagingGatewayTests(unittest.TestCase):
                 )
 
         self.get.side_effect = get_resource
+        self.mocks["gateway_list"].side_effect = lambda k, kind, ns="", **kwargs: [
+            copy.deepcopy(document)
+            for (resource_kind, resource_ns, _), document in state.items()
+            if resource_kind == kind and resource_ns == ns
+        ]
         self.mocks["run"].side_effect = delete_resource
         receipt = self.root / "receipts/gateway-proof.json"
         receipt.parent.mkdir(parents=True, exist_ok=True)
@@ -543,9 +718,10 @@ class StagingGatewayTests(unittest.TestCase):
         self.assertEqual(state, {})
 
     def test_retire_gateway_before_activation_refuses_orphan_service(self):
-        self.get.side_effect = lambda kubectl, kind, name, namespace="": (
-            {"metadata": {"uid": "orphan-service"}} if kind == "Service" else {}
-        )
+        self.get.side_effect = lambda kubectl, kind, name, namespace="": {}
+        self.mocks["gateway_list"].return_value = [
+            {"metadata": {"uid": "orphan-service"}}
+        ]
         with self.assertRaisesRegex(staging.StagingCellError, "orphan"):
             staging.retire_gateway_before_activation(
                 "kubectl", self.root, self.cell, self.cell["owner_id"]
