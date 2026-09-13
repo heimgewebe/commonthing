@@ -1409,6 +1409,20 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     staging.command_rebuild(args)
             create_mock.assert_not_called()
 
+    def test_retained_tree_fingerprint_rejects_symlink_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-retained-tree-symlink-entrypoint-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            target = root / "target"
+            target.mkdir()
+            (target / "state.bin").write_bytes(b"retained-state")
+            link = root / "link"
+            link.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(staging.StagingCellError, "contains a symlink"):
+                staging._retained_tree_sha256(link, label="retained test data")
+
     def test_delete_to_prove_reactivation_rejects_replaced_promotion_before_mutation(
         self,
     ) -> None:

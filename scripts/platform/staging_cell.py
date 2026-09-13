@@ -4701,6 +4701,18 @@ def _retained_tree_sha256(path: Path, *, label: str) -> str:
     def walk(directory: Path) -> None:
         try:
             directory_before = directory.stat(follow_symlinks=False)
+        except OSError as error:
+            raise StagingCellError(f"{label} cannot be fingerprinted") from error
+        relative_directory = directory.relative_to(path)
+        if stat.S_ISLNK(directory_before.st_mode):
+            raise StagingCellError(
+                f"{label} contains a symlink: {relative_directory}"
+            )
+        if not stat.S_ISDIR(directory_before.st_mode):
+            raise StagingCellError(
+                f"{label} contains unsupported filesystem state: {relative_directory}"
+            )
+        try:
             entries = sorted(directory.iterdir(), key=lambda item: os.fsencode(item.name))
         except OSError as error:
             raise StagingCellError(f"{label} cannot be fingerprinted") from error
