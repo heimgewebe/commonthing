@@ -13,3 +13,6 @@ spec:
       allowedRoutes:
         namespaces:
           from: Same
+        kinds:
+          - group: gateway.networking.k8s.io
+            kind: HTTPRoute

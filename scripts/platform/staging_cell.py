@@ -3516,6 +3516,10 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         }
         write_cell_receipt(root, pending_state)
 
+    # Only discard the old proof after the durable activation state no longer
+    # depends on it. An interruption before this point can safely retry retirement.
+    discard_retired_gateway_receipt(root)
+
     reference.normalize_owned_cluster_repository(
         kind,
         args.cluster,
@@ -3790,9 +3794,9 @@ def retire_gateway_before_activation(
                 )
             time.sleep(2)
 
-    proof_path = root / "receipts/gateway-proof.json"
-    if proof_path.exists() or proof_path.is_symlink():
-        proof_path.unlink()
+
+def discard_retired_gateway_receipt(root: Path) -> None:
+    (root / "receipts/gateway-proof.json").unlink(missing_ok=True)
 
 
 def gateway_get(kubectl: str, kind: str, name: str, namespace: str = "") -> dict:

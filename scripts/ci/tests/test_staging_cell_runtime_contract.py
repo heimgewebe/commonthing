@@ -2556,6 +2556,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             staging.registry_dockerconfig_json(registry_material).encode("utf-8")
         )
         activation_order: list[str] = []
+        durability_order: list[str] = []
         with tempfile.TemporaryDirectory(prefix="staging-activate-") as tmp_name:
             root = Path(tmp_name)
             with ExitStack() as stack:
@@ -2715,7 +2716,19 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 )
                 write_receipt = stack.enter_context(
                     mock.patch.object(
-                        staging, "write_cell_receipt", return_value="/receipt.json"
+                        staging,
+                        "write_cell_receipt",
+                        side_effect=lambda root_arg, payload: (
+                            durability_order.append(f"write:{payload['status']}"),
+                            "/receipt.json",
+                        )[-1],
+                    )
+                )
+                discard_gateway_receipt = stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "discard_retired_gateway_receipt",
+                        side_effect=lambda root_arg: durability_order.append("discard"),
                     )
                 )
                 result = staging.command_activate(args)
@@ -2744,6 +2757,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertEqual(retire_gateway.call_args.args[1], root)
         self.assertEqual(retire_gateway.call_args.args[3], owner)
         self.assertEqual(activation_order, ["gateway-retired", "network", "migration"])
+        self.assertEqual(
+            durability_order,
+            [
+                "write:app-activation-in-progress",
+                "discard",
+                "write:app-ready-gateway-pending",
+            ],
+        )
+        discard_gateway_receipt.assert_called_once_with(root)
         reconcile_app.assert_called_once_with("kubectl", active)
         apply_yaml.assert_called_once()
         app_documents = apply_yaml.call_args.args[1]

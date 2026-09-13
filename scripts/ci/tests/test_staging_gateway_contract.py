@@ -147,7 +147,15 @@ class StagingGatewayTests(unittest.TestCase):
                         "name": "http",
                         "protocol": "HTTP",
                         "port": 80,
-                        "allowedRoutes": {"namespaces": {"from": "Same"}},
+                        "allowedRoutes": {
+                            "namespaces": {"from": "Same"},
+                            "kinds": [
+                                {
+                                    "group": "gateway.networking.k8s.io",
+                                    "kind": "HTTPRoute",
+                                }
+                            ],
+                        },
                     }
                 ],
             },
@@ -699,7 +707,7 @@ class StagingGatewayTests(unittest.TestCase):
         self.mocks["staging_gateway_observation"].return_value = changed
         self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
 
-    def test_retire_gateway_before_activation_removes_bound_route_gateway_and_receipt(self):
+    def test_retire_gateway_before_activation_preserves_receipt_until_durable_transition(self):
         annotations = {
             "commonthing.net/gateway-owner-id": self.cell["owner_id"],
             "commonthing.net/gateway-active-commit": self.cell["active_commit"],
@@ -764,7 +772,7 @@ class StagingGatewayTests(unittest.TestCase):
             "kubectl", self.root, self.cell, self.cell["owner_id"]
         )
 
-        self.assertFalse(receipt.exists())
+        self.assertTrue(receipt.exists())
         deleted_kinds = [call.args[0][4] for call in self.mocks["run"].call_args_list]
         self.assertEqual(deleted_kinds, ["HTTPRoute", "Gateway"])
         self.assertEqual(state, {})
@@ -852,7 +860,7 @@ class StagingGatewayTests(unittest.TestCase):
             )
 
         self.assertGreaterEqual(direct_service_reads, 2)
-        self.assertFalse(receipt_path.exists())
+        self.assertTrue(receipt_path.exists())
         self.assertEqual(state, {})
 
     def test_retire_gateway_before_activation_refuses_orphan_service(self):
