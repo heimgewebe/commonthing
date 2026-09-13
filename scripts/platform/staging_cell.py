@@ -5211,7 +5211,6 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
     reference.validate_owner_id(args.owner_id)
     root = state_root(getattr(args, "state_root", None))
     configure_reference_paths(root)
-    receipt = load_tool_receipt(root, required_tools=("kind",), required_artifacts=())
     cell = load_cell_receipt(root)
     require_receipt_cluster(cell, args.cluster)
     commit = str(cell.get("bootstrap_commit") or "")
@@ -5227,6 +5226,11 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         raise StagingCellError(
             "activated staging may be downed for delete-to-prove only from gateway-ready"
         )
+    receipt = load_tool_receipt(
+        root,
+        required_tools=(("kind", "kubectl") if activated else ("kind",)),
+        required_artifacts=(),
+    )
     if not (root / CELL_DOWN_RECEIPT).exists() and (
         (root / CELL_REBUILD_RECEIPT).exists()
         or (root / DELETE_TO_PROVE_RECEIPT).exists()
@@ -5236,6 +5240,10 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         )
     gateway_sha = ""
     gateway_binding = cell.get("gateway_proof")
+    if activated and not isinstance(gateway_binding, dict):
+        raise StagingCellError(
+            "gateway-ready activated staging down requires a persisted gateway proof binding"
+        )
     if isinstance(gateway_binding, dict):
         gateway_path = root / "receipts/gateway-proof.json"
         _private_regular_file(gateway_path, label="staging gateway proof receipt")

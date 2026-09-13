@@ -2031,6 +2031,65 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     staging.command_down(args)
             delete_mock.assert_not_called()
 
+    def test_activated_down_requires_verified_kubectl_before_mutation(self) -> None:
+        owner = "owner-a"
+        commit = "4" * 40
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-down-kubectl-verified-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            self._write_gateway_ready_state(root, owner=owner, commit=commit)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging,
+                    "load_tool_receipt",
+                    side_effect=staging.StagingCellError("unverified kubectl sentinel"),
+                ) as load_tool_mock,
+                mock.patch.object(
+                    staging.reference, "delete_owned_cluster_if_present"
+                ) as delete_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "unverified kubectl sentinel"
+                ):
+                    staging.command_down(args)
+            load_tool_mock.assert_called_once_with(
+                root, required_tools=("kind", "kubectl"), required_artifacts=()
+            )
+            delete_mock.assert_not_called()
+
+    def test_gateway_ready_down_requires_persisted_gateway_binding(self) -> None:
+        owner = "owner-a"
+        commit = "6" * 40
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-down-gateway-binding-required-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            self._write_gateway_ready_state(root, owner=owner, commit=commit)
+            cell = staging.load_cell_receipt(root)
+            cell.pop("gateway_proof", None)
+            staging.write_cell_receipt(root, cell)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(
+                    staging.reference, "delete_owned_cluster_if_present"
+                ) as delete_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "persisted gateway proof binding"
+                ):
+                    staging.command_down(args)
+            delete_mock.assert_not_called()
+
     def test_activated_down_requires_gateway_ready_state(self) -> None:
         owner = "owner-a"
         commit = "5" * 40
