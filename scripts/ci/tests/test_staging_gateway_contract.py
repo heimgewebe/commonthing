@@ -715,7 +715,21 @@ class StagingGatewayTests(unittest.TestCase):
                 "Service",
                 staging.APP_NAMESPACE,
                 f"cilium-gateway-{staging.GATEWAY_NAME}",
-            ): {"metadata": {"uid": "service-uid"}},
+            ): {
+                "metadata": {
+                    "name": f"cilium-gateway-{staging.GATEWAY_NAME}",
+                    "uid": "service-uid",
+                    "labels": {staging.GATEWAY_SERVICE_LABEL: staging.GATEWAY_NAME},
+                    "ownerReferences": [
+                        {
+                            "apiVersion": "gateway.networking.k8s.io/v1",
+                            "kind": "Gateway",
+                            "name": staging.GATEWAY_NAME,
+                            "uid": "gateway-uid",
+                        }
+                    ],
+                }
+            },
         }
 
         def get_resource(kubectl, kind, name, namespace=""):
@@ -753,6 +767,92 @@ class StagingGatewayTests(unittest.TestCase):
         self.assertFalse(receipt.exists())
         deleted_kinds = [call.args[0][4] for call in self.mocks["run"].call_args_list]
         self.assertEqual(deleted_kinds, ["HTTPRoute", "Gateway"])
+        self.assertEqual(state, {})
+
+    def test_retire_gateway_tracks_service_by_receipt_when_label_disappears(self):
+        annotations = {
+            staging.GATEWAY_OWNER_ANNOTATION: self.cell["owner_id"],
+            staging.GATEWAY_ACTIVE_COMMIT_ANNOTATION: self.cell["active_commit"],
+        }
+        service_name = f"cilium-gateway-{staging.GATEWAY_NAME}"
+        state = {
+            ("Gateway", staging.APP_NAMESPACE, staging.GATEWAY_NAME): {
+                "metadata": {"annotations": annotations, "uid": "gateway-uid"}
+            },
+            ("HTTPRoute", staging.APP_NAMESPACE, staging.GATEWAY_NAME): {
+                "metadata": {"annotations": annotations, "uid": "route-uid"}
+            },
+            ("Service", staging.APP_NAMESPACE, service_name): {
+                "metadata": {
+                    "name": service_name,
+                    "uid": "service-uid",
+                    "labels": {},
+                    "ownerReferences": [
+                        {
+                            "apiVersion": "gateway.networking.k8s.io/v1",
+                            "kind": "Gateway",
+                            "name": staging.GATEWAY_NAME,
+                            "uid": "gateway-uid",
+                        }
+                    ],
+                }
+            },
+        }
+        receipt = {
+            "owner_id": self.cell["owner_id"],
+            "active_commit": self.cell["active_commit"],
+            "service": {"name": service_name, "uid": "service-uid"},
+        }
+        receipt_path = self.root / "receipts/gateway-proof.json"
+        staging.atomic_json(receipt_path, receipt)
+        self.cell.update(
+            status="gateway-ready",
+            gateway_proof={
+                "active_commit": self.cell["active_commit"],
+                "receipt_sha256": staging.sha256_file(receipt_path),
+            },
+        )
+        direct_service_reads = 0
+
+        def get_resource(kubectl, kind, name, namespace=""):
+            nonlocal direct_service_reads
+            identity = (kind, namespace, name)
+            if kind == "Service" and name == service_name:
+                direct_service_reads += 1
+                if direct_service_reads > 1:
+                    state.pop(identity, None)
+            return copy.deepcopy(state.get(identity, {}))
+
+        def list_resources(kubectl, kind, namespace="", *, label_selector=None):
+            services = [
+                copy.deepcopy(document)
+                for (resource_kind, resource_ns, _), document in state.items()
+                if resource_kind == kind and resource_ns == namespace
+            ]
+            if label_selector:
+                return [
+                    service
+                    for service in services
+                    if service.get("metadata", {}).get("labels", {}).get(
+                        staging.GATEWAY_SERVICE_LABEL
+                    )
+                    == staging.GATEWAY_NAME
+                ]
+            return services
+
+        def delete_resource(argv, **kwargs):
+            state.pop((argv[4], argv[2], argv[5]), None)
+
+        self.get.side_effect = get_resource
+        self.mocks["gateway_list"].side_effect = list_resources
+        self.mocks["run"].side_effect = delete_resource
+        with mock.patch.object(staging.time, "sleep"):
+            staging.retire_gateway_before_activation(
+                "kubectl", self.root, self.cell, self.cell["owner_id"]
+            )
+
+        self.assertGreaterEqual(direct_service_reads, 2)
+        self.assertFalse(receipt_path.exists())
         self.assertEqual(state, {})
 
     def test_retire_gateway_before_activation_refuses_orphan_service(self):

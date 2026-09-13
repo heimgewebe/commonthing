@@ -589,6 +589,7 @@ def _render_and_validate() -> dict[str, int]:
         "platform/infrastructure/gateway",
         "platform/clusters/local",
         "platform/clusters/staging/data",
+        "platform/clusters/staging/gateway",
     ]
     counts: dict[str, int] = {}
     with tempfile.TemporaryDirectory() as tmp:

@@ -3632,11 +3632,60 @@ def without_gateway_state(cell: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def gateway_receipt_service_identity(
+    root: Path, cell: dict[str, Any]
+) -> tuple[str, str] | None:
+    binding = cell.get("gateway_proof")
+    if not isinstance(binding, dict):
+        return None
+    path = root / "receipts/gateway-proof.json"
+    if (
+        path.is_symlink()
+        or not path.exists()
+        or stat.S_IMODE(path.stat().st_mode) != 0o600
+        or binding.get("active_commit") != cell_active_commit(cell)
+        or binding.get("receipt_sha256") != sha256_file(path)
+    ):
+        raise StagingCellError("staging gateway proof receipt is invalid during retirement")
+    try:
+        receipt = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise StagingCellError(
+            "staging gateway proof receipt is unreadable during retirement"
+        ) from error
+    if (
+        receipt.get("owner_id") != cell.get("owner_id")
+        or receipt.get("active_commit") != cell_active_commit(cell)
+    ):
+        raise StagingCellError(
+            "staging gateway proof receipt lost its owner/app binding during retirement"
+        )
+    service = receipt.get("service")
+    if not isinstance(service, dict):
+        raise StagingCellError("staging gateway proof receipt lacks Service identity")
+    name = str(service.get("name") or "")
+    uid = str(service.get("uid") or "")
+    if not name or not uid:
+        raise StagingCellError("staging gateway proof receipt has invalid Service identity")
+    return name, uid
+
+
+def gateway_service_owned_by(service: dict, gateway_uid: str) -> bool:
+    return bool(gateway_uid) and any(
+        owner.get("apiVersion") == "gateway.networking.k8s.io/v1"
+        and owner.get("kind") == "Gateway"
+        and owner.get("name") == GATEWAY_NAME
+        and owner.get("uid") == gateway_uid
+        for owner in service.get("metadata", {}).get("ownerReferences", [])
+    )
+
+
 def retire_gateway_before_activation(
     kubectl: str, root: Path, cell: dict[str, Any], owner_id: str
 ) -> None:
     active_commit = str(cell.get("active_commit") or "")
     observed: list[tuple[str, str, str]] = []
+    gateway_uid = ""
     for kind, namespace, name in GATEWAY_RESOURCES:
         document = gateway_get(kubectl, kind, name, namespace)
         if not document:
@@ -3651,15 +3700,46 @@ def retire_gateway_before_activation(
             raise StagingCellError(
                 "refusing to retire a staging gateway resource without the current owner/app binding"
             )
+        if kind == "Gateway":
+            gateway_uid = str(document.get("metadata", {}).get("uid") or "")
+            if not gateway_uid:
+                raise StagingCellError("staging Gateway lacks UID during retirement")
         observed.append((kind, namespace, name))
 
-    services_before = gateway_list(
+    labeled_services = gateway_list(
         kubectl,
         "Service",
         APP_NAMESPACE,
         label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
     )
-    if services_before and not observed:
+    tracked_services = set()
+    receipt_service = gateway_receipt_service_identity(root, cell)
+    if receipt_service is not None:
+        tracked_services.add(receipt_service)
+    if gateway_uid:
+        all_services = gateway_list(kubectl, "Service", APP_NAMESPACE)
+        owned_services = [
+            service
+            for service in all_services
+            if gateway_service_owned_by(service, gateway_uid)
+        ]
+        if any(
+            not gateway_service_owned_by(service, gateway_uid)
+            for service in labeled_services
+        ):
+            raise StagingCellError(
+                "refusing app activation while a mislabeled staging gateway Service remains"
+            )
+        for service in owned_services:
+            metadata = service.get("metadata", {})
+            name = str(metadata.get("name") or "")
+            uid = str(metadata.get("uid") or "")
+            if not name or not uid:
+                raise StagingCellError(
+                    "staging gateway Service lacks stable name/UID identity"
+                )
+            tracked_services.add((name, uid))
+    elif labeled_services and receipt_service is None:
         raise StagingCellError(
             "refusing app activation while an orphan staging gateway Service remains"
         )
@@ -3679,20 +3759,30 @@ def retire_gateway_before_activation(
             ]
         )
 
-    if observed:
+    if observed or tracked_services:
         deadline = time.monotonic() + 120
         while True:
             remaining = [
                 gateway_get(kubectl, kind, name, namespace)
                 for kind, namespace, name in GATEWAY_RESOURCES
             ]
-            services = gateway_list(
+            tracked_remaining = []
+            for name, uid in tracked_services:
+                service = gateway_get(kubectl, "Service", name, APP_NAMESPACE)
+                if not service:
+                    continue
+                if service.get("metadata", {}).get("uid") != uid:
+                    raise StagingCellError(
+                        "staging gateway Service identity changed during retirement"
+                    )
+                tracked_remaining.append(service)
+            labeled_remaining = gateway_list(
                 kubectl,
                 "Service",
                 APP_NAMESPACE,
                 label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
             )
-            if not any(remaining) and not services:
+            if not any(remaining) and not tracked_remaining and not labeled_remaining:
                 break
             if time.monotonic() >= deadline:
                 raise StagingCellError(
