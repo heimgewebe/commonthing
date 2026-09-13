@@ -62,6 +62,142 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         return source_sha
 
+    def _write_promotion_receipt(self, root: Path, *, commit: str) -> dict:
+        api_digest = "sha256:" + "a" * 64
+        web_digest = "sha256:" + "b" * 64
+        api = "ghcr.io/heimgewebe/commonthing-api"
+        web = "ghcr.io/heimgewebe/commonthing-web"
+        path = root / "promotion" / commit / "receipt.json"
+        staging.atomic_json(
+            path,
+            {
+                "schema_version": 1,
+                "status": "pass",
+                "scope": "staging-only",
+                "source_commit": commit,
+                "repository": "heimgewebe/commonthing",
+                "image_identity": "digest-authoritative",
+                "production_activation": False,
+                "images": {
+                    "api": {
+                        "canonical": api,
+                        "digest": api_digest,
+                        "canonical_reference": f"{api}@{api_digest}",
+                    },
+                    "web": {
+                        "canonical": web,
+                        "digest": web_digest,
+                        "canonical_reference": f"{web}@{web_digest}",
+                    },
+                },
+            },
+        )
+        return staging.load_promotion_receipt(root, commit)
+
+    def _write_gateway_ready_state(
+        self, root: Path, *, owner: str, commit: str
+    ) -> tuple[str, str, str]:
+        source_sha = self._write_bound_receipt(root, owner=owner, commit=commit)
+        (root / "data/postgres/PG_VERSION").write_text("17\n", encoding="utf-8")
+        (root / "data/nats").mkdir(parents=True, exist_ok=True)
+        (root / "data/nats/jetstream.marker").write_bytes(b"retained-nats-state")
+        promotion = self._write_promotion_receipt(root, commit=commit)
+        gateway_path = root / "receipts/gateway-proof.json"
+        staging.atomic_json(
+            gateway_path,
+            {
+                "schema_version": 1,
+                "status": "gateway-ready",
+                "cluster": staging.DEFAULT_CLUSTER,
+                "owner_id": owner,
+                "bootstrap_commit": commit,
+                "active_commit": commit,
+                "production_changed": False,
+            },
+        )
+        gateway_sha = staging.sha256_file(gateway_path)
+        cell = staging.load_cell_receipt(root)
+        staging.write_cell_receipt(
+            root,
+            {
+                **cell,
+                "status": "gateway-ready",
+                "active_commit": commit,
+                "app_activation": True,
+                "gateway_proof": {
+                    "active_commit": commit,
+                    "receipt_sha256": gateway_sha,
+                },
+                "image_promotion": {
+                    "status": "pass",
+                    "source_commit": commit,
+                    "receipt_sha256": promotion["receipt_sha256"],
+                    "images": promotion["images"],
+                },
+            },
+        )
+        cell_sha = staging.sha256_file(root / "receipts/cell-bootstrap.json")
+        return cell_sha, gateway_sha, source_sha
+
+    def _prepare_delete_to_prove_state(
+        self, root: Path, *, owner: str, commit: str
+    ) -> tuple[dict, dict, str, dict, str, str]:
+        _, gateway_sha, source_sha = self._write_gateway_ready_state(
+            root, owner=owner, commit=commit
+        )
+        registry_material = {
+            "registry": staging.GHCR_REGISTRY,
+            "username": "fixture-user",
+            "token": "fixture-token",
+        }
+        registry_source_sha = "c" * 64
+        registry_config = "fixture-config"
+        cell = staging.load_cell_receipt(root)
+        staging.write_cell_receipt(
+            root,
+            {
+                **cell,
+                "registry_pull_secret": {
+                    "source_sha256": registry_source_sha,
+                    "config_sha256": staging.sha256_bytes(
+                        registry_config.encode("utf-8")
+                    ),
+                },
+            },
+        )
+        cell = staging.load_cell_receipt(root)
+        cell_sha = staging.sha256_file(root / "receipts/cell-bootstrap.json")
+        staging.atomic_json(
+            root / staging.CELL_DOWN_RECEIPT,
+            {
+                **staging._down_receipt_binding(
+                    cell,
+                    cell_sha,
+                    gateway_sha,
+                    data_identity=staging._retained_data_identity(root),
+                    image_promotion=cell["image_promotion"],
+                ),
+                "retained_data_identity": staging._retained_data_identity(
+                    root, include_content=False
+                ),
+                "status": "cluster-deleted-state-preserved",
+                "cluster_was_present": True,
+                "started_at_unix": 10,
+                "completed_at_unix": 11,
+            },
+        )
+        down = staging.load_delete_to_prove_down_receipt(
+            root, cell, require_current_cell_match=True
+        )
+        return (
+            cell,
+            down,
+            source_sha,
+            registry_material,
+            registry_source_sha,
+            registry_config,
+        )
+
     def test_operational_commands_keep_public_stdout_reserved_for_json(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -77,6 +213,45 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertIn("+ external command [arguments redacted]", stderr.getvalue())
         self.assertIs(run_mock.call_args.kwargs["stdout"], stderr)
         self.assertNotIn("capture_output", run_mock.call_args.kwargs)
+
+    def test_reference_routing_forwards_kind_creation_environment(self) -> None:
+        completed = subprocess.CompletedProcess(["kind"], 0, stdout="", stderr="")
+        creation_env = {"COMMONTHING_KIND_CREATE_RESERVATION": "1" * 64}
+
+        @staging.reference_output_routed
+        def exercise() -> None:
+            staging.reference.run(["kind"], env=creation_env)
+
+        with mock.patch.object(
+            staging.subprocess, "run", return_value=completed
+        ) as run_mock:
+            exercise()
+
+        self.assertEqual(run_mock.call_args.kwargs["env"], creation_env)
+
+    def test_render_kind_config_pins_each_retained_volume(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="staging-kind-split-mounts-") as tmp_name:
+            root = Path(tmp_name)
+            rendered_path = staging.render_kind_config(root)
+            document = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+
+        data_worker = document["nodes"][1]
+        mounts = data_worker["extraMounts"]
+        self.assertEqual(
+            [mount["containerPath"] for mount in mounts],
+            [
+                "/var/local/commonthing-staging/postgres",
+                "/var/local/commonthing-staging/nats",
+            ],
+        )
+        self.assertEqual(
+            [mount["hostPath"] for mount in mounts],
+            [
+                str((root / "data/postgres").resolve()),
+                str((root / "data/nats").resolve()),
+            ],
+        )
+        self.assertTrue(all(mount["readOnly"] is False for mount in mounts))
 
     def test_reference_commands_use_scoped_staging_stdout_routing(self) -> None:
         original = staging.reference.run
@@ -298,10 +473,22 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         index, node, mounts = mounted[0]
         self.assertEqual(index, 1)
         self.assertEqual(node["role"], "worker")
-        self.assertEqual(len(mounts), 1)
-        self.assertEqual(mounts[0]["hostPath"], "__COMMONTHING_STAGING_DATA_ROOT__")
-        self.assertEqual(mounts[0]["containerPath"], "/var/local/commonthing-staging")
-        self.assertFalse(mounts[0]["readOnly"])
+        self.assertEqual(len(mounts), 2)
+        self.assertEqual(
+            [mount["hostPath"] for mount in mounts],
+            [
+                "__COMMONTHING_STAGING_POSTGRES_ROOT__",
+                "__COMMONTHING_STAGING_NATS_ROOT__",
+            ],
+        )
+        self.assertEqual(
+            [mount["containerPath"] for mount in mounts],
+            [
+                "/var/local/commonthing-staging/postgres",
+                "/var/local/commonthing-staging/nats",
+            ],
+        )
+        self.assertTrue(all(mount["readOnly"] is False for mount in mounts))
 
     def test_apply_yaml_emits_native_multi_document_stream(self) -> None:
         documents = [
@@ -804,6 +991,1133 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     )
         self.assertFalse((root / "receipts/cell-down.json").exists())
 
+    def test_gateway_ready_down_is_crash_resumable_from_predelete_receipt(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "a" * 40
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(prefix="staging-cell-down-resume-") as tmp_name:
+            root = Path(tmp_name)
+            cell_sha, gateway_sha, _ = self._write_gateway_ready_state(
+                root, owner=owner, commit=commit
+            )
+            pre_delete_identity = staging._retained_data_identity(root)
+            pending_path = root / staging.CELL_DOWN_RECEIPT
+            events: list[str] = []
+
+            def quiesce_before_fingerprint(_kubectl: str) -> None:
+                events.append("quiesce")
+
+            def fingerprint_after_quiesce(*_args: object, **_kwargs: object) -> dict:
+                events.append("fingerprint")
+                return pre_delete_identity
+
+            def interrupted_delete(*_args: object, **_kwargs: object) -> bool:
+                self.assertEqual(events, ["quiesce", "fingerprint"])
+                pending_before_delete = json.loads(
+                    pending_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    pending_before_delete["status"], "cluster-delete-in-progress"
+                )
+                self.assertEqual(
+                    pending_before_delete["pre_delete_data_identity"],
+                    pre_delete_identity,
+                )
+                raise staging.reference.ProofError("simulated interruption")
+
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(
+                    staging,
+                    "_quiesce_retained_data",
+                    side_effect=quiesce_before_fingerprint,
+                ),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_identity",
+                    side_effect=fingerprint_after_quiesce,
+                ),
+                mock.patch.object(
+                    staging.reference,
+                    "clusters",
+                    return_value=[staging.DEFAULT_CLUSTER],
+                ),
+                mock.patch.object(
+                    staging.reference,
+                    "delete_owned_cluster_if_present",
+                    side_effect=interrupted_delete,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    staging.reference.ProofError, "simulated interruption"
+                ):
+                    staging.command_down(args)
+
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+            self.assertEqual(pending["status"], "cluster-delete-in-progress")
+            self.assertTrue(pending["cluster_was_present"])
+            self.assertEqual(pending["cell_receipt_sha256"], cell_sha)
+            self.assertEqual(pending["gateway_proof_receipt_sha256"], gateway_sha)
+
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging.reference, "clusters", return_value=[]),
+                mock.patch.object(
+                    staging, "_mounted_retained_data_identity"
+                ) as post_delete_fingerprint_mock,
+                mock.patch.object(
+                    staging.reference,
+                    "delete_owned_cluster_if_present",
+                    return_value=True,
+                ) as delete_mock,
+            ):
+                result = staging.command_down(args)
+                first_receipt_sha = result["receipt_sha256"]
+                second = staging.command_down(args)
+
+            self.assertEqual(result["status"], "cluster-deleted-state-preserved")
+            self.assertTrue(result["cluster_was_present"])
+            self.assertEqual(second["receipt_sha256"], first_receipt_sha)
+            delete_mock.assert_called_once()
+            post_delete_fingerprint_mock.assert_not_called()
+            recovered = staging.load_delete_to_prove_down_receipt(
+                root,
+                staging.load_cell_receipt(root),
+                require_current_cell_match=True,
+            )
+            self.assertEqual(recovered["cell_receipt_sha256"], cell_sha)
+            self.assertEqual(recovered["gateway_proof_receipt_sha256"], gateway_sha)
+
+    def test_delete_to_prove_rebuild_refuses_first_run_while_cluster_exists(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "b" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-cell-rebuild-present-") as tmp_name:
+            root = Path(tmp_name)
+            (
+                _cell,
+                _down,
+                source_sha,
+                registry_material,
+                registry_source_sha,
+                registry_config,
+            ) = self._prepare_delete_to_prove_state(root, owner=owner, commit=commit)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=commit),
+                mock.patch.object(
+                    staging, "retained_data_directory_exists", return_value=True
+                ),
+                mock.patch.object(
+                    staging,
+                    "load_or_create_secret_material",
+                    return_value=({}, source_sha),
+                ),
+                mock.patch.object(
+                    staging,
+                    "load_registry_pull_material",
+                    return_value=(registry_material, registry_source_sha),
+                ),
+                mock.patch.object(
+                    staging,
+                    "registry_dockerconfig_json",
+                    return_value=registry_config,
+                ),
+                mock.patch.object(
+                    staging.reference,
+                    "clusters",
+                    return_value=[staging.DEFAULT_CLUSTER],
+                ),
+                mock.patch.object(staging.reference, "create_kind_cluster") as create_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "downed cluster to be absent"
+                ):
+                    staging.command_rebuild(args)
+            create_mock.assert_not_called()
+            self.assertFalse((root / staging.CELL_REBUILD_RECEIPT).exists())
+
+    def test_delete_to_prove_rebuild_restores_only_infrastructure(self) -> None:
+        owner = "owner-a"
+        commit = "d" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-rebuild-success-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            (
+                _cell,
+                down,
+                source_sha,
+                registry_material,
+                registry_source_sha,
+                registry_config,
+            ) = self._prepare_delete_to_prove_state(root, owner=owner, commit=commit)
+
+            def reconcile_after_mount_receipt(_kubectl: str, _commit: str) -> str:
+                persisted = json.loads(
+                    (root / staging.CELL_REBUILD_RECEIPT).read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    persisted["status"],
+                    "retained-mount-verified-data-reconcile-authorized",
+                )
+                self.assertEqual(
+                    persisted["retained_mount_identity"],
+                    down["pre_delete_data_identity"],
+                )
+                return "reconcile-after-mount-proof"
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(staging, "state_root", return_value=root)
+                )
+                stack.enter_context(mock.patch.object(staging, "configure_reference_paths"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "load_tool_receipt", return_value=self._tool_receipt()
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging.reference, "validate_ownership_binding")
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "require_clean_commit", return_value=commit
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "retained_data_directory_exists", return_value=True
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "load_or_create_secret_material",
+                        return_value=({}, source_sha),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "load_registry_pull_material",
+                        return_value=(registry_material, registry_source_sha),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "registry_dockerconfig_json",
+                        return_value=registry_config,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging.reference, "clusters", return_value=[])
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "render_kind_config", return_value=root / "kind.yaml"
+                    )
+                )
+                create_mock = stack.enter_context(
+                    mock.patch.object(staging.reference, "create_kind_cluster")
+                )
+                stack.enter_context(mock.patch.object(staging, "prepare_volume_permissions"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "_mounted_retained_data_identity",
+                        return_value=down["pre_delete_data_identity"],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging, "_set_data_reconciliation_suspended")
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging.reference,
+                        "control_plane_address",
+                        return_value="127.0.0.1",
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging.reference, "install_platform_components")
+                )
+                stack.enter_context(mock.patch.object(staging, "run"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "inject_external_secrets",
+                        return_value={"source_sha256": source_sha},
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "inject_registry_pull_secret",
+                        return_value={
+                            "source_sha256": registry_source_sha,
+                            "config_sha256": staging.sha256_bytes(
+                                registry_config.encode("utf-8")
+                            ),
+                        },
+                    )
+                )
+                apply_mock = stack.enter_context(mock.patch.object(staging, "apply_yaml"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "reconcile_data",
+                        side_effect=reconcile_after_mount_receipt,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "staging_live_health",
+                        return_value={
+                            "source-controller": "True",
+                            "kustomize-controller": "True",
+                            "postgres": "True",
+                            "nats": "True",
+                        },
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "output", return_value="node/a\nnode/b\nnode/c\n"
+                    )
+                )
+                result = staging.command_rebuild(args)
+
+            self.assertEqual(
+                result["status"],
+                "infrastructure-rebuilt-app-reactivation-required",
+            )
+            self.assertTrue(result["cluster_created"])
+            self.assertFalse(result["production_changed"])
+            create_mock.assert_called_once()
+            applied_documents = apply_mock.call_args.args[1]
+            data_kustomization = next(
+                document
+                for document in applied_documents
+                if document.get("kind") == "Kustomization"
+            )
+            self.assertIs(data_kustomization["spec"].get("suspend"), True)
+            rebuilt = json.loads(
+                (root / staging.CELL_REBUILD_RECEIPT).read_text(encoding="utf-8")
+            )
+            self.assertEqual(rebuilt["active_commit"], commit)
+            self.assertNotIn("app_activation", rebuilt)
+
+    def test_mount_verified_rebuild_retry_accepts_legitimate_later_data_writes(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "3" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-rebuild-mount-proof-retry-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            (
+                cell,
+                down,
+                source_sha,
+                registry_material,
+                registry_source_sha,
+                registry_config,
+            ) = self._prepare_delete_to_prove_state(root, owner=owner, commit=commit)
+            mount_identity = down["pre_delete_data_identity"]
+            staging.atomic_json(
+                root / staging.CELL_REBUILD_RECEIPT,
+                {
+                    **staging._rebuild_receipt_binding(cell, down, commit),
+                    "status": "retained-mount-verified-data-reconcile-authorized",
+                    "cluster_created": True,
+                    "retained_mount_identity": mount_identity,
+                    "started_at_unix": 12,
+                    "mount_verified_at_unix": 13,
+                },
+            )
+            (root / "data/nats/post-mount-proof.marker").write_bytes(
+                b"legitimate-live-write"
+            )
+            current_anchors = staging._retained_data_identity(
+                root, include_content=False
+            )
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(staging, "state_root", return_value=root)
+                )
+                stack.enter_context(mock.patch.object(staging, "configure_reference_paths"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "load_tool_receipt", return_value=self._tool_receipt()
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging.reference, "validate_ownership_binding")
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "require_clean_commit", return_value=commit
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "load_or_create_secret_material",
+                        return_value=({}, source_sha),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "load_registry_pull_material",
+                        return_value=(registry_material, registry_source_sha),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "registry_dockerconfig_json", return_value=registry_config
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging.reference,
+                        "clusters",
+                        return_value=[staging.DEFAULT_CLUSTER],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging.reference, "require_owned_cluster")
+                )
+                stack.enter_context(
+                    mock.patch.object(staging, "prepare_volume_permissions")
+                )
+                full_fingerprint_mock = stack.enter_context(
+                    mock.patch.object(staging, "_mounted_retained_data_identity")
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "_mounted_retained_data_anchors",
+                        return_value=current_anchors,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging.reference,
+                        "control_plane_address",
+                        return_value="127.0.0.1",
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging.reference, "install_platform_components")
+                )
+                stack.enter_context(mock.patch.object(staging, "run"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "inject_external_secrets",
+                        return_value={"source_sha256": source_sha},
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "inject_registry_pull_secret",
+                        return_value={
+                            "source_sha256": registry_source_sha,
+                            "config_sha256": staging.sha256_bytes(
+                                registry_config.encode("utf-8")
+                            ),
+                        },
+                    )
+                )
+                stack.enter_context(mock.patch.object(staging, "apply_yaml"))
+                stack.enter_context(
+                    mock.patch.object(staging, "_set_data_reconciliation_suspended")
+                )
+                stack.enter_context(mock.patch.object(staging, "reconcile_data"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "staging_live_health",
+                        return_value={
+                            "source-controller": "True",
+                            "kustomize-controller": "True",
+                            "postgres": "True",
+                            "nats": "True",
+                        },
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "output", return_value="node/a\nnode/b\nnode/c\n"
+                    )
+                )
+                result = staging.command_rebuild(args)
+
+            self.assertEqual(
+                result["status"],
+                "infrastructure-rebuilt-app-reactivation-required",
+            )
+            full_fingerprint_mock.assert_not_called()
+            self.assertTrue((root / "data/nats/post-mount-proof.marker").exists())
+
+    def test_completed_delete_to_prove_rebuild_cannot_recreate_missing_cluster(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "e" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-cell-rebuild-final-") as tmp_name:
+            root = Path(tmp_name)
+            (
+                cell,
+                down,
+                source_sha,
+                registry_material,
+                registry_source_sha,
+                registry_config,
+            ) = self._prepare_delete_to_prove_state(root, owner=owner, commit=commit)
+            staging.atomic_json(
+                root / staging.CELL_REBUILD_RECEIPT,
+                {
+                    **staging._rebuild_receipt_binding(cell, down, commit),
+                    "status": "infrastructure-rebuilt-app-reactivation-required",
+                    "completed_at_unix": 12,
+                },
+            )
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=commit),
+                mock.patch.object(
+                    staging, "retained_data_directory_exists", return_value=True
+                ),
+                mock.patch.object(
+                    staging,
+                    "load_or_create_secret_material",
+                    return_value=({}, source_sha),
+                ),
+                mock.patch.object(
+                    staging,
+                    "load_registry_pull_material",
+                    return_value=(registry_material, registry_source_sha),
+                ),
+                mock.patch.object(
+                    staging,
+                    "registry_dockerconfig_json",
+                    return_value=registry_config,
+                ),
+                mock.patch.object(staging.reference, "clusters", return_value=[]),
+                mock.patch.object(staging.reference, "create_kind_cluster") as create_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "already mount-verified cluster"
+                ):
+                    staging.command_rebuild(args)
+            create_mock.assert_not_called()
+
+    def test_delete_to_prove_final_receipt_binds_distinct_pre_and_post_proofs(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "f" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-cell-delete-proof-") as tmp_name:
+            root = Path(tmp_name)
+            self._write_gateway_ready_state(root, owner=owner, commit=commit)
+            cell = staging.load_cell_receipt(root)
+            pre_cell_sha = "1" * 64
+            pre_gateway_sha = "2" * 64
+            staging.atomic_json(
+                root / staging.CELL_DOWN_RECEIPT,
+                {
+                    **staging._down_receipt_binding(
+                        cell,
+                        pre_cell_sha,
+                        pre_gateway_sha,
+                        data_identity=staging._retained_data_identity(root),
+                        image_promotion=cell["image_promotion"],
+                    ),
+                    "retained_data_identity": staging._retained_data_identity(
+                        root, include_content=False
+                    ),
+                    "status": "cluster-deleted-state-preserved",
+                    "cluster_was_present": True,
+                    "started_at_unix": 10,
+                    "completed_at_unix": 11,
+                },
+            )
+            down = staging.load_delete_to_prove_down_receipt(
+                root, cell, require_current_cell_match=False
+            )
+            staging.atomic_json(
+                root / staging.CELL_REBUILD_RECEIPT,
+                {
+                    **staging._rebuild_receipt_binding(cell, down, commit),
+                    "status": "infrastructure-rebuilt-app-reactivation-required",
+                    "completed_at_unix": 12,
+                },
+            )
+            # Rebuilt data services may legitimately write new files before the
+            # final proof; the backing directory identity must remain stable.
+            (root / "data/nats/post-rebuild.marker").write_bytes(b"live-again")
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging, "require_clean_commit", return_value=commit),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(staging, "require_bootstrap_data_current"),
+                mock.patch.object(
+                    staging,
+                    "app_live_health",
+                    return_value={"api": "True", "web": "True"},
+                ),
+                mock.patch.object(staging, "gateway_receipt_current", return_value=True),
+            ):
+                first = staging.command_prove_delete_to_prove(args)
+                second = staging.command_prove_delete_to_prove(args)
+
+            self.assertEqual(first["status"], "delete-to-prove-verified")
+            self.assertFalse(first["production_changed"])
+            self.assertEqual(first["pre_delete_cell_receipt_sha256"], pre_cell_sha)
+            self.assertNotEqual(first["post_rebuild_cell_receipt_sha256"], pre_cell_sha)
+            self.assertEqual(
+                first["pre_delete_gateway_proof_receipt_sha256"], pre_gateway_sha
+            )
+            self.assertNotEqual(
+                first["post_rebuild_gateway_proof_receipt_sha256"], pre_gateway_sha
+            )
+            self.assertEqual(first["receipt_sha256"], second["receipt_sha256"])
+
+    def test_delete_to_prove_rebuild_rejects_replaced_promotion_receipt(self) -> None:
+        owner = "owner-a"
+        commit = "7" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-cell-rebuild-promotion-drift-") as tmp_name:
+            root = Path(tmp_name)
+            self._prepare_delete_to_prove_state(root, owner=owner, commit=commit)
+            path = root / "promotion" / commit / "receipt.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            digest = "sha256:" + "9" * 64
+            payload["images"]["api"]["digest"] = digest
+            payload["images"]["api"]["canonical_reference"] = (
+                "ghcr.io/heimgewebe/commonthing-api@" + digest
+            )
+            staging.atomic_json(path, payload)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=commit),
+                mock.patch.object(staging.reference, "create_kind_cluster") as create_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "promotion evidence differs"
+                ):
+                    staging.command_rebuild(args)
+            create_mock.assert_not_called()
+
+    def test_delete_to_prove_rebuild_rejects_in_place_retained_data_change(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "8" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-rebuild-data-content-drift-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            (
+                _cell,
+                down,
+                source_sha,
+                registry_material,
+                registry_source_sha,
+                registry_config,
+            ) = self._prepare_delete_to_prove_state(root, owner=owner, commit=commit)
+            marker = root / "data/nats/jetstream.marker"
+            original = marker.read_bytes()
+            marker.write_bytes(b"x" * len(original))
+            mounted_identity = staging._retained_data_identity(root)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=commit),
+                mock.patch.object(
+                    staging,
+                    "load_or_create_secret_material",
+                    return_value=({}, source_sha),
+                ),
+                mock.patch.object(
+                    staging,
+                    "load_registry_pull_material",
+                    return_value=(registry_material, registry_source_sha),
+                ),
+                mock.patch.object(
+                    staging, "registry_dockerconfig_json", return_value=registry_config
+                ),
+                mock.patch.object(staging.reference, "clusters", return_value=[]),
+                mock.patch.object(
+                    staging, "render_kind_config", return_value=root / "kind.yaml"
+                ),
+                mock.patch.object(
+                    staging.reference, "create_kind_cluster"
+                ) as create_mock,
+                mock.patch.object(staging, "prepare_volume_permissions"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_identity",
+                    return_value=mounted_identity,
+                ),
+                mock.patch.object(staging, "reconcile_data") as reconcile_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "retained mount content differs"
+                ):
+                    staging.command_rebuild(args)
+            create_mock.assert_called_once()
+            reconcile_mock.assert_not_called()
+            self.assertNotEqual(
+                mounted_identity["nats"]["tree_sha256"],
+                down["pre_delete_data_identity"]["nats"]["tree_sha256"],
+            )
+
+    def test_retained_tree_fingerprint_rejects_symlink_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-retained-tree-symlink-entrypoint-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            target = root / "target"
+            target.mkdir()
+            (target / "state.bin").write_bytes(b"retained-state")
+            link = root / "link"
+            link.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(staging.StagingCellError, "contains a symlink"):
+                staging._retained_tree_sha256(link, label="retained test data")
+
+    def test_delete_to_prove_reactivation_rejects_replaced_promotion_before_mutation(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "4" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-reactivation-promotion-drift-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            cell, down, *_ = self._prepare_delete_to_prove_state(
+                root, owner=owner, commit=commit
+            )
+            staging.atomic_json(
+                root / staging.CELL_REBUILD_RECEIPT,
+                {
+                    **staging._rebuild_receipt_binding(cell, down, commit),
+                    "status": "infrastructure-rebuilt-app-reactivation-required",
+                    "completed_at_unix": 12,
+                },
+            )
+            path = root / "promotion" / commit / "receipt.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            digest = "sha256:" + "9" * 64
+            payload["images"]["web"]["digest"] = digest
+            payload["images"]["web"]["canonical_reference"] = (
+                "ghcr.io/heimgewebe/commonthing-web@" + digest
+            )
+            staging.atomic_json(path, payload)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=commit),
+                mock.patch.object(staging, "load_registry_pull_material") as registry_mock,
+                mock.patch.object(
+                    staging.reference, "require_owned_cluster"
+                ) as cluster_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "promotion evidence differs"
+                ):
+                    staging.command_activate(args)
+            registry_mock.assert_not_called()
+            cluster_mock.assert_not_called()
+
+    def test_delete_to_prove_rebuild_rejects_replaced_retained_data_directory(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "8" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-rebuild-data-drift-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            (
+                _cell,
+                down,
+                source_sha,
+                registry_material,
+                registry_source_sha,
+                registry_config,
+            ) = self._prepare_delete_to_prove_state(root, owner=owner, commit=commit)
+            mounted_identity = json.loads(
+                json.dumps(down["pre_delete_data_identity"])
+            )
+            mounted_identity["nats"]["inode"] += 1
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=commit),
+                mock.patch.object(
+                    staging,
+                    "load_or_create_secret_material",
+                    return_value=({}, source_sha),
+                ),
+                mock.patch.object(
+                    staging,
+                    "load_registry_pull_material",
+                    return_value=(registry_material, registry_source_sha),
+                ),
+                mock.patch.object(
+                    staging, "registry_dockerconfig_json", return_value=registry_config
+                ),
+                mock.patch.object(staging.reference, "clusters", return_value=[]),
+                mock.patch.object(
+                    staging, "render_kind_config", return_value=root / "kind.yaml"
+                ),
+                mock.patch.object(
+                    staging.reference, "create_kind_cluster"
+                ) as create_mock,
+                mock.patch.object(staging, "prepare_volume_permissions"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_identity",
+                    return_value=mounted_identity,
+                ),
+                mock.patch.object(staging, "reconcile_data") as reconcile_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "retained mount content differs"
+                ):
+                    staging.command_rebuild(args)
+            create_mock.assert_called_once()
+            reconcile_mock.assert_not_called()
+
+    def test_delete_to_prove_rebuild_clears_exact_stale_creation_reservation(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "9" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-cell-rebuild-stale-marker-") as tmp_name:
+            root = Path(tmp_name)
+            (
+                cell,
+                down,
+                source_sha,
+                registry_material,
+                registry_source_sha,
+                registry_config,
+            ) = self._prepare_delete_to_prove_state(root, owner=owner, commit=commit)
+            staging.atomic_json(
+                root / staging.CELL_REBUILD_RECEIPT,
+                {
+                    **staging._rebuild_receipt_binding(cell, down, commit),
+                    "status": "rebuild-in-progress",
+                    "started_at_unix": 12,
+                },
+            )
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(staging, "state_root", return_value=root))
+                stack.enter_context(mock.patch.object(staging, "configure_reference_paths"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging, "load_tool_receipt", return_value=self._tool_receipt()
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging.reference, "validate_ownership_binding")
+                )
+                stack.enter_context(
+                    mock.patch.object(staging, "require_clean_commit", return_value=commit)
+                )
+                stack.enter_context(
+                    mock.patch.object(staging, "load_or_create_secret_material", return_value=({}, source_sha))
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "load_registry_pull_material",
+                        return_value=(registry_material, registry_source_sha),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging, "registry_dockerconfig_json", return_value=registry_config)
+                )
+                stack.enter_context(mock.patch.object(staging.reference, "clusters", return_value=[]))
+                clear_mock = stack.enter_context(
+                    mock.patch.object(
+                        staging.reference, "clear_stale_cluster_reservation", return_value=True
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging, "render_kind_config", return_value=root / "kind.yaml")
+                )
+                create_mock = stack.enter_context(
+                    mock.patch.object(staging.reference, "create_kind_cluster")
+                )
+                stack.enter_context(mock.patch.object(staging, "prepare_volume_permissions"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "_mounted_retained_data_identity",
+                        return_value=down["pre_delete_data_identity"],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging, "_set_data_reconciliation_suspended")
+                )
+                stack.enter_context(
+                    mock.patch.object(staging.reference, "control_plane_address", return_value="127.0.0.1")
+                )
+                stack.enter_context(
+                    mock.patch.object(staging.reference, "install_platform_components")
+                )
+                stack.enter_context(mock.patch.object(staging, "run"))
+                stack.enter_context(
+                    mock.patch.object(staging, "inject_external_secrets", return_value={"source_sha256": source_sha})
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "inject_registry_pull_secret",
+                        return_value={
+                            "source_sha256": registry_source_sha,
+                            "config_sha256": staging.sha256_bytes(registry_config.encode("utf-8")),
+                        },
+                    )
+                )
+                stack.enter_context(mock.patch.object(staging, "apply_yaml"))
+                stack.enter_context(mock.patch.object(staging, "reconcile_data"))
+                stack.enter_context(
+                    mock.patch.object(
+                        staging,
+                        "staging_live_health",
+                        return_value={
+                            "source-controller": "True",
+                            "kustomize-controller": "True",
+                            "postgres": "True",
+                            "nats": "True",
+                        },
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(staging, "output", return_value="node/a\nnode/b\nnode/c\n")
+                )
+                result = staging.command_rebuild(args)
+            self.assertEqual(result["status"], "infrastructure-rebuilt-app-reactivation-required")
+            clear_mock.assert_called_once_with(
+                "kind",
+                staging.DEFAULT_CLUSTER,
+                expected_commit=commit,
+                expected_owner_id=owner,
+            )
+            create_mock.assert_called_once()
+
+    def test_delete_to_prove_refuses_second_down_cycle_after_rebuild(self) -> None:
+        owner = "owner-a"
+        commit = "6" * 40
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(prefix="staging-cell-second-down-") as tmp_name:
+            root = Path(tmp_name)
+            cell, down, *_ = self._prepare_delete_to_prove_state(
+                root, owner=owner, commit=commit
+            )
+            staging.atomic_json(
+                root / staging.CELL_REBUILD_RECEIPT,
+                {
+                    **staging._rebuild_receipt_binding(cell, down, commit),
+                    "status": "infrastructure-rebuilt-app-reactivation-required",
+                    "completed_at_unix": 12,
+                },
+            )
+            cell = staging.load_cell_receipt(root)
+            staging.write_cell_receipt(root, {**cell, "rebuild_generation": 1})
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(
+                    staging.reference, "clusters", return_value=[staging.DEFAULT_CLUSTER]
+                ),
+                mock.patch.object(
+                    staging.reference, "delete_owned_cluster_if_present"
+                ) as delete_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "previous delete-to-prove recovery cycle"
+                ):
+                    staging.command_down(args)
+            delete_mock.assert_not_called()
+
+    def test_activated_down_requires_verified_kubectl_before_mutation(self) -> None:
+        owner = "owner-a"
+        commit = "4" * 40
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-down-kubectl-verified-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            self._write_gateway_ready_state(root, owner=owner, commit=commit)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging,
+                    "load_tool_receipt",
+                    side_effect=staging.StagingCellError("unverified kubectl sentinel"),
+                ) as load_tool_mock,
+                mock.patch.object(
+                    staging.reference, "delete_owned_cluster_if_present"
+                ) as delete_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "unverified kubectl sentinel"
+                ):
+                    staging.command_down(args)
+            load_tool_mock.assert_called_once_with(
+                root, required_tools=("kind", "kubectl"), required_artifacts=()
+            )
+            delete_mock.assert_not_called()
+
+    def test_gateway_ready_down_requires_persisted_gateway_binding(self) -> None:
+        owner = "owner-a"
+        commit = "6" * 40
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-down-gateway-binding-required-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            self._write_gateway_ready_state(root, owner=owner, commit=commit)
+            cell = staging.load_cell_receipt(root)
+            cell.pop("gateway_proof", None)
+            staging.write_cell_receipt(root, cell)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(
+                    staging.reference, "delete_owned_cluster_if_present"
+                ) as delete_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "persisted gateway proof binding"
+                ):
+                    staging.command_down(args)
+            delete_mock.assert_not_called()
+
+    def test_activated_down_requires_gateway_ready_state(self) -> None:
+        owner = "owner-a"
+        commit = "5" * 40
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(prefix="staging-cell-down-gateway-required-") as tmp_name:
+            root = Path(tmp_name)
+            self._write_gateway_ready_state(root, owner=owner, commit=commit)
+            cell = staging.load_cell_receipt(root)
+            staging.write_cell_receipt(
+                root, {**cell, "status": "app-ready-gateway-pending"}
+            )
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(
+                    staging.reference, "delete_owned_cluster_if_present"
+                ) as delete_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "only from gateway-ready"
+                ):
+                    staging.command_down(args)
+            delete_mock.assert_not_called()
+
     def test_lifecycle_lock_rejects_parallel_mutations(self) -> None:
         with tempfile.TemporaryDirectory(prefix="staging-cell-lifecycle-lock-") as tmp_name:
             root = Path(tmp_name)
@@ -849,6 +2163,47 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         for call in output_mock.call_args_list:
             self.assertIn("--ignore-not-found", call.args[0])
+
+    def test_mounted_retained_durable_fingerprint_syncs_before_hashing(self) -> None:
+        anchors = {
+            "postgres": {"device": 1, "inode": 2, "uid": 999, "gid": 999, "mode": 0o700},
+            "nats": {"device": 1, "inode": 3, "uid": 1000, "gid": 1000, "mode": 0o700},
+        }
+        events: list[str] = []
+
+        def fake_run(argv: list[str], *, timeout: int | None = None, **_kwargs: object):
+            del timeout
+            self.assertEqual(argv[-1], "sync")
+            events.append("sync")
+            return subprocess.CompletedProcess(argv, 0)
+
+        def fake_output(argv: list[str], *, timeout: int | None = None) -> str:
+            del timeout
+            events.append(f"hash:{argv[-1].rsplit('/', 1)[-1]}")
+            return "a" * 64
+
+        with tempfile.TemporaryDirectory(prefix="staging-cell-mounted-fingerprint-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_anchors",
+                    return_value=json.loads(json.dumps(anchors)),
+                ),
+                mock.patch.object(staging, "run", side_effect=fake_run),
+                mock.patch.object(staging, "output", side_effect=fake_output),
+            ):
+                result = staging._mounted_retained_data_identity(
+                    "kind",
+                    staging.DEFAULT_CLUSTER,
+                    root,
+                    durable=True,
+                    require_split=True,
+                )
+
+        self.assertEqual(events, ["sync", "hash:postgres", "hash:nats"])
+        self.assertEqual(result["postgres"]["tree_sha256"], "a" * 64)
+        self.assertEqual(result["nats"]["tree_sha256"], "a" * 64)
 
     def test_atomic_writes_fsync_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="staging-cell-fsync-parent-") as tmp_name:
@@ -1379,8 +2734,10 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory(prefix="staging-cell-volume-proof-") as tmp_name:
             root = Path(tmp_name)
-            (root / "data").mkdir()
-            expected_source = str((root / "data").resolve())
+            (root / "data/postgres").mkdir(parents=True)
+            (root / "data/nats").mkdir(parents=True)
+            expected_postgres = str((root / "data/postgres").resolve())
+            expected_nats = str((root / "data/nats").resolve())
 
             def fake_output(argv: list[str], *, timeout: int | None = None) -> str:
                 del timeout
@@ -1389,10 +2746,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     mounts = (
                         [
                             {
-                                "Destination": "/var/local/commonthing-staging",
-                                "Source": expected_source,
+                                "Destination": "/var/local/commonthing-staging/postgres",
+                                "Source": expected_postgres,
                                 "RW": True,
-                            }
+                            },
+                            {
+                                "Destination": "/var/local/commonthing-staging/nats",
+                                "Source": expected_nats,
+                                "RW": True,
+                            },
                         ]
                         if node == staging.data_node_name(staging.DEFAULT_CLUSTER)
                         else []
@@ -1427,8 +2789,10 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory(prefix="staging-cell-volume-init-") as tmp_name:
             root = Path(tmp_name)
-            (root / "data").mkdir()
-            expected_source = str((root / "data").resolve())
+            (root / "data/postgres").mkdir(parents=True)
+            (root / "data/nats").mkdir(parents=True)
+            expected_postgres = str((root / "data/postgres").resolve())
+            expected_nats = str((root / "data/nats").resolve())
             stat_calls = {"postgres": 0, "nats": 0}
 
             def fake_output(argv: list[str], *, timeout: int | None = None) -> str:
@@ -1438,10 +2802,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     mounts = (
                         [
                             {
-                                "Destination": "/var/local/commonthing-staging",
-                                "Source": expected_source,
+                                "Destination": "/var/local/commonthing-staging/postgres",
+                                "Source": expected_postgres,
                                 "RW": True,
-                            }
+                            },
+                            {
+                                "Destination": "/var/local/commonthing-staging/nats",
+                                "Source": expected_nats,
+                                "RW": True,
+                            },
                         ]
                         if node == staging.data_node_name(staging.DEFAULT_CLUSTER)
                         else []

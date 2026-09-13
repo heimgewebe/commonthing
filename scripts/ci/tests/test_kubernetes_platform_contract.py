@@ -2783,6 +2783,9 @@ spec:
                 with (
                     mock.patch.object(self.reference, "clusters", return_value=set()),
                     mock.patch.object(
+                        self.reference, "_reservation_creator_is_live", return_value=False
+                    ),
+                    mock.patch.object(
                         self.reference,
                         "_remove_cluster_state_files_durably",
                         wraps=self.reference._remove_cluster_state_files_durably,
@@ -2800,6 +2803,223 @@ spec:
             finally:
                 self.reference.MARKERS = original_markers
                 self.reference.KUBECONFIGS = original_kubeconfigs
+
+    def test_creation_reservation_preserves_marker_while_creator_descendant_is_live(
+        self,
+    ) -> None:
+        commit = "a" * 40
+        owner = "owner-live-descendant"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_markers = self.reference.MARKERS
+            original_kubeconfigs = self.reference.KUBECONFIGS
+            self.reference.MARKERS = root / "clusters"
+            self.reference.KUBECONFIGS = root / "kubeconfigs"
+            try:
+                with (
+                    mock.patch.object(self.reference, "clusters", return_value=set()),
+                    mock.patch.object(
+                        self.reference, "_reservation_creator_is_live", return_value=True
+                    ) as creator_live,
+                    mock.patch.object(
+                        self.reference, "_remove_cluster_state_files_durably"
+                    ) as durable_cleanup,
+                ):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "create timed out"
+                    ):
+                        with self.reference.cluster_creation_reservation(
+                            "kind", "proof", commit, owner
+                        ):
+                            raise self.reference.ProofError("create timed out")
+                creator_live.assert_called_once()
+                durable_cleanup.assert_not_called()
+                self.assertTrue(self.reference.marker_path("proof").is_file())
+                marker = json.loads(
+                    self.reference.marker_path("proof").read_text(encoding="utf-8")
+                )
+                self.assertRegex(marker.get("creation_token", ""), r"^[0-9a-f]{64}$")
+            finally:
+                self.reference.MARKERS = original_markers
+                self.reference.KUBECONFIGS = original_kubeconfigs
+
+    def test_reference_clears_only_exact_stale_creation_reservation(self) -> None:
+        commit = "a" * 40
+        owner = "owner-stale-reservation"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markers = root / "clusters"
+            kubeconfigs = root / "kubeconfigs"
+            original_markers = self.reference.MARKERS
+            original_kubeconfigs = self.reference.KUBECONFIGS
+            self.reference.MARKERS = markers
+            self.reference.KUBECONFIGS = kubeconfigs
+            try:
+                creation_token = "1" * 64
+                with self.reference.cluster_ownership_lock("proof"):
+                    self.reference._write_marker_locked(
+                        "proof", commit, owner, creation_token=creation_token
+                    )
+                self.reference.kubeconfig_path("proof").parent.mkdir(parents=True, exist_ok=True)
+                self.reference.kubeconfig_path("proof").write_text("apiVersion: v1\n", encoding="utf-8")
+                with (
+                    mock.patch.object(self.reference, "clusters", return_value=set()),
+                    mock.patch.object(
+                        self.reference, "_reservation_creator_is_live", return_value=False
+                    ) as creator_live,
+                ):
+                    cleared = self.reference.clear_stale_cluster_reservation(
+                        "kind",
+                        "proof",
+                        expected_commit=commit,
+                        expected_owner_id=owner,
+                    )
+                self.assertEqual(creator_live.call_count, 2)
+                creator_live.assert_has_calls(
+                    [mock.call(creation_token), mock.call(creation_token)]
+                )
+                self.assertTrue(cleared)
+                self.assertFalse(self.reference.marker_path("proof").exists())
+                self.assertFalse(self.reference.kubeconfig_path("proof").exists())
+            finally:
+                self.reference.MARKERS = original_markers
+                self.reference.KUBECONFIGS = original_kubeconfigs
+
+    def test_reference_stale_reservation_cleanup_requires_stable_quiescence(
+        self,
+    ) -> None:
+        commit = "a" * 40
+        owner = "owner-stale-reservation"
+        creation_token = "3" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_markers = self.reference.MARKERS
+            original_kubeconfigs = self.reference.KUBECONFIGS
+            self.reference.MARKERS = root / "clusters"
+            self.reference.KUBECONFIGS = root / "kubeconfigs"
+            try:
+                with self.reference.cluster_ownership_lock("proof"):
+                    self.reference._write_marker_locked(
+                        "proof", commit, owner, creation_token=creation_token
+                    )
+                with (
+                    mock.patch.object(self.reference, "clusters", return_value=set()),
+                    mock.patch.object(
+                        self.reference,
+                        "_reservation_creator_is_live",
+                        side_effect=[False, True],
+                    ) as creator_live,
+                    mock.patch.object(self.reference.time, "sleep") as sleep,
+                ):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "original Kind creator is still running"
+                    ):
+                        self.reference.clear_stale_cluster_reservation(
+                            "kind",
+                            "proof",
+                            expected_commit=commit,
+                            expected_owner_id=owner,
+                        )
+                self.assertEqual(creator_live.call_count, 2)
+                sleep.assert_called_once_with(
+                    self.reference.KIND_CREATOR_QUIET_SECONDS
+                )
+                self.assertTrue(self.reference.marker_path("proof").exists())
+            finally:
+                self.reference.MARKERS = original_markers
+                self.reference.KUBECONFIGS = original_kubeconfigs
+
+    def test_reference_stale_reservation_cleanup_refuses_live_creator(self) -> None:
+        commit = "a" * 40
+        owner = "owner-stale-reservation"
+        creation_token = "2" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_markers = self.reference.MARKERS
+            original_kubeconfigs = self.reference.KUBECONFIGS
+            self.reference.MARKERS = root / "clusters"
+            self.reference.KUBECONFIGS = root / "kubeconfigs"
+            try:
+                with self.reference.cluster_ownership_lock("proof"):
+                    self.reference._write_marker_locked(
+                        "proof", commit, owner, creation_token=creation_token
+                    )
+                with (
+                    mock.patch.object(self.reference, "clusters", return_value=set()),
+                    mock.patch.object(
+                        self.reference, "_reservation_creator_is_live", return_value=True
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "original Kind creator is still running"
+                    ):
+                        self.reference.clear_stale_cluster_reservation(
+                            "kind",
+                            "proof",
+                            expected_commit=commit,
+                            expected_owner_id=owner,
+                        )
+                self.assertTrue(self.reference.marker_path("proof").exists())
+            finally:
+                self.reference.MARKERS = original_markers
+                self.reference.KUBECONFIGS = original_kubeconfigs
+
+    def test_reference_stale_reservation_cleanup_refuses_tokenless_marker(self) -> None:
+        commit = "a" * 40
+        owner = "owner-stale-reservation"
+        with tempfile.TemporaryDirectory() as tmp:
+            original = self.reference.MARKERS
+            self.reference.MARKERS = Path(tmp)
+            try:
+                self.reference.write_marker("proof", commit, owner)
+                with mock.patch.object(self.reference, "clusters", return_value=set()):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "creator quiescence token is missing"
+                    ):
+                        self.reference.clear_stale_cluster_reservation(
+                            "kind",
+                            "proof",
+                            expected_commit=commit,
+                            expected_owner_id=owner,
+                        )
+                self.assertTrue(self.reference.marker_path("proof").exists())
+            finally:
+                self.reference.MARKERS = original
+
+    def test_reference_stale_reservation_cleanup_refuses_live_or_foreign_state(self) -> None:
+        commit = "a" * 40
+        owner = "owner-stale-reservation"
+        with tempfile.TemporaryDirectory() as tmp:
+            original = self.reference.MARKERS
+            self.reference.MARKERS = Path(tmp)
+            try:
+                self.reference.write_marker("proof", commit, owner)
+                with mock.patch.object(
+                    self.reference, "clusters", return_value={"proof"}
+                ):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "cluster exists"
+                    ):
+                        self.reference.clear_stale_cluster_reservation(
+                            "kind",
+                            "proof",
+                            expected_commit=commit,
+                            expected_owner_id=owner,
+                        )
+                self.assertTrue(self.reference.marker_path("proof").exists())
+                with mock.patch.object(self.reference, "clusters", return_value=set()):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "exact owner binding"
+                    ):
+                        self.reference.clear_stale_cluster_reservation(
+                            "kind",
+                            "proof",
+                            expected_commit=commit,
+                            expected_owner_id="different-owner",
+                        )
+                self.assertTrue(self.reference.marker_path("proof").exists())
+            finally:
+                self.reference.MARKERS = original
 
     def test_reference_refuses_cluster_without_marker_in_if_present_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

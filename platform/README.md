@@ -124,6 +124,80 @@ gebunden; ein stilles Umbinden des Datenpfads an ein inzwischen weitergelaufenes
 abgeschlossen ist, verweigert `up` fail-closed eine Rückschreibung auf den
 Bootstrap-Zustand.
 
+### Delete-to-Prove nach aktivierter Staging-App
+
+Für eine bereits aktivierte und `gateway-ready` Zelle existiert deshalb ein
+separater, enger Recovery-Pfad. Er dient ausschließlich dem Reproduzierbarkeits-
+beweis der Staging-Zelle und ersetzt **nicht** `up`. Vor der Clusterlöschung
+schreibt `down` ein privates `cluster-delete-in-progress`-Receipt, das Owner,
+Bootstrap-Commit, aktiven App-Commit sowie die SHA-256-Identitäten von Cell- und
+Gateway-Receipt bindet. Erst danach darf Kind gelöscht werden. Wird der Vorgang
+dazwischen unterbrochen, kann exakt derselbe `down`-Aufruf anhand dieses Receipts
+idempotent fortgesetzt werden. Ein Delete-to-Prove ist nur gültig, wenn der
+Cluster beim ersten Löschversuch tatsächlich vorhanden war und der finale
+`cell-down.json` den Status `cluster-deleted-state-preserved` trägt.
+
+Danach rekonstruiert `rebuild` ausschließlich die Infrastruktur aus dem erhaltenen
+State-Root. Es verlangt denselben Owner, denselben Bootstrap-Commit, denselben
+aktiven Public-`main`-Commit, **dieselbe Promotion-Receipt-Identität samt denselben
+Image-Digests**, unveränderte private Runtime-/Registry-Secrets und dieselben
+persistenten PostgreSQL-/NATS-Verzeichnisanker. `down` bindet dafür zunächst die
+Verzeichnisidentität vor dem Löschen und nach erfolgreichem Cluster-Shutdown die
+**exakte quieszente Datenidentität einschließlich eines deterministischen rekursiven
+SHA-256-Fingerprints der enthaltenen Dateien**. Symlinks, Spezialdateien oder eine
+während der Fingerprint-Bildung veränderte Datenstruktur werden fail-closed
+abgewiesen. `rebuild` verlangt diese Post-Delete-Identität vor dem ersten erneuten
+Mount; nach dem Wiederanlauf dürfen die Datenbanken wieder schreiben, solange der
+physische Verzeichnisanker unverändert bleibt.
+
+Beim ersten Recovery-Lauf muss der alte Cluster nachweislich abwesend sein. Ein vor
+der Clustererzeugung geschriebenes `cell-rebuild.json` macht auch diesen Schritt
+wiederaufnehmbar. Jede Kind-Erzeugung erhält zusätzlich einen zufälligen
+Creator-Token, der **vor dem Start des `kind create`-Prozesses** im Ownership-Marker
+gesichert und in dessen Prozess-Environment weitergereicht wird. Bleibt nach einem
+Prozessabbruch nur die exakt an Owner und Bootstrap-Commit gebundene
+Kind-Erzeugungsreservierung zurück, darf `rebuild` sie erst entfernen, wenn kein
+Prozess mit genau diesem Token mehr lebt **und** der Cluster danach weiterhin
+abwesend ist. Ein tokenloser Altmarker, ein noch lebender Erzeuger, eine fremde
+Reservierung oder ein sichtbarer Cluster bleiben fail-closed. `rebuild` stellt Kind,
+Cilium/Flux, Secrets und die persistente Datenebene wieder her, aktiviert die App
+aber absichtlich noch nicht.
+
+Vor der anschließenden `activate`-Phase werden `cell-down.json` und
+`cell-rebuild.json` erneut gelesen und die gebundene Promotion-Receipt-SHA sowie die
+API-/Web-Image-Digests **vor Registry-, Cluster-, Migration- oder Rollout-Mutationen**
+mit der aktuellen Promotion verglichen. Die Bindung wird auch im
+`app-activation-in-progress`-Receipt getragen, damit ein Crash-Retry nicht auf eine
+andere gültige Promotion desselben Commits wechseln kann.
+
+Eine bereits aktivierte Zelle darf für Delete-to-Prove nur aus `gateway-ready`
+heruntergefahren werden. Solange `cell-down.json`, `cell-rebuild.json` oder ein
+finales `delete-to-prove.json` den bestehenden Zyklus belegen, wird kein zweiter
+Destruktivzyklus mit neuer Receipt-Identität darübergeschrieben. Eine spätere
+Mehrfachausführung braucht daher einen eigenen, expliziten Receipt-Rotationsvertrag.
+
+Der vollständige Beweisablauf ist damit:
+
+```bash
+uv run --project tools/py --locked python scripts/platform/staging_cell.py down \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py rebuild \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$COMMONTHING_MAIN_SHA"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py activate \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$COMMONTHING_MAIN_SHA"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py prove-gateway \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$COMMONTHING_MAIN_SHA"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py prove-delete-to-prove \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$COMMONTHING_MAIN_SHA"
+```
+
+`prove-delete-to-prove` akzeptiert nur die rekonstruierte, erneut aktivierte und
+`gateway-ready` Zelle. Das finale `delete-to-prove.json` bindet die alten und neuen
+Cell-/Gateway-Receipt-Hashes sowie Down-/Rebuild-Receipt und verlangt, dass die
+Post-Rebuild-Beweise tatsächlich neue Identitäten haben. Der Pfad setzt
+`production_changed=false` und belegt weiterhin **nicht** DNS, TLS, einen externen
+Load Balancer oder einen Produktionscutover.
+
 Ein **App-Release** ist davon getrennt: `activate --owner-id <id>
 --source-commit <sha>` akzeptiert nur einen exakten aktuellen Public-`main`-Commit
 mit passendem Staging-Image-Promotion-Receipt. PostgreSQL/NATS und ihre
