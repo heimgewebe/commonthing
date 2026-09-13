@@ -3474,6 +3474,10 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         promotion = load_promotion_receipt(root, commit)
         migration_plan_value = migration_plan(commit, promotion)
 
+    delete_to_prove_recovery = _delete_to_prove_reactivation_binding(
+        root, cell, commit, promotion
+    )
+
     registry_material, registry_source_sha = load_registry_pull_material(root)
     pending_config_sha256 = sha256_bytes(
         registry_dockerconfig_json(registry_material).encode("utf-8")
@@ -3515,6 +3519,11 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
                 "secret_name": REGISTRY_SECRET,
                 "registry": GHCR_REGISTRY,
             },
+            **(
+                {"pending_delete_to_prove_recovery": delete_to_prove_recovery}
+                if delete_to_prove_recovery is not None
+                else {}
+            ),
             "production_changed": False,
         }
         write_cell_receipt(root, pending_state)
@@ -3583,6 +3592,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
             "pending_image_promotion",
             "pending_migration",
             "pending_registry_pull_secret",
+            "pending_delete_to_prove_recovery",
         }
     }
     updated = {
@@ -4685,8 +4695,83 @@ def _exact_cell_promotion(root: Path, cell: dict[str, Any], commit: str) -> dict
     return expected
 
 
-def _retained_data_identity(root: Path) -> dict[str, dict[str, int]]:
-    identity: dict[str, dict[str, int]] = {}
+def _retained_tree_sha256(path: Path, *, label: str) -> str:
+    digest = hashlib.sha256()
+
+    def walk(directory: Path) -> None:
+        try:
+            directory_before = directory.stat(follow_symlinks=False)
+            entries = sorted(directory.iterdir(), key=lambda item: os.fsencode(item.name))
+        except OSError as error:
+            raise StagingCellError(f"{label} cannot be fingerprinted") from error
+        for entry in entries:
+            relative = entry.relative_to(path)
+            encoded_relative = os.fsencode(str(relative))
+            try:
+                before = entry.lstat()
+            except OSError as error:
+                raise StagingCellError(f"{label} changed during fingerprinting") from error
+            if stat.S_ISLNK(before.st_mode):
+                raise StagingCellError(f"{label} contains a symlink: {relative}")
+            if stat.S_ISDIR(before.st_mode):
+                digest.update(b"D\0" + encoded_relative + b"\0")
+                walk(entry)
+                continue
+            if not stat.S_ISREG(before.st_mode):
+                raise StagingCellError(
+                    f"{label} contains unsupported filesystem state: {relative}"
+                )
+            digest.update(b"F\0" + encoded_relative + b"\0")
+            try:
+                with entry.open("rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                after = entry.lstat()
+            except OSError as error:
+                raise StagingCellError(f"{label} changed during fingerprinting") from error
+            stable_file_fields = (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+            if any(getattr(before, field) != getattr(after, field) for field in stable_file_fields):
+                raise StagingCellError(f"{label} changed during fingerprinting")
+            digest.update(b"\0")
+        try:
+            directory_after = directory.stat(follow_symlinks=False)
+        except OSError as error:
+            raise StagingCellError(f"{label} changed during fingerprinting") from error
+        stable_directory_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_gid",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(directory_before, field) != getattr(directory_after, field)
+            for field in stable_directory_fields
+        ):
+            raise StagingCellError(f"{label} changed during fingerprinting")
+
+    walk(path)
+    return digest.hexdigest()
+
+
+def _retained_data_identity(
+    root: Path, *, include_content: bool = True
+) -> dict[str, dict[str, Any]]:
+    identity: dict[str, dict[str, Any]] = {}
     for name in ("postgres", "nats"):
         if not retained_data_directory_exists(root, name):
             raise StagingCellError(
@@ -4695,17 +4780,22 @@ def _retained_data_identity(root: Path) -> dict[str, dict[str, int]]:
         path = root / "data" / name
         stable = _real_directory_identity(path, label=f"retained {name} data")
         linked = path.lstat()
-        identity[name] = {
+        observed: dict[str, Any] = {
             **stable,
             "size": linked.st_size,
             "mtime_ns": linked.st_mtime_ns,
             "ctime_ns": linked.st_ctime_ns,
         }
+        if include_content:
+            observed["tree_sha256"] = _retained_tree_sha256(
+                path, label=f"retained {name} data"
+            )
+        identity[name] = observed
     return identity
 
 
 def _same_retained_data_anchors(
-    before: dict[str, dict[str, int]], after: dict[str, dict[str, int]]
+    before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]]
 ) -> bool:
     anchor_fields = ("device", "inode", "uid", "gid", "mode")
     return all(
@@ -4721,7 +4811,7 @@ def _down_receipt_binding(
     cell_sha: str,
     gateway_sha: str,
     *,
-    data_identity: dict[str, dict[str, int]] | None = None,
+    data_identity: dict[str, dict[str, Any]] | None = None,
     image_promotion: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -4794,7 +4884,9 @@ def load_delete_to_prove_down_receipt(
         raise StagingCellError(
             "retained staging data directory anchor changed during cluster deletion"
         )
-    observed_data_identity = _retained_data_identity(root)
+    observed_data_identity = _retained_data_identity(
+        root, include_content=require_retained_data_match
+    )
     if require_retained_data_match:
         if retained_data_identity != observed_data_identity:
             raise StagingCellError(
@@ -4860,7 +4952,9 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         if gateway_binding.get("active_commit") != cell_active_commit(cell):
             raise StagingCellError("staging gateway proof active commit changed before down")
 
-    pre_delete_data_identity = _retained_data_identity(root) if activated else None
+    pre_delete_data_identity = (
+        _retained_data_identity(root, include_content=False) if activated else None
+    )
     image_promotion = (
         _exact_cell_promotion(root, cell, cell_active_commit(cell))
         if activated
@@ -5003,6 +5097,68 @@ def _rebuild_receipt_binding(
         "down_receipt_sha256": down["receipt_sha256"],
         "production_changed": False,
     }
+
+
+def _delete_to_prove_reactivation_binding(
+    root: Path,
+    cell: dict[str, Any],
+    commit: str,
+    promotion: dict[str, Any],
+) -> dict[str, Any] | None:
+    rebuild_path = root / CELL_REBUILD_RECEIPT
+    if not (rebuild_path.exists() or rebuild_path.is_symlink()):
+        return None
+    rebuild = _private_json_receipt(rebuild_path, label="staging rebuild receipt")
+    final_path = root / DELETE_TO_PROVE_RECEIPT
+    if final_path.exists() or final_path.is_symlink():
+        final = _private_json_receipt(final_path, label="delete-to-prove receipt")
+        if (
+            final.get("status") != "delete-to-prove-verified"
+            or final.get("rebuild_receipt_sha256") != sha256_file(rebuild_path)
+        ):
+            raise StagingCellError(
+                "delete-to-prove terminal receipt lost its rebuild binding"
+            )
+        return None
+    if rebuild.get("status") != "infrastructure-rebuilt-app-reactivation-required":
+        raise StagingCellError(
+            "delete-to-prove recovery must finish infrastructure rebuild before activation"
+        )
+    if rebuild.get("active_commit") != commit:
+        raise StagingCellError(
+            "delete-to-prove recovery must reactivate the exact pre-delete app commit"
+        )
+    activation_in_progress = cell.get("status") == "app-activation-in-progress"
+    down = load_delete_to_prove_down_receipt(
+        root,
+        cell,
+        require_current_cell_match=not activation_in_progress,
+        require_retained_data_match=False,
+    )
+    expected_rebuild = _rebuild_receipt_binding(cell, down, commit)
+    _require_receipt_binding(
+        rebuild, expected_rebuild, label="staging rebuild receipt before reactivation"
+    )
+    promotion_identity = {
+        "status": "pass",
+        "source_commit": commit,
+        "receipt_sha256": promotion["receipt_sha256"],
+        "images": promotion["images"],
+    }
+    if rebuild.get("image_promotion") != promotion_identity:
+        raise StagingCellError(
+            "promotion evidence differs from the pre-delete release before reactivation"
+        )
+    binding = {
+        "down_receipt_sha256": down["receipt_sha256"],
+        "rebuild_receipt_sha256": sha256_file(rebuild_path),
+        "image_promotion": promotion_identity,
+    }
+    if activation_in_progress and cell.get("pending_delete_to_prove_recovery") != binding:
+        raise StagingCellError(
+            "activation recovery lost its delete-to-prove rebuild binding"
+        )
+    return binding
 
 
 @lifecycle_mutation_locked

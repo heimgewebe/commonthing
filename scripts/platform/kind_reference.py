@@ -51,6 +51,7 @@ TRANSIENT_KIND_CREATE_MARKERS = (
     "service unavailable",
     "gateway timeout",
 )
+KIND_CREATE_RESERVATION_ENV = "COMMONTHING_KIND_CREATE_RESERVATION"
 GATEWAY_API_ARTIFACTS = (
     "gateway_api_gatewayclasses",
     "gateway_api_gateways",
@@ -70,6 +71,7 @@ def run(
     input_text: str | None = None,
     capture: bool = False,
     timeout: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     print("+", " ".join(argv), flush=True)
     return subprocess.run(
@@ -80,6 +82,7 @@ def run(
         check=True,
         capture_output=capture,
         timeout=timeout,
+        env=env,
     )
 
 
@@ -689,8 +692,16 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _write_marker_locked(name: str, commit: str, owner_id: str) -> None:
+def _write_marker_locked(
+    name: str,
+    commit: str,
+    owner_id: str,
+    *,
+    creation_token: str | None = None,
+) -> None:
     validate_ownership_binding(commit, owner_id)
+    if creation_token is not None and re.fullmatch(r"[0-9a-f]{64}", creation_token) is None:
+        raise ProofError("cluster creation reservation token is invalid")
     MARKERS.mkdir(parents=True, exist_ok=True)
     marker = marker_path(name)
     temporary = MARKERS / f".{name}.{os.getpid()}.{secrets.token_hex(8)}.marker.tmp"
@@ -702,6 +713,8 @@ def _write_marker_locked(name: str, commit: str, owner_id: str) -> None:
         "owner_id": owner_id,
         "pid": os.getpid(),
     }
+    if creation_token is not None:
+        payload["creation_token"] = creation_token
     try:
         with temporary.open("x", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
@@ -763,9 +776,12 @@ def cluster_creation_reservation(
                 f"cluster {name!r} has a stale ownership marker; "
                 "explicit exact-owner cleanup is required"
             )
-        _write_marker_locked(name, commit, owner_id)
+        creation_token = secrets.token_hex(32)
+        _write_marker_locked(
+            name, commit, owner_id, creation_token=creation_token
+        )
         try:
-            yield
+            yield creation_token
         except Exception:
             rollback_error: Exception | None = None
             try:
@@ -773,6 +789,14 @@ def cluster_creation_reservation(
                     run([kind, "delete", "cluster", "--name", name])
             except Exception as error:
                 rollback_error = error
+            if rollback_error is None:
+                try:
+                    if _reservation_creator_is_live(creation_token):
+                        rollback_error = ProofError(
+                            "cluster creator process remains live after creation failure"
+                        )
+                except Exception as error:
+                    rollback_error = error
             if rollback_error is None:
                 _remove_cluster_state_files_durably(name, marker_missing_ok=True)
             else:
@@ -856,6 +880,37 @@ def delete_owned_cluster_if_present(
         return False
 
 
+def _reservation_creator_is_live(creation_token: str) -> bool:
+    if re.fullmatch(r"[0-9a-f]{64}", creation_token) is None:
+        raise ProofError("cluster creation reservation token is invalid")
+    proc = Path("/proc")
+    if not proc.is_dir():
+        raise ProofError("cannot prove cluster creator quiescence without /proc")
+    needle = f"{KIND_CREATE_RESERVATION_ENV}={creation_token}".encode()
+    try:
+        processes = list(proc.iterdir())
+    except OSError as error:
+        raise ProofError(f"cannot enumerate cluster creator processes: {error}") from error
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            environment = (process / "environ").read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            # Unrelated processes may be unreadable; a Kind creator launched by
+            # this user remains readable and carries the exact random token.
+            continue
+        except OSError as error:
+            raise ProofError(
+                f"cannot prove cluster creator quiescence from {process}: {error}"
+            ) from error
+        if needle in environment.split(b"\0"):
+            return True
+    return False
+
+
 def clear_stale_cluster_reservation(
     kind: str,
     name: str,
@@ -863,10 +918,12 @@ def clear_stale_cluster_reservation(
     expected_commit: str,
     expected_owner_id: str,
 ) -> bool:
-    """Clear only an exact-bound creation reservation for an absent cluster.
+    """Clear only an exact-bound, demonstrably quiescent creation reservation.
 
-    This is narrower than cluster deletion: if Kind can already observe the
-    cluster, recovery must use the normal owned-cluster path instead.
+    An absent cluster snapshot alone is insufficient: an orphaned ``kind create``
+    process could still publish the cluster after recovery starts. Creation gets a
+    random process-environment token persisted in the marker, and cleanup refuses
+    while any process carrying that exact token is still alive.
     """
     with cluster_ownership_lock(name):
         if name in clusters(kind):
@@ -882,6 +939,24 @@ def clear_stale_cluster_reservation(
             expected_commit=expected_commit,
             expected_owner_id=expected_owner_id,
         )
+        creation_token = data.get("creation_token")
+        if not isinstance(creation_token, str) or re.fullmatch(
+            r"[0-9a-f]{64}", creation_token
+        ) is None:
+            raise ProofError(
+                f"refusing stale reservation cleanup for cluster {name!r}: "
+                "creator quiescence token is missing"
+            )
+        if _reservation_creator_is_live(creation_token):
+            raise ProofError(
+                f"refusing stale reservation cleanup for cluster {name!r}: "
+                "original Kind creator is still running"
+            )
+        if name in clusters(kind):
+            raise ProofError(
+                f"refusing stale reservation cleanup for cluster {name!r}: "
+                "cluster became visible during creator-quiescence proof"
+            )
         _remove_cluster_state_files_durably(name)
         return True
 
@@ -924,8 +999,17 @@ def create_kind_cluster(
     ]
     for attempt in range(KIND_CREATE_ATTEMPTS):
         try:
-            with cluster_creation_reservation(kind, name, commit, owner_id):
-                result = run(command, capture=True, timeout=timeout)
+            with cluster_creation_reservation(
+                kind, name, commit, owner_id
+            ) as creation_token:
+                creation_env = os.environ.copy()
+                creation_env[KIND_CREATE_RESERVATION_ENV] = str(creation_token)
+                result = run(
+                    command,
+                    capture=True,
+                    timeout=timeout,
+                    env=creation_env,
+                )
                 if result.stdout:
                     print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
                 if result.stderr:

@@ -142,19 +142,33 @@ State-Root. Es verlangt denselben Owner, denselben Bootstrap-Commit, denselben
 aktiven Public-`main`-Commit, **dieselbe Promotion-Receipt-Identität samt denselben
 Image-Digests**, unveränderte private Runtime-/Registry-Secrets und dieselben
 persistenten PostgreSQL-/NATS-Verzeichnisanker. `down` bindet dafür zunächst die
-Verzeichnisidentität vor dem Löschen und nach erfolgreichem Cluster-Shutdown noch
-einmal die exakte erhaltene Identität. `rebuild` verlangt diese Post-Delete-Identität
-vor dem ersten erneuten Mount; nach dem Wiederanlauf dürfen die Datenbanken wieder
-schreiben, solange der physische Verzeichnisanker unverändert bleibt.
+Verzeichnisidentität vor dem Löschen und nach erfolgreichem Cluster-Shutdown die
+**exakte quieszente Datenidentität einschließlich eines deterministischen rekursiven
+SHA-256-Fingerprints der enthaltenen Dateien**. Symlinks, Spezialdateien oder eine
+während der Fingerprint-Bildung veränderte Datenstruktur werden fail-closed
+abgewiesen. `rebuild` verlangt diese Post-Delete-Identität vor dem ersten erneuten
+Mount; nach dem Wiederanlauf dürfen die Datenbanken wieder schreiben, solange der
+physische Verzeichnisanker unverändert bleibt.
 
 Beim ersten Recovery-Lauf muss der alte Cluster nachweislich abwesend sein. Ein vor
 der Clustererzeugung geschriebenes `cell-rebuild.json` macht auch diesen Schritt
-wiederaufnehmbar. Bleibt nach einem Prozessabbruch nur die exakt an Owner und
-Bootstrap-Commit gebundene Kind-Erzeugungsreservierung zurück, darf `rebuild` diese
-**nur bei weiterhin abwesendem Cluster** entfernen und die Erzeugung wiederholen;
-fremde Reservierungen oder ein bereits sichtbarer Cluster bleiben fail-closed.
-`rebuild` stellt Kind, Cilium/Flux, Secrets und die persistente Datenebene wieder her,
-aktiviert die App aber absichtlich noch nicht.
+wiederaufnehmbar. Jede Kind-Erzeugung erhält zusätzlich einen zufälligen
+Creator-Token, der **vor dem Start des `kind create`-Prozesses** im Ownership-Marker
+gesichert und in dessen Prozess-Environment weitergereicht wird. Bleibt nach einem
+Prozessabbruch nur die exakt an Owner und Bootstrap-Commit gebundene
+Kind-Erzeugungsreservierung zurück, darf `rebuild` sie erst entfernen, wenn kein
+Prozess mit genau diesem Token mehr lebt **und** der Cluster danach weiterhin
+abwesend ist. Ein tokenloser Altmarker, ein noch lebender Erzeuger, eine fremde
+Reservierung oder ein sichtbarer Cluster bleiben fail-closed. `rebuild` stellt Kind,
+Cilium/Flux, Secrets und die persistente Datenebene wieder her, aktiviert die App
+aber absichtlich noch nicht.
+
+Vor der anschließenden `activate`-Phase werden `cell-down.json` und
+`cell-rebuild.json` erneut gelesen und die gebundene Promotion-Receipt-SHA sowie die
+API-/Web-Image-Digests **vor Registry-, Cluster-, Migration- oder Rollout-Mutationen**
+mit der aktuellen Promotion verglichen. Die Bindung wird auch im
+`app-activation-in-progress`-Receipt getragen, damit ein Crash-Retry nicht auf eine
+andere gültige Promotion desselben Commits wechseln kann.
 
 Eine bereits aktivierte Zelle darf für Delete-to-Prove nur aus `gateway-ready`
 heruntergefahren werden. Solange `cell-down.json`, `cell-rebuild.json` oder ein

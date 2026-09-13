@@ -174,7 +174,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     cell,
                     cell_sha,
                     gateway_sha,
-                    data_identity=staging._retained_data_identity(root),
+                    data_identity=staging._retained_data_identity(
+                        root, include_content=False
+                    ),
                     image_promotion=cell["image_promotion"],
                 ),
                 "retained_data_identity": staging._retained_data_identity(root),
@@ -1374,6 +1376,89 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 ):
                     staging.command_rebuild(args)
             create_mock.assert_not_called()
+
+    def test_delete_to_prove_rebuild_rejects_in_place_retained_data_change(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "8" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-rebuild-data-content-drift-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            self._prepare_delete_to_prove_state(root, owner=owner, commit=commit)
+            marker = root / "data/nats/jetstream.marker"
+            original = marker.read_bytes()
+            marker.write_bytes(b"x" * len(original))
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=commit),
+                mock.patch.object(staging.reference, "create_kind_cluster") as create_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "data identity differs"
+                ):
+                    staging.command_rebuild(args)
+            create_mock.assert_not_called()
+
+    def test_delete_to_prove_reactivation_rejects_replaced_promotion_before_mutation(
+        self,
+    ) -> None:
+        owner = "owner-a"
+        commit = "4" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=commit
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-reactivation-promotion-drift-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            cell, down, *_ = self._prepare_delete_to_prove_state(
+                root, owner=owner, commit=commit
+            )
+            staging.atomic_json(
+                root / staging.CELL_REBUILD_RECEIPT,
+                {
+                    **staging._rebuild_receipt_binding(cell, down, commit),
+                    "status": "infrastructure-rebuilt-app-reactivation-required",
+                    "completed_at_unix": 12,
+                },
+            )
+            path = root / "promotion" / commit / "receipt.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            digest = "sha256:" + "9" * 64
+            payload["images"]["web"]["digest"] = digest
+            payload["images"]["web"]["canonical_reference"] = (
+                "ghcr.io/heimgewebe/commonthing-web@" + digest
+            )
+            staging.atomic_json(path, payload)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=commit),
+                mock.patch.object(staging, "load_registry_pull_material") as registry_mock,
+                mock.patch.object(
+                    staging.reference, "require_owned_cluster"
+                ) as cluster_mock,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "promotion evidence differs"
+                ):
+                    staging.command_activate(args)
+            registry_mock.assert_not_called()
+            cluster_mock.assert_not_called()
 
     def test_delete_to_prove_rebuild_rejects_replaced_retained_data_directory(
         self,
