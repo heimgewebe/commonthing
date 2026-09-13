@@ -314,15 +314,22 @@ class StagingGatewayTests(unittest.TestCase):
             self.get_resource(k, kind, n, ns) if kind == "GatewayClass" else existing
         )
         staging.command_prove_gateway(self.args)
-        changed = copy.deepcopy(existing)
-        changed["metadata"]["annotations"][
-            staging.GATEWAY_MANIFEST_SHA256_ANNOTATION
-        ] = "d" * 64
-        self.get.side_effect = lambda k, kind, n, ns="": (
-            self.get_resource(k, kind, n, ns) if kind == "GatewayClass" else changed
-        )
-        with self.assertRaisesRegex(staging.StagingCellError, "exact owner/app/manifest"):
-            staging.command_prove_gateway(self.args)
+        for annotation, wrong_value in (
+            (staging.GATEWAY_ACTIVE_COMMIT_ANNOTATION, "d" * 40),
+            (staging.GATEWAY_MANIFEST_SHA256_ANNOTATION, "d" * 64),
+        ):
+            with self.subTest(annotation=annotation):
+                changed = copy.deepcopy(existing)
+                changed["metadata"]["annotations"][annotation] = wrong_value
+                self.get.side_effect = lambda k, kind, n, ns="", changed=changed: (
+                    self.get_resource(k, kind, n, ns)
+                    if kind == "GatewayClass"
+                    else changed
+                )
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "exact owner/app/manifest"
+                ):
+                    staging.command_prove_gateway(self.args)
 
     def test_changed_resources_during_probe_fail(self):
         self.mocks["staging_gateway_observation"].side_effect = [
@@ -556,6 +563,10 @@ class StagingGatewayTests(unittest.TestCase):
         observed = self._real_observation_with_inventory()
         self.assertEqual(observed["service"]["name"], "controller-chosen-name")
 
+    def test_observation_rejects_missing_gateway_service(self):
+        with self.assertRaisesRegex(staging.StagingCellError, "exactly one Cilium"):
+            self._real_observation_with_inventory(service_count=0)
+
     def test_desired_contract_normalizes_gateway_api_reference_defaults(self):
         desired = copy.deepcopy(self.docs[1])
         live = copy.deepcopy(desired)
@@ -570,6 +581,20 @@ class StagingGatewayTests(unittest.TestCase):
                     weight=1,
                 )
         self.assertEqual(
+            staging.gateway_routing_contract(desired),
+            staging.gateway_routing_contract(live),
+        )
+
+    def test_desired_contract_normalizes_gateway_listener_defaults(self):
+        desired = copy.deepcopy(self.docs[0])
+        live = copy.deepcopy(desired)
+        del desired["spec"]["listeners"][0]["allowedRoutes"]["namespaces"]["from"]
+        self.assertEqual(
+            staging.gateway_routing_contract(desired),
+            staging.gateway_routing_contract(live),
+        )
+        live["spec"]["listeners"][0]["hostname"] = "staging.example.invalid"
+        self.assertNotEqual(
             staging.gateway_routing_contract(desired),
             staging.gateway_routing_contract(live),
         )

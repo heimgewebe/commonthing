@@ -3795,19 +3795,82 @@ def gateway_routing_contract(document: dict) -> dict[str, Any]:
     if kind not in {"Gateway", "HTTPRoute"}:
         raise StagingCellError("unexpected resource in staging gateway routing contract")
     namespace = document.get("metadata", {}).get("namespace", APP_NAMESPACE)
-    spec = copy.deepcopy(document.get("spec", {}))
-    if kind == "HTTPRoute":
-        for parent in spec.get("parentRefs", []):
-            parent.setdefault("group", "gateway.networking.k8s.io")
-            parent.setdefault("kind", "Gateway")
-            parent.setdefault("namespace", namespace)
-        for rule in spec.get("rules", []):
-            for backend in rule.get("backendRefs", []):
-                backend.setdefault("group", "")
-                backend.setdefault("kind", "Service")
-                backend.setdefault("namespace", namespace)
-                backend.setdefault("weight", 1)
-    return spec
+    spec = document.get("spec", {})
+    if kind == "Gateway":
+        listeners = []
+        for listener in spec.get("listeners", []):
+            allowed = listener.get("allowedRoutes", {})
+            namespaces = allowed.get("namespaces", {})
+            listeners.append(
+                {
+                    "name": listener.get("name"),
+                    "protocol": listener.get("protocol"),
+                    "port": listener.get("port"),
+                    "hostname": listener.get("hostname"),
+                    "tls": copy.deepcopy(listener.get("tls")),
+                    "allowedRoutes": {
+                        "namespaces": {
+                            "from": namespaces.get("from", "Same"),
+                            "selector": copy.deepcopy(namespaces.get("selector")),
+                        },
+                        "kinds": (
+                            [
+                                {
+                                    "group": route_kind.get(
+                                        "group", "gateway.networking.k8s.io"
+                                    ),
+                                    "kind": route_kind.get("kind"),
+                                }
+                                for route_kind in allowed.get("kinds", [])
+                            ]
+                            if "kinds" in allowed
+                            else None
+                        ),
+                    },
+                }
+            )
+        return {
+            "gatewayClassName": spec.get("gatewayClassName"),
+            "addresses": copy.deepcopy(spec.get("addresses", [])),
+            "listeners": listeners,
+            "infrastructure": copy.deepcopy(spec.get("infrastructure")),
+        }
+
+    parent_refs = []
+    for parent in spec.get("parentRefs", []):
+        normalized = copy.deepcopy(parent)
+        normalized.setdefault("group", "gateway.networking.k8s.io")
+        normalized.setdefault("kind", "Gateway")
+        normalized.setdefault("namespace", namespace)
+        parent_refs.append(normalized)
+    rules = []
+    for rule in spec.get("rules", []):
+        matches = copy.deepcopy(rule.get("matches", []))
+        for match in matches:
+            if "path" in match:
+                match["path"].setdefault("type", "PathPrefix")
+                match["path"].setdefault("value", "/")
+        backends = []
+        for backend in rule.get("backendRefs", []):
+            normalized = copy.deepcopy(backend)
+            normalized.setdefault("group", "")
+            normalized.setdefault("kind", "Service")
+            normalized.setdefault("namespace", namespace)
+            normalized.setdefault("weight", 1)
+            backends.append(normalized)
+        rules.append(
+            {
+                "matches": matches,
+                "filters": copy.deepcopy(rule.get("filters", [])),
+                "backendRefs": backends,
+                "timeouts": copy.deepcopy(rule.get("timeouts")),
+            }
+        )
+    return {
+        "hostnames": copy.deepcopy(spec.get("hostnames", [])),
+        "parentRefs": parent_refs,
+        "rules": rules,
+    }
 
 
 def gateway_resource_binding(document: dict) -> dict:
