@@ -36,6 +36,9 @@ LEGACY_CLUSTER = "weltgewebe-staging"
 LEGACY_MIGRATION_RECEIPT = "receipts/legacy-state-migration.json"
 LEGACY_MIGRATION_PREPARED_STATUS = "legacy-state-data-move-prepared"
 LEGACY_MIGRATION_ADOPTED_STATUS = "legacy-state-adopted"
+CELL_DOWN_RECEIPT = "receipts/cell-down.json"
+CELL_REBUILD_RECEIPT = "receipts/cell-rebuild.json"
+DELETE_TO_PROVE_RECEIPT = "receipts/delete-to-prove.json"
 SOURCE_NAME = "commonthing-staging-source"
 APP_SOURCE_NAME = "commonthing-staging-app-source"
 DATA_KUSTOMIZATION = "commonthing-staging-data"
@@ -4649,6 +4652,79 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _private_json_receipt(path: Path, *, label: str) -> dict[str, Any]:
+    _private_regular_file(path, label=label)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StagingCellError(f"{label} is unreadable or malformed") from error
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise StagingCellError(f"{label} is malformed")
+    return payload
+
+
+def _canonical_sha256(value: Any, *, label: str) -> str:
+    digest = str(value or "")
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise StagingCellError(f"{label} is not a canonical sha256")
+    return digest
+
+
+def _down_receipt_binding(cell: dict[str, Any], cell_sha: str, gateway_sha: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "cluster": cell.get("cluster"),
+        "owner_id": cell.get("owner_id"),
+        "bootstrap_commit": cell.get("bootstrap_commit"),
+        "cell_status": str(cell.get("status") or ""),
+        "cell_receipt_sha256": cell_sha,
+        "active_commit": str(cell.get("active_commit") or ""),
+        "app_activation": cell.get("app_activation") is True,
+        "gateway_proof_receipt_sha256": gateway_sha,
+        "state_preserved": ["data", "secrets", "toolchain", "receipts"],
+        "production_changed": False,
+    }
+
+
+def _require_receipt_binding(payload: dict[str, Any], expected: dict[str, Any], *, label: str) -> None:
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            raise StagingCellError(f"{label} lost its {key} binding")
+
+
+def load_delete_to_prove_down_receipt(
+    root: Path,
+    cell: dict[str, Any],
+    *,
+    require_current_cell_match: bool,
+) -> dict[str, Any]:
+    path = root / CELL_DOWN_RECEIPT
+    payload = _private_json_receipt(path, label="staging down receipt")
+    expected = {
+        "status": "cluster-deleted-state-preserved",
+        "cluster_was_present": True,
+        "cluster": cell.get("cluster"),
+        "owner_id": cell.get("owner_id"),
+        "bootstrap_commit": cell.get("bootstrap_commit"),
+        "active_commit": cell_active_commit(cell),
+        "app_activation": True,
+        "production_changed": False,
+    }
+    _require_receipt_binding(payload, expected, label="staging down receipt")
+    if payload.get("state_preserved") != ["data", "secrets", "toolchain", "receipts"]:
+        raise StagingCellError("staging down receipt does not preserve the complete recovery state")
+    cell_sha = _canonical_sha256(
+        payload.get("cell_receipt_sha256"), label="staging down cell receipt hash"
+    )
+    _canonical_sha256(
+        payload.get("gateway_proof_receipt_sha256"),
+        label="staging down gateway proof receipt hash",
+    )
+    if require_current_cell_match and cell_sha != sha256_file(root / "receipts/cell-bootstrap.json"):
+        raise StagingCellError("staging cell receipt changed after down; refusing rebuild")
+    return {**payload, "receipt_sha256": sha256_file(path)}
+
+
 @lifecycle_mutation_locked
 @reference_output_routed
 def command_down(args: argparse.Namespace) -> dict[str, Any]:
@@ -4656,9 +4732,7 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
     reference.validate_owner_id(args.owner_id)
     root = state_root(getattr(args, "state_root", None))
     configure_reference_paths(root)
-    receipt = load_tool_receipt(
-        root, required_tools=("kind",), required_artifacts=()
-    )
+    receipt = load_tool_receipt(root, required_tools=("kind",), required_artifacts=())
     cell = load_cell_receipt(root)
     require_receipt_cluster(cell, args.cluster)
     commit = str(cell.get("bootstrap_commit") or "")
@@ -4666,8 +4740,59 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
     if args.owner_id != owner_id:
         raise StagingCellError("--owner-id does not match the persisted cluster owner")
     reference.validate_ownership_binding(commit, owner_id)
+
+    cell_path = root / "receipts/cell-bootstrap.json"
+    cell_sha = sha256_file(cell_path)
+    gateway_sha = ""
+    gateway_binding = cell.get("gateway_proof")
+    if isinstance(gateway_binding, dict):
+        gateway_path = root / "receipts/gateway-proof.json"
+        _private_regular_file(gateway_path, label="staging gateway proof receipt")
+        gateway_sha = sha256_file(gateway_path)
+        if gateway_binding.get("receipt_sha256") != gateway_sha:
+            raise StagingCellError("staging gateway proof receipt changed before down")
+        if gateway_binding.get("active_commit") != cell_active_commit(cell):
+            raise StagingCellError("staging gateway proof active commit changed before down")
+
+    binding = _down_receipt_binding(cell, cell_sha, gateway_sha)
     kind = receipt["tools"]["kind"]
+    path = root / CELL_DOWN_RECEIPT
     cluster_present = args.cluster in reference.clusters(kind)
+    cluster_was_present = cluster_present
+    started_at_unix = int(time.time())
+    if path.exists() or path.is_symlink():
+        previous = _private_json_receipt(path, label="staging down receipt")
+        previous_status = previous.get("status")
+        if previous_status == "cluster-delete-in-progress":
+            _require_receipt_binding(previous, binding, label="pending staging down receipt")
+            if not isinstance(previous.get("cluster_was_present"), bool):
+                raise StagingCellError("pending staging down receipt lacks cluster presence evidence")
+            cluster_was_present = bool(previous["cluster_was_present"])
+            started_at_unix = int(previous.get("started_at_unix") or 0)
+            if started_at_unix <= 0:
+                raise StagingCellError("pending staging down receipt lacks a valid start time")
+        elif previous_status in {"cluster-deleted-state-preserved", "cluster-absent-state-preserved"}:
+            previous_same_cycle = all(previous.get(key) == value for key, value in binding.items())
+            if previous_same_cycle:
+                if cluster_present:
+                    raise StagingCellError(
+                        "staging down receipt is already terminal but the same bound cluster exists; refusing ambiguous reuse"
+                    )
+                return {**previous, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
+            if not cluster_present:
+                raise StagingCellError(
+                    "a different staging down cycle already exists while the cluster is absent; refusing overwrite"
+                )
+        else:
+            raise StagingCellError("staging down receipt has an unexpected status")
+
+    pending = {
+        **binding,
+        "status": "cluster-delete-in-progress",
+        "cluster_was_present": cluster_was_present,
+        "started_at_unix": started_at_unix,
+    }
+    atomic_json(path, pending)
     reference.delete_owned_cluster_if_present(
         kind,
         args.cluster,
@@ -4675,25 +4800,283 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         expected_owner_id=owner_id,
     )
     result = {
-        "schema_version": 1,
+        **binding,
         "status": (
             "cluster-deleted-state-preserved"
-            if cluster_present
+            if cluster_was_present
             else "cluster-absent-state-preserved"
         ),
-        "cluster": args.cluster,
-        "owner_id": owner_id,
-        "bootstrap_commit": commit,
-        "state_preserved": ["data", "secrets", "toolchain", "receipts"],
-        "production_changed": False,
+        "cluster_was_present": cluster_was_present,
+        "started_at_unix": started_at_unix,
+        "completed_at_unix": int(time.time()),
     }
-    path = root / "receipts/cell-down.json"
     atomic_json(path, result)
     return {
         **result,
         "receipt_path": str(path),
         "receipt_sha256": sha256_file(path),
     }
+
+
+def _rebuild_receipt_binding(
+    cell: dict[str, Any], down: dict[str, Any], source_commit: str
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "cluster": cell.get("cluster"),
+        "owner_id": cell.get("owner_id"),
+        "bootstrap_commit": cell.get("bootstrap_commit"),
+        "active_commit": cell_active_commit(cell),
+        "implementation_commit": source_commit,
+        "pre_delete_cell_receipt_sha256": down["cell_receipt_sha256"],
+        "pre_delete_gateway_proof_receipt_sha256": down["gateway_proof_receipt_sha256"],
+        "down_receipt_sha256": down["receipt_sha256"],
+        "production_changed": False,
+    }
+
+
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
+    require_singleton_cluster(args.cluster)
+    reference.validate_owner_id(args.owner_id)
+    root = state_root(getattr(args, "state_root", None))
+    configure_reference_paths(root)
+    tool_receipt = load_tool_receipt(root)
+    cell = load_cell_receipt(root)
+    require_receipt_cluster(cell, args.cluster)
+    owner_id = str(cell.get("owner_id") or "")
+    bootstrap_commit = str(cell.get("bootstrap_commit") or "")
+    if args.owner_id != owner_id:
+        raise StagingCellError("--owner-id does not match the persisted cluster owner")
+    reference.validate_ownership_binding(bootstrap_commit, owner_id)
+    if cell.get("app_activation") is not True or cell.get("status") != "gateway-ready":
+        raise StagingCellError(
+            "delete-to-prove rebuild requires a previously gateway-ready activated cell"
+        )
+    active_commit = cell_active_commit(cell)
+    implementation_commit = require_clean_commit(args.source_commit)
+    if implementation_commit != active_commit:
+        raise StagingCellError(
+            "delete-to-prove rebuild implementation must equal the active app commit"
+        )
+    load_promotion_receipt(root, active_commit)
+    down = load_delete_to_prove_down_receipt(root, cell, require_current_cell_match=True)
+    if not all(retained_data_directory_exists(root, name) for name in ("postgres", "nats")):
+        raise StagingCellError("delete-to-prove rebuild requires retained PostgreSQL and NATS data")
+
+    _, secret_sha = load_or_create_secret_material(root)
+    external = cell.get("external_secret") if isinstance(cell.get("external_secret"), dict) else {}
+    if external.get("source_sha256") != secret_sha:
+        raise StagingCellError("retained runtime secret differs from the pre-delete cell receipt")
+    registry_material, registry_source_sha = load_registry_pull_material(root)
+    registry_binding = (
+        cell.get("registry_pull_secret")
+        if isinstance(cell.get("registry_pull_secret"), dict)
+        else {}
+    )
+    if registry_binding.get("source_sha256") != registry_source_sha:
+        raise StagingCellError("retained registry secret differs from the pre-delete cell receipt")
+    expected_registry_config = sha256_bytes(
+        registry_dockerconfig_json(registry_material).encode("utf-8")
+    )
+    if registry_binding.get("config_sha256") != expected_registry_config:
+        raise StagingCellError("retained registry config differs from the pre-delete cell receipt")
+
+    binding = _rebuild_receipt_binding(cell, down, implementation_commit)
+    rebuild_path = root / CELL_REBUILD_RECEIPT
+    existing_rebuild: dict[str, Any] | None = None
+    if rebuild_path.exists() or rebuild_path.is_symlink():
+        existing_rebuild = _private_json_receipt(rebuild_path, label="staging rebuild receipt")
+        _require_receipt_binding(existing_rebuild, binding, label="staging rebuild receipt")
+        if existing_rebuild.get("status") not in {
+            "rebuild-in-progress",
+            "infrastructure-rebuilt-app-reactivation-required",
+        }:
+            raise StagingCellError("staging rebuild receipt has an unexpected status")
+
+    kind = tool_receipt["tools"]["kind"]
+    kubectl = tool_receipt["tools"]["kubectl"]
+    flux = tool_receipt["tools"]["flux"]
+    helm = tool_receipt["tools"]["helm"]
+    cluster_present = args.cluster in reference.clusters(kind)
+    if existing_rebuild is None and cluster_present:
+        raise StagingCellError(
+            "delete-to-prove rebuild requires the downed cluster to be absent before first recovery"
+        )
+    if (
+        existing_rebuild is not None
+        and existing_rebuild.get("status") == "infrastructure-rebuilt-app-reactivation-required"
+        and not cluster_present
+    ):
+        raise StagingCellError(
+            "completed staging rebuild lost its cluster; refusing to create a second cluster under the same recovery receipt"
+        )
+    if existing_rebuild is None:
+        atomic_json(
+            rebuild_path,
+            {
+                **binding,
+                "status": "rebuild-in-progress",
+                "started_at_unix": int(time.time()),
+            },
+        )
+    if cluster_present:
+        reference.require_owned_cluster(
+            kind,
+            args.cluster,
+            expected_commit=bootstrap_commit,
+            expected_owner_id=owner_id,
+        )
+        created = False
+    else:
+        rendered_kind_config = render_kind_config(root)
+        reference.create_kind_cluster(
+            kind,
+            args.cluster,
+            tool_receipt["kubernetes"]["kind_node_image"],
+            str(rendered_kind_config),
+            bootstrap_commit,
+            owner_id,
+            timeout=900,
+        )
+        created = True
+
+    prepare_volume_permissions(kind, args.cluster, root)
+    api_server_host = reference.control_plane_address(args.cluster)
+    reference.install_platform_components(
+        kubectl, flux, helm, tool_receipt["artifacts"], api_server_host
+    )
+    run(
+        [kubectl, "wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5m"],
+        timeout=360,
+    )
+    secret_receipt = inject_external_secrets(kubectl, root)
+    registry_receipt = inject_registry_pull_secret(
+        kubectl,
+        root,
+        material=registry_material,
+        source_sha=registry_source_sha,
+    )
+    if secret_receipt.get("source_sha256") != secret_sha:
+        raise StagingCellError("rebuilt runtime Secret source hash drifted during injection")
+    if registry_receipt.get("source_sha256") != registry_source_sha:
+        raise StagingCellError("rebuilt registry Secret source hash drifted during injection")
+    if registry_receipt.get("config_sha256") != expected_registry_config:
+        raise StagingCellError("rebuilt registry Secret config hash drifted during injection")
+    apply_yaml(kubectl, flux_documents(bootstrap_commit))
+    reconcile_data(kubectl, bootstrap_commit)
+    live_workloads = staging_live_health(kubectl)
+    unhealthy = {name: state for name, state in live_workloads.items() if state != "True"}
+    if unhealthy:
+        raise StagingCellError(f"rebuilt staging infrastructure is not live: {unhealthy!r}")
+    node_names = output([kubectl, "get", "nodes", "-o", "name"]).splitlines()
+    if len(node_names) != 3:
+        raise StagingCellError(
+            f"rebuilt staging node count drift: expected 3, observed {len(node_names)}"
+        )
+    result = {
+        **binding,
+        "status": "infrastructure-rebuilt-app-reactivation-required",
+        "cluster_created": created,
+        "node_count": len(node_names),
+        "live_workloads": live_workloads,
+        "external_secret_source_sha256": secret_receipt["source_sha256"],
+        "registry_secret_source_sha256": registry_receipt["source_sha256"],
+        "completed_at_unix": int(time.time()),
+    }
+    atomic_json(rebuild_path, result)
+    return {
+        **result,
+        "receipt_path": str(rebuild_path),
+        "receipt_sha256": sha256_file(rebuild_path),
+    }
+
+
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_prove_delete_to_prove(args: argparse.Namespace) -> dict[str, Any]:
+    require_singleton_cluster(args.cluster)
+    reference.validate_owner_id(args.owner_id)
+    root = state_root(getattr(args, "state_root", None))
+    configure_reference_paths(root)
+    tool_receipt = load_tool_receipt(
+        root, required_tools=("kind", "kubectl"), required_artifacts=()
+    )
+    cell = load_cell_receipt(root)
+    require_receipt_cluster(cell, args.cluster)
+    owner_id = str(cell.get("owner_id") or "")
+    bootstrap_commit = str(cell.get("bootstrap_commit") or "")
+    if args.owner_id != owner_id:
+        raise StagingCellError("--owner-id does not match the persisted cluster owner")
+    active_commit = cell_active_commit(cell)
+    implementation_commit = require_clean_commit(args.source_commit)
+    if implementation_commit != active_commit:
+        raise StagingCellError("delete-to-prove proof must run from the active app commit")
+    if cell.get("app_activation") is not True or cell.get("status") != "gateway-ready":
+        raise StagingCellError("delete-to-prove proof requires a gateway-ready activated cell")
+
+    kind = tool_receipt["tools"]["kind"]
+    kubectl = tool_receipt["tools"]["kubectl"]
+    reference.require_owned_cluster(
+        kind,
+        args.cluster,
+        expected_commit=bootstrap_commit,
+        expected_owner_id=owner_id,
+    )
+    require_bootstrap_data_current(kubectl, bootstrap_commit)
+    workloads = app_live_health(kubectl)
+    if any(state != "True" for state in workloads.values()):
+        raise StagingCellError("delete-to-prove proof requires live API and Web workloads")
+    if not gateway_receipt_current(root, cell, kubectl):
+        raise StagingCellError("delete-to-prove proof requires the current live gateway receipt")
+
+    down = load_delete_to_prove_down_receipt(root, cell, require_current_cell_match=False)
+    rebuild_path = root / CELL_REBUILD_RECEIPT
+    rebuild = _private_json_receipt(rebuild_path, label="staging rebuild receipt")
+    expected_rebuild = _rebuild_receipt_binding(cell, down, implementation_commit)
+    _require_receipt_binding(rebuild, expected_rebuild, label="staging rebuild receipt")
+    if rebuild.get("status") != "infrastructure-rebuilt-app-reactivation-required":
+        raise StagingCellError("delete-to-prove proof requires a completed infrastructure rebuild")
+    if int(rebuild.get("completed_at_unix") or 0) < int(down.get("completed_at_unix") or 0):
+        raise StagingCellError("staging rebuild receipt predates the down receipt")
+
+    gateway_path = root / "receipts/gateway-proof.json"
+    gateway_sha = sha256_file(gateway_path)
+    current_cell_sha = sha256_file(root / "receipts/cell-bootstrap.json")
+    if gateway_sha == down["gateway_proof_receipt_sha256"]:
+        raise StagingCellError("gateway proof identity did not change across delete-to-prove")
+    if current_cell_sha == down["cell_receipt_sha256"]:
+        raise StagingCellError("cell receipt identity did not change across delete-to-prove")
+    result = {
+        "schema_version": 1,
+        "status": "delete-to-prove-verified",
+        "cluster": args.cluster,
+        "owner_id": owner_id,
+        "bootstrap_commit": bootstrap_commit,
+        "active_commit": active_commit,
+        "implementation_commit": implementation_commit,
+        "pre_delete_cell_receipt_sha256": down["cell_receipt_sha256"],
+        "post_rebuild_cell_receipt_sha256": current_cell_sha,
+        "pre_delete_gateway_proof_receipt_sha256": down["gateway_proof_receipt_sha256"],
+        "post_rebuild_gateway_proof_receipt_sha256": gateway_sha,
+        "down_receipt_sha256": down["receipt_sha256"],
+        "rebuild_receipt_sha256": sha256_file(rebuild_path),
+        "app_workloads": workloads,
+        "verified_at_unix": int(time.time()),
+        "production_changed": False,
+        "does_not_establish": ["DNS", "TLS", "external-LB", "production cutover"],
+    }
+    path = root / DELETE_TO_PROVE_RECEIPT
+    if path.exists() or path.is_symlink():
+        previous = _private_json_receipt(path, label="delete-to-prove receipt")
+        stable = {key: value for key, value in result.items() if key != "verified_at_unix"}
+        previous_stable = {key: value for key, value in previous.items() if key != "verified_at_unix"}
+        if previous_stable != stable:
+            raise StagingCellError("existing delete-to-prove receipt has different proof bindings")
+        return {**previous, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
+    atomic_json(path, result)
+    return {**result, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
 
 
 def command_self_check() -> dict[str, Any]:
@@ -4877,6 +5260,14 @@ def parser() -> argparse.ArgumentParser:
     down = sub.add_parser("down")
     down.set_defaults(cluster=DEFAULT_CLUSTER)
     down.add_argument("--owner-id", required=True)
+    rebuild = sub.add_parser("rebuild")
+    rebuild.set_defaults(cluster=DEFAULT_CLUSTER)
+    rebuild.add_argument("--owner-id", required=True)
+    rebuild.add_argument("--source-commit", required=True)
+    delete_to_prove = sub.add_parser("prove-delete-to-prove")
+    delete_to_prove.set_defaults(cluster=DEFAULT_CLUSTER)
+    delete_to_prove.add_argument("--owner-id", required=True)
+    delete_to_prove.add_argument("--source-commit", required=True)
     migrate = sub.add_parser("migrate-legacy-state")
     migrate.set_defaults(cluster=DEFAULT_CLUSTER)
     migrate.add_argument("--owner-id", required=True)
@@ -4992,6 +5383,20 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
         }
         print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
         return
+    if command in {"rebuild", "prove-delete-to-prove"}:
+        safe = {
+            "command": command,
+            "schema_version": 1,
+            "status": str(result.get("status") or "degraded"),
+            "cluster": str(result.get("cluster") or DEFAULT_CLUSTER),
+            "bootstrap_commit": str(result.get("bootstrap_commit") or ""),
+            "active_commit": str(result.get("active_commit") or ""),
+            "production_changed": bool(result.get("production_changed")),
+        }
+        if command == "prove-delete-to-prove":
+            safe["does_not_establish"] = ["DNS", "TLS", "external-LB", "production cutover"]
+        print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
+        return
     if command == "migrate-legacy-state":
         safe = {
             "command": "migrate-legacy-state",
@@ -5021,6 +5426,10 @@ def main() -> int:
             result = command_status(args)
         elif args.command == "down":
             result = command_down(args)
+        elif args.command == "rebuild":
+            result = command_rebuild(args)
+        elif args.command == "prove-delete-to-prove":
+            result = command_prove_delete_to_prove(args)
         elif args.command == "migrate-legacy-state":
             result = command_migrate_legacy_state(args)
         else:
