@@ -39,6 +39,12 @@ LEGACY_MIGRATION_ADOPTED_STATUS = "legacy-state-adopted"
 CELL_DOWN_RECEIPT = "receipts/cell-down.json"
 CELL_REBUILD_RECEIPT = "receipts/cell-rebuild.json"
 DELETE_TO_PROVE_RECEIPT = "receipts/delete-to-prove.json"
+HOST_GATEWAY_RECEIPT = "receipts/host-gateway-proof.json"
+BACKUP_DOWN_RECEIPT = "receipts/backup-delete-to-prove-down.json"
+BACKUP_REBUILD_RECEIPT = "receipts/backup-delete-to-prove-rebuild.json"
+BACKUP_DELETE_TO_PROVE_RECEIPT = "receipts/backup-delete-to-prove.json"
+STAGING_GATEWAY_NODE_PORT = 31844
+STAGING_GATEWAY_HOST_PORT = 18084
 SOURCE_NAME = "commonthing-staging-source"
 APP_SOURCE_NAME = "commonthing-staging-app-source"
 DATA_KUSTOMIZATION = "commonthing-staging-data"
@@ -122,6 +128,55 @@ def run(
 
 def output(argv: list[str], *, timeout: float | None = None) -> str:
     return run(argv, capture=True, timeout=timeout).stdout.strip()
+
+
+def stream_command_to_file(
+    argv: list[str], path: Path, *, timeout: float | None = None
+) -> None:
+    print("+ external command [arguments redacted]", file=sys.stderr, flush=True)
+    ensure_directory_durable(path.parent)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            os.fchmod(handle.fileno(), 0o600)
+            subprocess.run(
+                argv,
+                cwd=ROOT,
+                stdout=handle,
+                stderr=sys.stderr,
+                check=True,
+                timeout=timeout,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+        fsync_directory(path.parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+
+
+def stream_file_to_command(
+    path: Path, argv: list[str], *, timeout: float | None = None
+) -> None:
+    _private_regular_file(path, label="staging backup archive")
+    print("+ external command [arguments redacted]", file=sys.stderr, flush=True)
+    with path.open("rb") as handle:
+        subprocess.run(
+            argv,
+            cwd=ROOT,
+            stdin=handle,
+            stdout=sys.stderr,
+            stderr=sys.stderr,
+            check=True,
+            timeout=timeout,
+        )
 
 
 
@@ -1295,6 +1350,22 @@ def render_kind_config(root: Path) -> Path:
     roles = [node.get("role") if isinstance(node, dict) else None for node in nodes]
     if roles != ["control-plane", "worker", "worker"]:
         raise StagingCellError("staging kind template node roles drift")
+    expected_port_mappings = [
+        {
+            "containerPort": STAGING_GATEWAY_NODE_PORT,
+            "hostPort": STAGING_GATEWAY_HOST_PORT,
+            "listenAddress": "127.0.0.1",
+            "protocol": "TCP",
+        }
+    ]
+    if nodes[0].get("extraPortMappings") != expected_port_mappings:
+        raise StagingCellError(
+            "staging control plane must expose exactly the localhost-only Gateway proof port"
+        )
+    if any(node.get("extraPortMappings") for node in nodes[1:]):
+        raise StagingCellError(
+            "staging worker nodes must not expose host port mappings"
+        )
 
     retained_mounts = (
         (
@@ -2095,6 +2166,86 @@ def _set_data_reconciliation_suspended(kubectl: str, *, suspended: bool) -> None
         raise StagingCellError(
             f"staging data reconciliation did not {state} as requested"
         )
+
+
+def _set_app_reconciliation_suspended(kubectl: str, *, suspended: bool) -> None:
+    expected = "true" if suspended else "false"
+    run(
+        [
+            kubectl,
+            "patch",
+            "kustomization",
+            APP_KUSTOMIZATION,
+            "-n",
+            "flux-system",
+            "--type=merge",
+            "-p",
+            json.dumps({"spec": {"suspend": suspended}}, separators=(",", ":")),
+        ],
+        timeout=60,
+    )
+    observed = output(
+        [
+            kubectl,
+            "get",
+            "kustomization",
+            APP_KUSTOMIZATION,
+            "-n",
+            "flux-system",
+            "-o",
+            "jsonpath={.spec.suspend}",
+        ],
+        timeout=30,
+    )
+    if observed != expected:
+        state = "suspend" if suspended else "resume"
+        raise StagingCellError(
+            f"staging app reconciliation did not {state} as requested"
+        )
+
+
+def _quiesce_backup_cell(kubectl: str) -> None:
+    _set_app_reconciliation_suspended(kubectl, suspended=True)
+    run(
+        [
+            kubectl,
+            "scale",
+            "deployment/commonthing-api",
+            "deployment/commonthing-web",
+            "-n",
+            APP_NAMESPACE,
+            "--replicas=0",
+        ],
+        timeout=60,
+    )
+    deadline = time.monotonic() + 120.0
+    while True:
+        remaining: list[str] = []
+        for name in APP_DEPLOYMENTS:
+            pods = output(
+                [
+                    kubectl,
+                    "get",
+                    "pods",
+                    "-n",
+                    APP_NAMESPACE,
+                    "-l",
+                    f"app.kubernetes.io/name={name}",
+                    "-o",
+                    "name",
+                ],
+                timeout=30,
+            )
+            if pods:
+                remaining.append(name)
+        if not remaining:
+            break
+        if time.monotonic() >= deadline:
+            raise StagingCellError(
+                f"staging app workloads did not quiesce before backup: {remaining!r}"
+            )
+        time.sleep(1.0)
+    _quiesce_retained_data(kubectl)
 
 
 def _quiesce_retained_data(kubectl: str) -> None:
@@ -3731,12 +3882,25 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         migration_plan_value = require_pending_promotion_matches(
             cell, pending_commit, promotion
         )
-        commit = require_clean_commit(
-            args.source_commit,
-            require_public_main=False,
+        backup_controller = _backup_recovery_controller_commit(
+            root, cell, pending_commit
         )
+        if backup_controller is not None:
+            commit = pending_commit
+        else:
+            commit = require_clean_commit(
+                args.source_commit,
+                require_public_main=False,
+            )
     else:
-        commit = require_clean_commit(args.source_commit)
+        requested_commit = str(args.source_commit or "")
+        backup_controller = _backup_recovery_controller_commit(
+            root, cell, requested_commit
+        )
+        if backup_controller is not None:
+            commit = requested_commit
+        else:
+            commit = require_clean_commit(args.source_commit)
         promotion = load_promotion_receipt(root, commit)
         migration_plan_value = migration_plan(commit, promotion)
 
@@ -4424,11 +4588,24 @@ def staging_gateway_observation(kubectl: str) -> dict:
     )
     if gateway_addresses != service_addresses:
         raise StagingCellError("staging Gateway and Service IP addresses differ")
+    http_ports = [
+        port
+        for port in service.get("spec", {}).get("ports", [])
+        if isinstance(port, dict)
+        and port.get("port") == 80
+        and port.get("protocol", "TCP") == "TCP"
+    ]
+    if len(http_ports) != 1:
+        raise StagingCellError("staging Gateway Service HTTP port identity is ambiguous")
+    node_port = http_ports[0].get("nodePort")
+    if not isinstance(node_port, int) or isinstance(node_port, bool):
+        raise StagingCellError("staging Gateway Service lacks an integer NodePort")
     return {
         "resources": [gateway_resource_binding(doc) for doc in documents],
         "service": {
             "name": service["metadata"]["name"],
             "uid": service["metadata"]["uid"],
+            "node_port": node_port,
             "spec_sha256": sha256_bytes(
                 json.dumps(service["spec"], sort_keys=True).encode()
             ),
@@ -4436,6 +4613,132 @@ def staging_gateway_observation(kubectl: str) -> dict:
         "gateway_addresses": gateway_addresses,
         "service_addresses": service_addresses,
         "listener_port": 80,
+    }
+
+
+def gateway_service_node_port(kubectl: str, *, require_exact: bool = False) -> tuple[str, str, int]:
+    services = gateway_list(
+        kubectl,
+        "Service",
+        APP_NAMESPACE,
+        label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
+    )
+    if len(services) != 1:
+        raise StagingCellError(
+            "staging Gateway requires exactly one Cilium LoadBalancer Service"
+        )
+    service = services[0]
+    metadata = service.get("metadata", {})
+    name = str(metadata.get("name") or "")
+    uid = str(metadata.get("uid") or "")
+    ports = service.get("spec", {}).get("ports", [])
+    matches = [
+        (index, port)
+        for index, port in enumerate(ports)
+        if isinstance(port, dict)
+        and port.get("port") == 80
+        and port.get("protocol", "TCP") == "TCP"
+    ]
+    if not name or not uid or len(matches) != 1:
+        raise StagingCellError("staging Gateway Service HTTP port identity is ambiguous")
+    index, port = matches[0]
+    node_port = port.get("nodePort")
+    if not isinstance(node_port, int) or isinstance(node_port, bool):
+        raise StagingCellError("staging Gateway Service lacks an integer NodePort")
+    if require_exact and node_port != STAGING_GATEWAY_NODE_PORT:
+        raise StagingCellError(
+            f"staging Gateway NodePort drift: expected {STAGING_GATEWAY_NODE_PORT}, observed {node_port}"
+        )
+    return name, uid, node_port
+
+
+def ensure_gateway_node_port(kubectl: str) -> tuple[str, str, int]:
+    services = gateway_list(
+        kubectl,
+        "Service",
+        APP_NAMESPACE,
+        label_selector=f"{GATEWAY_SERVICE_LABEL}={GATEWAY_NAME}",
+    )
+    if len(services) != 1:
+        raise StagingCellError(
+            "staging Gateway requires exactly one Cilium LoadBalancer Service"
+        )
+    service = services[0]
+    ports = service.get("spec", {}).get("ports", [])
+    matches = [
+        (index, port)
+        for index, port in enumerate(ports)
+        if isinstance(port, dict)
+        and port.get("port") == 80
+        and port.get("protocol", "TCP") == "TCP"
+    ]
+    if len(matches) != 1:
+        raise StagingCellError("staging Gateway Service HTTP port identity is ambiguous")
+    index, port = matches[0]
+    if port.get("nodePort") != STAGING_GATEWAY_NODE_PORT:
+        name = str(service.get("metadata", {}).get("name") or "")
+        if not name:
+            raise StagingCellError("staging Gateway Service lacks a name")
+        patch = [
+            {
+                "op": "replace" if "nodePort" in port else "add",
+                "path": f"/spec/ports/{index}/nodePort",
+                "value": STAGING_GATEWAY_NODE_PORT,
+            }
+        ]
+        run(
+            [
+                kubectl,
+                "-n",
+                APP_NAMESPACE,
+                "patch",
+                "service",
+                name,
+                "--type=json",
+                "-p",
+                json.dumps(patch, separators=(",", ":")),
+            ],
+            timeout=60,
+        )
+    return gateway_service_node_port(kubectl, require_exact=True)
+
+
+def _host_http_bytes(path: str) -> bytes:
+    if not path.startswith("/") or "//" in path:
+        raise StagingCellError("host Gateway probe path is invalid")
+    url = f"http://127.0.0.1:{STAGING_GATEWAY_HOST_PORT}{path}"
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status != 200:
+                raise StagingCellError(
+                    f"host Gateway readback returned HTTP {response.status} for {path}"
+                )
+            return response.read(1024 * 1024)
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError) as error:
+        raise StagingCellError(
+            f"host Gateway readback failed for localhost:{STAGING_GATEWAY_HOST_PORT}{path}"
+        ) from error
+
+
+def host_gateway_http_readback() -> dict[str, Any]:
+    health = _host_http_bytes("/health/live")
+    web = _host_http_bytes("/")
+    web_prefix = web[:1024]
+    api_nodes = _host_http_bytes("/api/nodes")
+    try:
+        nodes_payload = json.loads(api_nodes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise StagingCellError("host Gateway /api/nodes readback is not valid JSON") from error
+    if not isinstance(nodes_payload, list):
+        raise StagingCellError("host Gateway /api/nodes readback is not a list")
+    return {
+        "probe_scope": "heim-pc-host-outside-kubernetes",
+        "endpoint": f"http://127.0.0.1:{STAGING_GATEWAY_HOST_PORT}",
+        "health_sha256": sha256_bytes(health),
+        "web_prefix_sha256": sha256_bytes(web_prefix),
+        "web_prefix_bytes": len(web_prefix),
+        "api_nodes_sha256": sha256_bytes(api_nodes),
     }
 
 
@@ -4481,11 +4784,15 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
         }
     ):
         raise StagingCellError("gateway proof requires completed app activation")
-    implementation_commit = require_clean_commit(args.source_commit)
-    if implementation_commit != commit:
-        raise StagingCellError(
-            "gateway implementation commit must equal the active app commit"
-        )
+    backup_controller = _backup_recovery_controller_commit(root, cell, commit)
+    if backup_controller is not None:
+        implementation_commit = backup_controller
+    else:
+        implementation_commit = require_clean_commit(args.source_commit)
+        if implementation_commit != commit:
+            raise StagingCellError(
+                "gateway implementation commit must equal the active app commit"
+            )
     promotion = load_promotion_receipt(root, commit)
     recorded = cell.get("image_promotion", {})
     if (
@@ -4581,6 +4888,9 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
     deadline = time.monotonic() + 120
     while True:
         try:
+            # Pin the controller-created Service first. Only the post-pin
+            # observation is proof-worthy; the prior shape is transient.
+            ensure_gateway_node_port(kubectl)
             observed = staging_gateway_observation(kubectl)
             break
         except StagingCellError:
@@ -4629,6 +4939,106 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_prove_host_gateway(args: argparse.Namespace) -> dict[str, Any]:
+    require_singleton_cluster(args.cluster)
+    reference.validate_owner_id(args.owner_id)
+    root = state_root(getattr(args, "state_root", None))
+    configure_reference_paths(root)
+    cell = load_cell_receipt(root)
+    require_receipt_cluster(cell, args.cluster)
+    if args.owner_id != cell.get("owner_id"):
+        raise StagingCellError("--owner-id does not match the persisted cluster owner")
+    active_commit = cell_active_commit(cell)
+    if args.source_commit != active_commit:
+        raise StagingCellError("host Gateway proof requires the exact active app commit")
+    tools = load_tool_receipt(
+        root, required_tools=("kind", "kubectl"), required_artifacts=()
+    )["tools"]
+    kubectl = tools["kubectl"]
+    reference.require_owned_cluster(
+        tools["kind"],
+        args.cluster,
+        expected_commit=cell["bootstrap_commit"],
+        expected_owner_id=args.owner_id,
+    )
+    if not gateway_receipt_current(root, cell, kubectl):
+        raise StagingCellError("host Gateway proof requires the current gateway proof")
+    service_name, service_uid, node_port = gateway_service_node_port(
+        kubectl, require_exact=True
+    )
+    if node_port != STAGING_GATEWAY_NODE_PORT:
+        raise StagingCellError("host Gateway proof NodePort is not pinned")
+    readback = host_gateway_http_readback()
+    if gateway_service_node_port(kubectl, require_exact=True) != (
+        service_name,
+        service_uid,
+        node_port,
+    ):
+        raise StagingCellError("staging Gateway Service changed during host readback")
+    if not gateway_receipt_current(root, cell, kubectl):
+        raise StagingCellError("staging gateway changed during host readback")
+    result = {
+        "schema_version": 1,
+        "status": "host-gateway-readback-verified",
+        "cluster": args.cluster,
+        "owner_id": args.owner_id,
+        "bootstrap_commit": cell["bootstrap_commit"],
+        "active_commit": active_commit,
+        "gateway_receipt_sha256": sha256_file(root / "receipts/gateway-proof.json"),
+        "service": {
+            "name": service_name,
+            "uid": service_uid,
+            "node_port": node_port,
+        },
+        **readback,
+        "production_changed": False,
+        "does_not_establish": ["public DNS", "public TLS", "production cutover"],
+        "verified_at_unix": int(time.time()),
+    }
+    path = root / HOST_GATEWAY_RECEIPT
+    atomic_json(path, result)
+    updated = {
+        **cell,
+        "host_gateway_proof": {
+            "active_commit": active_commit,
+            "receipt_sha256": sha256_file(path),
+        },
+    }
+    write_cell_receipt(root, updated)
+    return {**result, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
+
+
+def host_gateway_receipt_current(root: Path, cell: dict[str, Any], kubectl: str) -> bool:
+    try:
+        path = root / HOST_GATEWAY_RECEIPT
+        binding = cell.get("host_gateway_proof")
+        if not isinstance(binding, dict) or path.is_symlink():
+            return False
+        if stat.S_IMODE(path.stat().st_mode) != 0o600:
+            return False
+        if binding.get("active_commit") != cell_active_commit(cell):
+            return False
+        if binding.get("receipt_sha256") != sha256_file(path):
+            return False
+        receipt = _private_json_receipt(path, label="host Gateway proof receipt")
+        service_name, service_uid, node_port = gateway_service_node_port(
+            kubectl, require_exact=True
+        )
+        return (
+            receipt.get("status") == "host-gateway-readback-verified"
+            and receipt.get("active_commit") == cell_active_commit(cell)
+            and receipt.get("gateway_receipt_sha256")
+            == sha256_file(root / "receipts/gateway-proof.json")
+            and receipt.get("service")
+            == {"name": service_name, "uid": service_uid, "node_port": node_port}
+            and receipt.get("probe_scope") == "heim-pc-host-outside-kubernetes"
+        )
+    except (OSError, ValueError, StagingCellError, subprocess.CalledProcessError):
+        return False
+
+
 def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
     if cell.get("status") != "gateway-ready":
         return False
@@ -4654,8 +5064,22 @@ def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
             "manifest_sha256": receipt.get("manifest_sha256"),
         }
         require_gateway_observation_binding(observed, expected_binding)
+        implementation_commit = receipt.get("implementation_commit")
+        implementation_valid = implementation_commit == cell_active_commit(cell)
+        if not implementation_valid:
+            rebuild_path = root / BACKUP_REBUILD_RECEIPT
+            if rebuild_path.exists() and not rebuild_path.is_symlink():
+                rebuild = _private_json_receipt(
+                    rebuild_path, label="backup rebuild receipt"
+                )
+                implementation_valid = (
+                    rebuild.get("status")
+                    == "backup-restored-infrastructure-ready-app-reactivation-required"
+                    and rebuild.get("release_commit") == cell_active_commit(cell)
+                    and rebuild.get("controller_commit") == implementation_commit
+                )
         return (
-            receipt.get("implementation_commit") == cell_active_commit(cell)
+            implementation_valid
             and receipt.get("address") in observed["gateway_addresses"]
             and all(receipt.get(key) == value for key, value in observed.items())
         )
@@ -5836,6 +6260,814 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _backup_cycle_directory(root: Path, release_commit: str) -> Path:
+    if len(release_commit) != 40 or any(ch not in "0123456789abcdef" for ch in release_commit):
+        raise StagingCellError("backup recovery release commit is not canonical")
+    return root / "backups" / "t084-backup-delete-to-prove" / release_commit
+
+
+def _backup_archive_paths(root: Path, release_commit: str) -> dict[str, Path]:
+    directory = _backup_cycle_directory(root, release_commit)
+    return {name: directory / f"{name}.tar" for name in ("postgres", "nats")}
+
+
+def _backup_volume_archives(
+    kind: str,
+    cluster: str,
+    root: Path,
+    release_commit: str,
+) -> dict[str, dict[str, Any]]:
+    data_node = _retained_mount_node(kind, cluster, root, require_split=True)
+    paths = _backup_archive_paths(root, release_commit)
+    ensure_directory_durable(next(iter(paths.values())).parent)
+    result: dict[str, dict[str, Any]] = {}
+    for name, path in paths.items():
+        if path.exists() or path.is_symlink():
+            raise StagingCellError(
+                f"staging backup archive already exists without a bound backup-down receipt: {name}"
+            )
+        volume = f"/var/local/commonthing-staging/{name}"
+        stream_command_to_file(
+            [
+                "docker",
+                "exec",
+                data_node,
+                "tar",
+                "--sort=name",
+                "--format=gnu",
+                "--numeric-owner",
+                "-C",
+                volume,
+                "-cf",
+                "-",
+                ".",
+            ],
+            path,
+            timeout=600,
+        )
+        if path.stat().st_size <= 0:
+            raise StagingCellError(f"staging {name} backup archive is empty")
+        result[name] = {
+            "path": str(path),
+            "sha256": sha256_file(path),
+            "bytes": path.stat().st_size,
+        }
+    return result
+
+
+def _verify_backup_archives(
+    root: Path, release_commit: str, archives: dict[str, Any]
+) -> dict[str, Path]:
+    expected_paths = _backup_archive_paths(root, release_commit)
+    if set(archives) != set(expected_paths):
+        raise StagingCellError("staging backup receipt archive set is incomplete")
+    for name, expected_path in expected_paths.items():
+        entry = archives.get(name)
+        if not isinstance(entry, dict):
+            raise StagingCellError(f"staging {name} backup receipt is malformed")
+        if entry.get("path") != str(expected_path):
+            raise StagingCellError(f"staging {name} backup path drift")
+        _private_regular_file(expected_path, label=f"staging {name} backup archive")
+        if entry.get("sha256") != sha256_file(expected_path):
+            raise StagingCellError(f"staging {name} backup archive hash drift")
+        if entry.get("bytes") != expected_path.stat().st_size or expected_path.stat().st_size <= 0:
+            raise StagingCellError(f"staging {name} backup archive size drift")
+    return expected_paths
+
+
+def _identity_anchor_matches(expected: dict[str, Any], path: Path) -> bool:
+    try:
+        observed = _real_directory_identity(path, label="backup recovery data directory")
+    except (OSError, StagingCellError):
+        return False
+    return all(observed.get(field) == expected.get(field) for field in ("device", "inode"))
+
+
+def _prepare_empty_restore_roots(
+    root: Path,
+    release_commit: str,
+    pre_delete_identity: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    snapshot_root = root / "recovery-snapshots" / release_commit / "retained-original"
+    ensure_directory_durable(snapshot_root)
+    result: dict[str, dict[str, Any]] = {}
+    for name in ("postgres", "nats"):
+        expected = pre_delete_identity.get(name)
+        if not isinstance(expected, dict):
+            raise StagingCellError(f"backup recovery lost pre-delete {name} identity")
+        source = root / "data" / name
+        retained = snapshot_root / name
+        if not retained.exists():
+            if not _identity_anchor_matches(expected, source):
+                raise StagingCellError(
+                    f"refusing to rotate staging {name}: active directory is not the proven pre-delete root"
+                )
+            os.replace(source, retained)
+            fsync_directory(source.parent)
+            fsync_directory(retained.parent)
+        elif not _identity_anchor_matches(expected, retained):
+            raise StagingCellError(
+                f"staging {name} forensic original does not match the proven pre-delete root"
+            )
+        if source.exists():
+            linked = source.lstat()
+            if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
+                raise StagingCellError(f"staging {name} restore root is unsafe")
+            try:
+                has_entries = next(source.iterdir(), None) is not None
+            except OSError as error:
+                raise StagingCellError(f"staging {name} restore root is unreadable") from error
+            if has_entries:
+                raise StagingCellError(
+                    f"staging {name} restore root is not empty before backup restore"
+                )
+        else:
+            source.mkdir(mode=0o700)
+            fsync_directory(source.parent)
+        result[name] = {
+            **_real_directory_identity(source, label=f"empty staging {name} restore root"),
+            "empty": True,
+            "forensic_original": str(retained),
+        }
+    return result
+
+
+def _restore_volume_archives(
+    kind: str,
+    cluster: str,
+    root: Path,
+    release_commit: str,
+    archives: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    paths = _verify_backup_archives(root, release_commit, archives)
+    data_node = _retained_mount_node(kind, cluster, root, require_split=True)
+    for name, path in paths.items():
+        volume = f"/var/local/commonthing-staging/{name}"
+        occupied = output(
+            [
+                "docker",
+                "exec",
+                data_node,
+                "find",
+                volume,
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-print",
+                "-quit",
+            ],
+            timeout=30,
+        )
+        if occupied:
+            raise StagingCellError(
+                f"staging {name} restore target is not empty before archive extraction"
+            )
+        stream_file_to_command(
+            path,
+            [
+                "docker",
+                "exec",
+                "-i",
+                data_node,
+                "tar",
+                "--numeric-owner",
+                "-C",
+                volume,
+                "-xf",
+                "-",
+            ],
+            timeout=600,
+        )
+    return _mounted_retained_data_identity(
+        kind, cluster, root, durable=True, require_split=True
+    )
+
+
+def _same_data_tree_hashes(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    return all(
+        isinstance(before.get(name), dict)
+        and isinstance(after.get(name), dict)
+        and before[name].get("tree_sha256") == after[name].get("tree_sha256")
+        and isinstance(before[name].get("tree_sha256"), str)
+        for name in ("postgres", "nats")
+    )
+
+
+def _same_data_mount_anchors(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    return all(
+        isinstance(before.get(name), dict)
+        and isinstance(after.get(name), dict)
+        and all(
+            before[name].get(field) == after[name].get(field)
+            for field in ("device", "inode")
+        )
+        for name in ("postgres", "nats")
+    )
+
+
+def _load_backup_down_receipt(
+    root: Path, *, allow_pending: bool = False
+) -> dict[str, Any]:
+    path = root / BACKUP_DOWN_RECEIPT
+    payload = _private_json_receipt(path, label="backup delete-to-prove down receipt")
+    status = payload.get("status")
+    allowed = {"backup-created-cluster-deleted-primary-data-empty"}
+    if allow_pending:
+        allowed.add("backup-created-cluster-delete-pending")
+    if status not in allowed:
+        raise StagingCellError("backup delete-to-prove down receipt has unexpected state")
+    if payload.get("production_changed") is not False:
+        raise StagingCellError("backup delete-to-prove down receipt lost production isolation")
+    release_commit = str(payload.get("release_commit") or "")
+    archives = payload.get("backup_archives")
+    if not isinstance(archives, dict):
+        raise StagingCellError("backup delete-to-prove down receipt lost its archives")
+    _verify_backup_archives(root, release_commit, archives)
+    pre_delete = payload.get("pre_delete_data_identity")
+    if not isinstance(pre_delete, dict):
+        raise StagingCellError("backup delete-to-prove down receipt lost data identity")
+    _require_durable_retained_fingerprint(
+        pre_delete, label="backup delete-to-prove pre-delete data identity"
+    )
+    if status == "backup-created-cluster-deleted-primary-data-empty":
+        empty_roots = payload.get("empty_restore_roots")
+        if not isinstance(empty_roots, dict):
+            raise StagingCellError("backup delete-to-prove down receipt lost empty restore roots")
+        for name in ("postgres", "nats"):
+            root_identity = empty_roots.get(name)
+            if not isinstance(root_identity, dict) or root_identity.get("empty") is not True:
+                raise StagingCellError(f"backup down receipt lost empty {name} restore identity")
+    return {**payload, "receipt_sha256": sha256_file(path)}
+
+
+def _complete_backup_down_from_pending(
+    root: Path,
+    args: argparse.Namespace,
+    pending: dict[str, Any],
+    *,
+    resumed: bool,
+) -> dict[str, Any]:
+    tools = load_tool_receipt(
+        root, required_tools=("kind",), required_artifacts=()
+    )["tools"]
+    reference.delete_owned_cluster_if_present(
+        tools["kind"],
+        args.cluster,
+        expected_commit=pending["bootstrap_commit"],
+        expected_owner_id=args.owner_id,
+    )
+    started_at_unix = pending.get("started_at_unix")
+    if not isinstance(started_at_unix, int) or isinstance(started_at_unix, bool):
+        raise StagingCellError("backup delete-to-prove pending receipt lost its start boundary")
+    if resumed:
+        # We cannot know whether the prior process died immediately before or
+        # immediately after the cluster deletion. Using the earlier cycle start
+        # is deliberately pessimistic: measured RTO can only become larger.
+        cluster_deleted_at_unix = started_at_unix
+        recovery_boundary_basis = "conservative-cycle-start-after-unobserved-delete"
+    else:
+        cluster_deleted_at_unix = int(time.time())
+        recovery_boundary_basis = "cluster-delete-observed"
+    empty_roots = _prepare_empty_restore_roots(
+        root, pending["release_commit"], pending["pre_delete_data_identity"]
+    )
+    persisted_pending = dict(pending)
+    # receipt_sha256 is a derived loader field. Persisting it would write the
+    # hash of the pending receipt into the terminal receipt as a stale self-link.
+    persisted_pending.pop("receipt_sha256", None)
+    result = {
+        **persisted_pending,
+        "status": "backup-created-cluster-deleted-primary-data-empty",
+        "empty_restore_roots": empty_roots,
+        "cluster_deleted_at_unix": cluster_deleted_at_unix,
+        "recovery_boundary_basis": recovery_boundary_basis,
+        "completed_at_unix": int(time.time()),
+    }
+    path = root / BACKUP_DOWN_RECEIPT
+    atomic_json(path, result)
+    return {**result, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
+
+
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, Any]:
+    require_singleton_cluster(args.cluster)
+    reference.validate_owner_id(args.owner_id)
+    root = state_root(getattr(args, "state_root", None))
+    configure_reference_paths(root)
+    terminal_path = root / BACKUP_DOWN_RECEIPT
+    if terminal_path.exists() or terminal_path.is_symlink():
+        existing = _load_backup_down_receipt(root, allow_pending=True)
+        if existing.get("owner_id") != args.owner_id:
+            raise StagingCellError("backup down receipt owner mismatch")
+        if existing.get("cluster") != args.cluster:
+            raise StagingCellError("backup down receipt cluster mismatch")
+        if existing.get("release_commit") != args.source_commit:
+            raise StagingCellError("backup down receipt release mismatch")
+        if existing.get("status") == "backup-created-cluster-deleted-primary-data-empty":
+            return existing
+        controller_commit = require_clean_commit(None)
+        if existing.get("controller_commit") != controller_commit:
+            raise StagingCellError(
+                "backup down retry must use the exact controller commit that created the backup"
+            )
+        return _complete_backup_down_from_pending(
+            root, args, existing, resumed=True
+        )
+
+    cell = load_cell_receipt(root)
+    require_receipt_cluster(cell, args.cluster)
+    if args.owner_id != cell.get("owner_id"):
+        raise StagingCellError("--owner-id does not match the persisted cluster owner")
+    release_commit = cell_active_commit(cell)
+    if args.source_commit != release_commit:
+        raise StagingCellError(
+            "backup delete-to-prove down must target the exact active app release"
+        )
+    if cell.get("status") != "gateway-ready" or cell.get("app_activation") is not True:
+        raise StagingCellError("backup delete-to-prove down requires a gateway-ready cell")
+    controller_commit = require_clean_commit(None)
+    tools = load_tool_receipt(
+        root, required_tools=("kind", "kubectl"), required_artifacts=()
+    )["tools"]
+    kind = tools["kind"]
+    kubectl = tools["kubectl"]
+    reference.require_owned_cluster(
+        kind,
+        args.cluster,
+        expected_commit=cell["bootstrap_commit"],
+        expected_owner_id=args.owner_id,
+    )
+    require_bootstrap_data_current(kubectl, cell["bootstrap_commit"])
+    if app_live_health(kubectl) != {name: "True" for name in APP_DEPLOYMENTS}:
+        raise StagingCellError("backup delete-to-prove requires healthy app workloads")
+    if not gateway_receipt_current(root, cell, kubectl):
+        raise StagingCellError("backup delete-to-prove requires the current Gateway receipt")
+    promotion = _exact_cell_promotion(root, cell, release_commit)
+    gateway_before = _private_json_receipt(
+        root / "receipts/gateway-proof.json", label="staging gateway proof receipt"
+    )
+    pre_delete_api_nodes_sha256 = str(gateway_before.get("api_nodes_sha256") or "")
+    if len(pre_delete_api_nodes_sha256) != 64 or any(
+        ch not in "0123456789abcdef" for ch in pre_delete_api_nodes_sha256
+    ):
+        raise StagingCellError(
+            "backup delete-to-prove requires a canonical pre-delete API data readback hash"
+        )
+    started_at_unix = int(time.time())
+    _quiesce_backup_cell(kubectl)
+    pre_delete = _mounted_retained_data_identity(
+        kind, args.cluster, root, durable=True, require_split=True
+    )
+    archives = _backup_volume_archives(kind, args.cluster, root, release_commit)
+    after_backup = _mounted_retained_data_identity(
+        kind, args.cluster, root, durable=True, require_split=True
+    )
+    if pre_delete != after_backup:
+        raise StagingCellError("staging data changed while the cold backup was created")
+    pending = {
+        "schema_version": 1,
+        "status": "backup-created-cluster-delete-pending",
+        "cluster": args.cluster,
+        "owner_id": args.owner_id,
+        "bootstrap_commit": cell["bootstrap_commit"],
+        "release_commit": release_commit,
+        "controller_commit": controller_commit,
+        "cell_receipt_sha256": sha256_file(root / "receipts/cell-bootstrap.json"),
+        "gateway_receipt_sha256": sha256_file(root / "receipts/gateway-proof.json"),
+        "previous_delete_to_prove_receipt_sha256": (
+            sha256_file(root / DELETE_TO_PROVE_RECEIPT)
+            if (root / DELETE_TO_PROVE_RECEIPT).exists()
+            else None
+        ),
+        "image_promotion": promotion,
+        "pre_delete_data_identity": pre_delete,
+        "pre_delete_api_nodes_sha256": pre_delete_api_nodes_sha256,
+        "backup_archives": archives,
+        "started_at_unix": started_at_unix,
+        "production_changed": False,
+    }
+    # This pending receipt is the recovery authority for the destructive step.
+    # It is written only after the immutable backup and cold-source fingerprints
+    # are complete, so a process crash can safely continue rather than backing up
+    # a second time or guessing what happened.
+    atomic_json(terminal_path, pending)
+    return _complete_backup_down_from_pending(
+        root, args, pending, resumed=False
+    )
+
+
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str, Any]:
+    require_singleton_cluster(args.cluster)
+    reference.validate_owner_id(args.owner_id)
+    root = state_root(getattr(args, "state_root", None))
+    configure_reference_paths(root)
+    down = _load_backup_down_receipt(root)
+    if down.get("owner_id") != args.owner_id or down.get("cluster") != args.cluster:
+        raise StagingCellError("backup rebuild owner or cluster binding mismatch")
+    if args.source_commit != down.get("release_commit"):
+        raise StagingCellError("backup rebuild must restore the exact pre-delete release")
+    controller_commit = require_clean_commit(None)
+    if controller_commit != down.get("controller_commit"):
+        raise StagingCellError("backup rebuild controller commit differs from backup creation")
+    result_path = root / BACKUP_REBUILD_RECEIPT
+    existing: dict[str, Any] | None = None
+    if result_path.exists() or result_path.is_symlink():
+        existing = _private_json_receipt(result_path, label="backup rebuild receipt")
+        if existing.get("owner_id") != args.owner_id or existing.get("cluster") != args.cluster:
+            raise StagingCellError("backup rebuild receipt owner or cluster mismatch")
+        if existing.get("release_commit") != down.get("release_commit"):
+            raise StagingCellError("backup rebuild receipt release mismatch")
+        if existing.get("controller_commit") != controller_commit:
+            raise StagingCellError("backup rebuild receipt controller mismatch")
+        if existing.get("backup_down_receipt_sha256") != down["receipt_sha256"]:
+            raise StagingCellError("backup rebuild receipt is not bound to current backup-down receipt")
+        if existing.get("production_changed") is not False:
+            raise StagingCellError("backup rebuild receipt lost production isolation")
+        if existing.get("status") == "backup-restored-infrastructure-ready-app-reactivation-required":
+            return {
+                **existing,
+                "receipt_path": str(result_path),
+                "receipt_sha256": sha256_file(result_path),
+            }
+        if existing.get("status") not in {
+            "backup-restore-pending",
+            "backup-data-restored-platform-reconcile-pending",
+            "backup-platform-ready-data-reconcile-pending",
+        }:
+            raise StagingCellError("backup rebuild receipt has unexpected state")
+
+    tool_receipt = load_tool_receipt(root)
+    kind = tool_receipt["tools"]["kind"]
+    kubectl = tool_receipt["tools"]["kubectl"]
+    flux = tool_receipt["tools"]["flux"]
+    helm = tool_receipt["tools"]["helm"]
+    if args.cluster not in reference.clusters(kind):
+        reference.clear_stale_cluster_reservation(
+            kind,
+            args.cluster,
+            expected_commit=down["bootstrap_commit"],
+            expected_owner_id=args.owner_id,
+        )
+        reference.create_kind_cluster(
+            kind,
+            args.cluster,
+            tool_receipt["kubernetes"]["kind_node_image"],
+            str(render_kind_config(root)),
+            down["bootstrap_commit"],
+            args.owner_id,
+            timeout=900,
+        )
+    reference.require_owned_cluster(
+        kind,
+        args.cluster,
+        expected_commit=down["bootstrap_commit"],
+        expected_owner_id=args.owner_id,
+    )
+    prepare_volume_permissions(kind, args.cluster, root)
+
+    if existing is None:
+        anchors = _mounted_retained_data_anchors(
+            kind, args.cluster, root, require_split=True
+        )
+        if not _same_data_mount_anchors(down["empty_restore_roots"], anchors):
+            raise StagingCellError(
+                "backup rebuild empty restore roots are not the proven post-delete roots"
+            )
+        existing = {
+            "schema_version": 1,
+            "status": "backup-restore-pending",
+            "cluster": args.cluster,
+            "owner_id": args.owner_id,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": down["release_commit"],
+            "controller_commit": controller_commit,
+            "backup_down_receipt_sha256": down["receipt_sha256"],
+            "backup_archives": down["backup_archives"],
+            "pre_delete_data_identity": down["pre_delete_data_identity"],
+            "empty_restore_roots": down["empty_restore_roots"],
+            "restore_started_at_unix": int(time.time()),
+            "production_changed": False,
+        }
+        atomic_json(result_path, existing)
+
+    if existing["status"] == "backup-restore-pending":
+        observed = _mounted_retained_data_identity(
+            kind, args.cluster, root, durable=True, require_split=True
+        )
+        if _same_data_tree_hashes(down["pre_delete_data_identity"], observed):
+            restored = observed
+        else:
+            anchors = _mounted_retained_data_anchors(
+                kind, args.cluster, root, require_split=True
+            )
+            if not _same_data_mount_anchors(existing["empty_restore_roots"], anchors):
+                raise StagingCellError(
+                    "backup restore target identity changed before retry"
+                )
+            # A crash can leave a partial extraction. The pending receipt proves
+            # these are the fresh post-delete roots and binds the immutable backup,
+            # so clearing only their contents is retry-safe and cannot touch the
+            # forensic originals.
+            data_node = _retained_mount_node(kind, args.cluster, root, require_split=True)
+            for name in ("postgres", "nats"):
+                volume = f"/var/local/commonthing-staging/{name}"
+                run(
+                    [
+                        "docker",
+                        "exec",
+                        data_node,
+                        "find",
+                        volume,
+                        "-mindepth",
+                        "1",
+                        "-delete",
+                    ],
+                    timeout=120,
+                )
+                occupied = output(
+                    [
+                        "docker",
+                        "exec",
+                        data_node,
+                        "find",
+                        volume,
+                        "-mindepth",
+                        "1",
+                        "-maxdepth",
+                        "1",
+                        "-print",
+                        "-quit",
+                    ],
+                    timeout=30,
+                )
+                if occupied:
+                    raise StagingCellError(
+                        f"staging {name} restore target could not be reset for retry"
+                    )
+            restored = _restore_volume_archives(
+                kind,
+                args.cluster,
+                root,
+                down["release_commit"],
+                down["backup_archives"],
+            )
+        if not _same_data_tree_hashes(down["pre_delete_data_identity"], restored):
+            raise StagingCellError(
+                "restored staging data tree hashes differ from the cold backup source"
+            )
+        existing = {
+            **existing,
+            "status": "backup-data-restored-platform-reconcile-pending",
+            "restored_data_identity": restored,
+            "restore_completed_at_unix": int(time.time()),
+        }
+        atomic_json(result_path, existing)
+
+    if existing["status"] == "backup-data-restored-platform-reconcile-pending":
+        restored_now = _mounted_retained_data_identity(
+            kind, args.cluster, root, durable=True, require_split=True
+        )
+        if not _same_data_tree_hashes(
+            existing["pre_delete_data_identity"], restored_now
+        ):
+            raise StagingCellError(
+                "restored staging data drifted before platform reconcile"
+            )
+        if not _same_data_mount_anchors(
+            existing["restored_data_identity"], restored_now
+        ):
+            raise StagingCellError(
+                "restored staging mount identity changed before platform reconcile"
+            )
+        api_server_host = reference.control_plane_address(args.cluster)
+        reference.install_platform_components(
+            kubectl, flux, helm, tool_receipt["artifacts"], api_server_host
+        )
+        run(
+            [kubectl, "wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5m"],
+            timeout=360,
+        )
+        secret_receipt = inject_external_secrets(kubectl, root)
+        registry_material, registry_source_sha = load_registry_pull_material(root)
+        registry_receipt = inject_registry_pull_secret(
+            kubectl,
+            root,
+            material=registry_material,
+            source_sha=registry_source_sha,
+        )
+        apply_yaml(
+            kubectl,
+            flux_documents(down["bootstrap_commit"], suspend_data=True),
+        )
+        _set_data_reconciliation_suspended(kubectl, suspended=True)
+        mounted_before_resume = _mounted_retained_data_identity(
+            kind, args.cluster, root, durable=True, require_split=True
+        )
+        if not _same_data_tree_hashes(
+            down["pre_delete_data_identity"], mounted_before_resume
+        ):
+            raise StagingCellError("backup-restored data changed before workload start")
+        if not _same_data_mount_anchors(
+            existing["restored_data_identity"], mounted_before_resume
+        ):
+            raise StagingCellError(
+                "backup-restored mount identity changed before workload start"
+            )
+        existing = {
+            **existing,
+            "status": "backup-platform-ready-data-reconcile-pending",
+            "restored_data_identity": mounted_before_resume,
+            "external_secret_source_sha256": secret_receipt["source_sha256"],
+            "registry_secret_source_sha256": registry_receipt["source_sha256"],
+            "platform_ready_at_unix": int(time.time()),
+        }
+        atomic_json(result_path, existing)
+
+    if existing["status"] != "backup-platform-ready-data-reconcile-pending":
+        raise StagingCellError("backup rebuild did not reach data-reconcile state")
+    anchors_before_resume = _mounted_retained_data_anchors(
+        kind, args.cluster, root, require_split=True
+    )
+    if not _same_data_mount_anchors(
+        existing["restored_data_identity"], anchors_before_resume
+    ):
+        raise StagingCellError("backup-restored mount identity changed before data reconcile")
+    _set_data_reconciliation_suspended(kubectl, suspended=False)
+    reconcile_data(kubectl, down["bootstrap_commit"])
+    live_workloads = staging_live_health(kubectl)
+    unhealthy = {
+        name: state for name, state in live_workloads.items() if state != "True"
+    }
+    if unhealthy:
+        raise StagingCellError(
+            f"backup-restored staging infrastructure is not live: {unhealthy!r}"
+        )
+    anchors_after_resume = _mounted_retained_data_anchors(
+        kind, args.cluster, root, require_split=True
+    )
+    if not _same_data_mount_anchors(
+        existing["restored_data_identity"], anchors_after_resume
+    ):
+        raise StagingCellError("backup-restored mount identity changed during data reconcile")
+    result = {
+        **existing,
+        "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+        "live_workloads": live_workloads,
+        "completed_at_unix": int(time.time()),
+    }
+    atomic_json(result_path, result)
+    return {**result, "receipt_path": str(result_path), "receipt_sha256": sha256_file(result_path)}
+
+
+def _backup_recovery_controller_commit(
+    root: Path, cell: dict[str, Any], release_commit: str
+) -> str | None:
+    path = root / BACKUP_REBUILD_RECEIPT
+    if not (path.exists() or path.is_symlink()):
+        return None
+    receipt = _private_json_receipt(path, label="backup rebuild receipt")
+    if (
+        receipt.get("status")
+        != "backup-restored-infrastructure-ready-app-reactivation-required"
+        or receipt.get("cluster") != cell.get("cluster")
+        or receipt.get("owner_id") != cell.get("owner_id")
+        or receipt.get("bootstrap_commit") != cell.get("bootstrap_commit")
+        or receipt.get("release_commit") != release_commit
+    ):
+        return None
+    controller_commit = str(receipt.get("controller_commit") or "")
+    observed = require_clean_commit(None)
+    if observed != controller_commit:
+        raise StagingCellError(
+            "backup recovery must continue from the exact controller commit that restored data"
+        )
+    return controller_commit
+
+
+@lifecycle_mutation_locked
+@reference_output_routed
+def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, Any]:
+    require_singleton_cluster(args.cluster)
+    reference.validate_owner_id(args.owner_id)
+    root = state_root(getattr(args, "state_root", None))
+    configure_reference_paths(root)
+    cell = load_cell_receipt(root)
+    require_receipt_cluster(cell, args.cluster)
+    if cell.get("owner_id") != args.owner_id:
+        raise StagingCellError("backup proof owner mismatch")
+    release_commit = str(args.source_commit or "")
+    if cell_active_commit(cell) != release_commit:
+        raise StagingCellError("backup proof requires the restored release to be active")
+    down = _load_backup_down_receipt(root)
+    rebuild_path = root / BACKUP_REBUILD_RECEIPT
+    rebuild = _private_json_receipt(rebuild_path, label="backup rebuild receipt")
+    if (
+        rebuild.get("status")
+        != "backup-restored-infrastructure-ready-app-reactivation-required"
+        or rebuild.get("backup_down_receipt_sha256") != down["receipt_sha256"]
+        or rebuild.get("release_commit") != release_commit
+    ):
+        raise StagingCellError("backup rebuild receipt is not bound to this restored release")
+    tools = load_tool_receipt(
+        root, required_tools=("kind", "kubectl"), required_artifacts=()
+    )["tools"]
+    kubectl = tools["kubectl"]
+    reference.require_owned_cluster(
+        tools["kind"],
+        args.cluster,
+        expected_commit=cell["bootstrap_commit"],
+        expected_owner_id=args.owner_id,
+    )
+    require_bootstrap_data_current(kubectl, cell["bootstrap_commit"])
+    workloads = app_live_health(kubectl)
+    if workloads != {name: "True" for name in APP_DEPLOYMENTS}:
+        raise StagingCellError("backup proof requires healthy restored app workloads")
+    if not gateway_receipt_current(root, cell, kubectl):
+        raise StagingCellError("backup proof requires a current Gateway receipt")
+    if not host_gateway_receipt_current(root, cell, kubectl):
+        raise StagingCellError("backup proof requires a current host-external Gateway readback")
+    final_data_anchors = _mounted_retained_data_anchors(
+        tools["kind"], args.cluster, root, require_split=True
+    )
+    if not _same_data_mount_anchors(
+        rebuild["restored_data_identity"], final_data_anchors
+    ):
+        raise StagingCellError(
+            "restored data mount identity changed after workload reactivation"
+        )
+    live_workloads = staging_live_health(kubectl)
+    if any(state != "True" for state in live_workloads.values()):
+        raise StagingCellError(
+            f"backup proof requires healthy restored data and Flux workloads: {live_workloads!r}"
+        )
+    host_path = root / HOST_GATEWAY_RECEIPT
+    host_receipt = _private_json_receipt(
+        host_path, label="host Gateway proof receipt"
+    )
+    fresh_host = host_gateway_http_readback()
+    for key in (
+        "probe_scope",
+        "endpoint",
+        "health_sha256",
+        "web_prefix_sha256",
+        "api_nodes_sha256",
+    ):
+        if host_receipt.get(key) != fresh_host.get(key):
+            raise StagingCellError(
+                f"host Gateway readback changed before final backup proof: {key}"
+            )
+    if fresh_host.get("api_nodes_sha256") != down.get("pre_delete_api_nodes_sha256"):
+        raise StagingCellError(
+            "restored PostgreSQL-backed API data differs from the pre-delete readback"
+        )
+    verified_at_unix = int(time.time())
+    recovery_start = int(down.get("cluster_deleted_at_unix") or 0)
+    if recovery_start <= 0 or verified_at_unix < recovery_start:
+        raise StagingCellError("backup proof recovery timing evidence is invalid")
+    result = {
+        "schema_version": 1,
+        "status": "backup-delete-to-prove-verified",
+        "cluster": args.cluster,
+        "owner_id": args.owner_id,
+        "bootstrap_commit": cell["bootstrap_commit"],
+        "active_commit": release_commit,
+        "controller_commit": rebuild["controller_commit"],
+        "backup_down_receipt_sha256": down["receipt_sha256"],
+        "backup_rebuild_receipt_sha256": sha256_file(rebuild_path),
+        "gateway_receipt_sha256": sha256_file(root / "receipts/gateway-proof.json"),
+        "host_gateway_receipt_sha256": sha256_file(root / HOST_GATEWAY_RECEIPT),
+        "pre_delete_data_identity": down["pre_delete_data_identity"],
+        "restored_data_identity": rebuild["restored_data_identity"],
+        "final_data_mount_anchors": final_data_anchors,
+        "pre_delete_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
+        "post_restore_api_nodes_sha256": fresh_host["api_nodes_sha256"],
+        "app_workloads": workloads,
+        "live_workloads": live_workloads,
+        "rto_observed_seconds": verified_at_unix - recovery_start,
+        "rpo_observation": {
+            "confirmed_mutations_lost": 0,
+            "boundary": "quiesced-cold-backup-snapshot",
+        },
+        "verified_at_unix": verified_at_unix,
+        "production_changed": False,
+        "does_not_establish": ["public DNS", "public TLS", "production cutover"],
+    }
+    path = root / BACKUP_DELETE_TO_PROVE_RECEIPT
+    if path.exists() or path.is_symlink():
+        previous = _private_json_receipt(path, label="backup delete-to-prove receipt")
+        stable = {k: v for k, v in result.items() if k != "verified_at_unix"}
+        previous_stable = {k: v for k, v in previous.items() if k != "verified_at_unix"}
+        if previous_stable != stable:
+            raise StagingCellError("existing backup delete-to-prove receipt has different bindings")
+        return {**previous, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
+    atomic_json(path, result)
+    return {**result, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
+
+
 @lifecycle_mutation_locked
 @reference_output_routed
 def command_prove_delete_to_prove(args: argparse.Namespace) -> dict[str, Any]:
@@ -6106,6 +7338,22 @@ def parser() -> argparse.ArgumentParser:
     gateway.set_defaults(cluster=DEFAULT_CLUSTER)
     gateway.add_argument("--owner-id", required=True)
     gateway.add_argument("--source-commit", required=True)
+    host_gateway = sub.add_parser("prove-host-gateway")
+    host_gateway.set_defaults(cluster=DEFAULT_CLUSTER)
+    host_gateway.add_argument("--owner-id", required=True)
+    host_gateway.add_argument("--source-commit", required=True)
+    backup_down = sub.add_parser("backup-delete-to-prove-down")
+    backup_down.set_defaults(cluster=DEFAULT_CLUSTER)
+    backup_down.add_argument("--owner-id", required=True)
+    backup_down.add_argument("--source-commit", required=True)
+    backup_rebuild = sub.add_parser("backup-delete-to-prove-rebuild")
+    backup_rebuild.set_defaults(cluster=DEFAULT_CLUSTER)
+    backup_rebuild.add_argument("--owner-id", required=True)
+    backup_rebuild.add_argument("--source-commit", required=True)
+    backup_proof = sub.add_parser("prove-backup-delete-to-prove")
+    backup_proof.set_defaults(cluster=DEFAULT_CLUSTER)
+    backup_proof.add_argument("--owner-id", required=True)
+    backup_proof.add_argument("--source-commit", required=True)
     status = sub.add_parser("status")
     status.set_defaults(cluster=DEFAULT_CLUSTER)
     down = sub.add_parser("down")
@@ -6146,6 +7394,31 @@ def emit_public_success(command: str, result: dict[str, Any]) -> None:
         }
         if command == "prove-gateway":
             safe["does_not_establish"] = GATEWAY_LIMITS
+        print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
+        return
+    if command in {
+        "prove-host-gateway",
+        "backup-delete-to-prove-down",
+        "backup-delete-to-prove-rebuild",
+        "prove-backup-delete-to-prove",
+    }:
+        safe = {
+            "command": command,
+            "schema_version": 1,
+            "status": str(result.get("status") or "degraded"),
+            "cluster": str(result.get("cluster") or DEFAULT_CLUSTER),
+            "bootstrap_commit": str(result.get("bootstrap_commit") or ""),
+            "active_commit": str(
+                result.get("active_commit") or result.get("release_commit") or ""
+            ),
+            "production_changed": bool(result.get("production_changed")),
+        }
+        if command == "prove-backup-delete-to-prove":
+            safe["rto_observed_seconds"] = int(result.get("rto_observed_seconds") or 0)
+            safe["rpo_observation"] = result.get("rpo_observation")
+            safe["does_not_establish"] = result.get("does_not_establish", [])
+        if command == "prove-host-gateway":
+            safe["does_not_establish"] = result.get("does_not_establish", [])
         print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
         return
     if command == "status":
@@ -6273,6 +7546,14 @@ def main() -> int:
             result = command_activate(args)
         elif args.command == "prove-gateway":
             result = command_prove_gateway(args)
+        elif args.command == "prove-host-gateway":
+            result = command_prove_host_gateway(args)
+        elif args.command == "backup-delete-to-prove-down":
+            result = command_backup_delete_to_prove_down(args)
+        elif args.command == "backup-delete-to-prove-rebuild":
+            result = command_backup_delete_to_prove_rebuild(args)
+        elif args.command == "prove-backup-delete-to-prove":
+            result = command_prove_backup_delete_to_prove(args)
         elif args.command == "status":
             result = command_status(args)
         elif args.command == "down":

@@ -9,7 +9,7 @@ canonicality: normative
 lifecycle_state: active
 owner: ops
 review_after: 2026-09-30
-last_reviewed: 2026-09-10
+last_reviewed: 2026-09-16
 depends_on: []
 relations:
   - type: relates_to
@@ -126,6 +126,14 @@ Bootstrap-Zustand.
 
 ### Delete-to-Prove nach aktivierter Staging-App
 
+Der hier zuerst beschriebene, historische `down → rebuild → activate →
+prove-gateway → prove-delete-to-prove`-Pfad beweist die Rekonstruktion des
+Kubernetes-Clusters **bei erhaltenen PostgreSQL-/NATS-Hostverzeichnissen**. Er
+ist damit ein Cluster-Rebuild-Beweis, aber ausdrücklich **kein** Backup-only-
+Restore nach Verlust der primären Datenpfade. Ein stärkerer destruktiver
+Backup-to-empty-Beweis ist weiter unten separat definiert; die beiden Receipt-
+Familien dürfen semantisch nicht gleichgesetzt werden.
+
 Für eine bereits aktivierte und `gateway-ready` Zelle existiert deshalb ein
 separater, enger Recovery-Pfad. Er dient ausschließlich dem Reproduzierbarkeits-
 beweis der Staging-Zelle und ersetzt **nicht** `up`. Vor der Clusterlöschung
@@ -198,9 +206,83 @@ Post-Rebuild-Beweise tatsächlich neue Identitäten haben. Der Pfad setzt
 `production_changed=false` und belegt weiterhin **nicht** DNS, TLS, einen externen
 Load Balancer oder einen Produktionscutover.
 
-Ein **App-Release** ist davon getrennt: `activate --owner-id <id>
---source-commit <sha>` akzeptiert nur einen exakten aktuellen Public-`main`-Commit
-mit passendem Staging-Image-Promotion-Receipt. PostgreSQL/NATS und ihre
+### Stärkerer Backup-to-empty-Delete-to-Prove
+
+Für den stärkeren T084-Beweis existiert eine getrennte Receipt-Kette. Sie
+quiesziert App und Datenebene, erzeugt private SHA-256-/Größen-gebundene TAR-
+Backups von PostgreSQL und JetStream, löscht anschließend den Kind-Cluster und
+verschiebt die bisherigen primären Datenverzeichnisse unverändert in einen
+forensischen `recovery-snapshots/<release>/retained-original/`-Pfad. An den
+kanonischen Primärpfaden werden **neue leere Verzeichnisse** erzeugt. Erst in
+diese leeren Verzeichnisse werden die gebundenen Backups zurückgespielt. Damit
+beweist dieser Zyklus nicht nur Cluster-Rekonstruktion, sondern tatsächliche
+Wiederherstellung aus den vorher erzeugten Backup-Artefakten.
+
+Die destruktiven Schritte sind als kleine persistierte Zustandsmaschine gebaut.
+Ein Prozessabbruch nach dem Backup, nach Clusterlöschung, während der
+Archivextraktion oder zwischen Plattform- und Daten-Reconcile wird nicht durch
+Raten übersprungen: ein Retry muss dieselbe Owner-/Cluster-/Release-/Controller-
+und Receipt-Bindung fortsetzen. Eine partielle Extraktion darf nur in den zuvor
+als frisch und leer bewiesenen Primärverzeichnissen verworfen und erneut
+ausgeführt werden; die forensisch erhaltenen Originalverzeichnisse bleiben
+unangetastet. Vor dem ersten Datenbankstart müssen die rekonstruierten
+Datenbäume exakt den Cold-Backup-Quellhashes entsprechen. Nach dem Start dürfen
+PostgreSQL und NATS legitime Laufzeitmetadaten verändern; ab dort wird deshalb
+die physische Mount-Identität statt eines unveränderlichen Bytehashes gebunden.
+
+Der Controller und der wiederhergestellte App-Release sind dabei absichtlich
+getrennt: die Recovery-Implementierung muss aus dem aktuellen sauberen
+geschützten Public-`main` stammen, während `--source-commit` exakt den im Backup
+gebundenen, möglicherweise älteren App-Release bezeichnet. Dadurch muss kein
+neues App-Image erzeugt werden, nur um einen älteren Release mit einem gehärteten
+Recovery-Controller wiederherzustellen.
+
+Der vollständige stärkere Ablauf ist:
+
+```bash
+uv run --project tools/py --locked python scripts/platform/staging_cell.py backup-delete-to-prove-down \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$RESTORED_RELEASE_SHA"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py backup-delete-to-prove-rebuild \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$RESTORED_RELEASE_SHA"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py activate \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$RESTORED_RELEASE_SHA"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py prove-gateway \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$RESTORED_RELEASE_SHA"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py prove-host-gateway \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$RESTORED_RELEASE_SHA"
+uv run --project tools/py --locked python scripts/platform/staging_cell.py prove-backup-delete-to-prove \
+  --owner-id "$COMMONTHING_STAGING_OWNER_ID" --source-commit "$RESTORED_RELEASE_SHA"
+```
+
+`prove-host-gateway` ergänzt den internen Kind-Node-Beweis um einen HTTP-Readback
+vom Heim-PC **außerhalb Kubernetes**. Kind veröffentlicht dafür ausschließlich
+`127.0.0.1:18084` auf den fest gepinnten Gateway-NodePort `31844`; weder eine
+LAN-Adresse noch `0.0.0.0` werden gebunden. Der Receipt bindet Service-Name,
+Service-UID, NodePort, Gateway-Receipt sowie den vollständigen Health-/API-Hash
+und den SHA-256 des ersten KiB der Webantwort. Service- oder Gateway-Drift während des
+Readbacks macht den Beweis ungültig. Dies ist ein host-externer lokaler
+Gateway-Beweis, aber weiterhin **kein** öffentlicher DNS-, TLS- oder Internet-
+Load-Balancer-Beweis.
+
+Der finale `backup-delete-to-prove.json` verlangt zusätzlich, dass der frische
+Host-Readback von `/api/nodes` denselben SHA-256 wie vor der Löschung liefert.
+Das ist der anwendungsnahe Nachweis, dass die PostgreSQL-gestützten Nutzdaten den
+Backup-Restore überlebt haben. Die beobachtete RTO wird ab der nachweislich
+beobachteten Clusterlöschung gemessen. Musste ein Pending-Schritt nach einem
+Prozessabbruch wiederaufgenommen werden und ist der genaue Löschzeitpunkt nicht
+mehr beweisbar, wird konservativ der **frühere Zyklusstart** als RTO-Grenze
+verwendet; die Kennzahl kann dadurch nur schlechter, niemals künstlich besser
+aussehen. `confirmed_mutations_lost=0` beschreibt ausschließlich die quieszente
+Cold-Snapshot-Grenze und ist keine Aussage über Online-RPO unter laufenden
+Schreiblasten. Alle Receipts halten `production_changed=false`.
+
+Ein **App-Release** ist davon getrennt. Im normalen Aktivierungspfad akzeptiert
+`activate --owner-id <id> --source-commit <sha>` nur einen exakten aktuellen
+Public-`main`-Commit mit passendem Staging-Image-Promotion-Receipt. Die oben
+beschriebene Backup-Recovery ist die einzige enge Ausnahme: Sie darf den exakt
+receiptgebundenen älteren App-Release reaktivieren, während der Recovery-Controller
+selbst weiterhin vom exakt gebundenen aktuellen sauberen Public-`main` stammen
+muss. PostgreSQL/NATS und ihre
 `commonthing-staging-source`-/Data-Kustomization bleiben dabei am Bootstrap-Commit.
 Für die App wird `commonthing-staging-app-source` angelegt. Die statische
 Staging-Überlagerung behält `promotion-required`; die Laufzeit-Kustomization bindet
@@ -278,9 +360,13 @@ des erzeugten Cilium-LoadBalancer-Service müssen als vollständige Mengen
 Gateway-UID und über Port 80 an den HTTP-Listener gebunden sein. Alle beobachteten
 Adressen werden als Kandidaten an den kind-Node-HTTP-Probe übergeben. Ein statischer
 Adresspool wird nicht angelegt; NodeIPAM-Adressen sind kein externer LB-Beweis.
-Der gemeinsame Legacy-Gateway-Pfad wird nicht benutzt.
-HTTP auf Port 80 routet `/health` und `/api` unverändert an `commonthing-api:8080`,
-`/` an `commonthing-web:8080`. Es gibt weder Hostnamen noch TLS-Referenzen.
+Der gemeinsame Legacy-Gateway-Pfad wird nicht benutzt. Für den optionalen
+Host-Readback ist der Controller-erzeugte HTTP-Service deterministisch auf
+NodePort `31844` gepinnt; die Kind-Control-Plane mappt ausschließlich
+`127.0.0.1:18084` darauf. Das erzeugt bewusst keine öffentliche oder LAN-weite
+Exposition. HTTP auf Port 80 routet `/health` und `/api` unverändert an
+`commonthing-api:8080`, `/` an `commonthing-web:8080`. Es gibt weder Hostnamen
+noch TLS-Referenzen.
 
 Ein Lifecycle-Lock serialisiert den Beweis. Vor dem Apply persistiert
 `gateway-proof-in-progress` Owner, aktiven Commit und Manifest-Hash; Wiederanläufe

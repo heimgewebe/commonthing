@@ -252,6 +252,20 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(mount["readOnly"] is False for mount in mounts))
+        self.assertEqual(
+            document["nodes"][0].get("extraPortMappings"),
+            [
+                {
+                    "containerPort": staging.STAGING_GATEWAY_NODE_PORT,
+                    "hostPort": staging.STAGING_GATEWAY_HOST_PORT,
+                    "listenAddress": "127.0.0.1",
+                    "protocol": "TCP",
+                }
+            ],
+        )
+        self.assertFalse(
+            any(node.get("extraPortMappings") for node in document["nodes"][1:])
+        )
 
     def test_reference_commands_use_scoped_staging_stdout_routing(self) -> None:
         original = staging.reference.run
@@ -5233,6 +5247,294 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 registry_target.chmod(0o600)
                 with self.assertRaisesRegex(staging.StagingCellError, "registry secret differs"):
                     staging.load_legacy_state_migration(canonical, owner_id=owner)
+
+    def test_backup_data_comparison_distinguishes_content_from_mount_identity(self) -> None:
+        before = {
+            "postgres": {"device": 1, "inode": 2, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 3, "tree_sha256": "b" * 64},
+        }
+        restored = {
+            "postgres": {"device": 1, "inode": 20, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 30, "tree_sha256": "b" * 64},
+        }
+        running = {
+            "postgres": {"device": 1, "inode": 20, "tree_sha256": "c" * 64},
+            "nats": {"device": 1, "inode": 30, "tree_sha256": "d" * 64},
+        }
+        self.assertTrue(staging._same_data_tree_hashes(before, restored))
+        self.assertFalse(staging._same_data_mount_anchors(before, restored))
+        self.assertTrue(staging._same_data_mount_anchors(restored, running))
+
+    def test_backup_empty_restore_roots_are_reentrant_and_preserve_forensic_original(self) -> None:
+        release = "a" * 40
+        with tempfile.TemporaryDirectory(prefix="staging-backup-empty-roots-") as tmp_name:
+            root = Path(tmp_name)
+            pre_delete: dict[str, dict] = {}
+            expected_payloads = {"postgres": b"pg-state", "nats": b"nats-state"}
+            for name, payload in expected_payloads.items():
+                source = root / "data" / name
+                source.mkdir(parents=True)
+                (source / "marker").write_bytes(payload)
+                pre_delete[name] = staging._real_directory_identity(
+                    source, label=f"pre-delete {name}"
+                )
+
+            first = staging._prepare_empty_restore_roots(root, release, pre_delete)
+            for name, payload in expected_payloads.items():
+                active = root / "data" / name
+                retained = (
+                    root
+                    / "recovery-snapshots"
+                    / release
+                    / "retained-original"
+                    / name
+                )
+                self.assertEqual((retained / "marker").read_bytes(), payload)
+                self.assertEqual(retained.stat().st_ino, pre_delete[name]["inode"])
+                self.assertNotEqual(active.stat().st_ino, pre_delete[name]["inode"])
+                self.assertEqual(list(active.iterdir()), [])
+                self.assertTrue(first[name]["empty"])
+
+            second = staging._prepare_empty_restore_roots(root, release, pre_delete)
+            self.assertTrue(staging._same_data_mount_anchors(first, second))
+            for name, payload in expected_payloads.items():
+                retained = (
+                    root
+                    / "recovery-snapshots"
+                    / release
+                    / "retained-original"
+                    / name
+                )
+                self.assertEqual((retained / "marker").read_bytes(), payload)
+
+    def test_resumed_backup_down_uses_conservative_rto_boundary_without_stale_self_hash(self) -> None:
+        owner = "test:t084"
+        release = "b" * 40
+        pending = {
+            "schema_version": 1,
+            "status": "backup-created-cluster-delete-pending",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "a" * 40,
+            "release_commit": release,
+            "controller_commit": "c" * 40,
+            "started_at_unix": 100,
+            "pre_delete_data_identity": {"postgres": {}, "nats": {}},
+            "receipt_sha256": "d" * 64,
+            "production_changed": False,
+        }
+        empty_roots = {
+            "postgres": {"device": 1, "inode": 20, "empty": True},
+            "nats": {"device": 1, "inode": 30, "empty": True},
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=release,
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-resumed-boundary-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(
+                    staging,
+                    "load_tool_receipt",
+                    return_value={"tools": {"kind": "kind"}},
+                ),
+                mock.patch.object(
+                    staging.reference, "delete_owned_cluster_if_present"
+                ) as delete_owned,
+                mock.patch.object(
+                    staging,
+                    "_prepare_empty_restore_roots",
+                    return_value=empty_roots,
+                ),
+                mock.patch.object(staging.time, "time", return_value=200),
+            ):
+                result = staging._complete_backup_down_from_pending(
+                    root, args, pending, resumed=True
+                )
+            persisted = json.loads(
+                (root / staging.BACKUP_DOWN_RECEIPT).read_text(encoding="utf-8")
+            )
+        delete_owned.assert_called_once()
+        self.assertEqual(result["cluster_deleted_at_unix"], 100)
+        self.assertEqual(
+            result["recovery_boundary_basis"],
+            "conservative-cycle-start-after-unobserved-delete",
+        )
+        self.assertNotIn("receipt_sha256", persisted)
+        self.assertEqual(persisted["completed_at_unix"], 200)
+
+    def test_backup_down_pending_receipt_resumes_without_recreating_backup(self) -> None:
+        owner = "test:t084"
+        release = "d" * 40
+        controller = "e" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=release,
+        )
+        pending = {
+            "status": "backup-created-cluster-delete-pending",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "release_commit": release,
+            "controller_commit": controller,
+        }
+        with tempfile.TemporaryDirectory(prefix="staging-backup-pending-resume-") as tmp_name:
+            root = Path(tmp_name)
+            receipt = root / staging.BACKUP_DOWN_RECEIPT
+            receipt.parent.mkdir(parents=True)
+            receipt.write_text("{}\n", encoding="utf-8")
+            receipt.chmod(0o600)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "_load_backup_down_receipt", return_value=pending
+                ),
+                mock.patch.object(
+                    staging, "require_clean_commit", return_value=controller
+                ),
+                mock.patch.object(
+                    staging,
+                    "_complete_backup_down_from_pending",
+                    return_value={"status": "completed"},
+                ) as complete,
+                mock.patch.object(staging, "_backup_volume_archives") as backup,
+            ):
+                result = staging.command_backup_delete_to_prove_down(args)
+        self.assertEqual(result["status"], "completed")
+        complete.assert_called_once_with(root, args, pending, resumed=True)
+        backup.assert_not_called()
+
+    def test_backup_rebuild_retry_after_data_start_uses_mount_anchor_not_cold_tree_hash(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        anchors = {
+            "postgres": {"device": 1, "inode": 20},
+            "nats": {"device": 1, "inode": 30},
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-platform-ready-data-reconcile-pending",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "restored_data_identity": anchors,
+            "production_changed": False,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=release,
+        )
+        live = {name: "True" for name in staging.LIVE_DEPLOYMENTS}
+        with tempfile.TemporaryDirectory(prefix="staging-backup-post-start-resume-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "_load_backup_down_receipt", return_value=down
+                ),
+                mock.patch.object(
+                    staging, "require_clean_commit", return_value=controller
+                ),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(
+                    staging.reference,
+                    "clusters",
+                    return_value=[staging.DEFAULT_CLUSTER],
+                ),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(staging, "prepare_volume_permissions"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_anchors",
+                    side_effect=[anchors, anchors],
+                ),
+                mock.patch.object(
+                    staging, "_mounted_retained_data_identity"
+                ) as content_identity,
+                mock.patch.object(staging, "_set_data_reconciliation_suspended"),
+                mock.patch.object(staging, "reconcile_data"),
+                mock.patch.object(staging, "staging_live_health", return_value=live),
+            ):
+                result = staging.command_backup_delete_to_prove_rebuild(args)
+        self.assertEqual(
+            result["status"],
+            "backup-restored-infrastructure-ready-app-reactivation-required",
+        )
+        content_identity.assert_not_called()
+
+    def test_backup_archive_verification_rejects_receipt_and_file_tamper(self) -> None:
+        release = "7" * 40
+        with tempfile.TemporaryDirectory(prefix="staging-backup-archive-binding-") as tmp_name:
+            root = Path(tmp_name)
+            paths = staging._backup_archive_paths(root, release)
+            archives: dict[str, dict] = {}
+            for name, path in paths.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes((name + "-archive-bytes").encode("utf-8"))
+                path.chmod(0o600)
+                archives[name] = {
+                    "path": str(path),
+                    "sha256": staging.sha256_file(path),
+                    "bytes": path.stat().st_size,
+                }
+            verified = staging._verify_backup_archives(root, release, archives)
+            self.assertEqual(verified, paths)
+
+            path_drift = json.loads(json.dumps(archives))
+            path_drift["postgres"]["path"] = str(root / "elsewhere.tar")
+            with self.assertRaisesRegex(staging.StagingCellError, "backup path drift"):
+                staging._verify_backup_archives(root, release, path_drift)
+
+            hash_drift = json.loads(json.dumps(archives))
+            hash_drift["postgres"]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(staging.StagingCellError, "archive hash drift"):
+                staging._verify_backup_archives(root, release, hash_drift)
+
+            size_drift = json.loads(json.dumps(archives))
+            size_drift["postgres"]["bytes"] += 1
+            with self.assertRaisesRegex(staging.StagingCellError, "archive size drift"):
+                staging._verify_backup_archives(root, release, size_drift)
+
+            paths["postgres"].write_bytes(paths["postgres"].read_bytes() + b"tamper")
+            paths["postgres"].chmod(0o600)
+            with self.assertRaisesRegex(staging.StagingCellError, "archive hash drift"):
+                staging._verify_backup_archives(root, release, archives)
+
+    def test_parser_exposes_stronger_t084_proof_commands(self) -> None:
+        parser = staging.parser()
+        for command in (
+            "prove-host-gateway",
+            "backup-delete-to-prove-down",
+            "backup-delete-to-prove-rebuild",
+            "prove-backup-delete-to-prove",
+        ):
+            args = parser.parse_args(
+                [command, "--owner-id", "test:t084", "--source-commit", "a" * 40]
+            )
+            self.assertEqual(args.command, command)
+            self.assertEqual(args.cluster, staging.DEFAULT_CLUSTER)
 
 
 if __name__ == "__main__":

@@ -93,6 +93,11 @@ class StagingGatewayTests(unittest.TestCase):
             "require_gateway_app_current": None,
             "staging_gateway_documents": self.docs,
             "staging_gateway_observation": self.observed,
+            "ensure_gateway_node_port": (
+                "cilium-gateway-commonthing-staging",
+                "service-uid",
+                staging.STAGING_GATEWAY_NODE_PORT,
+            ),
             "gateway_list": [],
             "run": None,
         }
@@ -436,7 +441,10 @@ class StagingGatewayTests(unittest.TestCase):
                     "gateway.networking.k8s.io/gateway-name": staging.GATEWAY_NAME
                 },
             },
-            "spec": {"type": "LoadBalancer", "ports": [{"port": 80}]},
+            "spec": {
+                "type": "LoadBalancer",
+                "ports": [{"port": 80, "nodePort": staging.STAGING_GATEWAY_NODE_PORT}],
+            },
             "status": {
                 "loadBalancer": {"ingress": [{"ip": ip} for ip in reversed(ADDRESSES)]}
             },
@@ -552,7 +560,10 @@ class StagingGatewayTests(unittest.TestCase):
                 ],
                 "labels": {staging.GATEWAY_SERVICE_LABEL: staging.GATEWAY_NAME},
             },
-            "spec": {"type": "LoadBalancer", "ports": [{"port": 80}]},
+            "spec": {
+                "type": "LoadBalancer",
+                "ports": [{"port": 80, "nodePort": staging.STAGING_GATEWAY_NODE_PORT}],
+            },
             "status": {
                 "loadBalancer": {"ingress": [{"ip": ip} for ip in ADDRESSES]}
             },
@@ -892,6 +903,135 @@ class StagingGatewayTests(unittest.TestCase):
                 "kubectl", self.root, self.cell, self.cell["owner_id"]
             )
         self.mocks["run"].assert_not_called()
+
+    def test_host_gateway_readback_hashes_only_first_web_kib(self):
+        health = b"healthy"
+        web = b"a" * 1024 + b"different-tail"
+        api_nodes = b"[]"
+        with mock.patch.object(
+            staging,
+            "_host_http_bytes",
+            side_effect=[health, web, api_nodes],
+        ):
+            result = staging.host_gateway_http_readback()
+        self.assertEqual(result["health_sha256"], staging.sha256_bytes(health))
+        self.assertEqual(result["web_prefix_sha256"], staging.sha256_bytes(b"a" * 1024))
+        self.assertEqual(result["web_prefix_bytes"], 1024)
+        self.assertEqual(result["api_nodes_sha256"], staging.sha256_bytes(api_nodes))
+
+    def test_host_gateway_success_receipt_binds_exact_localhost_service_and_gateway(self):
+        staging.command_prove_gateway(self.args)
+        service = (
+            "cilium-gateway-commonthing-staging",
+            "service-uid",
+            staging.STAGING_GATEWAY_NODE_PORT,
+        )
+        readback = {
+            "probe_scope": "heim-pc-host-outside-kubernetes",
+            "endpoint": f"http://127.0.0.1:{staging.STAGING_GATEWAY_HOST_PORT}",
+            "health_sha256": "1" * 64,
+            "web_prefix_sha256": "2" * 64,
+            "web_prefix_bytes": 123,
+            "api_nodes_sha256": "3" * 64,
+        }
+        with (
+            mock.patch.object(staging, "gateway_receipt_current", return_value=True),
+            mock.patch.object(staging, "gateway_service_node_port", return_value=service),
+            mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(staging.time, "time", return_value=123456),
+        ):
+            result = staging.command_prove_host_gateway(self.args)
+        path = self.root / staging.HOST_GATEWAY_RECEIPT
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        cell = staging.load_cell_receipt(self.root)
+        self.assertEqual(result["status"], "host-gateway-readback-verified")
+        self.assertEqual(result["service"], {
+            "name": service[0], "uid": service[1], "node_port": service[2]
+        })
+        self.assertEqual(result["endpoint"], "http://127.0.0.1:18084")
+        self.assertEqual(result["probe_scope"], "heim-pc-host-outside-kubernetes")
+        self.assertFalse(result["production_changed"])
+        self.assertEqual(
+            result["does_not_establish"],
+            ["public DNS", "public TLS", "production cutover"],
+        )
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(persisted["verified_at_unix"], 123456)
+        self.assertEqual(
+            persisted["gateway_receipt_sha256"],
+            staging.sha256_file(self.root / "receipts/gateway-proof.json"),
+        )
+        self.assertEqual(
+            cell["host_gateway_proof"],
+            {
+                "active_commit": self.args.source_commit,
+                "receipt_sha256": staging.sha256_file(path),
+            },
+        )
+
+    def test_host_gateway_refuses_service_change_during_host_readback(self):
+        staging.command_prove_gateway(self.args)
+        service = (
+            "cilium-gateway-commonthing-staging",
+            "service-uid",
+            staging.STAGING_GATEWAY_NODE_PORT,
+        )
+        changed = (service[0], "replacement-service-uid", service[2])
+        readback = {
+            "probe_scope": "heim-pc-host-outside-kubernetes",
+            "endpoint": f"http://127.0.0.1:{staging.STAGING_GATEWAY_HOST_PORT}",
+            "health_sha256": "1" * 64,
+            "web_prefix_sha256": "2" * 64,
+            "web_prefix_bytes": 123,
+            "api_nodes_sha256": "3" * 64,
+        }
+        with (
+            mock.patch.object(staging, "gateway_receipt_current", return_value=True),
+            mock.patch.object(
+                staging, "gateway_service_node_port", side_effect=[service, changed]
+            ),
+            mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+        ):
+            with self.assertRaisesRegex(staging.StagingCellError, "changed during host readback"):
+                staging.command_prove_host_gateway(self.args)
+        self.assertFalse((self.root / staging.HOST_GATEWAY_RECEIPT).exists())
+        self.assertNotIn("host_gateway_proof", staging.load_cell_receipt(self.root))
+
+    def test_host_gateway_current_rejects_service_or_gateway_receipt_drift(self):
+        staging.command_prove_gateway(self.args)
+        service = (
+            "cilium-gateway-commonthing-staging",
+            "service-uid",
+            staging.STAGING_GATEWAY_NODE_PORT,
+        )
+        readback = {
+            "probe_scope": "heim-pc-host-outside-kubernetes",
+            "endpoint": f"http://127.0.0.1:{staging.STAGING_GATEWAY_HOST_PORT}",
+            "health_sha256": "1" * 64,
+            "web_prefix_sha256": "2" * 64,
+            "web_prefix_bytes": 123,
+            "api_nodes_sha256": "3" * 64,
+        }
+        with (
+            mock.patch.object(staging, "gateway_receipt_current", return_value=True),
+            mock.patch.object(staging, "gateway_service_node_port", return_value=service),
+            mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+        ):
+            staging.command_prove_host_gateway(self.args)
+        cell = staging.load_cell_receipt(self.root)
+        with mock.patch.object(staging, "gateway_service_node_port", return_value=service):
+            self.assertTrue(staging.host_gateway_receipt_current(self.root, cell, "kubectl"))
+        with mock.patch.object(
+            staging,
+            "gateway_service_node_port",
+            return_value=(service[0], "replacement-service-uid", service[2]),
+        ):
+            self.assertFalse(staging.host_gateway_receipt_current(self.root, cell, "kubectl"))
+        gateway_path = self.root / "receipts/gateway-proof.json"
+        gateway_path.write_bytes(gateway_path.read_bytes() + b"\n")
+        gateway_path.chmod(0o600)
+        with mock.patch.object(staging, "gateway_service_node_port", return_value=service):
+            self.assertFalse(staging.host_gateway_receipt_current(self.root, cell, "kubectl"))
 
     def test_cli_requires_owner_and_exact_source(self):
         parsed = staging.parser().parse_args(
