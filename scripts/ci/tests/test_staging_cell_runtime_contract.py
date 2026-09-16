@@ -5484,6 +5484,29 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         content_identity.assert_not_called()
 
+    def test_fresh_backup_intent_rejects_preexisting_archive_path(self) -> None:
+        release = "5" * 40
+        with tempfile.TemporaryDirectory(prefix="staging-backup-fresh-archive-") as tmp_name:
+            root = Path(tmp_name)
+            paths = staging._backup_archive_paths(root, release)
+            paths["postgres"].parent.mkdir(parents=True)
+            paths["postgres"].write_bytes(b"stale-pre-intent-archive")
+            paths["postgres"].chmod(0o600)
+            with self.assertRaisesRegex(
+                staging.StagingCellError, "already exists without a bound backup intent"
+            ):
+                staging._require_fresh_backup_archive_paths(root, release)
+
+    def test_fresh_backup_down_checks_archive_paths_before_persisting_intent(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging.command_backup_delete_to_prove_down)
+        archive_check = source.index(
+            "_require_fresh_backup_archive_paths(root, release_commit)"
+        )
+        intent_write = source.index("atomic_json(terminal_path, pending)")
+        self.assertLess(archive_check, intent_write)
+
     def test_backup_archive_retry_adopts_atomically_published_archive_and_records_progress(self) -> None:
         release = "6" * 40
         with tempfile.TemporaryDirectory(prefix="staging-backup-archive-resume-") as tmp_name:

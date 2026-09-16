@@ -6371,6 +6371,14 @@ def _backup_archive_paths(root: Path, release_commit: str) -> dict[str, Path]:
     return {name: directory / f"{name}.tar" for name in ("postgres", "nats")}
 
 
+def _require_fresh_backup_archive_paths(root: Path, release_commit: str) -> None:
+    for name, path in _backup_archive_paths(root, release_commit).items():
+        if path.exists() or path.is_symlink():
+            raise StagingCellError(
+                f"staging backup archive already exists without a bound backup intent: {name}"
+            )
+
+
 def _backup_archive_entry(name: str, path: Path) -> dict[str, Any]:
     _private_regular_file(path, label=f"staging {name} backup archive")
     size = path.stat().st_size
@@ -6832,6 +6840,7 @@ def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, A
         raise StagingCellError("backup delete-to-prove requires the current Gateway receipt")
     promotion = _exact_cell_promotion(root, cell, release_commit)
     require_gateway_app_current(kubectl, cell, promotion)
+    _require_fresh_backup_archive_paths(root, release_commit)
     gateway_before = _private_json_receipt(
         root / "receipts/gateway-proof.json", label="staging gateway proof receipt"
     )
