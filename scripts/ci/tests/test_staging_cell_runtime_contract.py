@@ -5484,6 +5484,76 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         content_identity.assert_not_called()
 
+    def test_backup_archive_retry_adopts_atomically_published_archive_and_records_progress(self) -> None:
+        release = "6" * 40
+        with tempfile.TemporaryDirectory(prefix="staging-backup-archive-resume-") as tmp_name:
+            root = Path(tmp_name)
+            paths = staging._backup_archive_paths(root, release)
+            paths["postgres"].parent.mkdir(parents=True)
+            paths["postgres"].write_bytes(b"already-published-postgres")
+            paths["postgres"].chmod(0o600)
+            progress: list[dict] = []
+
+            def create_archive(argv, path, timeout=None):
+                path.write_bytes(b"new-nats-archive")
+                path.chmod(0o600)
+
+            with (
+                mock.patch.object(staging, "_retained_mount_node", return_value="data-node"),
+                mock.patch.object(
+                    staging, "stream_command_to_file", side_effect=create_archive
+                ) as create,
+            ):
+                archives = staging._backup_volume_archives(
+                    "kind",
+                    staging.DEFAULT_CLUSTER,
+                    root,
+                    release,
+                    existing_archives={},
+                    progress=lambda current: progress.append(current),
+                )
+        self.assertEqual(set(archives), {"postgres", "nats"})
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(len(progress), 2)
+        self.assertEqual(
+            archives["postgres"]["sha256"],
+            staging.sha256_bytes(b"already-published-postgres"),
+        )
+
+    def test_backup_quiesce_intent_is_loadable_before_data_identity_exists(self) -> None:
+        release = "8" * 40
+        with tempfile.TemporaryDirectory(prefix="staging-backup-quiesce-intent-") as tmp_name:
+            root = Path(tmp_name)
+            payload = {
+                "schema_version": 1,
+                "status": "backup-quiesce-pending",
+                "cluster": staging.DEFAULT_CLUSTER,
+                "owner_id": "test:t084",
+                "bootstrap_commit": "a" * 40,
+                "release_commit": release,
+                "controller_commit": "b" * 40,
+                "pre_delete_api_nodes_sha256": "c" * 64,
+                "pre_delete_api_nodes_count": 2,
+                "pre_delete_api_nodes_pages": 1,
+                "pre_delete_api_nodes_hash_scope": "cursor-all-pages-canonical-json-v1",
+                "backup_archives": {},
+                "started_at_unix": 1,
+                "production_changed": False,
+            }
+            staging.atomic_json(root / staging.BACKUP_DOWN_RECEIPT, payload)
+            loaded = staging._load_backup_down_receipt(root, allow_pending=True)
+        self.assertEqual(loaded["status"], "backup-quiesce-pending")
+        self.assertNotIn("pre_delete_data_identity", loaded)
+
+    def test_terminal_backup_proof_code_revalidates_controller_release_and_reuses_timing(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging.command_prove_backup_delete_to_prove)
+        self.assertIn("controller_commit = require_clean_commit(None)", source)
+        self.assertIn("require_gateway_app_current(kubectl, cell, promotion)", source)
+        self.assertIn('previous.get("rto_observed_seconds")', source)
+        self.assertIn("previous_rto != previous_verified - recovery_start", source)
+
     def test_backup_archive_verification_rejects_receipt_and_file_tamper(self) -> None:
         release = "7" * 40
         with tempfile.TemporaryDirectory(prefix="staging-backup-archive-binding-") as tmp_name:

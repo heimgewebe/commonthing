@@ -904,20 +904,66 @@ class StagingGatewayTests(unittest.TestCase):
             )
         self.mocks["run"].assert_not_called()
 
-    def test_host_gateway_readback_hashes_only_first_web_kib(self):
+    def test_host_gateway_readback_hashes_all_cursor_pages_and_only_first_web_kib(self):
         health = b"healthy"
         web = b"a" * 1024 + b"different-tail"
-        api_nodes = b"[]"
+        page_one = json.dumps(
+            {
+                "items": [{"id": "node-a", "title": "A"}],
+                "page": {"limit": 1000, "next_cursor": "6e6f64652d61", "has_more": True},
+            }
+        ).encode("utf-8")
+        page_two = json.dumps(
+            {
+                "items": [{"id": "node-b", "title": "B"}],
+                "page": {"limit": 1000, "next_cursor": None, "has_more": False},
+            }
+        ).encode("utf-8")
+        canonical = json.dumps(
+            [
+                {"id": "node-a", "title": "A"},
+                {"id": "node-b", "title": "B"},
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         with mock.patch.object(
             staging,
             "_host_http_bytes",
-            side_effect=[health, web, api_nodes],
-        ):
+            side_effect=[health, web, page_one, page_two],
+        ) as fetch:
             result = staging.host_gateway_http_readback()
         self.assertEqual(result["health_sha256"], staging.sha256_bytes(health))
         self.assertEqual(result["web_prefix_sha256"], staging.sha256_bytes(b"a" * 1024))
         self.assertEqual(result["web_prefix_bytes"], 1024)
-        self.assertEqual(result["api_nodes_sha256"], staging.sha256_bytes(api_nodes))
+        self.assertEqual(result["api_nodes_sha256"], staging.sha256_bytes(canonical))
+        self.assertEqual(result["api_nodes_count"], 2)
+        self.assertEqual(result["api_nodes_pages"], 2)
+        self.assertEqual(
+            result["api_nodes_hash_scope"], "cursor-all-pages-canonical-json-v1"
+        )
+        self.assertIn("pagination=cursor", fetch.call_args_list[2].args[0])
+        self.assertIn("cursor=6e6f64652d61", fetch.call_args_list[3].args[0])
+
+    def test_kind_gateway_complete_readback_uses_the_proven_probe_node(self):
+        receipt = {"probe_node": "node-1", "address": "10.0.0.8", "listener_port": 80}
+        page = json.dumps(
+            {
+                "items": [{"id": "one"}],
+                "page": {"limit": 1000, "next_cursor": None, "has_more": False},
+            }
+        ).encode("utf-8")
+        with (
+            mock.patch.object(staging.reference, "kind_nodes", return_value=["node-1"]),
+            mock.patch.object(staging, "_kind_gateway_http_bytes", return_value=page) as fetch,
+        ):
+            result = staging.gateway_api_nodes_complete_readback(
+                "kind", staging.DEFAULT_CLUSTER, receipt
+            )
+        self.assertEqual(result["api_nodes_count"], 1)
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args.args[:3], ("node-1", "10.0.0.8", 80))
 
     def test_host_gateway_success_receipt_binds_exact_localhost_service_and_gateway(self):
         staging.command_prove_gateway(self.args)

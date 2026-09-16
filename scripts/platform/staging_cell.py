@@ -4721,24 +4721,124 @@ def _host_http_bytes(path: str) -> bytes:
         ) from error
 
 
+def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
+    items: list[Any] = []
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    page_count = 0
+    while True:
+        query = {"pagination": "cursor", "limit": "1000"}
+        if cursor is not None:
+            query["cursor"] = cursor
+        path = "/api/nodes?" + urllib.parse.urlencode(query)
+        raw = fetch_bytes(path)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise StagingCellError(
+                "Gateway /api/nodes cursor page is not valid JSON"
+            ) from error
+        if not isinstance(payload, dict):
+            raise StagingCellError(
+                "Gateway /api/nodes cursor page did not return an envelope"
+            )
+        page_items = payload.get("items")
+        page = payload.get("page")
+        if not isinstance(page_items, list) or not isinstance(page, dict):
+            raise StagingCellError("Gateway /api/nodes cursor envelope is malformed")
+        if page.get("limit") != 1000 or not isinstance(page.get("has_more"), bool):
+            raise StagingCellError("Gateway /api/nodes cursor metadata is malformed")
+        items.extend(page_items)
+        page_count += 1
+        if page_count > 256:
+            raise StagingCellError(
+                "Gateway /api/nodes proof exceeded the bounded 256-page snapshot limit"
+            )
+        has_more = page["has_more"]
+        next_cursor = page.get("next_cursor")
+        if not has_more:
+            if next_cursor is not None:
+                raise StagingCellError(
+                    "Gateway /api/nodes terminal cursor page unexpectedly has a next cursor"
+                )
+            break
+        if not isinstance(next_cursor, str) or not next_cursor:
+            raise StagingCellError(
+                "Gateway /api/nodes non-terminal page lacks a next cursor"
+            )
+        if next_cursor in seen_cursors:
+            raise StagingCellError("Gateway /api/nodes cursor loop detected")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    canonical = json.dumps(
+        items,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "api_nodes_sha256": sha256_bytes(canonical),
+        "api_nodes_count": len(items),
+        "api_nodes_pages": page_count,
+        "api_nodes_hash_scope": "cursor-all-pages-canonical-json-v1",
+    }
+
+
+def _kind_gateway_http_bytes(node: str, address: str, port: int, path: str) -> bytes:
+    if not path.startswith("/") or "//" in path:
+        raise StagingCellError("kind Gateway probe path is invalid")
+    host = f"[{address}]" if ":" in address and not address.startswith("[") else address
+    try:
+        return subprocess.run(
+            [
+                "docker",
+                "exec",
+                node,
+                "curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "10",
+                f"http://{host}:{port}{path}",
+            ],
+            cwd=ROOT,
+            text=False,
+            capture_output=True,
+            check=True,
+            timeout=15,
+        ).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise StagingCellError("kind Gateway API snapshot readback failed") from error
+
+
+def gateway_api_nodes_complete_readback(
+    kind: str, cluster: str, gateway_receipt: dict[str, Any]
+) -> dict[str, Any]:
+    node = str(gateway_receipt.get("probe_node") or "")
+    address = str(gateway_receipt.get("address") or "")
+    port = gateway_receipt.get("listener_port")
+    if not node or node not in reference.kind_nodes(kind, cluster):
+        raise StagingCellError("Gateway API snapshot lost its proven kind probe node")
+    if not address or not isinstance(port, int) or isinstance(port, bool):
+        raise StagingCellError("Gateway API snapshot lost its proven address or listener")
+    return _complete_api_nodes_readback(
+        lambda path: _kind_gateway_http_bytes(node, address, port, path)
+    )
+
+
 def host_gateway_http_readback() -> dict[str, Any]:
     health = _host_http_bytes("/health/live")
     web = _host_http_bytes("/")
     web_prefix = web[:1024]
-    api_nodes = _host_http_bytes("/api/nodes")
-    try:
-        nodes_payload = json.loads(api_nodes.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise StagingCellError("host Gateway /api/nodes readback is not valid JSON") from error
-    if not isinstance(nodes_payload, list):
-        raise StagingCellError("host Gateway /api/nodes readback is not a list")
+    nodes = _complete_api_nodes_readback(_host_http_bytes)
     return {
         "probe_scope": "heim-pc-host-outside-kubernetes",
         "endpoint": f"http://127.0.0.1:{STAGING_GATEWAY_HOST_PORT}",
         "health_sha256": sha256_bytes(health),
         "web_prefix_sha256": sha256_bytes(web_prefix),
         "web_prefix_bytes": len(web_prefix),
-        "api_nodes_sha256": sha256_bytes(api_nodes),
+        **nodes,
     }
 
 
@@ -6271,47 +6371,74 @@ def _backup_archive_paths(root: Path, release_commit: str) -> dict[str, Path]:
     return {name: directory / f"{name}.tar" for name in ("postgres", "nats")}
 
 
+def _backup_archive_entry(name: str, path: Path) -> dict[str, Any]:
+    _private_regular_file(path, label=f"staging {name} backup archive")
+    size = path.stat().st_size
+    if size <= 0:
+        raise StagingCellError(f"staging {name} backup archive is empty")
+    return {"path": str(path), "sha256": sha256_file(path), "bytes": size}
+
+
+def _verify_backup_archive_entry(name: str, expected_path: Path, entry: Any) -> None:
+    if not isinstance(entry, dict):
+        raise StagingCellError(f"staging {name} backup receipt is malformed")
+    if entry.get("path") != str(expected_path):
+        raise StagingCellError(f"staging {name} backup path drift")
+    observed = _backup_archive_entry(name, expected_path)
+    if entry.get("sha256") != observed["sha256"]:
+        raise StagingCellError(f"staging {name} backup archive hash drift")
+    if entry.get("bytes") != observed["bytes"]:
+        raise StagingCellError(f"staging {name} backup archive size drift")
+
+
 def _backup_volume_archives(
     kind: str,
     cluster: str,
     root: Path,
     release_commit: str,
+    *,
+    existing_archives: dict[str, Any] | None = None,
+    progress: Any | None = None,
 ) -> dict[str, dict[str, Any]]:
     data_node = _retained_mount_node(kind, cluster, root, require_split=True)
     paths = _backup_archive_paths(root, release_commit)
     ensure_directory_durable(next(iter(paths.values())).parent)
-    result: dict[str, dict[str, Any]] = {}
+    result: dict[str, dict[str, Any]] = dict(existing_archives or {})
+    if set(result) - set(paths):
+        raise StagingCellError("staging backup progress contains an unknown archive")
     for name, path in paths.items():
-        if path.exists() or path.is_symlink():
-            raise StagingCellError(
-                f"staging backup archive already exists without a bound backup-down receipt: {name}"
+        recorded = result.get(name)
+        if recorded is not None:
+            _verify_backup_archive_entry(name, path, recorded)
+        elif path.exists() or path.is_symlink():
+            # stream_command_to_file publishes by fsync + atomic rename. A crash
+            # can therefore leave a complete archive just before its receipt
+            # update. The earlier backup-intent receipt authorises adopting only
+            # this exact private path while the source data remains quiescent.
+            result[name] = _backup_archive_entry(name, path)
+        else:
+            volume = f"/var/local/commonthing-staging/{name}"
+            stream_command_to_file(
+                [
+                    "docker",
+                    "exec",
+                    data_node,
+                    "tar",
+                    "--sort=name",
+                    "--format=gnu",
+                    "--numeric-owner",
+                    "-C",
+                    volume,
+                    "-cf",
+                    "-",
+                    ".",
+                ],
+                path,
+                timeout=600,
             )
-        volume = f"/var/local/commonthing-staging/{name}"
-        stream_command_to_file(
-            [
-                "docker",
-                "exec",
-                data_node,
-                "tar",
-                "--sort=name",
-                "--format=gnu",
-                "--numeric-owner",
-                "-C",
-                volume,
-                "-cf",
-                "-",
-                ".",
-            ],
-            path,
-            timeout=600,
-        )
-        if path.stat().st_size <= 0:
-            raise StagingCellError(f"staging {name} backup archive is empty")
-        result[name] = {
-            "path": str(path),
-            "sha256": sha256_file(path),
-            "bytes": path.stat().st_size,
-        }
+            result[name] = _backup_archive_entry(name, path)
+        if progress is not None:
+            progress(dict(result))
     return result
 
 
@@ -6322,16 +6449,7 @@ def _verify_backup_archives(
     if set(archives) != set(expected_paths):
         raise StagingCellError("staging backup receipt archive set is incomplete")
     for name, expected_path in expected_paths.items():
-        entry = archives.get(name)
-        if not isinstance(entry, dict):
-            raise StagingCellError(f"staging {name} backup receipt is malformed")
-        if entry.get("path") != str(expected_path):
-            raise StagingCellError(f"staging {name} backup path drift")
-        _private_regular_file(expected_path, label=f"staging {name} backup archive")
-        if entry.get("sha256") != sha256_file(expected_path):
-            raise StagingCellError(f"staging {name} backup archive hash drift")
-        if entry.get("bytes") != expected_path.stat().st_size or expected_path.stat().st_size <= 0:
-            raise StagingCellError(f"staging {name} backup archive size drift")
+        _verify_backup_archive_entry(name, expected_path, archives.get(name))
     return expected_paths
 
 
@@ -6474,22 +6592,58 @@ def _load_backup_down_receipt(
     status = payload.get("status")
     allowed = {"backup-created-cluster-deleted-primary-data-empty"}
     if allow_pending:
-        allowed.add("backup-created-cluster-delete-pending")
+        allowed.update(
+            {
+                "backup-quiesce-pending",
+                "backup-archive-creation-pending",
+                "backup-created-cluster-delete-pending",
+            }
+        )
     if status not in allowed:
         raise StagingCellError("backup delete-to-prove down receipt has unexpected state")
     if payload.get("production_changed") is not False:
         raise StagingCellError("backup delete-to-prove down receipt lost production isolation")
     release_commit = str(payload.get("release_commit") or "")
-    archives = payload.get("backup_archives")
+    api_hash = str(payload.get("pre_delete_api_nodes_sha256") or "")
+    api_count = payload.get("pre_delete_api_nodes_count")
+    api_pages = payload.get("pre_delete_api_nodes_pages")
+    if (
+        len(api_hash) != 64
+        or any(ch not in "0123456789abcdef" for ch in api_hash)
+        or not isinstance(api_count, int)
+        or isinstance(api_count, bool)
+        or api_count < 0
+        or not isinstance(api_pages, int)
+        or isinstance(api_pages, bool)
+        or api_pages < 1
+        or payload.get("pre_delete_api_nodes_hash_scope")
+        != "cursor-all-pages-canonical-json-v1"
+    ):
+        raise StagingCellError("backup delete-to-prove receipt lost its full API baseline")
+    archives = payload.get("backup_archives", {})
     if not isinstance(archives, dict):
         raise StagingCellError("backup delete-to-prove down receipt lost its archives")
-    _verify_backup_archives(root, release_commit, archives)
-    pre_delete = payload.get("pre_delete_data_identity")
-    if not isinstance(pre_delete, dict):
-        raise StagingCellError("backup delete-to-prove down receipt lost data identity")
-    _require_durable_retained_fingerprint(
-        pre_delete, label="backup delete-to-prove pre-delete data identity"
-    )
+    expected_paths = _backup_archive_paths(root, release_commit)
+    if set(archives) - set(expected_paths):
+        raise StagingCellError("backup delete-to-prove receipt has unknown archive state")
+    for name, entry in archives.items():
+        _verify_backup_archive_entry(name, expected_paths[name], entry)
+    if status in {
+        "backup-archive-creation-pending",
+        "backup-created-cluster-delete-pending",
+        "backup-created-cluster-deleted-primary-data-empty",
+    }:
+        pre_delete = payload.get("pre_delete_data_identity")
+        if not isinstance(pre_delete, dict):
+            raise StagingCellError("backup delete-to-prove down receipt lost data identity")
+        _require_durable_retained_fingerprint(
+            pre_delete, label="backup delete-to-prove pre-delete data identity"
+        )
+    if status in {
+        "backup-created-cluster-delete-pending",
+        "backup-created-cluster-deleted-primary-data-empty",
+    }:
+        _verify_backup_archives(root, release_commit, archives)
     if status == "backup-created-cluster-deleted-primary-data-empty":
         empty_roots = payload.get("empty_restore_roots")
         if not isinstance(empty_roots, dict):
@@ -6521,9 +6675,6 @@ def _complete_backup_down_from_pending(
     if not isinstance(started_at_unix, int) or isinstance(started_at_unix, bool):
         raise StagingCellError("backup delete-to-prove pending receipt lost its start boundary")
     if resumed:
-        # We cannot know whether the prior process died immediately before or
-        # immediately after the cluster deletion. Using the earlier cycle start
-        # is deliberately pessimistic: measured RTO can only become larger.
         cluster_deleted_at_unix = started_at_unix
         recovery_boundary_basis = "conservative-cycle-start-after-unobserved-delete"
     else:
@@ -6533,9 +6684,8 @@ def _complete_backup_down_from_pending(
         root, pending["release_commit"], pending["pre_delete_data_identity"]
     )
     persisted_pending = dict(pending)
-    # receipt_sha256 is a derived loader field. Persisting it would write the
-    # hash of the pending receipt into the terminal receipt as a stale self-link.
     persisted_pending.pop("receipt_sha256", None)
+    persisted_pending.pop("receipt_path", None)
     result = {
         **persisted_pending,
         "status": "backup-created-cluster-deleted-primary-data-empty",
@@ -6547,6 +6697,84 @@ def _complete_backup_down_from_pending(
     path = root / BACKUP_DOWN_RECEIPT
     atomic_json(path, result)
     return {**result, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
+
+
+def _resume_backup_creation(
+    root: Path,
+    args: argparse.Namespace,
+    pending: dict[str, Any],
+    *,
+    resumed: bool,
+) -> dict[str, Any]:
+    status = pending.get("status")
+    if status in {"backup-quiesce-pending", "backup-archive-creation-pending"}:
+        tools = load_tool_receipt(
+            root, required_tools=("kind", "kubectl"), required_artifacts=()
+        )["tools"]
+        kind = tools["kind"]
+        kubectl = tools["kubectl"]
+        reference.require_owned_cluster(
+            kind,
+            args.cluster,
+            expected_commit=pending["bootstrap_commit"],
+            expected_owner_id=args.owner_id,
+        )
+        if status == "backup-quiesce-pending":
+            _quiesce_backup_cell(kubectl)
+            pre_delete = _mounted_retained_data_identity(
+                kind, args.cluster, root, durable=True, require_split=True
+            )
+            persisted = dict(pending)
+            persisted.pop("receipt_sha256", None)
+            persisted.pop("receipt_path", None)
+            pending = {
+                **persisted,
+                "status": "backup-archive-creation-pending",
+                "pre_delete_data_identity": pre_delete,
+                "backup_archives": {},
+            }
+            atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
+        expected_data = pending.get("pre_delete_data_identity")
+        observed_data = _mounted_retained_data_identity(
+            kind, args.cluster, root, durable=True, require_split=True
+        )
+        if observed_data != expected_data:
+            raise StagingCellError("staging cold data changed before backup archive creation")
+
+        def record_progress(archives: dict[str, Any]) -> None:
+            nonlocal pending
+            persisted = dict(pending)
+            persisted.pop("receipt_sha256", None)
+            persisted.pop("receipt_path", None)
+            pending = {**persisted, "backup_archives": archives}
+            atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
+
+        archives = _backup_volume_archives(
+            kind,
+            args.cluster,
+            root,
+            pending["release_commit"],
+            existing_archives=pending.get("backup_archives", {}),
+            progress=record_progress,
+        )
+        after_backup = _mounted_retained_data_identity(
+            kind, args.cluster, root, durable=True, require_split=True
+        )
+        if after_backup != expected_data:
+            raise StagingCellError("staging data changed while the cold backup was created")
+        persisted = dict(pending)
+        persisted.pop("receipt_sha256", None)
+        persisted.pop("receipt_path", None)
+        pending = {
+            **persisted,
+            "status": "backup-created-cluster-delete-pending",
+            "backup_archives": archives,
+        }
+        atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
+        status = pending["status"]
+    if status != "backup-created-cluster-delete-pending":
+        raise StagingCellError("backup recovery is not ready for cluster deletion")
+    return _complete_backup_down_from_pending(root, args, pending, resumed=resumed)
 
 
 @lifecycle_mutation_locked
@@ -6572,9 +6800,7 @@ def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, A
             raise StagingCellError(
                 "backup down retry must use the exact controller commit that created the backup"
             )
-        return _complete_backup_down_from_pending(
-            root, args, existing, resumed=True
-        )
+        return _resume_backup_creation(root, args, existing, resumed=True)
 
     cell = load_cell_receipt(root)
     require_receipt_cluster(cell, args.cluster)
@@ -6605,30 +6831,15 @@ def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, A
     if not gateway_receipt_current(root, cell, kubectl):
         raise StagingCellError("backup delete-to-prove requires the current Gateway receipt")
     promotion = _exact_cell_promotion(root, cell, release_commit)
+    require_gateway_app_current(kubectl, cell, promotion)
     gateway_before = _private_json_receipt(
         root / "receipts/gateway-proof.json", label="staging gateway proof receipt"
     )
-    pre_delete_api_nodes_sha256 = str(gateway_before.get("api_nodes_sha256") or "")
-    if len(pre_delete_api_nodes_sha256) != 64 or any(
-        ch not in "0123456789abcdef" for ch in pre_delete_api_nodes_sha256
-    ):
-        raise StagingCellError(
-            "backup delete-to-prove requires a canonical pre-delete API data readback hash"
-        )
+    baseline = gateway_api_nodes_complete_readback(kind, args.cluster, gateway_before)
     started_at_unix = int(time.time())
-    _quiesce_backup_cell(kubectl)
-    pre_delete = _mounted_retained_data_identity(
-        kind, args.cluster, root, durable=True, require_split=True
-    )
-    archives = _backup_volume_archives(kind, args.cluster, root, release_commit)
-    after_backup = _mounted_retained_data_identity(
-        kind, args.cluster, root, durable=True, require_split=True
-    )
-    if pre_delete != after_backup:
-        raise StagingCellError("staging data changed while the cold backup was created")
     pending = {
         "schema_version": 1,
-        "status": "backup-created-cluster-delete-pending",
+        "status": "backup-quiesce-pending",
         "cluster": args.cluster,
         "owner_id": args.owner_id,
         "bootstrap_commit": cell["bootstrap_commit"],
@@ -6642,20 +6853,18 @@ def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, A
             else None
         ),
         "image_promotion": promotion,
-        "pre_delete_data_identity": pre_delete,
-        "pre_delete_api_nodes_sha256": pre_delete_api_nodes_sha256,
-        "backup_archives": archives,
+        "pre_delete_api_nodes_sha256": baseline["api_nodes_sha256"],
+        "pre_delete_api_nodes_count": baseline["api_nodes_count"],
+        "pre_delete_api_nodes_pages": baseline["api_nodes_pages"],
+        "pre_delete_api_nodes_hash_scope": baseline["api_nodes_hash_scope"],
+        "backup_archives": {},
         "started_at_unix": started_at_unix,
         "production_changed": False,
     }
-    # This pending receipt is the recovery authority for the destructive step.
-    # It is written only after the immutable backup and cold-source fingerprints
-    # are complete, so a process crash can safely continue rather than backing up
-    # a second time or guessing what happened.
+    # Persist authority before scaling anything down or publishing an archive.
+    # Every later destructive step can therefore resume from an exact bound state.
     atomic_json(terminal_path, pending)
-    return _complete_backup_down_from_pending(
-        root, args, pending, resumed=False
-    )
+    return _resume_backup_creation(root, args, pending, resumed=False)
 
 
 @lifecycle_mutation_locked
@@ -6972,6 +7181,11 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         or rebuild.get("release_commit") != release_commit
     ):
         raise StagingCellError("backup rebuild receipt is not bound to this restored release")
+    controller_commit = require_clean_commit(None)
+    if controller_commit != rebuild.get("controller_commit"):
+        raise StagingCellError(
+            "backup proof controller commit differs from the rebuild-bound controller"
+        )
     tools = load_tool_receipt(
         root, required_tools=("kind", "kubectl"), required_artifacts=()
     )["tools"]
@@ -6983,6 +7197,8 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         expected_owner_id=args.owner_id,
     )
     require_bootstrap_data_current(kubectl, cell["bootstrap_commit"])
+    promotion = _exact_cell_promotion(root, cell, release_commit)
+    require_gateway_app_current(kubectl, cell, promotion)
     workloads = app_live_health(kubectl)
     if workloads != {name: "True" for name in APP_DEPLOYMENTS}:
         raise StagingCellError("backup proof requires healthy restored app workloads")
@@ -7015,19 +7231,47 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         "health_sha256",
         "web_prefix_sha256",
         "api_nodes_sha256",
+        "api_nodes_count",
+        "api_nodes_pages",
+        "api_nodes_hash_scope",
     ):
         if host_receipt.get(key) != fresh_host.get(key):
             raise StagingCellError(
                 f"host Gateway readback changed before final backup proof: {key}"
             )
-    if fresh_host.get("api_nodes_sha256") != down.get("pre_delete_api_nodes_sha256"):
+    if (
+        fresh_host.get("api_nodes_sha256") != down.get("pre_delete_api_nodes_sha256")
+        or fresh_host.get("api_nodes_count") != down.get("pre_delete_api_nodes_count")
+        or fresh_host.get("api_nodes_hash_scope")
+        != down.get("pre_delete_api_nodes_hash_scope")
+    ):
         raise StagingCellError(
-            "restored PostgreSQL-backed API data differs from the pre-delete readback"
+            "restored PostgreSQL-backed API data differs from the pre-delete full snapshot"
         )
-    verified_at_unix = int(time.time())
+    path = root / BACKUP_DELETE_TO_PROVE_RECEIPT
+    previous = None
+    if path.exists() or path.is_symlink():
+        previous = _private_json_receipt(path, label="backup delete-to-prove receipt")
+    observed_at_unix = int(time.time())
     recovery_start = int(down.get("cluster_deleted_at_unix") or 0)
-    if recovery_start <= 0 or verified_at_unix < recovery_start:
+    if recovery_start <= 0 or observed_at_unix < recovery_start:
         raise StagingCellError("backup proof recovery timing evidence is invalid")
+    verified_at_unix = observed_at_unix
+    rto_observed_seconds = observed_at_unix - recovery_start
+    if previous is not None:
+        previous_verified = previous.get("verified_at_unix")
+        previous_rto = previous.get("rto_observed_seconds")
+        if (
+            not isinstance(previous_verified, int)
+            or isinstance(previous_verified, bool)
+            or not isinstance(previous_rto, int)
+            or isinstance(previous_rto, bool)
+            or previous_verified < recovery_start
+            or previous_rto != previous_verified - recovery_start
+        ):
+            raise StagingCellError("existing backup proof has invalid recovery timing")
+        verified_at_unix = previous_verified
+        rto_observed_seconds = previous_rto
     result = {
         "schema_version": 1,
         "status": "backup-delete-to-prove-verified",
@@ -7035,7 +7279,7 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         "owner_id": args.owner_id,
         "bootstrap_commit": cell["bootstrap_commit"],
         "active_commit": release_commit,
-        "controller_commit": rebuild["controller_commit"],
+        "controller_commit": controller_commit,
         "backup_down_receipt_sha256": down["receipt_sha256"],
         "backup_rebuild_receipt_sha256": sha256_file(rebuild_path),
         "gateway_receipt_sha256": sha256_file(root / "receipts/gateway-proof.json"),
@@ -7045,9 +7289,11 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         "final_data_mount_anchors": final_data_anchors,
         "pre_delete_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
         "post_restore_api_nodes_sha256": fresh_host["api_nodes_sha256"],
+        "api_nodes_count": fresh_host["api_nodes_count"],
+        "api_nodes_hash_scope": fresh_host["api_nodes_hash_scope"],
         "app_workloads": workloads,
         "live_workloads": live_workloads,
-        "rto_observed_seconds": verified_at_unix - recovery_start,
+        "rto_observed_seconds": rto_observed_seconds,
         "rpo_observation": {
             "confirmed_mutations_lost": 0,
             "boundary": "quiesced-cold-backup-snapshot",
@@ -7056,12 +7302,8 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         "production_changed": False,
         "does_not_establish": ["public DNS", "public TLS", "production cutover"],
     }
-    path = root / BACKUP_DELETE_TO_PROVE_RECEIPT
-    if path.exists() or path.is_symlink():
-        previous = _private_json_receipt(path, label="backup delete-to-prove receipt")
-        stable = {k: v for k, v in result.items() if k != "verified_at_unix"}
-        previous_stable = {k: v for k, v in previous.items() if k != "verified_at_unix"}
-        if previous_stable != stable:
+    if previous is not None:
+        if previous != result:
             raise StagingCellError("existing backup delete-to-prove receipt has different bindings")
         return {**previous, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
     atomic_json(path, result)
