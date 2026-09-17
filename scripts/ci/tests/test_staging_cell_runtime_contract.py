@@ -6306,6 +6306,40 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             staging.atomic_json(gateway_path, gateway_receipt)
 
             staging.atomic_json(
+                gateway_path,
+                {"schema_version": 1, "status": "gateway-replaced"},
+            )
+            with self.assertRaisesRegex(
+                staging.StagingCellError,
+                "lost its Gateway proof receipt hash binding",
+            ):
+                staging._validated_existing_backup_delete_to_prove_receipt(
+                    root,
+                    cluster=staging.DEFAULT_CLUSTER,
+                    owner_id=owner,
+                    cell=cell,
+                    release_commit=release,
+                    controller_commit=controller,
+                    down=down,
+                    rebuild=rebuild,
+                )
+            staging.atomic_json(gateway_path, gateway_receipt)
+
+            host_gateway_path.unlink()
+            with self.assertRaises(staging.StagingCellError):
+                staging._validated_existing_backup_delete_to_prove_receipt(
+                    root,
+                    cluster=staging.DEFAULT_CLUSTER,
+                    owner_id=owner,
+                    cell=cell,
+                    release_commit=release,
+                    controller_commit=controller,
+                    down=down,
+                    rebuild=rebuild,
+                )
+            staging.atomic_json(host_gateway_path, host_gateway_receipt)
+
+            staging.atomic_json(
                 host_gateway_path,
                 {"schema_version": 1, "status": "host-gateway-replaced"},
             )
