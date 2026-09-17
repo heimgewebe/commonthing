@@ -7519,7 +7519,19 @@ def _validated_existing_backup_delete_to_prove_receipt(
         raise StagingCellError(
             "existing backup delete-to-prove receipt lost its restored mount binding"
         )
-    for key in ("gateway_receipt_sha256", "host_gateway_receipt_sha256"):
+    supporting_receipts = (
+        (
+            "gateway_receipt_sha256",
+            root / "receipts/gateway-proof.json",
+            "Gateway proof receipt",
+        ),
+        (
+            "host_gateway_receipt_sha256",
+            root / HOST_GATEWAY_RECEIPT,
+            "host Gateway proof receipt",
+        ),
+    )
+    for key, supporting_path, label in supporting_receipts:
         value = receipt.get(key)
         if (
             not isinstance(value, str)
@@ -7528,6 +7540,11 @@ def _validated_existing_backup_delete_to_prove_receipt(
         ):
             raise StagingCellError(
                 f"existing backup delete-to-prove receipt has invalid hash binding: {key}"
+            )
+        _private_json_receipt(supporting_path, label=label)
+        if sha256_file(supporting_path) != value:
+            raise StagingCellError(
+                f"existing backup delete-to-prove receipt lost its {label} hash binding"
             )
     recovery_start = down.get("cluster_deleted_at_unix")
     verified_at = receipt.get("verified_at_unix")

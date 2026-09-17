@@ -6226,6 +6226,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="staging-terminal-backup-proof-") as tmp_name:
             root = Path(tmp_name)
             staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, rebuild)
+            gateway_path = root / "receipts/gateway-proof.json"
+            host_gateway_path = root / staging.HOST_GATEWAY_RECEIPT
+            gateway_receipt = {"schema_version": 1, "status": "gateway-ready"}
+            host_gateway_receipt = {
+                "schema_version": 1,
+                "status": "host-gateway-ready",
+            }
+            staging.atomic_json(gateway_path, gateway_receipt)
+            staging.atomic_json(host_gateway_path, host_gateway_receipt)
             receipt = {
                 "schema_version": 1,
                 "status": "backup-delete-to-prove-verified",
@@ -6238,8 +6247,8 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 "backup_rebuild_receipt_sha256": staging.sha256_file(
                     root / staging.BACKUP_REBUILD_RECEIPT
                 ),
-                "gateway_receipt_sha256": "c" * 64,
-                "host_gateway_receipt_sha256": "d" * 64,
+                "gateway_receipt_sha256": staging.sha256_file(gateway_path),
+                "host_gateway_receipt_sha256": staging.sha256_file(host_gateway_path),
                 "pre_delete_data_identity": down["pre_delete_data_identity"],
                 "restored_data_identity": restored,
                 "final_data_mount_anchors": restored,
@@ -6281,6 +6290,41 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 result["receipt_sha256"],
                 staging.sha256_file(root / staging.BACKUP_DELETE_TO_PROVE_RECEIPT),
             )
+
+            gateway_path.unlink()
+            with self.assertRaises(staging.StagingCellError):
+                staging._validated_existing_backup_delete_to_prove_receipt(
+                    root,
+                    cluster=staging.DEFAULT_CLUSTER,
+                    owner_id=owner,
+                    cell=cell,
+                    release_commit=release,
+                    controller_commit=controller,
+                    down=down,
+                    rebuild=rebuild,
+                )
+            staging.atomic_json(gateway_path, gateway_receipt)
+
+            staging.atomic_json(
+                host_gateway_path,
+                {"schema_version": 1, "status": "host-gateway-replaced"},
+            )
+            with self.assertRaisesRegex(
+                staging.StagingCellError,
+                "lost its host Gateway proof receipt hash binding",
+            ):
+                staging._validated_existing_backup_delete_to_prove_receipt(
+                    root,
+                    cluster=staging.DEFAULT_CLUSTER,
+                    owner_id=owner,
+                    cell=cell,
+                    release_commit=release,
+                    controller_commit=controller,
+                    down=down,
+                    rebuild=rebuild,
+                )
+            staging.atomic_json(host_gateway_path, host_gateway_receipt)
+
             with self.assertRaisesRegex(
                 staging.StagingCellError, "controller is not a canonical 40-hex commit"
             ):
