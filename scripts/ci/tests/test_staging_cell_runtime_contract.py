@@ -5687,6 +5687,25 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertEqual(loaded["status"], "backup-quiesce-pending")
         self.assertNotIn("pre_delete_data_identity", loaded)
 
+    def test_backup_app_quiesce_waits_for_actual_deployment_labels(self) -> None:
+        with (
+            mock.patch.object(staging, "_set_app_reconciliation_suspended"),
+            mock.patch.object(staging, "run"),
+            mock.patch.object(staging, "output", side_effect=["", ""]) as output_mock,
+        ):
+            staging._quiesce_backup_app("kubectl")
+        selectors = [
+            call.args[0][call.args[0].index("-l") + 1]
+            for call in output_mock.call_args_list
+        ]
+        self.assertEqual(
+            selectors,
+            [
+                "app.kubernetes.io/name=commonthing-api",
+                "app.kubernetes.io/name=commonthing-web",
+            ],
+        )
+
     def test_postgres_snapshot_maps_the_api_projection_after_app_quiesce(self) -> None:
         rows = "\n".join(
             [
@@ -5726,6 +5745,20 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         argv = output_mock.call_args.args[0]
         self.assertIn("deployment/postgres", argv)
         self.assertIn("psql", argv[-3])
+
+    def test_postgres_timestamp_matches_chrono_fractional_width(self) -> None:
+        self.assertEqual(
+            staging._rfc3339_postgres_timestamp("2026-09-17T05:00:00.123000+00:00"),
+            "2026-09-17T05:00:00.123+00:00",
+        )
+        self.assertEqual(
+            staging._rfc3339_postgres_timestamp("2026-09-17T05:00:00.123400+00:00"),
+            "2026-09-17T05:00:00.123400+00:00",
+        )
+        self.assertEqual(
+            staging._rfc3339_postgres_timestamp("2026-09-17T05:00:00+00:00"),
+            "2026-09-17T05:00:00+00:00",
+        )
 
     def test_postgres_snapshot_normalizes_integral_coordinates_to_api_floats(self) -> None:
         projected = staging._api_node_from_postgres_snapshot_row(
@@ -5812,11 +5845,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("pre_delete_api_nodes_sha256", source)
         self.assertIn('"status": "backup-quiesce-pending"', source)
 
-    def test_terminal_backup_proof_code_revalidates_controller_release_and_reuses_timing(self) -> None:
+    def test_terminal_backup_proof_reuses_validated_receipt_before_live_reprobe(self) -> None:
         import inspect
 
         source = inspect.getsource(staging.command_prove_backup_delete_to_prove)
-        self.assertIn("controller_commit = require_clean_commit(None)", source)
+        completed = source.index("_validated_existing_backup_delete_to_prove_receipt(")
+        current_checkout = source.index("controller_commit = require_clean_commit(None)")
+        live_tools = source.index("tools = load_tool_receipt(")
+        self.assertLess(completed, current_checkout)
+        self.assertLess(current_checkout, live_tools)
         app_check = "require_gateway_app_current(kubectl, cell, promotion)"
         first_app_check = source.index(app_check)
         final_host_readback = source.index("fresh_host = host_gateway_http_readback()")
@@ -5833,8 +5870,93 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         self.assertLess(second_app_check, final_gateway_check)
         self.assertLess(final_gateway_check, final_host_binding_check)
-        self.assertIn('previous.get("rto_observed_seconds")', source)
-        self.assertIn("previous_rto != previous_verified - recovery_start", source)
+
+    def test_existing_terminal_backup_proof_validates_cycle_and_timing(self) -> None:
+        owner = "test:t084"
+        release = "7" * 40
+        controller = "8" * 40
+        cell = {"bootstrap_commit": "6" * 40}
+        down = {
+            "receipt_sha256": "a" * 64,
+            "pre_delete_data_identity": {"postgres": {}, "nats": {}},
+            "pre_delete_api_nodes_sha256": "b" * 64,
+            "pre_delete_api_nodes_count": 3,
+            "pre_delete_api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+            "cluster_deleted_at_unix": 100,
+        }
+        restored = {"postgres": {"anchor": "p"}, "nats": {"anchor": "n"}}
+        rebuild = {"restored_data_identity": restored}
+        with tempfile.TemporaryDirectory(prefix="staging-terminal-backup-proof-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, rebuild)
+            receipt = {
+                "schema_version": 1,
+                "status": "backup-delete-to-prove-verified",
+                "cluster": staging.DEFAULT_CLUSTER,
+                "owner_id": owner,
+                "bootstrap_commit": cell["bootstrap_commit"],
+                "active_commit": release,
+                "controller_commit": controller,
+                "backup_down_receipt_sha256": down["receipt_sha256"],
+                "backup_rebuild_receipt_sha256": staging.sha256_file(
+                    root / staging.BACKUP_REBUILD_RECEIPT
+                ),
+                "gateway_receipt_sha256": "c" * 64,
+                "host_gateway_receipt_sha256": "d" * 64,
+                "pre_delete_data_identity": down["pre_delete_data_identity"],
+                "restored_data_identity": restored,
+                "final_data_mount_anchors": restored,
+                "pre_delete_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
+                "post_restore_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
+                "api_nodes_count": down["pre_delete_api_nodes_count"],
+                "api_nodes_hash_scope": down["pre_delete_api_nodes_hash_scope"],
+                "app_workloads": {name: "True" for name in staging.APP_DEPLOYMENTS},
+                "live_workloads": {name: "True" for name in staging.LIVE_DEPLOYMENTS},
+                "rto_observed_seconds": 30,
+                "rpo_observation": {
+                    "confirmed_mutations_lost": 0,
+                    "boundary": "quiesced-cold-backup-snapshot",
+                },
+                "verified_at_unix": 130,
+                "production_changed": False,
+                "does_not_establish": [
+                    "public DNS",
+                    "public TLS",
+                    "production cutover",
+                ],
+            }
+            staging.atomic_json(root / staging.BACKUP_DELETE_TO_PROVE_RECEIPT, receipt)
+            with mock.patch.object(staging, "_same_data_mount_anchors", return_value=True):
+                result = staging._validated_existing_backup_delete_to_prove_receipt(
+                    root,
+                    cluster=staging.DEFAULT_CLUSTER,
+                    owner_id=owner,
+                    cell=cell,
+                    release_commit=release,
+                    controller_commit=controller,
+                    down=down,
+                    rebuild=rebuild,
+                )
+            self.assertIsNotNone(result)
+            self.assertEqual(result["verified_at_unix"], 130)
+            self.assertEqual(result["rto_observed_seconds"], 30)
+            self.assertEqual(
+                result["receipt_sha256"],
+                staging.sha256_file(root / staging.BACKUP_DELETE_TO_PROVE_RECEIPT),
+            )
+            with self.assertRaisesRegex(
+                staging.StagingCellError, "controller is not a canonical 40-hex commit"
+            ):
+                staging._validated_existing_backup_delete_to_prove_receipt(
+                    root,
+                    cluster=staging.DEFAULT_CLUSTER,
+                    owner_id=owner,
+                    cell=cell,
+                    release_commit=release,
+                    controller_commit="8" * 39,
+                    down=down,
+                    rebuild=rebuild,
+                )
 
     def test_backup_archive_verification_rejects_receipt_and_file_tamper(self) -> None:
         release = "7" * 40

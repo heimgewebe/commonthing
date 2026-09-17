@@ -2222,7 +2222,7 @@ def _quiesce_backup_app(kubectl: str) -> None:
     deadline = time.monotonic() + 120.0
     while True:
         remaining: list[str] = []
-        for name in APP_DEPLOYMENTS:
+        for name, (_, deployment) in APP_DEPLOYMENTS.items():
             pods = output(
                 [
                     kubectl,
@@ -2231,7 +2231,7 @@ def _quiesce_backup_app(kubectl: str) -> None:
                     "-n",
                     APP_NAMESPACE,
                     "-l",
-                    f"app.kubernetes.io/name={name}",
+                    f"app.kubernetes.io/name={deployment}",
                     "-o",
                     "name",
                 ],
@@ -4850,7 +4850,16 @@ def _rfc3339_postgres_timestamp(value: Any) -> str | None:
         raise StagingCellError("PostgreSQL node snapshot timestamp is malformed") from error
     if parsed.tzinfo is None:
         raise StagingCellError("PostgreSQL node snapshot timestamp lacks a timezone")
-    return parsed.astimezone(dt.timezone.utc).isoformat()
+    utc = parsed.astimezone(dt.timezone.utc)
+    if utc.microsecond == 0:
+        timespec = "seconds"
+    elif utc.microsecond % 1000 == 0:
+        timespec = "milliseconds"
+    else:
+        timespec = "microseconds"
+    # Chrono DateTime<Utc>::to_rfc3339() uses the shortest exact subsecond
+    # width for PostgreSQL's microsecond precision: .123, .123400, or none.
+    return utc.isoformat(timespec=timespec)
 
 
 def _api_node_from_postgres_snapshot_row(row: Any) -> dict[str, Any] | None:
@@ -7384,6 +7393,96 @@ def _backup_recovery_activation_binding(
     return binding
 
 
+def _validated_existing_backup_delete_to_prove_receipt(
+    root: Path,
+    *,
+    cluster: str,
+    owner_id: str,
+    cell: dict[str, Any],
+    release_commit: str,
+    controller_commit: str,
+    down: dict[str, Any],
+    rebuild: dict[str, Any],
+) -> dict[str, Any] | None:
+    path = root / BACKUP_DELETE_TO_PROVE_RECEIPT
+    if not (path.exists() or path.is_symlink()):
+        return None
+    receipt = _private_json_receipt(path, label="backup delete-to-prove receipt")
+    if len(controller_commit) != 40 or any(
+        ch not in "0123456789abcdef" for ch in controller_commit
+    ):
+        raise StagingCellError(
+            "backup rebuild receipt controller is not a canonical 40-hex commit"
+        )
+    expected = {
+        "schema_version": 1,
+        "status": "backup-delete-to-prove-verified",
+        "cluster": cluster,
+        "owner_id": owner_id,
+        "bootstrap_commit": cell["bootstrap_commit"],
+        "active_commit": release_commit,
+        "controller_commit": controller_commit,
+        "backup_down_receipt_sha256": down["receipt_sha256"],
+        "backup_rebuild_receipt_sha256": sha256_file(root / BACKUP_REBUILD_RECEIPT),
+        "pre_delete_data_identity": down["pre_delete_data_identity"],
+        "restored_data_identity": rebuild["restored_data_identity"],
+        "pre_delete_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
+        "post_restore_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
+        "api_nodes_count": down["pre_delete_api_nodes_count"],
+        "api_nodes_hash_scope": down["pre_delete_api_nodes_hash_scope"],
+        "app_workloads": {name: "True" for name in APP_DEPLOYMENTS},
+        "live_workloads": {name: "True" for name in LIVE_DEPLOYMENTS},
+        "rpo_observation": {
+            "confirmed_mutations_lost": 0,
+            "boundary": "quiesced-cold-backup-snapshot",
+        },
+        "production_changed": False,
+        "does_not_establish": ["public DNS", "public TLS", "production cutover"],
+    }
+    for key, value in expected.items():
+        if receipt.get(key) != value:
+            raise StagingCellError(
+                f"existing backup delete-to-prove receipt has different binding: {key}"
+            )
+    final_anchors = receipt.get("final_data_mount_anchors")
+    if not isinstance(final_anchors, dict) or not _same_data_mount_anchors(
+        rebuild["restored_data_identity"], final_anchors
+    ):
+        raise StagingCellError(
+            "existing backup delete-to-prove receipt lost its restored mount binding"
+        )
+    for key in ("gateway_receipt_sha256", "host_gateway_receipt_sha256"):
+        value = receipt.get(key)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise StagingCellError(
+                f"existing backup delete-to-prove receipt has invalid hash binding: {key}"
+            )
+    recovery_start = down.get("cluster_deleted_at_unix")
+    verified_at = receipt.get("verified_at_unix")
+    rto = receipt.get("rto_observed_seconds")
+    if (
+        not isinstance(recovery_start, int)
+        or isinstance(recovery_start, bool)
+        or recovery_start <= 0
+        or not isinstance(verified_at, int)
+        or isinstance(verified_at, bool)
+        or verified_at < recovery_start
+        or not isinstance(rto, int)
+        or isinstance(rto, bool)
+        or rto != verified_at - recovery_start
+    ):
+        raise StagingCellError("existing backup proof has invalid recovery timing")
+    return {
+        **receipt,
+        "receipt_path": str(path),
+        "receipt_sha256": sha256_file(path),
+    }
+
+
 @lifecycle_mutation_locked
 @reference_output_routed
 def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, Any]:
@@ -7408,8 +7507,22 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         or rebuild.get("release_commit") != release_commit
     ):
         raise StagingCellError("backup rebuild receipt is not bound to this restored release")
+    rebuild_controller_commit = str(rebuild.get("controller_commit") or "")
+    path = root / BACKUP_DELETE_TO_PROVE_RECEIPT
+    completed = _validated_existing_backup_delete_to_prove_receipt(
+        root,
+        cluster=args.cluster,
+        owner_id=args.owner_id,
+        cell=cell,
+        release_commit=release_commit,
+        controller_commit=rebuild_controller_commit,
+        down=down,
+        rebuild=rebuild,
+    )
+    if completed is not None:
+        return completed
     controller_commit = require_clean_commit(None)
-    if controller_commit != rebuild.get("controller_commit"):
+    if controller_commit != rebuild_controller_commit:
         raise StagingCellError(
             "backup proof controller commit differs from the rebuild-bound controller"
         )
@@ -7480,30 +7593,12 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         raise StagingCellError(
             "restored PostgreSQL-backed API data differs from the pre-delete full snapshot"
         )
-    path = root / BACKUP_DELETE_TO_PROVE_RECEIPT
-    previous = None
-    if path.exists() or path.is_symlink():
-        previous = _private_json_receipt(path, label="backup delete-to-prove receipt")
     observed_at_unix = int(time.time())
     recovery_start = int(down.get("cluster_deleted_at_unix") or 0)
     if recovery_start <= 0 or observed_at_unix < recovery_start:
         raise StagingCellError("backup proof recovery timing evidence is invalid")
     verified_at_unix = observed_at_unix
     rto_observed_seconds = observed_at_unix - recovery_start
-    if previous is not None:
-        previous_verified = previous.get("verified_at_unix")
-        previous_rto = previous.get("rto_observed_seconds")
-        if (
-            not isinstance(previous_verified, int)
-            or isinstance(previous_verified, bool)
-            or not isinstance(previous_rto, int)
-            or isinstance(previous_rto, bool)
-            or previous_verified < recovery_start
-            or previous_rto != previous_verified - recovery_start
-        ):
-            raise StagingCellError("existing backup proof has invalid recovery timing")
-        verified_at_unix = previous_verified
-        rto_observed_seconds = previous_rto
     result = {
         "schema_version": 1,
         "status": "backup-delete-to-prove-verified",
@@ -7534,10 +7629,6 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         "production_changed": False,
         "does_not_establish": ["public DNS", "public TLS", "production cutover"],
     }
-    if previous is not None:
-        if previous != result:
-            raise StagingCellError("existing backup delete-to-prove receipt has different bindings")
-        return {**previous, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
     atomic_json(path, result)
     return {**result, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
 
