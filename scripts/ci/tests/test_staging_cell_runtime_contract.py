@@ -5395,7 +5395,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     staging, "require_clean_commit", return_value=controller
-                ),
+                ) as require_clean,
                 mock.patch.object(
                     staging,
                     "_complete_backup_down_from_pending",
@@ -5405,6 +5405,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             ):
                 result = staging.command_backup_delete_to_prove_down(args)
         self.assertEqual(result["status"], "completed")
+        require_clean.assert_called_once_with(None, require_public_main=False)
         complete.assert_called_once_with(root, args, pending, resumed=True)
         backup.assert_not_called()
 
@@ -5456,7 +5457,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(staging, "state_root", return_value=root),
                 mock.patch.object(staging, "configure_reference_paths"),
                 mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
-                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(
+                    staging, "require_clean_commit", return_value=controller
+                ) as require_clean,
                 mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
                 mock.patch.object(staging.reference, "clusters", return_value=[staging.DEFAULT_CLUSTER]),
                 mock.patch.object(staging.reference, "require_owned_cluster"),
@@ -5472,7 +5475,39 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     staging.StagingCellError, "restore target identity changed before retry"
                 ):
                     staging.command_backup_delete_to_prove_rebuild(args)
+            require_clean.assert_called_once_with(None, require_public_main=False)
             restore.assert_not_called()
+
+    def test_backup_recovery_controller_uses_receipt_pinned_checkout_after_main_advances(self) -> None:
+        release = "7" * 40
+        controller = "8" * 40
+        cell = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": "test:t084",
+            "bootstrap_commit": "6" * 40,
+        }
+        with tempfile.TemporaryDirectory(prefix="staging-backup-controller-resume-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(
+                root / staging.BACKUP_REBUILD_RECEIPT,
+                {
+                    "schema_version": 1,
+                    "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+                    "cluster": cell["cluster"],
+                    "owner_id": cell["owner_id"],
+                    "bootstrap_commit": cell["bootstrap_commit"],
+                    "release_commit": release,
+                    "controller_commit": controller,
+                },
+            )
+            with mock.patch.object(
+                staging, "require_clean_commit", return_value=controller
+            ) as require_clean:
+                observed = staging._backup_recovery_controller_commit(
+                    root, cell, release
+                )
+        self.assertEqual(observed, controller)
+        require_clean.assert_called_once_with(None, require_public_main=False)
 
     def test_backup_recovery_activation_binding_is_restart_safe_and_single_use(self) -> None:
         release = "7" * 40
@@ -5577,7 +5612,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     staging, "require_clean_commit", return_value=controller
-                ),
+                ) as require_clean,
                 mock.patch.object(
                     staging, "load_tool_receipt", return_value=self._tool_receipt()
                 ),
@@ -5605,6 +5640,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             result["status"],
             "backup-restored-infrastructure-ready-app-reactivation-required",
         )
+        require_clean.assert_called_once_with(None, require_public_main=False)
         content_identity.assert_not_called()
 
     def test_fresh_backup_intent_rejects_preexisting_archive_path(self) -> None:
@@ -5844,16 +5880,21 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("gateway_api_nodes_complete_readback", source)
         self.assertNotIn("pre_delete_api_nodes_sha256", source)
         self.assertIn('"status": "backup-quiesce-pending"', source)
+        self.assertEqual(source.count("controller_commit = require_clean_commit(None)"), 1)
+        self.assertIn("require_public_main=False", source)
 
     def test_terminal_backup_proof_reuses_validated_receipt_before_live_reprobe(self) -> None:
         import inspect
 
         source = inspect.getsource(staging.command_prove_backup_delete_to_prove)
         completed = source.index("_validated_existing_backup_delete_to_prove_receipt(")
-        current_checkout = source.index("controller_commit = require_clean_commit(None)")
+        current_checkout = source.index("controller_commit = require_clean_commit(")
         live_tools = source.index("tools = load_tool_receipt(")
         self.assertLess(completed, current_checkout)
         self.assertLess(current_checkout, live_tools)
+        self.assertIn(
+            "require_public_main=False", source[current_checkout:live_tools]
+        )
         app_check = "require_gateway_app_current(kubectl, cell, promotion)"
         first_app_check = source.index(app_check)
         final_host_readback = source.index("fresh_host = host_gateway_http_readback()")

@@ -7003,7 +7003,9 @@ def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, A
             raise StagingCellError("backup down receipt release mismatch")
         if existing.get("status") == "backup-created-cluster-deleted-primary-data-empty":
             return existing
-        controller_commit = require_clean_commit(None)
+        controller_commit = require_clean_commit(
+            None, require_public_main=False
+        )
         if existing.get("controller_commit") != controller_commit:
             raise StagingCellError(
                 "backup down retry must use the exact controller commit that created the backup"
@@ -7080,7 +7082,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         raise StagingCellError("backup rebuild owner or cluster binding mismatch")
     if args.source_commit != down.get("release_commit"):
         raise StagingCellError("backup rebuild must restore the exact pre-delete release")
-    controller_commit = require_clean_commit(None)
+    controller_commit = require_clean_commit(None, require_public_main=False)
     if controller_commit != down.get("controller_commit"):
         raise StagingCellError("backup rebuild controller commit differs from backup creation")
     result_path = root / BACKUP_REBUILD_RECEIPT
@@ -7347,7 +7349,7 @@ def _backup_recovery_controller_commit(
     ):
         return None
     controller_commit = str(receipt.get("controller_commit") or "")
-    observed = require_clean_commit(None)
+    observed = require_clean_commit(None, require_public_main=False)
     if observed != controller_commit:
         raise StagingCellError(
             "backup recovery must continue from the exact controller commit that restored data"
@@ -7521,7 +7523,7 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
     )
     if completed is not None:
         return completed
-    controller_commit = require_clean_commit(None)
+    controller_commit = require_clean_commit(None, require_public_main=False)
     if controller_commit != rebuild_controller_commit:
         raise StagingCellError(
             "backup proof controller commit differs from the rebuild-bound controller"
