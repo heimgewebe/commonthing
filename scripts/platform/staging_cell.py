@@ -4753,6 +4753,7 @@ HOST_HTTP_PROOF_MAX_BYTES = 1024 * 1024
 API_NODES_PROOF_PAGE_LIMIT = 10
 API_NODES_PROOF_MAX_PAGES = 10000
 API_NODES_HASH_SCOPE = "complete-node-set-canonical-json-v2"
+API_NODES_DB_HTTP_CONSISTENCY = "postgres-share-lock-http-match-v1"
 
 
 def _host_http_bytes(path: str) -> bytes:
@@ -4975,6 +4976,33 @@ def postgres_api_nodes_complete_readback(kubectl: str) -> dict[str, Any]:
     pages = max(1, (len(items) + API_NODES_PROOF_PAGE_LIMIT - 1) // API_NODES_PROOF_PAGE_LIMIT)
     result = _canonical_api_nodes_snapshot(items, page_count=pages)
     return {**result, "api_nodes_source": "quiesced-postgres-api-projection-v1"}
+
+
+def _bind_locked_api_nodes_http_to_postgres(
+    kubectl: str, http_snapshot: dict[str, Any], *, label: str
+) -> dict[str, Any]:
+    database = postgres_api_nodes_complete_readback(kubectl)
+    expected_source = "quiesced-postgres-api-projection-v1"
+    if database.get("api_nodes_source") != expected_source:
+        raise StagingCellError(f"{label} PostgreSQL projection source is invalid")
+    for key in (
+        "api_nodes_sha256",
+        "api_nodes_count",
+        "api_nodes_pages",
+        "api_nodes_hash_scope",
+    ):
+        if http_snapshot.get(key) != database.get(key):
+            raise StagingCellError(
+                f"{label} differs from the locked PostgreSQL API projection: {key}"
+            )
+    return {
+        "api_nodes_consistency": API_NODES_DB_HTTP_CONSISTENCY,
+        "postgres_api_nodes_sha256": database["api_nodes_sha256"],
+        "postgres_api_nodes_count": database["api_nodes_count"],
+        "postgres_api_nodes_pages": database["api_nodes_pages"],
+        "postgres_api_nodes_hash_scope": database["api_nodes_hash_scope"],
+        "postgres_api_nodes_source": database["api_nodes_source"],
+    }
 
 
 def _kind_gateway_http_bytes(node: str, address: str, port: int, path: str) -> bytes:
@@ -5426,6 +5454,9 @@ def command_prove_host_gateway(args: argparse.Namespace) -> dict[str, Any]:
     require_gateway_app_current(kubectl, cell, promotion)
     with _postgres_domain_nodes_write_freeze(kubectl):
         readback = host_gateway_http_readback()
+        api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(
+            kubectl, readback, label="host Gateway API snapshot"
+        )
         require_gateway_app_current(kubectl, cell, promotion)
         if gateway_service_node_port(kubectl, require_exact=True) != (
             service_name,
@@ -5450,6 +5481,7 @@ def command_prove_host_gateway(args: argparse.Namespace) -> dict[str, Any]:
             "node_port": node_port,
         },
         **readback,
+        **api_nodes_consistency,
         "production_changed": False,
         "does_not_establish": ["public DNS", "public TLS", "production cutover"],
         "verified_at_unix": verified_at_unix,
@@ -5491,6 +5523,17 @@ def host_gateway_receipt_current(root: Path, cell: dict[str, Any], kubectl: str)
             and receipt.get("service")
             == {"name": service_name, "uid": service_uid, "node_port": node_port}
             and receipt.get("probe_scope") == "heim-pc-host-outside-kubernetes"
+            and receipt.get("api_nodes_consistency") == API_NODES_DB_HTTP_CONSISTENCY
+            and receipt.get("postgres_api_nodes_source")
+            == "quiesced-postgres-api-projection-v1"
+            and receipt.get("postgres_api_nodes_sha256")
+            == receipt.get("api_nodes_sha256")
+            and receipt.get("postgres_api_nodes_count")
+            == receipt.get("api_nodes_count")
+            and receipt.get("postgres_api_nodes_pages")
+            == receipt.get("api_nodes_pages")
+            and receipt.get("postgres_api_nodes_hash_scope")
+            == receipt.get("api_nodes_hash_scope")
         )
     except (OSError, ValueError, StagingCellError, subprocess.CalledProcessError):
         return False
@@ -7760,6 +7803,12 @@ def _validated_existing_backup_delete_to_prove_receipt(
         "post_restore_api_nodes_pages": down["pre_delete_api_nodes_pages"],
         "api_nodes_count": down["pre_delete_api_nodes_count"],
         "api_nodes_hash_scope": down["pre_delete_api_nodes_hash_scope"],
+        "api_nodes_consistency": API_NODES_DB_HTTP_CONSISTENCY,
+        "postgres_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
+        "postgres_api_nodes_count": down["pre_delete_api_nodes_count"],
+        "postgres_api_nodes_pages": down["pre_delete_api_nodes_pages"],
+        "postgres_api_nodes_hash_scope": down["pre_delete_api_nodes_hash_scope"],
+        "postgres_api_nodes_source": "quiesced-postgres-api-projection-v1",
         "app_workloads": {name: "True" for name in APP_DEPLOYMENTS},
         "live_workloads": {name: "True" for name in LIVE_DEPLOYMENTS},
         "rpo_observation": {
@@ -7913,6 +7962,9 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
     )
     with _postgres_domain_nodes_write_freeze(kubectl):
         fresh_host = host_gateway_http_readback()
+        fresh_api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(
+            kubectl, fresh_host, label="final host Gateway API snapshot"
+        )
         require_gateway_app_current(kubectl, cell, promotion)
         if not gateway_receipt_current(root, cell, kubectl):
             raise StagingCellError("staging Gateway changed during final host readback")
@@ -7931,6 +7983,11 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
             if host_receipt.get(key) != fresh_host.get(key):
                 raise StagingCellError(
                     f"host Gateway readback changed before final backup proof: {key}"
+                )
+        for key, value in fresh_api_nodes_consistency.items():
+            if host_receipt.get(key) != value:
+                raise StagingCellError(
+                    f"host Gateway PostgreSQL binding changed before final backup proof: {key}"
                 )
         if (
             fresh_host.get("api_nodes_sha256") != down.get("pre_delete_api_nodes_sha256")
@@ -7969,6 +8026,7 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         "post_restore_api_nodes_pages": fresh_host["api_nodes_pages"],
         "api_nodes_count": fresh_host["api_nodes_count"],
         "api_nodes_hash_scope": fresh_host["api_nodes_hash_scope"],
+        **fresh_api_nodes_consistency,
         "app_workloads": workloads,
         "live_workloads": live_workloads,
         "rto_observed_seconds": rto_observed_seconds,

@@ -6532,16 +6532,66 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         host_source = inspect.getsource(staging.command_prove_host_gateway)
         host_freeze = host_source.index("with _postgres_domain_nodes_write_freeze(kubectl):")
         host_readback = host_source.index("readback = host_gateway_http_readback()")
+        host_bind = host_source.index("api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(")
         host_verified = host_source.index("verified_at_unix = int(time.time())")
         self.assertLess(host_freeze, host_readback)
-        self.assertLess(host_readback, host_verified)
+        self.assertLess(host_readback, host_bind)
+        self.assertLess(host_bind, host_verified)
 
         final_source = inspect.getsource(staging.command_prove_backup_delete_to_prove)
         final_freeze = final_source.index("with _postgres_domain_nodes_write_freeze(kubectl):")
         final_readback = final_source.index("fresh_host = host_gateway_http_readback()")
+        final_bind = final_source.index("fresh_api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(")
         final_observed = final_source.index("observed_at_unix = int(time.time())")
         self.assertLess(final_freeze, final_readback)
-        self.assertLess(final_readback, final_observed)
+        self.assertLess(final_readback, final_bind)
+        self.assertLess(final_bind, final_observed)
+
+    def test_locked_http_snapshot_matches_postgres_projection_or_fails_closed(self) -> None:
+        http = {
+            "api_nodes_sha256": "a" * 64,
+            "api_nodes_count": 3,
+            "api_nodes_pages": 1,
+            "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+        }
+        database = {
+            **http,
+            "api_nodes_source": "quiesced-postgres-api-projection-v1",
+        }
+        with mock.patch.object(
+            staging, "postgres_api_nodes_complete_readback", return_value=database
+        ):
+            binding = staging._bind_locked_api_nodes_http_to_postgres(
+                "kubectl", http, label="test API snapshot"
+            )
+        self.assertEqual(
+            binding["api_nodes_consistency"], staging.API_NODES_DB_HTTP_CONSISTENCY
+        )
+        self.assertEqual(binding["postgres_api_nodes_sha256"], http["api_nodes_sha256"])
+        self.assertEqual(binding["postgres_api_nodes_count"], http["api_nodes_count"])
+        self.assertEqual(binding["postgres_api_nodes_pages"], http["api_nodes_pages"])
+
+        stale_http = {**http, "api_nodes_sha256": "b" * 64}
+        with (
+            mock.patch.object(
+                staging, "postgres_api_nodes_complete_readback", return_value=database
+            ),
+            self.assertRaisesRegex(staging.StagingCellError, "api_nodes_sha256"),
+        ):
+            staging._bind_locked_api_nodes_http_to_postgres(
+                "kubectl", stale_http, label="test API snapshot"
+            )
+
+    def test_host_receipt_requires_postgres_http_consistency_binding(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging.host_gateway_receipt_current)
+        self.assertIn(
+            'receipt.get("api_nodes_consistency") == API_NODES_DB_HTTP_CONSISTENCY',
+            source,
+        )
+        self.assertIn('receipt.get("postgres_api_nodes_sha256")', source)
+        self.assertIn('receipt.get("postgres_api_nodes_pages")', source)
 
     def test_postgres_write_freeze_is_table_scoped_and_fail_closed(self) -> None:
         import inspect
@@ -6646,6 +6696,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 "post_restore_api_nodes_pages": down["pre_delete_api_nodes_pages"],
                 "api_nodes_count": down["pre_delete_api_nodes_count"],
                 "api_nodes_hash_scope": down["pre_delete_api_nodes_hash_scope"],
+                "api_nodes_consistency": staging.API_NODES_DB_HTTP_CONSISTENCY,
+                "postgres_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
+                "postgres_api_nodes_count": down["pre_delete_api_nodes_count"],
+                "postgres_api_nodes_pages": down["pre_delete_api_nodes_pages"],
+                "postgres_api_nodes_hash_scope": down["pre_delete_api_nodes_hash_scope"],
+                "postgres_api_nodes_source": "quiesced-postgres-api-projection-v1",
                 "app_workloads": {name: "True" for name in staging.APP_DEPLOYMENTS},
                 "live_workloads": {name: "True" for name in staging.LIVE_DEPLOYMENTS},
                 "rto_observed_seconds": 30,

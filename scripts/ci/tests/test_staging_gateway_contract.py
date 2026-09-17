@@ -1031,11 +1031,25 @@ class StagingGatewayTests(unittest.TestCase):
             "web_prefix_sha256": "2" * 64,
             "web_prefix_bytes": 123,
             "api_nodes_sha256": "3" * 64,
+            "api_nodes_count": 1,
+            "api_nodes_pages": 1,
+            "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
         }
         with (
             mock.patch.object(staging, "gateway_receipt_current", return_value=True),
             mock.patch.object(staging, "gateway_service_node_port", return_value=service),
             mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(
+                staging,
+                "postgres_api_nodes_complete_readback",
+                return_value={
+                    "api_nodes_sha256": "3" * 64,
+                    "api_nodes_count": 1,
+                    "api_nodes_pages": 1,
+                    "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+                    "api_nodes_source": "quiesced-postgres-api-projection-v1",
+                },
+            ),
             mock.patch.object(
                 staging, "_postgres_domain_nodes_write_freeze", return_value=mock.MagicMock()
             ),
@@ -1085,6 +1099,9 @@ class StagingGatewayTests(unittest.TestCase):
             "web_prefix_sha256": "2" * 64,
             "web_prefix_bytes": 123,
             "api_nodes_sha256": "3" * 64,
+            "api_nodes_count": 1,
+            "api_nodes_pages": 1,
+            "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
         }
         with (
             mock.patch.object(staging, "gateway_receipt_current", return_value=True),
@@ -1092,6 +1109,17 @@ class StagingGatewayTests(unittest.TestCase):
                 staging, "gateway_service_node_port", side_effect=[service, changed]
             ),
             mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(
+                staging,
+                "postgres_api_nodes_complete_readback",
+                return_value={
+                    "api_nodes_sha256": "3" * 64,
+                    "api_nodes_count": 1,
+                    "api_nodes_pages": 1,
+                    "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+                    "api_nodes_source": "quiesced-postgres-api-projection-v1",
+                },
+            ),
             mock.patch.object(
                 staging, "_postgres_domain_nodes_write_freeze", return_value=mock.MagicMock()
             ),
@@ -1115,11 +1143,25 @@ class StagingGatewayTests(unittest.TestCase):
             "web_prefix_sha256": "2" * 64,
             "web_prefix_bytes": 123,
             "api_nodes_sha256": "3" * 64,
+            "api_nodes_count": 1,
+            "api_nodes_pages": 1,
+            "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
         }
         with (
             mock.patch.object(staging, "gateway_receipt_current", return_value=True),
             mock.patch.object(staging, "gateway_service_node_port", return_value=service),
             mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(
+                staging,
+                "postgres_api_nodes_complete_readback",
+                return_value={
+                    "api_nodes_sha256": "3" * 64,
+                    "api_nodes_count": 1,
+                    "api_nodes_pages": 1,
+                    "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+                    "api_nodes_source": "quiesced-postgres-api-projection-v1",
+                },
+            ),
             mock.patch.object(
                 staging, "_postgres_domain_nodes_write_freeze", return_value=mock.MagicMock()
             ),
