@@ -6626,10 +6626,20 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         final_freeze = final_source.index("with _postgres_domain_nodes_write_freeze(kubectl):")
         final_readback = final_source.index("fresh_host = host_gateway_http_readback()")
         final_bind = final_source.index("fresh_api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(")
+        first_live_health = final_source.index("live_workloads = staging_live_health(kubectl)")
+        final_live_health = final_source.index(
+            "live_workloads = staging_live_health(kubectl)",
+            first_live_health + 1,
+        )
         final_observed = final_source.index("observed_at_unix = int(time.time())")
         self.assertLess(final_freeze, final_readback)
         self.assertLess(final_readback, final_bind)
-        self.assertLess(final_bind, final_observed)
+        self.assertLess(final_bind, final_live_health)
+        self.assertLess(final_live_health, final_observed)
+        self.assertIn(
+            "restored data or Flux workload changed during final host readback",
+            final_source[final_live_health:final_observed],
+        )
 
     def test_locked_http_snapshot_matches_postgres_projection_or_fails_closed(self) -> None:
         http = {

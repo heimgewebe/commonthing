@@ -8033,6 +8033,12 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
             raise StagingCellError(
                 "restored PostgreSQL-backed API data differs from the pre-delete full snapshot"
             )
+        live_workloads = staging_live_health(kubectl)
+        if any(state != "True" for state in live_workloads.values()):
+            raise StagingCellError(
+                "restored data or Flux workload changed during final host readback: "
+                f"{live_workloads!r}"
+            )
         observed_at_unix = int(time.time())
     recovery_start = int(down.get("cluster_deleted_at_unix") or 0)
     if recovery_start <= 0 or observed_at_unix < recovery_start:
