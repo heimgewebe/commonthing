@@ -5408,6 +5408,129 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         complete.assert_called_once_with(root, args, pending, resumed=True)
         backup.assert_not_called()
 
+    def test_backup_restore_fast_path_rejects_matching_data_on_replaced_roots(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        pre_delete = {
+            "postgres": {"device": 1, "inode": 2, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 3, "tree_sha256": "b" * 64},
+        }
+        empty_roots = {
+            "postgres": {"device": 1, "inode": 20, "empty": True},
+            "nats": {"device": 1, "inode": 30, "empty": True},
+        }
+        replaced_with_old_data = {
+            "postgres": {"device": 1, "inode": 2, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 3, "tree_sha256": "b" * 64},
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+            "pre_delete_data_identity": pre_delete,
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-restore-pending",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "empty_restore_roots": empty_roots,
+            "production_changed": False,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-replaced-restore-root-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "clusters", return_value=[staging.DEFAULT_CLUSTER]),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(staging, "prepare_volume_permissions"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_identity",
+                    return_value=replaced_with_old_data,
+                ),
+                mock.patch.object(staging, "_restore_volume_archives") as restore,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "restore target identity changed before retry"
+                ):
+                    staging.command_backup_delete_to_prove_rebuild(args)
+            restore.assert_not_called()
+
+    def test_backup_recovery_activation_binding_is_restart_safe_and_single_use(self) -> None:
+        release = "7" * 40
+        controller = "8" * 40
+        base_cell = {
+            "status": "gateway-ready",
+            "bootstrap_commit": "6" * 40,
+            "active_commit": release,
+        }
+        with tempfile.TemporaryDirectory(prefix="staging-backup-reactivation-binding-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(
+                root / staging.BACKUP_REBUILD_RECEIPT,
+                {"status": "backup-restored-infrastructure-ready-app-reactivation-required"},
+            )
+            binding = staging._backup_recovery_activation_binding(
+                root, base_cell, release, controller
+            )
+            self.assertIsNotNone(binding)
+            pending = {
+                **base_cell,
+                "status": "app-activation-in-progress",
+                "pending_backup_recovery_reactivation": binding,
+            }
+            self.assertEqual(
+                staging._backup_recovery_activation_binding(
+                    root, pending, release, controller
+                ),
+                binding,
+            )
+            consumed = {
+                **base_cell,
+                "backup_recovery_reactivation_consumed": binding,
+            }
+            self.assertIsNone(
+                staging._backup_recovery_activation_binding(
+                    root, consumed, release, controller
+                )
+            )
+            moved_on = {**base_cell, "active_commit": "9" * 40}
+            self.assertIsNone(
+                staging._backup_recovery_activation_binding(
+                    root, moved_on, release, controller
+                )
+            )
+            with self.assertRaisesRegex(
+                staging.StagingCellError, "lost its backup recovery controller binding"
+            ):
+                staging._backup_recovery_activation_binding(
+                    root, pending, release, None
+                )
+
+        import inspect
+
+        activate_source = inspect.getsource(staging.command_activate)
+        self.assertIn("pending_backup_recovery_reactivation", activate_source)
+        self.assertIn("backup_recovery_reactivation_consumed", activate_source)
+
     def test_backup_rebuild_retry_after_data_start_uses_mount_anchor_not_cold_tree_hash(self) -> None:
         owner = "test:t084"
         release = "f" * 40
@@ -5680,6 +5803,16 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         second_app_check = source.index(app_check, first_app_check + len(app_check))
         self.assertLess(first_app_check, final_host_readback)
         self.assertLess(final_host_readback, second_app_check)
+        final_gateway_check = source.index(
+            "if not gateway_receipt_current(root, cell, kubectl):",
+            final_host_readback,
+        )
+        final_host_binding_check = source.index(
+            "if not host_gateway_receipt_current(root, cell, kubectl):",
+            final_host_readback,
+        )
+        self.assertLess(second_app_check, final_gateway_check)
+        self.assertLess(final_gateway_check, final_host_binding_check)
         self.assertIn('previous.get("rto_observed_seconds")', source)
         self.assertIn("previous_rto != previous_verified - recovery_start", source)
 

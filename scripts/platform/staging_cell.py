@@ -3890,7 +3890,10 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         backup_controller = _backup_recovery_controller_commit(
             root, cell, pending_commit
         )
-        if backup_controller is not None:
+        backup_reactivation = _backup_recovery_activation_binding(
+            root, cell, pending_commit, backup_controller
+        )
+        if backup_reactivation is not None:
             commit = pending_commit
         else:
             commit = require_clean_commit(
@@ -3902,7 +3905,10 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         backup_controller = _backup_recovery_controller_commit(
             root, cell, requested_commit
         )
-        if backup_controller is not None:
+        backup_reactivation = _backup_recovery_activation_binding(
+            root, cell, requested_commit, backup_controller
+        )
+        if backup_reactivation is not None:
             commit = requested_commit
         else:
             commit = require_clean_commit(args.source_commit)
@@ -3957,6 +3963,11 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
             **(
                 {"pending_delete_to_prove_recovery": delete_to_prove_recovery}
                 if delete_to_prove_recovery is not None
+                else {}
+            ),
+            **(
+                {"pending_backup_recovery_reactivation": backup_reactivation}
+                if backup_reactivation is not None
                 else {}
             ),
             "production_changed": False,
@@ -4028,6 +4039,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
             "pending_migration",
             "pending_registry_pull_secret",
             "pending_delete_to_prove_recovery",
+            "pending_backup_recovery_reactivation",
         }
     }
     updated = {
@@ -4046,6 +4058,11 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         },
         "image_promotion": promotion_state,
         "app_activation": True,
+        **(
+            {"backup_recovery_reactivation_consumed": backup_reactivation}
+            if backup_reactivation is not None
+            else {}
+        ),
         "app_workloads": workloads,
         "production_changed": False,
         "does_not_establish": [
@@ -7139,16 +7156,13 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         observed = _mounted_retained_data_identity(
             kind, args.cluster, root, durable=True, require_split=True
         )
+        if not _same_data_mount_anchors(existing["empty_restore_roots"], observed):
+            raise StagingCellError(
+                "backup restore target identity changed before retry"
+            )
         if _same_data_tree_hashes(down["pre_delete_data_identity"], observed):
             restored = observed
         else:
-            anchors = _mounted_retained_data_anchors(
-                kind, args.cluster, root, require_split=True
-            )
-            if not _same_data_mount_anchors(existing["empty_restore_roots"], anchors):
-                raise StagingCellError(
-                    "backup restore target identity changed before retry"
-                )
             # A crash can leave a partial extraction. The pending receipt proves
             # these are the fresh post-delete roots and binds the immutable backup,
             # so clearing only their contents is retry-safe and cannot touch the
@@ -7329,6 +7343,44 @@ def _backup_recovery_controller_commit(
     return controller_commit
 
 
+def _backup_recovery_activation_binding(
+    root: Path,
+    cell: dict[str, Any],
+    release_commit: str,
+    controller_commit: str | None,
+) -> dict[str, Any] | None:
+    pending = cell.get("pending_backup_recovery_reactivation")
+    activation_in_progress = cell.get("status") == "app-activation-in-progress"
+    if controller_commit is None:
+        if activation_in_progress and pending is not None:
+            raise StagingCellError(
+                "activation recovery lost its backup recovery controller binding"
+            )
+        return None
+    rebuild_path = root / BACKUP_REBUILD_RECEIPT
+    binding = {
+        "release_commit": release_commit,
+        "controller_commit": controller_commit,
+        "rebuild_receipt_sha256": sha256_file(rebuild_path),
+    }
+    if activation_in_progress:
+        if pending != binding:
+            raise StagingCellError(
+                "activation recovery lost its backup recovery reactivation binding"
+            )
+        return binding
+    consumed = cell.get("backup_recovery_reactivation_consumed")
+    if consumed is not None and not isinstance(consumed, dict):
+        raise StagingCellError(
+            "backup recovery reactivation consumption marker is malformed"
+        )
+    if cell_active_commit(cell) != release_commit:
+        return None
+    if consumed == binding:
+        return None
+    return binding
+
+
 @lifecycle_mutation_locked
 @reference_output_routed
 def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, Any]:
@@ -7398,6 +7450,10 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
     )
     fresh_host = host_gateway_http_readback()
     require_gateway_app_current(kubectl, cell, promotion)
+    if not gateway_receipt_current(root, cell, kubectl):
+        raise StagingCellError("staging Gateway changed during final host readback")
+    if not host_gateway_receipt_current(root, cell, kubectl):
+        raise StagingCellError("host Gateway binding changed during final host readback")
     for key in (
         "probe_scope",
         "endpoint",
