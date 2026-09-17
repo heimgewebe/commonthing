@@ -1036,6 +1036,9 @@ class StagingGatewayTests(unittest.TestCase):
             mock.patch.object(staging, "gateway_receipt_current", return_value=True),
             mock.patch.object(staging, "gateway_service_node_port", return_value=service),
             mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(
+                staging, "_postgres_domain_nodes_write_freeze", return_value=mock.MagicMock()
+            ),
             mock.patch.object(staging.time, "time", return_value=123456),
         ):
             result = staging.command_prove_host_gateway(self.args)
@@ -1089,6 +1092,9 @@ class StagingGatewayTests(unittest.TestCase):
                 staging, "gateway_service_node_port", side_effect=[service, changed]
             ),
             mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(
+                staging, "_postgres_domain_nodes_write_freeze", return_value=mock.MagicMock()
+            ),
         ):
             with self.assertRaisesRegex(staging.StagingCellError, "changed during host readback"):
                 staging.command_prove_host_gateway(self.args)
@@ -1114,6 +1120,9 @@ class StagingGatewayTests(unittest.TestCase):
             mock.patch.object(staging, "gateway_receipt_current", return_value=True),
             mock.patch.object(staging, "gateway_service_node_port", return_value=service),
             mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(
+                staging, "_postgres_domain_nodes_write_freeze", return_value=mock.MagicMock()
+            ),
         ):
             staging.command_prove_host_gateway(self.args)
         cell = staging.load_cell_receipt(self.root)

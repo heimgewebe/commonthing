@@ -5005,6 +5005,165 @@ def _kind_gateway_http_bytes(node: str, address: str, port: int, path: str) -> b
         raise StagingCellError("kind Gateway API snapshot readback failed") from error
 
 
+def _postgres_proof_scalar(kubectl: str, sql: str, *, timeout: float = 30) -> str:
+    return output(
+        [
+            kubectl,
+            "-n",
+            DATA_NAMESPACE,
+            "exec",
+            "deployment/postgres",
+            "-c",
+            "postgres",
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            'exec psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"',
+            "sh",
+            sql,
+        ],
+        timeout=timeout,
+    )
+
+
+def _postgres_domain_nodes_write_freeze_count(kubectl: str, application_name: str) -> int:
+    sql = (
+        "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid "
+        "WHERE a.application_name='" + application_name + "' "
+        "AND l.locktype='relation' AND l.relation='domain_nodes'::regclass "
+        "AND l.mode='ShareLock' AND l.granted"
+    )
+    raw = _postgres_proof_scalar(kubectl, sql)
+    try:
+        count = int(raw)
+    except ValueError as error:
+        raise StagingCellError("PostgreSQL proof write-freeze lock state is invalid") from error
+    if count not in {0, 1}:
+        raise StagingCellError("PostgreSQL proof write-freeze lock state is ambiguous")
+    return count
+
+
+def _postgres_domain_nodes_write_freeze_session_count(
+    kubectl: str, application_name: str
+) -> int:
+    raw = _postgres_proof_scalar(
+        kubectl,
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name='"
+        + application_name
+        + "'",
+    )
+    try:
+        count = int(raw)
+    except ValueError as error:
+        raise StagingCellError("PostgreSQL proof write-freeze session state is invalid") from error
+    if count < 0 or count > 1:
+        raise StagingCellError("PostgreSQL proof write-freeze session state is ambiguous")
+    return count
+
+
+@contextmanager
+def _postgres_domain_nodes_write_freeze(kubectl: str):
+    application_name = "commonthing-t084-proof-" + secrets.token_hex(8)
+    command = [
+        kubectl,
+        "-n",
+        DATA_NAMESPACE,
+        "exec",
+        "-i",
+        "deployment/postgres",
+        "-c",
+        "postgres",
+        "--",
+        "sh",
+        "-eu",
+        "-c",
+        'exec psql -XAtq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"',
+    ]
+    print("+ external command [arguments redacted]", file=sys.stderr, flush=True)
+    process = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    acquired = False
+    try:
+        if process.stdin is None:
+            raise StagingCellError("PostgreSQL proof write-freeze stdin is unavailable")
+        process.stdin.write(
+            "SET application_name='"
+            + application_name
+            + "'; BEGIN; SET LOCAL lock_timeout='10s'; "
+            "LOCK TABLE domain_nodes IN SHARE MODE;\n"
+        )
+        process.stdin.flush()
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                detail = process.stderr.read().strip() if process.stderr is not None else ""
+                raise StagingCellError(
+                    "PostgreSQL proof write-freeze exited before the lock was acquired"
+                    + (f": {detail}" if detail else "")
+                )
+            if _postgres_domain_nodes_write_freeze_count(kubectl, application_name) == 1:
+                acquired = True
+                break
+            time.sleep(0.1)
+        if not acquired:
+            raise StagingCellError("PostgreSQL proof write-freeze lock acquisition timed out")
+        yield
+        if (
+            process.poll() is not None
+            or _postgres_domain_nodes_write_freeze_count(kubectl, application_name) != 1
+        ):
+            raise StagingCellError(
+                "PostgreSQL proof write-freeze was lost during the Gateway snapshot"
+            )
+    finally:
+        if process.poll() is None and process.stdin is not None:
+            try:
+                process.stdin.write("ROLLBACK;\n\\q\n")
+                process.stdin.flush()
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        try:
+            remaining = _postgres_domain_nodes_write_freeze_session_count(
+                kubectl, application_name
+            )
+        except (subprocess.CalledProcessError, StagingCellError):
+            remaining = 1
+        if remaining:
+            try:
+                _postgres_proof_scalar(
+                    kubectl,
+                    "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+                    "WHERE application_name='" + application_name + "'",
+                )
+            except subprocess.CalledProcessError as error:
+                raise StagingCellError(
+                    "PostgreSQL proof write-freeze session could not be terminated"
+                ) from error
+            if _postgres_domain_nodes_write_freeze_session_count(
+                kubectl, application_name
+            ) != 0:
+                raise StagingCellError(
+                    "PostgreSQL proof write-freeze session remained after cleanup"
+                )
+
+
 def gateway_api_nodes_complete_readback(
     kind: str, cluster: str, gateway_receipt: dict[str, Any]
 ) -> dict[str, Any]:
@@ -5265,16 +5424,18 @@ def command_prove_host_gateway(args: argparse.Namespace) -> dict[str, Any]:
     if node_port != STAGING_GATEWAY_NODE_PORT:
         raise StagingCellError("host Gateway proof NodePort is not pinned")
     require_gateway_app_current(kubectl, cell, promotion)
-    readback = host_gateway_http_readback()
-    require_gateway_app_current(kubectl, cell, promotion)
-    if gateway_service_node_port(kubectl, require_exact=True) != (
-        service_name,
-        service_uid,
-        node_port,
-    ):
-        raise StagingCellError("staging Gateway Service changed during host readback")
-    if not gateway_receipt_current(root, cell, kubectl):
-        raise StagingCellError("staging gateway changed during host readback")
+    with _postgres_domain_nodes_write_freeze(kubectl):
+        readback = host_gateway_http_readback()
+        require_gateway_app_current(kubectl, cell, promotion)
+        if gateway_service_node_port(kubectl, require_exact=True) != (
+            service_name,
+            service_uid,
+            node_port,
+        ):
+            raise StagingCellError("staging Gateway Service changed during host readback")
+        if not gateway_receipt_current(root, cell, kubectl):
+            raise StagingCellError("staging gateway changed during host readback")
+        verified_at_unix = int(time.time())
     result = {
         "schema_version": 1,
         "status": "host-gateway-readback-verified",
@@ -5291,7 +5452,7 @@ def command_prove_host_gateway(args: argparse.Namespace) -> dict[str, Any]:
         **readback,
         "production_changed": False,
         "does_not_establish": ["public DNS", "public TLS", "production cutover"],
-        "verified_at_unix": int(time.time()),
+        "verified_at_unix": verified_at_unix,
     }
     path = root / HOST_GATEWAY_RECEIPT
     atomic_json(path, result)
@@ -7595,6 +7756,8 @@ def _validated_existing_backup_delete_to_prove_receipt(
         "restored_data_identity": rebuild["restored_data_identity"],
         "pre_delete_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
         "post_restore_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
+        "pre_delete_api_nodes_pages": down["pre_delete_api_nodes_pages"],
+        "post_restore_api_nodes_pages": down["pre_delete_api_nodes_pages"],
         "api_nodes_count": down["pre_delete_api_nodes_count"],
         "api_nodes_hash_scope": down["pre_delete_api_nodes_hash_scope"],
         "app_workloads": {name: "True" for name in APP_DEPLOYMENTS},
@@ -7748,36 +7911,38 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
     host_receipt = _private_json_receipt(
         host_path, label="host Gateway proof receipt"
     )
-    fresh_host = host_gateway_http_readback()
-    require_gateway_app_current(kubectl, cell, promotion)
-    if not gateway_receipt_current(root, cell, kubectl):
-        raise StagingCellError("staging Gateway changed during final host readback")
-    if not host_gateway_receipt_current(root, cell, kubectl):
-        raise StagingCellError("host Gateway binding changed during final host readback")
-    for key in (
-        "probe_scope",
-        "endpoint",
-        "health_sha256",
-        "web_prefix_sha256",
-        "api_nodes_sha256",
-        "api_nodes_count",
-        "api_nodes_pages",
-        "api_nodes_hash_scope",
-    ):
-        if host_receipt.get(key) != fresh_host.get(key):
+    with _postgres_domain_nodes_write_freeze(kubectl):
+        fresh_host = host_gateway_http_readback()
+        require_gateway_app_current(kubectl, cell, promotion)
+        if not gateway_receipt_current(root, cell, kubectl):
+            raise StagingCellError("staging Gateway changed during final host readback")
+        if not host_gateway_receipt_current(root, cell, kubectl):
+            raise StagingCellError("host Gateway binding changed during final host readback")
+        for key in (
+            "probe_scope",
+            "endpoint",
+            "health_sha256",
+            "web_prefix_sha256",
+            "api_nodes_sha256",
+            "api_nodes_count",
+            "api_nodes_pages",
+            "api_nodes_hash_scope",
+        ):
+            if host_receipt.get(key) != fresh_host.get(key):
+                raise StagingCellError(
+                    f"host Gateway readback changed before final backup proof: {key}"
+                )
+        if (
+            fresh_host.get("api_nodes_sha256") != down.get("pre_delete_api_nodes_sha256")
+            or fresh_host.get("api_nodes_count") != down.get("pre_delete_api_nodes_count")
+            or fresh_host.get("api_nodes_pages") != down.get("pre_delete_api_nodes_pages")
+            or fresh_host.get("api_nodes_hash_scope")
+            != down.get("pre_delete_api_nodes_hash_scope")
+        ):
             raise StagingCellError(
-                f"host Gateway readback changed before final backup proof: {key}"
+                "restored PostgreSQL-backed API data differs from the pre-delete full snapshot"
             )
-    if (
-        fresh_host.get("api_nodes_sha256") != down.get("pre_delete_api_nodes_sha256")
-        or fresh_host.get("api_nodes_count") != down.get("pre_delete_api_nodes_count")
-        or fresh_host.get("api_nodes_hash_scope")
-        != down.get("pre_delete_api_nodes_hash_scope")
-    ):
-        raise StagingCellError(
-            "restored PostgreSQL-backed API data differs from the pre-delete full snapshot"
-        )
-    observed_at_unix = int(time.time())
+        observed_at_unix = int(time.time())
     recovery_start = int(down.get("cluster_deleted_at_unix") or 0)
     if recovery_start <= 0 or observed_at_unix < recovery_start:
         raise StagingCellError("backup proof recovery timing evidence is invalid")
@@ -7800,6 +7965,8 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         "final_data_mount_anchors": final_data_anchors,
         "pre_delete_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
         "post_restore_api_nodes_sha256": fresh_host["api_nodes_sha256"],
+        "pre_delete_api_nodes_pages": down["pre_delete_api_nodes_pages"],
+        "post_restore_api_nodes_pages": fresh_host["api_nodes_pages"],
         "api_nodes_count": fresh_host["api_nodes_count"],
         "api_nodes_hash_scope": fresh_host["api_nodes_hash_scope"],
         "app_workloads": workloads,

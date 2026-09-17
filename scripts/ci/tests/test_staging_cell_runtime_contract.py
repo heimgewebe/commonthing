@@ -6526,6 +6526,46 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertEqual(source.count("controller_commit = require_clean_commit(None)"), 1)
         self.assertIn("require_public_main=False", source)
 
+    def test_gateway_node_snapshots_hold_postgres_write_freeze(self) -> None:
+        import inspect
+
+        host_source = inspect.getsource(staging.command_prove_host_gateway)
+        host_freeze = host_source.index("with _postgres_domain_nodes_write_freeze(kubectl):")
+        host_readback = host_source.index("readback = host_gateway_http_readback()")
+        host_verified = host_source.index("verified_at_unix = int(time.time())")
+        self.assertLess(host_freeze, host_readback)
+        self.assertLess(host_readback, host_verified)
+
+        final_source = inspect.getsource(staging.command_prove_backup_delete_to_prove)
+        final_freeze = final_source.index("with _postgres_domain_nodes_write_freeze(kubectl):")
+        final_readback = final_source.index("fresh_host = host_gateway_http_readback()")
+        final_observed = final_source.index("observed_at_unix = int(time.time())")
+        self.assertLess(final_freeze, final_readback)
+        self.assertLess(final_readback, final_observed)
+
+    def test_postgres_write_freeze_is_table_scoped_and_fail_closed(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging._postgres_domain_nodes_write_freeze)
+        self.assertIn("LOCK TABLE domain_nodes IN SHARE MODE", source)
+        self.assertIn("SET LOCAL lock_timeout='10s'", source)
+        self.assertGreaterEqual(
+            source.count("_postgres_domain_nodes_write_freeze_count"), 2
+        )
+        self.assertIn("ROLLBACK", source)
+        self.assertIn("pg_terminate_backend", source)
+
+    def test_terminal_backup_proof_binds_pre_and_post_restore_page_count(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging.command_prove_backup_delete_to_prove)
+        self.assertIn(
+            'fresh_host.get("api_nodes_pages") != down.get("pre_delete_api_nodes_pages")',
+            source,
+        )
+        self.assertIn('"pre_delete_api_nodes_pages": down["pre_delete_api_nodes_pages"]', source)
+        self.assertIn('"post_restore_api_nodes_pages": fresh_host["api_nodes_pages"]', source)
+
     def test_terminal_backup_proof_reuses_validated_receipt_before_live_reprobe(self) -> None:
         import inspect
 
@@ -6565,6 +6605,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "pre_delete_data_identity": {"postgres": {}, "nats": {}},
             "pre_delete_api_nodes_sha256": "b" * 64,
             "pre_delete_api_nodes_count": 3,
+            "pre_delete_api_nodes_pages": 1,
             "pre_delete_api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
             "cluster_deleted_at_unix": 100,
         }
@@ -6601,6 +6642,8 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 "final_data_mount_anchors": restored,
                 "pre_delete_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
                 "post_restore_api_nodes_sha256": down["pre_delete_api_nodes_sha256"],
+                "pre_delete_api_nodes_pages": down["pre_delete_api_nodes_pages"],
+                "post_restore_api_nodes_pages": down["pre_delete_api_nodes_pages"],
                 "api_nodes_count": down["pre_delete_api_nodes_count"],
                 "api_nodes_hash_scope": down["pre_delete_api_nodes_hash_scope"],
                 "app_workloads": {name: "True" for name in staging.APP_DEPLOYMENTS},
