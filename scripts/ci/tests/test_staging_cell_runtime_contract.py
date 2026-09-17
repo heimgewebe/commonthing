@@ -5397,6 +5397,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     staging, "require_clean_commit", return_value=controller
                 ) as require_clean,
                 mock.patch.object(
+                    staging, "_require_backup_pending_release_current"
+                ) as revalidate_release,
+                mock.patch.object(
                     staging,
                     "_complete_backup_down_from_pending",
                     return_value={"status": "completed"},
@@ -5406,6 +5409,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 result = staging.command_backup_delete_to_prove_down(args)
         self.assertEqual(result["status"], "completed")
         require_clean.assert_called_once_with(None, require_public_main=False)
+        revalidate_release.assert_called_once_with(root, pending)
         complete.assert_called_once_with(root, args, pending, resumed=True)
         backup.assert_not_called()
 
@@ -5920,6 +5924,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(staging.reference, "require_owned_cluster"),
                 mock.patch.object(staging, "prepare_volume_permissions"),
                 mock.patch.object(
+                    staging, "_data_reconciliation_is_suspended", return_value=False
+                ),
+                mock.patch.object(
                     staging,
                     "_mounted_retained_data_anchors",
                     side_effect=[anchors, anchors],
@@ -5938,6 +5945,97 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         require_clean.assert_called_once_with(None, require_public_main=False)
         content_identity.assert_not_called()
+
+    def test_backup_rebuild_rechecks_cold_tree_before_first_data_resume(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        cold = {
+            "postgres": {"device": 1, "inode": 20, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 30, "tree_sha256": "b" * 64},
+        }
+        changed = {
+            "postgres": {"device": 1, "inode": 20, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 30, "tree_sha256": "c" * 64},
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+            "pre_delete_data_identity": cold,
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-platform-ready-data-reconcile-pending",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "restored_data_identity": cold,
+            "production_changed": False,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-pre-data-resume-tree-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "clusters", return_value=[staging.DEFAULT_CLUSTER]),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(staging, "prepare_volume_permissions"),
+                mock.patch.object(
+                    staging, "_data_reconciliation_is_suspended", return_value=True
+                ),
+                mock.patch.object(
+                    staging, "_mounted_retained_data_identity", return_value=changed
+                ),
+                mock.patch.object(staging, "_set_data_reconciliation_suspended") as unsuspend,
+                mock.patch.object(staging, "reconcile_data") as reconcile,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "data changed before workload start"
+                ):
+                    staging.command_backup_delete_to_prove_rebuild(args)
+        unsuspend.assert_not_called()
+        reconcile.assert_not_called()
+
+    def test_backup_final_delete_pending_revalidates_release_before_delete(self) -> None:
+        pending = {
+            "status": "backup-created-cluster-delete-pending",
+            "bootstrap_commit": "a" * 40,
+            "release_commit": "b" * 40,
+            "owner_id": "test:t084",
+            "pre_delete_data_identity": {"postgres": {}, "nats": {}},
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id="test:t084"
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-final-delete-revalidate-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(
+                    staging,
+                    "_require_backup_pending_release_current",
+                    side_effect=staging.StagingCellError("release drift"),
+                ) as revalidate,
+                mock.patch.object(staging, "_complete_backup_down_from_pending") as complete,
+            ):
+                with self.assertRaisesRegex(staging.StagingCellError, "release drift"):
+                    staging._resume_backup_creation(root, args, pending, resumed=True)
+        revalidate.assert_called_once_with(root, pending)
+        complete.assert_not_called()
 
     def test_completed_backup_rebuild_retry_revalidates_owned_cluster_and_mounts(self) -> None:
         owner = "test:t084"

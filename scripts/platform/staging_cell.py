@@ -2133,6 +2133,25 @@ def _mounted_retained_data_identity(
     return identity
 
 
+def _data_reconciliation_is_suspended(kubectl: str) -> bool:
+    observed = output(
+        [
+            kubectl,
+            "get",
+            "kustomization",
+            DATA_KUSTOMIZATION,
+            "-n",
+            "flux-system",
+            "-o",
+            "jsonpath={.spec.suspend}",
+        ],
+        timeout=30,
+    )
+    if observed not in {"true", "false"}:
+        raise StagingCellError("staging data reconciliation suspension state is invalid")
+    return observed == "true"
+
+
 def _set_data_reconciliation_suspended(kubectl: str, *, suspended: bool) -> None:
     expected = "true" if suspended else "false"
     run(
@@ -6931,8 +6950,14 @@ def _resume_backup_creation(
         "backup-quiesce-pending",
         "backup-app-quiesced-data-stop-pending",
         "backup-archive-creation-pending",
+        "backup-created-cluster-delete-pending",
     }:
         _require_backup_pending_release_current(root, pending)
+    if status in {
+        "backup-quiesce-pending",
+        "backup-app-quiesced-data-stop-pending",
+        "backup-archive-creation-pending",
+    }:
         tools = load_tool_receipt(
             root, required_tools=("kind", "kubectl"), required_artifacts=()
         )["tools"]
@@ -7355,13 +7380,35 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
 
     if existing["status"] != "backup-platform-ready-data-reconcile-pending":
         raise StagingCellError("backup rebuild did not reach data-reconcile state")
-    anchors_before_resume = _mounted_retained_data_anchors(
-        kind, args.cluster, root, require_split=True
-    )
-    if not _same_data_mount_anchors(
-        existing["restored_data_identity"], anchors_before_resume
-    ):
-        raise StagingCellError("backup-restored mount identity changed before data reconcile")
+    if _data_reconciliation_is_suspended(kubectl):
+        restored_before_resume = _mounted_retained_data_identity(
+            kind, args.cluster, root, durable=True, require_split=True
+        )
+        if not _same_data_tree_hashes(
+            down["pre_delete_data_identity"], restored_before_resume
+        ):
+            raise StagingCellError(
+                "backup-restored data changed before workload start"
+            )
+        if not _same_data_mount_anchors(
+            existing["restored_data_identity"], restored_before_resume
+        ):
+            raise StagingCellError(
+                "backup-restored mount identity changed before data reconcile"
+            )
+    else:
+        # A retry can arrive after reconciliation was already resumed but before
+        # the terminal receipt was written. At that point workload writes are
+        # legitimate, so only the physical restore-root anchors remain stable.
+        anchors_before_resume = _mounted_retained_data_anchors(
+            kind, args.cluster, root, require_split=True
+        )
+        if not _same_data_mount_anchors(
+            existing["restored_data_identity"], anchors_before_resume
+        ):
+            raise StagingCellError(
+                "backup-restored mount identity changed before data reconcile"
+            )
     _set_data_reconciliation_suspended(kubectl, suspended=False)
     reconcile_data(kubectl, down["bootstrap_commit"])
     live_workloads = staging_live_health(kubectl)
