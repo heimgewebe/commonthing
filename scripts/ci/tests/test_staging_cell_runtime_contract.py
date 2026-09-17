@@ -5555,10 +5555,6 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 "bootstrap_commit": "a" * 40,
                 "release_commit": release,
                 "controller_commit": "b" * 40,
-                "pre_delete_api_nodes_sha256": "c" * 64,
-                "pre_delete_api_nodes_count": 2,
-                "pre_delete_api_nodes_pages": 1,
-                "pre_delete_api_nodes_hash_scope": "cursor-all-pages-canonical-json-v1",
                 "backup_archives": {},
                 "started_at_unix": 1,
                 "production_changed": False,
@@ -5567,6 +5563,66 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             loaded = staging._load_backup_down_receipt(root, allow_pending=True)
         self.assertEqual(loaded["status"], "backup-quiesce-pending")
         self.assertNotIn("pre_delete_data_identity", loaded)
+
+    def test_postgres_snapshot_maps_the_api_projection_after_app_quiesce(self) -> None:
+        rows = "\n".join(
+            [
+                json.dumps(
+                    [
+                        "node-b",
+                        "place",
+                        "B",
+                        53.5,
+                        9.9,
+                        "2026-09-16T12:00:00+00:00",
+                        "2026-09-16T12:01:00+00:00",
+                        {"info": "hello", "tags": ["x", 2], "created_by_account_id": "  acct  "},
+                        "public",
+                    ]
+                ),
+                json.dumps(
+                    [
+                        "node-a",
+                        "place",
+                        "A",
+                        53.4,
+                        9.8,
+                        None,
+                        None,
+                        {},
+                        "private",
+                    ]
+                ),
+            ]
+        )
+        with mock.patch.object(staging, "output", return_value=rows) as output_mock:
+            result = staging.postgres_api_nodes_complete_readback("kubectl")
+        self.assertEqual(result["api_nodes_count"], 2)
+        self.assertEqual(result["api_nodes_source"], "quiesced-postgres-api-projection-v1")
+        self.assertEqual(result["api_nodes_hash_scope"], staging.API_NODES_HASH_SCOPE)
+        argv = output_mock.call_args.args[0]
+        self.assertIn("deployment/postgres", argv)
+        self.assertIn("psql", argv[-3])
+
+    def test_backup_baseline_is_captured_only_after_app_quiesce(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging._resume_backup_creation)
+        app_quiesce = source.index("_quiesce_backup_app(kubectl)")
+        baseline = source.index("postgres_api_nodes_complete_readback(kubectl)")
+        baseline_receipt = source.index('"backup-app-quiesced-data-stop-pending"')
+        data_quiesce = source.index("_quiesce_retained_data(kubectl)")
+        self.assertLess(app_quiesce, baseline)
+        self.assertLess(baseline, baseline_receipt)
+        self.assertLess(baseline_receipt, data_quiesce)
+
+    def test_backup_down_initial_intent_contains_no_pre_quiesce_api_baseline(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging.command_backup_delete_to_prove_down)
+        self.assertNotIn("gateway_api_nodes_complete_readback", source)
+        self.assertNotIn("pre_delete_api_nodes_sha256", source)
+        self.assertIn('"status": "backup-quiesce-pending"', source)
 
     def test_terminal_backup_proof_code_revalidates_controller_release_and_reuses_timing(self) -> None:
         import inspect

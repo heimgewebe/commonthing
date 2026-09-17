@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import datetime as dt
 import errno
 import fcntl
 import hashlib
@@ -2204,7 +2205,7 @@ def _set_app_reconciliation_suspended(kubectl: str, *, suspended: bool) -> None:
         )
 
 
-def _quiesce_backup_cell(kubectl: str) -> None:
+def _quiesce_backup_app(kubectl: str) -> None:
     _set_app_reconciliation_suspended(kubectl, suspended=True)
     run(
         [
@@ -2239,12 +2240,16 @@ def _quiesce_backup_cell(kubectl: str) -> None:
             if pods:
                 remaining.append(name)
         if not remaining:
-            break
+            return
         if time.monotonic() >= deadline:
             raise StagingCellError(
                 f"staging app workloads did not quiesce before backup: {remaining!r}"
             )
         time.sleep(1.0)
+
+
+def _quiesce_backup_cell(kubectl: str) -> None:
+    _quiesce_backup_app(kubectl)
     _quiesce_retained_data(kubectl)
 
 
@@ -4703,6 +4708,12 @@ def ensure_gateway_node_port(kubectl: str) -> tuple[str, str, int]:
     return gateway_service_node_port(kubectl, require_exact=True)
 
 
+HOST_HTTP_PROOF_MAX_BYTES = 1024 * 1024
+API_NODES_PROOF_PAGE_LIMIT = 10
+API_NODES_PROOF_MAX_PAGES = 10000
+API_NODES_HASH_SCOPE = "complete-node-set-canonical-json-v2"
+
+
 def _host_http_bytes(path: str) -> bytes:
     if not path.startswith("/") or "//" in path:
         raise StagingCellError("host Gateway probe path is invalid")
@@ -4714,11 +4725,44 @@ def _host_http_bytes(path: str) -> bytes:
                 raise StagingCellError(
                     f"host Gateway readback returned HTTP {response.status} for {path}"
                 )
-            return response.read(1024 * 1024)
+            body = response.read(HOST_HTTP_PROOF_MAX_BYTES + 1)
+            if len(body) > HOST_HTTP_PROOF_MAX_BYTES:
+                raise StagingCellError(
+                    f"host Gateway response exceeds {HOST_HTTP_PROOF_MAX_BYTES} bytes for {path}"
+                )
+            return body
     except (OSError, urllib.error.URLError, urllib.error.HTTPError) as error:
         raise StagingCellError(
             f"host Gateway readback failed for localhost:{STAGING_GATEWAY_HOST_PORT}{path}"
         ) from error
+
+
+def _canonical_api_nodes_snapshot(items: list[Any], *, page_count: int) -> dict[str, Any]:
+    if not isinstance(page_count, int) or isinstance(page_count, bool) or page_count < 1:
+        raise StagingCellError("API node snapshot page count is invalid")
+    seen: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise StagingCellError("API node snapshot contains a non-object item")
+        node_id = item.get("id")
+        if not isinstance(node_id, str) or not node_id or node_id in seen:
+            raise StagingCellError("API node snapshot contains an invalid or duplicate id")
+        seen.add(node_id)
+        normalized.append(item)
+    normalized.sort(key=lambda item: item["id"])
+    canonical = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "api_nodes_sha256": sha256_bytes(canonical),
+        "api_nodes_count": len(normalized),
+        "api_nodes_pages": page_count,
+        "api_nodes_hash_scope": API_NODES_HASH_SCOPE,
+    }
 
 
 def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
@@ -4727,7 +4771,10 @@ def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
     seen_cursors: set[str] = set()
     page_count = 0
     while True:
-        query = {"pagination": "cursor", "limit": "1000"}
+        query = {
+            "pagination": "cursor",
+            "limit": str(API_NODES_PROOF_PAGE_LIMIT),
+        }
         if cursor is not None:
             query["cursor"] = cursor
         path = "/api/nodes?" + urllib.parse.urlencode(query)
@@ -4746,13 +4793,15 @@ def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
         page = payload.get("page")
         if not isinstance(page_items, list) or not isinstance(page, dict):
             raise StagingCellError("Gateway /api/nodes cursor envelope is malformed")
-        if page.get("limit") != 1000 or not isinstance(page.get("has_more"), bool):
+        if page.get("limit") != API_NODES_PROOF_PAGE_LIMIT or not isinstance(
+            page.get("has_more"), bool
+        ):
             raise StagingCellError("Gateway /api/nodes cursor metadata is malformed")
         items.extend(page_items)
         page_count += 1
-        if page_count > 256:
+        if page_count > API_NODES_PROOF_MAX_PAGES:
             raise StagingCellError(
-                "Gateway /api/nodes proof exceeded the bounded 256-page snapshot limit"
+                "Gateway /api/nodes proof exceeded the bounded page snapshot limit"
             )
         has_more = page["has_more"]
         next_cursor = page.get("next_cursor")
@@ -4770,18 +4819,109 @@ def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
             raise StagingCellError("Gateway /api/nodes cursor loop detected")
         seen_cursors.add(next_cursor)
         cursor = next_cursor
-    canonical = json.dumps(
-        items,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return {
-        "api_nodes_sha256": sha256_bytes(canonical),
-        "api_nodes_count": len(items),
-        "api_nodes_pages": page_count,
-        "api_nodes_hash_scope": "cursor-all-pages-canonical-json-v1",
+    return _canonical_api_nodes_snapshot(items, page_count=page_count)
+
+
+def _rfc3339_postgres_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise StagingCellError("PostgreSQL node snapshot contains an invalid timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise StagingCellError("PostgreSQL node snapshot timestamp is malformed") from error
+    if parsed.tzinfo is None:
+        raise StagingCellError("PostgreSQL node snapshot timestamp lacks a timezone")
+    return parsed.astimezone(dt.timezone.utc).isoformat()
+
+
+def _api_node_from_postgres_snapshot_row(row: Any) -> dict[str, Any] | None:
+    if not isinstance(row, list) or len(row) != 9:
+        raise StagingCellError("PostgreSQL node snapshot row is malformed")
+    node_id, kind, title, lat, lon, created_raw, updated_raw, payload_raw, visibility = row
+    if not all(isinstance(value, str) for value in (node_id, kind, title)) or not node_id:
+        raise StagingCellError("PostgreSQL node snapshot lost required node strings")
+    if lat is None or lon is None:
+        # Mirrors load_nodes_from_postgres: invalid NULL-location rows are not
+        # part of the API projection and therefore not part of the semantic proof.
+        return None
+    if (
+        not isinstance(lat, (int, float))
+        or isinstance(lat, bool)
+        or not isinstance(lon, (int, float))
+        or isinstance(lon, bool)
+    ):
+        raise StagingCellError("PostgreSQL node snapshot has invalid coordinates")
+    if visibility not in {"public", "private", "hidden", "revoked"}:
+        raise StagingCellError("PostgreSQL node snapshot has invalid search visibility")
+    payload = payload_raw if isinstance(payload_raw, dict) else {}
+    created = _rfc3339_postgres_timestamp(created_raw)
+    updated = _rfc3339_postgres_timestamp(updated_raw)
+    default_timestamp = "1970-01-01T00:00:00Z"
+    node: dict[str, Any] = {
+        "id": node_id,
+        "kind": kind,
+        "title": title,
+        "created_at": created or updated or default_timestamp,
+        "updated_at": updated or created or default_timestamp,
+        "search_visibility": visibility,
+        "location": {"lat": lat, "lon": lon},
     }
+    creator = payload.get("created_by_account_id")
+    if isinstance(creator, str) and creator.strip():
+        node["created_by_account_id"] = creator.strip()
+    for key in ("summary", "info", "address"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            node[key] = value
+    tags = payload.get("tags")
+    if isinstance(tags, list):
+        filtered = [tag for tag in tags if isinstance(tag, str)]
+        if filtered:
+            node["tags"] = filtered
+    return node
+
+
+def postgres_api_nodes_complete_readback(kubectl: str) -> dict[str, Any]:
+    sql = (
+        "SELECT json_build_array(id,kind,title,lat,lon,created_at,updated_at,payload,"
+        "search_visibility)::text FROM domain_nodes ORDER BY id ASC"
+    )
+    raw = output(
+        [
+            kubectl,
+            "-n",
+            DATA_NAMESPACE,
+            "exec",
+            "deployment/postgres",
+            "-c",
+            "postgres",
+            "--",
+            "sh",
+            "-eu",
+            "-c",
+            'exec psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"',
+            "sh",
+            sql,
+        ],
+        timeout=120,
+    )
+    items: list[dict[str, Any]] = []
+    if raw:
+        for line in raw.splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise StagingCellError(
+                    "PostgreSQL node snapshot emitted malformed JSON"
+                ) from error
+            node = _api_node_from_postgres_snapshot_row(row)
+            if node is not None:
+                items.append(node)
+    pages = max(1, (len(items) + API_NODES_PROOF_PAGE_LIMIT - 1) // API_NODES_PROOF_PAGE_LIMIT)
+    result = _canonical_api_nodes_snapshot(items, page_count=pages)
+    return {**result, "api_nodes_source": "quiesced-postgres-api-projection-v1"}
 
 
 def _kind_gateway_http_bytes(node: str, address: str, port: int, path: str) -> bytes:
@@ -5065,12 +5205,15 @@ def command_prove_host_gateway(args: argparse.Namespace) -> dict[str, Any]:
     )
     if not gateway_receipt_current(root, cell, kubectl):
         raise StagingCellError("host Gateway proof requires the current gateway proof")
+    promotion = _exact_cell_promotion(root, cell, active_commit)
     service_name, service_uid, node_port = gateway_service_node_port(
         kubectl, require_exact=True
     )
     if node_port != STAGING_GATEWAY_NODE_PORT:
         raise StagingCellError("host Gateway proof NodePort is not pinned")
+    require_gateway_app_current(kubectl, cell, promotion)
     readback = host_gateway_http_readback()
+    require_gateway_app_current(kubectl, cell, promotion)
     if gateway_service_node_port(kubectl, require_exact=True) != (
         service_name,
         service_uid,
@@ -6603,6 +6746,7 @@ def _load_backup_down_receipt(
         allowed.update(
             {
                 "backup-quiesce-pending",
+                "backup-app-quiesced-data-stop-pending",
                 "backup-archive-creation-pending",
                 "backup-created-cluster-delete-pending",
             }
@@ -6612,22 +6756,24 @@ def _load_backup_down_receipt(
     if payload.get("production_changed") is not False:
         raise StagingCellError("backup delete-to-prove down receipt lost production isolation")
     release_commit = str(payload.get("release_commit") or "")
-    api_hash = str(payload.get("pre_delete_api_nodes_sha256") or "")
-    api_count = payload.get("pre_delete_api_nodes_count")
-    api_pages = payload.get("pre_delete_api_nodes_pages")
-    if (
-        len(api_hash) != 64
-        or any(ch not in "0123456789abcdef" for ch in api_hash)
-        or not isinstance(api_count, int)
-        or isinstance(api_count, bool)
-        or api_count < 0
-        or not isinstance(api_pages, int)
-        or isinstance(api_pages, bool)
-        or api_pages < 1
-        or payload.get("pre_delete_api_nodes_hash_scope")
-        != "cursor-all-pages-canonical-json-v1"
-    ):
-        raise StagingCellError("backup delete-to-prove receipt lost its full API baseline")
+    if status != "backup-quiesce-pending":
+        api_hash = str(payload.get("pre_delete_api_nodes_sha256") or "")
+        api_count = payload.get("pre_delete_api_nodes_count")
+        api_pages = payload.get("pre_delete_api_nodes_pages")
+        if (
+            len(api_hash) != 64
+            or any(ch not in "0123456789abcdef" for ch in api_hash)
+            or not isinstance(api_count, int)
+            or isinstance(api_count, bool)
+            or api_count < 0
+            or not isinstance(api_pages, int)
+            or isinstance(api_pages, bool)
+            or api_pages < 1
+            or payload.get("pre_delete_api_nodes_hash_scope") != API_NODES_HASH_SCOPE
+            or payload.get("pre_delete_api_nodes_source")
+            != "quiesced-postgres-api-projection-v1"
+        ):
+            raise StagingCellError("backup delete-to-prove receipt lost its quiesced API baseline")
     archives = payload.get("backup_archives", {})
     if not isinstance(archives, dict):
         raise StagingCellError("backup delete-to-prove down receipt lost its archives")
@@ -6728,7 +6874,28 @@ def _resume_backup_creation(
             expected_owner_id=args.owner_id,
         )
         if status == "backup-quiesce-pending":
-            _quiesce_backup_cell(kubectl)
+            _quiesce_backup_app(kubectl)
+            baseline = postgres_api_nodes_complete_readback(kubectl)
+            persisted = dict(pending)
+            persisted.pop("receipt_sha256", None)
+            persisted.pop("receipt_path", None)
+            pending = {
+                **persisted,
+                "status": "backup-app-quiesced-data-stop-pending",
+                "pre_delete_api_nodes_sha256": baseline["api_nodes_sha256"],
+                "pre_delete_api_nodes_count": baseline["api_nodes_count"],
+                "pre_delete_api_nodes_pages": baseline["api_nodes_pages"],
+                "pre_delete_api_nodes_hash_scope": baseline["api_nodes_hash_scope"],
+                "pre_delete_api_nodes_source": baseline["api_nodes_source"],
+                "backup_archives": {},
+            }
+            atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
+            status = pending["status"]
+        if status == "backup-app-quiesced-data-stop-pending":
+            # Reassert the app-side write freeze after any process restart. The
+            # baseline was captured only after this freeze became observable.
+            _quiesce_backup_app(kubectl)
+            _quiesce_retained_data(kubectl)
             pre_delete = _mounted_retained_data_identity(
                 kind, args.cluster, root, durable=True, require_split=True
             )
@@ -6841,10 +7008,6 @@ def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, A
     promotion = _exact_cell_promotion(root, cell, release_commit)
     require_gateway_app_current(kubectl, cell, promotion)
     _require_fresh_backup_archive_paths(root, release_commit)
-    gateway_before = _private_json_receipt(
-        root / "receipts/gateway-proof.json", label="staging gateway proof receipt"
-    )
-    baseline = gateway_api_nodes_complete_readback(kind, args.cluster, gateway_before)
     started_at_unix = int(time.time())
     pending = {
         "schema_version": 1,
@@ -6862,10 +7025,6 @@ def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, A
             else None
         ),
         "image_promotion": promotion,
-        "pre_delete_api_nodes_sha256": baseline["api_nodes_sha256"],
-        "pre_delete_api_nodes_count": baseline["api_nodes_count"],
-        "pre_delete_api_nodes_pages": baseline["api_nodes_pages"],
-        "pre_delete_api_nodes_hash_scope": baseline["api_nodes_hash_scope"],
         "backup_archives": {},
         "started_at_unix": started_at_unix,
         "production_changed": False,

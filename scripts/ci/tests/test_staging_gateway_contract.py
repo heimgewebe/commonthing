@@ -34,6 +34,7 @@ class StagingGatewayTests(unittest.TestCase):
             "app_activation": True,
             "status": "app-ready-gateway-pending",
             "image_promotion": {
+                "status": "pass",
                 "source_commit": "b" * 40,
                 "images": {"api": "api@sha256:abc", "web": "web@sha256:def"},
                 "receipt_sha256": "c" * 64,
@@ -910,13 +911,13 @@ class StagingGatewayTests(unittest.TestCase):
         page_one = json.dumps(
             {
                 "items": [{"id": "node-a", "title": "A"}],
-                "page": {"limit": 1000, "next_cursor": "6e6f64652d61", "has_more": True},
+                "page": {"limit": staging.API_NODES_PROOF_PAGE_LIMIT, "next_cursor": "6e6f64652d61", "has_more": True},
             }
         ).encode("utf-8")
         page_two = json.dumps(
             {
                 "items": [{"id": "node-b", "title": "B"}],
-                "page": {"limit": 1000, "next_cursor": None, "has_more": False},
+                "page": {"limit": staging.API_NODES_PROOF_PAGE_LIMIT, "next_cursor": None, "has_more": False},
             }
         ).encode("utf-8")
         canonical = json.dumps(
@@ -941,17 +942,68 @@ class StagingGatewayTests(unittest.TestCase):
         self.assertEqual(result["api_nodes_count"], 2)
         self.assertEqual(result["api_nodes_pages"], 2)
         self.assertEqual(
-            result["api_nodes_hash_scope"], "cursor-all-pages-canonical-json-v1"
+            result["api_nodes_hash_scope"], staging.API_NODES_HASH_SCOPE
         )
         self.assertIn("pagination=cursor", fetch.call_args_list[2].args[0])
+        self.assertIn(
+            f"limit={staging.API_NODES_PROOF_PAGE_LIMIT}",
+            fetch.call_args_list[2].args[0],
+        )
         self.assertIn("cursor=6e6f64652d61", fetch.call_args_list[3].args[0])
+
+    def test_host_gateway_proof_revalidates_exact_app_around_readback(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging.command_prove_host_gateway)
+        promotion = source.index("promotion = _exact_cell_promotion(root, cell, active_commit)")
+        before = source.index("require_gateway_app_current(kubectl, cell, promotion)")
+        readback = source.index("readback = host_gateway_http_readback()")
+        after = source.index(
+            "require_gateway_app_current(kubectl, cell, promotion)", before + 1
+        )
+        receipt = source.index("result = {")
+        self.assertLess(promotion, before)
+        self.assertLess(before, readback)
+        self.assertLess(readback, after)
+        self.assertLess(after, receipt)
+
+    def test_staging_kind_network_surface_is_audited(self) -> None:
+        registry = (staging.ROOT / "audit/impl-registry.yaml").read_text(encoding="utf-8")
+        self.assertIn("id: impl.platform.staging-kind-network", registry)
+        self.assertIn("path: platform/clusters/staging/kind.yaml", registry)
+        self.assertIn("scripts/ci/tests/test_staging_gateway_contract.py", registry)
+
+    def test_host_http_readback_rejects_oversized_response_instead_of_truncating(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b"x" * (staging.HOST_HTTP_PROOF_MAX_BYTES + 1)
+        context = mock.MagicMock()
+        context.__enter__.return_value = response
+        with (
+            mock.patch.object(staging.urllib.request, "urlopen", return_value=context),
+            self.assertRaisesRegex(staging.StagingCellError, "response exceeds"),
+        ):
+            staging._host_http_bytes("/api/nodes?pagination=cursor&limit=10")
+        response.read.assert_called_once_with(staging.HOST_HTTP_PROOF_MAX_BYTES + 1)
+
+    def test_canonical_node_snapshot_is_independent_of_page_order(self):
+        forward = staging._canonical_api_nodes_snapshot(
+            [{"id": "b", "title": "B"}, {"id": "a", "title": "A"}],
+            page_count=2,
+        )
+        reverse = staging._canonical_api_nodes_snapshot(
+            [{"id": "a", "title": "A"}, {"id": "b", "title": "B"}],
+            page_count=2,
+        )
+        self.assertEqual(forward["api_nodes_sha256"], reverse["api_nodes_sha256"])
+        self.assertEqual(forward["api_nodes_hash_scope"], staging.API_NODES_HASH_SCOPE)
 
     def test_kind_gateway_complete_readback_uses_the_proven_probe_node(self):
         receipt = {"probe_node": "node-1", "address": "10.0.0.8", "listener_port": 80}
         page = json.dumps(
             {
                 "items": [{"id": "one"}],
-                "page": {"limit": 1000, "next_cursor": None, "has_more": False},
+                "page": {"limit": staging.API_NODES_PROOF_PAGE_LIMIT, "next_cursor": None, "has_more": False},
             }
         ).encode("utf-8")
         with (
