@@ -3878,7 +3878,8 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
     reference.validate_owner_id(args.owner_id)
     root = state_root(getattr(args, "state_root", None))
     configure_reference_paths(root)
-    _require_no_pending_backup_down_before_activation(root)
+    requested_commit = str(args.source_commit or "")
+    _require_no_pending_backup_down_before_activation(root, requested_commit)
     receipt = load_tool_receipt(
         root, required_tools=("kind", "kubectl"), required_artifacts=()
     )
@@ -3921,7 +3922,6 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
                 require_public_main=False,
             )
     else:
-        requested_commit = str(args.source_commit or "")
         backup_controller = _backup_recovery_controller_commit(
             root, cell, requested_commit
         )
@@ -7034,7 +7034,9 @@ def _load_completed_backup_rebuild_receipt(
     }
 
 
-def _require_no_pending_backup_down_before_activation(root: Path) -> None:
+def _require_no_pending_backup_down_before_activation(
+    root: Path, requested_commit: str
+) -> None:
     path = root / BACKUP_DOWN_RECEIPT
     if not (path.exists() or path.is_symlink()):
         return
@@ -7044,7 +7046,24 @@ def _require_no_pending_backup_down_before_activation(root: Path) -> None:
             "cannot activate while backup delete-to-prove is pending; "
             "resume the existing backup cycle first"
         )
-    _load_completed_backup_rebuild_receipt(root, receipt)
+    rebuild = _load_completed_backup_rebuild_receipt(root, receipt)
+    terminal_path = root / BACKUP_DELETE_TO_PROVE_RECEIPT
+    if terminal_path.exists() or terminal_path.is_symlink():
+        completed = _validated_existing_backup_delete_to_prove_receipt(
+            root,
+            cluster=str(receipt.get("cluster") or ""),
+            owner_id=str(receipt.get("owner_id") or ""),
+            release_commit=str(rebuild.get("release_commit") or ""),
+            controller_commit=str(rebuild.get("controller_commit") or ""),
+            down=receipt,
+            rebuild=rebuild,
+        )
+        if completed is not None:
+            return
+    if requested_commit != rebuild.get("release_commit"):
+        raise StagingCellError(
+            "activation before terminal backup proof must use the restored historical release"
+        )
 
 
 def _load_backup_down_receipt(
@@ -8033,6 +8052,16 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
             raise StagingCellError(
                 "restored PostgreSQL-backed API data differs from the pre-delete full snapshot"
             )
+        refreshed_data_anchors = _mounted_retained_data_anchors(
+            tools["kind"], args.cluster, root, require_split=True
+        )
+        if not _same_data_mount_anchors(
+            rebuild["restored_data_identity"], refreshed_data_anchors
+        ):
+            raise StagingCellError(
+                "restored data mount identity changed during final host readback"
+            )
+        final_data_anchors = refreshed_data_anchors
         live_workloads = staging_live_health(kubectl)
         if any(state != "True" for state in live_workloads.values()):
             raise StagingCellError(

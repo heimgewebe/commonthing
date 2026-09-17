@@ -5577,6 +5577,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "backup-archive-creation-pending",
             "backup-created-cluster-delete-pending",
         )
+        release = "7" * 40
         with tempfile.TemporaryDirectory(prefix="staging-backup-activate-guard-") as tmp_name:
             root = Path(tmp_name)
             path = root / staging.BACKUP_DOWN_RECEIPT
@@ -5595,14 +5596,16 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                         "resume the existing backup cycle first",
                     ),
                 ):
-                    staging._require_no_pending_backup_down_before_activation(root)
+                    staging._require_no_pending_backup_down_before_activation(
+                        root, release
+                    )
 
             terminal_down = {
                 "status": "backup-created-cluster-deleted-primary-data-empty",
                 "cluster": staging.DEFAULT_CLUSTER,
                 "owner_id": "test:t084",
                 "bootstrap_commit": "6" * 40,
-                "release_commit": "7" * 40,
+                "release_commit": release,
                 "controller_commit": "8" * 40,
                 "receipt_sha256": "9" * 64,
                 "empty_restore_roots": {
@@ -5618,7 +5621,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     staging.StagingCellError, "requires a completed backup rebuild"
                 ),
             ):
-                staging._require_no_pending_backup_down_before_activation(root)
+                staging._require_no_pending_backup_down_before_activation(root, release)
 
             staging.atomic_json(
                 root / staging.BACKUP_REBUILD_RECEIPT,
@@ -5628,7 +5631,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     "cluster": terminal_down["cluster"],
                     "owner_id": terminal_down["owner_id"],
                     "bootstrap_commit": terminal_down["bootstrap_commit"],
-                    "release_commit": terminal_down["release_commit"],
+                    "release_commit": release,
                     "controller_commit": terminal_down["controller_commit"],
                     "backup_down_receipt_sha256": terminal_down["receipt_sha256"],
                     "restored_data_identity": {
@@ -5638,16 +5641,44 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     "production_changed": False,
                 },
             )
+            with (
+                mock.patch.object(
+                    staging, "_load_backup_down_receipt", return_value=terminal_down
+                ),
+                self.assertRaisesRegex(
+                    staging.StagingCellError, "must use the restored historical release"
+                ),
+            ):
+                staging._require_no_pending_backup_down_before_activation(
+                    root, "a" * 40
+                )
             with mock.patch.object(
                 staging, "_load_backup_down_receipt", return_value=terminal_down
             ):
-                staging._require_no_pending_backup_down_before_activation(root)
+                staging._require_no_pending_backup_down_before_activation(root, release)
+
+            terminal_proof = root / staging.BACKUP_DELETE_TO_PROVE_RECEIPT
+            terminal_proof.write_text("{}\n", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    staging, "_load_backup_down_receipt", return_value=terminal_down
+                ),
+                mock.patch.object(
+                    staging,
+                    "_validated_existing_backup_delete_to_prove_receipt",
+                    return_value={"status": "backup-delete-to-prove-verified"},
+                ) as terminal_validator,
+            ):
+                staging._require_no_pending_backup_down_before_activation(
+                    root, "a" * 40
+                )
+            terminal_validator.assert_called_once()
 
         import inspect
 
         activate_source = inspect.getsource(staging.command_activate)
         guard = activate_source.index(
-            "_require_no_pending_backup_down_before_activation(root)"
+            "_require_no_pending_backup_down_before_activation(root, requested_commit)"
         )
         toolchain = activate_source.index("receipt = load_tool_receipt(")
         gateway_mutation = activate_source.index("retire_gateway_before_activation(")
@@ -6627,6 +6658,10 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         final_readback = final_source.index("fresh_host = host_gateway_http_readback()")
         final_bind = final_source.index("fresh_api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(")
         first_live_health = final_source.index("live_workloads = staging_live_health(kubectl)")
+        final_mount_anchors = final_source.index(
+            "refreshed_data_anchors = _mounted_retained_data_anchors(",
+            final_readback,
+        )
         final_live_health = final_source.index(
             "live_workloads = staging_live_health(kubectl)",
             first_live_health + 1,
@@ -6634,8 +6669,13 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         final_observed = final_source.index("observed_at_unix = int(time.time())")
         self.assertLess(final_freeze, final_readback)
         self.assertLess(final_readback, final_bind)
-        self.assertLess(final_bind, final_live_health)
+        self.assertLess(final_bind, final_mount_anchors)
+        self.assertLess(final_mount_anchors, final_live_health)
         self.assertLess(final_live_health, final_observed)
+        self.assertIn(
+            "restored data mount identity changed during final host readback",
+            final_source[final_mount_anchors:final_live_health],
+        )
         self.assertIn(
             "restored data or Flux workload changed during final host readback",
             final_source[final_live_health:final_observed],
