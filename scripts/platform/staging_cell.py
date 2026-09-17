@@ -7472,6 +7472,14 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         )
         if not _same_data_mount_anchors(restored_identity, observed_anchors):
             raise StagingCellError("completed backup rebuild lost restored mount identity")
+        live_workloads = staging_live_health(kubectl)
+        unhealthy = {
+            name: state for name, state in live_workloads.items() if state != "True"
+        }
+        if unhealthy:
+            raise StagingCellError(
+                f"completed backup rebuild infrastructure is not live: {unhealthy!r}"
+            )
         return {
             **existing,
             "receipt_path": str(result_path),

@@ -6197,6 +6197,11 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(
                     staging, "_mounted_retained_data_anchors", return_value=anchors
                 ) as mounted_anchors,
+                mock.patch.object(
+                    staging,
+                    "staging_live_health",
+                    return_value={name: "True" for name in staging.LIVE_DEPLOYMENTS},
+                ) as live_health,
                 mock.patch.object(staging.reference, "clusters") as clusters,
                 mock.patch.object(staging, "prepare_volume_permissions") as prepare_permissions,
             ):
@@ -6209,8 +6214,77 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         mounted_anchors.assert_called_once_with(
             "kind", staging.DEFAULT_CLUSTER, root, require_split=True
         )
+        live_health.assert_called_once_with("kubectl")
         clusters.assert_not_called()
         prepare_permissions.assert_not_called()
+
+    def test_completed_backup_rebuild_retry_rejects_stale_workload_health_without_mutation(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        anchors = {
+            "postgres": {"device": 1, "inode": 20, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 30, "tree_sha256": "b" * 64},
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "restored_data_identity": anchors,
+            "live_workloads": {name: "True" for name in staging.LIVE_DEPLOYMENTS},
+            "production_changed": False,
+        }
+        unhealthy = {name: "True" for name in staging.LIVE_DEPLOYMENTS}
+        unhealthy["nats"] = "False"
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-terminal-health-stale-") as tmp_name:
+            root = Path(tmp_name)
+            rebuild_path = root / staging.BACKUP_REBUILD_RECEIPT
+            staging.atomic_json(rebuild_path, existing)
+            receipt_sha_before = staging.sha256_file(rebuild_path)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(
+                    staging, "_mounted_retained_data_anchors", return_value=anchors
+                ),
+                mock.patch.object(
+                    staging, "staging_live_health", return_value=unhealthy
+                ) as live_health,
+                mock.patch.object(staging.reference, "clusters") as clusters,
+                mock.patch.object(staging, "prepare_volume_permissions") as prepare_permissions,
+                mock.patch.object(staging, "reconcile_data") as reconcile,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "completed backup rebuild infrastructure is not live",
+                ):
+                    staging.command_backup_delete_to_prove_rebuild(args)
+            self.assertEqual(staging.sha256_file(rebuild_path), receipt_sha_before)
+        live_health.assert_called_once_with("kubectl")
+        clusters.assert_not_called()
+        prepare_permissions.assert_not_called()
+        reconcile.assert_not_called()
 
     def test_completed_backup_rebuild_retry_fails_if_cluster_is_lost(self) -> None:
         owner = "test:t084"
