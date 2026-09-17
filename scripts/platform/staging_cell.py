@@ -3878,6 +3878,7 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
     reference.validate_owner_id(args.owner_id)
     root = state_root(getattr(args, "state_root", None))
     configure_reference_paths(root)
+    _require_no_pending_backup_down_before_activation(root)
     receipt = load_tool_receipt(
         root, required_tools=("kind", "kubectl"), required_artifacts=()
     )
@@ -6990,6 +6991,18 @@ def _same_data_mount_anchors(before: dict[str, Any], after: dict[str, Any]) -> b
         )
         for name in ("postgres", "nats")
     )
+
+
+def _require_no_pending_backup_down_before_activation(root: Path) -> None:
+    path = root / BACKUP_DOWN_RECEIPT
+    if not (path.exists() or path.is_symlink()):
+        return
+    receipt = _load_backup_down_receipt(root, allow_pending=True)
+    if receipt.get("status") != "backup-created-cluster-deleted-primary-data-empty":
+        raise StagingCellError(
+            "cannot activate while backup delete-to-prove is pending; "
+            "resume the existing backup cycle first"
+        )
 
 
 def _load_backup_down_receipt(

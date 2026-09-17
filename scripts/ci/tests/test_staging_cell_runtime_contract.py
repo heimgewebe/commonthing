@@ -5570,6 +5570,53 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertIn("pending_backup_recovery_reactivation", activate_source)
         self.assertIn("backup_recovery_reactivation_consumed", activate_source)
 
+    def test_activate_blocks_nonterminal_backup_cycle_before_any_activation_mutation(self) -> None:
+        pending_statuses = (
+            "backup-quiesce-pending",
+            "backup-app-quiesced-data-stop-pending",
+            "backup-archive-creation-pending",
+            "backup-created-cluster-delete-pending",
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-activate-guard-") as tmp_name:
+            root = Path(tmp_name)
+            path = root / staging.BACKUP_DOWN_RECEIPT
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+            for status in pending_statuses:
+                with (
+                    self.subTest(status=status),
+                    mock.patch.object(
+                        staging,
+                        "_load_backup_down_receipt",
+                        return_value={"status": status},
+                    ),
+                    self.assertRaisesRegex(
+                        staging.StagingCellError,
+                        "resume the existing backup cycle first",
+                    ),
+                ):
+                    staging._require_no_pending_backup_down_before_activation(root)
+
+            with mock.patch.object(
+                staging,
+                "_load_backup_down_receipt",
+                return_value={
+                    "status": "backup-created-cluster-deleted-primary-data-empty"
+                },
+            ):
+                staging._require_no_pending_backup_down_before_activation(root)
+
+        import inspect
+
+        activate_source = inspect.getsource(staging.command_activate)
+        guard = activate_source.index(
+            "_require_no_pending_backup_down_before_activation(root)"
+        )
+        toolchain = activate_source.index("receipt = load_tool_receipt(")
+        gateway_mutation = activate_source.index("retire_gateway_before_activation(")
+        self.assertLess(guard, toolchain)
+        self.assertLess(guard, gateway_mutation)
+
     def test_completed_backup_recovery_activation_retry_is_idempotent_before_mutation(self) -> None:
         release = "7" * 40
         controller = "8" * 40
