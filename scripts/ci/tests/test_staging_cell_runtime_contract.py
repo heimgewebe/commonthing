@@ -5604,13 +5604,58 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertIn("deployment/postgres", argv)
         self.assertIn("psql", argv[-3])
 
+    def test_backup_resume_continues_from_app_quiesced_data_stop_state(self) -> None:
+        pending = {
+            "status": "backup-app-quiesced-data-stop-pending",
+            "bootstrap_commit": "a" * 40,
+            "release_commit": "b" * 40,
+            "owner_id": "test:t084",
+            "backup_archives": {},
+        }
+        args = staging.argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id="test:t084"
+        )
+        identity = {"postgres": {"sha256": "1" * 64}, "nats": {"sha256": "2" * 64}}
+        with tempfile.TemporaryDirectory(prefix="staging-backup-app-quiesced-resume-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(
+                    staging,
+                    "load_tool_receipt",
+                    return_value={"tools": {"kind": "kind", "kubectl": "kubectl"}},
+                ),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(staging, "_quiesce_backup_app") as app_quiesce,
+                mock.patch.object(staging, "_quiesce_retained_data") as data_quiesce,
+                mock.patch.object(
+                    staging, "_mounted_retained_data_identity", return_value=identity
+                ),
+                mock.patch.object(staging, "_backup_volume_archives", return_value={}),
+                mock.patch.object(
+                    staging,
+                    "_complete_backup_down_from_pending",
+                    return_value={"status": "completed"},
+                ) as complete,
+            ):
+                result = staging._resume_backup_creation(
+                    root, args, pending, resumed=True
+                )
+        self.assertEqual(result["status"], "completed")
+        app_quiesce.assert_called_once_with("kubectl")
+        data_quiesce.assert_called_once_with("kubectl")
+        complete.assert_called_once()
+        completed_pending = complete.call_args.args[2]
+        self.assertEqual(
+            completed_pending["status"], "backup-created-cluster-delete-pending"
+        )
+
     def test_backup_baseline_is_captured_only_after_app_quiesce(self) -> None:
         import inspect
 
         source = inspect.getsource(staging._resume_backup_creation)
         app_quiesce = source.index("_quiesce_backup_app(kubectl)")
         baseline = source.index("postgres_api_nodes_complete_readback(kubectl)")
-        baseline_receipt = source.index('"backup-app-quiesced-data-stop-pending"')
+        baseline_receipt = source.index('"backup-app-quiesced-data-stop-pending"', baseline)
         data_quiesce = source.index("_quiesce_retained_data(kubectl)")
         self.assertLess(app_quiesce, baseline)
         self.assertLess(baseline, baseline_receipt)
@@ -5629,7 +5674,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
 
         source = inspect.getsource(staging.command_prove_backup_delete_to_prove)
         self.assertIn("controller_commit = require_clean_commit(None)", source)
-        self.assertIn("require_gateway_app_current(kubectl, cell, promotion)", source)
+        app_check = "require_gateway_app_current(kubectl, cell, promotion)"
+        first_app_check = source.index(app_check)
+        final_host_readback = source.index("fresh_host = host_gateway_http_readback()")
+        second_app_check = source.index(app_check, first_app_check + len(app_check))
+        self.assertLess(first_app_check, final_host_readback)
+        self.assertLess(final_host_readback, second_app_check)
         self.assertIn('previous.get("rto_observed_seconds")', source)
         self.assertIn("previous_rto != previous_verified - recovery_start", source)
 

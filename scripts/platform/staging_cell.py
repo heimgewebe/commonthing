@@ -6861,7 +6861,11 @@ def _resume_backup_creation(
     resumed: bool,
 ) -> dict[str, Any]:
     status = pending.get("status")
-    if status in {"backup-quiesce-pending", "backup-archive-creation-pending"}:
+    if status in {
+        "backup-quiesce-pending",
+        "backup-app-quiesced-data-stop-pending",
+        "backup-archive-creation-pending",
+    }:
         tools = load_tool_receipt(
             root, required_tools=("kind", "kubectl"), required_artifacts=()
         )["tools"]
@@ -7393,6 +7397,7 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         host_path, label="host Gateway proof receipt"
     )
     fresh_host = host_gateway_http_readback()
+    require_gateway_app_current(kubectl, cell, promotion)
     for key in (
         "probe_scope",
         "endpoint",
