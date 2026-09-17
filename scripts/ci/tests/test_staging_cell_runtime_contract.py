@@ -5727,6 +5727,26 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertIn("deployment/postgres", argv)
         self.assertIn("psql", argv[-3])
 
+    def test_postgres_snapshot_normalizes_integral_coordinates_to_api_floats(self) -> None:
+        projected = staging._api_node_from_postgres_snapshot_row(
+            [
+                "node-integral-coordinates",
+                "place",
+                "Integral coordinates",
+                10,
+                53,
+                "2026-09-17T05:00:00+00:00",
+                "2026-09-17T05:00:00+00:00",
+                {},
+                "public",
+            ]
+        )
+        self.assertIsNotNone(projected)
+        location = projected["location"]
+        self.assertEqual(location, {"lat": 10.0, "lon": 53.0})
+        self.assertIs(type(location["lat"]), float)
+        self.assertIs(type(location["lon"]), float)
+
     def test_backup_resume_continues_from_app_quiesced_data_stop_state(self) -> None:
         pending = {
             "status": "backup-app-quiesced-data-stop-pending",

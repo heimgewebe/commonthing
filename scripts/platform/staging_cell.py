@@ -4883,7 +4883,10 @@ def _api_node_from_postgres_snapshot_row(row: Any) -> dict[str, Any] | None:
         "created_at": created or updated or default_timestamp,
         "updated_at": updated or created or default_timestamp,
         "search_visibility": visibility,
-        "location": {"lat": lat, "lon": lon},
+        # PostgreSQL json_build_array may encode integral DOUBLE PRECISION values
+        # as JSON integers, while the Rust API serializes the same f64 as 10.0.
+        # Normalize the projection to API numeric semantics before hashing.
+        "location": {"lat": float(lat), "lon": float(lon)},
     }
     creator = payload.get("created_by_account_id")
     if isinstance(creator, str) and creator.strip():
