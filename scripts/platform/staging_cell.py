@@ -6993,6 +6993,47 @@ def _same_data_mount_anchors(before: dict[str, Any], after: dict[str, Any]) -> b
     )
 
 
+def _load_completed_backup_rebuild_receipt(
+    root: Path, down: dict[str, Any]
+) -> dict[str, Any]:
+    path = root / BACKUP_REBUILD_RECEIPT
+    if not (path.exists() or path.is_symlink()):
+        raise StagingCellError(
+            "terminal backup-down state requires a completed backup rebuild before activation"
+        )
+    rebuild = _private_json_receipt(path, label="backup rebuild receipt")
+    expected = {
+        "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+        "cluster": down.get("cluster"),
+        "owner_id": down.get("owner_id"),
+        "bootstrap_commit": down.get("bootstrap_commit"),
+        "release_commit": down.get("release_commit"),
+        "controller_commit": down.get("controller_commit"),
+        "backup_down_receipt_sha256": down.get("receipt_sha256"),
+        "production_changed": False,
+    }
+    for key, value in expected.items():
+        if rebuild.get(key) != value:
+            raise StagingCellError(
+                f"completed backup rebuild lost its backup-down binding: {key}"
+            )
+    empty_roots = down.get("empty_restore_roots")
+    restored = rebuild.get("restored_data_identity")
+    if (
+        not isinstance(empty_roots, dict)
+        or not isinstance(restored, dict)
+        or not _same_data_mount_anchors(empty_roots, restored)
+    ):
+        raise StagingCellError(
+            "completed backup rebuild is not bound to the proven empty restore roots"
+        )
+    return {
+        **rebuild,
+        "receipt_path": str(path),
+        "receipt_sha256": sha256_file(path),
+    }
+
+
 def _require_no_pending_backup_down_before_activation(root: Path) -> None:
     path = root / BACKUP_DOWN_RECEIPT
     if not (path.exists() or path.is_symlink()):
@@ -7003,6 +7044,7 @@ def _require_no_pending_backup_down_before_activation(root: Path) -> None:
             "cannot activate while backup delete-to-prove is pending; "
             "resume the existing backup cycle first"
         )
+    _load_completed_backup_rebuild_receipt(root, receipt)
 
 
 def _load_backup_down_receipt(
@@ -7782,7 +7824,6 @@ def _validated_existing_backup_delete_to_prove_receipt(
     *,
     cluster: str,
     owner_id: str,
-    cell: dict[str, Any],
     release_commit: str,
     controller_commit: str,
     down: dict[str, Any],
@@ -7803,7 +7844,7 @@ def _validated_existing_backup_delete_to_prove_receipt(
         "status": "backup-delete-to-prove-verified",
         "cluster": cluster,
         "owner_id": owner_id,
-        "bootstrap_commit": cell["bootstrap_commit"],
+        "bootstrap_commit": down["bootstrap_commit"],
         "active_commit": release_commit,
         "controller_commit": controller_commit,
         "backup_down_receipt_sha256": down["receipt_sha256"],
@@ -7843,33 +7884,17 @@ def _validated_existing_backup_delete_to_prove_receipt(
         raise StagingCellError(
             "existing backup delete-to-prove receipt lost its restored mount binding"
         )
-    supporting_receipts = (
-        (
-            "gateway_receipt_sha256",
-            root / "receipts/gateway-proof.json",
-            "Gateway proof receipt",
-        ),
-        (
-            "host_gateway_receipt_sha256",
-            root / HOST_GATEWAY_RECEIPT,
-            "host Gateway proof receipt",
-        ),
-    )
-    for key, supporting_path, label in supporting_receipts:
-        value = receipt.get(key)
-        if (
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(char not in "0123456789abcdef" for char in value)
-        ):
-            raise StagingCellError(
-                f"existing backup delete-to-prove receipt has invalid hash binding: {key}"
-            )
-        _private_json_receipt(supporting_path, label=label)
-        if sha256_file(supporting_path) != value:
-            raise StagingCellError(
-                f"existing backup delete-to-prove receipt lost its {label} hash binding"
-            )
+    # Gateway and host-Gateway receipts are live runtime receipts. Their exact
+    # hashes remain part of the historical terminal proof, but a later normal
+    # activation is allowed to retire/replace those mutable files. Requiring
+    # today's runtime receipts here would turn historical evidence into a live
+    # monitor and make a legitimate later release invalidate an already proven
+    # recovery cycle.
+    for key, label in (
+        ("gateway_receipt_sha256", "Gateway proof receipt hash"),
+        ("host_gateway_receipt_sha256", "host Gateway proof receipt hash"),
+    ):
+        _canonical_sha256(receipt.get(key), label=label)
     recovery_start = down.get("cluster_deleted_at_unix")
     verified_at = receipt.get("verified_at_unix")
     rto = receipt.get("rto_observed_seconds")
@@ -7899,30 +7924,19 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
     reference.validate_owner_id(args.owner_id)
     root = state_root(getattr(args, "state_root", None))
     configure_reference_paths(root)
-    cell = load_cell_receipt(root)
-    require_receipt_cluster(cell, args.cluster)
-    if cell.get("owner_id") != args.owner_id:
-        raise StagingCellError("backup proof owner mismatch")
     release_commit = str(args.source_commit or "")
-    if cell_active_commit(cell) != release_commit:
-        raise StagingCellError("backup proof requires the restored release to be active")
     down = _load_backup_down_receipt(root)
+    if down.get("cluster") != args.cluster or down.get("owner_id") != args.owner_id:
+        raise StagingCellError("backup proof owner or cluster mismatch")
+    if down.get("release_commit") != release_commit:
+        raise StagingCellError("backup proof release differs from the historical backup cycle")
+    rebuild = _load_completed_backup_rebuild_receipt(root, down)
     rebuild_path = root / BACKUP_REBUILD_RECEIPT
-    rebuild = _private_json_receipt(rebuild_path, label="backup rebuild receipt")
-    if (
-        rebuild.get("status")
-        != "backup-restored-infrastructure-ready-app-reactivation-required"
-        or rebuild.get("backup_down_receipt_sha256") != down["receipt_sha256"]
-        or rebuild.get("release_commit") != release_commit
-    ):
-        raise StagingCellError("backup rebuild receipt is not bound to this restored release")
     rebuild_controller_commit = str(rebuild.get("controller_commit") or "")
-    path = root / BACKUP_DELETE_TO_PROVE_RECEIPT
     completed = _validated_existing_backup_delete_to_prove_receipt(
         root,
         cluster=args.cluster,
         owner_id=args.owner_id,
-        cell=cell,
         release_commit=release_commit,
         controller_commit=rebuild_controller_commit,
         down=down,
@@ -7930,6 +7944,13 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
     )
     if completed is not None:
         return completed
+    cell = load_cell_receipt(root)
+    require_receipt_cluster(cell, args.cluster)
+    if cell.get("owner_id") != args.owner_id:
+        raise StagingCellError("backup proof owner mismatch")
+    if cell_active_commit(cell) != release_commit:
+        raise StagingCellError("backup proof requires the restored release to be active")
+    path = root / BACKUP_DELETE_TO_PROVE_RECEIPT
     controller_commit = require_clean_commit(None, require_public_main=False)
     if controller_commit != rebuild_controller_commit:
         raise StagingCellError(
