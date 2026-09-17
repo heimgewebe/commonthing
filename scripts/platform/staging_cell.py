@@ -7416,15 +7416,7 @@ def _completed_backup_recovery_activation_result(
         raise StagingCellError(
             "completed backup recovery activation still contains pending activation state"
         )
-    promotion = cell.get("image_promotion")
-    if (
-        not isinstance(promotion, dict)
-        or promotion.get("status") != "pass"
-        or promotion.get("source_commit") != release_commit
-    ):
-        raise StagingCellError(
-            "completed backup recovery activation lost its release promotion binding"
-        )
+    _exact_cell_promotion(root, cell, release_commit)
     return {
         **cell,
         "receipt_path": str(root / "receipts/cell-bootstrap.json"),

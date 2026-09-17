@@ -5594,6 +5594,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 "controller_commit": controller,
                 "rebuild_receipt_sha256": staging.sha256_file(rebuild_path),
             }
+            promotion = self._write_promotion_receipt(root, commit=release)
             cell = {
                 "schema_version": 1,
                 "cluster": staging.DEFAULT_CLUSTER,
@@ -5608,6 +5609,8 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 "image_promotion": {
                     "status": "pass",
                     "source_commit": release,
+                    "receipt_sha256": promotion["receipt_sha256"],
+                    "images": promotion["images"],
                 },
                 "backup_recovery_reactivation_consumed": binding,
                 "production_changed": False,
@@ -5637,6 +5640,146 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             result["receipt_path"], str(root / "receipts/cell-bootstrap.json")
         )
         require_clean.assert_called_once_with(None, require_public_main=False)
+        registry_material.assert_not_called()
+        require_owned.assert_not_called()
+
+    def test_completed_backup_recovery_activation_retry_rejects_missing_promotion_receipt_before_mutation(self) -> None:
+        release = "7" * 40
+        controller = "8" * 40
+        bootstrap = "6" * 40
+        owner = "test:t084"
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-activate-missing-promotion-") as tmp_name:
+            root = Path(tmp_name)
+            rebuild_path = root / staging.BACKUP_REBUILD_RECEIPT
+            staging.atomic_json(
+                rebuild_path,
+                {
+                    "schema_version": 1,
+                    "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+                    "cluster": staging.DEFAULT_CLUSTER,
+                    "owner_id": owner,
+                    "bootstrap_commit": bootstrap,
+                    "release_commit": release,
+                    "controller_commit": controller,
+                },
+            )
+            binding = {
+                "release_commit": release,
+                "controller_commit": controller,
+                "rebuild_receipt_sha256": staging.sha256_file(rebuild_path),
+            }
+            promotion = self._write_promotion_receipt(root, commit=release)
+            cell = {
+                "schema_version": 1,
+                "cluster": staging.DEFAULT_CLUSTER,
+                "owner_id": owner,
+                "bootstrap_commit": bootstrap,
+                "status": "gateway-ready",
+                "active_commit": release,
+                "gitops_source_commit": release,
+                "data_source_commit": bootstrap,
+                "app_source_commit": release,
+                "app_activation": True,
+                "image_promotion": {
+                    "status": "pass",
+                    "source_commit": release,
+                    "receipt_sha256": promotion["receipt_sha256"],
+                    "images": promotion["images"],
+                },
+                "backup_recovery_reactivation_consumed": binding,
+                "production_changed": False,
+            }
+            staging.atomic_json(root / "receipts/cell-bootstrap.json", cell)
+            (root / "promotion" / release / "receipt.json").unlink()
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(staging, "load_registry_pull_material") as registry_material,
+                mock.patch.object(staging.reference, "require_owned_cluster") as require_owned,
+            ):
+                with self.assertRaises(staging.StagingCellError):
+                    staging.command_activate(args)
+        registry_material.assert_not_called()
+        require_owned.assert_not_called()
+
+    def test_completed_backup_recovery_activation_retry_rejects_replaced_promotion_receipt_before_mutation(self) -> None:
+        release = "7" * 40
+        controller = "8" * 40
+        bootstrap = "6" * 40
+        owner = "test:t084"
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-activate-replaced-promotion-") as tmp_name:
+            root = Path(tmp_name)
+            rebuild_path = root / staging.BACKUP_REBUILD_RECEIPT
+            staging.atomic_json(
+                rebuild_path,
+                {
+                    "schema_version": 1,
+                    "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+                    "cluster": staging.DEFAULT_CLUSTER,
+                    "owner_id": owner,
+                    "bootstrap_commit": bootstrap,
+                    "release_commit": release,
+                    "controller_commit": controller,
+                },
+            )
+            binding = {
+                "release_commit": release,
+                "controller_commit": controller,
+                "rebuild_receipt_sha256": staging.sha256_file(rebuild_path),
+            }
+            promotion = self._write_promotion_receipt(root, commit=release)
+            cell = {
+                "schema_version": 1,
+                "cluster": staging.DEFAULT_CLUSTER,
+                "owner_id": owner,
+                "bootstrap_commit": bootstrap,
+                "status": "gateway-ready",
+                "active_commit": release,
+                "gitops_source_commit": release,
+                "data_source_commit": bootstrap,
+                "app_source_commit": release,
+                "app_activation": True,
+                "image_promotion": {
+                    "status": "pass",
+                    "source_commit": release,
+                    "receipt_sha256": promotion["receipt_sha256"],
+                    "images": promotion["images"],
+                },
+                "backup_recovery_reactivation_consumed": binding,
+                "production_changed": False,
+            }
+            staging.atomic_json(root / "receipts/cell-bootstrap.json", cell)
+            promotion_path = root / "promotion" / release / "receipt.json"
+            replaced = json.loads(promotion_path.read_text(encoding="utf-8"))
+            replacement_digest = "sha256:" + "c" * 64
+            replaced["images"]["api"]["digest"] = replacement_digest
+            replaced["images"]["api"]["canonical_reference"] = (
+                f'{replaced["images"]["api"]["canonical"]}@{replacement_digest}'
+            )
+            staging.atomic_json(promotion_path, replaced)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "validate_ownership_binding"),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(staging, "load_registry_pull_material") as registry_material,
+                mock.patch.object(staging.reference, "require_owned_cluster") as require_owned,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "promotion evidence differs from the active app receipt",
+                ):
+                    staging.command_activate(args)
         registry_material.assert_not_called()
         require_owned.assert_not_called()
 
