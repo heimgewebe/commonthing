@@ -5566,6 +5566,159 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertIn("pending_backup_recovery_reactivation", activate_source)
         self.assertIn("backup_recovery_reactivation_consumed", activate_source)
 
+    def test_completed_backup_recovery_activation_retry_is_idempotent_before_mutation(self) -> None:
+        release = "7" * 40
+        controller = "8" * 40
+        bootstrap = "6" * 40
+        owner = "test:t084"
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-activate-complete-retry-") as tmp_name:
+            root = Path(tmp_name)
+            rebuild_path = root / staging.BACKUP_REBUILD_RECEIPT
+            staging.atomic_json(
+                rebuild_path,
+                {
+                    "schema_version": 1,
+                    "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+                    "cluster": staging.DEFAULT_CLUSTER,
+                    "owner_id": owner,
+                    "bootstrap_commit": bootstrap,
+                    "release_commit": release,
+                    "controller_commit": controller,
+                },
+            )
+            binding = {
+                "release_commit": release,
+                "controller_commit": controller,
+                "rebuild_receipt_sha256": staging.sha256_file(rebuild_path),
+            }
+            cell = {
+                "schema_version": 1,
+                "cluster": staging.DEFAULT_CLUSTER,
+                "owner_id": owner,
+                "bootstrap_commit": bootstrap,
+                "status": "gateway-ready",
+                "active_commit": release,
+                "gitops_source_commit": release,
+                "data_source_commit": bootstrap,
+                "app_source_commit": release,
+                "app_activation": True,
+                "image_promotion": {
+                    "status": "pass",
+                    "source_commit": release,
+                },
+                "backup_recovery_reactivation_consumed": binding,
+                "production_changed": False,
+            }
+            staging.atomic_json(root / "receipts/cell-bootstrap.json", cell)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(
+                    staging.reference, "validate_ownership_binding"
+                ),
+                mock.patch.object(
+                    staging, "require_clean_commit", return_value=controller
+                ) as require_clean,
+                mock.patch.object(staging, "load_registry_pull_material") as registry_material,
+                mock.patch.object(
+                    staging.reference, "require_owned_cluster"
+                ) as require_owned,
+            ):
+                result = staging.command_activate(args)
+        self.assertEqual(result["status"], "gateway-ready")
+        self.assertEqual(result["active_commit"], release)
+        self.assertEqual(
+            result["receipt_path"], str(root / "receipts/cell-bootstrap.json")
+        )
+        require_clean.assert_called_once_with(None, require_public_main=False)
+        registry_material.assert_not_called()
+        require_owned.assert_not_called()
+
+    def test_completed_backup_recovery_activation_retry_rejects_after_cell_moves_on(self) -> None:
+        release = "7" * 40
+        controller = "8" * 40
+        bootstrap = "6" * 40
+        current_release = "9" * 40
+        owner = "test:t084"
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-activate-moved-on-") as tmp_name:
+            root = Path(tmp_name)
+            rebuild_path = root / staging.BACKUP_REBUILD_RECEIPT
+            staging.atomic_json(
+                rebuild_path,
+                {
+                    "schema_version": 1,
+                    "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+                    "cluster": staging.DEFAULT_CLUSTER,
+                    "owner_id": owner,
+                    "bootstrap_commit": bootstrap,
+                    "release_commit": release,
+                    "controller_commit": controller,
+                },
+            )
+            binding = {
+                "release_commit": release,
+                "controller_commit": controller,
+                "rebuild_receipt_sha256": staging.sha256_file(rebuild_path),
+            }
+            cell = {
+                "schema_version": 1,
+                "cluster": staging.DEFAULT_CLUSTER,
+                "owner_id": owner,
+                "bootstrap_commit": bootstrap,
+                "status": "gateway-ready",
+                "active_commit": current_release,
+                "gitops_source_commit": current_release,
+                "data_source_commit": bootstrap,
+                "app_source_commit": current_release,
+                "app_activation": True,
+                "image_promotion": {
+                    "status": "pass",
+                    "source_commit": current_release,
+                },
+                "backup_recovery_reactivation_consumed": binding,
+                "production_changed": False,
+            }
+            staging.atomic_json(root / "receipts/cell-bootstrap.json", cell)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(
+                    staging.reference, "validate_ownership_binding"
+                ),
+                mock.patch.object(
+                    staging,
+                    "require_clean_commit",
+                    side_effect=[
+                        controller,
+                        staging.StagingCellError("moved-on release rejected"),
+                    ],
+                ) as require_clean,
+                mock.patch.object(staging, "load_registry_pull_material") as registry_material,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "moved-on release rejected"
+                ):
+                    staging.command_activate(args)
+        self.assertEqual(require_clean.call_count, 2)
+        self.assertEqual(
+            require_clean.call_args_list[0],
+            mock.call(None, require_public_main=False),
+        )
+        self.assertEqual(require_clean.call_args_list[1], mock.call(release))
+        registry_material.assert_not_called()
+
     def test_backup_rebuild_retry_after_data_start_uses_mount_anchor_not_cold_tree_hash(self) -> None:
         owner = "test:t084"
         release = "f" * 40

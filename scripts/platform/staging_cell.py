@@ -3905,6 +3905,11 @@ def command_activate(args: argparse.Namespace) -> dict[str, Any]:
         backup_controller = _backup_recovery_controller_commit(
             root, cell, requested_commit
         )
+        completed_backup_reactivation = _completed_backup_recovery_activation_result(
+            root, cell, requested_commit, backup_controller
+        )
+        if completed_backup_reactivation is not None:
+            return completed_backup_reactivation
         backup_reactivation = _backup_recovery_activation_binding(
             root, cell, requested_commit, backup_controller
         )
@@ -7355,6 +7360,75 @@ def _backup_recovery_controller_commit(
             "backup recovery must continue from the exact controller commit that restored data"
         )
     return controller_commit
+
+
+def _completed_backup_recovery_activation_result(
+    root: Path,
+    cell: dict[str, Any],
+    release_commit: str,
+    controller_commit: str | None,
+) -> dict[str, Any] | None:
+    consumed = cell.get("backup_recovery_reactivation_consumed")
+    if consumed is None:
+        return None
+    if not isinstance(consumed, dict):
+        raise StagingCellError(
+            "backup recovery reactivation consumption marker is malformed"
+        )
+    if cell_active_commit(cell) != release_commit:
+        return None
+    if controller_commit is None:
+        raise StagingCellError(
+            "completed backup recovery activation lost its controller binding"
+        )
+    binding = {
+        "release_commit": release_commit,
+        "controller_commit": controller_commit,
+        "rebuild_receipt_sha256": sha256_file(root / BACKUP_REBUILD_RECEIPT),
+    }
+    if consumed != binding:
+        raise StagingCellError(
+            "completed backup recovery activation binding differs from the recovery receipt"
+        )
+    if cell.get("status") not in {"app-ready-gateway-pending", "gateway-ready"}:
+        return None
+    expected_fields = {
+        "gitops_source_commit": release_commit,
+        "data_source_commit": cell.get("bootstrap_commit"),
+        "app_source_commit": release_commit,
+        "app_activation": True,
+    }
+    for key, value in expected_fields.items():
+        if cell.get(key) != value:
+            raise StagingCellError(
+                f"completed backup recovery activation has drifted terminal field: {key}"
+            )
+    if any(
+        key in cell
+        for key in (
+            "pending_active_commit",
+            "pending_image_promotion",
+            "pending_migration",
+            "pending_registry_pull_secret",
+            "pending_backup_recovery_reactivation",
+        )
+    ):
+        raise StagingCellError(
+            "completed backup recovery activation still contains pending activation state"
+        )
+    promotion = cell.get("image_promotion")
+    if (
+        not isinstance(promotion, dict)
+        or promotion.get("status") != "pass"
+        or promotion.get("source_commit") != release_commit
+    ):
+        raise StagingCellError(
+            "completed backup recovery activation lost its release promotion binding"
+        )
+    return {
+        **cell,
+        "receipt_path": str(root / "receipts/cell-bootstrap.json"),
+    }
 
 
 def _backup_recovery_activation_binding(
