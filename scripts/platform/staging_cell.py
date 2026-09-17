@@ -6887,6 +6887,38 @@ def _complete_backup_down_from_pending(
     return {**result, "receipt_path": str(path), "receipt_sha256": sha256_file(path)}
 
 
+def _require_backup_pending_release_current(
+    root: Path, pending: dict[str, Any]
+) -> None:
+    release_commit = str(pending.get("release_commit") or "")
+    cluster = str(pending.get("cluster") or "")
+    owner_id = str(pending.get("owner_id") or "")
+    expected_cell_sha = _canonical_sha256(
+        pending.get("cell_receipt_sha256"),
+        label="backup pending cell receipt hash",
+    )
+    expected_gateway_sha = _canonical_sha256(
+        pending.get("gateway_receipt_sha256"),
+        label="backup pending Gateway receipt hash",
+    )
+    cell_path = root / "receipts/cell-bootstrap.json"
+    gateway_path = root / "receipts/gateway-proof.json"
+    cell = _private_json_receipt(cell_path, label="backup pending cell receipt")
+    if sha256_file(cell_path) != expected_cell_sha:
+        raise StagingCellError("backup pending cell receipt changed before resume")
+    require_receipt_cluster(cell, cluster)
+    if cell.get("owner_id") != owner_id:
+        raise StagingCellError("backup pending cell owner changed before resume")
+    if cell_active_commit(cell) != release_commit:
+        raise StagingCellError("backup pending app release changed before resume")
+    _private_json_receipt(gateway_path, label="backup pending Gateway receipt")
+    if sha256_file(gateway_path) != expected_gateway_sha:
+        raise StagingCellError("backup pending Gateway receipt changed before resume")
+    promotion = _exact_cell_promotion(root, cell, release_commit)
+    if pending.get("image_promotion") != promotion:
+        raise StagingCellError("backup pending promotion evidence changed before resume")
+
+
 def _resume_backup_creation(
     root: Path,
     args: argparse.Namespace,
@@ -6900,6 +6932,7 @@ def _resume_backup_creation(
         "backup-app-quiesced-data-stop-pending",
         "backup-archive-creation-pending",
     }:
+        _require_backup_pending_release_current(root, pending)
         tools = load_tool_receipt(
             root, required_tools=("kind", "kubectl"), required_artifacts=()
         )["tools"]
@@ -7092,6 +7125,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         raise StagingCellError("backup rebuild controller commit differs from backup creation")
     result_path = root / BACKUP_REBUILD_RECEIPT
     existing: dict[str, Any] | None = None
+    terminal_existing = False
     if result_path.exists() or result_path.is_symlink():
         existing = _private_json_receipt(result_path, label="backup rebuild receipt")
         if existing.get("owner_id") != args.owner_id or existing.get("cluster") != args.cluster:
@@ -7104,13 +7138,11 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             raise StagingCellError("backup rebuild receipt is not bound to current backup-down receipt")
         if existing.get("production_changed") is not False:
             raise StagingCellError("backup rebuild receipt lost production isolation")
-        if existing.get("status") == "backup-restored-infrastructure-ready-app-reactivation-required":
-            return {
-                **existing,
-                "receipt_path": str(result_path),
-                "receipt_sha256": sha256_file(result_path),
-            }
-        if existing.get("status") not in {
+        terminal_existing = (
+            existing.get("status")
+            == "backup-restored-infrastructure-ready-app-reactivation-required"
+        )
+        if not terminal_existing and existing.get("status") not in {
             "backup-restore-pending",
             "backup-data-restored-platform-reconcile-pending",
             "backup-platform-ready-data-reconcile-pending",
@@ -7122,6 +7154,26 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
     kubectl = tool_receipt["tools"]["kubectl"]
     flux = tool_receipt["tools"]["flux"]
     helm = tool_receipt["tools"]["helm"]
+    if terminal_existing:
+        reference.require_owned_cluster(
+            kind,
+            args.cluster,
+            expected_commit=down["bootstrap_commit"],
+            expected_owner_id=args.owner_id,
+        )
+        restored_identity = existing.get("restored_data_identity")
+        if not isinstance(restored_identity, dict):
+            raise StagingCellError("completed backup rebuild lost restored mount identity")
+        observed_anchors = _mounted_retained_data_anchors(
+            kind, args.cluster, root, require_split=True
+        )
+        if not _same_data_mount_anchors(restored_identity, observed_anchors):
+            raise StagingCellError("completed backup rebuild lost restored mount identity")
+        return {
+            **existing,
+            "receipt_path": str(result_path),
+            "receipt_sha256": sha256_file(result_path),
+        }
     if args.cluster not in reference.clusters(kind):
         reference.clear_stale_cluster_reservation(
             kind,

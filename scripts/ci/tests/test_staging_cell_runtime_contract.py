@@ -5939,6 +5939,180 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         require_clean.assert_called_once_with(None, require_public_main=False)
         content_identity.assert_not_called()
 
+    def test_completed_backup_rebuild_retry_revalidates_owned_cluster_and_mounts(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        anchors = {
+            "postgres": {"device": 1, "inode": 20, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 30, "tree_sha256": "b" * 64},
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "restored_data_identity": anchors,
+            "production_changed": False,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-terminal-rebuild-retry-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "require_owned_cluster") as require_owned,
+                mock.patch.object(
+                    staging, "_mounted_retained_data_anchors", return_value=anchors
+                ) as mounted_anchors,
+                mock.patch.object(staging.reference, "clusters") as clusters,
+                mock.patch.object(staging, "prepare_volume_permissions") as prepare_permissions,
+            ):
+                result = staging.command_backup_delete_to_prove_rebuild(args)
+        self.assertEqual(
+            result["status"],
+            "backup-restored-infrastructure-ready-app-reactivation-required",
+        )
+        require_owned.assert_called_once()
+        mounted_anchors.assert_called_once_with(
+            "kind", staging.DEFAULT_CLUSTER, root, require_split=True
+        )
+        clusters.assert_not_called()
+        prepare_permissions.assert_not_called()
+
+    def test_completed_backup_rebuild_retry_fails_if_cluster_is_lost(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "restored_data_identity": {
+                "postgres": {"device": 1, "inode": 20},
+                "nats": {"device": 1, "inode": 30},
+            },
+            "production_changed": False,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-terminal-cluster-lost-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(
+                    staging.reference,
+                    "require_owned_cluster",
+                    side_effect=staging.StagingCellError("owned cluster missing"),
+                ),
+                mock.patch.object(staging, "_mounted_retained_data_anchors") as mounted_anchors,
+                mock.patch.object(staging.reference, "clusters") as clusters,
+                mock.patch.object(staging, "prepare_volume_permissions") as prepare_permissions,
+            ):
+                with self.assertRaisesRegex(staging.StagingCellError, "owned cluster missing"):
+                    staging.command_backup_delete_to_prove_rebuild(args)
+        mounted_anchors.assert_not_called()
+        clusters.assert_not_called()
+        prepare_permissions.assert_not_called()
+
+    def test_completed_backup_rebuild_retry_fails_if_mount_anchor_changed(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        anchors = {
+            "postgres": {"device": 1, "inode": 20},
+            "nats": {"device": 1, "inode": 30},
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-restored-infrastructure-ready-app-reactivation-required",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "restored_data_identity": anchors,
+            "production_changed": False,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        changed = {
+            "postgres": {"device": 1, "inode": 999},
+            "nats": {"device": 1, "inode": 30},
+        }
+        with tempfile.TemporaryDirectory(prefix="staging-backup-terminal-mount-changed-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(
+                    staging, "_mounted_retained_data_anchors", return_value=changed
+                ),
+                mock.patch.object(staging.reference, "clusters") as clusters,
+                mock.patch.object(staging, "prepare_volume_permissions") as prepare_permissions,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "completed backup rebuild lost restored mount identity"
+                ):
+                    staging.command_backup_delete_to_prove_rebuild(args)
+        clusters.assert_not_called()
+        prepare_permissions.assert_not_called()
+
     def test_fresh_backup_intent_rejects_preexisting_archive_path(self) -> None:
         release = "5" * 40
         with tempfile.TemporaryDirectory(prefix="staging-backup-fresh-archive-") as tmp_name:
@@ -6127,6 +6301,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="staging-backup-app-quiesced-resume-") as tmp_name:
             root = Path(tmp_name)
             with (
+                mock.patch.object(staging, "_require_backup_pending_release_current"),
                 mock.patch.object(
                     staging,
                     "load_tool_receipt",
@@ -6156,6 +6331,80 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             completed_pending["status"], "backup-created-cluster-delete-pending"
         )
+
+    def test_backup_resume_revalidates_release_receipts_before_runtime(self) -> None:
+        release = "b" * 40
+        owner = "test:t084"
+        promotion = {
+            "status": "pass",
+            "source_commit": release,
+            "receipt_sha256": "7" * 64,
+            "images": {"api": "sha256:" + "8" * 64},
+        }
+        cell = {
+            "schema_version": 1,
+            "status": "gateway-ready",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "a" * 40,
+            "active_commit": release,
+            "app_activation": True,
+            "image_promotion": promotion,
+        }
+        gateway = {"schema_version": 1, "status": "gateway-verified"}
+        with tempfile.TemporaryDirectory(prefix="staging-backup-release-revalidate-") as tmp_name:
+            root = Path(tmp_name)
+            cell_path = root / "receipts/cell-bootstrap.json"
+            gateway_path = root / "receipts/gateway-proof.json"
+            staging.atomic_json(cell_path, cell)
+            staging.atomic_json(gateway_path, gateway)
+            pending = {
+                "cluster": staging.DEFAULT_CLUSTER,
+                "owner_id": owner,
+                "release_commit": release,
+                "cell_receipt_sha256": staging.sha256_file(cell_path),
+                "gateway_receipt_sha256": staging.sha256_file(gateway_path),
+                "image_promotion": promotion,
+            }
+            with mock.patch.object(
+                staging, "_exact_cell_promotion", return_value=promotion
+            ) as promotion_check:
+                staging._require_backup_pending_release_current(root, pending)
+
+                staging.atomic_json(cell_path, {**cell, "active_commit": "c" * 40})
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "cell receipt changed before resume"
+                ):
+                    staging._require_backup_pending_release_current(root, pending)
+
+                staging.atomic_json(cell_path, cell)
+                pending["cell_receipt_sha256"] = staging.sha256_file(cell_path)
+                staging.atomic_json(
+                    gateway_path, {"schema_version": 1, "status": "gateway-replaced"}
+                )
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "Gateway receipt changed before resume"
+                ):
+                    staging._require_backup_pending_release_current(root, pending)
+
+                staging.atomic_json(gateway_path, gateway)
+                pending["gateway_receipt_sha256"] = staging.sha256_file(gateway_path)
+                promotion_check.return_value = {
+                    **promotion,
+                    "receipt_sha256": "9" * 64,
+                }
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "promotion evidence changed before resume"
+                ):
+                    staging._require_backup_pending_release_current(root, pending)
+
+    def test_backup_resume_revalidates_release_before_runtime_effects(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging._resume_backup_creation)
+        release_check = source.index("_require_backup_pending_release_current(root, pending)")
+        tool_load = source.index("load_tool_receipt(")
+        self.assertLess(release_check, tool_load)
 
     def test_backup_baseline_is_captured_only_after_app_quiesce(self) -> None:
         import inspect
