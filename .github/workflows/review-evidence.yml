@@ -225,6 +225,9 @@ jobs:
               ] | map(select(type == "string" and length > 0)) | unique),
               additions: $pr[0].additions,
               deletions: $pr[0].deletions,
+              # Every missing/null per-file patch remains an opaque candidate here.
+              # Never filter by additions/deletions: only the exact full diff
+              # may later prove that a candidate contains an ordinary text hunk.
               opaque_files: [
                 $files[0][] |
                 select((has("patch") | not) or .patch == null) |
