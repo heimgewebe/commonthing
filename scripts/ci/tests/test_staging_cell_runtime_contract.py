@@ -5248,6 +5248,186 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(staging.StagingCellError, "registry secret differs"):
                     staging.load_legacy_state_migration(canonical, owner_id=owner)
 
+    def test_backup_transfer_timeout_is_bounded_and_configurable(self) -> None:
+        with mock.patch.dict(staging.os.environ, {}, clear=False):
+            staging.os.environ.pop(staging.BACKUP_TRANSFER_TIMEOUT_ENV, None)
+            self.assertEqual(
+                staging.backup_transfer_timeout_seconds(),
+                staging.BACKUP_TRANSFER_TIMEOUT_DEFAULT_SECONDS,
+            )
+        with mock.patch.dict(
+            staging.os.environ,
+            {staging.BACKUP_TRANSFER_TIMEOUT_ENV: "1800"},
+            clear=False,
+        ):
+            self.assertEqual(staging.backup_transfer_timeout_seconds(), 1800)
+        invalid = (
+            "",
+            "not-a-number",
+            str(staging.BACKUP_TRANSFER_TIMEOUT_MIN_SECONDS - 1),
+            str(staging.BACKUP_TRANSFER_TIMEOUT_MAX_SECONDS + 1),
+        )
+        for value in invalid:
+            with self.subTest(value=value), mock.patch.dict(
+                staging.os.environ,
+                {staging.BACKUP_TRANSFER_TIMEOUT_ENV: value},
+                clear=False,
+            ):
+                with self.assertRaises(staging.StagingCellError):
+                    staging.backup_transfer_timeout_seconds()
+
+    def test_backup_archive_and_restore_use_configured_transfer_timeout(self) -> None:
+        release = "a" * 40
+        root = Path(tempfile.mkdtemp(prefix="staging-backup-timeout-test-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        paths = {
+            "postgres": root / "postgres.tar",
+            "nats": root / "nats.tar",
+        }
+        archive_entries = {
+            name: {"path": str(path), "sha256": "f" * 64, "bytes": 1024}
+            for name, path in paths.items()
+        }
+        with (
+            mock.patch.dict(
+                staging.os.environ,
+                {staging.BACKUP_TRANSFER_TIMEOUT_ENV: "1800"},
+                clear=False,
+            ),
+            mock.patch.object(staging, "_retained_mount_node", return_value="data-node"),
+            mock.patch.object(staging, "_backup_archive_paths", return_value=paths),
+            mock.patch.object(staging, "ensure_directory_durable"),
+            mock.patch.object(
+                staging,
+                "stream_command_to_file",
+            ) as stream_out,
+            mock.patch.object(
+                staging,
+                "_backup_archive_entry",
+                side_effect=lambda name, path: archive_entries[name],
+            ),
+        ):
+            created = staging._backup_volume_archives(
+                "kind", staging.DEFAULT_CLUSTER, root, release
+            )
+        self.assertEqual(created, archive_entries)
+        self.assertEqual(stream_out.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in stream_out.call_args_list],
+            [1800, 1800],
+        )
+
+        restored_identity = {
+            "postgres": {"device": 1, "inode": 2, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 3, "tree_sha256": "b" * 64},
+        }
+        with (
+            mock.patch.dict(
+                staging.os.environ,
+                {staging.BACKUP_TRANSFER_TIMEOUT_ENV: "1800"},
+                clear=False,
+            ),
+            mock.patch.object(staging, "_verify_backup_archives", return_value=paths),
+            mock.patch.object(staging, "_retained_mount_node", return_value="data-node"),
+            mock.patch.object(staging, "output", return_value=""),
+            mock.patch.object(staging, "stream_file_to_command") as stream_in,
+            mock.patch.object(
+                staging,
+                "_mounted_retained_data_identity",
+                return_value=restored_identity,
+            ),
+        ):
+            restored = staging._restore_volume_archives(
+                "kind",
+                staging.DEFAULT_CLUSTER,
+                root,
+                release,
+                archive_entries,
+            )
+        self.assertEqual(restored, restored_identity)
+        self.assertEqual(stream_in.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in stream_in.call_args_list],
+            [1800, 1800],
+        )
+
+    def test_backup_restore_capacity_preflight_requires_archive_space_plus_margin(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="staging-backup-capacity-test-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        archives = {
+            "postgres": {"bytes": 1_000_000_000},
+            "nats": {"bytes": 500_000_000},
+        }
+        archive_bytes, required = staging._backup_restore_capacity_requirement(archives)
+        self.assertEqual(archive_bytes, 1_500_000_000)
+        self.assertEqual(
+            required,
+            archive_bytes + staging.BACKUP_RESTORE_CAPACITY_MARGIN_MIN_BYTES,
+        )
+        with mock.patch.object(
+            staging.shutil,
+            "disk_usage",
+            return_value=mock.Mock(free=required - 1),
+        ):
+            with self.assertRaisesRegex(staging.StagingCellError, "insufficient free space"):
+                staging._require_backup_restore_capacity(root, archives)
+        with (
+            mock.patch.object(
+                staging.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=required + 1),
+            ),
+            mock.patch.object(staging.time, "time", return_value=1234),
+        ):
+            proof = staging._require_backup_restore_capacity(root, archives)
+        self.assertEqual(proof["archive_bytes"], archive_bytes)
+        self.assertEqual(proof["required_free_bytes"], required)
+        self.assertEqual(proof["observed_free_bytes"], required + 1)
+        self.assertEqual(proof["observed_at_unix"], 1234)
+        staging._validate_backup_restore_capacity_preflight(archives, proof)
+
+    def test_backup_down_preflights_restore_capacity_before_cluster_delete(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="staging-backup-delete-preflight-test-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        pending = {
+            "bootstrap_commit": "1" * 40,
+            "release_commit": "2" * 40,
+            "pre_delete_data_identity": {
+                "postgres": {"device": 1, "inode": 2},
+                "nats": {"device": 1, "inode": 3},
+            },
+            "backup_archives": {
+                "postgres": {"bytes": 1024},
+                "nats": {"bytes": 1024},
+            },
+            "started_at_unix": 100,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id="owner-a",
+        )
+        with (
+            mock.patch.object(
+                staging,
+                "load_tool_receipt",
+                return_value={"tools": {"kind": "kind"}},
+            ),
+            mock.patch.object(
+                staging,
+                "_require_backup_restore_capacity",
+                side_effect=staging.StagingCellError("insufficient free space"),
+            ) as capacity,
+            mock.patch.object(
+                staging.reference, "delete_owned_cluster_if_present"
+            ) as delete_cluster,
+        ):
+            with self.assertRaisesRegex(staging.StagingCellError, "insufficient free space"):
+                staging._complete_backup_down_from_pending(
+                    root, args, pending, resumed=False
+                )
+        capacity.assert_called_once_with(root, pending["backup_archives"])
+        delete_cluster.assert_not_called()
+
     def test_backup_data_comparison_distinguishes_content_from_mount_identity(self) -> None:
         before = {
             "postgres": {"device": 1, "inode": 2, "tree_sha256": "a" * 64},
@@ -5320,6 +5500,10 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "controller_commit": "c" * 40,
             "started_at_unix": 100,
             "pre_delete_data_identity": {"postgres": {}, "nats": {}},
+            "backup_archives": {
+                "postgres": {"bytes": 1024},
+                "nats": {"bytes": 1024},
+            },
             "receipt_sha256": "d" * 64,
             "production_changed": False,
         }

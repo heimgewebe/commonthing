@@ -6934,6 +6934,96 @@ def command_rebuild(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+BACKUP_TRANSFER_TIMEOUT_ENV = "COMMONTHING_STAGING_BACKUP_TRANSFER_TIMEOUT_SECONDS"
+BACKUP_TRANSFER_TIMEOUT_DEFAULT_SECONDS = 2 * 60 * 60
+BACKUP_TRANSFER_TIMEOUT_MIN_SECONDS = 10 * 60
+BACKUP_TRANSFER_TIMEOUT_MAX_SECONDS = 12 * 60 * 60
+BACKUP_RESTORE_CAPACITY_MARGIN_MIN_BYTES = 512 * 1024 * 1024
+BACKUP_RESTORE_CAPACITY_MARGIN_PERCENT = 5
+
+
+def backup_transfer_timeout_seconds() -> int:
+    raw = os.environ.get(BACKUP_TRANSFER_TIMEOUT_ENV)
+    if raw is None:
+        return BACKUP_TRANSFER_TIMEOUT_DEFAULT_SECONDS
+    if not raw.isascii() or not raw.isdigit():
+        raise StagingCellError(
+            f"{BACKUP_TRANSFER_TIMEOUT_ENV} must be a decimal integer"
+        )
+    timeout = int(raw)
+    if not (
+        BACKUP_TRANSFER_TIMEOUT_MIN_SECONDS
+        <= timeout
+        <= BACKUP_TRANSFER_TIMEOUT_MAX_SECONDS
+    ):
+        raise StagingCellError(
+            f"{BACKUP_TRANSFER_TIMEOUT_ENV} must be between "
+            f"{BACKUP_TRANSFER_TIMEOUT_MIN_SECONDS} and "
+            f"{BACKUP_TRANSFER_TIMEOUT_MAX_SECONDS} seconds"
+        )
+    return timeout
+
+
+def _backup_restore_capacity_requirement(archives: dict[str, Any]) -> tuple[int, int]:
+    archive_bytes = 0
+    for name in ("postgres", "nats"):
+        entry = archives.get(name)
+        size = entry.get("bytes") if isinstance(entry, dict) else None
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise StagingCellError(
+                f"staging {name} backup size is unavailable for restore-capacity preflight"
+            )
+        archive_bytes += size
+    percentage_margin = (
+        archive_bytes * BACKUP_RESTORE_CAPACITY_MARGIN_PERCENT + 99
+    ) // 100
+    margin = max(BACKUP_RESTORE_CAPACITY_MARGIN_MIN_BYTES, percentage_margin)
+    return archive_bytes, archive_bytes + margin
+
+
+def _require_backup_restore_capacity(
+    root: Path, archives: dict[str, Any]
+) -> dict[str, Any]:
+    archive_bytes, required_free_bytes = _backup_restore_capacity_requirement(archives)
+    free_bytes = shutil.disk_usage(root).free
+    if free_bytes < required_free_bytes:
+        raise StagingCellError(
+            "insufficient free space for staging backup restore before cluster deletion: "
+            f"need at least {required_free_bytes} bytes, observed {free_bytes}"
+        )
+    return {
+        "archive_bytes": archive_bytes,
+        "required_free_bytes": required_free_bytes,
+        "observed_free_bytes": free_bytes,
+        "observed_at_unix": int(time.time()),
+    }
+
+
+def _validate_backup_restore_capacity_preflight(
+    archives: dict[str, Any], preflight: Any
+) -> None:
+    if not isinstance(preflight, dict):
+        raise StagingCellError(
+            "backup delete-to-prove receipt lost its pre-delete restore-capacity proof"
+        )
+    archive_bytes, required_free_bytes = _backup_restore_capacity_requirement(archives)
+    observed_free = preflight.get("observed_free_bytes")
+    observed_at = preflight.get("observed_at_unix")
+    if (
+        preflight.get("archive_bytes") != archive_bytes
+        or preflight.get("required_free_bytes") != required_free_bytes
+        or isinstance(observed_free, bool)
+        or not isinstance(observed_free, int)
+        or observed_free < required_free_bytes
+        or isinstance(observed_at, bool)
+        or not isinstance(observed_at, int)
+        or observed_at <= 0
+    ):
+        raise StagingCellError(
+            "backup delete-to-prove restore-capacity proof is invalid"
+        )
+
+
 def _backup_cycle_directory(root: Path, release_commit: str) -> Path:
     if len(release_commit) != 40 or any(ch not in "0123456789abcdef" for ch in release_commit):
         raise StagingCellError("backup recovery release commit is not canonical")
@@ -6984,6 +7074,7 @@ def _backup_volume_archives(
 ) -> dict[str, dict[str, Any]]:
     data_node = _retained_mount_node(kind, cluster, root, require_split=True)
     paths = _backup_archive_paths(root, release_commit)
+    transfer_timeout = backup_transfer_timeout_seconds()
     ensure_directory_durable(next(iter(paths.values())).parent)
     result: dict[str, dict[str, Any]] = dict(existing_archives or {})
     if set(result) - set(paths):
@@ -7016,7 +7107,7 @@ def _backup_volume_archives(
                     ".",
                 ],
                 path,
-                timeout=600,
+                timeout=transfer_timeout,
             )
             result[name] = _backup_archive_entry(name, path)
         if progress is not None:
@@ -7101,6 +7192,7 @@ def _restore_volume_archives(
 ) -> dict[str, dict[str, Any]]:
     paths = _verify_backup_archives(root, release_commit, archives)
     data_node = _retained_mount_node(kind, cluster, root, require_split=True)
+    transfer_timeout = backup_transfer_timeout_seconds()
     for name, path in paths.items():
         volume = f"/var/local/commonthing-staging/{name}"
         occupied = output(
@@ -7137,7 +7229,7 @@ def _restore_volume_archives(
                 "-xf",
                 "-",
             ],
-            timeout=600,
+            timeout=transfer_timeout,
         )
     return _mounted_retained_data_identity(
         kind, cluster, root, durable=True, require_split=True
@@ -7303,6 +7395,9 @@ def _load_backup_down_receipt(
     }:
         _verify_backup_archives(root, release_commit, archives)
     if status == "backup-created-cluster-deleted-primary-data-empty":
+        _validate_backup_restore_capacity_preflight(
+            archives, payload.get("restore_capacity_preflight")
+        )
         empty_roots = payload.get("empty_restore_roots")
         if not isinstance(empty_roots, dict):
             raise StagingCellError("backup delete-to-prove down receipt lost empty restore roots")
@@ -7323,6 +7418,17 @@ def _complete_backup_down_from_pending(
     tools = load_tool_receipt(
         root, required_tools=("kind",), required_artifacts=()
     )["tools"]
+    capacity_preflight = _require_backup_restore_capacity(
+        root, pending["backup_archives"]
+    )
+    persisted_preflight = dict(pending)
+    persisted_preflight.pop("receipt_sha256", None)
+    persisted_preflight.pop("receipt_path", None)
+    pending = {
+        **persisted_preflight,
+        "restore_capacity_preflight": capacity_preflight,
+    }
+    atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
     reference.delete_owned_cluster_if_present(
         tools["kind"],
         args.cluster,
@@ -8549,7 +8655,11 @@ def parser() -> argparse.ArgumentParser:
             f"timeout in whole seconds; default "
             f"{API_NODES_PROOF_TIMEOUT_DEFAULT_SECONDS}, allowed range "
             f"{API_NODES_PROOF_TIMEOUT_MIN_SECONDS}-"
-            f"{API_NODES_PROOF_TIMEOUT_MAX_SECONDS}."
+            f"{API_NODES_PROOF_TIMEOUT_MAX_SECONDS}. "
+            f"{BACKUP_TRANSFER_TIMEOUT_ENV} configures each backup/archive transfer "
+            f"timeout; default {BACKUP_TRANSFER_TIMEOUT_DEFAULT_SECONDS}, allowed range "
+            f"{BACKUP_TRANSFER_TIMEOUT_MIN_SECONDS}-"
+            f"{BACKUP_TRANSFER_TIMEOUT_MAX_SECONDS}."
         ),
     )
     sub = p.add_subparsers(dest="command", required=True)
