@@ -6955,6 +6955,8 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 "bootstrap_commit": "a" * 40,
                 "release_commit": release,
                 "controller_commit": "b" * 40,
+                "cell_receipt_sha256": "c" * 64,
+                "gateway_receipt_sha256": "d" * 64,
                 "backup_archives": {},
                 "started_at_unix": 1,
                 "production_changed": False,
@@ -7097,6 +7099,11 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     "postgres_api_nodes_complete_readback",
                     return_value=baseline,
                 ) as api_baseline,
+                mock.patch.object(
+                    staging,
+                    "_postgres_domain_nodes_write_freeze",
+                    return_value=mock.MagicMock(),
+                ) as write_freeze,
                 mock.patch.object(staging, "_quiesce_retained_data") as data_quiesce,
                 mock.patch.object(
                     staging, "_mounted_retained_data_identity", return_value=identity
@@ -7114,7 +7121,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         app_quiesce.assert_called_once_with("kubectl")
         api_baseline.assert_called_once_with("kubectl")
-        data_quiesce.assert_called_once_with("kubectl")
+        write_freeze.assert_called_once_with(
+            "kubectl", expect_postgres_shutdown=True
+        )
+        data_quiesce.assert_called_once_with(
+            "kubectl", fast_stop_postgres=True
+        )
         complete.assert_called_once()
         completed_pending = complete.call_args.args[2]
         self.assertEqual(
@@ -7161,6 +7173,11 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     staging,
                     "postgres_api_nodes_complete_readback",
                     return_value=changed,
+                ),
+                mock.patch.object(
+                    staging,
+                    "_postgres_domain_nodes_write_freeze",
+                    return_value=mock.MagicMock(),
                 ),
                 mock.patch.object(staging, "_quiesce_retained_data") as data_quiesce,
                 self.assertRaisesRegex(
@@ -7252,10 +7269,17 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         app_quiesce = source.index("_quiesce_backup_app(kubectl)")
         baseline = source.index("postgres_api_nodes_complete_readback(kubectl)")
         baseline_receipt = source.index('"backup-app-quiesced-data-stop-pending"', baseline)
-        data_quiesce = source.index("_quiesce_retained_data(kubectl)")
-        self.assertLess(app_quiesce, baseline)
+        write_freeze = source.index(
+            "with _postgres_domain_nodes_write_freeze("
+        )
+        data_quiesce = source.index(
+            "_quiesce_retained_data(kubectl, fast_stop_postgres=True)"
+        )
+        self.assertLess(app_quiesce, write_freeze)
+        self.assertLess(write_freeze, baseline)
         self.assertLess(baseline, baseline_receipt)
         self.assertLess(baseline_receipt, data_quiesce)
+        self.assertIn("expect_postgres_shutdown=True", source[write_freeze:data_quiesce])
 
     def test_backup_down_initial_intent_contains_no_pre_quiesce_api_baseline(self) -> None:
         import inspect
@@ -7437,6 +7461,8 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         down = {
             "receipt_sha256": "a" * 64,
             "bootstrap_commit": bootstrap,
+            "cell_receipt_sha256": "1" * 64,
+            "gateway_receipt_sha256": "2" * 64,
             "pre_delete_data_identity": {"postgres": {}, "nats": {}},
             "pre_delete_api_nodes_sha256": "b" * 64,
             "pre_delete_api_nodes_count": 3,
@@ -7459,8 +7485,17 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 "controller_commit": controller,
                 "backup_down_receipt_sha256": down["receipt_sha256"],
                 "backup_rebuild_receipt_sha256": staging.sha256_file(rebuild_path),
+                "pre_delete_cell_receipt_sha256": down["cell_receipt_sha256"],
+                "post_restore_cell_receipt_sha256": "3" * 64,
+                "pre_delete_gateway_receipt_sha256": down["gateway_receipt_sha256"],
+                "post_restore_gateway_receipt_sha256": "c" * 64,
                 "gateway_receipt_sha256": "c" * 64,
                 "host_gateway_receipt_sha256": "d" * 64,
+                "backup_archive_retention": {
+                    "policy": "retain-for-terminal-revalidation",
+                    "release_commit": release,
+                    "bounded_cycles_per_state_root": 1,
+                },
                 "pre_delete_data_identity": down["pre_delete_data_identity"],
                 "restored_data_identity": restored,
                 "final_data_mount_anchors": restored,

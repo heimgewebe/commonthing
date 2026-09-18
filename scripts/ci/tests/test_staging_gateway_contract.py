@@ -1036,7 +1036,12 @@ class StagingGatewayTests(unittest.TestCase):
             command_text,
         )
         self.assertIn('printf "%s\\n" "$1" |', command_text)
+        self.assertIn(
+            f"timeout --signal=TERM --kill-after=5s {outer_timeout - staging.API_NODES_PROOF_POSTGRES_MARGIN_SECONDS}s",
+            command_text,
+        )
         self.assertNotIn('-c "$1"', command_text)
+        self.assertTrue(command[-1].endswith("ORDER BY id ASC;"))
         self.assertEqual(stream.call_args.kwargs["timeout"], outer_timeout)
 
     def test_postgres_complete_readback_maps_valid_timeout_override_to_all_budgets(self):
@@ -1060,6 +1065,8 @@ class StagingGatewayTests(unittest.TestCase):
             f"FETCH_COUNT={staging.API_NODES_PROOF_FETCH_COUNT}",
             command_text,
         )
+        self.assertIn("timeout --signal=TERM --kill-after=5s 1740s", command_text)
+        self.assertTrue(command[-1].endswith("ORDER BY id ASC;"))
         self.assertEqual(stream.call_args.kwargs["timeout"], 1800)
 
     def test_api_nodes_proof_timeout_rejects_invalid_values_fail_closed(self):

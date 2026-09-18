@@ -2381,7 +2381,35 @@ def _quiesce_backup_cell(kubectl: str) -> None:
     _quiesce_retained_data(kubectl)
 
 
-def _quiesce_retained_data(kubectl: str) -> None:
+def _quiesce_retained_data(
+    kubectl: str, *, fast_stop_postgres: bool = False
+) -> None:
+    postgres_pod: str | None = None
+    if fast_stop_postgres:
+        pods = [
+            line
+            for line in output(
+                [
+                    kubectl,
+                    "get",
+                    "pods",
+                    "-n",
+                    DATA_NAMESPACE,
+                    "-l",
+                    "app.kubernetes.io/name=postgres",
+                    "-o",
+                    "name",
+                ],
+                timeout=30,
+            ).splitlines()
+            if line
+        ]
+        if len(pods) != 1:
+            raise StagingCellError(
+                "backup PostgreSQL fast shutdown requires exactly one running pod"
+            )
+        postgres_pod = pods[0]
+
     _set_data_reconciliation_suspended(kubectl, suspended=True)
     run(
         [
@@ -2395,6 +2423,50 @@ def _quiesce_retained_data(kubectl: str) -> None:
         ],
         timeout=60,
     )
+    if postgres_pod is not None:
+        try:
+            run(
+                [
+                    kubectl,
+                    "-n",
+                    DATA_NAMESPACE,
+                    "exec",
+                    postgres_pod,
+                    "-c",
+                    "postgres",
+                    "--",
+                    "sh",
+                    "-eu",
+                    "-c",
+                    'exec pg_ctl -D "$PGDATA" -m fast -w stop',
+                ],
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            fast_stop_deadline = time.monotonic() + 10.0
+            while time.monotonic() < fast_stop_deadline:
+                remaining_postgres = output(
+                    [
+                        kubectl,
+                        "get",
+                        "pods",
+                        "-n",
+                        DATA_NAMESPACE,
+                        "-l",
+                        "app.kubernetes.io/name=postgres",
+                        "-o",
+                        "name",
+                    ],
+                    timeout=30,
+                )
+                if not remaining_postgres:
+                    break
+                time.sleep(0.2)
+            else:
+                raise StagingCellError(
+                    "PostgreSQL did not complete the bounded fast shutdown"
+                ) from error
+
     deadline = time.monotonic() + 120.0
     while True:
         remaining: list[str] = []
@@ -5262,7 +5334,7 @@ def postgres_api_nodes_complete_readback(
         )
     sql = (
         "SELECT json_build_array(id,kind,title,lat,lon,created_at,updated_at,payload,"
-        "search_visibility)::text FROM domain_nodes ORDER BY id ASC"
+        "search_visibility)::text FROM domain_nodes ORDER BY id ASC;"
     )
     command = [
         kubectl,
@@ -5278,7 +5350,8 @@ def postgres_api_nodes_complete_readback(
         "-eu",
         "-c",
         f'printf "%s\\n" "$1" | PGOPTIONS="-c statement_timeout={postgres_timeout * 1000}" '
-        f'exec psql -XAt -v ON_ERROR_STOP=1 -v FETCH_COUNT={API_NODES_PROOF_FETCH_COUNT} '
+        f'exec timeout --signal=TERM --kill-after=5s {postgres_timeout}s '
+        f'psql -XAt -v ON_ERROR_STOP=1 -v FETCH_COUNT={API_NODES_PROOF_FETCH_COUNT} '
         '-U "$POSTGRES_USER" -d "$POSTGRES_DB"',
         "sh",
         sql,
@@ -5432,7 +5505,9 @@ def _postgres_domain_nodes_write_freeze_session_count(
 
 
 @contextmanager
-def _postgres_domain_nodes_write_freeze(kubectl: str):
+def _postgres_domain_nodes_write_freeze(
+    kubectl: str, *, expect_postgres_shutdown: bool = False
+):
     application_name = "commonthing-t084-proof-" + secrets.token_hex(8)
     command = [
         kubectl,
@@ -5484,12 +5559,19 @@ def _postgres_domain_nodes_write_freeze(kubectl: str):
         if not acquired:
             raise StagingCellError("PostgreSQL proof write-freeze lock acquisition timed out")
         yield
-        if (
+        if expect_postgres_shutdown:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired as error:
+                raise StagingCellError(
+                    "PostgreSQL proof write-freeze survived the expected fast shutdown"
+                ) from error
+        elif (
             process.poll() is not None
             or _postgres_domain_nodes_write_freeze_count(kubectl, application_name) != 1
         ):
             raise StagingCellError(
-                "PostgreSQL proof write-freeze was lost during the Gateway snapshot"
+                "PostgreSQL proof write-freeze was lost during the protected snapshot"
             )
     finally:
         if process.poll() is None and process.stdin is not None:
@@ -5508,29 +5590,30 @@ def _postgres_domain_nodes_write_freeze(kubectl: str):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
-        try:
-            remaining = _postgres_domain_nodes_write_freeze_session_count(
-                kubectl, application_name
-            )
-        except (subprocess.CalledProcessError, StagingCellError):
-            remaining = 1
-        if remaining:
+        if not (expect_postgres_shutdown and process.poll() is not None):
             try:
-                _postgres_proof_scalar(
-                    kubectl,
-                    "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
-                    "WHERE application_name='" + application_name + "'",
+                remaining = _postgres_domain_nodes_write_freeze_session_count(
+                    kubectl, application_name
                 )
-            except subprocess.CalledProcessError as error:
-                raise StagingCellError(
-                    "PostgreSQL proof write-freeze session could not be terminated"
-                ) from error
-            if _postgres_domain_nodes_write_freeze_session_count(
-                kubectl, application_name
-            ) != 0:
-                raise StagingCellError(
-                    "PostgreSQL proof write-freeze session remained after cleanup"
-                )
+            except (subprocess.CalledProcessError, StagingCellError):
+                remaining = 1
+            if remaining:
+                try:
+                    _postgres_proof_scalar(
+                        kubectl,
+                        "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+                        "WHERE application_name='" + application_name + "'",
+                    )
+                except subprocess.CalledProcessError as error:
+                    raise StagingCellError(
+                        "PostgreSQL proof write-freeze session could not be terminated"
+                    ) from error
+                if _postgres_domain_nodes_write_freeze_session_count(
+                    kubectl, application_name
+                ) != 0:
+                    raise StagingCellError(
+                        "PostgreSQL proof write-freeze session remained after cleanup"
+                    )
 
 
 def gateway_api_nodes_complete_readback(
@@ -7582,6 +7665,14 @@ def _load_backup_down_receipt(
         raise StagingCellError("backup delete-to-prove down receipt has unexpected state")
     if payload.get("production_changed") is not False:
         raise StagingCellError("backup delete-to-prove down receipt lost production isolation")
+    _canonical_sha256(
+        payload.get("cell_receipt_sha256"),
+        label="backup delete-to-prove pre-delete cell receipt hash",
+    )
+    _canonical_sha256(
+        payload.get("gateway_receipt_sha256"),
+        label="backup delete-to-prove pre-delete Gateway receipt hash",
+    )
     release_commit = str(payload.get("release_commit") or "")
     if status != "backup-quiesce-pending":
         api_hash = str(payload.get("pre_delete_api_nodes_sha256") or "")
@@ -7758,41 +7849,47 @@ def _resume_backup_creation(
             expected_commit=pending["bootstrap_commit"],
             expected_owner_id=args.owner_id,
         )
-        if status == "backup-quiesce-pending":
+        if status in {
+            "backup-quiesce-pending",
+            "backup-app-quiesced-data-stop-pending",
+        }:
+            # Freeze application writers first, then hold a PostgreSQL table
+            # write barrier continuously from the semantic baseline through a
+            # controlled fast shutdown. This makes the persisted baseline and
+            # the subsequent cold filesystem snapshot one atomic write epoch.
             _quiesce_backup_app(kubectl)
-            baseline = postgres_api_nodes_complete_readback(kubectl)
-            persisted = dict(pending)
-            persisted.pop("receipt_sha256", None)
-            persisted.pop("receipt_path", None)
-            pending = {
-                **persisted,
-                "status": "backup-app-quiesced-data-stop-pending",
-                "pre_delete_api_nodes_sha256": baseline["api_nodes_sha256"],
-                "pre_delete_api_nodes_count": baseline["api_nodes_count"],
-                "pre_delete_api_nodes_pages": baseline["api_nodes_pages"],
-                "pre_delete_api_nodes_hash_scope": baseline["api_nodes_hash_scope"],
-                "pre_delete_api_nodes_source": baseline["api_nodes_source"],
-                "backup_archives": {},
-            }
-            atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
-            status = pending["status"]
-        if status == "backup-app-quiesced-data-stop-pending":
-            # Reassert the app-side write freeze after any process restart. The
-            # baseline was captured only after this freeze became observable.
-            _quiesce_backup_app(kubectl)
-            resumed_baseline = postgres_api_nodes_complete_readback(kubectl)
-            for key in (
-                "api_nodes_sha256",
-                "api_nodes_count",
-                "api_nodes_pages",
-                "api_nodes_hash_scope",
-                "api_nodes_source",
+            with _postgres_domain_nodes_write_freeze(
+                kubectl, expect_postgres_shutdown=True
             ):
-                if resumed_baseline.get(key) != pending.get(f"pre_delete_{key}"):
-                    raise StagingCellError(
-                        "backup API baseline changed after app quiescence was resumed"
-                    )
-            _quiesce_retained_data(kubectl)
+                baseline = postgres_api_nodes_complete_readback(kubectl)
+                if status == "backup-app-quiesced-data-stop-pending":
+                    for key in (
+                        "api_nodes_sha256",
+                        "api_nodes_count",
+                        "api_nodes_pages",
+                        "api_nodes_hash_scope",
+                        "api_nodes_source",
+                    ):
+                        if baseline.get(key) != pending.get(f"pre_delete_{key}"):
+                            raise StagingCellError(
+                                "backup API baseline changed after app quiescence was resumed"
+                            )
+                else:
+                    persisted = dict(pending)
+                    persisted.pop("receipt_sha256", None)
+                    persisted.pop("receipt_path", None)
+                    pending = {
+                        **persisted,
+                        "status": "backup-app-quiesced-data-stop-pending",
+                        "pre_delete_api_nodes_sha256": baseline["api_nodes_sha256"],
+                        "pre_delete_api_nodes_count": baseline["api_nodes_count"],
+                        "pre_delete_api_nodes_pages": baseline["api_nodes_pages"],
+                        "pre_delete_api_nodes_hash_scope": baseline["api_nodes_hash_scope"],
+                        "pre_delete_api_nodes_source": baseline["api_nodes_source"],
+                        "backup_archives": {},
+                    }
+                    atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
+                _quiesce_retained_data(kubectl, fast_stop_postgres=True)
             pre_delete = _mounted_retained_data_identity(
                 kind,
                 args.cluster,
@@ -7811,6 +7908,7 @@ def _resume_backup_creation(
                 "backup_archives": {},
             }
             atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
+            status = pending["status"]
         expected_data = pending.get("pre_delete_data_identity")
         observed_data = _mounted_retained_data_identity(
             kind,
@@ -8445,6 +8543,13 @@ def _validated_existing_backup_delete_to_prove_receipt(
         "postgres_api_nodes_pages": down["pre_delete_api_nodes_pages"],
         "postgres_api_nodes_hash_scope": down["pre_delete_api_nodes_hash_scope"],
         "postgres_api_nodes_source": "quiesced-postgres-api-projection-v1",
+        "pre_delete_cell_receipt_sha256": down["cell_receipt_sha256"],
+        "pre_delete_gateway_receipt_sha256": down["gateway_receipt_sha256"],
+        "backup_archive_retention": {
+            "policy": "retain-for-terminal-revalidation",
+            "release_commit": release_commit,
+            "bounded_cycles_per_state_root": 1,
+        },
         "app_workloads": {name: "True" for name in APP_DEPLOYMENTS},
         "live_workloads": {name: "True" for name in LIVE_DEPLOYMENTS},
         "rpo_observation": {
@@ -8472,6 +8577,26 @@ def _validated_existing_backup_delete_to_prove_receipt(
     # today's runtime receipts here would turn historical evidence into a live
     # monitor and make a legitimate later release invalidate an already proven
     # recovery cycle.
+    post_restore_cell_sha = _canonical_sha256(
+        receipt.get("post_restore_cell_receipt_sha256"),
+        label="post-restore cell receipt hash",
+    )
+    post_restore_gateway_sha = _canonical_sha256(
+        receipt.get("post_restore_gateway_receipt_sha256"),
+        label="post-restore Gateway receipt hash",
+    )
+    if post_restore_cell_sha == down["cell_receipt_sha256"]:
+        raise StagingCellError(
+            "existing backup proof did not replace the cell receipt across the recovery cycle"
+        )
+    if post_restore_gateway_sha == down["gateway_receipt_sha256"]:
+        raise StagingCellError(
+            "existing backup proof did not replace the Gateway receipt across the recovery cycle"
+        )
+    if receipt.get("gateway_receipt_sha256") != post_restore_gateway_sha:
+        raise StagingCellError(
+            "existing backup proof lost its post-restore Gateway receipt binding"
+        )
     for key, label in (
         ("gateway_receipt_sha256", "Gateway proof receipt hash"),
         ("host_gateway_receipt_sha256", "host Gateway proof receipt hash"),
@@ -8636,6 +8761,17 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
                 f"{live_workloads!r}"
             )
         observed_at_unix = int(time.time())
+    post_restore_cell_sha = sha256_file(root / "receipts/cell-bootstrap.json")
+    post_restore_gateway_sha = sha256_file(root / "receipts/gateway-proof.json")
+    if post_restore_cell_sha == down["cell_receipt_sha256"]:
+        raise StagingCellError(
+            "cell receipt identity did not change across backup delete-to-prove"
+        )
+    if post_restore_gateway_sha == down["gateway_receipt_sha256"]:
+        raise StagingCellError(
+            "Gateway receipt identity did not change across backup delete-to-prove"
+        )
+
     recovery_start = int(down.get("cluster_deleted_at_unix") or 0)
     if recovery_start <= 0 or observed_at_unix < recovery_start:
         raise StagingCellError("backup proof recovery timing evidence is invalid")
@@ -8651,8 +8787,17 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         "controller_commit": controller_commit,
         "backup_down_receipt_sha256": down["receipt_sha256"],
         "backup_rebuild_receipt_sha256": sha256_file(rebuild_path),
-        "gateway_receipt_sha256": sha256_file(root / "receipts/gateway-proof.json"),
+        "pre_delete_cell_receipt_sha256": down["cell_receipt_sha256"],
+        "post_restore_cell_receipt_sha256": post_restore_cell_sha,
+        "pre_delete_gateway_receipt_sha256": down["gateway_receipt_sha256"],
+        "post_restore_gateway_receipt_sha256": post_restore_gateway_sha,
+        "gateway_receipt_sha256": post_restore_gateway_sha,
         "host_gateway_receipt_sha256": sha256_file(root / HOST_GATEWAY_RECEIPT),
+        "backup_archive_retention": {
+            "policy": "retain-for-terminal-revalidation",
+            "release_commit": release_commit,
+            "bounded_cycles_per_state_root": 1,
+        },
         "pre_delete_data_identity": down["pre_delete_data_identity"],
         "restored_data_identity": rebuild["restored_data_identity"],
         "final_data_mount_anchors": final_data_anchors,
