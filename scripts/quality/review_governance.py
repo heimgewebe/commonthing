@@ -444,7 +444,7 @@ def _build_bundle(
             f"review artifacts exceed the {MAX_ARTIFACT_BYTES}-byte safety limit"
         )
     diff_file_count = sum(
-        1 for line in diff_bytes.splitlines() if line.startswith(b"diff --git ")
+        1 for line in diff_bytes.split(b"\n") if line.startswith(b"diff --git ")
     )
     if diff_file_count != len(stats.changed_files):
         raise GovernanceError(

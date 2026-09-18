@@ -610,6 +610,49 @@ class BundleTests(unittest.TestCase):
                     risk_class="R2",
                 )
 
+    def test_materialized_diff_file_count_uses_lf_boundaries_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            diff_file = root / "pr.diff"
+            patch_file = root / "pr.patch"
+            metadata_file = root / "metadata.json"
+            diff_file.write_bytes(
+                b"diff --git a/carrier.txt b/carrier.txt\n"
+                b"--- a/carrier.txt\n"
+                b"+++ b/carrier.txt\n"
+                b"@@ -1 +1 @@\n"
+                b"-old\n"
+                b"+prefix\rdiff --git a/fake.txt b/fake.txt\n"
+            )
+            patch_file.write_bytes(diff_file.read_bytes())
+            metadata_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "pr_number": 20,
+                        "base_sha": "a" * 40,
+                        "head_sha": "b" * 40,
+                        "merge_base_sha": "c" * 40,
+                        "changed_file_count": 1,
+                        "changed_files": ["carrier.txt"],
+                        "additions": 1,
+                        "deletions": 1,
+                        "opaque_files": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            bundle = generate_materialized_bundle(
+                output_dir=root / "out",
+                metadata_file=metadata_file,
+                diff_file=diff_file,
+                patch_file=patch_file,
+                risk_class="R2",
+            )
+
+            self.assertEqual(bundle.stats.changed_files, ("carrier.txt",))
+
     def test_review_workflow_keeps_all_patchless_files_opaque_candidates(self) -> None:
         workflow_path = (
             Path(__file__).resolve().parents[3]
