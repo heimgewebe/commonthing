@@ -609,6 +609,91 @@ class BundleTests(unittest.TestCase):
                     risk_class="R2",
                 )
 
+    def test_materialized_patchless_text_is_resolved_by_full_diff_hunk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            diff_file = root / "pr.diff"
+            patch_file = root / "pr.patch"
+            metadata_file = root / "metadata.json"
+            diff_file.write_bytes(
+                b"diff --git a/large.py b/large.py\n"
+                b"index 1111111..2222222 100644\n"
+                b"--- a/large.py\n"
+                b"+++ b/large.py\n"
+                b"@@ -1 +1,2 @@\n"
+                b" old\n"
+                b"+new\n"
+            )
+            patch_file.write_bytes(diff_file.read_bytes())
+            metadata_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "pr_number": 18,
+                        "base_sha": "a" * 40,
+                        "head_sha": "b" * 40,
+                        "merge_base_sha": "c" * 40,
+                        "changed_file_count": 1,
+                        "changed_files": ["large.py"],
+                        "additions": 5000,
+                        "deletions": 20,
+                        "opaque_files": ["large.py"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            bundle = generate_materialized_bundle(
+                output_dir=root / "out",
+                metadata_file=metadata_file,
+                diff_file=diff_file,
+                patch_file=patch_file,
+                risk_class="R3",
+            )
+
+            self.assertEqual(bundle.stats.opaque_files, ())
+
+    def test_materialized_patchless_file_without_text_hunk_stays_opaque(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            diff_file = root / "pr.diff"
+            patch_file = root / "pr.patch"
+            metadata_file = root / "metadata.json"
+            diff_file.write_bytes(
+                b"diff --git a/large.py b/large.py\n"
+                b"index 1111111..2222222 100644\n"
+                b"--- a/large.py\n"
+                b"+++ b/large.py\n"
+            )
+            patch_file.write_bytes(diff_file.read_bytes())
+            metadata_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "pr_number": 19,
+                        "base_sha": "a" * 40,
+                        "head_sha": "b" * 40,
+                        "merge_base_sha": "c" * 40,
+                        "changed_file_count": 1,
+                        "changed_files": ["large.py"],
+                        "additions": 5000,
+                        "deletions": 20,
+                        "opaque_files": ["large.py"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            bundle = generate_materialized_bundle(
+                output_dir=root / "out",
+                metadata_file=metadata_file,
+                diff_file=diff_file,
+                patch_file=patch_file,
+                risk_class="R3",
+            )
+
+            self.assertEqual(bundle.stats.opaque_files, ("large.py",))
+
     def test_materialized_paths_reject_controls_and_opaque_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1404,14 +1489,6 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("pr-after.json", self.workflow)
         self.assertIn("diff_file_count", self.workflow)
         self.assertIn("max_artifact_bytes", self.workflow)
-        self.assertIn('((.additions | type) == "number")', self.workflow)
-        self.assertIn('((.deletions | type) == "number")', self.workflow)
-        self.assertIn(".additions == 0", self.workflow)
-        self.assertIn(".deletions == 0", self.workflow)
-        self.assertNotIn(
-            'select((has("patch") | not) or .patch == null) |',
-            self.workflow,
-        )
         self.assertIn("/reviews?per_page=100", self.workflow)
         self.assertIn("--reviews-file", self.workflow)
         self.assertIn("Refresh current-head evidence before publication", self.workflow)

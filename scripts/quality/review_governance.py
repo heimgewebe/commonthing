@@ -730,6 +730,59 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
     return pr_number, base_sha, head_sha, merge_base_sha, stats
 
 
+def _materialized_diff_has_text_hunk(diff_bytes: bytes, path: str) -> bool:
+    """Return true only when the exact GitHub diff positively exposes text for path.
+
+    The Files API may omit its per-file patch field for both binary files and
+    oversized textual diffs. Missing patch therefore remains an opaque
+    candidate. We clear that candidate only when the separately downloaded,
+    hash-bound full PR diff contains an ordinary textual hunk for the exact path.
+
+    Git-quoted, renamed, or otherwise ambiguous paths deliberately fail closed.
+    """
+
+    try:
+        encoded = path.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return False
+    if any(byte in encoded for byte in (0, 10, 13)):
+        return False
+
+    header = b"diff --git a/" + encoded + b" b/" + encoded + b"\n"
+    if diff_bytes.startswith(header):
+        start = 0
+    else:
+        anchored_header = b"\n" + header
+        anchored_start = diff_bytes.find(anchored_header)
+        if anchored_start < 0:
+            return False
+        start = anchored_start + 1
+    next_start = diff_bytes.find(b"\ndiff --git ", start + len(header))
+    end = len(diff_bytes) if next_start < 0 else next_start
+    section = diff_bytes[start:end]
+    if b"\nGIT binary patch\n" in section or b"\nBinary files " in section:
+        return False
+    return b"\n@@ " in section
+
+
+def _resolve_materialized_opaque_files(
+    stats: DiffStats, diff_bytes: bytes
+) -> DiffStats:
+    unresolved = tuple(
+        path
+        for path in stats.opaque_files
+        if not _materialized_diff_has_text_hunk(diff_bytes, path)
+    )
+    return DiffStats(
+        stats.changed_files,
+        stats.additions,
+        stats.deletions,
+        stats.binary_files,
+        unresolved,
+        stats.attention_changed_files,
+    )
+
+
 def generate_materialized_bundle(
     *,
     output_dir: Path,
@@ -741,6 +794,8 @@ def generate_materialized_bundle(
     pr_number, base_sha, head_sha, merge_base_sha, stats = _materialized_metadata(
         metadata_file
     )
+    diff_bytes = diff_file.read_bytes()
+    stats = _resolve_materialized_opaque_files(stats, diff_bytes)
     return _build_bundle(
         output_dir=output_dir,
         pr_number=pr_number,
@@ -748,7 +803,7 @@ def generate_materialized_bundle(
         head_sha=head_sha,
         merge_base_sha=merge_base_sha,
         risk_class=risk_class,
-        diff_bytes=diff_file.read_bytes(),
+        diff_bytes=diff_bytes,
         patch_bytes=patch_file.read_bytes(),
         stats=stats,
         source="github-pull-api",
