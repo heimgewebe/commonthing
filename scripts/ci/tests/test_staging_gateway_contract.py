@@ -958,6 +958,33 @@ class StagingGatewayTests(unittest.TestCase):
             staging.API_NODES_PROOF_MAX_ITEMS,
         )
 
+    def test_complete_node_proof_streams_without_full_snapshot_buffer(self):
+        import inspect
+
+        api_source = inspect.getsource(staging._complete_api_nodes_readback)
+        postgres_source = inspect.getsource(staging.postgres_api_nodes_complete_readback)
+        self.assertNotIn("items.extend", api_source)
+        self.assertNotIn("_canonical_api_nodes_snapshot", api_source)
+        self.assertIn("_CanonicalApiNodesAccumulator", api_source)
+        self.assertIn("stream_output_lines", postgres_source)
+        self.assertNotIn("output(", postgres_source)
+
+    def test_complete_node_proof_rejects_non_monotonic_cursor_items(self):
+        page = json.dumps(
+            {
+                "items": [{"id": "node-b"}, {"id": "node-a"}],
+                "page": {
+                    "limit": staging.API_NODES_PROOF_PAGE_LIMIT,
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            }
+        ).encode("utf-8")
+        with self.assertRaisesRegex(
+            staging.StagingCellError, "strictly ordered by unique id"
+        ):
+            staging._complete_api_nodes_readback(lambda _path: page)
+
     def test_host_gateway_proof_revalidates_exact_app_around_readback(self) -> None:
         import inspect
 

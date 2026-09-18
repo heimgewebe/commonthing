@@ -6584,37 +6584,37 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
 
     def test_postgres_snapshot_maps_the_api_projection_after_app_quiesce(self) -> None:
-        rows = "\n".join(
-            [
-                json.dumps(
-                    [
-                        "node-b",
-                        "place",
-                        "B",
-                        53.5,
-                        9.9,
-                        "2026-09-16T12:00:00+00:00",
-                        "2026-09-16T12:01:00+00:00",
-                        {"info": "hello", "tags": ["x", 2], "created_by_account_id": "  acct  "},
-                        "public",
-                    ]
-                ),
-                json.dumps(
-                    [
-                        "node-a",
-                        "place",
-                        "A",
-                        53.4,
-                        9.8,
-                        None,
-                        None,
-                        {},
-                        "private",
-                    ]
-                ),
-            ]
-        )
-        with mock.patch.object(staging, "output", return_value=rows) as output_mock:
+        rows = [
+            json.dumps(
+                [
+                    "node-a",
+                    "place",
+                    "A",
+                    53.4,
+                    9.8,
+                    None,
+                    None,
+                    {},
+                    "private",
+                ]
+            ),
+            json.dumps(
+                [
+                    "node-b",
+                    "place",
+                    "B",
+                    53.5,
+                    9.9,
+                    "2026-09-16T12:00:00+00:00",
+                    "2026-09-16T12:01:00+00:00",
+                    {"info": "hello", "tags": ["x", 2], "created_by_account_id": "  acct  "},
+                    "public",
+                ]
+            ),
+        ]
+        with mock.patch.object(
+            staging, "stream_output_lines", return_value=iter(rows)
+        ) as output_mock:
             result = staging.postgres_api_nodes_complete_readback("kubectl")
         self.assertEqual(result["api_nodes_count"], 2)
         self.assertEqual(result["api_nodes_source"], "quiesced-postgres-api-projection-v1")

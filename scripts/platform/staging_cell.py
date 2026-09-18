@@ -131,6 +131,30 @@ def output(argv: list[str], *, timeout: float | None = None) -> str:
     return run(argv, capture=True, timeout=timeout).stdout.strip()
 
 
+def stream_output_lines(
+    argv: list[str], *, timeout: float | None = None
+):
+    """Run a bounded command without retaining its complete stdout in memory."""
+    print("+ external command [arguments redacted]", file=sys.stderr, flush=True)
+    with tempfile.TemporaryFile(mode="w+b") as handle:
+        subprocess.run(
+            argv,
+            cwd=ROOT,
+            stdout=handle,
+            stderr=sys.stderr,
+            check=True,
+            timeout=timeout,
+        )
+        handle.seek(0)
+        for raw_line in handle:
+            try:
+                yield raw_line.decode("utf-8").rstrip("\r\n")
+            except UnicodeDecodeError as error:
+                raise StagingCellError(
+                    "external command emitted non-UTF-8 proof output"
+                ) from error
+
+
 def stream_command_to_file(
     argv: list[str], path: Path, *, timeout: float | None = None
 ) -> None:
@@ -4783,36 +4807,74 @@ def _host_http_bytes(path: str) -> bytes:
         ) from error
 
 
-def _canonical_api_nodes_snapshot(items: list[Any], *, page_count: int) -> dict[str, Any]:
-    if not isinstance(page_count, int) or isinstance(page_count, bool) or page_count < 1:
-        raise StagingCellError("API node snapshot page count is invalid")
-    seen: set[str] = set()
-    normalized: list[dict[str, Any]] = []
-    for item in items:
+class _CanonicalApiNodesAccumulator:
+    def __init__(self) -> None:
+        self._hasher = hashlib.sha256()
+        self._hasher.update(b"[")
+        self._count = 0
+        self._last_id: str | None = None
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def add(self, item: Any) -> None:
         if not isinstance(item, dict):
             raise StagingCellError("API node snapshot contains a non-object item")
         node_id = item.get("id")
-        if not isinstance(node_id, str) or not node_id or node_id in seen:
-            raise StagingCellError("API node snapshot contains an invalid or duplicate id")
-        seen.add(node_id)
-        normalized.append(item)
-    normalized.sort(key=lambda item: item["id"])
-    canonical = json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return {
-        "api_nodes_sha256": sha256_bytes(canonical),
-        "api_nodes_count": len(normalized),
-        "api_nodes_pages": page_count,
-        "api_nodes_hash_scope": API_NODES_HASH_SCOPE,
-    }
+        if not isinstance(node_id, str) or not node_id:
+            raise StagingCellError("API node snapshot contains an invalid id")
+        if self._last_id is not None and node_id <= self._last_id:
+            raise StagingCellError(
+                "API node snapshot is not strictly ordered by unique id"
+            )
+        if self._count >= API_NODES_PROOF_MAX_ITEMS:
+            raise StagingCellError(
+                "Gateway /api/nodes proof exceeded the bounded item snapshot limit"
+            )
+        if self._count:
+            self._hasher.update(b",")
+        self._hasher.update(
+            json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        self._count += 1
+        self._last_id = node_id
+
+    def snapshot(self, *, page_count: int) -> dict[str, Any]:
+        if (
+            not isinstance(page_count, int)
+            or isinstance(page_count, bool)
+            or page_count < 1
+        ):
+            raise StagingCellError("API node snapshot page count is invalid")
+        hasher = self._hasher.copy()
+        hasher.update(b"]")
+        return {
+            "api_nodes_sha256": hasher.hexdigest(),
+            "api_nodes_count": self._count,
+            "api_nodes_pages": page_count,
+            "api_nodes_hash_scope": API_NODES_HASH_SCOPE,
+        }
+
+
+def _canonical_api_nodes_snapshot(items: list[Any], *, page_count: int) -> dict[str, Any]:
+    ordered = sorted(
+        items,
+        key=lambda item: item.get("id", "") if isinstance(item, dict) else "",
+    )
+    accumulator = _CanonicalApiNodesAccumulator()
+    for item in ordered:
+        accumulator.add(item)
+    return accumulator.snapshot(page_count=page_count)
 
 
 def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
-    items: list[Any] = []
+    accumulator = _CanonicalApiNodesAccumulator()
     cursor: str | None = None
     seen_cursors: set[str] = set()
     page_count = 0
@@ -4839,16 +4901,19 @@ def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
         page = payload.get("page")
         if not isinstance(page_items, list) or not isinstance(page, dict):
             raise StagingCellError("Gateway /api/nodes cursor envelope is malformed")
-        if page.get("limit") != API_NODES_PROOF_PAGE_LIMIT or not isinstance(
-            page.get("has_more"), bool
+        if (
+            page.get("limit") != API_NODES_PROOF_PAGE_LIMIT
+            or not isinstance(page.get("has_more"), bool)
+            or len(page_items) > API_NODES_PROOF_PAGE_LIMIT
         ):
             raise StagingCellError("Gateway /api/nodes cursor metadata is malformed")
-        items.extend(page_items)
         page_count += 1
         if page_count > API_NODES_PROOF_MAX_PAGES:
             raise StagingCellError(
                 "Gateway /api/nodes proof exceeded the bounded page snapshot limit"
             )
+        for item in page_items:
+            accumulator.add(item)
         has_more = page["has_more"]
         next_cursor = page.get("next_cursor")
         if not has_more:
@@ -4865,7 +4930,7 @@ def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
             raise StagingCellError("Gateway /api/nodes cursor loop detected")
         seen_cursors.add(next_cursor)
         cursor = next_cursor
-    return _canonical_api_nodes_snapshot(items, page_count=page_count)
+    return accumulator.snapshot(page_count=page_count)
 
 
 def _rfc3339_postgres_timestamp(value: Any) -> str | None:
@@ -4946,39 +5011,43 @@ def postgres_api_nodes_complete_readback(kubectl: str) -> dict[str, Any]:
         "SELECT json_build_array(id,kind,title,lat,lon,created_at,updated_at,payload,"
         "search_visibility)::text FROM domain_nodes ORDER BY id ASC"
     )
-    raw = output(
-        [
-            kubectl,
-            "-n",
-            DATA_NAMESPACE,
-            "exec",
-            "deployment/postgres",
-            "-c",
-            "postgres",
-            "--",
-            "sh",
-            "-eu",
-            "-c",
-            'exec psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"',
-            "sh",
-            sql,
-        ],
-        timeout=120,
+    command = [
+        kubectl,
+        "--request-timeout=120s",
+        "-n",
+        DATA_NAMESPACE,
+        "exec",
+        "deployment/postgres",
+        "-c",
+        "postgres",
+        "--",
+        "sh",
+        "-eu",
+        "-c",
+        'PGOPTIONS="-c statement_timeout=110000" exec psql -XAt -v ON_ERROR_STOP=1 '
+        '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"',
+        "sh",
+        sql,
+    ]
+    accumulator = _CanonicalApiNodesAccumulator()
+    for line in stream_output_lines(command, timeout=120):
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise StagingCellError(
+                "PostgreSQL node snapshot emitted malformed JSON"
+            ) from error
+        node = _api_node_from_postgres_snapshot_row(row)
+        if node is not None:
+            accumulator.add(node)
+    pages = max(
+        1,
+        (accumulator.count + API_NODES_PROOF_PAGE_LIMIT - 1)
+        // API_NODES_PROOF_PAGE_LIMIT,
     )
-    items: list[dict[str, Any]] = []
-    if raw:
-        for line in raw.splitlines():
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise StagingCellError(
-                    "PostgreSQL node snapshot emitted malformed JSON"
-                ) from error
-            node = _api_node_from_postgres_snapshot_row(row)
-            if node is not None:
-                items.append(node)
-    pages = max(1, (len(items) + API_NODES_PROOF_PAGE_LIMIT - 1) // API_NODES_PROOF_PAGE_LIMIT)
-    result = _canonical_api_nodes_snapshot(items, page_count=pages)
+    result = accumulator.snapshot(page_count=pages)
     return {**result, "api_nodes_source": "quiesced-postgres-api-projection-v1"}
 
 
