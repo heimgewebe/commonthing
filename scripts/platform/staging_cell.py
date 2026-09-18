@@ -7545,56 +7545,52 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             raise StagingCellError(
                 "backup restore target identity changed before retry"
             )
-        if _same_data_tree_hashes(down["pre_delete_data_identity"], observed):
-            restored = observed
-        else:
-            # A crash can leave a partial extraction. The pending receipt proves
-            # these are the fresh post-delete roots and binds the immutable backup,
-            # so clearing only their contents is retry-safe and cannot touch the
-            # forensic originals.
-            data_node = _retained_mount_node(kind, args.cluster, root, require_split=True)
-            for name in ("postgres", "nats"):
-                volume = f"/var/local/commonthing-staging/{name}"
-                run(
-                    [
-                        "docker",
-                        "exec",
-                        data_node,
-                        "find",
-                        volume,
-                        "-mindepth",
-                        "1",
-                        "-delete",
-                    ],
-                    timeout=120,
-                )
-                occupied = output(
-                    [
-                        "docker",
-                        "exec",
-                        data_node,
-                        "find",
-                        volume,
-                        "-mindepth",
-                        "1",
-                        "-maxdepth",
-                        "1",
-                        "-print",
-                        "-quit",
-                    ],
-                    timeout=30,
-                )
-                if occupied:
-                    raise StagingCellError(
-                        f"staging {name} restore target could not be reset for retry"
-                    )
-            restored = _restore_volume_archives(
-                kind,
-                args.cluster,
-                root,
-                down["release_commit"],
-                down["backup_archives"],
+        # The pending receipt authorizes retrying restore into these exact
+        # post-delete roots; existing bytes never prove they came from the
+        # bound cold archives. Always reset the exact roots and re-extract.
+        data_node = _retained_mount_node(kind, args.cluster, root, require_split=True)
+        for name in ("postgres", "nats"):
+            volume = f"/var/local/commonthing-staging/{name}"
+            run(
+                [
+                    "docker",
+                    "exec",
+                    data_node,
+                    "find",
+                    volume,
+                    "-mindepth",
+                    "1",
+                    "-delete",
+                ],
+                timeout=120,
             )
+            occupied = output(
+                [
+                    "docker",
+                    "exec",
+                    data_node,
+                    "find",
+                    volume,
+                    "-mindepth",
+                    "1",
+                    "-maxdepth",
+                    "1",
+                    "-print",
+                    "-quit",
+                ],
+                timeout=30,
+            )
+            if occupied:
+                raise StagingCellError(
+                    f"staging {name} restore target could not be reset for retry"
+                )
+        restored = _restore_volume_archives(
+            kind,
+            args.cluster,
+            root,
+            down["release_commit"],
+            down["backup_archives"],
+        )
         if not _same_data_tree_hashes(down["pre_delete_data_identity"], restored):
             raise StagingCellError(
                 "restored staging data tree hashes differ from the cold backup source"

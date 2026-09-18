@@ -5482,6 +5482,90 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             require_clean.assert_called_once_with(None, require_public_main=False)
             restore.assert_not_called()
 
+    def test_backup_restore_pending_reextracts_archives_even_when_tree_hashes_match(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        pre_delete = {
+            "postgres": {"device": 1, "inode": 20, "tree_sha256": "a" * 64},
+            "nats": {"device": 1, "inode": 30, "tree_sha256": "b" * 64},
+        }
+        empty_roots = {
+            "postgres": {"device": 1, "inode": 20, "empty": True},
+            "nats": {"device": 1, "inode": 30, "empty": True},
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+            "pre_delete_data_identity": pre_delete,
+            "backup_archives": {
+                "postgres": {"sha256": "4" * 64},
+                "nats": {"sha256": "5" * 64},
+            },
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-restore-pending",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "backup_archives": down["backup_archives"],
+            "pre_delete_data_identity": pre_delete,
+            "empty_restore_roots": empty_roots,
+            "production_changed": False,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-reextract-bound-archives-") as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
+                mock.patch.object(staging.reference, "clusters", return_value=[staging.DEFAULT_CLUSTER]),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(staging, "prepare_volume_permissions"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_identity",
+                    side_effect=[
+                        pre_delete,
+                        staging.StagingCellError("stop after archive restore"),
+                    ],
+                ),
+                mock.patch.object(staging, "_retained_mount_node", return_value="data-node"),
+                mock.patch.object(staging, "run") as run_command,
+                mock.patch.object(staging, "output", return_value="") as read_command,
+                mock.patch.object(
+                    staging, "_restore_volume_archives", return_value=pre_delete
+                ) as restore,
+            ):
+                with self.assertRaisesRegex(
+                    staging.StagingCellError, "stop after archive restore"
+                ):
+                    staging.command_backup_delete_to_prove_rebuild(args)
+        self.assertEqual(run_command.call_count, 2)
+        self.assertEqual(read_command.call_count, 2)
+        restore.assert_called_once_with(
+            "kind",
+            staging.DEFAULT_CLUSTER,
+            root,
+            release,
+            down["backup_archives"],
+        )
+
     def test_backup_recovery_controller_uses_receipt_pinned_checkout_after_main_advances(self) -> None:
         release = "7" * 40
         controller = "8" * 40
