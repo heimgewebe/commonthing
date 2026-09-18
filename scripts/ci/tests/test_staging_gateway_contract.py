@@ -1146,15 +1146,46 @@ class StagingGatewayTests(unittest.TestCase):
     def test_host_http_readback_rejects_oversized_response_instead_of_truncating(self):
         response = mock.MagicMock()
         response.status = 200
-        response.read.return_value = b"x" * (staging.HOST_HTTP_PROOF_MAX_BYTES + 1)
-        context = mock.MagicMock()
-        context.__enter__.return_value = response
+        response.read1.return_value = b"x" * (staging.HOST_HTTP_PROOF_MAX_BYTES + 1)
+        connection = mock.MagicMock()
+        connection.getresponse.return_value = response
+        connection.sock = mock.MagicMock()
         with (
-            mock.patch.object(staging.urllib.request, "urlopen", return_value=context),
+            mock.patch.object(
+                staging.http.client, "HTTPConnection", return_value=connection
+            ),
             self.assertRaisesRegex(staging.StagingCellError, "response exceeds"),
         ):
             staging._host_http_bytes("/api/nodes?pagination=cursor&limit=10")
-        response.read.assert_called_once_with(staging.HOST_HTTP_PROOF_MAX_BYTES + 1)
+        response.read1.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_host_http_readback_stops_trickling_body_at_total_deadline(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.read1.side_effect = [b"x"]
+        connection = mock.MagicMock()
+        connection.getresponse.return_value = response
+        connection.sock = mock.MagicMock()
+        with (
+            mock.patch.object(
+                staging.http.client, "HTTPConnection", return_value=connection
+            ),
+            mock.patch.object(
+                staging.time, "monotonic", side_effect=[90.0, 90.0, 101.0]
+            ),
+            self.assertRaisesRegex(
+                staging.StagingCellError, "configured total timeout"
+            ),
+        ):
+            staging._host_http_bytes(
+                "/api/nodes?pagination=cursor&limit=10",
+                timeout_seconds=10.0,
+                deadline=100.0,
+            )
+        response.read1.assert_called_once()
+        connection.sock.settimeout.assert_called_once_with(10.0)
+        connection.close.assert_called_once()
 
     def test_canonical_node_snapshot_is_independent_of_page_order(self):
         forward = staging._canonical_api_nodes_snapshot(

@@ -2213,16 +2213,17 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "nats": {"device": 1, "inode": 3, "uid": 1000, "gid": 1000, "mode": 0o700},
         }
         events: list[str] = []
+        timeouts: list[int | None] = []
 
         def fake_run(argv: list[str], *, timeout: int | None = None, **_kwargs: object):
-            del timeout
             self.assertEqual(argv[-1], "sync")
             events.append("sync")
+            timeouts.append(timeout)
             return subprocess.CompletedProcess(argv, 0)
 
         def fake_output(argv: list[str], *, timeout: int | None = None) -> str:
-            del timeout
             events.append(f"hash:{argv[-1].rsplit('/', 1)[-1]}")
+            timeouts.append(timeout)
             return "a" * 64
 
         with tempfile.TemporaryDirectory(prefix="staging-cell-mounted-fingerprint-") as tmp_name:
@@ -2245,8 +2246,46 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 )
 
         self.assertEqual(events, ["sync", "hash:postgres", "hash:nats"])
+        self.assertEqual(timeouts, [120, 300, 300])
         self.assertEqual(result["postgres"]["tree_sha256"], "a" * 64)
         self.assertEqual(result["nats"]["tree_sha256"], "a" * 64)
+
+    def test_mounted_retained_fingerprint_uses_explicit_backup_budget(self) -> None:
+        anchors = {
+            "postgres": {"device": 1, "inode": 2, "uid": 999, "gid": 999, "mode": 0o700},
+            "nats": {"device": 1, "inode": 3, "uid": 1000, "gid": 1000, "mode": 0o700},
+        }
+        timeouts: list[int | None] = []
+
+        def fake_run(argv: list[str], *, timeout: int | None = None, **_kwargs: object):
+            timeouts.append(timeout)
+            return subprocess.CompletedProcess(argv, 0)
+
+        def fake_output(argv: list[str], *, timeout: int | None = None) -> str:
+            timeouts.append(timeout)
+            return "a" * 64
+
+        with tempfile.TemporaryDirectory(prefix="staging-cell-mounted-backup-budget-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_anchors",
+                    return_value=json.loads(json.dumps(anchors)),
+                ),
+                mock.patch.object(staging, "run", side_effect=fake_run),
+                mock.patch.object(staging, "output", side_effect=fake_output),
+            ):
+                staging._mounted_retained_data_identity(
+                    "kind",
+                    staging.DEFAULT_CLUSTER,
+                    root,
+                    durable=True,
+                    require_split=True,
+                    timeout_seconds=1800,
+                )
+
+        self.assertEqual(timeouts, [1800, 1800, 1800])
 
     def test_atomic_writes_fsync_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="staging-cell-fsync-parent-") as tmp_name:
@@ -5364,7 +5403,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 staging,
                 "_mounted_retained_data_identity",
                 return_value=restored_identity,
-            ),
+            ) as fingerprint,
         ):
             restored = staging._restore_volume_archives(
                 "kind",
@@ -5378,6 +5417,14 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             [call.kwargs["timeout"] for call in stream_in.call_args_list],
             [1800, 1800],
+        )
+        fingerprint.assert_called_once_with(
+            "kind",
+            staging.DEFAULT_CLUSTER,
+            root,
+            durable=True,
+            require_split=True,
+            timeout_seconds=1800,
         )
 
     def test_backup_restore_capacity_preflight_requires_archive_space_plus_margin(self) -> None:

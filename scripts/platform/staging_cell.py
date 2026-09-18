@@ -9,6 +9,7 @@ import errno
 import fcntl
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -2182,13 +2183,20 @@ def _mounted_retained_data_identity(
     *,
     durable: bool,
     require_split: bool,
+    timeout_seconds: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     identity = _mounted_retained_data_anchors(
         kind, cluster, root, require_split=require_split
     )
     data_node = data_node_name(cluster)
+    if timeout_seconds is not None and (
+        isinstance(timeout_seconds, bool) or timeout_seconds <= 0
+    ):
+        raise StagingCellError("mounted retained data timeout must be positive")
+    sync_timeout = timeout_seconds if timeout_seconds is not None else 120
+    fingerprint_timeout = timeout_seconds if timeout_seconds is not None else 300
     if durable:
-        run(["docker", "exec", data_node, "sync"], timeout=120)
+        run(["docker", "exec", data_node, "sync"], timeout=sync_timeout)
 
     fingerprint_script = (
         "set -euo pipefail\n"
@@ -2211,7 +2219,7 @@ def _mounted_retained_data_identity(
                     "bash",
                     volume_path,
                 ],
-                timeout=300,
+                timeout=fingerprint_timeout,
             )
         except subprocess.CalledProcessError as error:
             raise StagingCellError(
@@ -4841,6 +4849,7 @@ def ensure_gateway_node_port(kubectl: str) -> tuple[str, str, int]:
 
 
 HOST_HTTP_PROOF_MAX_BYTES = 1024 * 1024
+HOST_HTTP_PROOF_READ_CHUNK_BYTES = 64 * 1024
 API_NODES_PROOF_PAGE_LIMIT = 10
 API_NODES_PROOF_MAX_ITEMS = 1_000_000
 API_NODES_PROOF_MAX_PAGES = (
@@ -4924,31 +4933,64 @@ def _api_nodes_proof_remaining_timeouts(deadline: float) -> tuple[float, int, in
 
 
 def _host_http_bytes(
-    path: str, *, timeout_seconds: float = API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS
+    path: str,
+    *,
+    timeout_seconds: float = API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS,
+    deadline: float | None = None,
 ) -> bytes:
     if not path.startswith("/") or "//" in path:
         raise StagingCellError("host Gateway probe path is invalid")
-    url = f"http://127.0.0.1:{STAGING_GATEWAY_HOST_PORT}{path}"
-    request = urllib.request.Request(url, method="GET")
     bounded_timeout = max(
         0.001, min(API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS, timeout_seconds)
     )
+    request_deadline = (
+        deadline if deadline is not None else time.monotonic() + bounded_timeout
+    )
+    connection = http.client.HTTPConnection(
+        "127.0.0.1",
+        STAGING_GATEWAY_HOST_PORT,
+        timeout=max(
+            0.001,
+            min(
+                bounded_timeout,
+                _api_nodes_proof_remaining_seconds(request_deadline),
+            ),
+        ),
+    )
     try:
-        with urllib.request.urlopen(request, timeout=bounded_timeout) as response:
-            if response.status != 200:
-                raise StagingCellError(
-                    f"host Gateway readback returned HTTP {response.status} for {path}"
+        connection.request("GET", path)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise StagingCellError(
+                f"host Gateway readback returned HTTP {response.status} for {path}"
+            )
+        body = bytearray()
+        while len(body) <= HOST_HTTP_PROOF_MAX_BYTES:
+            remaining = _api_nodes_proof_remaining_seconds(request_deadline)
+            if connection.sock is not None:
+                connection.sock.settimeout(
+                    max(0.001, min(bounded_timeout, remaining))
                 )
-            body = response.read(HOST_HTTP_PROOF_MAX_BYTES + 1)
+            chunk = response.read1(
+                min(
+                    HOST_HTTP_PROOF_READ_CHUNK_BYTES,
+                    HOST_HTTP_PROOF_MAX_BYTES + 1 - len(body),
+                )
+            )
+            if not chunk:
+                break
+            body.extend(chunk)
             if len(body) > HOST_HTTP_PROOF_MAX_BYTES:
                 raise StagingCellError(
                     f"host Gateway response exceeds {HOST_HTTP_PROOF_MAX_BYTES} bytes for {path}"
                 )
-            return body
-    except (OSError, urllib.error.URLError, urllib.error.HTTPError) as error:
+        return bytes(body)
+    except (OSError, http.client.HTTPException) as error:
         raise StagingCellError(
             f"host Gateway readback failed for localhost:{STAGING_GATEWAY_HOST_PORT}{path}"
         ) from error
+    finally:
+        connection.close()
 
 
 class _CanonicalApiNodesAccumulator:
@@ -5459,13 +5501,24 @@ def gateway_api_nodes_complete_readback(
 def host_gateway_http_readback(*, deadline: float | None = None) -> dict[str, Any]:
     deadline = deadline if deadline is not None else api_nodes_proof_deadline()
     health = _host_http_bytes(
-        "/health/live", timeout_seconds=_api_nodes_http_request_timeout(deadline)
+        "/health/live",
+        timeout_seconds=_api_nodes_http_request_timeout(deadline),
+        deadline=deadline,
     )
     web = _host_http_bytes(
-        "/", timeout_seconds=_api_nodes_http_request_timeout(deadline)
+        "/",
+        timeout_seconds=_api_nodes_http_request_timeout(deadline),
+        deadline=deadline,
     )
     web_prefix = web[:1024]
-    nodes = _complete_api_nodes_readback(_host_http_bytes, deadline=deadline)
+    nodes = _complete_api_nodes_readback(
+        lambda path, *, timeout_seconds: _host_http_bytes(
+            path,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+        ),
+        deadline=deadline,
+    )
     return {
         "probe_scope": "heim-pc-host-outside-kubernetes",
         "endpoint": f"http://127.0.0.1:{STAGING_GATEWAY_HOST_PORT}",
@@ -7336,7 +7389,12 @@ def _restore_volume_archives(
             timeout=transfer_timeout,
         )
     return _mounted_retained_data_identity(
-        kind, cluster, root, durable=True, require_split=True
+        kind,
+        cluster,
+        root,
+        durable=True,
+        require_split=True,
+        timeout_seconds=transfer_timeout,
     )
 
 
@@ -7624,6 +7682,7 @@ def _resume_backup_creation(
         )["tools"]
         kind = tools["kind"]
         kubectl = tools["kubectl"]
+        backup_timeout = backup_transfer_timeout_seconds()
         reference.require_owned_cluster(
             kind,
             args.cluster,
@@ -7666,7 +7725,12 @@ def _resume_backup_creation(
                     )
             _quiesce_retained_data(kubectl)
             pre_delete = _mounted_retained_data_identity(
-                kind, args.cluster, root, durable=True, require_split=True
+                kind,
+                args.cluster,
+                root,
+                durable=True,
+                require_split=True,
+                timeout_seconds=backup_timeout,
             )
             persisted = dict(pending)
             persisted.pop("receipt_sha256", None)
@@ -7680,7 +7744,12 @@ def _resume_backup_creation(
             atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
         expected_data = pending.get("pre_delete_data_identity")
         observed_data = _mounted_retained_data_identity(
-            kind, args.cluster, root, durable=True, require_split=True
+            kind,
+            args.cluster,
+            root,
+            durable=True,
+            require_split=True,
+            timeout_seconds=backup_timeout,
         )
         if observed_data != expected_data:
             raise StagingCellError("staging cold data changed before backup archive creation")
@@ -7702,7 +7771,12 @@ def _resume_backup_creation(
             progress=record_progress,
         )
         after_backup = _mounted_retained_data_identity(
-            kind, args.cluster, root, durable=True, require_split=True
+            kind,
+            args.cluster,
+            root,
+            durable=True,
+            require_split=True,
+            timeout_seconds=backup_timeout,
         )
         if after_backup != expected_data:
             raise StagingCellError("staging data changed while the cold backup was created")
@@ -7852,6 +7926,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
     kubectl = tool_receipt["tools"]["kubectl"]
     flux = tool_receipt["tools"]["flux"]
     helm = tool_receipt["tools"]["helm"]
+    backup_timeout = backup_transfer_timeout_seconds()
     if terminal_existing:
         reference.require_owned_cluster(
             kind,
@@ -7931,7 +8006,12 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
 
     if existing["status"] == "backup-restore-pending":
         observed = _mounted_retained_data_identity(
-            kind, args.cluster, root, durable=True, require_split=True
+            kind,
+            args.cluster,
+            root,
+            durable=True,
+            require_split=True,
+            timeout_seconds=backup_timeout,
         )
         if not _same_data_mount_anchors(existing["empty_restore_roots"], observed):
             raise StagingCellError(
@@ -7997,7 +8077,12 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
 
     if existing["status"] == "backup-data-restored-platform-reconcile-pending":
         restored_now = _mounted_retained_data_identity(
-            kind, args.cluster, root, durable=True, require_split=True
+            kind,
+            args.cluster,
+            root,
+            durable=True,
+            require_split=True,
+            timeout_seconds=backup_timeout,
         )
         if not _same_data_tree_hashes(
             existing["pre_delete_data_identity"], restored_now
@@ -8033,7 +8118,12 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         )
         _set_data_reconciliation_suspended(kubectl, suspended=True)
         mounted_before_resume = _mounted_retained_data_identity(
-            kind, args.cluster, root, durable=True, require_split=True
+            kind,
+            args.cluster,
+            root,
+            durable=True,
+            require_split=True,
+            timeout_seconds=backup_timeout,
         )
         if not _same_data_tree_hashes(
             down["pre_delete_data_identity"], mounted_before_resume
@@ -8059,7 +8149,12 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         raise StagingCellError("backup rebuild did not reach data-reconcile state")
     if _data_reconciliation_is_suspended(kubectl):
         restored_before_resume = _mounted_retained_data_identity(
-            kind, args.cluster, root, durable=True, require_split=True
+            kind,
+            args.cluster,
+            root,
+            durable=True,
+            require_split=True,
+            timeout_seconds=backup_timeout,
         )
         if not _same_data_tree_hashes(
             down["pre_delete_data_identity"], restored_before_resume
