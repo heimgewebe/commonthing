@@ -998,6 +998,83 @@ class StagingGatewayTests(unittest.TestCase):
                     timeout=0.05,
                 )
             )
+        with self.assertRaises(subprocess.CalledProcessError):
+            list(
+                staging.stream_output_lines(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys; print('node-a', flush=True); sys.exit(7)",
+                    ],
+                    timeout=5,
+                )
+            )
+
+    def test_postgres_complete_readback_uses_scale_safe_default_timeout(self):
+        with (
+            mock.patch.dict(staging.os.environ, {}, clear=False),
+            mock.patch.object(
+                staging, "stream_output_lines", return_value=[]
+            ) as stream,
+        ):
+            staging.os.environ.pop(staging.API_NODES_PROOF_TIMEOUT_ENV, None)
+            staging.postgres_api_nodes_complete_readback("kubectl")
+
+        command = stream.call_args.args[0]
+        outer_timeout = staging.API_NODES_PROOF_TIMEOUT_DEFAULT_SECONDS
+        self.assertIn(
+            f"--request-timeout={outer_timeout - staging.API_NODES_PROOF_KUBECTL_MARGIN_SECONDS}s",
+            command,
+        )
+        command_text = " ".join(command)
+        self.assertIn(
+            f"statement_timeout={(outer_timeout - staging.API_NODES_PROOF_POSTGRES_MARGIN_SECONDS) * 1000}",
+            command_text,
+        )
+        self.assertIn(
+            f"FETCH_COUNT={staging.API_NODES_PROOF_FETCH_COUNT}",
+            command_text,
+        )
+        self.assertEqual(stream.call_args.kwargs["timeout"], outer_timeout)
+
+    def test_postgres_complete_readback_maps_valid_timeout_override_to_all_budgets(self):
+        with (
+            mock.patch.dict(
+                staging.os.environ,
+                {staging.API_NODES_PROOF_TIMEOUT_ENV: "1800"},
+                clear=False,
+            ),
+            mock.patch.object(
+                staging, "stream_output_lines", return_value=[]
+            ) as stream,
+        ):
+            staging.postgres_api_nodes_complete_readback("kubectl")
+
+        command = stream.call_args.args[0]
+        self.assertIn("--request-timeout=1770s", command)
+        command_text = " ".join(command)
+        self.assertIn("statement_timeout=1740000", command_text)
+        self.assertIn(
+            f"FETCH_COUNT={staging.API_NODES_PROOF_FETCH_COUNT}",
+            command_text,
+        )
+        self.assertEqual(stream.call_args.kwargs["timeout"], 1800)
+
+    def test_api_nodes_proof_timeout_rejects_invalid_values_fail_closed(self):
+        invalid = (
+            "",
+            "not-a-number",
+            str(staging.API_NODES_PROOF_TIMEOUT_MIN_SECONDS - 1),
+            str(staging.API_NODES_PROOF_TIMEOUT_MAX_SECONDS + 1),
+        )
+        for value in invalid:
+            with self.subTest(value=value), mock.patch.dict(
+                staging.os.environ,
+                {staging.API_NODES_PROOF_TIMEOUT_ENV: value},
+                clear=False,
+            ):
+                with self.assertRaises(staging.StagingCellError):
+                    staging.api_nodes_proof_timeouts()
 
     def test_complete_node_proof_rejects_non_monotonic_cursor_items(self):
         page = json.dumps(

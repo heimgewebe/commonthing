@@ -4848,6 +4848,39 @@ API_NODES_PROOF_MAX_PAGES = (
 ) // API_NODES_PROOF_PAGE_LIMIT
 API_NODES_HASH_SCOPE = "complete-node-set-canonical-json-v2"
 API_NODES_DB_HTTP_CONSISTENCY = "postgres-share-lock-http-match-v1"
+API_NODES_PROOF_TIMEOUT_ENV = "COMMONTHING_STAGING_API_NODES_PROOF_TIMEOUT_SECONDS"
+API_NODES_PROOF_TIMEOUT_DEFAULT_SECONDS = 2 * 60 * 60
+API_NODES_PROOF_TIMEOUT_MIN_SECONDS = 10 * 60
+API_NODES_PROOF_TIMEOUT_MAX_SECONDS = 6 * 60 * 60
+API_NODES_PROOF_KUBECTL_MARGIN_SECONDS = 30
+API_NODES_PROOF_POSTGRES_MARGIN_SECONDS = 60
+API_NODES_PROOF_FETCH_COUNT = 100
+
+
+def api_nodes_proof_timeouts() -> tuple[int, int, int]:
+    """Return outer, kubectl and PostgreSQL time budgets for the full node proof."""
+    raw = os.environ.get(API_NODES_PROOF_TIMEOUT_ENV)
+    if raw is None:
+        outer_seconds = API_NODES_PROOF_TIMEOUT_DEFAULT_SECONDS
+    else:
+        if not raw.isascii() or not raw.isdigit():
+            raise StagingCellError(
+                f"{API_NODES_PROOF_TIMEOUT_ENV} must be a decimal integer"
+            )
+        outer_seconds = int(raw)
+    if not (
+        API_NODES_PROOF_TIMEOUT_MIN_SECONDS
+        <= outer_seconds
+        <= API_NODES_PROOF_TIMEOUT_MAX_SECONDS
+    ):
+        raise StagingCellError(
+            f"{API_NODES_PROOF_TIMEOUT_ENV} must be between "
+            f"{API_NODES_PROOF_TIMEOUT_MIN_SECONDS} and "
+            f"{API_NODES_PROOF_TIMEOUT_MAX_SECONDS} seconds"
+        )
+    kubectl_seconds = outer_seconds - API_NODES_PROOF_KUBECTL_MARGIN_SECONDS
+    postgres_seconds = outer_seconds - API_NODES_PROOF_POSTGRES_MARGIN_SECONDS
+    return outer_seconds, kubectl_seconds, postgres_seconds
 
 
 def _host_http_bytes(path: str) -> bytes:
@@ -5073,13 +5106,14 @@ def _api_node_from_postgres_snapshot_row(row: Any) -> dict[str, Any] | None:
 
 
 def postgres_api_nodes_complete_readback(kubectl: str) -> dict[str, Any]:
+    outer_timeout, kubectl_timeout, postgres_timeout = api_nodes_proof_timeouts()
     sql = (
         "SELECT json_build_array(id,kind,title,lat,lon,created_at,updated_at,payload,"
         "search_visibility)::text FROM domain_nodes ORDER BY id ASC"
     )
     command = [
         kubectl,
-        "--request-timeout=120s",
+        f"--request-timeout={kubectl_timeout}s",
         "-n",
         DATA_NAMESPACE,
         "exec",
@@ -5090,13 +5124,14 @@ def postgres_api_nodes_complete_readback(kubectl: str) -> dict[str, Any]:
         "sh",
         "-eu",
         "-c",
-        'PGOPTIONS="-c statement_timeout=110000" exec psql -XAt -v ON_ERROR_STOP=1 '
+        f'PGOPTIONS="-c statement_timeout={postgres_timeout * 1000}" '
+        f'exec psql -XAt -v ON_ERROR_STOP=1 -v FETCH_COUNT={API_NODES_PROOF_FETCH_COUNT} '
         '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"',
         "sh",
         sql,
     ]
     accumulator = _CanonicalApiNodesAccumulator()
-    for line in stream_output_lines(command, timeout=120):
+    for line in stream_output_lines(command, timeout=outer_timeout):
         if not line:
             continue
         try:
@@ -8508,7 +8543,14 @@ def command_self_check() -> dict[str, Any]:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Persistent owner-bound T084 staging GewebeZelle controller"
+        description="Persistent owner-bound T084 staging GewebeZelle controller",
+        epilog=(
+            f"{API_NODES_PROOF_TIMEOUT_ENV} configures the complete /api/nodes proof "
+            f"timeout in whole seconds; default "
+            f"{API_NODES_PROOF_TIMEOUT_DEFAULT_SECONDS}, allowed range "
+            f"{API_NODES_PROOF_TIMEOUT_MIN_SECONDS}-"
+            f"{API_NODES_PROOF_TIMEOUT_MAX_SECONDS}."
+        ),
     )
     sub = p.add_subparsers(dest="command", required=True)
     up = sub.add_parser("up")
