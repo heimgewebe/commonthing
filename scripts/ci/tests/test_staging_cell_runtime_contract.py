@@ -6169,6 +6169,50 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertLess(guard, toolchain)
         self.assertLess(guard, gateway_mutation)
 
+    def test_host_gateway_proof_blocks_pending_backup_before_receipt_mutation(self) -> None:
+        import inspect
+
+        release = "7" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id="test:t084",
+            source_commit=release,
+            state_root="/ignored-by-test",
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-host-proof-guard-") as tmp_name:
+            root = Path(tmp_name)
+            down_path = root / staging.BACKUP_DOWN_RECEIPT
+            down_path.parent.mkdir(parents=True, exist_ok=True)
+            down_path.write_text("{}\n", encoding="utf-8")
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging.reference, "validate_owner_id"),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging,
+                    "_load_backup_down_receipt",
+                    return_value={"status": "backup-quiesce-pending"},
+                ),
+                mock.patch.object(staging, "load_cell_receipt") as load_cell,
+                self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "resume the existing backup cycle first",
+                ),
+            ):
+                staging.command_prove_host_gateway(args)
+            load_cell.assert_not_called()
+
+        source = inspect.getsource(staging.command_prove_host_gateway)
+        guard = source.index(
+            '_require_backup_release_mutation_allowed(root, str(args.source_commit or ""))'
+        )
+        cell_load = source.index("cell = load_cell_receipt(root)")
+        host_receipt_write = source.index("atomic_json(path, result)")
+        cell_receipt_write = source.index("write_cell_receipt(root, updated)")
+        self.assertLess(guard, cell_load)
+        self.assertLess(guard, host_receipt_write)
+        self.assertLess(guard, cell_receipt_write)
+
     def test_completed_backup_recovery_activation_retry_is_idempotent_before_mutation(self) -> None:
         release = "7" * 40
         controller = "8" * 40

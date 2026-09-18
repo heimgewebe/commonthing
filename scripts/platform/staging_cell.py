@@ -5870,6 +5870,7 @@ def command_prove_host_gateway(args: argparse.Namespace) -> dict[str, Any]:
     reference.validate_owner_id(args.owner_id)
     root = state_root(getattr(args, "state_root", None))
     configure_reference_paths(root)
+    _require_backup_release_mutation_allowed(root, str(args.source_commit or ""))
     cell = load_cell_receipt(root)
     require_receipt_cluster(cell, args.cluster)
     if args.owner_id != cell.get("owner_id"):
@@ -7711,7 +7712,7 @@ def _load_completed_backup_rebuild_receipt(
     }
 
 
-def _require_no_pending_backup_down_before_activation(
+def _require_backup_release_mutation_allowed(
     root: Path, requested_commit: str
 ) -> None:
     path = root / BACKUP_DOWN_RECEIPT
@@ -7720,7 +7721,7 @@ def _require_no_pending_backup_down_before_activation(
     receipt = _load_backup_down_receipt(root, allow_pending=True)
     if receipt.get("status") != "backup-created-cluster-deleted-primary-data-empty":
         raise StagingCellError(
-            "cannot activate while backup delete-to-prove is pending; "
+            "cannot mutate the active release while backup delete-to-prove is pending; "
             "resume the existing backup cycle first"
         )
     rebuild = _load_completed_backup_rebuild_receipt(root, receipt)
@@ -7739,8 +7740,14 @@ def _require_no_pending_backup_down_before_activation(
             return
     if requested_commit != rebuild.get("release_commit"):
         raise StagingCellError(
-            "activation before terminal backup proof must use the restored historical release"
+            "active-release mutation before terminal backup proof must use the restored historical release"
         )
+
+
+def _require_no_pending_backup_down_before_activation(
+    root: Path, requested_commit: str
+) -> None:
+    _require_backup_release_mutation_allowed(root, requested_commit)
 
 
 def _load_backup_down_receipt(
