@@ -4752,7 +4752,10 @@ def ensure_gateway_node_port(kubectl: str) -> tuple[str, str, int]:
 
 HOST_HTTP_PROOF_MAX_BYTES = 1024 * 1024
 API_NODES_PROOF_PAGE_LIMIT = 10
-API_NODES_PROOF_MAX_PAGES = 10000
+API_NODES_PROOF_MAX_ITEMS = 1_000_000
+API_NODES_PROOF_MAX_PAGES = (
+    API_NODES_PROOF_MAX_ITEMS + API_NODES_PROOF_PAGE_LIMIT - 1
+) // API_NODES_PROOF_PAGE_LIMIT
 API_NODES_HASH_SCOPE = "complete-node-set-canonical-json-v2"
 API_NODES_DB_HTTP_CONSISTENCY = "postgres-share-lock-http-match-v1"
 

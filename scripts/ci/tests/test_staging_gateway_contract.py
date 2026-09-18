@@ -951,6 +951,13 @@ class StagingGatewayTests(unittest.TestCase):
         )
         self.assertIn("cursor=6e6f64652d61", fetch.call_args_list[3].args[0])
 
+    def test_host_gateway_complete_readback_cap_covers_scale_1m(self):
+        self.assertGreaterEqual(staging.API_NODES_PROOF_MAX_ITEMS, 1_000_000)
+        self.assertGreaterEqual(
+            staging.API_NODES_PROOF_PAGE_LIMIT * staging.API_NODES_PROOF_MAX_PAGES,
+            staging.API_NODES_PROOF_MAX_ITEMS,
+        )
+
     def test_host_gateway_proof_revalidates_exact_app_around_readback(self) -> None:
         import inspect
 
