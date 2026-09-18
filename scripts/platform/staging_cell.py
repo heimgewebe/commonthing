@@ -7344,6 +7344,104 @@ def _backup_archive_paths(root: Path, release_commit: str) -> dict[str, Path]:
     return {name: directory / f"{name}.tar" for name in ("postgres", "nats")}
 
 
+def _backup_proof_supporting_receipt_paths(
+    root: Path, release_commit: str
+) -> dict[str, Path]:
+    directory = _backup_cycle_directory(root, release_commit) / "terminal-receipts"
+    return {
+        "cell": directory / "cell-bootstrap.json",
+        "gateway": directory / "gateway-proof.json",
+        "host_gateway": directory / "host-gateway-proof.json",
+    }
+
+
+def _validate_backup_proof_supporting_receipts(
+    root: Path,
+    release_commit: str,
+    evidence: Any,
+    expected_sha256s: dict[str, str],
+) -> dict[str, dict[str, str]]:
+    paths = _backup_proof_supporting_receipt_paths(root, release_commit)
+    if not isinstance(evidence, dict) or set(evidence) != set(paths):
+        raise StagingCellError(
+            "backup terminal proof lost its immutable supporting receipt set"
+        )
+    result: dict[str, dict[str, str]] = {}
+    for name, path in paths.items():
+        expected_sha = _canonical_sha256(
+            expected_sha256s.get(name),
+            label=f"backup terminal {name} supporting receipt hash",
+        )
+        expected = {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": expected_sha,
+        }
+        if evidence.get(name) != expected:
+            raise StagingCellError(
+                f"backup terminal {name} supporting receipt binding drift"
+            )
+        _private_regular_file(
+            path, label=f"backup terminal {name} supporting receipt"
+        )
+        if sha256_file(path) != expected_sha:
+            raise StagingCellError(
+                f"backup terminal {name} supporting receipt hash drift"
+            )
+        result[name] = expected
+    return result
+
+
+def _snapshot_backup_proof_supporting_receipts(
+    root: Path,
+    release_commit: str,
+    expected_sha256s: dict[str, str],
+) -> dict[str, dict[str, str]]:
+    live_paths = {
+        "cell": root / "receipts/cell-bootstrap.json",
+        "gateway": root / "receipts/gateway-proof.json",
+        "host_gateway": root / HOST_GATEWAY_RECEIPT,
+    }
+    snapshot_paths = _backup_proof_supporting_receipt_paths(root, release_commit)
+    evidence: dict[str, dict[str, str]] = {}
+    for name, live_path in live_paths.items():
+        expected_sha = _canonical_sha256(
+            expected_sha256s.get(name),
+            label=f"backup terminal {name} live receipt hash",
+        )
+        _private_regular_file(
+            live_path, label=f"backup terminal {name} live receipt"
+        )
+        try:
+            payload = live_path.read_bytes()
+        except OSError as error:
+            raise StagingCellError(
+                f"backup terminal {name} live receipt became unreadable"
+            ) from error
+        if sha256_bytes(payload) != expected_sha:
+            raise StagingCellError(
+                f"backup terminal {name} live receipt changed before snapshot"
+            )
+        snapshot_path = snapshot_paths[name]
+        if snapshot_path.exists() or snapshot_path.is_symlink():
+            _private_regular_file(
+                snapshot_path,
+                label=f"backup terminal {name} supporting receipt",
+            )
+            if sha256_file(snapshot_path) != expected_sha:
+                raise StagingCellError(
+                    f"backup terminal {name} supporting receipt already exists with different bytes"
+                )
+        else:
+            atomic_bytes(snapshot_path, payload)
+        evidence[name] = {
+            "path": snapshot_path.relative_to(root).as_posix(),
+            "sha256": expected_sha,
+        }
+    return _validate_backup_proof_supporting_receipts(
+        root, release_commit, evidence, expected_sha256s
+    )
+
+
 def _require_fresh_backup_archive_paths(root: Path, release_commit: str) -> None:
     for name, path in _backup_archive_paths(root, release_commit).items():
         if path.exists() or path.is_symlink():
@@ -8571,12 +8669,9 @@ def _validated_existing_backup_delete_to_prove_receipt(
         raise StagingCellError(
             "existing backup delete-to-prove receipt lost its restored mount binding"
         )
-    # Gateway and host-Gateway receipts are live runtime receipts. Their exact
-    # hashes remain part of the historical terminal proof, but a later normal
-    # activation is allowed to retire/replace those mutable files. Requiring
-    # today's runtime receipts here would turn historical evidence into a live
-    # monitor and make a legitimate later release invalidate an already proven
-    # recovery cycle.
+    # Live runtime receipts may be replaced by a later normal activation.
+    # The terminal proof therefore revalidates immutable cycle-scoped byte
+    # copies rather than treating today's mutable live paths as history.
     post_restore_cell_sha = _canonical_sha256(
         receipt.get("post_restore_cell_receipt_sha256"),
         label="post-restore cell receipt hash",
@@ -8597,11 +8692,20 @@ def _validated_existing_backup_delete_to_prove_receipt(
         raise StagingCellError(
             "existing backup proof lost its post-restore Gateway receipt binding"
         )
-    for key, label in (
-        ("gateway_receipt_sha256", "Gateway proof receipt hash"),
-        ("host_gateway_receipt_sha256", "host Gateway proof receipt hash"),
-    ):
-        _canonical_sha256(receipt.get(key), label=label)
+    host_gateway_sha = _canonical_sha256(
+        receipt.get("host_gateway_receipt_sha256"),
+        label="host Gateway proof receipt hash",
+    )
+    _validate_backup_proof_supporting_receipts(
+        root,
+        release_commit,
+        receipt.get("supporting_receipts"),
+        {
+            "cell": post_restore_cell_sha,
+            "gateway": post_restore_gateway_sha,
+            "host_gateway": host_gateway_sha,
+        },
+    )
     recovery_start = down.get("cluster_deleted_at_unix")
     verified_at = receipt.get("verified_at_unix")
     rto = receipt.get("rto_observed_seconds")
@@ -8771,6 +8875,16 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         raise StagingCellError(
             "Gateway receipt identity did not change across backup delete-to-prove"
         )
+    host_gateway_sha = sha256_file(root / HOST_GATEWAY_RECEIPT)
+    supporting_receipts = _snapshot_backup_proof_supporting_receipts(
+        root,
+        release_commit,
+        {
+            "cell": post_restore_cell_sha,
+            "gateway": post_restore_gateway_sha,
+            "host_gateway": host_gateway_sha,
+        },
+    )
 
     recovery_start = int(down.get("cluster_deleted_at_unix") or 0)
     if recovery_start <= 0 or observed_at_unix < recovery_start:
@@ -8792,7 +8906,8 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
         "pre_delete_gateway_receipt_sha256": down["gateway_receipt_sha256"],
         "post_restore_gateway_receipt_sha256": post_restore_gateway_sha,
         "gateway_receipt_sha256": post_restore_gateway_sha,
-        "host_gateway_receipt_sha256": sha256_file(root / HOST_GATEWAY_RECEIPT),
+        "host_gateway_receipt_sha256": host_gateway_sha,
+        "supporting_receipts": supporting_receipts,
         "backup_archive_retention": {
             "policy": "retain-for-terminal-revalidation",
             "release_commit": release_commit,

@@ -7475,6 +7475,26 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             root = Path(tmp_name)
             rebuild_path = root / staging.BACKUP_REBUILD_RECEIPT
             staging.atomic_json(rebuild_path, rebuild)
+            snapshot_paths = staging._backup_proof_supporting_receipt_paths(
+                root, release
+            )
+            snapshot_payloads = {
+                "cell": {"schema_version": 1, "kind": "historical-cell"},
+                "gateway": {"schema_version": 1, "kind": "historical-gateway"},
+                "host_gateway": {
+                    "schema_version": 1,
+                    "kind": "historical-host-gateway",
+                },
+            }
+            for name, snapshot_path in snapshot_paths.items():
+                staging.atomic_json(snapshot_path, snapshot_payloads[name])
+            supporting_receipts = {
+                name: {
+                    "path": snapshot_path.relative_to(root).as_posix(),
+                    "sha256": staging.sha256_file(snapshot_path),
+                }
+                for name, snapshot_path in snapshot_paths.items()
+            }
             receipt = {
                 "schema_version": 1,
                 "status": "backup-delete-to-prove-verified",
@@ -7486,11 +7506,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 "backup_down_receipt_sha256": down["receipt_sha256"],
                 "backup_rebuild_receipt_sha256": staging.sha256_file(rebuild_path),
                 "pre_delete_cell_receipt_sha256": down["cell_receipt_sha256"],
-                "post_restore_cell_receipt_sha256": "3" * 64,
+                "post_restore_cell_receipt_sha256": supporting_receipts["cell"]["sha256"],
                 "pre_delete_gateway_receipt_sha256": down["gateway_receipt_sha256"],
-                "post_restore_gateway_receipt_sha256": "c" * 64,
-                "gateway_receipt_sha256": "c" * 64,
-                "host_gateway_receipt_sha256": "d" * 64,
+                "post_restore_gateway_receipt_sha256": supporting_receipts["gateway"]["sha256"],
+                "gateway_receipt_sha256": supporting_receipts["gateway"]["sha256"],
+                "host_gateway_receipt_sha256": supporting_receipts["host_gateway"]["sha256"],
+                "supporting_receipts": supporting_receipts,
                 "backup_archive_retention": {
                     "policy": "retain-for-terminal-revalidation",
                     "release_commit": release,
@@ -7544,6 +7565,24 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             self.assertFalse((root / "receipts/gateway-proof.json").exists())
             self.assertFalse((root / staging.HOST_GATEWAY_RECEIPT).exists())
 
+            gateway_snapshot = snapshot_paths["gateway"]
+            original_gateway_snapshot = gateway_snapshot.read_bytes()
+            staging.atomic_bytes(gateway_snapshot, original_gateway_snapshot + b"tamper")
+            with self.assertRaisesRegex(
+                staging.StagingCellError,
+                "gateway supporting receipt hash drift",
+            ):
+                staging._validated_existing_backup_delete_to_prove_receipt(
+                    root,
+                    cluster=staging.DEFAULT_CLUSTER,
+                    owner_id=owner,
+                    release_commit=release,
+                    controller_commit=controller,
+                    down=down,
+                    rebuild=rebuild,
+                )
+            staging.atomic_bytes(gateway_snapshot, original_gateway_snapshot)
+
             staging.atomic_json(rebuild_path, {**rebuild, "tampered": True})
             with self.assertRaisesRegex(
                 staging.StagingCellError, "backup_rebuild_receipt_sha256"
@@ -7570,6 +7609,56 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     controller_commit="8" * 39,
                     down=down,
                     rebuild=rebuild,
+                )
+
+    def test_backup_terminal_supporting_receipts_are_exact_create_once_snapshots(self) -> None:
+        release = "9" * 40
+        with tempfile.TemporaryDirectory(
+            prefix="staging-backup-terminal-supporting-receipts-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            live_paths = {
+                "cell": root / "receipts/cell-bootstrap.json",
+                "gateway": root / "receipts/gateway-proof.json",
+                "host_gateway": root / staging.HOST_GATEWAY_RECEIPT,
+            }
+            for name, live_path in live_paths.items():
+                staging.atomic_json(
+                    live_path,
+                    {"schema_version": 1, "kind": f"live-{name}"},
+                )
+            expected = {
+                name: staging.sha256_file(path)
+                for name, path in live_paths.items()
+            }
+            evidence = staging._snapshot_backup_proof_supporting_receipts(
+                root, release, expected
+            )
+            expected_directory = (
+                staging._backup_cycle_directory(root, release) / "terminal-receipts"
+            )
+            for name, snapshot_path in (
+                staging._backup_proof_supporting_receipt_paths(root, release).items()
+            ):
+                self.assertEqual(snapshot_path.parent, expected_directory)
+                self.assertEqual(evidence[name]["sha256"], expected[name])
+                self.assertEqual(
+                    staging.sha256_file(snapshot_path), expected[name]
+                )
+                self.assertEqual(
+                    snapshot_path.read_bytes(), live_paths[name].read_bytes()
+                )
+
+            staging.atomic_json(
+                live_paths["gateway"],
+                {"schema_version": 1, "kind": "later-live-gateway"},
+            )
+            with self.assertRaisesRegex(
+                staging.StagingCellError,
+                "gateway live receipt changed before snapshot",
+            ):
+                staging._snapshot_backup_proof_supporting_receipts(
+                    root, release, expected
                 )
 
     def test_backup_archive_hash_streams_without_whole_file_read(self) -> None:
