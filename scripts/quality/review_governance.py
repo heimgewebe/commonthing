@@ -443,6 +443,8 @@ def _build_bundle(
         raise GovernanceError(
             f"review artifacts exceed the {MAX_ARTIFACT_BYTES}-byte safety limit"
         )
+    # Git diff records are LF-framed. bytes.splitlines() also treats a bare CR
+    # inside textual hunk content as a boundary and could fabricate a diff header.
     diff_file_count = sum(
         1 for line in diff_bytes.split(b"\n") if line.startswith(b"diff --git ")
     )
