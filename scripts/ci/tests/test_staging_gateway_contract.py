@@ -960,6 +960,37 @@ class StagingGatewayTests(unittest.TestCase):
             staging.API_NODES_PROOF_MAX_ITEMS,
         )
 
+    def test_host_http_cap_covers_maximally_escaped_valid_node_page(self):
+        escaped = "\x1f"
+        node = {
+            "id": "00000000-0000-4000-8000-000000000001",
+            "kind": escaped * 100,
+            "title": escaped * 200,
+            "created_at": "2026-09-18T18:44:09.123456Z",
+            "updated_at": "2026-09-18T18:44:09.123456Z",
+            "created_by_account_id": "00000000-0000-4000-8000-000000000002",
+            "info": escaped * 20_000,
+            "summary": escaped * 500,
+            "tags": [escaped * 64 for _ in range(32)],
+            "address": escaped * 500,
+            "location": {"lat": -90.0, "lon": -180.0},
+            "search_visibility": "private",
+        }
+        payload = json.dumps(
+            {
+                "items": [node for _ in range(staging.API_NODES_PROOF_PAGE_LIMIT)],
+                "page": {
+                    "limit": staging.API_NODES_PROOF_PAGE_LIMIT,
+                    "next_cursor": "f" * 72,
+                    "has_more": True,
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertGreater(len(payload), 1024 * 1024)
+        self.assertLessEqual(len(payload), staging.HOST_HTTP_PROOF_MAX_BYTES)
+
     def test_complete_node_proof_streams_without_full_snapshot_buffer(self):
         import inspect
 

@@ -4980,9 +4980,37 @@ def ensure_gateway_node_port(kubectl: str) -> tuple[str, str, int]:
     return gateway_service_node_port(kubectl, require_exact=True)
 
 
-HOST_HTTP_PROOF_MAX_BYTES = 1024 * 1024
-HOST_HTTP_PROOF_READ_CHUNK_BYTES = 64 * 1024
 API_NODES_PROOF_PAGE_LIMIT = 10
+# A valid Node can contain 20k info chars plus bounded title/kind/address/summary
+# and 32 tags of 64 chars. JSON control-character escaping can expand one input
+# character to six bytes (for example, U+001F -> \u001f). Keep the per-request
+# cap derived from those public write bounds instead of an unrelated 1 MiB
+# constant, while retaining a hard cap against unbounded/malformed responses.
+API_NODE_PROOF_WORST_CASE_JSON_ESCAPE_BYTES_PER_CHAR = 6
+API_NODE_PROOF_MAX_TEXT_CHARS = (
+    36  # id UUID
+    + 100  # kind
+    + 200  # title
+    + 64  # created_at, conservatively above RFC3339 output
+    + 64  # updated_at
+    + 36  # created_by_account_id UUID
+    + 20_000  # info
+    + 500  # summary
+    + 500  # address
+    + (32 * 64)  # tags
+    + 16  # search_visibility and fixed textual slack
+)
+API_NODE_PROOF_MAX_SERIALIZED_BYTES = (
+    API_NODE_PROOF_MAX_TEXT_CHARS
+    * API_NODE_PROOF_WORST_CASE_JSON_ESCAPE_BYTES_PER_CHAR
+    + 32 * 1024
+)
+API_NODES_PROOF_ENVELOPE_OVERHEAD_BYTES = 64 * 1024
+HOST_HTTP_PROOF_MAX_BYTES = (
+    API_NODES_PROOF_PAGE_LIMIT * API_NODE_PROOF_MAX_SERIALIZED_BYTES
+    + API_NODES_PROOF_ENVELOPE_OVERHEAD_BYTES
+)
+HOST_HTTP_PROOF_READ_CHUNK_BYTES = 64 * 1024
 API_NODES_PROOF_MAX_ITEMS = 1_000_000
 API_NODES_PROOF_MAX_PAGES = (
     API_NODES_PROOF_MAX_ITEMS + API_NODES_PROOF_PAGE_LIMIT - 1
