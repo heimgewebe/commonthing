@@ -610,6 +610,26 @@ class BundleTests(unittest.TestCase):
                     risk_class="R2",
                 )
 
+    def test_review_workflow_keeps_all_patchless_files_opaque_candidates(self) -> None:
+        workflow_path = (
+            Path(__file__).resolve().parents[3]
+            / ".github/workflows/review-evidence.yml"
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+        match = re.search(
+            r"opaque_files:\s*\[(.*?)\n\s*\]",
+            workflow,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        block = match.group(1)
+        self.assertIn(
+            'select((has("patch") | not) or .patch == null)',
+            block,
+        )
+        self.assertNotIn(".additions", block)
+        self.assertNotIn(".deletions", block)
+
     def test_materialized_patchless_text_is_resolved_by_full_diff_hunk(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
