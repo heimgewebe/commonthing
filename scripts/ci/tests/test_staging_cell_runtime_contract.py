@@ -959,6 +959,35 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "cluster-absent-state-preserved")
 
+    def test_down_rejects_pending_backup_intent_before_legacy_delete(self) -> None:
+        owner = "owner-a"
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-down-backup-pending-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(
+                root / staging.BACKUP_DOWN_RECEIPT,
+                {
+                    "schema_version": 1,
+                    "status": "backup-app-quiesced-data-stop-pending",
+                    "production_changed": False,
+                },
+            )
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging.reference, "delete_owned_cluster_if_present"
+                ) as delete_mock,
+                self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "ordinary down while backup delete-to-prove is pending",
+                ),
+            ):
+                staging.command_down(args)
+        delete_mock.assert_not_called()
+
     def test_down_fails_closed_for_wrong_owner_or_marker_binding(self) -> None:
         owner = "owner-a"
         commit = "e" * 40
@@ -6848,11 +6877,23 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "release_commit": "b" * 40,
             "owner_id": "test:t084",
             "backup_archives": {},
+            "pre_delete_api_nodes_sha256": "3" * 64,
+            "pre_delete_api_nodes_count": 2,
+            "pre_delete_api_nodes_pages": 1,
+            "pre_delete_api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+            "pre_delete_api_nodes_source": "quiesced-postgres-api-projection-v1",
         }
         args = staging.argparse.Namespace(
             cluster=staging.DEFAULT_CLUSTER, owner_id="test:t084"
         )
         identity = {"postgres": {"sha256": "1" * 64}, "nats": {"sha256": "2" * 64}}
+        baseline = {
+            "api_nodes_sha256": "3" * 64,
+            "api_nodes_count": 2,
+            "api_nodes_pages": 1,
+            "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+            "api_nodes_source": "quiesced-postgres-api-projection-v1",
+        }
         with tempfile.TemporaryDirectory(prefix="staging-backup-app-quiesced-resume-") as tmp_name:
             root = Path(tmp_name)
             with (
@@ -6864,6 +6905,11 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 ),
                 mock.patch.object(staging.reference, "require_owned_cluster"),
                 mock.patch.object(staging, "_quiesce_backup_app") as app_quiesce,
+                mock.patch.object(
+                    staging,
+                    "postgres_api_nodes_complete_readback",
+                    return_value=baseline,
+                ) as api_baseline,
                 mock.patch.object(staging, "_quiesce_retained_data") as data_quiesce,
                 mock.patch.object(
                     staging, "_mounted_retained_data_identity", return_value=identity
@@ -6880,12 +6926,63 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 )
         self.assertEqual(result["status"], "completed")
         app_quiesce.assert_called_once_with("kubectl")
+        api_baseline.assert_called_once_with("kubectl")
         data_quiesce.assert_called_once_with("kubectl")
         complete.assert_called_once()
         completed_pending = complete.call_args.args[2]
         self.assertEqual(
             completed_pending["status"], "backup-created-cluster-delete-pending"
         )
+
+    def test_backup_resume_rejects_changed_api_baseline_before_data_stop(self) -> None:
+        pending = {
+            "status": "backup-app-quiesced-data-stop-pending",
+            "bootstrap_commit": "a" * 40,
+            "release_commit": "b" * 40,
+            "owner_id": "test:t084",
+            "backup_archives": {},
+            "pre_delete_api_nodes_sha256": "3" * 64,
+            "pre_delete_api_nodes_count": 2,
+            "pre_delete_api_nodes_pages": 1,
+            "pre_delete_api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+            "pre_delete_api_nodes_source": "quiesced-postgres-api-projection-v1",
+        }
+        args = staging.argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id="test:t084"
+        )
+        changed = {
+            "api_nodes_sha256": "4" * 64,
+            "api_nodes_count": 2,
+            "api_nodes_pages": 1,
+            "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+            "api_nodes_source": "quiesced-postgres-api-projection-v1",
+        }
+        with tempfile.TemporaryDirectory(
+            prefix="staging-backup-api-baseline-changed-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(staging, "_require_backup_pending_release_current"),
+                mock.patch.object(
+                    staging,
+                    "load_tool_receipt",
+                    return_value={"tools": {"kind": "kind", "kubectl": "kubectl"}},
+                ),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(staging, "_quiesce_backup_app"),
+                mock.patch.object(
+                    staging,
+                    "postgres_api_nodes_complete_readback",
+                    return_value=changed,
+                ),
+                mock.patch.object(staging, "_quiesce_retained_data") as data_quiesce,
+                self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "backup API baseline changed after app quiescence was resumed",
+                ),
+            ):
+                staging._resume_backup_creation(root, args, pending, resumed=True)
+        data_quiesce.assert_not_called()
 
     def test_backup_resume_revalidates_release_receipts_before_runtime(self) -> None:
         release = "b" * 40
@@ -6987,18 +7084,30 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         import inspect
 
         host_source = inspect.getsource(staging.command_prove_host_gateway)
+        host_deadline = host_source.index("proof_deadline = api_nodes_proof_deadline()")
         host_freeze = host_source.index("with _postgres_domain_nodes_write_freeze(kubectl):")
-        host_readback = host_source.index("readback = host_gateway_http_readback()")
-        host_bind = host_source.index("api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(")
+        host_readback = host_source.index(
+            "readback = host_gateway_http_readback(deadline=proof_deadline)"
+        )
+        host_bind = host_source.index(
+            "api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres("
+        )
         host_verified = host_source.index("verified_at_unix = int(time.time())")
+        self.assertLess(host_deadline, host_freeze)
         self.assertLess(host_freeze, host_readback)
         self.assertLess(host_readback, host_bind)
+        self.assertIn("deadline=proof_deadline", host_source[host_bind:host_verified])
         self.assertLess(host_bind, host_verified)
 
         final_source = inspect.getsource(staging.command_prove_backup_delete_to_prove)
+        final_deadline = final_source.index("proof_deadline = api_nodes_proof_deadline()")
         final_freeze = final_source.index("with _postgres_domain_nodes_write_freeze(kubectl):")
-        final_readback = final_source.index("fresh_host = host_gateway_http_readback()")
-        final_bind = final_source.index("fresh_api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(")
+        final_readback = final_source.index(
+            "fresh_host = host_gateway_http_readback(deadline=proof_deadline)"
+        )
+        final_bind = final_source.index(
+            "fresh_api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres("
+        )
         first_live_health = final_source.index("live_workloads = staging_live_health(kubectl)")
         final_mount_anchors = final_source.index(
             "refreshed_data_anchors = _mounted_retained_data_anchors(",
@@ -7009,8 +7118,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             first_live_health + 1,
         )
         final_observed = final_source.index("observed_at_unix = int(time.time())")
+        self.assertLess(final_deadline, final_freeze)
         self.assertLess(final_freeze, final_readback)
         self.assertLess(final_readback, final_bind)
+        self.assertIn(
+            "deadline=proof_deadline", final_source[final_bind:final_mount_anchors]
+        )
         self.assertLess(final_bind, final_mount_anchors)
         self.assertLess(final_mount_anchors, final_live_health)
         self.assertLess(final_live_health, final_observed)
@@ -7108,7 +7221,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         app_check = "require_gateway_app_current(kubectl, cell, promotion)"
         first_app_check = source.index(app_check)
-        final_host_readback = source.index("fresh_host = host_gateway_http_readback()")
+        final_host_readback = source.index(
+            "fresh_host = host_gateway_http_readback(deadline=proof_deadline)"
+        )
         second_app_check = source.index(app_check, first_app_check + len(app_check))
         self.assertLess(first_app_check, final_host_readback)
         self.assertLess(final_host_readback, second_app_check)

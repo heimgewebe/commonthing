@@ -1090,7 +1090,34 @@ class StagingGatewayTests(unittest.TestCase):
         with self.assertRaisesRegex(
             staging.StagingCellError, "strictly ordered by unique id"
         ):
-            staging._complete_api_nodes_readback(lambda _path: page)
+            staging._complete_api_nodes_readback(
+                lambda _path, *, timeout_seconds: page
+            )
+
+    def test_complete_node_proof_enforces_one_total_deadline_across_pages(self):
+        first = json.dumps(
+            {
+                "items": [{"id": "node-a"}],
+                "page": {
+                    "limit": staging.API_NODES_PROOF_PAGE_LIMIT,
+                    "next_cursor": "next",
+                    "has_more": True,
+                },
+            }
+        ).encode("utf-8")
+        fetch = mock.Mock(return_value=first)
+        with (
+            mock.patch.object(staging.time, "monotonic", side_effect=[90.0, 101.0]),
+            self.assertRaisesRegex(
+                staging.StagingCellError, "configured total timeout"
+            ),
+        ):
+            staging._complete_api_nodes_readback(fetch, deadline=100.0)
+        fetch.assert_called_once()
+        self.assertEqual(
+            fetch.call_args.kwargs["timeout_seconds"],
+            staging.API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS,
+        )
 
     def test_host_gateway_proof_revalidates_exact_app_around_readback(self) -> None:
         import inspect
@@ -1098,7 +1125,9 @@ class StagingGatewayTests(unittest.TestCase):
         source = inspect.getsource(staging.command_prove_host_gateway)
         promotion = source.index("promotion = _exact_cell_promotion(root, cell, active_commit)")
         before = source.index("require_gateway_app_current(kubectl, cell, promotion)")
-        readback = source.index("readback = host_gateway_http_readback()")
+        readback = source.index(
+            "readback = host_gateway_http_readback(deadline=proof_deadline)"
+        )
         after = source.index(
             "require_gateway_app_current(kubectl, cell, promotion)", before + 1
         )
@@ -1157,6 +1186,11 @@ class StagingGatewayTests(unittest.TestCase):
         self.assertEqual(result["api_nodes_count"], 1)
         fetch.assert_called_once()
         self.assertEqual(fetch.call_args.args[:3], ("node-1", "10.0.0.8", 80))
+        self.assertGreater(fetch.call_args.kwargs["timeout_seconds"], 0)
+        self.assertLessEqual(
+            fetch.call_args.kwargs["timeout_seconds"],
+            staging.API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS,
+        )
 
     def test_host_gateway_success_receipt_binds_exact_localhost_service_and_gateway(self):
         staging.command_prove_gateway(self.args)

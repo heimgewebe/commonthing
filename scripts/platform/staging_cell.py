@@ -4855,6 +4855,7 @@ API_NODES_PROOF_TIMEOUT_MAX_SECONDS = 6 * 60 * 60
 API_NODES_PROOF_KUBECTL_MARGIN_SECONDS = 30
 API_NODES_PROOF_POSTGRES_MARGIN_SECONDS = 60
 API_NODES_PROOF_FETCH_COUNT = 100
+API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS = 10.0
 
 
 def api_nodes_proof_timeouts() -> tuple[int, int, int]:
@@ -4883,13 +4884,57 @@ def api_nodes_proof_timeouts() -> tuple[int, int, int]:
     return outer_seconds, kubectl_seconds, postgres_seconds
 
 
-def _host_http_bytes(path: str) -> bytes:
+def api_nodes_proof_deadline() -> float:
+    outer_seconds, _, _ = api_nodes_proof_timeouts()
+    return time.monotonic() + float(outer_seconds)
+
+
+def _api_nodes_proof_remaining_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise StagingCellError(
+            "Gateway /api/nodes proof exceeded its configured total timeout"
+        )
+    return remaining
+
+
+def _api_nodes_http_request_timeout(deadline: float) -> float:
+    return min(
+        API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS,
+        _api_nodes_proof_remaining_seconds(deadline),
+    )
+
+
+def _api_nodes_proof_remaining_timeouts(deadline: float) -> tuple[float, int, int]:
+    configured_outer, _, _ = api_nodes_proof_timeouts()
+    remaining = min(
+        float(configured_outer), _api_nodes_proof_remaining_seconds(deadline)
+    )
+    if remaining <= API_NODES_PROOF_POSTGRES_MARGIN_SECONDS:
+        raise StagingCellError(
+            "insufficient API node proof time remains for the PostgreSQL projection"
+        )
+    kubectl_seconds = max(
+        1, int(remaining - API_NODES_PROOF_KUBECTL_MARGIN_SECONDS)
+    )
+    postgres_seconds = max(
+        1, int(remaining - API_NODES_PROOF_POSTGRES_MARGIN_SECONDS)
+    )
+    return remaining, kubectl_seconds, postgres_seconds
+
+
+def _host_http_bytes(
+    path: str, *, timeout_seconds: float = API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS
+) -> bytes:
     if not path.startswith("/") or "//" in path:
         raise StagingCellError("host Gateway probe path is invalid")
     url = f"http://127.0.0.1:{STAGING_GATEWAY_HOST_PORT}{path}"
     request = urllib.request.Request(url, method="GET")
+    bounded_timeout = max(
+        0.001, min(API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS, timeout_seconds)
+    )
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=bounded_timeout) as response:
             if response.status != 200:
                 raise StagingCellError(
                     f"host Gateway readback returned HTTP {response.status} for {path}"
@@ -4972,7 +5017,10 @@ def _canonical_api_nodes_snapshot(items: list[Any], *, page_count: int) -> dict[
     return accumulator.snapshot(page_count=page_count)
 
 
-def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
+def _complete_api_nodes_readback(
+    fetch_bytes: Any, *, deadline: float | None = None
+) -> dict[str, Any]:
+    deadline = deadline if deadline is not None else api_nodes_proof_deadline()
     accumulator = _CanonicalApiNodesAccumulator()
     cursor: str | None = None
     seen_cursors: set[str] = set()
@@ -4985,7 +5033,9 @@ def _complete_api_nodes_readback(fetch_bytes: Any) -> dict[str, Any]:
         if cursor is not None:
             query["cursor"] = cursor
         path = "/api/nodes?" + urllib.parse.urlencode(query)
-        raw = fetch_bytes(path)
+        raw = fetch_bytes(
+            path, timeout_seconds=_api_nodes_http_request_timeout(deadline)
+        )
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as error:
@@ -5105,8 +5155,15 @@ def _api_node_from_postgres_snapshot_row(row: Any) -> dict[str, Any] | None:
     return node
 
 
-def postgres_api_nodes_complete_readback(kubectl: str) -> dict[str, Any]:
-    outer_timeout, kubectl_timeout, postgres_timeout = api_nodes_proof_timeouts()
+def postgres_api_nodes_complete_readback(
+    kubectl: str, *, deadline: float | None = None
+) -> dict[str, Any]:
+    if deadline is None:
+        outer_timeout, kubectl_timeout, postgres_timeout = api_nodes_proof_timeouts()
+    else:
+        outer_timeout, kubectl_timeout, postgres_timeout = (
+            _api_nodes_proof_remaining_timeouts(deadline)
+        )
     sql = (
         "SELECT json_build_array(id,kind,title,lat,lon,created_at,updated_at,payload,"
         "search_visibility)::text FROM domain_nodes ORDER BY id ASC"
@@ -5153,9 +5210,13 @@ def postgres_api_nodes_complete_readback(kubectl: str) -> dict[str, Any]:
 
 
 def _bind_locked_api_nodes_http_to_postgres(
-    kubectl: str, http_snapshot: dict[str, Any], *, label: str
+    kubectl: str,
+    http_snapshot: dict[str, Any],
+    *,
+    label: str,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
-    database = postgres_api_nodes_complete_readback(kubectl)
+    database = postgres_api_nodes_complete_readback(kubectl, deadline=deadline)
     expected_source = "quiesced-postgres-api-projection-v1"
     if database.get("api_nodes_source") != expected_source:
         raise StagingCellError(f"{label} PostgreSQL projection source is invalid")
@@ -5179,10 +5240,20 @@ def _bind_locked_api_nodes_http_to_postgres(
     }
 
 
-def _kind_gateway_http_bytes(node: str, address: str, port: int, path: str) -> bytes:
+def _kind_gateway_http_bytes(
+    node: str,
+    address: str,
+    port: int,
+    path: str,
+    *,
+    timeout_seconds: float = API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS,
+) -> bytes:
     if not path.startswith("/") or "//" in path:
         raise StagingCellError("kind Gateway probe path is invalid")
     host = f"[{address}]" if ":" in address and not address.startswith("[") else address
+    bounded_timeout = max(
+        0.001, min(API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS, timeout_seconds)
+    )
     try:
         return subprocess.run(
             [
@@ -5194,14 +5265,14 @@ def _kind_gateway_http_bytes(node: str, address: str, port: int, path: str) -> b
                 "--silent",
                 "--show-error",
                 "--max-time",
-                "10",
+                f"{bounded_timeout:.3f}",
                 f"http://{host}:{port}{path}",
             ],
             cwd=ROOT,
             text=False,
             capture_output=True,
             check=True,
-            timeout=15,
+            timeout=bounded_timeout,
         ).stdout
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         raise StagingCellError("kind Gateway API snapshot readback failed") from error
@@ -5376,16 +5447,25 @@ def gateway_api_nodes_complete_readback(
         raise StagingCellError("Gateway API snapshot lost its proven kind probe node")
     if not address or not isinstance(port, int) or isinstance(port, bool):
         raise StagingCellError("Gateway API snapshot lost its proven address or listener")
+    deadline = api_nodes_proof_deadline()
     return _complete_api_nodes_readback(
-        lambda path: _kind_gateway_http_bytes(node, address, port, path)
+        lambda path, *, timeout_seconds: _kind_gateway_http_bytes(
+            node, address, port, path, timeout_seconds=timeout_seconds
+        ),
+        deadline=deadline,
     )
 
 
-def host_gateway_http_readback() -> dict[str, Any]:
-    health = _host_http_bytes("/health/live")
-    web = _host_http_bytes("/")
+def host_gateway_http_readback(*, deadline: float | None = None) -> dict[str, Any]:
+    deadline = deadline if deadline is not None else api_nodes_proof_deadline()
+    health = _host_http_bytes(
+        "/health/live", timeout_seconds=_api_nodes_http_request_timeout(deadline)
+    )
+    web = _host_http_bytes(
+        "/", timeout_seconds=_api_nodes_http_request_timeout(deadline)
+    )
     web_prefix = web[:1024]
-    nodes = _complete_api_nodes_readback(_host_http_bytes)
+    nodes = _complete_api_nodes_readback(_host_http_bytes, deadline=deadline)
     return {
         "probe_scope": "heim-pc-host-outside-kubernetes",
         "endpoint": f"http://127.0.0.1:{STAGING_GATEWAY_HOST_PORT}",
@@ -5626,10 +5706,14 @@ def command_prove_host_gateway(args: argparse.Namespace) -> dict[str, Any]:
     if node_port != STAGING_GATEWAY_NODE_PORT:
         raise StagingCellError("host Gateway proof NodePort is not pinned")
     require_gateway_app_current(kubectl, cell, promotion)
+    proof_deadline = api_nodes_proof_deadline()
     with _postgres_domain_nodes_write_freeze(kubectl):
-        readback = host_gateway_http_readback()
+        readback = host_gateway_http_readback(deadline=proof_deadline)
         api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(
-            kubectl, readback, label="host Gateway API snapshot"
+            kubectl,
+            readback,
+            label="host Gateway API snapshot",
+            deadline=proof_deadline,
         )
         require_gateway_app_current(kubectl, cell, promotion)
         if gateway_service_node_port(kubectl, require_exact=True) != (
@@ -6309,6 +6393,26 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
     reference.validate_owner_id(args.owner_id)
     root = state_root(getattr(args, "state_root", None))
     configure_reference_paths(root)
+    backup_down_path = root / BACKUP_DOWN_RECEIPT
+    if backup_down_path.exists() or backup_down_path.is_symlink():
+        backup_down = _private_json_receipt(
+            backup_down_path, label="backup delete-to-prove down receipt"
+        )
+        backup_status = backup_down.get("status")
+        if backup_status in {
+            "backup-quiesce-pending",
+            "backup-app-quiesced-data-stop-pending",
+            "backup-archive-creation-pending",
+            "backup-created-cluster-delete-pending",
+        }:
+            raise StagingCellError(
+                "cannot use ordinary down while backup delete-to-prove is pending; "
+                "resume the existing backup cycle first"
+            )
+        if backup_status != "backup-created-cluster-deleted-primary-data-empty":
+            raise StagingCellError(
+                "backup delete-to-prove down receipt has unexpected state"
+            )
     cell = load_cell_receipt(root)
     require_receipt_cluster(cell, args.cluster)
     commit = str(cell.get("bootstrap_commit") or "")
@@ -7548,6 +7652,18 @@ def _resume_backup_creation(
             # Reassert the app-side write freeze after any process restart. The
             # baseline was captured only after this freeze became observable.
             _quiesce_backup_app(kubectl)
+            resumed_baseline = postgres_api_nodes_complete_readback(kubectl)
+            for key in (
+                "api_nodes_sha256",
+                "api_nodes_count",
+                "api_nodes_pages",
+                "api_nodes_hash_scope",
+                "api_nodes_source",
+            ):
+                if resumed_baseline.get(key) != pending.get(f"pre_delete_{key}"):
+                    raise StagingCellError(
+                        "backup API baseline changed after app quiescence was resumed"
+                    )
             _quiesce_retained_data(kubectl)
             pre_delete = _mounted_retained_data_identity(
                 kind, args.cluster, root, durable=True, require_split=True
@@ -8296,10 +8412,14 @@ def command_prove_backup_delete_to_prove(args: argparse.Namespace) -> dict[str, 
     host_receipt = _private_json_receipt(
         host_path, label="host Gateway proof receipt"
     )
+    proof_deadline = api_nodes_proof_deadline()
     with _postgres_domain_nodes_write_freeze(kubectl):
-        fresh_host = host_gateway_http_readback()
+        fresh_host = host_gateway_http_readback(deadline=proof_deadline)
         fresh_api_nodes_consistency = _bind_locked_api_nodes_http_to_postgres(
-            kubectl, fresh_host, label="final host Gateway API snapshot"
+            kubectl,
+            fresh_host,
+            label="final host Gateway API snapshot",
+            deadline=proof_deadline,
         )
         require_gateway_app_current(kubectl, cell, promotion)
         if not gateway_receipt_current(root, cell, kubectl):
