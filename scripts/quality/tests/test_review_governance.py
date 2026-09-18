@@ -22,6 +22,7 @@ from scripts.quality.review_governance import (
     load_allowed_attesters,
     minimum_risk_for_paths,
     parse_risk_class,
+    _materialized_diff_has_text_hunk,
     _parse_numstat_z,
 )
 
@@ -652,6 +653,52 @@ class BundleTests(unittest.TestCase):
             )
 
             self.assertEqual(bundle.stats.opaque_files, ())
+
+    def test_materialized_text_hunk_proof_rejects_binary_markers(self) -> None:
+        for binary_marker in (
+            b"GIT binary patch\nliteral 0\n",
+            b"Binary files a/blob.bin and b/blob.bin differ\n",
+        ):
+            with self.subTest(binary_marker=binary_marker):
+                diff_bytes = (
+                    b"diff --git a/blob.bin b/blob.bin\n"
+                    + binary_marker
+                    + b"@@ -1 +1 @@\n"
+                )
+                self.assertFalse(
+                    _materialized_diff_has_text_hunk(diff_bytes, "blob.bin")
+                )
+
+    def test_materialized_text_hunk_proof_rejects_quoted_and_renamed_paths(self) -> None:
+        quoted = (
+            b'diff --git "a/space name.py" "b/space name.py"\n'
+            b"@@ -1 +1 @@\n"
+        )
+        renamed = (
+            b"diff --git a/old.py b/new.py\n"
+            b"similarity index 90%\n"
+            b"rename from old.py\n"
+            b"rename to new.py\n"
+            b"@@ -1 +1 @@\n"
+        )
+        self.assertFalse(
+            _materialized_diff_has_text_hunk(quoted, "space name.py")
+        )
+        self.assertFalse(_materialized_diff_has_text_hunk(renamed, "new.py"))
+
+    def test_materialized_text_hunk_proof_ignores_embedded_fake_headers(self) -> None:
+        diff_bytes = (
+            b"diff --git a/carrier.txt b/carrier.txt\n"
+            b"--- a/carrier.txt\n"
+            b"+++ b/carrier.txt\n"
+            b"@@ -1 +1,3 @@\n"
+            b" safe\n"
+            b"+diff --git a/target.py b/target.py\n"
+            b"+@@ -1 +1 @@\n"
+        )
+        self.assertFalse(
+            _materialized_diff_has_text_hunk(diff_bytes, "target.py")
+        )
 
     def test_materialized_patchless_file_without_text_hunk_stays_opaque(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
