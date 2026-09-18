@@ -1404,6 +1404,14 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("pr-after.json", self.workflow)
         self.assertIn("diff_file_count", self.workflow)
         self.assertIn("max_artifact_bytes", self.workflow)
+        self.assertIn('((.additions | type) == "number")', self.workflow)
+        self.assertIn('((.deletions | type) == "number")', self.workflow)
+        self.assertIn(".additions == 0", self.workflow)
+        self.assertIn(".deletions == 0", self.workflow)
+        self.assertNotIn(
+            'select((has("patch") | not) or .patch == null) |',
+            self.workflow,
+        )
         self.assertIn("/reviews?per_page=100", self.workflow)
         self.assertIn("--reviews-file", self.workflow)
         self.assertIn("Refresh current-head evidence before publication", self.workflow)

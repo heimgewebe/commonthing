@@ -198,6 +198,15 @@ jobs:
             )
           ' "${RUNNER_TEMP}/files.json" >/dev/null
 
+          jq -e '
+            all(.[];
+              ((.additions | type) == "number") and
+              ((.deletions | type) == "number") and
+              (.additions >= 0) and
+              (.deletions >= 0)
+            )
+          ' "${RUNNER_TEMP}/files.json" >/dev/null
+
           gh api -H "${api_header}" "${pr_api}" > "${RUNNER_TEMP}/pr-after.json"
           jq -e --arg base "${base_sha}" --arg head "${head_sha}" '
             .state == "open" and
@@ -227,7 +236,11 @@ jobs:
               deletions: $pr[0].deletions,
               opaque_files: [
                 $files[0][] |
-                select((has("patch") | not) or .patch == null) |
+                select(
+                  ((has("patch") | not) or .patch == null) and
+                  .additions == 0 and
+                  .deletions == 0
+                ) |
                 .filename
               ]
             }
