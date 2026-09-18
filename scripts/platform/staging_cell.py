@@ -100,12 +100,22 @@ class StagingCellError(RuntimeError):
     pass
 
 
+SHA256_FILE_CHUNK_BYTES = 1024 * 1024
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
 def sha256_file(path: Path) -> str:
-    return sha256_bytes(path.read_bytes())
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(SHA256_FILE_CHUNK_BYTES)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def run(
@@ -6509,6 +6519,21 @@ def command_down(args: argparse.Namespace) -> dict[str, Any]:
         if backup_status != "backup-created-cluster-deleted-primary-data-empty":
             raise StagingCellError(
                 "backup delete-to-prove down receipt has unexpected state"
+            )
+        backup_down = _load_backup_down_receipt(root)
+        backup_rebuild = _load_completed_backup_rebuild_receipt(root, backup_down)
+        completed_backup = _validated_existing_backup_delete_to_prove_receipt(
+            root,
+            cluster=str(backup_down.get("cluster") or ""),
+            owner_id=str(backup_down.get("owner_id") or ""),
+            release_commit=str(backup_rebuild.get("release_commit") or ""),
+            controller_commit=str(backup_rebuild.get("controller_commit") or ""),
+            down=backup_down,
+            rebuild=backup_rebuild,
+        )
+        if completed_backup is None:
+            raise StagingCellError(
+                "cannot use ordinary down until backup delete-to-prove is proven"
             )
     cell = load_cell_receipt(root)
     require_receipt_cluster(cell, args.cluster)

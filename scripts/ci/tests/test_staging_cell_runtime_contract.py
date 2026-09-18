@@ -988,6 +988,133 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 staging.command_down(args)
         delete_mock.assert_not_called()
 
+    def test_down_rejects_terminal_backup_cycle_without_final_proof(self) -> None:
+        owner = "owner-a"
+        down = {
+            "status": "backup-created-cluster-deleted-primary-data-empty",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+        }
+        rebuild = {
+            "release_commit": "b" * 40,
+            "controller_commit": "c" * 40,
+        }
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-down-backup-unproven-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(
+                root / staging.BACKUP_DOWN_RECEIPT,
+                {
+                    "schema_version": 1,
+                    "status": "backup-created-cluster-deleted-primary-data-empty",
+                },
+            )
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "_load_backup_down_receipt", return_value=down
+                ),
+                mock.patch.object(
+                    staging,
+                    "_load_completed_backup_rebuild_receipt",
+                    return_value=rebuild,
+                ),
+                mock.patch.object(
+                    staging,
+                    "_validated_existing_backup_delete_to_prove_receipt",
+                    return_value=None,
+                ) as final_proof,
+                mock.patch.object(staging, "load_cell_receipt") as load_cell,
+                mock.patch.object(
+                    staging.reference, "delete_owned_cluster_if_present"
+                ) as delete_mock,
+                self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "ordinary down until backup delete-to-prove is proven",
+                ),
+            ):
+                staging.command_down(args)
+
+        final_proof.assert_called_once_with(
+            root,
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            release_commit="b" * 40,
+            controller_commit="c" * 40,
+            down=down,
+            rebuild=rebuild,
+        )
+        load_cell.assert_not_called()
+        delete_mock.assert_not_called()
+
+    def test_down_allows_terminal_backup_cycle_after_final_proof(self) -> None:
+        owner = "owner-a"
+        commit = "e" * 40
+        down = {
+            "status": "backup-created-cluster-deleted-primary-data-empty",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+        }
+        rebuild = {
+            "release_commit": "b" * 40,
+            "controller_commit": "c" * 40,
+        }
+        args = argparse.Namespace(cluster=staging.DEFAULT_CLUSTER, owner_id=owner)
+        with tempfile.TemporaryDirectory(
+            prefix="staging-cell-down-backup-proven-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            self._write_bound_receipt(root, owner=owner, commit=commit)
+            staging.atomic_json(
+                root / staging.BACKUP_DOWN_RECEIPT,
+                {
+                    "schema_version": 1,
+                    "status": "backup-created-cluster-deleted-primary-data-empty",
+                },
+            )
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "_load_backup_down_receipt", return_value=down
+                ),
+                mock.patch.object(
+                    staging,
+                    "_load_completed_backup_rebuild_receipt",
+                    return_value=rebuild,
+                ),
+                mock.patch.object(
+                    staging,
+                    "_validated_existing_backup_delete_to_prove_receipt",
+                    return_value={"status": "backup-delete-to-prove-verified"},
+                ) as final_proof,
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(staging.reference, "clusters", return_value=[]),
+                mock.patch.object(
+                    staging.reference,
+                    "delete_owned_cluster_if_present",
+                    return_value=True,
+                ) as delete_mock,
+            ):
+                result = staging.command_down(args)
+
+        final_proof.assert_called_once_with(
+            root,
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            release_commit="b" * 40,
+            controller_commit="c" * 40,
+            down=down,
+            rebuild=rebuild,
+        )
+        delete_mock.assert_called_once()
+        self.assertEqual(result["status"], "cluster-absent-state-preserved")
+
     def test_down_fails_closed_for_wrong_owner_or_marker_binding(self) -> None:
         owner = "owner-a"
         commit = "e" * 40
@@ -7409,6 +7536,24 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     down=down,
                     rebuild=rebuild,
                 )
+
+    def test_backup_archive_hash_streams_without_whole_file_read(self) -> None:
+        payload = b"x" * (staging.SHA256_FILE_CHUNK_BYTES + 37)
+        with tempfile.TemporaryDirectory(
+            prefix="staging-backup-archive-streaming-hash-"
+        ) as tmp_name:
+            path = Path(tmp_name) / "postgres.tar"
+            path.write_bytes(payload)
+            path.chmod(0o600)
+            with mock.patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("whole-file archive read"),
+            ):
+                entry = staging._backup_archive_entry("postgres", path)
+
+        self.assertEqual(entry["sha256"], staging.sha256_bytes(payload))
+        self.assertEqual(entry["bytes"], len(payload))
 
     def test_backup_archive_verification_rejects_receipt_and_file_tamper(self) -> None:
         release = "7" * 40
