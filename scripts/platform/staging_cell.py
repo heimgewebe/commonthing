@@ -15,6 +15,7 @@ import json
 import os
 import secrets
 import selectors
+import signal
 import shutil
 import stat
 import subprocess
@@ -4914,6 +4915,47 @@ def _api_nodes_http_request_timeout(deadline: float) -> float:
     )
 
 
+@contextmanager
+def _api_nodes_proof_hard_deadline(deadline: float):
+    remaining = _api_nodes_proof_remaining_seconds(deadline)
+    try:
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    except (AttributeError, ValueError, OSError) as error:
+        raise StagingCellError(
+            "Gateway /api/nodes hard deadline is unavailable"
+        ) from error
+    if previous_timer[0] > 0 or previous_timer[1] > 0:
+        raise StagingCellError(
+            "Gateway /api/nodes hard deadline conflicts with an existing process alarm"
+        )
+
+    def expire(_signum: int, _frame: Any) -> None:
+        raise StagingCellError(
+            "Gateway /api/nodes proof exceeded its configured total timeout"
+        )
+
+    handler_installed = False
+    try:
+        signal.signal(signal.SIGALRM, expire)
+        handler_installed = True
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+    except (ValueError, OSError) as error:
+        if handler_installed:
+            try:
+                signal.signal(signal.SIGALRM, previous_handler)
+            except (ValueError, OSError):
+                pass
+        raise StagingCellError(
+            "Gateway /api/nodes hard deadline could not be armed"
+        ) from error
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def _api_nodes_proof_remaining_timeouts(deadline: float) -> tuple[float, int, int]:
     configured_outer, _, _ = api_nodes_proof_timeouts()
     remaining = min(
@@ -4943,9 +4985,10 @@ def _host_http_bytes(
     bounded_timeout = max(
         0.001, min(API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS, timeout_seconds)
     )
-    request_deadline = (
-        deadline if deadline is not None else time.monotonic() + bounded_timeout
-    )
+    request_started = time.monotonic()
+    request_deadline = request_started + bounded_timeout
+    if deadline is not None:
+        request_deadline = min(request_deadline, deadline)
     connection = http.client.HTTPConnection(
         "127.0.0.1",
         STAGING_GATEWAY_HOST_PORT,
@@ -4958,33 +5001,34 @@ def _host_http_bytes(
         ),
     )
     try:
-        connection.request("GET", path)
-        response = connection.getresponse()
-        if response.status != 200:
-            raise StagingCellError(
-                f"host Gateway readback returned HTTP {response.status} for {path}"
-            )
-        body = bytearray()
-        while len(body) <= HOST_HTTP_PROOF_MAX_BYTES:
-            remaining = _api_nodes_proof_remaining_seconds(request_deadline)
-            if connection.sock is not None:
-                connection.sock.settimeout(
-                    max(0.001, min(bounded_timeout, remaining))
-                )
-            chunk = response.read1(
-                min(
-                    HOST_HTTP_PROOF_READ_CHUNK_BYTES,
-                    HOST_HTTP_PROOF_MAX_BYTES + 1 - len(body),
-                )
-            )
-            if not chunk:
-                break
-            body.extend(chunk)
-            if len(body) > HOST_HTTP_PROOF_MAX_BYTES:
+        with _api_nodes_proof_hard_deadline(request_deadline):
+            connection.request("GET", path)
+            response = connection.getresponse()
+            if response.status != 200:
                 raise StagingCellError(
-                    f"host Gateway response exceeds {HOST_HTTP_PROOF_MAX_BYTES} bytes for {path}"
+                    f"host Gateway readback returned HTTP {response.status} for {path}"
                 )
-        return bytes(body)
+            body = bytearray()
+            while len(body) <= HOST_HTTP_PROOF_MAX_BYTES:
+                remaining = _api_nodes_proof_remaining_seconds(request_deadline)
+                if connection.sock is not None:
+                    connection.sock.settimeout(
+                        max(0.001, min(bounded_timeout, remaining))
+                    )
+                chunk = response.read1(
+                    min(
+                        HOST_HTTP_PROOF_READ_CHUNK_BYTES,
+                        HOST_HTTP_PROOF_MAX_BYTES + 1 - len(body),
+                    )
+                )
+                if not chunk:
+                    break
+                body.extend(chunk)
+                if len(body) > HOST_HTTP_PROOF_MAX_BYTES:
+                    raise StagingCellError(
+                        f"host Gateway response exceeds {HOST_HTTP_PROOF_MAX_BYTES} bytes for {path}"
+                    )
+            return bytes(body)
     except (OSError, http.client.HTTPException) as error:
         raise StagingCellError(
             f"host Gateway readback failed for localhost:{STAGING_GATEWAY_HOST_PORT}{path}"
@@ -8034,7 +8078,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
                     "1",
                     "-delete",
                 ],
-                timeout=120,
+                timeout=backup_timeout,
             )
             occupied = output(
                 [

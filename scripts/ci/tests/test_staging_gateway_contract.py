@@ -1143,6 +1143,31 @@ class StagingGatewayTests(unittest.TestCase):
         self.assertIn("path: platform/clusters/staging/kind.yaml", registry)
         self.assertIn("scripts/ci/tests/test_staging_gateway_contract.py", registry)
 
+    def test_hard_deadline_restores_handler_when_timer_arm_fails(self):
+        previous_handler = object()
+        with (
+            mock.patch.object(staging.time, "monotonic", return_value=90.0),
+            mock.patch.object(
+                staging.signal, "getsignal", return_value=previous_handler
+            ),
+            mock.patch.object(staging.signal, "getitimer", return_value=(0.0, 0.0)),
+            mock.patch.object(staging.signal, "signal") as signal_handler,
+            mock.patch.object(
+                staging.signal, "setitimer", side_effect=OSError("timer unavailable")
+            ),
+            self.assertRaisesRegex(
+                staging.StagingCellError, "hard deadline could not be armed"
+            ),
+        ):
+            with staging._api_nodes_proof_hard_deadline(100.0):
+                self.fail("deadline guard unexpectedly entered")
+
+        self.assertEqual(signal_handler.call_count, 2)
+        self.assertEqual(
+            signal_handler.call_args_list[1],
+            mock.call(staging.signal.SIGALRM, previous_handler),
+        )
+
     def test_host_http_readback_rejects_oversized_response_instead_of_truncating(self):
         response = mock.MagicMock()
         response.status = 200
@@ -1172,7 +1197,9 @@ class StagingGatewayTests(unittest.TestCase):
                 staging.http.client, "HTTPConnection", return_value=connection
             ),
             mock.patch.object(
-                staging.time, "monotonic", side_effect=[90.0, 90.0, 101.0]
+                staging.time,
+                "monotonic",
+                side_effect=[90.0, 90.0, 90.0, 90.0, 101.0],
             ),
             self.assertRaisesRegex(
                 staging.StagingCellError, "configured total timeout"
@@ -1185,6 +1212,47 @@ class StagingGatewayTests(unittest.TestCase):
             )
         response.read1.assert_called_once()
         connection.sock.settimeout.assert_called_once_with(10.0)
+        connection.close.assert_called_once()
+
+    def test_host_http_hard_deadline_wraps_header_parsing(self):
+        active = {"value": False}
+
+        class Guard:
+            def __enter__(self):
+                active["value"] = True
+                return None
+
+            def __exit__(self, *_args):
+                active["value"] = False
+                return False
+
+        def getresponse():
+            self.assertTrue(active["value"])
+            raise staging.StagingCellError("header parse interrupted by hard deadline")
+
+        connection = mock.MagicMock()
+        connection.getresponse.side_effect = getresponse
+        with (
+            mock.patch.object(
+                staging.http.client, "HTTPConnection", return_value=connection
+            ),
+            mock.patch.object(
+                staging, "_api_nodes_proof_hard_deadline", return_value=Guard()
+            ) as guard,
+            mock.patch.object(staging.time, "monotonic", return_value=90.0),
+            self.assertRaisesRegex(
+                staging.StagingCellError, "header parse interrupted by hard deadline"
+            ),
+        ):
+            staging._host_http_bytes(
+                "/api/nodes?pagination=cursor&limit=10",
+                timeout_seconds=10.0,
+                deadline=100.0,
+            )
+        guard.assert_called_once_with(100.0)
+        connection.request.assert_called_once_with(
+            "GET", "/api/nodes?pagination=cursor&limit=10"
+        )
         connection.close.assert_called_once()
 
     def test_canonical_node_snapshot_is_independent_of_page_order(self):

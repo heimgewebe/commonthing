@@ -5789,6 +5789,11 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             root = Path(tmp_name)
             staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
             with (
+                mock.patch.dict(
+                    staging.os.environ,
+                    {staging.BACKUP_TRANSFER_TIMEOUT_ENV: "1800"},
+                    clear=False,
+                ),
                 mock.patch.object(staging, "state_root", return_value=root),
                 mock.patch.object(staging, "configure_reference_paths"),
                 mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
@@ -5804,7 +5809,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                         pre_delete,
                         staging.StagingCellError("stop after archive restore"),
                     ],
-                ),
+                ) as fingerprint,
                 mock.patch.object(staging, "_retained_mount_node", return_value="data-node"),
                 mock.patch.object(staging, "run") as run_command,
                 mock.patch.object(staging, "output", return_value="") as read_command,
@@ -5817,7 +5822,15 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 ):
                     staging.command_backup_delete_to_prove_rebuild(args)
         self.assertEqual(run_command.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in run_command.call_args_list],
+            [1800, 1800],
+        )
         self.assertEqual(read_command.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["timeout_seconds"] for call in fingerprint.call_args_list],
+            [1800, 1800],
+        )
         restore.assert_called_once_with(
             "kind",
             staging.DEFAULT_CLUSTER,
