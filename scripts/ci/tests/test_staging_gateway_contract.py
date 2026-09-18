@@ -4,6 +4,8 @@ import argparse
 import copy
 import json
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -963,11 +965,39 @@ class StagingGatewayTests(unittest.TestCase):
 
         api_source = inspect.getsource(staging._complete_api_nodes_readback)
         postgres_source = inspect.getsource(staging.postgres_api_nodes_complete_readback)
+        stream_source = inspect.getsource(staging.stream_output_lines)
         self.assertNotIn("items.extend", api_source)
         self.assertNotIn("_canonical_api_nodes_snapshot", api_source)
         self.assertIn("_CanonicalApiNodesAccumulator", api_source)
         self.assertIn("stream_output_lines", postgres_source)
         self.assertNotIn("output(", postgres_source)
+        self.assertIn("subprocess.Popen", stream_source)
+        self.assertIn("selectors.DefaultSelector", stream_source)
+        self.assertNotIn("TemporaryFile", stream_source)
+
+    def test_stream_output_lines_reads_pipe_and_enforces_timeout(self):
+        lines = list(
+            staging.stream_output_lines(
+                [
+                    sys.executable,
+                    "-c",
+                    "print('node-a'); print('node-b')",
+                ],
+                timeout=5,
+            )
+        )
+        self.assertEqual(lines, ["node-a", "node-b"])
+        with self.assertRaises(subprocess.TimeoutExpired):
+            list(
+                staging.stream_output_lines(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import time; print('node-a', flush=True); time.sleep(2)",
+                    ],
+                    timeout=0.05,
+                )
+            )
 
     def test_complete_node_proof_rejects_non_monotonic_cursor_items(self):
         page = json.dumps(

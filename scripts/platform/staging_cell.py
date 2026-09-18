@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 import secrets
+import selectors
 import shutil
 import stat
 import subprocess
@@ -131,28 +132,93 @@ def output(argv: list[str], *, timeout: float | None = None) -> str:
     return run(argv, capture=True, timeout=timeout).stdout.strip()
 
 
+STREAM_OUTPUT_MAX_LINE_BYTES = 1024 * 1024
+
+
 def stream_output_lines(
     argv: list[str], *, timeout: float | None = None
 ):
-    """Run a bounded command without retaining its complete stdout in memory."""
+    """Stream bounded command stdout line-by-line without whole-output buffering."""
     print("+ external command [arguments redacted]", file=sys.stderr, flush=True)
-    with tempfile.TemporaryFile(mode="w+b") as handle:
-        subprocess.run(
-            argv,
-            cwd=ROOT,
-            stdout=handle,
-            stderr=sys.stderr,
-            check=True,
-            timeout=timeout,
-        )
-        handle.seek(0)
-        for raw_line in handle:
-            try:
-                yield raw_line.decode("utf-8").rstrip("\r\n")
-            except UnicodeDecodeError as error:
-                raise StagingCellError(
-                    "external command emitted non-UTF-8 proof output"
-                ) from error
+    started = time.monotonic()
+    process = subprocess.Popen(
+        argv,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=None,
+    )
+    if process.stdout is None:
+        process.kill()
+        process.wait()
+        raise StagingCellError("external command stdout pipe is unavailable")
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    buffer = bytearray()
+
+    def remaining_timeout() -> float | None:
+        if timeout is None:
+            return None
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return remaining
+
+    def decode_line(raw_line: bytes) -> str:
+        if len(raw_line) > STREAM_OUTPUT_MAX_LINE_BYTES:
+            raise StagingCellError(
+                "external command proof line exceeds the bounded line limit"
+            )
+        if raw_line.endswith(b"\r"):
+            raw_line = raw_line[:-1]
+        try:
+            return raw_line.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise StagingCellError(
+                "external command emitted non-UTF-8 proof output"
+            ) from error
+
+    try:
+        eof = False
+        while not eof:
+            remaining = remaining_timeout()
+            wait = None if remaining is None else min(remaining, 0.5)
+            events = selector.select(wait)
+            if not events:
+                continue
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                if not chunk:
+                    eof = True
+                    break
+                buffer.extend(chunk)
+                while True:
+                    newline = buffer.find(b"\n")
+                    if newline < 0:
+                        if len(buffer) > STREAM_OUTPUT_MAX_LINE_BYTES:
+                            raise StagingCellError(
+                                "external command proof line exceeds the bounded line limit"
+                            )
+                        break
+                    raw_line = bytes(buffer[:newline])
+                    del buffer[: newline + 1]
+                    yield decode_line(raw_line)
+        if buffer:
+            yield decode_line(bytes(buffer))
+            buffer.clear()
+        returncode = process.wait(timeout=remaining_timeout())
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, argv)
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
 
 
 def stream_command_to_file(
