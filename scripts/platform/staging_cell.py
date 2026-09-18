@@ -5381,9 +5381,14 @@ def postgres_api_nodes_complete_readback(
         outer_timeout, kubectl_timeout, postgres_timeout = (
             _api_nodes_proof_remaining_timeouts(deadline)
         )
+    # /api/nodes cursor pages are ordered by Rust String::cmp. PostgreSQL's
+    # database collation may be locale-aware, so sort the id's explicit UTF-8
+    # byte representation instead. bytea ordering is binary and therefore keeps
+    # this proof independent of the cluster locale while matching Rust strings.
     sql = (
         "SELECT json_build_array(id,kind,title,lat,lon,created_at,updated_at,payload,"
-        "search_visibility)::text FROM domain_nodes ORDER BY id ASC;"
+        "search_visibility)::text FROM domain_nodes "
+        "ORDER BY convert_to(id, 'UTF8') ASC;"
     )
     command = [
         kubectl,

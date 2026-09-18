@@ -1041,7 +1041,9 @@ class StagingGatewayTests(unittest.TestCase):
             command_text,
         )
         self.assertNotIn('-c "$1"', command_text)
-        self.assertTrue(command[-1].endswith("ORDER BY id ASC;"))
+        self.assertTrue(
+            command[-1].endswith("ORDER BY convert_to(id, 'UTF8') ASC;")
+        )
         self.assertEqual(stream.call_args.kwargs["timeout"], outer_timeout)
 
     def test_postgres_complete_readback_maps_valid_timeout_override_to_all_budgets(self):
@@ -1066,8 +1068,30 @@ class StagingGatewayTests(unittest.TestCase):
             command_text,
         )
         self.assertIn("timeout --signal=TERM --kill-after=5s 1740s", command_text)
-        self.assertTrue(command[-1].endswith("ORDER BY id ASC;"))
+        self.assertTrue(
+            command[-1].endswith("ORDER BY convert_to(id, 'UTF8') ASC;")
+        )
         self.assertEqual(stream.call_args.kwargs["timeout"], 1800)
+
+    def test_postgres_complete_readback_uses_rust_utf8_byte_order(self):
+        with mock.patch.object(
+            staging, "stream_output_lines", return_value=[]
+        ) as stream:
+            staging.postgres_api_nodes_complete_readback("kubectl")
+
+        sql = stream.call_args.args[0][-1]
+        self.assertIn("ORDER BY convert_to(id, 'UTF8') ASC;", sql)
+
+        # Rust String::cmp follows UTF-8 byte order for valid strings. This
+        # fixture includes ASCII case and non-ASCII text, which locale
+        # collations may order differently.
+        ids = ["node-ä", "node-a", "node-Z"]
+        expected = ["node-Z", "node-a", "node-ä"]
+        self.assertEqual(sorted(ids), expected)
+        self.assertEqual(
+            sorted(ids, key=lambda value: value.encode("utf-8")),
+            expected,
+        )
 
     def test_api_nodes_proof_timeout_rejects_invalid_values_fail_closed(self):
         invalid = (
