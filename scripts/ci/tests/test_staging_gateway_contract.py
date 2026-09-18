@@ -1035,6 +1035,8 @@ class StagingGatewayTests(unittest.TestCase):
             f"FETCH_COUNT={staging.API_NODES_PROOF_FETCH_COUNT}",
             command_text,
         )
+        self.assertIn('printf "%s\\n" "$1" |', command_text)
+        self.assertNotIn('-c "$1"', command_text)
         self.assertEqual(stream.call_args.kwargs["timeout"], outer_timeout)
 
     def test_postgres_complete_readback_maps_valid_timeout_override_to_all_budgets(self):

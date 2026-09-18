@@ -5277,9 +5277,9 @@ def postgres_api_nodes_complete_readback(
         "sh",
         "-eu",
         "-c",
-        f'PGOPTIONS="-c statement_timeout={postgres_timeout * 1000}" '
+        f'printf "%s\\n" "$1" | PGOPTIONS="-c statement_timeout={postgres_timeout * 1000}" '
         f'exec psql -XAt -v ON_ERROR_STOP=1 -v FETCH_COUNT={API_NODES_PROOF_FETCH_COUNT} '
-        '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"',
+        '-U "$POSTGRES_USER" -d "$POSTGRES_DB"',
         "sh",
         sql,
     ]
