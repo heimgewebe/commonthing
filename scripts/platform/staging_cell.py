@@ -2381,6 +2381,55 @@ def _quiesce_backup_cell(kubectl: str) -> None:
     _quiesce_retained_data(kubectl)
 
 
+def _prepare_backup_data_stop_retry(kubectl: str) -> None:
+    replicas = output(
+        [
+            kubectl,
+            "get",
+            "deployment",
+            "postgres",
+            "-n",
+            DATA_NAMESPACE,
+            "-o",
+            "jsonpath={.spec.replicas}",
+        ],
+        timeout=30,
+    )
+    if replicas not in {"0", "1"}:
+        raise StagingCellError(
+            "backup PostgreSQL retry requires a canonical deployment replica state"
+        )
+    # A previous controller can exit after scaling the data plane to zero but
+    # before advancing the durable receipt. Keep reconciliation suspended,
+    # restart only PostgreSQL, and establish a fresh write-locked semantic
+    # baseline before attempting the protected shutdown again.
+    _set_data_reconciliation_suspended(kubectl, suspended=True)
+    if replicas == "0":
+        run(
+            [
+                kubectl,
+                "scale",
+                "deployment/postgres",
+                "-n",
+                DATA_NAMESPACE,
+                "--replicas=1",
+            ],
+            timeout=60,
+        )
+    run(
+        [
+            kubectl,
+            "rollout",
+            "status",
+            "deployment/postgres",
+            "-n",
+            DATA_NAMESPACE,
+            "--timeout=2m",
+        ],
+        timeout=150,
+    )
+
+
 def _quiesce_retained_data(
     kubectl: str, *, fast_stop_postgres: bool = False
 ) -> None:
@@ -5690,6 +5739,7 @@ def require_gateway_app_current(kubectl: str, cell: dict, promotion: dict) -> No
 def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
     root = state_root(getattr(args, "state_root", None))
     configure_reference_paths(root)
+    _require_backup_release_mutation_allowed(root, str(args.source_commit or ""))
     cell = load_cell_receipt(root)
     require_receipt_cluster(cell, args.cluster)
     if args.owner_id != cell.get("owner_id"):
@@ -7963,37 +8013,31 @@ def _resume_backup_creation(
             # controlled fast shutdown. This makes the persisted baseline and
             # the subsequent cold filesystem snapshot one atomic write epoch.
             _quiesce_backup_app(kubectl)
+            if status == "backup-app-quiesced-data-stop-pending":
+                _prepare_backup_data_stop_retry(kubectl)
             with _postgres_domain_nodes_write_freeze(
                 kubectl, expect_postgres_shutdown=True
             ):
                 baseline = postgres_api_nodes_complete_readback(kubectl)
-                if status == "backup-app-quiesced-data-stop-pending":
-                    for key in (
-                        "api_nodes_sha256",
-                        "api_nodes_count",
-                        "api_nodes_pages",
-                        "api_nodes_hash_scope",
-                        "api_nodes_source",
-                    ):
-                        if baseline.get(key) != pending.get(f"pre_delete_{key}"):
-                            raise StagingCellError(
-                                "backup API baseline changed after app quiescence was resumed"
-                            )
-                else:
-                    persisted = dict(pending)
-                    persisted.pop("receipt_sha256", None)
-                    persisted.pop("receipt_path", None)
-                    pending = {
-                        **persisted,
-                        "status": "backup-app-quiesced-data-stop-pending",
-                        "pre_delete_api_nodes_sha256": baseline["api_nodes_sha256"],
-                        "pre_delete_api_nodes_count": baseline["api_nodes_count"],
-                        "pre_delete_api_nodes_pages": baseline["api_nodes_pages"],
-                        "pre_delete_api_nodes_hash_scope": baseline["api_nodes_hash_scope"],
-                        "pre_delete_api_nodes_source": baseline["api_nodes_source"],
-                        "backup_archives": {},
-                    }
-                    atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
+                # No cold backup exists yet in either pending state. On retry,
+                # a previous controller may have released its lock while the
+                # deployment was already scaling to zero. Re-baseline under a
+                # fresh write freeze, persist it, and keep that same freeze
+                # through the new controlled shutdown.
+                persisted = dict(pending)
+                persisted.pop("receipt_sha256", None)
+                persisted.pop("receipt_path", None)
+                pending = {
+                    **persisted,
+                    "status": "backup-app-quiesced-data-stop-pending",
+                    "pre_delete_api_nodes_sha256": baseline["api_nodes_sha256"],
+                    "pre_delete_api_nodes_count": baseline["api_nodes_count"],
+                    "pre_delete_api_nodes_pages": baseline["api_nodes_pages"],
+                    "pre_delete_api_nodes_hash_scope": baseline["api_nodes_hash_scope"],
+                    "pre_delete_api_nodes_source": baseline["api_nodes_source"],
+                    "backup_archives": {},
+                }
+                atomic_json(root / BACKUP_DOWN_RECEIPT, pending)
                 _quiesce_retained_data(kubectl, fast_stop_postgres=True)
             pre_delete = _mounted_retained_data_identity(
                 kind,

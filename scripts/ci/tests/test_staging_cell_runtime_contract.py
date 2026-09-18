@@ -6213,6 +6213,45 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertLess(guard, host_receipt_write)
         self.assertLess(guard, cell_receipt_write)
 
+    def test_gateway_proof_blocks_pending_backup_before_receipt_mutation(self) -> None:
+        import inspect
+
+        release = "7" * 40
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id="test:t084",
+            source_commit=release,
+            state_root="/ignored-by-test",
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-gateway-proof-guard-") as tmp_name:
+            root = Path(tmp_name)
+            down_path = root / staging.BACKUP_DOWN_RECEIPT
+            down_path.parent.mkdir(parents=True, exist_ok=True)
+            down_path.write_text("{}\n", encoding="utf-8")
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging,
+                    "_load_backup_down_receipt",
+                    return_value={"status": "backup-quiesce-pending"},
+                ),
+                mock.patch.object(staging, "load_cell_receipt") as load_cell,
+                self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "resume the existing backup cycle first",
+                ),
+            ):
+                staging.command_prove_gateway(args)
+            load_cell.assert_not_called()
+
+        source = inspect.getsource(staging.command_prove_gateway)
+        guard = source.index(
+            '_require_backup_release_mutation_allowed(root, str(args.source_commit or ""))'
+        )
+        cell_load = source.index("cell = load_cell_receipt(root)")
+        self.assertLess(guard, cell_load)
+
     def test_completed_backup_recovery_activation_retry_is_idempotent_before_mutation(self) -> None:
         release = "7" * 40
         controller = "8" * 40
@@ -7103,6 +7142,44 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertIs(type(location["lat"]), float)
         self.assertIs(type(location["lon"]), float)
 
+    def test_backup_data_stop_retry_restarts_postgres_from_zero_replicas(self) -> None:
+        with (
+            mock.patch.object(staging, "output", return_value="0"),
+            mock.patch.object(staging, "_set_data_reconciliation_suspended") as suspend,
+            mock.patch.object(staging, "run") as run_command,
+        ):
+            staging._prepare_backup_data_stop_retry("kubectl")
+
+        suspend.assert_called_once_with("kubectl", suspended=True)
+        self.assertEqual(
+            run_command.call_args_list,
+            [
+                mock.call(
+                    [
+                        "kubectl",
+                        "scale",
+                        "deployment/postgres",
+                        "-n",
+                        staging.DATA_NAMESPACE,
+                        "--replicas=1",
+                    ],
+                    timeout=60,
+                ),
+                mock.call(
+                    [
+                        "kubectl",
+                        "rollout",
+                        "status",
+                        "deployment/postgres",
+                        "-n",
+                        staging.DATA_NAMESPACE,
+                        "--timeout=2m",
+                    ],
+                    timeout=150,
+                ),
+            ],
+        )
+
     def test_backup_resume_continues_from_app_quiesced_data_stop_state(self) -> None:
         pending = {
             "status": "backup-app-quiesced-data-stop-pending",
@@ -7139,6 +7216,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(staging.reference, "require_owned_cluster"),
                 mock.patch.object(staging, "_quiesce_backup_app") as app_quiesce,
                 mock.patch.object(
+                    staging, "_prepare_backup_data_stop_retry"
+                ) as prepare_retry,
+                mock.patch.object(
                     staging,
                     "postgres_api_nodes_complete_readback",
                     return_value=baseline,
@@ -7164,6 +7244,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 )
         self.assertEqual(result["status"], "completed")
         app_quiesce.assert_called_once_with("kubectl")
+        prepare_retry.assert_called_once_with("kubectl")
         api_baseline.assert_called_once_with("kubectl")
         write_freeze.assert_called_once_with(
             "kubectl", expect_postgres_shutdown=True
@@ -7177,7 +7258,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             completed_pending["status"], "backup-created-cluster-delete-pending"
         )
 
-    def test_backup_resume_rejects_changed_api_baseline_before_data_stop(self) -> None:
+    def test_backup_resume_rebaselines_changed_api_snapshot_before_retry_shutdown(self) -> None:
         pending = {
             "status": "backup-app-quiesced-data-stop-pending",
             "bootstrap_commit": "a" * 40,
@@ -7195,13 +7276,14 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         changed = {
             "api_nodes_sha256": "4" * 64,
-            "api_nodes_count": 2,
+            "api_nodes_count": 3,
             "api_nodes_pages": 1,
             "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
             "api_nodes_source": "quiesced-postgres-api-projection-v1",
         }
+        identity = {"postgres": {"sha256": "1" * 64}, "nats": {"sha256": "2" * 64}}
         with tempfile.TemporaryDirectory(
-            prefix="staging-backup-api-baseline-changed-"
+            prefix="staging-backup-api-baseline-rebase-"
         ) as tmp_name:
             root = Path(tmp_name)
             with (
@@ -7213,6 +7295,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 ),
                 mock.patch.object(staging.reference, "require_owned_cluster"),
                 mock.patch.object(staging, "_quiesce_backup_app"),
+                mock.patch.object(staging, "_prepare_backup_data_stop_retry") as prepare_retry,
                 mock.patch.object(
                     staging,
                     "postgres_api_nodes_complete_readback",
@@ -7224,13 +7307,32 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     return_value=mock.MagicMock(),
                 ),
                 mock.patch.object(staging, "_quiesce_retained_data") as data_quiesce,
-                self.assertRaisesRegex(
-                    staging.StagingCellError,
-                    "backup API baseline changed after app quiescence was resumed",
+                mock.patch.object(
+                    staging, "_mounted_retained_data_identity", return_value=identity
                 ),
+                mock.patch.object(staging, "_backup_volume_archives", return_value={}),
+                mock.patch.object(
+                    staging,
+                    "_complete_backup_down_from_pending",
+                    return_value={"status": "completed"},
+                ) as complete,
             ):
-                staging._resume_backup_creation(root, args, pending, resumed=True)
-        data_quiesce.assert_not_called()
+                result = staging._resume_backup_creation(
+                    root, args, pending, resumed=True
+                )
+
+        self.assertEqual(result["status"], "completed")
+        prepare_retry.assert_called_once_with("kubectl")
+        data_quiesce.assert_called_once_with("kubectl", fast_stop_postgres=True)
+        completed_pending = complete.call_args.args[2]
+        self.assertEqual(
+            completed_pending["pre_delete_api_nodes_sha256"],
+            changed["api_nodes_sha256"],
+        )
+        self.assertEqual(
+            completed_pending["pre_delete_api_nodes_count"],
+            changed["api_nodes_count"],
+        )
 
     def test_backup_resume_revalidates_release_receipts_before_runtime(self) -> None:
         release = "b" * 40
