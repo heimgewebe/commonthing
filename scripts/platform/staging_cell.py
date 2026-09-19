@@ -6071,6 +6071,34 @@ def host_gateway_receipt_current(root: Path, cell: dict[str, Any], kubectl: str)
         return False
 
 
+def _gateway_receipt_observation_matches(
+    receipt: dict[str, Any], observed: dict[str, Any]
+) -> bool:
+    if all(receipt.get(key) == value for key, value in observed.items()):
+        return True
+
+    # Gateway receipts created before the host-external proof contract recorded
+    # the complete Service spec hash but not node_port as a separate field.
+    # The spec hash already commits to the live NodePort, so accepting exactly
+    # this missing redundant field preserves the old proof without weakening
+    # any resource, UID, routing, address or Service-spec binding.
+    receipt_service = receipt.get("service")
+    observed_service = observed.get("service")
+    if (
+        not isinstance(receipt_service, dict)
+        or "node_port" in receipt_service
+        or not isinstance(observed_service, dict)
+        or not isinstance(observed_service.get("node_port"), int)
+        or isinstance(observed_service.get("node_port"), bool)
+    ):
+        return False
+    legacy_service = {
+        key: value for key, value in observed_service.items() if key != "node_port"
+    }
+    legacy_observed = {**observed, "service": legacy_service}
+    return all(receipt.get(key) == value for key, value in legacy_observed.items())
+
+
 def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
     if cell.get("status") != "gateway-ready":
         return False
@@ -6113,7 +6141,7 @@ def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
         return (
             implementation_valid
             and receipt.get("address") in observed["gateway_addresses"]
-            and all(receipt.get(key) == value for key, value in observed.items())
+            and _gateway_receipt_observation_matches(receipt, observed)
         )
     except (OSError, ValueError, StagingCellError, subprocess.CalledProcessError):
         return False
