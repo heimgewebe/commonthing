@@ -1,4 +1,4 @@
-"""Static contract for the separately released Schauwerk editor frontdoor."""
+"""Contract for the separately versioned Schaubild native-runtime frontdoor."""
 
 from __future__ import annotations
 
@@ -10,19 +10,31 @@ class SchaubildFrontdoorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = pathlib.Path(__file__).resolve().parents[3]
         self.caddy = (self.repo / "infra/caddy/Caddyfile.vps").read_text(encoding="utf-8")
-        self.compose = (self.repo / "infra/compose/compose.vps.override.yml").read_text(encoding="utf-8")
+        self.compose = (self.repo / "infra/compose/compose.vps.override.yml").read_text(
+            encoding="utf-8"
+        )
 
-    def test_editor_is_a_separate_read_only_release_mount(self) -> None:
-        self.assertIn("source: ${SCHAUWERK_EDITOR_RELEASE_DIR:-${SCHAUWERK_EDITOR_ROOT:-/opt/schauwerk-editor}/current}", self.compose)
-        self.assertIn("target: /srv/schauwerk-editor-release", self.compose)
+    def test_editor_is_a_digest_pinned_private_sidecar(self) -> None:
+        self.assertIn(
+            "image: ${SCHAUWERK_SCHAUBILD_IMAGE:?SCHAUWERK_SCHAUBILD_IMAGE must be set}",
+            self.compose,
+        )
         self.assertIn("read_only: true", self.compose)
-        self.assertIn("create_host_path: false", self.compose)
-        self.assertIn("root * /srv/schauwerk-editor-release", self.caddy)
-        self.assertNotIn("/srv/schauwerk-editor-root/current", self.caddy)
-        api_common = self.caddy.split("(api_common)", 1)[1].split("# HTTP sites", 1)[0]
-        self.assertNotIn("/srv/schauwerk-editor-release", api_common)
+        self.assertIn("/tmp:rw,noexec,nosuid,size=64m", self.compose)
+        self.assertIn("--trusted-reverse-proxy", self.compose)
+        self.assertIn("--trusted-proxy-source-cidr", self.compose)
+        self.assertIn(
+            "${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-172.16.0.0/12}",
+            self.compose,
+        )
+        self.assertIn("--public-base-path", self.compose)
+        self.assertIn("- /schaubild", self.compose)
+        self.assertIn("cap_drop:", self.compose)
+        self.assertIn("- ALL", self.compose)
+        self.assertNotIn("/srv/schauwerk-editor-release", self.compose)
+        self.assertNotIn("/srv/schauwerk-editor-release", self.caddy)
 
-    def test_editor_route_precedes_generic_trailing_slash_and_frontend_routes(self) -> None:
+    def test_editor_route_precedes_generic_routes_and_proxies_private_runtime(self) -> None:
         root_redirect = "@schauwerkRoot path /schaubild"
         route = "handle_path /schaubild/*"
         trailing = "@trailingSlash path_regexp ^/.+/$"
@@ -33,13 +45,27 @@ class SchaubildFrontdoorTest(unittest.TestCase):
         self.assertLess(self.caddy.index(route), self.caddy.index(trailing))
         self.assertLess(self.caddy.index(route), self.caddy.index(generic))
         self.assertIn("redir * /schaubild/ 308", self.caddy)
-        self.assertIn('header Cache-Control "no-store"', self.caddy)
+        self.assertIn("reverse_proxy schaubild:8765", self.caddy)
+        self.assertIn("header_up Host 127.0.0.1:8765", self.caddy)
+        self.assertIn("header_up -Forwarded", self.caddy)
+        self.assertIn("header_up X-Forwarded-For {remote_host}", self.caddy)
 
-    def test_editor_gets_exact_cross_origin_frame_csp_not_frontend_csp(self) -> None:
+    def test_postflight_accepts_exact_32_hex_native_capability_token(self) -> None:
+        script = (self.repo / "scripts/weltgewebe-up").read_text(encoding="utf-8")
+        self.assertIn(
+            r"/schaubild/native/[0-9a-f]{32}/index\.html",
+            script,
+        )
+        self.assertNotIn(
+            r"/schaubild/native/[0-9a-f]{64}/index\.html",
+            script,
+        )
+
+    def test_editor_csp_allows_native_same_origin_api_and_legacy_frame_only(self) -> None:
         expected = (
             "header @schauwerkResponse >Content-Security-Policy \"default-src 'self'; "
             "script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
-            "frame-src https://embed.diagrams.net; connect-src 'none'; object-src 'none'; "
+            "frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; "
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none';\""
         )
         self.assertIn(expected, self.caddy)

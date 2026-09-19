@@ -34,6 +34,50 @@ services:
     env_file:
       - ${WELTGEWEBE_ENV_FILE:-/etc/weltgewebe/weltgewebe.env}
 
+  schaubild:
+    image: ${SCHAUWERK_SCHAUBILD_IMAGE:?SCHAUWERK_SCHAUBILD_IMAGE must be set}
+    pull_policy: always
+    command:
+      - python
+      - -m
+      - schauwerk.visual.standalone_editor
+      - serve
+      - --bind-host
+      - 0.0.0.0
+      - --trusted-reverse-proxy
+      - --trusted-proxy-source-cidr
+      - ${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-172.16.0.0/12}
+      - --public-base-path
+      - /schaubild
+      - --port
+      - "8765"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    expose:
+      - "8765"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen(
+          urllib.request.Request(
+          'http://127.0.0.1:8765/manifest.json',
+          headers={'Host':'127.0.0.1:8765'}),
+          timeout=3).read(1)
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
   caddy:
     ports:
       - "${CADDY_IPV6_BIND:-[::]}:80:80"
@@ -43,13 +87,10 @@ services:
       - ../../build/basemap:/srv/weltgewebe-basemap:ro
       - ../../map-style:/srv/weltgewebe-map-style:ro
       - ../../apps/web/build:/srv/weltgewebe-web:ro
-      - type: bind
-        source: ${SCHAUWERK_EDITOR_RELEASE_DIR:-${SCHAUWERK_EDITOR_ROOT:-/opt/schauwerk-editor}/current}
-        target: /srv/schauwerk-editor-release
-        read_only: true
-        bind:
-          create_host_path: false
       - caddy_data:/data
       - caddy_config:/config
     environment:
       WELTGEWEBE_BUILD: ${WELTGEWEBE_BUILD:?WELTGEWEBE_BUILD must be set}
+    depends_on:
+      schaubild:
+        condition: service_healthy

@@ -1296,6 +1296,10 @@ Generated automatically. Do not edit.
 - [relates_to] docs/deploy/vps-http-smoke.md
 - [relates_to] docs/deploy/vps-migration-safe-runtime-smoke.md
 
+## infra/schauwerk-editor/release-lock.json
+
+- [relates_to] docs/deploy/schauwerk-editor-frontdoor.md
+
 ## platform/README.md
 
 - [relates_to] docs/reports/kubernetes-platform-foundation-status.md

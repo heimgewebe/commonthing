@@ -280,25 +280,72 @@ fetch_main() {
   git -C "$SOURCE_CHECKOUT" rev-parse refs/remotes/origin/main || return 1
 }
 
-verify_public_schauwerk_release() {
-  local expected_manifest_sha="$1"
-  local public_manifest_sha
+verify_public_schauwerk_runtime() {
+  local expected_image_ref="$1"
+  local container_ids
+  local container_id
+  local live_image
+  local live_health
+  local manifest_json
 
-  [[ "$expected_manifest_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-  public_manifest_sha="$(
+  [[ "$expected_image_ref" =~ ^ghcr\.io/heimgewebe/schauwerk-schaubild@sha256:[0-9a-f]{64}$ ]] || return 1
+
+  container_ids="$(
+    docker ps \
+      --filter 'label=com.docker.compose.project=weltgewebe' \
+      --filter 'label=com.docker.compose.service=schaubild' \
+      --format '{{.ID}}'
+  )" || return 1
+  [[ "$(grep -c . <<< "$container_ids")" == "1" ]] || {
+    echo "public Schaubild runtime container identity is ambiguous or absent" >&2
+    return 1
+  }
+  container_id="$container_ids"
+  live_image="$(docker inspect --format '{{.Config.Image}}' "$container_id")" || return 1
+  live_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id")" || return 1
+  [[ "$live_image" == "$expected_image_ref" ]] || {
+    echo "public Schaubild runtime image differs from reviewed digest" >&2
+    return 1
+  }
+  [[ "$live_health" == "healthy" ]] || {
+    echo "public Schaubild runtime container is not healthy" >&2
+    return 1
+  }
+
+  manifest_json="$(
     curl --fail --silent --show-error \
       --proto '=https' \
       --connect-timeout 5 \
       --max-time 15 \
       --max-filesize 1048576 \
       --header 'Accept-Encoding: identity' \
-      "$SCHAUWERK_MANIFEST_URL" |
-      sha256sum | awk '{print $1}'
+      "$SCHAUWERK_MANIFEST_URL"
   )" || return 1
-  if [[ "$public_manifest_sha" != "$expected_manifest_sha" ]]; then
-    echo "public Schauwerk manifest hash mismatch" >&2
-    return 1
-  fi
+  [[ -n "$manifest_json" ]] || return 1
+  SCHAUWERK_MANIFEST_JSON="$manifest_json" run_ops_python << 'PY_SCHAUWERK_PUBLIC' || return 1
+import json
+import os
+
+try:
+    manifest = json.loads(os.environ["SCHAUWERK_MANIFEST_JSON"])
+except (KeyError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid public Schaubild manifest: {exc}")
+if manifest.get("schema_version") != "schauwerk-standalone-editor-manifest.v2":
+    raise SystemExit("public Schaubild manifest schema is not native v2")
+if manifest.get("editor_engine") != "schauwerk-native-diagram-v1":
+    raise SystemExit("public Schaubild editor engine is not native")
+if manifest.get("cutover_status") != "native-primary-with-legacy-compatibility":
+    raise SystemExit("public Schaubild cutover status is not native-primary")
+if manifest.get("public_base_path") != "/schaubild":
+    raise SystemExit("public Schaubild base path is not canonical")
+native = manifest.get("native_renderer")
+if not isinstance(native, dict):
+    raise SystemExit("public Schaubild native renderer metadata is missing")
+if native.get("renderer") != "schauwerk-native-diagram-v1":
+    raise SystemExit("public Schaubild native renderer identity mismatch")
+if native.get("api_path") != "/schaubild/api/native-viewer":
+    raise SystemExit("public Schaubild native API path mismatch")
+PY_SCHAUWERK_PUBLIC
 }
 
 verify_public_germany_basemap_delivery() {
@@ -1445,49 +1492,55 @@ target_commit="$(fetch_main)"
 [[ "$target_commit" =~ ^[0-9a-f]{40}$ ]] || fail "origin/main did not resolve to a full commit"
 write_state "observed" "$target_commit" "reconcile started"
 
-# The public Schauwerk shell is separately versioned but served by this edge.
-# A same-commit no-op therefore needs the exact raw manifest bytes reviewed in
-# this repository commit, not only matching commonThing frontend/API versions.
-schauwerk_release_lock_json="$(
+# Schaubild is a separately versioned native runtime served by this edge.
+# A same-commit no-op therefore needs the exact reviewed OCI digest from this
+# repository commit plus live runtime/public-manifest readback.
+schauwerk_runtime_lock_json="$(
   git -C "$SOURCE_CHECKOUT" show "$target_commit:infra/schauwerk-editor/release-lock.json"
-)" || fail "target commit is missing the Schauwerk editor release lock"
-expected_schauwerk_manifest_sha="$(
-  SCHAUWERK_RELEASE_LOCK_JSON="$schauwerk_release_lock_json" run_ops_python << 'PY_SCHAUWERK_RELEASE_LOCK'
+)" || fail "target commit is missing the Schaubild runtime lock"
+IFS=$'\t' read -r expected_schauwerk_image_ref expected_schauwerk_source_commit <<< "$(
+  SCHAUWERK_RUNTIME_LOCK_JSON="$schauwerk_runtime_lock_json" run_ops_python << 'PY_SCHAUWERK_RUNTIME_LOCK'
 import json
 import os
 import re
 
 try:
-    payload = json.loads(os.environ["SCHAUWERK_RELEASE_LOCK_JSON"])
+    payload = json.loads(os.environ["SCHAUWERK_RUNTIME_LOCK_JSON"])
 except (KeyError, json.JSONDecodeError) as exc:
-    raise SystemExit(f"invalid Schauwerk release lock JSON: {exc}")
+    raise SystemExit(f"invalid Schaubild runtime lock JSON: {exc}")
 expected_keys = {
     "schema_version",
     "source_repository",
     "source_commit",
-    "release_id",
-    "manifest_file_sha256",
+    "image_repository",
+    "image_digest",
+    "public_base_path",
 }
 if not isinstance(payload, dict) or set(payload) != expected_keys:
-    raise SystemExit("Schauwerk release lock field matrix is invalid")
-if payload.get("schema_version") != "weltgewebe-schauwerk-release-lock.v1":
-    raise SystemExit("Schauwerk release lock schema is invalid")
+    raise SystemExit("Schaubild runtime lock field matrix is invalid")
+if payload.get("schema_version") != "weltgewebe-schauwerk-runtime-lock.v1":
+    raise SystemExit("Schaubild runtime lock schema is invalid")
 if payload.get("source_repository") != "heimgewebe/schauwerk":
-    raise SystemExit("Schauwerk release lock repository is invalid")
+    raise SystemExit("Schaubild runtime lock repository is invalid")
+if payload.get("image_repository") != "ghcr.io/heimgewebe/schauwerk-schaubild":
+    raise SystemExit("Schaubild runtime image repository is invalid")
+if payload.get("public_base_path") != "/schaubild":
+    raise SystemExit("Schaubild runtime public base path is invalid")
 source_commit = payload.get("source_commit")
-release_id = payload.get("release_id")
-manifest_sha = payload.get("manifest_file_sha256")
+image_digest = payload.get("image_digest")
 if not isinstance(source_commit, str) or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
-    raise SystemExit("Schauwerk source commit is invalid")
-if release_id != source_commit:
-    raise SystemExit("Schauwerk release id does not match source commit")
-if not isinstance(manifest_sha, str) or re.fullmatch(r"[0-9a-f]{64}", manifest_sha) is None:
-    raise SystemExit("Schauwerk manifest hash is invalid")
-print(manifest_sha)
-PY_SCHAUWERK_RELEASE_LOCK
-)" || fail "target Schauwerk editor release lock is invalid"
-[[ "$expected_schauwerk_manifest_sha" =~ ^[0-9a-f]{64}$ ]] ||
-  fail "target Schauwerk editor manifest hash is invalid"
+    raise SystemExit("Schaubild source commit is invalid")
+if not isinstance(image_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest) is None:
+    raise SystemExit("Schaubild image digest is invalid")
+print(
+    f"ghcr.io/heimgewebe/schauwerk-schaubild@{image_digest}\t{source_commit}"
+)
+PY_SCHAUWERK_RUNTIME_LOCK
+)" || fail "target Schaubild runtime lock is invalid"
+[[ "$expected_schauwerk_image_ref" =~ ^ghcr\.io/heimgewebe/schauwerk-schaubild@sha256:[0-9a-f]{64}$ ]] ||
+  fail "target Schaubild image reference is invalid"
+[[ "$expected_schauwerk_source_commit" =~ ^[0-9a-f]{40}$ ]] ||
+  fail "target Schaubild source commit is invalid"
 
 # Nationwide Germany is the production sovereign contract. Bind the no-op
 # decision to the exact Germany style in this commit before public readback.
@@ -1582,7 +1635,7 @@ if "$LIVE_VERIFIER" \
     basemap_identity_matches=1
   fi
   schauwerk_identity_matches=0
-  if verify_public_schauwerk_release "$expected_schauwerk_manifest_sha"; then
+  if verify_public_schauwerk_runtime "$expected_schauwerk_image_ref"; then
     schauwerk_identity_matches=1
   fi
   observed_main="$(fetch_main)"
@@ -1603,8 +1656,8 @@ if "$LIVE_VERIFIER" \
   fi
   if [[ "$schauwerk_identity_matches" != "1" ]]; then
     write_state "schauwerk_release_identity_drift" "$target_commit" \
-      "public commit matched but the public Schauwerk manifest did not match the reviewed release lock; redeploy required"
-    echo "production_reconcile=repair_required commit=$target_commit reason=schauwerk_release_identity_drift"
+      "public commit matched but the public Schaubild runtime did not match the reviewed OCI digest; redeploy required"
+    echo "production_reconcile=repair_required commit=$target_commit reason=schaubild_runtime_image_identity_drift"
   else
     write_state "basemap_identity_drift" "$target_commit" \
       "public commit matched but nationwide Germany basemap identity or delivery routes did not; rebuild required"
@@ -1809,8 +1862,8 @@ verify_public_germany_basemap_delivery \
   "$target_commit" "$expected_germany_style_sha" "$expected_germany_dark_style_sha" \
   "$expected_germany_artifact_size" "$expected_germany_range_sha" ||
   fail "public nationwide Germany basemap delivery mismatch after deploy"
-verify_public_schauwerk_release "$expected_schauwerk_manifest_sha" ||
-  fail "public Schauwerk manifest does not match the reviewed release after deploy"
+verify_public_schauwerk_runtime "$expected_schauwerk_image_ref" ||
+  fail "public Schaubild runtime does not match the reviewed OCI digest after deploy"
 
 current_main="$(fetch_main)"
 if [[ "$current_main" != "$target_commit" ]]; then

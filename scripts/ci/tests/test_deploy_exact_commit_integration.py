@@ -155,20 +155,32 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         )
         self.schauwerk_manifest = self.root / "schauwerk-manifest.json"
         self.schauwerk_manifest.write_text(
-            '{"fixture":"schauwerk"}\n', encoding="utf-8"
+            json.dumps(
+                {
+                    "schema_version": "schauwerk-standalone-editor-manifest.v2",
+                    "editor_engine": "schauwerk-native-diagram-v1",
+                    "cutover_status": "native-primary-with-legacy-compatibility",
+                    "public_base_path": "/schaubild",
+                    "native_renderer": {
+                        "renderer": "schauwerk-native-diagram-v1",
+                        "api_path": "/schaubild/api/native-viewer",
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        schauwerk_manifest_sha = hashlib.sha256(
-            self.schauwerk_manifest.read_bytes()
-        ).hexdigest()
         (self.seed / "infra/schauwerk-editor").mkdir(parents=True)
         (self.seed / "infra/schauwerk-editor/release-lock.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "weltgewebe-schauwerk-release-lock.v1",
+                    "schema_version": "weltgewebe-schauwerk-runtime-lock.v1",
                     "source_repository": "heimgewebe/schauwerk",
                     "source_commit": "c" * 40,
-                    "release_id": "c" * 40,
-                    "manifest_file_sha256": schauwerk_manifest_sha,
+                    "image_repository": "ghcr.io/heimgewebe/schauwerk-schaubild",
+                    "image_digest": "sha256:" + "d" * 64,
+                    "public_base_path": "/schaubild",
                 },
                 sort_keys=True,
             )
@@ -396,6 +408,24 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                 }
                 if [[ "$1" == "system" && "${2:-}" == "df" ]]; then
                   printf '{"Active":"0","Reclaimable":"0B","Size":"0B","TotalCount":"0","Type":"Build Cache"}\n'
+                  exit 0
+                fi
+                if [[ "$1" == "ps" && "$*" == *"label=com.docker.compose.service=schaubild"* ]]; then
+                  printf 'schaubild-runtime\n'
+                  exit 0
+                fi
+                if [[ "$1" == "inspect" && "${2:-}" == "--format" ]]; then
+                  case "${3:-}" in
+                    '{{.Config.Image}}')
+                      printf 'ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n'
+                      ;;
+                    '{{if .State.Health}}{{.State.Health.Status}}{{end}}')
+                      printf 'healthy\n'
+                      ;;
+                    *)
+                      exit 97
+                      ;;
+                  esac
                   exit 0
                 fi
                 cat "$TEST_WEB_ARTIFACT"
@@ -1028,7 +1058,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.assertIn("basemap_variant=germany", result.stdout)
         self.assertIn("schauwerk_release=verified", result.stdout)
         self.assertNotIn("reason=basemap_identity_drift", result.stdout)
-        self.assertNotIn("reason=schauwerk_release_identity_drift", result.stdout)
+        self.assertNotIn("reason=schaubild_runtime_image_identity_drift", result.stdout)
 
     def test_reconciler_repairs_same_commit_with_stale_public_schauwerk_release(self) -> None:
         marker = self.root / "deploy-complete"
@@ -1043,7 +1073,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.restore_test_ownership()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(marker.exists())
-        self.assertIn("reason=schauwerk_release_identity_drift", result.stdout)
+        self.assertIn("reason=schaubild_runtime_image_identity_drift", result.stdout)
         self.assertIn("production_reconcile=verified", result.stdout)
         self.assertNotIn("production_reconcile=noop", result.stdout)
 

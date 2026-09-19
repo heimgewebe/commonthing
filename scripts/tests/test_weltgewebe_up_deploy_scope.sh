@@ -72,6 +72,7 @@ setup_mocks() {
   printf 'db-1\n' > "$state/db.id"
   printf 'nats-1\n' > "$state/nats.id"
   printf 'caddy-1\n' > "$state/caddy.id"
+  printf 'schaubild-1\n' > "$state/schaubild.id"
   : > "$state/compose-up.log"
   : > "$state/mutation.log"
   printf 'verify-applied\n' > "$state/api.mode"
@@ -107,12 +108,20 @@ if [[ "${1:-}" != "compose" ]]; then
   exit 0
 fi
 
+if [[ "$joined" == *" config "* ]]; then
+  expected_schaubild_sentinel="ghcr.io/heimgewebe/schauwerk-schaubild@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  [[ "${SCHAUWERK_SCHAUBILD_IMAGE:-}" == "$expected_schaubild_sentinel" ]] || {
+    echo "bounded scope did not bind the non-deployable Schaubild compose sentinel" >&2
+    exit 95
+  }
+fi
+
 if [[ "$joined" == *" config --services "* ]]; then
-  printf 'api\ndb\nnats\ncaddy\n'
+  printf 'api\ndb\nnats\nschaubild\ncaddy\n'
   exit 0
 fi
 if [[ "$joined" == *" config --format json "* ]]; then
-  printf '%s\n' '{"services":{"api":{},"db":{},"nats":{},"caddy":{}}}'
+  printf '%s\n' '{"services":{"api":{},"db":{},"nats":{},"schaubild":{"image":"ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","read_only":true,"ports":[],"expose":["8765"],"command":["python","-m","schauwerk.visual.standalone_editor","serve","--bind-host","0.0.0.0","--trusted-reverse-proxy","--trusted-proxy-source-cidr","172.16.0.0/12","--public-base-path","/schaubild","--port","8765"]},"caddy":{"depends_on":{"schaubild":{"condition":"service_healthy"}}}}}'
   exit 0
 fi
 if [[ "$joined" == *" config "* ]]; then
@@ -226,7 +235,7 @@ assert len(p['git_head'])==40
 assert all(c in '0123456789abcdef' for c in p['git_head'])
 assert p['api_image_tag']
 assert p['target_services']==['api']
-assert p['protected_services']==['db','nats','caddy']
+assert p['protected_services']==['db','nats','caddy','schaubild']
 assert p['startup_migration_mode']=='verify-applied'
 assert p['no_deps'] is True
 assert p['remove_orphans'] is False
@@ -249,6 +258,7 @@ assert_not_contains "$api_call" "--remove-orphans"
 assert_not_contains "$api_call" " db"
 assert_not_contains "$api_call" " nats"
 assert_not_contains "$api_call" " caddy"
+assert_not_contains "$api_call" " schaubild"
 [[ "$(cat "$state_api/api.mode")" == "verify-applied" ]] || fail "API scope did not force verify-applied"
 assert_contains "$out_api" "Health OK"
 echo "PASS: API scope changes only API and forces verify-applied"
@@ -263,6 +273,8 @@ first_call="$(sed -n '1p' "$state_migration/compose-up.log")"
 second_call="$(sed -n '2p' "$state_migration/compose-up.log")"
 assert_contains "$first_call" "up -d --no-deps api"
 assert_contains "$second_call" "up -d --no-deps --force-recreate api"
+assert_not_contains "$first_call" " schaubild"
+assert_not_contains "$second_call" " schaubild"
 [[ "$(cat "$state_migration/api.mode")" == "verify-applied" ]] || fail "migration scope did not restore verify-applied"
 uv run --project "$REPO_ROOT/tools/py" --locked python - "$repo_migration/.ops/deploy-plan-migration.json" << 'PY'
 import json, sys
