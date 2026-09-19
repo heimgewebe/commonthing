@@ -34,6 +34,7 @@ permissions:
       - "docs/runbooks/gewebezelle-manual-pilot.md"
       - "docs/runbooks/gewebezelle-two-operator-pilot-v1.md"
       - "docs/proofs/gewebezelle-two-operator-pilot-contract-v1.md"
+      - "docs/proofs/kubernetes-staging-cell/**"
       - "docs/tasks/board.md"
       - "Makefile"
       - "tools/py/**"
@@ -93,6 +94,15 @@ jobs:
           scripts.ci.tests.test_kubernetes_ha_contract
           scripts.ci.tests.test_trivy_rendered_manifests
           scripts.ci.tests.test_kubernetes_python_bootstrap
+      - name: Validate staging evidence-only commit
+        if: ${{ hashFiles('docs/proofs/kubernetes-staging-cell/attestation.json') != '' }}
+        run: >-
+          uv run --project tools/py --locked python scripts/platform/proof_identity.py
+          validate-evidence-commit
+          --identity docs/proofs/kubernetes-staging-cell/identity.json
+          --record docs/proofs/kubernetes-staging-cell/record.json
+          --proof docs/proofs/kubernetes-staging-cell/proof.json
+          --attestation docs/proofs/kubernetes-staging-cell/attestation.json
       - name: Render and validate all platform targets
         run: uv run --project tools/py --locked python scripts/platform/validate_platform.py --render
 
