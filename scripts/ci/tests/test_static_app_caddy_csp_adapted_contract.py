@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import unittest
 
 REPO = Path(__file__).resolve().parents[3]
+RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 CADDY_BINARY = shutil.which("caddy")
 CADDY_DOCKER_IMAGE = "caddy:2.8.4"
 MAGIC_LINK_CONFIRM_PATH = "/api/auth/magic-link/consume"
@@ -134,10 +136,18 @@ def directive_map(policy: str) -> dict[str, tuple[str, ...]]:
 
 
 @unittest.skipUnless(
-    CADDY_BINARY or DOCKER_BINARY,
+    CADDY_BINARY or DOCKER_BINARY or RUNNING_IN_GITHUB_ACTIONS,
     "caddy binary or docker required for semantic adaptation tests",
 )
 class StaticAppCaddyAdaptedCspTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if RUNNING_IN_GITHUB_ACTIONS and not (CADDY_BINARY or DOCKER_BINARY):
+            raise AssertionError(
+                "GitHub Actions requires a caddy binary or reachable Docker daemon "
+                "for semantic adaptation tests"
+            )
+
     def test_legacy_map_html_redirect_adapts_on_vps_and_container_edges(self) -> None:
         for relative in ("infra/caddy/Caddyfile.vps", "apps/web/Caddyfile.container"):
             with self.subTest(caddyfile=relative):
