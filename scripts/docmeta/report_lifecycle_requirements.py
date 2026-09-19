@@ -276,6 +276,25 @@ def _git_blob_sha256(root: Path, revision: str, relative: Path) -> str | None:
     return hashlib.sha256(completed.stdout).hexdigest()
 
 
+def _canonical_iso_timestamp(value: str) -> str | None:
+    """Normalise a strict ISO-8601 timestamp to one deterministic spelling.
+
+    `git show -s --format=%cI` schreibt einen Nullversatz je nach git-Version
+    als `+00:00` oder als `Z`. Beide bezeichnen denselben Zeitpunkt, erzeugen
+    aber unterschiedliche Dateiinhalte — ein generiertes Artefakt wäre dann
+    nicht mehr reproduzierbar, sondern abhängig von der git-Version des
+    ausführenden Systems. Kanonisch ist hier die Schreibweise von
+    `datetime.isoformat()`, also der numerische Versatz.
+    """
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.isoformat()
+
+
 def _git_commit_timestamp(root: Path, revision: str) -> str | None:
     try:
         completed = subprocess.run(
@@ -287,14 +306,7 @@ def _git_commit_timestamp(root: Path, revision: str) -> str | None:
         )
     except (OSError, subprocess.CalledProcessError):
         return None
-    value = completed.stdout.strip()
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return value
+    return _canonical_iso_timestamp(completed.stdout.strip())
 
 
 def _git_is_shallow_repository(root: Path) -> bool | None:
@@ -312,6 +324,33 @@ def _git_is_shallow_repository(root: Path) -> bool | None:
     if value not in {"true", "false"}:
         return None
     return value == "true"
+
+
+def _parse_iso_instant(value: str | None) -> datetime | None:
+    """Parse a strict ISO-8601 timestamp into an aware datetime, or None."""
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _same_instant(left: str | None, right: str | None) -> bool:
+    """Compare two ISO-8601 timestamps by instant, not by spelling.
+
+    `git show -s --format=%cI` renders a zero UTC offset as `+00:00` in some
+    git versions and as `Z` in others. Beide bezeichnen denselben Zeitpunkt;
+    ein Stringvergleich würde die Schreibweise des ausführenden git zu einem
+    Provenance-Befund machen und damit etwas prüfen, das der Vertrag nicht
+    behauptet.
+    """
+    left_instant = _parse_iso_instant(left)
+    right_instant = _parse_iso_instant(right)
+    if left_instant is None or right_instant is None:
+        return False
+    return left_instant == right_instant
 
 
 def _ensure_git_revision(root: Path, revision: str) -> str | None:
@@ -419,7 +458,7 @@ def validate_truth_contract(
                 revision_resolved = True
                 if not _git_revision_is_ancestor(root, revision):
                     violations.append("source_revision_not_ancestor")
-                if generated_at != commit_timestamp:
+                if not _same_instant(generated_at, commit_timestamp):
                     violations.append("generated_at_revision_mismatch")
 
     sources = value.get("sources")
