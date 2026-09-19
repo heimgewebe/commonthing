@@ -83,6 +83,10 @@ DATA_KUSTOMIZATION_TIMEOUT = "8m"
 DATA_KUSTOMIZATION_TIMEOUT_SECONDS = 8 * 60.0
 PVC_BIND_TIMEOUT_SECONDS = 45.0
 ALLOWED_RETAINED_VOLUME_MODES = {"700", "770", "2770"}
+RETAINED_VOLUME_IDENTITIES = {
+    "postgres": (999, 999),
+    "nats": (1000, 1000),
+}
 REQUIRED_TOOLS = ("kind", "kubectl", "kustomize", "flux", "helm")
 REQUIRED_ARTIFACTS = (
     "gateway_api_gatewayclasses",
@@ -2092,10 +2096,9 @@ def prepare_volume_permissions(kind: str, cluster: str, root: Path) -> None:
     data_node = _retained_mount_node(
         kind, cluster, root, require_split=True
     )
-    for volume_path, identity in (
-        ("/var/local/commonthing-staging/postgres", "999:999"),
-        ("/var/local/commonthing-staging/nats", "1000:1000"),
-    ):
+    for name, (uid, gid) in RETAINED_VOLUME_IDENTITIES.items():
+        volume_path = f"/var/local/commonthing-staging/{name}"
+        identity = f"{uid}:{gid}"
         run(["docker", "exec", data_node, "mkdir", "-p", volume_path], timeout=30)
         observed = output(
             ["docker", "exec", data_node, "stat", "-c", "%u:%g:%a", volume_path],
@@ -6580,6 +6583,36 @@ def _same_retained_data_anchors(
     )
 
 
+def _restore_roots_are_retry_safe(
+    before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]]
+) -> bool:
+    for name, (uid, gid) in RETAINED_VOLUME_IDENTITIES.items():
+        expected = before.get(name)
+        observed = after.get(name)
+        if not isinstance(expected, dict) or not isinstance(observed, dict):
+            return False
+        if any(
+            expected.get(field) != observed.get(field)
+            for field in ("device", "inode")
+        ):
+            return False
+        original_metadata = all(
+            expected.get(field) == observed.get(field)
+            for field in ("uid", "gid", "mode")
+        )
+        mode = observed.get("mode")
+        prepared_metadata = (
+            observed.get("uid") == uid
+            and observed.get("gid") == gid
+            and isinstance(mode, int)
+            and not isinstance(mode, bool)
+            and format(mode, "o") in ALLOWED_RETAINED_VOLUME_MODES
+        )
+        if not (original_metadata or prepared_metadata):
+            return False
+    return True
+
+
 def _require_durable_retained_fingerprint(
     identity: dict[str, dict[str, Any]], *, label: str
 ) -> None:
@@ -8479,7 +8512,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             require_split=True,
             require_nonempty=False,
         )
-        if not _same_retained_data_anchors(down["empty_restore_roots"], anchors):
+        if not _restore_roots_are_retry_safe(down["empty_restore_roots"], anchors):
             raise StagingCellError(
                 "backup rebuild empty restore roots are not the proven post-delete roots"
             )
@@ -8510,41 +8543,21 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         }
         atomic_json(result_path, existing)
 
-    prepared_restore_roots: dict[str, Any] | None = None
-    if existing["status"] == "backup-restore-pending":
-        prepared_restore_roots = copy.deepcopy(existing.get("empty_restore_roots"))
-        if not isinstance(prepared_restore_roots, dict):
-            raise StagingCellError("backup rebuild receipt lost empty restore roots")
-        for name, (uid, gid) in {
-            "postgres": (999, 999),
-            "nats": (1000, 1000),
-        }.items():
-            prepared = prepared_restore_roots.get(name)
-            if not isinstance(prepared, dict):
-                raise StagingCellError(
-                    f"backup rebuild receipt lost empty {name} restore identity"
-                )
-            prepared["uid"] = uid
-            prepared["gid"] = gid
-            prepared["mode"] = 0o700
-        if rebuild_receipt_exists:
-            retry_anchors = _mounted_retained_data_anchors(
-                kind, args.cluster, root, require_split=True, require_nonempty=False
-            )
-            if not (
-                _same_retained_data_anchors(existing["empty_restore_roots"], retry_anchors)
-                or _same_retained_data_anchors(prepared_restore_roots, retry_anchors)
-            ):
-                raise StagingCellError("backup restore target identity changed before retry")
+    if existing["status"] == "backup-restore-pending" and rebuild_receipt_exists:
+        retry_anchors = _mounted_retained_data_anchors(
+            kind, args.cluster, root, require_split=True, require_nonempty=False
+        )
+        if not _restore_roots_are_retry_safe(
+            existing["empty_restore_roots"], retry_anchors
+        ):
+            raise StagingCellError("backup restore target identity changed before retry")
 
-    # The down receipt must prove the exact empty root metadata before the
-    # runtime-specific ownership transition. Persisting the rebuild intent
-    # first makes that deterministic transition restart-safe. A retry proves
-    # either the original or already-prepared metadata before any mutation.
+    # Each receipt-bound root may independently be original or already prepared.
+    # Device and inode always stay fixed, so an interrupted per-volume ownership
+    # transition is restart-safe without accepting a replaced restore root.
     prepare_volume_permissions(kind, args.cluster, root)
 
     if existing["status"] == "backup-restore-pending":
-        assert prepared_restore_roots is not None
         observed = _mounted_retained_data_identity(
             kind,
             args.cluster,
@@ -8554,7 +8567,9 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             require_nonempty=False,
             timeout_seconds=backup_timeout,
         )
-        if not _same_retained_data_anchors(prepared_restore_roots, observed):
+        if not _restore_roots_are_retry_safe(
+            existing["empty_restore_roots"], observed
+        ):
             raise StagingCellError(
                 "backup restore target identity changed before retry"
             )

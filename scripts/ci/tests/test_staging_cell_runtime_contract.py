@@ -5892,20 +5892,22 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
 
         source = inspect.getsource(staging.command_backup_delete_to_prove_rebuild)
         exact_anchor_check = source.index(
-            '_same_retained_data_anchors(down["empty_restore_roots"], anchors)'
+            '_restore_roots_are_retry_safe(down["empty_restore_roots"], anchors)'
         )
         initial_empty_check = source.index(
             "retained_data_directory_exists(root, name)"
         )
         rebuild_intent_write = source.index("atomic_json(result_path, existing)")
         retry_anchor_check = source.index(
-            "_same_retained_data_anchors(prepared_restore_roots, retry_anchors)"
+            '_restore_roots_are_retry_safe(\n'
+            '            existing["empty_restore_roots"], retry_anchors'
         )
         permission_prepare = source.index(
             "prepare_volume_permissions(kind, args.cluster, root)"
         )
         prepared_retry_check = source.index(
-            "_same_retained_data_anchors(prepared_restore_roots, observed)"
+            '_restore_roots_are_retry_safe(\n'
+            '            existing["empty_restore_roots"], observed'
         )
 
         self.assertLess(exact_anchor_check, initial_empty_check)
@@ -5917,6 +5919,270 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             '_same_data_mount_anchors(down["empty_restore_roots"], anchors)',
             source,
         )
+
+    def test_restore_root_retry_guard_accepts_partial_prepare_and_allowed_modes(self) -> None:
+        original = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o755,
+            },
+            "nats": {
+                "device": 1,
+                "inode": 30,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o755,
+            },
+        }
+        partial = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 999,
+                "gid": 999,
+                "mode": 0o700,
+            },
+            "nats": dict(original["nats"]),
+        }
+        self.assertTrue(staging._restore_roots_are_retry_safe(original, partial))
+
+        for mode in (0o700, 0o770, 0o2770):
+            with self.subTest(mode=oct(mode)):
+                prepared = {
+                    "postgres": {
+                        "device": 1,
+                        "inode": 20,
+                        "uid": 999,
+                        "gid": 999,
+                        "mode": mode,
+                    },
+                    "nats": {
+                        "device": 1,
+                        "inode": 30,
+                        "uid": 1000,
+                        "gid": 1000,
+                        "mode": mode,
+                    },
+                }
+                self.assertTrue(
+                    staging._restore_roots_are_retry_safe(original, prepared)
+                )
+
+        replaced = {name: dict(value) for name, value in partial.items()}
+        replaced["postgres"]["inode"] = 21
+        self.assertFalse(staging._restore_roots_are_retry_safe(original, replaced))
+        drifted = {name: dict(value) for name, value in partial.items()}
+        drifted["nats"]["uid"] = 12345
+        self.assertFalse(staging._restore_roots_are_retry_safe(original, drifted))
+
+    def test_backup_rebuild_accepts_already_prepared_initial_roots(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        original = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o755,
+                "empty": True,
+            },
+            "nats": {
+                "device": 1,
+                "inode": 30,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o755,
+                "empty": True,
+            },
+        }
+        prepared = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 999,
+                "gid": 999,
+                "mode": 0o770,
+            },
+            "nats": {
+                "device": 1,
+                "inode": 30,
+                "uid": 1000,
+                "gid": 1000,
+                "mode": 0o2770,
+            },
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": "0" * 40,
+            "receipt_sha256": "2" * 64,
+            "backup_archives": {
+                "postgres": {"sha256": "4" * 64},
+                "nats": {"sha256": "5" * 64},
+            },
+            "pre_delete_data_identity": {"postgres": {}, "nats": {}},
+            "empty_restore_roots": original,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=release,
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="staging-backup-initial-already-prepared-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "_load_backup_down_receipt", return_value=down
+                ),
+                mock.patch.object(
+                    staging, "require_clean_commit", return_value=controller
+                ),
+                mock.patch.object(
+                    staging,
+                    "_backup_controller_successor_handoff",
+                    return_value={
+                        "schema_version": 1,
+                        "from_controller_commit": down["controller_commit"],
+                        "to_controller_commit": controller,
+                        "reason": staging.BACKUP_CONTROLLER_HANDOFF_REASON,
+                        "authorized_at_unix": 123,
+                    },
+                ),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(
+                    staging.reference,
+                    "clusters",
+                    return_value=[staging.DEFAULT_CLUSTER],
+                ),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_anchors",
+                    return_value=prepared,
+                ),
+                mock.patch.object(
+                    staging,
+                    "retained_data_directory_exists",
+                    side_effect=[False, False],
+                ),
+                mock.patch.object(staging, "atomic_json") as persist,
+                mock.patch.object(
+                    staging,
+                    "prepare_volume_permissions",
+                    side_effect=staging.StagingCellError("stop after prepare"),
+                ) as prepare,
+                self.assertRaisesRegex(staging.StagingCellError, "stop after prepare"),
+            ):
+                staging.command_backup_delete_to_prove_rebuild(args)
+        persist.assert_called_once()
+        prepare.assert_called_once_with("kind", staging.DEFAULT_CLUSTER, root)
+
+    def test_backup_restore_retry_accepts_partial_permission_transition(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        original = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o755,
+                "empty": True,
+            },
+            "nats": {
+                "device": 1,
+                "inode": 30,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o755,
+                "empty": True,
+            },
+        }
+        partial = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 999,
+                "gid": 999,
+                "mode": 0o700,
+            },
+            "nats": dict(original["nats"]),
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-restore-pending",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "empty_restore_roots": original,
+            "production_changed": False,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="staging-backup-retry-partial-permissions-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(
+                    staging, "_load_backup_down_receipt", return_value=down
+                ),
+                mock.patch.object(
+                    staging, "require_clean_commit", return_value=controller
+                ),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(
+                    staging.reference,
+                    "clusters",
+                    return_value=[staging.DEFAULT_CLUSTER],
+                ),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_anchors",
+                    return_value=partial,
+                ),
+                mock.patch.object(
+                    staging,
+                    "prepare_volume_permissions",
+                    side_effect=staging.StagingCellError("stop after prepare"),
+                ) as prepare,
+                self.assertRaisesRegex(staging.StagingCellError, "stop after prepare"),
+            ):
+                staging.command_backup_delete_to_prove_rebuild(args)
+        prepare.assert_called_once_with("kind", staging.DEFAULT_CLUSTER, root)
 
     def test_backup_rebuild_rejects_initial_restore_root_metadata_drift_before_intent_or_permissions(self) -> None:
         owner = "test:t084"
@@ -5944,7 +6210,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "postgres": {
                 "device": 1,
                 "inode": 20,
-                "uid": 999,
+                "uid": 12345,
                 "gid": 999,
                 "mode": 0o700,
             },
