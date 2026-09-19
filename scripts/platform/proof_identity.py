@@ -558,11 +558,19 @@ def _validate_staging_cell_proof(
             raise IdentityError(f"staging proof receipt binding drifted: {label}")
 
 
+SUITE_VALIDATORS = {
+    "kind-gitops": _validate_controlled_oci_proof,
+    "ha-recovery": _validate_controlled_oci_proof,
+    "staging-cell": _validate_staging_cell_proof,
+}
+
+
 def _validate_suite_proof(identity: dict[str, Any], proof: dict[str, Any]) -> None:
-    if identity.get("suite") == "staging-cell":
-        _validate_staging_cell_proof(identity, proof)
-        return
-    _validate_controlled_oci_proof(identity, proof)
+    suite = identity.get("suite")
+    validator = SUITE_VALIDATORS.get(suite)
+    if validator is None:
+        raise IdentityError(f"reusable proof has unsupported validator suite: {suite}")
+    validator(identity, proof)
 
 
 def summarize_staging_proof(

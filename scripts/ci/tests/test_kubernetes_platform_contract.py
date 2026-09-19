@@ -2255,6 +2255,24 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                         second["identity_sha256"], third["identity_sha256"]
                     )
 
+    def test_proof_identity_has_explicit_suite_validators(self) -> None:
+        self.assertEqual(
+            set(self.proof_identity.SUITE_VALIDATORS),
+            set(self.proof_identity.SUITE_INPUTS),
+        )
+        self.assertIs(
+            self.proof_identity.SUITE_VALIDATORS["kind-gitops"],
+            self.proof_identity._validate_controlled_oci_proof,
+        )
+        self.assertIs(
+            self.proof_identity.SUITE_VALIDATORS["ha-recovery"],
+            self.proof_identity._validate_controlled_oci_proof,
+        )
+        self.assertIs(
+            self.proof_identity.SUITE_VALIDATORS["staging-cell"],
+            self.proof_identity._validate_staging_cell_proof,
+        )
+
     def test_staging_proof_identity_binds_controller_but_not_kind_ha_cache(self) -> None:
         staging = set(self.proof_identity.SUITE_INPUTS["staging-cell"])
         self.assertIn("scripts/platform/staging_cell.py", staging)
@@ -2605,8 +2623,9 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                 reuse = root / "reuse"
                 with mock.patch.object(
                     self.proof_identity, "_checkout_commit", return_value=commit
-                ), mock.patch.object(
-                    self.proof_identity, "_validate_controlled_oci_proof"
+                ), mock.patch.dict(
+                    self.proof_identity.SUITE_VALIDATORS,
+                    {"kind-gitops": mock.Mock()},
                 ):
                     self.proof_identity.record(identity_path, proof_path, reuse)
                     self.proof_identity.validate(
@@ -2647,8 +2666,9 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                 self.proof_identity, "compute_identity", return_value=identity
             ), mock.patch.object(
                 self.proof_identity, "_checkout_commit", return_value="5" * 40
-            ), mock.patch.object(
-                self.proof_identity, "_validate_controlled_oci_proof"
+            ), mock.patch.dict(
+                self.proof_identity.SUITE_VALIDATORS,
+                {"kind-gitops": mock.Mock()},
             ):
                 self.proof_identity.record(identity_path, source_proof_path, reuse)
 
