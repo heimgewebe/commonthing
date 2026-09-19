@@ -8483,6 +8483,11 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             raise StagingCellError(
                 "backup rebuild empty restore roots are not the proven post-delete roots"
             )
+        for name in ("postgres", "nats"):
+            if retained_data_directory_exists(root, name):
+                raise StagingCellError(
+                    f"backup rebuild requires empty {name} restore root before initial restore"
+                )
         existing = {
             "schema_version": 1,
             "status": "backup-restore-pending",

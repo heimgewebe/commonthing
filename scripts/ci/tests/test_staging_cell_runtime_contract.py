@@ -5894,6 +5894,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         exact_anchor_check = source.index(
             '_same_retained_data_anchors(down["empty_restore_roots"], anchors)'
         )
+        initial_empty_check = source.index(
+            "retained_data_directory_exists(root, name)"
+        )
         rebuild_intent_write = source.index("atomic_json(result_path, existing)")
         permission_prepare = source.index(
             "prepare_volume_permissions(kind, args.cluster, root)"
@@ -5902,13 +5905,103 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "_same_retained_data_anchors(prepared_restore_roots, observed)"
         )
 
-        self.assertLess(exact_anchor_check, rebuild_intent_write)
+        self.assertLess(exact_anchor_check, initial_empty_check)
+        self.assertLess(initial_empty_check, rebuild_intent_write)
         self.assertLess(rebuild_intent_write, permission_prepare)
         self.assertLess(permission_prepare, prepared_retry_check)
         self.assertNotIn(
             '_same_data_mount_anchors(down["empty_restore_roots"], anchors)',
             source,
         )
+
+    def test_backup_rebuild_rejects_nonempty_initial_restore_root_before_intent_or_permissions(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        empty_roots = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 1000,
+                "gid": 1000,
+                "mode": 0o700,
+                "empty": True,
+            },
+            "nats": {
+                "device": 1,
+                "inode": 30,
+                "uid": 1000,
+                "gid": 1000,
+                "mode": 0o700,
+                "empty": True,
+            },
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": "0" * 40,
+            "receipt_sha256": "2" * 64,
+            "backup_archives": {
+                "postgres": {"sha256": "4" * 64},
+                "nats": {"sha256": "5" * 64},
+            },
+            "pre_delete_data_identity": {"postgres": {}, "nats": {}},
+            "empty_restore_roots": empty_roots,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=release,
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-initial-nonempty-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(
+                    staging,
+                    "_backup_controller_successor_handoff",
+                    return_value={
+                        "schema_version": 1,
+                        "from_controller_commit": down["controller_commit"],
+                        "to_controller_commit": controller,
+                        "reason": staging.BACKUP_CONTROLLER_HANDOFF_REASON,
+                        "authorized_at_unix": 123,
+                    },
+                ),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(
+                    staging.reference,
+                    "clusters",
+                    return_value=[staging.DEFAULT_CLUSTER],
+                ),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_anchors",
+                    return_value=empty_roots,
+                ),
+                mock.patch.object(
+                    staging,
+                    "retained_data_directory_exists",
+                    side_effect=[False, True],
+                ),
+                mock.patch.object(staging, "prepare_volume_permissions") as prepare,
+                mock.patch.object(staging, "atomic_json") as persist,
+                self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "requires empty nats restore root before initial restore",
+                ),
+            ):
+                staging.command_backup_delete_to_prove_rebuild(args)
+        persist.assert_not_called()
+        prepare.assert_not_called()
 
     def test_backup_rebuild_controller_successor_rejects_unrelated_public_main(self) -> None:
         original = "1" * 40
