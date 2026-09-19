@@ -484,14 +484,14 @@ test.describe("Basemap Real Hamburg Visual Runtime Proof", () => {
         )
         .toBeGreaterThan(0);
 
-      // isSourceLoaded() is a momentary MapLibre state: retain the exact
+      // isSourceLoaded() is a momentary MapLibre state: return the exact
       // evidence object that satisfies the final coherent proof predicate.
-      // Reading again after the poll would reopen a TOCTOU window.
+      // Reading again after success would reopen a TOCTOU window.
       type FeatureEvidence = Awaited<ReturnType<typeof readFeatureEvidence>>;
-      let featureEvidence: FeatureEvidence | null = null;
-      await expect
-        .poll(
-          async () => {
+      const waitForCoherentFeatureEvidence =
+        async (): Promise<FeatureEvidence> => {
+          const deadline = Date.now() + 30_000;
+          while (Date.now() < deadline) {
             const evidence = await readFeatureEvidence();
             const ready =
               evidence.sourceLoaded &&
@@ -504,20 +504,15 @@ test.describe("Basemap Real Hamburg Visual Runtime Proof", () => {
               evidence.sourceFeatureCounts.water > 0 &&
               evidence.sourceFeatureCounts.place > 0;
             if (ready) {
-              featureEvidence = evidence;
+              return evidence;
             }
-            return ready;
-          },
-          {
-            message:
-              "Hamburg source and required feature layers must be coherent when final visual evidence is captured",
-            timeout: 30_000,
-          },
-        )
-        .toBeTruthy();
-      if (featureEvidence === null) {
-        throw new Error("Hamburg final feature evidence was not captured");
-      }
+            await page.waitForTimeout(100);
+          }
+          throw new Error(
+            "Hamburg source and required feature layers were not coherent before timeout",
+          );
+        };
+      const featureEvidence = await waitForCoherentFeatureEvidence();
 
       expect(featureEvidence.sourceLoaded).toBe(true);
       expect(featureEvidence.renderedLayerIds).toEqual(
