@@ -471,6 +471,7 @@ test.describe("Basemap Real Hamburg Visual Runtime Proof", () => {
           timeout: 30_000,
         })
         .toBeGreaterThan(0);
+      const featureEvidence = await readFeatureEvidence();
 
       await expect
         .poll(
@@ -484,18 +485,7 @@ test.describe("Basemap Real Hamburg Visual Runtime Proof", () => {
         )
         .toBeGreaterThan(0);
 
-      // isSourceLoaded() meldet waehrend des Kachelladens abwechselnd false und
-      // true. Ein einzelner Schnappschuss trifft daher zufaellig ein Ladefenster,
-      // deshalb wird auch dieser Zustand gepollt statt einmalig gelesen.
-      await expect
-        .poll(async () => (await readFeatureEvidence()).sourceLoaded, {
-          message: "Expected the Hamburg source to report fully loaded",
-          timeout: 30_000,
-        })
-        .toBe(true);
-
-      const featureEvidence = await readFeatureEvidence();
-
+      expect(featureEvidence.sourceLoaded).toBe(true);
       expect(featureEvidence.renderedLayerIds).toEqual(
         expect.arrayContaining(["landcover", "landuse"]),
       );
