@@ -83,46 +83,27 @@ uv run --project tools/py --locked python scripts/platform/staging_cell.py up --
 `bootstrap_tools.py` schreibt dabei das von `staging_cell.py` verlangte
 `toolchain/receipt.json`; ein anderer Cachepfad wird fail-closed abgewiesen.
 
-### Einmaliger Cutover einer bestehenden Legacy-Zelle
+### Historisch abgeschlossener Legacy-Cutover
 
-Eine vorhandene, noch nicht aktivierte Legacy-Zelle unter
-`~/.local/state/weltgewebe/staging-cell` wird **nicht** durch einen Fallback oder
-Symlink weiterbenutzt. Der einmalige Befehl
+Der einmalige State-Root-Cutover der bestehenden Legacy-Zelle ist abgeschlossen.
+Der aktuelle staging_cell.py-Controller enthält deshalb bewusst kein
+migrate-legacy-state-Subkommando mehr. Contraction Mode bedeutet hier: eine
+abgeschlossene Migrationsfunktion bleibt nicht als dauerhaft mutierbare
+Controlleroberfläche erhalten.
 
-```bash
-uv run --project tools/py --locked python scripts/platform/staging_cell.py migrate-legacy-state --owner-id "$COMMONTHING_STAGING_OWNER_ID"
-```
+Bereits adoptierter Zustand wird weiterhin fail-closed gelesen. Liegen retenierte
+Daten ohne Bootstrap-Receipt im kanonischen State-Root, muss das vorhandene
+receipts/legacy-state-migration.json den terminalen Status
+legacy-state-adopted, den Owner, die Datenidentitäten, Secret-Hashes und die
+unveränderten historischen Evidence-Receipts binden. Diese Prüfung verschiebt
+keine Daten und erzeugt keinen neuen Migrationszustand.
 
-prüft den alten Cell-Receipt und Owner, verweigert aktivierte oder mehrdeutige
-Zustände, löscht nur den exakt gebundenen alten Kind-Cluster `weltgewebe-staging`
-und verifiziert dessen Abwesenheit. Erst danach wird `data/` auf demselben
-Dateisystem atomar in den kanonischen State-Root verschoben. Dadurch bleiben
-Inodes, UID/GID und Dateimodi von PostgreSQL und NATS erhalten. Promotion-Receipts
-und private Secrets werden bytegleich übernommen und nach SHA-256 verifiziert;
-Secrets müssen reguläre owner-eigene Dateien mit Modus `0600` sein. Die alten
-Cell-/Toolchain-Receipts werden unverändert unter `legacy-evidence/` erhalten. Der
-alte Toolchain-Receipt wird **nicht** als aktive Toolchain übernommen, weil er
-absolute Legacy-Pfade bindet. Anschließend ist die Toolchain im neuen State-Root
-neu zu bootstrappen und `up` zu starten.
-
-Vor dem Daten-Move hält ein erhaltenes Legacy-Receipt den Bootstrap-Commit fest;
-damit ist der alte Cluster rekonstruierbar. Vor dem ersten Schreibzugriff des
-neuen Clusters kann `data/` außerdem per umgekehrtem Same-Filesystem-Rename in
-den Legacy-Root zurückgeführt werden. Ein erfolgreicher Migrations-Receipt bindet
-beide Roots, beide Clusteridentitäten, Owner, alte Receipt-Hashes, Secret-Hashes,
-Promotion-Dateien und die Inode-/Ownership-Identität der Daten. Kein normaler
-Controllerpfad fällt still auf den alten Root zurück.
-
-Beim ersten `up --owner-id <id>` wird die externe Secretquelle vor jeder
-Clustererzeugung erzeugt bzw. validiert. Anschließend bindet ein
-`bootstrap-in-progress`-Receipt Owner, exakten Commit und Secretquellen-Hash,
-bevor Kind erzeugt wird. Dadurch bleiben auch abgebrochene Bootstraps
-wiederaufnehmbar oder über `down --owner-id <id>` kontrolliert abbaubar. Ein
-späteres `up` nach `down` bleibt am Bootstrap-Commit und am ursprünglichen Owner
-gebunden; ein stilles Umbinden des Datenpfads an ein inzwischen weitergelaufenes
-`main` ist verboten. Sobald eine App-Aktivierung läuft oder erfolgreich
-abgeschlossen ist, verweigert `up` fail-closed eine Rückschreibung auf den
-Bootstrap-Zustand.
+Ein noch **nicht** migrierter Legacy-State darf nicht durch Symlink, stilles
+Kopieren oder einen improvisierten Fallback in den aktuellen Controller
+eingeschleust werden. Er ist ein eigener Recovery-/Migrationsfall und muss mit
+der erhaltenen historischen Revision und ihrer Evidence explizit rekonstruiert
+oder in einem getrennt geprüften Operatorvorgang migriert werden. Der heutige
+Legacy Experimental Controller ist dafür nicht die Migrationsoberfläche.
 
 ### Delete-to-Prove nach aktivierter Staging-App
 

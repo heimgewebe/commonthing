@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -186,6 +187,28 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             "weltgewebe_staging_cell",
             ROOT / "scripts/platform/staging_cell.py",
         )
+
+    def test_platform_readme_references_only_current_staging_cli(self) -> None:
+        readme = (ROOT / "platform/README.md").read_text(encoding="utf-8")
+        referenced = set(
+            re.findall(
+                r"scripts/platform/staging_cell\.py\s+([a-z0-9-]+)",
+                readme,
+            )
+        )
+        source = STAGING_CELL_PATH.read_text(encoding="utf-8")
+        modules = {
+            path.name for path in (ROOT / "scripts/platform").glob("*.py")
+        }
+        snapshot = _staging_contract_snapshot(
+            source,
+            platform_modules={
+                Path(name).stem for name in modules if name.endswith(".py")
+            },
+        )
+        self.assertTrue(referenced)
+        self.assertLessEqual(referenced, snapshot["commands"])
+        self.assertNotIn("migrate-legacy-state", referenced)
 
     def test_staging_cell_contraction_ratchet(self) -> None:
         current_source = STAGING_CELL_PATH.read_text(encoding="utf-8")

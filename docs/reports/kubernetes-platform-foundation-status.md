@@ -96,7 +96,7 @@ Belegt bleiben insbesondere:
 
 ## Weiterhin nicht behauptet
 
-- Kubernetes ist nicht die laufende Weltgewebe-Produktion.
+- Kubernetes ist nicht die laufende commonThing-Produktion.
 - Ein kind-Proof ist kein Beweis für mehrere physische Hosts, reale Providerfehlerdomänen, externes DNS/TLS oder einen produktiven Load Balancer.
 - Der begonnene neuere Backup-Zyklus ist kein terminaler Staging-E2E-Beweis.
 - Der Compose-Produktionspfad bleibt die aktuelle Laufzeit, bis ein getrennter Produktionscutover belegt ist.
