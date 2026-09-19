@@ -1058,7 +1058,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.assertIn("basemap_variant=germany", result.stdout)
         self.assertIn("schauwerk_release=verified", result.stdout)
         self.assertNotIn("reason=basemap_identity_drift", result.stdout)
-        self.assertNotIn("reason=schauwerk_release_identity_drift", result.stdout)
+        self.assertNotIn("reason=schaubild_runtime_image_identity_drift", result.stdout)
 
     def test_reconciler_repairs_same_commit_with_stale_public_schauwerk_release(self) -> None:
         marker = self.root / "deploy-complete"
@@ -1073,7 +1073,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.restore_test_ownership()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(marker.exists())
-        self.assertIn("reason=schauwerk_release_identity_drift", result.stdout)
+        self.assertIn("reason=schaubild_runtime_image_identity_drift", result.stdout)
         self.assertIn("production_reconcile=verified", result.stdout)
         self.assertNotIn("production_reconcile=noop", result.stdout)
 
