@@ -47,6 +47,7 @@ HOST_GATEWAY_RECEIPT = "receipts/host-gateway-proof.json"
 BACKUP_DOWN_RECEIPT = "receipts/backup-delete-to-prove-down.json"
 BACKUP_REBUILD_RECEIPT = "receipts/backup-delete-to-prove-rebuild.json"
 BACKUP_DELETE_TO_PROVE_RECEIPT = "receipts/backup-delete-to-prove.json"
+BACKUP_CONTROLLER_HANDOFF_REASON = "public-main-descendant-recovery-successor"
 STAGING_GATEWAY_NODE_PORT = 31844
 STAGING_GATEWAY_HOST_PORT = 18084
 SOURCE_NAME = "commonthing-staging-source"
@@ -82,6 +83,10 @@ DATA_KUSTOMIZATION_TIMEOUT = "8m"
 DATA_KUSTOMIZATION_TIMEOUT_SECONDS = 8 * 60.0
 PVC_BIND_TIMEOUT_SECONDS = 45.0
 ALLOWED_RETAINED_VOLUME_MODES = {"700", "770", "2770"}
+RETAINED_VOLUME_IDENTITIES = {
+    "postgres": (999, 999),
+    "nats": (1000, 1000),
+}
 REQUIRED_TOOLS = ("kind", "kubectl", "kustomize", "flux", "helm")
 REQUIRED_ARTIFACTS = (
     "gateway_api_gatewayclasses",
@@ -2091,10 +2096,9 @@ def prepare_volume_permissions(kind: str, cluster: str, root: Path) -> None:
     data_node = _retained_mount_node(
         kind, cluster, root, require_split=True
     )
-    for volume_path, identity in (
-        ("/var/local/commonthing-staging/postgres", "999:999"),
-        ("/var/local/commonthing-staging/nats", "1000:1000"),
-    ):
+    for name, (uid, gid) in RETAINED_VOLUME_IDENTITIES.items():
+        volume_path = f"/var/local/commonthing-staging/{name}"
+        identity = f"{uid}:{gid}"
         run(["docker", "exec", data_node, "mkdir", "-p", volume_path], timeout=30)
         observed = output(
             ["docker", "exec", data_node, "stat", "-c", "%u:%g:%a", volume_path],
@@ -2143,11 +2147,14 @@ def _mounted_retained_data_anchors(
     root: Path,
     *,
     require_split: bool,
+    require_nonempty: bool = True,
 ) -> dict[str, dict[str, Any]]:
     data_node = _retained_mount_node(
         kind, cluster, root, require_split=require_split
     )
-    identity = _retained_data_identity(root, include_content=False)
+    identity = _retained_data_identity(
+        root, include_content=False, require_nonempty=require_nonempty
+    )
     for name in ("postgres", "nats"):
         volume_path = f"/var/local/commonthing-staging/{name}"
         observed = output(
@@ -2194,10 +2201,15 @@ def _mounted_retained_data_identity(
     *,
     durable: bool,
     require_split: bool,
+    require_nonempty: bool = True,
     timeout_seconds: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     identity = _mounted_retained_data_anchors(
-        kind, cluster, root, require_split=require_split
+        kind,
+        cluster,
+        root,
+        require_split=require_split,
+        require_nonempty=require_nonempty,
     )
     data_node = data_node_name(cluster)
     if timeout_seconds is not None and (
@@ -6071,6 +6083,34 @@ def host_gateway_receipt_current(root: Path, cell: dict[str, Any], kubectl: str)
         return False
 
 
+def _gateway_receipt_observation_matches(
+    receipt: dict[str, Any], observed: dict[str, Any]
+) -> bool:
+    if all(receipt.get(key) == value for key, value in observed.items()):
+        return True
+
+    # Gateway receipts created before the host-external proof contract recorded
+    # the complete Service spec hash but not node_port as a separate field.
+    # The spec hash already commits to the live NodePort, so accepting exactly
+    # this missing redundant field preserves the old proof without weakening
+    # any resource, UID, routing, address or Service-spec binding.
+    receipt_service = receipt.get("service")
+    observed_service = observed.get("service")
+    if (
+        not isinstance(receipt_service, dict)
+        or "node_port" in receipt_service
+        or not isinstance(observed_service, dict)
+        or not isinstance(observed_service.get("node_port"), int)
+        or isinstance(observed_service.get("node_port"), bool)
+    ):
+        return False
+    legacy_service = {
+        key: value for key, value in observed_service.items() if key != "node_port"
+    }
+    legacy_observed = {**observed, "service": legacy_service}
+    return all(receipt.get(key) == value for key, value in legacy_observed.items())
+
+
 def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
     if cell.get("status") != "gateway-ready":
         return False
@@ -6113,7 +6153,7 @@ def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
         return (
             implementation_valid
             and receipt.get("address") in observed["gateway_addresses"]
-            and all(receipt.get(key) == value for key, value in observed.items())
+            and _gateway_receipt_observation_matches(receipt, observed)
         )
     except (OSError, ValueError, StagingCellError, subprocess.CalledProcessError):
         return False
@@ -6503,11 +6543,14 @@ def _retained_tree_sha256(path: Path, *, label: str) -> str:
 
 
 def _retained_data_identity(
-    root: Path, *, include_content: bool = True
+    root: Path,
+    *,
+    include_content: bool = True,
+    require_nonempty: bool = True,
 ) -> dict[str, dict[str, Any]]:
     identity: dict[str, dict[str, Any]] = {}
     for name in ("postgres", "nats"):
-        if not retained_data_directory_exists(root, name):
+        if require_nonempty and not retained_data_directory_exists(root, name):
             raise StagingCellError(
                 "delete-to-prove requires retained PostgreSQL and NATS data"
             )
@@ -6538,6 +6581,36 @@ def _same_retained_data_anchors(
         and all(before[name].get(field) == after[name].get(field) for field in anchor_fields)
         for name in ("postgres", "nats")
     )
+
+
+def _restore_roots_are_retry_safe(
+    before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]]
+) -> bool:
+    for name, (uid, gid) in RETAINED_VOLUME_IDENTITIES.items():
+        expected = before.get(name)
+        observed = after.get(name)
+        if not isinstance(expected, dict) or not isinstance(observed, dict):
+            return False
+        if any(
+            expected.get(field) != observed.get(field)
+            for field in ("device", "inode")
+        ):
+            return False
+        original_metadata = all(
+            expected.get(field) == observed.get(field)
+            for field in ("uid", "gid", "mode")
+        )
+        mode = observed.get("mode")
+        prepared_metadata = (
+            observed.get("uid") == uid
+            and observed.get("gid") == gid
+            and isinstance(mode, int)
+            and not isinstance(mode, bool)
+            and format(mode, "o") in ALLOWED_RETAINED_VOLUME_MODES
+        )
+        if not (original_metadata or prepared_metadata):
+            return False
+    return True
 
 
 def _require_durable_retained_fingerprint(
@@ -7769,7 +7842,6 @@ def _load_completed_backup_rebuild_receipt(
         "owner_id": down.get("owner_id"),
         "bootstrap_commit": down.get("bootstrap_commit"),
         "release_commit": down.get("release_commit"),
-        "controller_commit": down.get("controller_commit"),
         "backup_down_receipt_sha256": down.get("receipt_sha256"),
         "production_changed": False,
     }
@@ -7778,6 +7850,7 @@ def _load_completed_backup_rebuild_receipt(
             raise StagingCellError(
                 f"completed backup rebuild lost its backup-down binding: {key}"
             )
+    _require_backup_rebuild_controller_binding(down, rebuild)
     empty_roots = down.get("empty_restore_roots")
     restored = rebuild.get("restored_data_identity")
     if (
@@ -8229,6 +8302,105 @@ def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, A
     return _resume_backup_creation(root, args, pending, resumed=False)
 
 
+def _canonical_backup_controller_commit(value: Any, *, label: str) -> str:
+    commit = str(value or "")
+    if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
+        raise StagingCellError(f"{label} is not a canonical 40-hex commit")
+    return commit
+
+
+def _git_commit_is_ancestor(ancestor: str, descendant: str) -> bool:
+    ancestor = _canonical_backup_controller_commit(
+        ancestor, label="backup controller ancestor"
+    )
+    descendant = _canonical_backup_controller_commit(
+        descendant, label="backup controller successor"
+    )
+    completed = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    raise StagingCellError("cannot verify backup recovery controller ancestry")
+
+
+def _backup_controller_successor_handoff(
+    down: dict[str, Any], controller_commit: str
+) -> dict[str, Any] | None:
+    original = _canonical_backup_controller_commit(
+        down.get("controller_commit"), label="backup creation controller"
+    )
+    current = _canonical_backup_controller_commit(
+        controller_commit, label="backup rebuild controller"
+    )
+    if current == original:
+        return None
+    public_main = require_clean_commit(None)
+    if public_main != current:
+        raise StagingCellError(
+            "backup recovery controller successor must be the exact current public main"
+        )
+    if not _git_commit_is_ancestor(original, current):
+        raise StagingCellError(
+            "backup recovery controller successor must descend from the backup creation controller"
+        )
+    return {
+        "schema_version": 1,
+        "from_controller_commit": original,
+        "to_controller_commit": current,
+        "reason": BACKUP_CONTROLLER_HANDOFF_REASON,
+        "authorized_at_unix": int(time.time()),
+    }
+
+
+def _require_backup_rebuild_controller_binding(
+    down: dict[str, Any], rebuild: dict[str, Any]
+) -> None:
+    original = _canonical_backup_controller_commit(
+        down.get("controller_commit"), label="backup creation controller"
+    )
+    controller = _canonical_backup_controller_commit(
+        rebuild.get("controller_commit"), label="backup rebuild controller"
+    )
+    handoff = rebuild.get("controller_handoff")
+    if controller == original:
+        if handoff is not None:
+            raise StagingCellError(
+                "backup rebuild receipt has an unexpected controller handoff"
+            )
+        return
+    if not isinstance(handoff, dict) or set(handoff) != {
+        "schema_version",
+        "from_controller_commit",
+        "to_controller_commit",
+        "reason",
+        "authorized_at_unix",
+    }:
+        raise StagingCellError(
+            "backup rebuild controller successor has no exact handoff receipt"
+        )
+    authorized_at = handoff.get("authorized_at_unix")
+    if (
+        handoff.get("schema_version") != 1
+        or handoff.get("from_controller_commit") != original
+        or handoff.get("to_controller_commit") != controller
+        or handoff.get("reason") != BACKUP_CONTROLLER_HANDOFF_REASON
+        or not isinstance(authorized_at, int)
+        or isinstance(authorized_at, bool)
+        or authorized_at <= 0
+        or not _git_commit_is_ancestor(original, controller)
+    ):
+        raise StagingCellError("backup rebuild controller handoff binding is invalid")
+
+
 @lifecycle_mutation_locked
 @reference_output_routed
 def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str, Any]:
@@ -8241,13 +8413,17 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         raise StagingCellError("backup rebuild owner or cluster binding mismatch")
     if args.source_commit != down.get("release_commit"):
         raise StagingCellError("backup rebuild must restore the exact pre-delete release")
-    controller_commit = require_clean_commit(None, require_public_main=False)
-    if controller_commit != down.get("controller_commit"):
-        raise StagingCellError("backup rebuild controller commit differs from backup creation")
     result_path = root / BACKUP_REBUILD_RECEIPT
+    rebuild_receipt_exists = result_path.exists() or result_path.is_symlink()
+    controller_commit = require_clean_commit(None, require_public_main=False)
+    controller_handoff = (
+        None
+        if rebuild_receipt_exists
+        else _backup_controller_successor_handoff(down, controller_commit)
+    )
     existing: dict[str, Any] | None = None
     terminal_existing = False
-    if result_path.exists() or result_path.is_symlink():
+    if rebuild_receipt_exists:
         existing = _private_json_receipt(result_path, label="backup rebuild receipt")
         if existing.get("owner_id") != args.owner_id or existing.get("cluster") != args.cluster:
             raise StagingCellError("backup rebuild receipt owner or cluster mismatch")
@@ -8255,6 +8431,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             raise StagingCellError("backup rebuild receipt release mismatch")
         if existing.get("controller_commit") != controller_commit:
             raise StagingCellError("backup rebuild receipt controller mismatch")
+        _require_backup_rebuild_controller_binding(down, existing)
         if existing.get("backup_down_receipt_sha256") != down["receipt_sha256"]:
             raise StagingCellError("backup rebuild receipt is not bound to current backup-down receipt")
         if existing.get("production_changed") is not False:
@@ -8326,16 +8503,24 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         expected_commit=down["bootstrap_commit"],
         expected_owner_id=args.owner_id,
     )
-    prepare_volume_permissions(kind, args.cluster, root)
 
     if existing is None:
         anchors = _mounted_retained_data_anchors(
-            kind, args.cluster, root, require_split=True
+            kind,
+            args.cluster,
+            root,
+            require_split=True,
+            require_nonempty=False,
         )
-        if not _same_data_mount_anchors(down["empty_restore_roots"], anchors):
+        if not _restore_roots_are_retry_safe(down["empty_restore_roots"], anchors):
             raise StagingCellError(
                 "backup rebuild empty restore roots are not the proven post-delete roots"
             )
+        for name in ("postgres", "nats"):
+            if retained_data_directory_exists(root, name):
+                raise StagingCellError(
+                    f"backup rebuild requires empty {name} restore root before initial restore"
+                )
         existing = {
             "schema_version": 1,
             "status": "backup-restore-pending",
@@ -8344,6 +8529,11 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             "bootstrap_commit": down["bootstrap_commit"],
             "release_commit": down["release_commit"],
             "controller_commit": controller_commit,
+            **(
+                {"controller_handoff": controller_handoff}
+                if controller_handoff is not None
+                else {}
+            ),
             "backup_down_receipt_sha256": down["receipt_sha256"],
             "backup_archives": down["backup_archives"],
             "pre_delete_data_identity": down["pre_delete_data_identity"],
@@ -8353,6 +8543,20 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         }
         atomic_json(result_path, existing)
 
+    if existing["status"] == "backup-restore-pending" and rebuild_receipt_exists:
+        retry_anchors = _mounted_retained_data_anchors(
+            kind, args.cluster, root, require_split=True, require_nonempty=False
+        )
+        if not _restore_roots_are_retry_safe(
+            existing["empty_restore_roots"], retry_anchors
+        ):
+            raise StagingCellError("backup restore target identity changed before retry")
+
+    # Each receipt-bound root may independently be original or already prepared.
+    # Device and inode always stay fixed, so an interrupted per-volume ownership
+    # transition is restart-safe without accepting a replaced restore root.
+    prepare_volume_permissions(kind, args.cluster, root)
+
     if existing["status"] == "backup-restore-pending":
         observed = _mounted_retained_data_identity(
             kind,
@@ -8360,9 +8564,12 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             root,
             durable=True,
             require_split=True,
+            require_nonempty=False,
             timeout_seconds=backup_timeout,
         )
-        if not _same_data_mount_anchors(existing["empty_restore_roots"], observed):
+        if not _restore_roots_are_retry_safe(
+            existing["empty_restore_roots"], observed
+        ):
             raise StagingCellError(
                 "backup restore target identity changed before retry"
             )
