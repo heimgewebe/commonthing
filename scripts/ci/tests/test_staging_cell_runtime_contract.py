@@ -5711,12 +5711,43 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(staging, "output", side_effect=mounted_stats),
             ):
                 observed = staging._mounted_retained_data_anchors(
-                    "kind", staging.DEFAULT_CLUSTER, root, require_split=True
+                    "kind",
+                    staging.DEFAULT_CLUSTER,
+                    root,
+                    require_split=True,
+                    require_nonempty=False,
                 )
 
         for name in ("postgres", "nats"):
             for field in ("device", "inode", "uid", "gid", "mode"):
                 self.assertEqual(observed[name][field], expected[name][field])
+
+    def test_mounted_retained_data_identity_still_rejects_empty_roots_by_default(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="staging-backup-empty-mounted-identity-"
+        ) as tmp_name:
+            root = Path(tmp_name)
+            for name in ("postgres", "nats"):
+                (root / "data" / name).mkdir(parents=True)
+
+            with (
+                mock.patch.object(
+                    staging, "_retained_mount_node", return_value="data-node"
+                ),
+                self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "delete-to-prove requires retained PostgreSQL and NATS data",
+                ),
+            ):
+                staging._mounted_retained_data_identity(
+                    "kind",
+                    staging.DEFAULT_CLUSTER,
+                    root,
+                    durable=False,
+                    require_split=True,
+                )
 
     def test_resumed_backup_down_uses_conservative_rto_boundary_without_stale_self_hash(self) -> None:
         owner = "test:t084"
@@ -5827,6 +5858,75 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         revalidate_release.assert_called_once_with(root, pending)
         complete.assert_called_once_with(root, args, pending, resumed=True)
         backup.assert_not_called()
+
+    def test_backup_rebuild_controller_successor_requires_current_public_main_descendant(self) -> None:
+        original = "1" * 40
+        successor = "2" * 40
+        down = {"controller_commit": original}
+        with (
+            mock.patch.object(
+                staging, "require_clean_commit", return_value=successor
+            ) as require_clean,
+            mock.patch.object(
+                staging, "_git_commit_is_ancestor", return_value=True
+            ) as is_ancestor,
+            mock.patch.object(staging.time, "time", return_value=123),
+        ):
+            handoff = staging._backup_controller_successor_handoff(down, successor)
+
+        require_clean.assert_called_once_with(None)
+        is_ancestor.assert_called_once_with(original, successor)
+        self.assertEqual(
+            handoff,
+            {
+                "schema_version": 1,
+                "from_controller_commit": original,
+                "to_controller_commit": successor,
+                "reason": staging.BACKUP_CONTROLLER_HANDOFF_REASON,
+                "authorized_at_unix": 123,
+            },
+        )
+
+    def test_backup_rebuild_controller_successor_rejects_unrelated_public_main(self) -> None:
+        original = "1" * 40
+        successor = "2" * 40
+        down = {"controller_commit": original}
+        with (
+            mock.patch.object(staging, "require_clean_commit", return_value=successor),
+            mock.patch.object(staging, "_git_commit_is_ancestor", return_value=False),
+            self.assertRaisesRegex(
+                staging.StagingCellError, "must descend from the backup creation controller"
+            ),
+        ):
+            staging._backup_controller_successor_handoff(down, successor)
+
+    def test_backup_rebuild_controller_binding_accepts_exact_successor_handoff(self) -> None:
+        original = "1" * 40
+        successor = "2" * 40
+        down = {"controller_commit": original}
+        rebuild = {
+            "controller_commit": successor,
+            "controller_handoff": {
+                "schema_version": 1,
+                "from_controller_commit": original,
+                "to_controller_commit": successor,
+                "reason": staging.BACKUP_CONTROLLER_HANDOFF_REASON,
+                "authorized_at_unix": 123,
+            },
+        }
+        with mock.patch.object(
+            staging, "_git_commit_is_ancestor", return_value=True
+        ) as is_ancestor:
+            staging._require_backup_rebuild_controller_binding(down, rebuild)
+        is_ancestor.assert_called_once_with(original, successor)
+
+    def test_backup_rebuild_controller_binding_rejects_unproven_successor(self) -> None:
+        down = {"controller_commit": "1" * 40}
+        rebuild = {"controller_commit": "2" * 40}
+        with self.assertRaisesRegex(
+            staging.StagingCellError, "has no exact handoff receipt"
+        ):
+            staging._require_backup_rebuild_controller_binding(down, rebuild)
 
     def test_backup_restore_fast_path_rejects_matching_data_on_replaced_roots(self) -> None:
         owner = "test:t084"

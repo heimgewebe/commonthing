@@ -47,6 +47,7 @@ HOST_GATEWAY_RECEIPT = "receipts/host-gateway-proof.json"
 BACKUP_DOWN_RECEIPT = "receipts/backup-delete-to-prove-down.json"
 BACKUP_REBUILD_RECEIPT = "receipts/backup-delete-to-prove-rebuild.json"
 BACKUP_DELETE_TO_PROVE_RECEIPT = "receipts/backup-delete-to-prove.json"
+BACKUP_CONTROLLER_HANDOFF_REASON = "public-main-descendant-recovery-successor"
 STAGING_GATEWAY_NODE_PORT = 31844
 STAGING_GATEWAY_HOST_PORT = 18084
 SOURCE_NAME = "commonthing-staging-source"
@@ -2143,12 +2144,13 @@ def _mounted_retained_data_anchors(
     root: Path,
     *,
     require_split: bool,
+    require_nonempty: bool = True,
 ) -> dict[str, dict[str, Any]]:
     data_node = _retained_mount_node(
         kind, cluster, root, require_split=require_split
     )
     identity = _retained_data_identity(
-        root, include_content=False, require_nonempty=False
+        root, include_content=False, require_nonempty=require_nonempty
     )
     for name in ("postgres", "nats"):
         volume_path = f"/var/local/commonthing-staging/{name}"
@@ -2196,10 +2198,15 @@ def _mounted_retained_data_identity(
     *,
     durable: bool,
     require_split: bool,
+    require_nonempty: bool = True,
     timeout_seconds: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     identity = _mounted_retained_data_anchors(
-        kind, cluster, root, require_split=require_split
+        kind,
+        cluster,
+        root,
+        require_split=require_split,
+        require_nonempty=require_nonempty,
     )
     data_node = data_node_name(cluster)
     if timeout_seconds is not None and (
@@ -7802,7 +7809,6 @@ def _load_completed_backup_rebuild_receipt(
         "owner_id": down.get("owner_id"),
         "bootstrap_commit": down.get("bootstrap_commit"),
         "release_commit": down.get("release_commit"),
-        "controller_commit": down.get("controller_commit"),
         "backup_down_receipt_sha256": down.get("receipt_sha256"),
         "production_changed": False,
     }
@@ -7811,6 +7817,7 @@ def _load_completed_backup_rebuild_receipt(
             raise StagingCellError(
                 f"completed backup rebuild lost its backup-down binding: {key}"
             )
+    _require_backup_rebuild_controller_binding(down, rebuild)
     empty_roots = down.get("empty_restore_roots")
     restored = rebuild.get("restored_data_identity")
     if (
@@ -8262,6 +8269,105 @@ def command_backup_delete_to_prove_down(args: argparse.Namespace) -> dict[str, A
     return _resume_backup_creation(root, args, pending, resumed=False)
 
 
+def _canonical_backup_controller_commit(value: Any, *, label: str) -> str:
+    commit = str(value or "")
+    if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
+        raise StagingCellError(f"{label} is not a canonical 40-hex commit")
+    return commit
+
+
+def _git_commit_is_ancestor(ancestor: str, descendant: str) -> bool:
+    ancestor = _canonical_backup_controller_commit(
+        ancestor, label="backup controller ancestor"
+    )
+    descendant = _canonical_backup_controller_commit(
+        descendant, label="backup controller successor"
+    )
+    completed = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    raise StagingCellError("cannot verify backup recovery controller ancestry")
+
+
+def _backup_controller_successor_handoff(
+    down: dict[str, Any], controller_commit: str
+) -> dict[str, Any] | None:
+    original = _canonical_backup_controller_commit(
+        down.get("controller_commit"), label="backup creation controller"
+    )
+    current = _canonical_backup_controller_commit(
+        controller_commit, label="backup rebuild controller"
+    )
+    if current == original:
+        return None
+    public_main = require_clean_commit(None)
+    if public_main != current:
+        raise StagingCellError(
+            "backup recovery controller successor must be the exact current public main"
+        )
+    if not _git_commit_is_ancestor(original, current):
+        raise StagingCellError(
+            "backup recovery controller successor must descend from the backup creation controller"
+        )
+    return {
+        "schema_version": 1,
+        "from_controller_commit": original,
+        "to_controller_commit": current,
+        "reason": BACKUP_CONTROLLER_HANDOFF_REASON,
+        "authorized_at_unix": int(time.time()),
+    }
+
+
+def _require_backup_rebuild_controller_binding(
+    down: dict[str, Any], rebuild: dict[str, Any]
+) -> None:
+    original = _canonical_backup_controller_commit(
+        down.get("controller_commit"), label="backup creation controller"
+    )
+    controller = _canonical_backup_controller_commit(
+        rebuild.get("controller_commit"), label="backup rebuild controller"
+    )
+    handoff = rebuild.get("controller_handoff")
+    if controller == original:
+        if handoff is not None:
+            raise StagingCellError(
+                "backup rebuild receipt has an unexpected controller handoff"
+            )
+        return
+    if not isinstance(handoff, dict) or set(handoff) != {
+        "schema_version",
+        "from_controller_commit",
+        "to_controller_commit",
+        "reason",
+        "authorized_at_unix",
+    }:
+        raise StagingCellError(
+            "backup rebuild controller successor has no exact handoff receipt"
+        )
+    authorized_at = handoff.get("authorized_at_unix")
+    if (
+        handoff.get("schema_version") != 1
+        or handoff.get("from_controller_commit") != original
+        or handoff.get("to_controller_commit") != controller
+        or handoff.get("reason") != BACKUP_CONTROLLER_HANDOFF_REASON
+        or not isinstance(authorized_at, int)
+        or isinstance(authorized_at, bool)
+        or authorized_at <= 0
+        or not _git_commit_is_ancestor(original, controller)
+    ):
+        raise StagingCellError("backup rebuild controller handoff binding is invalid")
+
+
 @lifecycle_mutation_locked
 @reference_output_routed
 def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str, Any]:
@@ -8274,13 +8380,17 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         raise StagingCellError("backup rebuild owner or cluster binding mismatch")
     if args.source_commit != down.get("release_commit"):
         raise StagingCellError("backup rebuild must restore the exact pre-delete release")
-    controller_commit = require_clean_commit(None, require_public_main=False)
-    if controller_commit != down.get("controller_commit"):
-        raise StagingCellError("backup rebuild controller commit differs from backup creation")
     result_path = root / BACKUP_REBUILD_RECEIPT
+    rebuild_receipt_exists = result_path.exists() or result_path.is_symlink()
+    controller_commit = require_clean_commit(None, require_public_main=False)
+    controller_handoff = (
+        None
+        if rebuild_receipt_exists
+        else _backup_controller_successor_handoff(down, controller_commit)
+    )
     existing: dict[str, Any] | None = None
     terminal_existing = False
-    if result_path.exists() or result_path.is_symlink():
+    if rebuild_receipt_exists:
         existing = _private_json_receipt(result_path, label="backup rebuild receipt")
         if existing.get("owner_id") != args.owner_id or existing.get("cluster") != args.cluster:
             raise StagingCellError("backup rebuild receipt owner or cluster mismatch")
@@ -8288,6 +8398,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             raise StagingCellError("backup rebuild receipt release mismatch")
         if existing.get("controller_commit") != controller_commit:
             raise StagingCellError("backup rebuild receipt controller mismatch")
+        _require_backup_rebuild_controller_binding(down, existing)
         if existing.get("backup_down_receipt_sha256") != down["receipt_sha256"]:
             raise StagingCellError("backup rebuild receipt is not bound to current backup-down receipt")
         if existing.get("production_changed") is not False:
@@ -8363,7 +8474,11 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
 
     if existing is None:
         anchors = _mounted_retained_data_anchors(
-            kind, args.cluster, root, require_split=True
+            kind,
+            args.cluster,
+            root,
+            require_split=True,
+            require_nonempty=False,
         )
         if not _same_data_mount_anchors(down["empty_restore_roots"], anchors):
             raise StagingCellError(
@@ -8377,6 +8492,11 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             "bootstrap_commit": down["bootstrap_commit"],
             "release_commit": down["release_commit"],
             "controller_commit": controller_commit,
+            **(
+                {"controller_handoff": controller_handoff}
+                if controller_handoff is not None
+                else {}
+            ),
             "backup_down_receipt_sha256": down["receipt_sha256"],
             "backup_archives": down["backup_archives"],
             "pre_delete_data_identity": down["pre_delete_data_identity"],
@@ -8393,6 +8513,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             root,
             durable=True,
             require_split=True,
+            require_nonempty=False,
             timeout_seconds=backup_timeout,
         )
         if not _same_data_mount_anchors(existing["empty_restore_roots"], observed):
