@@ -8510,11 +8510,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         }
         atomic_json(result_path, existing)
 
-    # The down receipt must prove the exact empty root metadata before the
-    # runtime-specific ownership transition. Persisting the rebuild intent
-    # first makes that deterministic transition restart-safe.
-    prepare_volume_permissions(kind, args.cluster, root)
-
+    prepared_restore_roots: dict[str, Any] | None = None
     if existing["status"] == "backup-restore-pending":
         prepared_restore_roots = copy.deepcopy(existing.get("empty_restore_roots"))
         if not isinstance(prepared_restore_roots, dict):
@@ -8531,6 +8527,24 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             prepared["uid"] = uid
             prepared["gid"] = gid
             prepared["mode"] = 0o700
+        if rebuild_receipt_exists:
+            retry_anchors = _mounted_retained_data_anchors(
+                kind, args.cluster, root, require_split=True, require_nonempty=False
+            )
+            if not (
+                _same_retained_data_anchors(existing["empty_restore_roots"], retry_anchors)
+                or _same_retained_data_anchors(prepared_restore_roots, retry_anchors)
+            ):
+                raise StagingCellError("backup restore target identity changed before retry")
+
+    # The down receipt must prove the exact empty root metadata before the
+    # runtime-specific ownership transition. Persisting the rebuild intent
+    # first makes that deterministic transition restart-safe. A retry proves
+    # either the original or already-prepared metadata before any mutation.
+    prepare_volume_permissions(kind, args.cluster, root)
+
+    if existing["status"] == "backup-restore-pending":
+        assert prepared_restore_roots is not None
         observed = _mounted_retained_data_identity(
             kind,
             args.cluster,

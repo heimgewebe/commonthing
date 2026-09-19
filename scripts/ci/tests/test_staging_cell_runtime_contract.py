@@ -5898,6 +5898,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             "retained_data_directory_exists(root, name)"
         )
         rebuild_intent_write = source.index("atomic_json(result_path, existing)")
+        retry_anchor_check = source.index(
+            "_same_retained_data_anchors(prepared_restore_roots, retry_anchors)"
+        )
         permission_prepare = source.index(
             "prepare_volume_permissions(kind, args.cluster, root)"
         )
@@ -5907,7 +5910,8 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
 
         self.assertLess(exact_anchor_check, initial_empty_check)
         self.assertLess(initial_empty_check, rebuild_intent_write)
-        self.assertLess(rebuild_intent_write, permission_prepare)
+        self.assertLess(rebuild_intent_write, retry_anchor_check)
+        self.assertLess(retry_anchor_check, permission_prepare)
         self.assertLess(permission_prepare, prepared_retry_check)
         self.assertNotIn(
             '_same_data_mount_anchors(down["empty_restore_roots"], anchors)',
@@ -6202,7 +6206,12 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
                 mock.patch.object(staging.reference, "clusters", return_value=[staging.DEFAULT_CLUSTER]),
                 mock.patch.object(staging.reference, "require_owned_cluster"),
-                mock.patch.object(staging, "prepare_volume_permissions"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_anchors",
+                    return_value=replaced_with_old_data,
+                ),
+                mock.patch.object(staging, "prepare_volume_permissions") as prepare,
                 mock.patch.object(
                     staging,
                     "_mounted_retained_data_identity",
@@ -6215,7 +6224,110 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 ):
                     staging.command_backup_delete_to_prove_rebuild(args)
             require_clean.assert_called_once_with(None, require_public_main=False)
+            prepare.assert_not_called()
             restore.assert_not_called()
+
+    def test_backup_restore_retry_rejects_missing_or_metadata_drift_before_permissions(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        down_sha = "2" * 64
+        empty_roots = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o755,
+                "empty": True,
+            },
+            "nats": {
+                "device": 1,
+                "inode": 30,
+                "uid": 0,
+                "gid": 0,
+                "mode": 0o755,
+                "empty": True,
+            },
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": controller,
+            "receipt_sha256": down_sha,
+            "pre_delete_data_identity": {"postgres": {}, "nats": {}},
+        }
+        existing = {
+            "schema_version": 1,
+            "status": "backup-restore-pending",
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": down["bootstrap_commit"],
+            "release_commit": release,
+            "controller_commit": controller,
+            "backup_down_receipt_sha256": down_sha,
+            "empty_restore_roots": empty_roots,
+            "production_changed": False,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER, owner_id=owner, source_commit=release
+        )
+        metadata_drift = {name: dict(identity) for name, identity in empty_roots.items()}
+        metadata_drift["postgres"]["uid"] = 12345
+        cases = {
+            "missing": staging.StagingCellError("retry restore root missing"),
+            "metadata-drift": metadata_drift,
+        }
+        for label, observed in cases.items():
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory(
+                    prefix=f"staging-backup-retry-{label}-"
+                ) as tmp_name:
+                    root = Path(tmp_name)
+                    staging.atomic_json(root / staging.BACKUP_REBUILD_RECEIPT, existing)
+                    anchors_patch = (
+                        mock.patch.object(
+                            staging,
+                            "_mounted_retained_data_anchors",
+                            side_effect=observed,
+                        )
+                        if isinstance(observed, Exception)
+                        else mock.patch.object(
+                            staging,
+                            "_mounted_retained_data_anchors",
+                            return_value=observed,
+                        )
+                    )
+                    with (
+                        mock.patch.object(staging, "state_root", return_value=root),
+                        mock.patch.object(staging, "configure_reference_paths"),
+                        mock.patch.object(
+                            staging, "_load_backup_down_receipt", return_value=down
+                        ),
+                        mock.patch.object(
+                            staging, "require_clean_commit", return_value=controller
+                        ),
+                        mock.patch.object(
+                            staging,
+                            "load_tool_receipt",
+                            return_value=self._tool_receipt(),
+                        ),
+                        mock.patch.object(
+                            staging.reference,
+                            "clusters",
+                            return_value=[staging.DEFAULT_CLUSTER],
+                        ),
+                        mock.patch.object(staging.reference, "require_owned_cluster"),
+                        anchors_patch,
+                        mock.patch.object(
+                            staging, "prepare_volume_permissions"
+                        ) as prepare,
+                        self.assertRaises(staging.StagingCellError),
+                    ):
+                        staging.command_backup_delete_to_prove_rebuild(args)
+                prepare.assert_not_called()
 
     def test_backup_restore_pending_reextracts_archives_even_when_tree_hashes_match(self) -> None:
         owner = "test:t084"
@@ -6290,6 +6402,11 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 mock.patch.object(staging, "load_tool_receipt", return_value=self._tool_receipt()),
                 mock.patch.object(staging.reference, "clusters", return_value=[staging.DEFAULT_CLUSTER]),
                 mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_anchors",
+                    return_value=pre_delete,
+                ),
                 mock.patch.object(staging, "prepare_volume_permissions"),
                 mock.patch.object(
                     staging,
