@@ -13,12 +13,37 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[3]
 CADDY_BINARY = shutil.which("caddy")
-DOCKER_BINARY = shutil.which("docker")
 CADDY_DOCKER_IMAGE = "caddy:2.8.4"
 MAGIC_PATH = "/api/auth/magic-link/consume"
 MAGIC_POLICY = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
 STRICT_POLICY = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 UPSTREAM_POLICY = "default-src https://upstream.invalid; form-action https://upstream.invalid;"
+
+
+def _usable_docker() -> str | None:
+    """Docker-Pfad nur, wenn auch der Daemon erreichbar ist.
+
+    shutil.which findet die CLI auch dort, wo kein Daemon läuft (Container ohne
+    gemounteten Socket, rootless-Setups ohne Session). Die Tests unten fallen
+    dann nicht in den Skip, sondern scheitern mit einem Verbindungsfehler, der
+    wie eine echte Regression aussieht.
+    """
+    binary = shutil.which("docker")
+    if binary is None:
+        return None
+    try:
+        probe = subprocess.run(
+            [binary, "info"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return binary if probe.returncode == 0 else None
+
+
+DOCKER_BINARY = _usable_docker()
 
 
 class CspUpstreamHandler(BaseHTTPRequestHandler):

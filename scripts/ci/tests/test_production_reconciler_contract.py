@@ -1068,6 +1068,14 @@ prune_releases
             )
 
     def test_release_activator_rejects_unsafe_and_non_git_releases(self) -> None:
+        if os.geteuid() == 0:
+            # Der "unsafe" Fixture-Pfad lebt davon, dass ihn ein Nicht-Root
+            # anlegt. Läuft der Test selbst als Root, ist er root-owned, der
+            # Aktivator kommt an der Ownership-Prüfung vorbei und scheitert
+            # erst an der nächsten Bedingung — die Aussage des Tests ist dann
+            # nicht mehr herstellbar.
+            self.skipTest("release-root ownership check requires a non-root test process")
+
         sudo_probe = subprocess.run(
             ["sudo", "-n", "true"],
             check=False,

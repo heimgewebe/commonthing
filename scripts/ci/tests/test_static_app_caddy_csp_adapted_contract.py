@@ -8,7 +8,6 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[3]
 CADDY_BINARY = shutil.which("caddy")
-DOCKER_BINARY = shutil.which("docker")
 CADDY_DOCKER_IMAGE = "caddy:2.8.4"
 MAGIC_LINK_CONFIRM_PATH = "/api/auth/magic-link/consume"
 MAGIC_POLICY = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
@@ -24,6 +23,32 @@ CASES = (
     ("infra/caddy/Caddyfile.heim", "weltgewebe.home.arpa", ["/api/*"]),
     ("infra/caddy/Caddyfile.vps", "commonthing.net", ["/api/*", "/health/*"]),
 )
+
+
+def _usable_docker() -> str | None:
+    """Docker-Pfad nur, wenn auch der Daemon erreichbar ist.
+
+    shutil.which findet die CLI auch dort, wo kein Daemon läuft (Container ohne
+    gemounteten Socket, rootless-Setups ohne Session). Die Tests unten fallen
+    dann nicht in den Skip, sondern scheitern mit einem Verbindungsfehler, der
+    wie eine echte Regression aussieht.
+    """
+    binary = shutil.which("docker")
+    if binary is None:
+        return None
+    try:
+        probe = subprocess.run(
+            [binary, "info"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return binary if probe.returncode == 0 else None
+
+
+DOCKER_BINARY = _usable_docker()
 
 
 def adapt(relative: str) -> dict:

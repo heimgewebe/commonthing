@@ -17,3 +17,11 @@ select = ["E9", "F"]
 # Modul-Attribute ab (ha.require_wal_object_identity(...)), weshalb Ruff sie
 # nicht als benutzt erkennen kann.
 "scripts/platform/ha_reference.py" = ["F401"]
+
+# test_semantic_search_ranking_core.py ist über SOURCE_PATHS in
+# scripts/search/probe_hybrid_ranking_core.py hash-gebunden: ihr SHA-256 steht
+# im eingecheckten T004-Receipt. Jede Änderung am Dateiinhalt — auch eine rein
+# kosmetische — macht das Receipt ungültig ("T004 source binding is stale"),
+# ohne dass die zugrunde liegende Messung neu erhoben wurde. Der Befund
+# (ungenutzte Variable `schema`) bleibt damit bewusst stehen.
+"scripts/ci/tests/test_semantic_search_ranking_core.py" = ["F841"]

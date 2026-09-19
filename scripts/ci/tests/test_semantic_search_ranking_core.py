@@ -640,7 +640,7 @@ class SemanticSearchRankingCoreTests(unittest.TestCase):
     ) -> None:
         if not DEFAULT_OUTPUT.exists():
             self.skipTest("T004 live receipt not generated yet")
-        json.loads(RECEIPT_SCHEMA.read_text(encoding="utf-8"))
+        schema = json.loads(RECEIPT_SCHEMA.read_text(encoding="utf-8"))
         receipt = json.loads(DEFAULT_OUTPUT.read_text(encoding="utf-8"))
         self.assertEqual(receipt["task_id"], TASK_ID)
         self.assertEqual(receipt["schema_version"], 2)
