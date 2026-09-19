@@ -5914,6 +5914,110 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             source,
         )
 
+    def test_backup_rebuild_rejects_initial_restore_root_metadata_drift_before_intent_or_permissions(self) -> None:
+        owner = "test:t084"
+        release = "f" * 40
+        controller = "1" * 40
+        empty_roots = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 1000,
+                "gid": 1000,
+                "mode": 0o700,
+                "empty": True,
+            },
+            "nats": {
+                "device": 1,
+                "inode": 30,
+                "uid": 1000,
+                "gid": 1000,
+                "mode": 0o700,
+                "empty": True,
+            },
+        }
+        drifted_roots = {
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 999,
+                "gid": 999,
+                "mode": 0o700,
+            },
+            "nats": {
+                "device": 1,
+                "inode": 30,
+                "uid": 1000,
+                "gid": 1000,
+                "mode": 0o700,
+            },
+        }
+        down = {
+            "cluster": staging.DEFAULT_CLUSTER,
+            "owner_id": owner,
+            "bootstrap_commit": "3" * 40,
+            "release_commit": release,
+            "controller_commit": "0" * 40,
+            "receipt_sha256": "2" * 64,
+            "backup_archives": {
+                "postgres": {"sha256": "4" * 64},
+                "nats": {"sha256": "5" * 64},
+            },
+            "pre_delete_data_identity": {"postgres": {}, "nats": {}},
+            "empty_restore_roots": empty_roots,
+        }
+        args = argparse.Namespace(
+            cluster=staging.DEFAULT_CLUSTER,
+            owner_id=owner,
+            source_commit=release,
+        )
+        with tempfile.TemporaryDirectory(prefix="staging-backup-initial-metadata-drift-") as tmp_name:
+            root = Path(tmp_name)
+            with (
+                mock.patch.object(staging, "state_root", return_value=root),
+                mock.patch.object(staging, "configure_reference_paths"),
+                mock.patch.object(staging, "_load_backup_down_receipt", return_value=down),
+                mock.patch.object(staging, "require_clean_commit", return_value=controller),
+                mock.patch.object(
+                    staging,
+                    "_backup_controller_successor_handoff",
+                    return_value={
+                        "schema_version": 1,
+                        "from_controller_commit": down["controller_commit"],
+                        "to_controller_commit": controller,
+                        "reason": staging.BACKUP_CONTROLLER_HANDOFF_REASON,
+                        "authorized_at_unix": 123,
+                    },
+                ),
+                mock.patch.object(
+                    staging, "load_tool_receipt", return_value=self._tool_receipt()
+                ),
+                mock.patch.object(
+                    staging.reference,
+                    "clusters",
+                    return_value=[staging.DEFAULT_CLUSTER],
+                ),
+                mock.patch.object(staging.reference, "require_owned_cluster"),
+                mock.patch.object(
+                    staging,
+                    "_mounted_retained_data_anchors",
+                    return_value=drifted_roots,
+                ),
+                mock.patch.object(
+                    staging, "retained_data_directory_exists"
+                ) as check_empty,
+                mock.patch.object(staging, "prepare_volume_permissions") as prepare,
+                mock.patch.object(staging, "atomic_json") as persist,
+                self.assertRaisesRegex(
+                    staging.StagingCellError,
+                    "empty restore roots are not the proven post-delete roots",
+                ),
+            ):
+                staging.command_backup_delete_to_prove_rebuild(args)
+        check_empty.assert_not_called()
+        persist.assert_not_called()
+        prepare.assert_not_called()
+
     def test_backup_rebuild_rejects_nonempty_initial_restore_root_before_intent_or_permissions(self) -> None:
         owner = "test:t084"
         release = "f" * 40
