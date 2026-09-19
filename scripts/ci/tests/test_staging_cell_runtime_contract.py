@@ -5887,6 +5887,29 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             },
         )
 
+    def test_backup_rebuild_proves_exact_empty_roots_before_permission_mutation(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging.command_backup_delete_to_prove_rebuild)
+        exact_anchor_check = source.index(
+            '_same_retained_data_anchors(down["empty_restore_roots"], anchors)'
+        )
+        rebuild_intent_write = source.index("atomic_json(result_path, existing)")
+        permission_prepare = source.index(
+            "prepare_volume_permissions(kind, args.cluster, root)"
+        )
+        prepared_retry_check = source.index(
+            "_same_retained_data_anchors(prepared_restore_roots, observed)"
+        )
+
+        self.assertLess(exact_anchor_check, rebuild_intent_write)
+        self.assertLess(rebuild_intent_write, permission_prepare)
+        self.assertLess(permission_prepare, prepared_retry_check)
+        self.assertNotIn(
+            '_same_data_mount_anchors(down["empty_restore_roots"], anchors)',
+            source,
+        )
+
     def test_backup_rebuild_controller_successor_rejects_unrelated_public_main(self) -> None:
         original = "1" * 40
         successor = "2" * 40
@@ -6003,8 +6026,22 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         controller = "1" * 40
         down_sha = "2" * 64
         pre_delete = {
-            "postgres": {"device": 1, "inode": 20, "tree_sha256": "a" * 64},
-            "nats": {"device": 1, "inode": 30, "tree_sha256": "b" * 64},
+            "postgres": {
+                "device": 1,
+                "inode": 20,
+                "uid": 999,
+                "gid": 999,
+                "mode": 0o700,
+                "tree_sha256": "a" * 64,
+            },
+            "nats": {
+                "device": 1,
+                "inode": 30,
+                "uid": 1000,
+                "gid": 1000,
+                "mode": 0o700,
+                "tree_sha256": "b" * 64,
+            },
         }
         empty_roots = {
             "postgres": {"device": 1, "inode": 20, "empty": True},

@@ -8470,7 +8470,6 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         expected_commit=down["bootstrap_commit"],
         expected_owner_id=args.owner_id,
     )
-    prepare_volume_permissions(kind, args.cluster, root)
 
     if existing is None:
         anchors = _mounted_retained_data_anchors(
@@ -8480,7 +8479,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             require_split=True,
             require_nonempty=False,
         )
-        if not _same_data_mount_anchors(down["empty_restore_roots"], anchors):
+        if not _same_retained_data_anchors(down["empty_restore_roots"], anchors):
             raise StagingCellError(
                 "backup rebuild empty restore roots are not the proven post-delete roots"
             )
@@ -8506,7 +8505,27 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
         }
         atomic_json(result_path, existing)
 
+    # The down receipt must prove the exact empty root metadata before the
+    # runtime-specific ownership transition. Persisting the rebuild intent
+    # first makes that deterministic transition restart-safe.
+    prepare_volume_permissions(kind, args.cluster, root)
+
     if existing["status"] == "backup-restore-pending":
+        prepared_restore_roots = copy.deepcopy(existing.get("empty_restore_roots"))
+        if not isinstance(prepared_restore_roots, dict):
+            raise StagingCellError("backup rebuild receipt lost empty restore roots")
+        for name, (uid, gid) in {
+            "postgres": (999, 999),
+            "nats": (1000, 1000),
+        }.items():
+            prepared = prepared_restore_roots.get(name)
+            if not isinstance(prepared, dict):
+                raise StagingCellError(
+                    f"backup rebuild receipt lost empty {name} restore identity"
+                )
+            prepared["uid"] = uid
+            prepared["gid"] = gid
+            prepared["mode"] = 0o700
         observed = _mounted_retained_data_identity(
             kind,
             args.cluster,
@@ -8516,7 +8535,7 @@ def command_backup_delete_to_prove_rebuild(args: argparse.Namespace) -> dict[str
             require_nonempty=False,
             timeout_seconds=backup_timeout,
         )
-        if not _same_data_mount_anchors(existing["empty_restore_roots"], observed):
+        if not _same_retained_data_anchors(prepared_restore_roots, observed):
             raise StagingCellError(
                 "backup restore target identity changed before retry"
             )
