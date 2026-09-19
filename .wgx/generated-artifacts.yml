@@ -58,59 +58,6 @@
       "blocking": true
     },
     {
-      "path": "docs/_generated/architecture-drift.md",
-      "kind": "generated",
-      "role": "diagnostic",
-      "canonicality": "derived",
-      "generator": [
-        "python3",
-        "-m",
-        "scripts.docmeta.generate_architecture_drift"
-      ],
-      "checks": [
-        [
-          "python3",
-          "-m",
-          "scripts.docmeta.generate_architecture_drift",
-          "--check"
-        ]
-      ],
-      "sources": [
-        "docs",
-        "scripts/docmeta/generate_architecture_drift.py"
-      ],
-      "scope": "Canonical architecture documents and their declared implementation relations.",
-      "consumers": [
-        {
-          "path": ".github/workflows/docs-guard.yml",
-          "purpose": "Executes the registry tests and documentation validation gates in CI."
-        },
-        {
-          "path": "scripts/docmeta/generated-files-guard.sh",
-          "purpose": "Fails closed when the committed controlled surface or its registry declaration drifts."
-        },
-        {
-          "path": "docs/policies/architecture-critique.md",
-          "purpose": "Uses architecture drift as diagnostic input for structured critique."
-        }
-      ],
-      "claims": [
-        "Documentation-level architecture drift detected from canonical architecture sources."
-      ],
-      "does_not_establish": [
-        "Canonical policy, runtime state, or deployment truth.",
-        "Correctness of the underlying source claims beyond the declared generator method."
-      ],
-      "overlaps": [
-        {
-          "path": "docs/_generated/staleness-report.md",
-          "distinction": "`docs/policies/architecture-critique.md` uses structural drift, not review-age status."
-        }
-      ],
-      "commit_required": true,
-      "blocking": true
-    },
-    {
       "path": "docs/_generated/backlinks.md",
       "kind": "generated",
       "role": "diagnostic",
@@ -162,55 +109,6 @@
         {
           "path": "docs/_generated/supersession-map.md",
           "distinction": "`scripts/ci/fixtures/repoground_vertical_pilot.v1.json` tests backlink edge types."
-        }
-      ],
-      "commit_required": true,
-      "blocking": true
-    },
-    {
-      "path": "docs/_generated/change-resonance.md",
-      "kind": "generated",
-      "role": "diagnostic",
-      "canonicality": "derived",
-      "generator": [
-        "python3",
-        "-m",
-        "scripts.docmeta.generate_change_resonance"
-      ],
-      "checks": [
-        [
-          "python3",
-          "-m",
-          "scripts.docmeta.generate_change_resonance",
-          "--check"
-        ]
-      ],
-      "sources": [
-        "docs",
-        "scripts/docmeta/generate_change_resonance.py"
-      ],
-      "scope": "Declared documentation and implementation relations affected by a source change.",
-      "consumers": [
-        {
-          "path": ".github/workflows/docs-guard.yml",
-          "purpose": "Executes the registry tests and documentation validation gates in CI."
-        },
-        {
-          "path": "scripts/docmeta/generated-files-guard.sh",
-          "purpose": "Fails closed when the committed controlled surface or its registry declaration drifts."
-        }
-      ],
-      "claims": [
-        "Potential relation-based change impact across documented repository surfaces."
-      ],
-      "does_not_establish": [
-        "Canonical policy, runtime state, or deployment truth.",
-        "Correctness of the underlying source claims beyond the declared generator method."
-      ],
-      "overlaps": [
-        {
-          "path": "docs/_generated/implicit-dependencies.md",
-          "distinction": "`.github/workflows/docs-guard.yml` checks declared impact apart from inferred dependencies."
         }
       ],
       "commit_required": true,
@@ -416,10 +314,6 @@
         "Correctness of the underlying source claims beyond the declared generator method."
       ],
       "overlaps": [
-        {
-          "path": "docs/_generated/change-resonance.md",
-          "distinction": "`.github/workflows/docs-guard.yml` checks declared impact apart from inferred dependencies."
-        },
         {
           "path": "docs/_generated/knowledge-gaps.md",
           "distinction": "`.github/workflows/docs-guard.yml` checks inferred edges apart from missing knowledge."
@@ -832,12 +726,7 @@
         "Canonical policy, runtime state, or deployment truth.",
         "Correctness of the underlying source claims beyond the declared generator method."
       ],
-      "overlaps": [
-        {
-          "path": "docs/_generated/architecture-drift.md",
-          "distinction": "`docs/policies/architecture-critique.md` uses structural drift, not review-age status."
-        }
-      ],
+      "overlaps": [],
       "commit_required": true,
       "blocking": true
     },

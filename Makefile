@@ -107,11 +107,9 @@ generate: require-uv-tooling
 	$(UV_RUN) python -m scripts.docmeta.generate_orphans
 	$(UV_RUN) python -m scripts.docmeta.generate_supersession_map
 	$(UV_RUN) python -m scripts.docmeta.generate_system_map
-	$(UV_RUN) python -m scripts.docmeta.generate_architecture_drift
 	$(UV_RUN) python -m scripts.docmeta.generate_doc_coverage
 	$(UV_RUN) python -m scripts.docmeta.generate_knowledge_gaps
 	$(UV_RUN) python -m scripts.docmeta.generate_implicit_dependencies
-	$(UV_RUN) python -m scripts.docmeta.generate_change_resonance
 	$(UV_RUN) python -m scripts.docmeta.generate_staleness_report
 	$(UV_RUN) python -m scripts.docmeta.generate_agent_readiness
 	$(UV_RUN) python -m scripts.docmeta.generate_claim_evidence_map

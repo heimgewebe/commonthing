@@ -44,19 +44,17 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 
 | Metric | Count |
 | --- | ---: |
-| controlled_surfaces | 19 |
-| generated_surfaces | 18 |
+| controlled_surfaces | 17 |
+| generated_surfaces | 16 |
 | curated_surfaces | 1 |
-| declared_consumer_edges | 51 |
-| exclusive_claims | 19 |
-| justified_overlap_pairs | 10 |
+| declared_consumer_edges | 46 |
+| exclusive_claims | 17 |
+| justified_overlap_pairs | 8 |
 
 | Path | Kind | Scope | Sources | Generator | Checks | Consumers | Exclusive claim | Does not establish |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | docs/_generated/agent-readiness.md | generated | Repository agent contracts, claim fixtures, preflight and readiness inputs. | contracts/agent; scripts/agent; scripts/docmeta/generate_agent_readiness.py; docs/claims/registry.yml | python3 -m scripts.docmeta.generate_agent_readiness | python3 -m scripts.docmeta.generate_agent_readiness --check | .github/workflows/docs-guard.yml: Executes the registry tests and documentation validation gates in CI.; scripts/docmeta/generated-files-guard.sh: Fails closed when the committed controlled surface or its registry declaration drifts.; docs/blueprints/blueprint-agent-safety-control-layer.md: Uses the readiness diagnostics to explain the safety-control handoff boundary. | Readiness diagnostics derived from the declared agent contract and its evidence fixtures. | Canonical policy, runtime state, or deployment truth.; Correctness of the underlying source claims beyond the declared generator method. |
-| docs/_generated/architecture-drift.md | generated | Canonical architecture documents and their declared implementation relations. | docs; scripts/docmeta/generate_architecture_drift.py | python3 -m scripts.docmeta.generate_architecture_drift | python3 -m scripts.docmeta.generate_architecture_drift --check | .github/workflows/docs-guard.yml: Executes the registry tests and documentation validation gates in CI.; scripts/docmeta/generated-files-guard.sh: Fails closed when the committed controlled surface or its registry declaration drifts.; docs/policies/architecture-critique.md: Uses architecture drift as diagnostic input for structured critique. | Documentation-level architecture drift detected from canonical architecture sources. | Canonical policy, runtime state, or deployment truth.; Correctness of the underlying source claims beyond the declared generator method. |
 | docs/_generated/backlinks.md | generated | Exact reverse references between indexed documentation paths. | docs; scripts/docmeta/generate_backlinks.py | python3 -m scripts.docmeta.generate_backlinks | python3 -m scripts.docmeta.generate_backlinks --check | .github/workflows/docs-guard.yml: Executes the registry tests and documentation validation gates in CI.; scripts/docmeta/generated-files-guard.sh: Fails closed when the committed controlled surface or its registry declaration drifts.; scripts/ci/fixtures/repoground_vertical_pilot.v1.json: Uses backlink output as a retrieval and navigation fixture. | Reverse documentation references for every indexed target path. | Canonical policy, runtime state, or deployment truth.; Correctness of the underlying source claims beyond the declared generator method. |
-| docs/_generated/change-resonance.md | generated | Declared documentation and implementation relations affected by a source change. | docs; scripts/docmeta/generate_change_resonance.py | python3 -m scripts.docmeta.generate_change_resonance | python3 -m scripts.docmeta.generate_change_resonance --check | .github/workflows/docs-guard.yml: Executes the registry tests and documentation validation gates in CI.; scripts/docmeta/generated-files-guard.sh: Fails closed when the committed controlled surface or its registry declaration drifts. | Potential relation-based change impact across documented repository surfaces. | Canonical policy, runtime state, or deployment truth.; Correctness of the underlying source claims beyond the declared generator method. |
 | docs/_generated/claim-evidence-map.md | generated | Registered claims, freshness declarations and their linked evidence paths. | docs/doc-freshness-registry.yml; docs/claims/registry.yml; scripts/docmeta/generate_claim_evidence_map.py; scripts/docmeta/validate_doc_freshness_registry.py | python3 -m scripts.docmeta.generate_claim_evidence_map | python3 -m scripts.docmeta.generate_claim_evidence_map --check | .github/workflows/docs-guard.yml: Executes the registry tests and documentation validation gates in CI.; scripts/docmeta/generated-files-guard.sh: Fails closed when the committed controlled surface or its registry declaration drifts.; docs/claims/README.md: Explains how readers use the generated claim-to-evidence projection. | Exact declared links from registered claims to repository evidence. | Canonical policy, runtime state, or deployment truth.; Correctness of the underlying source claims beyond the declared generator method. |
 | docs/_generated/doc-coverage.md | generated | Frontmatter and registration coverage of repository documentation. | docs; scripts/docmeta/generate_doc_coverage.py | python3 -m scripts.docmeta.generate_doc_coverage | python3 -m scripts.docmeta.generate_doc_coverage --check | .github/workflows/docs-guard.yml: Executes the registry tests and documentation validation gates in CI.; scripts/docmeta/generated-files-guard.sh: Fails closed when the committed controlled surface or its registry declaration drifts.; audit/impl-registry.yaml: Uses coverage diagnostics when assessing mapped implementation evidence. | Documentation metadata and registration coverage for scanned documents. | Canonical policy, runtime state, or deployment truth.; Correctness of the underlying source claims beyond the declared generator method. |
 | docs/_generated/doc-index.md | generated | Forward navigation metadata for indexed documentation. | docs; scripts/docmeta/generate-doc-index.sh | bash scripts/docmeta/generate-doc-index.sh | bash scripts/docmeta/generate-doc-index.sh --check | .github/workflows/docs-guard.yml: Executes the registry tests and documentation validation gates in CI.; scripts/docmeta/generated-files-guard.sh: Fails closed when the committed controlled surface or its registry declaration drifts.; docs/blueprints/doc-structure-task-control-examples.md: Uses the document index as the navigation example surface. | Forward documentation index entries derived from document metadata. | Canonical policy, runtime state, or deployment truth.; Correctness of the underlying source claims beyond the declared generator method. |
@@ -78,10 +76,8 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | Surface | Related surface | Distinction / consumer justification |
 | --- | --- | --- |
 | docs/_generated/agent-readiness.md | docs/_generated/claim-evidence-map.md | `docs/claims/README.md` uses evidence links; readiness is a separate execution gate. |
-| docs/_generated/architecture-drift.md | docs/_generated/staleness-report.md | `docs/policies/architecture-critique.md` uses structural drift, not review-age status. |
 | docs/_generated/backlinks.md | docs/_generated/doc-index.md | `scripts/ci/fixtures/repoground_vertical_pilot.v1.json` tests lookup direction. |
 | docs/_generated/backlinks.md | docs/_generated/supersession-map.md | `scripts/ci/fixtures/repoground_vertical_pilot.v1.json` tests backlink edge types. |
-| docs/_generated/change-resonance.md | docs/_generated/implicit-dependencies.md | `.github/workflows/docs-guard.yml` checks declared impact apart from inferred dependencies. |
 | docs/_generated/doc-coverage.md | docs/_generated/orphans.md | `audit/impl-registry.yaml` uses metadata coverage; orphan checks stay relation-based. |
 | docs/_generated/impl-index.md | docs/_generated/system-map.md | `architecture/blueprint.docmeta-engine.md` uses the map; the index remains a path list. |
 | docs/_generated/implicit-dependencies.md | docs/_generated/knowledge-gaps.md | `.github/workflows/docs-guard.yml` checks inferred edges apart from missing knowledge. |
@@ -880,13 +876,13 @@ Schema: `contracts/audit-report-truth.schema.json`
 ```json audit-report-truth.v1
 {
   "coverage": {
-    "checked_items": 71,
+    "checked_items": 69,
     "complete": true,
     "failures": 0,
-    "fresh": true,
+    "fresh": false,
     "method": "exact",
     "scope": "all Markdown files under docs/reports and all generated/curated control surfaces declared in .wgx/generated-artifacts.yml",
-    "total_items": 71
+    "total_items": 69
   },
   "does_not_establish": [
     "The correctness of claims inside individual reports, runtime use of declared consumers, or deployment truth."
@@ -900,7 +896,7 @@ Schema: `contracts/audit-report-truth.schema.json`
   "sources": [
     {
       "path": ".wgx/generated-artifacts.yml",
-      "sha256": "8191345252da31384a8ee1318ffce25741ae352a27a8ddde7775a8763564b63f"
+      "sha256": "37e0d0ebfbb5f019e91d6a8cc8765507546b97634934dcfa8d811814812b9194"
     },
     {
       "path": "docs/reports/agent-readiness-audit.md",
@@ -1111,7 +1107,7 @@ Schema: `contracts/audit-report-truth.schema.json`
       "sha256": "680a44fa3507f4191fbe32b0068b3bf8a77e6979739ea7d88d5c4b07d43870a9"
     }
   ],
-  "status": "no_material_drift"
+  "status": "unknown"
 }
 ```
 
@@ -1120,9 +1116,7 @@ Schema: `contracts/audit-report-truth.schema.json`
 | File | inventory_status | reason |
 | --- | --- | --- |
 | docs/_generated/agent-readiness.md | not_decision_relevant | generated output is descriptive and not used as a decision gate |
-| docs/_generated/architecture-drift.md | not_decision_relevant | generated output is descriptive and not used as a decision gate |
 | docs/_generated/backlinks.md | not_decision_relevant | generated output is descriptive and not used as a decision gate |
-| docs/_generated/change-resonance.md | not_decision_relevant | generated output is descriptive and not used as a decision gate |
 | docs/_generated/claim-evidence-map.md | not_decision_relevant | generated output is descriptive and not used as a decision gate |
 | docs/_generated/doc-coverage.md | not_decision_relevant | generated output is descriptive and not used as a decision gate |
 | docs/_generated/doc-index.md | not_decision_relevant | generated output is descriptive and not used as a decision gate |
