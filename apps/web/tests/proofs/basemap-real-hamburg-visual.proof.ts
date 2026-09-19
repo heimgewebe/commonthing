@@ -484,17 +484,40 @@ test.describe("Basemap Real Hamburg Visual Runtime Proof", () => {
         )
         .toBeGreaterThan(0);
 
-      // isSourceLoaded() is a momentary MapLibre state: new tile work can make
-      // it false again after an earlier successful poll. Bind the final proof
-      // snapshot to a fresh loaded observation after feature and range proofs.
+      // isSourceLoaded() is a momentary MapLibre state: retain the exact
+      // evidence object that satisfies the final coherent proof predicate.
+      // Reading again after the poll would reopen a TOCTOU window.
+      type FeatureEvidence = Awaited<ReturnType<typeof readFeatureEvidence>>;
+      let featureEvidence: FeatureEvidence | null = null;
       await expect
-        .poll(async () => (await readFeatureEvidence()).sourceLoaded, {
-          message:
-            "Hamburg source must be loaded when final visual evidence is captured",
-          timeout: 30_000,
-        })
+        .poll(
+          async () => {
+            const evidence = await readFeatureEvidence();
+            const ready =
+              evidence.sourceLoaded &&
+              evidence.renderedFromExpectedSource > 0 &&
+              evidence.renderedLayerIds.includes("landcover") &&
+              evidence.renderedLayerIds.includes("landuse") &&
+              evidence.sourceFeatureCounts.transportation > 0 &&
+              evidence.sourceFeatureCounts.landcover > 0 &&
+              evidence.sourceFeatureCounts.landuse > 0 &&
+              evidence.sourceFeatureCounts.water > 0 &&
+              evidence.sourceFeatureCounts.place > 0;
+            if (ready) {
+              featureEvidence = evidence;
+            }
+            return ready;
+          },
+          {
+            message:
+              "Hamburg source and required feature layers must be coherent when final visual evidence is captured",
+            timeout: 30_000,
+          },
+        )
         .toBeTruthy();
-      const featureEvidence = await readFeatureEvidence();
+      if (featureEvidence === null) {
+        throw new Error("Hamburg final feature evidence was not captured");
+      }
 
       expect(featureEvidence.sourceLoaded).toBe(true);
       expect(featureEvidence.renderedLayerIds).toEqual(
