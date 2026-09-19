@@ -967,7 +967,7 @@ except Exception as exc:
     exit 1
   fi
   SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-172.16.0.0/12}"
-  if ! SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR" python3 - <<'PY'; then
+  if ! SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR" python3 - << 'PY'; then
 import ipaddress
 import os
 
@@ -2991,15 +2991,15 @@ else
       exit 1
     fi
 
-    SCHAUWERK_RUNTIME_CONTAINER_ID="$(docker compose "${BASE_ARGS[@]}" ps -q schaubild 2>/dev/null || true)"
+    SCHAUWERK_RUNTIME_CONTAINER_ID="$(docker compose "${BASE_ARGS[@]}" ps -q schaubild 2> /dev/null || true)"
     if [[ -z "$SCHAUWERK_RUNTIME_CONTAINER_ID" ]]; then
       msg="Schaubild runtime postflight found no running schaubild container."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       exit 1
     fi
-    SCHAUWERK_RUNTIME_LIVE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$SCHAUWERK_RUNTIME_CONTAINER_ID" 2>/dev/null || true)"
-    SCHAUWERK_RUNTIME_LIVE_HEALTH="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$SCHAUWERK_RUNTIME_CONTAINER_ID" 2>/dev/null || true)"
+    SCHAUWERK_RUNTIME_LIVE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$SCHAUWERK_RUNTIME_CONTAINER_ID" 2> /dev/null || true)"
+    SCHAUWERK_RUNTIME_LIVE_HEALTH="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$SCHAUWERK_RUNTIME_CONTAINER_ID" 2> /dev/null || true)"
     if [[ "$SCHAUWERK_RUNTIME_LIVE_IMAGE" != "$SCHAUWERK_RUNTIME_IMAGE_REF" ]]; then
       msg="Schaubild runtime image mismatch: live $SCHAUWERK_RUNTIME_LIVE_IMAGE, expected $SCHAUWERK_RUNTIME_IMAGE_REF."
       echo "ERROR: $msg" >&2
@@ -3043,7 +3043,7 @@ else
       rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
       exit 1
     fi
-    if ! python3 - "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_EXPECTED_CSP" <<'PY'; then
+    if ! python3 - "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_EXPECTED_CSP" << 'PY'; then
 import sys
 from pathlib import Path
 headers = Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict").splitlines()
@@ -3083,7 +3083,7 @@ PY
     fi
 
     if ! SCHAUWERK_ASSET_BINDINGS="$(
-      python3 - "$SCHAUWERK_MANIFEST_OUT" <<'PY'
+      python3 - "$SCHAUWERK_MANIFEST_OUT" << 'PY'
 import json
 import re
 import sys
@@ -3175,7 +3175,7 @@ PY
 
     SCHAUWERK_NATIVE_INPUT_OUT="$(mktemp)"
     SCHAUWERK_NATIVE_RESULT_OUT="$(mktemp)"
-    cat > "$SCHAUWERK_NATIVE_INPUT_OUT" <<'JSON'
+    cat > "$SCHAUWERK_NATIVE_INPUT_OUT" << 'JSON'
 {"schema_version":"schauwerk-representation-input.v1","id":"postflight","title":"Postflight","purpose":"Native runtime verification","intent":"process","groups":[],"nodes":[{"id":"start","label":"Start","kind":"action"}],"edges":[],"requirements":{"formal_relations":true,"free_spatial_layout":false,"presentation":true,"collaboration":false,"rich_text":false,"structured_comparison":false,"portable_offline":true},"requested_formats":[]}
 JSON
     if ! SCHAUWERK_NATIVE_HTTP_CODE="$(
@@ -3201,7 +3201,7 @@ JSON
       exit 1
     fi
     if ! SCHAUWERK_NATIVE_VIEWER_PATH="$(
-      python3 - "$SCHAUWERK_NATIVE_RESULT_OUT" <<'PY'
+      python3 - "$SCHAUWERK_NATIVE_RESULT_OUT" << 'PY'
 import json
 import re
 import sys

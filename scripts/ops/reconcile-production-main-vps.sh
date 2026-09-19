@@ -322,7 +322,7 @@ verify_public_schauwerk_runtime() {
       "$SCHAUWERK_MANIFEST_URL"
   )" || return 1
   [[ -n "$manifest_json" ]] || return 1
-  SCHAUWERK_MANIFEST_JSON="$manifest_json" run_ops_python <<'PY_SCHAUWERK_PUBLIC' || return 1
+  SCHAUWERK_MANIFEST_JSON="$manifest_json" run_ops_python << 'PY_SCHAUWERK_PUBLIC' || return 1
 import json
 import os
 
@@ -1499,7 +1499,7 @@ schauwerk_runtime_lock_json="$(
   git -C "$SOURCE_CHECKOUT" show "$target_commit:infra/schauwerk-editor/release-lock.json"
 )" || fail "target commit is missing the Schaubild runtime lock"
 IFS=$'\t' read -r expected_schauwerk_image_ref expected_schauwerk_source_commit <<< "$(
-  SCHAUWERK_RUNTIME_LOCK_JSON="$schauwerk_runtime_lock_json" run_ops_python <<'PY_SCHAUWERK_RUNTIME_LOCK'
+  SCHAUWERK_RUNTIME_LOCK_JSON="$schauwerk_runtime_lock_json" run_ops_python << 'PY_SCHAUWERK_RUNTIME_LOCK'
 import json
 import os
 import re

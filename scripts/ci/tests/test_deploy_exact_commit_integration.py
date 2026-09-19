@@ -157,18 +157,16 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.schauwerk_manifest.write_text(
             '{"fixture":"schauwerk"}\n', encoding="utf-8"
         )
-        schauwerk_manifest_sha = hashlib.sha256(
-            self.schauwerk_manifest.read_bytes()
-        ).hexdigest()
         (self.seed / "infra/schauwerk-editor").mkdir(parents=True)
         (self.seed / "infra/schauwerk-editor/release-lock.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "weltgewebe-schauwerk-release-lock.v1",
+                    "schema_version": "weltgewebe-schauwerk-runtime-lock.v1",
                     "source_repository": "heimgewebe/schauwerk",
                     "source_commit": "c" * 40,
-                    "release_id": "c" * 40,
-                    "manifest_file_sha256": schauwerk_manifest_sha,
+                    "image_repository": "ghcr.io/heimgewebe/schauwerk-schaubild",
+                    "image_digest": "sha256:" + "d" * 64,
+                    "public_base_path": "/schaubild",
                 },
                 sort_keys=True,
             )

@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null 2>&1 && pwd)"
 REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 SCRIPT_SOURCE="$REPO_ROOT/scripts/weltgewebe-up"
+PREFLIGHT_SOURCE="$REPO_ROOT/scripts/preflight/schauwerk_editor_release.py"
 WORK_ROOT="$(mktemp -d)"
 trap 'rm -rf "$WORK_ROOT"' EXIT
 
@@ -37,15 +38,26 @@ new_repo() {
     git init -q
     git config user.name "Weltgewebe Test"
     git config user.email "tests@weltgewebe.local"
-    mkdir -p scripts infra/compose
+    mkdir -p scripts/preflight infra/compose infra/schauwerk-editor
     cp "$SCRIPT_SOURCE" scripts/weltgewebe-up
-    chmod +x scripts/weltgewebe-up
+    cp "$PREFLIGHT_SOURCE" scripts/preflight/schauwerk_editor_release.py
+    chmod +x scripts/weltgewebe-up scripts/preflight/schauwerk_editor_release.py
     cat > .env << 'ENV'
 DATABASE_URL=postgres://example
 POSTGRES_USER=weltgewebe
 POSTGRES_PASSWORD=test
 POSTGRES_DB=weltgewebe
 ENV
+    cat > infra/schauwerk-editor/release-lock.json << 'JSON'
+{
+  "schema_version": "weltgewebe-schauwerk-runtime-lock.v1",
+  "source_repository": "heimgewebe/schauwerk",
+  "source_commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "image_repository": "ghcr.io/heimgewebe/schauwerk-schaubild",
+  "image_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "public_base_path": "/schaubild"
+}
+JSON
     cat > infra/compose/compose.prod.yml << 'YAML'
 services:
   api:
@@ -108,11 +120,11 @@ if [[ "${1:-}" != "compose" ]]; then
 fi
 
 if [[ "$joined" == *" config --services "* ]]; then
-  printf 'api\ndb\nnats\ncaddy\n'
+  printf 'api\ndb\nnats\nschaubild\ncaddy\n'
   exit 0
 fi
 if [[ "$joined" == *" config --format json "* ]]; then
-  printf '%s\n' '{"services":{"api":{},"db":{},"nats":{},"caddy":{}}}'
+  printf '%s\n' '{"services":{"api":{},"db":{},"nats":{},"schaubild":{"image":"ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","read_only":true,"ports":[],"expose":["8765"],"command":["python","-m","schauwerk.visual.standalone_editor","serve","--bind-host","0.0.0.0","--trusted-reverse-proxy","--trusted-proxy-source-cidr","172.16.0.0/12","--public-base-path","/schaubild","--port","8765"]},"caddy":{"depends_on":{"schaubild":{"condition":"service_healthy"}}}}}'
   exit 0
 fi
 if [[ "$joined" == *" config "* ]]; then
