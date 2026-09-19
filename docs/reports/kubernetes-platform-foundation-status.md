@@ -31,7 +31,7 @@ Dieser Bericht verwendet keinen einzelnen Datumsstempel als Wahrheitsanker. Die 
 
 | Wahrheitsschicht | commitgebundene Evidenz | Aussage |
 | --- | --- | --- |
-| Deklarative Plattform / aktueller Governance-Schnitt | Controller- und Proof-Identity-Inhalt: **1bc0b729304461e65b4f0adf0b054a5d9dc6fc88**; lokaler Render-/Contract-Pfad auf exakt diesem Inhalt grün. Veröffentlichung und GitHub-PR-CI stehen für diesen Schnitt noch aus. | Manifeste, Renderer, Proof-Identity- und Contraction-Vertrag sind für diesen Inhalt konsistent. Das ist kein Runtime-Beweis. |
+| Deklarative Plattform / aktueller Governance-Schnitt | Komponentenrevisionen: `staging_cell.py` zuletzt materiell geändert in **1bc0b729304461e65b4f0adf0b054a5d9dc6fc88**; `proof_identity.py` mit `SUITE_VALIDATORS` zuletzt materiell geändert in **65092e207c91facc7adf06661527331968a42414**; die fail-closed Evidence-Gate-Härtung folgte in **6a471152b180ff172d7f428025e7fa93afc9bad7**. Der lebende PR-Head und seine GitHub-Checks werden absichtlich nicht in diesem sich selbst verändernden Dokument als „aktuell“ eingefroren. | Manifeste, Renderer, Proof-Identity- und Contraction-Vertrag sind als getrennte Komponentenrevisionen ausgewiesen. Das ist kein Runtime- oder aktueller GitHub-Statusbeweis. |
 | CI-kind / GitOps | Main **9a8a8ed49211219b8b4e18345b7529c6cf666b2d**, Workflow-Run **35455115045**, Job **kind-gitops-proof** erfolgreich und tatsächlich ausgeführt. | Commitgebundene kind-/Flux-/GitOps-Referenz einschließlich kontrollierter OCI-Eingaben. |
 | CI-kind / HA-Recovery | Main **9a8a8ed49211219b8b4e18345b7529c6cf666b2d**, Workflow-Run **35455115045**, Job **kind-ha-recovery-proof** erfolgreich und tatsächlich ausgeführt. | Single-Host-kind-Failover und Blank-Cluster-Recovery für diesen Commit; keine unabhängigen physischen Fehlerdomänen. |
 | Staging-Cell E2E, letzter vollständiger Zyklus | Implementierungscommit **bb1e26d47b50d38ec720b123d55255c05436100b**; private Runtime-Receipts unter anderem cell-bootstrap, cell-rebuild, gateway-proof, cell-down und delete-to-prove; terminales delete-to-prove-Receipt SHA-256 **625f5cc1471013be4b960afe4fb7a0ca5b6466add904de4a1827aafb09a9314b**. | Ein realer Delete-to-Prove wurde ausgeführt. Dieser Beweis gilt nicht automatisch für spätere Controlleränderungen. |
@@ -42,7 +42,7 @@ Dieser Bericht verwendet keinen einzelnen Datumsstempel als Wahrheitsanker. Die 
 Der letzte vollständige Staging-E2E-Proof ist älter als der aktuelle Controller-Inhalt.
 
 - letzter vollständiger E2E-Implementierungscommit: **bb1e26d47b50d38ec720b123d55255c05436100b**
-- aktueller Controller-Inhaltscommit dieses Governance-Schnitts: **1bc0b729304461e65b4f0adf0b054a5d9dc6fc88**
+- aktueller Controller-Inhaltscommit (letzte Änderung an `scripts/platform/staging_cell.py`): **1bc0b729304461e65b4f0adf0b054a5d9dc6fc88**
 - proof_lag_commits: **66**
 - proof_lag_changed_lines_added: **4744**
 - proof_lag_changed_lines_removed: **1851**
