@@ -2147,7 +2147,9 @@ def _mounted_retained_data_anchors(
     data_node = _retained_mount_node(
         kind, cluster, root, require_split=require_split
     )
-    identity = _retained_data_identity(root, include_content=False)
+    identity = _retained_data_identity(
+        root, include_content=False, require_nonempty=False
+    )
     for name in ("postgres", "nats"):
         volume_path = f"/var/local/commonthing-staging/{name}"
         observed = output(
@@ -6531,11 +6533,14 @@ def _retained_tree_sha256(path: Path, *, label: str) -> str:
 
 
 def _retained_data_identity(
-    root: Path, *, include_content: bool = True
+    root: Path,
+    *,
+    include_content: bool = True,
+    require_nonempty: bool = True,
 ) -> dict[str, dict[str, Any]]:
     identity: dict[str, dict[str, Any]] = {}
     for name in ("postgres", "nats"):
-        if not retained_data_directory_exists(root, name):
+        if require_nonempty and not retained_data_directory_exists(root, name):
             raise StagingCellError(
                 "delete-to-prove requires retained PostgreSQL and NATS data"
             )

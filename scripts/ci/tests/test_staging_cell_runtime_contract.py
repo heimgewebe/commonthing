@@ -5690,6 +5690,34 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                 )
                 self.assertEqual((retained / "marker").read_bytes(), payload)
 
+    def test_mounted_backup_restore_anchors_accept_receipt_proven_empty_roots(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="staging-backup-empty-mounted-roots-") as tmp_name:
+            root = Path(tmp_name)
+            expected: dict[str, dict[str, int]] = {}
+            for name in ("postgres", "nats"):
+                path = root / "data" / name
+                path.mkdir(parents=True)
+                self.assertFalse(staging.retained_data_directory_exists(root, name))
+                expected[name] = staging._real_directory_identity(
+                    path, label=f"empty restore {name}"
+                )
+
+            mounted_stats = [
+                f"{expected[name]['device']}:{expected[name]['inode']}:{expected[name]['uid']}:{expected[name]['gid']}:{expected[name]['mode']:o}"
+                for name in ("postgres", "nats")
+            ]
+            with (
+                mock.patch.object(staging, "_retained_mount_node", return_value="data-node"),
+                mock.patch.object(staging, "output", side_effect=mounted_stats),
+            ):
+                observed = staging._mounted_retained_data_anchors(
+                    "kind", staging.DEFAULT_CLUSTER, root, require_split=True
+                )
+
+        for name in ("postgres", "nats"):
+            for field in ("device", "inode", "uid", "gid", "mode"):
+                self.assertEqual(observed[name][field], expected[name][field])
+
     def test_resumed_backup_down_uses_conservative_rto_boundary_without_stale_self_hash(self) -> None:
         owner = "test:t084"
         release = "b" * 40
