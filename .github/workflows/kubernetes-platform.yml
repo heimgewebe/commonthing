@@ -95,14 +95,17 @@ jobs:
           scripts.ci.tests.test_trivy_rendered_manifests
           scripts.ci.tests.test_kubernetes_python_bootstrap
       - name: Validate staging evidence-only commit
-        if: ${{ hashFiles('docs/proofs/kubernetes-staging-cell/attestation.json') != '' }}
-        run: >-
-          uv run --project tools/py --locked python scripts/platform/proof_identity.py
-          validate-evidence-commit
-          --identity docs/proofs/kubernetes-staging-cell/identity.json
-          --record docs/proofs/kubernetes-staging-cell/record.json
-          --proof docs/proofs/kubernetes-staging-cell/proof.json
-          --attestation docs/proofs/kubernetes-staging-cell/attestation.json
+        run: |
+          set -euo pipefail
+          evidence_root="docs/proofs/kubernetes-staging-cell"
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          if git diff --quiet "$base_sha"...HEAD -- "$evidence_root"; then
+            exit 0
+          fi
+          for name in identity.json record.json proof.json attestation.json; do
+            test -f "$evidence_root/$name"
+          done
+          uv run --project tools/py --locked python scripts/platform/proof_identity.py             validate-evidence-commit             --identity "$evidence_root/identity.json"             --record "$evidence_root/record.json"             --proof "$evidence_root/proof.json"             --attestation "$evidence_root/attestation.json"
       - name: Render and validate all platform targets
         run: uv run --project tools/py --locked python scripts/platform/validate_platform.py --render
 

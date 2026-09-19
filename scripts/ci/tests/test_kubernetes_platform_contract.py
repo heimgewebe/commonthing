@@ -2552,7 +2552,7 @@ class KubernetesPlatformContractTests(unittest.TestCase):
     def test_platform_pr_workflow_validates_staging_evidence_only_commit(self) -> None:
         workflow = (
             ROOT / ".github/workflows/kubernetes-platform.yml"
-        ).read_text(encoding="utf-8")
+         ).read_text(encoding="utf-8")
         self.assertIn(
             '"docs/proofs/kubernetes-staging-cell/**"',
             workflow,
@@ -2562,13 +2562,27 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             workflow,
         )
         self.assertIn(
+            'base_sha="${{ github.event.pull_request.base.sha }}"',
+            workflow,
+        )
+        self.assertIn(
+            'git diff --quiet "$base_sha"...HEAD -- "$evidence_root"',
+            workflow,
+        )
+        for name in ("identity.json", "record.json", "proof.json", "attestation.json"):
+            self.assertIn(name, workflow)
+        self.assertNotIn(
+            "hashFiles('docs/proofs/kubernetes-staging-cell/attestation.json')",
+            workflow,
+        )
+        self.assertIn(
             "scripts/platform/proof_identity.py",
             workflow,
         )
         self.assertIn(
             "validate-evidence-commit",
             workflow,
-        )
+         )
 
     def test_proof_identity_covers_all_api_image_inputs(self) -> None:
         for suite in ("kind-gitops", "ha-recovery"):
