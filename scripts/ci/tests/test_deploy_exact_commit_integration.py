@@ -155,7 +155,21 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         )
         self.schauwerk_manifest = self.root / "schauwerk-manifest.json"
         self.schauwerk_manifest.write_text(
-            '{"fixture":"schauwerk"}\n', encoding="utf-8"
+            json.dumps(
+                {
+                    "schema_version": "schauwerk-standalone-editor-manifest.v2",
+                    "editor_engine": "schauwerk-native-diagram-v1",
+                    "cutover_status": "native-primary-with-legacy-compatibility",
+                    "public_base_path": "/schaubild",
+                    "native_renderer": {
+                        "renderer": "schauwerk-native-diagram-v1",
+                        "api_path": "/schaubild/api/native-viewer",
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
         (self.seed / "infra/schauwerk-editor").mkdir(parents=True)
         (self.seed / "infra/schauwerk-editor/release-lock.json").write_text(
@@ -394,6 +408,24 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                 }
                 if [[ "$1" == "system" && "${2:-}" == "df" ]]; then
                   printf '{"Active":"0","Reclaimable":"0B","Size":"0B","TotalCount":"0","Type":"Build Cache"}\n'
+                  exit 0
+                fi
+                if [[ "$1" == "ps" && "$*" == *"label=com.docker.compose.service=schaubild"* ]]; then
+                  printf 'schaubild-runtime\n'
+                  exit 0
+                fi
+                if [[ "$1" == "inspect" && "${2:-}" == "--format" ]]; then
+                  case "${3:-}" in
+                    '{{.Config.Image}}')
+                      printf 'ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n'
+                      ;;
+                    '{{if .State.Health}}{{.State.Health.Status}}{{end}}')
+                      printf 'healthy\n'
+                      ;;
+                    *)
+                      exit 97
+                      ;;
+                  esac
                   exit 0
                 fi
                 cat "$TEST_WEB_ARTIFACT"

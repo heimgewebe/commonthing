@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null 2>&1 && pwd)"
 REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+COMPOSE_IMAGE_GUARD="$REPO_ROOT/scripts/guard/compose-image-guard.sh"
 
 bash "$REPO_ROOT/scripts/guard/lockfile-guard.sh" > /dev/null
 bash "$REPO_ROOT/scripts/guard/compose-image-guard.sh" > /dev/null
@@ -31,7 +32,7 @@ cat > "$TMP_ROOT/infra/schauwerk-editor/release-lock.json" << 'EOF'
   "public_base_path": "/schaubild"
 }
 EOF
-REPO_ROOT="$TMP_ROOT" bash "$REPO_ROOT/scripts/guard/compose-image-guard.sh" > /dev/null
+REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null
 
 uv run --project "$REPO_ROOT/tools/py" --locked python - "$TMP_ROOT/infra/schauwerk-editor/release-lock.json" << 'PY'
 import json
@@ -43,7 +44,7 @@ payload = json.loads(path.read_text(encoding="utf-8"))
 payload["image_digest"] = "sha256:short"
 path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 PY
-if REPO_ROOT="$TMP_ROOT" bash "$REPO_ROOT/scripts/guard/compose-image-guard.sh" > /dev/null 2>&1; then
+if REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null 2>&1; then
   echo "ERROR: compose-image-guard accepted an invalid Schaubild digest lock" >&2
   exit 1
 fi
@@ -59,7 +60,7 @@ cat > "$TMP_ROOT/infra/schauwerk-editor/release-lock.json" << 'EOF'
 }
 EOF
 sed -i 's/SCHAUWERK_SCHAUBILD_IMAGE/UNSAFE_IMAGE/g' "$TMP_ROOT/infra/compose/compose.vps.override.yml"
-if REPO_ROOT="$TMP_ROOT" bash "$REPO_ROOT/scripts/guard/compose-image-guard.sh" > /dev/null 2>&1; then
+if REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null 2>&1; then
   echo "ERROR: compose-image-guard accepted an arbitrary dynamic image variable" >&2
   exit 1
 fi
