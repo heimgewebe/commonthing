@@ -54,24 +54,21 @@
   }
 </script>
 
-<div
-  class="col"
-  style="gap:1.5rem; padding:1.5rem; max-width:400px; margin:0 auto; margin-top: 10vh;"
->
-  <div class="panel col" style="gap:1rem;">
+<div class="col step-up">
+  <div class="panel col step-up__panel">
     <h1>Aktion bestätigen</h1>
     {#if status === "invalid"}
-      <div style="color:var(--color-danger, #ff6b6b);">
+      <div class="step-up__danger">
         Dieser Bestätigungslink ist unvollständig oder ungültig. Bitte fordere
         einen neuen Link an.
       </div>
     {:else if status === "success"}
-      <div style="color:var(--color-theme-2, #2ecc71);">
+      <div class="step-up__success">
         Die Aktion wurde erfolgreich bestätigt. Du kannst dieses Fenster nun
         schließen.
       </div>
     {:else if status === "error"}
-      <div style="color:var(--color-danger, #ff6b6b);">
+      <div class="step-up__danger">
         Ein Fehler ist aufgetreten oder der Link ist abgelaufen.
       </div>
     {:else}
@@ -84,3 +81,26 @@
     {/if}
   </div>
 </div>
+
+<style>
+  /* Keine Inline-Styles: style-src laeuft ohne 'unsafe-inline'. */
+  .step-up {
+    gap: 1.5rem;
+    padding: 1.5rem;
+    max-width: 400px;
+    margin: 0 auto;
+    margin-top: 10vh;
+  }
+
+  .step-up__panel {
+    gap: 1rem;
+  }
+
+  .step-up__danger {
+    color: var(--color-danger, #ff6b6b);
+  }
+
+  .step-up__success {
+    color: var(--color-theme-2, #2ecc71);
+  }
+</style>

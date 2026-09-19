@@ -29,7 +29,9 @@
         class="search-direction"
         data-testid={`search-direction-${indicator.item.type}-${indicator.item.id}`}
         data-side={indicator.side}
-        style={`--search-direction-x: ${indicator.x}px; --search-direction-y: ${indicator.y}px; --search-direction-angle: ${indicator.angle}deg;`}
+        style:--search-direction-x={`${indicator.x}px`}
+        style:--search-direction-y={`${indicator.y}px`}
+        style:--search-direction-angle={`${indicator.angle}deg`}
         aria-label={labelFor(indicator)}
         title={indicator.item.title}
         onclick={() => dispatch("select", indicator.item)}

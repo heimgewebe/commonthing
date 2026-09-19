@@ -190,11 +190,36 @@ policies intersect; an edge policy without the same build-generated hashes would
 hash-authorized SvelteKit bootstrap. Directives that must remain edge-owned, including `frame-ancestors`, plus the
 non-script resource directives remain in the Caddy header.
 
+### Styles
+
+`style-src` is `'self'` and carries no `'unsafe-inline'`. Unlike `script-src` there is no per-document style policy to
+delegate to, so the edge header itself is the closed policy and the preflight rejects an edge CSP whose `style-src` is
+missing or permissive.
+
+The frontend therefore ships no inline styles: the `app.html` shell wrapper uses the `.app-root` class from
+`apps/web/src/app.css`, the inert polyfill no longer injects a style element at runtime, and every component style
+lives in a stylesheet. Svelte 5 needs no exception here — its transitions run through `element.animate()` and its
+`style:` directives through `CSSStyleDeclaration.setProperty()`, neither of which CSP governs.
+
+One framework-owned inline style attribute remains outside the repository's control: SvelteKit hardcodes the
+visually-hidden styling of its live region `#svelte-announcer` in the client runtime. The browser drops that attribute
+under this policy, so `apps/web/src/app.css` re-hides the region with an explicit rule.
+`apps/web/tests/csp-inline-styles.spec.ts` loads the app under the real edge policy and asserts that this is the only
+CSP violation and that the region stays hidden.
+
+The magic-link confirmation document served by the API is the one place that still emits an inline style element. Its
+policy binds that element to its own SHA-256, derived from `MAGIC_LINK_CONFIRM_STYLE` in `apps/api/src/routes/auth.rs`.
+The hash is never hardcoded: `scripts/guard/security-headers-guard.sh` re-derives it from that constant and fails
+closed when a Caddy contract carries a stale value.
+
+### Preflight
+
 The static preflight `scripts/preflight/csp_contract_static.sh` fails closed before deploy. It recursively validates
-**every** compiled HTML artifact, requires exactly one CSP meta policy with `script-src`, rejects `unsafe-inline`, and
-verifies every inline script body against a matching SHA-256 source expression. Because non-HTML active documents do
-not receive a meta CSP, the same guard also rejects scriptable constructs in static SVG artifacts. This keeps the split
-edge/document CSP contract explicit without relying on a running server.
+**every** compiled HTML artifact, requires exactly one CSP meta policy with `script-src`, rejects `unsafe-inline`,
+verifies every inline script body against a matching SHA-256 source expression, and rejects any inline style attribute
+or style element. Because non-HTML active documents do not receive a meta CSP, the same guard also rejects scriptable
+constructs in static SVG artifacts. This keeps the split edge/document CSP contract explicit without relying on a
+running server.
 
 ### Caddyfile Source of Truth
 

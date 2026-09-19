@@ -3,8 +3,23 @@ version: 2
 content_security_policy:
   script_delivery: sveltekit_prerender_meta
   script_mode: hash
+  # The frontend ships no inline styles at all: every rule lives in a
+  # stylesheet served from the same origin. The two constructs that used to
+  # require 'unsafe-inline' are gone:
+  #   - the app.html shell wrapper now carries .app-root from apps/web/src/app.css;
+  #   - the inert polyfill no longer injects a style element at runtime.
+  # SvelteKit's own #svelte-announcer still carries a framework-owned inline
+  # style attribute. It is blocked under this policy by design and re-hidden
+  # by an explicit rule in apps/web/src/app.css, guarded by
+  # apps/web/tests/csp-inline-styles.spec.ts.
+  style_delivery: external_stylesheets
+  style_mode: external
+  # The one remaining inline style element in the product is the magic-link
+  # confirmation document. It is bound to its own sha256, derived from this
+  # source file rather than hardcoded anywhere.
+  magic_link_confirm_style_source: apps/api/src/routes/auth.rs
   required_frontend_response_directives:
-    style-src: "'self' 'unsafe-inline'"
+    style-src: "'self'"
     connect-src: "'self'"
     img-src: "'self' data: blob:"
     worker-src: "'self' blob:"
@@ -17,13 +32,12 @@ content_security_policy:
     base-uri: "'self'"
     form-action: "'self'"
     frame-ancestors: "'none'"
-csp_exceptions:
-  - directive: "style-src 'unsafe-inline'"
-    status: accepted_residual_risk
-    reason: >
-      Svelte transitions can create runtime inline style elements. Script execution
-      does not share this exception: prerendered SvelteKit bootstrap scripts are
-      bound to build-generated sha256 hashes in the document CSP meta tag.
+# No accepted residual risk remains. The earlier style-src exception was
+# justified with Svelte transitions creating runtime style elements; that is
+# Svelte 3/4 behaviour. Svelte 5 drives transitions through element.animate()
+# and style: directives through CSSStyleDeclaration.setProperty(), neither of
+# which CSP governs. Any new entry here needs a reviewed reason, not a habit.
+csp_exceptions: []
 strict_transport_security:
   max_age_seconds: 31536000
   include_subdomains: true

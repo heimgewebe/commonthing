@@ -61,10 +61,7 @@
   <title>Swipe Debug Playground</title>
 </svelte:head>
 
-<div
-  class="col"
-  style="gap:1.5rem; padding:1.5rem; max-width:960px; margin:0 auto;"
->
+<div class="col dev-page">
   <header class="col">
     <h1>Swipe Playground</h1>
     <p class="ghost">
@@ -78,11 +75,11 @@
   <section class="panel col">
     <h2>Parameter</h2>
     <div class="row">
-      <label class="col" style="flex:1">
+      <label class="col dev-page__field">
         <span>threshold: {threshold}px</span>
         <input type="range" min="8" max="64" step="1" bind:value={threshold} />
       </label>
-      <label class="col" style="flex:1">
+      <label class="col dev-page__field">
         <span>angleRatio: {angleRatio.toFixed(2)}</span>
         <input
           type="range"
@@ -94,7 +91,7 @@
       </label>
     </div>
     <div class="row">
-      <label class="col" style="flex:1">
+      <label class="col dev-page__field">
         <span>velocityMin: {velocityMin.toFixed(2)} px/ms</span>
         <input
           type="range"
@@ -104,7 +101,7 @@
           bind:value={velocityMin}
         />
       </label>
-      <label class="col" style="flex:1">
+      <label class="col dev-page__field">
         <span>axisDeadzone: {axisDeadzone}px</span>
         <input
           type="range"
@@ -115,42 +112,38 @@
         />
       </label>
     </div>
-    <div class="row" style="flex-wrap:wrap; gap:.75rem;">
-      <label class="row" style="gap:.35rem;">
+    <div class="row dev-page__toggles">
+      <label class="row dev-page__toggle">
         <input type="checkbox" bind:checked={lockAxis} />
         <span>lockAxis</span>
       </label>
-      <label class="row" style="gap:.35rem;">
+      <label class="row dev-page__toggle">
         <input type="checkbox" bind:checked={passiveMove} />
         <span>passiveMove</span>
       </label>
-      <label class="row" style="gap:.35rem;">
+      <label class="row dev-page__toggle">
         <input type="checkbox" bind:checked={allowMouse} />
         <span>allowMouse</span>
       </label>
     </div>
   </section>
 
-  <section class="panel col" style="gap:1rem;">
+  <section class="panel col dev-page__section">
     <h2>Testfläche</h2>
-    <div class="swipe-parent" style="max-width:100%;">
-      <div
-        class="swipeable panel"
-        style="min-height:200px; display:flex; align-items:center; justify-content:center; text-align:center;"
-        use:swipe={currentOptions}
-      >
+    <div class="swipe-parent dev-page__stage">
+      <div class="swipeable panel dev-page__surface" use:swipe={currentOptions}>
         <div>
-          <p style="font-size:2rem; margin:0 0 .5rem;">{lastDirection}</p>
-          <p class="ghost" style="margin:0;">
+          <p class="dev-page__direction">{lastDirection}</p>
+          <p class="ghost dev-page__flush">
             Wische horizontal, um Richtung und Metadaten zu sehen. Vertikales
             Scrollen bleibt möglich.
           </p>
         </div>
       </div>
     </div>
-    <div class="row" style="align-items:flex-start; gap:1rem;">
-      <div class="col" style="flex:1;">
-        <h3 class="ghost" style="margin:0;">Letzter Swipe</h3>
+    <div class="row dev-page__readouts">
+      <div class="col dev-page__readout">
+        <h3 class="ghost dev-page__flush">Letzter Swipe</h3>
         {#if lastMeta}
           <code
             >dx={lastMeta.dx.toFixed(1)} dy={lastMeta.dy.toFixed(1)} v={lastMeta.v.toFixed(
@@ -161,8 +154,8 @@
           <span class="ghost">noch kein Swipe</span>
         {/if}
       </div>
-      <div class="col" style="flex:1;">
-        <h3 class="ghost" style="margin:0;">Letzte Ablehnung</h3>
+      <div class="col dev-page__readout">
+        <h3 class="ghost dev-page__flush">Letzte Ablehnung</h3>
         {#if lastReject}
           <code>
             dx={lastReject.dx.toFixed(1)} dy={lastReject.dy.toFixed(1)} v={lastReject.v.toFixed(
@@ -179,12 +172,12 @@
     </div>
   </section>
 
-  <section class="panel col" style="gap:.75rem;">
+  <section class="panel col dev-page__log">
     <h2>Log</h2>
     {#if log.length === 0}
       <span class="ghost">Noch keine Ereignisse</span>
     {:else}
-      <ul style="margin:0; padding-left:1.2rem;">
+      <ul class="dev-page__log-list">
         {#each log as entry, index (index)}
           <li><code>{entry}</code></li>
         {/each}
@@ -192,3 +185,69 @@
     {/if}
   </section>
 </div>
+
+<style>
+  /* Keine Inline-Styles: style-src laeuft ohne 'unsafe-inline'. */
+  .dev-page {
+    gap: 1.5rem;
+    padding: 1.5rem;
+    max-width: 960px;
+    margin: 0 auto;
+  }
+
+  .dev-page__flush {
+    margin: 0;
+  }
+
+  .dev-page__field {
+    flex: 1;
+  }
+
+  .dev-page__toggles {
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  .dev-page__toggle {
+    gap: 0.35rem;
+  }
+
+  .dev-page__section {
+    gap: 1rem;
+  }
+
+  .dev-page__stage {
+    max-width: 100%;
+  }
+
+  .dev-page__surface {
+    min-height: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+  }
+
+  .dev-page__direction {
+    font-size: 2rem;
+    margin: 0 0 0.5rem;
+  }
+
+  .dev-page__readouts {
+    align-items: flex-start;
+    gap: 1rem;
+  }
+
+  .dev-page__readout {
+    flex: 1;
+  }
+
+  .dev-page__log {
+    gap: 0.75rem;
+  }
+
+  .dev-page__log-list {
+    margin: 0;
+    padding-left: 1.2rem;
+  }
+</style>
