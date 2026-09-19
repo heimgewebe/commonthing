@@ -192,7 +192,7 @@ non-script resource directives remain in the Caddy header.
 
 ### Styles
 
-`style-src` is `'self'` and carries no `'unsafe-inline'`. Unlike `script-src` there is no per-document style policy to
+In every shipped path `style-src` is `'self'` and carries no `'unsafe-inline'`. Unlike `script-src` there is no per-document style policy to
 delegate to, so the edge header itself is the closed policy and the preflight rejects an edge CSP whose `style-src` is
 missing or permissive.
 
@@ -200,6 +200,13 @@ The frontend therefore ships no inline styles: the `app.html` shell wrapper uses
 `apps/web/src/app.css`, the inert polyfill no longer injects a style element at runtime, and every component style
 lives in a stylesheet. Svelte 5 needs no exception here — its transitions run through `element.animate()` and its
 `style:` directives through `CSSStyleDeclaration.setProperty()`, neither of which CSP governs.
+
+One path is deliberately exempt. `infra/caddy/Caddyfile.dev` fronts the Vite dev server, which injects imported CSS as
+runtime `<style>` elements for HMR; those elements are CSP-governed, so the dev proxy keeps `style-src 'self'
+'unsafe-inline'`. `infra/compose/compose.core.yml` mounts that file only under the `dev` profile, so it reaches no
+deployed host. The exception is declared as `content_security_policy.dev_proxy_style_src` in `policies/security.yml`
+rather than left to a file comment, and `scripts/guard/security-headers-guard.sh` now pins the dev file to exactly that
+value and keeps `script-src` closed there as well — coverage the file did not have before.
 
 One framework-owned inline style attribute remains outside the repository's control: SvelteKit hardcodes the
 visually-hidden styling of its live region `#svelte-announcer` in the client runtime. The browser drops that attribute

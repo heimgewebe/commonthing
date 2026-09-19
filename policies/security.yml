@@ -18,6 +18,14 @@ content_security_policy:
   # confirmation document. It is bound to its own sha256, derived from this
   # source file rather than hardcoded anywhere.
   magic_link_confirm_style_source: apps/api/src/routes/auth.rs
+  # The Vite dev server injects imported CSS as runtime style elements for HMR,
+  # and those elements are CSP-governed. infra/caddy/Caddyfile.dev therefore
+  # keeps an inline-style exception. It is declared here rather than left to a
+  # file comment so the guard can pin the exact value the dev proxy may serve.
+  # It never reaches a production path: compose.core.yml mounts this file only
+  # under the dev profile, and the three shipped Caddyfiles are validated
+  # against required_frontend_response_directives below.
+  dev_proxy_style_src: "'self' 'unsafe-inline'"
   required_frontend_response_directives:
     style-src: "'self'"
     connect-src: "'self'"
@@ -32,10 +40,11 @@ content_security_policy:
     base-uri: "'self'"
     form-action: "'self'"
     frame-ancestors: "'none'"
-# No accepted residual risk remains. The earlier style-src exception was
-# justified with Svelte transitions creating runtime style elements; that is
-# Svelte 3/4 behaviour. Svelte 5 drives transitions through element.animate()
-# and style: directives through CSSStyleDeclaration.setProperty(), neither of
+# No accepted residual risk remains in a shipped path. The earlier style-src
+# exception was justified with Svelte transitions creating runtime style
+# elements; that is Svelte 3/4 behaviour. Svelte 5 drives transitions through
+# element.animate() and style: directives through
+# CSSStyleDeclaration.setProperty(), neither of
 # which CSP governs. Any new entry here needs a reviewed reason, not a habit.
 csp_exceptions: []
 strict_transport_security:

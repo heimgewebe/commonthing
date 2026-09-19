@@ -21,8 +21,9 @@ relations:
 
 **Beschreibung:**
 
-Die letzte pauschale CSP-Ausnahme ist entfallen. `style-src` lautet jetzt
-`'self'`; die Frontendquellen enthalten keinen Inline-Style mehr, und das
+Die pauschale CSP-Ausnahme ist in allen ausgelieferten Pfaden entfallen.
+`style-src` lautet dort jetzt `'self'`; die Frontendquellen enthalten keinen
+Inline-Style mehr, und das
 Inert-Polyfill injiziert kein Style-Element mehr zur Laufzeit. Die zuvor in
 `policies/security.yml` eingetragene Begründung (Svelte-Transitions erzeugten
 Style-Elemente) galt für Svelte 3/4; Svelte 5 nutzt `element.animate()` und
@@ -37,6 +38,15 @@ und schlagen bei Abweichung geschlossen fehl.
 Der Preflight lehnt zusätzlich jedes Inline-Style-Attribut und jedes
 Style-Element in kompilierten HTML-Artefakten ab sowie eine Edge-CSP ohne
 geschlossenes `style-src`.
+
+**Ausnahme Devpfad:** `infra/caddy/Caddyfile.dev` behält `style-src 'self'
+'unsafe-inline'`. Der Vite-Devserver liefert importiertes CSS zur Laufzeit als
+Style-Element aus; ohne die Ausnahme greift im Devproxy kein Stylesheet. Die
+Datei wird ausschließlich vom Dev-Profil in `infra/compose/compose.core.yml`
+gemountet. Neu ist, dass sie überhaupt unter Guard-Kontrolle steht: der
+erlaubte Wert steht als `content_security_policy.dev_proxy_style_src` in
+`policies/security.yml`, und der Guard hält `script-src` auch dort geschlossen.
+Zuvor prüfte kein Guard diese Datei.
 
 **Wahrheitsgrenze:** SvelteKit verdrahtet den Inline-Style seiner Live-Region
 `#svelte-announcer` fest im Client. Das Attribut wird unter dieser Policy

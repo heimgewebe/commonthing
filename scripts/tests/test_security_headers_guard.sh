@@ -110,10 +110,49 @@ example.test {
 CADDY
 }
 
+# The dev proxy fronts the Vite dev server and keeps a style-only inline
+# exception. Its permitted value comes from the policy, so the fixture derives
+# it the same way the guard does instead of restating it.
+dev_style_src() {
+  uv run --project "$REPO_ROOT/tools/py" --locked python - \
+    "$TEMP_DIR/policies/security.yml" << 'PY'
+from pathlib import Path
+import sys
+
+import yaml
+
+data = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(data["content_security_policy"]["dev_proxy_style_src"])
+PY
+}
+
+write_dev_caddy() {
+  local file="$1"
+  local style="${2:-}"
+  if [[ -z "$style" ]]; then
+    style="$(dev_style_src)"
+  fi
+  cat > "$file" << CADDY
+:8081 {
+  handle_path /api/* {
+    reverse_proxy api:8080
+  }
+  reverse_proxy /* web:5173
+  header {
+    Content-Security-Policy "default-src 'self'; script-src 'self'; style-src ${style}; connect-src 'self' ws: wss:; img-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none';"
+    X-Frame-Options "DENY"
+    Referrer-Policy "no-referrer"
+    X-Weltgewebe-Build "{\$WELTGEWEBE_BUILD}"
+  }
+}
+CADDY
+}
+
 write_static_caddy "$TEMP_DIR/infra/caddy/Caddyfile" "'self' ws: wss:"
 write_static_caddy "$TEMP_DIR/infra/caddy/Caddyfile.vps" "'self'"
 write_static_caddy "$TEMP_DIR/infra/caddy/Caddyfile.heim" "'self'"
 write_prod_caddy "$TEMP_DIR/infra/caddy/Caddyfile.prod"
+write_dev_caddy "$TEMP_DIR/infra/caddy/Caddyfile.dev"
 
 REPO_ROOT="$TEMP_DIR" bash "$GUARD" > /dev/null
 
@@ -156,6 +195,10 @@ elif operation == "reinstated-style-exception":
             "reason": "reinstated without review",
         }
     ]
+elif operation == "wider-dev-style":
+    data["content_security_policy"]["dev_proxy_style_src"] = "'self' 'unsafe-inline' https:"
+elif operation == "dropped-dev-style":
+    del data["content_security_policy"]["dev_proxy_style_src"]
 elif operation == "coverage-control":
     data["effective_caddy_contract"] = {"production_https_caddyfiles": []}
 elif operation == "unknown-control":
@@ -235,6 +278,36 @@ if REPO_ROOT="$TEMP_DIR" bash "$GUARD" > /dev/null 2>&1; then
   echo "security headers guard should reject undeclared policy control surfaces" >&2
   exit 1
 fi
+reset_policy
+mutate_policy "wider-dev-style"
+if REPO_ROOT="$TEMP_DIR" bash "$GUARD" > /dev/null 2>&1; then
+  echo "security headers guard should fail when the dev style exception widens in policy alone" >&2
+  exit 1
+fi
+
+reset_policy
+mutate_policy "dropped-dev-style"
+if REPO_ROOT="$TEMP_DIR" bash "$GUARD" > /dev/null 2>&1; then
+  echo "security headers guard should fail when the dev style exception is undeclared" >&2
+  exit 1
+fi
+
+reset_policy
+
+write_dev_caddy "$TEMP_DIR/infra/caddy/Caddyfile.dev" "'self'"
+if REPO_ROOT="$TEMP_DIR" bash "$GUARD" > /dev/null 2>&1; then
+  echo "security headers guard should fail when the dev proxy style-src drifts from policy" >&2
+  exit 1
+fi
+write_dev_caddy "$TEMP_DIR/infra/caddy/Caddyfile.dev"
+
+sed -i "s/script-src 'self';/script-src 'self' 'unsafe-inline';/" "$TEMP_DIR/infra/caddy/Caddyfile.dev"
+if REPO_ROOT="$TEMP_DIR" bash "$GUARD" > /dev/null 2>&1; then
+  echo "security headers guard should fail when the dev proxy opens script-src" >&2
+  exit 1
+fi
+write_dev_caddy "$TEMP_DIR/infra/caddy/Caddyfile.dev"
+
 reset_policy
 
 uv run --project "$REPO_ROOT/tools/py" --locked python - "$TEMP_DIR/infra/caddy/Caddyfile.vps" << 'PY'

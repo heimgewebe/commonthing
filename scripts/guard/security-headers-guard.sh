@@ -133,6 +133,7 @@ csp_keys = {
     "style_delivery",
     "style_mode",
     "magic_link_confirm_style_source",
+    "dev_proxy_style_src",
     "required_frontend_response_directives",
 }
 if exact_keys(csp, csp_keys, "content_security_policy"):
@@ -312,6 +313,46 @@ for relative in static_paths:
                 fail(
                     f"{relative} @frontendResponse CSP weakens policy-required directive "
                     f"{name}: required={sorted(required_tokens)}, actual={sorted(actual_tokens)}"
+                )
+
+# infra/caddy/Caddyfile.dev fronts the Vite dev server, which injects imported
+# CSS as runtime style elements for HMR. Those elements are CSP-governed, so
+# this one path keeps an inline-style exception. The file had no guard coverage
+# at all before, which meant nothing stopped the exception from widening or
+# script-src from being opened alongside it. Both are pinned here.
+dev_relative = "infra/caddy/Caddyfile.dev"
+dev_path = contract_file(dev_relative, "dev proxy Caddyfile")
+dev_style_src = csp.get("dev_proxy_style_src") if isinstance(csp, dict) else None
+if dev_path is not None:
+    dev_headers = [
+        line
+        for line in dev_path.read_text(encoding="utf-8").splitlines()
+        if "Content-Security-Policy" in line
+    ]
+    if len(dev_headers) != 1:
+        fail(
+            f"{dev_relative} must declare exactly one Content-Security-Policy "
+            f"header; found {len(dev_headers)}"
+        )
+    else:
+        dev_header = dev_headers[0]
+        if re.search(r"script-src[^;]*'unsafe-inline'", dev_header):
+            fail(f"{dev_relative} must not allow script-src unsafe-inline")
+        if not isinstance(dev_style_src, str) or not dev_style_src.strip():
+            fail("content_security_policy.dev_proxy_style_src must be a non-empty string")
+        else:
+            found = re.findall(r"\bstyle-src\b([^;]*)", dev_header)
+            if len(found) != 1:
+                fail(
+                    f"{dev_relative} must declare exactly one style-src directive "
+                    "(style-src-elem and style-src-attr count); "
+                    f"found {len(found)}"
+                )
+            elif found[0].split() != dev_style_src.split():
+                fail(
+                    f"{dev_relative} style-src drifted from "
+                    "content_security_policy.dev_proxy_style_src: expected "
+                    f"{dev_style_src!r}, found {' '.join(found[0].split())!r}"
                 )
 
 svelte = contract_file("apps/web/svelte.config.js", "SvelteKit CSP config")
