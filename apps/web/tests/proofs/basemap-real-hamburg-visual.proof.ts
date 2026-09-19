@@ -471,7 +471,6 @@ test.describe("Basemap Real Hamburg Visual Runtime Proof", () => {
           timeout: 30_000,
         })
         .toBeGreaterThan(0);
-      const featureEvidence = await readFeatureEvidence();
 
       await expect
         .poll(
@@ -484,6 +483,18 @@ test.describe("Basemap Real Hamburg Visual Runtime Proof", () => {
           },
         )
         .toBeGreaterThan(0);
+
+      // isSourceLoaded() is a momentary MapLibre state: new tile work can make
+      // it false again after an earlier successful poll. Bind the final proof
+      // snapshot to a fresh loaded observation after feature and range proofs.
+      await expect
+        .poll(async () => (await readFeatureEvidence()).sourceLoaded, {
+          message:
+            "Hamburg source must be loaded when final visual evidence is captured",
+          timeout: 30_000,
+        })
+        .toBeTruthy();
+      const featureEvidence = await readFeatureEvidence();
 
       expect(featureEvidence.sourceLoaded).toBe(true);
       expect(featureEvidence.renderedLayerIds).toEqual(
