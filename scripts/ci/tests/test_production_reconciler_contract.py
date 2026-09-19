@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parents[3]
+RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
 class ProductionReconcilerContractTests(unittest.TestCase):
@@ -1068,6 +1069,17 @@ prune_releases
             )
 
     def test_release_activator_rejects_unsafe_and_non_git_releases(self) -> None:
+        if os.geteuid() == 0:
+            # Lokal ist die Testpraemisse unter Root nicht herstellbar. Im
+            # Required GitHub-CI darf daraus aber kein stiller gruener Skip
+            # werden: dort ist die Nicht-Root-Ausfuehrung Teil der Testumgebung.
+            if RUNNING_IN_GITHUB_ACTIONS:
+                self.fail(
+                    "GitHub Actions must run the release-root ownership proof "
+                    "as a non-root test process"
+                )
+            self.skipTest("release-root ownership check requires a non-root test process")
+
         sudo_probe = subprocess.run(
             ["sudo", "-n", "true"],
             check=False,
@@ -1075,6 +1087,10 @@ prune_releases
             text=True,
         )
         if sudo_probe.returncode != 0:
+            if RUNNING_IN_GITHUB_ACTIONS:
+                self.fail(
+                    "GitHub Actions requires passwordless sudo for root-safety tests"
+                )
             self.skipTest("passwordless sudo is unavailable for root-safety tests")
 
         base = Path(tempfile.mkdtemp(prefix="weltgewebe-activator-root-"))
@@ -1214,6 +1230,11 @@ prune_releases
 
     def test_release_activator_rejects_non_root_execution(self) -> None:
         if os.geteuid() == 0:
+            if RUNNING_IN_GITHUB_ACTIONS:
+                self.fail(
+                    "GitHub Actions must run the non-root activator guard proof "
+                    "as a non-root test process"
+                )
             self.skipTest("non-root guard requires a non-root test process")
         completed = subprocess.run(
             [

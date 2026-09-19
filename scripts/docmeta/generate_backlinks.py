@@ -14,7 +14,6 @@ from collections import defaultdict
 from scripts.docmeta.docmeta import REPO_ROOT
 from scripts.docmeta.generated_check import write_or_check
 from scripts.docmeta.relations_parser import (
-    extract_relations_from_content,
     collect_file_relations,
 )
 

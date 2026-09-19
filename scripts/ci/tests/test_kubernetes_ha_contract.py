@@ -2167,7 +2167,7 @@ spec:
             self.ha.require_wal_object_identity([], "postgres-ha", segment)
         with self.assertRaisesRegex(self.ha.ref.ProofError, "not uniquely present"):
             self.ha.require_wal_object_identity(
-                [f"postgres-ha/wals/000000020000000A/000000020000000A000000FF.gz"],
+                ["postgres-ha/wals/000000020000000A/000000020000000A000000FF.gz"],
                 "postgres-ha",
                 segment,
             )

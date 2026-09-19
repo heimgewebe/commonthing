@@ -1,7 +1,6 @@
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 def run_script(tmp_path, lines, extra_args=None):
     jsonl_file = tmp_path / "test.jsonl"
