@@ -4,6 +4,8 @@ import argparse
 import copy
 import json
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -34,6 +36,7 @@ class StagingGatewayTests(unittest.TestCase):
             "app_activation": True,
             "status": "app-ready-gateway-pending",
             "image_promotion": {
+                "status": "pass",
                 "source_commit": "b" * 40,
                 "images": {"api": "api@sha256:abc", "web": "web@sha256:def"},
                 "receipt_sha256": "c" * 64,
@@ -93,6 +96,11 @@ class StagingGatewayTests(unittest.TestCase):
             "require_gateway_app_current": None,
             "staging_gateway_documents": self.docs,
             "staging_gateway_observation": self.observed,
+            "ensure_gateway_node_port": (
+                "cilium-gateway-commonthing-staging",
+                "service-uid",
+                staging.STAGING_GATEWAY_NODE_PORT,
+            ),
             "gateway_list": [],
             "run": None,
         }
@@ -436,7 +444,10 @@ class StagingGatewayTests(unittest.TestCase):
                     "gateway.networking.k8s.io/gateway-name": staging.GATEWAY_NAME
                 },
             },
-            "spec": {"type": "LoadBalancer", "ports": [{"port": 80}]},
+            "spec": {
+                "type": "LoadBalancer",
+                "ports": [{"port": 80, "nodePort": staging.STAGING_GATEWAY_NODE_PORT}],
+            },
             "status": {
                 "loadBalancer": {"ingress": [{"ip": ip} for ip in reversed(ADDRESSES)]}
             },
@@ -552,7 +563,10 @@ class StagingGatewayTests(unittest.TestCase):
                 ],
                 "labels": {staging.GATEWAY_SERVICE_LABEL: staging.GATEWAY_NAME},
             },
-            "spec": {"type": "LoadBalancer", "ports": [{"port": 80}]},
+            "spec": {
+                "type": "LoadBalancer",
+                "ports": [{"port": 80, "nodePort": staging.STAGING_GATEWAY_NODE_PORT}],
+            },
             "status": {
                 "loadBalancer": {"ingress": [{"ip": ip} for ip in ADDRESSES]}
             },
@@ -892,6 +906,619 @@ class StagingGatewayTests(unittest.TestCase):
                 "kubectl", self.root, self.cell, self.cell["owner_id"]
             )
         self.mocks["run"].assert_not_called()
+
+    def test_host_gateway_readback_hashes_all_cursor_pages_and_only_first_web_kib(self):
+        health = b"healthy"
+        web = b"a" * 1024 + b"different-tail"
+        page_one = json.dumps(
+            {
+                "items": [{"id": "node-a", "title": "A"}],
+                "page": {"limit": staging.API_NODES_PROOF_PAGE_LIMIT, "next_cursor": "6e6f64652d61", "has_more": True},
+            }
+        ).encode("utf-8")
+        page_two = json.dumps(
+            {
+                "items": [{"id": "node-b", "title": "B"}],
+                "page": {"limit": staging.API_NODES_PROOF_PAGE_LIMIT, "next_cursor": None, "has_more": False},
+            }
+        ).encode("utf-8")
+        canonical = json.dumps(
+            [
+                {"id": "node-a", "title": "A"},
+                {"id": "node-b", "title": "B"},
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        with mock.patch.object(
+            staging,
+            "_host_http_bytes",
+            side_effect=[health, web, page_one, page_two],
+        ) as fetch:
+            result = staging.host_gateway_http_readback()
+        self.assertEqual(result["health_sha256"], staging.sha256_bytes(health))
+        self.assertEqual(result["web_prefix_sha256"], staging.sha256_bytes(b"a" * 1024))
+        self.assertEqual(result["web_prefix_bytes"], 1024)
+        self.assertEqual(result["api_nodes_sha256"], staging.sha256_bytes(canonical))
+        self.assertEqual(result["api_nodes_count"], 2)
+        self.assertEqual(result["api_nodes_pages"], 2)
+        self.assertEqual(
+            result["api_nodes_hash_scope"], staging.API_NODES_HASH_SCOPE
+        )
+        self.assertIn("pagination=cursor", fetch.call_args_list[2].args[0])
+        self.assertIn(
+            f"limit={staging.API_NODES_PROOF_PAGE_LIMIT}",
+            fetch.call_args_list[2].args[0],
+        )
+        self.assertIn("cursor=6e6f64652d61", fetch.call_args_list[3].args[0])
+
+    def test_host_gateway_complete_readback_cap_covers_scale_1m(self):
+        self.assertGreaterEqual(staging.API_NODES_PROOF_MAX_ITEMS, 1_000_000)
+        self.assertGreaterEqual(
+            staging.API_NODES_PROOF_PAGE_LIMIT * staging.API_NODES_PROOF_MAX_PAGES,
+            staging.API_NODES_PROOF_MAX_ITEMS,
+        )
+
+    def test_host_http_cap_covers_maximally_escaped_valid_node_page(self):
+        escaped = "\x1f"
+        node = {
+            "id": "00000000-0000-4000-8000-000000000001",
+            "kind": escaped * 100,
+            "title": escaped * 200,
+            "created_at": "2026-09-18T18:44:09.123456Z",
+            "updated_at": "2026-09-18T18:44:09.123456Z",
+            "created_by_account_id": "00000000-0000-4000-8000-000000000002",
+            "info": escaped * 20_000,
+            "summary": escaped * 500,
+            "tags": [escaped * 64 for _ in range(32)],
+            "address": escaped * 500,
+            "location": {"lat": -90.0, "lon": -180.0},
+            "search_visibility": "private",
+        }
+        payload = json.dumps(
+            {
+                "items": [node for _ in range(staging.API_NODES_PROOF_PAGE_LIMIT)],
+                "page": {
+                    "limit": staging.API_NODES_PROOF_PAGE_LIMIT,
+                    "next_cursor": "f" * 72,
+                    "has_more": True,
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertGreater(len(payload), 1024 * 1024)
+        self.assertLessEqual(len(payload), staging.HOST_HTTP_PROOF_MAX_BYTES)
+
+    def test_complete_node_proof_streams_without_full_snapshot_buffer(self):
+        import inspect
+
+        api_source = inspect.getsource(staging._complete_api_nodes_readback)
+        postgres_source = inspect.getsource(staging.postgres_api_nodes_complete_readback)
+        stream_source = inspect.getsource(staging.stream_output_lines)
+        self.assertNotIn("items.extend", api_source)
+        self.assertNotIn("_canonical_api_nodes_snapshot", api_source)
+        self.assertIn("_CanonicalApiNodesAccumulator", api_source)
+        self.assertIn("stream_output_lines", postgres_source)
+        self.assertNotIn("output(", postgres_source)
+        self.assertIn("subprocess.Popen", stream_source)
+        self.assertIn("selectors.DefaultSelector", stream_source)
+        self.assertNotIn("TemporaryFile", stream_source)
+
+    def test_stream_output_lines_reads_pipe_and_enforces_timeout(self):
+        lines = list(
+            staging.stream_output_lines(
+                [
+                    sys.executable,
+                    "-c",
+                    "print('node-a'); print('node-b')",
+                ],
+                timeout=5,
+            )
+        )
+        self.assertEqual(lines, ["node-a", "node-b"])
+        with self.assertRaises(subprocess.TimeoutExpired):
+            list(
+                staging.stream_output_lines(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import time; print('node-a', flush=True); time.sleep(2)",
+                    ],
+                    timeout=0.05,
+                )
+            )
+        with self.assertRaises(subprocess.CalledProcessError):
+            list(
+                staging.stream_output_lines(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys; print('node-a', flush=True); sys.exit(7)",
+                    ],
+                    timeout=5,
+                )
+            )
+
+    def test_postgres_complete_readback_uses_scale_safe_default_timeout(self):
+        with (
+            mock.patch.dict(staging.os.environ, {}, clear=False),
+            mock.patch.object(
+                staging, "stream_output_lines", return_value=[]
+            ) as stream,
+        ):
+            staging.os.environ.pop(staging.API_NODES_PROOF_TIMEOUT_ENV, None)
+            staging.postgres_api_nodes_complete_readback("kubectl")
+
+        command = stream.call_args.args[0]
+        outer_timeout = staging.API_NODES_PROOF_TIMEOUT_DEFAULT_SECONDS
+        self.assertIn(
+            f"--request-timeout={outer_timeout - staging.API_NODES_PROOF_KUBECTL_MARGIN_SECONDS}s",
+            command,
+        )
+        command_text = " ".join(command)
+        self.assertIn(
+            f"statement_timeout={(outer_timeout - staging.API_NODES_PROOF_POSTGRES_MARGIN_SECONDS) * 1000}",
+            command_text,
+        )
+        self.assertIn(
+            f"FETCH_COUNT={staging.API_NODES_PROOF_FETCH_COUNT}",
+            command_text,
+        )
+        self.assertIn('printf "%s\\n" "$1" |', command_text)
+        self.assertIn(
+            f"timeout --signal=TERM --kill-after=5s {outer_timeout - staging.API_NODES_PROOF_POSTGRES_MARGIN_SECONDS}s",
+            command_text,
+        )
+        self.assertNotIn('-c "$1"', command_text)
+        self.assertTrue(
+            command[-1].endswith("ORDER BY convert_to(id, 'UTF8') ASC;")
+        )
+        self.assertEqual(stream.call_args.kwargs["timeout"], outer_timeout)
+
+    def test_postgres_complete_readback_maps_valid_timeout_override_to_all_budgets(self):
+        with (
+            mock.patch.dict(
+                staging.os.environ,
+                {staging.API_NODES_PROOF_TIMEOUT_ENV: "1800"},
+                clear=False,
+            ),
+            mock.patch.object(
+                staging, "stream_output_lines", return_value=[]
+            ) as stream,
+        ):
+            staging.postgres_api_nodes_complete_readback("kubectl")
+
+        command = stream.call_args.args[0]
+        self.assertIn("--request-timeout=1770s", command)
+        command_text = " ".join(command)
+        self.assertIn("statement_timeout=1740000", command_text)
+        self.assertIn(
+            f"FETCH_COUNT={staging.API_NODES_PROOF_FETCH_COUNT}",
+            command_text,
+        )
+        self.assertIn("timeout --signal=TERM --kill-after=5s 1740s", command_text)
+        self.assertTrue(
+            command[-1].endswith("ORDER BY convert_to(id, 'UTF8') ASC;")
+        )
+        self.assertEqual(stream.call_args.kwargs["timeout"], 1800)
+
+    def test_postgres_complete_readback_uses_rust_utf8_byte_order(self):
+        with mock.patch.object(
+            staging, "stream_output_lines", return_value=[]
+        ) as stream:
+            staging.postgres_api_nodes_complete_readback("kubectl")
+
+        sql = stream.call_args.args[0][-1]
+        self.assertIn("ORDER BY convert_to(id, 'UTF8') ASC;", sql)
+
+        # Rust String::cmp follows UTF-8 byte order for valid strings. This
+        # fixture includes ASCII case and non-ASCII text, which locale
+        # collations may order differently.
+        ids = ["node-ä", "node-a", "node-Z"]
+        expected = ["node-Z", "node-a", "node-ä"]
+        self.assertEqual(sorted(ids), expected)
+        self.assertEqual(
+            sorted(ids, key=lambda value: value.encode("utf-8")),
+            expected,
+        )
+
+    def test_api_nodes_proof_timeout_rejects_invalid_values_fail_closed(self):
+        invalid = (
+            "",
+            "not-a-number",
+            str(staging.API_NODES_PROOF_TIMEOUT_MIN_SECONDS - 1),
+            str(staging.API_NODES_PROOF_TIMEOUT_MAX_SECONDS + 1),
+        )
+        for value in invalid:
+            with self.subTest(value=value), mock.patch.dict(
+                staging.os.environ,
+                {staging.API_NODES_PROOF_TIMEOUT_ENV: value},
+                clear=False,
+            ):
+                with self.assertRaises(staging.StagingCellError):
+                    staging.api_nodes_proof_timeouts()
+
+    def test_complete_node_proof_rejects_non_monotonic_cursor_items(self):
+        page = json.dumps(
+            {
+                "items": [{"id": "node-b"}, {"id": "node-a"}],
+                "page": {
+                    "limit": staging.API_NODES_PROOF_PAGE_LIMIT,
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            }
+        ).encode("utf-8")
+        with self.assertRaisesRegex(
+            staging.StagingCellError, "strictly ordered by unique id"
+        ):
+            staging._complete_api_nodes_readback(
+                lambda _path, *, timeout_seconds: page
+            )
+
+    def test_complete_node_proof_enforces_one_total_deadline_across_pages(self):
+        first = json.dumps(
+            {
+                "items": [{"id": "node-a"}],
+                "page": {
+                    "limit": staging.API_NODES_PROOF_PAGE_LIMIT,
+                    "next_cursor": "next",
+                    "has_more": True,
+                },
+            }
+        ).encode("utf-8")
+        fetch = mock.Mock(return_value=first)
+        with (
+            mock.patch.object(staging.time, "monotonic", side_effect=[90.0, 101.0]),
+            self.assertRaisesRegex(
+                staging.StagingCellError, "configured total timeout"
+            ),
+        ):
+            staging._complete_api_nodes_readback(fetch, deadline=100.0)
+        fetch.assert_called_once()
+        self.assertEqual(
+            fetch.call_args.kwargs["timeout_seconds"],
+            staging.API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS,
+        )
+
+    def test_host_gateway_proof_revalidates_exact_app_around_readback(self) -> None:
+        import inspect
+
+        source = inspect.getsource(staging.command_prove_host_gateway)
+        promotion = source.index("promotion = _exact_cell_promotion(root, cell, active_commit)")
+        before = source.index("require_gateway_app_current(kubectl, cell, promotion)")
+        readback = source.index(
+            "readback = host_gateway_http_readback(deadline=proof_deadline)"
+        )
+        after = source.index(
+            "require_gateway_app_current(kubectl, cell, promotion)", before + 1
+        )
+        receipt = source.index("result = {")
+        self.assertLess(promotion, before)
+        self.assertLess(before, readback)
+        self.assertLess(readback, after)
+        self.assertLess(after, receipt)
+
+    def test_staging_kind_network_surface_is_audited(self) -> None:
+        registry = (staging.ROOT / "audit/impl-registry.yaml").read_text(encoding="utf-8")
+        self.assertIn("id: impl.platform.staging-kind-network", registry)
+        self.assertIn("path: platform/clusters/staging/kind.yaml", registry)
+        self.assertIn("scripts/ci/tests/test_staging_gateway_contract.py", registry)
+
+    def test_hard_deadline_restores_handler_when_timer_arm_fails(self):
+        previous_handler = object()
+        with (
+            mock.patch.object(staging.time, "monotonic", return_value=90.0),
+            mock.patch.object(
+                staging.signal, "getsignal", return_value=previous_handler
+            ),
+            mock.patch.object(staging.signal, "getitimer", return_value=(0.0, 0.0)),
+            mock.patch.object(staging.signal, "signal") as signal_handler,
+            mock.patch.object(
+                staging.signal, "setitimer", side_effect=OSError("timer unavailable")
+            ),
+            self.assertRaisesRegex(
+                staging.StagingCellError, "hard deadline could not be armed"
+            ),
+        ):
+            with staging._api_nodes_proof_hard_deadline(100.0):
+                self.fail("deadline guard unexpectedly entered")
+
+        self.assertEqual(signal_handler.call_count, 2)
+        self.assertEqual(
+            signal_handler.call_args_list[1],
+            mock.call(staging.signal.SIGALRM, previous_handler),
+        )
+
+    def test_host_http_readback_rejects_oversized_response_instead_of_truncating(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.read1.return_value = b"x" * (staging.HOST_HTTP_PROOF_MAX_BYTES + 1)
+        connection = mock.MagicMock()
+        connection.getresponse.return_value = response
+        connection.sock = mock.MagicMock()
+        with (
+            mock.patch.object(
+                staging.http.client, "HTTPConnection", return_value=connection
+            ),
+            self.assertRaisesRegex(staging.StagingCellError, "response exceeds"),
+        ):
+            staging._host_http_bytes("/api/nodes?pagination=cursor&limit=10")
+        response.read1.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_host_http_readback_stops_trickling_body_at_total_deadline(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.read1.side_effect = [b"x"]
+        connection = mock.MagicMock()
+        connection.getresponse.return_value = response
+        connection.sock = mock.MagicMock()
+        with (
+            mock.patch.object(
+                staging.http.client, "HTTPConnection", return_value=connection
+            ),
+            mock.patch.object(
+                staging.time,
+                "monotonic",
+                side_effect=[90.0, 90.0, 90.0, 90.0, 101.0],
+            ),
+            self.assertRaisesRegex(
+                staging.StagingCellError, "configured total timeout"
+            ),
+        ):
+            staging._host_http_bytes(
+                "/api/nodes?pagination=cursor&limit=10",
+                timeout_seconds=10.0,
+                deadline=100.0,
+            )
+        response.read1.assert_called_once()
+        connection.sock.settimeout.assert_called_once_with(10.0)
+        connection.close.assert_called_once()
+
+    def test_host_http_hard_deadline_wraps_header_parsing(self):
+        active = {"value": False}
+
+        class Guard:
+            def __enter__(self):
+                active["value"] = True
+                return None
+
+            def __exit__(self, *_args):
+                active["value"] = False
+                return False
+
+        def getresponse():
+            self.assertTrue(active["value"])
+            raise staging.StagingCellError("header parse interrupted by hard deadline")
+
+        connection = mock.MagicMock()
+        connection.getresponse.side_effect = getresponse
+        with (
+            mock.patch.object(
+                staging.http.client, "HTTPConnection", return_value=connection
+            ),
+            mock.patch.object(
+                staging, "_api_nodes_proof_hard_deadline", return_value=Guard()
+            ) as guard,
+            mock.patch.object(staging.time, "monotonic", return_value=90.0),
+            self.assertRaisesRegex(
+                staging.StagingCellError, "header parse interrupted by hard deadline"
+            ),
+        ):
+            staging._host_http_bytes(
+                "/api/nodes?pagination=cursor&limit=10",
+                timeout_seconds=10.0,
+                deadline=100.0,
+            )
+        guard.assert_called_once_with(100.0)
+        connection.request.assert_called_once_with(
+            "GET", "/api/nodes?pagination=cursor&limit=10"
+        )
+        connection.close.assert_called_once()
+
+    def test_canonical_node_snapshot_is_independent_of_page_order(self):
+        forward = staging._canonical_api_nodes_snapshot(
+            [{"id": "b", "title": "B"}, {"id": "a", "title": "A"}],
+            page_count=2,
+        )
+        reverse = staging._canonical_api_nodes_snapshot(
+            [{"id": "a", "title": "A"}, {"id": "b", "title": "B"}],
+            page_count=2,
+        )
+        self.assertEqual(forward["api_nodes_sha256"], reverse["api_nodes_sha256"])
+        self.assertEqual(forward["api_nodes_hash_scope"], staging.API_NODES_HASH_SCOPE)
+
+    def test_kind_gateway_complete_readback_uses_the_proven_probe_node(self):
+        receipt = {"probe_node": "node-1", "address": "10.0.0.8", "listener_port": 80}
+        page = json.dumps(
+            {
+                "items": [{"id": "one"}],
+                "page": {"limit": staging.API_NODES_PROOF_PAGE_LIMIT, "next_cursor": None, "has_more": False},
+            }
+        ).encode("utf-8")
+        with (
+            mock.patch.object(staging.reference, "kind_nodes", return_value=["node-1"]),
+            mock.patch.object(staging, "_kind_gateway_http_bytes", return_value=page) as fetch,
+        ):
+            result = staging.gateway_api_nodes_complete_readback(
+                "kind", staging.DEFAULT_CLUSTER, receipt
+            )
+        self.assertEqual(result["api_nodes_count"], 1)
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args.args[:3], ("node-1", "10.0.0.8", 80))
+        self.assertGreater(fetch.call_args.kwargs["timeout_seconds"], 0)
+        self.assertLessEqual(
+            fetch.call_args.kwargs["timeout_seconds"],
+            staging.API_NODES_PROOF_HTTP_REQUEST_MAX_SECONDS,
+        )
+
+    def test_host_gateway_success_receipt_binds_exact_localhost_service_and_gateway(self):
+        staging.command_prove_gateway(self.args)
+        service = (
+            "cilium-gateway-commonthing-staging",
+            "service-uid",
+            staging.STAGING_GATEWAY_NODE_PORT,
+        )
+        readback = {
+            "probe_scope": "heim-pc-host-outside-kubernetes",
+            "endpoint": f"http://127.0.0.1:{staging.STAGING_GATEWAY_HOST_PORT}",
+            "health_sha256": "1" * 64,
+            "web_prefix_sha256": "2" * 64,
+            "web_prefix_bytes": 123,
+            "api_nodes_sha256": "3" * 64,
+            "api_nodes_count": 1,
+            "api_nodes_pages": 1,
+            "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+        }
+        with (
+            mock.patch.object(staging, "gateway_receipt_current", return_value=True),
+            mock.patch.object(staging, "gateway_service_node_port", return_value=service),
+            mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(
+                staging,
+                "postgres_api_nodes_complete_readback",
+                return_value={
+                    "api_nodes_sha256": "3" * 64,
+                    "api_nodes_count": 1,
+                    "api_nodes_pages": 1,
+                    "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+                    "api_nodes_source": "quiesced-postgres-api-projection-v1",
+                },
+            ),
+            mock.patch.object(
+                staging, "_postgres_domain_nodes_write_freeze", return_value=mock.MagicMock()
+            ),
+            mock.patch.object(staging.time, "time", return_value=123456),
+        ):
+            result = staging.command_prove_host_gateway(self.args)
+        path = self.root / staging.HOST_GATEWAY_RECEIPT
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        cell = staging.load_cell_receipt(self.root)
+        self.assertEqual(result["status"], "host-gateway-readback-verified")
+        self.assertEqual(result["service"], {
+            "name": service[0], "uid": service[1], "node_port": service[2]
+        })
+        self.assertEqual(result["endpoint"], "http://127.0.0.1:18084")
+        self.assertEqual(result["probe_scope"], "heim-pc-host-outside-kubernetes")
+        self.assertFalse(result["production_changed"])
+        self.assertEqual(
+            result["does_not_establish"],
+            ["public DNS", "public TLS", "production cutover"],
+        )
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(persisted["verified_at_unix"], 123456)
+        self.assertEqual(
+            persisted["gateway_receipt_sha256"],
+            staging.sha256_file(self.root / "receipts/gateway-proof.json"),
+        )
+        self.assertEqual(
+            cell["host_gateway_proof"],
+            {
+                "active_commit": self.args.source_commit,
+                "receipt_sha256": staging.sha256_file(path),
+            },
+        )
+
+    def test_host_gateway_refuses_service_change_during_host_readback(self):
+        staging.command_prove_gateway(self.args)
+        service = (
+            "cilium-gateway-commonthing-staging",
+            "service-uid",
+            staging.STAGING_GATEWAY_NODE_PORT,
+        )
+        changed = (service[0], "replacement-service-uid", service[2])
+        readback = {
+            "probe_scope": "heim-pc-host-outside-kubernetes",
+            "endpoint": f"http://127.0.0.1:{staging.STAGING_GATEWAY_HOST_PORT}",
+            "health_sha256": "1" * 64,
+            "web_prefix_sha256": "2" * 64,
+            "web_prefix_bytes": 123,
+            "api_nodes_sha256": "3" * 64,
+            "api_nodes_count": 1,
+            "api_nodes_pages": 1,
+            "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+        }
+        with (
+            mock.patch.object(staging, "gateway_receipt_current", return_value=True),
+            mock.patch.object(
+                staging, "gateway_service_node_port", side_effect=[service, changed]
+            ),
+            mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(
+                staging,
+                "postgres_api_nodes_complete_readback",
+                return_value={
+                    "api_nodes_sha256": "3" * 64,
+                    "api_nodes_count": 1,
+                    "api_nodes_pages": 1,
+                    "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+                    "api_nodes_source": "quiesced-postgres-api-projection-v1",
+                },
+            ),
+            mock.patch.object(
+                staging, "_postgres_domain_nodes_write_freeze", return_value=mock.MagicMock()
+            ),
+        ):
+            with self.assertRaisesRegex(staging.StagingCellError, "changed during host readback"):
+                staging.command_prove_host_gateway(self.args)
+        self.assertFalse((self.root / staging.HOST_GATEWAY_RECEIPT).exists())
+        self.assertNotIn("host_gateway_proof", staging.load_cell_receipt(self.root))
+
+    def test_host_gateway_current_rejects_service_or_gateway_receipt_drift(self):
+        staging.command_prove_gateway(self.args)
+        service = (
+            "cilium-gateway-commonthing-staging",
+            "service-uid",
+            staging.STAGING_GATEWAY_NODE_PORT,
+        )
+        readback = {
+            "probe_scope": "heim-pc-host-outside-kubernetes",
+            "endpoint": f"http://127.0.0.1:{staging.STAGING_GATEWAY_HOST_PORT}",
+            "health_sha256": "1" * 64,
+            "web_prefix_sha256": "2" * 64,
+            "web_prefix_bytes": 123,
+            "api_nodes_sha256": "3" * 64,
+            "api_nodes_count": 1,
+            "api_nodes_pages": 1,
+            "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+        }
+        with (
+            mock.patch.object(staging, "gateway_receipt_current", return_value=True),
+            mock.patch.object(staging, "gateway_service_node_port", return_value=service),
+            mock.patch.object(staging, "host_gateway_http_readback", return_value=readback),
+            mock.patch.object(
+                staging,
+                "postgres_api_nodes_complete_readback",
+                return_value={
+                    "api_nodes_sha256": "3" * 64,
+                    "api_nodes_count": 1,
+                    "api_nodes_pages": 1,
+                    "api_nodes_hash_scope": staging.API_NODES_HASH_SCOPE,
+                    "api_nodes_source": "quiesced-postgres-api-projection-v1",
+                },
+            ),
+            mock.patch.object(
+                staging, "_postgres_domain_nodes_write_freeze", return_value=mock.MagicMock()
+            ),
+        ):
+            staging.command_prove_host_gateway(self.args)
+        cell = staging.load_cell_receipt(self.root)
+        with mock.patch.object(staging, "gateway_service_node_port", return_value=service):
+            self.assertTrue(staging.host_gateway_receipt_current(self.root, cell, "kubectl"))
+        with mock.patch.object(
+            staging,
+            "gateway_service_node_port",
+            return_value=(service[0], "replacement-service-uid", service[2]),
+        ):
+            self.assertFalse(staging.host_gateway_receipt_current(self.root, cell, "kubectl"))
+        gateway_path = self.root / "receipts/gateway-proof.json"
+        gateway_path.write_bytes(gateway_path.read_bytes() + b"\n")
+        gateway_path.chmod(0o600)
+        with mock.patch.object(staging, "gateway_service_node_port", return_value=service):
+            self.assertFalse(staging.host_gateway_receipt_current(self.root, cell, "kubectl"))
 
     def test_cli_requires_owner_and_exact_source(self):
         parsed = staging.parser().parse_args(

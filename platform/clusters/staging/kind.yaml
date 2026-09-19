@@ -7,6 +7,11 @@ networking:
   kubeProxyMode: none
 nodes:
   - role: control-plane
+    extraPortMappings:
+      - containerPort: 31844
+        hostPort: 18084
+        listenAddress: "127.0.0.1"
+        protocol: TCP
   - role: worker
     extraMounts:
       - hostPath: __COMMONTHING_STAGING_POSTGRES_ROOT__
