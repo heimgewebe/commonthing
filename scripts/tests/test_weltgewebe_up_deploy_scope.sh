@@ -121,7 +121,7 @@ if [[ "$joined" == *" config --services "* ]]; then
   exit 0
 fi
 if [[ "$joined" == *" config --format json "* ]]; then
-  printf '%s\n' '{"services":{"api":{},"db":{},"nats":{},"schaubild":{"image":"ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","read_only":true,"ports":[],"expose":["8765"],"command":["python","-m","schauwerk.visual.standalone_editor","serve","--bind-host","0.0.0.0","--trusted-reverse-proxy","--trusted-proxy-source-cidr","172.16.0.0/12","--public-base-path","/schaubild","--port","8765"]},"caddy":{"depends_on":{"schaubild":{"condition":"service_healthy"}}}}}'
+  printf '%s\n' '{"services":{"api":{},"db":{},"nats":{},"schaubild":{"image":"ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","pull_policy":"missing","read_only":true,"ports":[],"expose":["8765"],"command":["python","-m","schauwerk.visual.standalone_editor","serve","--bind-host","0.0.0.0","--trusted-reverse-proxy","--trusted-proxy-source-cidr","172.16.0.0/12","--public-base-path","/schaubild","--port","8765"]},"caddy":{}}'
   exit 0
 fi
 if [[ "$joined" == *" config "* ]]; then

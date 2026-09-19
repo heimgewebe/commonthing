@@ -36,7 +36,7 @@ services:
 
   schaubild:
     image: ${SCHAUWERK_SCHAUBILD_IMAGE:?SCHAUWERK_SCHAUBILD_IMAGE must be set}
-    pull_policy: always
+    pull_policy: missing
     command:
       - python
       - -m
@@ -91,6 +91,3 @@ services:
       - caddy_config:/config
     environment:
       WELTGEWEBE_BUILD: ${WELTGEWEBE_BUILD:?WELTGEWEBE_BUILD must be set}
-    depends_on:
-      schaubild:
-        condition: service_healthy

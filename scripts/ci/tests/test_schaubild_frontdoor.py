@@ -13,12 +13,15 @@ class SchaubildFrontdoorTest(unittest.TestCase):
         self.compose = (self.repo / "infra/compose/compose.vps.override.yml").read_text(
             encoding="utf-8"
         )
+        self.deploy = (self.repo / "scripts/weltgewebe-up").read_text(encoding="utf-8")
 
     def test_editor_is_a_digest_pinned_private_sidecar(self) -> None:
         self.assertIn(
             "image: ${SCHAUWERK_SCHAUBILD_IMAGE:?SCHAUWERK_SCHAUBILD_IMAGE must be set}",
             self.compose,
         )
+        self.assertIn("pull_policy: missing", self.compose)
+        self.assertNotIn("pull_policy: always", self.compose)
         self.assertIn("read_only: true", self.compose)
         self.assertIn("/tmp:rw,noexec,nosuid,size=64m", self.compose)
         self.assertIn("--trusted-reverse-proxy", self.compose)
@@ -33,6 +36,22 @@ class SchaubildFrontdoorTest(unittest.TestCase):
         self.assertIn("- ALL", self.compose)
         self.assertNotIn("/srv/schauwerk-editor-release", self.compose)
         self.assertNotIn("/srv/schauwerk-editor-release", self.caddy)
+
+    def test_edge_startup_does_not_hard_depend_on_schaubild_health(self) -> None:
+        caddy_service = self.compose.split("\n  caddy:\n", 1)[1]
+        self.assertNotIn("depends_on:", caddy_service)
+        self.assertIn('"schaubild" in dependencies', self.deploy)
+        self.assertIn(
+            "Caddy must remain available when the Schaubild runtime is degraded",
+            self.deploy,
+        )
+
+    def test_full_deploy_requires_cache_resilient_digest_pull_policy(self) -> None:
+        self.assertIn('service.get("pull_policy") != "missing"', self.deploy)
+        self.assertIn(
+            "services.schaubild must reuse the exact cached digest when present",
+            self.deploy,
+        )
 
     def test_editor_route_precedes_generic_routes_and_proxies_private_runtime(self) -> None:
         root_redirect = "@schauwerkRoot path /schaubild"

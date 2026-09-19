@@ -46,7 +46,9 @@ capabilities, enables `no-new-privileges`, and receives only a bounded 64 MiB
 `SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR` (default `172.16.0.0/12` for the
 Docker bridge contract), and is configured with `--public-base-path /schaubild`.
 
-Caddy owns the public boundary:
+Caddy owns the public boundary and starts independently of Schaubild health. A
+missing or unhealthy renderer may therefore degrade only `/schaubild/*` with an
+upstream error while the main site, API and basemap remain available.
 
 - `/schaubild` redirects to `/schaubild/`;
 - `handle_path /schaubild/*` strips the public prefix and proxies to
@@ -69,7 +71,10 @@ No renderer implementation is copied into Commonthing.
 Before the first mutating full VPS Compose action, `scripts/weltgewebe-up`
 validates the repository-owned runtime lock and exports its exact digest reference
 as `SCHAUWERK_SCHAUBILD_IMAGE`. The authoritative Compose render must then show
-exactly that image on the `schaubild` service.
+exactly that image on the `schaubild` service and `pull_policy: missing`. The
+digest remains immutable deployment authority, while an already cached exact
+digest can be reused when GHCR is temporarily unavailable. If the digest is not
+cached, Compose still pulls that exact digest before the sidecar can start.
 
 A missing, malformed, mutable, wrong-repository or wrong-base-path lock fails
 closed. Bounded `api` and `migration` deployment scopes do not own the public
@@ -111,8 +116,10 @@ the diagrams.net compatibility surface.
 
 Rollback uses another reviewed immutable Schauwerk digest. Update the runtime lock
 to the verified previous source commit and `image_digest`, then run the normal
-full exact-revision Commonthing deployment. Do not retag an existing mutable name
-and do not directly mutate the running container.
+full exact-revision Commonthing deployment. A locally cached exact rollback digest
+remains usable during a temporary registry outage; an uncached digest still
+requires the registry. Do not retag an existing mutable name and do not directly
+mutate the running container.
 
 If the shared-edge change itself causes a regression, restore the prior Commonthing
 revision through the existing exact-revision production path. In either case,

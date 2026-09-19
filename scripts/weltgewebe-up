@@ -1017,6 +1017,8 @@ try:
         raise ValueError("services.schaubild is missing")
     if service.get("image") != expected:
         raise ValueError("services.schaubild image is not bound to the reviewed digest")
+    if service.get("pull_policy") != "missing":
+        raise ValueError("services.schaubild must reuse the exact cached digest when present")
     if service.get("read_only") is not True:
         raise ValueError("services.schaubild must use a read-only root filesystem")
     if service.get("ports"):
@@ -1040,9 +1042,9 @@ try:
     caddy = services.get("caddy")
     if not isinstance(caddy, dict):
         raise ValueError("services.caddy is missing")
-    dependency = caddy.get("depends_on", {}).get("schaubild", {})
-    if not isinstance(dependency, dict) or dependency.get("condition") != "service_healthy":
-        raise ValueError("Caddy must wait for healthy Schaubild runtime")
+    dependencies = caddy.get("depends_on", {})
+    if isinstance(dependencies, dict) and "schaubild" in dependencies:
+        raise ValueError("Caddy must remain available when the Schaubild runtime is degraded")
 except Exception as exc:
     print(f"ERROR: {exc}", file=sys.stderr)
     raise SystemExit(2)
