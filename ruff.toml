@@ -1,0 +1,19 @@
+# Ruff-Konfiguration für das Python-Scripting unter scripts/ und tools/.
+#
+# Bewusst eng gehalten: geprüft werden nur Syntaxfehler (E9) und Pyflakes (F).
+# Das sind Fehlerklassen mit echtem Bug-Charakter — undefinierte Namen,
+# doppelte Definitionen, unerreichbarer Code, ungenutzte Importe. Stilregeln
+# sind absichtlich NICHT aktiv: die Prüfung soll Fehler finden, nicht
+# Formatierung durchsetzen.
+
+target-version = "py311"
+
+[lint]
+select = ["E9", "F"]
+
+[lint.per-file-ignores]
+# ha_reference.py ist eine bewusste Re-Export-Fassade: die Tests in
+# scripts/ci/tests/test_kubernetes_ha_contract.py greifen die Symbole über
+# Modul-Attribute ab (ha.require_wal_object_identity(...)), weshalb Ruff sie
+# nicht als benutzt erkennen kann.
+"scripts/platform/ha_reference.py" = ["F401"]

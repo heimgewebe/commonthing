@@ -865,7 +865,7 @@ def determine_overall_status(
 ) -> tuple[str, str, list[str]]:
     hard_gaps = [r.id for r in results if r.hard and r.status != "pass"]
     failing = [r.id for r in results if r.status == "fail"]
-    passing = [r.id for r in results if r.status == "pass"]
+    [r.id for r in results if r.status == "pass"]
 
     if failing:
         reason = f"Inconsistent capability state detected: {', '.join(failing)}"
