@@ -64,21 +64,9 @@ export function ensureInertPolyfill() {
   if (win.__INERT_POLYFILL_ACTIVE__) return;
   win.__INERT_POLYFILL_ACTIVE__ = true;
 
-  // Style-Schutz nur einmal injizieren (Pointer & Selection aus).
-  const styleId = "wg-inert-polyfill-style";
-  if (!document.getElementById(styleId)) {
-    const style = document.createElement("style");
-    style.id = styleId;
-    style.textContent = `
-      [inert] {
-        pointer-events: none;
-        user-select: none;
-        -webkit-user-select: none;
-        -webkit-tap-highlight-color: transparent;
-      }
-    `;
-    document.head.appendChild(style);
-  }
+  // Der Style-Schutz (Pointer & Selection aus) steht als [inert]-Regel in
+  // src/app.css. Eine Laufzeit-Injektion waere ein Style-Element und damit
+  // auf style-src 'unsafe-inline' angewiesen; siehe policies/security.yml.
 
   // aria-hidden initial anwenden
   const syncAll = () => {

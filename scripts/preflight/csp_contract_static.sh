@@ -30,6 +30,10 @@ if grep -Eq "script-src[^;]*'unsafe-inline'" "$CADDYFILE"; then
   echo "ERROR: target Caddyfile still allows script-src 'unsafe-inline': $CADDYFILE" >&2
   exit 1
 fi
+if grep -Eq "style-src[^;]*'unsafe-inline'" "$CADDYFILE"; then
+  echo "ERROR: target Caddyfile still allows style-src 'unsafe-inline': $CADDYFILE" >&2
+  exit 1
+fi
 
 INDEX_HTML="$ROOT/apps/web/build/index.html"
 if [[ ! -f "$INDEX_HTML" ]]; then
@@ -81,6 +85,7 @@ class DocumentParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.csp_meta: list[str] = []
         self.inline_scripts: list[str] = []
+        self.inline_styles: list[str] = []
         self.executable_script_before_csp = False
         self.csp_meta_outside_head = False
         self.active_markup: list[str] = []
@@ -98,6 +103,10 @@ class DocumentParser(HTMLParser):
                 self.active_markup.append(f"inline event handler {key}")
             if value.lstrip().lower().startswith("javascript:"):
                 self.active_markup.append(f"javascript URL in {key}")
+        if "style" in values:
+            self.inline_styles.append(f"style attribute on <{lowered_tag}>")
+        if lowered_tag == "style":
+            self.inline_styles.append("style element")
         if lowered_tag == "meta" and values.get("http-equiv", "").lower() == "content-security-policy":
             if not self._in_head:
                 self.csp_meta_outside_head = True
@@ -150,6 +159,13 @@ for forbidden in ("default-src", "script-src"):
         raise SystemExit(
             f"ERROR: frontend edge CSP in {caddyfile} must delegate {forbidden} to the document policy"
         )
+# Styles are edge-owned: unlike script-src there is no per-document style
+# policy to delegate to, so the header itself must carry a closed style-src.
+edge_style_src = frontend_directives.get("style-src")
+if not edge_style_src:
+    raise SystemExit(f"ERROR: frontend edge CSP in {caddyfile} has no style-src directive")
+if "'unsafe-inline'" in edge_style_src:
+    raise SystemExit(f"ERROR: frontend edge CSP in {caddyfile} still allows style-src 'unsafe-inline'")
 
 html_files = sorted(build.rglob("*.html"))
 if not html_files:
@@ -165,6 +181,12 @@ for path in html_files:
         raise SystemExit(f"ERROR: CSP meta tag must appear inside <head> in {path}")
     if parser.active_markup:
         raise SystemExit(f"ERROR: active inline HTML markup is forbidden in {path}: {parser.active_markup[0]}")
+    # The edge style-src is 'self' with no hashes, so any inline style in a
+    # compiled artifact would be dropped by the browser rather than applied.
+    if parser.inline_styles:
+        raise SystemExit(
+            f"ERROR: inline styles are forbidden in {path}: {parser.inline_styles[0]}"
+        )
     if parser.executable_script_before_csp:
         raise SystemExit(f"ERROR: executable script appears before the CSP meta tag in {path}")
     policy = directives(parser.csp_meta[0])
@@ -179,7 +201,10 @@ for path in html_files:
         if token not in script_src:
             raise SystemExit(f"ERROR: inline script hash missing from script-src in {path}: {token}")
     validated += 1
-    print(f"csp_contract_static: {path.relative_to(build)} scripts={len(parser.inline_scripts)} hash-bound")
+    print(
+        f"csp_contract_static: {path.relative_to(build)} "
+        f"scripts={len(parser.inline_scripts)} hash-bound, inline styles=0"
+    )
 
 # The edge CSP intentionally delegates script-src to each HTML document so that
 # SvelteKit can authorize its inline bootstrap with build-generated hashes.

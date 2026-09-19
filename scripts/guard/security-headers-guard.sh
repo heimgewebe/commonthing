@@ -14,6 +14,8 @@ uv run --project "$TOOLING_ROOT/tools/py" --locked python - "$REPO_ROOT" "$POLIC
 from __future__ import annotations
 
 from pathlib import Path
+import base64
+import hashlib
 import re
 import sys
 
@@ -125,12 +127,24 @@ if policy.get("version") != 2:
     fail("policies/security.yml version must be 2")
 
 csp = policy.get("content_security_policy")
-if exact_keys(csp, {"script_delivery", "script_mode", "required_frontend_response_directives"}, "content_security_policy"):
+csp_keys = {
+    "script_delivery",
+    "script_mode",
+    "style_delivery",
+    "style_mode",
+    "magic_link_confirm_style_source",
+    "required_frontend_response_directives",
+}
+if exact_keys(csp, csp_keys, "content_security_policy"):
     assert isinstance(csp, dict)
     if csp["script_delivery"] != "sveltekit_prerender_meta":
         fail("content_security_policy.script_delivery must be sveltekit_prerender_meta")
     if csp["script_mode"] != "hash":
         fail("content_security_policy.script_mode must be hash")
+    if csp["style_delivery"] != "external_stylesheets":
+        fail("content_security_policy.style_delivery must be external_stylesheets")
+    if csp["style_mode"] != "external":
+        fail("content_security_policy.style_mode must be external")
     directives = csp["required_frontend_response_directives"]
     directive_names = {
         "style-src", "connect-src", "img-src", "worker-src", "font-src",
@@ -145,19 +159,17 @@ if exact_keys(csp, {"script_delivery", "script_mode", "required_frontend_respons
 else:
     directives = {}
 
+# The inline-script and inline-style exceptions are both gone. Re-introducing
+# one is a reviewed constitutional change, not a policy edit: this guard keeps
+# the list empty so a silent re-entry cannot pass CI.
 exceptions = policy.get("csp_exceptions")
-if not isinstance(exceptions, list) or len(exceptions) != 1:
-    fail("csp_exceptions must contain exactly the reviewed style-src residual risk")
-else:
-    exception = exceptions[0]
-    if exact_keys(exception, {"directive", "status", "reason"}, "csp_exceptions[0]"):
-        assert isinstance(exception, dict)
-        if exception["directive"] != "style-src 'unsafe-inline'":
-            fail("csp_exceptions[0].directive must be style-src 'unsafe-inline'")
-        if exception["status"] != "accepted_residual_risk":
-            fail("csp_exceptions[0].status must be accepted_residual_risk")
-        if not isinstance(exception["reason"], str) or not exception["reason"].strip():
-            fail("csp_exceptions[0].reason must document the accepted residual risk")
+if not isinstance(exceptions, list):
+    fail("csp_exceptions must be a list")
+elif exceptions:
+    fail(
+        "csp_exceptions must be empty; no residual CSP risk is accepted "
+        f"(found {len(exceptions)})"
+    )
 
 hsts = policy.get("strict_transport_security")
 expected_hsts = None
@@ -216,7 +228,36 @@ for relative in production_paths:
         if header not in text:
             fail(f"{relative} missing constitutional header: {header}")
 
-magic_policy = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
+# The magic-link confirmation document is the one place that still serves an
+# inline style element. Its policy is derived from the Rust constant that
+# renders it, so a byte changed there fails this guard instead of silently
+# shipping a stale hash to the edge.
+STYLE_CONST = re.compile(
+    r'const\s+MAGIC_LINK_CONFIRM_STYLE:\s*&str\s*=\s*"([^"\\]*)"\s*;'
+)
+
+
+def magic_link_policy() -> str | None:
+    source = csp.get("magic_link_confirm_style_source") if isinstance(csp, dict) else None
+    path = contract_file(source, "content_security_policy.magic_link_confirm_style_source")
+    if path is None:
+        return None
+    matches = STYLE_CONST.findall(path.read_text(encoding="utf-8"))
+    if len(matches) != 1:
+        fail(
+            f"{source} must define exactly one escape-free MAGIC_LINK_CONFIRM_STYLE "
+            f"string literal; found {len(matches)}"
+        )
+        return None
+    digest = base64.b64encode(hashlib.sha256(matches[0].encode("utf-8")).digest()).decode("ascii")
+    return (
+        "default-src 'none'; "
+        f"style-src 'sha256-{digest}'; "
+        "form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
+    )
+
+
+magic_policy = magic_link_policy()
 strict_policy = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 for relative in static_paths:
     path = contract_file(relative, "static-app Caddyfile")
@@ -228,6 +269,8 @@ for relative in static_paths:
         continue
     if re.search(r"script-src[^;]*'unsafe-inline'", text):
         fail(f"{relative} must not allow script-src unsafe-inline")
+    if re.search(r"style-src[^;]*'unsafe-inline'", text):
+        fail(f"{relative} must not allow style-src unsafe-inline")
     if strict_policy not in text:
         fail(f"{relative} missing strict non-document/error CSP baseline")
 
@@ -239,9 +282,15 @@ for relative in static_paths:
             fail(f"{relative} magic-link matcher must contain exactly one GET method constraint")
         if len(re.findall(r"(?m)^\s*path\s+/api/auth/magic-link/consume\s*$", magic_block)) != 1:
             fail(f"{relative} magic-link matcher must contain the exact consume path")
-    expected_magic_header = f'header @magicLinkConfirm >Content-Security-Policy "{magic_policy}"'
-    if expected_magic_header not in text:
-        fail(f"{relative} must defer and overwrite the canonical magic-link confirmation CSP")
+    if magic_policy is not None:
+        expected_magic_header = (
+            f'header @magicLinkConfirm >Content-Security-Policy "{magic_policy}"'
+        )
+        if expected_magic_header not in text:
+            fail(
+                f"{relative} must defer and overwrite the canonical magic-link confirmation CSP: "
+                f"{magic_policy}"
+            )
 
     strict_matcher = "@nonDocumentResponse" if path.name == "Caddyfile.vps" else "@apiResponse"
     expected_strict_header = f'header {strict_matcher} >Content-Security-Policy "{strict_policy}"'
@@ -249,6 +298,10 @@ for relative in static_paths:
         fail(f"{relative} must defer and overwrite the canonical strict API CSP")
 
     frontend_directives = frontend_response_csp(text, relative)
+    if frontend_directives is not None:
+        for name, tokens in frontend_directives.items():
+            if "'unsafe-inline'" in tokens:
+                fail(f"{relative} @frontendResponse CSP must not allow {name} 'unsafe-inline'")
     if frontend_directives is not None and isinstance(directives, dict):
         for name, value in directives.items():
             actual_tokens = frontend_directives.get(name)

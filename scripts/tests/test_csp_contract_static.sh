@@ -26,7 +26,7 @@ run_test() {
 export REQUIRE_FRONTEND=0
 run_test "frontend-disabled" 0
 export REQUIRE_FRONTEND=1
-printf '%s\n' 'header @frontendResponse Content-Security-Policy "frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
+printf '%s\n' 'header @frontendResponse Content-Security-Policy "style-src '\''self'\''; frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
 rm -f "$INDEX_HTML"
 run_test "missing-index" 1
 
@@ -73,7 +73,7 @@ run_test "inline-unsafe-inline-rejected" 1
 printf '%s\n' 'header { Content-Security-Policy "script-src '\''self'\'' '\''unsafe-inline'\'';" }' > "$CADDYFILE_PATH"
 run_test "edge-unsafe-inline-rejected" 1
 
-printf '%s\n' 'header @frontendResponse Content-Security-Policy "frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
+printf '%s\n' 'header @frontendResponse Content-Security-Policy "style-src '\''self'\''; frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
 
 printf '%s\n' '<html><body><meta http-equiv="content-security-policy" content="script-src '\''self'\''"></body></html>' > "$INDEX_HTML"
 run_test "csp-meta-outside-head-rejected" 1
@@ -87,10 +87,29 @@ run_test "javascript-url-rejected" 1
 printf '%s\n' '<html><head><meta http-equiv="content-security-policy" content="script-src '\''self'\''"><script type="text/javascript; charset=utf-8">console.log("mime")</script></head><body></body></html>' > "$INDEX_HTML"
 run_test "parameterized-javascript-mime-requires-hash" 1
 
-printf '%s\n' 'header @frontendResponse Content-Security-Policy "default-src '\''self'\''; frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
+printf '%s\n' 'header @frontendResponse Content-Security-Policy "default-src '\''self'\''; style-src '\''self'\''; frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
 run_test "frontend-edge-default-src-rejected" 1
 
-printf '%s\n' 'header @frontendResponse Content-Security-Policy "script-src '\''self'\''; frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
+printf '%s\n' 'header @frontendResponse Content-Security-Policy "script-src '\''self'\''; style-src '\''self'\''; frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
 run_test "frontend-edge-script-src-rejected" 1
+
+# Styles have no per-document policy to delegate to, so the edge header itself
+# must carry a closed style-src.
+printf '%s\n' 'header @frontendResponse Content-Security-Policy "frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
+run_test "frontend-edge-missing-style-src-rejected" 1
+
+printf '%s\n' 'header @frontendResponse Content-Security-Policy "style-src '\''self'\'' '\''unsafe-inline'\''; frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
+run_test "frontend-edge-style-unsafe-inline-rejected" 1
+
+printf '%s\n' 'header @frontendResponse Content-Security-Policy "style-src '\''self'\''; frame-ancestors '\''none'\'';"' > "$CADDYFILE_PATH"
+
+printf '%s\n' '<html><head><meta http-equiv="content-security-policy" content="script-src '\''self'\''"></head><body><div style="display: contents"></div></body></html>' > "$INDEX_HTML"
+run_test "inline-style-attribute-rejected" 1
+
+printf '%s\n' '<html><head><meta http-equiv="content-security-policy" content="script-src '\''self'\''"><style>body{margin:0}</style></head><body></body></html>' > "$INDEX_HTML"
+run_test "inline-style-element-rejected" 1
+
+printf '%s\n' '<html><head><meta http-equiv="content-security-policy" content="script-src '\''self'\''"></head><body></body></html>' > "$INDEX_HTML"
+run_test "no-inline-style-accepted" 0
 
 echo "All csp_contract_static tests passed"
