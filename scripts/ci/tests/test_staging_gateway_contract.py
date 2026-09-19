@@ -375,6 +375,39 @@ class StagingGatewayTests(unittest.TestCase):
         (self.root / "receipts/gateway-proof.json").write_text("{}")
         self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
 
+    def test_gateway_receipt_observation_accepts_legacy_missing_node_port_only(self):
+        receipt = {
+            "resources": [{"uid": "gateway"}],
+            "service": {
+                "name": "cilium-gateway-commonthing-staging",
+                "uid": "service-uid",
+                "spec_sha256": "a" * 64,
+            },
+            "gateway_addresses": ["172.20.0.2"],
+            "service_addresses": ["172.20.0.2"],
+            "listener_port": 80,
+        }
+        observed = copy.deepcopy(receipt)
+        observed["service"]["node_port"] = 31844
+
+        self.assertTrue(
+            staging._gateway_receipt_observation_matches(receipt, observed)
+        )
+
+        changed_spec = copy.deepcopy(observed)
+        changed_spec["service"]["spec_sha256"] = "b" * 64
+        self.assertFalse(
+            staging._gateway_receipt_observation_matches(receipt, changed_spec)
+        )
+
+        explicit_wrong_port = copy.deepcopy(receipt)
+        explicit_wrong_port["service"]["node_port"] = 30001
+        self.assertFalse(
+            staging._gateway_receipt_observation_matches(
+                explicit_wrong_port, observed
+            )
+        )
+
     def test_conditions_require_current_generation(self):
         doc = self.get_resource("kubectl", "GatewayClass", "cilium")
         self.assertTrue(staging.current_condition(doc, "Accepted"))
