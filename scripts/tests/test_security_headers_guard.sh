@@ -142,7 +142,6 @@ write_dev_caddy() {
     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src ${style}; connect-src 'self' ws: wss:; img-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none';"
     X-Frame-Options "DENY"
     Referrer-Policy "no-referrer"
-    X-Weltgewebe-Build "{\$WELTGEWEBE_BUILD}"
   }
 }
 CADDY
