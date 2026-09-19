@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null 2>&1 && pwd)"
 REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 SCRIPT_SOURCE="$REPO_ROOT/scripts/weltgewebe-up"
-PREFLIGHT_SOURCE="$REPO_ROOT/scripts/preflight/schauwerk_editor_release.py"
 WORK_ROOT="$(mktemp -d)"
 trap 'rm -rf "$WORK_ROOT"' EXIT
 
@@ -38,26 +37,15 @@ new_repo() {
     git init -q
     git config user.name "Weltgewebe Test"
     git config user.email "tests@weltgewebe.local"
-    mkdir -p scripts/preflight infra/compose infra/schauwerk-editor
+    mkdir -p scripts infra/compose
     cp "$SCRIPT_SOURCE" scripts/weltgewebe-up
-    cp "$PREFLIGHT_SOURCE" scripts/preflight/schauwerk_editor_release.py
-    chmod +x scripts/weltgewebe-up scripts/preflight/schauwerk_editor_release.py
+    chmod +x scripts/weltgewebe-up
     cat > .env << 'ENV'
 DATABASE_URL=postgres://example
 POSTGRES_USER=weltgewebe
 POSTGRES_PASSWORD=test
 POSTGRES_DB=weltgewebe
 ENV
-    cat > infra/schauwerk-editor/release-lock.json << 'JSON'
-{
-  "schema_version": "weltgewebe-schauwerk-runtime-lock.v1",
-  "source_repository": "heimgewebe/schauwerk",
-  "source_commit": "cccccccccccccccccccccccccccccccccccccccc",
-  "image_repository": "ghcr.io/heimgewebe/schauwerk-schaubild",
-  "image_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-  "public_base_path": "/schaubild"
-}
-JSON
     cat > infra/compose/compose.prod.yml << 'YAML'
 services:
   api:
@@ -84,6 +72,7 @@ setup_mocks() {
   printf 'db-1\n' > "$state/db.id"
   printf 'nats-1\n' > "$state/nats.id"
   printf 'caddy-1\n' > "$state/caddy.id"
+  printf 'schaubild-1\n' > "$state/schaubild.id"
   : > "$state/compose-up.log"
   : > "$state/mutation.log"
   printf 'verify-applied\n' > "$state/api.mode"
@@ -117,6 +106,14 @@ fi
 
 if [[ "${1:-}" != "compose" ]]; then
   exit 0
+fi
+
+if [[ "$joined" == *" config "* ]]; then
+  expected_schaubild_sentinel="ghcr.io/heimgewebe/schauwerk-schaubild@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  [[ "${SCHAUWERK_SCHAUBILD_IMAGE:-}" == "$expected_schaubild_sentinel" ]] || {
+    echo "bounded scope did not bind the non-deployable Schaubild compose sentinel" >&2
+    exit 95
+  }
 fi
 
 if [[ "$joined" == *" config --services "* ]]; then
@@ -238,7 +235,7 @@ assert len(p['git_head'])==40
 assert all(c in '0123456789abcdef' for c in p['git_head'])
 assert p['api_image_tag']
 assert p['target_services']==['api']
-assert p['protected_services']==['db','nats','caddy']
+assert p['protected_services']==['db','nats','caddy','schaubild']
 assert p['startup_migration_mode']=='verify-applied'
 assert p['no_deps'] is True
 assert p['remove_orphans'] is False
@@ -261,6 +258,7 @@ assert_not_contains "$api_call" "--remove-orphans"
 assert_not_contains "$api_call" " db"
 assert_not_contains "$api_call" " nats"
 assert_not_contains "$api_call" " caddy"
+assert_not_contains "$api_call" " schaubild"
 [[ "$(cat "$state_api/api.mode")" == "verify-applied" ]] || fail "API scope did not force verify-applied"
 assert_contains "$out_api" "Health OK"
 echo "PASS: API scope changes only API and forces verify-applied"
@@ -275,6 +273,8 @@ first_call="$(sed -n '1p' "$state_migration/compose-up.log")"
 second_call="$(sed -n '2p' "$state_migration/compose-up.log")"
 assert_contains "$first_call" "up -d --no-deps api"
 assert_contains "$second_call" "up -d --no-deps --force-recreate api"
+assert_not_contains "$first_call" " schaubild"
+assert_not_contains "$second_call" " schaubild"
 [[ "$(cat "$state_migration/api.mode")" == "verify-applied" ]] || fail "migration scope did not restore verify-applied"
 uv run --project "$REPO_ROOT/tools/py" --locked python - "$repo_migration/.ops/deploy-plan-migration.json" << 'PY'
 import json, sys

@@ -919,7 +919,7 @@ SCHAUWERK_RUNTIME_IMAGE_DIGEST=""
 SCHAUWERK_RUNTIME_SOURCE_COMMIT=""
 SCHAUWERK_RUNTIME_PUBLIC_BASE_PATH=""
 SCHAUWERK_RUNTIME_POSTFLIGHT_REQUIRED="0"
-if [[ "$DEPLOY_TARGET" == "vps" ]]; then
+if [[ "$DEPLOY_TARGET" == "vps" && "$DEPLOY_SCOPE" == "full" ]]; then
   SCHAUWERK_RUNTIME_LOCK_PATH="$PWD/infra/schauwerk-editor/release-lock.json"
   if ! SCHAUWERK_RUNTIME_PREFLIGHT_OUTPUT="$(
     python3 scripts/preflight/schauwerk_editor_release.py \
@@ -986,10 +986,15 @@ PY
   fi
   export SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR"
   export SCHAUWERK_SCHAUBILD_IMAGE="$SCHAUWERK_RUNTIME_IMAGE_REF"
-  if [[ "$DEPLOY_SCOPE" == "full" ]]; then
-    SCHAUWERK_RUNTIME_POSTFLIGHT_REQUIRED="1"
-  fi
+  SCHAUWERK_RUNTIME_POSTFLIGHT_REQUIRED="1"
   echo "   Schaubild runtime admitted source $SCHAUWERK_RUNTIME_SOURCE_COMMIT ($SCHAUWERK_RUNTIME_IMAGE_DIGEST)."
+elif [[ "$DEPLOY_TARGET" == "vps" ]]; then
+  # Bounded API/migration scopes do not own the Schaubild release. Compose still
+  # parses the VPS service graph, so bind its required image interpolation to a
+  # deliberately non-deployable digest sentinel. --no-deps plus the protected
+  # service identity gate below prevents this value from becoming runtime truth.
+  SCHAUWERK_BOUNDED_SCOPE_IMAGE_SENTINEL="ghcr.io/heimgewebe/schauwerk-schaubild@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  export SCHAUWERK_SCHAUBILD_IMAGE="$SCHAUWERK_BOUNDED_SCOPE_IMAGE_SENTINEL"
 fi
 
 if ! docker compose "${BASE_ARGS[@]}" config > /dev/null; then
@@ -997,7 +1002,7 @@ if ! docker compose "${BASE_ARGS[@]}" config > /dev/null; then
   exit 1
 fi
 
-if [[ "$DEPLOY_TARGET" == "vps" ]]; then
+if [[ "$DEPLOY_TARGET" == "vps" && "$DEPLOY_SCOPE" == "full" ]]; then
   if ! docker compose "${BASE_ARGS[@]}" config --format json 2> /dev/null |
     python3 -c '
 import json
@@ -2009,7 +2014,7 @@ join_command_for_plan() {
   printf '%s' "$joined"
 }
 
-PROTECTED_SERVICES=(db nats caddy)
+PROTECTED_SERVICES=(db nats caddy schaubild)
 declare -A PROTECTED_IDS_BEFORE=()
 
 snapshot_protected_services() {
@@ -2201,7 +2206,7 @@ payload = {
     "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     "scope": scope,
     "target_services": targets,
-    "protected_services": ["db", "nats", "caddy"],
+    "protected_services": ["db", "nats", "caddy", "schaubild"],
     "protected_service_ids": protected,
     "compose_project": os.environ["PLAN_PROJECT"],
     "deploy_target": os.environ["PLAN_TARGET"],
@@ -2221,7 +2226,7 @@ payload = {
     ],
     "authorization": {
         "allowed_recreated_services": targets,
-        "forbidden_recreated_services": ["db", "nats", "caddy"],
+        "forbidden_recreated_services": ["db", "nats", "caddy", "schaubild"],
     },
 }
 with open(os.environ["PLAN_PATH"], "w", encoding="utf-8") as handle:
@@ -2334,7 +2339,7 @@ else
   if grep -qFx search-worker <<< "$configured_scoped_services"; then
     # Both containers share the API network namespace. Recreating only the API
     # would strand them on the retired namespace, so all three are one bounded
-    # deployment unit while db, nats and caddy stay protected.
+    # deployment unit while db, nats, caddy and schaubild stay protected.
     SCOPED_TARGET_SERVICES+=(search-worker)
   fi
 
@@ -2353,7 +2358,7 @@ else
     echo "ERROR: bounded deployment command unexpectedly includes --remove-orphans." >&2
     exit 1
   fi
-  for forbidden_target in db nats caddy; do
+  for forbidden_target in "${PROTECTED_SERVICES[@]}"; do
     for arg in "${SCOPED_INITIAL_CMD[@]}"; do
       if [[ "$arg" == "$forbidden_target" ]]; then
         echo "ERROR: bounded deployment plan unexpectedly targets protected service '$forbidden_target'." >&2

@@ -5,7 +5,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null 2>&1 && pwd)"
 REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 SCRIPT_SOURCE="$REPO_ROOT/scripts/weltgewebe-up"
-PREFLIGHT_SOURCE="$REPO_ROOT/scripts/preflight/schauwerk_editor_release.py"
 REAL_GIT="$(command -v git)"
 
 # Synthetic VPS fixtures must not depend on the host network or resolver file.
@@ -49,25 +48,13 @@ new_repo() {
     git config user.name "Weltgewebe Test"
     git config user.email "tests@weltgewebe.local"
 
-    mkdir -p infra/compose infra/schauwerk-editor scripts/preflight apps/web/build/_app
+    mkdir -p infra/compose scripts apps/web/build/_app
     cp "$SCRIPT_SOURCE" scripts/weltgewebe-up
-    cp "$PREFLIGHT_SOURCE" scripts/preflight/schauwerk_editor_release.py
-    chmod +x scripts/weltgewebe-up scripts/preflight/schauwerk_editor_release.py
+    chmod +x scripts/weltgewebe-up
 
     cat > .env << 'EOF'
 WEB_UPSTREAM_URL=https://example.com
 WEB_UPSTREAM_HOST=example.com
-EOF
-
-    cat > infra/schauwerk-editor/release-lock.json << 'EOF'
-{
-  "schema_version": "weltgewebe-schauwerk-runtime-lock.v1",
-  "source_repository": "heimgewebe/schauwerk",
-  "source_commit": "cccccccccccccccccccccccccccccccccccccccc",
-  "image_repository": "ghcr.io/heimgewebe/schauwerk-schaubild",
-  "image_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-  "public_base_path": "/schaubild"
-}
 EOF
 
     cat > infra/compose/compose.prod.yml << 'EOF'
@@ -177,7 +164,7 @@ if [[ "$1" == "compose" ]]; then
     if [[ "${MOCK_FAIL_CONFIG_GUARD:-0}" == "1" ]]; then
       echo "{"
     else
-      echo '{"services":{"api":{"ports":[]},"db":{},"nats":{},"schaubild":{"image":"ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","read_only":true,"ports":[],"expose":["8765"],"command":["python","-m","schauwerk.visual.standalone_editor","serve","--bind-host","0.0.0.0","--trusted-reverse-proxy","--trusted-proxy-source-cidr","172.16.0.0/12","--public-base-path","/schaubild","--port","8765"]},"caddy":{"depends_on":{"schaubild":{"condition":"service_healthy"}}}}}'
+      echo '{"services":{"api":{"ports":[]},"db":{},"nats":{},"caddy":{}}'
     fi
     exit 0
   fi
