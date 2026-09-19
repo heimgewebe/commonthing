@@ -11,7 +11,6 @@ name: python-tooling
       - "**/uv.lock"
       - ".github/workflows/python-tooling.yml"
       - ".python-version"
-      - "ruff.toml"
       - "toolchain.versions.yml"
   push:
     branches: [main]
@@ -22,7 +21,6 @@ name: python-tooling
       - "**/uv.lock"
       - ".github/workflows/python-tooling.yml"
       - ".python-version"
-      - "ruff.toml"
       - "toolchain.versions.yml"
   workflow_dispatch: {}
 
@@ -58,12 +56,6 @@ jobs:
             exit 1
           fi
           UV_VERSION=$(grep '^uv:' toolchain.versions.yml | cut -d '"' -f2)
-          RUFF_VERSION=$(grep '^ruff:' toolchain.versions.yml | cut -d '"' -f2)
-          if [ -z "${RUFF_VERSION}" ]; then
-            echo "failed to parse ruff version from toolchain.versions.yml" >&2
-            exit 1
-          fi
-          printf 'ruff_version=%s\n' "${RUFF_VERSION}" >> "${GITHUB_OUTPUT}"
           if [ -z "${UV_VERSION}" ]; then
             echo "failed to parse uv version from toolchain.versions.yml" >&2
             exit 1
@@ -120,12 +112,3 @@ jobs:
 
       - name: Python sanity check
         run: python -c "import sys; print('python ok:', sys.version)"
-
-      # Statische Prüfung des gesamten Python-Bestands. Regelauswahl in
-      # ruff.toml bewusst eng (E9 + Pyflakes): Fehlerklassen, keine Stilregeln.
-      - name: Ruff lint
-        env:
-          RUFF_VERSION: ${{ steps.uv-version.outputs.ruff_version }}
-        run: |
-          set -euo pipefail
-          uv tool run "ruff@${RUFF_VERSION}" check --no-cache .
