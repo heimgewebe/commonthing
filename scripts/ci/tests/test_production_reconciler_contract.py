@@ -132,20 +132,24 @@ class ProductionReconcilerContractTests(unittest.TestCase):
         self.assertIn("--range 0-126", script)
         self.assertIn("public Germany PMTiles range response is not HTTP 206", script)
 
-    def test_reconciler_binds_noop_and_postdeploy_to_schauwerk_release_lock(self) -> None:
+    def test_reconciler_binds_noop_and_postdeploy_to_schaubild_runtime_lock(self) -> None:
         script = self.read("scripts/ops/reconcile-production-main-vps.sh")
         self.assertIn("WELTGEWEBE_SCHAUWERK_MANIFEST_URL", script)
         self.assertIn("infra/schauwerk-editor/release-lock.json", script)
-        self.assertIn("weltgewebe-schauwerk-release-lock.v1", script)
-        self.assertIn("verify_public_schauwerk_release", script)
-        self.assertEqual(script.count("verify_public_schauwerk_release"), 3)
-        self.assertIn("reason=schauwerk_release_identity_drift", script)
-        self.assertIn("schauwerk_release=verified", script)
+        self.assertIn("weltgewebe-schauwerk-runtime-lock.v1", script)
+        self.assertIn("ghcr.io/heimgewebe/schauwerk-schaubild", script)
+        self.assertIn("verify_public_schauwerk_runtime", script)
+        self.assertEqual(script.count("verify_public_schauwerk_runtime"), 3)
+        self.assertIn("reason=schaubild_runtime_image_identity_drift", script)
         self.assertIn(
-            "public Schauwerk manifest does not match the reviewed release after deploy",
+            "public Schaubild runtime does not match the reviewed OCI digest after deploy",
             script,
         )
-        no_op = script.index('if [[ "$basemap_identity_matches" == "1" && "$schauwerk_identity_matches" == "1" ]]')
+        self.assertIn("schauwerk-standalone-editor-manifest.v2", script)
+        self.assertIn("schauwerk-native-diagram-v1", script)
+        no_op = script.index(
+            'if [[ "$basemap_identity_matches" == "1" && "$schauwerk_identity_matches" == "1" ]]'
+        )
         repair = script.index("repair_observed_deployment_state", no_op)
         self.assertLess(no_op, repair)
 

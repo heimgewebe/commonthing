@@ -43,8 +43,12 @@ jedem abgeschlossenen Lauf erneut mit einem Abstand von zwei Minuten. Der Dienst
 2. liest den vollständigen Zielcommit;
 3. beendet sich ohne Änderung nur, wenn Frontend, API und Build-Header diesen
    Commit bereits öffentlich liefern, der bundesweite Deutschland-Basemap-Vertrag
-   stimmt **und** `/schaubild/manifest.json` bytegenau den im selben Commit
-   geprüften `infra/schauwerk-editor/release-lock.json`-Hash liefert;
+   stimmt **und** der laufende private `schaubild`-Dienst exakt das im selben
+   Commit geprüfte `image@sha256:digest` aus
+   `infra/schauwerk-editor/release-lock.json` verwendet; der öffentliche
+   `/schaubild/manifest.json`-Readback muss zusätzlich Manifest v2,
+   `schauwerk-native-diagram-v1` und den kanonischen
+   `/schaubild/api/native-viewer`-Pfad bestätigen;
 4. prüft mindestens 4 GiB freien Platz als absolute Host-Untergrenze und
    einen vollständig root-eigenen, nicht für Gruppe oder Welt beschreibbaren
    Git-Objektspeicher; unmittelbar vor einem tatsächlich nötigen Build verlangt
