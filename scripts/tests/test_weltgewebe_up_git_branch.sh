@@ -157,14 +157,14 @@ if [[ "$1" == "inspect" ]]; then
 fi
 if [[ "$1" == "compose" ]]; then
   if [[ "$ARGS" == *" config --services"* ]]; then
-    echo "api"
+    printf '%s\n' api db nats caddy
     exit 0
   fi
   if [[ "$ARGS" == *" config --format json"* ]]; then
     if [[ "${MOCK_FAIL_CONFIG_GUARD:-0}" == "1" ]]; then
       echo "{"
     else
-      echo '{"services":{"api":{"ports":[]}}}'
+      echo '{"services":{"api":{"ports":[]},"db":{},"nats":{},"caddy":{}}'
     fi
     exit 0
   fi
@@ -174,6 +174,18 @@ if [[ "$1" == "compose" ]]; then
   fi
   if [[ "$ARGS" == *" ps -q api"* ]]; then
     echo "api_container_id"
+    exit 0
+  fi
+  if [[ "$ARGS" == *" ps -q db"* ]]; then
+    echo "db_container_id"
+    exit 0
+  fi
+  if [[ "$ARGS" == *" ps -q nats"* ]]; then
+    echo "nats_container_id"
+    exit 0
+  fi
+  if [[ "$ARGS" == *" ps -q caddy"* ]]; then
+    echo "caddy_container_id"
     exit 0
   fi
   if [[ "$ARGS" == *" ps --format"* ]]; then
@@ -265,6 +277,7 @@ run_up() {
       ENV_FILE="$repo/.env" \
       EDGE_CA="$EDGE_CA_FIXTURE" \
       DEPLOY_FRONTEND_MODE=off \
+      WELTGEWEBE_DEPLOY_SCOPE="${WELTGEWEBE_DEPLOY_SCOPE:-api}" \
       WELTGEWEBE_STATE_DIR="$repo/.ops" \
       bash scripts/weltgewebe-up "$@"
   )
@@ -465,7 +478,7 @@ repo_bundle="$(new_repo failure-bundle)"
   git checkout feat/x > /dev/null
 )
 set +e
-out_bundle="$(DEPLOY_TARGET=heimserver MOCK_FAIL_CONFIG_GUARD=1 run_up "$repo_bundle" "$WORKDIR_ROOT/failure-bundle.git.log" 2>&1)"
+out_bundle="$(DEPLOY_TARGET=heimserver WELTGEWEBE_DEPLOY_SCOPE=full MOCK_FAIL_CONFIG_GUARD=1 run_up "$repo_bundle" "$WORKDIR_ROOT/failure-bundle.git.log" 2>&1)"
 rc_bundle=$?
 set -e
 [[ "$rc_bundle" -ne 0 ]] || fail "failure-bundle case must fail"

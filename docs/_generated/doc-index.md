@@ -53,7 +53,7 @@ Generated automatically. Do not edit.
 | deploy.map-html-canonical-route | Canonical Map Route Contract | runbook | active | docs/deploy/map-html-canonical-route.md |
 | deploy.public-app-base-url | Public APP_BASE_URL Contract | reference | active | docs/deploy/public-app-base-url.md |
 | deploy.public-metrics-boundary | Public Metrics Boundary | reference | active | docs/deploy/public-metrics-boundary.md |
-| deploy.schauwerk-editor-frontdoor | Schauwerk Editor Frontdoor | runbook | active | docs/deploy/schauwerk-editor-frontdoor.md |
+| deploy.schauwerk-editor-frontdoor | Schauwerk Schaubild Frontdoor | runbook | active | docs/deploy/schauwerk-editor-frontdoor.md |
 | deploy.secondary-domain-web-surfaces | Sekundäre Domain-Webflächen | reference | active | docs/deploy/secondary-domain-web-surfaces.md |
 | deploy.security | Deploy Security | architecture | active | docs/deploy/security.md |
 | deploy.vps | VPS-Deployment | reference | active | docs/deploy/vps.md |

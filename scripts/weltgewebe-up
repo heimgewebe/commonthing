@@ -910,11 +910,91 @@ generate_failure_bundle() {
   echo
 }
 
-# Never trust an externally supplied exact-release override before admission. The
-# discovery render may resolve only the configured parent root plus /current;
-# the authoritative render below is pinned to the verified releases/<commit> path.
-if [[ "$DEPLOY_TARGET" == "vps" ]]; then
-  export SCHAUWERK_EDITOR_RELEASE_DIR=""
+# Schaubild production identity is an exact OCI digest owned by the reviewed
+# repository lock. Resolve it before the first VPS Compose render; mutable tags
+# and externally supplied image overrides are never trusted as deployment truth.
+SCHAUWERK_RUNTIME_PREFLIGHT_OUTPUT=""
+SCHAUWERK_RUNTIME_IMAGE_REF=""
+SCHAUWERK_RUNTIME_IMAGE_DIGEST=""
+SCHAUWERK_RUNTIME_SOURCE_COMMIT=""
+SCHAUWERK_RUNTIME_PUBLIC_BASE_PATH=""
+SCHAUWERK_RUNTIME_POSTFLIGHT_REQUIRED="0"
+if [[ "$DEPLOY_TARGET" == "vps" && "$DEPLOY_SCOPE" == "full" ]]; then
+  SCHAUWERK_RUNTIME_LOCK_PATH="$PWD/infra/schauwerk-editor/release-lock.json"
+  if ! SCHAUWERK_RUNTIME_PREFLIGHT_OUTPUT="$(
+    python3 scripts/preflight/schauwerk_editor_release.py \
+      --lock "$SCHAUWERK_RUNTIME_LOCK_PATH" \
+      --json
+  )"; then
+    msg="Schaubild native runtime lock preflight failed."
+    echo "ERROR: $msg" >&2
+    generate_failure_bundle "$msg"
+    exit 1
+  fi
+  if ! SCHAUWERK_RUNTIME_BINDINGS="$(
+    python3 -c '
+import json
+import sys
+try:
+    value = json.load(sys.stdin)
+    fields = ("image_ref", "image_digest", "source_commit", "public_base_path")
+    selected = [value.get(field) for field in fields]
+    if any(not isinstance(item, str) or not item or "\n" in item or "\t" in item for item in selected):
+        raise ValueError("runtime preflight output fields are missing or unsafe")
+    print("\t".join(selected))
+except Exception as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+' <<< "$SCHAUWERK_RUNTIME_PREFLIGHT_OUTPUT"
+  )"; then
+    msg="Schaubild native runtime preflight did not return exact identity bindings."
+    echo "ERROR: $msg" >&2
+    generate_failure_bundle "$msg"
+    exit 1
+  fi
+  IFS=$'\t' read -r \
+    SCHAUWERK_RUNTIME_IMAGE_REF \
+    SCHAUWERK_RUNTIME_IMAGE_DIGEST \
+    SCHAUWERK_RUNTIME_SOURCE_COMMIT \
+    SCHAUWERK_RUNTIME_PUBLIC_BASE_PATH <<< "$SCHAUWERK_RUNTIME_BINDINGS"
+  if [[ ! "$SCHAUWERK_RUNTIME_IMAGE_REF" =~ ^ghcr\.io/heimgewebe/schauwerk-schaubild@sha256:[0-9a-f]{64}$ ||
+    ! "$SCHAUWERK_RUNTIME_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ||
+    ! "$SCHAUWERK_RUNTIME_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ||
+    "$SCHAUWERK_RUNTIME_PUBLIC_BASE_PATH" != "/schaubild" ]]; then
+    msg="Schaubild native runtime identity bindings are malformed."
+    echo "ERROR: $msg" >&2
+    generate_failure_bundle "$msg"
+    exit 1
+  fi
+  SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-172.16.0.0/12}"
+  if ! SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR" python3 - << 'PY'; then
+import ipaddress
+import os
+
+raw = os.environ["SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR"]
+try:
+    network = ipaddress.ip_network(raw, strict=True)
+except ValueError:
+    raise SystemExit(2)
+if not isinstance(network, ipaddress.IPv4Network) or str(network) != raw:
+    raise SystemExit(2)
+PY
+    msg="Schaubild trusted proxy source CIDR is not one canonical IPv4 network."
+    echo "ERROR: $msg" >&2
+    generate_failure_bundle "$msg"
+    exit 1
+  fi
+  export SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR"
+  export SCHAUWERK_SCHAUBILD_IMAGE="$SCHAUWERK_RUNTIME_IMAGE_REF"
+  SCHAUWERK_RUNTIME_POSTFLIGHT_REQUIRED="1"
+  echo "   Schaubild runtime admitted source $SCHAUWERK_RUNTIME_SOURCE_COMMIT ($SCHAUWERK_RUNTIME_IMAGE_DIGEST)."
+elif [[ "$DEPLOY_TARGET" == "vps" ]]; then
+  # Bounded API/migration scopes do not own the Schaubild release. Compose still
+  # parses the VPS service graph, so bind its required image interpolation to a
+  # deliberately non-deployable digest sentinel. --no-deps plus the protected
+  # service identity gate below prevents this value from becoming runtime truth.
+  SCHAUWERK_BOUNDED_SCOPE_IMAGE_SENTINEL="ghcr.io/heimgewebe/schauwerk-schaubild@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  export SCHAUWERK_SCHAUBILD_IMAGE="$SCHAUWERK_BOUNDED_SCOPE_IMAGE_SENTINEL"
 fi
 
 if ! docker compose "${BASE_ARGS[@]}" config > /dev/null; then
@@ -922,142 +1002,57 @@ if ! docker compose "${BASE_ARGS[@]}" config > /dev/null; then
   exit 1
 fi
 
-# The public VPS Caddy route for /schaubild/ depends on a separately
-# provisioned Schauwerk release. The first Compose render is discovery-only:
-# it exposes the configured parent root through its /current pointer but is
-# never used for a container mutation. Admission then verifies a reviewed
-# repository-owned lock, resolves the exact releases/<commit> directory, pins
-# that directory into SCHAUWERK_EDITOR_RELEASE_DIR, and rerenders Compose before
-# any build or container effect. Bounded API and migration deployments do not
-# own or mutate the public edge.
-SCHAUWERK_EDITOR_PREFLIGHT_OUTPUT=""
-SCHAUWERK_EDITOR_EXPECTED_MANIFEST_SHA=""
-SCHAUWERK_EDITOR_RELEASE_PATH=""
-SCHAUWERK_EDITOR_SOURCE_COMMIT=""
-SCHAUWERK_EDITOR_POSTFLIGHT_REQUIRED="0"
 if [[ "$DEPLOY_TARGET" == "vps" && "$DEPLOY_SCOPE" == "full" ]]; then
-  configured_preflight_services="$(docker compose "${BASE_ARGS[@]}" config --services)"
-  if grep -qFx caddy <<< "$configured_preflight_services"; then
-    set +e
-    SCHAUWERK_EDITOR_HOST_ROOT="$(
-      docker compose "${BASE_ARGS[@]}" config --format json 2> /dev/null | python3 -c '
-import json
-from pathlib import Path
-import sys
-try:
-    cfg = json.load(sys.stdin)
-    volumes = cfg.get("services", {}).get("caddy", {}).get("volumes", [])
-    matches = [v for v in volumes if isinstance(v, dict) and v.get("target") == "/srv/schauwerk-editor-release"]
-    if len(matches) != 1:
-        raise ValueError("expected exactly one Schauwerk editor release mount")
-    mount = matches[0]
-    source = mount.get("source")
-    bind = mount.get("bind") if isinstance(mount.get("bind"), dict) else {}
-    if mount.get("type") != "bind" or mount.get("read_only") is not True or bind.get("create_host_path") is not False:
-        raise ValueError("Schauwerk editor discovery mount is not fail-closed read-only bind")
-    if not isinstance(source, str) or not Path(source).is_absolute():
-        raise ValueError("Schauwerk editor discovery mount source must be absolute")
-    pointer = Path(source)
-    if pointer.name != "current":
-        raise ValueError("Schauwerk editor discovery mount must end in /current")
-    print(pointer.parent)
-except Exception as exc:
-    print(f"ERROR: {exc}", file=sys.stderr)
-    raise SystemExit(2)
-'
-    )"
-    schauwerk_mount_rc=$?
-    set -e
-    if [[ "$schauwerk_mount_rc" != "0" || -z "$SCHAUWERK_EDITOR_HOST_ROOT" ]]; then
-      msg="Schauwerk editor mount preflight could not resolve one fail-closed host release root."
-      echo "ERROR: $msg" >&2
-      generate_failure_bundle "$msg"
-      exit 1
-    fi
-
-    SCHAUWERK_EDITOR_LOCK_PATH="$PWD/infra/schauwerk-editor/release-lock.json"
-    if ! SCHAUWERK_EDITOR_PREFLIGHT_OUTPUT="$(
-      python3 scripts/preflight/schauwerk_editor_release.py \
-        --root "$SCHAUWERK_EDITOR_HOST_ROOT" \
-        --lock "$SCHAUWERK_EDITOR_LOCK_PATH" \
-        --json
-    )"; then
-      msg="Schauwerk editor release preflight failed for the reviewed release lock."
-      echo "ERROR: $msg" >&2
-      generate_failure_bundle "$msg"
-      exit 1
-    fi
-
-    if ! SCHAUWERK_EDITOR_BINDINGS="$(
-      python3 -c '
-import json
-import sys
-try:
-    value = json.load(sys.stdin)
-    fields = ("release_path", "manifest_sha256", "source_commit")
-    selected = [value.get(field) for field in fields]
-    if any(not isinstance(item, str) or not item or "\n" in item or "\t" in item for item in selected):
-        raise ValueError("preflight output fields are missing or unsafe")
-    print("\t".join(selected))
-except Exception as exc:
-    print(f"ERROR: {exc}", file=sys.stderr)
-    raise SystemExit(2)
-' <<< "$SCHAUWERK_EDITOR_PREFLIGHT_OUTPUT"
-    )"; then
-      msg="Schauwerk editor release preflight did not return exact admission bindings."
-      echo "ERROR: $msg" >&2
-      generate_failure_bundle "$msg"
-      exit 1
-    fi
-    IFS=$'\t' read -r \
-      SCHAUWERK_EDITOR_RELEASE_PATH \
-      SCHAUWERK_EDITOR_EXPECTED_MANIFEST_SHA \
-      SCHAUWERK_EDITOR_SOURCE_COMMIT <<< "$SCHAUWERK_EDITOR_BINDINGS"
-    if [[ "$SCHAUWERK_EDITOR_RELEASE_PATH" != /* ||
-      ! "$SCHAUWERK_EDITOR_EXPECTED_MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ||
-      ! "$SCHAUWERK_EDITOR_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-      msg="Schauwerk editor admission bindings are malformed."
-      echo "ERROR: $msg" >&2
-      generate_failure_bundle "$msg"
-      exit 1
-    fi
-
-    export SCHAUWERK_EDITOR_RELEASE_DIR="$SCHAUWERK_EDITOR_RELEASE_PATH"
-    if ! docker compose "${BASE_ARGS[@]}" config > /dev/null; then
-      msg="Docker Compose config failed after pinning the admitted Schauwerk release."
-      echo "ERROR: $msg" >&2
-      generate_failure_bundle "$msg"
-      exit 1
-    fi
-    if ! docker compose "${BASE_ARGS[@]}" config --format json 2> /dev/null |
-      python3 -c '
+  if ! docker compose "${BASE_ARGS[@]}" config --format json 2> /dev/null |
+    python3 -c '
 import json
 import sys
 expected = sys.argv[1]
+expected_proxy_cidr = sys.argv[2]
 try:
     cfg = json.load(sys.stdin)
-    volumes = cfg.get("services", {}).get("caddy", {}).get("volumes", [])
-    matches = [v for v in volumes if isinstance(v, dict) and v.get("target") == "/srv/schauwerk-editor-release"]
-    if len(matches) != 1:
-        raise ValueError("expected exactly one admitted Schauwerk release mount")
-    mount = matches[0]
-    bind = mount.get("bind") if isinstance(mount.get("bind"), dict) else {}
-    if mount.get("source") != expected:
-        raise ValueError("admitted Schauwerk release mount source does not match preflight")
-    if mount.get("type") != "bind" or mount.get("read_only") is not True or bind.get("create_host_path") is not False:
-        raise ValueError("admitted Schauwerk release mount is not fail-closed read-only bind")
+    services = cfg.get("services", {})
+    service = services.get("schaubild")
+    if not isinstance(service, dict):
+        raise ValueError("services.schaubild is missing")
+    if service.get("image") != expected:
+        raise ValueError("services.schaubild image is not bound to the reviewed digest")
+    if service.get("pull_policy") != "missing":
+        raise ValueError("services.schaubild must reuse the exact cached digest when present")
+    if service.get("read_only") is not True:
+        raise ValueError("services.schaubild must use a read-only root filesystem")
+    if service.get("ports"):
+        raise ValueError("services.schaubild must not publish a host port")
+    expose = service.get("expose", [])
+    if "8765" not in [str(item) for item in expose]:
+        raise ValueError("services.schaubild must expose only its private service port")
+    command = service.get("command", [])
+    command_text = "\n".join(str(item) for item in command)
+    for required in (
+        "--bind-host",
+        "0.0.0.0",
+        "--trusted-reverse-proxy",
+        "--trusted-proxy-source-cidr",
+        expected_proxy_cidr,
+        "--public-base-path",
+        "/schaubild",
+    ):
+        if required not in command_text:
+            raise ValueError(f"services.schaubild command missing {required}")
+    caddy = services.get("caddy")
+    if not isinstance(caddy, dict):
+        raise ValueError("services.caddy is missing")
+    dependencies = caddy.get("depends_on", {})
+    if isinstance(dependencies, dict) and "schaubild" in dependencies:
+        raise ValueError("Caddy must remain available when the Schaubild runtime is degraded")
 except Exception as exc:
     print(f"ERROR: {exc}", file=sys.stderr)
     raise SystemExit(2)
-' "$SCHAUWERK_EDITOR_RELEASE_PATH"; then
-      msg="Schauwerk editor authoritative Compose render is not bound to the admitted release."
-      echo "ERROR: $msg" >&2
-      generate_failure_bundle "$msg"
-      exit 1
-    fi
-
-    SCHAUWERK_EDITOR_POSTFLIGHT_REQUIRED="1"
-    echo "   Schauwerk editor admitted source $SCHAUWERK_EDITOR_SOURCE_COMMIT (manifest $SCHAUWERK_EDITOR_EXPECTED_MANIFEST_SHA)."
+' "$SCHAUWERK_RUNTIME_IMAGE_REF" "$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR"; then
+    msg="Rendered Compose does not preserve the reviewed Schaubild runtime contract."
+    echo "ERROR: $msg" >&2
+    generate_failure_bundle "$msg"
+    exit 1
   fi
 fi
 
@@ -2021,7 +2016,7 @@ join_command_for_plan() {
   printf '%s' "$joined"
 }
 
-PROTECTED_SERVICES=(db nats caddy)
+PROTECTED_SERVICES=(db nats caddy schaubild)
 declare -A PROTECTED_IDS_BEFORE=()
 
 snapshot_protected_services() {
@@ -2108,6 +2103,39 @@ wait_for_scoped_api_health() {
     fi
     sleep 1
   done
+  return 1
+}
+
+wait_for_schaubild_runtime_health() {
+  local container_id="$1"
+  local timeout_seconds="${WELTGEWEBE_SCHAUWERK_HEALTH_TIMEOUT_SECONDS:-120}"
+  case "$timeout_seconds" in
+    '' | *[!0-9]*)
+      echo "ERROR: WELTGEWEBE_SCHAUWERK_HEALTH_TIMEOUT_SECONDS must be an integer." >&2
+      return 1
+      ;;
+  esac
+  if ((timeout_seconds < 1 || timeout_seconds > 600)); then
+    echo "ERROR: WELTGEWEBE_SCHAUWERK_HEALTH_TIMEOUT_SECONDS must be between 1 and 600." >&2
+    return 1
+  fi
+
+  local attempt
+  local status
+  for ((attempt = 1; attempt <= timeout_seconds; attempt++)); do
+    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id" 2> /dev/null || true)"
+    if [[ "$status" == "healthy" ]]; then
+      return 0
+    fi
+    if [[ "$status" != "starting" ]]; then
+      echo "ERROR: Schaubild runtime container health is '${status:-missing}'." >&2
+      return 1
+    fi
+    if ((attempt < timeout_seconds)); then
+      sleep 1
+    fi
+  done
+  echo "ERROR: Schaubild runtime container did not become healthy within ${timeout_seconds} seconds." >&2
   return 1
 }
 
@@ -2213,7 +2241,7 @@ payload = {
     "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     "scope": scope,
     "target_services": targets,
-    "protected_services": ["db", "nats", "caddy"],
+    "protected_services": ["db", "nats", "caddy", "schaubild"],
     "protected_service_ids": protected,
     "compose_project": os.environ["PLAN_PROJECT"],
     "deploy_target": os.environ["PLAN_TARGET"],
@@ -2233,7 +2261,7 @@ payload = {
     ],
     "authorization": {
         "allowed_recreated_services": targets,
-        "forbidden_recreated_services": ["db", "nats", "caddy"],
+        "forbidden_recreated_services": ["db", "nats", "caddy", "schaubild"],
     },
 }
 with open(os.environ["PLAN_PATH"], "w", encoding="utf-8") as handle:
@@ -2346,7 +2374,7 @@ else
   if grep -qFx search-worker <<< "$configured_scoped_services"; then
     # Both containers share the API network namespace. Recreating only the API
     # would strand them on the retired namespace, so all three are one bounded
-    # deployment unit while db, nats and caddy stay protected.
+    # deployment unit while db, nats, caddy and schaubild stay protected.
     SCOPED_TARGET_SERVICES+=(search-worker)
   fi
 
@@ -2365,7 +2393,7 @@ else
     echo "ERROR: bounded deployment command unexpectedly includes --remove-orphans." >&2
     exit 1
   fi
-  for forbidden_target in db nats caddy; do
+  for forbidden_target in "${PROTECTED_SERVICES[@]}"; do
     for arg in "${SCOPED_INITIAL_CMD[@]}"; do
       if [[ "$arg" == "$forbidden_target" ]]; then
         echo "ERROR: bounded deployment plan unexpectedly targets protected service '$forbidden_target'." >&2
@@ -2995,9 +3023,30 @@ else
   echo "   Legacy Heimserver edge/home.arpa guards skipped for DEPLOY_TARGET=vps."
   echo "   Local/API health was verified by the generic health check above."
 
-  if [[ "$DEPLOY_SCOPE" == "full" && "$SCHAUWERK_EDITOR_POSTFLIGHT_REQUIRED" == "1" ]]; then
-    if [[ -z "$SCHAUWERK_EDITOR_EXPECTED_MANIFEST_SHA" || -z "${CADDY_BIND:-}" ]]; then
-      msg="Schauwerk editor postflight is missing its preflight manifest digest or Caddy bind."
+  if [[ "$DEPLOY_SCOPE" == "full" && "$SCHAUWERK_RUNTIME_POSTFLIGHT_REQUIRED" == "1" ]]; then
+    if [[ -z "$SCHAUWERK_RUNTIME_IMAGE_REF" || -z "$SCHAUWERK_RUNTIME_SOURCE_COMMIT" || -z "${CADDY_BIND:-}" ]]; then
+      msg="Schaubild runtime postflight is missing its reviewed image identity or Caddy bind."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      exit 1
+    fi
+
+    SCHAUWERK_RUNTIME_CONTAINER_ID="$(docker compose "${BASE_ARGS[@]}" ps -q schaubild 2> /dev/null || true)"
+    if [[ -z "$SCHAUWERK_RUNTIME_CONTAINER_ID" ]]; then
+      msg="Schaubild runtime postflight found no running schaubild container."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      exit 1
+    fi
+    SCHAUWERK_RUNTIME_LIVE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$SCHAUWERK_RUNTIME_CONTAINER_ID" 2> /dev/null || true)"
+    if [[ "$SCHAUWERK_RUNTIME_LIVE_IMAGE" != "$SCHAUWERK_RUNTIME_IMAGE_REF" ]]; then
+      msg="Schaubild runtime image mismatch: live $SCHAUWERK_RUNTIME_LIVE_IMAGE, expected $SCHAUWERK_RUNTIME_IMAGE_REF."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      exit 1
+    fi
+    if ! wait_for_schaubild_runtime_health "$SCHAUWERK_RUNTIME_CONTAINER_ID"; then
+      msg="Schaubild runtime container did not reach a healthy state."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       exit 1
@@ -3006,27 +3055,28 @@ else
     SCHAUWERK_INDEX_HEADERS_OUT="$(mktemp)"
     SCHAUWERK_MANIFEST_OUT="$(mktemp)"
     SCHAUWERK_RESOLVE="commonthing.net:443:${CADDY_BIND}"
-    SCHAUWERK_EXPECTED_CSP="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src https://embed.diagrams.net; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+    SCHAUWERK_EXPECTED_CSP="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+
     if ! SCHAUWERK_INDEX_HTTP_CODE="$(
       curl -sS --noproxy '*' --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 1 --retry-connrefused \
         --resolve "$SCHAUWERK_RESOLVE" -o /dev/null -D "$SCHAUWERK_INDEX_HEADERS_OUT" \
         -w "%{http_code}" https://commonthing.net/schaubild/
     )"; then
-      msg="Schauwerk editor postflight failed to reach /schaubild/ through the deployed Caddy listener."
+      msg="Schaubild runtime postflight failed to reach /schaubild/ through Caddy."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
       exit 1
     fi
     if [[ "$SCHAUWERK_INDEX_HTTP_CODE" != "200" ]]; then
-      msg="Schauwerk editor postflight returned HTTP $SCHAUWERK_INDEX_HTTP_CODE for /schaubild/."
+      msg="Schaubild runtime postflight returned HTTP $SCHAUWERK_INDEX_HTTP_CODE for /schaubild/."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
       exit 1
     fi
     if ! grep -iq '^Cache-Control:.*no-store' "$SCHAUWERK_INDEX_HEADERS_OUT"; then
-      msg="Schauwerk editor postflight did not receive Cache-Control: no-store for /schaubild/."
+      msg="Schaubild runtime postflight did not receive Cache-Control: no-store."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
@@ -3035,7 +3085,6 @@ else
     if ! python3 - "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_EXPECTED_CSP" << 'PY'; then
 import sys
 from pathlib import Path
-
 headers = Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict").splitlines()
 expected = sys.argv[2]
 values = []
@@ -3046,7 +3095,7 @@ for line in headers:
 if values != [expected]:
     raise SystemExit(1)
 PY
-      msg="Schauwerk editor postflight did not receive the exact isolated Content-Security-Policy for /schaubild/."
+      msg="Schaubild runtime postflight did not receive the exact isolated CSP."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
@@ -3058,22 +3107,14 @@ PY
         --resolve "$SCHAUWERK_RESOLVE" -o "$SCHAUWERK_MANIFEST_OUT" \
         -w "%{http_code}" https://commonthing.net/schaubild/manifest.json
     )"; then
-      msg="Schauwerk editor postflight failed to fetch the deployed manifest through Caddy."
+      msg="Schaubild runtime postflight failed to fetch manifest.json through Caddy."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
       exit 1
     fi
     if [[ "$SCHAUWERK_MANIFEST_HTTP_CODE" != "200" ]]; then
-      msg="Schauwerk editor postflight returned HTTP $SCHAUWERK_MANIFEST_HTTP_CODE for manifest.json."
-      echo "ERROR: $msg" >&2
-      generate_failure_bundle "$msg"
-      rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
-      exit 1
-    fi
-    SCHAUWERK_LIVE_MANIFEST_SHA="$(sha256sum "$SCHAUWERK_MANIFEST_OUT" | awk '{print $1}')"
-    if [[ "$SCHAUWERK_LIVE_MANIFEST_SHA" != "$SCHAUWERK_EDITOR_EXPECTED_MANIFEST_SHA" ]]; then
-      msg="Schauwerk editor postflight manifest digest mismatch: live $SCHAUWERK_LIVE_MANIFEST_SHA, expected $SCHAUWERK_EDITOR_EXPECTED_MANIFEST_SHA."
+      msg="Schaubild runtime postflight returned HTTP $SCHAUWERK_MANIFEST_HTTP_CODE for manifest.json."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
@@ -3083,13 +3124,29 @@ PY
     if ! SCHAUWERK_ASSET_BINDINGS="$(
       python3 - "$SCHAUWERK_MANIFEST_OUT" << 'PY'
 import json
+import re
 import sys
 from pathlib import Path
-
 manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-files = manifest.get("files")
-if not isinstance(files, list):
+if manifest.get("schema_version") != "schauwerk-standalone-editor-manifest.v2":
     raise SystemExit(2)
+if manifest.get("editor_engine") != "schauwerk-native-diagram-v1":
+    raise SystemExit(2)
+if manifest.get("cutover_status") != "native-primary-with-legacy-compatibility":
+    raise SystemExit(2)
+native = manifest.get("native_renderer")
+if not isinstance(native, dict):
+    raise SystemExit(2)
+if native.get("renderer") != "schauwerk-native-diagram-v1":
+    raise SystemExit(2)
+if native.get("api_path") != "/schaubild/api/native-viewer":
+    raise SystemExit(2)
+if manifest.get("public_base_path") != "/schaubild":
+    raise SystemExit(2)
+files = manifest.get("files")
+if not isinstance(files, list) or len(files) != 4:
+    raise SystemExit(2)
+seen = set()
 for item in files:
     if not isinstance(item, dict):
         raise SystemExit(2)
@@ -3097,18 +3154,17 @@ for item in files:
     digest = item.get("sha256")
     if (
         not isinstance(name, str)
-        or not name
+        or name in seen
         or "/" in name
-        or name in {".", ".."}
         or not isinstance(digest, str)
-        or len(digest) != 64
-        or any(ch not in "0123456789abcdef" for ch in digest)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
     ):
         raise SystemExit(2)
+    seen.add(name)
     print(f"{name}\t{digest}")
 PY
     )"; then
-      msg="Schauwerk editor postflight could not read asset bindings from the verified manifest."
+      msg="Schaubild runtime manifest does not prove the native v2 product contract."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
@@ -3124,14 +3180,14 @@ PY
           --resolve "$SCHAUWERK_RESOLVE" -o "$SCHAUWERK_ASSET_OUT" \
           -w "%{http_code}" "https://commonthing.net/schaubild/${SCHAUWERK_ASSET_NAME}"
       )"; then
-        msg="Schauwerk editor postflight failed to fetch manifest asset $SCHAUWERK_ASSET_NAME through Caddy."
+        msg="Schaubild runtime postflight failed to fetch asset $SCHAUWERK_ASSET_NAME."
         echo "ERROR: $msg" >&2
         generate_failure_bundle "$msg"
         rm -f "$SCHAUWERK_ASSET_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
         exit 1
       fi
       if [[ "$SCHAUWERK_ASSET_HTTP_CODE" != "200" ]]; then
-        msg="Schauwerk editor postflight returned HTTP $SCHAUWERK_ASSET_HTTP_CODE for asset $SCHAUWERK_ASSET_NAME."
+        msg="Schaubild runtime returned HTTP $SCHAUWERK_ASSET_HTTP_CODE for asset $SCHAUWERK_ASSET_NAME."
         echo "ERROR: $msg" >&2
         generate_failure_bundle "$msg"
         rm -f "$SCHAUWERK_ASSET_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
@@ -3139,7 +3195,7 @@ PY
       fi
       SCHAUWERK_ASSET_LIVE_SHA="$(sha256sum "$SCHAUWERK_ASSET_OUT" | awk '{print $1}')"
       if [[ "$SCHAUWERK_ASSET_LIVE_SHA" != "$SCHAUWERK_ASSET_EXPECTED_SHA" ]]; then
-        msg="Schauwerk editor postflight asset digest mismatch for $SCHAUWERK_ASSET_NAME: live $SCHAUWERK_ASSET_LIVE_SHA, expected $SCHAUWERK_ASSET_EXPECTED_SHA."
+        msg="Schaubild runtime asset digest mismatch for $SCHAUWERK_ASSET_NAME."
         echo "ERROR: $msg" >&2
         generate_failure_bundle "$msg"
         rm -f "$SCHAUWERK_ASSET_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
@@ -3149,16 +3205,86 @@ PY
       SCHAUWERK_ASSET_COUNT=$((SCHAUWERK_ASSET_COUNT + 1))
     done <<< "$SCHAUWERK_ASSET_BINDINGS"
     if [[ "$SCHAUWERK_ASSET_COUNT" != "4" ]]; then
-      msg="Schauwerk editor postflight verified $SCHAUWERK_ASSET_COUNT assets, expected 4."
+      msg="Schaubild runtime postflight verified $SCHAUWERK_ASSET_COUNT assets, expected 4."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
       exit 1
     fi
 
-    rm -f "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
-    echo "   Schauwerk editor verified through Caddy (manifest $SCHAUWERK_LIVE_MANIFEST_SHA)."
+    SCHAUWERK_NATIVE_INPUT_OUT="$(mktemp)"
+    SCHAUWERK_NATIVE_RESULT_OUT="$(mktemp)"
+    cat > "$SCHAUWERK_NATIVE_INPUT_OUT" << 'JSON'
+{"schema_version":"schauwerk-representation-input.v1","id":"postflight","title":"Postflight","purpose":"Native runtime verification","intent":"process","groups":[],"nodes":[{"id":"start","label":"Start","kind":"action"}],"edges":[],"requirements":{"formal_relations":true,"free_spatial_layout":false,"presentation":true,"collaboration":false,"rich_text":false,"structured_comparison":false,"portable_offline":true},"requested_formats":[]}
+JSON
+    if ! SCHAUWERK_NATIVE_HTTP_CODE="$(
+      curl -sS --noproxy '*' --connect-timeout 5 --max-time 30 \
+        --resolve "$SCHAUWERK_RESOLVE" \
+        -H 'Content-Type: application/json' \
+        --data-binary @"$SCHAUWERK_NATIVE_INPUT_OUT" \
+        -o "$SCHAUWERK_NATIVE_RESULT_OUT" \
+        -w "%{http_code}" \
+        https://commonthing.net/schaubild/api/native-viewer
+    )"; then
+      msg="Schaubild runtime native render POST failed."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      rm -f "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+      exit 1
+    fi
+    if [[ "$SCHAUWERK_NATIVE_HTTP_CODE" != "200" ]]; then
+      msg="Schaubild runtime native render POST returned HTTP $SCHAUWERK_NATIVE_HTTP_CODE."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      rm -f "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+      exit 1
+    fi
+    if ! SCHAUWERK_NATIVE_VIEWER_PATH="$(
+      python3 - "$SCHAUWERK_NATIVE_RESULT_OUT" << 'PY'
+import json
+import re
+import sys
+from pathlib import Path
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if value.get("renderer") != "schauwerk-native-diagram-v1":
+    raise SystemExit(2)
+path = value.get("url")
+if not isinstance(path, str) or re.fullmatch(r"/schaubild/native/[0-9a-f]{32}/index\.html", path) is None:
+    raise SystemExit(2)
+print(path)
+PY
+    )"; then
+      msg="Schaubild runtime native render response is not bound to the native renderer."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      rm -f "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+      exit 1
+    fi
+
+    SCHAUWERK_NATIVE_VIEWER_OUT="$(mktemp)"
+    if ! curl -fsS --noproxy '*' --connect-timeout 5 --max-time 20 \
+      --resolve "$SCHAUWERK_RESOLVE" \
+      -o "$SCHAUWERK_NATIVE_VIEWER_OUT" \
+      "https://commonthing.net$SCHAUWERK_NATIVE_VIEWER_PATH"; then
+      msg="Schaubild runtime native viewer GET failed."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      rm -f "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+      exit 1
+    fi
+    if ! grep -q 'id="nativeViewport"' "$SCHAUWERK_NATIVE_VIEWER_OUT"; then
+      msg="Schaubild runtime native viewer GET did not return the expected viewer."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      rm -f "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+      exit 1
+    fi
+
+    SCHAUWERK_LIVE_MANIFEST_SHA="$(sha256sum "$SCHAUWERK_MANIFEST_OUT" | awk '{print $1}')"
+    rm -f "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+    echo "   Schaubild native runtime verified through Caddy (image $SCHAUWERK_RUNTIME_IMAGE_DIGEST, manifest $SCHAUWERK_LIVE_MANIFEST_SHA)."
   fi
+
 fi
 
 # 8. Update State (Post-Health)
