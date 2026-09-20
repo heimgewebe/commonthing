@@ -47,6 +47,22 @@ Diese ADR ändert nicht automatisch die heutige Laufzeit.
 - Der Multi-Instance-Guard bleibt aktiv; Produktionsreplikation folgt erst mit dem Plattformrollout.
 - Kein Produktionscluster wird allein aufgrund dieser ADR installiert.
 - Keine bestehende Deploymentlane wird ungeprüft übernommen oder umgestellt.
+- „Kanonische Zielplattform“ verlangt Kubernetes-Kompatibilität und einen belegten späteren Cutoverpfad, aber nicht automatisch eine dauerhaft laufende Staging-Stufe.
+
+## Umgebungsspezifischer Lifecycle-Code
+
+Neuer umgebungsspezifischer Lifecycle-Code benötigt eine reale Zielumgebung und einen automatisierbaren oder maschinenprüfbar attestierten Proof-Pfad. Eine lokale Referenz darf portable Invarianten entwickeln und testen; sie rechtfertigt aber nicht durch sich selbst immer neue Controller-Sonderlogik.
+
+**scripts/platform/staging_cell.py** ist eine bestehende **Legacy Experimental Controller**-Ausnahme und steht im **Contraction Mode**. Dieser Status ist kein Grandfathering für weiteres Wachstum:
+
+- keine neue Lifecycle-Funktionalität, keine neuen Subkommandos und keine neuen staging-spezifischen persistenten Zustands- oder Receipt-Arten;
+- zulässig sind Abschluss bereits begonnener Recovery-/Proof-Zyklen, konkrete Fehlerkorrekturen, Reduktion, Vereinfachung und die Extraktion nachweislich allgemein benötigter portabler Invarianten;
+- die mechanische Contraction-Ratchet darf nur gleich bleiben oder enger werden; Tests dürfen wachsen;
+- neue staging-spezifische Hilfsmodule dürfen die Ratchet nicht durch bloße Codeverlagerung umgehen.
+
+Die nächste Architekturentscheidung über reale Kubernetes-Betriebsmechanismen fällt durch **Experiment B**: ein zeitlich begrenztes reales Kubernetes-Zieltestbed, möglichst ohne **staging_cell.py**, das vorhandene Kustomize-/Flux- und portable Proofteile wiederverwendet. Ziel ist festzustellen, welche Invarianten auf einer echten Zielplattform tatsächlich nötig sind; unnötige kind-/Host-spezifische Mechanismen werden danach abgebaut.
+
+Eine permanente Staging-Umgebung ist damit ausdrücklich nicht beschlossen. Ihr Nutzen muss aus realen Produktionsrisiken folgen, etwa irreversiblen Datenmigrationen, mehreren Produktionsinstanzen, Multi-Host-HA, Fremdbetreibern oder föderierten Zellen, verbindlichen SLOs oder wiederkehrenden DNS-/TLS-/Load-Balancer-/Provider-Cutovern.
 
 ## Kanonische Plattformstruktur
 

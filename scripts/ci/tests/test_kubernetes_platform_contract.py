@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -37,6 +39,127 @@ def load_module(name: str, path: Path):
     return module
 
 
+
+STAGING_CELL_PATH = ROOT / "scripts/platform/staging_cell.py"
+STAGING_CELL_HARD_MAX_LOC = 9708
+STAGING_CELL_ALLOWED_COMMANDS = frozenset(
+    {
+        "up",
+        "activate",
+        "prove-gateway",
+        "prove-host-gateway",
+        "backup-delete-to-prove-down",
+        "backup-delete-to-prove-rebuild",
+        "prove-backup-delete-to-prove",
+        "status",
+        "down",
+        "rebuild",
+        "prove-delete-to-prove",
+        "self-check",
+    }
+)
+STAGING_CELL_ALLOWED_RECEIPTS = frozenset(
+    {
+        "LEGACY_MIGRATION_RECEIPT",
+        "CELL_DOWN_RECEIPT",
+        "CELL_REBUILD_RECEIPT",
+        "DELETE_TO_PROVE_RECEIPT",
+        "HOST_GATEWAY_RECEIPT",
+        "BACKUP_DOWN_RECEIPT",
+        "BACKUP_REBUILD_RECEIPT",
+        "BACKUP_DELETE_TO_PROVE_RECEIPT",
+    }
+)
+STAGING_CELL_ALLOWED_LOCAL_IMPORTS = frozenset({"kind_reference"})
+
+
+def _staging_contract_snapshot(
+    source: str, *, platform_modules: set[str]
+) -> dict[str, object]:
+    tree = ast.parse(source)
+    commands: set[str] = set()
+    receipts: set[str] = set()
+    local_imports: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_parser"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            commands.add(node.args[0].value)
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if (
+                isinstance(target, ast.Name)
+                and target.id.endswith("_RECEIPT")
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+                and node.value.value.startswith("receipts/")
+            ):
+                receipts.add(target.id)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root in platform_modules:
+                    local_imports.add(root)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".", 1)[0]
+            if root in platform_modules:
+                local_imports.add(root)
+    return {
+        "loc": len(source.splitlines()),
+        "commands": commands,
+        "receipts": receipts,
+        "local_imports": local_imports,
+    }
+
+
+def _staging_contraction_violations(
+    current_source: str,
+    base_source: str,
+    *,
+    current_modules: set[str],
+    base_modules: set[str],
+) -> list[str]:
+    current_names = {Path(name).stem for name in current_modules if name.endswith(".py")}
+    base_names = {Path(name).stem for name in base_modules if name.endswith(".py")}
+    current = _staging_contract_snapshot(
+        current_source, platform_modules=current_names
+    )
+    base = _staging_contract_snapshot(base_source, platform_modules=base_names)
+    violations: list[str] = []
+    if current["loc"] > STAGING_CELL_HARD_MAX_LOC:
+        violations.append("loc-hard-max")
+    if current["loc"] > base["loc"]:
+        violations.append("loc-growth")
+    if not current["commands"] <= base["commands"]:
+        violations.append("cli-growth")
+    if not current["commands"] <= STAGING_CELL_ALLOWED_COMMANDS:
+        violations.append("cli-contract-growth")
+    if not current["receipts"] <= base["receipts"]:
+        violations.append("receipt-growth")
+    if not current["receipts"] <= STAGING_CELL_ALLOWED_RECEIPTS:
+        violations.append("receipt-contract-growth")
+    if not current["local_imports"] <= base["local_imports"]:
+        violations.append("local-module-dependency-growth")
+    if not current["local_imports"] <= STAGING_CELL_ALLOWED_LOCAL_IMPORTS:
+        violations.append("local-module-contract-growth")
+    current_staging_modules = {
+        name for name in current_modules if name.startswith("staging") and name.endswith(".py")
+    }
+    base_staging_modules = {
+        name for name in base_modules if name.startswith("staging") and name.endswith(".py")
+    }
+    if not current_staging_modules <= base_staging_modules:
+        violations.append("staging-module-growth")
+    if current_staging_modules != {"staging_cell.py"}:
+        violations.append("staging-module-contract-growth")
+    return violations
+
+
 class KubernetesPlatformContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -64,6 +187,195 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             "weltgewebe_staging_cell",
             ROOT / "scripts/platform/staging_cell.py",
         )
+
+    def test_platform_readme_references_only_current_staging_cli(self) -> None:
+        readme = (ROOT / "platform/README.md").read_text(encoding="utf-8")
+        referenced = set(
+            re.findall(
+                r"scripts/platform/staging_cell\.py\s+([a-z0-9-]+)",
+                readme,
+            )
+        )
+        source = STAGING_CELL_PATH.read_text(encoding="utf-8")
+        modules = {
+            path.name for path in (ROOT / "scripts/platform").glob("*.py")
+        }
+        snapshot = _staging_contract_snapshot(
+            source,
+            platform_modules={
+                Path(name).stem for name in modules if name.endswith(".py")
+            },
+        )
+        self.assertTrue(referenced)
+        self.assertLessEqual(referenced, snapshot["commands"])
+        self.assertNotIn("migrate-legacy-state", referenced)
+
+    def test_staging_cell_contraction_ratchet(self) -> None:
+        current_source = STAGING_CELL_PATH.read_text(encoding="utf-8")
+        current_modules = {
+            path.name for path in (ROOT / "scripts/platform").glob("*.py")
+        }
+        base_commit = os.environ.get("STAGING_CONTRACTION_BASE_SHA")
+        if base_commit is None and os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
+            event_path = os.environ.get("GITHUB_EVENT_PATH")
+            if not event_path:
+                self.fail("GITHUB_EVENT_PATH is required for pull_request ratchet")
+            try:
+                event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+                base_commit = event["pull_request"]["base"]["sha"]
+            except (OSError, KeyError, TypeError, json.JSONDecodeError):
+                self.fail("pull_request event does not provide an exact base SHA")
+        if base_commit is None:
+            merge_base = subprocess.run(
+                ["git", "merge-base", "HEAD", "origin/main"],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            base_commit = merge_base.stdout.strip()
+        self.assertRegex(base_commit, r"^[0-9a-f]{40}$")
+        completed = subprocess.run(
+            [
+                "git",
+                "show",
+                f"{base_commit}:scripts/platform/staging_cell.py",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        base_source = completed.stdout
+        tree = subprocess.run(
+            [
+                "git",
+                "ls-tree",
+                "-r",
+                "--name-only",
+                base_commit,
+                "scripts/platform",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        base_modules = {
+            Path(item).name
+            for item in tree.stdout.splitlines()
+            if item.endswith(".py")
+        }
+        self.assertEqual(
+            [],
+            _staging_contraction_violations(
+                current_source,
+                base_source,
+                current_modules=current_modules,
+                base_modules=base_modules,
+            ),
+        )
+
+    def test_staging_cell_contraction_ratchet_binds_exact_pr_base(self) -> None:
+        ratchet = __import__("inspect").getsource(
+            self.test_staging_cell_contraction_ratchet
+        )
+        self.assertIn("STAGING_CONTRACTION_BASE_SHA", ratchet)
+        self.assertNotIn("GITHUB_BASE_REF", ratchet)
+        workflow = (
+            ROOT / ".github/workflows/kubernetes-platform.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'STAGING_CONTRACTION_BASE_SHA: ${{ github.event.pull_request.base.sha }}',
+            workflow,
+        )
+
+    def test_staging_cell_contraction_ratchet_requires_exact_base_in_ci(self) -> None:
+        with mock.patch.object(
+            os,
+            "environ",
+            {
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_EVENT_NAME": "pull_request",
+            },
+        ), self.assertRaisesRegex(
+            AssertionError,
+            "GITHUB_EVENT_PATH is required",
+        ):
+            self.test_staging_cell_contraction_ratchet()
+
+    def test_staging_cell_contraction_ratchet_reads_pr_base_from_event(self) -> None:
+        base_commit = "a" * 40
+        current_source = STAGING_CELL_PATH.read_text(encoding="utf-8")
+        current_modules = sorted(
+            path.as_posix()
+            for path in (ROOT / "scripts/platform").glob("*.py")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            event_path = Path(tmp) / "event.json"
+            event_path.write_text(
+                json.dumps(
+                    {"pull_request": {"base": {"sha": base_commit}}}
+                ),
+                encoding="utf-8",
+            )
+            show = mock.Mock(returncode=0, stdout=current_source)
+            tree = mock.Mock(returncode=0, stdout="\n".join(current_modules))
+            with mock.patch.object(
+                os,
+                "environ",
+                {
+                    "GITHUB_ACTIONS": "true",
+                    "GITHUB_EVENT_NAME": "pull_request",
+                    "GITHUB_EVENT_PATH": str(event_path),
+                },
+            ), mock.patch.object(
+                subprocess,
+                "run",
+                side_effect=[show, tree],
+            ) as run:
+                self.test_staging_cell_contraction_ratchet()
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [
+                "git",
+                "show",
+                f"{base_commit}:scripts/platform/staging_cell.py",
+            ],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0][4],
+            base_commit,
+        )
+
+    def test_staging_cell_contraction_guard_fails_closed_on_growth(self) -> None:
+        base = (
+            'LEGACY_MIGRATION_RECEIPT = "receipts/legacy-state-migration.json"\n'
+            'import kind_reference\n'
+            'sub.add_parser("up")\n'
+        )
+        modules = {"staging_cell.py", "kind_reference.py"}
+        cases = {
+            "loc-growth": (base + "# extra\n", modules),
+            "cli-growth": (base + 'sub.add_parser("expand")\n', modules),
+            "receipt-growth": (
+                base + 'NEW_RECEIPT = "receipts/new-state.json"\n',
+                modules,
+            ),
+            "local-module-dependency-growth": (
+                base + "import staging_helper\n",
+                modules | {"staging_helper.py"},
+            ),
+        }
+        for expected_code, (candidate, candidate_modules) in cases.items():
+            with self.subTest(expected_code=expected_code):
+                violations = _staging_contraction_violations(
+                    candidate,
+                    base,
+                    current_modules=candidate_modules,
+                    base_modules=modules,
+                )
+                self.assertIn(expected_code, violations)
 
     def test_toolchain_lock_binds_installed_binary_digests(self) -> None:
         lock = json.loads(
@@ -1977,6 +2289,456 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                         f"{job_name}: bare python remains",
                     )
 
+    def test_proof_identity_uses_semantic_platform_dependencies(self) -> None:
+        for suite in ("kind-gitops", "ha-recovery"):
+            selectors = set(self.proof_identity.SUITE_INPUTS[suite])
+            self.assertNotIn("scripts/platform/", selectors)
+            self.assertIn("scripts/platform/proof_identity.py", selectors)
+            self.assertIn("scripts/platform/kind_reference.py", selectors)
+            self.assertIn("scripts/platform/bootstrap_tools.py", selectors)
+            self.assertIn("scripts/platform/oci_proof_mirror.py", selectors)
+            self.assertNotIn("scripts/platform/staging_cell.py", selectors)
+        ha = set(self.proof_identity.SUITE_INPUTS["ha-recovery"])
+        for path in (
+            "scripts/platform/ha_reference.py",
+            "scripts/platform/ha_availability.py",
+            "scripts/platform/ha_common.py",
+            "scripts/platform/ha_dependencies.py",
+            "scripts/platform/ha_migration.py",
+            "scripts/platform/ha_wal.py",
+        ):
+            self.assertIn(path, ha)
+
+    def test_staging_only_change_does_not_invalidate_kind_or_ha_identity(self) -> None:
+        def materialize(root: Path, suite: str) -> tuple[str, ...]:
+            tracked: set[str] = {"scripts/platform/staging_cell.py"}
+            for selector in self.proof_identity.SUITE_INPUTS[suite]:
+                path = selector + "fixture.txt" if selector.endswith("/") else selector
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    target.write_text(f"{path}\\n", encoding="utf-8")
+                tracked.add(path)
+            for lock in (
+                "platform/toolchain.lock.json",
+                "platform/oci-proof-mirror.lock.json",
+            ):
+                target = root / lock
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("{}\\n", encoding="utf-8")
+                tracked.add(lock)
+            staging = root / "scripts/platform/staging_cell.py"
+            staging.parent.mkdir(parents=True, exist_ok=True)
+            staging.write_text("staging-v1\\n", encoding="utf-8")
+            return tuple(sorted(tracked))
+
+        for suite, real_input in (
+            ("kind-gitops", "scripts/platform/kind_reference.py"),
+            ("ha-recovery", "scripts/platform/ha_common.py"),
+        ):
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                tracked = materialize(root, suite)
+                with mock.patch.object(
+                    self.proof_identity, "ROOT", root
+                ), mock.patch.object(
+                    self.proof_identity, "_tracked_files", return_value=tracked
+                ):
+                    first = self.proof_identity.compute_identity(suite, "1" * 40)
+                    (root / "scripts/platform/staging_cell.py").write_text(
+                        "staging-v2\\n", encoding="utf-8"
+                    )
+                    second = self.proof_identity.compute_identity(suite, "2" * 40)
+                    self.assertEqual(
+                        first["identity_sha256"], second["identity_sha256"]
+                    )
+                    self.assertNotEqual(
+                        first["source_commit"], second["source_commit"]
+                    )
+                    target = root / real_input
+                    target.write_text(
+                        target.read_text(encoding="utf-8") + "changed\\n",
+                        encoding="utf-8",
+                    )
+                    third = self.proof_identity.compute_identity(suite, "3" * 40)
+                    self.assertNotEqual(
+                        second["identity_sha256"], third["identity_sha256"]
+                    )
+
+    def test_proof_identity_has_explicit_suite_validators(self) -> None:
+        self.assertEqual(
+            set(self.proof_identity.SUITE_VALIDATORS),
+            set(self.proof_identity.SUITE_INPUTS),
+        )
+        self.assertIs(
+            self.proof_identity.SUITE_VALIDATORS["kind-gitops"],
+            self.proof_identity._validate_controlled_oci_proof,
+        )
+        self.assertIs(
+            self.proof_identity.SUITE_VALIDATORS["ha-recovery"],
+            self.proof_identity._validate_controlled_oci_proof,
+        )
+        self.assertIs(
+            self.proof_identity.SUITE_VALIDATORS["staging-cell"],
+            self.proof_identity._validate_staging_cell_proof,
+        )
+
+    def test_staging_proof_identity_binds_controller_but_not_kind_ha_cache(self) -> None:
+        staging = set(self.proof_identity.SUITE_INPUTS["staging-cell"])
+        self.assertIn("scripts/platform/staging_cell.py", staging)
+        self.assertIn("scripts/platform/proof_identity.py", staging)
+        self.assertNotIn("scripts/platform/ha_reference.py", staging)
+
+    def test_staging_proof_validator_rejects_wrong_commit_and_receipt_hash(self) -> None:
+        commit = "a" * 40
+        release = "b" * 40
+        identity = {"tool_lock_sha256": "c" * 64}
+        proof = {
+            "schema_version": 1,
+            "status": "pass",
+            "suite": "staging-cell",
+            "acceptance": "backup-delete-to-prove-v1",
+            "commit": commit,
+            "source_commit": commit,
+            "controller_commit": commit,
+            "release_commit": release,
+            "tool_lock_sha256": identity["tool_lock_sha256"],
+            "production_changed": False,
+            "receipts": {
+                label: {"sha256": "d" * 64, "status": status}
+                for label, (_filename, status)
+                in self.proof_identity.STAGING_RECEIPT_CONTRACT.items()
+            },
+        }
+        self.proof_identity._validate_staging_cell_proof(identity, proof)
+
+        wrong_commit = dict(proof)
+        wrong_commit["controller_commit"] = "e" * 40
+        with self.assertRaisesRegex(
+            self.proof_identity.IdentityError,
+            "exact controller commit",
+        ):
+            self.proof_identity._validate_staging_cell_proof(
+                identity, wrong_commit
+            )
+
+        bad_receipts = {
+            label: dict(value) for label, value in proof["receipts"].items()
+        }
+        bad_receipts["gateway-proof"]["sha256"] = "not-a-hash"
+        wrong_hash = {**proof, "receipts": bad_receipts}
+        with self.assertRaisesRegex(
+            self.proof_identity.IdentityError,
+            "receipt binding drifted",
+        ):
+            self.proof_identity._validate_staging_cell_proof(
+                identity, wrong_hash
+            )
+
+    def test_staging_attestation_is_reference_not_authenticity_claim(self) -> None:
+        commit = "a" * 40
+        proof = {
+            "schema_version": 1,
+            "suite": "staging-cell",
+            "commit": commit,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proof_path = root / "proof.json"
+            proof_path.write_bytes(self.proof_identity._canonical_json(proof))
+            record = {
+                "schema_version": 2,
+                "suite": "staging-cell",
+                "proof_commit": commit,
+                "proof_receipt_sha256": hashlib.sha256(
+                    proof_path.read_bytes()
+                ).hexdigest(),
+            }
+            record_path = root / "record.json"
+            record_path.write_bytes(
+                self.proof_identity._canonical_json(record)
+            )
+            attestation = self.proof_identity.staging_attestation(
+                record_path,
+                proof_path,
+                finding_id="ga-20260919T190000Z-abcdef123456",
+                finding_sha256="f" * 64,
+                checkpoint=commit,
+            )
+            self.assertEqual(
+                attestation["observer_authenticity"],
+                "live-verification-required",
+            )
+            self.assertEqual(
+                attestation["observer_hash_semantics"],
+                "integrity-not-authenticity",
+            )
+
+            with self.assertRaisesRegex(
+                self.proof_identity.IdentityError,
+                "different checkpoint",
+            ):
+                self.proof_identity.staging_attestation(
+                    record_path,
+                    proof_path,
+                    finding_id="ga-20260919T190000Z-abcdef123456",
+                    finding_sha256="f" * 64,
+                    checkpoint="b" * 40,
+                )
+
+            proof_path.write_bytes(
+                self.proof_identity._canonical_json(
+                    {**proof, "tampered": True}
+                )
+            )
+            with self.assertRaisesRegex(
+                self.proof_identity.IdentityError,
+                "proof hash differs",
+            ):
+                self.proof_identity.staging_attestation(
+                    record_path,
+                    proof_path,
+                    finding_id="ga-20260919T190000Z-abcdef123456",
+                    finding_sha256="f" * 64,
+                    checkpoint=commit,
+                )
+
+    def test_staging_evidence_commit_requires_direct_child_and_exact_files(self) -> None:
+        implementation = "a" * 40
+        evidence_commit = "b" * 40
+        proof = {
+            "schema_version": 1,
+            "suite": "staging-cell",
+            "commit": implementation,
+        }
+        identity = {
+            "schema_version": 2,
+            "suite": "staging-cell",
+            "source_commit": implementation,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence_root = (
+                root / self.proof_identity.STAGING_EVIDENCE_ROOT
+            )
+            evidence_root.mkdir(parents=True)
+            identity_path = evidence_root / "identity.json"
+            record_path = evidence_root / "record.json"
+            proof_path = evidence_root / "proof.json"
+            attestation_path = evidence_root / "attestation.json"
+            identity_path.write_bytes(
+                self.proof_identity._canonical_json(identity)
+            )
+            proof_path.write_bytes(
+                self.proof_identity._canonical_json(proof)
+            )
+            record = {
+                "schema_version": 2,
+                "status": "pass",
+                "suite": "staging-cell",
+                "proof_commit": implementation,
+                "proof_source_commit": implementation,
+                "proof_receipt_sha256": hashlib.sha256(
+                    proof_path.read_bytes()
+                ).hexdigest(),
+                "production_changed": False,
+            }
+            record_path.write_bytes(
+                self.proof_identity._canonical_json(record)
+            )
+            attestation = self.proof_identity.staging_attestation(
+                record_path,
+                proof_path,
+                finding_id="ga-20260919T190000Z-abcdef123456",
+                finding_sha256="f" * 64,
+                checkpoint=implementation,
+            )
+            attestation_path.write_bytes(
+                self.proof_identity._canonical_json(attestation)
+            )
+            changed = sorted(
+                (
+                    self.proof_identity.STAGING_EVIDENCE_ROOT / name
+                ).as_posix()
+                for name in self.proof_identity.STAGING_EVIDENCE_FILES
+            )
+
+            completed = mock.Mock(returncode=0)
+            with mock.patch.object(
+                self.proof_identity,
+                "ROOT",
+                root,
+            ), mock.patch.object(
+                self.proof_identity,
+                "validate",
+                return_value=record,
+            ), mock.patch.object(
+                self.proof_identity,
+                "_checkout_commit",
+                return_value=evidence_commit,
+            ), mock.patch.object(
+                self.proof_identity,
+                "_git_lines",
+                side_effect=[
+                    [f"{evidence_commit} {implementation}"],
+                    changed,
+                ],
+            ), mock.patch.object(
+                self.proof_identity.subprocess,
+                "run",
+                return_value=completed,
+            ):
+                result = self.proof_identity.validate_evidence_commit(
+                    identity_path,
+                    record_path,
+                    proof_path,
+                    attestation_path,
+                    expected_base_commit=implementation,
+                )
+            self.assertEqual(result["implementation_commit"], implementation)
+            self.assertEqual(result["evidence_commit"], evidence_commit)
+            self.assertTrue(result["observer_live_verification_required"])
+
+            with mock.patch.object(
+                self.proof_identity,
+                "validate",
+                return_value=record,
+            ), self.assertRaisesRegex(
+                self.proof_identity.IdentityError,
+                "pull request base",
+            ):
+                self.proof_identity.validate_evidence_commit(
+                    identity_path,
+                    record_path,
+                    proof_path,
+                    attestation_path,
+                    expected_base_commit="c" * 40,
+                )
+
+            with mock.patch.object(
+                self.proof_identity,
+                "ROOT",
+                root,
+            ), mock.patch.object(
+                self.proof_identity,
+                "validate",
+                return_value=record,
+            ), mock.patch.object(
+                self.proof_identity,
+                "_checkout_commit",
+                return_value=evidence_commit,
+            ), mock.patch.object(
+                self.proof_identity,
+                "_git_lines",
+                side_effect=[
+                    [f"{evidence_commit} {implementation}"],
+                    [*changed, "README.md"],
+                ],
+            ), mock.patch.object(
+                self.proof_identity.subprocess,
+                "run",
+                return_value=completed,
+            ), self.assertRaisesRegex(
+                self.proof_identity.IdentityError,
+                "outside the exact staging evidence set",
+            ):
+                self.proof_identity.validate_evidence_commit(
+                    identity_path,
+                    record_path,
+                    proof_path,
+                    attestation_path,
+                    expected_base_commit=implementation,
+                )
+
+            with mock.patch.object(
+                self.proof_identity,
+                "ROOT",
+                root,
+            ), mock.patch.object(
+                self.proof_identity,
+                "validate",
+                return_value=record,
+            ), mock.patch.object(
+                self.proof_identity,
+                "_checkout_commit",
+                return_value=evidence_commit,
+            ), mock.patch.object(
+                self.proof_identity,
+                "_git_lines",
+                return_value=[f"{evidence_commit} {'c' * 40}"],
+            ), self.assertRaisesRegex(
+                self.proof_identity.IdentityError,
+                "direct child",
+            ):
+                self.proof_identity.validate_evidence_commit(
+                    identity_path,
+                    record_path,
+                    proof_path,
+                    attestation_path,
+                    expected_base_commit=implementation,
+                )
+
+    def test_platform_pr_workflow_validates_staging_evidence_only_commit(self) -> None:
+        workflow = (
+            ROOT / ".github/workflows/kubernetes-platform.yml"
+         ).read_text(encoding="utf-8")
+        self.assertIn(
+            '"docs/proofs/kubernetes-staging-cell/**"',
+            workflow,
+        )
+        self.assertIn(
+            "Validate staging evidence-only commit",
+            workflow,
+        )
+        self.assertIn(
+            'base_sha="${{ github.event.pull_request.base.sha }}"',
+            workflow,
+        )
+        step_start = workflow.index("      - name: Validate staging evidence-only commit")
+        step_end = workflow.index("      - name: Render and validate all platform targets", step_start)
+        evidence_step = workflow[step_start:step_end]
+        self.assertIn('merge_commit="$(git rev-parse HEAD)"', evidence_step)
+        self.assertIn(
+            'head_sha="${{ github.event.pull_request.head.sha }}"',
+            evidence_step,
+        )
+        self.assertIn('git checkout --detach "$head_sha"', evidence_step)
+        self.assertIn(
+            'if git diff --quiet "$base_sha"...HEAD -- "$evidence_root"; then',
+            evidence_step,
+        )
+        self.assertIn('diff_rc="$?"', evidence_step)
+        self.assertIn('if [ "$diff_rc" -ne 1 ]; then', evidence_step)
+        self.assertIn('exit "$diff_rc"', evidence_step)
+        self.assertIn(
+            '--expected-base-commit "$base_sha"',
+            evidence_step,
+        )
+        self.assertIn('git checkout --detach "$merge_commit"', evidence_step)
+        self.assertNotIn("exit 0", evidence_step)
+        self.assertLess(
+            evidence_step.index('git checkout --detach "$head_sha"'),
+            evidence_step.index("validate-evidence-commit"),
+        )
+        self.assertLess(
+            evidence_step.index("validate-evidence-commit"),
+            evidence_step.index('git checkout --detach "$merge_commit"'),
+        )
+        for name in ("identity.json", "record.json", "proof.json", "attestation.json"):
+            self.assertIn(name, workflow)
+        self.assertNotIn(
+            "hashFiles('docs/proofs/kubernetes-staging-cell/attestation.json')",
+            workflow,
+        )
+        self.assertIn(
+            "scripts/platform/proof_identity.py",
+            workflow,
+        )
+        self.assertIn(
+            "validate-evidence-commit",
+            workflow,
+         )
+
     def test_proof_identity_covers_all_api_image_inputs(self) -> None:
         for suite in ("kind-gitops", "ha-recovery"):
             selectors = set(self.proof_identity.SUITE_INPUTS[suite])
@@ -2030,8 +2792,9 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                 reuse = root / "reuse"
                 with mock.patch.object(
                     self.proof_identity, "_checkout_commit", return_value=commit
-                ), mock.patch.object(
-                    self.proof_identity, "_validate_controlled_oci_proof"
+                ), mock.patch.dict(
+                    self.proof_identity.SUITE_VALIDATORS,
+                    {"kind-gitops": mock.Mock()},
                 ):
                     self.proof_identity.record(identity_path, proof_path, reuse)
                     self.proof_identity.validate(
@@ -2072,8 +2835,9 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                 self.proof_identity, "compute_identity", return_value=identity
             ), mock.patch.object(
                 self.proof_identity, "_checkout_commit", return_value="5" * 40
-            ), mock.patch.object(
-                self.proof_identity, "_validate_controlled_oci_proof"
+            ), mock.patch.dict(
+                self.proof_identity.SUITE_VALIDATORS,
+                {"kind-gitops": mock.Mock()},
             ):
                 self.proof_identity.record(identity_path, source_proof_path, reuse)
 
