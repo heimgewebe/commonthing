@@ -205,7 +205,7 @@ Der Coding-Agent darf dafür keine Privatdaten oder Rechtstexte erfinden.
 ## 7. Epistemische Grenze
 
 ```text
-infra/caddy/Caddyfile.prod darf nicht als aktive öffentliche Frontdoor des
+infra/caddy/Caddyfile.prod darf nicht als aktive öffentliche Frontdoor
 eines aktiven Deployments ausgegeben werden.
 
 In diesem Slice ist weder seine aktive Verwendung noch seine
