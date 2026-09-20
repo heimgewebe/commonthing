@@ -38,7 +38,7 @@ def test_scoped_deploy_treats_api_and_ollama_as_one_unit() -> None:
     assert "SCOPED_TARGET_SERVICES+=(search-worker)" in deploy
     assert 'SCOPED_INITIAL_CMD+=("${SCOPED_TARGET_SERVICES[@]}")' in deploy
     assert '"allowed_recreated_services": targets' in deploy
-    assert "PROTECTED_SERVICES=(db nats caddy)" in deploy
+    assert "PROTECTED_SERVICES=(db nats caddy schaubild)" in deploy
     assert "configured_preflight_services" in deploy
     assert "WELTGEWEBE_SEARCH_MIN_DISK_BYTES" in deploy
     assert "WELTGEWEBE_SEARCH_MIN_MEMORY_BYTES" in deploy

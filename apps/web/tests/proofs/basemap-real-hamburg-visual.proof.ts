@@ -471,7 +471,6 @@ test.describe("Basemap Real Hamburg Visual Runtime Proof", () => {
           timeout: 30_000,
         })
         .toBeGreaterThan(0);
-      const featureEvidence = await readFeatureEvidence();
 
       await expect
         .poll(
@@ -484,6 +483,36 @@ test.describe("Basemap Real Hamburg Visual Runtime Proof", () => {
           },
         )
         .toBeGreaterThan(0);
+
+      // isSourceLoaded() is a momentary MapLibre state: return the exact
+      // evidence object that satisfies the final coherent proof predicate.
+      // Reading again after success would reopen a TOCTOU window.
+      type FeatureEvidence = Awaited<ReturnType<typeof readFeatureEvidence>>;
+      const waitForCoherentFeatureEvidence =
+        async (): Promise<FeatureEvidence> => {
+          const deadline = Date.now() + 30_000;
+          while (Date.now() < deadline) {
+            const evidence = await readFeatureEvidence();
+            const ready =
+              evidence.sourceLoaded &&
+              evidence.renderedFromExpectedSource > 0 &&
+              evidence.renderedLayerIds.includes("landcover") &&
+              evidence.renderedLayerIds.includes("landuse") &&
+              evidence.sourceFeatureCounts.transportation > 0 &&
+              evidence.sourceFeatureCounts.landcover > 0 &&
+              evidence.sourceFeatureCounts.landuse > 0 &&
+              evidence.sourceFeatureCounts.water > 0 &&
+              evidence.sourceFeatureCounts.place > 0;
+            if (ready) {
+              return evidence;
+            }
+            await page.waitForTimeout(100);
+          }
+          throw new Error(
+            "Hamburg source and required feature layers were not coherent before timeout",
+          );
+        };
+      const featureEvidence = await waitForCoherentFeatureEvidence();
 
       expect(featureEvidence.sourceLoaded).toBe(true);
       expect(featureEvidence.renderedLayerIds).toEqual(
