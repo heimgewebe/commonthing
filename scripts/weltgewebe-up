@@ -856,14 +856,14 @@ generate_failure_bundle() {
   docker compose "${BASE_ARGS[@]}" logs --tail=200 nats > "${bundle_dir}/docker_logs_nats.txt" 2>&1 || true
   docker compose "${BASE_ARGS[@]}" logs --tail=200 db > "${bundle_dir}/docker_logs_db.txt" 2>&1 || true
   {
-    echo "api.weltgewebe.home.arpa:"
-    getent hosts api.weltgewebe.home.arpa || echo "(unresolvable)"
-    echo "weltgewebe.home.arpa:"
-    getent hosts weltgewebe.home.arpa || echo "(unresolvable)"
+    echo "api.commonthing.home.arpa:"
+    getent hosts api.commonthing.home.arpa || echo "(unresolvable)"
+    echo "commonthing.home.arpa:"
+    getent hosts commonthing.home.arpa || echo "(unresolvable)"
   } > "${bundle_dir}/dns_lookup.txt" 2>&1 || true
-  curl -fsS --cacert "$EDGE_CA" https://api.weltgewebe.home.arpa/health/ready > "${bundle_dir}/edge_api_health.txt" 2>&1 || true
-  curl -fsS --cacert "$EDGE_CA" https://weltgewebe.home.arpa/api/health/ready > "${bundle_dir}/alias_route_health.txt" 2>&1 || true
-  curl -fsSI --cacert "$EDGE_CA" https://weltgewebe.home.arpa > "${bundle_dir}/frontend_head.txt" 2>&1 || true
+  curl -fsS --cacert "$EDGE_CA" https://api.commonthing.home.arpa/health/ready > "${bundle_dir}/edge_api_health.txt" 2>&1 || true
+  curl -fsS --cacert "$EDGE_CA" https://commonthing.home.arpa/api/health/ready > "${bundle_dir}/alias_route_health.txt" 2>&1 || true
+  curl -fsSI --cacert "$EDGE_CA" https://commonthing.home.arpa > "${bundle_dir}/frontend_head.txt" 2>&1 || true
 
   if [[ -n "$extra_context_file" && -f "$extra_context_file" ]]; then
     cp "$extra_context_file" "${bundle_dir}/version_guard_context.txt"
@@ -1929,7 +1929,7 @@ if [[ -x "scripts/preflight/csp_contract_static.sh" ]]; then
   if [[ -z "${CADDY_TARGET_SITE:-}" ]]; then
     case "$DEPLOY_TARGET" in
       vps) export CADDY_TARGET_SITE="commonthing.net" ;;
-      *) export CADDY_TARGET_SITE="weltgewebe.home.arpa" ;;
+      *) export CADDY_TARGET_SITE="commonthing.home.arpa" ;;
     esac
   else
     export CADDY_TARGET_SITE
@@ -2654,8 +2654,8 @@ if [[ "$DEPLOY_TARGET" != "vps" ]]; then
 
   echo
   echo ">> Guard 1: DNS Resolution..."
-  if ! getent hosts api.weltgewebe.home.arpa > /dev/null 2>&1 || ! getent hosts weltgewebe.home.arpa > /dev/null 2>&1; then
-    msg="DNS Guard failed: api.weltgewebe.home.arpa or weltgewebe.home.arpa is not resolvable."
+  if ! getent hosts api.commonthing.home.arpa > /dev/null 2>&1 || ! getent hosts commonthing.home.arpa > /dev/null 2>&1; then
+    msg="DNS Guard failed: api.commonthing.home.arpa or commonthing.home.arpa is not resolvable."
     echo "ERROR: $msg"
     generate_failure_bundle "$msg"
     exit 1
@@ -2683,7 +2683,7 @@ if [[ "$DEPLOY_TARGET" != "vps" ]]; then
   fi
 
   echo ">> Guard 3: Edge Routing..."
-  if ! curl -fsS --cacert "$EDGE_CA" https://api.weltgewebe.home.arpa/health/ready > /dev/null 2>&1; then
+  if ! curl -fsS --cacert "$EDGE_CA" https://api.commonthing.home.arpa/health/ready > /dev/null 2>&1; then
     msg="Edge Routing Guard failed: Could not reach API via Edge Route."
     echo "ERROR: $msg"
     generate_failure_bundle "$msg"
@@ -2694,7 +2694,7 @@ if [[ "$DEPLOY_TARGET" != "vps" ]]; then
 
   echo
   echo ">> Guard 4: Alias Route..."
-  if ! curl -fsS --cacert "$EDGE_CA" https://weltgewebe.home.arpa/api/health/ready > /dev/null 2>&1; then
+  if ! curl -fsS --cacert "$EDGE_CA" https://commonthing.home.arpa/api/health/ready > /dev/null 2>&1; then
     msg="Alias Route Guard failed: Could not reach API via Alias Route."
     echo "ERROR: $msg"
     generate_failure_bundle "$msg"
@@ -2717,7 +2717,7 @@ if [[ "$DEPLOY_TARGET" != "vps" ]]; then
         if ! public_germany_edge_style_sha="$(
           curl -fsS --connect-timeout 2 --max-time 5 --max-filesize 1048576 \
             --header 'Accept-Encoding: identity' --cacert "$EDGE_CA" \
-            "https://weltgewebe.home.arpa/local-basemap/${germany_style}" |
+            "https://commonthing.home.arpa/local-basemap/${germany_style}" |
             sha256sum | awk '{print $1}'
         )"; then
           msg="Nationwide Germany Basemap Edge Guard failed: Could not fetch ${germany_style} via Edge Route (/local-basemap/${germany_style})."
@@ -2773,7 +2773,7 @@ PY_EDGE_GERMANY_RANGE
       if ! curl -fsS --connect-timeout 2 --max-time 5 --max-filesize 127 \
         --header 'Accept-Encoding: identity' --range 0-126 --cacert "$EDGE_CA" \
         -D "$germany_edge_headers" -o "$germany_edge_body" \
-        https://weltgewebe.home.arpa/local-basemap/basemap-germany.pmtiles; then
+        https://commonthing.home.arpa/local-basemap/basemap-germany.pmtiles; then
         msg="Nationwide Germany Basemap Edge Guard failed: Could not fetch the bounded basemap-germany.pmtiles range via Edge Route."
         echo "ERROR: $msg"
         generate_failure_bundle "$msg"
@@ -2829,14 +2829,14 @@ PY_EDGE_GERMANY_PUBLIC_RANGE
     else
       echo "   Explicit regional rollback selected; checking rollback routes advisory-only."
       if ! curl -fsS --connect-timeout 2 --max-time 5 --cacert "$EDGE_CA" \
-        https://weltgewebe.home.arpa/local-basemap/style.json > /dev/null 2>&1; then
+        https://commonthing.home.arpa/local-basemap/style.json > /dev/null 2>&1; then
         echo "   [!] WARNING: regional rollback style.json is not reachable via Edge Route."
       else
         echo "OK (regional rollback style.json reachable)"
       fi
       for regional_meta in basemap-hamburg.meta.json basemap-schleswig-holstein.meta.json; do
         if ! curl -fsS --connect-timeout 2 --max-time 5 --cacert "$EDGE_CA" \
-          "https://weltgewebe.home.arpa/local-basemap/${regional_meta}" > /dev/null 2>&1; then
+          "https://commonthing.home.arpa/local-basemap/${regional_meta}" > /dev/null 2>&1; then
           echo "   [!] WARNING: regional rollback ${regional_meta} is not reachable via Edge Route."
         else
           echo "OK (regional rollback ${regional_meta} reachable)"
@@ -2849,7 +2849,7 @@ PY_EDGE_GERMANY_PUBLIC_RANGE
   if [[ "$REQUIRE_FRONTEND" == "1" ]]; then
     # Explicitly verify HTTP 200 and the presence of SvelteKit structural elements like _app
     HTML_OUT=$(mktemp)
-    HTTP_CODE=$(curl -s -o "$HTML_OUT" -w "%{http_code}" --cacert "$EDGE_CA" "https://weltgewebe.home.arpa/map")
+    HTTP_CODE=$(curl -s -o "$HTML_OUT" -w "%{http_code}" --cacert "$EDGE_CA" "https://commonthing.home.arpa/map")
 
     if [[ "$HTTP_CODE" != "200" ]]; then
       msg="Frontend Reachability Guard failed: HTTP 200 expected for /map. HTML not reachable. Got: $HTTP_CODE"
@@ -2869,7 +2869,7 @@ PY_EDGE_GERMANY_PUBLIC_RANGE
 
     # Phase B: Verifizieren der HTML Cache-Header (revalidating)
     HTML_HEADERS_OUT=$(mktemp)
-    if ! curl -s -I --cacert "$EDGE_CA" "https://weltgewebe.home.arpa/map" > "$HTML_HEADERS_OUT"; then
+    if ! curl -s -I --cacert "$EDGE_CA" "https://commonthing.home.arpa/map" > "$HTML_HEADERS_OUT"; then
       msg="Frontend Cache Guard failed: curl connection failed while checking HTML headers for /map."
       echo "ERROR: $msg"
       generate_failure_bundle "$msg"
@@ -2895,7 +2895,7 @@ PY_EDGE_GERMANY_PUBLIC_RANGE
       ASSET_PATH_NORMALIZED="/${ASSET_PATH#./}"
       ASSET_PATH_NORMALIZED="${ASSET_PATH_NORMALIZED//\/\//\/}"
 
-      ASSET_URL="https://weltgewebe.home.arpa${ASSET_PATH_NORMALIZED}"
+      ASSET_URL="https://commonthing.home.arpa${ASSET_PATH_NORMALIZED}"
 
       # Verify asset reachability and Cache-Control headers (immutable)
       ASSET_HEADERS_OUT=$(mktemp)
@@ -2934,7 +2934,7 @@ PY_EDGE_GERMANY_PUBLIC_RANGE
     # This is a hard guard: version.json is the deploy contract.
     VERSION_OUT=$(mktemp)
     VERSION_HEADERS_OUT=$(mktemp)
-    if ! VERSION_HTTP_CODE=$(curl -s -w "%{http_code}" -o "$VERSION_OUT" -D "$VERSION_HEADERS_OUT" --cacert "$EDGE_CA" "https://weltgewebe.home.arpa/_app/version.json" 2> /dev/null); then
+    if ! VERSION_HTTP_CODE=$(curl -s -w "%{http_code}" -o "$VERSION_OUT" -D "$VERSION_HEADERS_OUT" --cacert "$EDGE_CA" "https://commonthing.home.arpa/_app/version.json" 2> /dev/null); then
       msg="Frontend Guard failed: curl connection failed while fetching /_app/version.json."
       echo "ERROR: $msg"
       generate_failure_bundle "$msg"
