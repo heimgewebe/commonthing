@@ -32,6 +32,11 @@
   header {
     # Local-sovereign CSP: WebSocket-Schemes bleiben fuer Dev/Proxy erlaubt;
     # externe Tile-/Bildquellen bleiben in diesem Caddy-Pfad bewusst gesperrt.
+    # Der Vite-Devserver liefert importiertes CSS zur Laufzeit als <style>-Element
+    # aus (HMR); diese Elemente unterliegen der CSP. Deshalb bleibt die
+    # Inline-Ausnahme fuer Styles allein auf diesem Devpfad bestehen. Den
+    # erlaubten Wert fixiert policies/security.yml, Skripte bleiben auch hier
+    # geschlossen; beides prueft scripts/guard/security-headers-guard.sh.
     Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none';"
     X-Frame-Options "DENY"
     Referrer-Policy "no-referrer"
