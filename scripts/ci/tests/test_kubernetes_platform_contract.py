@@ -215,42 +215,52 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         current_modules = {
             path.name for path in (ROOT / "scripts/platform").glob("*.py")
         }
-        base_ref = os.environ.get("GITHUB_BASE_REF")
-        if base_ref:
-            completed = subprocess.run(
-                [
-                    "git",
-                    "show",
-                    f"origin/{base_ref}:scripts/platform/staging_cell.py",
-                ],
+        base_commit = os.environ.get("STAGING_CONTRACTION_BASE_SHA")
+        if base_commit is None:
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                self.fail(
+                    "STAGING_CONTRACTION_BASE_SHA is required in GitHub Actions"
+                )
+            merge_base = subprocess.run(
+                ["git", "merge-base", "HEAD", "origin/main"],
                 cwd=ROOT,
                 check=True,
                 capture_output=True,
                 text=True,
             )
-            base_source = completed.stdout
-            tree = subprocess.run(
-                [
-                    "git",
-                    "ls-tree",
-                    "-r",
-                    "--name-only",
-                    f"origin/{base_ref}",
-                    "scripts/platform",
-                ],
-                cwd=ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            base_modules = {
-                Path(item).name
-                for item in tree.stdout.splitlines()
-                if item.endswith(".py")
-            }
-        else:
-            base_source = current_source
-            base_modules = current_modules
+            base_commit = merge_base.stdout.strip()
+        self.assertRegex(base_commit, r"^[0-9a-f]{40}$")
+        completed = subprocess.run(
+            [
+                "git",
+                "show",
+                f"{base_commit}:scripts/platform/staging_cell.py",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        base_source = completed.stdout
+        tree = subprocess.run(
+            [
+                "git",
+                "ls-tree",
+                "-r",
+                "--name-only",
+                base_commit,
+                "scripts/platform",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        base_modules = {
+            Path(item).name
+            for item in tree.stdout.splitlines()
+            if item.endswith(".py")
+        }
         self.assertEqual(
             [],
             _staging_contraction_violations(
@@ -260,6 +270,31 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                 base_modules=base_modules,
             ),
         )
+
+    def test_staging_cell_contraction_ratchet_binds_exact_pr_base(self) -> None:
+        ratchet = __import__("inspect").getsource(
+            self.test_staging_cell_contraction_ratchet
+        )
+        self.assertIn("STAGING_CONTRACTION_BASE_SHA", ratchet)
+        self.assertNotIn("GITHUB_BASE_REF", ratchet)
+        workflow = (
+            ROOT / ".github/workflows/kubernetes-platform.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'STAGING_CONTRACTION_BASE_SHA: ${{ github.event.pull_request.base.sha }}',
+            workflow,
+        )
+
+    def test_staging_cell_contraction_ratchet_requires_exact_base_in_ci(self) -> None:
+        with mock.patch.object(
+            os,
+            "environ",
+            {"GITHUB_ACTIONS": "true"},
+        ), self.assertRaisesRegex(
+            AssertionError,
+            "STAGING_CONTRACTION_BASE_SHA is required",
+        ):
+            self.test_staging_cell_contraction_ratchet()
 
     def test_staging_cell_contraction_guard_fails_closed_on_growth(self) -> None:
         base = (
@@ -2506,10 +2541,27 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                     record_path,
                     proof_path,
                     attestation_path,
+                    expected_base_commit=implementation,
                 )
             self.assertEqual(result["implementation_commit"], implementation)
             self.assertEqual(result["evidence_commit"], evidence_commit)
             self.assertTrue(result["observer_live_verification_required"])
+
+            with mock.patch.object(
+                self.proof_identity,
+                "validate",
+                return_value=record,
+            ), self.assertRaisesRegex(
+                self.proof_identity.IdentityError,
+                "pull request base",
+            ):
+                self.proof_identity.validate_evidence_commit(
+                    identity_path,
+                    record_path,
+                    proof_path,
+                    attestation_path,
+                    expected_base_commit="c" * 40,
+                )
 
             with mock.patch.object(
                 self.proof_identity,
@@ -2543,6 +2595,7 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                     record_path,
                     proof_path,
                     attestation_path,
+                    expected_base_commit=implementation,
                 )
 
             with mock.patch.object(
@@ -2570,6 +2623,7 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                     record_path,
                     proof_path,
                     attestation_path,
+                    expected_base_commit=implementation,
                 )
 
     def test_platform_pr_workflow_validates_staging_evidence_only_commit(self) -> None:
@@ -2598,7 +2652,14 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         )
         self.assertIn('git checkout --detach "$head_sha"', evidence_step)
         self.assertIn(
-            'if ! git diff --quiet "$base_sha"...HEAD -- "$evidence_root"; then',
+            'if git diff --quiet "$base_sha"...HEAD -- "$evidence_root"; then',
+            evidence_step,
+        )
+        self.assertIn('diff_rc="$?"', evidence_step)
+        self.assertIn('if [ "$diff_rc" -ne 1 ]; then', evidence_step)
+        self.assertIn('exit "$diff_rc"', evidence_step)
+        self.assertIn(
+            '--expected-base-commit "$base_sha"',
             evidence_step,
         )
         self.assertIn('git checkout --detach "$merge_commit"', evidence_step)

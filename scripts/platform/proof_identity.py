@@ -754,6 +754,8 @@ def validate_evidence_commit(
     record_path: Path,
     proof_path: Path,
     attestation_path: Path,
+    *,
+    expected_base_commit: str,
 ) -> dict[str, Any]:
     reusable = validate(identity_path, record_path, proof_path)
     identity = _read_object(identity_path)
@@ -765,6 +767,13 @@ def validate_evidence_commit(
     implementation_commit = _canonical_sha(
         reusable.get("proof_commit"), label="evidence implementation commit"
     )
+    pull_request_base_commit = _canonical_sha(
+        expected_base_commit, label="pull request base commit"
+    )
+    if implementation_commit != pull_request_base_commit:
+        raise IdentityError(
+            "staging implementation commit does not match pull request base"
+        )
     if identity.get("source_commit") != implementation_commit:
         raise IdentityError("staging identity is not bound to the implementation commit")
     if proof.get("commit") != implementation_commit:
@@ -841,6 +850,7 @@ def validate_evidence_commit(
         "status": "pass",
         "suite": "staging-cell",
         "implementation_commit": implementation_commit,
+        "pull_request_base_commit": pull_request_base_commit,
         "evidence_commit": current_commit,
         "changed_evidence_files": sorted(changed),
         "observer": normalized_observer,
@@ -946,6 +956,7 @@ def main() -> int:
     evidence.add_argument("--record", type=Path, required=True)
     evidence.add_argument("--proof", type=Path, required=True)
     evidence.add_argument("--attestation", type=Path, required=True)
+    evidence.add_argument("--expected-base-commit", required=True)
     check = sub.add_parser("validate")
     check.add_argument("--identity", type=Path, required=True)
     check.add_argument("--record", type=Path, required=True)
@@ -990,6 +1001,7 @@ def main() -> int:
                         args.record,
                         args.proof,
                         args.attestation,
+                        expected_base_commit=args.expected_base_commit,
                     ),
                     sort_keys=True,
                 )
