@@ -237,7 +237,7 @@
     data-testid="context-panel"
     data-sheet-stage={sheetStage}
     aria-label={panelTitle}
-    style={dragHeight === null ? undefined : `height: ${dragHeight}px`}
+    style:height={dragHeight === null ? null : `${dragHeight}px`}
   >
     <button
       type="button"

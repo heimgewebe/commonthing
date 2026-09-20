@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import unittest
@@ -12,13 +15,38 @@ RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 CADDY_BINARY = shutil.which("caddy")
 CADDY_DOCKER_IMAGE = "caddy:2.8.4"
 MAGIC_LINK_CONFIRM_PATH = "/api/auth/magic-link/consume"
-MAGIC_POLICY = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
 STRICT_POLICY = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 SCHAUWERK_PATHS = ["/schaubild", "/schaubild/*"]
 SCHAUWERK_POLICY = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
     "frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; "
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+)
+
+def magic_link_style_hash() -> str:
+    """Derive the magic-link style hash from the Rust constant that renders it.
+
+    Hardcoding it here would let the edge policy drift away from the document
+    it is supposed to authorize.
+    """
+    source = (REPO / "apps" / "api" / "src" / "routes" / "auth.rs").read_text(encoding="utf-8")
+    matches = re.findall(
+        r'const\s+MAGIC_LINK_CONFIRM_STYLE:\s*&str\s*=\s*"([^"\\]*)"\s*;',
+        source,
+    )
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected exactly one MAGIC_LINK_CONFIRM_STYLE literal, found {len(matches)}"
+        )
+    digest = base64.b64encode(hashlib.sha256(matches[0].encode("utf-8")).digest()).decode("ascii")
+    return f"'sha256-{digest}'"
+
+
+MAGIC_STYLE_HASH = magic_link_style_hash()
+MAGIC_POLICY = (
+    "default-src 'none'; "
+    f"style-src {MAGIC_STYLE_HASH}; "
+    "form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
 )
 CASES = (
     ("infra/caddy/Caddyfile", None, ["/api/*"]),
@@ -323,7 +351,7 @@ class StaticAppCaddyAdaptedCspTest(unittest.TestCase):
                     directive_map(magic[0]["policy"]),
                     {
                         "default-src": ("'none'",),
-                        "style-src": ("'unsafe-inline'",),
+                        "style-src": (MAGIC_STYLE_HASH,),
                         "form-action": ("'self'",),
                         "base-uri": ("'none'",),
                         "frame-ancestors": ("'none'",),
@@ -335,6 +363,13 @@ class StaticAppCaddyAdaptedCspTest(unittest.TestCase):
                 self.assertNotIn("default-src", frontend_directives)
                 self.assertNotIn("script-src", frontend_directives)
                 self.assertEqual(frontend_directives["frame-ancestors"], ("'none'",))
+                self.assertEqual(frontend_directives["style-src"], ("'self'",))
+                for name, tokens in frontend_directives.items():
+                    self.assertNotIn(
+                        "'unsafe-inline'",
+                        tokens,
+                        f"frontend CSP must not allow {name} 'unsafe-inline'",
+                    )
 
 
 if __name__ == "__main__":

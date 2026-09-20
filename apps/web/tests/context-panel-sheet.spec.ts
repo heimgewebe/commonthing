@@ -171,6 +171,9 @@ test.describe("ContextPanel mobile compact and full states", () => {
     await expect(panel).toHaveAttribute("data-sheet-stage", "full");
   });
 
+  // Die Ziehhoehe haengt an einer style:-Direktive, die die Eigenschaft ueber
+  // das CSSOM setzt und wieder entfernt. Das style-Attribut bleibt danach als
+  // leeres Attribut stehen, also wird hier die Eigenschaft geprueft.
   test("non-primary and secondary pointers cannot start a sheet drag", async ({
     page,
   }) => {
@@ -189,7 +192,7 @@ test.describe("ContextPanel mobile compact and full states", () => {
       });
       await expect(panel).not.toHaveClass(/dragging/);
       await expect(panel).toHaveAttribute("data-sheet-stage", "compact");
-      await expect(panel).not.toHaveAttribute("style");
+      await expect(panel).toHaveJSProperty("style.height", "");
     }
   });
 
@@ -241,7 +244,7 @@ test.describe("ContextPanel mobile compact and full states", () => {
       button: 0,
     });
     await expect(panel).not.toHaveClass(/dragging/);
-    await expect(panel).not.toHaveAttribute("style");
+    await expect(panel).toHaveJSProperty("style.height", "");
     await page.mouse.up();
   });
 
@@ -276,7 +279,7 @@ test.describe("ContextPanel mobile compact and full states", () => {
       isPrimary: true,
     });
     await expect(panel).not.toHaveClass(/dragging/);
-    await expect(panel).not.toHaveAttribute("style");
+    await expect(panel).toHaveJSProperty("style.height", "");
     await page.mouse.up();
   });
 

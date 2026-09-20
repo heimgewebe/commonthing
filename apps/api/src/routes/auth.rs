@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::LazyLock;
 #[cfg(not(test))]
 use std::sync::OnceLock;
 use time::Duration;
@@ -1152,6 +1153,30 @@ fn escape_attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Exact text content of the magic-link confirmation style element.
+///
+/// The document CSP authorizes this element by its own SHA-256 hash instead of
+/// `style-src 'unsafe-inline'`, so the rendered markup must embed this constant
+/// verbatim between `<style>` and `</style>`. Changing a single byte here
+/// changes the hash; `scripts/guard/security-headers-guard.sh` re-derives it
+/// from this file and fails closed when a Caddy contract drifts.
+const MAGIC_LINK_CONFIRM_STYLE: &str = "body { font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f4f4f4; } .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: center; } button { background: #0070f3; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 4px; font-size: 1rem; cursor: pointer; } button:hover { background: #005bb5; }";
+
+/// Content Security Policy for the magic-link confirmation document.
+///
+/// Derived from [`MAGIC_LINK_CONFIRM_STYLE`] so the hash can never be stale.
+/// Caddy is the canonical public owner of this header and overwrites it; the
+/// security-headers guard keeps both sides on the same derived value.
+static MAGIC_LINK_CONFIRM_CSP: LazyLock<String> = LazyLock::new(|| {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let digest = STANDARD.encode(Sha256::digest(MAGIC_LINK_CONFIRM_STYLE.as_bytes()));
+    format!(
+        "default-src 'none'; style-src 'sha256-{digest}'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    )
+});
+
 pub async fn consume_login_get(
     State(state): State<ApiState>,
     jar: CookieJar,
@@ -1190,12 +1215,7 @@ pub async fn consume_login_get(
 <head>
     <title>Confirm Login</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {{ font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f4f4f4; }}
-        .card {{ background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: center; }}
-        button {{ background: #0070f3; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 4px; font-size: 1rem; cursor: pointer; }}
-        button:hover {{ background: #005bb5; }}
-    </style>
+    <style>{}</style>
 </head>
 <body>
     <div class="card">
@@ -1209,6 +1229,7 @@ pub async fn consume_login_get(
     </div>
 </body>
 </html>"#,
+        MAGIC_LINK_CONFIRM_STYLE,
         escape_attr(&params.token),
         escape_attr(&nonce)
     );
@@ -1221,9 +1242,7 @@ pub async fn consume_login_get(
     );
     headers.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
-            .parse()
-            .unwrap(),
+        MAGIC_LINK_CONFIRM_CSP.parse().unwrap(),
     );
 
     (headers, jar.add(cookie), Html(html)).into_response()
@@ -3676,6 +3695,30 @@ mod tests {
     use axum::{body, http::header::CONTENT_TYPE, http::HeaderMap};
     use serial_test::serial;
     use std::net::SocketAddr;
+
+    #[test]
+    fn magic_link_confirm_csp_binds_the_style_block_to_its_own_hash() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let expected = STANDARD.encode(Sha256::digest(MAGIC_LINK_CONFIRM_STYLE.as_bytes()));
+        assert!(
+            MAGIC_LINK_CONFIRM_CSP.contains(&format!("style-src 'sha256-{expected}'")),
+            "magic-link CSP must authorize exactly the rendered style block: {}",
+            *MAGIC_LINK_CONFIRM_CSP
+        );
+        assert!(!MAGIC_LINK_CONFIRM_CSP.contains("'unsafe-inline'"));
+    }
+
+    #[test]
+    fn magic_link_confirm_style_stays_parseable_for_the_edge_guards() {
+        // scripts/guard/security-headers-guard.sh and the CI contract tests
+        // re-derive this hash by reading the literal out of this file with a
+        // deliberately escape-free regex. A quote or backslash here would make
+        // them silently stop matching, so it fails loudly instead.
+        assert!(!MAGIC_LINK_CONFIRM_STYLE.contains('"'));
+        assert!(!MAGIC_LINK_CONFIRM_STYLE.contains('\\'));
+    }
 
     #[tokio::test]
     async fn shared_auth_backend_failure_uses_json_contract() {

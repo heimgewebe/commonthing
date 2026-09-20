@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
+import hashlib
 import http.client
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -17,7 +20,6 @@ RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 CADDY_BINARY = shutil.which("caddy")
 CADDY_DOCKER_IMAGE = "caddy:2.8.4"
 MAGIC_PATH = "/api/auth/magic-link/consume"
-MAGIC_POLICY = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
 STRICT_POLICY = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 UPSTREAM_POLICY = "default-src https://upstream.invalid; form-action https://upstream.invalid;"
 
@@ -46,6 +48,31 @@ def _usable_docker() -> str | None:
 
 
 DOCKER_BINARY = _usable_docker()
+
+
+def magic_link_policy() -> str:
+    """Derive the magic-link CSP from the Rust constant that renders the form.
+
+    The hash must never be hardcoded: it follows the style block byte for byte.
+    """
+    source = (REPO / "apps" / "api" / "src" / "routes" / "auth.rs").read_text(encoding="utf-8")
+    matches = re.findall(
+        r'const\s+MAGIC_LINK_CONFIRM_STYLE:\s*&str\s*=\s*"([^"\\]*)"\s*;',
+        source,
+    )
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected exactly one MAGIC_LINK_CONFIRM_STYLE literal, found {len(matches)}"
+        )
+    digest = base64.b64encode(hashlib.sha256(matches[0].encode("utf-8")).digest()).decode("ascii")
+    return (
+        "default-src 'none'; "
+        f"style-src 'sha256-{digest}'; "
+        "form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
+    )
+
+
+MAGIC_POLICY = magic_link_policy()
 
 
 class CspUpstreamHandler(BaseHTTPRequestHandler):

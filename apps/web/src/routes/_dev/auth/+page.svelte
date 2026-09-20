@@ -49,21 +49,15 @@
   <title>Dev Login</title>
 </svelte:head>
 
-<div
-  class="col"
-  style="gap:1.5rem; padding:1.5rem; max-width:720px; margin:0 auto;"
->
-  <header class="col" style="gap:.5rem;">
+<div class="col dev-page">
+  <header class="col dev-page__header">
     <h1>Dev Login</h1>
     <p class="ghost">
       Wähle einen Account zum Einloggen. Nur verfügbar wenn AUTH_DEV_LOGIN=1.
     </p>
 
     {#if $authStore.authenticated}
-      <div
-        class="panel row"
-        style="align-items:center; justify-content:space-between; border-color:var(--color-theme-1);"
-      >
+      <div class="panel row dev-page__session">
         <div class="col">
           <strong>Angemeldet als:</strong>
           <span>{$authStore.role} (Account: {$authStore.account_id})</span>
@@ -76,22 +70,19 @@
   {#if loading}
     <p>Lade Accounts...</p>
   {:else if error}
-    <div class="panel" style="border-color:var(--color-danger);">
+    <div class="panel dev-page__error">
       Error: {error}
     </div>
   {:else if accounts.length === 0}
     <p>Keine Accounts gefunden.</p>
   {:else}
-    <ul class="col" style="gap:1rem; margin:0; padding:0; list-style:none;">
+    <ul class="col dev-page__list">
       {#each accounts as account}
-        <li class="panel col" style="gap:.5rem;">
-          <div
-            class="row"
-            style="justify-content:space-between; align-items:flex-start;"
-          >
+        <li class="panel col dev-page__item">
+          <div class="row dev-page__item-head">
             <div class="col">
-              <h2 style="margin:0; font-size:1.1rem;">{account.title}</h2>
-              <code style="font-size:0.8rem; opacity:0.7;">{account.id}</code>
+              <h2 class="dev-page__item-title">{account.title}</h2>
+              <code class="dev-page__item-id">{account.id}</code>
             </div>
             <span class="badge">{account.role}</span>
           </div>
@@ -100,7 +91,7 @@
             <p>{account.summary}</p>
           {/if}
 
-          <div class="row" style="justify-content:flex-end;">
+          <div class="row dev-page__actions">
             <button
               class="btn"
               onclick={() => login(account.id)}
@@ -121,6 +112,58 @@
 </div>
 
 <style>
+  /* Keine Inline-Styles: style-src laeuft ohne 'unsafe-inline'. */
+  .dev-page {
+    gap: 1.5rem;
+    padding: 1.5rem;
+    max-width: 720px;
+    margin: 0 auto;
+  }
+
+  .dev-page__header {
+    gap: 0.5rem;
+  }
+
+  .dev-page__session {
+    align-items: center;
+    justify-content: space-between;
+    border-color: var(--color-theme-1);
+  }
+
+  .dev-page__error {
+    border-color: var(--color-danger);
+  }
+
+  .dev-page__list {
+    gap: 1rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .dev-page__item {
+    gap: 0.5rem;
+  }
+
+  .dev-page__item-head {
+    justify-content: space-between;
+    align-items: flex-start;
+  }
+
+  .dev-page__item-title {
+    margin: 0;
+    font-size: 1.1rem;
+  }
+
+  .dev-page__item-id {
+    font-size: 0.8rem;
+    opacity: 0.7;
+  }
+
+  .dev-page__actions {
+    justify-content: flex-end;
+  }
+
   .badge {
     background: var(--color-bg-2);
     padding: 0.2rem 0.5rem;

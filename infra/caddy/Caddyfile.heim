@@ -74,11 +74,13 @@ weltgewebe.home.arpa {
   # The magic-link confirmation endpoint intentionally serves one tiny HTML form.
   # Caddy is the canonical public CSP owner: defer the write so any upstream CSP
   # is replaced after proxying. All other API responses stay non-document locked.
+  # style-src is bound to the sha256 of MAGIC_LINK_CONFIRM_STYLE in
+  # apps/api/src/routes/auth.rs; the security-headers guard re-derives it.
   @magicLinkConfirm {
     method GET
     path /api/auth/magic-link/consume
   }
-  header @magicLinkConfirm >Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
+  header @magicLinkConfirm >Content-Security-Policy "default-src 'none'; style-src 'sha256-XYsxxeVpv60caZc9t5I3otd7S/55JHCBDH1oEdipHSY='; form-action 'self'; base-uri 'none'; frame-ancestors 'none';"
   @apiResponse {
     path /api/*
     not {
@@ -90,7 +92,7 @@ weltgewebe.home.arpa {
   @frontendResponse {
     not path /api/*
   }
-  header @frontendResponse Content-Security-Policy "style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; worker-src 'self' blob:; font-src 'self'; media-src 'self'; manifest-src 'self'; child-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';"
+  header @frontendResponse Content-Security-Policy "style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; worker-src 'self' blob:; font-src 'self'; media-src 'self'; manifest-src 'self'; child-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';"
 
   header {
     # Security headers (Heim-first specific)
