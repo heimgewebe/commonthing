@@ -188,3 +188,41 @@ body {
 .timeline .event {
   font-size: 0.95rem;
 }
+
+/*
+ * CSP-Vertrag: style-src kommt ohne 'unsafe-inline' aus.
+ * Alles, was vorher als Inline-Style im Markup oder zur Laufzeit als
+ * Style-Element entstand, wird hier als externe Regel gehalten.
+ * Siehe policies/security.yml und docs/deployment.md.
+ */
+
+/* Ersetzt das frühere style="display: contents" in src/app.html. */
+.app-root {
+  display: contents;
+}
+
+/*
+ * SvelteKit rendert seine Live-Region #svelte-announcer mit einem fest im
+ * Framework verdrahteten Inline-Style. Unter style-src ohne 'unsafe-inline'
+ * wird dieses Attribut verworfen, die Region würde sichtbar. Diese Regel
+ * hält sie verlässlich verborgen; tests/csp-inline-styles.spec.ts bewacht das.
+ */
+#svelte-announcer,
+.sr-only {
+  position: absolute;
+  left: 0;
+  top: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+  width: 1px;
+  height: 1px;
+}
+
+/* Ersetzt die frühere Style-Injektion in src/lib/utils/inert-polyfill.ts. */
+[inert] {
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
