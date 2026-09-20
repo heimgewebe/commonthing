@@ -2106,6 +2106,39 @@ wait_for_scoped_api_health() {
   return 1
 }
 
+wait_for_schaubild_runtime_health() {
+  local container_id="$1"
+  local timeout_seconds="${WELTGEWEBE_SCHAUWERK_HEALTH_TIMEOUT_SECONDS:-120}"
+  case "$timeout_seconds" in
+    '' | *[!0-9]*)
+      echo "ERROR: WELTGEWEBE_SCHAUWERK_HEALTH_TIMEOUT_SECONDS must be an integer." >&2
+      return 1
+      ;;
+  esac
+  if ((timeout_seconds < 1 || timeout_seconds > 600)); then
+    echo "ERROR: WELTGEWEBE_SCHAUWERK_HEALTH_TIMEOUT_SECONDS must be between 1 and 600." >&2
+    return 1
+  fi
+
+  local attempt
+  local status
+  for ((attempt = 1; attempt <= timeout_seconds; attempt++)); do
+    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id" 2> /dev/null || true)"
+    if [[ "$status" == "healthy" ]]; then
+      return 0
+    fi
+    if [[ "$status" != "starting" ]]; then
+      echo "ERROR: Schaubild runtime container health is '${status:-missing}'." >&2
+      return 1
+    fi
+    if ((attempt < timeout_seconds)); then
+      sleep 1
+    fi
+  done
+  echo "ERROR: Schaubild runtime container did not become healthy within ${timeout_seconds} seconds." >&2
+  return 1
+}
+
 restore_scoped_migration_mode() {
   export WELTGEWEBE_API_STARTUP_MIGRATIONS="verify-applied"
   echo "Running automatic migration-mode restore: ${SCOPED_RESTORE_CMD[*]}"
@@ -3006,15 +3039,14 @@ else
       exit 1
     fi
     SCHAUWERK_RUNTIME_LIVE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$SCHAUWERK_RUNTIME_CONTAINER_ID" 2> /dev/null || true)"
-    SCHAUWERK_RUNTIME_LIVE_HEALTH="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$SCHAUWERK_RUNTIME_CONTAINER_ID" 2> /dev/null || true)"
     if [[ "$SCHAUWERK_RUNTIME_LIVE_IMAGE" != "$SCHAUWERK_RUNTIME_IMAGE_REF" ]]; then
       msg="Schaubild runtime image mismatch: live $SCHAUWERK_RUNTIME_LIVE_IMAGE, expected $SCHAUWERK_RUNTIME_IMAGE_REF."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       exit 1
     fi
-    if [[ "$SCHAUWERK_RUNTIME_LIVE_HEALTH" != "healthy" ]]; then
-      msg="Schaubild runtime container is not healthy: ${SCHAUWERK_RUNTIME_LIVE_HEALTH:-<none>}."
+    if ! wait_for_schaubild_runtime_health "$SCHAUWERK_RUNTIME_CONTAINER_ID"; then
+      msg="Schaubild runtime container did not reach a healthy state."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       exit 1

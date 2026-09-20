@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
+import subprocess
+import tempfile
 import unittest
 
 
@@ -79,6 +82,71 @@ class SchaubildFrontdoorTest(unittest.TestCase):
             r"/schaubild/native/[0-9a-f]{64}/index\.html",
             script,
         )
+
+    def _schaubild_health_wait_function(self) -> str:
+        start = self.deploy.index("wait_for_schaubild_runtime_health() {")
+        end = self.deploy.index(
+            "\n}\n\nrestore_scoped_migration_mode()", start
+        ) + 2
+        return self.deploy[start:end]
+
+    def test_full_deploy_waits_for_transient_schaubild_health(self) -> None:
+        function = self._schaubild_health_wait_function()
+        with tempfile.TemporaryDirectory() as temporary:
+            counter = pathlib.Path(temporary) / "health-counter"
+            environment = os.environ.copy()
+            environment["HEALTH_COUNTER"] = str(counter)
+            environment["WELTGEWEBE_SCHAUWERK_HEALTH_TIMEOUT_SECONDS"] = "3"
+            harness = f"""\
+set -euo pipefail
+{function}
+sleep() {{ :; }}
+docker() {{
+  count=0
+  if [[ -e "$HEALTH_COUNTER" ]]; then
+    count="$(cat "$HEALTH_COUNTER")"
+  fi
+  count=$((count + 1))
+  printf '%s\\n' "$count" > "$HEALTH_COUNTER"
+  if ((count == 1)); then
+    printf 'starting\\n'
+  else
+    printf 'healthy\\n'
+  fi
+}}
+wait_for_schaubild_runtime_health schaubild-test
+"""
+            result = subprocess.run(
+                ["bash", "-c", harness],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(counter.read_text(encoding="utf-8").strip(), "2")
+        self.assertIn(
+            'wait_for_schaubild_runtime_health "$SCHAUWERK_RUNTIME_CONTAINER_ID"',
+            self.deploy,
+        )
+
+    def test_full_deploy_rejects_nontransient_schaubild_health(self) -> None:
+        function = self._schaubild_health_wait_function()
+        harness = f"""\
+set -euo pipefail
+{function}
+sleep() {{ exit 98; }}
+docker() {{ printf 'unhealthy\\n'; }}
+wait_for_schaubild_runtime_health schaubild-test
+"""
+        result = subprocess.run(
+            ["bash", "-c", harness],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("health is 'unhealthy'", result.stderr)
 
     def test_editor_csp_allows_native_same_origin_api_and_legacy_frame_only(self) -> None:
         expected = (
