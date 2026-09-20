@@ -295,7 +295,7 @@ def _workflow_text_folded_run_block(target_id):
         lines.append("    steps:")
         if proof_id == target_id:
             lines.append("      - run: >-")
-            lines.append(f"          cargo test --locked -p weltgewebe-api")
+            lines.append("          cargo test --locked -p weltgewebe-api")
             lines.append(f"          --test {test_name}")
             lines.append("          -- --include-ignored --test-threads=1")
         else:

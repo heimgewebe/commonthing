@@ -555,6 +555,54 @@ jobs:
       - name: Run PostgreSQL and multi-instance proof suite
         run: scripts/ci/run-postgres-integration-proofs.sh
 
+  python-lint:
+    name: Python Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # tag: v7.0.0
+        with:
+          python-version-file: '.python-version'
+
+      - name: Read tool versions
+        id: tool-versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          UV_VERSION=$(grep '^uv:' toolchain.versions.yml | cut -d '"' -f2)
+          if [ -z "${UV_VERSION}" ]; then
+            echo "failed to parse uv version from toolchain.versions.yml" >&2
+            exit 1
+          fi
+          printf 'uv_version=%s\n' "${UV_VERSION}" >> "${GITHUB_OUTPUT}"
+          RUFF_VERSION=$(grep '^ruff:' toolchain.versions.yml | cut -d '"' -f2)
+          if [ -z "${RUFF_VERSION}" ]; then
+            echo "failed to parse ruff version from toolchain.versions.yml" >&2
+            exit 1
+          fi
+          printf 'ruff_version=%s\n' "${RUFF_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # tag: v8.3.2
+        with:
+          version: ${{ steps.tool-versions.outputs.uv_version }}
+
+      # Statische Pruefung des gesamten Python-Bestands. Regelauswahl in
+      # ruff.toml bewusst eng (E9 + Pyflakes): Fehlerklassen, keine Stilregeln.
+      # Dieser Job liegt bewusst in ci.yml, weil nur dessen Ergebnisse vom
+      # "Required merge gate" aggregiert werden.
+      - name: Ruff lint
+        env:
+          RUFF_VERSION: ${{ steps.tool-versions.outputs.ruff_version }}
+        run: |
+          set -euo pipefail
+          uv tool run "ruff@${RUFF_VERSION}" check --no-cache .
+
   lint-docs:
     name: Docs & Shell Hygiene
     needs: docs-changes
@@ -680,6 +728,7 @@ jobs:
       - web-runtime-proof
       - postgres-proofs
       - lint-docs
+      - python-lint
     runs-on: ubuntu-latest
     steps:
       - name: Verify all required proof jobs
@@ -693,6 +742,7 @@ jobs:
             "web-runtime-proof=${{ needs.web-runtime-proof.result }}"
             "postgres-proofs=${{ needs.postgres-proofs.result }}"
             "lint-docs=${{ needs.lint-docs.result }}"
+            "python-lint=${{ needs.python-lint.result }}"
           )
           failed=0
           for item in "${results[@]}"; do
