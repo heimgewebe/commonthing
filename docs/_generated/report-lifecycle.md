@@ -155,12 +155,12 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "Runtime health, deployment health, or the correctness of claims inside individual reports."
   ],
-  "generated_at": "2026-09-19T20:20:55+02:00",
+  "generated_at": "2026-09-19T22:18:16+02:00",
   "limitations": [
     "The report reflects repository files only and does not execute product runtime checks."
   ],
   "schema_version": 1,
-  "source_revision": "4ff3cac8e21dea30084fd0ec7ab32e65d0e00569",
+  "source_revision": "5fdbdfcf412f9ea1187ed9f1abd0f670af14d9c0",
   "sources": [
     {
       "path": "docs/reports/agent-readiness-audit.md",
@@ -316,7 +316,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/kubernetes-platform-foundation-status.md",
-      "sha256": "a81b1f8dff0dcd4658e64d34967b10ad92e324e9694c042e2e3ed2da48dc6d9e"
+      "sha256": "25aaddadaaef9e0b3ddbf8052a8b84329bfb5277d79ec6e7161715ae62799efd"
     },
     {
       "path": "docs/reports/map-architekturkritik.md",
