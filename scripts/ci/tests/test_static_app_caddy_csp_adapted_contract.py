@@ -18,7 +18,7 @@ STRICT_POLICY = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-
 SCHAUWERK_PATHS = ["/schaubild", "/schaubild/*"]
 SCHAUWERK_POLICY = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
-    "frame-src https://embed.diagrams.net; connect-src 'none'; object-src 'none'; "
+    "frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; "
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 )
 
@@ -173,16 +173,18 @@ class StaticAppCaddyAdaptedCspTest(unittest.TestCase):
         self.assertIn('"Location": ["/schaubild/"]', redirect_json)
         self.assertIn('"status_code": 308', redirect_json)
 
-        static = next(
+        proxied = next(
             route
             for route in routes
             if route.get("match") == [{"path": ["/schaubild/*"]}]
         )
-        static_json = json.dumps(static, sort_keys=True)
-        self.assertIn('"strip_path_prefix": "/schaubild"', static_json)
-        self.assertIn('"root": "/srv/schauwerk-editor-release"', static_json)
-        self.assertNotIn("/srv/schauwerk-editor-root/current", static_json)
-        self.assertIn('"handler": "file_server"', static_json)
+        proxied_json = json.dumps(proxied, sort_keys=True)
+        self.assertIn('"strip_path_prefix": "/schaubild"', proxied_json)
+        self.assertIn('"handler": "reverse_proxy"', proxied_json)
+        self.assertIn('"dial": "schaubild:8765"', proxied_json)
+        self.assertIn('"Host": ["127.0.0.1:8765"]', proxied_json)
+        self.assertNotIn('"handler": "file_server"', proxied_json)
+        self.assertNotIn("/srv/schauwerk-editor-release", proxied_json)
 
     def test_vps_legacy_redirect_precedes_catchall_static_handle_after_adapt(self) -> None:
         routes = app_routes(adapt("infra/caddy/Caddyfile.vps"), "commonthing.net")
@@ -293,7 +295,7 @@ class StaticAppCaddyAdaptedCspTest(unittest.TestCase):
                             "style-src": ("'self'",),
                             "img-src": ("'self'", "data:", "blob:"),
                             "frame-src": ("https://embed.diagrams.net",),
-                            "connect-src": ("'none'",),
+                            "connect-src": ("'self'",),
                             "object-src": ("'none'",),
                             "base-uri": ("'none'",),
                             "form-action": ("'none'",),

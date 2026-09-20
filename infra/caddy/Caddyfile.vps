@@ -79,18 +79,22 @@
 		file_server
 	}
 
-	# Schauwerk is deployed as a separately versioned static artifact. Keep the
-	# product release outside the Weltgewebe web build and expose only this
-	# dedicated path through the shared HTTPS edge.
+	# Schaubild is a separately versioned, digest-pinned Schauwerk runtime.
+	# Caddy owns public HTTPS and strips /schaubild before forwarding to the
+	# private sidecar; the runtime still emits public URLs under /schaubild.
 	@schauwerkRoot path /schaubild
 	handle @schauwerkRoot {
 		redir * /schaubild/ 308
 	}
 
 	handle_path /schaubild/* {
-		root * /srv/schauwerk-editor-release
-		header Cache-Control "no-store"
-		file_server
+		reverse_proxy schaubild:8765 {
+			# The sidecar accepts client identity only from this trusted Caddy hop.
+			# Strip any client-supplied forwarding chain and send exactly one peer IP.
+			header_up Host 127.0.0.1:8765
+			header_up -Forwarded
+			header_up X-Forwarded-For {remote_host}
+		}
 	}
 
 	# Legacy static filenames must never reach the SvelteKit document. The
@@ -148,7 +152,7 @@
 	}
 	header @nonDocumentResponse >Content-Security-Policy "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 	@schauwerkResponse path /schaubild /schaubild/*
-	header @schauwerkResponse >Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src https://embed.diagrams.net; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+	header @schauwerkResponse >Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 	@frontendResponse {
 		not path /api/* /health/* /schaubild /schaubild/*
 	}
