@@ -216,11 +216,16 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             path.name for path in (ROOT / "scripts/platform").glob("*.py")
         }
         base_commit = os.environ.get("STAGING_CONTRACTION_BASE_SHA")
+        if base_commit is None and os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
+            event_path = os.environ.get("GITHUB_EVENT_PATH")
+            if not event_path:
+                self.fail("GITHUB_EVENT_PATH is required for pull_request ratchet")
+            try:
+                event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+                base_commit = event["pull_request"]["base"]["sha"]
+            except (OSError, KeyError, TypeError, json.JSONDecodeError):
+                self.fail("pull_request event does not provide an exact base SHA")
         if base_commit is None:
-            if os.environ.get("GITHUB_ACTIONS") == "true":
-                self.fail(
-                    "STAGING_CONTRACTION_BASE_SHA is required in GitHub Actions"
-                )
             merge_base = subprocess.run(
                 ["git", "merge-base", "HEAD", "origin/main"],
                 cwd=ROOT,
@@ -289,12 +294,59 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         with mock.patch.object(
             os,
             "environ",
-            {"GITHUB_ACTIONS": "true"},
+            {
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_EVENT_NAME": "pull_request",
+            },
         ), self.assertRaisesRegex(
             AssertionError,
-            "STAGING_CONTRACTION_BASE_SHA is required",
+            "GITHUB_EVENT_PATH is required",
         ):
             self.test_staging_cell_contraction_ratchet()
+
+    def test_staging_cell_contraction_ratchet_reads_pr_base_from_event(self) -> None:
+        base_commit = "a" * 40
+        current_source = STAGING_CELL_PATH.read_text(encoding="utf-8")
+        current_modules = sorted(
+            path.as_posix()
+            for path in (ROOT / "scripts/platform").glob("*.py")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            event_path = Path(tmp) / "event.json"
+            event_path.write_text(
+                json.dumps(
+                    {"pull_request": {"base": {"sha": base_commit}}}
+                ),
+                encoding="utf-8",
+            )
+            show = mock.Mock(returncode=0, stdout=current_source)
+            tree = mock.Mock(returncode=0, stdout="\n".join(current_modules))
+            with mock.patch.object(
+                os,
+                "environ",
+                {
+                    "GITHUB_ACTIONS": "true",
+                    "GITHUB_EVENT_NAME": "pull_request",
+                    "GITHUB_EVENT_PATH": str(event_path),
+                },
+            ), mock.patch.object(
+                subprocess,
+                "run",
+                side_effect=[show, tree],
+            ) as run:
+                self.test_staging_cell_contraction_ratchet()
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [
+                "git",
+                "show",
+                f"{base_commit}:scripts/platform/staging_cell.py",
+            ],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0][4],
+            base_commit,
+        )
 
     def test_staging_cell_contraction_guard_fails_closed_on_growth(self) -> None:
         base = (
