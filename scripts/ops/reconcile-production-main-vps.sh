@@ -320,7 +320,7 @@ verify_public_schauwerk_runtime() {
       echo "public Schaubild runtime container health is '${live_health:-missing}'" >&2
       return 1
     fi
-    if (( health_attempt < 120 )); then
+    if ((health_attempt < 120)); then
       sleep 1
     fi
   done
