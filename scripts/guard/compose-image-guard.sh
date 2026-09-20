@@ -11,6 +11,7 @@ fi
 uv run --project "$TOOLING_ROOT/tools/py" --locked python - "$REPO_ROOT" << 'PY'
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -30,6 +31,41 @@ else:
 
 image_re = re.compile(r"^\s*image:\s*([^\s#]+)")
 digest_re = re.compile(r"@sha256:[0-9a-f]{64}$")
+schauwerk_dynamic_image_line = (
+    "image: ${SCHAUWERK_SCHAUBILD_IMAGE:?SCHAUWERK_SCHAUBILD_IMAGE must be set}"
+)
+
+
+def validate_schauwerk_runtime_lock() -> str | None:
+    lock_path = root / "infra" / "schauwerk-editor" / "release-lock.json"
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"cannot read Schaubild runtime lock: {exc}"
+    required = {
+        "schema_version",
+        "source_repository",
+        "source_commit",
+        "image_repository",
+        "image_digest",
+        "public_base_path",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        return "Schaubild runtime lock field matrix is invalid"
+    if payload.get("schema_version") != "weltgewebe-schauwerk-runtime-lock.v1":
+        return "Schaubild runtime lock schema is invalid"
+    if payload.get("source_repository") != "heimgewebe/schauwerk":
+        return "Schaubild runtime lock source repository is invalid"
+    if not re.fullmatch(r"[0-9a-f]{40}", str(payload.get("source_commit", ""))):
+        return "Schaubild runtime lock source commit is invalid"
+    if payload.get("image_repository") != "ghcr.io/heimgewebe/schauwerk-schaubild":
+        return "Schaubild runtime lock image repository is invalid"
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(payload.get("image_digest", ""))):
+        return "Schaubild runtime lock image digest is invalid"
+    if payload.get("public_base_path") != "/schaubild":
+        return "Schaubild runtime lock public base path is invalid"
+    return None
+
 
 for path in sorted(compose_dir.glob("*.y*ml")):
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -44,6 +80,14 @@ for path in sorted(compose_dir.glob("*.y*ml")):
                 failures.append(f"{rel}:{line_no} malformed API image contract")
             continue
         if "${" in image:
+            if (
+                rel == Path("infra/compose/compose.vps.override.yml")
+                and line.strip() == schauwerk_dynamic_image_line
+            ):
+                lock_error = validate_schauwerk_runtime_lock()
+                if lock_error is not None:
+                    failures.append(f"{rel}:{line_no} {lock_error}")
+                continue
             failures.append(f"{rel}:{line_no} variable image reference is not statically reviewable: {image}")
             continue
         if ":latest" in image or ":-latest" in image:
