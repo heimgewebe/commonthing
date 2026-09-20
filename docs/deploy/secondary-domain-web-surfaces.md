@@ -5,7 +5,7 @@ doc_type: reference
 status: active
 summary: >
   Definiert das Weltweberei-Webartefakt und den verhaltensorientierten
-  Handoff an den externen Heimserver-Edge für weltweb.net und weltweberei.org.
+  Handoff an einen separat zu bindenden aktiven Edge für weltweb.net und weltweberei.org.
 relations:
   - type: relates_to
     target: docs/deploy/README.md
@@ -20,12 +20,12 @@ relations:
 # Sekundäre Domain-Webflächen
 
 Dieses Dokument beschreibt das repo-seitige Webartefakt für `weltweberei.org`
-und den Handoff-Vertrag an den externen Heimserver-Edge für `weltweb.net`
+und den Handoff-Vertrag an einen separat zu bindenden aktiven Edge für `weltweb.net`
 (permanenter Redirect) und `weltweberei.org` (statische Informationsfläche).
 
 Es ist ein **Artefakt- und Handoff-Vertrag**, kein Beleg für öffentliche
-Einsatzbereitschaft. Der tatsächliche öffentliche Cutover ist Folgearbeit im
-Repo `heimgewebe/heimserver` und anschließende Operatorarbeit.
+Einsatzbereitschaft. Der tatsächliche öffentliche Cutover erfordert zuerst eine
+separate, aktuelle Owner-Entscheidung für den Edge und anschließend Operatorarbeit.
 
 ## 1. Eigentumsgrenzen
 
@@ -37,12 +37,7 @@ Repo `heimgewebe/heimserver` und anschließende Operatorarbeit.
 - den Build- und Browser-Proof;
 - den verhaltensorientierten Handoff-Vertrag.
 
-`heimgewebe/heimserver` besitzt:
-
-- das operative Edge-Template;
-- die konkrete Caddy-Syntax;
-- die Validierungs- und Synchronisierungsmechanismen;
-- den Runbook-Vertrag für den Edge-Cutover.
+Für die Edge-Implementierung ist in diesem Dokument **kein aktuelles Owner-Repo** gebunden. Das physisch gelöschte Repository `heimgewebe/heimserver` ist nur historische Provenienz und besitzt keine aktuelle Owner-, Merge- oder Runtime-Autorität. Vor einer Aktivierung muss ein separates, aktuelles Owner-Repo bzw. eine autorisierte Betriebsfläche festgelegt und belegt werden.
 
 Der Operator besitzt:
 
@@ -62,8 +57,8 @@ in diesem Slice nicht belegt und bleibt Operatorarbeit.
 Der Quell- und Buildpfad wird durch diesen PR belegt.
 
 Host- und Edge-Mounts werden durch eingecheckte Integrations- und
-Deploymentverträge beschrieben. Sie sind in diesem Slice nicht gegen die
-aktive Heimserver-Laufzeit verifiziert und stellen daher keinen
+Deploymentverträge beschrieben. Sie sind in diesem Slice nicht gegen eine
+aktive Edge-Laufzeit verifiziert und stellen daher keinen
 Runtime-Nachweis dar.
 
 ### Durch diesen PR belegt
@@ -112,16 +107,14 @@ erst nach belegtem HTTPS-, Edge-, DNS- und Publikationsgate ändern.
 
 Die Aktivierungsreihenfolge ist:
 
-1. Das Repo `heimgewebe/heimserver` implementiert und validiert den
-   Edge-Vertrag.
+1. Eine separate Owner-Entscheidung bindet eine aktuelle Implementierungsfläche, die den Edge-Vertrag implementiert und validiert.
 2. Der Operator belegt Deployment, HTTPS, DNS und öffentliche Runtime.
 3. Erst danach aktualisiert ein separater PR in `heimgewebe/commonthing`
    Robots-Metadaten, Canonical-Link, Browser-Proof und Task-Evidenz.
 
 ## 4. Vorgesehener späterer Edge-Vertrag
 
-Die konkrete Edge- und Caddy-Implementierung gehört ausschließlich in das
-Owner-Repo `heimgewebe/heimserver`.
+Die konkrete Edge- und Caddy-Implementierung gehört ausschließlich in eine separat gebundene, aktuell autorisierte Owner-Fläche. Das gelöschte Repository `heimgewebe/heimserver` ist dafür kein gültiger Zielpfad.
 
 Dieses Dokument definiert nur das von außen beobachtbare Zielverhalten und
 den Artefakt-Handoff. Es ist weder eine aktive Edge-Konfiguration noch eine
@@ -129,7 +122,7 @@ Copy-Paste-Vorlage für den Betrieb.
 
 ### `weltweb.net`
 
-Der spätere Heimserver-Edge muss folgendes Verhalten herstellen und
+Der spätere Edge muss folgendes Verhalten herstellen und
 automatisiert prüfen:
 
 - HTTP-Anfragen werden auf das kanonische HTTPS-Ziel umgeleitet.
@@ -142,7 +135,7 @@ automatisiert prüfen:
 
 ### `weltweberei.org`
 
-Der spätere Heimserver-Edge muss folgendes Verhalten herstellen und
+Der später separat autorisierte Edge muss folgendes Verhalten herstellen und
 automatisiert prüfen:
 
 - HTTP-Anfragen werden dauerhaft auf HTTPS derselben Domain umgeleitet.
@@ -180,10 +173,11 @@ Sie dürfen im späteren Edge-PR nicht still ergänzt werden.
 
 ## 5. Explizit offene Punkte
 
-- aktives `/opt/heimgewebe/edge/Caddyfile` noch nicht als Target-Proof gelesen;
+- `/opt/heimgewebe/edge/Caddyfile` ist nur historischer Target-Kontext; kein aktueller
+  Owner- oder Runtime-Proof ist daran gebunden;
 - aktiver Edge-Compose-Stand noch nicht belegt;
 - aktiver Mount noch nicht live geprüft;
-- Heimserver-PR noch nicht umgesetzt;
+- aktueller Edge-Owner und zugehöriger Implementierungs-PR noch nicht gebunden;
 - Caddy noch nicht validiert oder neu geladen;
 - INWX-Delegation noch nicht geändert;
 - öffentlicher HTTPS-Endzustand noch nicht belegt;
@@ -211,8 +205,8 @@ Der Coding-Agent darf dafür keine Privatdaten oder Rechtstexte erfinden.
 ## 7. Epistemische Grenze
 
 ```text
-infra/caddy/Caddyfile.prod darf nicht als aktive öffentliche Frontdoor des
-aktuellen Heimserver-Deployments ausgegeben werden.
+infra/caddy/Caddyfile.prod darf nicht als aktive öffentliche Frontdoor
+eines aktiven Deployments ausgegeben werden.
 
 In diesem Slice ist weder seine aktive Verwendung noch seine
 Übereinstimmung mit /opt/heimgewebe/edge/Caddyfile belegt.

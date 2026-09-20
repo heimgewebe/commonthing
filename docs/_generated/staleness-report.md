@@ -12,7 +12,7 @@ Generated automatically. Do not edit.
 
 > This report is metadata-based. It does not infer semantic staleness from prose.
 
-Explicitly stale documents: **47**
+Explicitly stale documents: **48**
 
 | Document | status | lifecycle_state |
 | --- | --- | --- |
@@ -28,6 +28,7 @@ Explicitly stale documents: **47**
 | `docs/blueprints/weltgewebe.auth-and-ui-routing.md` | deprecated | — |
 | `docs/blueprints/weltgewebe.config.diff.md` | deprecated | — |
 | `docs/blueprints/weltgewebe.deploy.plan.md` | deprecated | — |
+| `docs/deploy/heim-first-phase0.md` | deprecated | — |
 | `docs/deploy/heimserver.deployment.md` | deprecated | — |
 | `docs/deploy/heimserver.integration.md` | deprecated | — |
 | `docs/deploy/weltgewebe.naming.md` | superseded | — |

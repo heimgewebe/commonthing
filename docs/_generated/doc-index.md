@@ -47,7 +47,7 @@ Generated automatically. Do not edit.
 | deploy.commonthing.naming | commonThing Naming Policy | reference | active | docs/deploy/commonthing.naming.md |
 | deploy.domain-mail-migration-ionos-inwx-mailbox-brevo | Architektur & Historie: Domain-/Mail-Migration IONOS zu INWX | reference | active | docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md |
 | deploy.germany-basemap-rollout | Deutschlandweite PMTiles-Basemap ausrollen | runbook | active | docs/deploy/germany-basemap-rollout.md |
-| deploy.heim-first-phase0 | Heim-First Phase 0 | reference | active | docs/deploy/heim-first-phase0.md |
+| deploy.heim-first-phase0 | Heim-First Phase 0 | reference | deprecated | docs/deploy/heim-first-phase0.md |
 | deploy.heimserver.deployment | Heimserver Deployment | reference | deprecated | docs/deploy/heimserver.deployment.md |
 | deploy.heimserver.integration | Heimserver Integration | reference | deprecated | docs/deploy/heimserver.integration.md |
 | deploy.map-html-canonical-route | Canonical Map Route Contract | runbook | active | docs/deploy/map-html-canonical-route.md |

@@ -30,7 +30,7 @@ Heimserver-Pfad ist retired/deprecated und kein Produktionsziel mehr.
 
 - [VPS-Deployment](vps.md) – kanonisches Produktionsrunbook für `commonserver`
 - [Domain-/Providerarchitektur und historischer DDNS-Pfad](domain-mail-migration-ionos-to-inwx-mailbox-brevo.md) – Providerstand, stillgelegter Heimberry-Schreibpfad und Runtime-Beweisgrenze
-- [Sekundäre Domain-Webflächen](secondary-domain-web-surfaces.md) – Artefakt- und Handoff-Vertrag für die Weltweberei-Informationsfläche und den späteren Heimserver-Edge (keine öffentliche Einsatzbereitschaft)
+- [Sekundäre Domain-Webflächen](secondary-domain-web-surfaces.md) – Artefakt- und Handoff-Vertrag für die Weltweberei-Informationsfläche und einen später separat zu bindenden Edge (keine öffentliche Einsatzbereitschaft)
 - [Deployment-Änderungsprotokoll](./CHANGELOG.md) – Infrastrukturänderungen und deren Auswirkungen
 - [Drift-Taxonomie & Guard-Policy](./DRIFT_POLICY.md) – Klassifizierung und Handling von Drift
 
@@ -147,7 +147,7 @@ Schalter verwaltet.
   - **nicht** host-published
 - **Caddy**
   - routet innerhalb des Stacks
-  - **nicht** host-published im produktiven Heimserver-Deployment
+  - **nicht** host-published im optionalen lokalen Edge-Profil
 
 **Konsequenz:**
 Health-Checks dürfen **nicht** über `127.0.0.1:8080` (Host) erfolgen, sondern müssen container-intern laufen.
@@ -429,21 +429,20 @@ Der Check gibt nur Status- und Presence-Metadaten aus, keine SMTP-Werte.
 
 ---
 
-## 10. Heimserver-Policy
+## 10. Lokales Edge-Profil
 
-Für den Betrieb auf einem Heimserver (z. B. hinter einer Firewall oder in einem lokalen Netzwerk) gilt ein striktes **Gateway-Prinzip**.
+Für ein ausdrücklich reaktiviertes lokales Edge-Profil (z. B. hinter einer Firewall oder in einem lokalen Netzwerk) gilt ein striktes **Gateway-Prinzip**. Dieses Profil ist **nicht** der aktuelle Produktionspfad; das physisch gelöschte Repository `heimgewebe/heimserver` besitzt keine Owner- oder Runtime-Autorität.
 
 ### Grundsätze
 
 1. **Internal-Only Stack:**
-   Weltgewebe ist im Heimserver-Produktionspfad internal-only. Die Frontdoor (Reverse Proxy mit den Ports 80 und 443) wird
-   durch den Heimserver-Edge bereitgestellt.
+   commonThing bleibt in einem solchen lokalen Edge-Profil internal-only. Eine Frontdoor (Reverse Proxy mit den Ports 80 und 443) darf nur durch einen separat belegten, aktuell autorisierten Edge bereitgestellt werden.
    Das `weltgewebe-up` Script (Deployment Härtung) erzwingt dies auf API-Ebene fail-closed: Der *Host-Port Drift Guard*
    verhindert aktiv Deployments, bei denen der `api`-Service unzulässige Host-Ports (wie z.B. `8081`) exponiert.
 
 2. **Referenzkonfiguration & Frontdoor:**
    `infra/caddy/Caddyfile.heim` dient als *repo-interne Referenz* für das Routing. Die operativ wirksame Frontdoor
-   (Edge-Caddyfile) wird jedoch im Heimserver-Repository konfiguriert und durchgesetzt.
+   (Edge-Caddyfile) benötigt jedoch einen ausdrücklich aktuellen Owner und separaten Runtime-Beleg; aus dem historischen Heimserver-Repository entsteht keine Autorität.
 
 3. **Guards & Failure Bundles:**
    Das Deployment wird durch preflight `Guards` geschützt, z.B. CSP Contract Static Checks und Host-Port Prüfungen.
@@ -456,7 +455,7 @@ Für den Betrieb auf einem Heimserver (z. B. hinter einer Firewall oder in einem
 
 ### Einrichtung & Lokale Upstreams
 
-1. **Netzwerk erstellen (Heimserver-Infrastruktur):**
+1. **Netzwerk erstellen (optionales lokales Edge-Profil):**
    Damit externe Edge-Proxys oder Upstreams (z.B. Leitstand) sicher mit Weltgewebe kommunizieren können, wird ein
    dediziertes Netzwerk genutzt (statt Host-Ports).
 
@@ -465,7 +464,7 @@ Für den Betrieb auf einem Heimserver (z. B. hinter einer Firewall oder in einem
    ```
 
 2. **Lokale Edge-Simulation (Optionaler Override):**
-   In Produktion übernimmt der Heimserver-Edge (außerhalb dieses Stacks) das Proxy-Routing.
+   In einem ausdrücklich aktivierten lokalen Edge-Profil übernimmt ein separat belegter Edge (außerhalb dieses Stacks) das Proxy-Routing.
    Für lokale Integrations- und Debug-Tests ohne reale Edge-Infrastruktur kann das Heimnet
    angebunden und die Referenz-Konfiguration lokal simuliert werden:
 
@@ -477,7 +476,7 @@ Für den Betrieb auf einem Heimserver (z. B. hinter einer Firewall oder in einem
    ```
 
 > **Hinweis für lokales Debugging (ohne Edge-Proxy):**
-> Sollte der Stack *außerhalb* des Heimserver-Produktionspfades (z.B. für reine lokale Entwicklung) gestartet werden,
+> Sollte der Stack für reine lokale Entwicklung ohne separates Edge-Profil gestartet werden,
 > bindet Caddy standardmäßig sicher an `127.0.0.1`. Setze `CADDY_BIND=0.0.0.0` (oder eine LAN-IP) in deiner
 > `.env`-Datei, wenn du direkten Zugriff auf den Stack-internen Caddy benötigst. In Produktion übernimmt das Routing
 > der Edge-Proxy.
