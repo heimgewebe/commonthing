@@ -315,7 +315,44 @@ test.describe("Garnrolle marker rendering", () => {
         ];
 
         const settle = async () => {
-          await new Promise((resolve) => setTimeout(resolve, 220));
+          // Wait for all marker artwork to exist before observing transitions.
+          // The old fixed 220 ms sleep mixed initial render latency with the
+          // 180 ms CSS scale transition and became flaky on busy CI runners.
+          const deadline = performance.now() + 2_000;
+          let visuals: HTMLElement[] = [];
+          while (performance.now() < deadline) {
+            const candidates = targets.map(({ testId }) =>
+              document
+                .querySelector<HTMLElement>(`[data-testid="${testId}"]`)
+                ?.querySelector<HTMLElement>(".map-marker__visual"),
+            );
+            if (
+              candidates.every(
+                (visual) => visual !== null && visual !== undefined,
+              )
+            ) {
+              visuals = candidates as HTMLElement[];
+              break;
+            }
+            await new Promise<void>((resolve) =>
+              requestAnimationFrame(() => resolve()),
+            );
+          }
+          if (visuals.length !== targets.length) {
+            throw new Error(
+              "marker artwork did not render before transition wait",
+            );
+          }
+
+          // Give the zoom-driven scale write a render turn, then wait for the
+          // browser's actual CSS transitions instead of guessing wall time.
+          await new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          );
+          const animations = visuals.flatMap((visual) =>
+            visual.getAnimations(),
+          );
+          await Promise.all(animations.map((animation) => animation.finished));
           await new Promise<void>((resolve) =>
             requestAnimationFrame(() => resolve()),
           );
@@ -445,7 +482,12 @@ test.describe("Garnrolle marker rendering", () => {
 
       element.classList.add("is-selected");
       try {
-        await new Promise((resolve) => setTimeout(resolve, 220));
+        await new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        );
+        await Promise.all(
+          visual.getAnimations().map((animation) => animation.finished),
+        );
         await new Promise<void>((resolve) =>
           requestAnimationFrame(() => resolve()),
         );
