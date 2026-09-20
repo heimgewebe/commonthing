@@ -34,6 +34,7 @@ permissions:
       - "docs/runbooks/gewebezelle-manual-pilot.md"
       - "docs/runbooks/gewebezelle-two-operator-pilot-v1.md"
       - "docs/proofs/gewebezelle-two-operator-pilot-contract-v1.md"
+      - "docs/proofs/kubernetes-staging-cell/**"
       - "docs/tasks/board.md"
       - "Makefile"
       - "tools/py/**"
@@ -84,6 +85,8 @@ jobs:
           scripts/platform/ha_reference.py
           scripts/security/trivy_rendered_manifests.py
       - name: Run platform contract tests
+        env:
+          STAGING_CONTRACTION_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: >-
           uv run --project tools/py --locked python -m unittest
           scripts.ci.tests.test_kubernetes_platform_contract
@@ -93,6 +96,35 @@ jobs:
           scripts.ci.tests.test_kubernetes_ha_contract
           scripts.ci.tests.test_trivy_rendered_manifests
           scripts.ci.tests.test_kubernetes_python_bootstrap
+      - name: Validate staging evidence-only commit
+        run: |
+          set -euo pipefail
+          evidence_root="docs/proofs/kubernetes-staging-cell"
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          merge_commit="$(git rev-parse HEAD)"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          git checkout --detach "$head_sha"
+          if git diff --quiet "$base_sha"...HEAD -- "$evidence_root"; then
+            :
+          else
+            diff_rc="$?"
+            if [ "$diff_rc" -ne 1 ]; then
+              echo "failed to compare staging evidence against exact PR base" >&2
+              exit "$diff_rc"
+            fi
+            for name in identity.json record.json proof.json attestation.json; do
+              test -f "$evidence_root/$name"
+            done
+            uv run --project tools/py --locked python \
+              scripts/platform/proof_identity.py \
+              validate-evidence-commit \
+              --identity "$evidence_root/identity.json" \
+              --record "$evidence_root/record.json" \
+              --proof "$evidence_root/proof.json" \
+              --attestation "$evidence_root/attestation.json" \
+              --expected-base-commit "$base_sha"
+          fi
+          git checkout --detach "$merge_commit"
       - name: Render and validate all platform targets
         run: uv run --project tools/py --locked python scripts/platform/validate_platform.py --render
 

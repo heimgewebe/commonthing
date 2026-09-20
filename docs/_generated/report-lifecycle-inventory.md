@@ -140,7 +140,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/github-action-ref-pinning-audit.md | report | active | active | audit | OPT-INF-002 | 2026-09-30 |  | not_decision_relevant | 0 | 4 | 4 |  |  |
 | docs/reports/github-actions-node24-readiness.md | report | active | active | audit | OPT-CI-005 | 2026-09-29 |  | not_decision_relevant | 2 | 4 | 5 |  |  |
 | docs/reports/inwx-zone-reconciliation-plan.md | report | deprecated | archived | planning | DEPLOY-DNS-001 |  |  | deprecated | 1 | 5 | 4 | review_after |  |
-| docs/reports/kubernetes-platform-foundation-status.md | status | active |  |  | WELTGEWEBE-OS-006 | 2026-08-16 |  | not_decision_relevant | 1 | 5 | 7 | lifecycle, lifecycle_state |  |
+| docs/reports/kubernetes-platform-foundation-status.md | status | active |  |  | WELTGEWEBE-OS-006 | 2026-10-19 |  | not_decision_relevant | 1 | 5 | 7 | lifecycle, lifecycle_state |  |
 | docs/reports/map-architekturkritik.md | report | deprecated | archived | audit | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | deprecated | 4 | 5 | 2 |  |  |
 | docs/reports/map-basemap-proof-gap-reconciliation.md | report | deprecated | archived | audit | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | deprecated | 2 | 6 | 6 |  |  |
 | docs/reports/map-status-matrix.md | status-matrix | deprecated | archived |  |  |  |  | deprecated | 8 | 6 | 3 | lifecycle, owner_task, review_after |  |
@@ -891,12 +891,12 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "The correctness of claims inside individual reports, runtime use of declared consumers, or deployment truth."
   ],
-  "generated_at": "2026-09-11T07:02:42+02:00",
+  "generated_at": "2026-09-19T22:18:16+02:00",
   "limitations": [
     "The inventory evaluates repository metadata, exact path references and declared control contracts, not runtime behaviour."
   ],
   "schema_version": 1,
-  "source_revision": "62574177681d11af736ad76104a4a55d2c62ae78",
+  "source_revision": "5fdbdfcf412f9ea1187ed9f1abd0f670af14d9c0",
   "sources": [
     {
       "path": ".wgx/generated-artifacts.yml",
@@ -1056,7 +1056,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/kubernetes-platform-foundation-status.md",
-      "sha256": "4377b5d352139c75a53668fc868c430af5ccd1224a610387bed730ace62fc722"
+      "sha256": "25aaddadaaef9e0b3ddbf8052a8b84329bfb5277d79ec6e7161715ae62799efd"
     },
     {
       "path": "docs/reports/map-architekturkritik.md",
