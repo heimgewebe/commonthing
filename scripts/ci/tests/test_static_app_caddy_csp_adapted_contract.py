@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -10,8 +11,8 @@ import subprocess
 import unittest
 
 REPO = Path(__file__).resolve().parents[3]
+RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 CADDY_BINARY = shutil.which("caddy")
-DOCKER_BINARY = shutil.which("docker")
 CADDY_DOCKER_IMAGE = "caddy:2.8.4"
 MAGIC_LINK_CONFIRM_PATH = "/api/auth/magic-link/consume"
 STRICT_POLICY = "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
@@ -52,6 +53,32 @@ CASES = (
     ("infra/caddy/Caddyfile.heim", "weltgewebe.home.arpa", ["/api/*"]),
     ("infra/caddy/Caddyfile.vps", "commonthing.net", ["/api/*", "/health/*"]),
 )
+
+
+def _usable_docker() -> str | None:
+    """Docker-Pfad nur, wenn auch der Daemon erreichbar ist.
+
+    shutil.which findet die CLI auch dort, wo kein Daemon läuft (Container ohne
+    gemounteten Socket, rootless-Setups ohne Session). Die Tests unten fallen
+    dann nicht in den Skip, sondern scheitern mit einem Verbindungsfehler, der
+    wie eine echte Regression aussieht.
+    """
+    binary = shutil.which("docker")
+    if binary is None:
+        return None
+    try:
+        probe = subprocess.run(
+            [binary, "info"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return binary if probe.returncode == 0 else None
+
+
+DOCKER_BINARY = _usable_docker()
 
 
 def adapt(relative: str) -> dict:
@@ -137,10 +164,18 @@ def directive_map(policy: str) -> dict[str, tuple[str, ...]]:
 
 
 @unittest.skipUnless(
-    CADDY_BINARY or DOCKER_BINARY,
+    CADDY_BINARY or DOCKER_BINARY or RUNNING_IN_GITHUB_ACTIONS,
     "caddy binary or docker required for semantic adaptation tests",
 )
 class StaticAppCaddyAdaptedCspTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if RUNNING_IN_GITHUB_ACTIONS and not (CADDY_BINARY or DOCKER_BINARY):
+            raise AssertionError(
+                "GitHub Actions requires a caddy binary or reachable Docker daemon "
+                "for semantic adaptation tests"
+            )
+
     def test_legacy_map_html_redirect_adapts_on_vps_and_container_edges(self) -> None:
         for relative in ("infra/caddy/Caddyfile.vps", "apps/web/Caddyfile.container"):
             with self.subTest(caddyfile=relative):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -21,6 +22,7 @@ from scripts.docmeta.report_lifecycle_requirements import (
     truth_contract_markdown,
     validate_truth_contract,
 )
+from scripts.docmeta.report_lifecycle_requirements import _canonical_iso_timestamp
 
 
 class TestReportLifecycleRequirements(unittest.TestCase):
@@ -469,6 +471,103 @@ class TestSourceRevisionMetadata(unittest.TestCase):
             self.assertEqual(revision, source_revision)
             self.assertFalse(fresh)
 
+
+    def test_commit_timestamp_spelling_is_canonical(self) -> None:
+        """Generierte Artefakte dürfen nicht von der git-Version abhängen.
+
+        `git show -s --format=%cI` liefert einen Nullversatz je nach Version
+        als `+00:00` oder als `Z`. Landete das roh im Artefakt, wäre dessen
+        Inhalt nicht mehr reproduzierbar: `validate_generated_artifacts`
+        meldete einen Diff, sobald Erzeugung und Prüfung auf unterschiedlichen
+        git-Versionen liefen.
+        """
+        self.assertEqual(
+            _canonical_iso_timestamp("2026-08-24T17:04:00Z"),
+            _canonical_iso_timestamp("2026-08-24T17:04:00+00:00"),
+        )
+        self.assertEqual(
+            _canonical_iso_timestamp("2026-08-24T17:04:00Z"),
+            "2026-08-24T17:04:00+00:00",
+        )
+        self.assertEqual(
+            _canonical_iso_timestamp("2026-09-11T07:02:42+02:00"),
+            "2026-09-11T07:02:42+02:00",
+        )
+        # Ohne Zeitzone oder unparsbar bleibt es fail-closed.
+        self.assertIsNone(_canonical_iso_timestamp("2026-08-24T17:04:00"))
+        self.assertIsNone(_canonical_iso_timestamp("not-a-timestamp"))
+
+    def test_generated_at_matches_revision_across_utc_offset_spellings(self) -> None:
+        """Zero-offset commits: `+00:00` und `Z` sind derselbe Zeitpunkt.
+
+        `git show -s --format=%cI` schreibt einen Nullversatz je nach
+        git-Version als `+00:00` oder als `Z`. Ein Stringvergleich machte aus
+        dieser Schreibweise einen `generated_at_revision_mismatch`, obwohl die
+        Provenance korrekt war.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            source = root / "source.md"
+            source.write_text("source v1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "source.md"], cwd=root, check=True)
+            utc_date = "2026-08-24T17:04:00 +0000"
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "source"],
+                cwd=root,
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_DATE": utc_date,
+                    "GIT_COMMITTER_DATE": utc_date,
+                },
+            )
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+            def contract_for(generated_at: str) -> dict[str, object]:
+                return build_truth_contract(
+                    status="pass",
+                    scope="one exact source",
+                    complete=True,
+                    fresh=True,
+                    method="exact",
+                    checked_items=1,
+                    total_items=1,
+                    failures=0,
+                    source_revision=revision,
+                    generated_at=generated_at,
+                    sources=[{"path": "source.md", "sha256": digest}],
+                    limitations=["repository-only"],
+                    does_not_establish=["runtime_health"],
+                )
+
+            # Beide Schreibweisen müssen durchgehen, unabhängig davon, welche
+            # das lokale git erzeugt.
+            for spelling in ("2026-08-24T17:04:00+00:00", "2026-08-24T17:04:00Z"):
+                with self.subTest(spelling=spelling):
+                    self.assertNotIn(
+                        "generated_at_revision_mismatch",
+                        validate_truth_contract(contract_for(spelling), root=root),
+                    )
+
+            # Ein echter Zeitpunktunterschied bleibt ein Befund.
+            self.assertIn(
+                "generated_at_revision_mismatch",
+                validate_truth_contract(contract_for("2026-08-24T17:04:01Z"), root=root),
+            )
 
     def test_shallow_history_stays_read_only_and_is_explicitly_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

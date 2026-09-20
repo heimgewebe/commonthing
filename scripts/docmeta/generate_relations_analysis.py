@@ -243,8 +243,8 @@ def write_output(edges, all_docs, stats, cycles, warnings, out_file=None):
 
         # Overview
         f.write("### Übersicht\n\n")
-        f.write(f"| Metrik | Wert |\n")
-        f.write(f"| --- | --- |\n")
+        f.write("| Metrik | Wert |\n")
+        f.write("| --- | --- |\n")
         f.write(f"| Dokumente gesamt | {len(all_docs)} |\n")
         f.write(f"| Dokumente mit ausgehenden Relationen | {docs_with_relations} |\n")
         f.write(f"| Dokumente als Ziel referenziert | {docs_as_targets} |\n")

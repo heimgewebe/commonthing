@@ -209,7 +209,9 @@ Achsen E und F: konditioniert — wenn inaktiv, explizit als „nicht anwendbar"
 ### D. Runtime vs. Dokumentation
 
 - Behauptung ≠ Implementierung? Tote Dokumentation?
-- Ist `docs/_generated/architecture-drift.md` relevant?
+- Zeigt `docs/_generated/impl-index.md` nicht dokumentierte Implementierungen?
+  Es gibt keinen automatischen Drift-Report: strukturelle Drift ist hier von
+  Hand zu belegen.
 
 → Pflichtstruktur §7 / Punkt 2 (Diagnose) + Punkt 7 (Risikoanalyse: epistemisch)
 
