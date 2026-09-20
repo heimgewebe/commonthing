@@ -436,7 +436,7 @@ Für ein ausdrücklich reaktiviertes lokales Edge-Profil (z. B. hinter einer Fir
 ### Grundsätze
 
 1. **Internal-Only Stack:**
-   Weltgewebe bleibt in einem solchen lokalen Edge-Profil internal-only. Eine Frontdoor (Reverse Proxy mit den Ports 80 und 443) darf nur durch einen separat belegten, aktuell autorisierten Edge bereitgestellt werden.
+   commonThing bleibt in einem solchen lokalen Edge-Profil internal-only. Eine Frontdoor (Reverse Proxy mit den Ports 80 und 443) darf nur durch einen separat belegten, aktuell autorisierten Edge bereitgestellt werden.
    Das `weltgewebe-up` Script (Deployment Härtung) erzwingt dies auf API-Ebene fail-closed: Der *Host-Port Drift Guard*
    verhindert aktiv Deployments, bei denen der `api`-Service unzulässige Host-Ports (wie z.B. `8081`) exponiert.
 

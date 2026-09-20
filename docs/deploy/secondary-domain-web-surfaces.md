@@ -57,8 +57,8 @@ in diesem Slice nicht belegt und bleibt Operatorarbeit.
 Der Quell- und Buildpfad wird durch diesen PR belegt.
 
 Host- und Edge-Mounts werden durch eingecheckte Integrations- und
-Deploymentverträge beschrieben. Sie sind in diesem Slice nicht gegen die
-eine aktive Edge-Laufzeit verifiziert und stellen daher keinen
+Deploymentverträge beschrieben. Sie sind in diesem Slice nicht gegen eine
+aktive Edge-Laufzeit verifiziert und stellen daher keinen
 Runtime-Nachweis dar.
 
 ### Durch diesen PR belegt
@@ -135,7 +135,7 @@ automatisiert prüfen:
 
 ### `weltweberei.org`
 
-Der spätere Heimserver-Edge muss folgendes Verhalten herstellen und
+Der später separat autorisierte Edge muss folgendes Verhalten herstellen und
 automatisiert prüfen:
 
 - HTTP-Anfragen werden dauerhaft auf HTTPS derselben Domain umgeleitet.
@@ -173,7 +173,8 @@ Sie dürfen im späteren Edge-PR nicht still ergänzt werden.
 
 ## 5. Explizit offene Punkte
 
-- aktives `/opt/heimgewebe/edge/Caddyfile` noch nicht als Target-Proof gelesen;
+- `/opt/heimgewebe/edge/Caddyfile` ist nur historischer Target-Kontext; kein aktueller
+  Owner- oder Runtime-Proof ist daran gebunden;
 - aktiver Edge-Compose-Stand noch nicht belegt;
 - aktiver Mount noch nicht live geprüft;
 - aktueller Edge-Owner und zugehöriger Implementierungs-PR noch nicht gebunden;
