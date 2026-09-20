@@ -286,6 +286,7 @@ verify_public_schauwerk_runtime() {
   local container_id
   local live_image
   local live_health
+  local health_attempt
   local manifest_json
 
   [[ "$expected_image_ref" =~ ^ghcr\.io/heimgewebe/schauwerk-schaubild@sha256:[0-9a-f]{64}$ ]] || return 1
@@ -302,13 +303,29 @@ verify_public_schauwerk_runtime() {
   }
   container_id="$container_ids"
   live_image="$(docker inspect --format '{{.Config.Image}}' "$container_id")" || return 1
-  live_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id")" || return 1
   [[ "$live_image" == "$expected_image_ref" ]] || {
     echo "public Schaubild runtime image differs from reviewed digest" >&2
     return 1
   }
+
+  # A freshly recreated container can legitimately remain in Docker's
+  # "starting" health state through the configured 10s start period and first
+  # probes. Poll only that transient state; fail closed on any other state.
+  for ((health_attempt = 1; health_attempt <= 120; health_attempt++)); do
+    live_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id")" || return 1
+    if [[ "$live_health" == "healthy" ]]; then
+      break
+    fi
+    if [[ "$live_health" != "starting" ]]; then
+      echo "public Schaubild runtime container health is '${live_health:-missing}'" >&2
+      return 1
+    fi
+    if (( health_attempt < 120 )); then
+      sleep 1
+    fi
+  done
   [[ "$live_health" == "healthy" ]] || {
-    echo "public Schaubild runtime container is not healthy" >&2
+    echo "public Schaubild runtime container did not become healthy within 120 seconds" >&2
     return 1
   }
 

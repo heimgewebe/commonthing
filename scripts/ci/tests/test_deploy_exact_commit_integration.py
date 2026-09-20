@@ -420,6 +420,14 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                       printf 'ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n'
                       ;;
                     '{{if .State.Health}}{{.State.Health.Status}}{{end}}')
+                      if [[ "${TEST_SCHAUWERK_HEALTH_STARTING_ONCE:-0}" == "1" ]]; then
+                        health_state_file="$WELTGEWEBE_DEPLOY_STATE_ROOT/schaubild-health-probe-count"
+                        if [[ ! -e "$health_state_file" ]]; then
+                          : > "$health_state_file"
+                          printf 'starting\n'
+                          exit 0
+                        fi
+                      fi
                       printf 'healthy\n'
                       ;;
                     *)
@@ -2094,6 +2102,14 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("field matrix is invalid", result.stderr)
         self.assertFalse((self.state / "current.json").exists())
+
+    def test_public_noop_waits_for_transient_schaubild_starting_health(self) -> None:
+        result = self.reconcile_existing_public_commit(
+            extra_env={"TEST_SCHAUWERK_HEALTH_STARTING_ONCE": "1"}
+        )
+        self.restore_test_ownership()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.state / "schaubild-health-probe-count").exists())
 
     def test_public_noop_repairs_missing_deployment_receipt(self) -> None:
         result = self.reconcile_existing_public_commit()
