@@ -3141,7 +3141,7 @@ if native.get("renderer") != "schauwerk-native-diagram-v1":
     raise SystemExit(2)
 if native.get("api_path") != "/schaubild/api/native-viewer":
     raise SystemExit(2)
-if manifest.get("public_base_path") != "/schaubild":
+if native.get("public_base_path") != "/schaubild":
     raise SystemExit(2)
 files = manifest.get("files")
 if not isinstance(files, list) or len(files) != 4:
