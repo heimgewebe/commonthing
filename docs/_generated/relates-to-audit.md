@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 735 |
+| Relationen gesamt | 736 |
 | — depends_on | 33 |
 | — implements | 1 |
-| — relates_to | 679 |
+| — relates_to | 680 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |
@@ -32,7 +32,7 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (289 Dokumente):
+**Cluster 1** (290 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
@@ -275,6 +275,7 @@ _Keine Lücken erkannt._
 - `infra/compose/compose.observ.yml`
 - `infra/compose/compose.prod.override.yml`
 - `infra/compose/compose.vps.override.yml`
+- `infra/schauwerk-editor/release-lock.json`
 - `platform/README.md`
 - `platform/cell-pilot/two-operator-pilot.contract.json`
 - `platform/cell-profile.contract.json`

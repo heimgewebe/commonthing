@@ -133,22 +133,89 @@ class ProductionReconcilerContractTests(unittest.TestCase):
         self.assertIn("--range 0-126", script)
         self.assertIn("public Germany PMTiles range response is not HTTP 206", script)
 
-    def test_reconciler_binds_noop_and_postdeploy_to_schauwerk_release_lock(self) -> None:
+    def test_reconciler_binds_noop_and_postdeploy_to_schaubild_runtime_lock(self) -> None:
         script = self.read("scripts/ops/reconcile-production-main-vps.sh")
         self.assertIn("WELTGEWEBE_SCHAUWERK_MANIFEST_URL", script)
         self.assertIn("infra/schauwerk-editor/release-lock.json", script)
-        self.assertIn("weltgewebe-schauwerk-release-lock.v1", script)
-        self.assertIn("verify_public_schauwerk_release", script)
-        self.assertEqual(script.count("verify_public_schauwerk_release"), 3)
-        self.assertIn("reason=schauwerk_release_identity_drift", script)
-        self.assertIn("schauwerk_release=verified", script)
+        self.assertIn("weltgewebe-schauwerk-runtime-lock.v1", script)
+        self.assertIn("ghcr.io/heimgewebe/schauwerk-schaubild", script)
+        self.assertIn("verify_public_schauwerk_runtime", script)
+        self.assertEqual(script.count("verify_public_schauwerk_runtime"), 3)
+        self.assertIn("reason=schaubild_runtime_image_identity_drift", script)
         self.assertIn(
-            "public Schauwerk manifest does not match the reviewed release after deploy",
+            "public Schaubild runtime does not match the reviewed OCI digest after deploy",
             script,
         )
-        no_op = script.index('if [[ "$basemap_identity_matches" == "1" && "$schauwerk_identity_matches" == "1" ]]')
+        self.assertIn("schauwerk-standalone-editor-manifest.v2", script)
+        self.assertIn("schauwerk-native-diagram-v1", script)
+        no_op = script.index(
+            'if [[ "$basemap_identity_matches" == "1" && "$schauwerk_identity_matches" == "1" ]]'
+        )
         repair = script.index("repair_observed_deployment_state", no_op)
         self.assertLess(no_op, repair)
+
+    def test_schaubild_runtime_health_waits_through_starting(self) -> None:
+        script = self.read("scripts/ops/reconcile-production-main-vps.sh")
+        start = script.index("verify_public_schauwerk_runtime() {")
+        end = script.index(
+            "\n}\n\nverify_public_germany_basemap_delivery()", start
+        ) + 2
+        function = script[start:end]
+        expected_image_ref = (
+            "ghcr.io/heimgewebe/schauwerk-schaubild@sha256:" + "d" * 64
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            health_counter = Path(temporary) / "health-counter"
+            environment = os.environ.copy()
+            environment["EXPECTED_IMAGE_REF"] = expected_image_ref
+            environment["HEALTH_COUNTER"] = str(health_counter)
+            harness = f"""\
+set -euo pipefail
+{function}
+sleep() {{ :; }}
+docker() {{
+  if [[ "$1" == "ps" ]]; then
+    printf 'schaubild-runtime\\n'
+    return 0
+  fi
+  if [[ "$1" == "inspect" && "${3:-}" == '{{{{.Config.Image}}}}' ]]; then
+    printf '%s\\n' "$EXPECTED_IMAGE_REF"
+    return 0
+  fi
+  if [[ "$1" == "inspect" && "${3:-}" == '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{end}}}}' ]]; then
+    count=0
+    if [[ -e "$HEALTH_COUNTER" ]]; then
+      count="$(cat "$HEALTH_COUNTER")"
+    fi
+    count=$((count + 1))
+    printf '%s\\n' "$count" > "$HEALTH_COUNTER"
+    if (( count == 1 )); then
+      printf 'starting\\n'
+    else
+      printf 'healthy\\n'
+    fi
+    return 0
+  fi
+  return 97
+}}
+curl() {{
+  printf '%s\\n' '{{"schema_version":"schauwerk-standalone-editor-manifest.v2","editor_engine":"schauwerk-native-diagram-v1","cutover_status":"native-primary-with-legacy-compatibility","public_base_path":"/schaubild","native_renderer":{{"renderer":"schauwerk-native-diagram-v1","api_path":"/schaubild/api/native-viewer"}}}}'
+}}
+run_ops_python() {{
+  python3 -I - "$@"
+}}
+SCHAUWERK_MANIFEST_URL='https://example.invalid/schaubild/manifest.json'
+verify_public_schauwerk_runtime "$EXPECTED_IMAGE_REF"
+"""
+            result = subprocess.run(
+                ["bash", "-c", harness],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(health_counter.read_text(encoding="utf-8").strip(), "2")
 
     def test_deploy_helper_runs_bounded_migrations_before_full_deploy(self) -> None:
         script = self.read("scripts/ops/deploy-exact-commit-vps.sh")
