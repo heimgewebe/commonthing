@@ -160,10 +160,10 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                     "schema_version": "schauwerk-standalone-editor-manifest.v2",
                     "editor_engine": "schauwerk-native-diagram-v1",
                     "cutover_status": "native-primary-with-legacy-compatibility",
-                    "public_base_path": "/schaubild",
                     "native_renderer": {
                         "renderer": "schauwerk-native-diagram-v1",
                         "api_path": "/schaubild/api/native-viewer",
+                        "public_base_path": "/schaubild",
                     },
                 },
                 sort_keys=True,

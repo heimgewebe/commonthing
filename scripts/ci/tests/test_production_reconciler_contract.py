@@ -199,7 +199,7 @@ docker() {{
   return 97
 }}
 curl() {{
-  printf '%s\\n' '{{"schema_version":"schauwerk-standalone-editor-manifest.v2","editor_engine":"schauwerk-native-diagram-v1","cutover_status":"native-primary-with-legacy-compatibility","public_base_path":"/schaubild","native_renderer":{{"renderer":"schauwerk-native-diagram-v1","api_path":"/schaubild/api/native-viewer"}}}}'
+  printf '%s\\n' '{{"schema_version":"schauwerk-standalone-editor-manifest.v2","editor_engine":"schauwerk-native-diagram-v1","cutover_status":"native-primary-with-legacy-compatibility","native_renderer":{{"renderer":"schauwerk-native-diagram-v1","api_path":"/schaubild/api/native-viewer","public_base_path":"/schaubild"}}}}'
 }}
 run_ops_python() {{
   python3 -I - "$@"

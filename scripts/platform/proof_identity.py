@@ -14,52 +14,95 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 FULL_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+COMMON_PROOF_INPUTS = (
+    ".github/workflows/kubernetes-platform.yml",
+    ".github/workflows/kubernetes-platform-proof.yml",
+    ".dockerignore",
+    ".python-version",
+    "Cargo.toml",
+    "Cargo.lock",
+    "toolchain.versions.yml",
+    "tools/py/",
+    "apps/api/",
+    "apps/web/",
+    "configs/",
+    "scripts/dev/",
+    "scripts/ops/",
+    "policies/",
+    "infra/compose/compose.prod.yml",
+    "platform/",
+    "scripts/security/",
+    "repo.meta.yaml",
+)
+
 SUITE_INPUTS = {
-    "kind-gitops": (
-        ".github/workflows/kubernetes-platform.yml",
-        ".github/workflows/kubernetes-platform-proof.yml",
-        ".dockerignore",
-        "Cargo.toml",
-        "Cargo.lock",
-        "toolchain.versions.yml",
-        "apps/api/",
-        "apps/web/",
-        "configs/",
-        "scripts/dev/",
-        "scripts/ops/",
-        "policies/",
-        "infra/compose/compose.prod.yml",
-        "platform/",
-        "scripts/platform/",
-        "scripts/security/",
+    "kind-gitops": COMMON_PROOF_INPUTS
+    + (
+        "scripts/platform/bootstrap_tools.py",
+        "scripts/platform/proof_identity.py",
+        "scripts/platform/oci_proof_mirror.py",
+        "scripts/platform/validate_platform.py",
+        "scripts/platform/kind_reference.py",
         "scripts/ci/tests/test_kubernetes_platform_contract.py",
+        "scripts/ci/tests/test_kubernetes_platform_workflow.py",
+        "scripts/ci/tests/test_kubernetes_python_bootstrap.py",
         "scripts/ci/tests/test_trivy_rendered_manifests.py",
-        "scripts/ci/tests/test_kubernetes_ha_contract.py",
-        "repo.meta.yaml",
     ),
-    "ha-recovery": (
-        ".github/workflows/kubernetes-platform.yml",
-        ".github/workflows/kubernetes-platform-proof.yml",
-        ".dockerignore",
-        "Cargo.toml",
-        "Cargo.lock",
-        "toolchain.versions.yml",
-        "apps/api/",
-        "apps/web/",
-        "configs/",
-        "scripts/dev/",
-        "scripts/ops/",
-        "policies/",
-        "infra/compose/compose.prod.yml",
-        "platform/",
-        "scripts/platform/",
-        "scripts/security/",
+    "ha-recovery": COMMON_PROOF_INPUTS
+    + (
+        "scripts/platform/bootstrap_tools.py",
+        "scripts/platform/proof_identity.py",
+        "scripts/platform/oci_proof_mirror.py",
+        "scripts/platform/validate_platform.py",
+        "scripts/platform/kind_reference.py",
+        "scripts/platform/ha_reference.py",
+        "scripts/platform/ha_availability.py",
+        "scripts/platform/ha_common.py",
+        "scripts/platform/ha_dependencies.py",
+        "scripts/platform/ha_migration.py",
+        "scripts/platform/ha_wal.py",
         "scripts/ci/tests/test_kubernetes_platform_contract.py",
+        "scripts/ci/tests/test_kubernetes_platform_workflow.py",
+        "scripts/ci/tests/test_kubernetes_python_bootstrap.py",
         "scripts/ci/tests/test_trivy_rendered_manifests.py",
         "scripts/ci/tests/test_kubernetes_ha_contract.py",
-        "repo.meta.yaml",
+    ),
+    "staging-cell": COMMON_PROOF_INPUTS
+    + (
+        "scripts/platform/bootstrap_tools.py",
+        "scripts/platform/proof_identity.py",
+        "scripts/platform/validate_platform.py",
+        "scripts/platform/kind_reference.py",
+        "scripts/platform/staging_cell.py",
+        "scripts/ci/tests/test_kubernetes_platform_contract.py",
+        "scripts/ci/tests/test_staging_cell_runtime_contract.py",
+        "scripts/ci/tests/test_staging_gateway_contract.py",
     ),
 }
+
+STAGING_EVIDENCE_ROOT = Path("docs/proofs/kubernetes-staging-cell")
+STAGING_EVIDENCE_FILES = frozenset(
+    {"identity.json", "record.json", "proof.json", "attestation.json"}
+)
+
+STAGING_RECEIPT_CONTRACT = {
+    "cell-bootstrap": ("cell-bootstrap.json", "gateway-ready"),
+    "gateway-proof": ("gateway-proof.json", "gateway-ready"),
+    "host-gateway-proof": ("host-gateway-proof.json", "host-gateway-readback-verified"),
+    "backup-delete-to-prove-down": (
+        "backup-delete-to-prove-down.json",
+        "backup-created-cluster-deleted-primary-data-empty",
+    ),
+    "backup-delete-to-prove-rebuild": (
+        "backup-delete-to-prove-rebuild.json",
+        "backup-restored-infrastructure-ready-app-reactivation-required",
+    ),
+    "backup-delete-to-prove": (
+        "backup-delete-to-prove.json",
+        "backup-delete-to-prove-verified",
+    ),
+}
+
 
 
 class IdentityError(RuntimeError):
@@ -140,10 +183,9 @@ def compute_identity(suite: str, source_commit: str) -> dict[str, Any]:
         raise IdentityError("proof source commit must be a full lowercase Git object id")
     manifest = input_manifest(suite)
     manifest_sha256 = _sha256_bytes(_canonical_json({"files": manifest}))
-    payload = {
-        "schema_version": 1,
+    stable = {
+        "schema_version": 2,
         "suite": suite,
-        "source_commit": source_commit,
         "input_manifest_sha256": manifest_sha256,
         "tool_lock_sha256": _sha256_bytes(
             (ROOT / "platform/toolchain.lock.json").read_bytes()
@@ -153,8 +195,11 @@ def compute_identity(suite: str, source_commit: str) -> dict[str, Any]:
         ),
         "invalidation_contract": list(SUITE_INPUTS[suite]),
     }
-    payload["identity_sha256"] = _sha256_bytes(_canonical_json(payload))
-    return payload
+    return {
+        **stable,
+        "source_commit": source_commit,
+        "identity_sha256": _sha256_bytes(_canonical_json(stable)),
+    }
 
 
 def _checkout_commit() -> str:
@@ -471,6 +516,349 @@ def _validate_controlled_oci_proof(
         cluster_node_inventories[field] = image_nodes
 
 
+def _canonical_sha(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not FULL_GIT_OBJECT_ID.fullmatch(value):
+        raise IdentityError(f"{label} is not a canonical Git object id")
+    return value
+
+
+def _validate_staging_cell_proof(
+    identity: dict[str, Any], proof: dict[str, Any]
+) -> None:
+    if proof.get("suite") != "staging-cell":
+        raise IdentityError("staging proof suite binding is missing")
+    commit = _canonical_sha(proof.get("commit"), label="staging proof commit")
+    controller = _canonical_sha(
+        proof.get("controller_commit"), label="staging controller commit"
+    )
+    source = _canonical_sha(
+        proof.get("source_commit"), label="staging proof source commit"
+    )
+    _canonical_sha(proof.get("release_commit"), label="staging release commit")
+    if commit != controller or source != commit:
+        raise IdentityError("staging proof is not bound to its exact controller commit")
+    if proof.get("tool_lock_sha256") != identity.get("tool_lock_sha256"):
+        raise IdentityError("staging proof tool lock differs from the proof identity")
+    if proof.get("production_changed") is not False:
+        raise IdentityError("staging proof must assert production_changed=false")
+    if proof.get("acceptance") != "backup-delete-to-prove-v1":
+        raise IdentityError("staging proof acceptance contract is unsupported")
+    receipts = proof.get("receipts")
+    if not isinstance(receipts, dict) or set(receipts) != set(STAGING_RECEIPT_CONTRACT):
+        raise IdentityError("staging proof receipt inventory is incomplete")
+    for label, (_filename, expected_status) in STAGING_RECEIPT_CONTRACT.items():
+        item = receipts.get(label)
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"sha256", "status"}
+            or item.get("status") != expected_status
+            or not isinstance(item.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+        ):
+            raise IdentityError(f"staging proof receipt binding drifted: {label}")
+
+
+SUITE_VALIDATORS = {
+    "kind-gitops": _validate_controlled_oci_proof,
+    "ha-recovery": _validate_controlled_oci_proof,
+    "staging-cell": _validate_staging_cell_proof,
+}
+
+
+def _validate_suite_proof(identity: dict[str, Any], proof: dict[str, Any]) -> None:
+    suite = identity.get("suite")
+    validator = SUITE_VALIDATORS.get(suite)
+    if validator is None:
+        raise IdentityError(f"reusable proof has unsupported validator suite: {suite}")
+    validator(identity, proof)
+
+
+def summarize_staging_proof(
+    identity_path: Path, state_root: Path, output: Path
+) -> dict[str, Any]:
+    identity = _read_object(identity_path)
+    if identity.get("suite") != "staging-cell":
+        raise IdentityError("staging summary requires the staging-cell suite")
+    expected = compute_identity(
+        identity.get("suite", ""), identity.get("source_commit", "")
+    )
+    if identity != expected:
+        raise IdentityError("staging proof identity no longer matches current inputs")
+    checkout_commit = _checkout_commit()
+    if identity.get("source_commit") != checkout_commit:
+        raise IdentityError("staging identity must target the checked-out commit")
+
+    receipt_root = state_root.expanduser().resolve() / "receipts"
+    payloads: dict[str, dict[str, Any]] = {}
+    hashes: dict[str, str] = {}
+    for label, (filename, expected_status) in STAGING_RECEIPT_CONTRACT.items():
+        path = receipt_root / filename
+        raw = path.read_bytes()
+        payload = _read_object(path)
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("status") != expected_status
+            or payload.get("production_changed") is not False
+        ):
+            raise IdentityError(f"staging runtime receipt is not terminal: {label}")
+        payloads[label] = payload
+        hashes[label] = _sha256_bytes(raw)
+
+    rebuild = payloads["backup-delete-to-prove-rebuild"]
+    terminal = payloads["backup-delete-to-prove"]
+    controller = _canonical_sha(
+        terminal.get("controller_commit"), label="terminal staging controller"
+    )
+    if controller != checkout_commit or rebuild.get("controller_commit") != controller:
+        raise IdentityError("staging recovery was not executed by the target controller")
+    release = _canonical_sha(
+        terminal.get("active_commit"), label="terminal staging release"
+    )
+    if terminal.get("backup_down_receipt_sha256") != hashes["backup-delete-to-prove-down"]:
+        raise IdentityError("terminal staging proof lost its backup-down binding")
+    if terminal.get("backup_rebuild_receipt_sha256") != hashes["backup-delete-to-prove-rebuild"]:
+        raise IdentityError("terminal staging proof lost its rebuild binding")
+    if terminal.get("post_restore_cell_receipt_sha256") != hashes["cell-bootstrap"]:
+        raise IdentityError("terminal staging proof lost its restored cell binding")
+    if terminal.get("post_restore_gateway_receipt_sha256") != hashes["gateway-proof"]:
+        raise IdentityError("terminal staging proof lost its restored gateway binding")
+    if terminal.get("host_gateway_receipt_sha256") != hashes["host-gateway-proof"]:
+        raise IdentityError("terminal staging proof lost its host-gateway binding")
+    if payloads["cell-bootstrap"].get("active_commit") != release:
+        raise IdentityError("restored cell is not bound to the proven release")
+    if payloads["gateway-proof"].get("active_commit") != release:
+        raise IdentityError("restored gateway is not bound to the proven release")
+
+    proof = {
+        "schema_version": 1,
+        "status": "pass",
+        "suite": "staging-cell",
+        "acceptance": "backup-delete-to-prove-v1",
+        "commit": checkout_commit,
+        "source_commit": checkout_commit,
+        "controller_commit": controller,
+        "release_commit": release,
+        "tool_lock_sha256": identity["tool_lock_sha256"],
+        "production_changed": False,
+        "receipts": {
+            label: {
+                "sha256": hashes[label],
+                "status": STAGING_RECEIPT_CONTRACT[label][1],
+            }
+            for label in STAGING_RECEIPT_CONTRACT
+        },
+        "does_not_establish": [
+            "public DNS",
+            "public TLS",
+            "production Kubernetes cutover",
+        ],
+    }
+    _validate_staging_cell_proof(identity, proof)
+    _atomic_write(output, _canonical_json(proof))
+    return proof
+
+
+def _finding_reference(
+    finding_id: str, finding_sha256: str, checkpoint: str
+) -> dict[str, str]:
+    checkpoint = _canonical_sha(checkpoint, label="observer checkpoint")
+    if (
+        not isinstance(finding_id, str)
+        or re.fullmatch(r"ga-[A-Za-z0-9TZ-]{8,96}", finding_id) is None
+    ):
+        raise IdentityError("observer finding_id is malformed")
+    if (
+        not isinstance(finding_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", finding_sha256) is None
+    ):
+        raise IdentityError("observer finding_sha256 is malformed")
+    return {
+        "kind": "grosser-adler-finding-reference",
+        "finding_id": finding_id,
+        "finding_sha256": finding_sha256,
+        "checkpoint": checkpoint,
+    }
+
+
+def staging_attestation(
+    record_path: Path,
+    proof_path: Path,
+    *,
+    finding_id: str,
+    finding_sha256: str,
+    checkpoint: str,
+) -> dict[str, Any]:
+    record_bytes = record_path.read_bytes()
+    record = _read_object(record_path)
+    proof_bytes = proof_path.read_bytes()
+    proof = _read_object(proof_path)
+    implementation_commit = _canonical_sha(
+        record.get("proof_commit"), label="staging record proof commit"
+    )
+    if proof.get("commit") != implementation_commit:
+        raise IdentityError("staging record and proof commit differ")
+    observer = _finding_reference(finding_id, finding_sha256, checkpoint)
+    if observer["checkpoint"] != implementation_commit:
+        raise IdentityError("observer finding is bound to a different checkpoint")
+    if record.get("suite") != "staging-cell" or proof.get("suite") != "staging-cell":
+        raise IdentityError("staging attestation requires staging-cell evidence")
+    if record.get("proof_receipt_sha256") != _sha256_bytes(proof_bytes):
+        raise IdentityError("staging attestation proof hash differs from record")
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "suite": "staging-cell",
+        "implementation_commit": implementation_commit,
+        "proof_record_sha256": _sha256_bytes(record_bytes),
+        "proof_receipt_sha256": _sha256_bytes(proof_bytes),
+        "observer": observer,
+        "observer_authenticity": "live-verification-required",
+        "observer_hash_semantics": "integrity-not-authenticity",
+        "production_changed": False,
+    }
+
+
+def write_staging_attestation(
+    record_path: Path,
+    proof_path: Path,
+    output: Path,
+    *,
+    finding_id: str,
+    finding_sha256: str,
+    checkpoint: str,
+) -> dict[str, Any]:
+    attestation = staging_attestation(
+        record_path,
+        proof_path,
+        finding_id=finding_id,
+        finding_sha256=finding_sha256,
+        checkpoint=checkpoint,
+    )
+    _atomic_write(output, _canonical_json(attestation))
+    return attestation
+
+
+def _git_lines(*arguments: str) -> list[str]:
+    result = subprocess.run(
+        ["git", *arguments],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def validate_evidence_commit(
+    identity_path: Path,
+    record_path: Path,
+    proof_path: Path,
+    attestation_path: Path,
+    *,
+    expected_base_commit: str,
+) -> dict[str, Any]:
+    reusable = validate(identity_path, record_path, proof_path)
+    identity = _read_object(identity_path)
+    record_bytes = record_path.read_bytes()
+    proof_bytes = proof_path.read_bytes()
+    proof = _read_object(proof_path)
+    attestation = _read_object(attestation_path)
+
+    implementation_commit = _canonical_sha(
+        reusable.get("proof_commit"), label="evidence implementation commit"
+    )
+    pull_request_base_commit = _canonical_sha(
+        expected_base_commit, label="pull request base commit"
+    )
+    if implementation_commit != pull_request_base_commit:
+        raise IdentityError(
+            "staging implementation commit does not match pull request base"
+        )
+    if identity.get("source_commit") != implementation_commit:
+        raise IdentityError("staging identity is not bound to the implementation commit")
+    if proof.get("commit") != implementation_commit:
+        raise IdentityError("staging proof is not bound to the implementation commit")
+
+    expected_attestation = {
+        "schema_version": 1,
+        "status": "pass",
+        "suite": "staging-cell",
+        "implementation_commit": implementation_commit,
+        "proof_record_sha256": _sha256_bytes(record_bytes),
+        "proof_receipt_sha256": _sha256_bytes(proof_bytes),
+        "observer_authenticity": "live-verification-required",
+        "observer_hash_semantics": "integrity-not-authenticity",
+        "production_changed": False,
+    }
+    for key, expected in expected_attestation.items():
+        if attestation.get(key) != expected:
+            raise IdentityError(f"staging attestation field drifted: {key}")
+    observer = attestation.get("observer")
+    if not isinstance(observer, dict):
+        raise IdentityError("staging attestation has no observer reference")
+    normalized_observer = _finding_reference(
+        observer.get("finding_id"),
+        observer.get("finding_sha256"),
+        observer.get("checkpoint"),
+    )
+    if observer != normalized_observer or observer["checkpoint"] != implementation_commit:
+        raise IdentityError("staging observer reference is not exact")
+
+    current_commit = _checkout_commit()
+    if current_commit == implementation_commit:
+        raise IdentityError("evidence commit must follow the implementation commit")
+    parents = _git_lines("rev-list", "--parents", "-n", "1", current_commit)
+    if len(parents) != 1:
+        raise IdentityError("cannot resolve evidence commit parent")
+    parent_fields = parents[0].split()
+    if len(parent_fields) != 2 or parent_fields[1] != implementation_commit:
+        raise IdentityError("evidence commit must be the direct child of implementation commit")
+
+    changed = _git_lines(
+        "diff", "--name-only", "--no-renames", implementation_commit, current_commit
+    )
+    allowed = {
+        (STAGING_EVIDENCE_ROOT / name).as_posix()
+        for name in STAGING_EVIDENCE_FILES
+    }
+    if set(changed) != allowed:
+        raise IdentityError(
+            "evidence commit changes files outside the exact staging evidence set"
+        )
+
+    for selector in SUITE_INPUTS["staging-cell"]:
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--quiet",
+                implementation_commit,
+                current_commit,
+                "--",
+                selector,
+            ],
+            cwd=ROOT,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise IdentityError(
+                f"staging proof input changed in evidence-only commit: {selector}"
+            )
+
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "suite": "staging-cell",
+        "implementation_commit": implementation_commit,
+        "pull_request_base_commit": pull_request_base_commit,
+        "evidence_commit": current_commit,
+        "changed_evidence_files": sorted(changed),
+        "observer": normalized_observer,
+        "observer_live_verification_required": True,
+        "production_changed": False,
+    }
+
+
 def record(identity_path: Path, proof_receipt: Path, output_dir: Path) -> dict[str, Any]:
     identity = _read_object(identity_path)
     expected = compute_identity(identity.get("suite", ""), identity.get("source_commit", ""))
@@ -486,15 +874,17 @@ def record(identity_path: Path, proof_receipt: Path, output_dir: Path) -> dict[s
         raise IdentityError("proof receipt is not bound to the current checkout commit")
     if proof.get("production_changed") is not False:
         raise IdentityError("reusable proof must explicitly assert production_changed=false")
-    _validate_controlled_oci_proof(identity, proof)
+    _validate_suite_proof(identity, proof)
     output_dir.mkdir(parents=True, exist_ok=True)
     proof_bytes = _canonical_json(proof)
     proof_path = output_dir / "proof.json"
     _atomic_write(proof_path, proof_bytes)
     reusable = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "pass",
-        "identity": identity,
+        "suite": identity["suite"],
+        "identity_sha256": identity["identity_sha256"],
+        "proof_input_manifest_sha256": identity["input_manifest_sha256"],
         "proof_receipt_sha256": _sha256_bytes(proof_bytes),
         "proof_commit": proof.get("commit"),
         "proof_source_commit": proof.get("source_commit"),
@@ -510,10 +900,14 @@ def validate(identity_path: Path, record_path: Path, proof_path: Path) -> dict[s
     if identity != expected:
         raise IdentityError("current proof inputs do not match the requested identity")
     reusable = _read_object(record_path)
-    if reusable.get("schema_version") != 1 or reusable.get("status") != "pass":
-        raise IdentityError("reusable proof record is not a passing v1 record")
-    if reusable.get("identity") != identity:
-        raise IdentityError("reusable proof record is bound to a different identity")
+    if reusable.get("schema_version") != 2 or reusable.get("status") != "pass":
+        raise IdentityError("reusable proof record is not a passing v2 record")
+    if reusable.get("suite") != identity.get("suite"):
+        raise IdentityError("reusable proof record suite differs from current inputs")
+    if reusable.get("identity_sha256") != identity.get("identity_sha256"):
+        raise IdentityError("reusable proof record is bound to different proof inputs")
+    if reusable.get("proof_input_manifest_sha256") != identity.get("input_manifest_sha256"):
+        raise IdentityError("reusable proof input manifest differs from current inputs")
     proof_bytes = proof_path.read_bytes()
     if _sha256_bytes(proof_bytes) != reusable.get("proof_receipt_sha256"):
         raise IdentityError("reusable proof receipt digest mismatch")
@@ -530,7 +924,7 @@ def validate(identity_path: Path, record_path: Path, proof_path: Path) -> dict[s
         raise IdentityError("reusable proof record commit does not match the proof payload")
     if reusable.get("proof_source_commit") != proof.get("source_commit"):
         raise IdentityError("reusable proof record source commit does not match the proof payload")
-    _validate_controlled_oci_proof(identity, proof)
+    _validate_suite_proof(identity, proof)
     return reusable
 
 
@@ -542,10 +936,27 @@ def main() -> int:
     compute.add_argument("--source-commit", required=True)
     compute.add_argument("--output", type=Path, required=True)
     compute.add_argument("--github-output", type=Path)
+    summarize = sub.add_parser("summarize-staging")
+    summarize.add_argument("--identity", type=Path, required=True)
+    summarize.add_argument("--state-root", type=Path, required=True)
+    summarize.add_argument("--output", type=Path, required=True)
     create = sub.add_parser("record")
     create.add_argument("--identity", type=Path, required=True)
     create.add_argument("--proof-receipt", type=Path, required=True)
     create.add_argument("--output-dir", type=Path, required=True)
+    attest = sub.add_parser("attest-staging")
+    attest.add_argument("--record", type=Path, required=True)
+    attest.add_argument("--proof", type=Path, required=True)
+    attest.add_argument("--finding-id", required=True)
+    attest.add_argument("--finding-sha256", required=True)
+    attest.add_argument("--checkpoint", required=True)
+    attest.add_argument("--output", type=Path, required=True)
+    evidence = sub.add_parser("validate-evidence-commit")
+    evidence.add_argument("--identity", type=Path, required=True)
+    evidence.add_argument("--record", type=Path, required=True)
+    evidence.add_argument("--proof", type=Path, required=True)
+    evidence.add_argument("--attestation", type=Path, required=True)
+    evidence.add_argument("--expected-base-commit", required=True)
     check = sub.add_parser("validate")
     check.add_argument("--identity", type=Path, required=True)
     check.add_argument("--record", type=Path, required=True)
@@ -559,8 +970,42 @@ def main() -> int:
                 with args.github_output.open("a", encoding="utf-8") as handle:
                     handle.write(f"identity={payload['identity_sha256']}\n")
             print(json.dumps(payload, sort_keys=True))
+        elif args.command == "summarize-staging":
+            print(
+                json.dumps(
+                    summarize_staging_proof(args.identity, args.state_root, args.output),
+                    sort_keys=True,
+                )
+            )
         elif args.command == "record":
             print(json.dumps(record(args.identity, args.proof_receipt, args.output_dir), sort_keys=True))
+        elif args.command == "attest-staging":
+            print(
+                json.dumps(
+                    write_staging_attestation(
+                        args.record,
+                        args.proof,
+                        args.output,
+                        finding_id=args.finding_id,
+                        finding_sha256=args.finding_sha256,
+                        checkpoint=args.checkpoint,
+                    ),
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "validate-evidence-commit":
+            print(
+                json.dumps(
+                    validate_evidence_commit(
+                        args.identity,
+                        args.record,
+                        args.proof,
+                        args.attestation,
+                        expected_base_commit=args.expected_base_commit,
+                    ),
+                    sort_keys=True,
+                )
+            )
         else:
             print(json.dumps(validate(args.identity, args.record, args.proof), sort_keys=True))
     except (IdentityError, OSError, subprocess.CalledProcessError) as error:

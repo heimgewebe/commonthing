@@ -353,11 +353,11 @@ if manifest.get("editor_engine") != "schauwerk-native-diagram-v1":
     raise SystemExit("public Schaubild editor engine is not native")
 if manifest.get("cutover_status") != "native-primary-with-legacy-compatibility":
     raise SystemExit("public Schaubild cutover status is not native-primary")
-if manifest.get("public_base_path") != "/schaubild":
-    raise SystemExit("public Schaubild base path is not canonical")
 native = manifest.get("native_renderer")
 if not isinstance(native, dict):
     raise SystemExit("public Schaubild native renderer metadata is missing")
+if native.get("public_base_path") != "/schaubild":
+    raise SystemExit("public Schaubild base path is not canonical")
 if native.get("renderer") != "schauwerk-native-diagram-v1":
     raise SystemExit("public Schaubild native renderer identity mismatch")
 if native.get("api_path") != "/schaubild/api/native-viewer":
