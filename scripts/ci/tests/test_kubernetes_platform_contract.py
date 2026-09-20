@@ -2588,9 +2588,28 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             'base_sha="${{ github.event.pull_request.base.sha }}"',
             workflow,
         )
+        step_start = workflow.index("      - name: Validate staging evidence-only commit")
+        step_end = workflow.index("      - name: Render and validate all platform targets", step_start)
+        evidence_step = workflow[step_start:step_end]
+        self.assertIn('merge_commit="$(git rev-parse HEAD)"', evidence_step)
         self.assertIn(
-            'git diff --quiet "$base_sha"...HEAD -- "$evidence_root"',
-            workflow,
+            'head_sha="${{ github.event.pull_request.head.sha }}"',
+            evidence_step,
+        )
+        self.assertIn('git checkout --detach "$head_sha"', evidence_step)
+        self.assertIn(
+            'if ! git diff --quiet "$base_sha"...HEAD -- "$evidence_root"; then',
+            evidence_step,
+        )
+        self.assertIn('git checkout --detach "$merge_commit"', evidence_step)
+        self.assertNotIn("exit 0", evidence_step)
+        self.assertLess(
+            evidence_step.index('git checkout --detach "$head_sha"'),
+            evidence_step.index("validate-evidence-commit"),
+        )
+        self.assertLess(
+            evidence_step.index("validate-evidence-commit"),
+            evidence_step.index('git checkout --detach "$merge_commit"'),
         )
         for name in ("identity.json", "record.json", "proof.json", "attestation.json"):
             self.assertIn(name, workflow)
