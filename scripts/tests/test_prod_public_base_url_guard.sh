@@ -119,21 +119,44 @@ run_case() {
 
 echo "Running prod-public-base-url guard tests..."
 
+LEGACY_HOME_HOST="weltgewebe.home.arpa" # commonthing-naming: legacy
+LEGACY_HOME_URL="https://${LEGACY_HOME_HOST}"
+
 run_case \
   "valid production contract" \
   "https://commonthing.net" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
   "__absent__" \
   "__absent__" \
   "1" "0" \
   0 "prod-public-base-url guard passed"
 
 run_case \
+  "legacy API WEB_UPSTREAM_HOST is rejected" \
+  "https://commonthing.net" \
+  "$LEGACY_HOME_HOST" \
+  "https://commonthing.home.arpa" \
+  "__absent__" \
+  "__absent__" \
+  "1" "0" \
+  1 "services.api.environment.WEB_UPSTREAM_HOST"
+
+run_case \
+  "legacy API WEB_UPSTREAM_URL is rejected" \
+  "https://commonthing.net" \
+  "commonthing.home.arpa" \
+  "$LEGACY_HOME_URL" \
+  "__absent__" \
+  "__absent__" \
+  "1" "0" \
+  1 "services.api.environment.WEB_UPSTREAM_URL"
+
+run_case \
   "legacy public APP_BASE_URL is rejected" \
   "https://weltgewebe.net" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
   "__absent__" \
   "__absent__" \
   "1" "0" \
@@ -141,9 +164,9 @@ run_case \
 
 run_case \
   "internal APP_BASE_URL is rejected" \
-  "https://weltgewebe.home.arpa" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
+  "https://commonthing.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
   "__absent__" \
   "__absent__" \
   "1" "0" \
@@ -152,7 +175,7 @@ run_case \
 run_case \
   "public API WEB_UPSTREAM_URL is rejected" \
   "https://commonthing.net" \
-  "weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
   "https://commonthing.net" \
   "__absent__" \
   "__absent__" \
@@ -160,21 +183,21 @@ run_case \
   1 "services.api.environment.WEB_UPSTREAM_URL"
 
 run_case \
-  "legacy Caddy WEB_UPSTREAM_HOST is rejected" \
+  "Caddy WEB_UPSTREAM_HOST is rejected" \
   "https://commonthing.net" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
   "commonthing.net" \
-  "https://weltgewebe.home.arpa" \
+  "https://commonthing.home.arpa" \
   "1" "0" \
   1 "services.caddy.environment.WEB_UPSTREAM_HOST"
 
 run_case \
-  "legacy Caddy WEB_UPSTREAM_URL is rejected" \
+  "Caddy WEB_UPSTREAM_URL is rejected" \
   "https://commonthing.net" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
-  "weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
+  "commonthing.home.arpa" \
   "https://commonthing.net" \
   "1" "0" \
   1 "services.caddy.environment.WEB_UPSTREAM_URL"
@@ -182,8 +205,8 @@ run_case \
 run_case \
   "disabled public login is rejected" \
   "https://commonthing.net" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
   "__absent__" \
   "__absent__" \
   "0" "0" \
@@ -192,8 +215,8 @@ run_case \
 run_case \
   "magic-token logging is rejected" \
   "https://commonthing.net" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
   "__absent__" \
   "__absent__" \
   "1" "1" \
@@ -203,8 +226,8 @@ TEST_WEBAUTHN_RP_ID=wrong.example
 run_case \
   "non-canonical WebAuthn RP ID is rejected" \
   "https://commonthing.net" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
   "__absent__" \
   "__absent__" \
   "1" "0" \
@@ -215,8 +238,8 @@ TEST_WEBAUTHN_RP_ORIGIN=https://example.invalid
 run_case \
   "non-canonical WebAuthn RP origin is rejected" \
   "https://commonthing.net" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
   "__absent__" \
   "__absent__" \
   "1" "0" \
@@ -227,8 +250,8 @@ TEST_WEBAUTHN_RP_NAME=wrongName
 run_case \
   "non-canonical WebAuthn RP name is rejected" \
   "https://commonthing.net" \
-  "weltgewebe.home.arpa" \
-  "https://weltgewebe.home.arpa" \
+  "commonthing.home.arpa" \
+  "https://commonthing.home.arpa" \
   "__absent__" \
   "__absent__" \
   "1" "0" \
