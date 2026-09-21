@@ -206,7 +206,7 @@ class RegionalBasemapStyleTest(unittest.TestCase):
             script,
         )
         expected_url = (
-            '"https://weltgewebe.home.arpa/local-basemap/'
+            '"https://commonthing.home.arpa/local-basemap/'
             + chr(36)
             + '{regional_meta}"'
         )
