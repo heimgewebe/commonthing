@@ -48,8 +48,8 @@ BUILD_TIMESTAMP=2026-07-12T19:57:15+00:00
 POSTGRES_USER=dummy
 POSTGRES_PASSWORD=dummy
 POSTGRES_DB=dummy
-WEB_UPSTREAM_HOST=weltgewebe.home.arpa
-WEB_UPSTREAM_URL=https://weltgewebe.home.arpa
+WEB_UPSTREAM_HOST=commonthing.home.arpa
+WEB_UPSTREAM_URL=https://commonthing.home.arpa
 EOF_ENV
 
 if ! WELTGEWEBE_ENV_FILE="$TMP_ENV" \
@@ -121,11 +121,11 @@ expected = {
     ),
     "services.api.environment.WEB_UPSTREAM_HOST": (
         api_env.get("WEB_UPSTREAM_HOST"),
-        "weltgewebe.home.arpa",
+        "commonthing.home.arpa",
     ),
     "services.api.environment.WEB_UPSTREAM_URL": (
         api_env.get("WEB_UPSTREAM_URL"),
-        "https://weltgewebe.home.arpa",
+        "https://commonthing.home.arpa",
     ),
 }
 

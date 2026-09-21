@@ -27,8 +27,8 @@ services:
       AUTH_RL_IP_PER_HOUR: "30"
       AUTH_RL_EMAIL_PER_MIN: "2"
       AUTH_RL_EMAIL_PER_HOUR: "10"
-      WEB_UPSTREAM_HOST: weltgewebe.home.arpa
-      WEB_UPSTREAM_URL: https://weltgewebe.home.arpa
+      WEB_UPSTREAM_HOST: commonthing.home.arpa
+      WEB_UPSTREAM_URL: https://commonthing.home.arpa
     volumes:
       - type: bind
         source: ${REPO_DIR:-/opt/weltgewebe}/policies/limits.yaml

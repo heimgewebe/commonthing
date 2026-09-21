@@ -96,6 +96,8 @@ Endzustand.
 
 Seit dem kontrollierten Repository-Rename am 1. September 2026 ist `heimgewebe/commonthing` die kanonische GitHub-Repository-Identität. `heimgewebe/weltgewebe` bleibt ausschließlich als GitHub-Redirect und historische Referenz erhalten; der alte Slug darf nicht für ein neues Repository wiederverwendet werden.
 
+Für das Heimnetz ist `commonthing.home.arpa` seit dem kontrollierten DNS-Schritt vom 20. September 2026 der kanonische Root-Name. Pi-hole löst `commonthing.home.arpa` und den vorbereiteten optionalen Namen `api.commonthing.home.arpa` auf denselben bisherigen Edge-Zielhost auf. Der verpflichtende Heimserver-Deployvertrag bleibt jedoch bewusst beim belegten Root-Pfad `https://commonthing.home.arpa`; API-Readiness wird über `/api/health/ready` auf diesem Host geprüft. Der separate `api.commonthing.home.arpa`-Endpunkt wird erst nach eigenem Edge-/TLS-Readback verpflichtend. Die alten `*.weltgewebe.home.arpa`-Namen bleiben während der Observe-Phase als Legacy-Kompatibilität erhalten; ihr Abbau ist noch kein abgeschlossener Zustand.
+
 ## 6. CI-Regel
 
 Der commonThing Naming Guard verhindert neue unmarkierte Produktverwendungen von
