@@ -860,7 +860,6 @@ generate_failure_bundle() {
     getent hosts commonthing.home.arpa || echo "(unresolvable)"
   } > "${bundle_dir}/dns_lookup.txt" 2>&1 || true
   curl -fsS --cacert "$EDGE_CA" https://commonthing.home.arpa/api/health/ready > "${bundle_dir}/edge_api_health.txt" 2>&1 || true
-  curl -fsS --cacert "$EDGE_CA" https://commonthing.home.arpa/api/health/ready > "${bundle_dir}/alias_route_health.txt" 2>&1 || true
   curl -fsSI --cacert "$EDGE_CA" https://commonthing.home.arpa > "${bundle_dir}/frontend_head.txt" 2>&1 || true
 
   if [[ -n "$extra_context_file" && -f "$extra_context_file" ]]; then
