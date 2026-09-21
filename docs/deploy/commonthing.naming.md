@@ -45,7 +45,7 @@ Namen Weltgewebe eingeführt.
 | Build-Header | `X-CommonThing-*` | `X-Weltgewebe-*` nur als Übergangsheader |
 | Repository | `heimgewebe/commonthing` | `heimgewebe/weltgewebe` nur als GitHub-Redirect und historische Referenz |
 | Betriebsnamen | `commonthing-*` | `weltgewebe-*` bis zur jeweiligen Unit-/Pfad-Migration |
-| interne Domains | `*.commonthing.home.arpa` | `*.weltgewebe.home.arpa` bis zur kontrollierten Heimnetz-Migration |
+| interne Domains | `*.commonthing.home.arpa` als reservierter Namespace; derzeit kein aktiver Service-Layer | `*.weltgewebe.home.arpa` nur historisch/Legacy, ohne aktive Produkt-DNS-Zuordnung |
 
 Die Tabelle beschreibt den Zielzustand. Ein Zielname darf nicht als bereits live
 behauptet werden, solange DNS, Runtime oder Providerzustand noch nicht entsprechend
@@ -60,6 +60,12 @@ Jede technische Identitätsmigration folgt derselben Reihenfolge:
 Der alte Name wird nie zuerst gelöscht. Für jede Migration müssen vor dem Abbau
 des Legacy-Namens mindestens die neue Identität, der tatsächliche Consumer-Pfad
 und ein Readback des Zielzustands belegt sein.
+
+Diese Reihenfolge erzwingt keinen Scheindienst. Wird ein bisheriger Zielhost
+vollständig stillgelegt und existiert kein aktueller Consumer-Pfad bzw. kein
+zugewiesener Service-Layer, werden tote DNS-Aliase entfernt statt auf einen
+unbelegten Ersatzhost umgebogen. Eine spätere Reaktivierung beginnt wieder mit
+`add new` und braucht neue Runtime-Evidenz.
 
 ## 4. Was `Weltgewebe` noch heißen darf
 
@@ -96,7 +102,25 @@ Endzustand.
 
 Seit dem kontrollierten Repository-Rename am 1. September 2026 ist `heimgewebe/commonthing` die kanonische GitHub-Repository-Identität. `heimgewebe/weltgewebe` bleibt ausschließlich als GitHub-Redirect und historische Referenz erhalten; der alte Slug darf nicht für ein neues Repository wiederverwendet werden.
 
-Für das Heimnetz ist `commonthing.home.arpa` seit dem kontrollierten DNS-Schritt vom 20. September 2026 der kanonische Root-Name. Pi-hole löst `commonthing.home.arpa` und den vorbereiteten optionalen Namen `api.commonthing.home.arpa` auf denselben bisherigen Edge-Zielhost auf. Der verpflichtende Heimserver-Deployvertrag bleibt jedoch bewusst beim belegten Root-Pfad `https://commonthing.home.arpa`; API-Readiness wird über `/api/health/ready` auf diesem Host geprüft. Der separate `api.commonthing.home.arpa`-Endpunkt wird erst nach eigenem Edge-/TLS-Readback verpflichtend. Die alten `*.weltgewebe.home.arpa`-Namen bleiben während der Observe-Phase als Legacy-Kompatibilität erhalten; ihr Abbau ist noch kein abgeschlossener Zustand.
+Der DNS-Schritt vom 20. September 2026 hatte `commonthing.home.arpa`,
+`api.commonthing.home.arpa` sowie die beiden Legacy-Namen
+`weltgewebe.home.arpa` und `api.weltgewebe.home.arpa` noch auf den früheren
+Heimserver-Edge gelegt. Der frische Infrastruktur- und Runtime-Readback am
+21. September 2026 hat diese Annahme verworfen: Der Heimserver ist ausdrücklich
+außer Betrieb, die kanonische Infrastruktur weist derzeit keinen
+`service-layer`-Host zu, und die kanonische Produktion läuft auf
+`commonserver` unter `https://commonthing.net`. Die vier Produkt-DNS-Einträge
+auf den stillgelegten Heimserver wurden deshalb aus Pi-hole entfernt.
+
+`*.commonthing.home.arpa` bleibt als interner Namespace reserviert, ist aber
+derzeit **nicht aktiv**. Eine spätere Aktivierung setzt zuerst eine explizite
+Service-Layer-Zuweisung in der kanonischen Infrastruktur und danach frische
+DNS-, TLS- und Runtime-Evidenz voraus. Der Namespace darf nicht aus Bequemlichkeit
+auf `heim-pc` oder den öffentlichen VPS umgebogen werden. Die
+`*.weltgewebe.home.arpa`-Namen sind nur noch historische/Legacy-Referenzen und
+haben keine aktive Produkt-DNS-Zuordnung. Der explizite
+`DEPLOY_TARGET=heimserver`-Pfad bleibt ein Legacy-Vertrag und ist kein aktueller
+Produktionspfad.
 
 ## 6. CI-Regel
 
