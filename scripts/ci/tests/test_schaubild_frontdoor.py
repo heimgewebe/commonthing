@@ -152,15 +152,68 @@ wait_for_schaubild_runtime_health schaubild-test
         expected = (
             "header @schauwerkResponse >Content-Security-Policy \"default-src 'self'; "
             "script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
-            "frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; "
+            "frame-src 'self' https://embed.diagrams.net; connect-src 'self'; object-src 'none'; "
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none';\""
         )
         self.assertIn(expected, self.caddy)
+        self.assertIn("@schauwerkResponse {", self.caddy)
+        self.assertIn("path /schaubild /schaubild/*", self.caddy)
+        self.assertIn("not path /schaubild/native/*", self.caddy)
         self.assertIn(
             "not path /api/* /health/* /schaubild /schaubild/*",
             self.caddy,
         )
-        self.assertEqual(self.caddy.count("frame-src https://embed.diagrams.net"), 1)
+        self.assertEqual(self.caddy.count("frame-src 'self' https://embed.diagrams.net"), 1)
+
+    def test_native_viewer_is_frameable_only_by_same_origin_schaubild(self) -> None:
+        native_csp = (
+            "header @schauwerkNativeResponse >Content-Security-Policy \"default-src 'self'; "
+            "script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+            "frame-src 'none'; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'self';\""
+        )
+        self.assertIn(
+            "@schauwerkNativeResponse path /schaubild/native/*",
+            self.caddy,
+        )
+        self.assertIn(native_csp, self.caddy)
+        self.assertIn(
+            'header @schauwerkNativeResponse >X-Frame-Options "SAMEORIGIN"',
+            self.caddy,
+        )
+        self.assertIn("@frameDenied {", self.caddy)
+        self.assertIn("not path /schaubild/native/*", self.caddy)
+        self.assertIn('header @frameDenied >X-Frame-Options "DENY"', self.caddy)
+
+    def test_native_postflight_verifies_browser_embedding_headers(self) -> None:
+        self.assertIn(
+            'SCHAUWERK_NATIVE_EXPECTED_FRAME_ANCESTORS="frame-ancestors \'self\'"',
+            self.deploy,
+        )
+        self.assertIn(
+            'SCHAUWERK_NATIVE_EXPECTED_X_FRAME_OPTIONS="SAMEORIGIN"',
+            self.deploy,
+        )
+        self.assertIn(
+            'SCHAUWERK_NATIVE_VIEWER_HEADERS_OUT="$(mktemp)"',
+            self.deploy,
+        )
+        self.assertIn(
+            "native viewer response does not permit same-origin embedding",
+            self.deploy,
+        )
+        self.assertIn(
+            "expected_tokens = expected_frame_ancestors.split()",
+            self.deploy,
+        )
+        self.assertIn(
+            "expected_name = expected_tokens[0].lower()",
+            self.deploy,
+        )
+        self.assertNotIn(
+            "expected_frame_ancestors.split(maxsplit=1)",
+            self.deploy,
+        )
 
 
 if __name__ == "__main__":
