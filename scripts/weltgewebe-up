@@ -3294,8 +3294,12 @@ for raw_directive in csp_values[0].split(";"):
     if not tokens:
         continue
     directives[tokens[0].lower()] = tokens[1:]
-expected_name, expected_value = expected_frame_ancestors.split(maxsplit=1)
-if directives.get(expected_name) != [expected_value]:
+expected_tokens = expected_frame_ancestors.split()
+if len(expected_tokens) < 2:
+    raise SystemExit(1)
+expected_name = expected_tokens[0].lower()
+expected_values = expected_tokens[1:]
+if directives.get(expected_name) != expected_values:
     raise SystemExit(1)
 if x_frame_options != [expected_x_frame_options]:
     raise SystemExit(1)

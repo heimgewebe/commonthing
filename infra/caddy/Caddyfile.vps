@@ -170,7 +170,7 @@
 	@frameDenied {
 		not path /schaubild/native/*
 	}
-	header @frameDenied X-Frame-Options "DENY"
+	header @frameDenied >X-Frame-Options "DENY"
 
 	header {
 		# Script execution is intentionally document-owned: SvelteKit emits a hash-bound

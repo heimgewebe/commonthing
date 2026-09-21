@@ -158,6 +158,25 @@ def collect_csp(routes: list[dict]) -> list[dict]:
     return found
 
 
+def collect_response_header(routes: list[dict], field: str) -> list[dict]:
+    found: list[dict] = []
+    for route in routes:
+        for handler in route.get("handle", []):
+            if handler.get("handler") == "headers":
+                response = handler.get("response", {})
+                for value in response.get("set", {}).get(field, []):
+                    found.append(
+                        {
+                            "match": route.get("match"),
+                            "value": value,
+                            "deferred": response.get("deferred", False),
+                        }
+                    )
+            if handler.get("handler") == "subroute":
+                found.extend(collect_response_header(handler.get("routes", []), field))
+    return found
+
+
 def directive_map(policy: str) -> dict[str, tuple[str, ...]]:
     directives: dict[str, tuple[str, ...]] = {}
     for raw in policy.split(";"):
@@ -285,7 +304,9 @@ class StaticAppCaddyAdaptedCspTest(unittest.TestCase):
     def test_adapted_app_route_has_exact_matchers_and_canonical_edge_csp(self) -> None:
         for relative, host, protected_paths in CASES:
             with self.subTest(caddyfile=relative):
-                policies = collect_csp(app_routes(adapt(relative), host))
+                routes = app_routes(adapt(relative), host)
+                policies = collect_csp(routes)
+                frame_options = collect_response_header(routes, "X-Frame-Options")
                 is_vps = relative == "infra/caddy/Caddyfile.vps"
                 self.assertEqual(len(policies), 5 if is_vps else 3, policies)
 
@@ -380,6 +401,28 @@ class StaticAppCaddyAdaptedCspTest(unittest.TestCase):
                             "form-action": ("'none'",),
                             "frame-ancestors": ("'self'",),
                         },
+                    )
+                    native_xfo = [
+                        item for item in frame_options if item["value"] == "SAMEORIGIN"
+                    ]
+                    deny_xfo = [item for item in frame_options if item["value"] == "DENY"]
+                    self.assertEqual(len(native_xfo), 1, frame_options)
+                    self.assertEqual(
+                        native_xfo[0]["match"],
+                        [{"path": SCHAUWERK_NATIVE_PATHS}],
+                    )
+                    self.assertTrue(
+                        native_xfo[0]["deferred"],
+                        "native SAMEORIGIN must overwrite any upstream X-Frame-Options",
+                    )
+                    self.assertEqual(len(deny_xfo), 1, frame_options)
+                    self.assertEqual(
+                        deny_xfo[0]["match"],
+                        [{"not": [{"path": SCHAUWERK_NATIVE_PATHS}]}],
+                    )
+                    self.assertTrue(
+                        deny_xfo[0]["deferred"],
+                        "DENY must overwrite any upstream X-Frame-Options",
                     )
 
                 self.assertTrue(

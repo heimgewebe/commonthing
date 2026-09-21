@@ -156,11 +156,9 @@ wait_for_schaubild_runtime_health schaubild-test
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none';\""
         )
         self.assertIn(expected, self.caddy)
-        self.assertIn(
-            "@schauwerkResponse {\n\t\tpath /schaubild /schaubild/*\n"
-            "\t\tnot path /schaubild/native/*\n\t}",
-            self.caddy,
-        )
+        self.assertIn("@schauwerkResponse {", self.caddy)
+        self.assertIn("path /schaubild /schaubild/*", self.caddy)
+        self.assertIn("not path /schaubild/native/*", self.caddy)
         self.assertIn(
             "not path /api/* /health/* /schaubild /schaubild/*",
             self.caddy,
@@ -183,11 +181,9 @@ wait_for_schaubild_runtime_health schaubild-test
             'header @schauwerkNativeResponse >X-Frame-Options "SAMEORIGIN"',
             self.caddy,
         )
-        self.assertIn(
-            "@frameDenied {\n\t\tnot path /schaubild/native/*\n\t}",
-            self.caddy,
-        )
-        self.assertIn('header @frameDenied X-Frame-Options "DENY"', self.caddy)
+        self.assertIn("@frameDenied {", self.caddy)
+        self.assertIn("not path /schaubild/native/*", self.caddy)
+        self.assertIn('header @frameDenied >X-Frame-Options "DENY"', self.caddy)
 
     def test_native_postflight_verifies_browser_embedding_headers(self) -> None:
         self.assertIn(
@@ -204,6 +200,18 @@ wait_for_schaubild_runtime_health schaubild-test
         )
         self.assertIn(
             "native viewer response does not permit same-origin embedding",
+            self.deploy,
+        )
+        self.assertIn(
+            "expected_tokens = expected_frame_ancestors.split()",
+            self.deploy,
+        )
+        self.assertIn(
+            "expected_name = expected_tokens[0].lower()",
+            self.deploy,
+        )
+        self.assertNotIn(
+            "expected_frame_ancestors.split(maxsplit=1)",
             self.deploy,
         )
 
