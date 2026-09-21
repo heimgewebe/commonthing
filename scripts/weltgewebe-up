@@ -856,12 +856,10 @@ generate_failure_bundle() {
   docker compose "${BASE_ARGS[@]}" logs --tail=200 nats > "${bundle_dir}/docker_logs_nats.txt" 2>&1 || true
   docker compose "${BASE_ARGS[@]}" logs --tail=200 db > "${bundle_dir}/docker_logs_db.txt" 2>&1 || true
   {
-    echo "api.commonthing.home.arpa:"
-    getent hosts api.commonthing.home.arpa || echo "(unresolvable)"
     echo "commonthing.home.arpa:"
     getent hosts commonthing.home.arpa || echo "(unresolvable)"
   } > "${bundle_dir}/dns_lookup.txt" 2>&1 || true
-  curl -fsS --cacert "$EDGE_CA" https://api.commonthing.home.arpa/health/ready > "${bundle_dir}/edge_api_health.txt" 2>&1 || true
+  curl -fsS --cacert "$EDGE_CA" https://commonthing.home.arpa/api/health/ready > "${bundle_dir}/edge_api_health.txt" 2>&1 || true
   curl -fsS --cacert "$EDGE_CA" https://commonthing.home.arpa/api/health/ready > "${bundle_dir}/alias_route_health.txt" 2>&1 || true
   curl -fsSI --cacert "$EDGE_CA" https://commonthing.home.arpa > "${bundle_dir}/frontend_head.txt" 2>&1 || true
 
@@ -2654,8 +2652,8 @@ if [[ "$DEPLOY_TARGET" != "vps" ]]; then
 
   echo
   echo ">> Guard 1: DNS Resolution..."
-  if ! getent hosts api.commonthing.home.arpa > /dev/null 2>&1 || ! getent hosts commonthing.home.arpa > /dev/null 2>&1; then
-    msg="DNS Guard failed: api.commonthing.home.arpa or commonthing.home.arpa is not resolvable."
+  if ! getent hosts commonthing.home.arpa > /dev/null 2>&1; then
+    msg="DNS Guard failed: commonthing.home.arpa is not resolvable."
     echo "ERROR: $msg"
     generate_failure_bundle "$msg"
     exit 1
@@ -2682,8 +2680,8 @@ if [[ "$DEPLOY_TARGET" != "vps" ]]; then
     exit 1
   fi
 
-  echo ">> Guard 3: Edge Routing..."
-  if ! curl -fsS --cacert "$EDGE_CA" https://api.commonthing.home.arpa/health/ready > /dev/null 2>&1; then
+  echo ">> Guard 3: Canonical Edge API Route..."
+  if ! curl -fsS --cacert "$EDGE_CA" https://commonthing.home.arpa/api/health/ready > /dev/null 2>&1; then
     msg="Edge Routing Guard failed: Could not reach API via Edge Route."
     echo "ERROR: $msg"
     generate_failure_bundle "$msg"
@@ -2692,20 +2690,7 @@ if [[ "$DEPLOY_TARGET" != "vps" ]]; then
     echo "OK (health endpoint reachable)"
   fi
 
-  echo
-  echo ">> Guard 4: Alias Route..."
-  if ! curl -fsS --cacert "$EDGE_CA" https://commonthing.home.arpa/api/health/ready > /dev/null 2>&1; then
-    msg="Alias Route Guard failed: Could not reach API via Alias Route."
-    echo "ERROR: $msg"
-    generate_failure_bundle "$msg"
-    exit 1
-  else
-    echo "OK (health endpoint reachable)"
-  fi
-
-  echo
-
-  echo ">> Guard 4b: Sovereign Basemap Edge Delivery..."
+  echo ">> Guard 4: Sovereign Basemap Edge Delivery..."
   if [[ "$REQUIRE_FRONTEND" == "1" ]]; then
     if [[ "${PUBLIC_BASEMAP_MODE:-local-sovereign}" == "remote-style" ]]; then
       echo "OK (remote-style selected; local sovereign basemap edge guard not applicable)"
