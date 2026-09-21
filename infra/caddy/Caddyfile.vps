@@ -151,19 +151,32 @@
 		}
 	}
 	header @nonDocumentResponse >Content-Security-Policy "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
-	@schauwerkResponse path /schaubild /schaubild/*
+	# The outer Schaubild shell must not be framed, while the generated native
+	# viewer is intentionally embedded by that same-origin shell. Keep the
+	# exception path-scoped so no other Commonthing document becomes frameable.
+	@schauwerkNativeResponse path /schaubild/native/*
+	header @schauwerkNativeResponse >Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src 'none'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self';"
+	header @schauwerkNativeResponse >X-Frame-Options "SAMEORIGIN"
+	@schauwerkResponse {
+		path /schaubild /schaubild/*
+		not path /schaubild/native/*
+	}
 	header @schauwerkResponse >Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 	@frontendResponse {
 		not path /api/* /health/* /schaubild /schaubild/*
 	}
 	header @frontendResponse Content-Security-Policy "style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; worker-src 'self' blob:; font-src 'self'; media-src 'self'; manifest-src 'self'; child-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';"
 
+	@frameDenied {
+		not path /schaubild/native/*
+	}
+	header @frameDenied X-Frame-Options "DENY"
+
 	header {
 		# Script execution is intentionally document-owned: SvelteKit emits a hash-bound
 		# meta CSP for every served HTML artifact. An edge default-src/script-src would
 		# intersect with that policy and block the hash-authorized inline bootstrap.
 		# The static CSP preflight validates every HTML artifact and rejects active SVGs.
-		X-Frame-Options "DENY"
 		Referrer-Policy "no-referrer"
 		X-Content-Type-Options "nosniff"
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"

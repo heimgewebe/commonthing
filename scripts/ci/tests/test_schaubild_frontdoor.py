@@ -157,10 +157,55 @@ wait_for_schaubild_runtime_health schaubild-test
         )
         self.assertIn(expected, self.caddy)
         self.assertIn(
+            "@schauwerkResponse {\n\t\tpath /schaubild /schaubild/*\n"
+            "\t\tnot path /schaubild/native/*\n\t}",
+            self.caddy,
+        )
+        self.assertIn(
             "not path /api/* /health/* /schaubild /schaubild/*",
             self.caddy,
         )
         self.assertEqual(self.caddy.count("frame-src https://embed.diagrams.net"), 1)
+
+    def test_native_viewer_is_frameable_only_by_same_origin_schaubild(self) -> None:
+        native_csp = (
+            "header @schauwerkNativeResponse >Content-Security-Policy \"default-src 'self'; "
+            "script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+            "frame-src 'none'; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'self';\""
+        )
+        self.assertIn(
+            "@schauwerkNativeResponse path /schaubild/native/*",
+            self.caddy,
+        )
+        self.assertIn(native_csp, self.caddy)
+        self.assertIn(
+            'header @schauwerkNativeResponse >X-Frame-Options "SAMEORIGIN"',
+            self.caddy,
+        )
+        self.assertIn(
+            "@frameDenied {\n\t\tnot path /schaubild/native/*\n\t}",
+            self.caddy,
+        )
+        self.assertIn('header @frameDenied X-Frame-Options "DENY"', self.caddy)
+
+    def test_native_postflight_verifies_browser_embedding_headers(self) -> None:
+        self.assertIn(
+            'SCHAUWERK_NATIVE_EXPECTED_FRAME_ANCESTORS="frame-ancestors \'self\'"',
+            self.deploy,
+        )
+        self.assertIn(
+            'SCHAUWERK_NATIVE_EXPECTED_X_FRAME_OPTIONS="SAMEORIGIN"',
+            self.deploy,
+        )
+        self.assertIn(
+            'SCHAUWERK_NATIVE_VIEWER_HEADERS_OUT="$(mktemp)"',
+            self.deploy,
+        )
+        self.assertIn(
+            "native viewer response does not permit same-origin embedding",
+            self.deploy,
+        )
 
 
 if __name__ == "__main__":

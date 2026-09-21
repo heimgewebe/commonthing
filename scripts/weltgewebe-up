@@ -3056,6 +3056,8 @@ else
     SCHAUWERK_MANIFEST_OUT="$(mktemp)"
     SCHAUWERK_RESOLVE="commonthing.net:443:${CADDY_BIND}"
     SCHAUWERK_EXPECTED_CSP="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+    SCHAUWERK_NATIVE_EXPECTED_FRAME_ANCESTORS="frame-ancestors 'self'"
+    SCHAUWERK_NATIVE_EXPECTED_X_FRAME_OPTIONS="SAMEORIGIN"
 
     if ! SCHAUWERK_INDEX_HTTP_CODE="$(
       curl -sS --noproxy '*' --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 1 --retry-connrefused \
@@ -3262,26 +3264,67 @@ PY
     fi
 
     SCHAUWERK_NATIVE_VIEWER_OUT="$(mktemp)"
+    SCHAUWERK_NATIVE_VIEWER_HEADERS_OUT="$(mktemp)"
     if ! curl -fsS --noproxy '*' --connect-timeout 5 --max-time 20 \
       --resolve "$SCHAUWERK_RESOLVE" \
+      -D "$SCHAUWERK_NATIVE_VIEWER_HEADERS_OUT" \
       -o "$SCHAUWERK_NATIVE_VIEWER_OUT" \
       "https://commonthing.net$SCHAUWERK_NATIVE_VIEWER_PATH"; then
       msg="Schaubild runtime native viewer GET failed."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
-      rm -f "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+      rm -f "$SCHAUWERK_NATIVE_VIEWER_HEADERS_OUT" "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
       exit 1
     fi
     if ! grep -q 'id="nativeViewport"' "$SCHAUWERK_NATIVE_VIEWER_OUT"; then
       msg="Schaubild runtime native viewer GET did not return the expected viewer."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
-      rm -f "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+      rm -f "$SCHAUWERK_NATIVE_VIEWER_HEADERS_OUT" "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+      exit 1
+    fi
+    if ! python3 - "$SCHAUWERK_NATIVE_VIEWER_HEADERS_OUT" "$SCHAUWERK_NATIVE_EXPECTED_FRAME_ANCESTORS" "$SCHAUWERK_NATIVE_EXPECTED_X_FRAME_OPTIONS" << 'PY'; then
+import sys
+from pathlib import Path
+
+headers = Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict").splitlines()
+expected_frame_ancestors = sys.argv[2]
+expected_x_frame_options = sys.argv[3]
+csp_values = []
+x_frame_options = []
+for line in headers:
+    name, separator, value = line.partition(":")
+    if not separator:
+        continue
+    name = name.strip().lower()
+    value = value.strip()
+    if name == "content-security-policy":
+        csp_values.append(value)
+    elif name == "x-frame-options":
+        x_frame_options.append(value)
+if len(csp_values) != 1:
+    raise SystemExit(1)
+directives = {}
+for raw_directive in csp_values[0].split(";"):
+    tokens = raw_directive.strip().split()
+    if not tokens:
+        continue
+    directives[tokens[0].lower()] = tokens[1:]
+expected_name, expected_value = expected_frame_ancestors.split(maxsplit=1)
+if directives.get(expected_name) != [expected_value]:
+    raise SystemExit(1)
+if x_frame_options != [expected_x_frame_options]:
+    raise SystemExit(1)
+PY
+      msg="Schaubild runtime native viewer response does not permit same-origin embedding."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      rm -f "$SCHAUWERK_NATIVE_VIEWER_HEADERS_OUT" "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
       exit 1
     fi
 
     SCHAUWERK_LIVE_MANIFEST_SHA="$(sha256sum "$SCHAUWERK_MANIFEST_OUT" | awk '{print $1}')"
-    rm -f "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
+    rm -f "$SCHAUWERK_NATIVE_VIEWER_HEADERS_OUT" "$SCHAUWERK_NATIVE_VIEWER_OUT" "$SCHAUWERK_NATIVE_INPUT_OUT" "$SCHAUWERK_NATIVE_RESULT_OUT" "$SCHAUWERK_INDEX_HEADERS_OUT" "$SCHAUWERK_MANIFEST_OUT"
     echo "   Schaubild native runtime verified through Caddy (image $SCHAUWERK_RUNTIME_IMAGE_DIGEST, manifest $SCHAUWERK_LIVE_MANIFEST_SHA)."
   fi
 
