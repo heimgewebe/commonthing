@@ -152,7 +152,7 @@ wait_for_schaubild_runtime_health schaubild-test
         expected = (
             "header @schauwerkResponse >Content-Security-Policy \"default-src 'self'; "
             "script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
-            "frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; "
+            "frame-src 'self' https://embed.diagrams.net; connect-src 'self'; object-src 'none'; "
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none';\""
         )
         self.assertIn(expected, self.caddy)
@@ -165,7 +165,7 @@ wait_for_schaubild_runtime_health schaubild-test
             "not path /api/* /health/* /schaubild /schaubild/*",
             self.caddy,
         )
-        self.assertEqual(self.caddy.count("frame-src https://embed.diagrams.net"), 1)
+        self.assertEqual(self.caddy.count("frame-src 'self' https://embed.diagrams.net"), 1)
 
     def test_native_viewer_is_frameable_only_by_same_origin_schaubild(self) -> None:
         native_csp = (

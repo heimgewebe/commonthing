@@ -161,7 +161,7 @@
 		path /schaubild /schaubild/*
 		not path /schaubild/native/*
 	}
-	header @schauwerkResponse >Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+	header @schauwerkResponse >Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src 'self' https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 	@frontendResponse {
 		not path /api/* /health/* /schaubild /schaubild/*
 	}

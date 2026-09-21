@@ -3055,7 +3055,7 @@ else
     SCHAUWERK_INDEX_HEADERS_OUT="$(mktemp)"
     SCHAUWERK_MANIFEST_OUT="$(mktemp)"
     SCHAUWERK_RESOLVE="commonthing.net:443:${CADDY_BIND}"
-    SCHAUWERK_EXPECTED_CSP="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+    SCHAUWERK_EXPECTED_CSP="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src 'self' https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
     SCHAUWERK_NATIVE_EXPECTED_FRAME_ANCESTORS="frame-ancestors 'self'"
     SCHAUWERK_NATIVE_EXPECTED_X_FRAME_OPTIONS="SAMEORIGIN"
 

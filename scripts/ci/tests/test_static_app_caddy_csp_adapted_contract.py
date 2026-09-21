@@ -20,7 +20,7 @@ SCHAUWERK_PATHS = ["/schaubild", "/schaubild/*"]
 SCHAUWERK_NATIVE_PATHS = ["/schaubild/native/*"]
 SCHAUWERK_POLICY = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
-    "frame-src https://embed.diagrams.net; connect-src 'self'; object-src 'none'; "
+    "frame-src 'self' https://embed.diagrams.net; connect-src 'self'; object-src 'none'; "
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 )
 SCHAUWERK_NATIVE_POLICY = (
@@ -353,7 +353,7 @@ class StaticAppCaddyAdaptedCspTest(unittest.TestCase):
                             "script-src": ("'self'",),
                             "style-src": ("'self'",),
                             "img-src": ("'self'", "data:", "blob:"),
-                            "frame-src": ("https://embed.diagrams.net",),
+                            "frame-src": ("'self'", "https://embed.diagrams.net"),
                             "connect-src": ("'self'",),
                             "object-src": ("'none'",),
                             "base-uri": ("'none'",),

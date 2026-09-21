@@ -67,7 +67,8 @@ upstream error while the main site, API and basemap remain available.
   iframe, so Caddy replaces the upstream framing headers with
   `frame-ancestors 'self'` and `X-Frame-Options: SAMEORIGIN`;
 - the path-specific CSP permits `connect-src 'self'` for the native render API
-  and retains `frame-src https://embed.diagrams.net` only for explicit legacy
+  and permits `frame-src 'self' https://embed.diagrams.net`: same-origin for the
+  native viewer, plus the remote origin for explicit legacy
   Mermaid/JSON-Canvas/draw.io compatibility.
 
 No renderer implementation is copied into Commonthing.
