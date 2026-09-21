@@ -60,6 +60,12 @@ upstream error while the main site, API and basemap remain available.
   this identity only when the direct peer belongs to the configured proxy CIDR;
 - Schaubild responses use the runtime's `Cache-Control: no-store` and security
   headers;
+- the outer Schaubild shell and all non-native-viewer Commonthing documents remain
+  non-frameable with `frame-ancestors 'none'` and `X-Frame-Options: DENY`;
+- generated native viewer resources under `/schaubild/native/*` are the one
+  path-scoped framing exception: the shell embeds the viewer in a same-origin
+  iframe, so Caddy replaces the upstream framing headers with
+  `frame-ancestors 'self'` and `X-Frame-Options: SAMEORIGIN`;
 - the path-specific CSP permits `connect-src 'self'` for the native render API
   and retains `frame-src https://embed.diagrams.net` only for explicit legacy
   Mermaid/JSON-Canvas/draw.io compatibility.
@@ -93,7 +99,11 @@ A successful full deployment is not complete until all of these are observed:
 6. `cutover_status == native-primary-with-legacy-compatibility`;
 7. the native renderer metadata reports
    `api_path == /schaubild/api/native-viewer`;
-8. the public native POST/viewer path remains same-origin and bounded.
+8. the public native POST/viewer path remains same-origin and bounded;
+9. the generated native viewer response exposes exactly one same-origin framing
+   contract (`frame-ancestors 'self'` plus `X-Frame-Options: SAMEORIGIN`) so
+   the product shell can display the native result without widening framing for
+   the rest of Commonthing.
 
 The production reconciler includes the exact OCI image identity plus public native
 manifest semantics in its same-commit no-op decision. A matching Commonthing
