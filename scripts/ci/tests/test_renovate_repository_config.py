@@ -33,13 +33,14 @@ EXPECTED_ACTION_MANAGER = {
         "`# tag: <tag>` provenance comment. The built-in github-actions manager "
         "only accepts a bare `# <tag>` comment and skips every ref here as "
         "unversioned-reference, so without this manager no pinned action is ever "
-        "updated."
+        "updated. A quoted reference is matched too, because the pinning guard "
+        "accepts one; the rewrite drops the quotes and leaves the canonical form."
     ),
     "customType": "regex",
     "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
     "matchStrings": [
-        "uses:\\s*(?<depName>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"
-        "@(?<currentDigest>[0-9a-f]{40})"
+        "uses:\\s*[\"']?(?<depName>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"
+        "@(?<currentDigest>[0-9a-f]{40})[\"']?"
         "[ \\t]+#[ \\t]*tag:[ \\t]*(?<currentValue>v[0-9][A-Za-z0-9._-]*)"
     ],
     "autoReplaceStringTemplate": (
@@ -105,6 +106,25 @@ class RenovateRepositoryConfigTests(unittest.TestCase):
         )
         self.assertEqual(match.group("currentValue"), "v7.0.1")
 
+    def test_action_manager_reads_a_quoted_reference(self) -> None:
+        # The pinning guard strips quotes (clean_uses), so a quoted ref is a
+        # legal pin. If the manager missed it, that pin would be invisible to
+        # Renovate while passing every check.
+        matcher = action_matcher()
+        sha = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+
+        for quote in ('"', "'"):
+            with self.subTest(quote=quote):
+                match = matcher.search(
+                    f"      - uses: {quote}actions/checkout@{sha}{quote}"
+                    " # tag: v7.0.1"
+                )
+                self.assertIsNotNone(match)
+                assert match is not None
+                self.assertEqual(match.group("depName"), "actions/checkout")
+                self.assertEqual(match.group("currentDigest"), sha)
+                self.assertEqual(match.group("currentValue"), "v7.0.1")
+
     def test_action_manager_ignores_refs_without_a_tag(self) -> None:
         matcher = action_matcher()
         commit = "3edfce9056124e459a23f683a21433670d47daca"
@@ -120,7 +140,8 @@ class RenovateRepositoryConfigTests(unittest.TestCase):
     def test_every_tagged_pin_in_the_workflows_is_matched(self) -> None:
         matcher = action_matcher()
         declared = re.compile(
-            r"^\s*-?\s*uses:\s*[A-Za-z0-9._/-]+@[0-9a-f]{40}[ \t]+#[ \t]*tag:"
+            r"^\s*-?\s*uses:\s*[\"']?[A-Za-z0-9._/-]+@[0-9a-f]{40}[\"']?"
+            r"[ \t]+#[ \t]*tag:"
         )
         missed: list[str] = []
         matched = 0

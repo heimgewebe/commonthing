@@ -3,13 +3,13 @@
   "automerge": false,
   "customManagers": [
     {
-      "description": "Read SHA-pinned GitHub Actions that declare their tag in the repo's `# tag: <tag>` provenance comment. The built-in github-actions manager only accepts a bare `# <tag>` comment and skips every ref here as unversioned-reference, so without this manager no pinned action is ever updated.",
+      "description": "Read SHA-pinned GitHub Actions that declare their tag in the repo's `# tag: <tag>` provenance comment. The built-in github-actions manager only accepts a bare `# <tag>` comment and skips every ref here as unversioned-reference, so without this manager no pinned action is ever updated. A quoted reference is matched too, because the pinning guard accepts one; the rewrite drops the quotes and leaves the canonical form.",
       "customType": "regex",
       "managerFilePatterns": [
         "/^\\.github/workflows/[^/]+\\.ya?ml$/"
       ],
       "matchStrings": [
-        "uses:\\s*(?<depName>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)@(?<currentDigest>[0-9a-f]{40})[ \\t]+#[ \\t]*tag:[ \\t]*(?<currentValue>v[0-9][A-Za-z0-9._-]*)"
+        "uses:\\s*[\"']?(?<depName>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)@(?<currentDigest>[0-9a-f]{40})[\"']?[ \\t]+#[ \\t]*tag:[ \\t]*(?<currentValue>v[0-9][A-Za-z0-9._-]*)"
       ],
       "autoReplaceStringTemplate": "uses: {{{depName}}}@{{{newDigest}}} # tag: {{{newValue}}}",
       "datasourceTemplate": "github-tags",
