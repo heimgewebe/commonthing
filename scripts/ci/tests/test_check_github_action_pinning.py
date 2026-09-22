@@ -116,6 +116,19 @@ jobs:
         self.assertIn("kind.local-action=1", result.stdout)
         self.assertIn("kind.docker-image=1", result.stdout)
 
+    def test_reusable_workflow_needs_no_declaration(self) -> None:
+        result = self.run_checker(
+            """
+name: pin
+on: workflow_dispatch
+jobs:
+  audit:
+    uses: owner/repo/.github/workflows/reusable.yml@1234567890123456789012345678901234567890
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("kind.reusable-workflow=1", result.stdout)
+
     def test_declaration_blockers_are_reported_in_json(self) -> None:
         result = self.run_checker(
             """

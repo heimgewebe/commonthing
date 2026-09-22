@@ -16,6 +16,6 @@ permissions:
 
 jobs:
   metrics:
-    uses: heimgewebe/metarepo/.github/workflows/wgx-metrics.yml@5c86ca69c0e2ae78a736c151f8d851e5cdda811e # provenance: untagged (upstream publishes no release tags)
+    uses: heimgewebe/metarepo/.github/workflows/wgx-metrics.yml@5c86ca69c0e2ae78a736c151f8d851e5cdda811e
     with:
       metarepo_ref: "5c86ca69c0e2ae78a736c151f8d851e5cdda811e"

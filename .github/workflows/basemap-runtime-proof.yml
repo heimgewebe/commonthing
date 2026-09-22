@@ -355,7 +355,7 @@ jobs:
           version: 9.11.0
 
       - name: Setup Node for PMTiles validator
-        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (7 commits after v7.0.0)
+        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
         with:
           node-version-file: ".node-version"
           cache: "pnpm"
@@ -565,7 +565,7 @@ jobs:
           version: 9.11.0
 
       - name: Setup Node for PMTiles validator
-        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (7 commits after v7.0.0)
+        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
         with:
           node-version-file: ".node-version"
           cache: "pnpm"
@@ -678,7 +678,7 @@ jobs:
           version: 9.11.0
 
       - name: Setup Node
-        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (7 commits after v7.0.0)
+        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
         with:
           node-version-file: ".node-version"
           cache: "pnpm"
@@ -693,13 +693,13 @@ jobs:
         working-directory: apps/web
 
       - name: Download Hamburg PMTiles artefact from content proof
-        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317 # provenance: untagged (1 commit after v8.0.1)
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317 # provenance: untagged (after v8.0.1)
         with:
           name: basemap-visual-proof-input
           path: /tmp/basemap-visual-proof-input/hamburg
 
       - name: Download Schleswig-Holstein PMTiles artefact from content proof
-        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317 # provenance: untagged (1 commit after v8.0.1)
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317 # provenance: untagged (after v8.0.1)
         with:
           name: basemap-schleswig-holstein-content-proof-evidence
           path: /tmp/basemap-visual-proof-input/schleswig-holstein

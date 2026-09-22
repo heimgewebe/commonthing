@@ -18,7 +18,7 @@ concurrency:
 jobs:
   guard:
     # Compatibility filename only: verification policy is owned by Metarepo.
-    uses: heimgewebe/metarepo/.github/workflows/reusable-repo-verify.yml@fe6950616b2d06343e284a56a8944e0a36f1f972 # provenance: untagged (upstream publishes no release tags)
+    uses: heimgewebe/metarepo/.github/workflows/reusable-repo-verify.yml@fe6950616b2d06343e284a56a8944e0a36f1f972
     with:
       mode: guard
     permissions:

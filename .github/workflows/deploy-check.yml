@@ -41,7 +41,7 @@ jobs:
         uses: pnpm/action-setup@b0f76dfb45f55f8421693e4803ac7bb65143bd34 # tag: v6
 
       - name: Setup Node
-        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (7 commits after v7.0.0)
+        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
         with:
           node-version-file: '.node-version'
           cache: 'pnpm'

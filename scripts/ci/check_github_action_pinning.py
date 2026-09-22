@@ -30,7 +30,7 @@ UNTAGGED_COMMENT_RE = re.compile(
 MUTABLE_DEFAULT_BRANCHES = {"main", "master", "trunk"}
 BLOCKING_POLICIES = {"named-ref", "mutable-default-branch", "missing-ref"}
 BLOCKING_PROVENANCE = {"tag_mismatch", "unresolved"}
-DECLARATION_REQUIRED_KINDS = {"github-action", "reusable-workflow"}
+DECLARATION_REQUIRED_KINDS = {"github-action"}
 PROVENANCE_ACTIONS = {"actions/cache"}
 
 EXPECTED_ACTION_CONSUMERS: Mapping[str, Mapping[str, int]] = {
@@ -346,6 +346,11 @@ def undeclared_refs(refs: Sequence[ActionRef]) -> list[ActionRef]:
     `# tag: <tag>` comment is what renovate.json's custom manager reads; the
     `# provenance: untagged` marker is the deliberate opt-out for commits that
     carry no tag at all.
+
+    Reusable workflows are exempt. Their `owner/repo/path@sha` reference is
+    already close to the 120-character yaml line limit, so a trailing comment
+    does not fit, and the custom manager does not match path-suffixed
+    references either — declaring one would serve no reader.
     """
     return [
         ref

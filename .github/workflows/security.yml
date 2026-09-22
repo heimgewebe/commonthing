@@ -139,7 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
       - name: Generate SBOM with Syft
-        uses: anchore/sbom-action@04151451f829cb881fd7b3250eccf4021433e14e # provenance: untagged (61 commits after v0)
+        uses: anchore/sbom-action@04151451f829cb881fd7b3250eccf4021433e14e # provenance: untagged (after v0)
         with:
           path: .
           format: spdx-json

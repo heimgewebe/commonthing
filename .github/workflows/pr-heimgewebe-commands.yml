@@ -13,5 +13,5 @@ permissions:
 jobs:
   dispatch:
     if: github.event.issue.pull_request != null
-    uses: heimgewebe/metarepo/.github/workflows/heimgewebe-command-dispatch.yml@a1984186a98a1e4214769f87649c5affc9686a53 # provenance: untagged (upstream publishes no release tags)
+    uses: heimgewebe/metarepo/.github/workflows/heimgewebe-command-dispatch.yml@a1984186a98a1e4214769f87649c5affc9686a53
     secrets: inherit

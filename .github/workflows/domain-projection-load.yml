@@ -53,7 +53,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (1 commit after v7.0.0)
+      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: ".python-version"
 

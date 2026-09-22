@@ -114,7 +114,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
 
       - name: Setup Python
-        uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (1 commit after v7.0.0)
+        uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: '.python-version'
 
@@ -349,7 +349,7 @@ jobs:
           run_install: false
 
       - name: Setup Node
-        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (7 commits after v7.0.0)
+        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
         with:
           node-version-file: '.node-version'
           check-latest: false
@@ -359,7 +359,7 @@ jobs:
             apps/web/pnpm-lock.yaml
 
       - name: Setup Python
-        uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (1 commit after v7.0.0)
+        uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: '.python-version'
 
@@ -472,7 +472,7 @@ jobs:
         with:
           run_install: false
 
-      - uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (7 commits after v7.0.0)
+      - uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
         with:
           node-version-file: '.node-version'
           check-latest: false
@@ -565,7 +565,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
 
       - name: Setup Python
-        uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (1 commit after v7.0.0)
+        uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: '.python-version'
 

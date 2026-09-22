@@ -45,7 +45,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (1 commit after v7.0.0)
+      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: ".python-version"
       - name: Read uv version
@@ -114,7 +114,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (1 commit after v7.0.0)
+      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: ".python-version"
       - name: Read uv version
@@ -269,7 +269,7 @@ jobs:
           mkdir -p "$docker_config"
           echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
       - name: Download publisher evidence
-        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317 # provenance: untagged (1 commit after v8.0.1)
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317 # provenance: untagged (after v8.0.1)
         with:
           name: kubernetes-proof-oci-mirror-${{ inputs.expected_head }}
           path: build/kubernetes-platform
