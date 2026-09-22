@@ -54,7 +54,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # tag: v7.0.0
+      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (1 commit after v7.0.0)
         with:
           python-version-file: ".python-version"
       - name: Read uv version
@@ -137,7 +137,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # tag: v7.0.0
+      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (1 commit after v7.0.0)
         with:
           python-version-file: ".python-version"
       - name: Read uv version

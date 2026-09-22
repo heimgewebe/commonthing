@@ -30,6 +30,7 @@ UNTAGGED_COMMENT_RE = re.compile(
 MUTABLE_DEFAULT_BRANCHES = {"main", "master", "trunk"}
 BLOCKING_POLICIES = {"named-ref", "mutable-default-branch", "missing-ref"}
 BLOCKING_PROVENANCE = {"tag_mismatch", "unresolved"}
+DECLARATION_REQUIRED_KINDS = {"github-action", "reusable-workflow"}
 PROVENANCE_ACTIONS = {"actions/cache"}
 
 EXPECTED_ACTION_CONSUMERS: Mapping[str, Mapping[str, int]] = {
@@ -337,6 +338,25 @@ def provenance_records(
     )
 
 
+def undeclared_refs(refs: Sequence[ActionRef]) -> list[ActionRef]:
+    """SHA pins that state neither a tag nor an explicit untagged provenance.
+
+    A bare commit says what is executed but not what it is supposed to be, so
+    neither a reviewer nor Renovate can tell whether the pin is current. The
+    `# tag: <tag>` comment is what renovate.json's custom manager reads; the
+    `# provenance: untagged` marker is the deliberate opt-out for commits that
+    carry no tag at all.
+    """
+    return [
+        ref
+        for ref in refs
+        if ref.kind in DECLARATION_REQUIRED_KINDS
+        and ref.ref_type == "sha"
+        and ref.declared_tag is None
+        and not ref.explicit_untagged
+    ]
+
+
 def consumer_contract_errors(refs: Sequence[ActionRef]) -> list[str]:
     errors: list[str] = []
     for action, expected_counts in EXPECTED_ACTION_CONSUMERS.items():
@@ -382,11 +402,15 @@ def report_payload(
     provenance_blockers = [
         record for record in records if record.classification in BLOCKING_PROVENANCE
     ]
+    declaration_blockers = undeclared_refs(refs)
     return {
         "schema_version": 1,
         "status": (
             "fail"
-            if pinning_blockers or provenance_blockers or contract_errors
+            if pinning_blockers
+            or provenance_blockers
+            or declaration_blockers
+            or contract_errors
             else "pass"
         ),
         "summary": {
@@ -405,6 +429,14 @@ def report_payload(
                 "policy": ref.policy,
             }
             for ref in pinning_blockers
+        ],
+        "declaration_blockers": [
+            {
+                "workflow": ref.workflow.as_posix(),
+                "job": ref.job,
+                "uses": ref.uses,
+            }
+            for ref in declaration_blockers
         ],
     }
 
@@ -452,6 +484,20 @@ def print_text_report(payload: Mapping[str, Any], refs: Sequence[ActionRef]) -> 
             print(
                 f"- {blocker['workflow']} {blocker['job']}: "
                 f"{blocker['uses']} policy={blocker['policy']}"
+            )
+    if payload["declaration_blockers"]:
+        print()
+        print(
+            "ERROR: every SHA-pinned action must declare its provenance, either "
+            "'# tag: <tag>' or '# provenance: untagged'."
+        )
+        print(
+            "Undeclared pins are invisible to the Renovate custom manager in "
+            "renovate.json and never receive update proposals."
+        )
+        for blocker in payload["declaration_blockers"]:
+            print(
+                f"- {blocker['workflow']} {blocker['job']}: {blocker['uses']}"
             )
     provenance_blockers = [
         record
