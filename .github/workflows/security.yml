@@ -191,6 +191,99 @@ jobs:
           format: json
           output: trivy-image-report.json
           exit-code: "1"
+      # The scan writes JSON only, so its findings reach neither the log nor the
+      # summary. Render them into both: the summary for people, the log for
+      # anyone reading job logs through the API, where summaries are not served.
+      - name: Render Trivy findings into job summary and log
+        if: always()
+        shell: bash
+        env:
+          TRIVY_REPORT: trivy-image-report.json
+        run: |
+          set -euo pipefail
+          rendered="$(mktemp)"
+          trap 'rm -f "${rendered}"' EXIT
+          # A missing Dockerfile must not abort the step: its job is to report
+          # even when everything before it failed.
+          runtime_base=""
+          if [[ -f apps/api/Dockerfile ]]; then
+            runtime_base="$(awk 'toupper($1) == "FROM" {
+                for (i = 2; i <= NF; i++) if ($i !~ /^--/) { ref = $i; break }
+              } END { print ref }' apps/api/Dockerfile)"
+          fi
+          # os-pkgs only says "OS package", not which layer brought it. A finding
+          # counts as base image only if Trivy attributes it to a layer of the
+          # pinned runtime base; packages installed after the last FROM do not.
+          base_layers=null
+          if [[ -n "${runtime_base}" ]] && docker pull --quiet "${runtime_base}" > /dev/null 2>&1; then
+            base_layers="$(docker image inspect --format '{{json .RootFS.Layers}}' "${runtime_base}" 2> /dev/null \
+              || true)"
+          fi
+          # Anything but a list of layer ids, e.g. partial output of a failed
+          # inspect, counts as unknown instead of breaking --argjson below.
+          if ! jq -e 'type == "array" and length > 0 and all(type == "string")' <<< "${base_layers}" \
+            > /dev/null 2>&1; then
+            base_layers=null
+          fi
+          if [[ ! -s "${TRIVY_REPORT}" ]]; then
+            {
+              printf '## Trivy API image: kein Report\n\n'
+              printf 'Der Scan hat keinen Report geschrieben; die Ursache steht im fehlgeschlagenen Step davor.\n'
+            } > "${rendered}"
+          else
+            total="$(jq '[.Results[]?.Vulnerabilities[]?] | length' "${TRIVY_REPORT}")"
+            {
+              printf '## Trivy API image: %s behebbare HIGH/CRITICAL-Treffer\n\n' "${total}"
+              printf 'Laufzeitbasis laut `apps/api/Dockerfile`: `%s`, ' "${runtime_base:-?}"
+              if [[ "${base_layers}" == null ]]; then
+                printf 'Basisschichten nicht ermittelt, Herkunft der OS-Pakete offen\n\n'
+              else
+                printf '%s Basisschichten ermittelt\n\n' "$(jq length <<< "${base_layers}")"
+              fi
+              jq -r '"Im Image erkannt: \(.Metadata.OS.Family // "?") \(.Metadata.OS.Name // "?")\n"' "${TRIVY_REPORT}"
+              if (( total == 0 )); then
+                printf 'Keine Treffer oberhalb der Schwelle.\n'
+              else
+                printf '| Quelle | Paket | Installiert | Behoben in | Schwere | CVE |\n'
+                printf '| --- | --- | --- | --- | --- | --- |\n'
+                jq -r --argjson base "${base_layers}" '
+                  [ .Results[]?
+                    | .Class as $class
+                    | (.Type // "?") as $type
+                    | .Vulnerabilities[]?
+                    | (.Layer.DiffID // "") as $diff
+                    | ( if $class != "os-pkgs" then "Abhängigkeit"
+                        elif $base == null or $diff == "" then "OS-Paket, Schicht unbekannt"
+                        elif any($base[]; . == $diff) then "Basisimage"
+                        else "Dockerfile-Schicht" end ) as $origin
+                    | . + {Source: "\($origin) (\($type))"} ]
+                  | sort_by(if .Severity == "CRITICAL" then 0 else 1 end, .Source, .PkgName, .VulnerabilityID)
+                  | .[0:100][]
+                  | [ .Source, .PkgName, .InstalledVersion, (.FixedVersion // "-"), .Severity ]
+                    as $cells
+                  | ($cells | map(tostring | gsub("\\|"; "\\|")))
+                    + [ "[\(.VulnerabilityID)](\((.PrimaryURL | select(. != ""))
+                          // ("https://nvd.nist.gov/vuln/detail/" + .VulnerabilityID)))" ]
+                  | "| " + join(" | ") + " |"
+                ' "${TRIVY_REPORT}"
+                if (( total > 100 )); then
+                  printf '\n_Gekürzt auf 100 Zeilen; der vollständige Report liegt im Artefakt %s._\n' \
+                    '`trivy-api-image-report`'
+                fi
+                printf '\n_Basisimage_: Schicht des gepinnten Basisimages; ein neuerer Basis-Digest kann helfen.\n'
+                printf '_Dockerfile-Schicht_: nach dem letzten `FROM` installiert oder aktualisiert; '
+                printf 'die Version bestimmt der `apt-get`-Schritt, nicht der Basis-Digest.\n'
+                printf '_OS-Paket, Schicht unbekannt_: Basisschichten nicht ermittelbar; Herkunft offen.\n'
+                printf '_Abhängigkeit_: braucht ein Update in `Cargo.lock`; ein Digest-Bump ändert daran nichts.\n'
+              fi
+            } > "${rendered}"
+            if (( total > 0 )); then
+              printf '::error title=Trivy API image::%s behebbare HIGH/CRITICAL-Treffer, %s\n' \
+                "${total}" "Tabelle im Job-Summary und im Log von \"Render Trivy findings\""
+            fi
+          fi
+          cat "${rendered}" >> "${GITHUB_STEP_SUMMARY}"
+          cat "${rendered}"
       - name: Upload Trivy image report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
