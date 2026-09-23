@@ -205,7 +205,7 @@ jobs:
 
       - uses: pnpm/action-setup@b0f76dfb45f55f8421693e4803ac7bb65143bd34 # tag: v6
 
-      - uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858
+      - uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
         with:
           node-version-file: ".node-version"
           cache: "pnpm"
@@ -227,12 +227,12 @@ jobs:
 
       - uses: pnpm/action-setup@b0f76dfb45f55f8421693e4803ac7bb65143bd34 # tag: v6
 
-      - uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858
+      - uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
         with:
           node-version-file: ".node-version"
           cache: "pnpm"
 
-      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # tag: v7.0.0
+      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: ".python-version"
 
