@@ -32,8 +32,9 @@ def image_scan_steps() -> list[dict]:
     return payload["jobs"]["image-scan"]["steps"]
 
 
-def runtime_base_image() -> str:
-    refs = [line.split()[1] for line in DOCKERFILE.read_text(encoding="utf-8").splitlines() if line.startswith("FROM ")]
+def runtime_base_image(dockerfile: Path = DOCKERFILE) -> str:
+    """Last FROM image, parsed like the render step's awk: any case, flags skipped."""
+    refs = re.findall(r"(?mi)^\s*FROM\s+(?:--\S+\s+)*(\S+)", dockerfile.read_text(encoding="utf-8"))
     return refs[-1]
 
 
@@ -150,9 +151,15 @@ class TrivyReportRenderingTest(unittest.TestCase):
         }
 
     def render(
-        self, report: dict | None, *, pull_fails: bool = False
+        self,
+        report: dict | None,
+        *,
+        pull_fails: bool = False,
+        inspect_output: str | None = None,
+        cwd: Path = ROOT,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         report_path = self.tmp / "trivy-image-report.json"
+        report_path.unlink(missing_ok=True)
         if report is not None:
             report_path.write_text(json.dumps(report), encoding="utf-8")
         summary_path = self.tmp / "summary.md"
@@ -161,12 +168,13 @@ class TrivyReportRenderingTest(unittest.TestCase):
             **os.environ,
             **self.docker_env,
             "FAKE_DOCKER_PULL_RC": "1" if pull_fails else "0",
+            **({"FAKE_BASE_LAYERS": inspect_output} if inspect_output is not None else {}),
             "TRIVY_REPORT": str(report_path),
             "GITHUB_STEP_SUMMARY": str(summary_path),
         }
         result = subprocess.run(
             ["bash", "-c", self.script],
-            cwd=ROOT,
+            cwd=cwd,
             env=env,
             capture_output=True,
             text=True,
@@ -214,7 +222,7 @@ class TrivyReportRenderingTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"pull --quiet {runtime_base_image()}", self.docker_log.read_text(encoding="utf-8"))
         self.assertIn("## Trivy API image: 3 behebbare HIGH/CRITICAL-Treffer", summary)
-        self.assertIn(f"`{runtime_base_image()}`", summary)
+        self.assertIn(f"`{runtime_base_image()}`, 2 Basisschichten ermittelt", summary)
         self.assertIn("Im Image erkannt: debian 12.15", summary)
         self.assertEqual(
             self.table_rows(summary),
@@ -240,11 +248,67 @@ class TrivyReportRenderingTest(unittest.TestCase):
         _, unreachable_base = self.render(report, pull_fails=True)
         self.assertNotIn("| Basisimage", unreachable_base)
         self.assertEqual(unreachable_base.count("| OS-Paket, Schicht unbekannt (debian) |"), 2)
+        self.assertIn("Basisschichten nicht ermittelt", unreachable_base)
+
+        # A failed inspect may still print something; it must not break jq or
+        # pass as layer proof.
+        for garbage in ("", "[", '"sha256:base-layer-1"', "[]", "[1]"):
+            with self.subTest(inspect_output=garbage):
+                result, garbled = self.render(report, inspect_output=garbage)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("| Basisimage", garbled)
+                self.assertEqual(garbled.count("| OS-Paket, Schicht unbekannt (debian) |"), 2)
 
         _, known_base = self.render(report)
         rows = self.table_rows(known_base)
         self.assertTrue(rows[0].startswith("| Basisimage (debian) | libpcre2-8-0 |"), rows)
         self.assertTrue(rows[1].startswith("| OS-Paket, Schicht unbekannt (debian) | wget |"), rows)
+
+    def test_an_empty_primary_url_falls_back_to_nvd(self) -> None:
+        report = {
+            "Metadata": {},
+            "Results": [
+                {"Class": "lang-pkgs", "Type": "cargo", "Vulnerabilities": [vulnerability("CVE-2026-5555", "c", "HIGH", "")]}
+            ],
+        }
+        _, summary = self.render(report)
+
+        self.assertIn("[CVE-2026-5555](https://nvd.nist.gov/vuln/detail/CVE-2026-5555)", summary)
+        self.assertNotIn("]()", summary)
+
+    def test_the_runtime_base_is_the_last_from_in_any_case_and_with_flags(self) -> None:
+        dockerfile = self.tmp / "apps" / "api" / "Dockerfile"
+        dockerfile.parent.mkdir(parents=True)
+        dockerfile.write_text(
+            "FROM rust:1 AS build\nRUN true\nfrom\t--platform=linux/amd64 debian:runtime@sha256:abc AS runtime\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(runtime_base_image(dockerfile), "debian:runtime@sha256:abc")
+
+        result, summary = self.render({"Metadata": {}, "Results": []}, cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pull --quiet debian:runtime@sha256:abc", self.docker_log.read_text(encoding="utf-8"))
+        self.assertIn("`debian:runtime@sha256:abc`, 2 Basisschichten ermittelt", summary)
+
+    def test_a_missing_dockerfile_still_renders_the_report(self) -> None:
+        report = {
+            "Metadata": {},
+            "Results": [
+                {"Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [vulnerability("CVE-2026-6666", "x", "HIGH")]}
+            ],
+        }
+        result, summary = self.render(report, cwd=self.tmp)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("`?`, Basisschichten nicht ermittelt", summary)
+        self.assertIn("| OS-Paket, Schicht unbekannt (debian) | x |", summary)
+        self.assert_log_carries_summary(result, summary)
+
+        result, summary = self.render(None, cwd=self.tmp)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("## Trivy API image: kein Report", summary)
+        self.assert_log_carries_summary(result, summary)
+        self.assertFalse(self.docker_log.exists(), "no base to pull without a Dockerfile")
 
     def test_results_without_vulnerabilities_render_as_clean(self) -> None:
         report = {

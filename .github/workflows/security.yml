@@ -202,15 +202,28 @@ jobs:
         run: |
           set -euo pipefail
           rendered="$(mktemp)"
-          runtime_base="$(awk '$1 == "FROM" { for (i = 2; i <= NF; i++) if ($i !~ /^--/) { ref = $i; break } }
-            END { print ref }' apps/api/Dockerfile)"
+          trap 'rm -f "${rendered}"' EXIT
+          # A missing Dockerfile must not abort the step: its job is to report
+          # even when everything before it failed.
+          runtime_base=""
+          if [[ -f apps/api/Dockerfile ]]; then
+            runtime_base="$(awk 'toupper($1) == "FROM" {
+                for (i = 2; i <= NF; i++) if ($i !~ /^--/) { ref = $i; break }
+              } END { print ref }' apps/api/Dockerfile)"
+          fi
           # os-pkgs only says "OS package", not which layer brought it. A finding
           # counts as base image only if Trivy attributes it to a layer of the
           # pinned runtime base; packages installed after the last FROM do not.
           base_layers=null
           if [[ -n "${runtime_base}" ]] && docker pull --quiet "${runtime_base}" > /dev/null 2>&1; then
             base_layers="$(docker image inspect --format '{{json .RootFS.Layers}}' "${runtime_base}" 2> /dev/null \
-              || echo null)"
+              || true)"
+          fi
+          # Anything but a list of layer ids, e.g. partial output of a failed
+          # inspect, counts as unknown instead of breaking --argjson below.
+          if ! jq -e 'type == "array" and length > 0 and all(type == "string")' <<< "${base_layers}" \
+            > /dev/null 2>&1; then
+            base_layers=null
           fi
           if [[ ! -s "${TRIVY_REPORT}" ]]; then
             {
@@ -221,7 +234,12 @@ jobs:
             total="$(jq '[.Results[]?.Vulnerabilities[]?] | length' "${TRIVY_REPORT}")"
             {
               printf '## Trivy API image: %s behebbare HIGH/CRITICAL-Treffer\n\n' "${total}"
-              printf 'Laufzeitbasis laut `apps/api/Dockerfile`: `%s`\n\n' "${runtime_base:-?}"
+              printf 'Laufzeitbasis laut `apps/api/Dockerfile`: `%s`, ' "${runtime_base:-?}"
+              if [[ "${base_layers}" == null ]]; then
+                printf 'Basisschichten nicht ermittelt, Herkunft der OS-Pakete offen\n\n'
+              else
+                printf '%s Basisschichten ermittelt\n\n' "$(jq length <<< "${base_layers}")"
+              fi
               jq -r '"Im Image erkannt: \(.Metadata.OS.Family // "?") \(.Metadata.OS.Name // "?")\n"' "${TRIVY_REPORT}"
               if (( total == 0 )); then
                 printf 'Keine Treffer oberhalb der Schwelle.\n'
@@ -244,7 +262,7 @@ jobs:
                   | [ .Source, .PkgName, .InstalledVersion, (.FixedVersion // "-"), .Severity ]
                     as $cells
                   | ($cells | map(tostring | gsub("\\|"; "\\|")))
-                    + [ "[\(.VulnerabilityID)](\(.PrimaryURL
+                    + [ "[\(.VulnerabilityID)](\((.PrimaryURL | select(. != ""))
                           // ("https://nvd.nist.gov/vuln/detail/" + .VulnerabilityID)))" ]
                   | "| " + join(" | ") + " |"
                 ' "${TRIVY_REPORT}"
