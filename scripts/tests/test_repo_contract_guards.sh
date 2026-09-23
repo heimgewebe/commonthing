@@ -47,6 +47,38 @@ if REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null 2>&1; then
 fi
 mv "$TMP_ROOT/compose.prod.yml.valid" "$TMP_ROOT/infra/compose/compose.prod.yml"
 
+# Compose merges plain alias lists from an override, so adding a network stays
+# valid; !reset/!override on the alias path would drop the alias at deploy.
+cp "$TMP_ROOT/infra/compose/compose.vps.override.yml" "$TMP_ROOT/compose.vps.override.yml.valid"
+cat >> "$TMP_ROOT/infra/compose/compose.vps.override.yml" << 'EOF'
+  api:
+    networks:
+      edge: {}
+EOF
+REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null
+cp "$TMP_ROOT/compose.vps.override.yml.valid" "$TMP_ROOT/infra/compose/compose.vps.override.yml"
+cat >> "$TMP_ROOT/infra/compose/compose.vps.override.yml" << 'EOF'
+  api:
+    networks:
+      default:
+        aliases: !override
+          - other-name
+EOF
+if REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null 2>&1; then
+  echo "ERROR: compose-image-guard accepted an override that replaces the weltgewebe-api alias" >&2
+  exit 1
+fi
+cp "$TMP_ROOT/compose.vps.override.yml.valid" "$TMP_ROOT/infra/compose/compose.vps.override.yml"
+cat >> "$TMP_ROOT/infra/compose/compose.vps.override.yml" << 'EOF'
+  api:
+    networks: !reset {}
+EOF
+if REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null 2>&1; then
+  echo "ERROR: compose-image-guard accepted an override that resets the API networks" >&2
+  exit 1
+fi
+mv "$TMP_ROOT/compose.vps.override.yml.valid" "$TMP_ROOT/infra/compose/compose.vps.override.yml"
+
 uv run --project "$REPO_ROOT/tools/py" --locked python - "$TMP_ROOT/infra/schauwerk-editor/release-lock.json" << 'PY'
 import json
 import sys

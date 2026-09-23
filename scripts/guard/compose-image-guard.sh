@@ -32,25 +32,61 @@ else:
         failures.append("production API image must require a concrete API_VERSION")
 
 
-def api_default_aliases(path: Path) -> list | None:
+class ComposeLoader(yaml.SafeLoader):
+    """SafeLoader that keeps Compose's merge tags visible instead of failing."""
+
+
+class MergeTag:
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+
+def _construct_merge_tag(loader: yaml.SafeLoader, node: yaml.Node) -> MergeTag:
+    return MergeTag(node.tag)
+
+
+for merge_tag in ("!reset", "!override"):
+    ComposeLoader.add_constructor(merge_tag, _construct_merge_tag)
+
+API_ALIAS_PATH = ("services", "api", "networks", "default", "aliases")
+
+
+def load_compose(path: Path) -> object:
     try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
+        return yaml.load(path.read_text(encoding="utf-8"), Loader=ComposeLoader)
+    except (OSError, yaml.YAMLError) as exc:
+        failures.append(f"{path.relative_to(root)} cannot be parsed: {exc}")
         return None
-    node: object = document
-    for key in ("services", "api", "networks", "default", "aliases"):
-        node = node.get(key) if isinstance(node, dict) else None
-    return node if isinstance(node, list) else None
 
 
 # Stable internal DNS identity (docs/deploy/heimserver.integration.md, section 11):
 # Edge Caddy and Prometheus address the API as weltgewebe-api, never as a
 # Compose service suffix. Checked on the parsed alias list, not by text search,
 # because the API image name contains the same word.
-if prod.is_file() and "weltgewebe-api" not in (api_default_aliases(prod) or []):
-    failures.append(
-        "infra/compose/compose.prod.yml: services.api.networks.default.aliases must list 'weltgewebe-api'"
-    )
+if prod.is_file():
+    node: object = load_compose(prod)
+    for key in API_ALIAS_PATH:
+        node = node.get(key) if isinstance(node, dict) else None
+    if not isinstance(node, list) or "weltgewebe-api" not in node:
+        failures.append(
+            "infra/compose/compose.prod.yml: services.api.networks.default.aliases must list 'weltgewebe-api'"
+        )
+
+# weltgewebe-up deploys compose.prod.yml plus an override. Compose merges plain
+# alias lists, but !reset or !override anywhere on the alias path, or a
+# network_mode, removes the alias from the deployed model.
+for overlay in sorted(compose_dir.glob("compose.*.override.y*ml")):
+    rel = overlay.relative_to(root)
+    node = load_compose(overlay)
+    for depth, key in enumerate(API_ALIAS_PATH):
+        node = node.get(key) if isinstance(node, dict) else None
+        if isinstance(node, MergeTag):
+            failures.append(
+                f"{rel}: {node.tag} on {'.'.join(API_ALIAS_PATH[: depth + 1])} can drop the 'weltgewebe-api' alias"
+            )
+            break
+        if depth == 1 and isinstance(node, dict) and "network_mode" in node:
+            failures.append(f"{rel}: services.api.network_mode drops the 'weltgewebe-api' alias")
 
 image_re = re.compile(r"^\s*image:\s*([^\s#]+)")
 digest_re = re.compile(r"@sha256:[0-9a-f]{64}$")
