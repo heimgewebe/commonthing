@@ -191,6 +191,64 @@ jobs:
           format: json
           output: trivy-image-report.json
           exit-code: "1"
+      # The scan writes JSON only, so its findings reach neither the log nor the
+      # summary. Render them into both: the summary for people, the log for
+      # anyone reading job logs through the API, where summaries are not served.
+      - name: Render Trivy findings into job summary and log
+        if: always()
+        shell: bash
+        env:
+          TRIVY_REPORT: trivy-image-report.json
+        run: |
+          set -euo pipefail
+          rendered="$(mktemp)"
+          runtime_base="$(awk '$1 == "FROM" { ref = $2 } END { print ref }' apps/api/Dockerfile)"
+          if [[ ! -s "${TRIVY_REPORT}" ]]; then
+            {
+              printf '## Trivy API image: kein Report\n\n'
+              printf 'Der Scan hat keinen Report geschrieben; die Ursache steht im fehlgeschlagenen Step davor.\n'
+            } > "${rendered}"
+          else
+            total="$(jq '[.Results[]?.Vulnerabilities[]?] | length' "${TRIVY_REPORT}")"
+            {
+              printf '## Trivy API image: %s behebbare HIGH/CRITICAL-Treffer\n\n' "${total}"
+              printf 'Laufzeitbasis laut `apps/api/Dockerfile`: `%s`\n\n' "${runtime_base:-?}"
+              jq -r '"Im Image erkannt: \(.Metadata.OS.Family // "?") \(.Metadata.OS.Name // "?")\n"' "${TRIVY_REPORT}"
+              if (( total == 0 )); then
+                printf 'Keine Treffer oberhalb der Schwelle.\n'
+              else
+                printf '| Quelle | Paket | Installiert | Behoben in | Schwere | CVE |\n'
+                printf '| --- | --- | --- | --- | --- | --- |\n'
+                jq -r '
+                  [ .Results[]?
+                    | (if .Class == "os-pkgs" then "Basisimage" else "Abhängigkeit" end
+                       + " (" + (.Type // "?") + ")") as $source
+                    | .Vulnerabilities[]?
+                    | . + {Source: $source} ]
+                  | sort_by(if .Severity == "CRITICAL" then 0 else 1 end, .Source, .PkgName, .VulnerabilityID)
+                  | .[0:100][]
+                  | [ .Source, .PkgName, .InstalledVersion, (.FixedVersion // "-"), .Severity ]
+                    as $cells
+                  | ($cells | map(tostring | gsub("\\|"; "\\|")))
+                    + [ "[\(.VulnerabilityID)](\(.PrimaryURL
+                          // ("https://nvd.nist.gov/vuln/detail/" + .VulnerabilityID)))" ]
+                  | "| " + join(" | ") + " |"
+                ' "${TRIVY_REPORT}"
+                if (( total > 100 )); then
+                  printf '\n_Gekürzt auf 100 Zeilen; der vollständige Report liegt im Artefakt %s._\n' \
+                    '`trivy-api-image-report`'
+                fi
+                printf '\n_Basisimage_: behoben durch einen neueren Basis-Digest oder ein Paket-Upgrade im Image.\n'
+                printf '_Abhängigkeit_: braucht ein Update in `Cargo.lock`; ein Digest-Bump ändert daran nichts.\n'
+              fi
+            } > "${rendered}"
+            if (( total > 0 )); then
+              printf '::error title=Trivy API image::%s behebbare HIGH/CRITICAL-Treffer, %s\n' \
+                "${total}" "Tabelle im Job-Summary und im Log von \"Render Trivy findings\""
+            fi
+          fi
+          cat "${rendered}" >> "${GITHUB_STEP_SUMMARY}"
+          cat "${rendered}"
       - name: Upload Trivy image report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
