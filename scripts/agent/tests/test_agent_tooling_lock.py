@@ -268,6 +268,7 @@ class TestAgentToolingLock(unittest.TestCase):
             "scripts/tests/test_weltgewebe_up_git_branch.sh",
             "scripts/tests/test_weltgewebe_up_frontend_required.sh",
             "scripts/tests/test_weltgewebe_up_deploy_scope.sh",
+            "scripts/tests/test_verify_deployment.sh",
             "scripts/tests/test_version_guard.sh",
             "scripts/tests/test_basemap_mode_guard.sh",
             "scripts/tests/test_basemap_runtime_proof_contract.sh",

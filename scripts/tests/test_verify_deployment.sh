@@ -1,17 +1,33 @@
 #!/bin/bash
 # shellcheck disable=SC2155
 # ------------------------------------------------------------------
-# Local Mock Test for Deployment Logic
-# Not intended for CI execution without mock setup.
+# Mock test for scripts/weltgewebe-up deployment logic.
+# Every external effect (docker, git, curl, wget, getent, pnpm, sleep) is mocked
+# under mock_bin; runs in CI (ci.yml, Core Guard Tests) and make validate.
 # ------------------------------------------------------------------
 set -euo pipefail
 
 # Ensure we are in the repo root
 cd "$(dirname "$0")/../.."
 
+# weltgewebe-up writes into the checkout it deploys. Remember what existed before
+# the harness ran so cleanup removes only what the mocked deploys created.
+HAD_WEB_BUILD=0
+[[ -e apps/web/build ]] && HAD_WEB_BUILD=1
+HAD_OPS_DIR=0
+[[ -e .ops ]] && HAD_OPS_DIR=1
+HAD_DEPLOY_SNAPSHOT=0
+[[ -e artifacts/deploy.snapshot.json ]] && HAD_DEPLOY_SNAPSHOT=1
+HAD_GLYPHS=0
+[[ -e "map-style/glyphs/Noto Sans Regular" ]] && HAD_GLYPHS=1
+
 # Cleanup Trap
 cleanup() {
-  rm -rf mock_bin test.env custom_state
+  rm -rf mock_bin test.env custom_state mock_edge_ca.crt
+  [[ "$HAD_WEB_BUILD" == "1" ]] || rm -rf apps/web/build
+  [[ "$HAD_OPS_DIR" == "1" ]] || rm -rf .ops
+  [[ "$HAD_DEPLOY_SNAPSHOT" == "1" ]] || rm -f artifacts/deploy.snapshot.json
+  [[ "$HAD_GLYPHS" == "1" ]] || rm -rf "map-style/glyphs/Noto Sans Regular"
   if [[ -n "${MOCK_PORT_CALLS_FILE:-}" ]]; then
     rm -f "$MOCK_PORT_CALLS_FILE"
   fi
@@ -51,6 +67,11 @@ elif [[ "$1" == "rm" ]]; then
     fi
 elif [[ "$1" == "inspect" ]]; then
     ARGS="$*"
+    # Schaubild postflight: the live container runs exactly the image weltgewebe-up bound.
+    if [[ "$ARGS" == *"{{.Config.Image}}"* && "$ARGS" == *"schaubild_container_id"* ]]; then
+        echo "${SCHAUWERK_SCHAUBILD_IMAGE:-}"
+        exit 0
+    fi
     # Deferred zombie purge binds the immutable Docker container ID before any later effect.
     if [[ "$ARGS" == *"--format"* && "$ARGS" == *"{{.Id}}"* ]]; then
         echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -88,12 +109,20 @@ elif [[ "$1" == "compose" ]]; then
      if [[ "$ARGS" != *"--services"* ]]; then
          # Keep both ordinary and JSON config renders valid for current preflights.
          if [[ "$ARGS" == *"--format json"* ]]; then
-             echo '{"services": {}}'
+             # Render the Schaubild service the way Compose interpolates it from the
+             # bindings weltgewebe-up exports, so the full-scope runtime contract holds.
+             printf '{"services": {"caddy": {}, "schaubild": {"image": "%s", "pull_policy": "missing", "read_only": true, "ports": [], "expose": ["8765"], "command": ["--bind-host", "0.0.0.0", "--trusted-reverse-proxy", "--trusted-proxy-source-cidr", "%s", "--public-base-path", "/schaubild"]}}}\n' \
+                 "${SCHAUWERK_SCHAUBILD_IMAGE:-}" "${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-}"
          else
              echo "services: {}"
          fi
      fi
      exit 0
+  fi
+
+  if [[ "$ARGS" == *" ps -q schaubild"* ]]; then
+      echo "schaubild_container_id"
+      exit 0
   fi
 
   # HANDLE docker compose ... ps -q api
@@ -165,8 +194,9 @@ cat << 'EOF' > mock_bin/pnpm
 #!/bin/bash
 echo "Mocked pnpm execution: $*"
 if [[ "$*" == *"-C apps/web build"* ]]; then
-    mkdir -p apps/web/build
-    touch apps/web/build/index.html
+    mkdir -p apps/web/build/_app
+    # Smallest build that satisfies the runtime and static CSP preflights.
+    echo '<!doctype html><html><head><meta http-equiv="content-security-policy" content="script-src '"'"'self'"'"'"></head><body></body></html>' > apps/web/build/index.html
 fi
 exit 0
 EOF
@@ -177,6 +207,58 @@ cat << 'EOF' > mock_bin/curl
 # Fail if trying to connect to port 0
 if [[ "$*" == *":0/health/ready"* ]]; then
     exit 7
+fi
+# VPS Schaubild postflight: serve a native runtime that satisfies the reviewed contract.
+if [[ "$*" == *"https://commonthing.net/schaubild/"* ]]; then
+    headers_out="" body_out="" write_out="" url=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -D) headers_out="$2"; shift 2 ;;
+            -o) body_out="$2"; shift 2 ;;
+            -w) write_out="$2"; shift 2 ;;
+            --resolve | --connect-timeout | --max-time | --retry | --retry-delay | --noproxy | -H | --data-binary) shift 2 ;;
+            https://*) url="$1"; shift ;;
+            *) shift ;;
+        esac
+    done
+    asset_body() { printf 'schaubild asset %s\n' "$1"; }
+    headers="" body=""
+    case "$url" in
+        https://commonthing.net/schaubild/)
+            headers="HTTP/2 200"$'\r\n'"cache-control: no-store"$'\r\n'"content-security-policy: ${MOCK_SCHAUBILD_CSP:-}"$'\r\n'
+            body="<html></html>"
+            ;;
+        https://commonthing.net/schaubild/manifest.json)
+            files=""
+            for name in index.html app.js app.css native.js; do
+                digest="$(asset_body "$name" | sha256sum | awk '{print $1}')"
+                files="${files:+$files,}{\"path\": \"$name\", \"sha256\": \"$digest\"}"
+            done
+            body="{\"schema_version\": \"schauwerk-standalone-editor-manifest.v2\", \"editor_engine\": \"schauwerk-native-diagram-v1\", \"cutover_status\": \"native-primary-with-legacy-compatibility\", \"native_renderer\": {\"renderer\": \"schauwerk-native-diagram-v1\", \"api_path\": \"/schaubild/api/native-viewer\", \"public_base_path\": \"/schaubild\"}, \"files\": [$files]}"
+            ;;
+        https://commonthing.net/schaubild/api/native-viewer)
+            body='{"renderer": "schauwerk-native-diagram-v1", "url": "/schaubild/native/0123456789abcdef0123456789abcdef/index.html"}'
+            ;;
+        https://commonthing.net/schaubild/native/*)
+            headers="HTTP/2 200"$'\r\n'"content-security-policy: default-src 'self'; frame-ancestors 'self'"$'\r\n'"x-frame-options: SAMEORIGIN"$'\r\n'
+            body='<div id="nativeViewport"></div>'
+            ;;
+        *)
+            body="$(asset_body "${url##*/}")"
+            ;;
+    esac
+    if [[ -n "$headers_out" ]]; then
+        printf '%s' "$headers" > "$headers_out"
+    fi
+    if [[ -n "$body_out" ]]; then
+        printf '%s\n' "$body" > "$body_out"
+    else
+        printf '%s\n' "$body"
+    fi
+    if [[ "$write_out" == "%{http_code}" ]]; then
+        printf '200'
+    fi
+    exit 0
 fi
 echo '{"status": "ok"}'
 exit 0
@@ -212,6 +294,13 @@ else
 fi
 EOF
 
+# Retry loops (health: 10 x 5 s) wait on mocks that never change state; keep
+# the harness inside the CI job budget by not actually sleeping.
+cat << 'EOF' > mock_bin/sleep
+#!/bin/bash
+exit 0
+EOF
+
 chmod +x mock_bin/*
 export PATH="$(pwd)/mock_bin:$PATH"
 
@@ -219,6 +308,18 @@ export PATH="$(pwd)/mock_bin:$PATH"
 touch mock_edge_ca.crt
 export EDGE_CA="$PWD/mock_edge_ca.crt"
 export MOCK_HEALTH_EXISTS="1"
+
+# The harness is no VPS: pin the public Caddy binds so weltgewebe-up does not
+# probe the host's real interfaces via scripts/ops/resolve_vps_public_bind.py.
+export CADDY_BIND="127.0.0.1"
+export CADDY_IPV6_BIND="127.0.0.1"
+# The VPS target enables the stack-internal Caddy whenever Compose defines it.
+export MOCK_HAS_CADDY="1"
+# Frontend delivery (web build, basemap artifacts, edge reachability) has its own
+# harness in test_weltgewebe_up_frontend_required.sh; this one covers the API path.
+export DEPLOY_FRONTEND_MODE="off"
+# The exact isolated CSP the Schaubild postflight requires from /schaubild/.
+export MOCK_SCHAUBILD_CSP="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src 'self' https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 
 REPO_DIR=$(pwd)
 export REPO_DIR
@@ -279,7 +380,9 @@ fi
 echo ">>> Test 3b: Zombie Guard (Protect External Edge Gateway)"
 export MOCK_ZOMBIE=EDGE
 set +e
-OUTPUT=$(EDGE_GATEWAY_CONTAINER=edge-caddy DEPLOY_FRONTEND_MODE=edge REQUIRE_FRONTEND=1 ./scripts/weltgewebe-up --no-pull --no-build --purge-compose-leaks 2>&1)
+# The refusal does not depend on the frontend mode. Keep the rest of the mocked
+# deploy passing so a non-zero exit can only come from the refusal itself.
+OUTPUT=$(EDGE_GATEWAY_CONTAINER=edge-caddy DEPLOY_FRONTEND_MODE=off REQUIRE_FRONTEND=0 ./scripts/weltgewebe-up --no-pull --no-build --purge-compose-leaks 2>&1)
 EDGE_PURGE_RC=$?
 set -e
 if [[ "$EDGE_PURGE_RC" -ne 0 ]] &&
@@ -488,7 +591,8 @@ OUTPUT=$(./scripts/weltgewebe-up --no-build 2>&1)
 
 if [[ -f "$WELTGEWEBE_STATE_DIR/weltgewebe-up.state" ]]; then
   CONTENT=$(cat "$WELTGEWEBE_STATE_DIR/weltgewebe-up.state")
-  if [[ "$CONTENT" == "mock-sha-12345" ]]; then
+  # The state file records the deployed HEAD, i.e. what the git mock returns for rev-parse HEAD.
+  if [[ "$CONTENT" == "0123456789abcdef0123456789abcdef01234567" ]]; then
     echo "PASS: State file created in custom directory with correct SHA."
   else
     echo "FAIL: State file content incorrect. Got: $CONTENT"
@@ -671,6 +775,16 @@ else
 fi
 unset MOCK_MISSING_API
 
+# Tests 20-23 cover the edge guards (DNS, container health, frontend cache and
+# version.json). weltgewebe-up runs them only for the legacy
+# DEPLOY_TARGET=heimserver contract, which the script still accepts
+# (docs/deploy/commonthing.naming.md); the VPS target skips them.
+export DEPLOY_TARGET="heimserver"
+unset DEPLOY_FRONTEND_MODE
+# Sovereign Germany map delivery has its own regression in
+# test_weltgewebe_up_frontend_required.sh; keep these guards on remote-style.
+export PUBLIC_BASEMAP_MODE="remote-style"
+
 # 20. DNS Guard Success
 echo ">>> Test 20: DNS Guard Success"
 cat << 'EOF_GETENT' > mock_bin/getent
@@ -773,7 +887,22 @@ if [[ "$*" == *"-I"* && "$*" == *"/map"* ]]; then
 fi
 # Mock general reachability / frontend asset extraction (Guard 5)
 if [[ "$*" == *"/map"* ]]; then
-    echo "<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    MAP_HTML="<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    O_FILE=""
+    for ((i = 1; i < $#; i++)); do
+        if [[ "${!i}" == "-o" ]]; then
+            next=$((i + 1))
+            O_FILE="${!next}"
+        fi
+    done
+    if [[ -n "$O_FILE" ]]; then
+        echo "$MAP_HTML" > "$O_FILE"
+    else
+        echo "$MAP_HTML"
+    fi
+    if [[ "$*" == *"%{http_code}"* ]]; then
+        printf '200'
+    fi
     exit 0
 fi
 exit 0
@@ -821,7 +950,8 @@ if [[ "$*" == *"-I"* && "$*" == *"/map"* ]]; then
     exit 0
 fi
 # Mock Asset Cache Guard (make it fail by providing empty headers)
-if [[ "$*" == *"-D"* && "$*" == *".js"* ]]; then
+# (version.json also matches *.js*; it has its own branch below.)
+if [[ "$*" == *"-D"* && "$*" == *".js"* && "$*" != *"/_app/version.json"* ]]; then
     # Parse args for -D <file> to accurately write headers
     D_FILE=""
     while [[ $# -gt 0 ]]; do
@@ -839,7 +969,22 @@ if [[ "$*" == *"-D"* && "$*" == *".js"* ]]; then
 fi
 # Mock general reachability / frontend asset extraction (Guard 5)
 if [[ "$*" == *"/map"* ]]; then
-    echo "<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    MAP_HTML="<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    O_FILE=""
+    for ((i = 1; i < $#; i++)); do
+        if [[ "${!i}" == "-o" ]]; then
+            next=$((i + 1))
+            O_FILE="${!next}"
+        fi
+    done
+    if [[ -n "$O_FILE" ]]; then
+        echo "$MAP_HTML" > "$O_FILE"
+    else
+        echo "$MAP_HTML"
+    fi
+    if [[ "$*" == *"%{http_code}"* ]]; then
+        printf '200'
+    fi
     exit 0
 fi
 exit 0
@@ -878,7 +1023,8 @@ if [[ "$*" == *"-I"* && "$*" == *"/map"* ]]; then
     exit 0
 fi
 # Mock Asset Cache Guard (make it pass)
-if [[ "$*" == *"-D"* && "$*" == *".js"* ]]; then
+# (version.json also matches *.js*; it has its own branch below.)
+if [[ "$*" == *"-D"* && "$*" == *".js"* && "$*" != *"/_app/version.json"* ]]; then
     D_FILE=""
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == "-D" ]]; then
@@ -896,6 +1042,7 @@ if [[ "$*" == *"-D"* && "$*" == *".js"* ]]; then
 fi
 # Mock /_app/version.json (make it pass)
 if [[ "$*" == *"/_app/version.json"* ]]; then
+    ALL_ARGS="$*" # the option loop below shifts "$@" away
     O_FILE=""
     D_FILE=""
     while [[ $# -gt 0 ]]; do
@@ -914,7 +1061,7 @@ if [[ "$*" == *"/_app/version.json"* ]]; then
         echo "Cache-Control: no-store" >> "$D_FILE"
     fi
     # If -w %{http_code} is used, we output ONLY 200 to stdout
-    if [[ "$*" == *"-w"* ]]; then
+    if [[ "$ALL_ARGS" == *"-w"* ]]; then
         echo "200"
     else
         # Fallback if no -w and no -o was used (for manual curls)
@@ -926,7 +1073,22 @@ if [[ "$*" == *"/_app/version.json"* ]]; then
 fi
 # Mock general reachability / frontend asset extraction (Guard 5)
 if [[ "$*" == *"/map"* ]]; then
-    echo "<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    MAP_HTML="<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    O_FILE=""
+    for ((i = 1; i < $#; i++)); do
+        if [[ "${!i}" == "-o" ]]; then
+            next=$((i + 1))
+            O_FILE="${!next}"
+        fi
+    done
+    if [[ -n "$O_FILE" ]]; then
+        echo "$MAP_HTML" > "$O_FILE"
+    else
+        echo "$MAP_HTML"
+    fi
+    if [[ "$*" == *"%{http_code}"* ]]; then
+        printf '200'
+    fi
     exit 0
 fi
 exit 0
@@ -967,7 +1129,8 @@ if [[ "$*" == *"-I"* && "$*" == *"/map"* ]]; then
     exit 0
 fi
 # Mock Asset Cache Guard (make it pass)
-if [[ "$*" == *"-D"* && "$*" == *".js"* ]]; then
+# (version.json also matches *.js*; it has its own branch below.)
+if [[ "$*" == *"-D"* && "$*" == *".js"* && "$*" != *"/_app/version.json"* ]]; then
     D_FILE=""
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == "-D" ]]; then
@@ -985,6 +1148,7 @@ if [[ "$*" == *"-D"* && "$*" == *".js"* ]]; then
 fi
 # Mock /_app/version.json (make it fail by not providing Cache-Control: no-store)
 if [[ "$*" == *"/_app/version.json"* ]]; then
+    ALL_ARGS="$*" # the option loop below shifts "$@" away
     O_FILE=""
     D_FILE=""
     while [[ $# -gt 0 ]]; do
@@ -1002,7 +1166,7 @@ if [[ "$*" == *"/_app/version.json"* ]]; then
         echo "HTTP/1.1 200 OK" > "$D_FILE"
     fi
     # If -w %{http_code} is used, we output ONLY 200 to stdout
-    if [[ "$*" == *"-w"* ]]; then
+    if [[ "$ALL_ARGS" == *"-w"* ]]; then
         echo "200"
     else
         # Fallback if no -w and no -o was used (for manual curls)
@@ -1014,7 +1178,22 @@ if [[ "$*" == *"/_app/version.json"* ]]; then
 fi
 # Mock general reachability / frontend asset extraction (Guard 5)
 if [[ "$*" == *"/map"* ]]; then
-    echo "<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    MAP_HTML="<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    O_FILE=""
+    for ((i = 1; i < $#; i++)); do
+        if [[ "${!i}" == "-o" ]]; then
+            next=$((i + 1))
+            O_FILE="${!next}"
+        fi
+    done
+    if [[ -n "$O_FILE" ]]; then
+        echo "$MAP_HTML" > "$O_FILE"
+    else
+        echo "$MAP_HTML"
+    fi
+    if [[ "$*" == *"%{http_code}"* ]]; then
+        printf '200'
+    fi
     exit 0
 fi
 exit 0
@@ -1053,7 +1232,8 @@ if [[ "$*" == *"-I"* && "$*" == *"/map"* ]]; then
     exit 0
 fi
 # Mock Asset Cache Guard (make it pass)
-if [[ "$*" == *"-D"* && "$*" == *".js"* ]]; then
+# (version.json also matches *.js*; it has its own branch below.)
+if [[ "$*" == *"-D"* && "$*" == *".js"* && "$*" != *"/_app/version.json"* ]]; then
     D_FILE=""
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == "-D" ]]; then
@@ -1071,6 +1251,7 @@ if [[ "$*" == *"-D"* && "$*" == *".js"* ]]; then
 fi
 # Mock /_app/version.json (make it fail by providing valid JSON without canonical version)
 if [[ "$*" == *"/_app/version.json"* ]]; then
+    ALL_ARGS="$*" # the option loop below shifts "$@" away
     O_FILE=""
     D_FILE=""
     while [[ $# -gt 0 ]]; do
@@ -1090,7 +1271,7 @@ if [[ "$*" == *"/_app/version.json"* ]]; then
         echo "Cache-Control: no-store" >> "$D_FILE"
     fi
     # If -w %{http_code} is used, we output ONLY 200 to stdout
-    if [[ "$*" == *"-w"* ]]; then
+    if [[ "$ALL_ARGS" == *"-w"* ]]; then
         echo "200"
     else
         # Fallback if no -w and no -o was used (for manual curls)
@@ -1102,7 +1283,22 @@ if [[ "$*" == *"/_app/version.json"* ]]; then
 fi
 # Mock general reachability / frontend asset extraction (Guard 5)
 if [[ "$*" == *"/map"* ]]; then
-    echo "<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    MAP_HTML="<div id=\"_app/\"></div><script src=\"./_app/immutable/test.js\"></script>"
+    O_FILE=""
+    for ((i = 1; i < $#; i++)); do
+        if [[ "${!i}" == "-o" ]]; then
+            next=$((i + 1))
+            O_FILE="${!next}"
+        fi
+    done
+    if [[ -n "$O_FILE" ]]; then
+        echo "$MAP_HTML" > "$O_FILE"
+    else
+        echo "$MAP_HTML"
+    fi
+    if [[ "$*" == *"%{http_code}"* ]]; then
+        printf '200'
+    fi
     exit 0
 fi
 exit 0
@@ -1127,7 +1323,6 @@ else
 fi
 
 unset REQUIRE_FRONTEND
-unset PUBLIC_BASEMAP_MODE
 unset EDGE_CA
 unset MOCK_HEALTH_EXISTS
 rm -f mock_edge_ca.crt
@@ -1166,5 +1361,7 @@ unset REPO_DIR
 unset MOCK_PORT_MODE
 unset MOCK_EXEC_FAIL
 unset MOCK_HAS_CADDY
+unset DEPLOY_TARGET
+unset PUBLIC_BASEMAP_MODE
 
 echo ">>> All refined tests passed."
