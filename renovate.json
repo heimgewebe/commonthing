@@ -1,6 +1,22 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "automerge": false,
+  "customManagers": [
+    {
+      "description": "Read SHA-pinned GitHub Actions that declare their tag in the repo's `# tag: <tag>` provenance comment. The built-in github-actions manager only accepts a bare `# <tag>` comment and skips every ref here as unversioned-reference, so without this manager no pinned action is ever updated. A quoted reference is matched too, because the pinning guard accepts one; the rewrite drops the quotes and leaves the canonical form.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "uses:\\s*[\"']?(?<depName>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)@(?<currentDigest>[0-9a-f]{40})[\"']?[ \\t]+#[ \\t]*tag:[ \\t]*(?<currentValue>v[0-9][A-Za-z0-9._-]*)"
+      ],
+      "autoReplaceStringTemplate": "uses: {{{depName}}}@{{{newDigest}}} # tag: {{{newValue}}}",
+      "datasourceTemplate": "github-tags",
+      "versioningTemplate": "github-actions",
+      "depTypeTemplate": "action"
+    }
+  ],
   "packageRules": [
     {
       "description": "Attach proven governance metadata to allowlisted web tooling patches",
@@ -22,6 +38,17 @@
         "<!-- weltgewebe-attention-impact: none -->",
         "<!-- weltgewebe-attention-rationale: Allowlisted dependency-only patch update in apps/web; no attention-domain semantics, prioritization, triggers, or user-facing attention behavior changed. -->"
       ]
+    },
+    {
+      "description": "Land the newly visible action pins as one review instead of one pull request per action",
+      "matchManagers": [
+        "github-actions",
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        ".github/workflows/**"
+      ],
+      "groupName": "github actions"
     }
   ]
 }

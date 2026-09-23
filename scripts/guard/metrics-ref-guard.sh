@@ -18,9 +18,11 @@ if [[ ! -f "$WORKFLOW" ]]; then
 fi
 
 # Extract the ref after the @ in the uses: line
-# Pattern: uses: heimgewebe/metarepo/...@<REF>
+# Pattern: uses: heimgewebe/metarepo/...@<REF> [# <provenance comment>]
+# The trailing comment carries the pin's provenance declaration and is not
+# part of the ref, so strip it before comparing.
 USES_REF="$(grep -E '^\s+uses:\s+heimgewebe/metarepo/' "$WORKFLOW" |
-  head -n1 | sed 's/.*@//' | tr -d '[:space:]')"
+  head -n1 | sed 's/.*@//; s/[[:space:]]*#.*$//' | tr -d '[:space:]')"
 
 if [[ -z "$USES_REF" ]]; then
   echo "ERROR: could not extract uses: ref from $WORKFLOW" >&2

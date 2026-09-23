@@ -63,12 +63,101 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@1234567890123456789012345678901234567890
+      - uses: actions/checkout@1234567890123456789012345678901234567890 # tag: v7.0.1
 """
         )
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("kind.github-action=1", result.stdout)
         self.assertIn("policy.pinned-sha=1", result.stdout)
+
+    def test_sha_pin_without_provenance_declaration_fails(self) -> None:
+        result = self.run_checker(
+            """
+name: pin
+on: workflow_dispatch
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1234567890123456789012345678901234567890
+"""
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("must declare its provenance", result.stdout)
+
+    def test_explicit_untagged_marker_satisfies_the_declaration(self) -> None:
+        result = self.run_checker(
+            """
+name: pin
+on: workflow_dispatch
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1234567890123456789012345678901234567890 # provenance: untagged (1 commit after v7.0.1)
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_local_and_docker_refs_need_no_declaration(self) -> None:
+        result = self.run_checker(
+            """
+name: pin
+on: workflow_dispatch
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/setup
+      - uses: docker://alpine:3.21
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("kind.local-action=1", result.stdout)
+        self.assertIn("kind.docker-image=1", result.stdout)
+
+    def test_reusable_workflow_needs_no_declaration(self) -> None:
+        result = self.run_checker(
+            """
+name: pin
+on: workflow_dispatch
+jobs:
+  audit:
+    uses: owner/repo/.github/workflows/reusable.yml@1234567890123456789012345678901234567890
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("kind.reusable-workflow=1", result.stdout)
+
+    def test_declaration_blockers_are_reported_in_json(self) -> None:
+        result = self.run_checker(
+            """
+name: pin
+on: workflow_dispatch
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1234567890123456789012345678901234567890
+""",
+            arguments=("--format", "json"),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "fail")
+        self.assertEqual(
+            payload["declaration_blockers"],
+            [
+                {
+                    "workflow": ".github/workflows/audit.yml",
+                    "job": "audit",
+                    "uses": (
+                        "actions/checkout@"
+                        "1234567890123456789012345678901234567890"
+                    ),
+                }
+            ],
+        )
 
     def test_named_action_ref_is_classified(self) -> None:
         result = self.run_checker(
