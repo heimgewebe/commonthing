@@ -37,8 +37,21 @@ def runtime_base_image() -> str:
     return refs[-1]
 
 
-def vulnerability(vuln_id: str, pkg: str, severity: str, url: str | None = None) -> dict:
-    return {
+BASE_LAYERS = ["sha256:base-layer-1", "sha256:base-layer-2"]
+FAKE_DOCKER = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "${FAKE_DOCKER_LOG}"
+case "$1" in
+  pull) exit "${FAKE_DOCKER_PULL_RC:-0}" ;;
+  image) printf '%s\\n' "${FAKE_BASE_LAYERS}" ;;
+  *) exit 2 ;;
+esac
+"""
+
+
+def vulnerability(
+    vuln_id: str, pkg: str, severity: str, url: str | None = None, layer: str | None = None
+) -> dict:
+    finding = {
         "VulnerabilityID": vuln_id,
         "PkgName": pkg,
         "InstalledVersion": "1.0",
@@ -46,6 +59,9 @@ def vulnerability(vuln_id: str, pkg: str, severity: str, url: str | None = None)
         "Severity": severity,
         "PrimaryURL": url,
     }
+    if layer is not None:
+        finding["Layer"] = {"DiffID": layer}
+    return finding
 
 
 class SecurityWorkflowContractTest(unittest.TestCase):
@@ -121,8 +137,21 @@ class TrivyReportRenderingTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp)
         render_step = next(step for step in image_scan_steps() if step.get("name") == RENDER_STEP)
         self.script = render_step["run"]
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        fake_docker = bin_dir / "docker"
+        fake_docker.write_text(FAKE_DOCKER, encoding="utf-8")
+        fake_docker.chmod(0o755)
+        self.docker_log = self.tmp / "docker.log"
+        self.docker_env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "FAKE_DOCKER_LOG": str(self.docker_log),
+            "FAKE_BASE_LAYERS": json.dumps(BASE_LAYERS),
+        }
 
-    def render(self, report: dict | None) -> tuple[subprocess.CompletedProcess[str], str]:
+    def render(
+        self, report: dict | None, *, pull_fails: bool = False
+    ) -> tuple[subprocess.CompletedProcess[str], str]:
         report_path = self.tmp / "trivy-image-report.json"
         if report is not None:
             report_path.write_text(json.dumps(report), encoding="utf-8")
@@ -130,6 +159,8 @@ class TrivyReportRenderingTest(unittest.TestCase):
         summary_path.write_text("", encoding="utf-8")
         env = {
             **os.environ,
+            **self.docker_env,
+            "FAKE_DOCKER_PULL_RC": "1" if pull_fails else "0",
             "TRIVY_REPORT": str(report_path),
             "GITHUB_STEP_SUMMARY": str(summary_path),
         }
@@ -149,7 +180,11 @@ class TrivyReportRenderingTest(unittest.TestCase):
         )
         self.assertEqual(log_without_annotations, summary)
 
-    def test_findings_become_a_sorted_table_with_their_source(self) -> None:
+    @staticmethod
+    def table_rows(summary: str) -> list[str]:
+        return [line for line in summary.splitlines() if line.startswith("| ") and "---" not in line][1:]
+
+    def test_findings_become_a_sorted_table_with_their_layer_provenance(self) -> None:
         report = {
             "Metadata": {"OS": {"Family": "debian", "Name": "12.15"}, "RepoDigests": []},
             "Results": [
@@ -157,8 +192,14 @@ class TrivyReportRenderingTest(unittest.TestCase):
                     "Class": "os-pkgs",
                     "Type": "debian",
                     "Vulnerabilities": [
-                        vulnerability("CVE-2026-2222", "zlib1g", "HIGH"),
-                        vulnerability("CVE-2026-1111", "libssl3", "CRITICAL", "https://avd.example/cve-2026-1111"),
+                        vulnerability("CVE-2026-2222", "zlib1g", "HIGH", layer=BASE_LAYERS[1]),
+                        vulnerability(
+                            "CVE-2026-1111",
+                            "libssl3",
+                            "CRITICAL",
+                            "https://avd.example/cve-2026-1111",
+                            layer="sha256:layer-after-last-from",
+                        ),
                     ],
                 },
                 {
@@ -171,14 +212,14 @@ class TrivyReportRenderingTest(unittest.TestCase):
         result, summary = self.render(report)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"pull --quiet {runtime_base_image()}", self.docker_log.read_text(encoding="utf-8"))
         self.assertIn("## Trivy API image: 3 behebbare HIGH/CRITICAL-Treffer", summary)
         self.assertIn(f"`{runtime_base_image()}`", summary)
         self.assertIn("Im Image erkannt: debian 12.15", summary)
-        rows = [line for line in summary.splitlines() if line.startswith("| ") and "---" not in line][1:]
         self.assertEqual(
-            rows,
+            self.table_rows(summary),
             [
-                "| Basisimage (debian) | libssl3 | 1.0 | 1.1 | CRITICAL | "
+                "| Dockerfile-Schicht (debian) | libssl3 | 1.0 | 1.1 | CRITICAL | "
                 "[CVE-2026-1111](https://avd.example/cve-2026-1111) |",
                 "| Abhängigkeit (rustbinary) | odd\\|crate | 1.0 | 1.1 | HIGH | [GHSA-0000](https://gh.example/a) |",
                 "| Basisimage (debian) | zlib1g | 1.0 | 1.1 | HIGH | "
@@ -188,6 +229,22 @@ class TrivyReportRenderingTest(unittest.TestCase):
         self.assertIn("::error title=Trivy API image::3 behebbare HIGH/CRITICAL-Treffer", result.stdout)
         self.assertNotIn("::error", summary)
         self.assert_log_carries_summary(result, summary)
+
+    def test_os_packages_are_never_called_base_image_without_layer_proof(self) -> None:
+        findings = [
+            vulnerability("CVE-2026-3333", "libpcre2-8-0", "HIGH", layer=BASE_LAYERS[0]),
+            vulnerability("CVE-2026-4444", "wget", "HIGH"),
+        ]
+        report = {"Metadata": {}, "Results": [{"Class": "os-pkgs", "Type": "debian", "Vulnerabilities": findings}]}
+
+        _, unreachable_base = self.render(report, pull_fails=True)
+        self.assertNotIn("| Basisimage", unreachable_base)
+        self.assertEqual(unreachable_base.count("| OS-Paket, Schicht unbekannt (debian) |"), 2)
+
+        _, known_base = self.render(report)
+        rows = self.table_rows(known_base)
+        self.assertTrue(rows[0].startswith("| Basisimage (debian) | libpcre2-8-0 |"), rows)
+        self.assertTrue(rows[1].startswith("| OS-Paket, Schicht unbekannt (debian) | wget |"), rows)
 
     def test_results_without_vulnerabilities_render_as_clean(self) -> None:
         report = {
@@ -210,7 +267,10 @@ class TrivyReportRenderingTest(unittest.TestCase):
         self.assert_log_carries_summary(result, summary)
 
     def test_more_than_a_hundred_findings_are_truncated_with_a_pointer(self) -> None:
-        findings = [vulnerability(f"CVE-2026-{index:04d}", f"pkg{index:03d}", "HIGH") for index in range(101)]
+        findings = [
+            vulnerability(f"CVE-2026-{index:04d}", f"pkg{index:03d}", "HIGH", layer=BASE_LAYERS[0])
+            for index in range(101)
+        ]
         report = {"Metadata": {}, "Results": [{"Class": "os-pkgs", "Type": "debian", "Vulnerabilities": findings}]}
         result, summary = self.render(report)
 
