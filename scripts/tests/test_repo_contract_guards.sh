@@ -16,6 +16,10 @@ cat > "$TMP_ROOT/infra/compose/compose.prod.yml" << 'EOF'
 services:
   api:
     image: weltgewebe-api:${API_VERSION:?API_VERSION must be set}
+    networks:
+      default:
+        aliases:
+          - weltgewebe-api
 EOF
 cat > "$TMP_ROOT/infra/compose/compose.vps.override.yml" << 'EOF'
 services:
@@ -33,6 +37,15 @@ cat > "$TMP_ROOT/infra/schauwerk-editor/release-lock.json" << 'EOF'
 }
 EOF
 REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null
+
+# The image name also contains weltgewebe-api; a renamed alias must still fail.
+cp "$TMP_ROOT/infra/compose/compose.prod.yml" "$TMP_ROOT/compose.prod.yml.valid"
+sed -i 's/^          - weltgewebe-api$/          - weltgewebe-api-legacy/' "$TMP_ROOT/infra/compose/compose.prod.yml"
+if REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null 2>&1; then
+  echo "ERROR: compose-image-guard accepted a production API without the weltgewebe-api alias" >&2
+  exit 1
+fi
+mv "$TMP_ROOT/compose.prod.yml.valid" "$TMP_ROOT/infra/compose/compose.prod.yml"
 
 uv run --project "$REPO_ROOT/tools/py" --locked python - "$TMP_ROOT/infra/schauwerk-editor/release-lock.json" << 'PY'
 import json
