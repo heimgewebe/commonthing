@@ -79,9 +79,9 @@ Each historical row remains individually addressable by a stable finding ID. A d
 
 ## Current tracked Makefile snapshot
 
-- Makefile SHA-256: `62b1d025974969bbc0a1a1ae11cfaa72a9cd83e5e26c92039673efea803e52ad`
-- Current tracked execution edges decided: **59 / 59**
-- Classification counts: `accepted-coupling`=6, `explicit`=53, `not-relevant`=0, `remove`=0
+- Makefile SHA-256: `3047b3a366fd226d04b4f4ff0fb87305cb8f8848d7f50f47b9bd9664ccfdd5df`
+- Current tracked execution edges decided: **60 / 60**
+- Classification counts: `accepted-coupling`=6, `explicit`=54, `not-relevant`=0, `remove`=0
 - New tracked Python-module, Python-script, or Bash-script edges without a resolvable decision make generation and `--check` fail closed.
 
 | ID | Target | Line | Dependency | Evidence | Decision | Decision evidence |
@@ -129,22 +129,23 @@ Each historical row remains individually addressable by a stable finding ID. A d
 | `e7cbe7003de3` | validate-shell-tests | 93 | `scripts/tests/test_offhost_backup_pull_contract.sh` | `bash scripts/tests/test_offhost_backup_pull_contract.sh` | explicit | current repository file `scripts/tests/test_offhost_backup_pull_contract.sh` exists and is invoked directly |
 | `3bc4b6b53b0c` | validate-shell-tests | 94 | `scripts/tests/test_web_artifact_install_contract.sh` | `bash scripts/tests/test_web_artifact_install_contract.sh` | explicit | current repository file `scripts/tests/test_web_artifact_install_contract.sh` exists and is invoked directly |
 | `8e8bb22c760c` | validate-shell-tests | 95 | `scripts/tests/test_api_release_identity_contract.sh` | `bash scripts/tests/test_api_release_identity_contract.sh` | explicit | current repository file `scripts/tests/test_api_release_identity_contract.sh` exists and is invoked directly |
-| `1eb7490b26a6` | generate | 104 | `scripts/docmeta/generate-doc-index.sh` | `bash scripts/docmeta/generate-doc-index.sh` | explicit | current repository file `scripts/docmeta/generate-doc-index.sh` exists and is invoked directly |
-| `4aed6f8e48e9` | generate | 105 | `scripts.docmeta.generate_backlinks` | `$(UV_RUN) python -m scripts.docmeta.generate_backlinks` | explicit | current repository module resolves to `scripts/docmeta/generate_backlinks.py` and is invoked directly |
-| `c90a1061567f` | generate | 106 | `scripts/docmeta/generate-impl-index.sh` | `bash scripts/docmeta/generate-impl-index.sh` | explicit | current repository file `scripts/docmeta/generate-impl-index.sh` exists and is invoked directly |
-| `dcbb72b087c9` | generate | 107 | `scripts.docmeta.generate_orphans` | `$(UV_RUN) python -m scripts.docmeta.generate_orphans` | explicit | current repository module resolves to `scripts/docmeta/generate_orphans.py` and is invoked directly |
-| `d3848f0d2f4b` | generate | 108 | `scripts.docmeta.generate_supersession_map` | `$(UV_RUN) python -m scripts.docmeta.generate_supersession_map` | explicit | current repository module resolves to `scripts/docmeta/generate_supersession_map.py` and is invoked directly |
-| `b8a2756108db` | generate | 109 | `scripts.docmeta.generate_system_map` | `$(UV_RUN) python -m scripts.docmeta.generate_system_map` | explicit | current repository module resolves to `scripts/docmeta/generate_system_map.py` and is invoked directly |
-| `af65dfb28750` | generate | 110 | `scripts.docmeta.generate_doc_coverage` | `$(UV_RUN) python -m scripts.docmeta.generate_doc_coverage` | explicit | current repository module resolves to `scripts/docmeta/generate_doc_coverage.py` and is invoked directly |
-| `99f33f30e2a0` | generate | 111 | `scripts.docmeta.generate_knowledge_gaps` | `$(UV_RUN) python -m scripts.docmeta.generate_knowledge_gaps` | explicit | current repository module resolves to `scripts/docmeta/generate_knowledge_gaps.py` and is invoked directly |
-| `f11e1c46e857` | generate | 112 | `scripts.docmeta.generate_implicit_dependencies` | `$(UV_RUN) python -m scripts.docmeta.generate_implicit_dependencies` | explicit | current repository module resolves to `scripts/docmeta/generate_implicit_dependencies.py` and is invoked directly |
-| `45313dc2583d` | generate | 113 | `scripts.docmeta.generate_staleness_report` | `$(UV_RUN) python -m scripts.docmeta.generate_staleness_report` | explicit | current repository module resolves to `scripts/docmeta/generate_staleness_report.py` and is invoked directly |
-| `3858cdc6c5da` | generate | 114 | `scripts.docmeta.generate_agent_readiness` | `$(UV_RUN) python -m scripts.docmeta.generate_agent_readiness` | explicit | current repository module resolves to `scripts/docmeta/generate_agent_readiness.py` and is invoked directly |
-| `787f31d26a36` | generate | 115 | `scripts.docmeta.generate_claim_evidence_map` | `$(UV_RUN) python -m scripts.docmeta.generate_claim_evidence_map` | explicit | current repository module resolves to `scripts/docmeta/generate_claim_evidence_map.py` and is invoked directly |
-| `d65433cf4dfb` | generate | 116 | `scripts.docmeta.generate_relations_analysis` | `$(UV_RUN) python -m scripts.docmeta.generate_relations_analysis` | explicit | current repository module resolves to `scripts/docmeta/generate_relations_analysis.py` and is invoked directly |
-| `8057cbe6809c` | generate | 117 | `scripts.docmeta.generate_relates_to_audit` | `$(UV_RUN) python -m scripts.docmeta.generate_relates_to_audit` | explicit | current repository module resolves to `scripts/docmeta/generate_relates_to_audit.py` and is invoked directly |
-| `86ae7c39f5a2` | generate | 118 | `scripts.docmeta.generate_report_lifecycle` | `$(UV_RUN) python -m scripts.docmeta.generate_report_lifecycle` | explicit | current repository module resolves to `scripts/docmeta/generate_report_lifecycle.py` and is invoked directly |
-| `768a67e15fd0` | generate | 119 | `scripts.docmeta.generate_report_lifecycle_inventory` | `$(UV_RUN) python -m scripts.docmeta.generate_report_lifecycle_inventory` | explicit | current repository module resolves to `scripts/docmeta/generate_report_lifecycle_inventory.py` and is invoked directly |
+| `c36dce3ceff7` | validate-shell-tests | 96 | `scripts/tests/test_runtime_contract.sh` | `bash scripts/tests/test_runtime_contract.sh` | explicit | current repository file `scripts/tests/test_runtime_contract.sh` exists and is invoked directly |
+| `1eb7490b26a6` | generate | 105 | `scripts/docmeta/generate-doc-index.sh` | `bash scripts/docmeta/generate-doc-index.sh` | explicit | current repository file `scripts/docmeta/generate-doc-index.sh` exists and is invoked directly |
+| `4aed6f8e48e9` | generate | 106 | `scripts.docmeta.generate_backlinks` | `$(UV_RUN) python -m scripts.docmeta.generate_backlinks` | explicit | current repository module resolves to `scripts/docmeta/generate_backlinks.py` and is invoked directly |
+| `c90a1061567f` | generate | 107 | `scripts/docmeta/generate-impl-index.sh` | `bash scripts/docmeta/generate-impl-index.sh` | explicit | current repository file `scripts/docmeta/generate-impl-index.sh` exists and is invoked directly |
+| `dcbb72b087c9` | generate | 108 | `scripts.docmeta.generate_orphans` | `$(UV_RUN) python -m scripts.docmeta.generate_orphans` | explicit | current repository module resolves to `scripts/docmeta/generate_orphans.py` and is invoked directly |
+| `d3848f0d2f4b` | generate | 109 | `scripts.docmeta.generate_supersession_map` | `$(UV_RUN) python -m scripts.docmeta.generate_supersession_map` | explicit | current repository module resolves to `scripts/docmeta/generate_supersession_map.py` and is invoked directly |
+| `b8a2756108db` | generate | 110 | `scripts.docmeta.generate_system_map` | `$(UV_RUN) python -m scripts.docmeta.generate_system_map` | explicit | current repository module resolves to `scripts/docmeta/generate_system_map.py` and is invoked directly |
+| `af65dfb28750` | generate | 111 | `scripts.docmeta.generate_doc_coverage` | `$(UV_RUN) python -m scripts.docmeta.generate_doc_coverage` | explicit | current repository module resolves to `scripts/docmeta/generate_doc_coverage.py` and is invoked directly |
+| `99f33f30e2a0` | generate | 112 | `scripts.docmeta.generate_knowledge_gaps` | `$(UV_RUN) python -m scripts.docmeta.generate_knowledge_gaps` | explicit | current repository module resolves to `scripts/docmeta/generate_knowledge_gaps.py` and is invoked directly |
+| `f11e1c46e857` | generate | 113 | `scripts.docmeta.generate_implicit_dependencies` | `$(UV_RUN) python -m scripts.docmeta.generate_implicit_dependencies` | explicit | current repository module resolves to `scripts/docmeta/generate_implicit_dependencies.py` and is invoked directly |
+| `45313dc2583d` | generate | 114 | `scripts.docmeta.generate_staleness_report` | `$(UV_RUN) python -m scripts.docmeta.generate_staleness_report` | explicit | current repository module resolves to `scripts/docmeta/generate_staleness_report.py` and is invoked directly |
+| `3858cdc6c5da` | generate | 115 | `scripts.docmeta.generate_agent_readiness` | `$(UV_RUN) python -m scripts.docmeta.generate_agent_readiness` | explicit | current repository module resolves to `scripts/docmeta/generate_agent_readiness.py` and is invoked directly |
+| `787f31d26a36` | generate | 116 | `scripts.docmeta.generate_claim_evidence_map` | `$(UV_RUN) python -m scripts.docmeta.generate_claim_evidence_map` | explicit | current repository module resolves to `scripts/docmeta/generate_claim_evidence_map.py` and is invoked directly |
+| `d65433cf4dfb` | generate | 117 | `scripts.docmeta.generate_relations_analysis` | `$(UV_RUN) python -m scripts.docmeta.generate_relations_analysis` | explicit | current repository module resolves to `scripts/docmeta/generate_relations_analysis.py` and is invoked directly |
+| `8057cbe6809c` | generate | 118 | `scripts.docmeta.generate_relates_to_audit` | `$(UV_RUN) python -m scripts.docmeta.generate_relates_to_audit` | explicit | current repository module resolves to `scripts/docmeta/generate_relates_to_audit.py` and is invoked directly |
+| `86ae7c39f5a2` | generate | 119 | `scripts.docmeta.generate_report_lifecycle` | `$(UV_RUN) python -m scripts.docmeta.generate_report_lifecycle` | explicit | current repository module resolves to `scripts/docmeta/generate_report_lifecycle.py` and is invoked directly |
+| `768a67e15fd0` | generate | 120 | `scripts.docmeta.generate_report_lifecycle_inventory` | `$(UV_RUN) python -m scripts.docmeta.generate_report_lifecycle_inventory` | explicit | current repository module resolves to `scripts/docmeta/generate_report_lifecycle_inventory.py` and is invoked directly |
 
 ## Interpretation boundary
 
