@@ -147,6 +147,7 @@ jobs:
           bash -n scripts/guard/prod-public-base-url-guard.sh
           bash -n scripts/tests/test_prod_public_base_url_guard.sh
           bash -n scripts/tests/test_verify_deployment.sh
+          bash -n scripts/tests/test_verify_deployment_isolation.sh
           bash -n scripts/guard/security-headers-guard.sh
           bash -n scripts/guard/lockfile-guard.sh
           bash -n scripts/guard/compose-image-guard.sh
@@ -171,6 +172,7 @@ jobs:
           for t in \
             scripts/tests/test_token_leak_guard.sh \
             scripts/tests/test_verify_deployment.sh \
+            scripts/tests/test_verify_deployment_isolation.sh \
             scripts/tests/test_compose_volumes_guard.sh \
             scripts/tests/test_metrics_ref_guard.sh \
             scripts/tests/test_domain_multi_instance_guard.sh \

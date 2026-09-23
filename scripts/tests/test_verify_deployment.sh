@@ -7,33 +7,25 @@
 # ------------------------------------------------------------------
 set -euo pipefail
 
-# Ensure we are in the repo root
-cd "$(dirname "$0")/../.."
-
-# weltgewebe-up writes into the checkout it deploys. Remember what existed before
-# the harness ran so cleanup removes only what the mocked deploys created.
-HAD_WEB_BUILD=0
-[[ -e apps/web/build ]] && HAD_WEB_BUILD=1
-HAD_OPS_DIR=0
-[[ -e .ops ]] && HAD_OPS_DIR=1
-HAD_DEPLOY_SNAPSHOT=0
-[[ -e artifacts/deploy.snapshot.json ]] && HAD_DEPLOY_SNAPSHOT=1
-HAD_GLYPHS=0
-[[ -e "map-style/glyphs/Noto Sans Regular" ]] && HAD_GLYPHS=1
+# weltgewebe-up writes into the checkout it deploys (build output, .ops, the
+# deploy snapshot, glyphs, state). Run it against a private copy of the working
+# tree so the developer's checkout is never written to, overwritten or cleaned.
+SOURCE_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+WORK_ROOT="$(mktemp -d)"
 
 # Cleanup Trap
 cleanup() {
-  rm -rf mock_bin test.env custom_state mock_edge_ca.crt
-  [[ "$HAD_WEB_BUILD" == "1" ]] || rm -rf apps/web/build
-  [[ "$HAD_OPS_DIR" == "1" ]] || rm -rf .ops
-  [[ "$HAD_DEPLOY_SNAPSHOT" == "1" ]] || rm -f artifacts/deploy.snapshot.json
-  [[ "$HAD_GLYPHS" == "1" ]] || rm -rf "map-style/glyphs/Noto Sans Regular"
-  if [[ -n "${MOCK_PORT_CALLS_FILE:-}" ]]; then
-    rm -f "$MOCK_PORT_CALLS_FILE"
-  fi
+  rm -rf "$WORK_ROOT"
   unset HEALTH_URL API_INTERNAL_PORT MOCK_HEALTH_EXISTS MOCK_PORT_CALLS_FILE
 }
 trap cleanup EXIT
+
+# Tracked and untracked-but-not-ignored files, as they are in the working tree.
+# Ignored local artifacts stay behind, so each mocked deploy starts clean.
+git -C "$SOURCE_ROOT" ls-files -z --cached --others --exclude-standard |
+  tar -C "$SOURCE_ROOT" --null --ignore-failed-read -T - -cf - |
+  tar -xf - -C "$WORK_ROOT"
+cd "$WORK_ROOT"
 
 # 0. Setup Mocks
 mkdir -p mock_bin
