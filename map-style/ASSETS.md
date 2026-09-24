@@ -30,4 +30,4 @@ MapLibre benötigt Schriften im Protocol Buffer Format (PBF), gesplittet in Unic
 
 ## Sprites (entfallen)
 
-*Entfällt (bewusst).* Sprites sind nicht vergessen, sondern im aktuellen MVP-Architekturziel bewusst nicht Bestandteil der Basemap. Da die commonThing-Basemap gemäß Architektur-Blaupause eine streng visuell beruhigte Infrastrukturebene ohne POIs oder komplexe Füllmuster darstellt, werden keine Sprites in der `style.json` referenziert oder benötigt. commonThing-Overlay bleibt der exklusive Ort für ikonische und semantische Darstellungen (Nodes, Edges, Activity).
+*Entfällt (bewusst).* Sprites sind nicht vergessen, sondern im aktuellen MVP-Architekturziel bewusst nicht Bestandteil der Basemap. Da die commonThing-Basemap gemäß Architektur-Blaupause eine streng visuell beruhigte Infrastrukturebene ohne POIs oder komplexe Füllmuster darstellt, werden keine Sprites in der `style.json` referenziert oder benötigt. Das commonThing-Overlay bleibt der exklusive Ort für ikonische und semantische Darstellungen (Nodes, Edges, Activity).
