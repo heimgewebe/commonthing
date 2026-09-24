@@ -45,6 +45,7 @@ Dieses Dokument dient als belastbare, repo-belegte Ist-Stand-Analyse der commonT
 - **Test-Skript:** `scripts/tests/test_verify_deployment.sh` enthält Test 22 für "Cache Guards Logic".
 - **Vorhandene Tests:** Das Skript testet den Cache-Guard aktuell über Sub-Tests `22a` (HTML-Cache) bis `22c` (Positiv-Pfad).
 - **Weitere Tests:** Die in der Blaupause (`versionierungs-blaupause.md`) erwähnten Sub-Tests `22d` (`version.json` ohne `no-store`) und `22e` (`version.json` erreichbar, aber ohne brauchbare kanonische Versionsangabe) sind ebenfalls im Code implementiert.
+- **Ausführung:** Das Skript läuft in `ci.yml` (Core Guard Tests) und in `make validate`. Die Sub-Tests `22a`–`22e` prüfen die Frontend-Guards auf dem Legacy-Pfad `DEPLOY_TARGET=heimserver`, denn nur dort führt `weltgewebe-up` sie aus; das VPS-Ziel überspringt sie.
 
 ## 3. Kanonische Begriffe
 
