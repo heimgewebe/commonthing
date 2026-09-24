@@ -1,20 +1,20 @@
 ---
 id: docs.index
-title: Weltgewebe - Doku-Index
+title: commonThing - Doku-Index
 doc_type: index
 status: active
 canonicality: navigation
 lifecycle_state: active
 summary: Navigationsindex zu den aktuellen Verträgen, Betriebsdokumenten, Arbeitsplänen und historischen Belegen.
 ---
-# Weltgewebe – Doku-Index
+# commonThing – Doku-Index
 
 > Dieser Index ist Navigation, keine eigenständige Wahrheit. Bei Konflikten gilt die Rangfolge aus `repo.meta.yaml`. Kanonische Dokumente sind ausschließlich die in `manifest/repo-index.yaml` registrierten Dateien.
 
 ## In fünf Minuten
 
-1. [Vision](vision.md) – wozu das Weltgewebe dient.
-2. [Weltgewebe OS](../architecture/weltgewebe-os.md) – verbindliche langfristige Zielarchitektur.
+1. [Vision](vision.md) – wozu commonThing dient.
+2. [commonThing OS](../architecture/commonthing-os.md) – verbindliche langfristige Zielarchitektur.
 3. [Architektur](../architecture/overview.md) – was heute im System existiert.
 4. [Garnrolle, Knoten und Faden](specs/garnrolle-knoten-faden.md) – Produktdomäne.
 5. [Föderationskern](specs/federation-core.md) – Zell-, Ursprungs- und Reichweiteninvarianten.
@@ -41,7 +41,7 @@ Diese Dokumente präzisieren Teilbereiche, sind aber nicht als eigene kanonische
 
 ## Architektur und Daten
 
-- [Weltgewebe OS](../architecture/weltgewebe-os.md)
+- [commonThing OS](../architecture/commonthing-os.md)
 - [Architecture Overview](../architecture/overview.md)
 - [Security Architecture](../architecture/security.md)
 - [Semantic Search v1](../architecture/semantic-search.md)
@@ -55,8 +55,8 @@ Diese Dokumente präzisieren Teilbereiche, sind aber nicht als eigene kanonische
 Roadmaps und Blaupausen beschreiben Arbeit oder mögliche Zielbilder. Sie sind nicht automatisch aktuelle Produktwahrheit.
 
 - [Master-Roadmap](roadmap.md)
-- [Weltgewebe-OS-Masterplan](blueprints/weltgewebe-os-masterplan.md)
-- [Weltgewebe-OS-Foundation-Status](reports/weltgewebe-os-foundation-status.md)
+- [commonThing-OS-Masterplan](blueprints/weltgewebe-os-masterplan.md)
+- [commonThing-OS-Foundation-Status](reports/weltgewebe-os-foundation-status.md)
 - [Auth-Roadmap](blueprints/auth-roadmap.md)
 - [Domain-PostgreSQL-Cutover](blueprints/domain-data-postgres-cutover.md)
 - [Basemap-Architektur](blueprints/map-blaupause.md)

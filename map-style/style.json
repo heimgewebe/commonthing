@@ -1,11 +1,11 @@
 {
   "version": 8,
-  "name": "Weltgewebe Sovereign Basemap",
+  "name": "commonThing Sovereign Basemap",
   "metadata": {
     "weltgewebe:version": "0.4.0",
     "weltgewebe:note": "Regional PMTiles sources with visible landcover and landuse; bare aliases are resolved by the runtime protocol handler",
     "weltgewebe:colorScheme": "light",
-    "weltgewebe:darkStyleSha256": "1320add546a4e577f98c79ddc01c1640140b7c9abebe362d67584b16f0cfb114"
+    "weltgewebe:darkStyleSha256": "97061dc7cda9ba027e229b9d85e8cdbc910b86b7b3ce7be23cbfcdb63e28cdd9"
   },
   "sources": {
     "basemap": {

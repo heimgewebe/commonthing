@@ -1732,7 +1732,7 @@
       "risk": "medium",
       "owner": "governance",
       "evidence": [
-        "architecture/weltgewebe-os.md",
+        "architecture/commonthing-os.md",
         "docs/adr/ADR-0010__kubernetes-kanonische-plattform.md",
         "docs/adr/ADR-0011__foederierte-gewebezellen.md",
         "docs/adr/ADR-0012__ereignisrueckgrat-transactional-outbox.md",
@@ -1754,7 +1754,7 @@
         "issues": [],
         "prs": [],
         "docs": [
-          "architecture/weltgewebe-os.md",
+          "architecture/commonthing-os.md",
           "docs/blueprints/weltgewebe-os-masterplan.md",
           "docs/reports/weltgewebe-os-foundation-status.md"
         ]
@@ -1938,7 +1938,7 @@
       "risk": "medium",
       "owner": "infra",
       "evidence": [
-        "architecture/weltgewebe-os.md",
+        "architecture/commonthing-os.md",
         "docs/blueprints/weltgewebe-os-masterplan.md"
       ],
       "missing_evidence": [
@@ -1954,7 +1954,7 @@
         "issues": [],
         "prs": [],
         "docs": [
-          "architecture/weltgewebe-os.md",
+          "architecture/commonthing-os.md",
           "docs/blueprints/weltgewebe-os-masterplan.md"
         ]
       },

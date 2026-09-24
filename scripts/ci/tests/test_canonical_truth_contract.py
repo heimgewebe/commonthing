@@ -160,14 +160,14 @@ class CanonicalTruthContractTests(unittest.TestCase):
     def test_readme_describes_active_implementation_not_docs_only_status(self) -> None:
         text = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("aktives, im Aufbau befindliches Karten- und Koordinationssystem", text)
-        self.assertIn("föderierten Weltgewebe OS", text)
+        self.assertIn("föderierten commonThing OS", text)
         self.assertIn("Docker Compose die heutige reale Runtime", text)
         self.assertNotRegex(text, r"(?i)formaler\s+\*\*docs-only")
         self.assertNotIn("<!-- Docs-only", text)
 
     def test_canonical_entrypoints_are_substantive(self) -> None:
         required = {
-            "architecture/weltgewebe-os.md": ("## 2. Verfassungsprinzipien", "## 7. Plattformarchitektur"),
+            "architecture/commonthing-os.md": ("## 2. Verfassungsprinzipien", "## 7. Plattformarchitektur"),
             "architecture/overview.md": ("## Komponenten", "## Hauptdatenflüsse"),
             "architecture/security.md": (
                 "## Vertrauensgrenzen",

@@ -1,6 +1,6 @@
 ---
 id: runbooks.weltgewebe-ddns-runtime-verification
-title: Weltgewebe Heimberry-DDNS-Stilllegung verifizieren
+title: commonThing Heimberry-DDNS-Stilllegung verifizieren
 doc_type: runbook
 status: active
 summary: Aktive, wiederholbare Sicherheitsprüfung des stillgelegten Heimberry-DDNS-Schreibpfads.
@@ -15,7 +15,7 @@ relations:
     target: docs/runbooks/incident-response.md
 ---
 
-# Weltgewebe Heimberry-DDNS-Stilllegung verifizieren
+# commonThing Heimberry-DDNS-Stilllegung verifizieren
 
 ## Zweck
 

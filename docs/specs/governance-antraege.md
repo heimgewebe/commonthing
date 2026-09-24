@@ -41,7 +41,7 @@ attention_transition_tests:
 
 ## Grundsatz
 
-Alles, was im Weltgewebe gemeinschaftlich verändert werden kann, soll über
+Alles, was in commonThing gemeinschaftlich verändert werden kann, soll über
 einen transparenten Antragsmechanismus disponibel sein. Jeder Antrag besitzt
 eine Informationsseite, einen öffentlichen Gesprächsraum, eindeutige Fristen
 und eine dauerhaft nachvollziehbare Zustandsfolge.
@@ -63,7 +63,7 @@ Garnrolle.
 
 Ein Gast darf:
 
-- das gesamte öffentliche Weltgewebe ansehen, suchen und filtern;
+- alles Öffentliche in commonThing ansehen, suchen und filtern;
 - die eigene Garnrolle beschreiben und freiwillig verankern;
 - Knoten knüpfen und eigene Knoten pflegen;
 - zulässige, serverseitig abgeleitete Fäden auslösen;

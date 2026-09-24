@@ -5,7 +5,7 @@ doc_type: reference
 status: active
 canonicality: supporting
 lifecycle_state: superseded
-summary: Historischer Zielentwurf für Event-Sourcing, Inhaltsverschlüsselung und Key-Erase; keine Beschreibung der heutigen Weltgewebe-Runtime.
+summary: Historischer Zielentwurf für Event-Sourcing, Inhaltsverschlüsselung und Key-Erase; keine Beschreibung der heutigen commonThing-Runtime.
 relations:
   - type: relates_to
     target: docs/domain/vocabulary.md
@@ -19,7 +19,7 @@ relations:
 
 > **Nicht kanonisch:** Dieses Dokument beschreibt einen früheren Zielentwurf.
 > Event-Sourcing, objektbezogene Inhaltsverschlüsselung, Transparency-Log und
-> Key-Erase sind nicht als heutige produktive Weltgewebe-Wahrheit belegt.
+> Key-Erase sind nicht als heutige produktive commonThing-Wahrheit belegt.
 > Maßgeblich für aktuelle Löschwirkungen ist
 > `docs/specs/objektlebenszyklen-und-loeschwirkungen.md`; das reale physische
 > Modell steht in `docs/datenmodell.md`.

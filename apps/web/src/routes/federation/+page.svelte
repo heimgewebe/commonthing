@@ -127,7 +127,7 @@
 
 <main class="container">
   <header>
-    <p class="eyebrow">Weltgewebe OS · Föderation v1</p>
+    <p class="eyebrow">commonThing OS · Föderation v1</p>
     <h1>Föderationsdiagnose</h1>
     <p class="intro">
       Diese Ansicht prüft die öffentliche Zellgrenze. Sie zeigt keine lokalen,

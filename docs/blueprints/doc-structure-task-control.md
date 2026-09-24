@@ -1,6 +1,6 @@
 ---
 id: blueprint-doc-structure-task-control
-title: Weltgewebe Dokumentationsstruktur und Task-Steuerung
+title: commonThing Dokumentationsstruktur und Task-Steuerung
 doc_type: blueprint
 status: draft
 summary: >
@@ -18,7 +18,7 @@ relations:
     target: docs/blueprints/doc-structure-task-control-examples.md
 ---
 
-# Blaupause: Dokumentationsstruktur und Task-Steuerung für Weltgewebe
+# Blaupause: Dokumentationsstruktur und Task-Steuerung für commonThing
 
 ## 0. Status und Grenze
 
@@ -34,7 +34,7 @@ Konkrete YAML-, JSON- und Workflow-Beispiele leben in
 
 ## 1. Kurzfassung
 
-Weltgewebe besitzt bereits eine starke Dokumentationsmaschine. Es fehlen nicht
+commonThing besitzt bereits eine starke Dokumentationsmaschine. Es fehlen nicht
 primär weitere Dokumente, sondern eine klarere Arbeitsumlaufbahn zwischen
 Orientierung, Nachweis und Arbeitspaket:
 
@@ -262,7 +262,7 @@ PR-Checks.
 
 Diese Blaupause gilt, wenn folgende Prämissen stimmen:
 
-1. Weltgewebe soll langfristig agentenlesbar bleiben.
+1. commonThing soll langfristig agentenlesbar bleiben.
 2. Offene Aufgaben sollen nicht nur im Fließtext existieren.
 3. GitHub Issues/PRs/Projects sollen Arbeitsumlauf sein, nicht Wahrheitsschicht.
 4. Generated Artefacts sollen Diagnose liefern, aber nicht manuell gepflegt werden.

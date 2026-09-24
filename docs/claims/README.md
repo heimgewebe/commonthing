@@ -130,7 +130,7 @@ traegt mindestens eine Evidence, die gegen das Live-Dateisystem geprueft wird
 (`file`/`test`/`proof`). Es wird keine Wall-Clock-Freshness berechnet.
 
 Hinweis zu `proof`: `proof` ist in `EVIDENCE_KINDS_CHECK_PATH` und damit
-live-geprueft. Es ist aber kein Weltgewebe-Claim-Evidence-Kind (nicht in
+live-geprueft. Es ist aber kein commonThing-Claim-Evidence-Kind (nicht in
 `CLAIM_EVIDENCE_KIND_TO_LENSKIT`). Ein Bridge-Eintrag mit `proof` besteht
 `require_live_check`, aber wird beim Cross-Check Findings erzeugen, wenn die
 Claim-Evidence-Seite keine passende Gegenseite aufweist.
@@ -163,7 +163,7 @@ Operative Schritte:
 - Bei `require_live_check: true` muss mindestens eine live-gepruefte Evidence
   vorhanden sein. Live-geprueft sind genau die Kinds aus
   `EVIDENCE_KINDS_CHECK_PATH` (aktuell `file`/`test`/`proof`).
-  `proof` erfuellt diese Bedingung, ist aber kein Weltgewebe-Claim-Evidence-Kind
+  `proof` erfuellt diese Bedingung, ist aber kein commonThing-Claim-Evidence-Kind
   und erzeugt Cross-Check-Findings wenn die Claim-Evidence keine Gegenseite hat.
 - Danach pruefen:
   - `python3 scripts/docmeta/validate_doc_freshness_registry.py`

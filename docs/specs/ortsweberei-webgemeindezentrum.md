@@ -36,7 +36,7 @@ attention_source_rationale: "Ordnet lokale Gemeinschaft und Webrat; persönliche
 
 ## Grundsatz
 
-Eine Ortsweberei ist die lokale Gemeinschaft des Weltgewebes. Sie bildet
+Eine Ortsweberei ist die lokale Gemeinschaft von commonThing. Sie bildet
 logisch genau eine Gewebezelle und besitzt genau ein aktives
 Webgemeindezentrum. Das Zentrum verbindet die digitale Ortsweberei mit einem
 bewusst gewählten Ort auf der Karte, an dem sich die Gemeinschaft treffen kann
@@ -141,7 +141,7 @@ Die normale Kartenansicht zeigt mindestens:
 Bei kleinen Zoomstufen dürfen Zentren gebündelt werden. Bei Auswahl bleibt die
 Zentrum-ID der Fokus; Detailbereiche werden im Kontextpanel geöffnet. Die
 Basiskarte enthält das Zentrum nicht als eingebranntes Kartenmerkmal, sondern es
-bleibt eine Weltgewebe-Domänenentität.
+bleibt eine commonThing-Domänenentität.
 
 ## Zentrumoberfläche
 

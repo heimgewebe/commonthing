@@ -1,6 +1,6 @@
-# Weltgewebe API
+# commonThing API
 
-The Weltgewebe API is a Rust-based Axum service that powers the platform's backend capabilities.
+The commonThing API is a Rust-based Axum service that powers the platform's backend capabilities.
 This README provides a quick orientation for running and developing the service locally.
 
 ## Quickstart

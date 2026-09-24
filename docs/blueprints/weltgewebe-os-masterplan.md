@@ -1,13 +1,13 @@
 ---
 id: docs.blueprints.weltgewebe-os-masterplan
-title: Weltgewebe OS — Masterplan
+title: commonThing OS — Masterplan
 doc_type: roadmap
 status: active
 summary: >
   Bündelt Produktverfassung, föderierte Zellen, Kubernetes-Plattform, Ereignisrückgrat, Grabowski-Betrieb und die beweisgebundene Umsetzungsreihenfolge.
 relations:
   - type: depends_on
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
   - type: relates_to
     target: docs/roadmap.md
   - type: relates_to
@@ -22,11 +22,11 @@ relations:
     target: docs/tasks/board.md
 ---
 
-# Weltgewebe OS — Masterplan
+# commonThing OS — Masterplan
 
 ## 1. Ziel
 
-Weltgewebe wird als föderiertes Betriebssystem gesellschaftlicher Koordination entwickelt:
+commonThing wird als föderiertes Betriebssystem gesellschaftlicher Koordination entwickelt:
 
 ```text
 lokale autonome Gewebe-Zellen
@@ -35,7 +35,7 @@ lokale autonome Gewebe-Zellen
 + gemeinsame Räume
 + Kubernetes-native Laufzeit
 + Grabowski als kontrollierter Operator
-= Weltgewebe OS
+= commonThing OS
 ```
 
 Das Ziel ist kein zentral beherrschtes Weltportal. Viele unabhängige Zellen sollen lokale Wahrheit, Regeln und Betriebsfähigkeit behalten und trotzdem Nachbarschaft, Projekte und öffentliche Zusammenhänge über Zellgrenzen hinweg bilden können.
@@ -139,7 +139,7 @@ Grabowski koordiniert den vollständigen Regelkreis von Absicht über isolierte 
 
 **Ergebnisse:**
 
-- `architecture/weltgewebe-os.md`,
+- `architecture/commonthing-os.md`,
 - ADRs zu Kubernetes, Zellen und Ereignisrückgrat,
 - dieser Masterplan,
 - belegter Statusbericht,
@@ -275,19 +275,19 @@ Grabowski koordiniert den vollständigen Regelkreis von Absicht über isolierte 
 
 | System | Rolle im Zielbild | Verbindliche Ausrichtung |
 |---|---|---|
-| Weltgewebe | Produkt- und Fachkern | Zellen, Identitäten, Knoten, Fäden, Räume, Reichweiten, Föderation |
+| commonThing | Produkt- und Fachkern | Zellen, Identitäten, Knoten, Fäden, Räume, Reichweiten, Föderation |
 | Grabowski | autonomer, kontrollierter Operator | vollständiger Regelkreis, GitOps, SLO- und Recoverybelege, isolierte Agentenjobs |
 | Bureau | Verpflichtungs- und Aufgabenwahrheit | Initiative, Abhängigkeiten, Claims, Akzeptanz und Abschlussbelege |
-| Konvergenzregelkreis | allgemeiner Regelkreisvertrag | portable Soll-Ist-Wirkungs- und Rücknahmesemantik, ohne Weltgewebe-Fachwahrheit zu duplizieren |
+| Konvergenzregelkreis | allgemeiner Regelkreisvertrag | portable Soll-Ist-Wirkungs- und Rücknahmesemantik, ohne commonThing-Fachwahrheit zu duplizieren |
 | Chronik | Ereignis- und Wirkungsverlauf | versionierte Receipts, Herkunft, Deployment- und Föderationsereignisse |
-| Systemkatalog | Auffindbarkeit und Rollenwahrheit | Weltgewebe-OS-Komponenten, Zellen, Einstiegspunkte und Beziehungen sichtbar machen |
+| Systemkatalog | Auffindbarkeit und Rollenwahrheit | commonThing-OS-Komponenten, Zellen, Einstiegspunkte und Beziehungen sichtbar machen |
 | Leitstand | operative Sicht | SLOs, Deployments, Föderationszustand, Fehlerbudgets und offene Verpflichtungen |
 | Schauwerk | visuelle Erklärbarkeit | Systemkarte, Zellgraph, Ereignisfluss, Nachbarschaft und Betriebszustand |
 | Commonworld | globale Erfahrungs- und Erkundungsschicht | öffentliche Welt- und Zellprojektionen, keine zweite Domänenwahrheit |
 | RepoBrief/Lenskit | Code- und Änderungskontext | Call Graph, Impact, Tests und Kontext für sichere große Änderungen |
 | Heimlern/Vibe-Lab | Lern- und Wirkungsauswertung | nur belegte Outcomes; keine operative Wahrheitskonkurrenz |
 
-Jedes System behält eine klare Rolle. Funktionsduplikate werden nicht durch Kopieren des Weltgewebe-Modells geschaffen, sondern durch Verträge und Projektionen verbunden.
+Jedes System behält eine klare Rolle. Funktionsduplikate werden nicht durch Kopieren des commonThing-Modells geschaffen, sondern durch Verträge und Projektionen verbunden.
 
 ## 7. Erste Initiativekette
 

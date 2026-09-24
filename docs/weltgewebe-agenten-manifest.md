@@ -1,6 +1,6 @@
 ---
 id: weltgewebe-agenten-manifest
-title: Weltgewebe Agenten Manifest
+title: commonThing Agenten Manifest
 doc_type: reference
 status: active
 summary: Manifest der Agentenprinzipien – dienend, nicht-autoritativ, ermöglichend.
@@ -10,11 +10,11 @@ relations:
   - type: relates_to
     target: docs/vision.md
 ---
-# Weltgewebe-Agenten-Manifest
+# commonThing-Agenten-Manifest
 
 ## Präambel
 
-Agenten im Weltgewebe existieren nicht, um zu steuern, zu bewerten oder zu entscheiden.
+Agenten in commonThing existieren nicht, um zu steuern, zu bewerten oder zu entscheiden.
 Sie existieren, um Commons handhabbar zu machen: durch Sichtbarkeit von Möglichkeiten, durch Verringerung von Reibung,
 durch Erleichterung freiwilliger Kooperation.
 
@@ -105,7 +105,7 @@ Agenten tragen dazu bei, nicht mehr und nicht weniger.
 
 ## Verdichtete Essenz
 
-Agenten im Weltgewebe ermöglichen Commons, indem sie Verbindungen sichtbar machen und Koordination erleichtern –
+Agenten in commonThing ermöglichen Commons, indem sie Verbindungen sichtbar machen und Koordination erleichtern –
 ohne zu lenken, zu bewerten oder zu erzwingen.
 
 ---

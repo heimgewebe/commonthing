@@ -232,7 +232,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/proof-matrix-generalization-decision.md | 6 | relates_to | .github/workflows/opt-arc-001-db-proof-matrix.yml, docs/reports/opt-arc-001-db-proof-matrix.json, docs/tasks/board.md, docs/tasks/index.json, scripts/docmeta/tests/test_validate_opt_arc_001_db_proof_matrix.py, scripts/docmeta/validate_opt_arc_001_db_proof_matrix.py |
 | docs/reports/repo-audit-2026-07-02.md | 4 | relates_to | docs/policies/agent-reading-protocol.md, docs/policies/architecture-critique.md, docs/reports/optimierungsstatus.md, docs/tasks/board.md |
 | docs/reports/report-lifecycle-restbestand-triage.md | 3 | relates_to | docs/process/report-lifecycle.md, docs/tasks/index.json, scripts/docmeta/validate_report_lifecycle.py |
-| docs/reports/weltgewebe-os-foundation-status.md | 6 | depends_on, relates_to | architecture/weltgewebe-os.md, docs/blueprints/weltgewebe-os-masterplan.md, docs/proofs/weltgewebe-os-v1-t032-federation-delivery.md, docs/reports/domain-postgres-instance-coherence-decision.md, docs/reports/kubernetes-platform-foundation-status.md, docs/tasks/board.md |
+| docs/reports/weltgewebe-os-foundation-status.md | 6 | depends_on, relates_to | architecture/commonthing-os.md, docs/blueprints/weltgewebe-os-masterplan.md, docs/proofs/weltgewebe-os-v1-t032-federation-delivery.md, docs/reports/domain-postgres-instance-coherence-decision.md, docs/reports/kubernetes-platform-foundation-status.md, docs/tasks/board.md |
 | docs/reports/weltgewebe-os-v1-t018-conversation-convergence-plan.md | 7 | relates_to | apps/api/src/governance.rs, apps/api/src/routes/conversations.rs, apps/web/src/lib/components/governance/ProposalDetail.svelte, contracts/domain/conversation.schema.json, contracts/domain/message.schema.json, docs/datenmodell.md, docs/specs/governance-antraege.md |
 
 ## Primary Referenced Reports
@@ -880,7 +880,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     "checked_items": 69,
     "complete": true,
     "failures": 0,
-    "fresh": true,
+    "fresh": false,
     "method": "exact",
     "scope": "all Markdown files under docs/reports and all generated/curated control surfaces declared in .wgx/generated-artifacts.yml",
     "total_items": 69
@@ -901,7 +901,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/agent-readiness-audit.md",
-      "sha256": "a2470245a3a062f9383207285855cf856e3990a28c947354d34ce2795f5cd1c8"
+      "sha256": "097965f8ed9c92247a6f92aaf106f0d6e5034b3189e056ac4cee9e7ee0895fe4"
     },
     {
       "path": "docs/reports/auth-persistence-direct-proof-diagnose-audit.md",
@@ -973,7 +973,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/auth-status-matrix.md",
-      "sha256": "d11caeeff96963286a9619900ee6194e7342f37cb809c556140c448c1cee2a82"
+      "sha256": "dd6c4ba146d503144493dbe249bb4310243d626bdfac370d03f21f1ebbb84244"
     },
     {
       "path": "docs/reports/cost-report.md",
@@ -1037,7 +1037,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/garnrolle-identity-cutover-proof.md",
-      "sha256": "4a369b7e178aefc5c3ea0121f325da4de07d39cc209e1326716ebcbe2cc51ea3"
+      "sha256": "558dccd40e6ee50e32039969b7120c0c73c0ea044fe34df944f0c7ecf3aa87bb"
     },
     {
       "path": "docs/reports/github-action-ref-pinning-audit.md",
@@ -1073,11 +1073,11 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/optimierungsbericht.md",
-      "sha256": "e55e2e9e676d05e49e3373f9d47b675c61c837afb234aa72b57885f2b9e16830"
+      "sha256": "a7ae29b7f49cd669d1cedcea5e3443a3bcd67e0ab9e97ef741042bed16f34405"
     },
     {
       "path": "docs/reports/optimierungsstatus.md",
-      "sha256": "a90079fee67d6351835cc04e337c655a9bb7a81675ecb15aea9a92bf89571142"
+      "sha256": "dbf838227ebef3cbb4ec3b9a258385d83167306733304ef15397f61aaf81f9e4"
     },
     {
       "path": "docs/reports/passkey-register-verify-prep.md",
@@ -1101,14 +1101,14 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/weltgewebe-os-foundation-status.md",
-      "sha256": "f3b21dd0dead470dbb09cc5838534c2fc32d22a85fe9cfe258464e33bb308653"
+      "sha256": "9603b2fea90c8e4a7118bfa910d77e7ab75a2cfe057f0e331af0d0dd38e6e4fe"
     },
     {
       "path": "docs/reports/weltgewebe-os-v1-t018-conversation-convergence-plan.md",
-      "sha256": "680a44fa3507f4191fbe32b0068b3bf8a77e6979739ea7d88d5c4b07d43870a9"
+      "sha256": "8971b15c7e9a8d0297e3c26c4721f392709927e8f69547a91f13691ec7376c16"
     }
   ],
-  "status": "no_material_drift"
+  "status": "unknown"
 }
 ```
 

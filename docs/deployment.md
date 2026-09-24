@@ -31,7 +31,7 @@ Conditionally required (when the frontend is deployed):
 
 ## Runtime Contract for Static UI
 
-Weltgewebe UI deployment fundamentally operates on three coupled layers:
+commonThing UI deployment fundamentally operates on three coupled layers:
 
 1. **Build layer**: `pnpm build` produces the static artifacts in `apps/web/build`.
 2. **Container mount layer**: A bind mount structurally exposes these artifacts to the `edge-caddy` container (`/srv/weltgewebe-web`).

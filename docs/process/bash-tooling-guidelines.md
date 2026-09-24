@@ -10,7 +10,7 @@ relations:
 ---
 # Bash-Tooling-Richtlinien
 
-Diese Richtlinien beschreiben, wie wir Shell-Skripte im Weltgewebe-Projekt
+Diese Richtlinien beschreiben, wie wir Shell-Skripte im commonThing-Projekt
 entwickeln, prüfen und ausführen.
 Sie kombinieren generelle Best Practices (Formatierung, Checks) mit projektspezifischen Vorgaben
 wie Devcontainer-Setup, CLI-Bootstrap und SemVer.

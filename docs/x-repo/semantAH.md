@@ -10,6 +10,6 @@ relations:
   - type: relates_to
     target: docs/adr/0042-consume-semantah-contracts.md
 ---
-Weltgewebe könnte perspektivisch semantAH-Exports konsumieren.
+commonThing könnte perspektivisch semantAH-Exports konsumieren.
 Aktueller Stand: keine aktive Anbindung, keine CI-Validierung, keine Import-Jobs.
 Diese Datei dokumentiert lediglich den ursprünglichen Plan; erneute Aktivierung erfolgt über eine neue ADR.

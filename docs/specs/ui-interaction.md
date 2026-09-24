@@ -47,7 +47,7 @@ attention_source_rationale: "Definiert die Attention-Darstellung und Projektion 
 
 ## Leitidee
 
-Weltgewebe ist ein kartenbasiertes Koordinationsinterface. Die Karte ist der öffentliche Wahrnehmungsraum; Details und Handlungen werden nicht in parallelen Dashboards verteilt, sondern in einem einzigen kontextbezogenen Arbeitsraum gebündelt.
+commonThing ist ein kartenbasiertes Koordinationsinterface. Die Karte ist der öffentliche Wahrnehmungsraum; Details und Handlungen werden nicht in parallelen Dashboards verteilt, sondern in einem einzigen kontextbezogenen Arbeitsraum gebündelt.
 
 ## Drei Hauptflächen
 

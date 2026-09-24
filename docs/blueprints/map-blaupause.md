@@ -6,7 +6,7 @@ status: active
 summary: >
   Architektur-Blaupause für einen souveränen Basemap-Stack basierend auf
   MapLibre, PMTiles und einer reproduzierbaren Tile-Generierungs-Pipeline
-  für Weltgewebe-Overlays.
+  für commonThing-Overlays.
 relations:
   - type: relates_to
     target: docs/specs/map-experience.md
@@ -68,7 +68,7 @@ Damit erhält man Souveränität ohne Architekturbruch.
 - → PMTiles-Artefakt
 - → Hosting
 - → MapLibre Rendering
-- → Weltgewebe-Overlay-Layer
+- → commonThing-Overlay-Layer
 
 Ziel: Die Basemap wird als Artefakt erzeugt und verteilt, nicht als externer Kartenservice konsumiert.
 
@@ -103,7 +103,7 @@ Ziel: Die Basemap wird als Artefakt erzeugt und verteilt, nicht als externer Kar
 ### Prinzip
 
 Basemap = Infrastruktur
-Overlay = Weltgewebe
+Overlay = commonThing
 
 ---
 
@@ -395,7 +395,7 @@ Basemap enthält NICHT:
 
 Strikte Trennung. Das verhindert später die Frage: "Packen wir das noch in die Basemap?"
 
-Weltgewebe enthält:
+commonThing enthält:
 
 - nodes
 - edges
@@ -479,7 +479,7 @@ local pmtiles
 
 ## 11. Alternative Sinnachse
 
-Langfristig könnte Weltgewebe mehrere Kartenprojektionen haben:
+Langfristig könnte commonThing mehrere Kartenprojektionen haben:
 
 - Geographie
 - Netzwerk

@@ -1,6 +1,6 @@
 ## Domain-Contracts lokal validieren
 
-Weltgewebe nutzt JSON-Schemas, um die zentralen Domänenobjekte (`node`, `edge`, `conversation`, `message`)
+commonThing nutzt JSON-Schemas, um die zentralen Domänenobjekte (`node`, `edge`, `conversation`, `message`)
 konsistent zu halten. Zu jedem Schema existiert mindestens ein Beispiel unter `contracts/domain/examples/`.
 CI prüft bei jedem Push sowohl die Schema-Syntax als auch die Beispieldateien – dieselbe Prüfung lässt sich
 lokal ausführen.
@@ -69,12 +69,12 @@ Der Validator prüft Schemaform, eindeutige Fall-IDs, sichtbare relevante Knoten
 
 ### Warum dieser Check?
 
-Er verhindert Schema-Drift: Weltgewebe ist ein eigenständiges Projekt, aber die Domain-Contracts sind eine
+Er verhindert Schema-Drift: commonThing ist ein eigenständiges Projekt, aber die Domain-Contracts sind eine
 stabile, externe Schnittstelle. Durch lokale Validierung bleibt alles synchron zu CI und Dokumentation.
 
 ## Föderationsvertrag v1 prüfen
 
-Die öffentliche Grenze zwischen unabhängig betriebenen Weltgewebe-Zellen ist unter `contracts/federation/v1/` beschrieben. Sie umfasst die öffentliche Zellbeschreibung und signierte Objekt-Ereignisse für Knoten, Kanten und gemeinsame Räume.
+Die öffentliche Grenze zwischen unabhängig betriebenen commonThing-Zellen ist unter `contracts/federation/v1/` beschrieben. Sie umfasst die öffentliche Zellbeschreibung und signierte Objekt-Ereignisse für Knoten, Kanten und gemeinsame Räume.
 
 Die statische Prüfung läuft ohne zusätzliche Python-Abhängigkeiten:
 

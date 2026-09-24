@@ -26,7 +26,7 @@ Status: Accepted
 
 ## Entscheidung
 
-Weltgewebe verwendet künftig ein einziges Accountmodell:
+commonThing verwendet künftig ein einziges Accountmodell:
 
 > Jeder Account hat genau eine Garnrolle.
 
@@ -84,7 +84,7 @@ Nicht:
 
 ## Sichtbarkeit
 
-Sichtbarkeit ist im Weltgewebe ein positiver Wert. Ein genauer öffentlicher Ort
+Sichtbarkeit ist in commonThing ein positiver Wert. Ein genauer öffentlicher Ort
 ist kein Fehlerfall, sondern kann selbst ein Gemeingut sein: Menschen,
 Initiativen und Orte werden auffindbar, ansprechbar und anschlussfähig.
 
@@ -144,7 +144,7 @@ Dokumentationssprache konsistent bleibt.
    "Alexander hat die Fairschenkbox gebaut / betreut sie".
 
 Damit entsteht kein Demo-Datensatz von außen, sondern der erste echte
-Weltgewebe-Akt aus einer Garnrolle heraus.
+commonThing-Akt aus einer Garnrolle heraus.
 
 ## API-Zielrichtung
 

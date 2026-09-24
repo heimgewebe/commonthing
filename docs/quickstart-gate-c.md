@@ -34,7 +34,7 @@ make down
 ## Hinweise
 
 - In der lokalen Entwicklungsumgebung ist der primäre Einstiegspunkt der Proxy auf Port `8081`.
-  (Im Heimserver-Produktionsbetrieb ist der Port 8081 reserviert und Weltgewebe publiziert keinen eigenen Host-Port.)
+  (Im Heimserver-Produktionsbetrieb ist der Port 8081 reserviert und commonThing publiziert keinen eigenen Host-Port.)
 - Das Frontend (Port `5173`) wird automatisch vom Proxy bedient.
 - Frontend nutzt `PUBLIC_API_BASE=/api` (siehe `apps/web/.env.development`).
 - Compose-Profil `dev` schützt vor Verwechslungen mit späteren prod-Stacks.

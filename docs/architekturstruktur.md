@@ -12,7 +12,7 @@ relations:
   - type: relates_to
     target: docs/datenmodell.md
   - type: relates_to
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
 ---
 
 # Architektur und Repositorystruktur
@@ -109,7 +109,7 @@ und ein Betriebsvertrag bestehen. Aktuell nicht als Standard vorhanden sind:
 - vollständige Observability-Plattform mit verbindlichen SLOs.
 
 Die fehlende Runtime-Implementierung hebt die Zielentscheidung nicht auf. Neue
-Strukturen werden entlang `architecture/weltgewebe-os.md` eingeführt, sobald der
+Strukturen werden entlang `architecture/commonthing-os.md` eingeführt, sobald der
 jeweilige kleine Implementierungsschnitt und sein Betriebsvertrag belegt sind.
 
 ## Änderungsregel

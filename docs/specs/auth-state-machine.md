@@ -3,7 +3,7 @@ id: specs.auth-state-machine
 title: Auth State Machine
 doc_type: reference
 status: active
-summary: Beschreibt die kanonischen Zustände und Transitionen des Weltgewebe-Auth-Systems.
+summary: Beschreibt die kanonischen Zustände und Transitionen des commonThing-Auth-Systems.
 relations:
   - type: relates_to
     target: docs/adr/ADR-0006__auth-magic-link-session-passkey.md

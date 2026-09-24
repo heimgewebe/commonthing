@@ -25,7 +25,7 @@ verifies_with:
 
 ## Vorbedingungen
 
-- sauberer, isolierter Weltgewebe-Worktree;
+- sauberer, isolierter commonThing-Worktree;
 - funktionierender Docker-Daemon;
 - Linux amd64;
 - kein bestehender Cluster mit dem gewählten Namen;
@@ -34,7 +34,7 @@ verifies_with:
 Die lokale Datenzelle, der Migrationsjob und die lokale App verwenden eine deterministische, öffentliche Test-Fixture als ConfigMap; reale Geheimnisse werden weder benötigt noch geschrieben. Staging und Produktion behalten unverändert den externen Secretvertrag.
 
 Die Werkzeuge werden nicht global installiert. `bootstrap_tools.py` lädt sie in den ignorierten Repositorycache und verifiziert jeden SHA-256.
-Gateway API ist zusätzlich an den Cilium-Vertrag gebunden: Für Cilium 1.19.5 werden aus Gateway API 1.4.1 ausschließlich GatewayClass, Gateway, HTTPRoute, ReferenceGrant und GRPCRoute installiert. TLSRoute bleibt uninstalled, weil Weltgewebe es nicht benötigt und Cilium fehlende optionale TLSRoute-Unterstützung sauber deaktiviert. Der Bootstrap weist zusätzliche oder falsch gebundene CRDs fail-closed zurück.
+Gateway API ist zusätzlich an den Cilium-Vertrag gebunden: Für Cilium 1.19.5 werden aus Gateway API 1.4.1 ausschließlich GatewayClass, Gateway, HTTPRoute, ReferenceGrant und GRPCRoute installiert. TLSRoute bleibt uninstalled, weil commonThing es nicht benötigt und Cilium fehlende optionale TLSRoute-Unterstützung sauber deaktiviert. Der Bootstrap weist zusätzliche oder falsch gebundene CRDs fail-closed zurück.
 
 ## Statischer Vertrag
 

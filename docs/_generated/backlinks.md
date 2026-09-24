@@ -165,6 +165,17 @@ Generated automatically. Do not edit.
 
 - [relates_to] docs/reports/weltgewebe-os-v1-t018-conversation-convergence-plan.md
 
+## architecture/commonthing-os.md
+
+- [relates_to] docs/adr/ADR-0010__kubernetes-kanonische-plattform.md
+- [relates_to] docs/adr/ADR-0011__foederierte-gewebezellen.md
+- [relates_to] docs/adr/ADR-0012__ereignisrueckgrat-transactional-outbox.md
+- [relates_to] docs/architecture/weltgewebe-os-convergence-adapter.md
+- [relates_to] docs/architekturstruktur.md
+- [depends_on] docs/blueprints/weltgewebe-os-masterplan.md
+- [depends_on] docs/reports/weltgewebe-os-foundation-status.md
+- [relates_to] docs/techstack.md
+
 ## architecture/overview.md
 
 - [relates_to] docs/architekturstruktur.md
@@ -178,17 +189,6 @@ Generated automatically. Do not edit.
 ## architecture/semantic-search.md
 
 - [relates_to] docs/deploy/kubernetes-production-cutover-t044.md
-
-## architecture/weltgewebe-os.md
-
-- [relates_to] docs/adr/ADR-0010__kubernetes-kanonische-plattform.md
-- [relates_to] docs/adr/ADR-0011__foederierte-gewebezellen.md
-- [relates_to] docs/adr/ADR-0012__ereignisrueckgrat-transactional-outbox.md
-- [relates_to] docs/architecture/weltgewebe-os-convergence-adapter.md
-- [relates_to] docs/architekturstruktur.md
-- [depends_on] docs/blueprints/weltgewebe-os-masterplan.md
-- [depends_on] docs/reports/weltgewebe-os-foundation-status.md
-- [relates_to] docs/techstack.md
 
 ## audit/impl-registry.yaml
 
