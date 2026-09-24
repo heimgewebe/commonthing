@@ -120,7 +120,7 @@ if [[ "$1" == "compose" ]]; then
     exit 0
   fi
   if [[ "$ARGS" == *" config --format json"* ]]; then
-    echo '{"services":{"api":{"ports":[]}}}'
+    echo '{"services":{"api":{"ports":[],"networks":{"default":{"aliases":["weltgewebe-api"]}}}}}'
     exit 0
   fi
   if [[ "$ARGS" == *" config"* ]]; then
