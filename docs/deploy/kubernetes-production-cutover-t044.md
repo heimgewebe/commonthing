@@ -590,9 +590,81 @@ Fehlt eine Zahl, ist sie nur qualitativ oder der Green-Bezug nicht mehr frisch,
 bleibt R8 blockiert. Vor Existenz der realen Zielplattform werden keine Werte
 erfunden.
 
-Erst nach diesem Gate darf der öffentliche Canary beginnen. Bis zur expliziten
-Writer-Transition bleibt Blue alleiniger Writer; ein Canary erzeugt keine zweite
-Schreibautorität.
+### R8-Eintrittsgate — Produktions-Green-Wirkungsbeweise
+
+Die Referenz- und Staging-Proofs werden nicht auf das konkrete Produktions-Green
+hochgerechnet. Vor R8 müssen die Produktions-Akzeptanzbedingungen aus ADR-0010
+für **genau das identifizierte Green**, die gewünschte Release-Revision und die
+gebundenen API-/Web-Image-Digests als frische Wirkungsevidenz vorliegen:
+
+- mindestens zwei Green-API-Instanzen werden unter demselben Daten-, Auth-,
+  Event- und Projektionsvertrag gleichzeitig betrieben; revisionsgebundene
+  Cross-Instance-Read-/Write- und Restart-Readbacks belegen fachliche Kohärenz
+  statt nur `2/2 ready`;
+- ein Datenbankausfall bzw. der für das konkrete Green vorgesehene
+  Datenbank-Failover wird real geprobt. Writer-Autorität, Fencing,
+  Wiederanlauf, Datenkontinuität und anschließende Read-/Write-Fähigkeit werden
+  zielgebunden zurückgelesen;
+- ein Messaging-/JetStream-Ausfall bzw. der vorgesehene Messaging-Failover wird
+  real geprobt. Stream-/Consumer-Fortschritt, Wiederanlauf,
+  At-least-once-/Idempotenzvertrag und Event-/Projektionskontinuität werden
+  zielgebunden zurückgelesen;
+- Backup **und Point-in-Time-Recovery** werden für das konkrete Green
+  ausgeführt. Wiederherstellter Daten-, Auth-, Outbox-/Consumption-,
+  JetStream- und Such-/Projektionsstand werden fachlich gelesen und gemeinsam
+  mit den gemessenen RTO-/RPO-Werten gebunden;
+- ein leerer Zielcluster bzw. eine äquivalente leere Zielumgebung ist aus den
+  registrierten versionierten Artefakten, gebundenen externen
+  Secret-/Infrastrukturreferenzen und der gewünschten Release-Revision
+  reproduzierbar aufgebaut und mit den für R8 benötigten Kernfähigkeiten
+  zurückgelesen;
+- Zielidentität, Fehlerdomäne, Release-Commit, Image-Digests, Messzeitpunkt,
+  Ausgangs-/Endzustand und Evidenzreferenzen sind in jedem Proof gemeinsam
+  gebunden.
+
+Ein lokaler HA-Proof, ein Staging-Failover, bloße Pod-Readiness oder ein
+generischer Restorebeleg schließen dieses Gate nicht. Fehlt einer der
+zielgebundenen Wirkungsbeweise, bleibt R8 BLOCKED.
+
+### R8-Eintrittsgate — deklarative Herkunft und Driftfreiheit
+
+Vor jeder öffentlichen Produktionswirkung muss zusätzlich bewiesen sein, dass
+der **effektiv laufende Green-Zustand** keine unregistrierte manuelle
+Konfigurationswahrheit enthält. Für das konkrete Ziel werden deshalb
+revisionsgebunden mindestens folgende Belege gemeinsam erfasst:
+
+- die registrierte deklarative Soll-Wahrheit: Repo-Commit sowie die tatsächlich
+  verwendeten Kubernetes-/Kustomize-/GitOps-Artefakte, Image-Digests und
+  referenzierten externen Secret-/Infrastrukturquellen;
+- der vom GitOps-/Reconciliation-Pfad beobachtete angewendete Source-Stand samt
+  Ziel-/Namespace-/Objektinventar;
+- ein zielseitiger Desired-vs-Live-Readback der effektiven relevanten
+  Workloads, Services, Gateway-/Routingobjekte, Policies, ConfigMaps,
+  Secret-Referenzen, Storage-/Datenbank-/Messaging-Konfiguration und sonstigen
+  cutoverkritischen Objekte;
+- eine enge, revisionsgebundene Allowlist ausschließlich für
+  controller-/runtimegenerierte Felder, die keine fachliche Konfiguration,
+  Writer-Autorität, Routing-, Policy-, Secret-, Storage- oder
+  Delivery-Wahrheit verändern;
+- der Nachweis, dass ein Neuaufbau aus derselben registrierten Soll-Wahrheit
+  denselben cutoverrelevanten Zustand erzeugt.
+
+Ein manuelles `kubectl patch`, ein ad-hoc angelegtes oder verändertes
+cutoverrelevantes Objekt, eine nur auf dem Ziel vorhandene ConfigMap-/
+Secret-Referenz, eine nicht registrierte Host-/Load-Balancer-/Routinganpassung
+oder sonstiger wirksamer Drift blockiert R8, bis die Änderung entweder in die
+deklarative Wahrheit übernommen und erneut reconciliiert oder vollständig
+entfernt ist. Secrets selbst müssen dabei nicht im Git liegen; ihre
+**registrierte Quelle, Zielbindung und Materialisierung** müssen jedoch
+reproduzierbar und revisionsgebunden belegt sein.
+
+Kann der effektive Green-Zustand nicht vollständig gegen seine registrierte
+Soll-Wahrheit zurückgelesen werden, gilt Driftfreiheit als **nicht bewiesen** und
+R8 bleibt fail-closed.
+
+Erst nach **allen drei** R8-Eintrittsgates darf der öffentliche Canary beginnen.
+Bis zur expliziten Writer-Transition bleibt Blue alleiniger Writer; ein Canary
+erzeugt keine zweite Schreibautorität.
 
 ### R8-Canary und progressive Traffic-Steuerung
 
