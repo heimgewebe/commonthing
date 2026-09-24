@@ -13,7 +13,7 @@ last_reviewed: 2026-07-19
 review_after: 2026-10-18
 depends_on:
   - overview
-  - architecture.commonthing-os
+  - architecture.weltgewebe-os
   - specs.garnrolle-knoten-faden
 relations:
   - type: relates_to
@@ -54,7 +54,7 @@ T001 ist ein Architektur- und Testgrundlagen-Schnitt. Es führt weder Datenbankm
 
 ## 2. Dialektik und alternative Sinnachse
 
-**These:** Ein semantischer Retrieval-Anteil kann natürliche Anfragen auffangen, die exakte Begriffe, Tags oder Schreibweisen verfehlen. Innerhalb von commonThing kann er dieselben Sichtbarkeits-, Lösch-, Revisions- und Multi-Instance-Grenzen wie die übrige Domänenlogik verwenden.
+**These:** Ein semantischer Retrieval-Anteil kann natürliche Anfragen auffangen, die exakte Begriffe, Tags oder Schreibweisen verfehlen. Innerhalb des Weltgewebes kann er dieselben Sichtbarkeits-, Lösch-, Revisions- und Multi-Instance-Grenzen wie die übrige Domänenlogik verwenden.
 
 **Antithese:** PostgreSQL-Volltext und Trigramme können den praktisch relevanten Gewinn bereits liefern. Ein externer Vektorindex oder Cloud-Provider würde eine zweite Zustandswahrheit, neue Kosten- und Verfügbarkeitsabhängigkeiten sowie schwierigere Löschfortpflanzung erzeugen.
 
@@ -386,7 +386,7 @@ Nicht Bestandteil der Zielarchitektur sind:
 - Commonworld-Anbindung
 - Shadow-Modus
 - automatische Fäden, Beziehungen, Löschungen oder Zusammenführungen aus Ähnlichkeit
-- ANN-/HNSW-Arbeit ohne gemessenen commonThing-Engpass
+- ANN-/HNSW-Arbeit ohne gemessenen Weltgewebe-Engpass
 
 Brauchbare SemantAH-Konzepte wie Providergrenzen, Dimensionsprüfung, Normalisierung, deterministische Cosinus-Referenzsuche, Benchmarks und Tests dürfen zielgerichtet neu implementiert werden. SemantAH-Code wird nicht als dauerhafte Abhängigkeit übernommen.
 

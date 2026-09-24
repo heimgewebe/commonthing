@@ -112,6 +112,9 @@ Consumer), nie durch Umschreiben des Bestands:
 - Such-Revisionen (`weltgewebe-search-normalization-v1`,
   `weltgewebe-hybrid-ranking-v2`), die an Receipts und Contracts gebunden sind;
 - Schema-`$id`s bestehender Contract-Versionen.
+- Dateien, deren Inhalt per Hash in einem eingecheckten Receipt gebunden ist
+  (z. B. `architecture/semantic-search.md` im T004-Ranking-Receipt); ihr Text
+  ändert sich erst mit einem neu erzeugten Receipt.
 
 Treffer dieser Klasse gelten als klassifiziert; sie brauchen keinen
 Zeilenmarker `commonthing-naming: legacy`.
