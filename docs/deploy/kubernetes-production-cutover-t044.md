@@ -411,6 +411,40 @@ Rücksetzungsnachweis vorliegen. Er umfasst mindestens:
 - eindeutige Testobjekt- und Korrelationskennungen sowie einen gebundenen
   Ausgangszustand.
 
+Zusätzlich gilt eine eigenständige **External-Side-Effect-Fence**. Vor dem
+ersten R6-Testwrite wird für die exakte Green-Revision und ihre aktive
+Konfiguration revisionsgebunden inventarisiert, welche Pfade die
+Rehearsal-Grenze nach außen verlassen und dort nicht vollständig rücksetzbare
+Wirkung erzeugen können. Dazu gehören mindestens, soweit in dieser Revision
+aktivierbar oder aktiviert:
+
+- Web-Push-/Notification-Delivery;
+- SMTP-/Magic-Link-/Step-up-Mail;
+- Federation-Delivery zu Remote-Zellen;
+- weitere release-spezifische Webhook-, Message-, Mail- oder externe
+  Delivery-/Callback-Pfade.
+
+Jeder inventarisierte externe Seiteneffektpfad muss **vor** dem ersten
+Testwrite genau einen belegten Zustand haben:
+
+1. technisch fail-closed deaktiviert, sodass zugehöriger Worker, Transport und
+   Egress kein externes Ziel erreichen können; **oder**
+2. auf einen verifizierten Rehearsal-Sink umgeleitet, dessen Identität,
+   Zieladresse, Empfänger-/Peer-Menge und Egresspfad nachweislich nicht
+   produktiv sind.
+
+Eine kopierte Produktionsdatenbank, Produktions-Subscriptions,
+Produktions-Peer-Endpunkte oder vorhandene Produktions-Credentials sind
+ausdrücklich **kein** Isolationsbeweis. Solche Daten dürfen nur vorhanden sein,
+wenn der zugehörige externe Pfad trotzdem technisch gefenced ist und eine reale
+Produktionszustellung fail-closed unmöglich bleibt.
+
+Das Side-Effect-Gate verlangt vor dem Testwrite mindestens einen gemeinsamen
+Readback aus Runtime-Konfiguration, Worker-/Delivery-Zustand und
+Netzwerk-/Egressentscheidung. Ist ein externer Wirkungspfad unbekannt, nicht
+inventarisiert oder kann er noch ein Produktionsziel erreichen, bleibt R6 für
+Writes BLOCKED und die Generalprobe read-only.
+
 Bevorzugt wird ein **disposable/isolierter Rehearsal-Datenpfad** derselben
 Revision und Konfiguration, zum Beispiel über eine getrennte Datenkopie,
 Namespace-/Schema-/Stream-/Index-Isolation oder eine äquivalente
@@ -425,15 +459,22 @@ Nach der Write-Generalprobe gilt fail-closed:
    zurückgesetzt;
 2. im späteren Produktionskandidaten sind Testobjekt- und Korrelationskennungen
    in PostgreSQL, Outbox/Consumption, JetStream und Suche nachweislich abwesend;
-3. Green erhält danach einen frischen finalen Datenabgleich aus der weiterhin
+3. für jeden zuvor inventarisierten externen Seiteneffektpfad wird
+   zielgebunden zurückgelesen, dass nur der erwartete Rehearsal-Sink erreicht
+   wurde oder der Pfad vollständig deaktiviert blieb; ein Kontakt zu einem
+   Produktionsziel ist ein harter Abbruch und kann **nicht** durch nachträgliches
+   Store-Cleanup geheilt werden;
+4. Green erhält danach einen frischen finalen Datenabgleich aus der weiterhin
    autoritativen Blue-Wahrheit;
-4. Daten-, Ereignis- und Projektionsgleichheit werden erneut read-only
+5. Daten-, Ereignis- und Projektionsgleichheit werden erneut read-only
    zurückgelesen.
 
 Kann auch nur ein betroffener Store nicht isoliert oder vollständig
-zurückgesetzt werden, bleibt R6 auf read-only beschränkt. **R7 darf erst nach
-diesem Cleanup-/Isolationsbeweis und dem anschließenden frischen
-Blue-zu-Green-Abgleich beginnen.**
+zurückgesetzt werden, ist ein externer Side-Effect-Pfad nicht vollständig
+gefenced oder fehlt dessen zielgebundener Readback, bleibt R6 auf read-only
+beschränkt. **R7 darf erst nach diesem Cleanup-/Isolations- und
+Side-Effect-Beweis sowie dem anschließenden frischen Blue-zu-Green-Abgleich
+beginnen.**
 
 Für jedes Szenario werden Blue und Green unter demselben fachlichen Vertrag
 verglichen. HTTP 200 allein genügt nicht; Daten-, Auth-, Event- und
