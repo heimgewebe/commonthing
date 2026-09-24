@@ -435,8 +435,10 @@ definiert.
 
 Die Grenze darf erst gebunden werden, wenn der finale Blue-zu-Green-Abgleich
 und Gleichheits-Readback bestanden sind, Blue als Writer gefenced ist und Green
-noch technisch write-inhibited bleibt. Während die Grenze festgehalten wird,
-darf weder ein öffentlicher Green-Write noch ein persistenzmutierender
+noch technisch write-inhibited bleibt. Bei Continuous-Sync muss zusätzlich der
+Zero-Lag-/Drain-Checkpoint bestanden und der Blue-zu-Green-Replikationswriter
+nachweislich gefenced sein. Während die Grenze festgehalten wird, darf weder ein
+öffentlicher Green-Write, ein Replikations-Apply noch ein persistenzmutierender
 Green-Hintergrundpfad laufen.
 
 Bis **vor** diese dauerhaft festgehaltene Grenze darf Blue nur mit frischem
@@ -497,7 +499,11 @@ Canary-Plan festgehalten. Er enthält mindestens:
   Datenstabilitätsmodus belegt:
   1. kontinuierliche Blue-zu-Green-Synchronisierung für PostgreSQL/Auth,
      Outbox/Consumption, JetStream und Suche mit gemessener Lag-Grenze und
-     automatischem Canary-Abbruch bei deren Überschreitung; **oder**
+     automatischem Canary-Abbruch bei deren Überschreitung. Zusätzlich ist für
+     die spätere Writer-Transition ein revisionsgebundener Stop-Pfad belegt:
+     nach Fencing aller Blue-Zustandsmutatoren muss die Synchronisierung
+     Zero-Lag erreichen, queued/in-flight Forward-Apply vollständig drainen und
+     ihr Green-schreibender Replikationspfad explizit gefenced werden; **oder**
   2. vollständige **Blue-Quiescence-Barriere** vom finalen
      Blue-zu-Green-Abgleich bis zum Ende des Read-Canary. Sie blockiert nicht
      nur gewöhnliche öffentliche Writes, sondern jeden Blue-Pfad, der
@@ -561,11 +567,16 @@ Die Sequenz ist fail-closed:
    nächsten Stufe;
 5. erst nach bestandener Read-Canary-Sequenz die Writer-Transition beginnen.
    Bei Modus 1 werden jetzt alle Blue-Zustandsmutatoren über dieselbe
-   Quiescence-Barriere gefenced; bei Modus 2 bleibt die bestehende Quieszenz
-   aktiv. Danach finalen Gleichheits-Readback auf Green durchführen und Blue als
-   Writer fencen. **Green bleibt dabei noch vollständig write-inhibited.**
-   Solange dieser Zustand nicht belegt ist, darf die Transition nicht
-   fortgesetzt werden;
+   Quiescence-Barriere gefenced. Danach muss die Blue-zu-Green-Synchronisierung
+   den gebundenen **Zero-Lag-Checkpoint** erreichen; queued und in-flight
+   Forward-Apply werden vollständig beendet, anschließend wird der
+   Green-schreibende Replikationspfad explizit gefenced. Ein Readback muss
+   belegen, dass kein Replikationswriter und kein ausstehender Apply mehr Green
+   verändern kann. Bei Modus 2 bleibt die bestehende Quieszenz aktiv. **Erst
+   danach** finalen Gleichheits-Readback auf Green durchführen und Blue als
+   Writer fencen. Green bleibt dabei noch vollständig write-inhibited. Solange
+   dieser Zustand nicht belegt ist, darf die Transition nicht fortgesetzt
+   werden;
 6. jetzt — während Blue gefenced und Green noch write-inhibited ist — die
    **Write-Cutover-Grenze** revisions- und zeitgebunden festhalten. Ab diesem
    Moment gilt der Post-Write-Recoveryvertrag, noch bevor irgendein
