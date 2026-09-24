@@ -386,18 +386,20 @@ Unveränderliche Invariante:
 
 > Eine Schreibklasse hat genau einen autoritativen Writer.
 
-Sequenz:
+R7 bindet und beweist den Umschaltmechanismus, führt ihn aber noch **nicht**
+produktiv aus:
 
 ```text
 Blue Writer
-  -> letzter Datenabgleich
-  -> Blue Writer Fence
-  -> finale Konvergenz
-  -> Green Readback
-  -> Green Writer Authority
+  -> Fencing-/Blockiermechanismus revisionsgebunden beweisen
+  -> finalen Konvergenz- und Green-Readback-Pfad beweisen
+  -> kontrollierten Green-Probe-Write-Pfad beweisen
+  -> Blue bleibt alleiniger Writer
 ```
 
-Keine Phase darf Blue und Green gleichzeitig als unabhängige Writer zulassen.
+R7 endet ausdrücklich **ohne** Writer-Transfer. Blue bleibt bis zur in R8
+definierten Writer-Transition alleinige Schreibautorität. Keine Phase darf Blue
+und Green gleichzeitig als unabhängige Writer zulassen.
 
 ### Write-Cutover-Grenze und Rückweg
 
@@ -484,16 +486,24 @@ Die Sequenz ist fail-closed:
    Beobachtungsfenster, SLOs, Datenfrische und fachliche Readbacks vollständig
    bestanden sein;
 5. erst nach bestandener Read-Canary-Sequenz die Writer-Transition beginnen:
-   öffentliche Writes kontrolliert anhalten oder fail-closed blockieren, final
-   Blue nach Green konvergieren, Blue-Writer fencen, Gleichheit auf Green
-   zurücklesen und erst dann Green Writer-Autorität erteilen;
-6. ab Green-Writer-Autorität müssen **alle Writes und alle
-   zustandsabhängigen Reads** Green erreichen. Blue darf ohne zusätzlich
-   belegte Rückreplikation nur noch statische/immutable Pfade bedienen;
-7. einen kontrollierten produktiven Write über Green samt
-   Event-/Projektionsnachzug prüfen und bei Annahme die Write-Cutover-Grenze
-   revisions- und zeitgebunden festhalten;
-8. verbleibenden statischen/Edge-Traffic erst danach weiter stufenweise bis
+   **gewöhnliche öffentliche Writes vollständig anhalten oder fail-closed
+   blockieren**, final Blue nach Green konvergieren, Blue-Writer fencen,
+   Gleichheit auf Green zurücklesen und erst dann Green Writer-Autorität
+   erteilen; die gewöhnliche öffentliche Green-Write-Freigabe bleibt dabei noch
+   geschlossen;
+6. ab Green-Writer-Autorität müssen alle **zustandsabhängigen Reads** Green
+   erreichen. Für Writes ist zunächst ausschließlich der exakt gebundene
+   kontrollierte Probe-Write-Pfad freigegeben; alle übrigen öffentlichen Writes
+   bleiben blockiert. Blue darf ohne zusätzlich belegte Rückreplikation nur noch
+   statische/immutable Pfade bedienen;
+7. genau einen kontrollierten produktiven Probe-Write über Green ausführen und
+   dessen Fachdatenzustand, Outbox-/Eventfortschritt, JetStream sowie
+   Such-/Projektionsnachzug vollständig zurücklesen. Erst wenn dieser vollständige
+   Readback besteht, wird bei Annahme die Write-Cutover-Grenze revisions- und
+   zeitgebunden festgehalten;
+8. **erst nach bestandenem Schritt 7** gewöhnliche öffentliche Writes auf Green
+   freigeben und deren Fehler-/Latenz-/Datenintegritätsgrenzen erneut beobachten;
+9. verbleibenden statischen/Edge-Traffic erst danach weiter stufenweise bis
    100 % verschieben; jede Stufe benötigt erneut ihr vollständiges
    Beobachtungsfenster.
 
