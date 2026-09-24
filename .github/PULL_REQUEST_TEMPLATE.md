@@ -1,5 +1,5 @@
 <!--
-Weltgewebe is the primary project. Replace R? with exactly one class:
+commonThing is the primary project. Replace R? with exactly one class:
 R0 = Markdown-only, at most 50 changed lines; CI only
 R1 = bounded low-risk change or approved raster asset; one native current-head GitHub approval is enough
 R2 = application code, API, tests, scripts or dependencies; two hash-bound reports

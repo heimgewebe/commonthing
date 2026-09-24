@@ -1,6 +1,6 @@
 ---
 id: reports.optimierungsbericht
-title: "Optimierungsbericht Weltgewebe"
+title: "Optimierungsbericht commonThing"
 doc_type: report
 status: active
 lifecycle_state: active
@@ -25,7 +25,7 @@ relations:
     target: docs/reports/optimierungsstatus.md
 ---
 
-# Optimierungsbericht Weltgewebe
+# Optimierungsbericht commonThing
 
 > Umfassende Analyse aller Schichten: API, Frontend, Infrastruktur, CI/CD, Dokumentation, Domain-Contracts.
 

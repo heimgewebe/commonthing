@@ -36,7 +36,7 @@ relations:
 
 ## 1. Entscheidung in einem Satz
 
-Das Weltgewebe erweitert das bestehende kanonische Modell
+commonThing erweitert das bestehende kanonische Modell
 `domain_conversations` / `domain_messages` um den ausdrücklich typisierten
 Gesprächsgegenstand `governance_proposal`, schaltet den Governance-Pfad in drei
 reversiblen Stufen auf dieses Modell um und entfernt `governance_messages` erst

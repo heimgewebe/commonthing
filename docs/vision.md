@@ -1,7 +1,7 @@
 ---
 id: docs.vision
 title: Vision
-summary: Dauerhafte Leitidee des Weltgewebes ohne Behauptungen über aktuellen Implementierungs- oder Betriebsstand.
+summary: Dauerhafte Leitidee von commonThing ohne Behauptungen über aktuellen Implementierungs- oder Betriebsstand.
 doc_type: vision
 status: active
 canonicality: supporting
@@ -18,7 +18,7 @@ relations:
 ---
 # Vision
 
-Weltgewebe ist eine kartenbasierte Infrastruktur für Commons, Kooperation und kollektive Verantwortung. Es soll sichtbar machen, wo Menschen, Initiativen, Ressourcen, Bedürfnisse und Vorhaben miteinander verbunden sind.
+commonThing ist eine kartenbasierte Infrastruktur für Commons, Kooperation und kollektive Verantwortung. Es soll sichtbar machen, wo Menschen, Initiativen, Ressourcen, Bedürfnisse und Vorhaben miteinander verbunden sind.
 
 ## Leitidee
 

@@ -155,16 +155,16 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "Runtime health, deployment health, or the correctness of claims inside individual reports."
   ],
-  "generated_at": "2026-09-20T19:06:28+02:00",
+  "generated_at": "2026-09-24T06:04:04+00:00",
   "limitations": [
     "The report reflects repository files only and does not execute product runtime checks."
   ],
   "schema_version": 1,
-  "source_revision": "980500baf412becdf25f7036e4eb9e1bb9079d9f",
+  "source_revision": "ffe3b73767dba470c364129a0f4a45d7432ee423",
   "sources": [
     {
       "path": "docs/reports/agent-readiness-audit.md",
-      "sha256": "a2470245a3a062f9383207285855cf856e3990a28c947354d34ce2795f5cd1c8"
+      "sha256": "097965f8ed9c92247a6f92aaf106f0d6e5034b3189e056ac4cee9e7ee0895fe4"
     },
     {
       "path": "docs/reports/auth-persistence-direct-proof-diagnose-audit.md",
@@ -236,7 +236,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/auth-status-matrix.md",
-      "sha256": "d11caeeff96963286a9619900ee6194e7342f37cb809c556140c448c1cee2a82"
+      "sha256": "dd6c4ba146d503144493dbe249bb4310243d626bdfac370d03f21f1ebbb84244"
     },
     {
       "path": "docs/reports/cost-report.md",
@@ -300,7 +300,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/garnrolle-identity-cutover-proof.md",
-      "sha256": "4a369b7e178aefc5c3ea0121f325da4de07d39cc209e1326716ebcbe2cc51ea3"
+      "sha256": "558dccd40e6ee50e32039969b7120c0c73c0ea044fe34df944f0c7ecf3aa87bb"
     },
     {
       "path": "docs/reports/github-action-ref-pinning-audit.md",
@@ -336,11 +336,11 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/optimierungsbericht.md",
-      "sha256": "e55e2e9e676d05e49e3373f9d47b675c61c837afb234aa72b57885f2b9e16830"
+      "sha256": "a7ae29b7f49cd669d1cedcea5e3443a3bcd67e0ab9e97ef741042bed16f34405"
     },
     {
       "path": "docs/reports/optimierungsstatus.md",
-      "sha256": "a90079fee67d6351835cc04e337c655a9bb7a81675ecb15aea9a92bf89571142"
+      "sha256": "dbf838227ebef3cbb4ec3b9a258385d83167306733304ef15397f61aaf81f9e4"
     },
     {
       "path": "docs/reports/passkey-register-verify-prep.md",
@@ -364,11 +364,11 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/weltgewebe-os-foundation-status.md",
-      "sha256": "f3b21dd0dead470dbb09cc5838534c2fc32d22a85fe9cfe258464e33bb308653"
+      "sha256": "9603b2fea90c8e4a7118bfa910d77e7ab75a2cfe057f0e331af0d0dd38e6e4fe"
     },
     {
       "path": "docs/reports/weltgewebe-os-v1-t018-conversation-convergence-plan.md",
-      "sha256": "680a44fa3507f4191fbe32b0068b3bf8a77e6979739ea7d88d5c4b07d43870a9"
+      "sha256": "8971b15c7e9a8d0297e3c26c4721f392709927e8f69547a91f13691ec7376c16"
     }
   ],
   "status": "pass"

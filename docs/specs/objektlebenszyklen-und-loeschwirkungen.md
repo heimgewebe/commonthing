@@ -33,7 +33,7 @@ attention_source_rationale: "Definiert Lebenszykluswirkungen, aber derzeit keine
 
 ## Zweck
 
-Im Weltgewebe darf das Wort **löschen** nicht mehrere technisch und fachlich
+In commonThing darf das Wort **löschen** nicht mehrere technisch und fachlich
 verschiedene Wirkungen verdecken. Ein Kartenobjekt kann aus der aktiven Welt
 verschwinden, während die durch mehrere Personen entstandene Geschichte erhalten
 bleiben muss. Umgekehrt kann ein einzelner Inhalt zurückgezogen werden, ohne die

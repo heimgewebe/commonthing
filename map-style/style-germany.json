@@ -1,12 +1,12 @@
 {
   "version": 8,
-  "name": "Weltgewebe Sovereign Basemap — Germany",
+  "name": "commonThing Sovereign Basemap — Germany",
   "metadata": {
     "weltgewebe:version": "0.4.0",
     "weltgewebe:variant": "germany",
     "weltgewebe:note": "Opt-in nationwide PMTiles source; production activation requires artifact and live runtime proof",
     "weltgewebe:colorScheme": "light",
-    "weltgewebe:darkStyleSha256": "253bbbbdb0fadc932675585f48d27c86f9e41f421c5454a9e924e010b8e4fdf7"
+    "weltgewebe:darkStyleSha256": "8c717836078993f006a8ba8aff459f11e45d4af0160b3cf8014e18c1f9f6adaa"
   },
   "sources": {
     "basemap-germany": {

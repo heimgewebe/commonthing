@@ -45,7 +45,7 @@ attention_source_rationale: "Definiert langlebige Identitäten und Gewebebeziehu
 ## Grundsatz
 
 Jeder registrierte Account besitzt genau eine Garnrolle. Die Garnrolle ist der
-persönliche Ausgangspunkt im Weltgewebe; die Berechtigungsrolle `gast`, `weber`
+persönliche Ausgangspunkt in commonThing; die Berechtigungsrolle `gast`, `weber`
 oder `admin` beschreibt dagegen, welche Verantwortung der Account übernehmen
 darf. Sichtbarkeit und Kartenposition werden ausschließlich durch `map_state`
 gesteuert.

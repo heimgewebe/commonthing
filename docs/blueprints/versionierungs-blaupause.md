@@ -1,6 +1,6 @@
 ---
 id: versionierungs-blaupause
-title: "Weltgewebe Deploy-Versionierung und Browser-Aktualität"
+title: "commonThing Deploy-Versionierung und Browser-Aktualität"
 doc_type: blueprint
 status: draft
 summary: "Blaupause für eine saubere, beobachtbare Deploy-Identität, die konsistent von Build bis zur UI-Diagnose bleibt."
@@ -11,13 +11,13 @@ relations:
     target: docs/deployment.md
 ---
 
-# Weltgewebe Deploy-Versionierung und Browser-Aktualität
+# commonThing Deploy-Versionierung und Browser-Aktualität
 
-Weltgewebe bekommt eine saubere, beobachtbare Deploy-Identität, die entlang der ganzen Kette konsistent bleibt: Build → version.json → Edge/Caddy → Deploy-Verify → UI-Diagnose → kontrollierte Client-Reaktion.
+commonThing bekommt eine saubere, beobachtbare Deploy-Identität, die entlang der ganzen Kette konsistent bleibt: Build → version.json → Edge/Caddy → Deploy-Verify → UI-Diagnose → kontrollierte Client-Reaktion.
 
 ## 0. Zielbild
 
-Weltgewebe soll zuverlässig Folgendes leisten:
+commonThing soll zuverlässig Folgendes leisten:
 
 - Jeder Frontend-Build erzeugt eine technische, maschinenlesbare Build-Identität.
 - Diese Identität wird ungecacht und kanonisch ausgeliefert.

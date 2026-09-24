@@ -377,7 +377,7 @@ fn build_openapi_document(manifest: &MachineManifest) -> Result<Value, String> {
     Ok(json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "Weltgewebe Machine Surface",
+            "title": "commonThing Machine Surface",
             "version": manifest.schema_version.to_string(),
             "description": "Machine-discoverable operation surface. Handler-specific payloads are explicitly marked instead of guessed; canonical JSON Schemas are linked separately."
         },

@@ -62,9 +62,9 @@ _Keine Lücken erkannt._
 - `apps/api/tests/db_multi_instance_foundation.rs`
 - `apps/web/Caddyfile.container`
 - `apps/web/src/lib/components/governance/ProposalDetail.svelte`
+- `architecture/commonthing-os.md`
 - `architecture/overview.md`
 - `architecture/security.md`
-- `architecture/weltgewebe-os.md`
 - `audit/impl-registry.yaml`
 - `contracts/agent/handoff.schema.json`
 - `contracts/agent/run-result.schema.json`

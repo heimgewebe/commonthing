@@ -23,7 +23,7 @@ Accepted
 
 ## Kontext
 
-Weltgewebe benötigt ein Authentifizierungsmodell, das:
+commonThing benötigt ein Authentifizierungsmodell, das:
 
 - niedrige Einstiegshürde ermöglicht
 - wiederkehrende Nutzung ohne Reibung erlaubt
@@ -142,4 +142,4 @@ Das Auth-System beeinflusst nicht:
 
 ## Statusentscheidung
 
-Dieses Modell definiert den kanonischen Zielzustand für Auth in Weltgewebe.
+Dieses Modell definiert den kanonischen Zielzustand für Auth in commonThing.

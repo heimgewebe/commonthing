@@ -7,11 +7,11 @@ scope: global
 relations:
   - type: relates_to
     target: docs/policies/agent-reading-protocol.md
-description: "Repository-Audit und Ausarbeitung des Agent-Readiness-Masterplans für Weltgewebe"
-summary: "Repository-Audit und Ausarbeitung des Agent-Readiness-Masterplans für Weltgewebe"
+description: "Repository-Audit und Ausarbeitung des Agent-Readiness-Masterplans für commonThing"
+summary: "Repository-Audit und Ausarbeitung des Agent-Readiness-Masterplans für commonThing"
 ---
 
-# Weltgewebe Repository-Audit und Ausarbeitung des Agent-Readiness-Masterplans
+# commonThing Repository-Audit und Ausarbeitung des Agent-Readiness-Masterplans
 
 > **Hinweis:** Dieses Audit ist ein Diagnose- und Berichtsartefakt. Es dient als Grundlage für Priorisierungen, ist aber **keine Primärnorm**. Für bindende Agenten-Regeln siehe das [`Agent Reading Protocol`](../policies/agent-reading-protocol.md).
 >
@@ -43,7 +43,7 @@ summary: "Repository-Audit und Ausarbeitung des Agent-Readiness-Masterplans für
 **Synthese:** Aus dem Masterplan wird (im Sinne deiner Datei) ein **Audit mit Entscheidungslogik**, nicht „noch mehr Doku“: Wir verdichten die Wahrheitsschicht (Lesereihenfolge, Konfliktauflösung, Abbruchregeln) und binden sie an die realen Module (API/Web/Infra/CI), sodass Agenten **reproduzierbar** und **ohne Interpolationsdrift** arbeiten.
 
 **Alternative Sinnachse (Zielannahme kippen):**
-Statt „Weltgewebe als Produkt bauen“ kann man Weltgewebe als **Wahrheitssystem** verstehen, das später Produktarbeit **ermöglicht**. Dann ist „Agent-Readiness“ nicht Feature, sondern *Betriebssystem der Wissensordnung*. Das verschiebt Prioritäten: erst Konfliktlogik & Lesepfade, dann Features.
+Statt „commonThing als Produkt bauen“ kann man commonThing als **Wahrheitssystem** verstehen, das später Produktarbeit **ermöglicht**. Dann ist „Agent-Readiness“ nicht Feature, sondern *Betriebssystem der Wissensordnung*. Das verschiebt Prioritäten: erst Konfliktlogik & Lesepfade, dann Features.
 
 **Resonanz- und Kontrastprüfung (zwei plausible Deutungen):**
 Deutung A („fast agent-ready“) passt zu AGENTS/Policy/State-Machine-Strenge.
@@ -290,7 +290,7 @@ Unten ist eine **komprimierte** Inventur- und Kanonizitätsmatrix (repräsentati
 ### Konkrete Empfehlungen mit Prämissencheck, Aufwand und Priorität
 
 **Prämissencheck (Was müsste wahr sein, damit die Empfehlung gilt?):**
-Wenn Weltgewebe *mehr als Single-Node-Demo* ist (mehrere Nutzer, Neustarts, ggf. mehrere Instanzen), dann müssen Sessions/Tokens persistieren und API↔Contracts konsistent werden.
+Wenn commonThing *mehr als Single-Node-Demo* ist (mehrere Nutzer, Neustarts, ggf. mehrere Instanzen), dann müssen Sessions/Tokens persistieren und API↔Contracts konsistent werden.
 Wenn Heimserver ein Referenz-Deploy bleibt, müssen Caddy/Compose/Policies als operative Wahrheit driftfrei bleiben.
 
 | Empfehlung | Kategorie | Nutzenklasse | Risiko/Nebenwirkung | Aufwand | Priorität |
@@ -348,7 +348,7 @@ Security/Privacy (Sessions, Magic Links, Garnrollen-Sichtbarkeit), Operational (
 
 ```mermaid
 gantt
- title Weltgewebe Umsetzungspfad (Audit -> Truth Layer -> Produktfähigkeit)
+ title commonThing Umsetzungspfad (Audit -> Truth Layer -> Produktfähigkeit)
  dateFormat YYYY-MM-DD
  axisFormat %d.%m.
 

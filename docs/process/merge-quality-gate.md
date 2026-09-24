@@ -22,7 +22,7 @@ relations:
 # Merge-Qualitätsgate
 
 Dieses Dokument beschreibt den verbindlichen Qualitätsprozess für nichttriviale
-Änderungen am Weltgewebe. Ziel ist nicht möglichst viel Bürokratie, sondern eine
+Änderungen an commonThing. Ziel ist nicht möglichst viel Bürokratie, sondern eine
 prüfbare Bindung zwischen dem tatsächlich gemergten Code und genau dem Diff, der
 geprüft wurde.
 

@@ -3,7 +3,7 @@ id: docs.specs.federation-wire-v1
 title: Föderations-Drahtvertrag v1
 doc_type: specification
 status: canonical
-summary: "Definiert die öffentliche, signierte HTTP- und JSON-Grenze zwischen unabhängig betriebenen Weltgewebe-Zellen."
+summary: "Definiert die öffentliche, signierte HTTP- und JSON-Grenze zwischen unabhängig betriebenen commonThing-Zellen."
 role: norm
 organ: platform
 canonicality: normative
@@ -27,7 +27,7 @@ attention_source_rationale: "Definiert den Zellen-Drahtvertrag und transportiert
 
 Status: implementiert und durch automatisierte Vertrags-, API-, Browser- und Persistenztests prüfbar.
 
-Dieser Vertrag beschreibt ausschließlich die öffentliche Grenze zwischen unabhängig betriebenen Weltgewebe-Zellen. PostgreSQL, NATS, Kubernetes, interne Tabellen und Betreibergeheimnisse sind keine Bestandteile des Drahtvertrags.
+Dieser Vertrag beschreibt ausschließlich die öffentliche Grenze zwischen unabhängig betriebenen commonThing-Zellen. PostgreSQL, NATS, Kubernetes, interne Tabellen und Betreibergeheimnisse sind keine Bestandteile des Drahtvertrags.
 
 ## 1. Grundmodell
 
