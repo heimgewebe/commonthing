@@ -1,6 +1,6 @@
 ---
 id: docs.roadmap
-title: Weltgewebe — Master-Umsetzungsroadmap
+title: commonThing — Master-Umsetzungsroadmap
 doc_type: roadmap
 status: active
 created: 2026-05-08
@@ -39,7 +39,7 @@ relations:
     target: docs/reports/map-status.md
 ---
 
-# Weltgewebe — Master-Umsetzungsroadmap
+# commonThing — Master-Umsetzungsroadmap
 
 > **Zweck.** Diese Roadmap ist der **Koordinations-Index** über alle
 > aktiven Umsetzungsstränge. Sie ordnet Verträge, Belege und offene Arbeit,
@@ -84,7 +84,7 @@ Status- oder Reihenfolgequelle für die Master-Roadmap dient.
 
 | Thema | Sub-Roadmap | Statusbeleg |
 |---|---|---|
-| Weltgewebe OS | [weltgewebe-os-masterplan.md](blueprints/weltgewebe-os-masterplan.md), [kanonische Zielarchitektur](../architecture/weltgewebe-os.md) | [weltgewebe-os-foundation-status.md](reports/weltgewebe-os-foundation-status.md) |
+| commonThing OS | [weltgewebe-os-masterplan.md](blueprints/weltgewebe-os-masterplan.md), [kanonische Zielarchitektur](../architecture/commonthing-os.md) | [weltgewebe-os-foundation-status.md](reports/weltgewebe-os-foundation-status.md) |
 | Auth | [auth-roadmap.md](blueprints/auth-roadmap.md) | [auth-status-matrix.md](reports/auth-status-matrix.md) |
 | Auth-Persistenz (Runtime-Proof) | [auth-persistence-runtime-proof.md](blueprints/auth-persistence-runtime-proof.md) | [ADR-0007](adr/ADR-0007__auth-persistence-production-db-path.md), [optimierungsstatus.md](reports/optimierungsstatus.md) |
 | UI | [UI-Interaktionsvertrag](specs/ui-interaction.md), [Zustandsmaschine](specs/ui-state-machine.md) | [Kartenstatus](reports/map-status.md) |
@@ -95,9 +95,9 @@ Status- oder Reihenfolgequelle für die Master-Roadmap dient.
 | Versionierung | [versionierungs-blaupause.md](blueprints/versionierungs-blaupause.md) | [versionierungs-statusgrundlage.md](blueprints/versionierungs-statusgrundlage.md) |
 | Optimierungsfront | (kein Sub-Plan) | [optimierungsstatus.md](reports/optimierungsstatus.md), [optimierungsbericht.md](reports/optimierungsbericht.md) |
 
-## Strang Weltgewebe OS
+## Strang commonThing OS
 
-Die Zielarchitektur ist föderiert und Kubernetes-native, ohne den heutigen Compose- und Single-Instance-Zustand als bereits migriert darzustellen. Die ausführliche Reihenfolge steht im [Weltgewebe-OS-Masterplan](blueprints/weltgewebe-os-masterplan.md).
+Die Zielarchitektur ist föderiert und Kubernetes-native, ohne den heutigen Compose- und Single-Instance-Zustand als bereits migriert darzustellen. Die ausführliche Reihenfolge steht im [commonThing-OS-Masterplan](blueprints/weltgewebe-os-masterplan.md).
 
 - [~] Welle 0 — Verfassung und Architekturentscheidungen: kanonische Zielarchitektur, ADR-0010 bis ADR-0012, Föderationskern, Masterplan und Statusbericht in diesem Änderungsschnitt.
 - [ ] Welle 1 — Multi-Instanz-Wahrheit: State-Audit, Shared Auth State, abgeleitete Caches, Transactional Outbox, idempotente Konsumenten und Zwei-API-Kohärenz.
@@ -176,7 +176,7 @@ Dauerhafte UX-Regeln stehen in [Kartenerlebnis](specs/map-experience.md); die Ba
 
 ## Themenübergreifende Reihenfolge (Was vor Was)
 
-1. **Weltgewebe-OS-Verfassung und Multi-Instance-State-Audit** vor jeder horizontalen Skalierung, Kubernetes-Produktionsmigration oder öffentlichen Föderation.
+1. **commonThing-OS-Verfassung und Multi-Instance-State-Audit** vor jeder horizontalen Skalierung, Kubernetes-Produktionsmigration oder öffentlichen Föderation.
 2. **Kubernetes-/GitOps-Grundlage** auf dem belegten Shared-State-, Outbox- und Multi-Instance-Vertrag aufbauen.
 3. **Zwei-API-Kohärenzbeweis** vor Kubernetes-Replica-Skalierung.
 4. **Kubernetes-Reproduzierbarkeit und Restore-Proof** vor einer HA-Behauptung.

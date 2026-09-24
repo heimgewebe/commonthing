@@ -1,6 +1,6 @@
 ---
 id: reports.optimierungsstatus
-title: "Optimierungsstatus Weltgewebe"
+title: "Optimierungsstatus commonThing"
 doc_type: status-matrix
 status: active
 created: 2026-04-27
@@ -19,7 +19,7 @@ relations:
     target: docs/reports/domain-read-path-proof.md
 ---
 
-# Optimierungsstatus Weltgewebe
+# Optimierungsstatus commonThing
 
 Diese Datei führt den operativen Umsetzungsstand.
 Maßgeblich sind nur belegte Repo-Pfade, Tests und dokumentierte Restlücken.

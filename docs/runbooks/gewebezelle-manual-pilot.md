@@ -24,7 +24,7 @@ relations:
 
 ## Zweck und Grenze
 
-Dieses Profil ermöglicht einem technisch betreuten Orts-, Regional- oder Institutionsgewebe, eine eigenständige Weltgewebe-Instanz als Pilot aufzubauen und mit ausdrücklich freigegebenen Nachbarzellen zu verbinden. Es ist ein manueller GitOps-Betreibervertrag, keine Selbstbedienung, kein GewebeZelle-Operator und keine allgemeine Produktionsfreigabe.
+Dieses Profil ermöglicht einem technisch betreuten Orts-, Regional- oder Institutionsgewebe, eine eigenständige commonThing-Instanz als Pilot aufzubauen und mit ausdrücklich freigegebenen Nachbarzellen zu verbinden. Es ist ein manueller GitOps-Betreibervertrag, keine Selbstbedienung, kein GewebeZelle-Operator und keine allgemeine Produktionsfreigabe.
 
 Die öffentliche Föderationsgrenze verwendet ausschließlich HTTPS, JSON und Ed25519. Sie benötigt keinen gegenseitigen Kubernetes-, PostgreSQL- oder NATS-Zugriff.
 
@@ -33,7 +33,7 @@ Die öffentliche Föderationsgrenze verwendet ausschließlich HTTPS, JSON und Ed
 Eine Pilotzelle benötigt mindestens:
 
 - ein eigentumsgebundenes Kubernetes-Namespace oder einen eigenen Cluster;
-- die kanonische Weltgewebe-Kustomize-Basis mit umgebungseigenem Overlay;
+- die kanonische commonThing-Kustomize-Basis mit umgebungseigenem Overlay;
 - digestgebundene API- und Webimages aus einem geprüften Commit;
 - PostgreSQL mit angewandten Migrationen;
 - NATS JetStream;

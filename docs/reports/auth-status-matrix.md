@@ -13,7 +13,7 @@ relations:
     target: docs/blueprints/auth-roadmap.md
 ---
 
-# Auth Status Matrix – Weltgewebe
+# Auth Status Matrix – commonThing
 
 Status: aktiv
 Zweck: Verifikation der Auth-Architektur gegen ADR-0006 + Specs

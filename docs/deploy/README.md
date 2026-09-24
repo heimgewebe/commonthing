@@ -18,9 +18,9 @@ relations:
   - type: relates_to
     target: docs/deploy/secondary-domain-web-surfaces.md
 ---
-# Weltgewebe – Deployment
+# commonThing – Deployment
 
-Dieses Dokument beschreibt den **kanonischen Deployment-Stand** von Weltgewebe.
+Dieses Dokument beschreibt den **kanonischen Deployment-Stand** von commonThing.
 Es ist normativ. Abweichungen davon gelten als Drift.
 
 **Aktuelle Produktion:** `commonserver` über den Public-VPS-Pfad. Der historische
@@ -456,7 +456,7 @@ Für ein ausdrücklich reaktiviertes lokales Edge-Profil (z. B. hinter einer Fir
 ### Einrichtung & Lokale Upstreams
 
 1. **Netzwerk erstellen (optionales lokales Edge-Profil):**
-   Damit externe Edge-Proxys oder Upstreams (z.B. Leitstand) sicher mit Weltgewebe kommunizieren können, wird ein
+   Damit externe Edge-Proxys oder Upstreams (z.B. Leitstand) sicher mit commonThing kommunizieren können, wird ein
    dediziertes Netzwerk genutzt (statt Host-Ports).
 
    ```bash

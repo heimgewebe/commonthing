@@ -228,14 +228,14 @@ CLI (bewusst simpel):
 wgx task run fix_map_submission
 ```
 
-*(Hinweis: `wgx` dient hier als möglicher CLI-Einstiegspunkt; daraus folgt keine allgemeine Repo-Abhängigkeit des Weltgewebe-Kerns von externen Systemstrukturen. Weltgewebe bleibt eigenständig.)*
+*(Hinweis: `wgx` dient hier als möglicher CLI-Einstiegspunkt; daraus folgt keine allgemeine Repo-Abhängigkeit des commonThing-Kerns von externen Systemstrukturen. commonThing bleibt eigenständig.)*
 
 Was passiert intern?
 load task → execute commands sequentially → log results
 
 ## Optionale spätere Erweiterungen nach Phase 3
 
-Die folgenden Elemente gehören nicht zum zwingenden Minimal-Kern. Sie orientieren sich teilweise an erprobten experimentellen Mustern aus anderen Repos, werden hier aber ausschließlich als optionale, native Erweiterungen für Weltgewebe geführt. Sie sind nicht Voraussetzung für Phase 1–3 der Roadmap und werden nur nach erfolgreicher Basiserprobung relevant, um die Agent-Produktivität gezielt zu erhöhen:
+Die folgenden Elemente gehören nicht zum zwingenden Minimal-Kern. Sie orientieren sich teilweise an erprobten experimentellen Mustern aus anderen Repos, werden hier aber ausschließlich als optionale, native Erweiterungen für commonThing geführt. Sie sind nicht Voraussetzung für Phase 1–3 der Roadmap und werden nur nach erfolgreicher Basiserprobung relevant, um die Agent-Produktivität gezielt zu erhöhen:
 
 ### 1. Experiment-Struktur (Kernmodul)
 
@@ -416,7 +416,7 @@ Einsatzregel: Minimal halten.
 - Vollständige epistemische Dokumentstruktur (zu schwergewichtig)
 - Benchmark-System (zu früh, falscher Fokus)
 - Export-/IR-System (bereits andere Mechaniken vorhanden)
-- Vollständiger Intelligence Layer (Weltgewebe hat bereits eigene Architektur)
+- Vollständiger Intelligence Layer (commonThing hat bereits eigene Architektur)
 
 
 Die folgende Roadmap priorisiert ausschließlich den operativen Minimalpfad. Die im vorigen Abschnitt beschriebenen optionalen Erweiterungen gehören nicht zum Initialumfang und werden erst nach erfolgreicher Basiserprobung des Kerns relevant.
@@ -465,7 +465,7 @@ Die folgende Roadmap priorisiert ausschließlich den operativen Minimalpfad. Die
 ### Phase 4: Optionale experimentelle Erweiterungen
 
 - **WICHTIG:** NICHT vor erfolgreichem Abschluss von Phase 3 beginnen.
-- **Ziel:** Etablierung eines leichtgewichtigen Experiment-Schemas für Weltgewebe.
+- **Ziel:** Etablierung eines leichtgewichtigen Experiment-Schemas für commonThing.
 - **Diagnose:** Sind die grundlegenden Tasks stabil und verlässlich?
 - **Erwartete Outputs:** Diagnostisch begründetes Scaffolding für ein experimentelles Verzeichnis und dessen Kernartefakte.
 - **Stop-Kriterium:** Belegter Zielpfad und valides Schema für `manifest.yml` und `evidence.jsonl` existieren.

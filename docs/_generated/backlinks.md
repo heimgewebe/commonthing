@@ -165,17 +165,7 @@ Generated automatically. Do not edit.
 
 - [relates_to] docs/reports/weltgewebe-os-v1-t018-conversation-convergence-plan.md
 
-## architecture/overview.md
-
-- [relates_to] docs/architekturstruktur.md
-- [relates_to] docs/datenmodell.md
-- [relates_to] docs/techstack.md
-
-## architecture/security.md
-
-- [relates_to] docs/adr/ADR-0014__accountable-collective-node-mutations.md
-
-## architecture/weltgewebe-os.md
+## architecture/commonthing-os.md
 
 - [relates_to] docs/adr/ADR-0010__kubernetes-kanonische-plattform.md
 - [relates_to] docs/adr/ADR-0011__foederierte-gewebezellen.md
@@ -185,6 +175,16 @@ Generated automatically. Do not edit.
 - [depends_on] docs/blueprints/weltgewebe-os-masterplan.md
 - [depends_on] docs/reports/weltgewebe-os-foundation-status.md
 - [relates_to] docs/techstack.md
+
+## architecture/overview.md
+
+- [relates_to] docs/architekturstruktur.md
+- [relates_to] docs/datenmodell.md
+- [relates_to] docs/techstack.md
+
+## architecture/security.md
+
+- [relates_to] docs/adr/ADR-0014__accountable-collective-node-mutations.md
 
 ## audit/impl-registry.yaml
 

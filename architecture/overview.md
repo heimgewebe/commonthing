@@ -1,7 +1,7 @@
 ---
 id: overview
 title: Architecture Overview
-summary: Aktuelle Komponenten, Datenflüsse, Wahrheitsorte und Ausbaugrenzen des Weltgewebe-Systems.
+summary: Aktuelle Komponenten, Datenflüsse, Wahrheitsorte und Ausbaugrenzen des commonThing-Systems.
 role: norm
 organ: governance
 status: canonical
@@ -19,7 +19,7 @@ relations:
   - type: relates_to
     target: docs/techstack.md
   - type: relates_to
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
 verifies_with: []
 ---
 
@@ -27,7 +27,7 @@ verifies_with: []
 
 ## Systemgrenze
 
-Weltgewebe ist ein Karten- und Koordinationssystem. Die heute implementierte
+commonThing ist ein Karten- und Koordinationssystem. Die heute implementierte
 Kernfläche besteht aus:
 
 1. einer statisch baubaren SvelteKit-Webanwendung,
@@ -43,7 +43,7 @@ Gewebekonten sind weiterhin nur teilweise als Contracts oder Konzepte vorhanden.
 
 ## Kanonische Zielrichtung
 
-Die langfristige Zielarchitektur steht in [`architecture/weltgewebe-os.md`](weltgewebe-os.md). Weltgewebe wird als föderiertes System autonomer Gewebe-Zellen mit globalen Identitäten, Beziehungen und gemeinsamen Räumen entwickelt. Kubernetes ist die kanonische Zielplattform; Compose bleibt die heutige reale Runtime und ein begrenzter Entwicklungs-/Recoverypfad.
+Die langfristige Zielarchitektur steht in [`architecture/commonthing-os.md`](commonthing-os.md). commonThing wird als föderiertes System autonomer Gewebe-Zellen mit globalen Identitäten, Beziehungen und gemeinsamen Räumen entwickelt. Kubernetes ist die kanonische Zielplattform; Compose bleibt die heutige reale Runtime und ein begrenzter Entwicklungs-/Recoverypfad.
 
 Der PostgreSQL-Mehrinstanzvertrag ist seit dem 16. Juli 2026 belegt und durch einen stärkeren Guard geschützt. Das aktiviert noch keine Produktionsreplikation; diese bleibt Teil des Kubernetes-/GitOps-Rollouts.
 

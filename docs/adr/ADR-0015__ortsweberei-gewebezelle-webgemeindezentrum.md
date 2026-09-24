@@ -22,7 +22,7 @@ Status: accepted
 
 ## Kontext
 
-Weltgewebe braucht einen verständlichen lokalen Mittelpunkt, an dem digitale
+commonThing braucht einen verständlichen lokalen Mittelpunkt, an dem digitale
 Selbstverwaltung, gemeinschaftliche Vorhaben und reale Begegnung zusammenfinden.
 Die bisherige Antragsoberfläche versuchte Governance-Aktivitäten als eigenes
 abgeleitetes Fadendiagramm darzustellen. Verfahrenskategorien und Zähler sind

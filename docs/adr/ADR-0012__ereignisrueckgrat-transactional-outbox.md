@@ -7,7 +7,7 @@ summary: >
   Entscheidet Transactional Outbox, versionierte Domain-Ereignisse und idempotente Konsumenten als Grundlage für Projektionen, Skalierung und Föderation.
 relations:
   - type: relates_to
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
   - type: relates_to
     target: docs/reports/domain-postgres-instance-coherence-decision.md
   - type: relates_to
@@ -21,7 +21,7 @@ Status: Accepted
 
 ## Kontext
 
-Weltgewebe benötigt künftig mehrere API-Instanzen, abgeleitete Such- und Kartenprojektionen, Benachrichtigungen, Agentenworkloads und föderierte Zustellung. Direkte Best-Effort-Nachrichten nach einer Datenbankänderung können verloren gehen. Prozesslokale Caches und Zwischenzustände verhindern derzeit eine sichere horizontale Skalierung.
+commonThing benötigt künftig mehrere API-Instanzen, abgeleitete Such- und Kartenprojektionen, Benachrichtigungen, Agentenworkloads und föderierte Zustellung. Direkte Best-Effort-Nachrichten nach einer Datenbankänderung können verloren gehen. Prozesslokale Caches und Zwischenzustände verhindern derzeit eine sichere horizontale Skalierung.
 
 ## Entscheidung
 

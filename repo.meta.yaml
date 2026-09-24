@@ -1,11 +1,11 @@
 ---
-repo_name: weltgewebe
+repo_name: commonthing
 repo_type: service
-role: weltgewebe-stack
+role: commonthing-stack
 status: active
 summary: >
   Aktives Karten- und Koordinationssystem mit kanonischer Zielarchitektur als
-  föderiertes Weltgewebe OS; heutige Runtime mit SvelteKit, Rust/Axum,
+  föderiertes commonThing OS; heutige Runtime mit SvelteKit, Rust/Axum,
   PostgreSQL, NATS, Caddy und Compose.
 
 owners:
@@ -38,7 +38,7 @@ canonical_sources:
   - agent-policy.yaml
   - docs/policies/agent-reading-protocol.md
   - docs/policies/architecture-critique.md
-  - architecture/weltgewebe-os.md
+  - architecture/commonthing-os.md
   - platform/README.md
   - docs/specs/federation-core.md
   - docs/specs/map-experience.md
@@ -153,7 +153,7 @@ truth_model:
         - "docs/policies/agent-reading-protocol.md"
         - "docs/policies/architecture-critique.md"
         - "architecture/overview.md"
-        - "architecture/weltgewebe-os.md"
+        - "architecture/commonthing-os.md"
     - class: runtime_configs_and_code
       paths: ["infra/compose/*.yml", "apps/api/src/*", "apps/web/src/*", ".github/workflows/*.yml"]
     - class: normative_specifications

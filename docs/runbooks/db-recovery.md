@@ -5,7 +5,7 @@ doc_type: runbook
 status: active
 summary: >
   Wiederherstellungsablauf für die produktive PostgreSQL-Wahrheit von
-  Weltgewebe: logische Backups, isolierter Restore-Proof, Off-Host-Kopie,
+  commonThing: logische Backups, isolierter Restore-Proof, Off-Host-Kopie,
   Integritätsprüfung und kontrollierte Promotion.
 relations:
   - type: relates_to

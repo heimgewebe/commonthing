@@ -4,7 +4,7 @@ title: AGENTS
 doc_type: policy
 status: active
 canonicality: canonical
-summary: Progressive agent entry card for Weltgewebe; machine authority lives in agent-contract.json.
+summary: Progressive agent entry card for commonThing; machine authority lives in agent-contract.json.
 ---
 
 # AGENTS

@@ -4,10 +4,10 @@ title: CLAUDE
 doc_type: runbook
 status: active
 canonicality: supplementary
-summary: Claude Code operational interface for Weltgewebe — commands, navigation, and workflow shortcuts.
+summary: Claude Code operational interface for commonThing — commands, navigation, and workflow shortcuts.
 ---
 
-# CLAUDE.md — Weltgewebe
+# CLAUDE.md — commonThing
 
 > **For Claude Code (AI assistant) working in this repository.**
 > This file is an operational interface. It does NOT define rules, policies, or architecture.
@@ -54,7 +54,7 @@ Before making any changes, read these files in order:
 
 `docs/index.md` is navigation only. `docs/_generated/*` is diagnostic only — never canonical.
 
-Canonical cognitive modules are not part of the default reading order. Their structure is defined in `repo.meta.yaml` under `cognitive_modules`. They represent optional, high-cost reasoning layers and should only be loaded when explicitly required by the task. If a cognitive module is relevant, it must be loaded only through the activation logic defined in `docs/policies/agent-reading-protocol.md`. For Weltgewebe, this applies in particular to `docs/policies/architecture-critique.md`.
+Canonical cognitive modules are not part of the default reading order. Their structure is defined in `repo.meta.yaml` under `cognitive_modules`. They represent optional, high-cost reasoning layers and should only be loaded when explicitly required by the task. If a cognitive module is relevant, it must be loaded only through the activation logic defined in `docs/policies/agent-reading-protocol.md`. For commonThing, this applies in particular to `docs/policies/architecture-critique.md`.
 
 ### Roadmap / Status Tasks
 
@@ -74,7 +74,7 @@ change.
 
 ## What This Repository Is
 
-**Weltgewebe** is a mobile-first web application for managing nodes, edges, and domain relationships, with a focus on ethics, UX, and community autonomy.
+**commonThing** is a mobile-first web application for managing nodes, edges, and domain relationships, with a focus on ethics, UX, and community autonomy.
 
 | Layer | Technology |
 |---|---|
@@ -90,7 +90,7 @@ change.
 ## Repository Layout
 
 ```text
-weltgewebe/
+commonthing/
 ├── apps/
 │   ├── api/          # Rust/Axum HTTP API
 │   └── web/          # SvelteKit frontend
