@@ -111,6 +111,13 @@ Consumer), nie durch Umschreiben des Bestands:
   kein Migrationscode Nutzerdaten überträgt;
 - Such-Revisionen (`weltgewebe-search-normalization-v1`,
   `weltgewebe-hybrid-ranking-v2`), die an Receipts und Contracts gebunden sind;
+- der Wortlaut des versionierten Embedding-/Ranking-Prompts
+  `Weltgewebe-Knoten` in `apps/api/src/search/ranking.rs`,
+  `scripts/search/hybrid_ranking_core.py` und
+  `scripts/search/benchmark_relevance.py`: Er gehört zum Suchvertrag
+  `weltgewebe-hybrid-ranking-v2` und wird erst zusammen mit einer neuen
+  `RANKING_REVISION`, aktualisierten Benchmarks und neu gebundenen Receipts
+  umbenannt;
 - Schema-`$id`s bestehender Contract-Versionen;
 - Dokument-IDs im Frontmatter (`id:`), z. B. `architecture.weltgewebe-os` für
   `architecture/commonthing-os.md`; Pfad und Titel dürfen sich ändern, die ID
