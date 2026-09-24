@@ -84,6 +84,8 @@ validate-shell-tests:
 	bash scripts/tests/test_weltgewebe_up_git_branch.sh
 	bash scripts/tests/test_weltgewebe_up_frontend_required.sh
 	bash scripts/tests/test_weltgewebe_up_deploy_scope.sh
+	bash scripts/tests/test_verify_deployment.sh
+	bash scripts/tests/test_verify_deployment_isolation.sh
 	bash scripts/tests/test_version_guard.sh
 	bash scripts/tests/test_basemap_mode_guard.sh
 	bash scripts/tests/test_basemap_runtime_proof_contract.sh
