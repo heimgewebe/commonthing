@@ -119,8 +119,12 @@ Consumer), nie durch Umschreiben des Bestands:
   (z. B. `architecture/semantic-search.md` im T004-Ranking-Receipt); ihr Text
   ändert sich erst mit einem neu erzeugten Receipt.
 
-Treffer dieser Klasse gelten als klassifiziert; sie brauchen keinen
-Zeilenmarker `commonthing-naming: legacy`.
+Bereits bestehende Treffer dieser Klasse gelten für Bestandsinventur und
+Abschlusskriterium als klassifiziert; sie brauchen nicht rückwirkend tausende
+Zeilenmarker. Sobald ein solcher Treffer jedoch in einer neu hinzugefügten oder
+bearbeiteten Zeile erscheint, gilt die CI-Regel aus Abschnitt 6 unverändert:
+Die Zeile braucht `commonthing-naming: legacy`, sofern ihr Pfad nicht ausdrücklich
+vom Guard ausgenommen ist.
 
 ### 4.2 Zielarchitektur
 
