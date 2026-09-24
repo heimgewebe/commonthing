@@ -279,6 +279,7 @@ class TestAgentToolingLock(unittest.TestCase):
             "scripts/tests/test_offhost_backup_pull_contract.sh",
             "scripts/tests/test_web_artifact_install_contract.sh",
             "scripts/tests/test_api_release_identity_contract.sh",
+            "scripts/tests/test_runtime_contract.sh",
         }
         self.assertEqual(direct, expected_direct)
         reviewed = direct | {

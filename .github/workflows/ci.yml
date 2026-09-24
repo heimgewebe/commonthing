@@ -163,6 +163,10 @@ jobs:
           bash -n scripts/tests/test_web_artifact_install_contract.sh
           bash -n scripts/tests/test_api_release_identity_contract.sh
           bash -n scripts/tests/test_weltgewebe_up_deploy_scope.sh
+          bash -n scripts/preflight/runtime_contract.sh
+          bash -n scripts/preflight/csp_contract_static.sh
+          bash -n scripts/tests/test_runtime_contract.sh
+          bash -n scripts/tests/test_csp_contract_static.sh
           bash -n scripts/guard/run.sh
 
       - name: Run guard fixture suites
@@ -182,7 +186,9 @@ jobs:
             scripts/tests/test_postgres_backup_restore_contract.sh \
             scripts/tests/test_web_artifact_install_contract.sh \
             scripts/tests/test_api_release_identity_contract.sh \
-            scripts/tests/test_weltgewebe_up_deploy_scope.sh
+            scripts/tests/test_weltgewebe_up_deploy_scope.sh \
+            scripts/tests/test_runtime_contract.sh \
+            scripts/tests/test_csp_contract_static.sh
           do
             echo "── $t ──"
             bash "$t"
