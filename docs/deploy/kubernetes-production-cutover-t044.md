@@ -487,11 +487,24 @@ Canary-Plan festgehalten. Er enthält mindestens:
   1. kontinuierliche Blue-zu-Green-Synchronisierung für PostgreSQL/Auth,
      Outbox/Consumption, JetStream und Suche mit gemessener Lag-Grenze und
      automatischem Canary-Abbruch bei deren Überschreitung; **oder**
-  2. vollständige Pause beziehungsweise fail-closed-Blockade aller gewöhnlichen
-     öffentlichen Writes vom finalen Blue-zu-Green-Abgleich bis zum Ende des
-     Read-Canary;
-- ohne Beleg für Modus 1 gilt verpflichtend Modus 2; dessen maximale
-  Write-Pause-Dauer und Abort-/Rückkehraktion werden vorab gebunden;
+  2. vollständige **Blue-Quiescence-Barriere** vom finalen
+     Blue-zu-Green-Abgleich bis zum Ende des Read-Canary. Sie blockiert nicht
+     nur gewöhnliche öffentliche Writes, sondern jeden Blue-Pfad, der
+     PostgreSQL/Auth, Outbox/Consumption, JetStream, Suchjobs/-projektionen oder
+     sonstigen persistenten Fachzustand verändern kann;
+- ohne Beleg für Modus 1 gilt verpflichtend Modus 2. Vor seinem finalen
+  Datenabgleich muss revisionsgebunden bewiesen sein, dass
+  - öffentlicher, Operator- und Admin-Write-Ingress fail-closed blockiert ist,
+  - bereits angenommene/in-flight Mutationen vollständig beendet oder sicher
+    abgebrochen sind,
+  - DB-/NATS-/Search-mutierende Hintergrundpfade gefenced sind, insbesondere
+    Outbox-Relay, Receipt-/Notification-Consumer und Retry-Worker,
+    Cleanup-/Fristen-Sweeper sowie der Search-Worker,
+  - ein gebundener Blue-Quieszenzanker für Fachdaten, Outbox/Consumption,
+    JetStream und Suche während des gesamten Canary unverändert bleiben muss;
+- für Modus 2 werden maximale Quieszenzdauer und Abort-/Rückkehraktion vorab
+  gebunden. Kann ein Blue-Mutationspfad nicht nachweislich gefenced werden,
+  darf Modus 2 nicht beginnen;
 - der konkrete Routingmechanismus ist vor der ersten öffentlichen Wirkung
   zielplattformgebunden belegt und kann Canary-Stufe, weitere Inkremente und
   Abort deterministisch erzwingen;
@@ -501,43 +514,46 @@ Canary-Plan festgehalten. Er enthält mindestens:
   stufenspezifische Fehler-, Latenz- und Datenintegritäts-Abbruchbedingungen;
 - die konkrete Abort-/Recovery-Aktion für jede Stufe.
 
-Read-only-Routing allein hält Green **nicht** frisch. Solange Blue Writes
-annimmt, darf Green zustandsabhängige Canary-Reads deshalb nur bedienen, wenn
-Modus 1 nachweislich läuft und innerhalb seiner Lag-Grenze bleibt. Ohne diesen
-Synchronisationsbeweis bleiben gewöhnliche öffentliche Writes während des
-gesamten Read-Canary blockiert. Ein unbelegter Zwischenzustand ist keine
-Canary-Option.
+Read-only-Routing allein hält Green **nicht** frisch. Solange irgendein
+Blue-Mutationspfad aktiv ist, darf Green zustandsabhängige Canary-Reads deshalb
+nur bedienen, wenn Modus 1 nachweislich läuft und innerhalb seiner Lag-Grenze
+bleibt. Ohne diesen Synchronisationsbeweis muss Blue während des gesamten
+Read-Canary quieszent sein. Eine reine Ingress-Sperre bei weiterlaufendem
+Outbox-, Consumer-, Sweeper- oder Search-Worker ist ausdrücklich **keine**
+Quieszenz und keine Canary-Option.
 
 Die Sequenz ist fail-closed:
 
-1. Green-Revision/Digests prüfen und den Datenstabilitätsmodus aktivieren. Bei
-   Modus 2 werden gewöhnliche öffentliche Writes **vor** dem finalen
-   Blue-zu-Green-Abgleich blockiert; danach werden Daten-, Event- und
-   Projektionsgleichheit read-only bestätigt. Bei Modus 1 muss die laufende
+1. Green-Revision/Digests prüfen und den Datenstabilitätsmodus aktivieren.
+   Bei Modus 2 zuerst die vollständige Blue-Quiescence-Barriere herstellen:
+   Write-Ingress blockieren, in-flight Mutationen drainen/stoppen und sämtliche
+   persistenzmutierenden Hintergrund-/Operatorpfade fencen. **Erst danach**
+   Quieszenzanker erfassen, final Blue nach Green abgleichen und Daten-, Event-
+   und Projektionsgleichheit read-only bestätigen. Bei Modus 1 muss die laufende
    Synchronisierung bereits vor dem ersten Canary-Read innerhalb der gebundenen
    Lag-Grenze liegen;
 2. Blue bleibt bis zur Writer-Transition alleinige Writer-Autorität. Nur die
    gebundene kleinste Canary-Kohorte bzw. Traffic-Fraktion wird für öffentliche
    Reads auf Green geroutet. In Modus 1 erreichen gewöhnliche Writes weiterhin
-   ausschließlich Blue; in Modus 2 bleiben sie vollständig blockiert. Green
-   bleibt technisch write-inhibited;
+   ausschließlich Blue; in Modus 2 darf **kein** Blue-Pfad persistenten Zustand
+   verändern. Green bleibt technisch write-inhibited;
 3. Web/API/Auth/Fachdaten/Search/Schauwerk/Basemap für die Canary-Stufe lesen,
    die Abwesenheit persistenter Green-Writes prüfen und das vollständige
    Beobachtungsfenster auswerten. Modus 1 verlangt zusätzlich fortlaufend
    belegten Synchronisations-Lag innerhalb der Grenze; Modus 2 verlangt den
-   Nachweis, dass während des Fensters keine gewöhnlichen öffentlichen Writes
-   angenommen wurden;
+   fortlaufenden Nachweis, dass alle gebundenen Blue-Quieszenzanker unverändert
+   sind. Jede unerwartete Änderung gilt als Write-Leak und stoppt den Canary;
 4. Read-Traffic nur stufenweise erhöhen. Zwischen zwei Stufen müssen
    Beobachtungsfenster, SLOs, Datenfrische und fachliche Readbacks vollständig
-   bestanden sein. Lag-Grenzverletzung, Write-Leak oder Überschreitung der
-   gebundenen Write-Pause-Dauer stoppt den Canary vor der nächsten Stufe;
+   bestanden sein. Lag-Grenzverletzung, Änderung eines Quieszenzankers oder
+   Überschreitung der gebundenen Quieszenzdauer stoppt den Canary vor der
+   nächsten Stufe;
 5. erst nach bestandener Read-Canary-Sequenz die Writer-Transition beginnen.
-   Bei Modus 1 werden jetzt gewöhnliche öffentliche Writes vollständig
-   angehalten oder fail-closed blockiert; bei Modus 2 bleibt die bestehende
-   Blockade aktiv. Danach final Blue nach Green konvergieren, Blue-Writer fencen,
-   Gleichheit auf Green zurücklesen und erst dann Green Writer-Autorität
-   erteilen; die gewöhnliche öffentliche Green-Write-Freigabe bleibt dabei noch
-   geschlossen;
+   Bei Modus 1 werden jetzt alle Blue-Zustandsmutatoren über dieselbe
+   Quiescence-Barriere gefenced; bei Modus 2 bleibt die bestehende Quieszenz
+   aktiv. Danach finalen Gleichheits-Readback auf Green durchführen, Blue als
+   Writer fencen und erst dann Green Writer-Autorität erteilen; die gewöhnliche
+   öffentliche Green-Write-Freigabe bleibt dabei noch geschlossen;
 6. ab Green-Writer-Autorität müssen alle **zustandsabhängigen Reads** Green
    erreichen. Für Writes ist zunächst ausschließlich der exakt gebundene
    kontrollierte Probe-Write-Pfad freigegeben; alle übrigen öffentlichen Writes
@@ -566,9 +582,11 @@ stufenspezifischen Canary-Schwelle wird **nicht** in die nächste Traffic-Stufe
 gewechselt.
 
 Während des read-only Canary kann Traffic ohne Writer-Wechsel auf Blue
-zurückgeführt werden. Nach dem Blue-Writer-Fence, aber vor dem ersten
-bestätigten Green-Write, braucht eine Reaktivierung von Blue frische
-Gleichheits- und Writer-Fence-Evidenz. Nach der Write-Cutover-Grenze wird bei
+zurückgeführt werden. In Modus 2 werden die gefenceten Blue-Mutationspfade erst
+nach abgebrochenem Green-Traffic, unverändertem Quieszenzanker und gebundenem
+Abort-Readback kontrolliert wieder aktiviert. Nach dem Blue-Writer-Fence, aber
+vor dem ersten bestätigten Green-Write, braucht eine Reaktivierung von Blue
+frische Gleichheits- und Writer-Fence-Evidenz. Nach der Write-Cutover-Grenze wird bei
 einem Fehler die weitere Traffic-Erhöhung gestoppt; direkter Blue-Rollback ist
 verboten. Dann gilt nur Post-Write-Recovery mit Reverse-Reconciliation und
 erneutem Writer-Fencing.
