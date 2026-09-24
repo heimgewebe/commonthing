@@ -18,8 +18,8 @@ To ensure stable operation on home servers alongside other services, `weltgewebe
 
 | Port | Owner | Description |
 | :--- | :--- | :--- |
-| **8081** | **Pi-hole (FTL)** | Strictly reserved. Weltgewebe must NOT use this port. |
-| **8080** | **Weltgewebe API** | Internal container port. Default unpublished. |
+| **8081** | **Pi-hole (FTL)** | Strictly reserved. commonThing must NOT use this port. |
+| **8080** | **commonThing API** | Internal container port. Default unpublished. |
 | **80/443** | **Edge (Caddy)** | Reverse Proxy handling public traffic and TLS. |
 
 ## Health Check Strategy

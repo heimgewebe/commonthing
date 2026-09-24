@@ -4,7 +4,7 @@ title: Incident Response Runbook
 doc_type: reference
 status: active
 summary: >
-  Eigenständiger Incident-Response-Ablauf für Weltgewebe über Web, API, Datenebene
+  Eigenständiger Incident-Response-Ablauf für commonThing über Web, API, Datenebene
   und Edge: Erkennung, Ersteinschätzung, Eindämmung, Analyse, Wiederherstellung,
   Nachbereitung, Evidenzsicherung und Kommunikationspfad.
 relations:
@@ -22,14 +22,14 @@ relations:
 # Incident Response Runbook
 
 Eigenständiger Ablauf für operative, sicherheits- und datenschutzbezogene
-Vorfälle im Weltgewebe-Stack. Dieses Runbook ist die Prozessebene; konkrete
+Vorfälle im commonThing-Stack. Dieses Runbook ist die Prozessebene; konkrete
 Datenwiederherstellung beschreibt [DB Recovery](db-recovery.md), der
 quartalsweise Probelauf steht in [`docs/runbook.md` §2](../runbook.md).
 
 ## 1. Ziel und Anwendungsbereich
 
 Ziel ist ein reproduzierbarer, evidenzsichernder Umgang mit Vorfällen, die
-Verfügbarkeit, Integrität, Vertraulichkeit oder Datenschutz des Weltgewebe-Stacks
+Verfügbarkeit, Integrität, Vertraulichkeit oder Datenschutz des commonThing-Stacks
 betreffen.
 
 Betroffene Komponenten:

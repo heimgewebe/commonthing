@@ -1,19 +1,19 @@
 ---
 id: versionierungs-statusgrundlage
-title: "Weltgewebe – Versionierungs-Statusgrundlage"
+title: "commonThing – Versionierungs-Statusgrundlage"
 doc_type: blueprint
 status: active
-summary: "Belastbare Arbeitsgrundlage und Ist-Stand-Dokumentation für alle Folgeschritte zur Weltgewebe-Versionierung."
+summary: "Belastbare Arbeitsgrundlage und Ist-Stand-Dokumentation für alle Folgeschritte zur commonThing-Versionierung."
 relations:
   - type: relates_to
     target: docs/blueprints/versionierungs-blaupause.md
 ---
 
-# Weltgewebe – Versionierungs-Statusgrundlage
+# commonThing – Versionierungs-Statusgrundlage
 
 ## 1. Ziel und Zweck
 
-Dieses Dokument dient als belastbare, repo-belegte Ist-Stand-Analyse der Weltgewebe-Deploy-Versionierung. Es beendet den Zyklus aus isolierten Patches und unkoordinierten Reparaturen, indem es eine präzise Bestandsaufnahme liefert. Es ist die kanonische Arbeitsgrundlage für die Einordnung und Nachvollziehbarkeit der inzwischen umgesetzten Versionierungsverträge (Cache-Guards, Caddy-Header, Testsemantik).
+Dieses Dokument dient als belastbare, repo-belegte Ist-Stand-Analyse der commonThing-Deploy-Versionierung. Es beendet den Zyklus aus isolierten Patches und unkoordinierten Reparaturen, indem es eine präzise Bestandsaufnahme liefert. Es ist die kanonische Arbeitsgrundlage für die Einordnung und Nachvollziehbarkeit der inzwischen umgesetzten Versionierungsverträge (Cache-Guards, Caddy-Header, Testsemantik).
 
 ## 2. Repo-belegter Ist-Stand
 

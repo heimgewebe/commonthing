@@ -12,7 +12,7 @@ relations:
   - type: relates_to
     target: docs/blueprints/auth-roadmap.md
 ---
-# Blaupause: Schrittweise Implementierung von Account- und Login-Logik im Weltgewebe
+# Blaupause: Schrittweise Implementierung von Account- und Login-Logik in commonThing
 
 > **Hinweis:** Diese Blaupause ist eine ältere, an [ADR-0005](../adr/ADR-0005-auth.md)
 > gebundene Implementierungslinie und nicht mehr das kanonische Zieldokument.

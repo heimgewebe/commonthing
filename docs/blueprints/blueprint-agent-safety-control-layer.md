@@ -3,7 +3,7 @@ id: docs.blueprints.agent-safety-control-layer
 title: "Blueprint — Agent Safety Control Layer"
 doc_type: blueprint
 status: draft
-summary: "Vollausbau eines KI-narrensicheren Agent-/Evidence-Kontrollsystems für Weltgewebe: Safety Preflight, Claim Evidence, Agent Contracts, Non-Ideal Guard, Dry-Run Runner, Run Evidence und gated Write Mode."
+summary: "Vollausbau eines KI-narrensicheren Agent-/Evidence-Kontrollsystems für commonThing: Safety Preflight, Claim Evidence, Agent Contracts, Non-Ideal Guard, Dry-Run Runner, Run Evidence und gated Write Mode."
 relations:
   - type: relates_to
     target: docs/blueprints/agent-operability-blaupause.md
@@ -31,11 +31,11 @@ relations:
 
 ### These
 
-Weltgewebe wird nahezu vollständig agentisch entwickelt. Deshalb reicht es nicht, Agents gute Hinweise zu geben. Das Repository muss so gebaut sein, dass Agents auch bei unvollständigem Kontext, zu breitem Auftrag, veralteter Roadmap oder fehlender Evidence nicht still falsch handeln können.
+commonThing wird nahezu vollständig agentisch entwickelt. Deshalb reicht es nicht, Agents gute Hinweise zu geben. Das Repository muss so gebaut sein, dass Agents auch bei unvollständigem Kontext, zu breitem Auftrag, veralteter Roadmap oder fehlender Evidence nicht still falsch handeln können.
 
 ### Antithese
 
-Weltgewebe besitzt bereits starke Kontrollflächen: Docmeta, AGENTS-Policy, Task-Control, Statusmatrizen, Generated Reports, CI-Guards, Deploy-Snapshot und Drift-Guards. Ein weiterer Governance-Layer kann selbst zur Driftquelle werden, wenn er bestehende Strukturen ersetzt statt sie zu härten.
+commonThing besitzt bereits starke Kontrollflächen: Docmeta, AGENTS-Policy, Task-Control, Statusmatrizen, Generated Reports, CI-Guards, Deploy-Snapshot und Drift-Guards. Ein weiterer Governance-Layer kann selbst zur Driftquelle werden, wenn er bestehende Strukturen ersetzt statt sie zu härten.
 
 ### Synthese
 
@@ -51,17 +51,17 @@ Der Agent Safety Control Layer ist kein paralleles Steuerungssystem. Er erweiter
 - gated Write Mode
 - Roadmap-/Blueprint-Ratchet
 
-Kurz: Weltgewebe wird nicht nur agentenfreundlich, sondern agentensicher.
+Kurz: commonThing wird nicht nur agentenfreundlich, sondern agentensicher.
 
 ### Quellenbasis
 
-Interne Grundlage sind insbesondere `docs/reports/agent-readiness-audit.md` sowie `docs/blueprints/agent-operability-blaupause.md`. Externe bzw. repoübergreifende Vergleichsmuster aus LensKit und Vibe-Lab dienen als Inspirationsachsen, werden aber nicht als Weltgewebe-Primärnorm behandelt.
+Interne Grundlage sind insbesondere `docs/reports/agent-readiness-audit.md` sowie `docs/blueprints/agent-operability-blaupause.md`. Externe bzw. repoübergreifende Vergleichsmuster aus LensKit und Vibe-Lab dienen als Inspirationsachsen, werden aber nicht als commonThing-Primärnorm behandelt.
 
 Dieses Blueprint ist ein Ziel- und Planungsartefakt. Es ist nicht selbst Evidence dafür, dass die beschriebenen Mechaniken existieren.
 
 ## 1. Ziel
 
-Dieses Blueprint definiert den Vollausbau eines Agent-Safety-Control-Layers für Weltgewebe.
+Dieses Blueprint definiert den Vollausbau eines Agent-Safety-Control-Layers für commonThing.
 
 Ziel ist, dass jede agentische Änderung folgende Kette erfüllt:
 
@@ -555,7 +555,7 @@ read_context
 
 ##### PR 5 — agent/minimal-contracts-and-guard: Akzeptanzkriterien
 
-- Drei reale Weltgewebe-Tasktypen sind valide modelliert.
+- Drei reale commonThing-Tasktypen sind valide modelliert.
 - Drei gefährliche Negativfälle scheitern.
 - Fixture-Matrix dokumentiert Coverage und bekannte Lücken.
 - Ein Task ohne Scope oder Validation kann nicht pass werden.
@@ -958,7 +958,7 @@ Regeln:
 
 Diese Blaupause gilt unter folgenden Prämissen:
 
-1. Weltgewebe wird überwiegend agentisch entwickelt.
+1. commonThing wird überwiegend agentisch entwickelt.
 2. Agentische Fehler sollen durch Repo-Mechanik, nicht durch Hoffnung, verhindert werden.
 3. Bestehende Kontrollflächen bleiben führend.
 4. Neue Artefakte dürfen keine Parallelwahrheit erzeugen.

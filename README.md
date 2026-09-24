@@ -1,8 +1,8 @@
-# Weltgewebe
+# commonThing
 
-Weltgewebe ist ein aktives, im Aufbau befindliches Karten- und Koordinationssystem für
+commonThing ist ein aktives, im Aufbau befindliches Karten- und Koordinationssystem für
 Kollektivgüter, lokale Beziehungen und gemeinschaftliche Handlungsfähigkeit. Die
-kanonische Zielarchitektur entwickelt es zum föderierten Weltgewebe OS: lokale
+kanonische Zielarchitektur entwickelt es zum föderierten commonThing OS: lokale
 autonome Zellen mit globalen Identitäten, Beziehungen und gemeinsamen Räumen. Das
 Repository enthält die Webanwendung, die Rust-API, Datenverträge,
 Datenbankmigrationen, Compose-Profile, Caddy-Konfiguration und Betriebswerkzeuge.
@@ -25,7 +25,7 @@ Datenbankmigrationen, Compose-Profile, Caddy-Konfiguration und Betriebswerkzeuge
 
 ## Zielarchitektur
 
-[`architecture/weltgewebe-os.md`](architecture/weltgewebe-os.md) ist die verbindliche langfristige Zielarchitektur. Kubernetes ist die kanonische Zielplattform, während Docker Compose die heutige reale Runtime und ein begrenzter Entwicklungs-/Recoverypfad bleibt. Der PostgreSQL-Mehrinstanzvertrag ist durch Shared Auth State, generationsgebundene Domain-Projektionen, Transactional Outbox, idempotente Konsumenten und einen Zwei-API-/Restart-Beweis geschützt. Die Produktionsreplikazahl bleibt bis zum getrennten Plattformrollout unverändert.
+[`architecture/commonthing-os.md`](architecture/commonthing-os.md) ist die verbindliche langfristige Zielarchitektur. Kubernetes ist die kanonische Zielplattform, während Docker Compose die heutige reale Runtime und ein begrenzter Entwicklungs-/Recoverypfad bleibt. Der PostgreSQL-Mehrinstanzvertrag ist durch Shared Auth State, generationsgebundene Domain-Projektionen, Transactional Outbox, idempotente Konsumenten und einen Zwei-API-/Restart-Beweis geschützt. Die Produktionsreplikazahl bleibt bis zum getrennten Plattformrollout unverändert.
 
 Historische ADRs und Berichte bleiben als Entscheidungs- und
 Entwicklungsgeschichte erhalten. Sie dürfen den aktuellen Code, die Migrationen
@@ -39,7 +39,7 @@ aktualisiert und sind keine eigenständige Wahrheits- oder Entscheidungsschicht.
 
 | Frage | Wahrheitsort |
 |---|---|
-| Was ist das langfristige Ziel? | [`architecture/weltgewebe-os.md`](architecture/weltgewebe-os.md) |
+| Was ist das langfristige Ziel? | [`architecture/commonthing-os.md`](architecture/commonthing-os.md) |
 | Was läuft heute? | [`runtime/README.md`](runtime/README.md) |
 | Wie sind die Komponenten verbunden? | [`architecture/overview.md`](architecture/overview.md) |
 | Welche Sicherheitsgrenzen gelten? | [`architecture/security.md`](architecture/security.md) |
@@ -128,7 +128,7 @@ Produktionscutover entfernt.
 
 ## Daten- und Datenschutzgrenze
 
-Weltgewebe verwendet notwendige, sichere Sitzungscookies für Anmeldung und
+commonThing verwendet notwendige, sichere Sitzungscookies für Anmeldung und
 Sitzungserhalt. Der Datenschutzvertrag erlaubt diese Cookies, schließt aber
 Werbe- und Trackingcookies sowie verdeckte Profilbildung aus. Öffentliche und
 private Accountfelder werden getrennt behandelt; reale Privatpositionen dürfen
@@ -162,5 +162,5 @@ belegt ihn über `/_app/version.json` sowie den `X-Weltgewebe-Build`-Header.
 
 ## Lizenz
 
-Weltgewebe steht unter der
+commonThing steht unter der
 [GNU Affero General Public License 3.0 oder später](LICENSE).

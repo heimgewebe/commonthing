@@ -1,6 +1,6 @@
 # CONTRIBUTING
 
-Wie im Weltgewebe-Repository gearbeitet wird: Orientierung, Routing, Workflow, Qualität.
+Wie im commonThing-Repository gearbeitet wird: Orientierung, Routing, Workflow, Qualität.
 
 Verbindliche Grundlagen vor jedem Patch:
 

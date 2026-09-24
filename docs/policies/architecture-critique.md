@@ -26,10 +26,10 @@ relations:
 
 # weltgewebe.architecture.critique
 
-Status: canonical — maßgebliches kognitives Protokoll für Architekturkritik im Weltgewebe.
+Status: canonical — maßgebliches kognitives Protokoll für Architekturkritik in commonThing.
 
 Begründung der Kanonisierung:
-Dieser Skill wird als canonical geführt, da Architekturkritik als verbindliches kognitives Protokoll für Agenten im Weltgewebe etabliert wird. Ziel ist die systematische Aufdeckung struktureller Schwächen, semantischer Brüche und epistemischer Inkonsistenzen über alle Module hinweg. Der Skill ersetzt keine fachlichen Entscheidungen, sondern standardisiert deren kritische Prüfung.
+Dieser Skill wird als canonical geführt, da Architekturkritik als verbindliches kognitives Protokoll für Agenten in commonThing etabliert wird. Ziel ist die systematische Aufdeckung struktureller Schwächen, semantischer Brüche und epistemischer Inkonsistenzen über alle Module hinweg. Der Skill ersetzt keine fachlichen Entscheidungen, sondern standardisiert deren kritische Prüfung.
 
 Einordnung im Truth Model:
 Dieses Dokument ist ein kanonisches Policy-Dokument. Seine Einordnung und sein normativer Vorrang ergeben sich ausschließlich aus der in `repo.meta.yaml` definierten Truth-Model-Precedence.
@@ -69,7 +69,7 @@ Klassenverwechslung ist der häufigste epistemische Fehler — muss explizit sic
 
 | Wert | Bedeutung | Kritiktiefe |
 |------|-----------|-------------|
-| `System` | Gesamtes Weltgewebe-System | Vollständig |
+| `System` | Gesamtes commonThing-System | Vollständig |
 | `Modul` | Einzelnes Subsystem (API, Web, Auth, Map, Identity) | Strukturell |
 | `Entscheidung` | Einzelner ADR oder Blueprint | Strukturell |
 | `PR/Diff` | Konkrete Implementierungsänderung | Essenziell |
@@ -218,14 +218,14 @@ Achsen E und F: konditioniert — wenn inaktiv, explizit als „nicht anwendbar"
 ### E. Kartenarchitektur *(aktiv nur bei: Kartenrendering, Basemap-Pipeline, Overlay-Architektur, räumliche Semantik)*
 
 - Rendering oder semantischer Kern?
-- Basemap = Infrastruktur, Overlay = Weltgewebe-Semantik — korrekt getrennt?
+- Basemap = Infrastruktur, Overlay = commonThing-Semantik — korrekt getrennt?
 
 → Pflichtstruktur §7 / Punkt 5 (Architekturkritik) + Punkt 8 (Alternative Sinnachse)
 
 ### F. Garnrollen- und Sichtbarkeitssystem *(aktiv nur bei: Garnrolle, Verortung, Auth-Identität, Sichtbarkeitslogik)*
 
 - Garnrollen-Sichtbarkeit konsistent (nicht auf Karte, exakt sichtbar, im Umkreis sichtbar)?
-- Vertrauen als Systemwert modelliert? (im Weltgewebe verboten)
+- Vertrauen als Systemwert modelliert? (in commonThing verboten)
 
 → Pflichtstruktur §7 / Punkt 5 (Architekturkritik) + Punkt 8 (Alternative Sinnachse)
 

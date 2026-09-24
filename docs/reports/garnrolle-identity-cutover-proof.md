@@ -27,7 +27,7 @@ relations:
 
 ## Entscheidung
 
-Weltgewebe kennt genau eine persönliche Identität: die Garnrolle. Nicht auf der
+commonThing kennt genau eine persönliche Identität: die Garnrolle. Nicht auf der
 Karte zu erscheinen ist mit `map_state=not_on_map` eine Eigenschaft derselben
 Garnrolle. Es gibt weder fachlich noch technisch eine „Rolle ohne Namen“ als
 zweite Identität.

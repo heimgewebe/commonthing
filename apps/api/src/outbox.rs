@@ -68,7 +68,7 @@ fn expected_stream_config(replicas: usize) -> stream::Config {
     stream::Config {
         name: STREAM_NAME.to_string(),
         description: Some(
-            "Transactional Weltgewebe domain events emitted from PostgreSQL".to_string(),
+            "Transactional commonThing domain events emitted from PostgreSQL".to_string(),
         ),
         subjects: vec![STREAM_SUBJECT.to_string()],
         retention: stream::RetentionPolicy::Limits,
@@ -282,27 +282,27 @@ async fn ensure_stream_with_replicas(
     let mut stream = context
         .get_or_create_stream(expected_stream_config(expected_replicas))
         .await
-        .context("failed to get or create Weltgewebe domain JetStream")?;
+        .context("failed to get or create commonThing domain JetStream")?;
     let info = stream
         .info()
         .await
-        .context("failed to inspect Weltgewebe domain JetStream")?;
+        .context("failed to inspect commonThing domain JetStream")?;
     if stream_replica_upgrade_needed(&info.config, expected_replicas)? {
         let mut upgraded = info.config.clone();
         upgraded.num_replicas = expected_replicas;
         context
             .update_stream(&upgraded)
             .await
-            .context("failed to upgrade Weltgewebe domain JetStream replication")?;
+            .context("failed to upgrade commonThing domain JetStream replication")?;
         stream = context
             .get_stream(STREAM_NAME)
             .await
-            .context("failed to re-open upgraded Weltgewebe domain JetStream")?;
+            .context("failed to re-open upgraded commonThing domain JetStream")?;
     }
     let info = stream
         .info()
         .await
-        .context("failed to verify Weltgewebe domain JetStream replication")?;
+        .context("failed to verify commonThing domain JetStream replication")?;
     validate_stream_contract(&info.config, expected_replicas)?;
     Ok((context, stream))
 }
@@ -318,11 +318,11 @@ pub async fn verify_jetstream_contract(client: &Client) -> anyhow::Result<()> {
     let mut stream = context
         .get_stream(STREAM_NAME)
         .await
-        .context("expected Weltgewebe domain JetStream is missing")?;
+        .context("expected commonThing domain JetStream is missing")?;
     let stream_info = stream
         .info()
         .await
-        .context("failed to inspect Weltgewebe domain JetStream")?;
+        .context("failed to inspect commonThing domain JetStream")?;
     validate_stream_contract(&stream_info.config, expected_replicas)?;
     let consumer_info = stream
         .consumer_info(CONSUMER_NAME)

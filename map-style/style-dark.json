@@ -1,6 +1,6 @@
 {
   "version": 8,
-  "name": "Weltgewebe Sovereign Basemap \u2014 Dark",
+  "name": "commonThing Sovereign Basemap \u2014 Dark",
   "metadata": {
     "weltgewebe:version": "0.4.0",
     "weltgewebe:note": "Regional PMTiles sources with visible landcover and landuse; bare aliases are resolved by the runtime protocol handler; dark basemap palette",

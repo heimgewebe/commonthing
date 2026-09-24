@@ -30,7 +30,7 @@ Generated automatically. Do not edit.
 | adr.ADR-0012__ereignisrueckgrat-transactional-outbox | ADR-0012 — Ereignisrückgrat mit Transactional Outbox | reference | active | docs/adr/ADR-0012__ereignisrueckgrat-transactional-outbox.md |
 | adr.ADR-0013__ha-referenzzelle-und-wiederherstellung | ADR-0013 — Hochverfügbare Referenzzelle und Wiederherstellungsbeweis | reference | active | docs/adr/ADR-0013__ha-referenzzelle-und-wiederherstellung.md |
 | adr.ADR-0015__ortsweberei-gewebezelle-webgemeindezentrum | ADR-0015 — Ortsweberei, Gewebezelle und Webgemeindezentrum | reference | active | docs/adr/ADR-0015__ortsweberei-gewebezelle-webgemeindezentrum.md |
-| blueprint-doc-structure-task-control | Weltgewebe Dokumentationsstruktur und Task-Steuerung | blueprint | draft | docs/blueprints/doc-structure-task-control.md |
+| blueprint-doc-structure-task-control | commonThing Dokumentationsstruktur und Task-Steuerung | blueprint | draft | docs/blueprints/doc-structure-task-control.md |
 | blueprint-doc-structure-task-control-examples | Dokumentationsstruktur und Task-Steuerung Beispiele | reference | draft | docs/blueprints/doc-structure-task-control-examples.md |
 | blueprint-doc-structure-task-control-roadmap | Dokumentationsstruktur und Task-Steuerung Roadmap | roadmap | draft | docs/blueprints/doc-structure-task-control-roadmap.md |
 | blueprints.auth-persistence-runtime-proof | Auth-Persistenz — Runtime-Proof-Blaupause | blueprint | active | docs/blueprints/auth-persistence-runtime-proof.md |
@@ -67,16 +67,16 @@ Generated automatically. Do not edit.
 | deployment_governance | Deployment Governance | reference | active | docs/deployment_governance.md |
 | dev.codespaces | Codespaces | reference | active | docs/dev/codespaces.md |
 | docs.architecture.overview | Architekturüberblick | architecture | active | docs/architekturstruktur.md |
-| docs.architecture.weltgewebe-os-convergence-adapter | Weltgewebe OS Convergence Adapter | architecture | active | docs/architecture/weltgewebe-os-convergence-adapter.md |
+| docs.architecture.weltgewebe-os-convergence-adapter | commonThing OS Convergence Adapter | architecture | active | docs/architecture/weltgewebe-os-convergence-adapter.md |
 | docs.blueprints.agent-operability | Minimaler Agent-Operability-Kern | blueprint | draft | docs/blueprints/agent-operability-blaupause.md |
 | docs.blueprints.agent-safety-control-layer | Blueprint — Agent Safety Control Layer | blueprint | draft | docs/blueprints/blueprint-agent-safety-control-layer.md |
 | docs.blueprints.domain-scale-foundation | Domain Scale Foundation | blueprint | active | docs/blueprints/domain-scale-foundation.md |
 | docs.blueprints.kartenklarheit | Blaupause zur Optimierung der Karte | blueprint | deprecated | docs/blueprints/kartenklarheit.md |
 | docs.blueprints.kartenklarheit-phase6 | Kartenklarheit Phase 6: Der Wahrheitsbeweis | blueprint | deprecated | docs/blueprints/kartenklarheit-phase6.md |
 | docs.blueprints.kartenklarheit-roadmap | Roadmap - Kartenklarheit | roadmap | deprecated | docs/blueprints/kartenklarheit-roadmap.md |
-| docs.blueprints.weltgewebe-os-masterplan | Weltgewebe OS — Masterplan | roadmap | active | docs/blueprints/weltgewebe-os-masterplan.md |
+| docs.blueprints.weltgewebe-os-masterplan | commonThing OS — Masterplan | roadmap | active | docs/blueprints/weltgewebe-os-masterplan.md |
 | docs.claims.readme | Claim-Registry | reference | active | docs/claims/README.md |
-| docs.index | Weltgewebe - Doku-Index | index | active | docs/index.md |
+| docs.index | commonThing - Doku-Index | index | active | docs/index.md |
 | docs.policies.agent-reading-protocol | Agent Reading Protocol | policy | canonical | docs/policies/agent-reading-protocol.md |
 | docs.policies.architecture-critique | Architekturkritik-Skill: weltgewebe.architecture.critique | policy | canonical | docs/policies/architecture-critique.md |
 | docs.proofs.basemap-hamburg-artifact-proof | Basemap Hamburg Artifact Proof (Heimserver) | proof | active | docs/proofs/basemap-hamburg-artifact-proof.md |
@@ -89,8 +89,8 @@ Generated automatically. Do not edit.
 | docs.reports.agent-readiness-audit | Agent Readiness Audit | documentation | active | docs/reports/agent-readiness-audit.md |
 | docs.reports.domain-runtime-data-source-reconciliation | Domain Runtime Data Source Reconciliation | report | active | docs/reports/domain-runtime-data-source-reconciliation.md |
 | docs.reports.kubernetes-platform-foundation-status | Kubernetes- und GitOps-Grundlage — Status und Beweisgrenzen | status | active | docs/reports/kubernetes-platform-foundation-status.md |
-| docs.reports.weltgewebe-os-foundation-status | Weltgewebe OS Foundation — Status und Beweisgrenzen | status | active | docs/reports/weltgewebe-os-foundation-status.md |
-| docs.roadmap | Weltgewebe — Master-Umsetzungsroadmap | roadmap | active | docs/roadmap.md |
+| docs.reports.weltgewebe-os-foundation-status | commonThing OS Foundation — Status und Beweisgrenzen | status | active | docs/reports/weltgewebe-os-foundation-status.md |
+| docs.roadmap | commonThing — Master-Umsetzungsroadmap | roadmap | active | docs/roadmap.md |
 | docs.runbook | Runbook | runbook | active | docs/runbook.md |
 | docs.runbook.observability | Observability Runbook | runbook | active | docs/runbook.observability.md |
 | docs.security.agent-write-scope-baseline | Agent Write Scope Baseline | security | active | docs/security/agent-write-scope-baseline.md |
@@ -166,8 +166,8 @@ Generated automatically. Do not edit.
 | reports.github-actions-node24-readiness | GitHub Actions Node-24 Runtime Readiness — OPT-CI-005 | report | active | docs/reports/github-actions-node24-readiness.md |
 | reports.inwx-zone-reconciliation-plan | INWX Zone Reconciliation Plan | report | deprecated | docs/reports/inwx-zone-reconciliation-plan.md |
 | reports.map-status | Kartenstatus | report | active | docs/reports/map-status.md |
-| reports.optimierungsbericht | Optimierungsbericht Weltgewebe | report | active | docs/reports/optimierungsbericht.md |
-| reports.optimierungsstatus | Optimierungsstatus Weltgewebe | status-matrix | active | docs/reports/optimierungsstatus.md |
+| reports.optimierungsbericht | Optimierungsbericht commonThing | report | active | docs/reports/optimierungsbericht.md |
+| reports.optimierungsstatus | Optimierungsstatus commonThing | status-matrix | active | docs/reports/optimierungsstatus.md |
 | reports.passkey-register-verify-prep | Passkey Register-Verify – Vorbereitungsbericht | report | deprecated | docs/reports/passkey-register-verify-prep.md |
 | reports.planning-registration-findings | Planning Registration Findings Triage | report | deprecated | docs/reports/planning-registration-findings.md |
 | reports.proof-matrix-generalization-decision | Proof-Matrix-Generalisierung — DOCMETA-PROOF-001 | report | active | docs/reports/proof-matrix-generalization-decision.md |
@@ -185,7 +185,7 @@ Generated automatically. Do not edit.
 | runbooks.incident-response | Incident Response Runbook | reference | active | docs/runbooks/incident-response.md |
 | runbooks.ops.runbook.weltgewebe-selfhost-deploy | Selfhost-Deploy Runbook | reference | deprecated | docs/runbooks/ops.runbook.weltgewebe-selfhost-deploy.md |
 | runbooks.uv-tooling | UV-Tooling | reference | active | docs/runbooks/uv-tooling.md |
-| runbooks.weltgewebe-ddns-runtime-verification | Weltgewebe Heimberry-DDNS-Stilllegung verifizieren | runbook | active | docs/runbooks/weltgewebe-ddns-runtime-verification.md |
+| runbooks.weltgewebe-ddns-runtime-verification | commonThing Heimberry-DDNS-Stilllegung verifizieren | runbook | active | docs/runbooks/weltgewebe-ddns-runtime-verification.md |
 | specs.auth-api | Auth API Spec | reference | active | docs/specs/auth-api.md |
 | specs.auth-blueprint | Auth Blueprint | reference | active | docs/specs/auth-blueprint.md |
 | specs.auth-state-machine | Auth State Machine | reference | active | docs/specs/auth-state-machine.md |
@@ -209,9 +209,9 @@ Generated automatically. Do not edit.
 | ui-interaction-doctrine | Weltgewebe UI Interaction Doctrine | blueprint | deprecated | docs/blueprints/ui-interaction-doctrine.md |
 | ui-roadmap | Weltgewebe UI Roadmap | blueprint | deprecated | docs/blueprints/ui-roadmap.md |
 | ui-state-machine | Weltgewebe UI State Machine | blueprint | deprecated | docs/blueprints/ui-state-machine.md |
-| versionierungs-blaupause | Weltgewebe Deploy-Versionierung und Browser-Aktualität | blueprint | draft | docs/blueprints/versionierungs-blaupause.md |
-| versionierungs-statusgrundlage | Weltgewebe – Versionierungs-Statusgrundlage | blueprint | active | docs/blueprints/versionierungs-statusgrundlage.md |
-| weltgewebe-agenten-manifest | Weltgewebe Agenten Manifest | reference | active | docs/weltgewebe-agenten-manifest.md |
+| versionierungs-blaupause | commonThing Deploy-Versionierung und Browser-Aktualität | blueprint | draft | docs/blueprints/versionierungs-blaupause.md |
+| versionierungs-statusgrundlage | commonThing – Versionierungs-Statusgrundlage | blueprint | active | docs/blueprints/versionierungs-statusgrundlage.md |
+| weltgewebe-agenten-manifest | commonThing Agenten Manifest | reference | active | docs/weltgewebe-agenten-manifest.md |
 | x-repo.peers-learnings | Peers Learnings | reference | active | docs/x-repo/peers-learnings.md |
 | x-repo.semantAH | SemanticAH | reference | active | docs/x-repo/semantAH.md |
 | zusammenstellung | Zusammenstellung | reference | deprecated | docs/zusammenstellung.md |

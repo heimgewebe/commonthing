@@ -1,15 +1,15 @@
 ---
 id: docs.reports.weltgewebe-os-foundation-status
-title: Weltgewebe OS Foundation — Status und Beweisgrenzen
+title: commonThing OS Foundation — Status und Beweisgrenzen
 doc_type: status
 status: active
 summary: >
-  Trennt den belegten aktuellen Weltgewebe-OS- und Referenzplattformstand von der weiterhin nicht erfolgten Kubernetes-Produktionsaktivierung.
+  Trennt den belegten aktuellen commonThing-OS- und Referenzplattformstand von der weiterhin nicht erfolgten Kubernetes-Produktionsaktivierung.
 owner_task: WELTGEWEBE-OS-001
 review_after: 2026-08-15
 relations:
   - type: depends_on
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
   - type: relates_to
     target: docs/blueprints/weltgewebe-os-masterplan.md
   - type: relates_to
@@ -22,7 +22,7 @@ relations:
     target: docs/tasks/board.md
 ---
 
-# Weltgewebe OS Foundation — Status und Beweisgrenzen
+# commonThing OS Foundation — Status und Beweisgrenzen
 
 ## Zweck und Gegenwartsgrenze
 
@@ -30,7 +30,7 @@ Dieser Bericht verhindert, dass langfristige Architektur, Referenzbeweise und la
 
 ## Belegt
 
-- Weltgewebe besitzt eine SvelteKit-Webanwendung und eine Rust/Axum-API.
+- commonThing besitzt eine SvelteKit-Webanwendung und eine Rust/Axum-API.
 - PostgreSQL trägt die wesentlichen Domain-, Auth- und Projektionspfade.
 - Multi-Instance-Zwischenzustände, Transactional Outbox, idempotente Konsumenten und Zwei-API-Kohärenz sind revisionsgebunden belegt.
 - Die Kubernetes-/GitOps-Grundlage ist aus versionierten Artefakten direkt und über Flux reproduzierbar.
@@ -46,7 +46,7 @@ Dieser Bericht verhindert, dass langfristige Architektur, Referenzbeweise und la
 
 | Bestandteil | Status | Beleggrenze |
 |---|---|---|
-| Weltgewebe-OS-Verfassung | belegt | Architektur und ADRs sind kanonisch; spätere Aktivierung bleibt gategebunden |
+| commonThing-OS-Verfassung | belegt | Architektur und ADRs sind kanonisch; spätere Aktivierung bleibt gategebunden |
 | Multi-Instance- und Ereignisgrundlage | belegt | gemeinsamer Zustand, Outbox und Zwei-API-Kohärenz; Produktionskapazität separat |
 | Kubernetes-/GitOps-Referenzpfad | belegt | Kustomize, Flux, Gateway, Policies, Direct-/GitOps-Proof; kein Produktionscluster |
 | HA- und Recovery-Referenzzelle | teilweise | logische Zonen in einem Single-Host-kind-Setup belegen Failover, PITR, Blank-Cluster-Restore und Messwerte; ein physisch verteilter Fehlerdomänenbeweis fehlt |

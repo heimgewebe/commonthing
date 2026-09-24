@@ -430,7 +430,7 @@ fn push_service(state: &ApiState) -> Result<&WebPushService, NotificationApiErro
         NotificationApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "push_not_configured",
-            "Web Push is not configured on this Weltgewebe cell",
+            "Web Push is not configured on this commonThing cell",
         )
     })
 }
