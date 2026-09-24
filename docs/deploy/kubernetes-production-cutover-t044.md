@@ -335,7 +335,46 @@ Zuerst read-only:
 7. Schauwerk/Schaubild
 8. Event-/Projektionsreadback
 
-Danach ausschließlich kontrollierte Testwrites gegen Green.
+### R6-Write-Isolation und Cleanup
+
+Die read-only-Vergleiche dürfen gegen den späteren Produktionskandidaten laufen.
+**Kontrollierte Testwrites dürfen dessen späteren produktiven Daten- und
+Ereignisstand dagegen nicht verunreinigen.**
+
+Vor dem ersten R6-Testwrite muss für **jeden betroffenen persistenten Zustand**
+ein zielplattformgebundener Isolations- oder vollständiger
+Rücksetzungsnachweis vorliegen. Er umfasst mindestens:
+
+- PostgreSQL-Fachdaten und gegebenenfalls Auth-Zustand;
+- Domain-Outbox und Consumption-Positionen;
+- NATS/JetStream-Streams, Consumer und Sequenzfortschritt;
+- Suchjobs, Suchprojektionen und aktive Indexgenerationen;
+- eindeutige Testobjekt- und Korrelationskennungen sowie einen gebundenen
+  Ausgangszustand.
+
+Bevorzugt wird ein **disposable/isolierter Rehearsal-Datenpfad** derselben
+Revision und Konfiguration, zum Beispiel über eine getrennte Datenkopie,
+Namespace-/Schema-/Stream-/Index-Isolation oder eine äquivalente
+zielplattformnative Trennung. Eine bloße Löschung des fachlichen Testobjekts
+genügt ausdrücklich nicht, wenn append-only Ereignisse, Sequenzen oder
+Projektionen zurückbleiben.
+
+Nach der Write-Generalprobe gilt fail-closed:
+
+1. der isolierte Rehearsal-Zustand wird vollständig verworfen oder jeder
+   betroffene Store nachweislich auf den gebundenen Ausgangszustand
+   zurückgesetzt;
+2. im späteren Produktionskandidaten sind Testobjekt- und Korrelationskennungen
+   in PostgreSQL, Outbox/Consumption, JetStream und Suche nachweislich abwesend;
+3. Green erhält danach einen frischen finalen Datenabgleich aus der weiterhin
+   autoritativen Blue-Wahrheit;
+4. Daten-, Ereignis- und Projektionsgleichheit werden erneut read-only
+   zurückgelesen.
+
+Kann auch nur ein betroffener Store nicht isoliert oder vollständig
+zurückgesetzt werden, bleibt R6 auf read-only beschränkt. **R7 darf erst nach
+diesem Cleanup-/Isolationsbeweis und dem anschließenden frischen
+Blue-zu-Green-Abgleich beginnen.**
 
 Für jedes Szenario werden Blue und Green unter demselben fachlichen Vertrag
 verglichen. HTTP 200 allein genügt nicht; Daten-, Auth-, Event- und
@@ -400,22 +439,75 @@ Fehlt eine Zahl, ist sie nur qualitativ oder der Green-Bezug nicht mehr frisch,
 bleibt R8 blockiert. Vor Existenz der realen Zielplattform werden keine Werte
 erfunden.
 
-Erst nach diesem Gate und bestätigter Green-Writer-Autorität:
+Erst nach diesem Gate darf der öffentliche Canary beginnen. Bis zur expliziten
+Writer-Transition bleibt Blue alleiniger Writer; ein Canary erzeugt keine zweite
+Schreibautorität.
 
-1. Green-Revision/Digests erneut prüfen;
-2. öffentliches Routing umstellen;
-3. Web/API/Auth/Fachdaten/Search/Schauwerk/Basemap lesen;
-4. kontrollierten produktiven Write samt Event-/Projektionsnachzug prüfen;
-5. bei Annahme die Write-Cutover-Grenze revisions- und zeitgebunden festhalten.
+### R8-Canary und progressive Traffic-Steuerung
 
-Automatischer STOP bei falscher Revision/Digest, unklarer Writer-Autorität,
-Daten- oder Auth-Abweichung, Eventverlust/-duplikation,
-Search-/Schauwerk-/Basemap-Verlust, Überschreitung einer vor R8 gebundenen
-SLO-/RTO-/RPO-Grenze oder fehlendem Recoverybeweis.
+Vor dem ersten öffentlichen Green-Traffic wird ein revisionsgebundener
+Canary-Plan festgehalten. Er enthält mindestens:
 
-Vor der Write-Cutover-Grenze braucht ein Blue-Rückfall frische Gleichheits- und
-Writer-Fence-Evidenz. Danach ist direkter Blue-Rollback verboten; es gilt nur
-Post-Write-Recovery mit Reverse-Reconciliation und erneutem Writer-Fencing.
+- die kleinste technisch erzwingbare Nutzerkohorte oder Traffic-Fraktion;
+- der konkrete Routingmechanismus ist vor der ersten öffentlichen Wirkung
+  zielplattformgebunden belegt und kann Canary-Stufe, weitere Inkremente und
+  Abort deterministisch erzwingen;
+- die geplanten weiteren Stufen bis 100 %;
+- ein Mess- und Beobachtungsfenster pro Stufe;
+- dieselben numerischen SLO-Schwellen wie das R8-Eintrittsgate sowie
+  stufenspezifische Fehler-, Latenz- und Datenintegritäts-Abbruchbedingungen;
+- die konkrete Abort-/Recovery-Aktion für jede Stufe.
+
+Ohne einen zusätzlich belegten bidirektionalen Kohärenz-/Replikationspfad ist
+der öffentliche Canary **vor der Writer-Transition read-only**. Das ist
+absichtlich konservativ: Nach einem produktiven Green-Write wäre Blue sonst
+veraltet und dürfte nicht weiter zustandsabhängige Reads für den Resttraffic
+bedienen. Ein solcher Rückpfad wird hier nicht unterstellt.
+
+Die Sequenz ist fail-closed:
+
+1. Green-Revision/Digests und einen frischen Blue-zu-Green-Datenabgleich prüfen;
+2. Blue bleibt alleiniger Writer; nur die gebundene kleinste Canary-Kohorte bzw.
+   Traffic-Fraktion für öffentliche Reads auf Green routen, während öffentliche
+   Writes weiterhin ausschließlich Blue erreichen;
+3. Web/API/Auth/Fachdaten/Search/Schauwerk/Basemap für die Canary-Stufe lesen,
+   Replikations-/Datenfrische prüfen und das vollständige Beobachtungsfenster
+   auswerten;
+4. Read-Traffic nur stufenweise erhöhen; zwischen zwei Stufen müssen
+   Beobachtungsfenster, SLOs, Datenfrische und fachliche Readbacks vollständig
+   bestanden sein;
+5. erst nach bestandener Read-Canary-Sequenz die Writer-Transition beginnen:
+   öffentliche Writes kontrolliert anhalten oder fail-closed blockieren, final
+   Blue nach Green konvergieren, Blue-Writer fencen, Gleichheit auf Green
+   zurücklesen und erst dann Green Writer-Autorität erteilen;
+6. ab Green-Writer-Autorität müssen **alle Writes und alle
+   zustandsabhängigen Reads** Green erreichen. Blue darf ohne zusätzlich
+   belegte Rückreplikation nur noch statische/immutable Pfade bedienen;
+7. einen kontrollierten produktiven Write über Green samt
+   Event-/Projektionsnachzug prüfen und bei Annahme die Write-Cutover-Grenze
+   revisions- und zeitgebunden festhalten;
+8. verbleibenden statischen/Edge-Traffic erst danach weiter stufenweise bis
+   100 % verschieben; jede Stufe benötigt erneut ihr vollständiges
+   Beobachtungsfenster.
+
+Ein alternatives post-write-progressives Routing zustandsabhängiger Reads ist
+nur zulässig, wenn das konkrete Produktionsziel vorab einen revisionsgebundenen
+Green-zu-Blue-Kohärenz-/Replikationsbeweis samt Lag-Grenze und Abortpfad besitzt.
+Ohne diesen Beweis ist dieser Alternativpfad BLOCKED.
+
+Bei falscher Revision/Digest, unklarer Writer-Autorität, Daten- oder
+Auth-Abweichung, Eventverlust/-duplikation, Search-/Schauwerk-/Basemap-Verlust,
+Überschreitung einer vor R8 gebundenen SLO-/RTO-/RPO-Grenze oder einer
+stufenspezifischen Canary-Schwelle wird **nicht** in die nächste Traffic-Stufe
+gewechselt.
+
+Während des read-only Canary kann Traffic ohne Writer-Wechsel auf Blue
+zurückgeführt werden. Nach dem Blue-Writer-Fence, aber vor dem ersten
+bestätigten Green-Write, braucht eine Reaktivierung von Blue frische
+Gleichheits- und Writer-Fence-Evidenz. Nach der Write-Cutover-Grenze wird bei
+einem Fehler die weitere Traffic-Erhöhung gestoppt; direkter Blue-Rollback ist
+verboten. Dann gilt nur Post-Write-Recovery mit Reverse-Reconciliation und
+erneutem Writer-Fencing.
 
 ## 11. R9 — Abschluss
 
