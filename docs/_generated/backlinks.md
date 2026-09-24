@@ -175,6 +175,10 @@ Generated automatically. Do not edit.
 
 - [relates_to] docs/adr/ADR-0014__accountable-collective-node-mutations.md
 
+## architecture/semantic-search.md
+
+- [relates_to] docs/deploy/kubernetes-production-cutover-t044.md
+
 ## architecture/weltgewebe-os.md
 
 - [relates_to] docs/adr/ADR-0010__kubernetes-kanonische-plattform.md
@@ -295,6 +299,7 @@ Generated automatically. Do not edit.
 
 - [relates_to] docs/adr/ADR-0013__ha-referenzzelle-und-wiederherstellung.md
 - [relates_to] docs/blueprints/weltgewebe-os-masterplan.md
+- [relates_to] docs/deploy/kubernetes-production-cutover-t044.md
 - [depends_on] docs/reports/kubernetes-platform-foundation-status.md
 - [relates_to] docs/techstack.md
 
@@ -579,6 +584,7 @@ Generated automatically. Do not edit.
 ## docs/deploy/vps.md
 
 - [relates_to] docs/deploy/README.md
+- [relates_to] docs/deploy/kubernetes-production-cutover-t044.md
 - [relates_to] docs/deploy/merge-to-live.md
 - [relates_to] docs/deploy/public-metrics-boundary.md
 - [relates_to] docs/deploy/schauwerk-editor-frontdoor.md
@@ -913,6 +919,7 @@ Generated automatically. Do not edit.
 
 ## docs/reports/kubernetes-platform-foundation-status.md
 
+- [depends_on] docs/deploy/kubernetes-production-cutover-t044.md
 - [relates_to] docs/reports/weltgewebe-os-foundation-status.md
 
 ## docs/reports/map-architekturkritik.md

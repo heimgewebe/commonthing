@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 736 |
-| — depends_on | 33 |
+| Relationen gesamt | 740 |
+| — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 680 |
+| — relates_to | 683 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |
@@ -32,7 +32,7 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (290 Dokumente):
+**Cluster 1** (292 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
@@ -64,6 +64,7 @@ _Keine Lücken erkannt._
 - `apps/web/src/lib/components/governance/ProposalDetail.svelte`
 - `architecture/overview.md`
 - `architecture/security.md`
+- `architecture/semantic-search.md`
 - `architecture/weltgewebe-os.md`
 - `audit/impl-registry.yaml`
 - `contracts/agent/handoff.schema.json`
@@ -126,6 +127,7 @@ _Keine Lücken erkannt._
 - `docs/deploy/heim-first-phase0.md`
 - `docs/deploy/heimserver.deployment.md`
 - `docs/deploy/heimserver.integration.md`
+- `docs/deploy/kubernetes-production-cutover-t044.md`
 - `docs/deploy/map-html-canonical-route.md`
 - `docs/deploy/merge-to-live.md`
 - `docs/deploy/public-app-base-url.md`

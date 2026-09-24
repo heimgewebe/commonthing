@@ -136,7 +136,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/github-action-ref-pinning-audit.md | report | active | active | audit | OPT-INF-002 | 2026-09-30 |  | not_decision_relevant | 0 | 4 | 4 |  |  |
 | docs/reports/github-actions-node24-readiness.md | report | active | active | audit | OPT-CI-005 | 2026-09-29 |  | not_decision_relevant | 2 | 4 | 5 |  |  |
 | docs/reports/inwx-zone-reconciliation-plan.md | report | deprecated | archived | planning | DEPLOY-DNS-001 |  |  | deprecated | 1 | 5 | 4 | review_after |  |
-| docs/reports/kubernetes-platform-foundation-status.md | status | active |  |  | WELTGEWEBE-OS-006 | 2026-10-19 |  | not_decision_relevant | 1 | 5 | 7 | lifecycle, lifecycle_state |  |
+| docs/reports/kubernetes-platform-foundation-status.md | status | active |  |  | WELTGEWEBE-OS-006 | 2026-10-19 |  | not_decision_relevant | 2 | 5 | 7 | lifecycle, lifecycle_state |  |
 | docs/reports/map-architekturkritik.md | report | deprecated | archived | audit | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | deprecated | 4 | 5 | 2 |  |  |
 | docs/reports/map-basemap-proof-gap-reconciliation.md | report | deprecated | archived | audit | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | deprecated | 2 | 6 | 6 |  |  |
 | docs/reports/map-status-matrix.md | status-matrix | deprecated | archived |  |  |  |  | deprecated | 8 | 6 | 3 | lifecycle, owner_task, review_after |  |
@@ -417,6 +417,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
   - `docs/tasks/DEPLOY-DNS-001B.md`
 
 - `docs/reports/kubernetes-platform-foundation-status.md`
+  - `docs/deploy/kubernetes-production-cutover-t044.md`
   - `docs/reports/weltgewebe-os-foundation-status.md`
 
 - `docs/reports/map-architekturkritik.md`
