@@ -595,12 +595,49 @@ erfunden.
 Die Referenz- und Staging-Proofs werden nicht auf das konkrete Produktions-Green
 hochgerechnet. Vor R8 müssen die Produktions-Akzeptanzbedingungen aus ADR-0010
 für **genau das identifizierte Green**, die gewünschte Release-Revision und die
-gebundenen API-/Web-Image-Digests als frische Wirkungsevidenz vorliegen:
+gebundenen API-/Web-Image-Digests als frische Wirkungsevidenz vorliegen.
+
+Für **jeden** nachfolgenden Proof, der schreibt, Worker ausführt, einen
+Restart/Failover erzwingt oder Restore-/PITR-Zustand erzeugt, gilt vor seiner
+ersten Mutation zusätzlich dieselbe Sicherheitsgrenze wie für R6-Testwrites:
+
+- Release, Kubernetes-/Datenbank-/Messaging-Topologie, Fehlerdomäne,
+  Storageklasse und der konkret zu beweisende Failovermechanismus bleiben an
+  das Produktions-Green gebunden; die Isolation darf den zu prüfenden
+  Wirkungsmechanismus nicht durch eine vereinfachte Ersatzarchitektur ersetzen;
+- Fach-, Auth-, Outbox-/Consumption-, JetStream- und Such-/Projektionszustand
+  des Proofs liegen in einem disposable bzw. vollständig isolierten
+  Rehearsal-Datenpfad mit gebundenem Ausgangszustand und eindeutigen
+  Test-/Korrelationskennungen;
+- sämtliche externen Side-Effect-Pfade einschließlich Web Push, Mail,
+  Federation, Webhooks und sonstiger Delivery sind vor dem Proof fail-closed
+  deaktiviert oder auf verifizierte nichtproduktive Rehearsal-Sinks gebunden;
+- Produktions-Credentials, kopierte Subscriptions oder reale Peer-/Empfängerziele
+  sind **kein** Sicherheitsbeweis und dürfen keinen tatsächlichen externen
+  Kontakt ermöglichen;
+- nach jedem mutierenden/destruktiven Proof wird der Rehearsal-Zustand
+  verworfen oder vollständig auf den gebundenen Ausgangszustand zurückgesetzt.
+  Testkennungen müssen in PostgreSQL/Auth, Outbox/Consumption, JetStream und
+  Suche abwesend sein; externe Delivery wird zielgebunden als ausschließlich
+  gefenced bzw. am erwarteten Rehearsal-Sink zurückgelesen;
+- vor dem öffentlichen Canary folgen ein frischer finaler Blue-zu-Green-Abgleich
+  und read-only Daten-/Event-/Projektionsgleichheit auf dem späteren
+  Produktionsdatenpfad.
+
+Kann die notwendige Isolation nur dadurch erreicht werden, dass der tatsächlich
+zu beweisende Multi-Instanz-, Datenbank-, Messaging-, Storage- oder
+Failovermechanismus verändert wird, ist der Proof **nicht repräsentativ** und
+schließt das Gate nicht. Ein Proof darf also die Produktions-Topologie isoliert
+testen, aber vor der Write-Cutover-Grenze weder den späteren produktiven
+Datenpfad mit synthetischem Zustand verunreinigen noch reale externe Empfänger
+erreichen.
+
+Erst innerhalb dieser Sicherheitsgrenze gelten die folgenden Wirkungsgates:
 
 - mindestens zwei Green-API-Instanzen werden unter demselben Daten-, Auth-,
   Event- und Projektionsvertrag gleichzeitig betrieben; revisionsgebundene
-  Cross-Instance-Read-/Write- und Restart-Readbacks belegen fachliche Kohärenz
-  statt nur `2/2 ready`;
+  Cross-Instance-Read-/Write- und Restart-Readbacks **im isolierten
+  Proof-Datenpfad** belegen fachliche Kohärenz statt nur `2/2 ready`;
 - ein Datenbankausfall bzw. der für das konkrete Green vorgesehene
   Datenbank-Failover wird real geprobt. Writer-Autorität, Fencing,
   Wiederanlauf, Datenkontinuität und anschließende Read-/Write-Fähigkeit werden
