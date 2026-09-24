@@ -734,10 +734,39 @@ Die Sequenz ist fail-closed:
    Schritt 6 unter den Post-Write-Recoveryvertrag. Scheitert irgendein Teil des
    Probe-Readbacks, wird **kein** nicht-Probe-Write-Ingress freigegeben;
 8. **erst nach vollständig bestandenem Schritt 7** die Probe-Verifikation
-   revisionsgebunden festhalten und danach die zuvor gefenceten
-   nicht-Probe-Write-Ingresspfade gemäß dem gebundenen Cutover-Plan freigeben.
-   Gewöhnliche öffentliche Writes auf Green werden jetzt aktiviert und ihre
-   Fehler-/Latenz-/Datenintegritätsgrenzen erneut beobachtet;
+   revisionsgebunden festhalten. Alle nicht-Probe-Write-Ingresspfade bleiben
+   zunächst weiterhin gefenced. Vor der Freigabe **jeder** Ingressklasse wird
+   revisionsgebunden festgehalten, welche Green-Mutatoren/Worker und externen
+   Deliverypfade für deren vollständige fachliche Verarbeitung erforderlich
+   sind. Diese Mutator-Readiness-Zuordnung umfasst mindestens, soweit für die
+   konkrete Release-Revision und Ingressklasse relevant:
+   - Green-API-/Domain-Writer;
+   - Domain-Outbox und Receipt-/Consumption-Consumer;
+   - Notification-/Web-Push-Consumer und Retry-/Delivery-Worker;
+   - Cleanup-/Fristen- und Governance-Sweeper;
+   - Search-Worker sowie Such-/Projektionsnachzug;
+   - Federation-/Mail-/sonstige externe Deliverypfade und weitere
+     release-spezifische Hintergrundmutatoren.
+   Jeder für die Ingressklasse erforderliche Pfad muss **vor deren Öffnung**
+   aktiviert und mit exakter Revision/Konfiguration, erreichbaren Abhängigkeiten,
+   erfolgreichem Readiness-/Health-Readback sowie einem gebundenen
+   Backlog-/Catch-up-Zustand belegt sein. Externe Deliverypfade müssen dabei
+   bewusst vom Rehearsal-Fence auf die korrekten Produktionsziele umgebunden und
+   zielgebunden zurückgelesen sein. Persistente Mutationen, die bereits bei
+   Aktivierung oder Catch-up entstehen, liegen hinter der Write-Cutover-Grenze
+   und müssen vor der Ingressfreigabe vollständig auf Daten-, Event- und
+   Projektionskonsistenz zurückgelesen werden.
+
+   Ist ein für die Ingressklasse erforderlicher Worker weiterhin gefenced,
+   nicht ready, auf einen Rehearsal-Sink gebunden oder sein Catch-up nicht
+   innerhalb der vorab gebundenen Grenze, bleibt **genau diese Ingressklasse**
+   fail-closed. Erst nach bestandenem Mutator-Readiness-Gate werden die
+   zugehörigen zuvor gefenceten nicht-Probe-Write-Ingresspfade gemäß dem
+   gebundenen Cutover-Plan freigegeben. Gewöhnliche öffentliche Writes auf Green
+   werden erst dann aktiviert, wenn ihr vollständiger erforderlicher
+   API-/Outbox-/Receipt-/Notification-/Search-/Sweeper-Pfad belegt ready ist;
+   anschließend werden ihre Fehler-/Latenz-/Datenintegritätsgrenzen erneut
+   beobachtet;
 9. verbleibenden statischen/Edge-Traffic erst danach weiter stufenweise bis
    100 % verschieben; jede Stufe benötigt erneut ihr vollständiges
    Beobachtungsfenster.
