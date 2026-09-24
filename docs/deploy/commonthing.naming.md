@@ -35,6 +35,7 @@ Namen Weltgewebe eingeführt.
 | Bereich | Kanonisch | Legacy / Übergang |
 | --- | --- | --- |
 | Produkt | `commonThing` | `Weltgewebe` nur historisch |
+| Zielarchitektur | `commonThing OS` (`architecture/commonthing-os.md`) | `Weltgewebe OS` nur in historischen Identitäten (siehe 4.1); `architecture/weltgewebe-os.md` nur als Verweis auf den neuen Pfad |
 | Hauptdomain | `commonthing.net` | `weltgewebe.net` als permanenter Redirect |
 | www | `www.commonthing.net` -> `commonthing.net` | `www.weltgewebe.net` als permanenter Redirect |
 | API | `api.commonthing.net` | `api.weltgewebe.net` als zeitlich begrenzter Kompatibilitätsname |
@@ -46,6 +47,7 @@ Namen Weltgewebe eingeführt.
 | Repository | `heimgewebe/commonthing` | `heimgewebe/weltgewebe` nur als GitHub-Redirect und historische Referenz |
 | Betriebsnamen | `commonthing-*` | `weltgewebe-*` bis zur jeweiligen Unit-/Pfad-Migration |
 | interne Domains | `*.commonthing.home.arpa` als reservierter Namespace; derzeit kein aktiver Service-Layer | `*.weltgewebe.home.arpa` nur historisch/Legacy, ohne aktive Produkt-DNS-Zuordnung |
+| Schema-`$id` | noch nicht festgelegt; wird mit der ersten neuen Contract-Version bestimmt | `https://weltgewebe.org/...` und `https://weltgewebe.net/contracts/...` bleiben für bestehende Contract-Versionen stabil |
 
 Die Tabelle beschreibt den Zielzustand. Ein Zielname darf nicht als bereits live
 behauptet werden, solange DNS, Runtime oder Providerzustand noch nicht entsprechend
@@ -87,6 +89,42 @@ Nicht zulässig sind neue Verwendungen als:
 - neue Architekturbezeichnung;
 - neue kanonische Domain, Mailadresse oder API-Identität;
 - neuer Service-, Binary-, Variablen- oder Betriebsname.
+
+### 4.1 Dauerhafte Identitäten
+
+Diese Namen tragen Historie, Datenintegrität oder Protokollidentität. Sie werden
+**nicht** umbenannt. Eine Ablösung ist nur über eine neue Version mit eigener,
+kompatibler Migration zulässig (neue Migration, neue Contract-Version, neuer
+Consumer), nie durch Umschreiben des Bestands:
+
+- Task- und Serien-IDs wie `WELTGEWEBE-OS-V1-T…`, `WELTGEWEBE-OS-0…` und
+  `WELTGEWEBE-SEMANTIC-SEARCH-V1-T…` sowie die Proofs, Reports und Receipts, die
+  sie tragen;
+- Objekte in bereits angewendeten Datenbankmigrationen (z. B. SQL-Funktionen
+  `weltgewebe_*`), weil angewendete Migrationen nicht nachträglich geändert werden;
+- Hash-Seeds und Lock-Namespaces (z. B. `weltgewebe:node-conversation:v1:`,
+  `weltgewebe:node-mutation:v1`), weil sie deterministische IDs und Sperren
+  erzeugen;
+- NATS-Subjects und Durable-Consumer-Namen (`weltgewebe.domain.>`,
+  `weltgewebe-api-domain-receipts-v1`), weil ihr Zustand im Stream liegt;
+- Browser-Speicherschlüssel (`weltgewebe.theme`, `weltgewebe:garnrolle-*`), solange
+  kein Migrationscode Nutzerdaten überträgt;
+- Such-Revisionen (`weltgewebe-search-normalization-v1`,
+  `weltgewebe-hybrid-ranking-v2`), die an Receipts und Contracts gebunden sind;
+- Schema-`$id`s bestehender Contract-Versionen.
+
+Treffer dieser Klasse gelten als klassifiziert; sie brauchen keinen
+Zeilenmarker `commonthing-naming: legacy`.
+
+### 4.2 Zielarchitektur
+
+Die kanonische Zielarchitektur heißt **commonThing OS** und steht in
+`architecture/commonthing-os.md`. Das ist eine Namensentscheidung, keine
+Architekturänderung. `Weltgewebe OS` bleibt nur dort bestehen, wo der Name selbst
+historische Identität trägt (4.1). Aktive Dokumente und UI-Texte verwenden
+`commonThing OS`. Bestehende ID-Serien wie `WELTGEWEBE-OS-V1-T…` laufen
+unverändert weiter, damit Belege und Querverweise stabil bleiben; Titel und
+Beschreibungen neuer Tasks verwenden den neuen Namen.
 
 ## 5. Aktueller Übergangszustand
 
@@ -141,7 +179,8 @@ Die Umbenennung ist vollständig, wenn:
 1. alle öffentlichen kanonischen Identitäten commonThing verwenden;
 2. neue technische Identitäten commonThing verwenden;
 3. alle verbleibenden Weltgewebe-Treffer als Historie oder Legacy-Kompatibilität
-   klassifiziert sind;
+   klassifiziert sind, entweder über eine Klasse aus 4.1 oder über den
+   Zeilenmarker aus Abschnitt 6;
 4. Legacy-Fallbacks nur dort bestehen, wo ihr Nutzen bewusst belegt ist;
 5. der Naming Guard verhindert, dass der alte Name wieder als aktueller Name
    zurückkehrt.

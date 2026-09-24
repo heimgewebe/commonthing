@@ -24,7 +24,7 @@ Der Begriff „thread“ war doppeldeutig (Graph ↔ Kommunikation) und erzeugte
 
 - Graph-Beziehungen heißen ausschließlich **edge** (DE: Faden).
 - Gesprächsräume heißen ausschließlich **conversation** (DE: Gespräch / Gesprächsraum).
-- **thread** ist im gesamten Weltgewebe verboten.
+- **thread** ist in ganz commonThing verboten.
 - Offizielle Domänenfamilie: `node`, `edge`, `conversation`, `message`.
 
 ## Konsequenzen

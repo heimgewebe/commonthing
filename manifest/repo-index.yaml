@@ -4,7 +4,7 @@ zones:
     path: architecture/
     canonical_docs:
       - overview.md
-      - weltgewebe-os.md
+      - commonthing-os.md
       - security.md
       - semantic-search.md
       - docmeta.schema.md

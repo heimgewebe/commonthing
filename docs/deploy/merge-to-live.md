@@ -20,7 +20,7 @@ relations:
 
 # Merge-to-Live-Vertrag
 
-Ein Merge ist noch keine Auslieferung. Weltgewebe unterscheidet deshalb:
+Ein Merge ist noch keine Auslieferung. commonThing unterscheidet deshalb:
 
 1. `merged`: Der Commit liegt auf `origin/main`.
 2. `building`: Eine flüchtige Container-Arbeitskopie wird aus dem Commit gebaut.

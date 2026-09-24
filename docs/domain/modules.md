@@ -3,16 +3,16 @@ id: domain.modules
 title: Modul-IDs
 doc_type: reference
 status: active
-summary: Kanonische Policy für Modul-IDs im Weltgewebe (profile, forum, responsibilities).
+summary: Kanonische Policy für Modul-IDs in commonThing (profile, forum, responsibilities).
 relations:
   - type: relates_to
     target: docs/domain/vocabulary.md
 ---
-# Modul-IDs im Weltgewebe
+# Modul-IDs in commonThing
 
 ## Zweck
 
-Dieses Dokument definiert die kanonische Policy für Modul-IDs im Weltgewebe.
+Dieses Dokument definiert die kanonische Policy für Modul-IDs in commonThing.
 Ziel ist maximale Zukunftsfestigkeit, klare Trennung von Identität und Darstellung
 sowie Konsistenz über Backend, Frontend, Tests und Contracts hinweg.
 

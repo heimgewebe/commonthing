@@ -1,7 +1,7 @@
 ---
 id: specs.private-nachrichten
 title: Private Nachrichten zwischen Konten
-summary: Kanonischer Produkt-, Datenschutz- und Ausführungsvertrag für private 1:1-Unterhaltungen im Weltgewebe.
+summary: Kanonischer Produkt-, Datenschutz- und Ausführungsvertrag für private 1:1-Unterhaltungen in commonThing.
 doc_type: specification
 status: canonical
 canonicality: normative

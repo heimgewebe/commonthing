@@ -5,7 +5,7 @@ doc_type: roadmap
 status: active
 summary: >
   Exekutive Roadmap zur schrittweisen Kanonisierung, Verifikation und
-  Vollendung der Auth-Architektur im Weltgewebe.
+  Vollendung der Auth-Architektur in commonThing.
 relations:
   - type: relates_to
     target: docs/adr/ADR-0006__auth-magic-link-session-passkey.md
@@ -17,9 +17,9 @@ relations:
     target: docs/specs/auth-blueprint.md
 ---
 
-# Auth Roadmap – Weltgewebe
+# Auth Roadmap – commonThing
 
-> Diese Roadmap ist der exekutive Pfad für Auth im Weltgewebe.
+> Diese Roadmap ist der exekutive Pfad für Auth in commonThing.
 > Sie ergänzt den normativen Zielrahmen aus ADR-0006 und den zugehörigen
 > Specs um Reihenfolge, Stop-Kriterien, Drift-Schutz und
 > Implementierungsprioritäten.
@@ -485,7 +485,7 @@ Kein Ausbau von Passkeys, UI-Polish oder anderen Komfortpfaden, wenn:
 
 ## 16. Essenz
 
-Auth ist im Weltgewebe kein einzelnes Feature.
+Auth ist in commonThing kein einzelnes Feature.
 Auth ist ein Systemzustand.
 
 Der größte Fehler wäre, neue Auth-Teile zu bauen,

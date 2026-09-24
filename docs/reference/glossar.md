@@ -3,7 +3,7 @@ id: reference.glossar
 title: Glossar
 doc_type: reference
 status: active
-summary: Schnellreferenz der zentralen Begriffe im Weltgewebe-Projekt.
+summary: Schnellreferenz der zentralen Begriffe im commonThing-Projekt.
 relations:
   - type: relates_to
     target: docs/domain/vocabulary.md
@@ -13,7 +13,7 @@ relations:
 
 # Glossar
 
-**Garnrolle:** Die sichtbare und handelnde Rolle eines Accounts im Weltgewebe.
+**Garnrolle:** Die sichtbare und handelnde Rolle eines Accounts in commonThing.
 Von ihr gehen Fäden aus; aus ihr heraus werden Knoten gewoben.
 
 **Verortung:** Handlung, mit der eine Garnrolle auf einen realen Ort gesetzt

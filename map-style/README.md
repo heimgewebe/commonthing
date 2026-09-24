@@ -1,6 +1,6 @@
-# Weltgewebe Map Style
+# commonThing Map Style
 
-This directory serves as the single source of truth for the sovereign visual presentation of the Weltgewebe basemap, as outlined in the `docs/blueprints/map-blaupause.md`.
+This directory serves as the single source of truth for the sovereign visual presentation of the commonThing basemap, as outlined in the `docs/blueprints/map-blaupause.md`.
 
 ## Purpose
 
@@ -24,7 +24,7 @@ To ensure total visual sovereignty and compliance (no silent vendor dependencies
 * `colors.json`: High-level light (`theme`) and dark (`theme_dark`) palettes.
 * `glyphs/`: Local, self-hosted font stacks in PBF format to prevent external font service dependencies. (Fetched via `scripts/basemap/fetch-glyphs.sh`)
 
-> **Note on Sprites:** To maintain a visually calmed infrastructure basemap, sprites (icons/patterns) are intentionally omitted from this map style MVP. Visual semantics belong in the Weltgewebe overlay.
+> **Note on Sprites:** To maintain a visually calmed infrastructure basemap, sprites (icons/patterns) are intentionally omitted from this map style MVP. Visual semantics belong in the commonThing overlay.
 
 ## Regional coverage
 

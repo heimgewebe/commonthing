@@ -10,7 +10,7 @@ relations:
   - type: relates_to
     target: docs/weltgewebe-agenten-manifest.md
 ---
-> **Historischer Orientierungsstand:** Dieser Text vermischt Vision, abgeleitete Governancewerte und frühere technische Zielbilder. Maßgeblich sind heute `architecture/weltgewebe-os.md`, `docs/vision.md`, `docs/specs/federation-core.md`, `docs/specs/garnrolle-knoten-faden.md`, `docs/specs/ui-interaction.md`, `docs/specs/ui-state-machine.md` und `docs/specs/map-experience.md`.
+> **Historischer Orientierungsstand:** Dieser Text vermischt Vision, abgeleitete Governancewerte und frühere technische Zielbilder. Maßgeblich sind heute `architecture/commonthing-os.md`, `docs/vision.md`, `docs/specs/federation-core.md`, `docs/specs/garnrolle-knoten-faden.md`, `docs/specs/ui-interaction.md`, `docs/specs/ui-state-machine.md` und `docs/specs/map-experience.md`.
 
 # Leitfaden · Ethik & Systemdesign (Weltgewebe)
 

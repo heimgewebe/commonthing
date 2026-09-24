@@ -1,22 +1,22 @@
 ---
 id: docs.architecture.weltgewebe-os-convergence-adapter
-title: Weltgewebe OS Convergence Adapter
+title: commonThing OS Convergence Adapter
 doc_type: architecture
 status: active
 canonicality: supporting
 lifecycle_state: active
-summary: Read-only adapter boundary for producing public konvergenzregelkreis Assessment Request v1 objects without duplicating Weltgewebe, Bureau or Chronik truth.
+summary: Read-only adapter boundary for producing public konvergenzregelkreis Assessment Request v1 objects without duplicating commonThing, Bureau or Chronik truth.
 role: norm
 organ: governance
 owner: governance
 last_reviewed: 2026-07-16
 review_after: 2026-10-16
 depends_on:
-  - architecture.weltgewebe-os
+  - architecture.commonthing-os
   - docs.specs.federation-core
 relations:
   - type: relates_to
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
   - type: relates_to
     target: docs/specs/federation-core.md
   - type: relates_to
@@ -25,11 +25,11 @@ verifies_with:
   - scripts/ci/tests/test_convergence_adapter_contract.py
 ---
 
-# Weltgewebe OS Convergence Adapter
+# commonThing OS Convergence Adapter
 
 ## Purpose
 
-`scripts/convergence/weltgewebe_convergence_adapter.py` is a local read-only adapter from a versioned Weltgewebe input profile to the public konvergenzregelkreis `Assessment Request v1`.
+`scripts/convergence/weltgewebe_convergence_adapter.py` is a local read-only adapter from a versioned commonThing input profile to the public konvergenzregelkreis `Assessment Request v1`.
 
 The pinned public protocol head is:
 
@@ -81,14 +81,14 @@ The adapter must not call Bureau, Chronik, Grabowski, GitHub, Docker, Kubernetes
 
 ## Reference Boundary
 
-The input profile may model objective, desired state, observed state, deviation, decision and rollback in domain-neutral text. It must not copy Bureau task payloads, Chronik histories, Grabowski receipt bodies or Weltgewebe domain objects.
+The input profile may model objective, desired state, observed state, deviation, decision and rollback in domain-neutral text. It must not copy Bureau task payloads, Chronik histories, Grabowski receipt bodies or commonThing domain objects.
 
 The public request carries external truth only as protocol references and digests:
 
 - Bureau task authority is mapped into `observation.source_refs` and `closure.bureau_task_ref`.
 - Chronik event evidence is mapped into `observation.source_refs` and `closure.chronik_event_ref`.
 - Grabowski live receipt evidence is mapped into `observation.source_refs`, verification evidence and closure cleanup evidence.
-- The exact Weltgewebe commit or deploy receipt is mapped into `observation.source_refs` and `effects`.
+- The exact commonThing commit or deploy receipt is mapped into `observation.source_refs` and `effects`.
 
 ## Rollback And Negative Control
 

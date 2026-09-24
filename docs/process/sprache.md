@@ -8,7 +8,7 @@ relations:
   - type: relates_to
     target: docs/process/README.md
 ---
-# Sprache & Ton im Weltgewebe
+# Sprache & Ton in commonThing
 
 ## 1. Grundsatz
 

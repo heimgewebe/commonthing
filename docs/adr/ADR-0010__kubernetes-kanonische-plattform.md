@@ -4,10 +4,10 @@ title: ADR-0010 — Kubernetes als kanonische Zielplattform
 doc_type: reference
 status: active
 summary: >
-  Entscheidet Kubernetes als langfristige Zielplattform für Weltgewebe, ohne den heutigen Compose-Betrieb oder den Single-Instance-Schutz vorzeitig abzulösen.
+  Entscheidet Kubernetes als langfristige Zielplattform für commonThing, ohne den heutigen Compose-Betrieb oder den Single-Instance-Schutz vorzeitig abzulösen.
 relations:
   - type: relates_to
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
   - type: relates_to
     target: docs/blueprints/weltgewebe-os-masterplan.md
   - type: relates_to
@@ -21,7 +21,7 @@ Status: Accepted
 
 ## Kontext
 
-Weltgewebe soll langfristig hochverfügbar, regional betreibbar, föderierbar und durch Grabowski kontrolliert operierbar sein. Der heutige Produktions- und Entwicklungsbetrieb verwendet Docker Compose und Caddy. Diese Laufzeit ist real und bleibt so lange maßgeblich, bis ein neuer Pfad belegt und kontrolliert umgestellt wurde.
+commonThing soll langfristig hochverfügbar, regional betreibbar, föderierbar und durch Grabowski kontrolliert operierbar sein. Der heutige Produktions- und Entwicklungsbetrieb verwendet Docker Compose und Caddy. Diese Laufzeit ist real und bleibt so lange maßgeblich, bis ein neuer Pfad belegt und kontrolliert umgestellt wurde.
 
 Eine spätere ungeplante Migration würde invasive Umbauten an Zuständen, Probes, Deployments, Secrets, Observability, Datenbanken und Rolloutmechanismen erzwingen. Umgekehrt würde ein sofortiger Lift-and-Shift nur heutige Grenzen in einen komplexeren Orchestrator übertragen.
 

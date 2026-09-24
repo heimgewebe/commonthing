@@ -18,8 +18,8 @@ relations:
   - type: relates_to
     target: AGENTS.md
 scope: global
-description: "Bindendes Lese- und Entscheidungsprotokoll für Agentenarbeit im Weltgewebe-Repository"
-summary: "Bindendes Lese- und Entscheidungsprotokoll für Agentenarbeit im Weltgewebe-Repository"
+description: "Bindendes Lese- und Entscheidungsprotokoll für Agentenarbeit im commonThing-Repository"
+summary: "Bindendes Lese- und Entscheidungsprotokoll für Agentenarbeit im commonThing-Repository"
 ---
 
 # Agent Reading Protocol

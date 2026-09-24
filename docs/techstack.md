@@ -12,7 +12,7 @@ relations:
   - type: relates_to
     target: docs/datenmodell.md
   - type: relates_to
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
   - type: relates_to
     target: docs/adr/ADR-0010__kubernetes-kanonische-plattform.md
 ---
@@ -100,7 +100,7 @@ Für diese Punkte ist jeweils ein eigener Runtime- oder Ende-zu-Ende-Beleg nöti
 - NATS JetStream mit Transactional Outbox und idempotenten Konsumenten
 - autonome Gewebe-Zellen mit fachlicher Föderation
 
-Diese Punkte sind durch `architecture/weltgewebe-os.md` und ADR-0010 bis ADR-0012 als Zielrichtung entschieden. Sie sind noch keine Behauptung über eine laufende Produktionsruntime. Compose bleibt bis zum belegten Cutover der reale Betriebsweg und ein begrenzter Entwicklungs-/Recoverypfad.
+Diese Punkte sind durch `architecture/commonthing-os.md` und ADR-0010 bis ADR-0012 als Zielrichtung entschieden. Sie sind noch keine Behauptung über eine laufende Produktionsruntime. Compose bleibt bis zum belegten Cutover der reale Betriebsweg und ein begrenzter Entwicklungs-/Recoverypfad.
 
 ## Geplant oder noch unvollständig
 
@@ -131,7 +131,7 @@ Folgende Fähigkeiten oder Technologien dürfen trotz Zielentscheidung nicht als
 
 Eine konkrete Implementierung wird erst Teil der betriebenen Runtime, wenn
 
-1. sie der kanonischen Weltgewebe-OS-Architektur entspricht,
+1. sie der kanonischen commonThing-OS-Architektur entspricht,
 2. ein konkretes Produkt- oder Betriebsproblem belegt ist,
 3. der einfachere vorhandene Stack nicht genügt oder spätere invasive Migrationen verhindert werden müssen,
 4. Betriebs- und Wiederherstellungspfad definiert sind,

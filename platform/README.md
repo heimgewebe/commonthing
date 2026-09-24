@@ -1,6 +1,6 @@
 ---
 id: platform.readme
-title: Weltgewebe Kubernetes- und GitOps-Plattform
+title: commonThing Kubernetes- und GitOps-Plattform
 summary: Kanonischer Plattformvertrag für Kustomize, Flux, Gateway API, Cilium und den isolierten kind-Referenzbeweis.
 role: norm
 organ: ops
@@ -13,7 +13,7 @@ last_reviewed: 2026-09-16
 depends_on: []
 relations:
   - type: relates_to
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
   - type: relates_to
     target: docs/reports/kubernetes-platform-foundation-status.md
   - type: relates_to
@@ -27,9 +27,9 @@ verifies_with:
   - scripts/platform/kind_reference.py
 ---
 
-# Weltgewebe Kubernetes- und GitOps-Plattform
+# commonThing Kubernetes- und GitOps-Plattform
 
-`platform/` ist die kanonische deklarative Zielplattform für Weltgewebe. Docker Compose bleibt die gegenwärtige Produktions- und Recovery-Laufzeit, bis ein eigener Produktionsfreigabevertrag abgeschlossen ist.
+`platform/` ist die kanonische deklarative Zielplattform für commonThing. Docker Compose bleibt die gegenwärtige Produktions- und Recovery-Laufzeit, bis ein eigener Produktionsfreigabevertrag abgeschlossen ist.
 
 ## Wahrheitsschichten
 

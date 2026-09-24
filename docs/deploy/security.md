@@ -97,7 +97,7 @@ exakt commitgebundenen VPS-Releasepfad gebunden.
    entstehen.
 6. Eine private Testnachricht senden und auf dem Gerät prüfen, dass der Hinweis
    weder Nachrichtentext noch Absendername oder Account-ID zeigt und nur zur
-   gleichursprünglichen Weltgewebe-Unterhaltung führt.
+   gleichursprünglichen commonThing-Unterhaltung führt.
 7. Das Gerät wieder deaktivieren und durch eine weitere Testnachricht belegen,
    dass kein neuer Push-Hinweis entsteht, während beide Nachrichten weiterhin
    im Postfach vorhanden sind.

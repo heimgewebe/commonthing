@@ -7,7 +7,7 @@ summary: >
   Entscheidet autonome lokale Gewebe-Zellen mit globalen Identitäten, Beziehungen und gemeinsamen Räumen als langfristiges Skalierungsmodell.
 relations:
   - type: relates_to
-    target: architecture/weltgewebe-os.md
+    target: architecture/commonthing-os.md
   - type: relates_to
     target: docs/specs/garnrolle-knoten-faden.md
   - type: relates_to
@@ -21,11 +21,11 @@ Status: Accepted
 
 ## Kontext
 
-Weltgewebe soll lokale Selbstbestimmung, Datenschutz, regionale Betriebsfähigkeit und globale Zusammenarbeit zugleich ermöglichen. Eine zentrale Welt-Datenbank oder ein weltweiter Einzelcluster würden diese Ziele gegeneinander ausspielen.
+commonThing soll lokale Selbstbestimmung, Datenschutz, regionale Betriebsfähigkeit und globale Zusammenarbeit zugleich ermöglichen. Eine zentrale Welt-Datenbank oder ein weltweiter Einzelcluster würden diese Ziele gegeneinander ausspielen.
 
 ## Entscheidung
 
-Weltgewebe skaliert über autonome Gewebe-Zellen.
+commonThing skaliert über autonome Gewebe-Zellen.
 
 Eine Gewebe-Zelle ist eine betriebliche und soziale Domäne mit:
 
@@ -93,7 +93,7 @@ Nicht jedes gewöhnliche Objekt erhält globale Mehrschreiber-Semantik.
 
 ## Nachbarschaft
 
-Nachbarschaft ist nicht nur geografisch. Weltgewebe führt getrennte Nähegraphen für soziale, thematische, ökologische, institutionelle, infrastrukturelle, zeitliche und bedarfsbezogene Nähe.
+Nachbarschaft ist nicht nur geografisch. commonThing führt getrennte Nähegraphen für soziale, thematische, ökologische, institutionelle, infrastrukturelle, zeitliche und bedarfsbezogene Nähe.
 
 Die Produktoberfläche darf daraus Nachbarschaftshorizonte und ein Vorschlagsradar ableiten. Vorschläge begründen keine automatische Handlungsvollmacht.
 

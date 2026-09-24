@@ -4,7 +4,7 @@ title: Domain Scale Foundation
 doc_type: blueprint
 status: active
 canonicality: planning
-summary: Reproduzierbarer PostgreSQL-Prüfstand für große Weltgewebe-Graphen und belegbare Abfragebudgets.
+summary: Reproduzierbarer PostgreSQL-Prüfstand für große commonThing-Graphen und belegbare Abfragebudgets.
 owner: architecture
 organ: architecture
 role: plan
@@ -27,7 +27,7 @@ depends_on:
 
 ## Zweck
 
-Weltgewebe soll perspektivisch einen großen Graphen mit vielen gleichzeitigen
+commonThing soll perspektivisch einen großen Graphen mit vielen gleichzeitigen
 Lese- und Schreibvorgängen tragen. Vor Änderungen am Laufzeit-Datenpfad braucht
 das Projekt deshalb einen reproduzierbaren Prüfstand.
 

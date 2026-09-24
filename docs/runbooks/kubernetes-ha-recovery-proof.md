@@ -25,7 +25,7 @@ relations:
 python scripts/platform/ha_reference.py proof --cluster weltgewebe-ha-reference
 ```
 
-Der Runner installiert Werkzeuge ausschließlich aus `platform/toolchain.lock.json`, baut die Weltgewebe-Images aus dem aktuellen Commit und erzeugt alle kurzlebigen Secrets erst zur Laufzeit.
+Der Runner installiert Werkzeuge ausschließlich aus `platform/toolchain.lock.json`, baut die commonThing-Images aus dem aktuellen Commit und erzeugt alle kurzlebigen Secrets erst zur Laufzeit.
 
 ## Beweisphasen
 

@@ -167,7 +167,7 @@ class CanonicalTruthContractTests(unittest.TestCase):
 
     def test_canonical_entrypoints_are_substantive(self) -> None:
         required = {
-            "architecture/weltgewebe-os.md": ("## 2. Verfassungsprinzipien", "## 7. Plattformarchitektur"),
+            "architecture/commonthing-os.md": ("## 2. Verfassungsprinzipien", "## 7. Plattformarchitektur"),
             "architecture/overview.md": ("## Komponenten", "## Hauptdatenflüsse"),
             "architecture/security.md": (
                 "## Vertrauensgrenzen",

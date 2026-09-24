@@ -54,7 +54,7 @@ Zwischen Rohdaten und Darstellung liegt ein Szenenmodell. Es entscheidet, welche
 
 ## Basiskarte und Gewebe
 
-Die Basiskarte ist ruhige räumliche Infrastruktur. Fachliche Weltgewebe-Objekte bleiben davon getrennt.
+Die Basiskarte ist ruhige räumliche Infrastruktur. Fachliche commonThing-Objekte bleiben davon getrennt.
 
 Layer-Reihenfolge:
 
