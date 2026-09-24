@@ -428,13 +428,24 @@ und Green gleichzeitig als unabhängige Writer zulassen.
 
 ### Write-Cutover-Grenze und Rückweg
 
-Vor dem **ersten bestätigten produktiven Green-Write** darf Blue nur mit
-fortbestehendem Writer-Fence und frischem Gleichheits-Readback reaktiviert
-werden.
+Die **Write-Cutover-Grenze** ist der revisions- und zeitgebundene Zeitpunkt
+unmittelbar **vor dem ersten möglichen persistenten Green-Mutationspfad**. Sie
+wird also nicht erst durch einen später erfolgreich verifizierten Probe-Write
+definiert.
 
-Der erste bestätigte produktive Green-Write ist die **Write-Cutover-Grenze** und
-wird revisions- und zeitgebunden belegt. Danach gilt Blue als veraltet und darf
-nicht direkt Writer werden. Eine Rückkehr ist dann Recovery:
+Die Grenze darf erst gebunden werden, wenn der finale Blue-zu-Green-Abgleich
+und Gleichheits-Readback bestanden sind, Blue als Writer gefenced ist und Green
+noch technisch write-inhibited bleibt. Während die Grenze festgehalten wird,
+darf weder ein öffentlicher Green-Write noch ein persistenzmutierender
+Green-Hintergrundpfad laufen.
+
+Bis **vor** diese dauerhaft festgehaltene Grenze darf Blue nur mit frischem
+Gleichheits-Readback und intaktem Writer-Fence reaktiviert werden. Ab der Grenze
+gilt Blue als potenziell veraltet und darf nicht direkt Writer werden — auch
+dann nicht, wenn der kontrollierte Probe-Write noch nicht erfolgreich
+abgeschlossen ist. Sobald Green-Mutatoren freigegeben werden, können unter
+anderem Outbox-, Receipt-/Notification- oder andere Hintergrundworker vor dem
+Probe-Write persistenten Zustand verändern. Eine Rückkehr ist dann Recovery:
 
 1. Green als Writer fencen und letzten autoritativen Zustand binden;
 2. PostgreSQL-/Auth-Zustand, Outbox-/Consumption-Positionen, JetStream und aktive
@@ -551,20 +562,28 @@ Die Sequenz ist fail-closed:
 5. erst nach bestandener Read-Canary-Sequenz die Writer-Transition beginnen.
    Bei Modus 1 werden jetzt alle Blue-Zustandsmutatoren über dieselbe
    Quiescence-Barriere gefenced; bei Modus 2 bleibt die bestehende Quieszenz
-   aktiv. Danach finalen Gleichheits-Readback auf Green durchführen, Blue als
-   Writer fencen und erst dann Green Writer-Autorität erteilen; die gewöhnliche
-   öffentliche Green-Write-Freigabe bleibt dabei noch geschlossen;
-6. ab Green-Writer-Autorität müssen alle **zustandsabhängigen Reads** Green
-   erreichen. Für Writes ist zunächst ausschließlich der exakt gebundene
-   kontrollierte Probe-Write-Pfad freigegeben; alle übrigen öffentlichen Writes
-   bleiben blockiert. Blue darf ohne zusätzlich belegte Rückreplikation nur noch
+   aktiv. Danach finalen Gleichheits-Readback auf Green durchführen und Blue als
+   Writer fencen. **Green bleibt dabei noch vollständig write-inhibited.**
+   Solange dieser Zustand nicht belegt ist, darf die Transition nicht
+   fortgesetzt werden;
+6. jetzt — während Blue gefenced und Green noch write-inhibited ist — die
+   **Write-Cutover-Grenze** revisions- und zeitgebunden festhalten. Ab diesem
+   Moment gilt der Post-Write-Recoveryvertrag, noch bevor irgendein
+   Green-API-/Worker-Mutator freigegeben wird. Erst nach erfolgreicher Bindung
+   der Grenze Green Writer-Autorität erteilen und die dafür erforderlichen
+   Green-Mutatoren aktivieren. Alle **zustandsabhängigen Reads** müssen ab dann
+   Green erreichen; gewöhnliche öffentliche Writes bleiben weiterhin blockiert.
+   Blue darf ohne zusätzlich belegte Rückreplikation nur noch
    statische/immutable Pfade bedienen;
-7. genau einen kontrollierten produktiven Probe-Write über Green ausführen und
-   dessen Fachdatenzustand, Outbox-/Eventfortschritt, JetStream sowie
-   Such-/Projektionsnachzug vollständig zurücklesen. Erst wenn dieser vollständige
-   Readback besteht, wird bei Annahme die Write-Cutover-Grenze revisions- und
-   zeitgebunden festgehalten;
-8. **erst nach bestandenem Schritt 7** gewöhnliche öffentliche Writes auf Green
+7. genau einen kontrollierten produktiven Probe-Write über den gebundenen
+   Probe-Ingress ausführen und dessen Fachdatenzustand, Outbox-/Eventfortschritt,
+   JetStream sowie Such-/Projektionsnachzug vollständig zurücklesen. Interne
+   Green-Hintergrundmutationen, die nach Schritt 6 auftreten, liegen bereits
+   hinter der Write-Cutover-Grenze und unterliegen deshalb ebenfalls dem
+   Post-Write-Recoveryvertrag. Scheitert irgendein Teil des Probe-Readbacks,
+   werden gewöhnliche öffentliche Writes **nicht** freigegeben;
+8. **erst nach vollständig bestandenem Schritt 7** die Probe-Verifikation
+   revisionsgebunden festhalten, gewöhnliche öffentliche Writes auf Green
    freigeben und deren Fehler-/Latenz-/Datenintegritätsgrenzen erneut beobachten;
 9. verbleibenden statischen/Edge-Traffic erst danach weiter stufenweise bis
    100 % verschieben; jede Stufe benötigt erneut ihr vollständiges
@@ -584,11 +603,15 @@ gewechselt.
 Während des read-only Canary kann Traffic ohne Writer-Wechsel auf Blue
 zurückgeführt werden. In Modus 2 werden die gefenceten Blue-Mutationspfade erst
 nach abgebrochenem Green-Traffic, unverändertem Quieszenzanker und gebundenem
-Abort-Readback kontrolliert wieder aktiviert. Nach dem Blue-Writer-Fence, aber
-vor dem ersten bestätigten Green-Write, braucht eine Reaktivierung von Blue
-frische Gleichheits- und Writer-Fence-Evidenz. Nach der Write-Cutover-Grenze wird bei
-einem Fehler die weitere Traffic-Erhöhung gestoppt; direkter Blue-Rollback ist
-verboten. Dann gilt nur Post-Write-Recovery mit Reverse-Reconciliation und
+Abort-Readback kontrolliert wieder aktiviert.
+
+Während der Writer-Transition darf Blue nur **vor** der dauerhaft festgehaltenen
+Write-Cutover-Grenze und nur mit frischer Gleichheits- und Writer-Fence-Evidenz
+reaktiviert werden. Sobald die Grenze gebunden ist, ist direkter Blue-Rollback
+verboten — unabhängig davon, ob bereits der kontrollierte Probe-Write oder ein
+Green-Hintergrundworker die erste bestätigte Mutation erzeugt hat. Bei jedem
+Fehler nach dieser Grenze wird die weitere Traffic-/Write-Freigabe gestoppt und
+es gilt ausschließlich Post-Write-Recovery mit Reverse-Reconciliation und
 erneutem Writer-Fencing.
 
 ## 11. R9 — Abschluss
