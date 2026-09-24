@@ -15,13 +15,13 @@ summary: >
   Capability-Parität, Datenübergang, Backup und Rollback konkret belegt sind.
 relations:
   - type: depends_on
-    target: docs.reports.kubernetes-platform-foundation-status
+    target: docs/reports/kubernetes-platform-foundation-status.md
   - type: relates_to
-    target: deploy.vps
+    target: docs/deploy/vps.md
   - type: relates_to
-    target: architecture.semantic-search
+    target: architecture/semantic-search.md
   - type: relates_to
-    target: adr.ADR-0010__kubernetes-kanonische-plattform
+    target: docs/adr/ADR-0010__kubernetes-kanonische-plattform.md
 ---
 
 # T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates
@@ -37,8 +37,9 @@ Traffic-, Writer-, Datenbank- noch Kubernetes-Produktionsmutationen.
 
 Beobachtungsbasis:
 
-- Datum: 2026-09-23
-- geschützter Public-`main`: `04f182c2ce8a9269c520719166e04aa13d8c7178`
+- Liveinventur: 2026-09-23; Zielplattform-Gegencheck: 2026-09-24
+- aktueller geschützter Repo-`main`: `240f4ca6c6fe9117bf336fb34ed51f2c5a28fb15`
+- produktiv ausgelieferte Blue-Revision: `04f182c2ce8a9269c520719166e04aa13d8c7178`
 - T044: Revision 5, kein aktueller Verification-Stamp
 - T084: aktueller Verification-Stamp vorhanden
 - produktive Blue-Runtime: `commonserver`
@@ -70,6 +71,7 @@ Frischer Readback vom VPS `commonserver`:
 - kanonischer Web-Origin: `https://commonthing.net`
 - kanonischer API-Origin: `https://api.commonthing.net`
 - Legacy-Web/API bleiben Kompatibilitätspfade
+<!-- commonthing-naming: legacy -->
 - DNS für `commonthing.net`, `api.commonthing.net`, `weltgewebe.net` und
   `api.weltgewebe.net` zeigte auf `94.16.121.119`
 - Web-Readback: HTTP 200
@@ -251,9 +253,10 @@ Frischer Gegencheck vom 24.09.2026:
   mit demselben Operatorbenutzer auf; beide Live-Probes melden den Hostnamen
   `commonserver`. Sie sind damit zwei Namen für denselben beobachteten
   Produktionshost und **kein** getrenntes Green-Ziel.
-- Auf dem exakten Public-Main `04f182c2ce8a9269c520719166e04aa13d8c7178`
-  existiert kein `platform/clusters/production`. Deklarierte Clusterkompositionen
-  sind `local`, `staging` und `ha`.
+- Auf dem am 24.09.2026 frisch gebundenen Public-Main
+  `240f4ca6c6fe9117bf336fb34ed51f2c5a28fb15` existiert kein
+  `platform/clusters/production`. Deklarierte Clusterkompositionen sind
+  `local`, `staging` und `ha`.
 - `platform/apps/weltgewebe/overlays/production` ist ein Anwendungs-Overlay;
   seine Existenz belegt keinen provisionierten oder betriebsbereiten
   Produktionscluster.
@@ -314,7 +317,8 @@ R6 darf erst starten, wenn **alle** folgenden Bedingungen erfüllt sind:
    Kubernetes-native, explizit extern oder retired entschieden und belegt;
 6. Green kann aktuelle Produktionsdaten aufnehmen, ohne Blue-Writer zu berühren;
 7. frisches Blue-Backup und konkreter Restorepfad sind belegt;
-8. Rollback auf Blue ist weiterhin möglich;
+8. Pre-Write-Rollback auf Blue und Post-Write-Recovery mit
+   Reverse-Reconciliation plus erneutem Writer-Fencing sind getrennt belegt;
 9. keine fremde T044-/Produktionswriter-Lane ist aktiv;
 10. keine reale Produktionsmutation wurde aus einem älteren Preflight abgeleitet.
 
@@ -356,28 +360,62 @@ Blue Writer
 
 Keine Phase darf Blue und Green gleichzeitig als unabhängige Writer zulassen.
 
+### Write-Cutover-Grenze und Rückweg
+
+Vor dem **ersten bestätigten produktiven Green-Write** darf Blue nur mit
+fortbestehendem Writer-Fence und frischem Gleichheits-Readback reaktiviert
+werden.
+
+Der erste bestätigte produktive Green-Write ist die **Write-Cutover-Grenze** und
+wird revisions- und zeitgebunden belegt. Danach gilt Blue als veraltet und darf
+nicht direkt Writer werden. Eine Rückkehr ist dann Recovery:
+
+1. Green als Writer fencen und letzten autoritativen Zustand binden;
+2. PostgreSQL-/Auth-Zustand, Outbox-/Consumption-Positionen, JetStream und aktive
+   Suchprojektionen in Richtung Blue reconciliieren;
+3. Gleichheit und Ereigniskontinuität read-only zurücklesen;
+4. erst danach Blue erneut Writer-Autorität erteilen.
+
+Fehlt vollständige Reverse-Reconciliation, bleibt Green die einzige
+Datenwahrheit und wird vorwärts repariert. Bloßes Zurückschalten auf Compose ist
+nach der Write-Cutover-Grenze verboten.
+
 ## 10. R8 — Traffic-Cutover
 
-Erst nach bestätigter Green-Writer-Autorität:
+### R8-Eintrittsgate — gemessene Betriebsgrenzen
 
-1. exakte Green-Revision/Digests erneut prüfen;
+R8 bleibt blockiert, bis für das konkrete Green revisionsgebundene Mess- und
+Entscheidungsevidenz vorliegt:
+
+- cutoverkritische SLO-Schwellen und Messfenster für Verfügbarkeit, Fehler und
+  Latenz sind numerische Pass/Fail-Bedingungen, und Green besteht sie;
+- RTO ist durch einen Ziel-Recovery-/Restorelauf numerisch gemessen und liegt
+  innerhalb der vor R8 gebundenen Höchstgrenze;
+- RPO ist am wiederhergestellten Daten- und Ereignisstand numerisch gemessen und
+  liegt innerhalb der vor R8 gebundenen Höchstgrenze;
+- Messzeitpunkt, Green-Revision/Digests, Datenstand und Evidenzreferenzen sind
+  gemeinsam gebunden.
+
+Fehlt eine Zahl, ist sie nur qualitativ oder der Green-Bezug nicht mehr frisch,
+bleibt R8 blockiert. Vor Existenz der realen Zielplattform werden keine Werte
+erfunden.
+
+Erst nach diesem Gate und bestätigter Green-Writer-Autorität:
+
+1. Green-Revision/Digests erneut prüfen;
 2. öffentliches Routing umstellen;
 3. Web/API/Auth/Fachdaten/Search/Schauwerk/Basemap lesen;
-4. kontrollierten Write und Event-/Projektionsnachzug prüfen.
+4. kontrollierten produktiven Write samt Event-/Projektionsnachzug prüfen;
+5. bei Annahme die Write-Cutover-Grenze revisions- und zeitgebunden festhalten.
 
-Automatischer STOP bzw. Rückfall bei:
+Automatischer STOP bei falscher Revision/Digest, unklarer Writer-Autorität,
+Daten- oder Auth-Abweichung, Eventverlust/-duplikation,
+Search-/Schauwerk-/Basemap-Verlust, Überschreitung einer vor R8 gebundenen
+SLO-/RTO-/RPO-Grenze oder fehlendem Recoverybeweis.
 
-- falscher Revision oder falschem Digest
-- unklarer Writer-Autorität
-- Datenabweichung
-- Auth-Regression
-- Eventverlust oder -duplikation
-- Search-/Schauwerk-/Basemap-Verlust
-- erheblicher, vorher definierter Fehler- oder Latenzverletzung
-- fehlendem Recovery-/Rollbackbeweis
-
-Es werden keine SLO-, RTO- oder RPO-Zielwerte erfunden. Grenzwerte werden aus
-frischen Messungen und dem konkreten Zielvertrag abgeleitet.
+Vor der Write-Cutover-Grenze braucht ein Blue-Rückfall frische Gleichheits- und
+Writer-Fence-Evidenz. Danach ist direkter Blue-Rollback verboten; es gilt nur
+Post-Write-Recovery mit Reverse-Reconciliation und erneutem Writer-Fencing.
 
 ## 11. R9 — Abschluss
 
@@ -385,8 +423,10 @@ T044 darf erst terminalisiert werden, wenn seine elf Acceptance-Kriterien
 revisionsgebunden gegen die tatsächlich laufende Produktion authentifiziert
 wurden und `verification-stamp WELTGEWEBE-OS-V1-T044` erfolgreich ist.
 
-Der alte Compose-Pfad bleibt danach während der festgelegten Beobachtungs- und
-Rollbackfrist deaktivierte Recovery-Option; er wird nicht sofort gelöscht.
+Der alte Compose-Pfad bleibt während der Beobachtungs- und Recoveryfrist
+erhalten und wird nicht sofort gelöscht. Nach der Write-Cutover-Grenze ist er
+keine direkt aktivierbare zweite Produktionswahrheit: Rückkehr zu Blue erfordert
+Reverse-Reconciliation und erneutes Writer-Fencing.
 
 ## 12. Aktuelle Entscheidung
 
