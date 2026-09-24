@@ -25,6 +25,15 @@ trap cleanup EXIT
 git -C "$SOURCE_ROOT" ls-files -z --cached --others --exclude-standard |
   tar -C "$SOURCE_ROOT" --null --ignore-failed-read -T - -cf - |
   tar -xf - -C "$WORK_ROOT"
+
+# Untracked, non-ignored entries are copied too so local in-progress work is
+# exercised. Refuse symlinks/FIFOs/sockets/devices before mocks or deploy code
+# can follow them out of WORK_ROOT.
+unsafe_entry="$(find -P "$WORK_ROOT" -mindepth 1 ! -type f ! -type d -print -quit)"
+if [[ -n "$unsafe_entry" ]]; then
+  echo "ERROR: Refusing test working copy containing non-regular entry: ${unsafe_entry#"$WORK_ROOT"/}" >&2
+  exit 1
+fi
 cd "$WORK_ROOT"
 
 # 0. Setup Mocks

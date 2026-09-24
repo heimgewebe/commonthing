@@ -7,7 +7,11 @@ set -euo pipefail
 
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHECKOUT="$(mktemp -d)"
-trap 'rm -rf "$CHECKOUT"' EXIT
+OUTSIDE="$(mktemp -d)"
+cleanup() {
+  rm -rf "$CHECKOUT" "$OUTSIDE"
+}
+trap cleanup EXIT
 
 # A disposable checkout of the current working tree, so the sentinels below
 # never touch the real one.
@@ -54,3 +58,33 @@ if [[ "$before" != "$after" ]]; then
   exit 1
 fi
 echo "PASS: checkout byte-identical after test_verify_deployment.sh (${#sentinels[@]} sentinels)."
+
+# Regression for an untracked, non-ignored symlink. The harness copies such
+# working-tree entries, so a path like mock_bin -> /outside must be rejected
+# before it writes mock executables through the link.
+rm -rf "$CHECKOUT/mock_bin"
+printf 'outside sentinel
+' > "$OUTSIDE/docker"
+ln -s "$OUTSIDE" "$CHECKOUT/mock_bin"
+outside_before="$(sha256sum "$OUTSIDE/docker" | awk '{print $1}')"
+
+set +e
+symlink_output="$(bash "$CHECKOUT/scripts/tests/test_verify_deployment.sh" 2>&1)"
+symlink_rc=$?
+set -e
+outside_after="$(sha256sum "$OUTSIDE/docker" | awk '{print $1}')"
+
+if [[ "$symlink_rc" -eq 0 ]]; then
+  echo "FAIL: harness accepted an untracked symlink that can escape WORK_ROOT." >&2
+  exit 1
+fi
+if [[ "$outside_before" != "$outside_after" ]]; then
+  echo "FAIL: harness modified a file outside WORK_ROOT through an untracked symlink." >&2
+  exit 1
+fi
+if [[ "$symlink_output" != *"Refusing test working copy containing non-regular entry"* ]]; then
+  echo "FAIL: symlink case failed for an unrelated reason:" >&2
+  echo "$symlink_output" >&2
+  exit 1
+fi
+echo "PASS: untracked symlink is rejected before any write can escape WORK_ROOT."
