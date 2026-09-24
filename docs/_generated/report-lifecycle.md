@@ -147,7 +147,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     "checked_items": 52,
     "complete": true,
     "failures": 0,
-    "fresh": false,
+    "fresh": true,
     "method": "exact",
     "scope": "all Markdown files discovered under docs/reports",
     "total_items": 52
@@ -155,12 +155,12 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "Runtime health, deployment health, or the correctness of claims inside individual reports."
   ],
-  "generated_at": "2026-09-20T19:06:28+02:00",
+  "generated_at": "2026-09-24T06:04:04+00:00",
   "limitations": [
     "The report reflects repository files only and does not execute product runtime checks."
   ],
   "schema_version": 1,
-  "source_revision": "980500baf412becdf25f7036e4eb9e1bb9079d9f",
+  "source_revision": "ffe3b73767dba470c364129a0f4a45d7432ee423",
   "sources": [
     {
       "path": "docs/reports/agent-readiness-audit.md",
@@ -371,6 +371,6 @@ Schema: `contracts/audit-report-truth.schema.json`
       "sha256": "8971b15c7e9a8d0297e3c26c4721f392709927e8f69547a91f13691ec7376c16"
     }
   ],
-  "status": "unknown"
+  "status": "pass"
 }
 ```

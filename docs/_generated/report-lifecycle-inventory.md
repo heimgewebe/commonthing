@@ -880,7 +880,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     "checked_items": 69,
     "complete": true,
     "failures": 0,
-    "fresh": false,
+    "fresh": true,
     "method": "exact",
     "scope": "all Markdown files under docs/reports and all generated/curated control surfaces declared in .wgx/generated-artifacts.yml",
     "total_items": 69
@@ -888,12 +888,12 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "The correctness of claims inside individual reports, runtime use of declared consumers, or deployment truth."
   ],
-  "generated_at": "2026-09-20T20:32:43+02:00",
+  "generated_at": "2026-09-24T06:04:04+00:00",
   "limitations": [
     "The inventory evaluates repository metadata, exact path references and declared control contracts, not runtime behaviour."
   ],
   "schema_version": 1,
-  "source_revision": "78908d6bb5daafbcb6102b34082f56ab9c0c3b47",
+  "source_revision": "ffe3b73767dba470c364129a0f4a45d7432ee423",
   "sources": [
     {
       "path": ".wgx/generated-artifacts.yml",
@@ -1108,7 +1108,7 @@ Schema: `contracts/audit-report-truth.schema.json`
       "sha256": "8971b15c7e9a8d0297e3c26c4721f392709927e8f69547a91f13691ec7376c16"
     }
   ],
-  "status": "unknown"
+  "status": "no_material_drift"
 }
 ```
 

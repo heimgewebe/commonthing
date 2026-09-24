@@ -38,8 +38,8 @@ Traffic-, Writer-, Datenbank- noch Kubernetes-Produktionsmutationen.
 Beobachtungsbasis:
 
 - Liveinventur: 2026-09-23; Zielplattform-Gegencheck: 2026-09-24
-- aktueller geschützter Repo-`main`: `240f4ca6c6fe9117bf336fb34ed51f2c5a28fb15`
-- produktiv ausgelieferte Blue-Revision: `04f182c2ce8a9269c520719166e04aa13d8c7178`
+- aktueller geschützter Repo-`main`: `bd88a1df8712f23485e80e3f1f2a296ba05590e1`
+- produktiv ausgelieferte Blue-Revision: `240f4ca6c6fe9117bf336fb34ed51f2c5a28fb15`
 - T044: Revision 5, kein aktueller Verification-Stamp
 - T084: aktueller Verification-Stamp vorhanden
 - produktive Blue-Runtime: `commonserver`
@@ -66,8 +66,8 @@ Frischer Readback vom VPS `commonserver`:
 ### 3.1 Revision und Frontdoor
 
 - Compose-Projekt: `weltgewebe`
-- ausgelieferter Build: `04f182c2`
-- exakter Main-Commit: `04f182c2ce8a9269c520719166e04aa13d8c7178`
+- ausgelieferter Build: `240f4ca6`
+- exakter Blue-Release-Commit: `240f4ca6c6fe9117bf336fb34ed51f2c5a28fb15`
 - kanonischer Web-Origin: `https://commonthing.net`
 - kanonischer API-Origin: `https://api.commonthing.net`
 - Legacy-Web/API bleiben Kompatibilitätspfade
@@ -162,7 +162,7 @@ aus dem aktuellen Idle-Readback abgeleitet werden.
 - Bootstrap-/Datenrevision:
   `6a10c76666b9769fdfddb62ecb3fbf0c2c5df935`
 
-Damit ist Green aktuell **nicht** auf demselben App-Commit wie Blue/Public-Main.
+Damit ist Green aktuell **weder** auf derselben App-Revision wie Blue noch auf dem aktuellen Repo-`main`.
 
 ### 4.2 Workloads
 
@@ -254,7 +254,7 @@ Frischer Gegencheck vom 24.09.2026:
   `commonserver`. Sie sind damit zwei Namen für denselben beobachteten
   Produktionshost und **kein** getrenntes Green-Ziel.
 - Auf dem am 24.09.2026 frisch gebundenen Public-Main
-  `240f4ca6c6fe9117bf336fb34ed51f2c5a28fb15` existiert kein
+  `bd88a1df8712f23485e80e3f1f2a296ba05590e1` existiert kein
   `platform/clusters/production`. Deklarierte Clusterkompositionen sind
   `local`, `staging` und `ha`.
 - `platform/apps/weltgewebe/overlays/production` ist ein Anwendungs-Overlay;
@@ -449,6 +449,12 @@ Vor dem ersten öffentlichen Green-Traffic wird ein revisionsgebundener
 Canary-Plan festgehalten. Er enthält mindestens:
 
 - die kleinste technisch erzwingbare Nutzerkohorte oder Traffic-Fraktion;
+- jede als read-only bezeichnete Requestklasse ist vorab als frei von
+  persistenten Nebenwirkungen auf PostgreSQL/Auth-Session, Outbox/Consumption,
+  JetStream und Suche belegt;
+- der Green-Canary-Pfad ist bis zur Writer-Transition technisch
+  **write-inhibited**; jeder persistente Green-Writeversuch muss fail-closed
+  scheitern und den Canary stoppen;
 - der konkrete Routingmechanismus ist vor der ersten öffentlichen Wirkung
   zielplattformgebunden belegt und kann Canary-Stufe, weitere Inkremente und
   Abort deterministisch erzwingen;
@@ -469,10 +475,11 @@ Die Sequenz ist fail-closed:
 1. Green-Revision/Digests und einen frischen Blue-zu-Green-Datenabgleich prüfen;
 2. Blue bleibt alleiniger Writer; nur die gebundene kleinste Canary-Kohorte bzw.
    Traffic-Fraktion für öffentliche Reads auf Green routen, während öffentliche
-   Writes weiterhin ausschließlich Blue erreichen;
+   Writes weiterhin ausschließlich Blue erreichen und Green technisch
+   write-inhibited bleibt;
 3. Web/API/Auth/Fachdaten/Search/Schauwerk/Basemap für die Canary-Stufe lesen,
-   Replikations-/Datenfrische prüfen und das vollständige Beobachtungsfenster
-   auswerten;
+   Replikations-/Datenfrische sowie die Abwesenheit persistenter Green-Writes
+   prüfen und das vollständige Beobachtungsfenster auswerten;
 4. Read-Traffic nur stufenweise erhöhen; zwischen zwei Stufen müssen
    Beobachtungsfenster, SLOs, Datenfrische und fachliche Readbacks vollständig
    bestanden sein;
