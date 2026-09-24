@@ -607,7 +607,10 @@ Canary-Plan festgehalten. Er enthält mindestens:
   applikative, operatorische und Green-interne Hintergrundmutatoren**
   write-inhibited. Ein persistenter Green-Write außerhalb der nachfolgend für
   Modus 1 exakt gebundenen Replikationsausnahme muss fail-closed scheitern und
-  den Canary stoppen;
+  den Canary stoppen. Nach der Writer-Transition bleibt zusätzlich jeder
+  **extern auslösbare Write-Ingress** außer dem exakt gebundenen Probe-Ingress
+  bis zur vollständig bestandenen Probe-Verifikation aus Schritt 7 fail-closed
+  gesperrt;
 - vor dem ersten Canary-Read ist genau ein revisionsgebundener
   Datenstabilitätsmodus belegt:
   1. kontinuierliche Blue-zu-Green-Synchronisierung für PostgreSQL/Auth,
@@ -712,19 +715,29 @@ Die Sequenz ist fail-closed:
    Green-API-/Worker-Mutator freigegeben wird. Erst nach erfolgreicher Bindung
    der Grenze Green Writer-Autorität erteilen und die dafür erforderlichen
    Green-Mutatoren aktivieren. Alle **zustandsabhängigen Reads** müssen ab dann
-   Green erreichen; gewöhnliche öffentliche Writes bleiben weiterhin blockiert.
-   Blue darf ohne zusätzlich belegte Rückreplikation nur noch
+   Green erreichen. Jeder extern auslösbare Schreibpfad bleibt jedoch weiterhin
+   fail-closed gesperrt — ausdrücklich öffentliche/applikative Writes,
+   Operator-/Admin-Ingress, Automation/Batch/Maintenance und sonstige
+   nicht-Probe-Writer. **Genau eine Ausnahme** ist der revisionsgebundene
+   Probe-Ingress aus Schritt 7. Interne Green-Mutatoren dürfen nur soweit laufen,
+   wie sie für die Verarbeitung dieses Probe-Writes oder bereits gebundene
+   interne Nachzüge erforderlich sind; sie eröffnen keinen zweiten externen
+   Write-Ingress. Blue darf ohne zusätzlich belegte Rückreplikation nur noch
    statische/immutable Pfade bedienen;
 7. genau einen kontrollierten produktiven Probe-Write über den gebundenen
    Probe-Ingress ausführen und dessen Fachdatenzustand, Outbox-/Eventfortschritt,
-   JetStream sowie Such-/Projektionsnachzug vollständig zurücklesen. Interne
-   Green-Hintergrundmutationen, die nach Schritt 6 auftreten, liegen bereits
-   hinter der Write-Cutover-Grenze und unterliegen deshalb ebenfalls dem
-   Post-Write-Recoveryvertrag. Scheitert irgendein Teil des Probe-Readbacks,
-   werden gewöhnliche öffentliche Writes **nicht** freigegeben;
+   JetStream sowie Such-/Projektionsnachzug vollständig zurücklesen. Bis dieser
+   Readback vollständig bestanden und revisionsgebunden festgehalten ist, muss
+   der Fence aller nicht-Probe-Ingresspfade unverändert aktiv bleiben. Jede
+   persistente Green-Mutation, die über einen anderen externen Ingress ausgelöst
+   wird, ist ein harter Abbruch und fällt wie jede interne Green-Mutation nach
+   Schritt 6 unter den Post-Write-Recoveryvertrag. Scheitert irgendein Teil des
+   Probe-Readbacks, wird **kein** nicht-Probe-Write-Ingress freigegeben;
 8. **erst nach vollständig bestandenem Schritt 7** die Probe-Verifikation
-   revisionsgebunden festhalten, gewöhnliche öffentliche Writes auf Green
-   freigeben und deren Fehler-/Latenz-/Datenintegritätsgrenzen erneut beobachten;
+   revisionsgebunden festhalten und danach die zuvor gefenceten
+   nicht-Probe-Write-Ingresspfade gemäß dem gebundenen Cutover-Plan freigeben.
+   Gewöhnliche öffentliche Writes auf Green werden jetzt aktiviert und ihre
+   Fehler-/Latenz-/Datenintegritätsgrenzen erneut beobachtet;
 9. verbleibenden statischen/Edge-Traffic erst danach weiter stufenweise bis
    100 % verschieben; jede Stufe benötigt erneut ihr vollständiges
    Beobachtungsfenster.
