@@ -326,26 +326,60 @@ Ein lokaler Referenzproof, ein Produktionskandidat oder eine bloße
 Manifestexistenz darf diese separate Staging-Phase nicht ersetzen. Aus einer
 bestandenen Staging-Abnahme folgt außerdem **keine** Produktionsfreigabe.
 
+### B6 — Zwei-Betreiber-Aktivierungsvertrag fehlt
+
+T044 verlangt vor R6 den vorhandenen fail-closed Zwei-Betreiber-Zellvertrag als
+eigene Vorstufe. Kanonisch sind
+`platform/cell-pilot/two-operator-pilot.contract.json` und
+`scripts/platform/validate_two_operator_pilot.py`.
+
+Das Gate ist erst geschlossen, wenn für **dieselbe gewünschte Release-Revision**
+ein konkretes Aktivierungsdokument vorliegt und folgende Evidenz gemeinsam
+gebunden ist:
+
+- `document_mode=activation` und `activation.approved=true`;
+- `activation.source_commit` entspricht der gewünschten Release-Revision und
+  bindet über den Vertrag beide Zellen auf denselben Source-Commit sowie
+  dieselben API-/Web-Image-Digests;
+- `activation.approved_by` enthält beide Operator-IDs; kein Einzeloperator darf
+  die Aktivierung allein attestieren;
+- Identitäts-, Peer-, Egress-, DNS/TLS-, Backup-/Restore-, Betriebs-,
+  Upgrade-/Rollback- und Mutual-Proof-Receipts sind konkret und eindeutig;
+- der Aktivierungsbeleg besteht
+  `python3 scripts/platform/validate_two_operator_pilot.py <activation.json> --mode activation`;
+- **zusätzlich** sind sämtliche referenzierten Receipts gegen ihre externen
+  Autoritäten verifiziert und gegen ein autoritatives Replay-Ledger geprüft.
+
+Der statische Validator beweist ausdrücklich **keine** Aktivierungsbereitschaft,
+Operatorunabhängigkeit oder externe Receipt-Gültigkeit. Ein nur strukturell
+gültiges Dokument, bloße SHA-256-Werte oder das vorhandene `.invalid`-Beispiel
+schließen B6 deshalb nicht. Fehlt auch nur ein Teil der gemeinsamen Freigabe
+oder externen Receipt-/Replay-Verifikation, bleibt R6 BLOCKED.
+
 ## 7. Eintrittsgates für R6
 
 R6 darf erst starten, wenn **alle** folgenden Bedingungen erfüllt sind:
 
-1. die separate reale Staging-Phase aus B5 ist für die gewünschte Release-Revision
+1. der Zwei-Betreiber-Aktivierungsvertrag aus B6 ist für die gewünschte
+   Release-Revision vollständig bestanden: gemeinsame Freigabe beider
+   Operatoren, `--mode activation` erfolgreich, externe Receipt-Verifikation
+   vollständig und autoritatives Replay-Ledger ohne Konflikt;
+2. die separate reale Staging-Phase aus B5 ist für die gewünschte Release-Revision
    live beobachtet und mit externer Secretbereitstellung, digestgebundener
    Promotion, produktionsnaher Last sowie Backup-/Restore-/Recovery-Evidenz
    erfolgreich abgenommen;
-2. ein konkretes Produktions-Green ist identifiziert und live beobachtet;
-3. dessen Kapazität und Fehlerdomäne sind dokumentiert;
-4. Current Main und gewünschte Release-Revision sind erneut frisch bestimmt;
-5. digestgebundene API-/Web-Promotion für die gewünschte Revision liegt vor;
-6. Search/Ollama/Schauwerk/Basemap/Auth sind jeweils als
+3. ein konkretes Produktions-Green ist identifiziert und live beobachtet;
+4. dessen Kapazität und Fehlerdomäne sind dokumentiert;
+5. Current Main und gewünschte Release-Revision sind erneut frisch bestimmt;
+6. digestgebundene API-/Web-Promotion für die gewünschte Revision liegt vor;
+7. Search/Ollama/Schauwerk/Basemap/Auth sind jeweils als
    Kubernetes-native, explizit extern oder retired entschieden und belegt;
-7. Green kann aktuelle Produktionsdaten aufnehmen, ohne Blue-Writer zu berühren;
-8. frisches Blue-Backup und konkreter Restorepfad sind belegt;
-9. Pre-Write-Rollback auf Blue und Post-Write-Recovery mit
-   Reverse-Reconciliation plus erneutem Writer-Fencing sind getrennt belegt;
-10. keine fremde T044-/Produktionswriter-Lane ist aktiv;
-11. keine reale Produktionsmutation wurde aus einem älteren Preflight abgeleitet.
+8. Green kann aktuelle Produktionsdaten aufnehmen, ohne Blue-Writer zu berühren;
+9. frisches Blue-Backup und konkreter Restorepfad sind belegt;
+10. Pre-Write-Rollback auf Blue und Post-Write-Recovery mit
+    Reverse-Reconciliation plus erneutem Writer-Fencing sind getrennt belegt;
+11. keine fremde T044-/Produktionswriter-Lane ist aktiv;
+12. keine reale Produktionsmutation wurde aus einem älteren Preflight abgeleitet.
 
 ## 8. R6 — Generalprobe
 
