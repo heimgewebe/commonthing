@@ -48,7 +48,8 @@ def _construct_merge_tag(loader: yaml.SafeLoader, node: yaml.Node) -> MergeTag:
 for merge_tag in ("!reset", "!override"):
     ComposeLoader.add_constructor(merge_tag, _construct_merge_tag)
 
-API_ALIAS_PATH = ("services", "api", "networks", "default", "aliases")
+LEGACY_API_ALIAS = "weltgewebe-api"  # commonthing-naming: legacy
+LEGACY_API_ALIAS_PATH = ("services", "api", "networks", "default", "aliases")
 
 
 def load_compose(path: Path) -> object:
@@ -59,34 +60,40 @@ def load_compose(path: Path) -> object:
         return None
 
 
-# Stable internal DNS identity (docs/deploy/heimserver.integration.md, section 11):
-# Edge Caddy and Prometheus address the API as weltgewebe-api, never as a
-# Compose service suffix. Checked on the parsed alias list, not by text search,
-# because the API image name contains the same word.
+# Transitional compatibility contract (docs/deploy/commonthing.naming.md):
+# commonThing is canonical, but current Edge Caddy and Prometheus consumers still
+# use LEGACY_API_ALIAS. Guard it only until those consumers migrate. Check the
+# parsed alias list, not text, because the legacy API image contains the same word.
 if prod.is_file():
     node: object = load_compose(prod)
-    for key in API_ALIAS_PATH:
+    for key in LEGACY_API_ALIAS_PATH:
         node = node.get(key) if isinstance(node, dict) else None
-    if not isinstance(node, list) or "weltgewebe-api" not in node:
+    if not isinstance(node, list) or LEGACY_API_ALIAS not in node:
         failures.append(
-            "infra/compose/compose.prod.yml: services.api.networks.default.aliases must list 'weltgewebe-api'"
+            "infra/compose/compose.prod.yml: services.api.networks.default.aliases "
+            f"must retain legacy compatibility alias {LEGACY_API_ALIAS!r}"
         )
 
-# weltgewebe-up deploys compose.prod.yml plus an override. Compose merges plain
-# alias lists, but !reset or !override anywhere on the alias path, or a
-# network_mode, removes the alias from the deployed model.
+# Legacy deploy entrypoint `scripts/weltgewebe-up`.  # commonthing-naming: legacy
+# It deploys compose.prod.yml plus an override. Compose merges plain alias lists,
+# but !reset or !override anywhere on the alias path, or a network_mode, can
+# remove the compatibility alias from the deployed model.
 for overlay in sorted(compose_dir.glob("compose.*.override.y*ml")):
     rel = overlay.relative_to(root)
     node = load_compose(overlay)
-    for depth, key in enumerate(API_ALIAS_PATH):
+    for depth, key in enumerate(LEGACY_API_ALIAS_PATH):
         node = node.get(key) if isinstance(node, dict) else None
         if isinstance(node, MergeTag):
             failures.append(
-                f"{rel}: {node.tag} on {'.'.join(API_ALIAS_PATH[: depth + 1])} can drop the 'weltgewebe-api' alias"
+                f"{rel}: {node.tag} on {'.'.join(LEGACY_API_ALIAS_PATH[: depth + 1])} "
+                f"can drop legacy compatibility alias {LEGACY_API_ALIAS!r}"
             )
             break
         if depth == 1 and isinstance(node, dict) and "network_mode" in node:
-            failures.append(f"{rel}: services.api.network_mode drops the 'weltgewebe-api' alias")
+            failures.append(
+                f"{rel}: services.api.network_mode drops legacy compatibility alias "
+                f"{LEGACY_API_ALIAS!r}"
+            )
 
 image_re = re.compile(r"^\s*image:\s*([^\s#]+)")
 digest_re = re.compile(r"@sha256:[0-9a-f]{64}$")
@@ -160,6 +167,6 @@ if failures:
     raise SystemExit(1)
 print(
     "PASS: all external Compose images are digest-pinned, the API tag is fail-closed"
-    " and the API keeps its weltgewebe-api alias"
+    " and the API keeps its required legacy compatibility alias"
 )
 PY
