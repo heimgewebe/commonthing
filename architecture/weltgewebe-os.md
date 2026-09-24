@@ -1,5 +1,5 @@
 ---
-id: architecture.weltgewebe-os
+id: architecture.weltgewebe-os-verweis
 title: Frühere Adresse der Zielarchitektur (Verweis)
 doc_type: reference
 status: superseded

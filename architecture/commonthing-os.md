@@ -1,5 +1,5 @@
 ---
-id: architecture.commonthing-os
+id: architecture.weltgewebe-os
 title: commonThing OS — kanonische Zielarchitektur
 summary: Verbindliche langfristige Architektur für ein föderiertes, lokal souveränes und global verbundenes Koordinationssystem.
 role: norm

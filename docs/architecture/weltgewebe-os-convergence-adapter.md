@@ -12,7 +12,7 @@ owner: governance
 last_reviewed: 2026-07-16
 review_after: 2026-10-16
 depends_on:
-  - architecture.commonthing-os
+  - architecture.weltgewebe-os
   - docs.specs.federation-core
 relations:
   - type: relates_to

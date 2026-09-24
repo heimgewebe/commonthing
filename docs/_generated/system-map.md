@@ -15,8 +15,8 @@ Source: scripts/docmeta/generate_system_map.py
 
 |id|path|role|organ|status|last_reviewed|depends_on|verifies_with|missing_scripts|
 |---|---|---|---|---|---|---|---|---|
-|architecture.commonthing-os|architecture/commonthing-os.md|norm|governance|canonical|2026-07-15|overview|||
 |architecture.semantic-search|architecture/semantic-search.md|norm|product-domain|canonical|2026-07-19|overview, architecture.weltgewebe-os, specs.garnrolle-knoten-faden|contracts/search/examples/hybrid-ranking-core.heim-pc.json, contracts/search/examples/postgres-foundation.heim-pc.json, contracts/search/examples/relevance-benchmark.heim-pc.json, contracts/search/examples/relevance-goldset.example.json, contracts/search/hybrid-ranking-core-receipt.schema.json, contracts/search/postgres-foundation-receipt.schema.json, contracts/search/postgres-foundation.down.sql, contracts/search/postgres-foundation.up.sql, contracts/search/relevance-goldset.schema.json, scripts/ci/tests/test_semantic_search_contract.py, scripts/ci/tests/test_semantic_search_postgres_foundation.py, scripts/ci/tests/test_semantic_search_ranking_core.py, scripts/search/benchmark_relevance.py, scripts/search/hybrid_ranking_core.py, scripts/search/probe_hybrid_ranking_core.py, scripts/search/probe_postgres_foundation.py, scripts/search/validate_relevance_goldset.py||
+|architecture.weltgewebe-os|architecture/commonthing-os.md|norm|governance|canonical|2026-07-15|overview|||
 |docmeta.schema|architecture/docmeta.schema.md|norm|docmeta|canonical|2026-06-09||scripts/docmeta/check_doc_review_age.py, scripts/docmeta/check_repo_index_consistency.py, scripts/docmeta/generate_system_map.py, scripts/docmeta/validate_relations.py||
 |overview|architecture/overview.md|norm|governance|canonical|2026-07-11||||
 |security|architecture/security.md|norm|governance|canonical|2026-07-11||||
@@ -38,7 +38,7 @@ Source: scripts/docmeta/generate_system_map.py
 
 |id|path|role|organ|status|last_reviewed|depends_on|verifies_with|missing_scripts|
 |---|---|---|---|---|---|---|---|---|
-|docs.specs.federation-core|docs/specs/federation-core.md|norm|governance|canonical|2026-07-15|architecture.commonthing-os|||
+|docs.specs.federation-core|docs/specs/federation-core.md|norm|governance|canonical|2026-07-15|architecture.weltgewebe-os|||
 |docs.specs.federation-wire-v1|docs/specs/federation-wire-v1.md|norm|platform|canonical|2026-07-20|docs.specs.federation-core|||
 |specs.garnrolle-knoten-faden|docs/specs/garnrolle-knoten-faden.md|norm|product-domain|canonical|2026-08-02||apps/api/tests/api_accounts.rs, apps/api/tests/api_governance_guards.rs, apps/api/tests/db_domain_edge_write_path.rs, apps/api/tests/db_node_conversations.rs, apps/web/src/lib/demo/resolvers.test.ts, apps/web/tests/garnrolle-relations.spec.ts, apps/web/tests/garnrolle-self-service.spec.ts, apps/web/tests/komposition.spec.ts, contracts/domain/account.schema.json, contracts/domain/edge.schema.json, contracts/domain/node.schema.json||
 |specs.governance-antraege|docs/specs/governance-antraege.md|norm|governance|canonical|2026-08-16|specs.garnrolle-knoten-faden|apps/api/tests/api_governance_guards.rs, apps/api/tests/db_governance.rs, apps/web/src/lib/api/governance.test.ts, apps/web/tests/governance.spec.ts, apps/web/tests/proofs/governance-full-flow.proof.ts||
