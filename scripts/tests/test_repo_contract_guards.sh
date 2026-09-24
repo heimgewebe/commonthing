@@ -19,7 +19,7 @@ services:
     networks:
       default:
         aliases:
-          - weltgewebe-api
+          - weltgewebe-api  # commonthing-naming: legacy
 EOF
 cat > "$TMP_ROOT/infra/compose/compose.vps.override.yml" << 'EOF'
 services:
@@ -38,11 +38,11 @@ cat > "$TMP_ROOT/infra/schauwerk-editor/release-lock.json" << 'EOF'
 EOF
 REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null
 
-# The image name also contains weltgewebe-api; a renamed alias must still fail.
+# The legacy API image still contains the same alias text; renaming the alias must fail.
 cp "$TMP_ROOT/infra/compose/compose.prod.yml" "$TMP_ROOT/compose.prod.yml.valid"
-sed -i 's/^          - weltgewebe-api$/          - weltgewebe-api-legacy/' "$TMP_ROOT/infra/compose/compose.prod.yml"
+sed -i 's/^          - weltgewebe-api.*$/          - other-name/' "$TMP_ROOT/infra/compose/compose.prod.yml"
 if REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null 2>&1; then
-  echo "ERROR: compose-image-guard accepted a production API without the weltgewebe-api alias" >&2
+  echo "ERROR: compose-image-guard accepted a production API without the required legacy API alias" >&2
   exit 1
 fi
 mv "$TMP_ROOT/compose.prod.yml.valid" "$TMP_ROOT/infra/compose/compose.prod.yml"
@@ -65,7 +65,7 @@ cat >> "$TMP_ROOT/infra/compose/compose.vps.override.yml" << 'EOF'
           - other-name
 EOF
 if REPO_ROOT="$TMP_ROOT" bash "$COMPOSE_IMAGE_GUARD" > /dev/null 2>&1; then
-  echo "ERROR: compose-image-guard accepted an override that replaces the weltgewebe-api alias" >&2
+  echo "ERROR: compose-image-guard accepted an override that replaces the required legacy API alias" >&2
   exit 1
 fi
 cp "$TMP_ROOT/compose.vps.override.yml.valid" "$TMP_ROOT/infra/compose/compose.vps.override.yml"
