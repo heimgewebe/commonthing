@@ -322,6 +322,9 @@ export DEPLOY_FRONTEND_MODE="off"
 # The exact isolated CSP the Schaubild postflight requires from /schaubild/.
 export MOCK_SCHAUBILD_CSP="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src 'self' https://embed.diagrams.net; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
 
+# Tests 1-19 exercise the production VPS contract regardless of caller environment.
+export DEPLOY_TARGET="vps"
+
 REPO_DIR=$(pwd)
 export REPO_DIR
 export ENV_FILE="$REPO_DIR/test.env"
