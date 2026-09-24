@@ -6,7 +6,7 @@ status: active
 canonicality: operational
 lifecycle_state: active
 owner_task: WELTGEWEBE-OS-V1-T044
-last_reviewed: 2026-09-23
+last_reviewed: 2026-09-24
 review_after: 2026-10-07
 summary: >
   Revisionsgebundener R5-Preflight für den Wechsel von Compose/Caddy-Blue auf
@@ -244,6 +244,30 @@ Für T044 fehlt ein konkret beobachtbares Produktionsziel mit mindestens:
 
 Bis diese Zielidentität feststeht, wird **keine** Produktions-Kubernetes-Topologie
 aus der lokalen Staging-Implementierung extrapoliert.
+
+Frischer Gegencheck vom 24.09.2026:
+
+- Die SSH-Ziele `wg-prod-1` und `commonserver` lösen beide auf `94.16.121.119:22`
+  mit demselben Operatorbenutzer auf; beide Live-Probes melden den Hostnamen
+  `commonserver`. Sie sind damit zwei Namen für denselben beobachteten
+  Produktionshost und **kein** getrenntes Green-Ziel.
+- Auf dem exakten Public-Main `04f182c2ce8a9269c520719166e04aa13d8c7178`
+  existiert kein `platform/clusters/production`. Deklarierte Clusterkompositionen
+  sind `local`, `staging` und `ha`.
+- `platform/apps/weltgewebe/overlays/production` ist ein Anwendungs-Overlay;
+  seine Existenz belegt keinen provisionierten oder betriebsbereiten
+  Produktionscluster.
+- Ein In-place-Wechsel auf `commonserver` bleibt ein möglicher Alternativpfad,
+  ist aber **nicht freigegeben oder belegt**. Vor einer solchen Festlegung
+  müssten mindestens Kapazität unter realer Blue-Last, Port-/Edge-Kollisionen,
+  Storage-Isolation, progressive Traffic-Steuerung, Writer-Fencing, Search/Ollama,
+  Rollback und Recovery auf demselben Host separat bewiesen werden.
+
+Damit ist B1 nach dem Gegencheck enger: Es fehlt nicht nur die Zielidentität auf
+dem Papier; im heute registrierten und erreichbaren Bestand wurde **kein zweiter
+externer Green-Host gefunden**. Daraus folgt weder die Erlaubnis, neue
+kostenpflichtige Infrastruktur zu beschaffen, noch die Freigabe für einen
+In-place-Cutover.
 
 ### B2 — Semantic-Search-Parität fehlt
 
