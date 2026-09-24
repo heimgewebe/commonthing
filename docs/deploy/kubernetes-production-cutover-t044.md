@@ -383,7 +383,37 @@ R6 darf erst starten, wenn **alle** folgenden Bedingungen erfüllt sind:
 
 ## 8. R6 — Generalprobe
 
-Zuerst read-only:
+### R6-Request-Safety-Gate
+
+**Vor der ersten R6-Anfrage überhaupt** wird jede benötigte Vergleichs- und
+Readback-Klasse für die exakte Green-Revision samt aktiver Konfiguration
+revisionsgebunden klassifiziert. Die Bezeichnung `read-only` ist dabei kein
+Name, sondern eine zu beweisende Wirkungseigenschaft.
+
+Eine Requestklasse darf nur dann als **read-only** gegen den späteren
+Produktionskandidaten ausgeführt werden, wenn belegt ist, dass sie weder direkt
+noch über Worker, Retry-/Cleanup-Pfade oder ausgelöste Folgearbeit
+
+- PostgreSQL-Fachdaten, Auth-/Session-/Token-/Credential-Zustand,
+  Outbox/Consumption, JetStream oder Suchjobs/-projektionen/-indexgenerationen
+  persistent verändert;
+- noch Web Push, SMTP/Magic-Link/Step-up-Mail, Federation, Webhooks, Callbacks
+  oder andere externe Delivery auslösen kann.
+
+Insbesondere sind Login-/Magic-Link-Anfragen, Auto-Provisioning,
+credential-/sessionverändernde Auth-Flows und andere Endpunkte mit möglicher
+Persistenz- oder Delivery-Wirkung **nicht** allein deshalb read-only, weil sie in
+einem Auth-Readback verwendet werden. Für solche Klassen ist entweder ein
+nachweislich nebenwirkungsfreier Inspektions-/Readiness-Pfad zu verwenden oder
+vor ihrer Ausführung der unten definierte isolierte Rehearsal-Zustand samt
+External-Side-Effect-Fence herzustellen.
+
+Kann für eine der benötigten Klassen weder Nebenwirkungsfreiheit noch ein
+isolierter und extern gefenceter Rehearsal-Pfad bewiesen werden, bleibt **R6
+insgesamt BLOCKED**; die betreffende Prüfung darf nicht still übersprungen oder
+als read-only umetikettiert werden.
+
+Erst nach diesem Gate werden die benötigten Vergleiche ausgeführt:
 
 1. Web
 2. API
@@ -396,12 +426,14 @@ Zuerst read-only:
 
 ### R6-Write-Isolation und Cleanup
 
-Die read-only-Vergleiche dürfen gegen den späteren Produktionskandidaten laufen.
-**Kontrollierte Testwrites dürfen dessen späteren produktiven Daten- und
-Ereignisstand dagegen nicht verunreinigen.**
+Nur revisionsgebunden als nebenwirkungsfrei belegte Readbacks dürfen unmittelbar
+gegen den späteren Produktionskandidaten laufen. **Jede mutierende oder nicht
+als nebenwirkungsfrei belegte R6-Anfrage** wird als Rehearsal-Mutation behandelt
+und darf dessen späteren produktiven Daten-, Ereignis- oder externen
+Wirkungszustand nicht verunreinigen.
 
-Vor dem ersten R6-Testwrite muss für **jeden betroffenen persistenten Zustand**
-ein zielplattformgebundener Isolations- oder vollständiger
+Vor der ersten solchen R6-Anfrage muss für **jeden betroffenen persistenten
+Zustand** ein zielplattformgebundener Isolations- oder vollständiger
 Rücksetzungsnachweis vorliegen. Er umfasst mindestens:
 
 - PostgreSQL-Fachdaten und gegebenenfalls Auth-Zustand;
@@ -411,12 +443,12 @@ Rücksetzungsnachweis vorliegen. Er umfasst mindestens:
 - eindeutige Testobjekt- und Korrelationskennungen sowie einen gebundenen
   Ausgangszustand.
 
-Zusätzlich gilt eine eigenständige **External-Side-Effect-Fence**. Vor dem
-ersten R6-Testwrite wird für die exakte Green-Revision und ihre aktive
-Konfiguration revisionsgebunden inventarisiert, welche Pfade die
-Rehearsal-Grenze nach außen verlassen und dort nicht vollständig rücksetzbare
-Wirkung erzeugen können. Dazu gehören mindestens, soweit in dieser Revision
-aktivierbar oder aktiviert:
+Zusätzlich gilt eine eigenständige **External-Side-Effect-Fence**. Bereits
+vor der ersten aktiven R6-Probe wird für die exakte Green-Revision und ihre
+aktive Konfiguration revisionsgebunden inventarisiert, welche Request-, Worker-,
+Retry-, Cleanup- oder Delivery-Pfade die Rehearsal-Grenze nach außen verlassen
+und dort nicht vollständig rücksetzbare Wirkung erzeugen können. Dazu gehören
+mindestens, soweit in dieser Revision aktivierbar oder aktiviert:
 
 - Web-Push-/Notification-Delivery;
 - SMTP-/Magic-Link-/Step-up-Mail;
@@ -424,8 +456,8 @@ aktivierbar oder aktiviert:
 - weitere release-spezifische Webhook-, Message-, Mail- oder externe
   Delivery-/Callback-Pfade.
 
-Jeder inventarisierte externe Seiteneffektpfad muss **vor** dem ersten
-Testwrite genau einen belegten Zustand haben:
+Jeder inventarisierte externe Seiteneffektpfad muss **vor jeder R6-Anfrage,
+die ihn erreichen oder auslösen könnte**, genau einen belegten Zustand haben:
 
 1. technisch fail-closed deaktiviert, sodass zugehöriger Worker, Transport und
    Egress kein externes Ziel erreichen können; **oder**
@@ -439,11 +471,12 @@ ausdrücklich **kein** Isolationsbeweis. Solche Daten dürfen nur vorhanden sein
 wenn der zugehörige externe Pfad trotzdem technisch gefenced ist und eine reale
 Produktionszustellung fail-closed unmöglich bleibt.
 
-Das Side-Effect-Gate verlangt vor dem Testwrite mindestens einen gemeinsamen
-Readback aus Runtime-Konfiguration, Worker-/Delivery-Zustand und
-Netzwerk-/Egressentscheidung. Ist ein externer Wirkungspfad unbekannt, nicht
-inventarisiert oder kann er noch ein Produktionsziel erreichen, bleibt R6 für
-Writes BLOCKED und die Generalprobe read-only.
+Das Side-Effect-Gate verlangt vor der ersten betroffenen R6-Anfrage mindestens
+einen gemeinsamen Readback aus Runtime-Konfiguration, Worker-/Delivery-Zustand
+und Netzwerk-/Egressentscheidung. Ist ein externer Wirkungspfad unbekannt,
+nicht inventarisiert oder kann er noch ein Produktionsziel erreichen, bleibt
+**R6 insgesamt BLOCKED**. Eine Anfrage mit unbewiesener Persistenz- oder
+Delivery-Wirkung darf nicht als read-only fortgeführt werden.
 
 Bevorzugt wird ein **disposable/isolierter Rehearsal-Datenpfad** derselben
 Revision und Konfiguration, zum Beispiel über eine getrennte Datenkopie,
@@ -452,7 +485,7 @@ zielplattformnative Trennung. Eine bloße Löschung des fachlichen Testobjekts
 genügt ausdrücklich nicht, wenn append-only Ereignisse, Sequenzen oder
 Projektionen zurückbleiben.
 
-Nach der Write-Generalprobe gilt fail-closed:
+Nach jeder mutierenden oder isolierten R6-Generalprobe gilt fail-closed:
 
 1. der isolierte Rehearsal-Zustand wird vollständig verworfen oder jeder
    betroffene Store nachweislich auf den gebundenen Ausgangszustand
@@ -493,11 +526,14 @@ produktiv aus:
 Blue Writer
   -> Fencing-/Blockiermechanismus revisionsgebunden beweisen
   -> finalen Konvergenz- und Green-Readback-Pfad beweisen
-  -> kontrollierten Green-Probe-Write-Pfad beweisen
+  -> kontrollierten Green-Probe-Write-Pfad ohne produktive Ausführung beweisen
   -> Blue bleibt alleiniger Writer
 ```
 
-R7 endet ausdrücklich **ohne** Writer-Transfer. Blue bleibt bis zur in R8
+R7 endet ausdrücklich **ohne** Writer-Transfer und ohne persistenten
+Green-Probe-Write. Der Probe-Pfad wird hier nur hinsichtlich Routing, Fencing,
+Isolation und erwarteter Readbacks belegt; seine produktive Ausführung erfolgt
+erst in R8 hinter der Write-Cutover-Grenze. Blue bleibt bis zur in R8
 definierten Writer-Transition alleinige Schreibautorität. Keine Phase darf Blue
 und Green gleichzeitig als unabhängige Writer zulassen.
 
@@ -567,15 +603,28 @@ Canary-Plan festgehalten. Er enthält mindestens:
 - jede als read-only bezeichnete Requestklasse ist vorab als frei von
   persistenten Nebenwirkungen auf PostgreSQL/Auth-Session, Outbox/Consumption,
   JetStream und Suche belegt;
-- der Green-Canary-Pfad ist bis zur Writer-Transition technisch
-  **write-inhibited**; jeder persistente Green-Writeversuch muss fail-closed
-  scheitern und den Canary stoppen;
+- der Green-Canary-Pfad ist bis zur Writer-Transition für **öffentliche,
+  applikative, operatorische und Green-interne Hintergrundmutatoren**
+  write-inhibited. Ein persistenter Green-Write außerhalb der nachfolgend für
+  Modus 1 exakt gebundenen Replikationsausnahme muss fail-closed scheitern und
+  den Canary stoppen;
 - vor dem ersten Canary-Read ist genau ein revisionsgebundener
   Datenstabilitätsmodus belegt:
   1. kontinuierliche Blue-zu-Green-Synchronisierung für PostgreSQL/Auth,
      Outbox/Consumption, JetStream und Suche mit gemessener Lag-Grenze und
-     automatischem Canary-Abbruch bei deren Überschreitung. Zusätzlich ist für
-     die spätere Writer-Transition ein revisionsgebundener Stop-Pfad belegt:
+     automatischem Canary-Abbruch bei deren Überschreitung. **Genau ein**
+     Blue-zu-Green-Replikationswriter darf dabei als einzige persistente
+     Green-Mutationsausnahme aktiv sein. Vor dem Canary werden seine Identität,
+     Source, Ziel und eine mechanismusspezifische, wildcardfreie Allowlist der
+     von ihm veränderbaren Stores/Tabellen bzw. Schemas, Streams/
+     Consumerpositionen und Such-/Indexgenerationen revisionsgebunden
+     festgehalten. Jeder Apply wird dieser Identität und Allowlist zugerechnet;
+     jede Green-Mutation durch einen anderen Writer oder außerhalb der Allowlist
+     stoppt den Canary. Green-API-Writer, Outbox-/Notification-/Receipt-Worker,
+     Retry-/Cleanup-/Fristen-Sweeper und Search-Worker bleiben gefenced, sofern
+     sie nicht selbst der ausdrücklich gebundene Replikationsmechanismus sind.
+     Zusätzlich ist für die spätere Writer-Transition ein revisionsgebundener
+     Stop-Pfad belegt:
      nach Fencing aller Blue-Zustandsmutatoren muss die Synchronisierung
      Zero-Lag erreichen, queued/in-flight Forward-Apply vollständig drainen und
      ihr Green-schreibender Replikationspfad explizit gefenced werden; **oder**
@@ -627,14 +676,19 @@ Die Sequenz ist fail-closed:
 2. Blue bleibt bis zur Writer-Transition alleinige Writer-Autorität. Nur die
    gebundene kleinste Canary-Kohorte bzw. Traffic-Fraktion wird für öffentliche
    Reads auf Green geroutet. In Modus 1 erreichen gewöhnliche Writes weiterhin
-   ausschließlich Blue; in Modus 2 darf **kein** Blue-Pfad persistenten Zustand
-   verändern. Green bleibt technisch write-inhibited;
-3. Web/API/Auth/Fachdaten/Search/Schauwerk/Basemap für die Canary-Stufe lesen,
-   die Abwesenheit persistenter Green-Writes prüfen und das vollständige
-   Beobachtungsfenster auswerten. Modus 1 verlangt zusätzlich fortlaufend
-   belegten Synchronisations-Lag innerhalb der Grenze; Modus 2 verlangt den
-   fortlaufenden Nachweis, dass alle gebundenen Blue-Quieszenzanker unverändert
-   sind. Jede unerwartete Änderung gilt als Write-Leak und stoppt den Canary;
+   ausschließlich Blue; auf Green bleiben alle Mutatoren außer dem exakt
+   gebundenen Replikationswriter gefenced. In Modus 2 darf **kein** Blue-Pfad
+   persistenten Zustand verändern und Green bleibt vollständig
+   write-inhibited;
+3. Web/API/Auth/Fachdaten/Search/Schauwerk/Basemap für die Canary-Stufe lesen
+   und das vollständige Beobachtungsfenster auswerten. Modus 1 verlangt
+   zusätzlich fortlaufend belegten Synchronisations-Lag innerhalb der Grenze
+   sowie einen Audit-Readback, dass **jede** persistente Green-Mutation vom
+   gebundenen Replikationswriter stammt und ausschließlich dessen erlaubte
+   Zielmenge betrifft; jede andere Green-Mutation gilt als Write-Leak und stoppt
+   den Canary. Modus 2 verlangt die vollständige Abwesenheit persistenter
+   Green-Writes sowie den fortlaufenden Nachweis, dass alle gebundenen
+   Blue-Quieszenzanker unverändert sind;
 4. Read-Traffic nur stufenweise erhöhen. Zwischen zwei Stufen müssen
    Beobachtungsfenster, SLOs, Datenfrische und fachliche Readbacks vollständig
    bestanden sein. Lag-Grenzverletzung, Änderung eines Quieszenzankers oder
