@@ -305,22 +305,47 @@ Produktionsdatenstand. Vor Writer-Fencing müssen PostgreSQL, JetStream,
 Suchprojektion und sonstiger persistenter Fachzustand aus Blue gegen das konkrete
 Green-Ziel abgeglichen werden.
 
+### B5 — echte Staging-Abnahme fehlt
+
+Das in §4 beobachtete `commonthing-staging` ist der lokale T084-Referenzcluster
+und erfüllt **nicht** das T044-Akzeptanzkriterium eines echten Staging-Clusters.
+
+Bevor R6 gegen einen Produktionskandidaten beginnen darf, muss eine vom lokalen
+Referenzcluster und vom Produktions-Green getrennte reale Staging-Umgebung live
+beobachtet und für die gewünschte Release-Revision erfolgreich abgenommen sein.
+Die revisionsgebundene Staging-Abnahme umfasst mindestens:
+
+- externe Secrets und deren Bereitstellungspfad;
+- commit-/digestgebundene Imagepromotion für API und Web;
+- produktionsnahe Last mit numerischen Pass/Fail-Grenzen;
+- Backup-, Restore- und Recovery-Probe samt gemessener Recovery-Evidenz;
+- fachliche Readbacks für Web, API, Auth, Fachdaten, Events/Projektionen und die
+  dort aktivierten Zusatzfähigkeiten.
+
+Ein lokaler Referenzproof, ein Produktionskandidat oder eine bloße
+Manifestexistenz darf diese separate Staging-Phase nicht ersetzen. Aus einer
+bestandenen Staging-Abnahme folgt außerdem **keine** Produktionsfreigabe.
+
 ## 7. Eintrittsgates für R6
 
 R6 darf erst starten, wenn **alle** folgenden Bedingungen erfüllt sind:
 
-1. ein konkretes Produktions-Green ist identifiziert und live beobachtet;
-2. dessen Kapazität und Fehlerdomäne sind dokumentiert;
-3. Current Main und gewünschte Release-Revision sind erneut frisch bestimmt;
-4. digestgebundene API-/Web-Promotion für die gewünschte Revision liegt vor;
-5. Search/Ollama/Schauwerk/Basemap/Auth sind jeweils als
+1. die separate reale Staging-Phase aus B5 ist für die gewünschte Release-Revision
+   live beobachtet und mit externer Secretbereitstellung, digestgebundener
+   Promotion, produktionsnaher Last sowie Backup-/Restore-/Recovery-Evidenz
+   erfolgreich abgenommen;
+2. ein konkretes Produktions-Green ist identifiziert und live beobachtet;
+3. dessen Kapazität und Fehlerdomäne sind dokumentiert;
+4. Current Main und gewünschte Release-Revision sind erneut frisch bestimmt;
+5. digestgebundene API-/Web-Promotion für die gewünschte Revision liegt vor;
+6. Search/Ollama/Schauwerk/Basemap/Auth sind jeweils als
    Kubernetes-native, explizit extern oder retired entschieden und belegt;
-6. Green kann aktuelle Produktionsdaten aufnehmen, ohne Blue-Writer zu berühren;
-7. frisches Blue-Backup und konkreter Restorepfad sind belegt;
-8. Pre-Write-Rollback auf Blue und Post-Write-Recovery mit
+7. Green kann aktuelle Produktionsdaten aufnehmen, ohne Blue-Writer zu berühren;
+8. frisches Blue-Backup und konkreter Restorepfad sind belegt;
+9. Pre-Write-Rollback auf Blue und Post-Write-Recovery mit
    Reverse-Reconciliation plus erneutem Writer-Fencing sind getrennt belegt;
-9. keine fremde T044-/Produktionswriter-Lane ist aktiv;
-10. keine reale Produktionsmutation wurde aus einem älteren Preflight abgeleitet.
+10. keine fremde T044-/Produktionswriter-Lane ist aktiv;
+11. keine reale Produktionsmutation wurde aus einem älteren Preflight abgeleitet.
 
 ## 8. R6 — Generalprobe
 
@@ -457,6 +482,16 @@ Canary-Plan festgehalten. Er enthält mindestens:
 - der Green-Canary-Pfad ist bis zur Writer-Transition technisch
   **write-inhibited**; jeder persistente Green-Writeversuch muss fail-closed
   scheitern und den Canary stoppen;
+- vor dem ersten Canary-Read ist genau ein revisionsgebundener
+  Datenstabilitätsmodus belegt:
+  1. kontinuierliche Blue-zu-Green-Synchronisierung für PostgreSQL/Auth,
+     Outbox/Consumption, JetStream und Suche mit gemessener Lag-Grenze und
+     automatischem Canary-Abbruch bei deren Überschreitung; **oder**
+  2. vollständige Pause beziehungsweise fail-closed-Blockade aller gewöhnlichen
+     öffentlichen Writes vom finalen Blue-zu-Green-Abgleich bis zum Ende des
+     Read-Canary;
+- ohne Beleg für Modus 1 gilt verpflichtend Modus 2; dessen maximale
+  Write-Pause-Dauer und Abort-/Rückkehraktion werden vorab gebunden;
 - der konkrete Routingmechanismus ist vor der ersten öffentlichen Wirkung
   zielplattformgebunden belegt und kann Canary-Stufe, weitere Inkremente und
   Abort deterministisch erzwingen;
@@ -466,28 +501,40 @@ Canary-Plan festgehalten. Er enthält mindestens:
   stufenspezifische Fehler-, Latenz- und Datenintegritäts-Abbruchbedingungen;
 - die konkrete Abort-/Recovery-Aktion für jede Stufe.
 
-Ohne einen zusätzlich belegten bidirektionalen Kohärenz-/Replikationspfad ist
-der öffentliche Canary **vor der Writer-Transition read-only**. Das ist
-absichtlich konservativ: Nach einem produktiven Green-Write wäre Blue sonst
-veraltet und dürfte nicht weiter zustandsabhängige Reads für den Resttraffic
-bedienen. Ein solcher Rückpfad wird hier nicht unterstellt.
+Read-only-Routing allein hält Green **nicht** frisch. Solange Blue Writes
+annimmt, darf Green zustandsabhängige Canary-Reads deshalb nur bedienen, wenn
+Modus 1 nachweislich läuft und innerhalb seiner Lag-Grenze bleibt. Ohne diesen
+Synchronisationsbeweis bleiben gewöhnliche öffentliche Writes während des
+gesamten Read-Canary blockiert. Ein unbelegter Zwischenzustand ist keine
+Canary-Option.
 
 Die Sequenz ist fail-closed:
 
-1. Green-Revision/Digests und einen frischen Blue-zu-Green-Datenabgleich prüfen;
-2. Blue bleibt alleiniger Writer; nur die gebundene kleinste Canary-Kohorte bzw.
-   Traffic-Fraktion für öffentliche Reads auf Green routen, während öffentliche
-   Writes weiterhin ausschließlich Blue erreichen und Green technisch
-   write-inhibited bleibt;
+1. Green-Revision/Digests prüfen und den Datenstabilitätsmodus aktivieren. Bei
+   Modus 2 werden gewöhnliche öffentliche Writes **vor** dem finalen
+   Blue-zu-Green-Abgleich blockiert; danach werden Daten-, Event- und
+   Projektionsgleichheit read-only bestätigt. Bei Modus 1 muss die laufende
+   Synchronisierung bereits vor dem ersten Canary-Read innerhalb der gebundenen
+   Lag-Grenze liegen;
+2. Blue bleibt bis zur Writer-Transition alleinige Writer-Autorität. Nur die
+   gebundene kleinste Canary-Kohorte bzw. Traffic-Fraktion wird für öffentliche
+   Reads auf Green geroutet. In Modus 1 erreichen gewöhnliche Writes weiterhin
+   ausschließlich Blue; in Modus 2 bleiben sie vollständig blockiert. Green
+   bleibt technisch write-inhibited;
 3. Web/API/Auth/Fachdaten/Search/Schauwerk/Basemap für die Canary-Stufe lesen,
-   Replikations-/Datenfrische sowie die Abwesenheit persistenter Green-Writes
-   prüfen und das vollständige Beobachtungsfenster auswerten;
-4. Read-Traffic nur stufenweise erhöhen; zwischen zwei Stufen müssen
+   die Abwesenheit persistenter Green-Writes prüfen und das vollständige
+   Beobachtungsfenster auswerten. Modus 1 verlangt zusätzlich fortlaufend
+   belegten Synchronisations-Lag innerhalb der Grenze; Modus 2 verlangt den
+   Nachweis, dass während des Fensters keine gewöhnlichen öffentlichen Writes
+   angenommen wurden;
+4. Read-Traffic nur stufenweise erhöhen. Zwischen zwei Stufen müssen
    Beobachtungsfenster, SLOs, Datenfrische und fachliche Readbacks vollständig
-   bestanden sein;
-5. erst nach bestandener Read-Canary-Sequenz die Writer-Transition beginnen:
-   **gewöhnliche öffentliche Writes vollständig anhalten oder fail-closed
-   blockieren**, final Blue nach Green konvergieren, Blue-Writer fencen,
+   bestanden sein. Lag-Grenzverletzung, Write-Leak oder Überschreitung der
+   gebundenen Write-Pause-Dauer stoppt den Canary vor der nächsten Stufe;
+5. erst nach bestandener Read-Canary-Sequenz die Writer-Transition beginnen.
+   Bei Modus 1 werden jetzt gewöhnliche öffentliche Writes vollständig
+   angehalten oder fail-closed blockiert; bei Modus 2 bleibt die bestehende
+   Blockade aktiv. Danach final Blue nach Green konvergieren, Blue-Writer fencen,
    Gleichheit auf Green zurücklesen und erst dann Green Writer-Autorität
    erteilen; die gewöhnliche öffentliche Green-Write-Freigabe bleibt dabei noch
    geschlossen;
@@ -544,8 +591,10 @@ Stand dieses R5-Preflights:
 - **Blue bleibt Produktion.**
 - **Blue bleibt alleiniger Writer.**
 - **T084-Staging bleibt Referenz, nicht Produktionsziel.**
+- **Die separate echte Staging-Abnahme aus B5 fehlt weiterhin.**
 - **Kein Traffic-/DNS-/Writer-Cutover.**
 - **Keine neue Plattformschicht.**
-- Nächster harter Hebel ist die konkrete, kapazitiv belegte
-  Produktions-Green-Zielidentität; anschließend werden die bereits belegten
-  Capability-Lücken gegen genau dieses Ziel geschlossen.
+- Nächster harter Hebel ist zuerst die reale Staging-Aktivierung samt
+  produktionsnaher Last-/Recovery-Evidenz. Erst danach folgt die konkrete,
+  kapazitiv belegte Produktions-Green-Zielidentität und die Schließung der
+  Capability-Lücken gegen genau dieses Ziel.
