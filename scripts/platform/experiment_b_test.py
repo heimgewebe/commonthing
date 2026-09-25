@@ -146,6 +146,10 @@ class ExperimentBContractTests(unittest.TestCase):
         self.assertIn("app.kubernetes.io/name: postgres", migration)
         self.assertIn("port: 5432", migration)
         self.assertNotIn("port: 4222", migration)
+        self.assertIn("kubernetes.io/metadata.name: kube-system", migration)
+        self.assertIn("port: 53", migration)
+        self.assertIn("protocol: UDP", migration)
+        self.assertIn("protocol: TCP", migration)
         self.assertIn("migration-postgres-egress.yaml", namespace_stage)
         self.assertNotIn("migration-postgres-egress", app_overlay)
 
