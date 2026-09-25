@@ -1,0 +1,10 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: weltgewebe-runtime
+data:
+  APP_BASE_URL: http://commonthing-experiment-b.invalid
+  AUTH_COOKIE_SECURE: "0"
+  AUTH_PUBLIC_LOGIN: "0"
+  NATS_URL: nats://nats.commonthing-data.svc.cluster.local:4222

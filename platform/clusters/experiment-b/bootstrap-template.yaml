@@ -1,0 +1,140 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: commonthing-experiment-b
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/heimgewebe/commonthing
+  ref:
+    commit: ${SOURCE_COMMIT}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: commonthing-experiment-b-release
+  namespace: flux-system
+data:
+  SOURCE_COMMIT: "${SOURCE_COMMIT}"
+  API_DIGEST: "${API_DIGEST}"
+  WEB_DIGEST: "${WEB_DIGEST}"
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: commonthing-experiment-b-namespaces
+  namespace: flux-system
+spec:
+  interval: 2m
+  retryInterval: 20s
+  timeout: 3m
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    name: commonthing-experiment-b
+  path: ./platform/clusters/experiment-b/namespaces
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: commonthing-experiment-b-data
+  namespace: flux-system
+spec:
+  interval: 2m
+  retryInterval: 20s
+  timeout: 5m
+  prune: true
+  wait: true
+  dependsOn:
+    - name: commonthing-experiment-b-namespaces
+  sourceRef:
+    kind: GitRepository
+    name: commonthing-experiment-b
+  path: ./platform/clusters/experiment-b/data
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: postgres
+      namespace: commonthing-data
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: nats
+      namespace: commonthing-data
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: commonthing-experiment-b-migration
+  namespace: flux-system
+spec:
+  interval: 2m
+  retryInterval: 20s
+  timeout: 8m
+  prune: true
+  wait: true
+  dependsOn:
+    - name: commonthing-experiment-b-data
+  sourceRef:
+    kind: GitRepository
+    name: commonthing-experiment-b
+  path: ./platform/clusters/experiment-b/migration
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: commonthing-experiment-b-release
+  healthChecks:
+    - apiVersion: batch/v1
+      kind: Job
+      name: commonthing-experiment-b-migration
+      namespace: commonthing-experiment-b
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: commonthing-experiment-b-app
+  namespace: flux-system
+spec:
+  interval: 2m
+  retryInterval: 20s
+  timeout: 5m
+  prune: true
+  wait: true
+  dependsOn:
+    - name: commonthing-experiment-b-migration
+  sourceRef:
+    kind: GitRepository
+    name: commonthing-experiment-b
+  path: ./platform/apps/weltgewebe/overlays/experiment-b
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: commonthing-experiment-b-release
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: weltgewebe-api
+      namespace: commonthing-experiment-b
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: weltgewebe-web
+      namespace: commonthing-experiment-b
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: commonthing-experiment-b-gateway
+  namespace: flux-system
+spec:
+  interval: 2m
+  retryInterval: 20s
+  timeout: 5m
+  prune: true
+  wait: true
+  dependsOn:
+    - name: commonthing-experiment-b-app
+  sourceRef:
+    kind: GitRepository
+    name: commonthing-experiment-b
+  path: ./platform/clusters/experiment-b/gateway
