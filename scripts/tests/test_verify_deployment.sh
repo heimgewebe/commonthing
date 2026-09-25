@@ -112,7 +112,7 @@ elif [[ "$1" == "compose" ]]; then
          if [[ "$ARGS" == *"--format json"* ]]; then
              # Render the Schaubild service the way Compose interpolates it from the
              # bindings weltgewebe-up exports, so the full-scope runtime contract holds.
-             printf '{"services": {"caddy": {}, "schaubild": {"image": "%s", "pull_policy": "missing", "read_only": true, "ports": [], "expose": ["8765"], "command": ["--bind-host", "0.0.0.0", "--trusted-reverse-proxy", "--trusted-proxy-source-cidr", "%s", "--public-base-path", "/schaubild"]}}}\n' \
+             printf '{"services": {"api": {"networks": {"default": {"aliases": ["weltgewebe-api"]}}}, "caddy": {}, "schaubild": {"image": "%s", "pull_policy": "missing", "read_only": true, "ports": [], "expose": ["8765"], "command": ["--bind-host", "0.0.0.0", "--trusted-reverse-proxy", "--trusted-proxy-source-cidr", "%s", "--public-base-path", "/schaubild"]}}}\n' \
                  "${SCHAUWERK_SCHAUBILD_IMAGE:-}" "${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-}"
          else
              echo "services: {}"
