@@ -7,7 +7,7 @@
   "vm": {
     "name": "commonthing-experiment-b",
     "vcpu": 6,
-    "memory_mib": 10240,
+    "memory_mib": 12288,
     "disk_gib": 60,
     "network": "default",
     "network_mode": "nat-only",
@@ -53,6 +53,21 @@
     "runtime_secret": "weltgewebe-runtime",
     "registry_secret": "commonthing-experiment-b-registry",
     "registry_required": true
+  },
+  "semantic_search": {
+    "topology": "api-pod-sidecars",
+    "api_replicas": 1,
+    "provider": "local:ollama",
+    "ollama_url": "http://127.0.0.1:11434/",
+    "ollama_image": "ollama/ollama:0.12.6@sha256:352e045b937ac29d3d9550c22fb85525f60a89e064df34c26579bee5a93b3a16",
+    "model_id": "qwen3-embedding:4b",
+    "model_revision": "sha256:df5bd2e3c74cd8d069d21dc038f1b359fcdc9458fce1c99bd43c9eb1518ff907",
+    "runtime_identity": "ollama:0.12.6@http://127.0.0.1:11434",
+    "dimension": 2560,
+    "generation_id": "search-gen-2e8358273aa6d41e6a59025985a99738614aba725b8f369b3a54f390f8752e5c",
+    "model_storage_class": "local-path",
+    "model_storage_gib": 10,
+    "contract": "preserve-literal-loopback; no clusterwide provider service"
   },
   "runtime_binding": {
     "template": "platform/clusters/experiment-b/bootstrap-template.yaml",

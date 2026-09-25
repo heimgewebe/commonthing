@@ -118,6 +118,28 @@ def validate_config(config: dict[str, Any]) -> None:
     if external_secrets.get("registry_required") is not True:
         raise ContractError("Experiment-B GHCR pull secret must remain required")
 
+    semantic = config.get("semantic_search", {})
+    expected_semantic = {
+        "topology": "api-pod-sidecars",
+        "api_replicas": 1,
+        "provider": "local:ollama",
+        "ollama_url": "http://127.0.0.1:11434/",
+        "ollama_image": "ollama/ollama:0.12.6@sha256:352e045b937ac29d3d9550c22fb85525f60a89e064df34c26579bee5a93b3a16",
+        "model_id": "qwen3-embedding:4b",
+        "model_revision": "sha256:df5bd2e3c74cd8d069d21dc038f1b359fcdc9458fce1c99bd43c9eb1518ff907",
+        "runtime_identity": "ollama:0.12.6@http://127.0.0.1:11434",
+        "dimension": 2560,
+        "generation_id": "search-gen-2e8358273aa6d41e6a59025985a99738614aba725b8f369b3a54f390f8752e5c",
+        "model_storage_class": "local-path",
+        "model_storage_gib": 10,
+    }
+    if any(semantic.get(key) != value for key, value in expected_semantic.items()):
+        raise ContractError("Experiment-B semantic-search contract drifted")
+    if semantic.get("contract") != "preserve-literal-loopback; no clusterwide provider service":
+        raise ContractError("Experiment-B semantic-search boundary drifted")
+    if int(vm.get("memory_mib", 0)) != 12288:
+        raise ContractError("semantic-search Experiment B requires the pinned 12 GiB VM")
+
     forbidden = config.get("forbidden", {})
     required_forbidden = {
         "kind",

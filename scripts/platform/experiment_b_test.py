@@ -18,6 +18,9 @@ class ExperimentBContractTests(unittest.TestCase):
         eb.validate_config(config)
         self.assertEqual(config["vm"]["network_mode"], "nat-only")
         self.assertEqual(config["vm"]["host_mounts"], [])
+        self.assertEqual(config["vm"]["vcpu"], 6)
+        self.assertEqual(config["vm"]["memory_mib"], 12288)
+        self.assertEqual(config["vm"]["disk_gib"], 60)
         self.assertEqual(config["kubernetes"]["version"], "v1.36.1+k3s1")
         self.assertIn("--flannel-backend=none", config["kubernetes"]["server_flags"])
         self.assertIn("--disable-kube-proxy", config["kubernetes"]["server_flags"])
@@ -95,6 +98,32 @@ class ExperimentBContractTests(unittest.TestCase):
         self.assertEqual(images.count("commonthing-experiment-b-registry"), 2)
         migration = (CLUSTER / "migration/job.yaml").read_text(encoding="utf-8")
         self.assertIn("commonthing-experiment-b-registry", migration)
+
+    def test_semantic_search_preserves_literal_loopback_contract(self) -> None:
+        config = json.loads((CLUSTER / "config.json").read_text(encoding="utf-8"))
+        semantic = config["semantic_search"]
+        patch = (OVERLAY / "semantic-search-patch.yaml").read_text(encoding="utf-8")
+        runtime = (OVERLAY / "config-map-patch.yaml").read_text(encoding="utf-8")
+        storage = (OVERLAY / "semantic-search-storage.yaml").read_text(encoding="utf-8")
+
+        self.assertEqual(semantic["topology"], "api-pod-sidecars")
+        self.assertEqual(semantic["api_replicas"], 1)
+        self.assertEqual(semantic["ollama_url"], "http://127.0.0.1:11434/")
+        self.assertEqual(semantic["dimension"], 2560)
+        self.assertIn(
+            "ollama/ollama:0.12.6@sha256:352e045b937ac29d3d9550c22fb85525f60a89e064df34c26579bee5a93b3a16",
+            patch,
+        )
+        self.assertIn("name: search-worker", patch)
+        self.assertIn("commonthing-api@${API_DIGEST}", patch)
+        self.assertIn("value: 127.0.0.1:11434", patch)
+        self.assertIn(
+            "WELTGEWEBE_SEARCH_OLLAMA_URL: http://127.0.0.1:11434/",
+            runtime,
+        )
+        self.assertNotIn("kind: Service", patch)
+        self.assertIn("storageClassName: local-path", storage)
+        self.assertIn("storage: 10Gi", storage)
 
 
 if __name__ == "__main__":

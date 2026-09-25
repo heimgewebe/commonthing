@@ -4,10 +4,12 @@ kind: Kustomization
 namespace: commonthing-experiment-b
 resources:
   - ../../base
+  - semantic-search-storage.yaml
 patches:
   - path: config-map-patch.yaml
   - path: image-patch.yaml
   - path: network-policy-api-data-egress-patch.yaml
+  - path: semantic-search-patch.yaml
 labels:
   - pairs:
       app.kubernetes.io/part-of: commonthing
