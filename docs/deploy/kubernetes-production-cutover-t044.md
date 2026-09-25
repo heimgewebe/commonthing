@@ -6,11 +6,11 @@ status: active
 canonicality: operational
 lifecycle_state: active
 owner_task: WELTGEWEBE-OS-V1-T044
-last_reviewed: 2026-09-24
+last_reviewed: 2026-09-25
 review_after: 2026-10-07
 summary: >
   Revisionsgebundener R5-Preflight für den Wechsel von Compose/Caddy-Blue auf
-  Kubernetes-Green. Bindet die am 23.09.2026 live beobachtete Produktions- und
+  Kubernetes-Green. Bindet die am 25.09.2026 frisch rückgelesene Produktions- und
   Referenzplattformwahrheit und blockiert jede Produktionswirkung bis Zielplattform,
   Capability-Parität, Datenübergang, Backup und Rollback konkret belegt sind.
 relations:
@@ -37,13 +37,20 @@ Traffic-, Writer-, Datenbank- noch Kubernetes-Produktionsmutationen.
 
 Beobachtungsbasis:
 
-- Liveinventur: 2026-09-23; Zielplattform-Gegencheck: 2026-09-24
-- aktueller geschützter Repo-`main`: `bd88a1df8712f23485e80e3f1f2a296ba05590e1`
-- produktiv ausgelieferte Blue-Revision: `240f4ca6c6fe9117bf336fb34ed51f2c5a28fb15`
+- Liveinventur und Zielplattform-Gegencheck: 2026-09-25
+- beim Readback geschützter Repo-`main`: `85ebdd71846f8d6a2de1076745de20725ebcb48a`
+- produktiv ausgelieferte Blue-Revision: `85ebdd71846f8d6a2de1076745de20725ebcb48a`
 - T044: Revision 5, kein aktueller Verification-Stamp
-- T084: aktueller Verification-Stamp vorhanden
+- T084: Referenz-/Recovery-Evidenz vorhanden; der letzte vollständige E2E-Proof
+  ist älter als der heutige Legacy-Staging-Controller
 - produktive Blue-Runtime: `commonserver`
 - Referenz-Green: `commonthing-staging`
+
+Diese Angaben sind **zeitgebundene Evidenzanker**, keine fortlaufend gültige
+„Current Truth“. Vor jedem R6- oder späteren Eintrittsgate werden `main`,
+Blue-Release, Green-Revision/-Digests und Zielidentität erneut live gelesen.
+Abweichungen aktualisieren den Preflight; ältere erfolgreiche Readbacks
+autorisieren keine Mutation.
 
 ## 2. Dialektische Disposition
 
@@ -66,8 +73,8 @@ Frischer Readback vom VPS `commonserver`:
 ### 3.1 Revision und Frontdoor
 
 - Compose-Projekt: `weltgewebe`
-- ausgelieferter Build: `240f4ca6`
-- exakter Blue-Release-Commit: `240f4ca6c6fe9117bf336fb34ed51f2c5a28fb15`
+- ausgelieferter Build: `85ebdd71`
+- exakter Blue-Release-Commit: `85ebdd71846f8d6a2de1076745de20725ebcb48a`
 - kanonischer Web-Origin: `https://commonthing.net`
 - kanonischer API-Origin: `https://api.commonthing.net`
 - Legacy-Web/API bleiben Kompatibilitätspfade
@@ -76,6 +83,8 @@ Frischer Readback vom VPS `commonserver`:
   `api.weltgewebe.net` zeigte auf `94.16.121.119`
 - Web-Readback: HTTP 200
 - API-Readiness: HTTP 200, Datenbank/Event-Chain/NATS/Policy = ready
+- Web-`version.json` und API-`/version` binden beide exakt
+  `85ebdd71846f8d6a2de1076745de20725ebcb48a`
 
 ### 3.2 Laufende Fähigkeiten
 
@@ -102,7 +111,7 @@ API-Konfiguration:
 - `AUTH_PUBLIC_LOGIN=1`
 - NATS: `nats://nats:4222`
 
-Beobachtete PostgreSQL-Zustände, nicht als SLO oder Sollwert zu lesen:
+Am 25.09.2026 erneut read-only geprüfte PostgreSQL-Zustände, nicht als SLO oder Sollwert zu lesen:
 
 - `domain_accounts=13`
 - `domain_nodes=4`
@@ -113,7 +122,7 @@ Beobachtete PostgreSQL-Zustände, nicht als SLO oder Sollwert zu lesen:
 - `search_node_projections=4`
 - `search_projection_jobs=23`
 
-JetStream:
+Zuletzt separat beobachteter JetStream-Zustand aus dem 23.09.2026-Readback:
 
 - Stream: `WELTGEWEBE_DOMAIN`
 - Consumers: 2
@@ -140,9 +149,9 @@ clusterweiter Ollama-Service ist daher **keine** äquivalente Kleinänderung.
 Am Beobachtungszeitpunkt:
 
 - 4 vCPU
-- ca. 8,33 GB RAM
+- ca. 8,33 GB RAM, davon beim Readback ca. 6,37 GB verfügbar
 - kein Swap
-- ca. 144 GB freier Plattenspeicher
+- ca. 136,7 GB freier Plattenspeicher
 
 Der bestehende Produktions-Search-Vertrag verlangt vor seinem Rollout mindestens
 3 Online-CPUs, 5 GiB verfügbaren Arbeitsspeicher und 8 GiB freien Speicher.
@@ -152,7 +161,14 @@ aus dem aktuellen Idle-Readback abgeleitet werden.
 
 ## 4. Green — heutige Kubernetes-Referenz
 
-`commonthing-staging` meldete beim frischen Readback `status=ready`.
+`commonthing-staging` wurde am 25.09.2026 direkt über die im Staging-State
+gepinnten `kind`-/`kubectl`-Binärdateien rückgelesen. Der Cluster existiert;
+Control-Plane und beide Worker melden `Ready` unter Kubernetes v1.36.1.
+
+Dieser Live-Readback belegt den heutigen Laufzeitzustand der Referenzzelle,
+aber **keinen neuen vollständigen T084-E2E-Proof** für den inzwischen
+weiterentwickelten Legacy-Staging-Controller; der im Foundation-Status
+dokumentierte Proof-Lag bleibt damit ausdrücklich sichtbar.
 
 ### 4.1 Bindungen
 
@@ -172,7 +188,11 @@ Bereit:
 - Web: 2/2
 - PostgreSQL: 1/1
 - NATS: 1/1
-- Flux-Controller
+- Flux-Controller: alle vier Deployments 1/1 ready
+- Flux-Kustomization `commonthing-staging-app`: Ready auf
+  `sha1:bb1e26d47b50d38ec720b123d55255c05436100b`
+- Flux-Kustomization `commonthing-staging-data`: Ready auf
+  `sha1:6a10c76666b9769fdfddb62ecb3fbf0c2c5df935`
 - Cilium Gateway API
 - PostgreSQL-PVC: Bound, 10 Gi
 - NATS-PVC: Bound, 5 Gi
@@ -247,14 +267,16 @@ Für T044 fehlt ein konkret beobachtbares Produktionsziel mit mindestens:
 Bis diese Zielidentität feststeht, wird **keine** Produktions-Kubernetes-Topologie
 aus der lokalen Staging-Implementierung extrapoliert.
 
-Frischer Gegencheck vom 24.09.2026:
+Frischer Gegencheck vom 25.09.2026:
 
-- Die SSH-Ziele `wg-prod-1` und `commonserver` lösen beide auf `94.16.121.119:22`
-  mit demselben Operatorbenutzer auf; beide Live-Probes melden den Hostnamen
-  `commonserver`. Sie sind damit zwei Namen für denselben beobachteten
-  Produktionshost und **kein** getrenntes Green-Ziel.
-- Auf dem am 24.09.2026 frisch gebundenen Public-Main
-  `bd88a1df8712f23485e80e3f1f2a296ba05590e1` existiert kein
+- Im aktuellen Grabowski-Fleetregister ist `commonserver` als erreichbarer
+  Produktionshost registriert. Ein eigenständiger zweiter Kubernetes-
+  Produktionshost bzw. ein konkretes Production-Green-Ziel ist dort nicht
+  registriert. Der Systemkatalog führt `host:wg-prod-1` weiterhin als
+  Failure-Domain-Bezeichner; dies etabliert keinen separat adressierbaren
+  Fleet-Host und keinen Green-Cluster.
+- Auf dem am 25.09.2026 frisch gebundenen Public-Main
+  `85ebdd71846f8d6a2de1076745de20725ebcb48a` existiert kein
   `platform/clusters/production`. Deklarierte Clusterkompositionen sind
   `local`, `staging` und `ha`.
 - `platform/apps/weltgewebe/overlays/production` ist ein Anwendungs-Overlay;
@@ -305,15 +327,20 @@ Produktionsdatenstand. Vor Writer-Fencing müssen PostgreSQL, JetStream,
 Suchprojektion und sonstiger persistenter Fachzustand aus Blue gegen das konkrete
 Green-Ziel abgeglichen werden.
 
-### B5 — echte Staging-Abnahme fehlt
+### B5 — reale Staging-/Zieltestbed-Abnahme fehlt
 
 Das in §4 beobachtete `commonthing-staging` ist der lokale T084-Referenzcluster
-und erfüllt **nicht** das T044-Akzeptanzkriterium eines echten Staging-Clusters.
+und erfüllt **nicht** das T044-Akzeptanzkriterium einer realen, vom lokalen
+Referenzcluster und vom Produktions-Green getrennten Abnahmeumgebung.
 
-Bevor R6 gegen einen Produktionskandidaten beginnen darf, muss eine vom lokalen
-Referenzcluster und vom Produktions-Green getrennte reale Staging-Umgebung live
-beobachtet und für die gewünschte Release-Revision erfolgreich abgenommen sein.
-Die revisionsgebundene Staging-Abnahme umfasst mindestens:
+Bevor R6 gegen einen Produktionskandidaten beginnen darf, muss eine solche reale
+Umgebung live beobachtet und für die gewünschte Release-Revision erfolgreich
+abgenommen sein. Sie darf **zeitlich begrenzt und ausschließlich für diesen
+Proof** betrieben werden. Damit bleibt T044 mit ADR-0010 vereinbar: Das dort
+definierte Experiment B kann diese Abnahme liefern; ein permanenter
+Staging-Dauerbetrieb wird dadurch ausdrücklich **nicht** beschlossen.
+
+Die revisionsgebundene Staging-/Zieltestbed-Abnahme umfasst mindestens:
 
 - externe Secrets und deren Bereitstellungspfad;
 - commit-/digestgebundene Imagepromotion für API und Web;
@@ -323,8 +350,9 @@ Die revisionsgebundene Staging-Abnahme umfasst mindestens:
   dort aktivierten Zusatzfähigkeiten.
 
 Ein lokaler Referenzproof, ein Produktionskandidat oder eine bloße
-Manifestexistenz darf diese separate Staging-Phase nicht ersetzen. Aus einer
-bestandenen Staging-Abnahme folgt außerdem **keine** Produktionsfreigabe.
+Manifestexistenz darf diese separate reale Abnahmephase nicht ersetzen. Aus
+einer bestandenen Staging-/Zieltestbed-Abnahme folgt außerdem **keine**
+Produktionsfreigabe.
 
 ### B6 — Zwei-Betreiber-Aktivierungsvertrag fehlt
 
@@ -364,10 +392,10 @@ R6 darf erst starten, wenn **alle** folgenden Bedingungen erfüllt sind:
    Release-Revision vollständig bestanden: gemeinsame Freigabe beider
    Operatoren, `--mode activation` erfolgreich, externe Receipt-Verifikation
    vollständig und autoritatives Replay-Ledger ohne Konflikt;
-2. die separate reale Staging-Phase aus B5 ist für die gewünschte Release-Revision
-   live beobachtet und mit externer Secretbereitstellung, digestgebundener
-   Promotion, produktionsnaher Last sowie Backup-/Restore-/Recovery-Evidenz
-   erfolgreich abgenommen;
+2. die separate reale, gegebenenfalls temporäre Staging-/Experiment-B-Abnahme
+   aus B5 ist für die gewünschte Release-Revision live beobachtet und mit
+   externer Secretbereitstellung, digestgebundener Promotion, produktionsnaher
+   Last sowie Backup-/Restore-/Recovery-Evidenz erfolgreich abgenommen;
 3. ein konkretes Produktions-Green ist identifiziert und live beobachtet;
 4. dessen Kapazität und Fehlerdomäne sind dokumentiert;
 5. Current Main und gewünschte Release-Revision sind erneut frisch bestimmt;
@@ -923,10 +951,11 @@ Stand dieses R5-Preflights:
 - **Blue bleibt Produktion.**
 - **Blue bleibt alleiniger Writer.**
 - **T084-Staging bleibt Referenz, nicht Produktionsziel.**
-- **Die separate echte Staging-Abnahme aus B5 fehlt weiterhin.**
+- **Die separate reale Staging-/Zieltestbed-Abnahme aus B5 fehlt weiterhin.**
 - **Kein Traffic-/DNS-/Writer-Cutover.**
 - **Keine neue Plattformschicht.**
-- Nächster harter Hebel ist zuerst die reale Staging-Aktivierung samt
+- Nächster harter Hebel ist zuerst ein zeitlich begrenztes reales
+  Kubernetes-Zieltestbed als T044-Staging-/Experiment-B-Abnahme samt
   produktionsnaher Last-/Recovery-Evidenz. Erst danach folgt die konkrete,
   kapazitiv belegte Produktions-Green-Zielidentität und die Schließung der
   Capability-Lücken gegen genau dieses Ziel.
