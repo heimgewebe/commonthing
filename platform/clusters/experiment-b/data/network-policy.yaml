@@ -26,6 +26,12 @@ spec:
           podSelector:
             matchLabels:
               app.kubernetes.io/name: weltgewebe-api
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: commonthing-experiment-b
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: commonthing-experiment-b-migration
       ports:
         - port: 5432
           protocol: TCP

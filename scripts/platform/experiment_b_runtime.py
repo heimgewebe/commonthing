@@ -13,6 +13,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -101,11 +102,14 @@ def sha256_file(path: Path) -> str:
 
 def state_root(value: str | None) -> Path:
     root = (Path(value).expanduser() if value else DEFAULT_STATE_ROOT).resolve()
-    home_state = (Path.home() / ".local/state/commonthing").resolve()
-    try:
-        root.relative_to(home_state)
-    except ValueError as exc:
-        raise RuntimeErrorEB(f"state root must stay below {home_state}") from exc
+    allowed_root = DEFAULT_STATE_ROOT.resolve()
+    if root != allowed_root:
+        try:
+            root.relative_to(allowed_root)
+        except ValueError as exc:
+            raise RuntimeErrorEB(
+                f"state root must be {allowed_root} or one of its descendants"
+            ) from exc
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
     return root
@@ -721,6 +725,18 @@ def apply_release(
 def semantic_activate(root: Path) -> dict[str, Any]:
     config = load_config()
     semantic = config["semantic_search"]
+    release_path = root / "receipts/release.json"
+    if not release_path.is_file():
+        raise RuntimeErrorEB("semantic provider proof requires an applied release receipt")
+    release = json.loads(release_path.read_text(encoding="utf-8"))
+    source_commit = str(release.get("source_commit", ""))
+    if (
+        not COMMIT_RE.fullmatch(source_commit)
+        or git_head() != source_commit
+        or remote_main() != source_commit
+    ):
+        raise RuntimeErrorEB("semantic provider proof is not bound to current protected main")
+
     kubectl = toolchain(root)["tools"]["kubectl"]
     env = kube_env(root)
     egress_name = "commonthing-experiment-b-model-bootstrap-egress"
@@ -775,6 +791,43 @@ def semantic_activate(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 "Ollama model digest differs from the pinned revision"
             )
+
+        probe_text = "commonThing Experiment B semantic continuity"
+        probe_request = json.dumps(
+            {"model": semantic["model_id"], "input": probe_text},
+            separators=(",", ":"),
+        )
+        embedding_raw = run(
+            [
+                kubectl, "-n", APP_NAMESPACE,
+                "exec", "deployment/weltgewebe-api",
+                "-c", "search-worker", "--",
+                "wget", "-qO-",
+                "--header=Content-Type: application/json",
+                f"--post-data={probe_request}",
+                "http://127.0.0.1:11434/api/embed",
+            ],
+            env=env,
+            timeout=300,
+        ).stdout
+        embedding_payload = json.loads(embedding_raw)
+        embeddings = embedding_payload.get("embeddings")
+        dimension = int(semantic["dimension"])
+        if (
+            not isinstance(embeddings, list)
+            or len(embeddings) != 1
+            or not isinstance(embeddings[0], list)
+            or len(embeddings[0]) != dimension
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in embeddings[0]
+            )
+        ):
+            raise RuntimeErrorEB(
+                "Ollama embedding smoke does not match the pinned finite dimension"
+            )
     finally:
         run(
             [
@@ -794,53 +847,20 @@ def semantic_activate(root: Path) -> dict[str, Any]:
     ).returncode == 0:
         raise RuntimeErrorEB("temporary model-bootstrap egress policy still exists")
 
-    generation = semantic["generation_id"]
-    ready = "f"
-    for _ in range(180):
-        query = (
-            "SELECT weltgewebe_search_generation_activation_ready("
-            f"'{generation}');"
-        )
-        result = run(
-            [
-                kubectl, "-n", DATA_NAMESPACE,
-                "exec", "deployment/postgres", "--",
-                "psql", "-U", "commonthing", "-d", "commonthing",
-                "-Atc", query,
-            ],
-            env=env,
-            check=False,
-        )
-        if result.returncode == 0:
-            ready = result.stdout.strip()
-        if ready == "t":
-            break
-        time.sleep(5)
-    if ready != "t":
-        raise RuntimeErrorEB(
-            "semantic search generation did not become activation-ready"
-        )
-    run(
-        [
-            kubectl, "-n", DATA_NAMESPACE,
-            "exec", "deployment/postgres", "--",
-            "psql", "-U", "commonthing", "-d", "commonthing",
-            "-Atc",
-            f"SELECT weltgewebe_activate_search_generation('{generation}');",
-        ],
-        env=env,
-    )
     receipt = {
         "schema_version": 1,
-        "status": "active",
-        "generation_id": generation,
+        "status": "pass",
+        "source_commit": source_commit,
         "provider": semantic["provider"],
         "model_id": semantic["model_id"],
         "model_revision": semantic["model_revision"],
         "runtime_identity": semantic["runtime_identity"],
         "dimension": semantic["dimension"],
+        "embedding_probe": True,
+        "embedding_probe_sha256": hashlib.sha256(probe_text.encode("utf-8")).hexdigest(),
         "literal_loopback": True,
         "temporary_model_egress_removed": True,
+        "database_generation_activation": False,
     }
     atomic_json(root / "receipts/semantic-search.json", receipt)
     return receipt
@@ -1297,6 +1317,72 @@ INSERT INTO domain_edges (id, source_id, target_id, edge_kind, created_at, paylo
 SELECT id, source_id, target_id, edge_kind, created_at, payload
   FROM weltgewebe_perf.domain_edges
  ORDER BY id;
+
+INSERT INTO search_node_projections (
+    generation_id, node_id, source_version, source_revision, content_sha256,
+    title, tags, searchable_text, language, kind, status, visibility_scopes,
+    semantic_state, embedding
+)
+SELECT
+    g.generation_id,
+    n.id,
+    v.source_version,
+    v.source_revision,
+    CASE
+        WHEN n.search_visibility = 'public' THEN repeat('0', 64)
+        ELSE 'e0f631f5602e764ef8a5f14e36d2d81663b20cd305a30af0dad6c0d759e5a955'
+    END,
+    CASE WHEN n.search_visibility = 'public' THEN n.title ELSE '[nicht öffentlich]' END,
+    CASE
+        WHEN n.search_visibility = 'public'
+        THEN ARRAY(SELECT jsonb_array_elements_text(n.payload -> 'tags'))
+        ELSE '{{}}'::TEXT[]
+    END,
+    CASE
+        WHEN n.search_visibility = 'public'
+        THEN coalesce(n.payload ->> 'summary', n.title)
+        ELSE '[nicht öffentlich]'
+    END,
+    CASE WHEN n.search_visibility = 'public' THEN 'de' ELSE 'und' END,
+    CASE WHEN n.search_visibility = 'public' THEN n.kind ELSE '[nicht öffentlich]' END,
+    CASE WHEN n.search_visibility = 'public' THEN 'active' ELSE 'hidden' END,
+    CASE
+        WHEN n.search_visibility = 'public' THEN ARRAY['public']::TEXT[]
+        ELSE '{{}}'::TEXT[]
+    END,
+    CASE WHEN n.search_visibility = 'public' THEN 'ready' ELSE 'unavailable' END,
+    CASE
+        WHEN n.search_visibility = 'public'
+        THEN array_fill(0.0::DOUBLE PRECISION, ARRAY[g.dimension])
+        ELSE NULL
+    END
+  FROM domain_nodes n
+  JOIN search_node_versions v ON v.node_id = n.id
+  CROSS JOIN search_index_generations g
+ WHERE g.state = 'building'
+ ORDER BY n.id;
+
+UPDATE search_projection_jobs
+   SET state = 'done', completed_at = clock_timestamp()
+ WHERE generation_id = '{semantic["generation_id"]}';
+
+UPDATE search_index_generations
+   SET expected_nodes = (SELECT count(*) FROM domain_nodes),
+       completed_nodes = (
+           SELECT count(*) FROM search_node_versions WHERE deleted_at IS NULL
+       )
+ WHERE generation_id = '{semantic["generation_id"]}';
+
+DO $$
+BEGIN
+    IF NOT weltgewebe_search_generation_activation_ready(
+        '{semantic["generation_id"]}'
+    ) THEN
+        RAISE EXCEPTION 'Experiment-B T048 search generation is not activation-ready';
+    END IF;
+END
+$$;
+SELECT weltgewebe_activate_search_generation('{semantic["generation_id"]}');
 COMMIT;
 """
     _psql(root, seed_sql, tuples_only=False)
@@ -1305,20 +1391,53 @@ COMMIT;
     public_nodes = int(
         _psql(root, "SELECT count(*) FROM domain_nodes WHERE search_visibility='public';")
     )
-    if observed_nodes != node_count or observed_edges != edge_count or public_nodes < 1:
+    observed_projections = int(
+        _psql(
+            root,
+            "SELECT count(*) FROM search_node_projections "
+            f"WHERE generation_id = '{generation_id}';",
+        )
+    )
+    active_generation = int(
+        _psql(
+            root,
+            "SELECT count(*) FROM search_index_generations "
+            f"WHERE generation_id = '{generation_id}' AND state = 'active';",
+        )
+    )
+    pending_jobs = int(
+        _psql(
+            root,
+            "SELECT count(*) FROM search_projection_jobs "
+            f"WHERE generation_id = '{generation_id}' AND state <> 'done';",
+        )
+    )
+    if (
+        observed_nodes != node_count
+        or observed_edges != edge_count
+        or public_nodes < 1
+        or observed_projections != node_count
+        or active_generation != 1
+        or pending_jobs != 0
+    ):
         raise RuntimeErrorEB(
-            "T048 fixture load counts do not match the canonical manifest"
+            "T048 fixture/search projection counts do not match the canonical manifest"
         )
     receipt = {
         "schema_version": 1,
         "status": "loaded",
+        "source_commit": source_commit,
         "profile": profile,
         "manifest": str(manifest),
         "manifest_sha256": binding["manifest_sha256"],
         "nodes": observed_nodes,
         "edges": observed_edges,
         "public_semantic_nodes": public_nodes,
+        "search_projections": observed_projections,
         "generation_id": generation_id,
+        "generation_state": "active",
+        "projection_mode": "synthetic-canonical-t048",
+        "pending_projection_jobs": pending_jobs,
         "production_data_used": False,
     }
     atomic_json(receipt_path, receipt)
@@ -1362,7 +1481,11 @@ def _wait_http_200(url: str, process: subprocess.Popen[Any] | None = None) -> No
     for _ in range(60):
         if process is not None and process.poll() is not None:
             raise RuntimeErrorEB("port-forward exited before the target became ready")
-        status_code, _body, _elapsed = _http_read(url, timeout=2)
+        try:
+            status_code, _body, _elapsed = _http_read(url, timeout=2)
+        except urllib.error.URLError:
+            time.sleep(1)
+            continue
         if status_code == 200:
             return
         time.sleep(1)
@@ -1981,6 +2104,13 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     nats_tar = backup_dir / "nats.tar"
     before_db = _database_signature(root)
     before_nats = _jetstream_signature(root)
+    release_path = root / "receipts/release.json"
+    if not release_path.is_file():
+        raise RuntimeErrorEB("recovery proof requires an applied release receipt")
+    release = json.loads(release_path.read_text(encoding="utf-8"))
+    source_commit = str(release.get("source_commit", ""))
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB("recovery proof release binding is not exact")
     if before_nats["streams"] < 1 or before_nats["messages"] < 1:
         raise RuntimeErrorEB("JetStream test state is empty before recovery proof")
 
@@ -2074,26 +2204,38 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             or after_nats["messages"] != before_nats["messages"]
         ):
             raise RuntimeErrorEB("JetStream stream/message state changed across restore")
+        _flux_resume(root, "commonthing-experiment-b-data")
+        _flux_resume(root, "commonthing-experiment-b-app")
+        _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")
+        _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")
         rto_seconds = time.monotonic() - destructive_started
     except Exception:
+        resuspended: dict[str, bool] = {}
+        for name in (
+            "commonthing-experiment-b-app",
+            "commonthing-experiment-b-data",
+        ):
+            try:
+                _flux_suspend(root, name)
+                resuspended[name] = True
+            except Exception:
+                resuspended[name] = False
         atomic_json(
             root / "receipts/recovery-failed.json",
             {
                 "schema_version": 1,
-                "status": "failed-and-suspended",
+                "status": "failed",
+                "source_commit": source_commit,
                 "database_before": before_db,
                 "jetstream_before": before_nats,
+                "flux_resuspended": resuspended,
             },
         )
         raise
-    _flux_resume(root, "commonthing-experiment-b-data")
-    _flux_resume(root, "commonthing-experiment-b-app")
-
-    _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")
-    _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")
     receipt = {
         "schema_version": 1,
         "status": "pass",
+        "source_commit": source_commit,
         "rpo_seconds": 0,
         "rto_seconds": round(rto_seconds, 3),
         "postgres_dump_sha256": sha256_file(db_dump),
@@ -2110,27 +2252,63 @@ def recovery_proof(root: Path) -> dict[str, Any]:
 
 
 def portability_report(root: Path) -> dict[str, Any]:
-    required_receipts = [
-        "k3s.json",
-        "platform.json",
-        "secrets.json",
-        "release.json",
-        "t048-fixture.json",
-        "semantic-search.json",
-        "functional-readback.json",
-        "t048-load.json",
-        "recovery.json",
-        "status.json",
-    ]
+    expected_status = {
+        "k3s.json": "ready",
+        "platform.json": "ready",
+        "secrets.json": "ready",
+        "release.json": "applied",
+        "t048-fixture.json": "loaded",
+        "semantic-search.json": "pass",
+        "functional-readback.json": "pass",
+        "t048-load.json": "pass",
+        "recovery.json": "pass",
+        "status.json": "observed",
+    }
+    payloads: dict[str, dict[str, Any]] = {}
     receipts: dict[str, str] = {}
-    for name in required_receipts:
+    for name, required_status in expected_status.items():
         path = root / "receipts" / name
         if not path.is_file():
             raise RuntimeErrorEB(f"portability report is missing receipt: {name}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeErrorEB(
+                f"portability receipt is not valid JSON: {name}"
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("status") != required_status:
+            raise RuntimeErrorEB(
+                f"portability receipt does not prove success: {name}"
+            )
+        payloads[name] = payload
         receipts[name] = sha256_file(path)
+
+    source_commit = str(payloads["release.json"].get("source_commit", ""))
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB("release receipt has no exact source commit")
+    for name in (
+        "t048-fixture.json",
+        "semantic-search.json",
+        "functional-readback.json",
+        "recovery.json",
+        "status.json",
+    ):
+        if payloads[name].get("source_commit") != source_commit:
+            raise RuntimeErrorEB(
+                f"portability receipt source binding drifted: {name}"
+            )
+    load_revision = payloads["t048-load.json"].get("revision")
+    if (
+        not isinstance(load_revision, dict)
+        or load_revision.get("git_head") != source_commit
+        or load_revision.get("measured_api_commit") != source_commit
+    ):
+        raise RuntimeErrorEB("T048 load receipt is not bound to the release commit")
+
     result = {
         "schema_version": 1,
         "status": "pass",
+        "source_commit": source_commit,
         "receipts": receipts,
         "portable_invariants": [
             "exact protected-main Git commit",
@@ -2152,6 +2330,7 @@ def portability_report(root: Path) -> dict[str, Any]:
             "k3s local-path storage",
             "temporary model-download egress",
             "host-side pinned k6 load generator",
+            "synthetic canonical-T048 search projections",
         ],
         "production_green_open_questions": [
             "multi-node failure-domain and HA behavior",
@@ -2167,6 +2346,7 @@ def portability_report(root: Path) -> dict[str, Any]:
     }
     atomic_json(root / "receipts/portability.json", result)
     return result
+
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
@@ -2244,5 +2424,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (RuntimeErrorEB, contract.ContractError) as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True))
+        print(json.dumps({"status": "error", "error_class": type(exc).__name__}, sort_keys=True))
         raise SystemExit(2)

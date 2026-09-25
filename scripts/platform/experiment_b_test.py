@@ -99,6 +99,19 @@ class ExperimentBContractTests(unittest.TestCase):
         migration = (CLUSTER / "migration/job.yaml").read_text(encoding="utf-8")
         self.assertIn("commonthing-experiment-b-registry", migration)
 
+    def test_network_policy_allows_only_api_and_migration_to_postgres(self) -> None:
+        policy = (CLUSTER / "data/network-policy.yaml").read_text(encoding="utf-8")
+        postgres_rule = policy.split(
+            "name: allow-app-postgres-access", 1
+        )[1].split("---", 1)[0]
+        self.assertIn("app.kubernetes.io/name: weltgewebe-api", postgres_rule)
+        self.assertIn(
+            "app.kubernetes.io/name: commonthing-experiment-b-migration",
+            postgres_rule,
+        )
+        self.assertIn("port: 5432", postgres_rule)
+        self.assertNotIn("port: 4222", postgres_rule)
+
     def test_semantic_search_preserves_literal_loopback_contract(self) -> None:
         config = json.loads((CLUSTER / "config.json").read_text(encoding="utf-8"))
         semantic = config["semantic_search"]

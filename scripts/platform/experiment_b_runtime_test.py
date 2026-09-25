@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import experiment_b_runtime as runtime
 
@@ -50,6 +53,121 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             self.assertEqual(rendered.count("\\.\n"), 2)
             self.assertIn("n-1", rendered)
             self.assertIn("e-1", rendered)
+
+    def test_state_root_is_scoped_to_experiment_b_subtree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "experiment-b"
+            sibling = Path(tmp) / "other-controller"
+            with mock.patch.object(runtime, "DEFAULT_STATE_ROOT", base):
+                self.assertEqual(runtime.state_root(str(base)), base.resolve())
+                child = base / "attempt-1"
+                self.assertEqual(runtime.state_root(str(child)), child.resolve())
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime.state_root(str(base.parent))
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime.state_root(str(sibling))
+
+    def test_wait_http_200_retries_transient_connection_refusal(self) -> None:
+        responses = [
+            runtime.urllib.error.URLError("listener not ready"),
+            (200, b"ok", 1.0),
+        ]
+
+        def read(*_args, **_kwargs):
+            value = responses.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with (
+            mock.patch.object(runtime, "_http_read", side_effect=read),
+            mock.patch.object(runtime.time, "sleep"),
+        ):
+            runtime._wait_http_200("http://127.0.0.1:1/health/live")
+        self.assertEqual(responses, [])
+
+    def test_t048_fixture_activates_canonical_synthetic_projections_atomically(self) -> None:
+        source = inspect.getsource(runtime.seed_t048_fixture)
+        self.assertIn("INSERT INTO search_node_projections", source)
+        self.assertIn("UPDATE search_projection_jobs", source)
+        self.assertIn("state = 'done'", source)
+        self.assertIn("weltgewebe_search_generation_activation_ready", source)
+        self.assertIn("weltgewebe_activate_search_generation", source)
+        self.assertIn("synthetic-canonical-t048", source)
+
+    def test_semantic_provider_smoke_is_separate_from_t048_generation(self) -> None:
+        source = inspect.getsource(runtime.semantic_activate)
+        self.assertIn("/api/embed", source)
+        self.assertIn('"database_generation_activation": False', source)
+        self.assertNotIn("weltgewebe_search_generation_activation_ready", source)
+        self.assertNotIn("weltgewebe_activate_search_generation", source)
+
+    def test_recovery_rto_includes_application_rollout(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        api_wait = source.index(
+            '_wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")'
+        )
+        web_wait = source.index(
+            '_wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")'
+        )
+        rto = source.index("rto_seconds = time.monotonic() - destructive_started")
+        self.assertLess(api_wait, rto)
+        self.assertLess(web_wait, rto)
+
+    def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
+        commit = "a" * 40
+        statuses = {
+            "k3s.json": "ready",
+            "platform.json": "ready",
+            "secrets.json": "ready",
+            "release.json": "applied",
+            "t048-fixture.json": "loaded",
+            "semantic-search.json": "pass",
+            "functional-readback.json": "pass",
+            "t048-load.json": "pass",
+            "recovery.json": "pass",
+            "status.json": "observed",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            for name, status in statuses.items():
+                payload: dict[str, object] = {"schema_version": 1, "status": status}
+                if name == "release.json":
+                    payload["source_commit"] = commit
+                elif name in {
+                    "t048-fixture.json",
+                    "semantic-search.json",
+                    "functional-readback.json",
+                    "recovery.json",
+                    "status.json",
+                }:
+                    payload["source_commit"] = commit
+                elif name == "t048-load.json":
+                    payload["revision"] = {
+                        "git_head": commit,
+                        "measured_api_commit": commit,
+                    }
+                (receipts / name).write_text(
+                    json.dumps(payload) + "\n", encoding="utf-8"
+                )
+
+            failed = json.loads((receipts / "t048-load.json").read_text())
+            failed["status"] = "fail"
+            (receipts / "t048-load.json").write_text(
+                json.dumps(failed) + "\n", encoding="utf-8"
+            )
+            with self.assertRaises(runtime.RuntimeErrorEB):
+                runtime.portability_report(root)
+
+            failed["status"] = "pass"
+            failed["revision"]["measured_api_commit"] = "b" * 40
+            (receipts / "t048-load.json").write_text(
+                json.dumps(failed) + "\n", encoding="utf-8"
+            )
+            with self.assertRaises(runtime.RuntimeErrorEB):
+                runtime.portability_report(root)
 
     def test_cli_exposes_full_t085_proof_sequence(self) -> None:
         parser = runtime.parser()

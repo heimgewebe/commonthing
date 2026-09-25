@@ -361,6 +361,43 @@ implementations:
       - .github/workflows/kubernetes-platform-proof.yml
 
 
+  - id: impl.platform.experiment-b-runtime
+    path: scripts/platform/experiment_b_runtime.py
+    impl_type: workflow
+    status: active
+    criticality: high
+    evidence_level: test
+    documented_by:
+      - docs/deploy/experiment-b.md
+    verified_by:
+      - scripts/platform/experiment_b_runtime_test.py
+      - scripts/platform/experiment_b_test.py
+
+  - id: impl.platform.experiment-b-cluster
+    path: platform/clusters/experiment-b/
+    impl_type: platform
+    status: active
+    criticality: high
+    evidence_level: test
+    documented_by:
+      - docs/deploy/experiment-b.md
+    verified_by:
+      - scripts/platform/experiment_b_test.py
+      - scripts/platform/experiment_b_runtime_test.py
+
+  - id: impl.platform.experiment-b-app-overlay
+    path: platform/apps/weltgewebe/overlays/experiment-b/
+    impl_type: platform
+    status: active
+    criticality: high
+    evidence_level: test
+    documented_by:
+      - docs/deploy/experiment-b.md
+    verified_by:
+      - scripts/platform/experiment_b_test.py
+      - scripts/platform/experiment_b_runtime_test.py
+
+
   - id: impl.platform.staging-kind-network
     path: platform/clusters/staging/kind.yaml
     impl_type: platform
