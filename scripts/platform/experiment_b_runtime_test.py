@@ -145,10 +145,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 }:
                     payload["source_commit"] = commit
                 elif name == "t048-load.json":
-                    payload["revision"] = {
-                        "git_head": commit,
-                        "measured_api_commit": commit,
-                    }
+                    payload["source_commit"] = commit
                 (receipts / name).write_text(
                     json.dumps(payload) + "\n", encoding="utf-8"
                 )
@@ -162,12 +159,39 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 runtime.portability_report(root)
 
             failed["status"] = "pass"
-            failed["revision"]["measured_api_commit"] = "b" * 40
+            failed["source_commit"] = "b" * 40
             (receipts / "t048-load.json").write_text(
                 json.dumps(failed) + "\n", encoding="utf-8"
             )
             with self.assertRaises(runtime.RuntimeErrorEB):
                 runtime.portability_report(root)
+
+    def test_database_signature_hashes_complete_persisted_domain_and_search_rows(self) -> None:
+        source = inspect.getsource(runtime._database_signature)
+        self.assertIn("md5(to_jsonb(n)::text)", source)
+        self.assertIn("md5(to_jsonb(e)::text)", source)
+        self.assertIn("search_node_versions", source)
+        self.assertIn("md5(to_jsonb(v)::text)", source)
+        self.assertIn("search_index_generations", source)
+        self.assertIn("md5(to_jsonb(g)::text)", source)
+        self.assertIn("search_node_projections", source)
+        self.assertIn("md5(to_jsonb(p)::text)", source)
+        self.assertIn("search_projection_jobs", source)
+        self.assertIn("md5(to_jsonb(j)::text)", source)
+
+    def test_recovery_compares_complete_jetstream_signature(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        self.assertIn("if after_nats != before_nats:", source)
+        self.assertIn("streams/messages/bytes signature", source)
+
+    def test_inject_secrets_cli_does_not_forward_secret_tainted_return(self) -> None:
+        source = inspect.getsource(runtime.main)
+        branch = source.split('elif args.command == "inject-secrets":', 1)[1].split(
+            'elif args.command == "apply-release":', 1
+        )[0]
+        self.assertIn("inject_secrets(", branch)
+        self.assertNotIn("result = inject_secrets(", branch)
+        self.assertIn('"receipt": "receipts/secrets.json"', branch)
 
     def test_cli_exposes_full_t085_proof_sequence(self) -> None:
         parser = runtime.parser()

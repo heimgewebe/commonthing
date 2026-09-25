@@ -1940,15 +1940,53 @@ def _database_signature(root: Path) -> dict[str, Any]:
     sql = r"""
 SELECT json_build_object(
   'nodes_count', (SELECT count(*) FROM domain_nodes),
-  'nodes_md5', (SELECT md5(coalesce(string_agg(md5(id || ':' || title), '' ORDER BY id), '')) FROM domain_nodes),
+  'nodes_md5', (
+      SELECT md5(coalesce(string_agg(md5(to_jsonb(n)::text), '' ORDER BY n.id), ''))
+      FROM domain_nodes n
+  ),
   'edges_count', (SELECT count(*) FROM domain_edges),
-  'edges_md5', (SELECT md5(coalesce(string_agg(md5(id || ':' || source_id || ':' || target_id), '' ORDER BY id), '')) FROM domain_edges),
-  'active_generation', (SELECT generation_id FROM search_index_generations WHERE state='active' ORDER BY activated_at DESC NULLS LAST LIMIT 1),
-  'projection_count', (SELECT count(*) FROM search_node_projections WHERE generation_id=(SELECT generation_id FROM search_index_generations WHERE state='active' ORDER BY activated_at DESC NULLS LAST LIMIT 1)),
+  'edges_md5', (
+      SELECT md5(coalesce(string_agg(md5(to_jsonb(e)::text), '' ORDER BY e.id), ''))
+      FROM domain_edges e
+  ),
+  'search_versions_count', (SELECT count(*) FROM search_node_versions),
+  'search_versions_md5', (
+      SELECT md5(coalesce(string_agg(md5(to_jsonb(v)::text), '' ORDER BY v.node_id), ''))
+      FROM search_node_versions v
+  ),
+  'search_generations_count', (SELECT count(*) FROM search_index_generations),
+  'search_generations_md5', (
+      SELECT md5(coalesce(string_agg(md5(to_jsonb(g)::text), '' ORDER BY g.generation_id), ''))
+      FROM search_index_generations g
+  ),
+  'projection_count', (SELECT count(*) FROM search_node_projections),
   'projection_md5', (
-      SELECT md5(coalesce(string_agg(md5(node_id || ':' || source_revision || ':' || semantic_state), '' ORDER BY node_id), ''))
-      FROM search_node_projections
-      WHERE generation_id=(SELECT generation_id FROM search_index_generations WHERE state='active' ORDER BY activated_at DESC NULLS LAST LIMIT 1)
+      SELECT md5(coalesce(
+          string_agg(
+              md5(to_jsonb(p)::text),
+              '' ORDER BY p.generation_id, p.node_id
+          ),
+          ''
+      ))
+      FROM search_node_projections p
+  ),
+  'projection_jobs_count', (SELECT count(*) FROM search_projection_jobs),
+  'projection_jobs_md5', (
+      SELECT md5(coalesce(
+          string_agg(
+              md5(to_jsonb(j)::text),
+              '' ORDER BY j.generation_id, j.node_id, j.source_version, j.operation
+          ),
+          ''
+      ))
+      FROM search_projection_jobs j
+  ),
+  'active_generation', (
+      SELECT generation_id
+      FROM search_index_generations
+      WHERE state='active'
+      ORDER BY activated_at DESC NULLS LAST
+      LIMIT 1
   )
 )::text;
 """
@@ -2199,11 +2237,10 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         after_nats = _jetstream_signature(root)
         if after_db != before_db:
             raise RuntimeErrorEB("PostgreSQL/search signature changed across delete-to-prove")
-        if (
-            after_nats["streams"] != before_nats["streams"]
-            or after_nats["messages"] != before_nats["messages"]
-        ):
-            raise RuntimeErrorEB("JetStream stream/message state changed across restore")
+        if after_nats != before_nats:
+            raise RuntimeErrorEB(
+                "JetStream streams/messages/bytes signature changed across restore"
+            )
         _flux_resume(root, "commonthing-experiment-b-data")
         _flux_resume(root, "commonthing-experiment-b-app")
         _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")
@@ -2290,6 +2327,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         "t048-fixture.json",
         "semantic-search.json",
         "functional-readback.json",
+        "t048-load.json",
         "recovery.json",
         "status.json",
     ):
@@ -2297,14 +2335,6 @@ def portability_report(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 f"portability receipt source binding drifted: {name}"
             )
-    load_revision = payloads["t048-load.json"].get("revision")
-    if (
-        not isinstance(load_revision, dict)
-        or load_revision.get("git_head") != source_commit
-        or load_revision.get("measured_api_commit") != source_commit
-    ):
-        raise RuntimeErrorEB("T048 load receipt is not bound to the release commit")
-
     result = {
         "schema_version": 1,
         "status": "pass",
@@ -2391,9 +2421,14 @@ def main() -> int:
     elif args.command == "install-platform":
         result = install_platform(root)
     elif args.command == "inject-secrets":
-        result = inject_secrets(
+        inject_secrets(
             root, Path(args.registry_config).expanduser().resolve()
         )
+        result = {
+            "schema_version": 1,
+            "status": "ready",
+            "receipt": "receipts/secrets.json",
+        }
     elif args.command == "apply-release":
         result = apply_release(
             root, args.source_commit, args.api_digest, args.web_digest
