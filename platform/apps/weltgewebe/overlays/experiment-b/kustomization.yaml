@@ -5,7 +5,6 @@ namespace: commonthing-experiment-b
 resources:
   - ../../base
   - semantic-search-storage.yaml
-  - network-policy-migration-postgres-egress.yaml
 patches:
   - path: config-map-patch.yaml
   - path: image-patch.yaml

@@ -128,24 +128,26 @@ class ExperimentBContractTests(unittest.TestCase):
         self.assertIn("port: 5432", postgres_rule)
         self.assertNotIn("port: 4222", postgres_rule)
 
-    def test_migration_egress_is_postgres_only(self) -> None:
+    def test_migration_egress_is_installed_before_migration_and_postgres_only(self) -> None:
         api_patch = (OVERLAY / "network-policy-api-data-egress-patch.yaml").read_text(
             encoding="utf-8"
         )
         migration = (
-            OVERLAY / "network-policy-migration-postgres-egress.yaml"
+            CLUSTER / "namespaces/migration-postgres-egress.yaml"
         ).read_text(encoding="utf-8")
-        kustomization = (OVERLAY / "kustomization.yaml").read_text(encoding="utf-8")
+        namespace_stage = (
+            CLUSTER / "namespaces/kustomization.yaml"
+        ).read_text(encoding="utf-8")
+        app_overlay = (OVERLAY / "kustomization.yaml").read_text(encoding="utf-8")
 
         self.assertNotIn("commonthing-experiment-b-migration", api_patch)
-        self.assertIn("port: 5432", api_patch)
-        self.assertIn("port: 4222", api_patch)
-
+        self.assertIn("namespace: commonthing-experiment-b", migration)
         self.assertIn("commonthing-experiment-b-migration", migration)
         self.assertIn("app.kubernetes.io/name: postgres", migration)
         self.assertIn("port: 5432", migration)
         self.assertNotIn("port: 4222", migration)
-        self.assertIn("network-policy-migration-postgres-egress.yaml", kustomization)
+        self.assertIn("migration-postgres-egress.yaml", namespace_stage)
+        self.assertNotIn("migration-postgres-egress", app_overlay)
 
     def test_experiment_b_contract_is_registered_in_platform_ci(self) -> None:
         workflow = (ROOT / ".github/workflows/kubernetes-platform-proof.yml").read_text(

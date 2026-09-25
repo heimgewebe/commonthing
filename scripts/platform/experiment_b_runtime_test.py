@@ -166,6 +166,26 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             with self.assertRaises(runtime.RuntimeErrorEB):
                 runtime.portability_report(root)
 
+    def test_semantic_cleanup_requires_verified_policy_absence(self) -> None:
+        source = inspect.getsource(runtime.semantic_activate)
+        cleanup = source.split("finally:", 1)[1].split("receipt = {", 1)[0]
+        self.assertIn("_kubectl(", cleanup)
+        self.assertIn('"--ignore-not-found=true"', cleanup)
+        self.assertIn('"-o", "name"', cleanup)
+        self.assertIn("remaining_egress.stdout.strip()", cleanup)
+        self.assertNotIn("check=False", cleanup)
+
+    def test_recovery_rerun_invalidates_stale_success(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        self.assertIn('recovery_receipt = root / "receipts/recovery.json"', source)
+        self.assertIn("recovery_receipt.unlink(missing_ok=True)", source)
+        self.assertIn("recovery_failed_receipt.unlink(missing_ok=True)", source)
+        self.assertIn("atomic_json(", source)
+        self.assertIn("recovery_failed_receipt,", source)
+        self.assertIn("atomic_json(recovery_receipt, receipt)", source)
+        portability = inspect.getsource(runtime.portability_report)
+        self.assertIn("recovery_failed_receipt.is_file()", portability)
+
     def test_fixture_reuse_requires_live_content_binding(self) -> None:
         source = inspect.getsource(runtime.seed_t048_fixture)
         self.assertIn(

@@ -829,22 +829,21 @@ def semantic_activate(root: Path) -> dict[str, Any]:
                 "Ollama embedding smoke does not match the pinned finite dimension"
             )
     finally:
-        run(
+        _kubectl(
+            root,
             [
-                kubectl, "-n", APP_NAMESPACE, "delete", "networkpolicy",
+                "-n", APP_NAMESPACE, "delete", "networkpolicy",
                 egress_name, "--ignore-not-found=true",
             ],
-            env=env,
-            check=False,
         )
-    if run(
+    remaining_egress = _kubectl(
+        root,
         [
-            kubectl, "-n", APP_NAMESPACE, "get", "networkpolicy",
-            egress_name,
+            "-n", APP_NAMESPACE, "get", "networkpolicy",
+            egress_name, "--ignore-not-found=true", "-o", "name",
         ],
-        env=env,
-        check=False,
-    ).returncode == 0:
+    )
+    if remaining_egress.stdout.strip():
         raise RuntimeErrorEB("temporary model-bootstrap egress policy still exists")
 
     receipt = {
@@ -2347,6 +2346,11 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     source_commit = str(release.get("source_commit", ""))
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("recovery proof release binding is not exact")
+    recovery_receipt = root / "receipts/recovery.json"
+    recovery_failed_receipt = root / "receipts/recovery-failed.json"
+    recovery_receipt.unlink(missing_ok=True)
+    recovery_failed_receipt.unlink(missing_ok=True)
+
     _flux_suspend(root, "commonthing-experiment-b-app")
     _flux_suspend(root, "commonthing-experiment-b-data")
     destructive_started = time.monotonic()
@@ -2478,7 +2482,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             except Exception:
                 resuspended[name] = False
         atomic_json(
-            root / "receipts/recovery-failed.json",
+            recovery_failed_receipt,
             {
                 "schema_version": 1,
                 "status": "failed",
@@ -2506,11 +2510,16 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         "pvc_delete_to_prove": True,
         "production_data_used": False,
     }
-    atomic_json(root / "receipts/recovery.json", receipt)
+    atomic_json(recovery_receipt, receipt)
     return receipt
 
 
 def portability_report(root: Path) -> dict[str, Any]:
+    recovery_failed_receipt = root / "receipts/recovery-failed.json"
+    if recovery_failed_receipt.is_file():
+        raise RuntimeErrorEB(
+            "portability report is blocked by the latest failed recovery attempt"
+        )
     expected_status = {
         "k3s.json": "ready",
         "platform.json": "ready",
