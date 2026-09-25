@@ -166,10 +166,28 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             with self.assertRaises(runtime.RuntimeErrorEB):
                 runtime.portability_report(root)
 
+    def test_fixture_reuse_requires_live_content_binding(self) -> None:
+        source = inspect.getsource(runtime.seed_t048_fixture)
+        self.assertIn(
+            "current_live_binding = _t048_live_fixture_binding(",
+            source,
+        )
+        self.assertIn(
+            'receipt.get("live_binding") != current_live_binding',
+            source,
+        )
+        self.assertIn('"live_binding": live_binding', source)
+
     def test_database_signature_hashes_complete_persisted_domain_and_search_rows(self) -> None:
         source = inspect.getsource(runtime._database_signature)
         self.assertIn("md5(to_jsonb(n)::text)", source)
         self.assertIn("md5(to_jsonb(e)::text)", source)
+        self.assertIn("domain_outbox", source)
+        self.assertIn("md5(to_jsonb(o)::text)", source)
+        self.assertIn("domain_event_consumptions", source)
+        self.assertIn("md5(to_jsonb(c)::text)", source)
+        self.assertIn("domain_projection_state", source)
+        self.assertIn("md5(to_jsonb(s)::text)", source)
         self.assertIn("search_node_versions", source)
         self.assertIn("md5(to_jsonb(v)::text)", source)
         self.assertIn("search_index_generations", source)
@@ -179,10 +197,63 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         self.assertIn("search_projection_jobs", source)
         self.assertIn("md5(to_jsonb(j)::text)", source)
 
+    def test_recovery_captures_signatures_after_application_quiescence(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        api_scale = source.index(
+            '_scale_deployment(root, APP_NAMESPACE, "weltgewebe-api", 0)'
+        )
+        web_scale = source.index(
+            '_scale_deployment(root, APP_NAMESPACE, "weltgewebe-web", 0)'
+        )
+        api_wait = source.index(
+            '"app.kubernetes.io/name=weltgewebe-api"', api_scale
+        )
+        web_wait = source.index(
+            '"app.kubernetes.io/name=weltgewebe-web"', web_scale
+        )
+        db_signature = source.index("before_db = _database_signature(root)")
+        nats_signature = source.index("before_nats = _jetstream_signature(root)")
+        dump = source.index('"pg_dump"')
+        self.assertLess(api_scale, api_wait)
+        self.assertLess(web_scale, web_wait)
+        self.assertLess(api_wait, db_signature)
+        self.assertLess(web_wait, db_signature)
+        self.assertLess(db_signature, nats_signature)
+        self.assertLess(nats_signature, dump)
+
+    def test_recovery_waits_for_nats_quiescence_before_pvc_backup(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        scaled = source.index('_scale_deployment(root, DATA_NAMESPACE, "nats", 0)')
+        waited = source.index("_wait_pods_absent(", scaled)
+        transfer = source.index(
+            '_nats_transfer_pod(root, "commonthing-experiment-b-nats-backup")'
+        )
+        self.assertLess(scaled, waited)
+        self.assertLess(waited, transfer)
+
+    def test_recovery_waits_for_postgres_quiescence_before_pvc_delete(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        scaled = source.index('_scale_deployment(root, DATA_NAMESPACE, "postgres", 0)')
+        waited = source.index(
+            '"app.kubernetes.io/name=postgres"',
+            scaled,
+        )
+        pvc_delete = source.index('"delete", "pvc"', waited)
+        self.assertLess(scaled, waited)
+        self.assertLess(waited, pvc_delete)
+
     def test_recovery_compares_complete_jetstream_signature(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         self.assertIn("if after_nats != before_nats:", source)
         self.assertIn("streams/messages/bytes signature", source)
+
+    def test_libvirt_absence_query_fails_closed(self) -> None:
+        failed = runtime.subprocess.CompletedProcess(
+            ["virsh"], 1, stdout="", stderr="permission denied"
+        )
+        with mock.patch.object(runtime, "run", return_value=failed):
+            with self.assertRaises(runtime.RuntimeErrorEB):
+                runtime._libvirt_resource_present("domain", runtime.VM_NAME)
 
     def test_inject_secrets_cli_does_not_forward_secret_tainted_return(self) -> None:
         source = inspect.getsource(runtime.main)

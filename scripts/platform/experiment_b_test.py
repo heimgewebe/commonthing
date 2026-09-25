@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import experiment_b as eb
 
@@ -32,6 +33,21 @@ class ExperimentBContractTests(unittest.TestCase):
             "commonthing-experiment-b-registry",
         )
         self.assertTrue(all(config["forbidden"].values()))
+
+    def test_renderer_state_root_is_scoped_to_experiment_b_subtree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "experiment-b"
+            sibling = Path(tmp) / "other-controller"
+            with mock.patch.object(eb, "DEFAULT_STATE_ROOT", base):
+                self.assertEqual(eb.state_root(str(base)), base.resolve())
+                self.assertEqual(
+                    eb.state_root(str(base / "attempt-1")),
+                    (base / "attempt-1").resolve(),
+                )
+                with self.assertRaises(eb.ContractError):
+                    eb.state_root(str(base.parent))
+                with self.assertRaises(eb.ContractError):
+                    eb.state_root(str(sibling))
 
     def test_bootstrap_binds_exact_commit_and_image_digests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,6 +127,40 @@ class ExperimentBContractTests(unittest.TestCase):
         )
         self.assertIn("port: 5432", postgres_rule)
         self.assertNotIn("port: 4222", postgres_rule)
+
+    def test_migration_egress_is_postgres_only(self) -> None:
+        api_patch = (OVERLAY / "network-policy-api-data-egress-patch.yaml").read_text(
+            encoding="utf-8"
+        )
+        migration = (
+            OVERLAY / "network-policy-migration-postgres-egress.yaml"
+        ).read_text(encoding="utf-8")
+        kustomization = (OVERLAY / "kustomization.yaml").read_text(encoding="utf-8")
+
+        self.assertNotIn("commonthing-experiment-b-migration", api_patch)
+        self.assertIn("port: 5432", api_patch)
+        self.assertIn("port: 4222", api_patch)
+
+        self.assertIn("commonthing-experiment-b-migration", migration)
+        self.assertIn("app.kubernetes.io/name: postgres", migration)
+        self.assertIn("port: 5432", migration)
+        self.assertNotIn("port: 4222", migration)
+        self.assertIn("network-policy-migration-postgres-egress.yaml", kustomization)
+
+    def test_experiment_b_contract_is_registered_in_platform_ci(self) -> None:
+        workflow = (ROOT / ".github/workflows/kubernetes-platform-proof.yml").read_text(
+            encoding="utf-8"
+        )
+        validator = (ROOT / "scripts/platform/validate_platform.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("scripts/platform/experiment_b_test.py -v", workflow)
+        self.assertIn("scripts/platform/experiment_b_runtime_test.py -v", workflow)
+        self.assertIn('"experiment-b"', validator)
+        self.assertIn("platform/clusters/experiment-b/data", validator)
+        self.assertIn("platform/clusters/experiment-b/gateway", validator)
+        self.assertIn("platform/clusters/experiment-b/migration", validator)
+        self.assertIn("platform/clusters/experiment-b/namespaces", validator)
 
     def test_semantic_search_preserves_literal_loopback_contract(self) -> None:
         config = json.loads((CLUSTER / "config.json").read_text(encoding="utf-8"))

@@ -999,6 +999,22 @@ def status(root: Path) -> dict[str, Any]:
     return result
 
 
+def _libvirt_resource_present(kind: str, name: str) -> bool:
+    if kind == "domain":
+        argv = ["virsh", "-c", LIBVIRT_URI, "list", "--all", "--name"]
+    elif kind == "pool":
+        argv = ["virsh", "-c", LIBVIRT_URI, "pool-list", "--all", "--name"]
+    else:
+        raise RuntimeErrorEB(f"unsupported libvirt resource kind: {kind}")
+    result = run(argv, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeErrorEB(
+            f"cannot prove libvirt {kind} state for {name}: {detail[-1000:]}"
+        )
+    return name in {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
 def teardown(root: Path) -> dict[str, Any]:
     evidence_hashes: dict[str, str] = {}
     receipts_dir = root / "receipts"
@@ -1006,7 +1022,7 @@ def teardown(root: Path) -> dict[str, Any]:
         for path in sorted(receipts_dir.glob("*.json")):
             evidence_hashes[path.name] = sha256_file(path)
 
-    if run(["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME], check=False).returncode == 0:
+    if _libvirt_resource_present("domain", VM_NAME):
         run(["virsh", "-c", LIBVIRT_URI, "destroy", VM_NAME], check=False)
         undefine = run(
             ["virsh", "-c", LIBVIRT_URI, "undefine", VM_NAME, "--nvram"],
@@ -1015,7 +1031,7 @@ def teardown(root: Path) -> dict[str, Any]:
         if undefine.returncode != 0:
             run(["virsh", "-c", LIBVIRT_URI, "undefine", VM_NAME], check=False)
 
-    if run(["virsh", "-c", LIBVIRT_URI, "pool-info", POOL_NAME], check=False).returncode == 0:
+    if _libvirt_resource_present("pool", POOL_NAME):
         run(
             ["virsh", "-c", LIBVIRT_URI, "vol-delete", VOLUME_NAME, "--pool", POOL_NAME],
             check=False,
@@ -1028,9 +1044,9 @@ def teardown(root: Path) -> dict[str, Any]:
         run(["virsh", "-c", LIBVIRT_URI, "pool-delete", POOL_NAME], check=False)
         run(["virsh", "-c", LIBVIRT_URI, "pool-undefine", POOL_NAME], check=False)
 
-    if run(["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME], check=False).returncode == 0:
+    if _libvirt_resource_present("domain", VM_NAME):
         raise RuntimeErrorEB("Experiment-B VM still exists after teardown")
-    if run(["virsh", "-c", LIBVIRT_URI, "pool-info", POOL_NAME], check=False).returncode == 0:
+    if _libvirt_resource_present("pool", POOL_NAME):
         raise RuntimeErrorEB("Experiment-B storage pool still exists after teardown")
     if POOL_TARGET.exists():
         if any(POOL_TARGET.iterdir()):
@@ -1187,6 +1203,132 @@ def _write_streamed_fixture_sql(
                 output.write(line)
 
 
+def _t048_live_fixture_binding(
+    root: Path, manifest: Path, generation_id: str
+) -> dict[str, Any]:
+    root_text = str(ROOT)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    from scripts.performance import api_runtime_live_binding as live_binding
+
+    _manifest, fixture_rows = live_binding._manifest_and_fixture(manifest)
+    db_rows = live_binding._json_lines(
+        _psql(
+            root,
+            r"""
+SELECT json_build_object(
+  'id', id,
+  'kind', kind,
+  'title', title,
+  'lat', lat,
+  'lon', lon,
+  'created_at', to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+  'updated_at', to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+  'payload', payload
+)::text
+FROM domain_nodes
+ORDER BY id;
+""",
+        ),
+        "Experiment-B domain_nodes query",
+    )
+    fixture_sha = live_binding._rows_sha256(fixture_rows)
+    database_sha = live_binding._rows_sha256(db_rows)
+    if len(db_rows) != len(fixture_rows) or database_sha != fixture_sha:
+        raise RuntimeErrorEB(
+            "live domain_nodes content does not match the deterministic T048 fixture"
+        )
+
+    generation_literal = live_binding._sql_literal(generation_id)
+    generation_rows = live_binding._json_lines(
+        _psql(
+            root,
+            f"""
+SELECT json_build_object(
+  'generation_id', generation_id,
+  'state', state,
+  'expected_nodes', expected_nodes,
+  'completed_nodes', completed_nodes
+)::text
+FROM search_index_generations
+WHERE generation_id = {generation_literal} AND state = 'active';
+""",
+        ),
+        "Experiment-B active search generation query",
+    )
+    if len(generation_rows) != 1:
+        raise RuntimeErrorEB("Experiment-B requires exactly one active T048 generation")
+    generation = generation_rows[0]
+
+    projection_rows = live_binding._json_lines(
+        _psql(
+            root,
+            f"""
+SELECT json_build_object(
+  'id', p.node_id,
+  'kind', p.kind,
+  'title', p.title,
+  'search_visibility', n.search_visibility,
+  'owner_account_id', weltgewebe_search_node_owner_account_id(n.payload)
+)::text
+FROM search_node_projections p
+JOIN domain_nodes n ON n.id = p.node_id
+WHERE p.generation_id = {generation_literal}
+ORDER BY p.node_id;
+""",
+        ),
+        "Experiment-B active search projection query",
+    )
+    expected_nodes = generation.get("expected_nodes")
+    completed_nodes = generation.get("completed_nodes")
+    if (
+        len(projection_rows) < 1
+        or expected_nodes != len(projection_rows)
+        or completed_nodes != len(projection_rows)
+    ):
+        raise RuntimeErrorEB("Experiment-B active T048 search generation is incomplete")
+
+    fixture_by_id = {row["id"]: row for row in fixture_rows}
+    expected_projection_rows: list[dict[str, Any]] = []
+    actual_projection_rows: list[dict[str, Any]] = []
+    for projection in projection_rows:
+        node_id = projection.get("id")
+        fixture = fixture_by_id.get(node_id)
+        if fixture is None:
+            raise RuntimeErrorEB(
+                f"Experiment-B search projection {node_id!r} is absent from fixture"
+            )
+        expected_projection_rows.append(
+            live_binding._expected_projection_identity(projection, fixture)
+        )
+        actual_projection_rows.append(
+            {
+                "id": projection.get("id"),
+                "kind": projection.get("kind"),
+                "title": projection.get("title"),
+                "search_visibility": projection.get("search_visibility"),
+            }
+        )
+    projection_sha = live_binding._rows_sha256(actual_projection_rows)
+    expected_projection_sha = live_binding._rows_sha256(expected_projection_rows)
+    if projection_sha != expected_projection_sha:
+        raise RuntimeErrorEB(
+            "live search projection content does not match the deterministic T048 fixture"
+        )
+    return {
+        "manifest_sha256": sha256_file(manifest),
+        "domain_nodes_count": len(db_rows),
+        "fixture_nodes_content_sha256": fixture_sha,
+        "database_nodes_content_sha256": database_sha,
+        "generation_id": generation_id,
+        "expected_nodes": int(expected_nodes),
+        "completed_nodes": int(completed_nodes),
+        "active_projection_count": len(projection_rows),
+        "fixture_projection_content_sha256": expected_projection_sha,
+        "database_projection_content_sha256": projection_sha,
+    }
+
+
 def seed_t048_fixture(root: Path) -> dict[str, Any]:
     evidence, _domain_scale = _performance_modules()
     config = load_config()
@@ -1252,6 +1394,15 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         if receipt.get("manifest_sha256") != binding["manifest_sha256"]:
             raise RuntimeErrorEB("existing T048 fixture receipt has a different manifest")
+        if receipt.get("source_commit") != source_commit:
+            raise RuntimeErrorEB("existing T048 fixture receipt has a different source commit")
+        current_live_binding = _t048_live_fixture_binding(
+            root, manifest, generation_id
+        )
+        if receipt.get("live_binding") != current_live_binding:
+            raise RuntimeErrorEB(
+                "existing T048 fixture receipt does not match live database/search contents"
+            )
         return receipt
     if existing_nodes or existing_edges or existing_generation:
         raise RuntimeErrorEB(
@@ -1423,6 +1574,7 @@ COMMIT;
         raise RuntimeErrorEB(
             "T048 fixture/search projection counts do not match the canonical manifest"
         )
+    live_binding = _t048_live_fixture_binding(root, manifest, generation_id)
     receipt = {
         "schema_version": 1,
         "status": "loaded",
@@ -1438,6 +1590,7 @@ COMMIT;
         "generation_state": "active",
         "projection_mode": "synthetic-canonical-t048",
         "pending_projection_jobs": pending_jobs,
+        "live_binding": live_binding,
         "production_data_used": False,
     }
     atomic_json(receipt_path, receipt)
@@ -1949,6 +2102,27 @@ SELECT json_build_object(
       SELECT md5(coalesce(string_agg(md5(to_jsonb(e)::text), '' ORDER BY e.id), ''))
       FROM domain_edges e
   ),
+  'outbox_count', (SELECT count(*) FROM domain_outbox),
+  'outbox_md5', (
+      SELECT md5(coalesce(string_agg(md5(to_jsonb(o)::text), '' ORDER BY o.id), ''))
+      FROM domain_outbox o
+  ),
+  'event_consumptions_count', (SELECT count(*) FROM domain_event_consumptions),
+  'event_consumptions_md5', (
+      SELECT md5(coalesce(
+          string_agg(md5(to_jsonb(c)::text), '' ORDER BY c.consumer_name, c.event_id),
+          ''
+      ))
+      FROM domain_event_consumptions c
+  ),
+  'projection_state_count', (SELECT count(*) FROM domain_projection_state),
+  'projection_state_md5', (
+      SELECT md5(coalesce(
+          string_agg(md5(to_jsonb(s)::text), '' ORDER BY s.singleton),
+          ''
+      ))
+      FROM domain_projection_state s
+  ),
   'search_versions_count', (SELECT count(*) FROM search_node_versions),
   'search_versions_md5', (
       SELECT md5(coalesce(string_agg(md5(to_jsonb(v)::text), '' ORDER BY v.node_id), ''))
@@ -2063,6 +2237,30 @@ def _flux_resume(root: Path, name: str) -> None:
     )
 
 
+def _wait_pods_absent(
+    root: Path,
+    namespace: str,
+    selector: str,
+    *,
+    timeout_seconds: int = 180,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        pods = _kubectl_json(
+            root,
+            ["-n", namespace, "get", "pods", "-l", selector],
+        )
+        items = pods.get("items")
+        if not isinstance(items, list):
+            raise RuntimeErrorEB("pod absence readback is not a list")
+        if not items:
+            return
+        time.sleep(2)
+    raise RuntimeErrorEB(
+        f"pods did not terminate before exclusive PVC access: {namespace} {selector}"
+    )
+
+
 def _nats_transfer_pod(root: Path, name: str) -> None:
     deployment = _kubectl_json(
         root, ["-n", DATA_NAMESPACE, "get", "deployment", "nats"]
@@ -2140,8 +2338,8 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     backup_dir.mkdir(parents=True, exist_ok=True)
     db_dump = backup_dir / "postgres.dump"
     nats_tar = backup_dir / "nats.tar"
-    before_db = _database_signature(root)
-    before_nats = _jetstream_signature(root)
+    before_db: dict[str, Any] | None = None
+    before_nats: dict[str, int] | None = None
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
         raise RuntimeErrorEB("recovery proof requires an applied release receipt")
@@ -2149,15 +2347,27 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     source_commit = str(release.get("source_commit", ""))
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("recovery proof release binding is not exact")
-    if before_nats["streams"] < 1 or before_nats["messages"] < 1:
-        raise RuntimeErrorEB("JetStream test state is empty before recovery proof")
-
     _flux_suspend(root, "commonthing-experiment-b-app")
     _flux_suspend(root, "commonthing-experiment-b-data")
     destructive_started = time.monotonic()
     try:
         _scale_deployment(root, APP_NAMESPACE, "weltgewebe-api", 0)
         _scale_deployment(root, APP_NAMESPACE, "weltgewebe-web", 0)
+        _wait_pods_absent(
+            root,
+            APP_NAMESPACE,
+            "app.kubernetes.io/name=weltgewebe-api",
+        )
+        _wait_pods_absent(
+            root,
+            APP_NAMESPACE,
+            "app.kubernetes.io/name=weltgewebe-web",
+        )
+
+        before_db = _database_signature(root)
+        before_nats = _jetstream_signature(root)
+        if before_nats["streams"] < 1 or before_nats["messages"] < 1:
+            raise RuntimeErrorEB("JetStream test state is empty before recovery proof")
 
         kubectl = toolchain(root)["tools"]["kubectl"]
         _run_binary_to_file(
@@ -2171,6 +2381,11 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         )
 
         _scale_deployment(root, DATA_NAMESPACE, "nats", 0)
+        _wait_pods_absent(
+            root,
+            DATA_NAMESPACE,
+            "app.kubernetes.io/name=nats",
+        )
         _nats_transfer_pod(root, "commonthing-experiment-b-nats-backup")
         try:
             _run_binary_to_file(
@@ -2189,6 +2404,11 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             )
 
         _scale_deployment(root, DATA_NAMESPACE, "postgres", 0)
+        _wait_pods_absent(
+            root,
+            DATA_NAMESPACE,
+            "app.kubernetes.io/name=postgres",
+        )
         _kubectl(
             root,
             [
@@ -2269,6 +2489,8 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             },
         )
         raise
+    if before_db is None or before_nats is None:
+        raise RuntimeErrorEB("recovery proof has no quiesced before-signature")
     receipt = {
         "schema_version": 1,
         "status": "pass",

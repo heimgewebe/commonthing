@@ -170,8 +170,16 @@ def validate_config(config: dict[str, Any]) -> None:
 
 
 def state_root(value: str | None) -> Path:
-    root = Path(value).expanduser() if value else DEFAULT_STATE_ROOT
-    return root.resolve()
+    root = (Path(value).expanduser() if value else DEFAULT_STATE_ROOT).resolve()
+    allowed_root = DEFAULT_STATE_ROOT.resolve()
+    if root != allowed_root:
+        try:
+            root.relative_to(allowed_root)
+        except ValueError as exc:
+            raise ContractError(
+                f"state root must be {allowed_root} or one of its descendants"
+            ) from exc
+    return root
 
 
 def require_state_path(root: Path, path: Path) -> Path:
