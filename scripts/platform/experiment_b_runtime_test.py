@@ -211,6 +211,10 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         create_vm = inspect.getsource(runtime.create_vm)
         self.assertLess(
             create_vm.index("_invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)"),
+            create_vm.index("prepared = prepare(root)"),
+        )
+        self.assertLess(
+            create_vm.index("_invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)"),
             create_vm.index("POOL_TARGET.mkdir"),
         )
 
@@ -251,6 +255,34 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             ),
             inject_secrets.index("kubectl_apply(root, render_namespaces(root))"),
         )
+
+    def test_create_vm_rerun_invalidates_stale_chain_before_prepare_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            for name in runtime.VM_ATTEMPT_INVALIDATES:
+                (receipts / name).write_text(
+                    json.dumps({"schema_version": 1, "status": "stale"}) + "\n",
+                    encoding="utf-8",
+                )
+            absent = runtime.subprocess.CompletedProcess(
+                ["virsh"], 1, stdout="", stderr=""
+            )
+            with (
+                mock.patch.object(runtime, "load_config", return_value={}),
+                mock.patch.object(runtime, "run", return_value=absent),
+                mock.patch.object(
+                    runtime,
+                    "prepare",
+                    side_effect=runtime.RuntimeErrorEB("prepare failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "prepare failed"):
+                    runtime.create_vm(root)
+
+            for name in runtime.VM_ATTEMPT_INVALIDATES:
+                self.assertFalse((receipts / name).exists(), name)
 
     def test_dirty_k3s_rerun_invalidates_stale_chain_before_binding_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

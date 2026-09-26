@@ -420,12 +420,12 @@ def create_vm(root: Path) -> dict[str, Any]:
             "Experiment-B libvirt pool already exists; run bounded teardown first"
         )
 
+    _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
     prepared = prepare(root)
     cloud_image = Path(prepared["cloud_image"])
     source_virtual_size = int(prepared["cloud_image_virtual_size"])
     if POOL_TARGET.exists() and any(POOL_TARGET.iterdir()):
         raise RuntimeErrorEB("Experiment-B libvirt pool target already contains files")
-    _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
     POOL_TARGET.mkdir(parents=True, exist_ok=True)
 
     pool_defined = False
