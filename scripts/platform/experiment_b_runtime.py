@@ -920,6 +920,70 @@ def semantic_activate(root: Path) -> dict[str, Any]:
     return receipt
 
 
+
+EXPECTED_FLUX_KUSTOMIZATIONS = frozenset(
+    {
+        "commonthing-experiment-b-namespaces",
+        "commonthing-experiment-b-data",
+        "commonthing-experiment-b-migration",
+        "commonthing-experiment-b-app",
+        "commonthing-experiment-b-gateway",
+    }
+)
+
+
+def _require_exact_flux_kustomizations(flux_readback: dict[str, Any]) -> None:
+    observed = set(flux_readback)
+    if observed == EXPECTED_FLUX_KUSTOMIZATIONS:
+        return
+    missing = sorted(EXPECTED_FLUX_KUSTOMIZATIONS - observed)
+    unexpected = sorted(observed - EXPECTED_FLUX_KUSTOMIZATIONS)
+    raise RuntimeErrorEB(
+        "Experiment-B Flux Kustomization set mismatch: "
+        f"missing={missing}; unexpected={unexpected}"
+    )
+
+
+def _deployment_availability_snapshot(
+    deployment: dict[str, Any], name: str
+) -> dict[str, Any]:
+    metadata = deployment.get("metadata", {})
+    spec = deployment.get("spec", {})
+    status_obj = deployment.get("status", {})
+    generation = int(metadata.get("generation") or 0)
+    desired = int(spec.get("replicas") or 0)
+    observed_generation = int(status_obj.get("observedGeneration") or 0)
+    updated = int(status_obj.get("updatedReplicas") or 0)
+    ready = int(status_obj.get("readyReplicas") or 0)
+    available = int(status_obj.get("availableReplicas") or 0)
+    available_condition = any(
+        condition.get("type") == "Available" and condition.get("status") == "True"
+        for condition in status_obj.get("conditions", [])
+        if isinstance(condition, dict)
+    )
+    if (
+        generation < 1
+        or desired < 1
+        or observed_generation < generation
+        or updated < desired
+        or ready < desired
+        or available < desired
+        or not available_condition
+    ):
+        raise RuntimeErrorEB(
+            f"Experiment-B deployment is not currently available: {name}"
+        )
+    return {
+        "generation": generation,
+        "observed_generation": observed_generation,
+        "desired_replicas": desired,
+        "updated_replicas": updated,
+        "ready_replicas": ready,
+        "available_replicas": available,
+        "available": True,
+    }
+
+
 def status(root: Path) -> dict[str, Any]:
     config = load_config()
     tools = toolchain(root)["tools"]
@@ -980,12 +1044,22 @@ def status(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(f"Flux Kustomization is not exact-revision Ready: {name}")
         flux_readback[name] = {"ready": True, "revision": revision}
 
+    _require_exact_flux_kustomizations(flux_readback)
+
     api = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-api"]
     )
     web = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-web"]
     )
+    deployment_readback = {
+        "weltgewebe-api": _deployment_availability_snapshot(
+            api, "weltgewebe-api"
+        ),
+        "weltgewebe-web": _deployment_availability_snapshot(
+            web, "weltgewebe-web"
+        ),
+    }
     api_containers = {
         item.get("name"): item.get("image")
         for item in api.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
@@ -1043,6 +1117,7 @@ def status(root: Path) -> dict[str, Any]:
         "os_image": os_image,
         "flux_source_revision": source_revision,
         "flux": flux_readback,
+        "deployments": deployment_readback,
         "images": {
             "api": api_containers.get("api"),
             "web": web_containers.get("web"),

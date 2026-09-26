@@ -175,6 +175,66 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         )
         self.assertIn("_complete_live_check_attempt(", status)
 
+    def test_status_requires_exact_flux_kustomization_set(self) -> None:
+        complete = {
+            name: {"ready": True}
+            for name in runtime.EXPECTED_FLUX_KUSTOMIZATIONS
+        }
+        runtime._require_exact_flux_kustomizations(complete)
+
+        for name in runtime.EXPECTED_FLUX_KUSTOMIZATIONS:
+            with self.subTest(missing=name):
+                incomplete = dict(complete)
+                incomplete.pop(name)
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime._require_exact_flux_kustomizations(incomplete)
+
+        unexpected = dict(complete)
+        unexpected["commonthing-experiment-b-shadow"] = {"ready": True}
+        with self.assertRaises(runtime.RuntimeErrorEB):
+            runtime._require_exact_flux_kustomizations(unexpected)
+
+    def test_deployment_availability_requires_current_ready_rollout(self) -> None:
+        healthy = {
+            "metadata": {"generation": 7},
+            "spec": {"replicas": 1},
+            "status": {
+                "observedGeneration": 7,
+                "updatedReplicas": 1,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+                "conditions": [{"type": "Available", "status": "True"}],
+            },
+        }
+        snapshot = runtime._deployment_availability_snapshot(
+            healthy, "weltgewebe-api"
+        )
+        self.assertTrue(snapshot["available"])
+
+        failure_paths = (
+            ("observedGeneration", 6),
+            ("updatedReplicas", 0),
+            ("readyReplicas", 0),
+            ("availableReplicas", 0),
+        )
+        for field, value in failure_paths:
+            with self.subTest(field=field):
+                broken = json.loads(json.dumps(healthy))
+                broken["status"][field] = value
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime._deployment_availability_snapshot(
+                        broken, "weltgewebe-api"
+                    )
+
+        no_available_condition = json.loads(json.dumps(healthy))
+        no_available_condition["status"]["conditions"] = [
+            {"type": "Available", "status": "False"}
+        ]
+        with self.assertRaises(runtime.RuntimeErrorEB):
+            runtime._deployment_availability_snapshot(
+                no_available_condition, "weltgewebe-api"
+            )
+
     def test_t048_rerun_invalidates_stale_success_before_early_failure(self) -> None:
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as tmp:
