@@ -569,11 +569,11 @@ def scp_to(root: Path, ip: str, source: Path, destination: str) -> None:
 
 
 def install_k3s(root: Path) -> dict[str, Any]:
-    config = load_config()
+    _invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
+    config = load_config()
     ip = vm_ip()
     wait_ssh(root, ip)
-    _invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)
     scp_to(root, ip, root / "downloads/k3s", "/tmp/k3s")
     scp_to(root, ip, CLUSTER / "k3s-config.yaml", "/tmp/config.yaml")
     scp_to(root, ip, CLUSTER / "k3s.service", "/tmp/k3s.service")
@@ -639,6 +639,7 @@ def kube_env(root: Path) -> dict[str, str]:
 
 
 def install_platform(root: Path) -> dict[str, Any]:
+    _invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
     receipt = toolchain(root)
     tools = receipt["tools"]
@@ -648,7 +649,6 @@ def install_platform(root: Path) -> dict[str, Any]:
     helm = tools["helm"]
     flux = tools["flux"]
 
-    _invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)
     for name in (
         "gateway_api_gatewayclasses",
         "gateway_api_gateways",
@@ -752,6 +752,8 @@ def ensure_secret_material(root: Path) -> dict[str, str]:
 
 
 def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
+    _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
+    source_commit = _current_protected_main_commit()
     if not registry_config.is_file() or registry_config.is_symlink():
         raise RuntimeErrorEB("registry config must be a regular external file")
     try:
@@ -760,8 +762,6 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("registry config is not valid JSON") from exc
     if "ghcr.io" not in registry_payload.get("auths", {}):
         raise RuntimeErrorEB("registry config has no ghcr.io credential")
-    source_commit = _current_protected_main_commit()
-    _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
     kubectl_apply(root, render_namespaces(root))
     db = ensure_secret_material(root)
     database_url = (

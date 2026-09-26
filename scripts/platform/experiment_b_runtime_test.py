@@ -217,10 +217,20 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         install_k3s = inspect.getsource(runtime.install_k3s)
         self.assertLess(
             install_k3s.index("_invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)"),
+            install_k3s.index("_current_protected_main_commit()"),
+        )
+        self.assertLess(
+            install_k3s.index("_invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)"),
             install_k3s.index('scp_to(root, ip, root / "downloads/k3s"'),
         )
 
         install_platform = inspect.getsource(runtime.install_platform)
+        self.assertLess(
+            install_platform.index(
+                "_invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)"
+            ),
+            install_platform.index("_current_protected_main_commit()"),
+        )
         self.assertLess(
             install_platform.index(
                 "_invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)"
@@ -233,8 +243,34 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             inject_secrets.index(
                 "_invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)"
             ),
+            inject_secrets.index("_current_protected_main_commit()"),
+        )
+        self.assertLess(
+            inject_secrets.index(
+                "_invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)"
+            ),
             inject_secrets.index("kubectl_apply(root, render_namespaces(root))"),
         )
+
+    def test_dirty_k3s_rerun_invalidates_stale_chain_before_binding_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            for name in runtime.K3S_ATTEMPT_INVALIDATES:
+                (receipts / name).write_text(
+                    json.dumps({"schema_version": 1, "status": "stale"}) + "\n",
+                    encoding="utf-8",
+                )
+            with mock.patch.object(
+                runtime,
+                "_current_protected_main_commit",
+                side_effect=runtime.RuntimeErrorEB("dirty checkout"),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "dirty checkout"):
+                    runtime.install_k3s(root)
+            for name in runtime.K3S_ATTEMPT_INVALIDATES:
+                self.assertFalse((receipts / name).exists(), name)
 
     def test_recovery_attempt_invalidates_post_recovery_evidence(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
