@@ -383,8 +383,11 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with (
-                mock.patch.object(runtime, "git_head", return_value=commit),
-                mock.patch.object(runtime, "remote_main", return_value=commit),
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=commit,
+                ),
                 mock.patch.object(
                     runtime,
                     "seed_t048_fixture",
@@ -518,9 +521,14 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
 
     def test_protected_main_binding_fails_closed_on_revision_drift(self) -> None:
         commit = "a" * 40
+        clean_status = mock.Mock(stdout="")
+        dirty_status = mock.Mock(
+            stdout=" M scripts/platform/experiment_b_runtime.py\n"
+        )
         with (
             mock.patch.object(runtime, "git_head", return_value=commit),
             mock.patch.object(runtime, "remote_main", return_value=commit),
+            mock.patch.object(runtime, "run", return_value=clean_status),
         ):
             self.assertEqual(runtime._current_protected_main_commit(), commit)
 
@@ -534,6 +542,17 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             ):
                 runtime._current_protected_main_commit()
 
+        with (
+            mock.patch.object(runtime, "git_head", return_value=commit),
+            mock.patch.object(runtime, "remote_main", return_value=commit),
+            mock.patch.object(runtime, "run", return_value=dirty_status),
+        ):
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "must be clean to bind current protected main",
+            ):
+                runtime._current_protected_main_commit()
+
         for function in (
             runtime.install_k3s,
             runtime.install_platform,
@@ -542,6 +561,22 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             source = inspect.getsource(function)
             self.assertIn("_current_protected_main_commit()", source)
             self.assertIn('"source_commit": source_commit', source)
+
+        for function in (
+            runtime.apply_release,
+            runtime.semantic_activate,
+            runtime.status,
+            runtime.seed_t048_fixture,
+            runtime.functional_readback,
+            runtime.t048_load_proof,
+            runtime.recovery_proof,
+            runtime.portability_report,
+        ):
+            with self.subTest(source_bound_function=function.__name__):
+                self.assertIn(
+                    "_current_protected_main_commit()",
+                    inspect.getsource(function),
+                )
 
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
         commit = "a" * 40
@@ -847,8 +882,11 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                     "load_config",
                     return_value={"semantic_search": {"generation_id": generation_id}},
                 ),
-                mock.patch.object(runtime, "git_head", return_value=commit),
-                mock.patch.object(runtime, "remote_main", return_value=commit),
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=commit,
+                ),
                 mock.patch.object(runtime, "_psql", side_effect=psql_values),
                 mock.patch.object(
                     runtime,

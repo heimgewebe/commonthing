@@ -289,6 +289,8 @@ def _current_protected_main_commit() -> str:
     current_main = remote_main()
     if current_main != head:
         raise RuntimeErrorEB("checkout HEAD is no longer current protected main")
+    if run(["git", "status", "--porcelain"]).stdout.strip():
+        raise RuntimeErrorEB("checkout must be clean to bind current protected main")
     return head
 
 
@@ -816,7 +818,7 @@ def apply_release(
         raise RuntimeErrorEB("source commit is not exact")
     if not DIGEST_RE.fullmatch(api_digest) or not DIGEST_RE.fullmatch(web_digest):
         raise RuntimeErrorEB("image digests must be exact sha256 values")
-    if git_head() != source_commit or remote_main() != source_commit:
+    if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("release source is not current protected main")
     output = root / "bootstrap.yaml"
     binding = contract.render_bootstrap(
@@ -870,8 +872,7 @@ def semantic_activate(root: Path) -> dict[str, Any]:
     source_commit = str(release.get("source_commit", ""))
     if (
         not COMMIT_RE.fullmatch(source_commit)
-        or git_head() != source_commit
-        or remote_main() != source_commit
+        or _current_protected_main_commit() != source_commit
     ):
         raise RuntimeErrorEB("semantic provider proof is not bound to current protected main")
 
@@ -1088,6 +1089,11 @@ def status(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("Experiment-B status requires release receipt")
     release = json.loads(release_path.read_text(encoding="utf-8"))
     source_commit = str(release.get("source_commit", ""))
+    if (
+        not COMMIT_RE.fullmatch(source_commit)
+        or _current_protected_main_commit() != source_commit
+    ):
+        raise RuntimeErrorEB("Experiment-B status release is not current protected main")
     receipt_path, attempt_path, attempt_started_at_unix_ms = (
         _begin_live_check_attempt(root, "status", source_commit)
     )
@@ -1591,8 +1597,7 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
     if (
         not isinstance(source_commit, str)
         or not COMMIT_RE.fullmatch(source_commit)
-        or git_head() != source_commit
-        or remote_main() != source_commit
+        or _current_protected_main_commit() != source_commit
     ):
         raise RuntimeErrorEB("T048 fixture release is not current protected main")
     contract_section = evidence.api_runtime_section(
@@ -2062,13 +2067,12 @@ def _sample_t048_load(
 
 
 def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
-    evidence, _domain_scale = _performance_modules()
-    if git_head() != source_commit or remote_main() != source_commit:
-        raise RuntimeErrorEB("T048 proof source is not current protected main")
-
     report_path, attempt_path, attempt_started_at_unix_ms = (
         _begin_live_check_attempt(root, "t048-load", source_commit)
     )
+    if _current_protected_main_commit() != source_commit:
+        raise RuntimeErrorEB("T048 proof source is not current protected main")
+    evidence, _domain_scale = _performance_modules()
     fixture_receipt = seed_t048_fixture(root)
     manifest = Path(fixture_receipt["manifest"])
     policy = evidence.load_policy(PERFORMANCE_POLICY)
@@ -2322,6 +2326,11 @@ def _gateway_base_url(root: Path) -> str:
 
 
 def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
+    if (
+        not COMMIT_RE.fullmatch(source_commit)
+        or _current_protected_main_commit() != source_commit
+    ):
+        raise RuntimeErrorEB("functional readback source is not current protected main")
     receipt_path, attempt_path, attempt_started_at_unix_ms = (
         _begin_live_check_attempt(root, "functional-readback", source_commit)
     )
@@ -2790,6 +2799,8 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     source_commit = str(release.get("source_commit", ""))
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("recovery proof release binding is not exact")
+    if _current_protected_main_commit() != source_commit:
+        raise RuntimeErrorEB("recovery proof release is not current protected main")
     _invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)
     recovery_receipt = root / "receipts/recovery.json"
     recovery_failed_receipt = root / "receipts/recovery-failed.json"
