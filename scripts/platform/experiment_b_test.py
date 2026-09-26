@@ -65,6 +65,14 @@ class ExperimentBContractTests(unittest.TestCase):
             self.assertIn("sha256:" + "c" * 64, rendered)
             self.assertEqual(result["sha256"], eb.sha256_file(output))
 
+    def test_migration_flux_recreates_digest_changed_job(self) -> None:
+        template = (CLUSTER / "bootstrap-template.yaml").read_text(encoding="utf-8")
+        migration = template.split(
+            "name: commonthing-experiment-b-migration", 1
+        )[1].split("---", 1)[0]
+        self.assertIn("force: true", migration)
+        self.assertIn("path: ./platform/clusters/experiment-b/migration", migration)
+
     def test_mutable_release_bindings_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "bootstrap.yaml"

@@ -141,6 +141,18 @@ RECOVERY_ATTEMPT_INVALIDATES = (
     "status-attempt.json",
     "portability.json",
 )
+FIXTURE_ATTEMPT_INVALIDATES = (
+    "t048-fixture.json",
+    "functional-readback.json",
+    "functional-readback-attempt.json",
+    "t048-load.json",
+    "t048-load-attempt.json",
+    "recovery.json",
+    "recovery-failed.json",
+    "status.json",
+    "status-attempt.json",
+    "portability.json",
+)
 
 
 def _invalidate_receipts(root: Path, names: tuple[str, ...]) -> None:
@@ -574,7 +586,14 @@ def install_k3s(root: Path) -> dict[str, Any]:
     config = load_config()
     ip = vm_ip()
     wait_ssh(root, ip)
-    scp_to(root, ip, root / "downloads/k3s", "/tmp/k3s")
+    k3s_binary = root / "downloads/k3s"
+    if not k3s_binary.is_file():
+        raise RuntimeErrorEB("prepared k3s binary is missing")
+    expected_k3s_sha256 = str(config["kubernetes"]["binary_sha256"])
+    observed_k3s_sha256 = sha256_file(k3s_binary)
+    if observed_k3s_sha256 != expected_k3s_sha256:
+        raise RuntimeErrorEB("prepared k3s binary digest does not match current config")
+    scp_to(root, ip, k3s_binary, "/tmp/k3s")
     scp_to(root, ip, CLUSTER / "k3s-config.yaml", "/tmp/config.yaml")
     scp_to(root, ip, CLUSTER / "k3s.service", "/tmp/k3s.service")
     command = (
@@ -1582,7 +1601,7 @@ ORDER BY p.node_id;
 
 
 def seed_t048_fixture(root: Path) -> dict[str, Any]:
-    _invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)
+    _invalidate_receipts(root, FIXTURE_ATTEMPT_INVALIDATES)
     evidence, _domain_scale = _performance_modules()
     config = load_config()
     release_path = root / "receipts/release.json"
@@ -1701,25 +1720,6 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         atomic_json(receipt_path, receipt)
         return receipt
 
-    if (
-        existing_nodes == node_count
-        and existing_edges == edge_count
-        and existing_generation == 1
-        and receipt_path.is_file()
-    ):
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        if receipt.get("manifest_sha256") != binding["manifest_sha256"]:
-            raise RuntimeErrorEB("existing T048 fixture receipt has a different manifest")
-        if receipt.get("source_commit") != source_commit:
-            raise RuntimeErrorEB("existing T048 fixture receipt has a different source commit")
-        current_live_binding = _t048_live_fixture_binding(
-            root, manifest, generation_id
-        )
-        if receipt.get("live_binding") != current_live_binding:
-            raise RuntimeErrorEB(
-                "existing T048 fixture receipt does not match live database/search contents"
-            )
-        return receipt
     if (
         existing_nodes == node_count
         and existing_edges == edge_count

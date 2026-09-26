@@ -221,7 +221,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         )
         self.assertLess(
             install_k3s.index("_invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)"),
-            install_k3s.index('scp_to(root, ip, root / "downloads/k3s"'),
+            install_k3s.index('scp_to(root, ip, k3s_binary, "/tmp/k3s")'),
         )
 
         install_platform = inspect.getsource(runtime.install_platform)
@@ -272,6 +272,42 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             for name in runtime.K3S_ATTEMPT_INVALIDATES:
                 self.assertFalse((receipts / name).exists(), name)
 
+    def test_install_k3s_rechecks_pinned_binary_before_copy(self) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "downloads/k3s"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"tampered-k3s")
+            config = {
+                "kubernetes": {
+                    "binary_sha256": "0" * 64,
+                }
+            }
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=commit,
+                ),
+                mock.patch.object(runtime, "load_config", return_value=config),
+                mock.patch.object(runtime, "vm_ip", return_value="192.0.2.10"),
+                mock.patch.object(runtime, "wait_ssh"),
+                mock.patch.object(runtime, "scp_to") as copy_to_vm,
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "k3s binary digest does not match",
+                ):
+                    runtime.install_k3s(root)
+            copy_to_vm.assert_not_called()
+
+        source = inspect.getsource(runtime.install_k3s)
+        self.assertLess(
+            source.index("observed_k3s_sha256 = sha256_file(k3s_binary)"),
+            source.index('scp_to(root, ip, k3s_binary, "/tmp/k3s")'),
+        )
+
     def test_recovery_attempt_invalidates_post_recovery_evidence(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         self.assertIn(
@@ -299,7 +335,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
     def test_derived_portability_is_invalidated_before_rerun_work(self) -> None:
         seed = inspect.getsource(runtime.seed_t048_fixture)
         self.assertLess(
-            seed.index("_invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)"),
+            seed.index("_invalidate_receipts(root, FIXTURE_ATTEMPT_INVALIDATES)"),
             seed.index("_performance_modules()"),
         )
 
@@ -855,17 +891,77 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         portability = inspect.getsource(runtime.portability_report)
         self.assertIn("recovery_failed_receipt.is_file()", portability)
 
-    def test_fixture_reuse_requires_live_content_binding(self) -> None:
-        source = inspect.getsource(runtime.seed_t048_fixture)
-        self.assertIn(
-            "current_live_binding = _t048_live_fixture_binding(",
-            source,
+    def test_fixture_rerun_invalidates_its_downstream_chain_only(self) -> None:
+        self.assertEqual(
+            set(runtime.FIXTURE_ATTEMPT_INVALIDATES),
+            {
+                "t048-fixture.json",
+                "functional-readback.json",
+                "functional-readback-attempt.json",
+                "t048-load.json",
+                "t048-load-attempt.json",
+                "recovery.json",
+                "recovery-failed.json",
+                "status.json",
+                "status-attempt.json",
+                "portability.json",
+            },
         )
-        self.assertIn(
-            'receipt.get("live_binding") != current_live_binding',
-            source,
-        )
-        self.assertIn('"live_binding": live_binding', source)
+        self.assertNotIn("semantic-search.json", runtime.FIXTURE_ATTEMPT_INVALIDATES)
+
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            (receipts / "release.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "applied",
+                        "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            semantic = receipts / "semantic-search.json"
+            semantic.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            for name in runtime.FIXTURE_ATTEMPT_INVALIDATES:
+                (receipts / name).write_text(
+                    json.dumps({"schema_version": 1, "status": "stale"}) + "\n",
+                    encoding="utf-8",
+                )
+            evidence = mock.Mock()
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_performance_modules",
+                    return_value=(evidence, Path("/unused/domain_scale.py")),
+                ),
+                mock.patch.object(runtime, "load_config", return_value={}),
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    side_effect=runtime.RuntimeErrorEB("dirty checkout"),
+                ),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "dirty checkout"):
+                    runtime.seed_t048_fixture(root)
+
+            for name in runtime.FIXTURE_ATTEMPT_INVALIDATES:
+                self.assertFalse((receipts / name).exists(), name)
+            self.assertTrue(semantic.is_file())
 
     def test_t048_canonical_visibility_is_fixture_derived(self) -> None:
         self.assertEqual(
@@ -939,6 +1035,19 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                         "schema_version": 1,
                         "status": "applied",
                         "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (receipts / "t048-fixture.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "loaded",
+                        "source_commit": "b" * 40,
+                        "manifest_sha256": "stale",
+                        "live_binding": {"stale": True},
                     }
                 )
                 + "\n",

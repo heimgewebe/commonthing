@@ -76,6 +76,7 @@ spec:
   wait: true
   dependsOn:
     - name: commonthing-experiment-b-data
+  force: true
   sourceRef:
     kind: GitRepository
     name: commonthing-experiment-b
