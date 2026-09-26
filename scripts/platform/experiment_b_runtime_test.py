@@ -304,6 +304,67 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         )
         self.assertIn("_complete_live_check_attempt(", status)
 
+        for function, begin_marker in (
+            (runtime.apply_release, "_begin_release_attempt("),
+            (runtime.semantic_activate, "_begin_live_check_attempt("),
+            (runtime.functional_readback, "_begin_live_check_attempt("),
+            (runtime.t048_load_proof, "_begin_live_check_attempt("),
+            (runtime.status, "_begin_live_check_attempt("),
+        ):
+            source = inspect.getsource(function)
+            with self.subTest(protected_main_order=function.__name__):
+                self.assertLess(
+                    source.index(begin_marker),
+                    source.index("_current_protected_main_commit()"),
+                )
+
+        recovery = inspect.getsource(runtime.recovery_proof)
+        self.assertLess(
+            recovery.index("_invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)"),
+            recovery.index("_current_protected_main_commit()"),
+        )
+
+    def test_dirty_rerun_invalidates_functional_success_before_binding_failure(self) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            success = receipts / "functional-readback.json"
+            success.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            portability = receipts / "portability.json"
+            portability.write_text(
+                json.dumps({"schema_version": 1, "status": "pass"}) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                runtime,
+                "_current_protected_main_commit",
+                side_effect=runtime.RuntimeErrorEB("dirty checkout"),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "dirty checkout"):
+                    runtime.functional_readback(root, commit)
+
+            self.assertFalse(success.exists())
+            self.assertFalse(portability.exists())
+            attempt = json.loads(
+                (receipts / "functional-readback-attempt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(attempt["status"], "running")
+            self.assertEqual(attempt["source_commit"], commit)
+
     def test_status_requires_exact_flux_kustomization_set(self) -> None:
         complete = {
             name: {"ready": True}

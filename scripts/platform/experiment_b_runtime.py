@@ -818,14 +818,14 @@ def apply_release(
         raise RuntimeErrorEB("source commit is not exact")
     if not DIGEST_RE.fullmatch(api_digest) or not DIGEST_RE.fullmatch(web_digest):
         raise RuntimeErrorEB("image digests must be exact sha256 values")
+    receipt_path, attempt_path, attempt_started_at_unix_ms = (
+        _begin_release_attempt(root, source_commit)
+    )
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("release source is not current protected main")
     output = root / "bootstrap.yaml"
     binding = contract.render_bootstrap(
         source_commit, api_digest, web_digest, output
-    )
-    receipt_path, attempt_path, attempt_started_at_unix_ms = (
-        _begin_release_attempt(root, source_commit)
     )
     kubectl_apply(root, output.read_text(encoding="utf-8"))
     flux = toolchain(root)["tools"]["flux"]
@@ -863,22 +863,20 @@ def apply_release(
 
 
 def semantic_activate(root: Path) -> dict[str, Any]:
-    config = load_config()
-    semantic = config["semantic_search"]
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
         raise RuntimeErrorEB("semantic provider proof requires an applied release receipt")
     release = json.loads(release_path.read_text(encoding="utf-8"))
     source_commit = str(release.get("source_commit", ""))
-    if (
-        not COMMIT_RE.fullmatch(source_commit)
-        or _current_protected_main_commit() != source_commit
-    ):
-        raise RuntimeErrorEB("semantic provider proof is not bound to current protected main")
-
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB("semantic provider proof release binding is not exact")
     receipt_path, attempt_path, attempt_started_at_unix_ms = (
         _begin_live_check_attempt(root, "semantic-search", source_commit)
     )
+    if _current_protected_main_commit() != source_commit:
+        raise RuntimeErrorEB("semantic provider proof is not bound to current protected main")
+    config = load_config()
+    semantic = config["semantic_search"]
     kubectl = toolchain(root)["tools"]["kubectl"]
     env = kube_env(root)
     egress_name = "commonthing-experiment-b-model-bootstrap-egress"
@@ -1079,24 +1077,22 @@ def _deployment_availability_snapshot(
 
 
 def status(root: Path) -> dict[str, Any]:
-    config = load_config()
-    tools = toolchain(root)["tools"]
-    env = kube_env(root)
-    kubectl = tools["kubectl"]
-
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
         raise RuntimeErrorEB("Experiment-B status requires release receipt")
     release = json.loads(release_path.read_text(encoding="utf-8"))
     source_commit = str(release.get("source_commit", ""))
-    if (
-        not COMMIT_RE.fullmatch(source_commit)
-        or _current_protected_main_commit() != source_commit
-    ):
-        raise RuntimeErrorEB("Experiment-B status release is not current protected main")
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB("Experiment-B status release binding is not exact")
     receipt_path, attempt_path, attempt_started_at_unix_ms = (
         _begin_live_check_attempt(root, "status", source_commit)
     )
+    if _current_protected_main_commit() != source_commit:
+        raise RuntimeErrorEB("Experiment-B status release is not current protected main")
+    config = load_config()
+    tools = toolchain(root)["tools"]
+    env = kube_env(root)
+    kubectl = tools["kubectl"]
 
     nodes = json.loads(run([kubectl, "get", "nodes", "-o", "json"], env=env).stdout)
     if len(nodes.get("items", [])) != 1:
@@ -2326,14 +2322,13 @@ def _gateway_base_url(root: Path) -> str:
 
 
 def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
-    if (
-        not COMMIT_RE.fullmatch(source_commit)
-        or _current_protected_main_commit() != source_commit
-    ):
-        raise RuntimeErrorEB("functional readback source is not current protected main")
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB("functional readback source commit is not exact")
     receipt_path, attempt_path, attempt_started_at_unix_ms = (
         _begin_live_check_attempt(root, "functional-readback", source_commit)
     )
+    if _current_protected_main_commit() != source_commit:
+        raise RuntimeErrorEB("functional readback source is not current protected main")
     base = _gateway_base_url(root)
     checks: dict[str, Any] = {}
     status_code, body, elapsed = _http_read(base + "/")
@@ -2786,12 +2781,6 @@ def _delete_pod(root: Path, namespace: str, name: str) -> None:
 
 
 def recovery_proof(root: Path) -> dict[str, Any]:
-    backup_dir = root / "recovery"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    db_dump = backup_dir / "postgres.dump"
-    nats_tar = backup_dir / "nats.tar"
-    before_db: dict[str, Any] | None = None
-    before_nats: dict[str, Any] | None = None
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
         raise RuntimeErrorEB("recovery proof requires an applied release receipt")
@@ -2799,9 +2788,15 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     source_commit = str(release.get("source_commit", ""))
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("recovery proof release binding is not exact")
+    _invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("recovery proof release is not current protected main")
-    _invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)
+    backup_dir = root / "recovery"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    db_dump = backup_dir / "postgres.dump"
+    nats_tar = backup_dir / "nats.tar"
+    before_db: dict[str, Any] | None = None
+    before_nats: dict[str, Any] | None = None
     recovery_receipt = root / "receipts/recovery.json"
     recovery_failed_receipt = root / "receipts/recovery-failed.json"
 
