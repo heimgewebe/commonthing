@@ -133,6 +133,21 @@ def atomic_json(path: Path, payload: dict[str, Any], mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
+PORTABILITY_DERIVED_RECEIPTS = ("portability.json",)
+RECOVERY_ATTEMPT_INVALIDATES = (
+    "recovery.json",
+    "recovery-failed.json",
+    "status.json",
+    "status-attempt.json",
+    "portability.json",
+)
+
+
+def _invalidate_receipts(root: Path, names: tuple[str, ...]) -> None:
+    for name in names:
+        (root / "receipts" / name).unlink(missing_ok=True)
+
+
 def _begin_live_check_attempt(
     root: Path,
     receipt_stem: str,
@@ -140,6 +155,7 @@ def _begin_live_check_attempt(
 ) -> tuple[Path, Path, int]:
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB(f"{receipt_stem} attempt source commit is not exact")
+    _invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)
     receipt_path = root / "receipts" / f"{receipt_stem}.json"
     attempt_path = root / "receipts" / f"{receipt_stem}-attempt.json"
     started_at_unix_ms = time.time_ns() // 1_000_000
@@ -201,8 +217,7 @@ def _begin_release_attempt(
     receipt_path, attempt_path, started_at_unix_ms = _begin_live_check_attempt(
         root, "release", source_commit
     )
-    for name in RELEASE_DEPENDENT_RECEIPTS:
-        (root / "receipts" / name).unlink(missing_ok=True)
+    _invalidate_receipts(root, RELEASE_DEPENDENT_RECEIPTS)
     return receipt_path, attempt_path, started_at_unix_ms
 
 
@@ -1525,6 +1540,7 @@ ORDER BY p.node_id;
 
 
 def seed_t048_fixture(root: Path) -> dict[str, Any]:
+    _invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)
     evidence, _domain_scale = _performance_modules()
     config = load_config()
     release_path = root / "receipts/release.json"
@@ -2734,10 +2750,9 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     source_commit = str(release.get("source_commit", ""))
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("recovery proof release binding is not exact")
+    _invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)
     recovery_receipt = root / "receipts/recovery.json"
     recovery_failed_receipt = root / "receipts/recovery-failed.json"
-    recovery_receipt.unlink(missing_ok=True)
-    recovery_failed_receipt.unlink(missing_ok=True)
 
     _flux_suspend(root, "commonthing-experiment-b-app")
     _flux_suspend(root, "commonthing-experiment-b-data")
@@ -2903,6 +2918,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
 
 
 def portability_report(root: Path) -> dict[str, Any]:
+    _invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)
     recovery_failed_receipt = root / "receipts/recovery-failed.json"
     if recovery_failed_receipt.is_file():
         raise RuntimeErrorEB(

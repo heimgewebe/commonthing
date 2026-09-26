@@ -121,6 +121,11 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            portability = receipts / "portability.json"
+            portability.write_text(
+                json.dumps({"schema_version": 1, "status": "pass"}) + "\n",
+                encoding="utf-8",
+            )
             receipt_path, attempt_path, started = runtime._begin_live_check_attempt(
                 root,
                 "semantic-search",
@@ -128,6 +133,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             )
             self.assertEqual(receipt_path, receipt)
             self.assertFalse(receipt.exists())
+            self.assertFalse(portability.exists())
             running = json.loads(attempt_path.read_text(encoding="utf-8"))
             self.assertEqual(running["status"], "running")
             self.assertEqual(running["receipt"], "semantic-search.json")
@@ -178,6 +184,45 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             self.assertEqual(attempt["status"], "running")
             self.assertEqual(attempt["source_commit"], commit)
             self.assertEqual(attempt["receipt"], "release.json")
+
+    def test_recovery_attempt_invalidates_post_recovery_evidence(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        self.assertIn(
+            "_invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)",
+            source,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            for name in runtime.RECOVERY_ATTEMPT_INVALIDATES:
+                (receipts / name).write_text(
+                    json.dumps({"schema_version": 1, "status": "stale"}) + "\n",
+                    encoding="utf-8",
+                )
+
+            runtime._invalidate_receipts(
+                root,
+                runtime.RECOVERY_ATTEMPT_INVALIDATES,
+            )
+
+            for name in runtime.RECOVERY_ATTEMPT_INVALIDATES:
+                self.assertFalse((receipts / name).exists(), name)
+
+    def test_derived_portability_is_invalidated_before_rerun_work(self) -> None:
+        seed = inspect.getsource(runtime.seed_t048_fixture)
+        self.assertLess(
+            seed.index("_invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)"),
+            seed.index("_performance_modules()"),
+        )
+
+        portability = inspect.getsource(runtime.portability_report)
+        self.assertLess(
+            portability.index(
+                "_invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)"
+            ),
+            portability.index("recovery_failed_receipt"),
+        )
 
     def test_live_checks_start_attempt_before_live_work(self) -> None:
         release = inspect.getsource(runtime.apply_release)
@@ -534,9 +579,20 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
 
     def test_recovery_rerun_invalidates_stale_success(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
-        self.assertIn('recovery_receipt = root / "receipts/recovery.json"', source)
-        self.assertIn("recovery_receipt.unlink(missing_ok=True)", source)
-        self.assertIn("recovery_failed_receipt.unlink(missing_ok=True)", source)
+        self.assertIn(
+            "_invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)",
+            source,
+        )
+        self.assertEqual(
+            set(runtime.RECOVERY_ATTEMPT_INVALIDATES),
+            {
+                "recovery.json",
+                "recovery-failed.json",
+                "status.json",
+                "status-attempt.json",
+                "portability.json",
+            },
+        )
         self.assertIn("atomic_json(", source)
         self.assertIn("recovery_failed_receipt,", source)
         self.assertIn("atomic_json(recovery_receipt, receipt)", source)
