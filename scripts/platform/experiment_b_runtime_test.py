@@ -12,6 +12,56 @@ from unittest import mock
 import experiment_b_runtime as runtime
 
 
+def vm_substrate_fixture() -> dict:
+    return {
+        "vm": runtime.VM_NAME,
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "hypervisor": "kvm",
+        "vcpu": 6,
+        "current_vcpu": 6,
+        "memory_bytes": 12288 * 1024**2,
+        "current_memory_bytes": 12288 * 1024**2,
+        "interface_type": "network",
+        "network": "default",
+        "network_uuid": "22222222-2222-4222-8222-222222222222",
+        "network_mode": "nat",
+        "network_bridge": "virbr0",
+        "mac": "52:54:00:12:34:56",
+        "pool": runtime.POOL_NAME,
+        "pool_uuid": "33333333-3333-4333-8333-333333333333",
+        "pool_type": "dir",
+        "pool_target": str(runtime.POOL_TARGET),
+        "volume": runtime.VOLUME_NAME,
+        "disk_path": str(runtime.POOL_TARGET / runtime.VOLUME_NAME),
+        "disk_key": str(runtime.POOL_TARGET / runtime.VOLUME_NAME),
+        "disk_format": "qcow2",
+        "disk_target": "vda",
+        "disk_bus": "virtio",
+        "disk_capacity_bytes": 60 * 1024**3,
+        "disk_device": 1,
+        "disk_inode": 2,
+        "base_volume": runtime.BASE_VOLUME,
+        "base_path": str(runtime.POOL_TARGET / runtime.BASE_VOLUME),
+        "base_key": str(runtime.POOL_TARGET / runtime.BASE_VOLUME),
+        "base_format": "qcow2",
+        "base_image_sha256": runtime.load_config()["vm"]["image"]["sha256"],
+    }
+
+
+def vm_receipt_fixture(substrate: dict | None = None) -> dict:
+    return {
+        "schema_version": 1,
+        "status": "created",
+        "source_commit": "a" * 40,
+        "config_sha256": runtime.sha256_file(runtime.CLUSTER / "config.json"),
+        "vm": runtime.VM_NAME,
+        "pool": runtime.POOL_NAME,
+        "volume": runtime.VOLUME_NAME,
+        "network": "default",
+        "substrate": vm_substrate_fixture() if substrate is None else substrate,
+    }
+
+
 class ExperimentBRuntimeContractTests(unittest.TestCase):
     def test_canonical_k6_image_is_digest_bound_from_workflow(self) -> None:
         image, workflow_sha = runtime._k6_image_binding()
@@ -270,6 +320,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 ["virsh"], 1, stdout="", stderr=""
             )
             with (
+                mock.patch.object(runtime, "_current_protected_main_commit", return_value="a" * 40),
                 mock.patch.object(runtime, "load_config", return_value={}),
                 mock.patch.object(runtime, "run", return_value=absent),
                 mock.patch.object(
@@ -719,6 +770,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 runtime._current_protected_main_commit()
 
         for function in (
+            runtime.create_vm,
             runtime.install_k3s,
             runtime.install_platform,
             runtime.inject_secrets,
@@ -746,6 +798,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
         commit = "a" * 40
         statuses = {
+            "vm-create.json": "created",
             "k3s.json": "ready",
             "platform.json": "ready",
             "secrets.json": "ready",
@@ -775,7 +828,9 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             receipts.mkdir()
             for name, status in statuses.items():
                 payload: dict[str, object] = {"schema_version": 1, "status": status}
-                if name == "release.json":
+                if name == "vm-create.json":
+                    payload.update(vm_receipt_fixture())
+                elif name == "release.json":
                     payload["source_commit"] = commit
                 elif name in {
                     "k3s.json",
@@ -803,12 +858,60 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                     payload["receipt_sha256"] = runtime.sha256_file(
                         receipts / receipt_name
                     )
+                if name == "status.json":
+                    payload["vm_create_sha256"] = runtime.sha256_file(receipts / "vm-create.json")
+                    payload["vm_substrate"] = vm_substrate_fixture()
                 (receipts / name).write_text(
                     json.dumps(payload) + "\n", encoding="utf-8"
                 )
 
             baseline = runtime.portability_report(root)
             self.assertEqual(baseline["status"], "pass")
+            self.assertIn("vm-create.json", baseline["receipts"])
+
+            vm_path = receipts / "vm-create.json"
+            vm_receipt = vm_path.read_text(encoding="utf-8")
+            vm_path.unlink()
+            with self.assertRaisesRegex(runtime.RuntimeErrorEB, "missing receipt: vm-create.json"):
+                runtime.portability_report(root)
+            self.assertFalse((receipts / "portability.json").exists())
+            for key, value, error in (
+                ("source_commit", "b" * 40, "source binding drifted: vm-create.json"),
+                ("source_commit", None, "source binding drifted: vm-create.json"),
+                ("status", "failed", "does not prove success: vm-create.json"),
+                ("config_sha256", "0" * 64, "source/config binding drifted"),
+                ("substrate", {}, "VM substrate contract drifted"),
+            ):
+                with self.subTest(vm_receipt_field=key, value=value):
+                    changed = json.loads(vm_receipt)
+                    changed[key] = value
+                    runtime.atomic_json(vm_path, changed)
+                    with self.assertRaisesRegex(runtime.RuntimeErrorEB, error):
+                        runtime.portability_report(root)
+            vm_path.write_text(vm_receipt, encoding="utf-8")
+
+            status_path, attempt_path = receipts / "status.json", receipts / "status-attempt.json"
+            original_status, original_attempt = status_path.read_text(), attempt_path.read_text()
+            for field, value in (("vm_create_sha256", "0" * 64), ("vm_substrate", {})):
+                with self.subTest(status_field=field):
+                    changed_status = json.loads(original_status)
+                    changed_status[field] = value
+                    runtime.atomic_json(status_path, changed_status)
+                    changed_attempt = json.loads(original_attempt)
+                    changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+                    runtime.atomic_json(attempt_path, changed_attempt)
+                    with self.assertRaisesRegex(runtime.RuntimeErrorEB, "status is not bound"):
+                        runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+            self.assertEqual(runtime.portability_report(root)["status"], "pass")
+            # A replacement receipt with a valid identity still needs a new live status.
+            changed = json.loads(vm_receipt)
+            changed["substrate"]["uuid"] = "44444444-4444-4444-8444-444444444444"
+            runtime.atomic_json(vm_path, changed)
+            with self.assertRaisesRegex(runtime.RuntimeErrorEB, "status is not bound"):
+                runtime.portability_report(root)
+            vm_path.write_text(vm_receipt, encoding="utf-8")
 
             upstream = json.loads(
                 (receipts / "k3s.json").read_text(encoding="utf-8")
@@ -1660,6 +1763,386 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("commonthing.net/api", source)
         self.assertNotIn("kubectl config use-context", source)
         self.assertNotIn("get.k3s.io", source)
+
+
+class ExperimentBVMSubstrateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.pool = self.root / "pool"
+        self.pool.mkdir()
+        self.base_bytes = b"pinned Ubuntu image fixture"
+        self.disk = self.pool / runtime.VOLUME_NAME
+        self.base = self.pool / runtime.BASE_VOLUME
+        self.disk.write_bytes(b"mutable guest overlay")
+        self.base.write_bytes(self.base_bytes)
+        self.config = runtime.load_config()
+        self.config["vm"]["image"]["sha256"] = hashlib.sha256(self.base_bytes).hexdigest()
+        self.commit = "a" * 40
+        self.domain_present = True
+        self.pool_present = True
+        self.patch("POOL_TARGET", self.pool)
+        self.patch("load_config", return_value=self.config)
+        self.main = self.patch("_current_protected_main_commit", return_value=self.commit)
+        expected = vm_substrate_fixture()
+        self.xml = {
+            "live": f"""<domain type='kvm' id='7'>
+              <name>{runtime.VM_NAME}</name><uuid>{expected['uuid']}</uuid>
+              <vcpu current='6'>6</vcpu>
+              <memory unit='KiB'>12582912</memory>
+              <currentMemory unit='KiB'>12582912</currentMemory>
+              <devices>
+                <disk type='file' device='disk'>
+                  <driver name='qemu' type='qcow2'/><source file='{self.disk}'/>
+                  <backingStore type='file'><format type='qcow2'/>
+                    <source file='{self.base}'/><backingStore/>
+                  </backingStore><target dev='vda' bus='virtio'/>
+                </disk>
+                <disk type='file' device='cdrom'><readonly/></disk>
+                <interface type='network'><mac address='{expected['mac']}'/>
+                  <source network='default' bridge='virbr0'/>
+                </interface>
+              </devices>
+            </domain>""",
+            "network": f"""<network><name>default</name>
+              <uuid>{expected['network_uuid']}</uuid><bridge name='virbr0'/>
+              <forward mode='nat'/></network>""",
+            "pool": f"""<pool type='dir'><name>{runtime.POOL_NAME}</name>
+              <uuid>{expected['pool_uuid']}</uuid><target><path>{self.pool}</path></target>
+            </pool>""",
+            "disk": f"""<volume type='file'><name>{runtime.VOLUME_NAME}</name>
+              <key>{self.disk}</key><capacity unit='bytes'>{60 * 1024**3}</capacity>
+              <target><path>{self.disk}</path><format type='qcow2'/></target>
+              <backingStore><path>{self.base}</path><format type='qcow2'/></backingStore>
+            </volume>""",
+            "base": f"""<volume type='file'><name>{runtime.BASE_VOLUME}</name>
+              <key>{self.base}</key><target><path>{self.base}</path>
+              <format type='qcow2'/></target></volume>""",
+        }
+        self.xml["inactive"] = self.xml["live"].replace(" id='7'", "")
+        self.qmp = {"return": [{
+            "removable": False,
+            "inserted": {"image": {
+                "filename": str(self.disk), "format": "qcow2", "virtual-size": 60 * 1024**3,
+                "backing-image": {"filename": str(self.base), "format": "qcow2"},
+            }},
+        }, {"removable": True, "inserted": {"image": {"format": "raw"}}}]}
+        self.runner = self.patch("run", side_effect=self.run_fixture)
+
+    def patch(self, name: str, *args, **kwargs):
+        patcher = mock.patch.object(runtime, name, *args, **kwargs)
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    def run_fixture(self, argv: list[str], **_kwargs):
+        output, code = "", 0
+        if argv[0] == "virt-install":
+            self.domain_present = True
+        elif argv[0] == "kubectl":
+            self.assertEqual(argv[1:], ["get", "nodes", "-o", "json"])
+            output = json.dumps({"items": [{
+                "metadata": {"name": runtime.VM_NAME},
+                "status": {"nodeInfo": {"kubeletVersion": "v1.36.1+k3s1"}},
+            }]})
+        else:
+            self.assertEqual(argv[:3], ["virsh", "-c", runtime.LIBVIRT_URI])
+            command = argv[3]
+            if command == "dominfo":
+                code = 0 if self.domain_present else 1
+            elif command == "pool-info":
+                code = 0 if self.pool_present else 1
+            elif command == "dumpxml":
+                output = self.xml["inactive" if "--inactive" in argv else "live"]
+            elif command == "net-dumpxml":
+                output = self.xml["network"]
+            elif command == "pool-dumpxml":
+                output = self.xml["pool"]
+            elif command == "vol-dumpxml":
+                output = self.xml["disk" if argv[4] == runtime.VOLUME_NAME else "base"]
+            elif command == "qemu-monitor-command":
+                self.assertEqual(json.loads(argv[5]), {"execute": "query-block"})
+                output = json.dumps(self.qmp)
+            elif command == "vol-download":
+                Path(argv[5]).write_bytes(self.base_bytes)
+            elif command == "pool-define-as":
+                self.pool_present = True
+            elif command == "vol-create-as":
+                (self.pool / argv[5]).write_bytes(b"created volume")
+            elif command == "vol-delete":
+                (self.pool / argv[4]).unlink()
+            elif command == "undefine":
+                self.domain_present = False
+            elif command == "pool-undefine":
+                self.pool_present = False
+            else:
+                self.assertIn(command, {
+                    "pool-build", "pool-start", "vol-upload", "pool-refresh",
+                    "destroy", "pool-destroy", "pool-delete",
+                })
+        return runtime.subprocess.CompletedProcess(argv, code, stdout=output, stderr="")
+
+    def write_vm_receipt(self) -> dict:
+        receipt = vm_receipt_fixture(runtime._live_vm_substrate(self.root, self.config))
+        runtime.atomic_json(self.root / "receipts/vm-create.json", receipt)
+        return receipt
+
+    def prepare_create(self) -> None:
+        self.disk.unlink()
+        self.base.unlink()
+        self.pool.rmdir()
+        self.domain_present = self.pool_present = False
+        self.patch("prepare", return_value={
+            "cloud_image": str(self.root / "ubuntu.img"), "cloud_image_virtual_size": 4 * 1024**3,
+        })
+
+    def prepare_status(self) -> None:
+        runtime.atomic_json(self.root / "receipts/release.json", {
+            "source_commit": self.commit, "api_digest": "sha256:" + "b" * 64,
+            "web_digest": "sha256:" + "c" * 64,
+        })
+        self.tools = self.patch("toolchain", return_value={"tools": {"kubectl": "kubectl"}})
+        self.patch("kube_env", return_value={})
+        self.patch("vm_ip", return_value="192.168.122.10")
+        self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
+
+    def kubernetes_fixture(self, _root, arguments):
+        if "gitrepository" in arguments:
+            return {"status": {"artifact": {"revision": self.commit}}}
+        if "kustomizations" in arguments:
+            return {"items": [{
+                "metadata": {"name": name},
+                "status": {"lastAppliedRevision": self.commit, "conditions": [
+                    {"type": "Ready", "status": "True"},
+                ]},
+            } for name in runtime.EXPECTED_FLUX_KUSTOMIZATIONS]}
+        if "deployment" in arguments:
+            return {
+                "metadata": {"generation": 1},
+                "spec": {"replicas": 1, "template": {"spec": {"containers": [
+                    {"name": name, "image": image} for name, image in {
+                        "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64,
+                        "web": "ghcr.io/heimgewebe/commonthing-web@sha256:" + "c" * 64,
+                        "search-worker": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64,
+                        "ollama": self.config["semantic_search"]["ollama_image"],
+                    }.items()
+                ]}}},
+                "status": {
+                    "observedGeneration": 1, "updatedReplicas": 1, "readyReplicas": 1,
+                    "availableReplicas": 1, "conditions": [{"type": "Available", "status": "True"}],
+                },
+            }
+        if "pvc" in arguments:
+            return {"items": []}
+        self.assertIn("gateway", arguments)
+        return {"status": {"conditions": [{"type": "Programmed", "status": "True"}]}}
+
+    def test_live_readback_captures_actual_substrate_and_base_volume_digest(self) -> None:
+        observed = runtime._live_vm_substrate(self.root, self.config)
+        expected = vm_substrate_fixture()
+        expected.update(disk_device=self.disk.stat().st_dev, disk_inode=self.disk.stat().st_ino)
+        self.assertEqual(observed, expected)
+        self.assertFalse(list(self.root.glob(".vm-substrate-*")))
+
+    def test_live_readback_rejects_xml_contract_drift_and_missing_evidence(self) -> None:
+        cases = (
+            ("live", "type='kvm'", "type='qemu'"),
+            ("live", " id='7'", ""),
+            ("live", runtime.VM_NAME, "retained-vm"),
+            ("live", "current='6'>6", "current='6'>8"),
+            ("live", "current='6'>6", "current='2'>6"),
+            ("live", "12582912", "8388608"),
+            ("live", "network='default'", "network='bridged'"),
+            ("live", "bridge='virbr0'", "bridge='other-network'"),
+            ("live", "type='network'", "type='bridge'"),
+            ("live", str(self.disk), "/other/guest.qcow2"),
+            ("live", str(self.base), "/other/base.qcow2"),
+            ("live", "</devices>", "<filesystem/></devices>"),
+            ("live", "</devices>", "<disk device='disk'/></devices>"),
+            ("live", "</devices>", "<interface type='bridge'/></devices>"),
+            ("inactive", "current='6'>6", "current='4'>4"),
+            ("network", "mode='nat'", "mode='bridge'"),
+            ("network", "<forward mode='nat'/>", ""),
+            ("pool", str(self.pool), "/other/pool"),
+            ("disk", str(60 * 1024**3), str(30 * 1024**3)),
+            ("disk", str(self.base), "/other/base.qcow2"),
+            ("disk", f"<key>{self.disk}</key>", "<key>wrong</key>"),
+            ("base", "type='qcow2'", "type='raw'"),
+            ("live", "<vcpu current='6'>6</vcpu>", ""),
+            ("live", "<domain", "<malformed"),
+        )
+        original = self.xml.copy()
+        for name, before, after in cases:
+            with self.subTest(readback=name, before=before, after=after):
+                self.xml = original.copy()
+                self.assertIn(before, self.xml[name])
+                self.xml[name] = self.xml[name].replace(before, after)
+                if name == "live":
+                    self.xml["inactive"] = self.xml["live"].replace(" id='7'", "")
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime._live_vm_substrate(self.root, self.config)
+
+    def test_live_readback_rejects_qemu_disk_and_backing_drift(self) -> None:
+        original = json.dumps(self.qmp)
+        for key, value in (
+            ("filename", "/other/guest.qcow2"), ("format", "raw"),
+            ("virtual-size", 59 * 1024**3), ("backing-image", {}),
+            ("backing-image", {"filename": "/other/base", "format": "qcow2"}),
+            ("backing-image", {"filename": str(self.base), "format": "raw"}),
+            ("backing-image", {
+                "filename": str(self.base), "format": "qcow2", "backing-filename": "/old/base",
+            }),
+        ):
+            with self.subTest(key=key, value=value):
+                self.qmp = json.loads(original)
+                self.qmp["return"][0]["inserted"]["image"][key] = value
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "QEMU capacity/backing"):
+                    runtime._live_vm_substrate(self.root, self.config)
+        for response in ({"return": []}, {"error": {"desc": "unavailable"}}):
+            self.qmp = response
+            with self.assertRaises(runtime.RuntimeErrorEB):
+                runtime._live_vm_substrate(self.root, self.config)
+
+    def test_status_requires_revision_config_and_complete_substrate_receipt(self) -> None:
+        receipt = self.write_vm_receipt()
+        self.prepare_status()
+        vm_path = self.root / "receipts/vm-create.json"
+        cases = [None, [], {}, {**receipt, "source_commit": None},
+                 {**receipt, "source_commit": "main"}, {**receipt, "source_commit": "b" * 40},
+                 {**receipt, "status": "failed"}, {**receipt, "config_sha256": "0" * 64},
+                 {**receipt, "substrate": {}},
+                 {**receipt, "substrate": {**receipt["substrate"], "vcpu": 4}},
+                 {**receipt, "substrate": {**receipt["substrate"], "base_image_sha256": "0" * 64}}]
+        for value in cases:
+            with self.subTest(receipt=value):
+                vm_path.unlink(missing_ok=True)
+                if value is not None:
+                    vm_path.write_text(json.dumps(value), encoding="utf-8")
+                for name in ("status.json", "portability.json"):
+                    runtime.atomic_json(self.root / "receipts" / name, {"status": "stale"})
+                self.runner.reset_mock()
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime.status(self.root)
+                self.runner.assert_not_called()
+                self.tools.assert_not_called()
+                for name in ("status.json", "portability.json"):
+                    self.assertFalse((self.root / "receipts" / name).exists())
+
+    def test_status_records_matching_live_substrate_and_creation_receipt_hash(self) -> None:
+        receipt = self.write_vm_receipt()
+        self.prepare_status()
+        result = runtime.status(self.root)
+        self.assertEqual(result["status"], "observed")
+        self.assertEqual(result["vm_substrate"], receipt["substrate"])
+        self.assertEqual(result["vm_create_sha256"], runtime.sha256_file(
+            self.root / "receipts/vm-create.json",
+        ))
+        attempt = json.loads((self.root / "receipts/status-attempt.json").read_text())
+        self.assertEqual(attempt["status"], "pass")
+        self.assertEqual(attempt["receipt_sha256"], runtime.sha256_file(self.root / "receipts/status.json"))
+
+    def test_status_rejects_live_identity_capacity_network_and_base_drift(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        original_xml, original_qmp = self.xml.copy(), json.dumps(self.qmp)
+        for change in ("uuid", "mac", "disk_inode", "vcpu", "memory", "network", "capacity", "backing", "base"):
+            with self.subTest(drift=change):
+                self.xml, self.qmp = original_xml.copy(), json.loads(original_qmp)
+                self.base_bytes = b"pinned Ubuntu image fixture"
+                self.write_vm_receipt()
+                if change in {"uuid", "mac", "vcpu", "memory"}:
+                    before, after = {
+                        "uuid": ("11111111-1111-4111-8111-111111111111", "44444444-4444-4444-8444-444444444444"),
+                        "mac": ("52:54:00:12:34:56", "52:54:00:ab:cd:ef"),
+                        "vcpu": ("current='6'>6", "current='4'>4"),
+                        "memory": ("12582912", "8388608"),
+                    }[change]
+                    for key in ("live", "inactive"):
+                        self.xml[key] = self.xml[key].replace(before, after)
+                elif change == "disk_inode":
+                    replacement = self.pool / "replacement"
+                    replacement.write_bytes(b"different guest disk at same path")
+                    replacement.replace(self.disk)
+                elif change == "network":
+                    self.xml["network"] = self.xml["network"].replace("mode='nat'", "mode='route'")
+                elif change == "capacity":
+                    self.qmp["return"][0]["inserted"]["image"]["virtual-size"] = 30 * 1024**3
+                elif change == "backing":
+                    self.qmp["return"][0]["inserted"]["image"]["backing-image"]["filename"] = "/old/base"
+                else:
+                    self.base_bytes = b"unapproved Ubuntu image"
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "VM substrate"):
+                    runtime.status(self.root)
+                self.assertFalse((self.root / "receipts/status.json").exists())
+                self.assertFalse((self.root / "receipts/portability.json").exists())
+                self.tools.assert_not_called()
+
+    def test_create_invalidates_before_revision_or_config_failure(self) -> None:
+        for failed_check in ("_current_protected_main_commit", "load_config"):
+            with self.subTest(failed_check=failed_check):
+                for name in runtime.VM_ATTEMPT_INVALIDATES:
+                    runtime.atomic_json(self.root / "receipts" / name, {"status": "stale"})
+                with mock.patch.object(runtime, failed_check, side_effect=runtime.RuntimeErrorEB("binding failed")):
+                    with self.assertRaisesRegex(runtime.RuntimeErrorEB, "binding failed"):
+                        runtime.create_vm(self.root)
+                for name in runtime.VM_ATTEMPT_INVALIDATES:
+                    self.assertFalse((self.root / "receipts" / name).exists(), name)
+                self.runner.assert_not_called()
+
+    def test_create_refuses_retained_vm_or_pool_without_cleanup(self) -> None:
+        for present_domain in (True, False):
+            with self.subTest(present_domain=present_domain):
+                self.domain_present = present_domain
+                self.runner.reset_mock()
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "already exists"):
+                    runtime.create_vm(self.root)
+                self.assertTrue(all(call.args[0][3] in {"dominfo", "pool-info"}
+                                    for call in self.runner.call_args_list))
+
+    def test_create_binds_actual_vm_to_current_source_and_config(self) -> None:
+        self.prepare_create()
+        result = runtime.create_vm(self.root)
+        self.assertEqual(result, vm_receipt_fixture(result["substrate"]))
+        self.assertEqual(result["substrate"], runtime._live_vm_substrate(self.root, self.config))
+        self.assertEqual(json.loads((self.root / "receipts/vm-create.json").read_text()), result)
+        self.assertEqual(self.main.call_count, 2)
+
+    def test_post_create_validation_and_binding_failures_cleanup_vm_and_pool(self) -> None:
+        for failure in ("substrate", "base_digest", "source", "config", "receipt_write"):
+            with self.subTest(failure=failure):
+                if not self.pool.exists():
+                    self.pool.mkdir()
+                    self.disk.touch()
+                    self.base.touch()
+                self.prepare_create()
+                self.main.side_effect = [self.commit, "b" * 40] if failure == "source" else None
+                self.base_bytes = b"wrong image" if failure == "base_digest" else b"pinned Ubuntu image fixture"
+                self.qmp["return"][0]["inserted"]["image"]["virtual-size"] = (
+                    30 if failure == "substrate" else 60
+                ) * 1024**3
+                original_sha256, original_write = runtime.sha256_file, runtime.atomic_json
+
+                def digest(path):
+                    if failure == "config" and path == runtime.CLUSTER / "config.json" and self.domain_present:
+                        return "0" * 64
+                    return original_sha256(path)
+
+                def write(path, payload):
+                    if failure == "receipt_write":
+                        raise OSError("receipt write failed")
+                    original_write(path, payload)
+
+                with mock.patch.object(runtime, "sha256_file", side_effect=digest), mock.patch.object(
+                    runtime, "atomic_json", side_effect=write,
+                ):
+                    with self.assertRaises((runtime.RuntimeErrorEB, OSError)):
+                        runtime.create_vm(self.root)
+                self.assertFalse(self.domain_present)
+                self.assertFalse(self.pool_present)
+                self.assertFalse(self.pool.exists())
+                self.assertFalse((self.root / "receipts/vm-create.json").exists())
+                self.assertFalse(list(self.root.glob(".vm-substrate-*")))
 
 
 if __name__ == "__main__":

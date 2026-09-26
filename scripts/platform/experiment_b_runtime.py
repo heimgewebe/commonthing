@@ -27,6 +27,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -409,8 +411,216 @@ def prepare(root: Path) -> dict[str, Any]:
     return receipt
 
 
+def _libvirt_xml(*arguments: str) -> ET.Element:
+    return ET.fromstring(run(["virsh", "-c", LIBVIRT_URI, *arguments]).stdout)
+
+
+def _xml_bytes(element: ET.Element) -> int:
+    units = {"bytes": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
+    return int(element.text or "0") * units[element.get("unit", "KiB")]
+
+
+def _vm_definition(domain: ET.Element) -> dict[str, Any]:
+    disks = domain.findall("./devices/disk[@device='disk']")
+    interfaces = domain.findall("./devices/interface")
+    if (
+        len(disks) != 1 or len(interfaces) != 1
+        or domain.findall("./devices/filesystem")
+        or domain.findall("./devices/hostdev")
+    ):
+        raise RuntimeErrorEB("VM substrate requires one disk/NAT interface and no host mounts")
+    disk, interface = disks[0], interfaces[0]
+    source = disk.find("source")
+    if disk.get("type") == "volume" and (
+        source.get("pool") == POOL_NAME and source.get("volume") == VOLUME_NAME
+    ):
+        disk_path = str(POOL_TARGET / VOLUME_NAME)
+    elif disk.get("type") == "file":
+        disk_path = source.get("file")
+    else:
+        raise RuntimeErrorEB("VM substrate disk is not the Experiment-B volume")
+    backing = disk.find("backingStore")
+    if backing is not None and (
+        backing.get("type") != "file"
+        or backing.find("source").get("file") != str(POOL_TARGET / BASE_VOLUME)
+        or backing.find("format").get("type") != "qcow2"
+        or backing.find("backingStore/source") is not None
+    ):
+        raise RuntimeErrorEB("VM substrate libvirt backing relation drifted")
+    vcpu = domain.find("vcpu")
+    return {
+        "vm": domain.findtext("name"),
+        "uuid": domain.findtext("uuid"),
+        "hypervisor": domain.get("type"),
+        "vcpu": int(vcpu.text or "0"),
+        "current_vcpu": int(vcpu.get("current", vcpu.text or "0")),
+        "memory_bytes": _xml_bytes(domain.find("memory")),
+        "current_memory_bytes": _xml_bytes(domain.find("currentMemory")),
+        "interface_type": interface.get("type"),
+        "network": interface.find("source").get("network"),
+        "mac": interface.find("mac").get("address"),
+        "disk_path": disk_path,
+        "disk_format": disk.find("driver").get("type"),
+        "disk_target": disk.find("target").get("dev"),
+        "disk_bus": disk.find("target").get("bus"),
+    }
+
+
+def _validate_vm_substrate(substrate: Any, config: dict[str, Any]) -> None:
+    vm = config["vm"]
+    expected = {
+        "vm": VM_NAME,
+        "hypervisor": "kvm",
+        "vcpu": vm["vcpu"],
+        "current_vcpu": vm["vcpu"],
+        "memory_bytes": vm["memory_mib"] * 1024**2,
+        "current_memory_bytes": vm["memory_mib"] * 1024**2,
+        "interface_type": "network",
+        "network": vm["network"],
+        "network_mode": "nat",
+        "pool": POOL_NAME,
+        "pool_type": "dir",
+        "pool_target": str(POOL_TARGET),
+        "volume": VOLUME_NAME,
+        "disk_path": str(POOL_TARGET / VOLUME_NAME),
+        "disk_key": str(POOL_TARGET / VOLUME_NAME),
+        "disk_format": "qcow2",
+        "disk_target": "vda",
+        "disk_bus": "virtio",
+        "disk_capacity_bytes": vm["disk_gib"] * 1024**3,
+        "base_volume": BASE_VOLUME,
+        "base_path": str(POOL_TARGET / BASE_VOLUME),
+        "base_key": str(POOL_TARGET / BASE_VOLUME),
+        "base_format": "qcow2",
+        "base_image_sha256": vm["image"]["sha256"],
+    }
+    if not isinstance(substrate, dict):
+        raise RuntimeErrorEB("VM substrate evidence is missing")
+    for key, value in expected.items():
+        if substrate.get(key) != value or type(substrate[key]) is not type(value):
+            raise RuntimeErrorEB(f"VM substrate contract drifted: {key}")
+    try:
+        for key in ("uuid", "pool_uuid", "network_uuid"):
+            if str(uuid.UUID(substrate[key])) != substrate[key]:
+                raise ValueError(key)
+        if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", substrate["mac"]):
+            raise ValueError("mac")
+        if not isinstance(substrate["network_bridge"], str) or not substrate["network_bridge"]:
+            raise ValueError("network_bridge")
+        for key in ("disk_device", "disk_inode"):
+            if type(substrate[key]) is not int or substrate[key] < 0:
+                raise ValueError(key)
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
+        raise RuntimeErrorEB("VM substrate identity is missing or invalid") from exc
+
+
+def _live_vm_substrate(root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Read the active guest and its actual QEMU backing chain, never cached prepare data."""
+    try:
+        domain = _libvirt_xml("dumpxml", VM_NAME)
+        if int(domain.get("id", "-1")) < 0:
+            raise RuntimeErrorEB("VM substrate domain is not active")
+        substrate = _vm_definition(domain)
+        if _vm_definition(_libvirt_xml("dumpxml", VM_NAME, "--inactive")) != substrate:
+            raise RuntimeErrorEB("VM substrate live/persistent definitions differ")
+        network = _libvirt_xml("net-dumpxml", config["vm"]["network"])
+        network_bridge = network.find("bridge").get("name")
+        if (
+            network.findtext("name") != substrate["network"]
+            or domain.find("./devices/interface/source").get("bridge") != network_bridge
+        ):
+            raise RuntimeErrorEB("VM substrate network attachment drifted")
+        pool = _libvirt_xml("pool-dumpxml", POOL_NAME)
+        disk = _libvirt_xml("vol-dumpxml", VOLUME_NAME, "--pool", POOL_NAME)
+        base = _libvirt_xml("vol-dumpxml", BASE_VOLUME, "--pool", POOL_NAME)
+        disk_path, base_path = str(POOL_TARGET / VOLUME_NAME), str(POOL_TARGET / BASE_VOLUME)
+        if (
+            disk.findtext("target/path") != disk_path
+            or disk.findtext("backingStore/path") != base_path
+            or disk.find("target/format").get("type") != "qcow2"
+            or disk.find("backingStore/format").get("type") != "qcow2"
+            or base.findtext("target/path") != base_path
+            or base.find("backingStore/path") is not None
+        ):
+            raise RuntimeErrorEB("VM substrate volume/backing relation drifted")
+        # QMP observes the running disk graph even when the host user cannot open
+        # libvirt-owned images. It also detects live resize/backing-store overrides.
+        blocks = json.loads(run([
+            "virsh", "-c", LIBVIRT_URI, "qemu-monitor-command", VM_NAME,
+            '{"execute":"query-block"}',
+        ]).stdout)["return"]
+        images = [
+            block["inserted"]["image"] for block in blocks
+            if not block.get("removable", False)
+        ]
+        if len(images) != 1:
+            raise RuntimeErrorEB("VM substrate QEMU disk set drifted")
+        image = images[0]
+        backing = image.get("backing-image", {})
+        if (
+            image.get("filename") != disk_path or image.get("format") != "qcow2"
+            or image.get("virtual-size") != config["vm"]["disk_gib"] * 1024**3
+            or backing.get("filename") != base_path or backing.get("format") != "qcow2"
+            or backing.get("backing-image") or backing.get("backing-filename")
+        ):
+            raise RuntimeErrorEB("VM substrate QEMU capacity/backing relation drifted")
+        # Hash the uploaded base volume itself through libvirt, not the download
+        # cache or the guest's mutable overlay; volume permissions stay unchanged.
+        with tempfile.TemporaryDirectory(dir=root, prefix=".vm-substrate-") as tmp:
+            downloaded_base = Path(tmp) / BASE_VOLUME
+            run([
+                "virsh", "-c", LIBVIRT_URI, "vol-download", BASE_VOLUME,
+                str(downloaded_base), "--pool", POOL_NAME, "--sparse",
+            ])
+            base_sha256 = sha256_file(downloaded_base)
+        disk_stat = (POOL_TARGET / VOLUME_NAME).stat()
+        substrate.update({
+            "network_uuid": network.findtext("uuid"),
+            "network_mode": network.find("forward").get("mode"),
+            "network_bridge": network_bridge,
+            "pool": pool.findtext("name"),
+            "pool_uuid": pool.findtext("uuid"),
+            "pool_type": pool.get("type"),
+            "pool_target": pool.findtext("target/path"),
+            "volume": disk.findtext("name"),
+            "disk_key": disk.findtext("key"),
+            "disk_capacity_bytes": _xml_bytes(disk.find("capacity")),
+            "disk_device": disk_stat.st_dev,
+            "disk_inode": disk_stat.st_ino,
+            "base_volume": base.findtext("name"),
+            "base_key": base.findtext("key"),
+            "base_path": base.findtext("target/path"),
+            "base_format": base.find("target/format").get("type"),
+            "base_image_sha256": base_sha256,
+        })
+    except (ET.ParseError, ValueError, KeyError, TypeError, AttributeError, OSError) as exc:
+        raise RuntimeErrorEB("VM substrate readback is missing or malformed") from exc
+    _validate_vm_substrate(substrate, config)
+    return substrate
+
+
+def _require_vm_create_receipt(
+    receipt: Any, source_commit: str, config: dict[str, Any]
+) -> None:
+    if not isinstance(receipt, dict) or (
+        receipt.get("schema_version") != 1
+        or receipt.get("status") != "created"
+        or receipt.get("source_commit") != source_commit
+        or receipt.get("config_sha256") != sha256_file(CLUSTER / "config.json")
+        or receipt.get("vm") != VM_NAME
+        or receipt.get("pool") != POOL_NAME
+        or receipt.get("volume") != VOLUME_NAME
+        or receipt.get("network") != config["vm"]["network"]
+    ):
+        raise RuntimeErrorEB("VM creation receipt source/config binding drifted")
+    _validate_vm_substrate(receipt.get("substrate"), config)
+
+
 def create_vm(root: Path) -> dict[str, Any]:
+    _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
+    source_commit = _current_protected_main_commit()
     config = load_config()
+    config_sha256 = sha256_file(CLUSTER / "config.json")
     if run(
         ["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME],
         check=False,
@@ -426,7 +636,6 @@ def create_vm(root: Path) -> dict[str, Any]:
             "Experiment-B libvirt pool already exists; run bounded teardown first"
         )
 
-    _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
     prepared = prepare(root)
     cloud_image = Path(prepared["cloud_image"])
     source_virtual_size = int(prepared["cloud_image_virtual_size"])
@@ -490,6 +699,24 @@ def create_vm(root: Path) -> dict[str, Any]:
             ],
             timeout=120,
         )
+        substrate = _live_vm_substrate(root, config)
+        if (
+            _current_protected_main_commit() != source_commit
+            or sha256_file(CLUSTER / "config.json") != config_sha256
+        ):
+            raise RuntimeErrorEB("VM creation source/config changed during creation")
+        receipt = {
+            "schema_version": 1,
+            "status": "created",
+            "source_commit": source_commit,
+            "config_sha256": config_sha256,
+            "vm": VM_NAME,
+            "pool": POOL_NAME,
+            "volume": VOLUME_NAME,
+            "network": config["vm"]["network"],
+            "substrate": substrate,
+        }
+        atomic_json(root / "receipts/vm-create.json", receipt)
     except Exception:
         if run(
             ["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME],
@@ -518,15 +745,6 @@ def create_vm(root: Path) -> dict[str, Any]:
             POOL_TARGET.rmdir()
         raise
 
-    receipt = {
-        "schema_version": 1,
-        "status": "created",
-        "vm": VM_NAME,
-        "pool": POOL_NAME,
-        "volume": VOLUME_NAME,
-        "network": config["vm"]["network"],
-    }
-    atomic_json(root / "receipts/vm-create.json", receipt)
     return receipt
 
 
@@ -1116,6 +1334,15 @@ def status(root: Path) -> dict[str, Any]:
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("Experiment-B status release is not current protected main")
     config = load_config()
+    vm_create_path = root / "receipts/vm-create.json"
+    try:
+        vm_create = json.loads(vm_create_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB("Experiment-B status requires valid vm-create.json") from exc
+    _require_vm_create_receipt(vm_create, source_commit, config)
+    vm_substrate = _live_vm_substrate(root, config)
+    if vm_substrate != vm_create["substrate"]:
+        raise RuntimeErrorEB("VM substrate drifted from creation receipt")
     tools = toolchain(root)["tools"]
     env = kube_env(root)
     kubectl = tools["kubectl"]
@@ -1232,6 +1459,8 @@ def status(root: Path) -> dict[str, Any]:
         "schema_version": 1,
         "status": "observed",
         "source_commit": source_commit,
+        "vm_create_sha256": sha256_file(vm_create_path),
+        "vm_substrate": vm_substrate,
         "vm_ip": vm_ip(),
         "node": node["metadata"]["name"],
         "kubelet_version": kubelet,
@@ -3309,6 +3538,7 @@ def portability_report(root: Path) -> dict[str, Any]:
             "portability report is blocked by the latest failed recovery attempt"
         )
     expected_status = {
+        "vm-create.json": "created",
         "k3s.json": "ready",
         "platform.json": "ready",
         "secrets.json": "ready",
@@ -3348,6 +3578,7 @@ def portability_report(root: Path) -> dict[str, Any]:
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("release receipt has no exact source commit")
     for name in (
+        "vm-create.json",
         "k3s.json",
         "platform.json",
         "secrets.json",
@@ -3384,6 +3615,14 @@ def portability_report(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 f"latest {receipt_stem} attempt is not bound to its current success receipt"
             )
+
+    _require_vm_create_receipt(payloads["vm-create.json"], source_commit, load_config())
+    if (
+        payloads["status.json"].get("vm_create_sha256") != receipts["vm-create.json"]
+        or payloads["status.json"].get("vm_substrate")
+        != payloads["vm-create.json"]["substrate"]
+    ):
+        raise RuntimeErrorEB("status is not bound to the current VM creation substrate receipt")
 
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB(
