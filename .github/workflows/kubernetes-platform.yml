@@ -26,6 +26,7 @@ permissions:
       - "scripts/platform/**"
       - "scripts/security/**"
       - "scripts/ci/tests/test_kubernetes_platform_contract.py"
+      - "scripts/ci/tests/test_kubernetes_platform_workflow.py"
       - "scripts/ci/tests/test_staging_cell_runtime_contract.py"
       - "scripts/ci/tests/test_staging_gateway_contract.py"
       - "scripts/ci/tests/test_two_operator_cell_pilot.py"

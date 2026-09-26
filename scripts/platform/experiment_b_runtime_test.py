@@ -1720,6 +1720,68 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         self.assertIn("if after_nats != before_nats:", source)
         self.assertIn("stream/durable-consumer continuity signature", source)
 
+    def test_delete_pod_fails_closed_and_verifies_absence(self) -> None:
+        root = Path("/tmp/experiment-b-delete-pod-test")
+        deleted = runtime.subprocess.CompletedProcess(
+            ["kubectl"], 0, stdout="pod/deleted\n", stderr=""
+        )
+        absent = runtime.subprocess.CompletedProcess(
+            ["kubectl"], 0, stdout="", stderr=""
+        )
+        with mock.patch.object(runtime, "_kubectl", side_effect=[deleted, absent]) as kubectl:
+            runtime._delete_pod(root, "commonthing-data", "transfer")
+        self.assertEqual(kubectl.call_count, 2)
+        self.assertEqual(
+            kubectl.call_args_list[0],
+            mock.call(
+                root,
+                [
+                    "-n", "commonthing-data", "delete", "pod", "transfer",
+                    "--ignore-not-found=true", "--wait=true", "--timeout=2m",
+                ],
+                timeout=150,
+            ),
+        )
+        self.assertEqual(
+            kubectl.call_args_list[1],
+            mock.call(
+                root,
+                [
+                    "-n", "commonthing-data", "get", "pod", "transfer",
+                    "--ignore-not-found=true", "-o", "name",
+                ],
+                timeout=30,
+            ),
+        )
+        self.assertNotIn("check=False", inspect.getsource(runtime._delete_pod))
+
+        with mock.patch.object(
+            runtime, "_kubectl", side_effect=runtime.RuntimeErrorEB("delete failed")
+        ) as kubectl:
+            with self.assertRaisesRegex(runtime.RuntimeErrorEB, "delete failed"):
+                runtime._delete_pod(root, "commonthing-data", "transfer")
+            self.assertEqual(kubectl.call_count, 1)
+
+        present = runtime.subprocess.CompletedProcess(
+            ["kubectl"], 0, stdout="pod/transfer\n", stderr=""
+        )
+        with mock.patch.object(runtime, "_kubectl", side_effect=[deleted, present]):
+            with self.assertRaisesRegex(runtime.RuntimeErrorEB, "still exists"):
+                runtime._delete_pod(root, "commonthing-data", "transfer")
+
+    def test_recovery_deletes_restore_transfer_before_nats_restart(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        restore = source.index(
+            '_nats_transfer_pod(root, "commonthing-experiment-b-nats-restore")'
+        )
+        deleted = source.index("_delete_pod(", restore)
+        restarted = source.index(
+            '_scale_deployment(root, DATA_NAMESPACE, "nats", 1)',
+            deleted,
+        )
+        self.assertLess(restore, deleted)
+        self.assertLess(deleted, restarted)
+
     def test_libvirt_absence_query_fails_closed(self) -> None:
         failed = runtime.subprocess.CompletedProcess(
             ["virsh"], 1, stdout="", stderr="permission denied"
@@ -2065,19 +2127,42 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 self.assertEqual(result["kubelet_version"], version)
                 self.assertIs(result["kind_runtime"], False)
 
-    def test_status_requires_nodelist_with_exactly_one_node_item(self) -> None:
+    def test_status_accepts_supported_node_inventory_list_kinds(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        for kind in ("NodeList", "List"):
+            with self.subTest(kind=kind):
+                self.node_inventory = {
+                    "apiVersion": "v1",
+                    "kind": kind,
+                    "items": [self.node],
+                }
+                result = runtime.status(self.root)
+                self.assertEqual(result["status"], "observed")
+                self.assertEqual(result["node"], runtime.VM_NAME)
+                self.assertEqual(
+                    result["kubelet_version"],
+                    self.config["kubernetes"]["version"],
+                )
+
+    def test_status_requires_exactly_one_node_inventory_item(self) -> None:
         self.write_vm_receipt()
         self.prepare_status()
         valid_node = self.node
         cases = (
             valid_node,
-            {"apiVersion": "v1", "kind": "List", "items": [valid_node]},
+            {"apiVersion": "v1", "kind": "ConfigMapList", "items": [valid_node]},
+            {"apiVersion": "v1", "kind": "NodeList", "items": {}},
             {"apiVersion": "v1", "kind": "NodeList", "items": []},
-            {"apiVersion": "v1", "kind": "NodeList", "items": [valid_node, valid_node]},
-            {"apiVersion": "v1", "kind": "NodeList", "items": [{**valid_node, "kind": "Pod"}]},
+            {"apiVersion": "v1", "kind": "List", "items": [valid_node, valid_node]},
+            {"apiVersion": "v1", "kind": "List", "items": [{**valid_node, "kind": "Pod"}]},
         )
         for inventory in cases:
-            with self.subTest(inventory_kind=inventory.get("kind"), item_count=len(inventory.get("items", [])) if isinstance(inventory.get("items"), list) else None):
+            items = inventory.get("items")
+            with self.subTest(
+                inventory_kind=inventory.get("kind"),
+                item_count=len(items) if isinstance(items, list) else None,
+            ):
                 self.node_inventory = inventory
                 for name in ("status.json", "portability.json"):
                     runtime.atomic_json(self.root / "receipts" / name, {"status": "stale"})

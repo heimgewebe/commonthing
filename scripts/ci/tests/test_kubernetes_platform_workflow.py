@@ -14,6 +14,9 @@ UPLOAD_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0
 class KubernetesPlatformWorkflowDiagnosticsTests(unittest.TestCase):
     def test_pull_request_workflow_runs_experiment_b_contract(self) -> None:
         workflow = yaml.safe_load(PR_WORKFLOW.read_text(encoding="utf-8"))
+        test_path = "scripts/ci/tests/test_kubernetes_platform_workflow.py"
+        self.assertIn(test_path, workflow["on"]["pull_request"]["paths"])
+
         steps = workflow["jobs"]["contract"]["steps"]
         named = {step["name"]: step for step in steps if "name" in step}
 

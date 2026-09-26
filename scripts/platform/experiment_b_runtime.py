@@ -1348,8 +1348,8 @@ def status(root: Path) -> dict[str, Any]:
     kubectl = tools["kubectl"]
 
     nodes = json.loads(run([kubectl, "get", "nodes", "-o", "json"], env=env).stdout)
-    if nodes.get("kind") != "NodeList":
-        raise RuntimeErrorEB("Experiment B node inventory is not a Kubernetes NodeList")
+    if nodes.get("kind") not in {"NodeList", "List"}:
+        raise RuntimeErrorEB("Experiment B node inventory is not a Kubernetes node list")
     items = nodes.get("items")
     if not isinstance(items, list) or len(items) != 1:
         raise RuntimeErrorEB("Experiment B expects exactly one k3s VM node")
@@ -3347,9 +3347,20 @@ def _delete_pod(root: Path, namespace: str, name: str) -> None:
             "-n", namespace, "delete", "pod", name,
             "--ignore-not-found=true", "--wait=true", "--timeout=2m",
         ],
-        check=False,
         timeout=150,
     )
+    readback = _kubectl(
+        root,
+        [
+            "-n", namespace, "get", "pod", name,
+            "--ignore-not-found=true", "-o", "name",
+        ],
+        timeout=30,
+    )
+    if readback.stdout.strip():
+        raise RuntimeErrorEB(
+            f"transfer pod still exists after deletion: {namespace}/{name}"
+        )
 
 
 def recovery_proof(root: Path) -> dict[str, Any]:
