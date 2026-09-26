@@ -554,6 +554,87 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         )
         self.assertIn('"live_binding": live_binding', source)
 
+    def test_fixture_rebinds_canonical_live_state_without_stale_receipt(self) -> None:
+        commit = "a" * 40
+        generation_id = "experiment-b-t048"
+        live_binding = {
+            "manifest_sha256": "b" * 64,
+            "database_nodes_content_sha256": "c" * 64,
+            "database_projection_content_sha256": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            (receipts / "release.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "applied",
+                        "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fixture = root / "performance/fixture"
+            fixture.mkdir(parents=True)
+            (fixture / "manifest.json").write_text("{}\n", encoding="utf-8")
+
+            evidence = mock.Mock()
+            evidence.load_policy.return_value = {"policy": "test"}
+            evidence.api_runtime_section.return_value = {
+                "dataset_proof": {"profile": "domain-scale-ci"}
+            }
+            evidence.load_dataset_binding.return_value = {
+                "counts": {"nodes": 20000, "edges": 100000},
+                "manifest_sha256": "b" * 64,
+            }
+            psql_values = [
+                "20000",
+                "100000",
+                "1",
+                "20000",
+                "100000",
+                "1000",
+                "20000",
+                "1",
+                "0",
+            ]
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_performance_modules",
+                    return_value=(evidence, Path("/unused/domain_scale.py")),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "load_config",
+                    return_value={"semantic_search": {"generation_id": generation_id}},
+                ),
+                mock.patch.object(runtime, "git_head", return_value=commit),
+                mock.patch.object(runtime, "remote_main", return_value=commit),
+                mock.patch.object(runtime, "_psql", side_effect=psql_values),
+                mock.patch.object(
+                    runtime,
+                    "_t048_live_fixture_binding",
+                    return_value=live_binding,
+                ) as live_check,
+                mock.patch.object(runtime, "run") as run_command,
+                mock.patch.object(runtime, "_run_input_file") as load_fixture,
+            ):
+                receipt = runtime.seed_t048_fixture(root)
+
+            self.assertEqual(receipt["status"], "loaded")
+            self.assertEqual(receipt["source_commit"], commit)
+            self.assertEqual(receipt["live_binding"], live_binding)
+            self.assertEqual(receipt["nodes"], 20000)
+            self.assertEqual(receipt["edges"], 100000)
+            self.assertTrue((receipts / "t048-fixture.json").is_file())
+            live_check.assert_called_once()
+            run_command.assert_not_called()
+            load_fixture.assert_not_called()
+
     def test_database_signature_hashes_complete_persisted_domain_and_search_rows(self) -> None:
         source = inspect.getsource(runtime._database_signature)
         self.assertIn("md5(to_jsonb(n)::text)", source)

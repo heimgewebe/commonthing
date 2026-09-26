@@ -1564,6 +1564,70 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         )
     )
     receipt_path = root / "receipts/t048-fixture.json"
+
+    def emit_receipt() -> dict[str, Any]:
+        observed_nodes = int(_psql(root, "SELECT count(*) FROM domain_nodes;"))
+        observed_edges = int(_psql(root, "SELECT count(*) FROM domain_edges;"))
+        public_nodes = int(
+            _psql(
+                root,
+                "SELECT count(*) FROM domain_nodes WHERE search_visibility='public';",
+            )
+        )
+        observed_projections = int(
+            _psql(
+                root,
+                "SELECT count(*) FROM search_node_projections "
+                f"WHERE generation_id = '{generation_id}';",
+            )
+        )
+        active_generation = int(
+            _psql(
+                root,
+                "SELECT count(*) FROM search_index_generations "
+                f"WHERE generation_id = '{generation_id}' AND state = 'active';",
+            )
+        )
+        pending_jobs = int(
+            _psql(
+                root,
+                "SELECT count(*) FROM search_projection_jobs "
+                f"WHERE generation_id = '{generation_id}' AND state <> 'done';",
+            )
+        )
+        if (
+            observed_nodes != node_count
+            or observed_edges != edge_count
+            or public_nodes < 1
+            or observed_projections != node_count
+            or active_generation != 1
+            or pending_jobs != 0
+        ):
+            raise RuntimeErrorEB(
+                "T048 fixture/search projection counts do not match the canonical manifest"
+            )
+        live_binding = _t048_live_fixture_binding(root, manifest, generation_id)
+        receipt = {
+            "schema_version": 1,
+            "status": "loaded",
+            "source_commit": source_commit,
+            "profile": profile,
+            "manifest": str(manifest),
+            "manifest_sha256": binding["manifest_sha256"],
+            "nodes": observed_nodes,
+            "edges": observed_edges,
+            "public_semantic_nodes": public_nodes,
+            "search_projections": observed_projections,
+            "generation_id": generation_id,
+            "generation_state": "active",
+            "projection_mode": "synthetic-canonical-t048",
+            "pending_projection_jobs": pending_jobs,
+            "live_binding": live_binding,
+            "production_data_used": False,
+        }
+        atomic_json(receipt_path, receipt)
+        return receipt
+
     if (
         existing_nodes == node_count
         and existing_edges == edge_count
@@ -1583,6 +1647,13 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
                 "existing T048 fixture receipt does not match live database/search contents"
             )
         return receipt
+    if (
+        existing_nodes == node_count
+        and existing_edges == edge_count
+        and existing_generation == 1
+        and not receipt_path.is_file()
+    ):
+        return emit_receipt()
     if existing_nodes or existing_edges or existing_generation:
         raise RuntimeErrorEB(
             "target database is not empty enough for a fresh T048 fixture load"
@@ -1716,64 +1787,7 @@ SELECT weltgewebe_activate_search_generation('{semantic["generation_id"]}');
 COMMIT;
 """
     _psql(root, seed_sql, tuples_only=False)
-    observed_nodes = int(_psql(root, "SELECT count(*) FROM domain_nodes;"))
-    observed_edges = int(_psql(root, "SELECT count(*) FROM domain_edges;"))
-    public_nodes = int(
-        _psql(root, "SELECT count(*) FROM domain_nodes WHERE search_visibility='public';")
-    )
-    observed_projections = int(
-        _psql(
-            root,
-            "SELECT count(*) FROM search_node_projections "
-            f"WHERE generation_id = '{generation_id}';",
-        )
-    )
-    active_generation = int(
-        _psql(
-            root,
-            "SELECT count(*) FROM search_index_generations "
-            f"WHERE generation_id = '{generation_id}' AND state = 'active';",
-        )
-    )
-    pending_jobs = int(
-        _psql(
-            root,
-            "SELECT count(*) FROM search_projection_jobs "
-            f"WHERE generation_id = '{generation_id}' AND state <> 'done';",
-        )
-    )
-    if (
-        observed_nodes != node_count
-        or observed_edges != edge_count
-        or public_nodes < 1
-        or observed_projections != node_count
-        or active_generation != 1
-        or pending_jobs != 0
-    ):
-        raise RuntimeErrorEB(
-            "T048 fixture/search projection counts do not match the canonical manifest"
-        )
-    live_binding = _t048_live_fixture_binding(root, manifest, generation_id)
-    receipt = {
-        "schema_version": 1,
-        "status": "loaded",
-        "source_commit": source_commit,
-        "profile": profile,
-        "manifest": str(manifest),
-        "manifest_sha256": binding["manifest_sha256"],
-        "nodes": observed_nodes,
-        "edges": observed_edges,
-        "public_semantic_nodes": public_nodes,
-        "search_projections": observed_projections,
-        "generation_id": generation_id,
-        "generation_state": "active",
-        "projection_mode": "synthetic-canonical-t048",
-        "pending_projection_jobs": pending_jobs,
-        "live_binding": live_binding,
-        "production_data_used": False,
-    }
-    atomic_json(receipt_path, receipt)
-    return receipt
+    return emit_receipt()
 
 
 def _k6_image_binding() -> tuple[str, str]:
