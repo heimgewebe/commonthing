@@ -1052,6 +1052,281 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         self.assertIn("_validated_t048_fixture_receipt(root, source_commit)", source)
         self.assertNotIn("seed_t048_fixture(root)", source)
 
+    def test_t048_seed_serializes_empty_worker_generation(self) -> None:
+        source = inspect.getsource(runtime.seed_t048_fixture)
+        lock = source.index("SELECT pg_advisory_xact_lock(")
+        guarded_worker_generation = source.index("IF generation_count = 1 THEN")
+        delete_worker_generation = source.index(
+            "DELETE FROM search_index_generations"
+        )
+        insert_generation = source.index(
+            "INSERT INTO search_index_generations (",
+            delete_worker_generation,
+        )
+        insert_nodes = source.index("INSERT INTO domain_nodes (", insert_generation)
+        self.assertLess(lock, guarded_worker_generation)
+        self.assertLess(guarded_worker_generation, delete_worker_generation)
+        self.assertLess(delete_worker_generation, insert_generation)
+        self.assertLess(insert_generation, insert_nodes)
+        self.assertIn("state = 'building'", source)
+        self.assertIn("expected_nodes = 0", source)
+        self.assertIn("completed_nodes = 0", source)
+        self.assertIn("search_node_versions", source)
+        self.assertNotIn(
+            "existing_nodes or existing_edges or existing_generation",
+            source,
+        )
+
+    def test_t048_expected_projection_row_binds_complete_synthetic_state(self) -> None:
+        public = {
+            "id": "node-public",
+            "kind": "Projekt",
+            "title": "Public node",
+            "payload": {"tags": ["scale", "public"], "summary": "Public summary"},
+        }
+        public_row = runtime._t048_expected_projection_row(
+            public,
+            "experiment-b-t048",
+            2560,
+        )
+        self.assertEqual(
+            public_row,
+            {
+                "generation_id": "experiment-b-t048",
+                "node_id": "node-public",
+                "source_version": 1,
+                "source_revision": "node-1",
+                "content_sha256": "0" * 64,
+                "title": "Public node",
+                "tags": ["scale", "public"],
+                "searchable_text": "Public summary",
+                "language": "de",
+                "kind": "Projekt",
+                "status": "active",
+                "visibility_scopes": ["public"],
+                "semantic_state": "ready",
+                "embedding_canonical": True,
+            },
+        )
+
+        hidden = {
+            "id": "node-hidden",
+            "kind": "Organisation",
+            "title": "Hidden node",
+            "payload": {"tags": ["private"], "summary": "Hidden summary"},
+        }
+        hidden_row = runtime._t048_expected_projection_row(
+            hidden,
+            "experiment-b-t048",
+            2560,
+        )
+        self.assertEqual(hidden_row["source_version"], 1)
+        self.assertEqual(hidden_row["source_revision"], "node-1")
+        self.assertEqual(hidden_row["content_sha256"], runtime.T048_HIDDEN_CONTENT_SHA256)
+        self.assertEqual(hidden_row["title"], runtime.T048_REDACTED_TEXT)
+        self.assertEqual(hidden_row["tags"], [])
+        self.assertEqual(hidden_row["searchable_text"], runtime.T048_REDACTED_TEXT)
+        self.assertEqual(hidden_row["language"], "und")
+        self.assertEqual(hidden_row["kind"], runtime.T048_REDACTED_TEXT)
+        self.assertEqual(hidden_row["status"], "hidden")
+        self.assertEqual(hidden_row["visibility_scopes"], [])
+        self.assertEqual(hidden_row["semantic_state"], "unavailable")
+        self.assertTrue(hidden_row["embedding_canonical"])
+
+    def test_t048_live_binding_rejects_complete_projection_drift(self) -> None:
+        fixture_node = {
+            "id": "node-1",
+            "kind": "Projekt",
+            "title": "Node",
+            "lat": 53.5,
+            "lon": 10.0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "payload": {"tags": ["test"], "summary": "Node summary"},
+        }
+        database_node = {**fixture_node, "search_visibility": "public"}
+        canonical_edge = {
+            "id": "edge-1",
+            "source_id": "node-1",
+            "target_id": "node-2",
+            "edge_kind": "wirkt_mit",
+            "created_at": "2026-01-01T00:00:00Z",
+            "payload": {"scale_fixture": True},
+        }
+        version_row = {
+            "node_id": "node-1",
+            "source_version": 1,
+            "source_revision": "node-1",
+            "deleted": False,
+        }
+        generation_id = "experiment-b-t048"
+        semantic = {
+            "provider": "local:ollama",
+            "model_id": "qwen3-embedding:4b",
+            "model_revision": "sha256:" + "a" * 64,
+            "runtime_identity": "ollama:test",
+            "dimension": 2560,
+        }
+        generation_row = {
+            "generation_id": generation_id,
+            **semantic,
+            "document_revision": runtime.T048_DOCUMENT_REVISION,
+            "normalization_revision": runtime.T048_NORMALIZATION_REVISION,
+            "ranking_revision": runtime.T048_RANKING_REVISION,
+            "state": "active",
+            "expected_nodes": 1,
+            "completed_nodes": 1,
+        }
+        canonical_projection = runtime._t048_expected_projection_row(
+            fixture_node,
+            generation_id,
+            2560,
+        )
+
+        root_text = str(runtime.ROOT)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
+        from scripts.performance import api_runtime_live_binding as live_binding
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            edge_path = manifest_path.parent / "domain_edges.csv"
+            edge_path.write_text(
+                "id,source_id,target_id,edge_kind,created_at,payload\n"
+                'edge-1,node-1,node-2,wirkt_mit,2026-01-01T00:00:00Z,"{""scale_fixture"":true}"\n',
+                encoding="utf-8",
+            )
+            manifest = {
+                "counts": {"nodes": 1, "edges": 1},
+                "files": {
+                    "edges": {
+                        "name": edge_path.name,
+                        "sha256": runtime.sha256_file(edge_path),
+                    }
+                },
+            }
+            drifts = (
+                ("content_sha256", "1" * 64),
+                ("tags", ["changed"]),
+                ("searchable_text", "changed"),
+                ("semantic_state", "unavailable"),
+                ("embedding_canonical", False),
+            )
+            for field, value in drifts:
+                with self.subTest(field=field):
+                    drifted_projection = {
+                        **canonical_projection,
+                        field: value,
+                    }
+                    with (
+                        mock.patch.object(
+                            live_binding,
+                            "_manifest_and_fixture",
+                            return_value=(manifest, [fixture_node]),
+                        ),
+                        mock.patch.object(
+                            runtime,
+                            "load_config",
+                            return_value={"semantic_search": semantic},
+                        ),
+                        mock.patch.object(
+                            runtime,
+                            "_psql",
+                            side_effect=[
+                                json.dumps(database_node) + "\n",
+                                json.dumps(canonical_edge) + "\n",
+                                json.dumps(version_row) + "\n",
+                                json.dumps(generation_row) + "\n",
+                                json.dumps(drifted_projection) + "\n",
+                            ],
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            runtime.RuntimeErrorEB,
+                            "live search projection content does not match",
+                        ):
+                            runtime._t048_live_fixture_binding(
+                                Path("/unused-root"),
+                                manifest_path,
+                                generation_id,
+                            )
+
+    def test_t048_live_binding_rejects_version_drift(self) -> None:
+        fixture_node = {
+            "id": "node-1",
+            "kind": "Projekt",
+            "title": "Node",
+            "lat": 53.5,
+            "lon": 10.0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "payload": {"tags": ["test"]},
+        }
+        database_node = {**fixture_node, "search_visibility": "public"}
+        canonical_edge = {
+            "id": "edge-1",
+            "source_id": "node-1",
+            "target_id": "node-2",
+            "edge_kind": "wirkt_mit",
+            "created_at": "2026-01-01T00:00:00Z",
+            "payload": {"scale_fixture": True},
+        }
+        root_text = str(runtime.ROOT)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
+        from scripts.performance import api_runtime_live_binding as live_binding
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            edge_path = manifest_path.parent / "domain_edges.csv"
+            edge_path.write_text(
+                "id,source_id,target_id,edge_kind,created_at,payload\n"
+                'edge-1,node-1,node-2,wirkt_mit,2026-01-01T00:00:00Z,"{""scale_fixture"":true}"\n',
+                encoding="utf-8",
+            )
+            manifest = {
+                "counts": {"nodes": 1, "edges": 1},
+                "files": {
+                    "edges": {
+                        "name": edge_path.name,
+                        "sha256": runtime.sha256_file(edge_path),
+                    }
+                },
+            }
+            drifted_version = {
+                "node_id": "node-1",
+                "source_version": 2,
+                "source_revision": "node-2",
+                "deleted": False,
+            }
+            with (
+                mock.patch.object(
+                    live_binding,
+                    "_manifest_and_fixture",
+                    return_value=(manifest, [fixture_node]),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_psql",
+                    side_effect=[
+                        json.dumps(database_node) + "\n",
+                        json.dumps(canonical_edge) + "\n",
+                        json.dumps(drifted_version) + "\n",
+                    ],
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "live search_node_versions content does not match",
+                ):
+                    runtime._t048_live_fixture_binding(
+                        Path("/unused-root"),
+                        manifest_path,
+                        "experiment-b-t048",
+                    )
+
     def test_t048_live_binding_rejects_edge_content_drift(self) -> None:
         fixture_node = {
             "id": "node-1",

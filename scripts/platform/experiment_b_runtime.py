@@ -53,6 +53,12 @@ DOMAIN_SCALE_CONFIG = ROOT / "configs/performance/domain-scale.v1.json"
 K6_WORKFLOW = ROOT / ".github/workflows/domain-scale.yml"
 K6_WORKLOAD = ROOT / "scripts/performance/api_runtime_k6.js"
 RETIREMENT_RECEIPT = Path.home() / ".local/state/commonthing/experiment-b-retirement.json"
+T048_DOCUMENT_REVISION = "node-document-v4-canonical-visibility"
+T048_NORMALIZATION_REVISION = "weltgewebe-search-normalization-v1"
+T048_RANKING_REVISION = "weltgewebe-hybrid-ranking-v2"
+T048_PUBLIC_CONTENT_SHA256 = "0" * 64
+T048_HIDDEN_CONTENT_SHA256 = "e0f631f5602e764ef8a5f14e36d2d81663b20cd305a30af0dad6c0d759e5a955"
+T048_REDACTED_TEXT = "[nicht öffentlich]"
 
 
 class RuntimeErrorEB(RuntimeError):
@@ -1466,6 +1472,79 @@ def _t048_canonical_visibility(fixture: dict[str, Any]) -> str:
     return "public" if kind == "Projekt" else "hidden"
 
 
+def _t048_expected_projection_row(
+    fixture: dict[str, Any],
+    generation_id: str,
+    dimension: int,
+) -> dict[str, Any]:
+    node_id = fixture.get("id")
+    kind = fixture.get("kind")
+    title = fixture.get("title")
+    payload = fixture.get("payload")
+    if (
+        not isinstance(node_id, str)
+        or not node_id
+        or not isinstance(kind, str)
+        or not kind
+        or not isinstance(title, str)
+        or not title
+        or not isinstance(payload, dict)
+        or not isinstance(dimension, int)
+        or isinstance(dimension, bool)
+        or dimension < 1
+    ):
+        raise RuntimeErrorEB("T048 fixture projection input is not canonical")
+    visibility = _t048_canonical_visibility(fixture)
+    is_public = visibility == "public"
+    if is_public:
+        raw_tags = payload.get("tags", [])
+        if not isinstance(raw_tags, list) or any(
+            not isinstance(tag, str) for tag in raw_tags
+        ):
+            raise RuntimeErrorEB("T048 public fixture tags are not canonical")
+        summary = payload.get("summary")
+        if summary is None:
+            searchable_text = title
+        elif isinstance(summary, str) and summary:
+            searchable_text = summary
+        else:
+            raise RuntimeErrorEB("T048 public fixture summary is not canonical")
+        projection_kind = kind
+        projection_title = title
+        tags = raw_tags
+        language = "de"
+        status = "active"
+        visibility_scopes = ["public"]
+        semantic_state = "ready"
+        content_sha256 = T048_PUBLIC_CONTENT_SHA256
+    else:
+        projection_kind = T048_REDACTED_TEXT
+        projection_title = T048_REDACTED_TEXT
+        tags = []
+        searchable_text = T048_REDACTED_TEXT
+        language = "und"
+        status = "hidden"
+        visibility_scopes = []
+        semantic_state = "unavailable"
+        content_sha256 = T048_HIDDEN_CONTENT_SHA256
+    return {
+        "generation_id": generation_id,
+        "node_id": node_id,
+        "source_version": 1,
+        "source_revision": "node-1",
+        "content_sha256": content_sha256,
+        "title": projection_title,
+        "tags": tags,
+        "searchable_text": searchable_text,
+        "language": language,
+        "kind": projection_kind,
+        "status": status,
+        "visibility_scopes": visibility_scopes,
+        "semantic_state": semantic_state,
+        "embedding_canonical": True,
+    }
+
+
 def _t048_fixture_edge_rows(
     manifest_path: Path,
     manifest: dict[str, Any],
@@ -1601,6 +1680,41 @@ ORDER BY id;
             "live domain_edges content does not match the deterministic T048 fixture"
         )
 
+    version_rows = live_binding._json_lines(
+        _psql(
+            root,
+            r"""
+SELECT json_build_object(
+  'node_id', node_id,
+  'source_version', source_version,
+  'source_revision', source_revision,
+  'deleted', deleted_at IS NOT NULL
+)::text
+FROM search_node_versions
+ORDER BY node_id;
+""",
+        ),
+        "Experiment-B search_node_versions query",
+    )
+    expected_version_rows = [
+        {
+            "node_id": row["id"],
+            "source_version": 1,
+            "source_revision": "node-1",
+            "deleted": False,
+        }
+        for row in fixture_rows
+    ]
+    fixture_versions_sha = live_binding._rows_sha256(expected_version_rows)
+    database_versions_sha = live_binding._rows_sha256(version_rows)
+    if (
+        len(version_rows) != len(expected_version_rows)
+        or database_versions_sha != fixture_versions_sha
+    ):
+        raise RuntimeErrorEB(
+            "live search_node_versions content does not match the deterministic T048 fixture"
+        )
+
     generation_literal = live_binding._sql_literal(generation_id)
     generation_rows = live_binding._json_lines(
         _psql(
@@ -1608,6 +1722,14 @@ ORDER BY id;
             f"""
 SELECT json_build_object(
   'generation_id', generation_id,
+  'provider', provider,
+  'model_id', model_id,
+  'model_revision', model_revision,
+  'runtime_identity', runtime_identity,
+  'dimension', dimension,
+  'document_revision', document_revision,
+  'normalization_revision', normalization_revision,
+  'ranking_revision', ranking_revision,
   'state', state,
   'expected_nodes', expected_nodes,
   'completed_nodes', completed_nodes
@@ -1621,20 +1743,56 @@ WHERE generation_id = {generation_literal} AND state = 'active';
     if len(generation_rows) != 1:
         raise RuntimeErrorEB("Experiment-B requires exactly one active T048 generation")
     generation = generation_rows[0]
+    semantic = load_config()["semantic_search"]
+    expected_generation_identity = {
+        "generation_id": generation_id,
+        "provider": semantic["provider"],
+        "model_id": semantic["model_id"],
+        "model_revision": semantic["model_revision"],
+        "runtime_identity": semantic["runtime_identity"],
+        "dimension": int(semantic["dimension"]),
+        "document_revision": T048_DOCUMENT_REVISION,
+        "normalization_revision": T048_NORMALIZATION_REVISION,
+        "ranking_revision": T048_RANKING_REVISION,
+        "state": "active",
+    }
+    if any(
+        generation.get(key) != value
+        for key, value in expected_generation_identity.items()
+    ):
+        raise RuntimeErrorEB(
+            "Experiment-B active T048 generation identity is not canonical"
+        )
+    dimension = int(semantic["dimension"])
 
     projection_rows = live_binding._json_lines(
         _psql(
             root,
             f"""
 SELECT json_build_object(
-  'id', p.node_id,
-  'kind', p.kind,
+  'generation_id', p.generation_id,
+  'node_id', p.node_id,
+  'source_version', p.source_version,
+  'source_revision', p.source_revision,
+  'content_sha256', p.content_sha256,
   'title', p.title,
-  'search_visibility', n.search_visibility,
-  'owner_account_id', weltgewebe_search_node_owner_account_id(n.payload)
+  'tags', p.tags,
+  'searchable_text', p.searchable_text,
+  'language', p.language,
+  'kind', p.kind,
+  'status', p.status,
+  'visibility_scopes', p.visibility_scopes,
+  'semantic_state', p.semantic_state,
+  'embedding_canonical',
+    CASE
+      WHEN n.search_visibility = 'public'
+      THEN p.embedding = array_fill(0.0::DOUBLE PRECISION, ARRAY[g.dimension])
+      ELSE p.embedding IS NULL
+    END
 )::text
 FROM search_node_projections p
 JOIN domain_nodes n ON n.id = p.node_id
+JOIN search_index_generations g ON g.generation_id = p.generation_id
 WHERE p.generation_id = {generation_literal}
 ORDER BY p.node_id;
 """,
@@ -1652,30 +1810,21 @@ ORDER BY p.node_id;
 
     fixture_by_id = {row["id"]: row for row in fixture_rows}
     expected_projection_rows: list[dict[str, Any]] = []
-    actual_projection_rows: list[dict[str, Any]] = []
     for projection in projection_rows:
-        node_id = projection.get("id")
+        node_id = projection.get("node_id")
         fixture = fixture_by_id.get(node_id)
         if fixture is None:
             raise RuntimeErrorEB(
                 f"Experiment-B search projection {node_id!r} is absent from fixture"
             )
-        canonical_visibility = _t048_canonical_visibility(fixture)
         expected_projection_rows.append(
-            live_binding._expected_projection_identity(
-                {**projection, "search_visibility": canonical_visibility},
+            _t048_expected_projection_row(
                 fixture,
+                generation_id,
+                dimension,
             )
         )
-        actual_projection_rows.append(
-            {
-                "id": projection.get("id"),
-                "kind": projection.get("kind"),
-                "title": projection.get("title"),
-                "search_visibility": projection.get("search_visibility"),
-            }
-        )
-    projection_sha = live_binding._rows_sha256(actual_projection_rows)
+    projection_sha = live_binding._rows_sha256(projection_rows)
     expected_projection_sha = live_binding._rows_sha256(expected_projection_rows)
     if projection_sha != expected_projection_sha:
         raise RuntimeErrorEB(
@@ -1689,6 +1838,9 @@ ORDER BY p.node_id;
         "domain_edges_count": len(database_edge_rows),
         "fixture_edges_content_sha256": fixture_edges_sha,
         "database_edges_content_sha256": database_edges_sha,
+        "search_node_versions_count": len(version_rows),
+        "fixture_versions_content_sha256": fixture_versions_sha,
+        "database_versions_content_sha256": database_versions_sha,
         "generation_id": generation_id,
         "expected_nodes": int(expected_nodes),
         "completed_nodes": int(completed_nodes),
@@ -1868,7 +2020,7 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         and not receipt_path.is_file()
     ):
         return emit_receipt()
-    if existing_nodes or existing_edges or existing_generation:
+    if existing_nodes or existing_edges:
         raise RuntimeErrorEB(
             "target database is not empty enough for a fresh T048 fixture load"
         )
@@ -1902,6 +2054,51 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
     semantic = config["semantic_search"]
     seed_sql = f"""
 BEGIN;
+SELECT pg_advisory_xact_lock(
+    hashtextextended('weltgewebe.search.generation.activation', 0)
+);
+DO $$
+DECLARE
+    generation_count BIGINT;
+BEGIN
+    IF EXISTS (SELECT 1 FROM domain_nodes)
+       OR EXISTS (SELECT 1 FROM domain_edges) THEN
+        RAISE EXCEPTION 'Experiment-B T048 target domain changed before seed lock';
+    END IF;
+    IF EXISTS (SELECT 1 FROM search_node_versions)
+       OR EXISTS (SELECT 1 FROM search_projection_jobs)
+       OR EXISTS (SELECT 1 FROM search_node_projections) THEN
+        RAISE EXCEPTION 'Experiment-B T048 search ledger is not empty before fresh seed';
+    END IF;
+    SELECT count(*) INTO generation_count FROM search_index_generations;
+    IF generation_count > 1 THEN
+        RAISE EXCEPTION 'Experiment-B T048 has unexpected pre-seed generations';
+    END IF;
+    IF generation_count = 1 THEN
+        IF NOT EXISTS (
+            SELECT 1
+              FROM search_index_generations
+             WHERE generation_id = '{semantic["generation_id"]}'
+               AND provider = '{semantic["provider"]}'
+               AND model_id = '{semantic["model_id"]}'
+               AND model_revision = '{semantic["model_revision"]}'
+               AND runtime_identity = '{semantic["runtime_identity"]}'
+               AND dimension = {int(semantic["dimension"])}
+               AND document_revision = '{T048_DOCUMENT_REVISION}'
+               AND normalization_revision = '{T048_NORMALIZATION_REVISION}'
+               AND ranking_revision = '{T048_RANKING_REVISION}'
+               AND state = 'building'
+               AND expected_nodes = 0
+               AND completed_nodes = 0
+               AND activated_at IS NULL
+        ) THEN
+            RAISE EXCEPTION 'Experiment-B T048 pre-seed generation is not the empty worker generation';
+        END IF;
+        DELETE FROM search_index_generations
+         WHERE generation_id = '{semantic["generation_id"]}';
+    END IF;
+END
+$$;
 INSERT INTO search_index_generations (
     generation_id, provider, model_id, model_revision, runtime_identity,
     dimension, document_revision, normalization_revision, ranking_revision,
@@ -1913,9 +2110,9 @@ INSERT INTO search_index_generations (
     '{semantic["model_revision"]}',
     '{semantic["runtime_identity"]}',
     {int(semantic["dimension"])},
-    'node-document-v4-canonical-visibility',
-    'weltgewebe-search-normalization-v1',
-    'weltgewebe-hybrid-ranking-v2',
+    '{T048_DOCUMENT_REVISION}',
+    '{T048_NORMALIZATION_REVISION}',
+    '{T048_RANKING_REVISION}',
     'building',
     (SELECT count(*) FROM weltgewebe_perf.domain_nodes)
 );
@@ -1944,8 +2141,8 @@ SELECT
     v.source_version,
     v.source_revision,
     CASE
-        WHEN n.search_visibility = 'public' THEN repeat('0', 64)
-        ELSE 'e0f631f5602e764ef8a5f14e36d2d81663b20cd305a30af0dad6c0d759e5a955'
+        WHEN n.search_visibility = 'public' THEN '{T048_PUBLIC_CONTENT_SHA256}'
+        ELSE '{T048_HIDDEN_CONTENT_SHA256}'
     END,
     CASE WHEN n.search_visibility = 'public' THEN n.title ELSE '[nicht öffentlich]' END,
     CASE
