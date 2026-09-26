@@ -1828,6 +1828,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "backing-image": {"filename": str(self.base), "format": "qcow2"},
             }},
         }, {"removable": True, "inserted": {"image": {"format": "raw"}}}]}
+        self.node = {
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": runtime.VM_NAME},
+            "status": {"nodeInfo": {
+                "kubeletVersion": self.config["kubernetes"]["version"],
+                "osImage": "Ubuntu 24.04.3 LTS",
+            }},
+        }
         self.runner = self.patch("run", side_effect=self.run_fixture)
 
     def patch(self, name: str, *args, **kwargs):
@@ -1842,10 +1851,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             self.domain_present = True
         elif argv[0] == "kubectl":
             self.assertEqual(argv[1:], ["get", "nodes", "-o", "json"])
-            output = json.dumps({"items": [{
-                "metadata": {"name": runtime.VM_NAME},
-                "status": {"nodeInfo": {"kubeletVersion": "v1.36.1+k3s1"}},
-            }]})
+            output = json.dumps({"apiVersion": "v1", "kind": "NodeList", "items": [self.node]})
         else:
             self.assertEqual(argv[:3], ["virsh", "-c", runtime.LIBVIRT_URI])
             command = argv[3]
@@ -2041,6 +2047,39 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         attempt = json.loads((self.root / "receipts/status-attempt.json").read_text())
         self.assertEqual(attempt["status"], "pass")
         self.assertEqual(attempt["receipt_sha256"], runtime.sha256_file(self.root / "receipts/status.json"))
+
+    def test_status_accepts_node_typemeta_with_exact_configured_k3s_version(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        for version in (self.config["kubernetes"]["version"], "v1.36.2+k3s1"):
+            with self.subTest(version=version):
+                self.config["kubernetes"]["version"] = version
+                self.node["status"]["nodeInfo"]["kubeletVersion"] = version
+                result = runtime.status(self.root)
+                self.assertEqual(result["status"], "observed")
+                self.assertEqual(result["kubelet_version"], version)
+                self.assertIs(result["kind_runtime"], False)
+
+    def test_status_rejects_wrong_or_missing_kubelet_version(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        for info in (
+            {},
+            *({"kubeletVersion": version} for version in (
+                None, "", "v1.36.1", "v1.36.1+kind", "v1.36.0+k3s1",
+                "v1.36.1+k3s2", self.config["kubernetes"]["version"] + "-unexpected",
+            )),
+        ):
+            with self.subTest(node_info=info):
+                self.node["status"]["nodeInfo"] = info
+                for name in ("status.json", "portability.json"):
+                    runtime.atomic_json(self.root / "receipts" / name, {"status": "stale"})
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "k3s"):
+                    runtime.status(self.root)
+                for name in ("status.json", "portability.json"):
+                    self.assertFalse((self.root / "receipts" / name).exists())
+                attempt = json.loads((self.root / "receipts/status-attempt.json").read_text())
+                self.assertEqual(attempt["status"], "running")
 
     def test_status_rejects_live_identity_capacity_network_and_base_drift(self) -> None:
         self.write_vm_receipt()

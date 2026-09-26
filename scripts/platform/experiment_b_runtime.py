@@ -1356,8 +1356,8 @@ def status(root: Path) -> dict[str, Any]:
     os_image = str(info.get("osImage", ""))
     if "k3s" not in kubelet:
         raise RuntimeErrorEB("node is not a k3s runtime")
-    if "kind" in json.dumps(node).lower():
-        raise RuntimeErrorEB("kind marker found in Experiment-B node identity")
+    if kubelet != config["kubernetes"]["version"]:
+        raise RuntimeErrorEB("node kubelet version does not match pinned k3s version")
 
     expected_api = f"ghcr.io/heimgewebe/commonthing-api@{release.get('api_digest', '')}"
     expected_web = f"ghcr.io/heimgewebe/commonthing-web@{release.get('web_digest', '')}"
