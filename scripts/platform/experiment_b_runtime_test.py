@@ -1933,19 +1933,20 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             elif command == "pool-list":
                 output = f"{runtime.POOL_NAME}\n" if self.pool_present else ""
             elif command == "vol-list":
+                self.assertEqual(argv[4:], [runtime.POOL_NAME])
                 if not self.pool_present:
                     code = 1
                 else:
-                    output = "\n".join(
-                        name
+                    rows = [
+                        (name, path)
                         for name, path in (
                             (runtime.VOLUME_NAME, self.disk),
                             (runtime.BASE_VOLUME, self.base),
                         )
                         if path.exists()
-                    )
-                    if output:
-                        output += "\n"
+                    ]
+                    output = " Name Path\n----------------------------------------\n"
+                    output += "".join(f" {name} {path}\n" for name, path in rows)
             elif command == "dumpxml":
                 output = self.xml["inactive" if "--inactive" in argv else "live"]
             elif command == "net-dumpxml":

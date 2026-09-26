@@ -1513,7 +1513,7 @@ def _libvirt_resource_present(kind: str, name: str) -> bool:
 
 def _libvirt_volume_present(pool: str, name: str) -> bool:
     result = run(
-        ["virsh", "-c", LIBVIRT_URI, "vol-list", pool, "--name"],
+        ["virsh", "-c", LIBVIRT_URI, "vol-list", pool],
         check=False,
     )
     if result.returncode != 0:
@@ -1521,7 +1521,13 @@ def _libvirt_volume_present(pool: str, name: str) -> bool:
         raise RuntimeErrorEB(
             f"cannot prove libvirt volume state for {pool}/{name}: {detail[-1000:]}"
         )
-    return name in {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    volume_names: set[str] = set()
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("-"):
+            continue
+        volume_names.add(stripped.split(None, 1)[0])
+    return name in volume_names
 
 
 def teardown(root: Path) -> dict[str, Any]:
