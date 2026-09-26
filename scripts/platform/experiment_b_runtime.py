@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import hashlib
 import ipaddress
 import json
@@ -1465,6 +1466,71 @@ def _t048_canonical_visibility(fixture: dict[str, Any]) -> str:
     return "public" if kind == "Projekt" else "hidden"
 
 
+def _t048_fixture_edge_rows(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> list[dict[str, Any]]:
+    files = manifest.get("files")
+    counts = manifest.get("counts")
+    if not isinstance(files, dict) or not isinstance(counts, dict):
+        raise RuntimeErrorEB("T048 fixture manifest is missing canonical files/counts")
+    edge_file = files.get("edges")
+    edge_count = counts.get("edges")
+    if (
+        not isinstance(edge_file, dict)
+        or not isinstance(edge_count, int)
+        or isinstance(edge_count, bool)
+        or edge_count < 1
+    ):
+        raise RuntimeErrorEB("T048 fixture manifest has no canonical edge binding")
+    name = edge_file.get("name")
+    expected_sha256 = edge_file.get("sha256")
+    if (
+        not isinstance(name, str)
+        or not name
+        or Path(name).name != name
+        or not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+    ):
+        raise RuntimeErrorEB("T048 fixture manifest edge binding is malformed")
+    edge_path = manifest_path.parent / name
+    if not edge_path.is_file() or sha256_file(edge_path) != expected_sha256:
+        raise RuntimeErrorEB("T048 fixture edge CSV does not match its manifest digest")
+
+    expected_header = (
+        "id",
+        "source_id",
+        "target_id",
+        "edge_kind",
+        "created_at",
+        "payload",
+    )
+    rows: list[dict[str, Any]] = []
+    try:
+        with edge_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if tuple(reader.fieldnames or ()) != expected_header:
+                raise RuntimeErrorEB("T048 fixture edge CSV header is not canonical")
+            for row in reader:
+                rows.append(
+                    {
+                        "id": row["id"],
+                        "source_id": row["source_id"],
+                        "target_id": row["target_id"],
+                        "edge_kind": row["edge_kind"],
+                        "created_at": row["created_at"],
+                        "payload": json.loads(row["payload"]),
+                    }
+                )
+    except (OSError, KeyError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB("cannot parse canonical T048 edge fixture") from exc
+    if len(rows) != edge_count:
+        raise RuntimeErrorEB(
+            "T048 fixture edge CSV row count does not match its manifest"
+        )
+    return rows
+
+
 def _t048_live_fixture_binding(
     root: Path, manifest: Path, generation_id: str
 ) -> dict[str, Any]:
@@ -1504,6 +1570,35 @@ ORDER BY id;
     if len(db_rows) != len(canonical_fixture_rows) or database_sha != fixture_sha:
         raise RuntimeErrorEB(
             "live domain_nodes content does not match the deterministic T048 fixture"
+        )
+
+    fixture_edge_rows = _t048_fixture_edge_rows(manifest, _manifest)
+    database_edge_rows = live_binding._json_lines(
+        _psql(
+            root,
+            r"""
+SELECT json_build_object(
+  'id', id,
+  'source_id', source_id,
+  'target_id', target_id,
+  'edge_kind', edge_kind,
+  'created_at', to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+  'payload', payload
+)::text
+FROM domain_edges
+ORDER BY id;
+""",
+        ),
+        "Experiment-B domain_edges query",
+    )
+    fixture_edges_sha = live_binding._rows_sha256(fixture_edge_rows)
+    database_edges_sha = live_binding._rows_sha256(database_edge_rows)
+    if (
+        len(database_edge_rows) != len(fixture_edge_rows)
+        or database_edges_sha != fixture_edges_sha
+    ):
+        raise RuntimeErrorEB(
+            "live domain_edges content does not match the deterministic T048 fixture"
         )
 
     generation_literal = live_binding._sql_literal(generation_id)
@@ -1591,6 +1686,9 @@ ORDER BY p.node_id;
         "domain_nodes_count": len(db_rows),
         "fixture_nodes_content_sha256": fixture_sha,
         "database_nodes_content_sha256": database_sha,
+        "domain_edges_count": len(database_edge_rows),
+        "fixture_edges_content_sha256": fixture_edges_sha,
+        "database_edges_content_sha256": database_edges_sha,
         "generation_id": generation_id,
         "expected_nodes": int(expected_nodes),
         "completed_nodes": int(completed_nodes),
@@ -1598,6 +1696,49 @@ ORDER BY p.node_id;
         "fixture_projection_content_sha256": expected_projection_sha,
         "database_projection_content_sha256": projection_sha,
     }
+
+
+def _validated_t048_fixture_receipt(
+    root: Path,
+    source_commit: str,
+) -> dict[str, Any]:
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB("T048 fixture validation source commit is not exact")
+    receipt_path = root / "receipts/t048-fixture.json"
+    if not receipt_path.is_file():
+        raise RuntimeErrorEB("T048 load proof requires a seeded fixture receipt")
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB("T048 fixture receipt is not valid JSON") from exc
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("status") != "loaded"
+        or receipt.get("source_commit") != source_commit
+    ):
+        raise RuntimeErrorEB("T048 fixture receipt is not bound to the load-proof source")
+
+    manifest = root / "performance/fixture/manifest.json"
+    if receipt.get("manifest") != str(manifest) or not manifest.is_file():
+        raise RuntimeErrorEB("T048 fixture receipt does not name the canonical manifest")
+    if receipt.get("manifest_sha256") != sha256_file(manifest):
+        raise RuntimeErrorEB("T048 fixture receipt manifest digest is stale")
+
+    generation_id = receipt.get("generation_id")
+    expected_generation = str(load_config()["semantic_search"]["generation_id"])
+    if (
+        not isinstance(generation_id, str)
+        or generation_id != expected_generation
+    ):
+        raise RuntimeErrorEB("T048 fixture receipt generation is not current")
+    current_live_binding = _t048_live_fixture_binding(
+        root, manifest, generation_id
+    )
+    if receipt.get("live_binding") != current_live_binding:
+        raise RuntimeErrorEB(
+            "T048 fixture receipt does not match current live fixture contents"
+        )
+    return receipt
 
 
 def seed_t048_fixture(root: Path) -> dict[str, Any]:
@@ -2068,8 +2209,8 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     )
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("T048 proof source is not current protected main")
+    fixture_receipt = _validated_t048_fixture_receipt(root, source_commit)
     evidence, _domain_scale = _performance_modules()
-    fixture_receipt = seed_t048_fixture(root)
     manifest = Path(fixture_receipt["manifest"])
     policy = evidence.load_policy(PERFORMANCE_POLICY)
     contract_section = evidence.api_runtime_section(policy)

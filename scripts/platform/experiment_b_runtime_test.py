@@ -963,6 +963,133 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 self.assertFalse((receipts / name).exists(), name)
             self.assertTrue(semantic.is_file())
 
+    def test_t048_load_validation_preserves_functional_evidence(self) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            functional = receipts / "functional-readback.json"
+            functional_attempt = receipts / "functional-readback-attempt.json"
+            functional.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            functional_attempt.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=commit,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_validated_t048_fixture_receipt",
+                    side_effect=runtime.RuntimeErrorEB("fixture validation stop"),
+                ),
+                mock.patch.object(runtime, "seed_t048_fixture") as seed_fixture,
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "fixture validation stop",
+                ):
+                    runtime.t048_load_proof(root, commit)
+
+            self.assertTrue(functional.is_file())
+            self.assertTrue(functional_attempt.is_file())
+            seed_fixture.assert_not_called()
+
+        source = inspect.getsource(runtime.t048_load_proof)
+        self.assertIn("_validated_t048_fixture_receipt(root, source_commit)", source)
+        self.assertNotIn("seed_t048_fixture(root)", source)
+
+    def test_t048_live_binding_rejects_edge_content_drift(self) -> None:
+        fixture_node = {
+            "id": "node-1",
+            "kind": "Projekt",
+            "title": "Node",
+            "lat": 53.5,
+            "lon": 10.0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "payload": {"tags": ["test"]},
+        }
+        database_node = {**fixture_node, "search_visibility": "public"}
+        canonical_edge = {
+            "id": "edge-1",
+            "source_id": "node-1",
+            "target_id": "node-2",
+            "edge_kind": "wirkt_mit",
+            "created_at": "2026-01-01T00:00:00Z",
+            "payload": {"scale_fixture": True},
+        }
+        drifted_edge = {**canonical_edge, "target_id": "node-3"}
+
+        root_text = str(runtime.ROOT)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
+        from scripts.performance import api_runtime_live_binding as live_binding
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            edge_path = manifest_path.parent / "domain_edges.csv"
+            edge_path.write_text(
+                "id,source_id,target_id,edge_kind,created_at,payload\n"
+                'edge-1,node-1,node-2,wirkt_mit,2026-01-01T00:00:00Z,"{""scale_fixture"":true}"\n',
+                encoding="utf-8",
+            )
+            manifest = {
+                "counts": {"nodes": 1, "edges": 1},
+                "files": {
+                    "edges": {
+                        "name": edge_path.name,
+                        "sha256": runtime.sha256_file(edge_path),
+                    }
+                },
+            }
+            with (
+                mock.patch.object(
+                    live_binding,
+                    "_manifest_and_fixture",
+                    return_value=(manifest, [fixture_node]),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_psql",
+                    side_effect=[
+                        json.dumps(database_node) + "\n",
+                        json.dumps(drifted_edge) + "\n",
+                    ],
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "live domain_edges content does not match",
+                ):
+                    runtime._t048_live_fixture_binding(
+                        Path("/unused-root"),
+                        manifest_path,
+                        "experiment-b-t048",
+                    )
+
     def test_t048_canonical_visibility_is_fixture_derived(self) -> None:
         self.assertEqual(
             runtime._t048_canonical_visibility({"kind": "Projekt"}),
