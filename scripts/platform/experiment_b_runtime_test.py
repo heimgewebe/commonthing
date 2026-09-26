@@ -102,6 +102,120 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("weltgewebe_search_generation_activation_ready", source)
         self.assertNotIn("weltgewebe_activate_search_generation", source)
 
+    def test_t048_rerun_invalidates_stale_success_before_early_failure(self) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            stale = receipts / "t048-load.json"
+            stale.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(runtime, "git_head", return_value=commit),
+                mock.patch.object(runtime, "remote_main", return_value=commit),
+                mock.patch.object(
+                    runtime,
+                    "seed_t048_fixture",
+                    side_effect=runtime.RuntimeErrorEB("fixture failed"),
+                ),
+            ):
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime.t048_load_proof(root, commit)
+
+            self.assertFalse(stale.exists())
+            attempt = json.loads(
+                (receipts / "t048-load-attempt.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(attempt["status"], "running")
+            self.assertEqual(attempt["source_commit"], commit)
+
+    def test_jetstream_signature_tracks_durable_consumer_continuity_only(self) -> None:
+        monitoring = {
+            "streams": 1,
+            "messages": 3,
+            "bytes": 99,
+            "account_details": [
+                {
+                    "name": "$G",
+                    "stream_detail": [
+                        {
+                            "name": "commonthing-domain-events-v1",
+                            "state": {
+                                "messages": 3,
+                                "bytes": 99,
+                                "first_seq": 1,
+                                "last_seq": 3,
+                                "consumer_count": 2,
+                            },
+                            "consumer_detail": [
+                                {
+                                    "stream_name": "commonthing-domain-events-v1",
+                                    "name": "weltgewebe-api-domain-receipts-v1",
+                                    "config": {
+                                        "durable_name": "weltgewebe-api-domain-receipts-v1",
+                                        "ack_policy": "explicit",
+                                        "filter_subject": "weltgewebe.domain.v1",
+                                    },
+                                    "delivered": {
+                                        "consumer_seq": 3,
+                                        "stream_seq": 3,
+                                        "last_active": "volatile",
+                                    },
+                                    "ack_floor": {
+                                        "consumer_seq": 2,
+                                        "stream_seq": 2,
+                                        "last_active": "volatile",
+                                    },
+                                    "num_ack_pending": 1,
+                                    "num_redelivered": 0,
+                                    "num_waiting": 7,
+                                    "num_pending": 0,
+                                    "ts": "volatile",
+                                },
+                                {
+                                    "stream_name": "commonthing-domain-events-v1",
+                                    "name": "ephemeral-client",
+                                    "config": {"ack_policy": "explicit"},
+                                    "delivered": {"consumer_seq": 0, "stream_seq": 3},
+                                    "ack_floor": {"consumer_seq": 0, "stream_seq": 0},
+                                    "num_ack_pending": 0,
+                                    "num_redelivered": 0,
+                                    "num_waiting": 1,
+                                    "num_pending": 3,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        signature = runtime._jetstream_signature_from_monitoring(monitoring)
+        self.assertEqual(signature["durable_consumers"], 1)
+        durable = signature["stream_detail"][0]["durable_consumers"]
+        self.assertEqual(len(durable), 1)
+        self.assertNotIn("num_waiting", durable[0])
+        self.assertNotIn("last_active", durable[0]["delivered"])
+        self.assertNotIn("ts", durable[0])
+
+        changed = json.loads(json.dumps(monitoring))
+        changed["account_details"][0]["stream_detail"][0]["consumer_detail"][0][
+            "ack_floor"
+        ]["stream_seq"] = 1
+        self.assertNotEqual(
+            signature,
+            runtime._jetstream_signature_from_monitoring(changed),
+        )
+
     def test_recovery_rto_includes_application_rollout(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         api_wait = source.index(
@@ -125,6 +239,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             "semantic-search.json": "pass",
             "functional-readback.json": "pass",
             "t048-load.json": "pass",
+            "t048-load-attempt.json": "pass",
             "recovery.json": "pass",
             "status.json": "observed",
         }
@@ -146,6 +261,11 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                     payload["source_commit"] = commit
                 elif name == "t048-load.json":
                     payload["source_commit"] = commit
+                elif name == "t048-load-attempt.json":
+                    payload["source_commit"] = commit
+                    payload["receipt_sha256"] = runtime.sha256_file(
+                        receipts / "t048-load.json"
+                    )
                 (receipts / name).write_text(
                     json.dumps(payload) + "\n", encoding="utf-8"
                 )
@@ -162,6 +282,20 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             failed["source_commit"] = "b" * 40
             (receipts / "t048-load.json").write_text(
                 json.dumps(failed) + "\n", encoding="utf-8"
+            )
+            with self.assertRaises(runtime.RuntimeErrorEB):
+                runtime.portability_report(root)
+
+            failed["source_commit"] = commit
+            (receipts / "t048-load.json").write_text(
+                json.dumps(failed) + "\n", encoding="utf-8"
+            )
+            attempt = json.loads(
+                (receipts / "t048-load-attempt.json").read_text(encoding="utf-8")
+            )
+            attempt["receipt_sha256"] = "0" * 64
+            (receipts / "t048-load-attempt.json").write_text(
+                json.dumps(attempt) + "\n", encoding="utf-8"
             )
             with self.assertRaises(runtime.RuntimeErrorEB):
                 runtime.portability_report(root)
@@ -265,7 +399,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
     def test_recovery_compares_complete_jetstream_signature(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         self.assertIn("if after_nats != before_nats:", source)
-        self.assertIn("streams/messages/bytes signature", source)
+        self.assertIn("stream/durable-consumer continuity signature", source)
 
     def test_libvirt_absence_query_fails_closed(self) -> None:
         failed = runtime.subprocess.CompletedProcess(

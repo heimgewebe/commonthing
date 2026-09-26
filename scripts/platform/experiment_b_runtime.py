@@ -1769,6 +1769,21 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     evidence, _domain_scale = _performance_modules()
     if git_head() != source_commit or remote_main() != source_commit:
         raise RuntimeErrorEB("T048 proof source is not current protected main")
+
+    report_path = root / "receipts/t048-load.json"
+    attempt_path = root / "receipts/t048-load-attempt.json"
+    attempt_started_at_unix_ms = time.time_ns() // 1_000_000
+    atomic_json(
+        attempt_path,
+        {
+            "schema_version": 1,
+            "status": "running",
+            "source_commit": source_commit,
+            "started_at_unix_ms": attempt_started_at_unix_ms,
+        },
+    )
+    report_path.unlink(missing_ok=True)
+
     fixture_receipt = seed_t048_fixture(root)
     manifest = Path(fixture_receipt["manifest"])
     policy = evidence.load_policy(PERFORMANCE_POLICY)
@@ -1780,7 +1795,6 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     metrics_after_path = root / "performance/metrics-after.prom"
     resource_path = root / "performance/resource-receipt.json"
     db_path = root / "performance/database-connections.json"
-    report_path = root / "receipts/t048-load.json"
 
     pod_name, pod = _api_pod(root)
     api_container = next(
@@ -1985,6 +1999,17 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             ],
         }
         atomic_json(report_path, report)
+        atomic_json(
+            attempt_path,
+            {
+                "schema_version": 1,
+                "status": report["status"],
+                "source_commit": source_commit,
+                "started_at_unix_ms": attempt_started_at_unix_ms,
+                "finished_at_unix_ms": time.time_ns() // 1_000_000,
+                "receipt_sha256": sha256_file(report_path),
+            },
+        )
         if failures:
             raise RuntimeErrorEB("T048 Experiment-B load gate failed: " + "; ".join(failures))
         return report
@@ -2173,25 +2198,151 @@ SELECT json_build_object(
     return value
 
 
-def _jetstream_signature(root: Path) -> dict[str, int]:
+def _jetstream_sequence_progress(value: Any, context: str) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise RuntimeErrorEB(f"{context} is missing from JetStream monitoring output")
+    try:
+        return {
+            "consumer_seq": int(value["consumer_seq"]),
+            "stream_seq": int(value["stream_seq"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeErrorEB(f"{context} has an invalid JetStream sequence") from exc
+
+
+def _jetstream_signature_from_monitoring(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeErrorEB("NATS JetStream monitoring output is not an object")
+    accounts = value.get("account_details")
+    if not isinstance(accounts, list):
+        raise RuntimeErrorEB("NATS JetStream monitoring output has no account details")
+
+    stream_signatures: list[dict[str, Any]] = []
+    durable_consumer_count = 0
+    for account in accounts:
+        if not isinstance(account, dict):
+            raise RuntimeErrorEB("NATS JetStream account detail is invalid")
+        account_name = str(account.get("name") or account.get("id") or "")
+        streams = account.get("stream_detail", [])
+        if not isinstance(streams, list):
+            raise RuntimeErrorEB("NATS JetStream stream detail is invalid")
+        for stream in streams:
+            if not isinstance(stream, dict):
+                raise RuntimeErrorEB("NATS JetStream stream entry is invalid")
+            stream_name = str(stream.get("name") or "")
+            if not stream_name:
+                raise RuntimeErrorEB("NATS JetStream stream detail has no name")
+            state = stream.get("state")
+            if not isinstance(state, dict):
+                raise RuntimeErrorEB(f"NATS JetStream stream {stream_name!r} has no state")
+            try:
+                stream_state = {
+                    "messages": int(state["messages"]),
+                    "bytes": int(state["bytes"]),
+                    "first_seq": int(state["first_seq"]),
+                    "last_seq": int(state["last_seq"]),
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeErrorEB(
+                    f"NATS JetStream stream {stream_name!r} state is incomplete"
+                ) from exc
+
+            durable_consumers: list[dict[str, Any]] = []
+            consumers = stream.get("consumer_detail", [])
+            if not isinstance(consumers, list):
+                raise RuntimeErrorEB(
+                    f"NATS JetStream stream {stream_name!r} consumer detail is invalid"
+                )
+            for consumer in consumers:
+                if not isinstance(consumer, dict):
+                    raise RuntimeErrorEB("NATS JetStream consumer detail is invalid")
+                config = consumer.get("config")
+                if not isinstance(config, dict):
+                    continue
+                durable_name = config.get("durable_name")
+                if not isinstance(durable_name, str) or not durable_name:
+                    continue
+                consumer_name = str(consumer.get("name") or "")
+                consumer_stream = str(consumer.get("stream_name") or "")
+                if not consumer_name or consumer_stream != stream_name:
+                    raise RuntimeErrorEB(
+                        "NATS durable consumer identity is incomplete or cross-stream"
+                    )
+                try:
+                    num_ack_pending = int(consumer["num_ack_pending"])
+                    num_redelivered = int(consumer["num_redelivered"])
+                    num_pending = int(consumer["num_pending"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeErrorEB(
+                        f"NATS durable consumer {consumer_name!r} state is incomplete"
+                    ) from exc
+                durable_consumers.append(
+                    {
+                        "name": consumer_name,
+                        "stream_name": consumer_stream,
+                        "config": config,
+                        "delivered": _jetstream_sequence_progress(
+                            consumer.get("delivered"),
+                            f"NATS durable consumer {consumer_name!r} delivered state",
+                        ),
+                        "ack_floor": _jetstream_sequence_progress(
+                            consumer.get("ack_floor"),
+                            f"NATS durable consumer {consumer_name!r} ack floor",
+                        ),
+                        "num_ack_pending": num_ack_pending,
+                        "num_redelivered": num_redelivered,
+                        "num_pending": num_pending,
+                    }
+                )
+            durable_consumers.sort(
+                key=lambda item: (str(item["stream_name"]), str(item["name"]))
+            )
+            durable_consumer_count += len(durable_consumers)
+            stream_signatures.append(
+                {
+                    "account": account_name,
+                    "name": stream_name,
+                    "state": stream_state,
+                    "durable_consumers": durable_consumers,
+                }
+            )
+
+    stream_signatures.sort(key=lambda item: (str(item["account"]), str(item["name"])))
+    try:
+        result = {
+            "streams": int(value["streams"]),
+            "messages": int(value["messages"]),
+            "bytes": int(value["bytes"]),
+            "durable_consumers": durable_consumer_count,
+            "stream_detail": stream_signatures,
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeErrorEB("NATS JetStream aggregate state is incomplete") from exc
+    if result["streams"] < 1 or len(stream_signatures) != result["streams"]:
+        raise RuntimeErrorEB("NATS JetStream stream detail does not cover all streams")
+    if durable_consumer_count < 1:
+        raise RuntimeErrorEB("NATS JetStream has no persisted durable consumer state")
+    return result
+
+
+def _jetstream_signature(root: Path) -> dict[str, Any]:
     raw = _kubectl(
         root,
         [
             "-n", DATA_NAMESPACE, "exec", "deployment/nats", "--",
             "/bin/sh", "-c",
-            "wget -qO- 'http://127.0.0.1:8222/jsz?streams=true'",
+            (
+                "wget -qO- "
+                "'http://127.0.0.1:8222/jsz?"
+                "accounts=true&streams=true&consumers=true&config=true'"
+            ),
         ],
     ).stdout
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeErrorEB("NATS JetStream monitoring output is not JSON") from exc
-    result = {
-        "streams": int(value.get("streams", 0)),
-        "messages": int(value.get("messages", 0)),
-        "bytes": int(value.get("bytes", 0)),
-    }
-    return result
+    return _jetstream_signature_from_monitoring(value)
 
 
 def _scale_deployment(root: Path, namespace: str, name: str, replicas: int) -> None:
@@ -2338,7 +2489,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     db_dump = backup_dir / "postgres.dump"
     nats_tar = backup_dir / "nats.tar"
     before_db: dict[str, Any] | None = None
-    before_nats: dict[str, int] | None = None
+    before_nats: dict[str, Any] | None = None
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
         raise RuntimeErrorEB("recovery proof requires an applied release receipt")
@@ -2463,7 +2614,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB("PostgreSQL/search signature changed across delete-to-prove")
         if after_nats != before_nats:
             raise RuntimeErrorEB(
-                "JetStream streams/messages/bytes signature changed across restore"
+                "JetStream stream/durable-consumer continuity signature changed across restore"
             )
         _flux_resume(root, "commonthing-experiment-b-data")
         _flux_resume(root, "commonthing-experiment-b-app")
@@ -2529,6 +2680,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         "semantic-search.json": "pass",
         "functional-readback.json": "pass",
         "t048-load.json": "pass",
+        "t048-load-attempt.json": "pass",
         "recovery.json": "pass",
         "status.json": "observed",
     }
@@ -2559,6 +2711,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         "semantic-search.json",
         "functional-readback.json",
         "t048-load.json",
+        "t048-load-attempt.json",
         "recovery.json",
         "status.json",
     ):
@@ -2566,6 +2719,12 @@ def portability_report(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 f"portability receipt source binding drifted: {name}"
             )
+    load_attempt = payloads["t048-load-attempt.json"]
+    if load_attempt.get("receipt_sha256") != receipts["t048-load.json"]:
+        raise RuntimeErrorEB(
+            "latest T048 attempt is not bound to the current successful load receipt"
+        )
+
     result = {
         "schema_version": 1,
         "status": "pass",
