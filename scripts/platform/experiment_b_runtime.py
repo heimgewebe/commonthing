@@ -1382,6 +1382,13 @@ def _write_streamed_fixture_sql(
                 output.write(line)
 
 
+def _t048_canonical_visibility(fixture: dict[str, Any]) -> str:
+    kind = fixture.get("kind")
+    if not isinstance(kind, str) or not kind:
+        raise RuntimeErrorEB("T048 fixture node has no canonical kind")
+    return "public" if kind == "Projekt" else "hidden"
+
+
 def _t048_live_fixture_binding(
     root: Path, manifest: Path, generation_id: str
 ) -> dict[str, Any]:
@@ -1403,7 +1410,8 @@ SELECT json_build_object(
   'lon', lon,
   'created_at', to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
   'updated_at', to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-  'payload', payload
+  'payload', payload,
+  'search_visibility', search_visibility
 )::text
 FROM domain_nodes
 ORDER BY id;
@@ -1411,9 +1419,13 @@ ORDER BY id;
         ),
         "Experiment-B domain_nodes query",
     )
-    fixture_sha = live_binding._rows_sha256(fixture_rows)
+    canonical_fixture_rows = [
+        {**row, "search_visibility": _t048_canonical_visibility(row)}
+        for row in fixture_rows
+    ]
+    fixture_sha = live_binding._rows_sha256(canonical_fixture_rows)
     database_sha = live_binding._rows_sha256(db_rows)
-    if len(db_rows) != len(fixture_rows) or database_sha != fixture_sha:
+    if len(db_rows) != len(canonical_fixture_rows) or database_sha != fixture_sha:
         raise RuntimeErrorEB(
             "live domain_nodes content does not match the deterministic T048 fixture"
         )
@@ -1477,8 +1489,12 @@ ORDER BY p.node_id;
             raise RuntimeErrorEB(
                 f"Experiment-B search projection {node_id!r} is absent from fixture"
             )
+        canonical_visibility = _t048_canonical_visibility(fixture)
         expected_projection_rows.append(
-            live_binding._expected_projection_identity(projection, fixture)
+            live_binding._expected_projection_identity(
+                {**projection, "search_visibility": canonical_visibility},
+                fixture,
+            )
         )
         actual_projection_rows.append(
             {

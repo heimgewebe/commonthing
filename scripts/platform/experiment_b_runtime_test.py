@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -553,6 +554,60 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             source,
         )
         self.assertIn('"live_binding": live_binding', source)
+
+    def test_t048_canonical_visibility_is_fixture_derived(self) -> None:
+        self.assertEqual(
+            runtime._t048_canonical_visibility({"kind": "Projekt"}),
+            "public",
+        )
+        self.assertEqual(
+            runtime._t048_canonical_visibility({"kind": "Organisation"}),
+            "hidden",
+        )
+        with self.assertRaises(runtime.RuntimeErrorEB):
+            runtime._t048_canonical_visibility({"kind": ""})
+
+    def test_t048_live_binding_rejects_visibility_drift(self) -> None:
+        fixture_row = {
+            "id": "node-1",
+            "kind": "Organisation",
+            "title": "Hidden fixture node",
+            "lat": 53.5,
+            "lon": 10.0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "payload": {"tags": ["test"]},
+        }
+        drifted_database_row = {
+            **fixture_row,
+            "search_visibility": "public",
+        }
+        root_text = str(runtime.ROOT)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
+        from scripts.performance import api_runtime_live_binding as live_binding
+
+        with (
+            mock.patch.object(
+                live_binding,
+                "_manifest_and_fixture",
+                return_value=({}, [fixture_row]),
+            ),
+            mock.patch.object(
+                runtime,
+                "_psql",
+                return_value=json.dumps(drifted_database_row) + "\n",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "live domain_nodes content does not match",
+            ):
+                runtime._t048_live_fixture_binding(
+                    Path("/unused-root"),
+                    Path("/unused-manifest.json"),
+                    "experiment-b-t048",
+                )
 
     def test_fixture_rebinds_canonical_live_state_without_stale_receipt(self) -> None:
         commit = "a" * 40
