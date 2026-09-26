@@ -47,6 +47,13 @@ BASE_VOLUME = "commonthing-experiment-b-base.qcow2"
 VOLUME_NAME = "commonthing-experiment-b.qcow2"
 APP_NAMESPACE = "commonthing-experiment-b"
 DATA_NAMESPACE = "commonthing-data"
+EXPECTED_PVCS = frozenset(
+    {
+        f"{DATA_NAMESPACE}/postgres-data",
+        f"{DATA_NAMESPACE}/nats-data",
+        f"{APP_NAMESPACE}/ollama-models",
+    }
+)
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 PERFORMANCE_POLICY = ROOT / "policies/performance.v1.json"
@@ -1280,6 +1287,48 @@ def _require_exact_flux_kustomizations(flux_readback: dict[str, Any]) -> None:
     )
 
 
+def _require_exact_healthy_pvcs(pvc_items: Any) -> dict[str, Any]:
+    if not isinstance(pvc_items, list):
+        raise RuntimeErrorEB("Experiment-B PVC inventory is not a list")
+
+    pvc_readback: dict[str, Any] = {}
+    for item in pvc_items:
+        if not isinstance(item, dict):
+            raise RuntimeErrorEB("Experiment-B PVC inventory contains a non-object item")
+        metadata = item.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise RuntimeErrorEB("Experiment-B PVC metadata is not an object")
+        namespace = str(metadata.get("namespace", ""))
+        name = str(metadata.get("name", ""))
+        if namespace not in {APP_NAMESPACE, DATA_NAMESPACE}:
+            continue
+
+        key = f"{namespace}/{name}"
+        if key in pvc_readback:
+            raise RuntimeErrorEB(f"Experiment-B PVC inventory contains duplicate: {key}")
+        if metadata.get("deletionTimestamp"):
+            raise RuntimeErrorEB(f"Experiment-B PVC is pending deletion: {key}")
+
+        phase = str(item.get("status", {}).get("phase", ""))
+        storage_class = str(item.get("spec", {}).get("storageClassName", ""))
+        if phase != "Bound" or storage_class != "local-path":
+            raise RuntimeErrorEB(f"Experiment-B PVC is not Bound/local-path: {key}")
+        pvc_readback[key] = {
+            "phase": phase,
+            "storage_class": storage_class,
+        }
+
+    observed = set(pvc_readback)
+    if observed != EXPECTED_PVCS:
+        missing = sorted(EXPECTED_PVCS - observed)
+        unexpected = sorted(observed - EXPECTED_PVCS)
+        raise RuntimeErrorEB(
+            "Experiment-B PVC set mismatch: "
+            f"missing={missing}; unexpected={unexpected}"
+        )
+    return pvc_readback
+
+
 def _deployment_availability_snapshot(
     deployment: dict[str, Any], name: str
 ) -> dict[str, Any]:
@@ -1434,20 +1483,7 @@ def status(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("live search-worker image does not match API release digest")
 
     pvc_items = _kubectl_json(root, ["-A", "get", "pvc"]).get("items", [])
-    pvc_readback: dict[str, Any] = {}
-    for item in pvc_items:
-        namespace = str(item.get("metadata", {}).get("namespace", ""))
-        name = str(item.get("metadata", {}).get("name", ""))
-        if namespace not in {APP_NAMESPACE, DATA_NAMESPACE}:
-            continue
-        phase = str(item.get("status", {}).get("phase", ""))
-        storage_class = str(item.get("spec", {}).get("storageClassName", ""))
-        if phase != "Bound" or storage_class != "local-path":
-            raise RuntimeErrorEB(f"Experiment-B PVC is not Bound/local-path: {namespace}/{name}")
-        pvc_readback[f"{namespace}/{name}"] = {
-            "phase": phase,
-            "storage_class": storage_class,
-        }
+    pvc_readback = _require_exact_healthy_pvcs(pvc_items)
 
     gateway = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "gateway", "commonthing-experiment-b"]

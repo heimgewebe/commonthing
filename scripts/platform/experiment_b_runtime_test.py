@@ -1906,6 +1906,23 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "kind": "NodeList",
             "items": [self.node],
         }
+        self.pvcs = [
+            {
+                "metadata": {"namespace": runtime.DATA_NAMESPACE, "name": "postgres-data"},
+                "spec": {"storageClassName": "local-path"},
+                "status": {"phase": "Bound"},
+            },
+            {
+                "metadata": {"namespace": runtime.DATA_NAMESPACE, "name": "nats-data"},
+                "spec": {"storageClassName": "local-path"},
+                "status": {"phase": "Bound"},
+            },
+            {
+                "metadata": {"namespace": runtime.APP_NAMESPACE, "name": "ollama-models"},
+                "spec": {"storageClassName": "local-path"},
+                "status": {"phase": "Bound"},
+            },
+        ]
         self.runner = self.patch("run", side_effect=self.run_fixture)
 
     def patch(self, name: str, *args, **kwargs):
@@ -2028,7 +2045,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 },
             }
         if "pvc" in arguments:
-            return {"items": []}
+            return {"items": self.pvcs}
         self.assertIn("gateway", arguments)
         return {"status": {"conditions": [{"type": "Programmed", "status": "True"}]}}
 
@@ -2169,6 +2186,53 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         attempt = json.loads((self.root / "receipts/status-attempt.json").read_text())
         self.assertEqual(attempt["status"], "pass")
         self.assertEqual(attempt["receipt_sha256"], runtime.sha256_file(self.root / "receipts/status.json"))
+
+    def test_status_requires_exact_healthy_pvc_set(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        result = runtime.status(self.root)
+        self.assertEqual(set(result["pvcs"]), runtime.EXPECTED_PVCS)
+
+        healthy = list(self.pvcs)
+        cases = [
+            ("missing", healthy[:-1], "PVC set mismatch"),
+            (
+                "unexpected",
+                healthy + [{
+                    "metadata": {"namespace": runtime.APP_NAMESPACE, "name": "shadow-data"},
+                    "spec": {"storageClassName": "local-path"},
+                    "status": {"phase": "Bound"},
+                }],
+                "PVC set mismatch",
+            ),
+            (
+                "deleting",
+                [{
+                    **healthy[0],
+                    "metadata": {
+                        **healthy[0]["metadata"],
+                        "deletionTimestamp": "2026-09-26T18:40:31Z",
+                    },
+                }] + healthy[1:],
+                "pending deletion",
+            ),
+            ("duplicate", healthy + [healthy[0]], "duplicate"),
+        ]
+
+        for name, pvcs, message in cases:
+            with self.subTest(case=name):
+                self.pvcs = pvcs
+                for receipt in ("status.json", "portability.json"):
+                    runtime.atomic_json(
+                        self.root / "receipts" / receipt, {"status": "stale"}
+                    )
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, message):
+                    runtime.status(self.root)
+                self.assertFalse((self.root / "receipts/status.json").exists())
+                self.assertFalse((self.root / "receipts/portability.json").exists())
+
+        self.pvcs = healthy
 
     def test_status_accepts_node_typemeta_with_exact_configured_k3s_version(self) -> None:
         self.write_vm_receipt()
