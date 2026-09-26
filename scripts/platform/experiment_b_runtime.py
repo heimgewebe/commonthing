@@ -178,6 +178,34 @@ def _complete_live_check_attempt(
     )
 
 
+RELEASE_DEPENDENT_RECEIPTS = (
+    "t048-fixture.json",
+    "semantic-search.json",
+    "semantic-search-attempt.json",
+    "functional-readback.json",
+    "functional-readback-attempt.json",
+    "t048-load.json",
+    "t048-load-attempt.json",
+    "recovery.json",
+    "recovery-failed.json",
+    "status.json",
+    "status-attempt.json",
+    "portability.json",
+)
+
+
+def _begin_release_attempt(
+    root: Path,
+    source_commit: str,
+) -> tuple[Path, Path, int]:
+    receipt_path, attempt_path, started_at_unix_ms = _begin_live_check_attempt(
+        root, "release", source_commit
+    )
+    for name in RELEASE_DEPENDENT_RECEIPTS:
+        (root / "receipts" / name).unlink(missing_ok=True)
+    return receipt_path, attempt_path, started_at_unix_ms
+
+
 def download(url: str, expected_sha256: str, destination: Path) -> None:
     if destination.is_file() and sha256_file(destination) == expected_sha256:
         return
@@ -739,6 +767,9 @@ def apply_release(
     binding = contract.render_bootstrap(
         source_commit, api_digest, web_digest, output
     )
+    receipt_path, attempt_path, attempt_started_at_unix_ms = (
+        _begin_release_attempt(root, source_commit)
+    )
     kubectl_apply(root, output.read_text(encoding="utf-8"))
     flux = toolchain(root)["tools"]["flux"]
     env = kube_env(root)
@@ -763,7 +794,14 @@ def apply_release(
         "status": "applied",
         **binding,
     }
-    atomic_json(root / "receipts/release.json", receipt)
+    atomic_json(receipt_path, receipt)
+    _complete_live_check_attempt(
+        attempt_path,
+        receipt_path,
+        source_commit,
+        attempt_started_at_unix_ms,
+        "pass",
+    )
     return receipt
 
 
@@ -2845,6 +2883,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         "platform.json": "ready",
         "secrets.json": "ready",
         "release.json": "applied",
+        "release-attempt.json": "pass",
         "t048-fixture.json": "loaded",
         "semantic-search.json": "pass",
         "semantic-search-attempt.json": "pass",
@@ -2879,6 +2918,7 @@ def portability_report(root: Path) -> dict[str, Any]:
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("release receipt has no exact source commit")
     for name in (
+        "release-attempt.json",
         "t048-fixture.json",
         "semantic-search.json",
         "semantic-search-attempt.json",
@@ -2895,6 +2935,7 @@ def portability_report(root: Path) -> dict[str, Any]:
                 f"portability receipt source binding drifted: {name}"
             )
     for receipt_stem in (
+        "release",
         "semantic-search",
         "functional-readback",
         "t048-load",

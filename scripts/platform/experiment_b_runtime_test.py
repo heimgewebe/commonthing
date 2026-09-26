@@ -153,7 +153,39 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             self.assertEqual(completed["status"], "pass")
             self.assertEqual(completed["receipt_sha256"], runtime.sha256_file(receipt))
 
+    def test_release_attempt_invalidates_release_dependent_evidence(self) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            stale_names = ("release.json", *runtime.RELEASE_DEPENDENT_RECEIPTS)
+            for name in stale_names:
+                (receipts / name).write_text(
+                    json.dumps({"schema_version": 1, "status": "stale"}) + "\n",
+                    encoding="utf-8",
+                )
+
+            receipt_path, attempt_path, _ = runtime._begin_release_attempt(
+                root, commit
+            )
+
+            self.assertFalse(receipt_path.exists())
+            for name in runtime.RELEASE_DEPENDENT_RECEIPTS:
+                self.assertFalse((receipts / name).exists(), name)
+            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+            self.assertEqual(attempt["status"], "running")
+            self.assertEqual(attempt["source_commit"], commit)
+            self.assertEqual(attempt["receipt"], "release.json")
+
     def test_live_checks_start_attempt_before_live_work(self) -> None:
+        release = inspect.getsource(runtime.apply_release)
+        self.assertLess(
+            release.index("_begin_release_attempt("),
+            release.index("kubectl_apply(root, output.read_text"),
+        )
+        self.assertIn("_complete_live_check_attempt(", release)
+
         semantic = inspect.getsource(runtime.semantic_activate)
         self.assertLess(
             semantic.index("_begin_live_check_attempt("),
@@ -394,6 +426,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             "platform.json": "ready",
             "secrets.json": "ready",
             "release.json": "applied",
+            "release-attempt.json": "pass",
             "t048-fixture.json": "loaded",
             "semantic-search.json": "pass",
             "semantic-search-attempt.json": "pass",
@@ -424,6 +457,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 elif name == "t048-load.json":
                     payload["source_commit"] = commit
                 elif name in {
+                    "release-attempt.json",
                     "semantic-search-attempt.json",
                     "functional-readback-attempt.json",
                     "t048-load-attempt.json",
@@ -438,6 +472,9 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 (receipts / name).write_text(
                     json.dumps(payload) + "\n", encoding="utf-8"
                 )
+
+            baseline = runtime.portability_report(root)
+            self.assertEqual(baseline["status"], "pass")
 
             failed = json.loads((receipts / "t048-load.json").read_text())
             failed["status"] = "fail"
@@ -465,6 +502,22 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             attempt["receipt_sha256"] = "0" * 64
             (receipts / "t048-load-attempt.json").write_text(
                 json.dumps(attempt) + "\n", encoding="utf-8"
+            )
+            with self.assertRaises(runtime.RuntimeErrorEB):
+                runtime.portability_report(root)
+
+            attempt["receipt_sha256"] = runtime.sha256_file(
+                receipts / "t048-load.json"
+            )
+            (receipts / "t048-load-attempt.json").write_text(
+                json.dumps(attempt) + "\n", encoding="utf-8"
+            )
+            release_attempt = json.loads(
+                (receipts / "release-attempt.json").read_text(encoding="utf-8")
+            )
+            release_attempt["receipt_sha256"] = "0" * 64
+            (receipts / "release-attempt.json").write_text(
+                json.dumps(release_attempt) + "\n", encoding="utf-8"
             )
             with self.assertRaises(runtime.RuntimeErrorEB):
                 runtime.portability_report(root)
