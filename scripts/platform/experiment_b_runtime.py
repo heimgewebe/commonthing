@@ -1348,9 +1348,14 @@ def status(root: Path) -> dict[str, Any]:
     kubectl = tools["kubectl"]
 
     nodes = json.loads(run([kubectl, "get", "nodes", "-o", "json"], env=env).stdout)
-    if len(nodes.get("items", [])) != 1:
+    if nodes.get("kind") != "NodeList":
+        raise RuntimeErrorEB("Experiment B node inventory is not a Kubernetes NodeList")
+    items = nodes.get("items")
+    if not isinstance(items, list) or len(items) != 1:
         raise RuntimeErrorEB("Experiment B expects exactly one k3s VM node")
-    node = nodes["items"][0]
+    node = items[0]
+    if not isinstance(node, dict) or node.get("kind") != "Node":
+        raise RuntimeErrorEB("Experiment B node inventory item is not a Kubernetes Node")
     info = node.get("status", {}).get("nodeInfo", {})
     kubelet = str(info.get("kubeletVersion", ""))
     os_image = str(info.get("osImage", ""))

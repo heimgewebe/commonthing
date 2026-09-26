@@ -1837,6 +1837,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "osImage": "Ubuntu 24.04.3 LTS",
             }},
         }
+        self.node_inventory = {
+            "apiVersion": "v1",
+            "kind": "NodeList",
+            "items": [self.node],
+        }
         self.runner = self.patch("run", side_effect=self.run_fixture)
 
     def patch(self, name: str, *args, **kwargs):
@@ -1851,7 +1856,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             self.domain_present = True
         elif argv[0] == "kubectl":
             self.assertEqual(argv[1:], ["get", "nodes", "-o", "json"])
-            output = json.dumps({"apiVersion": "v1", "kind": "NodeList", "items": [self.node]})
+            output = json.dumps(self.node_inventory)
         else:
             self.assertEqual(argv[:3], ["virsh", "-c", runtime.LIBVIRT_URI])
             command = argv[3]
@@ -2059,6 +2064,27 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 self.assertEqual(result["status"], "observed")
                 self.assertEqual(result["kubelet_version"], version)
                 self.assertIs(result["kind_runtime"], False)
+
+    def test_status_requires_nodelist_with_exactly_one_node_item(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        valid_node = self.node
+        cases = (
+            valid_node,
+            {"apiVersion": "v1", "kind": "List", "items": [valid_node]},
+            {"apiVersion": "v1", "kind": "NodeList", "items": []},
+            {"apiVersion": "v1", "kind": "NodeList", "items": [valid_node, valid_node]},
+            {"apiVersion": "v1", "kind": "NodeList", "items": [{**valid_node, "kind": "Pod"}]},
+        )
+        for inventory in cases:
+            with self.subTest(inventory_kind=inventory.get("kind"), item_count=len(inventory.get("items", [])) if isinstance(inventory.get("items"), list) else None):
+                self.node_inventory = inventory
+                for name in ("status.json", "portability.json"):
+                    runtime.atomic_json(self.root / "receipts" / name, {"status": "stale"})
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime.status(self.root)
+                for name in ("status.json", "portability.json"):
+                    self.assertFalse((self.root / "receipts" / name).exists())
 
     def test_status_rejects_wrong_or_missing_kubelet_version(self) -> None:
         self.write_vm_receipt()
