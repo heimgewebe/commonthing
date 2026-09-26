@@ -133,6 +133,51 @@ def atomic_json(path: Path, payload: dict[str, Any], mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
+def _begin_live_check_attempt(
+    root: Path,
+    receipt_stem: str,
+    source_commit: str,
+) -> tuple[Path, Path, int]:
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB(f"{receipt_stem} attempt source commit is not exact")
+    receipt_path = root / "receipts" / f"{receipt_stem}.json"
+    attempt_path = root / "receipts" / f"{receipt_stem}-attempt.json"
+    started_at_unix_ms = time.time_ns() // 1_000_000
+    atomic_json(
+        attempt_path,
+        {
+            "schema_version": 1,
+            "status": "running",
+            "source_commit": source_commit,
+            "receipt": receipt_path.name,
+            "started_at_unix_ms": started_at_unix_ms,
+        },
+    )
+    receipt_path.unlink(missing_ok=True)
+    return receipt_path, attempt_path, started_at_unix_ms
+
+
+def _complete_live_check_attempt(
+    attempt_path: Path,
+    receipt_path: Path,
+    source_commit: str,
+    started_at_unix_ms: int,
+    status: str,
+) -> None:
+    atomic_json(
+        attempt_path,
+        {
+            "schema_version": 1,
+            "status": status,
+            "source_commit": source_commit,
+            "receipt": receipt_path.name,
+            "started_at_unix_ms": started_at_unix_ms,
+            "finished_at_unix_ms": time.time_ns() // 1_000_000,
+            "receipt_sha256": sha256_file(receipt_path),
+        },
+    )
+
+
 def download(url: str, expected_sha256: str, destination: Path) -> None:
     if destination.is_file() and sha256_file(destination) == expected_sha256:
         return
@@ -737,6 +782,9 @@ def semantic_activate(root: Path) -> dict[str, Any]:
     ):
         raise RuntimeErrorEB("semantic provider proof is not bound to current protected main")
 
+    receipt_path, attempt_path, attempt_started_at_unix_ms = (
+        _begin_live_check_attempt(root, "semantic-search", source_commit)
+    )
     kubectl = toolchain(root)["tools"]["kubectl"]
     env = kube_env(root)
     egress_name = "commonthing-experiment-b-model-bootstrap-egress"
@@ -861,7 +909,14 @@ def semantic_activate(root: Path) -> dict[str, Any]:
         "temporary_model_egress_removed": True,
         "database_generation_activation": False,
     }
-    atomic_json(root / "receipts/semantic-search.json", receipt)
+    atomic_json(receipt_path, receipt)
+    _complete_live_check_attempt(
+        attempt_path,
+        receipt_path,
+        source_commit,
+        attempt_started_at_unix_ms,
+        "pass",
+    )
     return receipt
 
 
@@ -1765,25 +1820,44 @@ def _database_connection_count(root: Path) -> int:
     return count
 
 
+def _stop_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _sample_t048_load(
+    root: Path,
+    pod_name: str,
+    load: subprocess.Popen[Any],
+    resource_samples: list[dict[str, Any]],
+    db_samples: list[int],
+) -> int:
+    try:
+        while load.poll() is None:
+            time.sleep(1)
+            resource_samples.append(_sample_api_cgroup(root, pod_name))
+            db_samples.append(_database_connection_count(root))
+        if load.returncode is None:
+            raise RuntimeErrorEB("canonical T048 k6 workload has no terminal return code")
+        return int(load.returncode)
+    finally:
+        _stop_process(load)
+
+
 def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     evidence, _domain_scale = _performance_modules()
     if git_head() != source_commit or remote_main() != source_commit:
         raise RuntimeErrorEB("T048 proof source is not current protected main")
 
-    report_path = root / "receipts/t048-load.json"
-    attempt_path = root / "receipts/t048-load-attempt.json"
-    attempt_started_at_unix_ms = time.time_ns() // 1_000_000
-    atomic_json(
-        attempt_path,
-        {
-            "schema_version": 1,
-            "status": "running",
-            "source_commit": source_commit,
-            "started_at_unix_ms": attempt_started_at_unix_ms,
-        },
+    report_path, attempt_path, attempt_started_at_unix_ms = (
+        _begin_live_check_attempt(root, "t048-load", source_commit)
     )
-    report_path.unlink(missing_ok=True)
-
     fixture_receipt = seed_t048_fixture(root)
     manifest = Path(fixture_receipt["manifest"])
     policy = evidence.load_policy(PERFORMANCE_POLICY)
@@ -1856,11 +1930,13 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             load = subprocess.Popen(
                 docker_args, cwd=ROOT, stdout=out, stderr=err, text=True
             )
-            while load.poll() is None:
-                time.sleep(1)
-                resource_samples.append(_sample_api_cgroup(root, pod_name))
-                db_samples.append(_database_connection_count(root))
-            load_returncode = int(load.returncode)
+            load_returncode = _sample_t048_load(
+                root,
+                pod_name,
+                load,
+                resource_samples,
+                db_samples,
+            )
         resource_samples.append(_sample_api_cgroup(root, pod_name))
         db_samples.append(_database_connection_count(root))
         sampler_finished = time.time_ns() // 1_000_000
@@ -1999,16 +2075,12 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             ],
         }
         atomic_json(report_path, report)
-        atomic_json(
+        _complete_live_check_attempt(
             attempt_path,
-            {
-                "schema_version": 1,
-                "status": report["status"],
-                "source_commit": source_commit,
-                "started_at_unix_ms": attempt_started_at_unix_ms,
-                "finished_at_unix_ms": time.time_ns() // 1_000_000,
-                "receipt_sha256": sha256_file(report_path),
-            },
+            report_path,
+            source_commit,
+            attempt_started_at_unix_ms,
+            str(report["status"]),
         )
         if failures:
             raise RuntimeErrorEB("T048 Experiment-B load gate failed: " + "; ".join(failures))
@@ -2039,6 +2111,9 @@ def _gateway_base_url(root: Path) -> str:
 
 
 def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
+    receipt_path, attempt_path, attempt_started_at_unix_ms = (
+        _begin_live_check_attempt(root, "functional-readback", source_commit)
+    )
     base = _gateway_base_url(root)
     checks: dict[str, Any] = {}
     status_code, body, elapsed = _http_read(base + "/")
@@ -2109,7 +2184,14 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
         "jetstream": jetstream,
         "production_endpoint_used": False,
     }
-    atomic_json(root / "receipts/functional-readback.json", receipt)
+    atomic_json(receipt_path, receipt)
+    _complete_live_check_attempt(
+        attempt_path,
+        receipt_path,
+        source_commit,
+        attempt_started_at_unix_ms,
+        "pass",
+    )
     return receipt
 
 
@@ -2678,7 +2760,9 @@ def portability_report(root: Path) -> dict[str, Any]:
         "release.json": "applied",
         "t048-fixture.json": "loaded",
         "semantic-search.json": "pass",
+        "semantic-search-attempt.json": "pass",
         "functional-readback.json": "pass",
+        "functional-readback-attempt.json": "pass",
         "t048-load.json": "pass",
         "t048-load-attempt.json": "pass",
         "recovery.json": "pass",
@@ -2709,7 +2793,9 @@ def portability_report(root: Path) -> dict[str, Any]:
     for name in (
         "t048-fixture.json",
         "semantic-search.json",
+        "semantic-search-attempt.json",
         "functional-readback.json",
+        "functional-readback-attempt.json",
         "t048-load.json",
         "t048-load-attempt.json",
         "recovery.json",
@@ -2719,11 +2805,21 @@ def portability_report(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 f"portability receipt source binding drifted: {name}"
             )
-    load_attempt = payloads["t048-load-attempt.json"]
-    if load_attempt.get("receipt_sha256") != receipts["t048-load.json"]:
-        raise RuntimeErrorEB(
-            "latest T048 attempt is not bound to the current successful load receipt"
-        )
+    for receipt_stem in (
+        "semantic-search",
+        "functional-readback",
+        "t048-load",
+    ):
+        attempt_name = f"{receipt_stem}-attempt.json"
+        receipt_name = f"{receipt_stem}.json"
+        attempt = payloads[attempt_name]
+        if (
+            attempt.get("receipt") != receipt_name
+            or attempt.get("receipt_sha256") != receipts[receipt_name]
+        ):
+            raise RuntimeErrorEB(
+                f"latest {receipt_stem} attempt is not bound to its current success receipt"
+            )
 
     result = {
         "schema_version": 1,

@@ -102,6 +102,72 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("weltgewebe_search_generation_activation_ready", source)
         self.assertNotIn("weltgewebe_activate_search_generation", source)
 
+    def test_live_check_attempt_invalidates_stale_success_and_binds_completion(self) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            receipt = receipts / "semantic-search.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            receipt_path, attempt_path, started = runtime._begin_live_check_attempt(
+                root,
+                "semantic-search",
+                commit,
+            )
+            self.assertEqual(receipt_path, receipt)
+            self.assertFalse(receipt.exists())
+            running = json.loads(attempt_path.read_text(encoding="utf-8"))
+            self.assertEqual(running["status"], "running")
+            self.assertEqual(running["receipt"], "semantic-search.json")
+
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "source_commit": commit,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runtime._complete_live_check_attempt(
+                attempt_path,
+                receipt,
+                commit,
+                started,
+                "pass",
+            )
+            completed = json.loads(attempt_path.read_text(encoding="utf-8"))
+            self.assertEqual(completed["status"], "pass")
+            self.assertEqual(completed["receipt_sha256"], runtime.sha256_file(receipt))
+
+    def test_semantic_and_functional_checks_start_attempt_before_live_work(self) -> None:
+        semantic = inspect.getsource(runtime.semantic_activate)
+        self.assertLess(
+            semantic.index("_begin_live_check_attempt("),
+            semantic.index("kubectl_apply(root, temporary_egress)"),
+        )
+        self.assertIn("_complete_live_check_attempt(", semantic)
+
+        functional = inspect.getsource(runtime.functional_readback)
+        self.assertLess(
+            functional.index("_begin_live_check_attempt("),
+            functional.index("_gateway_base_url(root)"),
+        )
+        self.assertIn("_complete_live_check_attempt(", functional)
+
     def test_t048_rerun_invalidates_stale_success_before_early_failure(self) -> None:
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as tmp:
@@ -138,6 +204,32 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             )
             self.assertEqual(attempt["status"], "running")
             self.assertEqual(attempt["source_commit"], commit)
+
+    def test_t048_sampler_failure_terminates_and_reaps_k6(self) -> None:
+        load = mock.Mock()
+        load.poll.return_value = None
+        load.wait.return_value = -15
+        resource_samples = [{"sample": "initial"}]
+        db_samples = [1]
+        with (
+            mock.patch.object(runtime.time, "sleep"),
+            mock.patch.object(
+                runtime,
+                "_sample_api_cgroup",
+                side_effect=runtime.RuntimeErrorEB("sampler failed"),
+            ),
+        ):
+            with self.assertRaises(runtime.RuntimeErrorEB):
+                runtime._sample_t048_load(
+                    Path("/tmp"),
+                    "api-pod",
+                    load,
+                    resource_samples,
+                    db_samples,
+                )
+        load.terminate.assert_called_once_with()
+        load.wait.assert_called_once_with(timeout=10)
+        load.kill.assert_not_called()
 
     def test_jetstream_signature_tracks_durable_consumer_continuity_only(self) -> None:
         monitoring = {
@@ -237,7 +329,9 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             "release.json": "applied",
             "t048-fixture.json": "loaded",
             "semantic-search.json": "pass",
+            "semantic-search-attempt.json": "pass",
             "functional-readback.json": "pass",
+            "functional-readback-attempt.json": "pass",
             "t048-load.json": "pass",
             "t048-load-attempt.json": "pass",
             "recovery.json": "pass",
@@ -261,10 +355,16 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                     payload["source_commit"] = commit
                 elif name == "t048-load.json":
                     payload["source_commit"] = commit
-                elif name == "t048-load-attempt.json":
+                elif name in {
+                    "semantic-search-attempt.json",
+                    "functional-readback-attempt.json",
+                    "t048-load-attempt.json",
+                }:
+                    receipt_name = name.removesuffix("-attempt.json") + ".json"
                     payload["source_commit"] = commit
+                    payload["receipt"] = receipt_name
                     payload["receipt_sha256"] = runtime.sha256_file(
-                        receipts / "t048-load.json"
+                        receipts / receipt_name
                     )
                 (receipts / name).write_text(
                     json.dumps(payload) + "\n", encoding="utf-8"
