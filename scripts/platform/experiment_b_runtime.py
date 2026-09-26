@@ -210,6 +210,26 @@ RELEASE_DEPENDENT_RECEIPTS = (
 )
 
 
+SECRETS_ATTEMPT_INVALIDATES = (
+    "secrets.json",
+    "release.json",
+    "release-attempt.json",
+    *RELEASE_DEPENDENT_RECEIPTS,
+)
+PLATFORM_ATTEMPT_INVALIDATES = (
+    "platform.json",
+    *SECRETS_ATTEMPT_INVALIDATES,
+)
+K3S_ATTEMPT_INVALIDATES = (
+    "k3s.json",
+    *PLATFORM_ATTEMPT_INVALIDATES,
+)
+VM_ATTEMPT_INVALIDATES = (
+    "vm-create.json",
+    *K3S_ATTEMPT_INVALIDATES,
+)
+
+
 def _begin_release_attempt(
     root: Path,
     source_commit: str,
@@ -380,6 +400,7 @@ def create_vm(root: Path) -> dict[str, Any]:
     source_virtual_size = int(prepared["cloud_image_virtual_size"])
     if POOL_TARGET.exists() and any(POOL_TARGET.iterdir()):
         raise RuntimeErrorEB("Experiment-B libvirt pool target already contains files")
+    _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
     POOL_TARGET.mkdir(parents=True, exist_ok=True)
 
     pool_defined = False
@@ -539,6 +560,7 @@ def install_k3s(root: Path) -> dict[str, Any]:
     config = load_config()
     ip = vm_ip()
     wait_ssh(root, ip)
+    _invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)
     scp_to(root, ip, root / "downloads/k3s", "/tmp/k3s")
     scp_to(root, ip, CLUSTER / "k3s-config.yaml", "/tmp/config.yaml")
     scp_to(root, ip, CLUSTER / "k3s.service", "/tmp/k3s.service")
@@ -611,6 +633,7 @@ def install_platform(root: Path) -> dict[str, Any]:
     helm = tools["helm"]
     flux = tools["flux"]
 
+    _invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)
     for name in (
         "gateway_api_gatewayclasses",
         "gateway_api_gateways",
@@ -721,6 +744,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("registry config is not valid JSON") from exc
     if "ghcr.io" not in registry_payload.get("auths", {}):
         raise RuntimeErrorEB("registry config has no ghcr.io credential")
+    _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
     kubectl_apply(root, render_namespaces(root))
     db = ensure_secret_material(root)
     database_url = (

@@ -185,6 +185,57 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             self.assertEqual(attempt["source_commit"], commit)
             self.assertEqual(attempt["receipt"], "release.json")
 
+    def test_upstream_reruns_invalidate_complete_downstream_proof_chain(self) -> None:
+        release_tail = {
+            "release.json",
+            "release-attempt.json",
+            *runtime.RELEASE_DEPENDENT_RECEIPTS,
+        }
+        self.assertEqual(
+            set(runtime.SECRETS_ATTEMPT_INVALIDATES),
+            {"secrets.json", *release_tail},
+        )
+        self.assertEqual(
+            set(runtime.PLATFORM_ATTEMPT_INVALIDATES),
+            {"platform.json", *runtime.SECRETS_ATTEMPT_INVALIDATES},
+        )
+        self.assertEqual(
+            set(runtime.K3S_ATTEMPT_INVALIDATES),
+            {"k3s.json", *runtime.PLATFORM_ATTEMPT_INVALIDATES},
+        )
+        self.assertEqual(
+            set(runtime.VM_ATTEMPT_INVALIDATES),
+            {"vm-create.json", *runtime.K3S_ATTEMPT_INVALIDATES},
+        )
+
+        create_vm = inspect.getsource(runtime.create_vm)
+        self.assertLess(
+            create_vm.index("_invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)"),
+            create_vm.index("POOL_TARGET.mkdir"),
+        )
+
+        install_k3s = inspect.getsource(runtime.install_k3s)
+        self.assertLess(
+            install_k3s.index("_invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)"),
+            install_k3s.index('scp_to(root, ip, root / "downloads/k3s"'),
+        )
+
+        install_platform = inspect.getsource(runtime.install_platform)
+        self.assertLess(
+            install_platform.index(
+                "_invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)"
+            ),
+            install_platform.index('run([kubectl, "apply", "-f", artifacts[name]]'),
+        )
+
+        inject_secrets = inspect.getsource(runtime.inject_secrets)
+        self.assertLess(
+            inject_secrets.index(
+                "_invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)"
+            ),
+            inject_secrets.index("kubectl_apply(root, render_namespaces(root))"),
+        )
+
     def test_recovery_attempt_invalidates_post_recovery_evidence(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         self.assertIn(
