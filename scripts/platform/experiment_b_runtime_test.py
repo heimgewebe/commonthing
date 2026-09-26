@@ -1789,6 +1789,8 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         with mock.patch.object(runtime, "run", return_value=failed):
             with self.assertRaises(runtime.RuntimeErrorEB):
                 runtime._libvirt_resource_present("domain", runtime.VM_NAME)
+            with self.assertRaises(runtime.RuntimeErrorEB):
+                runtime._libvirt_volume_present(runtime.POOL_NAME, runtime.VOLUME_NAME)
 
     def test_inject_secrets_cli_does_not_forward_secret_tainted_return(self) -> None:
         source = inspect.getsource(runtime.main)
@@ -1924,8 +1926,26 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             command = argv[3]
             if command == "dominfo":
                 code = 0 if self.domain_present else 1
+            elif command == "list":
+                output = f"{runtime.VM_NAME}\n" if self.domain_present else ""
             elif command == "pool-info":
                 code = 0 if self.pool_present else 1
+            elif command == "pool-list":
+                output = f"{runtime.POOL_NAME}\n" if self.pool_present else ""
+            elif command == "vol-list":
+                if not self.pool_present:
+                    code = 1
+                else:
+                    output = "\n".join(
+                        name
+                        for name, path in (
+                            (runtime.VOLUME_NAME, self.disk),
+                            (runtime.BASE_VOLUME, self.base),
+                        )
+                        if path.exists()
+                    )
+                    if output:
+                        output += "\n"
             elif command == "dumpxml":
                 output = self.xml["inactive" if "--inactive" in argv else "live"]
             elif command == "net-dumpxml":
@@ -2010,6 +2030,40 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             return {"items": []}
         self.assertIn("gateway", arguments)
         return {"status": {"conditions": [{"type": "Programmed", "status": "True"}]}}
+
+    def test_teardown_proves_domain_pool_volume_and_state_absence(self) -> None:
+        retirement = self.root.with_name(self.root.name + "-retirement.json")
+        self.addCleanup(retirement.unlink, missing_ok=True)
+        runtime.atomic_json(
+            self.root / "receipts/example.json",
+            {"schema_version": 1, "status": "pass"},
+        )
+        with mock.patch.object(runtime, "RETIREMENT_RECEIPT", retirement):
+            result = runtime.teardown(self.root)
+
+        self.assertEqual(result["status"], "retired")
+        self.assertEqual(
+            result["volumes_absent"],
+            {
+                runtime.VOLUME_NAME: True,
+                runtime.BASE_VOLUME: True,
+            },
+        )
+        self.assertEqual(
+            result["volume_paths_absent"],
+            {
+                runtime.VOLUME_NAME: True,
+                runtime.BASE_VOLUME: True,
+            },
+        )
+        self.assertTrue(result["pool_target_removed"])
+        self.assertTrue(result["state_removed"])
+        self.assertFalse(self.domain_present)
+        self.assertFalse(self.pool_present)
+        self.assertFalse(self.root.exists())
+        stored = json.loads(retirement.read_text(encoding="utf-8"))
+        self.assertEqual(stored, result)
+        self.assertIn("example.json", stored["evidence_receipts"])
 
     def test_live_readback_captures_actual_substrate_and_base_volume_digest(self) -> None:
         observed = runtime._live_vm_substrate(self.root, self.config)

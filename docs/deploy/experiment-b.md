@@ -100,9 +100,12 @@ fehlgeschlagenen Receipt statt eines Erfolgssignals.
 
 ## Teardown
 
-`teardown` entfernt nur die Experiment-B-Domain, ihren libvirt-Pool und den
-Experiment-B-State. Vorher werden die vorhandenen Receipt-Hashes in einen
-dauerhaften Retirement-Receipt übernommen.
+`teardown` entfernt nur die Experiment-B-Domain, beide libvirt-Volumes, ihren
+libvirt-Pool und den Experiment-B-State. Vorher werden die vorhandenen
+Receipt-Hashes in einen dauerhaften Retirement-Receipt übernommen. Die
+Volume-Abwesenheit wird noch am definierten Pool fail-closed zurückgelesen;
+danach werden zusätzlich die Volume-Pfade, der Pool, das Pool-Target und der
+State als abwesend belegt.
 
 Ein erfolgreicher Teardown beweist die Rückbaubarkeit dieses Testbeds. Er
 beweist weder einen Produktions-Cutover noch Produktions-Hochverfügbarkeit.

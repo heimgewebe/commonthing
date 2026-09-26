@@ -1511,6 +1511,19 @@ def _libvirt_resource_present(kind: str, name: str) -> bool:
     return name in {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+def _libvirt_volume_present(pool: str, name: str) -> bool:
+    result = run(
+        ["virsh", "-c", LIBVIRT_URI, "vol-list", pool, "--name"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeErrorEB(
+            f"cannot prove libvirt volume state for {pool}/{name}: {detail[-1000:]}"
+        )
+    return name in {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
 def teardown(root: Path) -> dict[str, Any]:
     evidence_hashes: dict[str, str] = {}
     receipts_dir = root / "receipts"
@@ -1527,6 +1540,10 @@ def teardown(root: Path) -> dict[str, Any]:
         if undefine.returncode != 0:
             run(["virsh", "-c", LIBVIRT_URI, "undefine", VM_NAME], check=False)
 
+    volume_absence = {
+        VOLUME_NAME: False,
+        BASE_VOLUME: False,
+    }
     if _libvirt_resource_present("pool", POOL_NAME):
         run(
             ["virsh", "-c", LIBVIRT_URI, "vol-delete", VOLUME_NAME, "--pool", POOL_NAME],
@@ -1536,14 +1553,33 @@ def teardown(root: Path) -> dict[str, Any]:
             ["virsh", "-c", LIBVIRT_URI, "vol-delete", BASE_VOLUME, "--pool", POOL_NAME],
             check=False,
         )
+        for volume_name in volume_absence:
+            if _libvirt_volume_present(POOL_NAME, volume_name):
+                raise RuntimeErrorEB(
+                    f"Experiment-B libvirt volume still exists after deletion: {volume_name}"
+                )
+            volume_absence[volume_name] = True
         run(["virsh", "-c", LIBVIRT_URI, "pool-destroy", POOL_NAME], check=False)
         run(["virsh", "-c", LIBVIRT_URI, "pool-delete", POOL_NAME], check=False)
         run(["virsh", "-c", LIBVIRT_URI, "pool-undefine", POOL_NAME], check=False)
+    else:
+        for volume_name in volume_absence:
+            volume_absence[volume_name] = True
 
     if _libvirt_resource_present("domain", VM_NAME):
         raise RuntimeErrorEB("Experiment-B VM still exists after teardown")
     if _libvirt_resource_present("pool", POOL_NAME):
         raise RuntimeErrorEB("Experiment-B storage pool still exists after teardown")
+
+    volume_paths = {
+        VOLUME_NAME: POOL_TARGET / VOLUME_NAME,
+        BASE_VOLUME: POOL_TARGET / BASE_VOLUME,
+    }
+    for volume_name, path in volume_paths.items():
+        if path.exists():
+            raise RuntimeErrorEB(
+                f"Experiment-B volume path still exists after teardown: {volume_name}"
+            )
     if POOL_TARGET.exists():
         if any(POOL_TARGET.iterdir()):
             raise RuntimeErrorEB("Experiment-B libvirt pool directory is not empty after teardown")
@@ -1555,6 +1591,10 @@ def teardown(root: Path) -> dict[str, Any]:
         "status": "retired",
         "vm": VM_NAME,
         "pool": POOL_NAME,
+        "volumes_absent": volume_absence,
+        "volume_paths_absent": {
+            name: not path.exists() for name, path in volume_paths.items()
+        },
         "pool_target_removed": not POOL_TARGET.exists(),
         "state_removed": not root.exists(),
         "evidence_receipts": evidence_hashes,
