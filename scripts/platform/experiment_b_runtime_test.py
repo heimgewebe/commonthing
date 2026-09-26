@@ -516,6 +516,33 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         self.assertLess(api_wait, rto)
         self.assertLess(web_wait, rto)
 
+    def test_protected_main_binding_fails_closed_on_revision_drift(self) -> None:
+        commit = "a" * 40
+        with (
+            mock.patch.object(runtime, "git_head", return_value=commit),
+            mock.patch.object(runtime, "remote_main", return_value=commit),
+        ):
+            self.assertEqual(runtime._current_protected_main_commit(), commit)
+
+        with (
+            mock.patch.object(runtime, "git_head", return_value=commit),
+            mock.patch.object(runtime, "remote_main", return_value="b" * 40),
+        ):
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "no longer current protected main",
+            ):
+                runtime._current_protected_main_commit()
+
+        for function in (
+            runtime.install_k3s,
+            runtime.install_platform,
+            runtime.inject_secrets,
+        ):
+            source = inspect.getsource(function)
+            self.assertIn("_current_protected_main_commit()", source)
+            self.assertIn('"source_commit": source_commit', source)
+
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
         commit = "a" * 40
         statuses = {
@@ -535,7 +562,14 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             "status.json": "observed",
             "status-attempt.json": "pass",
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(
+                runtime,
+                "_current_protected_main_commit",
+                return_value=commit,
+            ),
+        ):
             root = Path(tmp)
             receipts = root / "receipts"
             receipts.mkdir()
@@ -544,6 +578,9 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 if name == "release.json":
                     payload["source_commit"] = commit
                 elif name in {
+                    "k3s.json",
+                    "platform.json",
+                    "secrets.json",
                     "t048-fixture.json",
                     "semantic-search.json",
                     "functional-readback.json",
@@ -572,6 +609,25 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
 
             baseline = runtime.portability_report(root)
             self.assertEqual(baseline["status"], "pass")
+
+            upstream = json.loads(
+                (receipts / "k3s.json").read_text(encoding="utf-8")
+            )
+            upstream["source_commit"] = "b" * 40
+            (receipts / "k3s.json").write_text(
+                json.dumps(upstream) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "source binding drifted: k3s.json",
+            ):
+                runtime.portability_report(root)
+            upstream["source_commit"] = commit
+            (receipts / "k3s.json").write_text(
+                json.dumps(upstream) + "\n",
+                encoding="utf-8",
+            )
 
             failed = json.loads((receipts / "t048-load.json").read_text())
             failed["status"] = "fail"
@@ -618,6 +674,23 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             )
             with self.assertRaises(runtime.RuntimeErrorEB):
                 runtime.portability_report(root)
+
+            release_attempt["receipt_sha256"] = runtime.sha256_file(
+                receipts / "release.json"
+            )
+            (receipts / "release-attempt.json").write_text(
+                json.dumps(release_attempt) + "\n", encoding="utf-8"
+            )
+            with mock.patch.object(
+                runtime,
+                "_current_protected_main_commit",
+                return_value="b" * 40,
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "no longer current protected main",
+                ):
+                    runtime.portability_report(root)
 
     def test_semantic_cleanup_requires_verified_policy_absence(self) -> None:
         source = inspect.getsource(runtime.semantic_activate)

@@ -282,6 +282,16 @@ def remote_main() -> str:
     return lines[0].split()[0]
 
 
+def _current_protected_main_commit() -> str:
+    head = git_head()
+    if not COMMIT_RE.fullmatch(head):
+        raise RuntimeErrorEB("checkout HEAD is not an exact lowercase commit SHA")
+    current_main = remote_main()
+    if current_main != head:
+        raise RuntimeErrorEB("checkout HEAD is no longer current protected main")
+    return head
+
+
 def preflight(expected_source_commit: str | None = None) -> dict[str, Any]:
     config = load_config()
     for command in (
@@ -558,6 +568,7 @@ def scp_to(root: Path, ip: str, source: Path, destination: str) -> None:
 
 def install_k3s(root: Path) -> dict[str, Any]:
     config = load_config()
+    source_commit = _current_protected_main_commit()
     ip = vm_ip()
     wait_ssh(root, ip)
     _invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)
@@ -602,6 +613,7 @@ def install_k3s(root: Path) -> dict[str, Any]:
     receipt = {
         "schema_version": 1,
         "status": "ready",
+        "source_commit": source_commit,
         "vm_ip": ip,
         "k3s_version": version,
         "kubeconfig_sha256": sha256_file(kubeconfig_path),
@@ -625,6 +637,7 @@ def kube_env(root: Path) -> dict[str, str]:
 
 
 def install_platform(root: Path) -> dict[str, Any]:
+    source_commit = _current_protected_main_commit()
     receipt = toolchain(root)
     tools = receipt["tools"]
     artifacts = receipt["artifacts"]
@@ -675,6 +688,7 @@ def install_platform(root: Path) -> dict[str, Any]:
     result = {
         "schema_version": 1,
         "status": "ready",
+        "source_commit": source_commit,
         "toolchain_lock_sha256": receipt["lock_sha256"],
         "vm_ip": ip,
     }
@@ -744,6 +758,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("registry config is not valid JSON") from exc
     if "ghcr.io" not in registry_payload.get("auths", {}):
         raise RuntimeErrorEB("registry config has no ghcr.io credential")
+    source_commit = _current_protected_main_commit()
     _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
     kubectl_apply(root, render_namespaces(root))
     db = ensure_secret_material(root)
@@ -780,6 +795,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     receipt = {
         "schema_version": 1,
         "status": "ready",
+        "source_commit": source_commit,
         "database_secret": "commonthing-experiment-b-database",
         "runtime_secret": "weltgewebe-runtime",
         "registry_secret": "commonthing-experiment-b-registry",
@@ -2988,6 +3004,9 @@ def portability_report(root: Path) -> dict[str, Any]:
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("release receipt has no exact source commit")
     for name in (
+        "k3s.json",
+        "platform.json",
+        "secrets.json",
         "release-attempt.json",
         "t048-fixture.json",
         "semantic-search.json",
@@ -3021,6 +3040,11 @@ def portability_report(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 f"latest {receipt_stem} attempt is not bound to its current success receipt"
             )
+
+    if _current_protected_main_commit() != source_commit:
+        raise RuntimeErrorEB(
+            "portability release is no longer current protected main"
+        )
 
     result = {
         "schema_version": 1,
