@@ -391,6 +391,107 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             source.index('scp_to(root, ip, k3s_binary, "/tmp/k3s")'),
         )
 
+    def test_install_k3s_restarts_and_requires_live_pinned_node(self) -> None:
+        source = inspect.getsource(runtime.install_k3s)
+        self.assertIn("sudo systemctl enable k3s && ", source)
+        self.assertIn("sudo systemctl restart k3s", source)
+        self.assertNotIn("sudo systemctl enable --now k3s", source)
+        self.assertIn("kubectl get nodes -o json", source)
+        self.assertIn("_require_exact_k3s_node_inventory(", source)
+
+        expected = "v1.36.1+k3s1"
+        inventory = {
+            "apiVersion": "v1",
+            "kind": "NodeList",
+            "items": [
+                {
+                    "kind": "Node",
+                    "metadata": {"name": runtime.VM_NAME},
+                    "status": {
+                        "nodeInfo": {
+                            "kubeletVersion": expected,
+                            "osImage": "Ubuntu 24.04 LTS",
+                        }
+                    },
+                }
+            ],
+        }
+        readback = runtime._require_exact_k3s_node_inventory(inventory, expected)
+        self.assertEqual(readback["kubelet_version"], expected)
+
+        stale = json.loads(json.dumps(inventory))
+        stale["items"][0]["status"]["nodeInfo"]["kubeletVersion"] = "v1.35.0+k3s1"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "pinned k3s version"):
+            runtime._require_exact_k3s_node_inventory(stale, expected)
+
+    def test_apply_release_requires_exact_flux_revision_and_set(self) -> None:
+        source = inspect.getsource(runtime.apply_release)
+        self.assertIn("_require_flux_source_revision(", source)
+        self.assertIn("_require_exact_flux_revision_ready(", source)
+        self.assertIn('"gitrepository"', source)
+        self.assertIn('"kustomizations"', source)
+        self.assertNotIn('flux, "get", "kustomizations"', source)
+
+        commit = "a" * 40
+        git_source = {
+            "status": {"artifact": {"revision": f"main@sha1:{commit}"}}
+        }
+        self.assertIn(
+            commit, runtime._require_flux_source_revision(git_source, commit)
+        )
+        for exact_revision in (commit, f"sha1:{commit}", f"main@sha1:{commit}"):
+            with self.subTest(exact_revision=exact_revision):
+                self.assertIn(
+                    commit,
+                    runtime._require_flux_source_revision(
+                        {"status": {"artifact": {"revision": exact_revision}}},
+                        commit,
+                    ),
+                )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "GitRepository"):
+            runtime._require_flux_source_revision(
+                {"status": {"artifact": {"revision": "main@sha1:" + "b" * 40}}},
+                commit,
+            )
+        for malformed in (
+            f"main@sha1:{commit}00",
+            f"prefix-{commit}",
+            f"main@sha256:{commit}",
+        ):
+            with self.subTest(malformed_revision=malformed):
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime._require_flux_source_revision(
+                        {"status": {"artifact": {"revision": malformed}}},
+                        commit,
+                    )
+
+        items = []
+        for name in sorted(runtime.EXPECTED_FLUX_KUSTOMIZATIONS):
+            items.append(
+                {
+                    "metadata": {"name": name},
+                    "status": {
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "lastAppliedRevision": f"main@sha1:{commit}",
+                    },
+                }
+            )
+        readback = runtime._require_exact_flux_revision_ready(items, commit)
+        self.assertEqual(set(readback), runtime.EXPECTED_FLUX_KUSTOMIZATIONS)
+
+        stale_items = json.loads(json.dumps(items))
+        stale_items[0]["status"]["lastAppliedRevision"] = "main@sha1:" + "b" * 40
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "exact-revision Ready"):
+            runtime._require_exact_flux_revision_ready(stale_items, commit)
+
+        malformed_items = json.loads(json.dumps(items))
+        malformed_items[0]["status"]["lastAppliedRevision"] = f"main@sha1:{commit}00"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "exact-revision Ready"):
+            runtime._require_exact_flux_revision_ready(malformed_items, commit)
+
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "set mismatch"):
+            runtime._require_exact_flux_revision_ready(items[:-1], commit)
+
     def test_recovery_attempt_invalidates_post_recovery_evidence(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         self.assertIn(
@@ -1923,6 +2024,37 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "status": {"phase": "Bound"},
             },
         ]
+        route_parent = {
+            "name": "commonthing-experiment-b",
+            "namespace": runtime.APP_NAMESPACE,
+            "sectionName": "http",
+        }
+        self.httproute = {
+            "metadata": {
+                "name": "commonthing-experiment-b",
+                "namespace": runtime.APP_NAMESPACE,
+                "generation": 1,
+            },
+            "spec": {"parentRefs": [route_parent]},
+            "status": {
+                "parents": [{
+                    "parentRef": route_parent,
+                    "controllerName": "io.cilium/gateway-controller",
+                    "conditions": [
+                        {
+                            "type": "Accepted",
+                            "status": "True",
+                            "observedGeneration": 1,
+                        },
+                        {
+                            "type": "ResolvedRefs",
+                            "status": "True",
+                            "observedGeneration": 1,
+                        },
+                    ],
+                }]
+            },
+        }
         self.runner = self.patch("run", side_effect=self.run_fixture)
 
     def patch(self, name: str, *args, **kwargs):
@@ -2020,11 +2152,17 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
 
     def kubernetes_fixture(self, _root, arguments):
         if "gitrepository" in arguments:
-            return {"status": {"artifact": {"revision": self.commit}}}
+            return {
+                "status": {
+                    "artifact": {"revision": f"main@sha1:{self.commit}"}
+                }
+            }
         if "kustomizations" in arguments:
             return {"items": [{
                 "metadata": {"name": name},
-                "status": {"lastAppliedRevision": self.commit, "conditions": [
+                "status": {
+                    "lastAppliedRevision": f"main@sha1:{self.commit}",
+                    "conditions": [
                     {"type": "Ready", "status": "True"},
                 ]},
             } for name in runtime.EXPECTED_FLUX_KUSTOMIZATIONS]}
@@ -2046,6 +2184,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             }
         if "pvc" in arguments:
             return {"items": self.pvcs}
+        if "httproute" in arguments:
+            return self.httproute
         self.assertIn("gateway", arguments)
         return {"status": {"conditions": [{"type": "Programmed", "status": "True"}]}}
 
@@ -2233,6 +2373,57 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 self.assertFalse((self.root / "receipts/portability.json").exists())
 
         self.pvcs = healthy
+
+    def test_status_requires_live_httproute_accepted_and_resolved(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        healthy = json.loads(json.dumps(self.httproute))
+        result = runtime.status(self.root)
+        self.assertTrue(result["httproute"]["accepted"])
+        self.assertTrue(result["httproute"]["resolved_refs"])
+        self.assertEqual(result["httproute"]["generation"], 1)
+
+        cases = []
+
+        accepted_false = json.loads(json.dumps(healthy))
+        accepted_false["status"]["parents"][0]["conditions"][0]["status"] = "False"
+        cases.append(("accepted", accepted_false))
+
+        unresolved = json.loads(json.dumps(healthy))
+        unresolved["status"]["parents"][0]["conditions"][1]["status"] = "False"
+        cases.append(("resolved", unresolved))
+
+        stale_generation = json.loads(json.dumps(healthy))
+        stale_generation["metadata"]["generation"] = 2
+        cases.append(("generation", stale_generation))
+
+        wrong_parent = json.loads(json.dumps(healthy))
+        wrong_parent["spec"]["parentRefs"][0]["sectionName"] = "other"
+        cases.append(("parent", wrong_parent))
+
+        wrong_controller = json.loads(json.dumps(healthy))
+        wrong_controller["status"]["parents"][0]["controllerName"] = "example.invalid/controller"
+        cases.append(("controller", wrong_controller))
+
+        future_generation = json.loads(json.dumps(healthy))
+        future_generation["status"]["parents"][0]["conditions"][0]["observedGeneration"] = 2
+        future_generation["status"]["parents"][0]["conditions"][1]["observedGeneration"] = 2
+        cases.append(("future-generation", future_generation))
+
+        for name, route in cases:
+            with self.subTest(case=name):
+                self.httproute = route
+                for receipt in ("status.json", "portability.json"):
+                    runtime.atomic_json(
+                        self.root / "receipts" / receipt, {"status": "stale"}
+                    )
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime.status(self.root)
+                self.assertFalse((self.root / "receipts/status.json").exists())
+                self.assertFalse((self.root / "receipts/portability.json").exists())
+
+        self.httproute = healthy
 
     def test_status_accepts_node_typemeta_with_exact_configured_k3s_version(self) -> None:
         self.write_vm_receipt()

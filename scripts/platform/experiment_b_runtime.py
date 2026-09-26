@@ -834,19 +834,31 @@ def install_k3s(root: Path) -> dict[str, Any]:
         "sudo install -m 0600 /tmp/config.yaml /etc/rancher/k3s/config.yaml && "
         "sudo install -m 0644 /tmp/k3s.service /etc/systemd/system/k3s.service && "
         "sudo systemctl daemon-reload && "
-        "sudo systemctl enable --now k3s"
+        "sudo systemctl enable k3s && "
+        "sudo systemctl restart k3s"
     )
     run([*ssh_argv(root, ip), command], timeout=180)
+    live_node: dict[str, Any] | None = None
     for _ in range(90):
         result = run(
-            [*ssh_argv(root, ip), "sudo /usr/local/bin/k3s kubectl get node -o name"],
+            [*ssh_argv(root, ip), "sudo /usr/local/bin/k3s kubectl get nodes -o json"],
             check=False,
         )
-        if result.returncode == 0 and "node/" in result.stdout:
-            break
+        if result.returncode == 0:
+            try:
+                inventory = json.loads(result.stdout)
+                live_node = _require_exact_k3s_node_inventory(
+                    inventory, str(config["kubernetes"]["version"])
+                )
+            except (json.JSONDecodeError, RuntimeErrorEB):
+                live_node = None
+            if live_node is not None:
+                break
         time.sleep(2)
     else:
-        raise RuntimeErrorEB("k3s node did not become queryable")
+        raise RuntimeErrorEB(
+            "k3s node did not become queryable at the exact pinned version"
+        )
 
     kubeconfig_raw = run(
         [*ssh_argv(root, ip), "sudo cat /etc/rancher/k3s/k3s.yaml"]
@@ -869,6 +881,7 @@ def install_k3s(root: Path) -> dict[str, Any]:
         "source_commit": source_commit,
         "vm_ip": ip,
         "k3s_version": version,
+        "live_kubelet_version": live_node["kubelet_version"],
         "kubeconfig_sha256": sha256_file(kubeconfig_path),
     }
     atomic_json(root / "receipts/k3s.json", receipt)
@@ -1079,24 +1092,58 @@ def apply_release(
         source_commit, api_digest, web_digest, output
     )
     kubectl_apply(root, output.read_text(encoding="utf-8"))
-    flux = toolchain(root)["tools"]["flux"]
+    kubectl = toolchain(root)["tools"]["kubectl"]
     env = kube_env(root)
     for _ in range(120):
-        result = run(
-            [flux, "get", "kustomizations", "-A"],
+        source_result = run(
+            [
+                kubectl,
+                "-n",
+                "flux-system",
+                "get",
+                "gitrepository",
+                "commonthing-experiment-b",
+                "-o",
+                "json",
+            ],
             env=env,
             check=False,
         )
-        text = result.stdout
-        if (
-            result.returncode == 0
-            and "commonthing-experiment-b-gateway" in text
-            and text.count("True") >= 5
-        ):
-            break
+        flux_result = run(
+            [
+                kubectl,
+                "-n",
+                "flux-system",
+                "get",
+                "kustomizations",
+                "-o",
+                "json",
+            ],
+            env=env,
+            check=False,
+        )
+        if source_result.returncode == 0 and flux_result.returncode == 0:
+            try:
+                source_payload = json.loads(source_result.stdout)
+                flux_payload = json.loads(flux_result.stdout)
+                if not isinstance(source_payload, dict) or not isinstance(
+                    flux_payload, dict
+                ):
+                    raise RuntimeErrorEB("Flux readiness payload is not an object")
+                _require_flux_source_revision(source_payload, source_commit)
+                _require_exact_flux_revision_ready(
+                    flux_payload.get("items", []), source_commit
+                )
+            except (json.JSONDecodeError, RuntimeErrorEB):
+                pass
+            else:
+                break
         time.sleep(5)
     else:
-        raise RuntimeErrorEB("Flux Experiment-B kustomizations did not converge")
+        raise RuntimeErrorEB(
+            "Flux Experiment-B source and kustomizations did not converge "
+            "to the exact release revision"
+        )
     receipt = {
         "schema_version": 1,
         "status": "applied",
@@ -1287,6 +1334,89 @@ def _require_exact_flux_kustomizations(flux_readback: dict[str, Any]) -> None:
     )
 
 
+def _flux_revision_matches_commit(revision: Any, source_commit: str) -> bool:
+    if not COMMIT_RE.fullmatch(source_commit):
+        return False
+    value = str(revision or "")
+    return value in {source_commit, f"sha1:{source_commit}"} or value.endswith(
+        f"@sha1:{source_commit}"
+    )
+
+
+def _require_flux_source_revision(
+    source: Any, source_commit: str
+) -> str:
+    if not isinstance(source, dict):
+        raise RuntimeErrorEB("Flux GitRepository payload is not an object")
+    revision = str(
+        source.get("status", {}).get("artifact", {}).get("revision", "")
+    )
+    if not _flux_revision_matches_commit(revision, source_commit):
+        raise RuntimeErrorEB("Flux GitRepository is not bound to the release commit")
+    return revision
+
+
+def _require_exact_flux_revision_ready(
+    flux_items: Any, source_commit: str
+) -> dict[str, Any]:
+    if not isinstance(flux_items, list):
+        raise RuntimeErrorEB("Flux Kustomization inventory is not a list")
+
+    flux_readback: dict[str, Any] = {}
+    for item in flux_items:
+        if not isinstance(item, dict):
+            raise RuntimeErrorEB("Flux Kustomization inventory contains a non-object item")
+        name = str(item.get("metadata", {}).get("name", ""))
+        if not name.startswith("commonthing-experiment-b-"):
+            continue
+        if name in flux_readback:
+            raise RuntimeErrorEB(f"duplicate Flux Kustomization: {name}")
+        status_obj = item.get("status", {})
+        conditions = status_obj.get("conditions", [])
+        ready = any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in conditions
+            if isinstance(condition, dict)
+        )
+        revision = str(status_obj.get("lastAppliedRevision", ""))
+        if not ready or not _flux_revision_matches_commit(revision, source_commit):
+            raise RuntimeErrorEB(
+                f"Flux Kustomization is not exact-revision Ready: {name}"
+            )
+        flux_readback[name] = {"ready": True, "revision": revision}
+
+    _require_exact_flux_kustomizations(flux_readback)
+    return flux_readback
+
+
+def _require_exact_k3s_node_inventory(
+    nodes: Any, expected_version: str
+) -> dict[str, str]:
+    if not isinstance(nodes, dict) or nodes.get("kind") not in {"NodeList", "List"}:
+        raise RuntimeErrorEB("Experiment B node inventory is not a Kubernetes node list")
+    items = nodes.get("items")
+    if not isinstance(items, list) or len(items) != 1:
+        raise RuntimeErrorEB("Experiment B expects exactly one k3s VM node")
+    node = items[0]
+    if not isinstance(node, dict) or node.get("kind") != "Node":
+        raise RuntimeErrorEB("Experiment B node inventory item is not a Kubernetes Node")
+    metadata = node.get("metadata", {})
+    if not isinstance(metadata, dict) or not metadata.get("name"):
+        raise RuntimeErrorEB("Experiment B node inventory item has no node name")
+    info = node.get("status", {}).get("nodeInfo", {})
+    kubelet = str(info.get("kubeletVersion", ""))
+    os_image = str(info.get("osImage", ""))
+    if "k3s" not in kubelet:
+        raise RuntimeErrorEB("node is not a k3s runtime")
+    if kubelet != expected_version:
+        raise RuntimeErrorEB("node kubelet version does not match pinned k3s version")
+    return {
+        "node": str(metadata["name"]),
+        "kubelet_version": kubelet,
+        "os_image": os_image,
+    }
+
+
 def _require_exact_healthy_pvcs(pvc_items: Any) -> dict[str, Any]:
     if not isinstance(pvc_items, list):
         raise RuntimeErrorEB("Experiment-B PVC inventory is not a list")
@@ -1369,6 +1499,115 @@ def _deployment_availability_snapshot(
     }
 
 
+def _require_httproute_ready(route: Any) -> dict[str, Any]:
+    if not isinstance(route, dict):
+        raise RuntimeErrorEB("Experiment-B HTTPRoute payload is not an object")
+
+    metadata = route.get("metadata", {})
+    spec = route.get("spec", {})
+    if not isinstance(metadata, dict) or not isinstance(spec, dict):
+        raise RuntimeErrorEB("Experiment-B HTTPRoute metadata/spec is invalid")
+    if (
+        metadata.get("name") != "commonthing-experiment-b"
+        or metadata.get("namespace") != APP_NAMESPACE
+    ):
+        raise RuntimeErrorEB("Experiment-B HTTPRoute identity is invalid")
+    generation = int(metadata.get("generation") or 0)
+    if generation < 1:
+        raise RuntimeErrorEB("Experiment-B HTTPRoute generation is invalid")
+
+    expected_parent = {
+        "name": "commonthing-experiment-b",
+        "namespace": APP_NAMESPACE,
+        "sectionName": "http",
+    }
+    parent_refs = spec.get("parentRefs")
+    if (
+        not isinstance(parent_refs, list)
+        or len(parent_refs) != 1
+        or not isinstance(parent_refs[0], dict)
+    ):
+        raise RuntimeErrorEB("Experiment-B HTTPRoute parentRef drifted")
+    spec_parent = parent_refs[0]
+    normalized_spec_parent = {
+        "name": str(spec_parent.get("name", "")),
+        "namespace": str(spec_parent.get("namespace") or APP_NAMESPACE),
+        "sectionName": str(spec_parent.get("sectionName", "")),
+    }
+    if (
+        normalized_spec_parent != expected_parent
+        or str(spec_parent.get("group") or "gateway.networking.k8s.io")
+        != "gateway.networking.k8s.io"
+        or str(spec_parent.get("kind") or "Gateway") != "Gateway"
+    ):
+        raise RuntimeErrorEB("Experiment-B HTTPRoute parentRef drifted")
+
+    status_obj = route.get("status", {})
+    parents = status_obj.get("parents", []) if isinstance(status_obj, dict) else []
+    if not isinstance(parents, list):
+        raise RuntimeErrorEB("Experiment-B HTTPRoute parent status is invalid")
+
+    matching: list[dict[str, Any]] = []
+    for parent in parents:
+        if not isinstance(parent, dict):
+            raise RuntimeErrorEB("Experiment-B HTTPRoute parent status contains a non-object")
+        parent_ref = parent.get("parentRef", {})
+        if not isinstance(parent_ref, dict):
+            raise RuntimeErrorEB("Experiment-B HTTPRoute status parentRef is invalid")
+        normalized_parent = {
+            "name": str(parent_ref.get("name", "")),
+            "namespace": str(parent_ref.get("namespace") or APP_NAMESPACE),
+            "sectionName": str(parent_ref.get("sectionName", "")),
+        }
+        if (
+            normalized_parent != expected_parent
+            or parent.get("controllerName") != "io.cilium/gateway-controller"
+        ):
+            continue
+        conditions = parent.get("conditions", [])
+        if not isinstance(conditions, list):
+            raise RuntimeErrorEB("Experiment-B HTTPRoute conditions are invalid")
+
+        observed: dict[str, dict[str, Any]] = {}
+        for condition in conditions:
+            if not isinstance(condition, dict):
+                continue
+            condition_type = str(condition.get("type", ""))
+            if condition_type not in {"Accepted", "ResolvedRefs"}:
+                continue
+            if condition.get("status") != "True":
+                continue
+            try:
+                observed_generation = int(condition.get("observedGeneration"))
+            except (TypeError, ValueError):
+                continue
+            if observed_generation != generation:
+                continue
+            observed[condition_type] = {
+                "status": "True",
+                "observed_generation": observed_generation,
+            }
+        if set(observed) == {"Accepted", "ResolvedRefs"}:
+            matching.append(
+                {
+                    "controller_name": str(parent.get("controllerName", "")),
+                    "parent_ref": normalized_parent,
+                    "conditions": observed,
+                }
+            )
+
+    if len(matching) != 1:
+        raise RuntimeErrorEB(
+            "Experiment-B HTTPRoute is not currently Accepted with ResolvedRefs"
+        )
+    return {
+        "generation": generation,
+        "accepted": True,
+        "resolved_refs": True,
+        **matching[0],
+    }
+
+
 def status(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
@@ -1397,21 +1636,11 @@ def status(root: Path) -> dict[str, Any]:
     kubectl = tools["kubectl"]
 
     nodes = json.loads(run([kubectl, "get", "nodes", "-o", "json"], env=env).stdout)
-    if nodes.get("kind") not in {"NodeList", "List"}:
-        raise RuntimeErrorEB("Experiment B node inventory is not a Kubernetes node list")
-    items = nodes.get("items")
-    if not isinstance(items, list) or len(items) != 1:
-        raise RuntimeErrorEB("Experiment B expects exactly one k3s VM node")
-    node = items[0]
-    if not isinstance(node, dict) or node.get("kind") != "Node":
-        raise RuntimeErrorEB("Experiment B node inventory item is not a Kubernetes Node")
-    info = node.get("status", {}).get("nodeInfo", {})
-    kubelet = str(info.get("kubeletVersion", ""))
-    os_image = str(info.get("osImage", ""))
-    if "k3s" not in kubelet:
-        raise RuntimeErrorEB("node is not a k3s runtime")
-    if kubelet != config["kubernetes"]["version"]:
-        raise RuntimeErrorEB("node kubelet version does not match pinned k3s version")
+    node_readback = _require_exact_k3s_node_inventory(
+        nodes, str(config["kubernetes"]["version"])
+    )
+    kubelet = node_readback["kubelet_version"]
+    os_image = node_readback["os_image"]
 
     expected_api = f"ghcr.io/heimgewebe/commonthing-api@{release.get('api_digest', '')}"
     expected_web = f"ghcr.io/heimgewebe/commonthing-web@{release.get('web_digest', '')}"
@@ -1420,33 +1649,12 @@ def status(root: Path) -> dict[str, Any]:
         root,
         ["-n", "flux-system", "get", "gitrepository", "commonthing-experiment-b"],
     )
-    source_revision = str(
-        source.get("status", {}).get("artifact", {}).get("revision", "")
-    )
-    if source_commit not in source_revision:
-        raise RuntimeErrorEB("Flux GitRepository is not bound to the release commit")
+    source_revision = _require_flux_source_revision(source, source_commit)
 
     flux_items = _kubectl_json(
         root, ["-n", "flux-system", "get", "kustomizations"]
     ).get("items", [])
-    flux_readback: dict[str, Any] = {}
-    for item in flux_items:
-        name = str(item.get("metadata", {}).get("name", ""))
-        if not name.startswith("commonthing-experiment-b-"):
-            continue
-        status_obj = item.get("status", {})
-        conditions = status_obj.get("conditions", [])
-        ready = any(
-            condition.get("type") == "Ready" and condition.get("status") == "True"
-            for condition in conditions
-            if isinstance(condition, dict)
-        )
-        revision = str(status_obj.get("lastAppliedRevision", ""))
-        if not ready or source_commit not in revision:
-            raise RuntimeErrorEB(f"Flux Kustomization is not exact-revision Ready: {name}")
-        flux_readback[name] = {"ready": True, "revision": revision}
-
-    _require_exact_flux_kustomizations(flux_readback)
+    flux_readback = _require_exact_flux_revision_ready(flux_items, source_commit)
 
     api = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-api"]
@@ -1496,6 +1704,11 @@ def status(root: Path) -> dict[str, Any]:
     if not gateway_ready:
         raise RuntimeErrorEB("Cilium Gateway is not Programmed")
 
+    httproute = _kubectl_json(
+        root, ["-n", APP_NAMESPACE, "get", "httproute", "commonthing-experiment-b"]
+    )
+    httproute_readback = _require_httproute_ready(httproute)
+
     result = {
         "schema_version": 1,
         "status": "observed",
@@ -1503,7 +1716,7 @@ def status(root: Path) -> dict[str, Any]:
         "vm_create_sha256": sha256_file(vm_create_path),
         "vm_substrate": vm_substrate,
         "vm_ip": vm_ip(),
-        "node": node["metadata"]["name"],
+        "node": node_readback["node"],
         "kubelet_version": kubelet,
         "os_image": os_image,
         "flux_source_revision": source_revision,
@@ -1517,6 +1730,7 @@ def status(root: Path) -> dict[str, Any]:
         },
         "pvcs": pvc_readback,
         "gateway_programmed": True,
+        "httproute": httproute_readback,
         "kind_runtime": False,
         "staging_cell_runtime_controller": False,
     }
