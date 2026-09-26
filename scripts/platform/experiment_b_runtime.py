@@ -925,6 +925,16 @@ def status(root: Path) -> dict[str, Any]:
     tools = toolchain(root)["tools"]
     env = kube_env(root)
     kubectl = tools["kubectl"]
+
+    release_path = root / "receipts/release.json"
+    if not release_path.is_file():
+        raise RuntimeErrorEB("Experiment-B status requires release receipt")
+    release = json.loads(release_path.read_text(encoding="utf-8"))
+    source_commit = str(release.get("source_commit", ""))
+    receipt_path, attempt_path, attempt_started_at_unix_ms = (
+        _begin_live_check_attempt(root, "status", source_commit)
+    )
+
     nodes = json.loads(run([kubectl, "get", "nodes", "-o", "json"], env=env).stdout)
     if len(nodes.get("items", [])) != 1:
         raise RuntimeErrorEB("Experiment B expects exactly one k3s VM node")
@@ -937,11 +947,6 @@ def status(root: Path) -> dict[str, Any]:
     if "kind" in json.dumps(node).lower():
         raise RuntimeErrorEB("kind marker found in Experiment-B node identity")
 
-    release_path = root / "receipts/release.json"
-    if not release_path.is_file():
-        raise RuntimeErrorEB("Experiment-B status requires release receipt")
-    release = json.loads(release_path.read_text(encoding="utf-8"))
-    source_commit = str(release.get("source_commit", ""))
     expected_api = f"ghcr.io/heimgewebe/commonthing-api@{release.get('api_digest', '')}"
     expected_web = f"ghcr.io/heimgewebe/commonthing-web@{release.get('web_digest', '')}"
 
@@ -1049,7 +1054,14 @@ def status(root: Path) -> dict[str, Any]:
         "kind_runtime": False,
         "staging_cell_runtime_controller": False,
     }
-    atomic_json(root / "receipts/status.json", result)
+    atomic_json(receipt_path, result)
+    _complete_live_check_attempt(
+        attempt_path,
+        receipt_path,
+        source_commit,
+        attempt_started_at_unix_ms,
+        "pass",
+    )
     return result
 
 
@@ -2767,6 +2779,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         "t048-load-attempt.json": "pass",
         "recovery.json": "pass",
         "status.json": "observed",
+        "status-attempt.json": "pass",
     }
     payloads: dict[str, dict[str, Any]] = {}
     receipts: dict[str, str] = {}
@@ -2800,6 +2813,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         "t048-load-attempt.json",
         "recovery.json",
         "status.json",
+        "status-attempt.json",
     ):
         if payloads[name].get("source_commit") != source_commit:
             raise RuntimeErrorEB(
@@ -2809,6 +2823,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         "semantic-search",
         "functional-readback",
         "t048-load",
+        "status",
     ):
         attempt_name = f"{receipt_stem}-attempt.json"
         receipt_name = f"{receipt_stem}.json"

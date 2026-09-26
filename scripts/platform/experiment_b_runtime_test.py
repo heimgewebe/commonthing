@@ -153,7 +153,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             self.assertEqual(completed["status"], "pass")
             self.assertEqual(completed["receipt_sha256"], runtime.sha256_file(receipt))
 
-    def test_semantic_and_functional_checks_start_attempt_before_live_work(self) -> None:
+    def test_live_checks_start_attempt_before_live_work(self) -> None:
         semantic = inspect.getsource(runtime.semantic_activate)
         self.assertLess(
             semantic.index("_begin_live_check_attempt("),
@@ -167,6 +167,13 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             functional.index("_gateway_base_url(root)"),
         )
         self.assertIn("_complete_live_check_attempt(", functional)
+
+        status = inspect.getsource(runtime.status)
+        self.assertLess(
+            status.index("_begin_live_check_attempt("),
+            status.index('run([kubectl, "get", "nodes", "-o", "json"]'),
+        )
+        self.assertIn("_complete_live_check_attempt(", status)
 
     def test_t048_rerun_invalidates_stale_success_before_early_failure(self) -> None:
         commit = "a" * 40
@@ -336,6 +343,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             "t048-load-attempt.json": "pass",
             "recovery.json": "pass",
             "status.json": "observed",
+            "status-attempt.json": "pass",
         }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -359,6 +367,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                     "semantic-search-attempt.json",
                     "functional-readback-attempt.json",
                     "t048-load-attempt.json",
+                    "status-attempt.json",
                 }:
                     receipt_name = name.removesuffix("-attempt.json") + ".json"
                     payload["source_commit"] = commit
