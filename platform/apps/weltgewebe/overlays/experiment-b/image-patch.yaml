@@ -1,0 +1,28 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weltgewebe-api
+spec:
+  template:
+    spec:
+      imagePullSecrets:
+        - name: commonthing-experiment-b-registry
+      containers:
+        - name: api
+          image: ghcr.io/heimgewebe/commonthing-api@${API_DIGEST}
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weltgewebe-web
+spec:
+  template:
+    spec:
+      imagePullSecrets:
+        - name: commonthing-experiment-b-registry
+      containers:
+        - name: web
+          image: ghcr.io/heimgewebe/commonthing-web@${WEB_DIGEST}
+          imagePullPolicy: IfNotPresent

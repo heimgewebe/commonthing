@@ -1309,6 +1309,7 @@ Generated automatically. Do not edit.
 
 ## platform/README.md
 
+- [relates_to] docs/deploy/experiment-b.md
 - [relates_to] docs/reports/kubernetes-platform-foundation-status.md
 - [relates_to] docs/runbooks/gewebezelle-manual-pilot.md
 
@@ -1512,6 +1513,10 @@ Generated automatically. Do not edit.
 ## scripts/performance/domain_projection_load.py
 
 - [relates_to] docs/reports/cq-02-domain-projection-load.md
+
+## scripts/platform/experiment_b_runtime.py
+
+- [relates_to] docs/deploy/experiment-b.md
 
 ## scripts/platform/ha_reference.py
 

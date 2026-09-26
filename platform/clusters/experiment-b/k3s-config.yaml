@@ -1,0 +1,10 @@
+---
+write-kubeconfig-mode: "0600"
+flannel-backend: none
+disable-network-policy: true
+disable-kube-proxy: true
+cluster-cidr: 10.42.0.0/16
+service-cidr: 10.43.0.0/16
+disable:
+  - traefik
+  - servicelb

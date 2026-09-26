@@ -46,6 +46,7 @@ Generated automatically. Do not edit.
 | deploy.README | Deployment-Übersicht | reference | active | docs/deploy/README.md |
 | deploy.commonthing.naming | commonThing Naming Policy | reference | active | docs/deploy/commonthing.naming.md |
 | deploy.domain-mail-migration-ionos-inwx-mailbox-brevo | Architektur & Historie: Domain-/Mail-Migration IONOS zu INWX | reference | active | docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md |
+| deploy.experiment-b | Experiment B: isolierter Kubernetes-Zieltest | runbook | active | docs/deploy/experiment-b.md |
 | deploy.germany-basemap-rollout | Deutschlandweite PMTiles-Basemap ausrollen | runbook | active | docs/deploy/germany-basemap-rollout.md |
 | deploy.heim-first-phase0 | Heim-First Phase 0 | reference | deprecated | docs/deploy/heim-first-phase0.md |
 | deploy.heimserver.deployment | Heimserver Deployment | reference | deprecated | docs/deploy/heimserver.deployment.md |

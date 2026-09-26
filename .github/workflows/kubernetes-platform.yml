@@ -26,6 +26,7 @@ permissions:
       - "scripts/platform/**"
       - "scripts/security/**"
       - "scripts/ci/tests/test_kubernetes_platform_contract.py"
+      - "scripts/ci/tests/test_kubernetes_platform_workflow.py"
       - "scripts/ci/tests/test_staging_cell_runtime_contract.py"
       - "scripts/ci/tests/test_staging_gateway_contract.py"
       - "scripts/ci/tests/test_two_operator_cell_pilot.py"
@@ -80,6 +81,8 @@ jobs:
           scripts/platform/proof_identity.py
           scripts/platform/oci_proof_mirror.py
           scripts/platform/validate_platform.py
+          scripts/platform/experiment_b.py
+          scripts/platform/experiment_b_runtime.py
           scripts/platform/validate_two_operator_pilot.py
           scripts/platform/kind_reference.py
           scripts/platform/ha_reference.py
@@ -90,12 +93,17 @@ jobs:
         run: >-
           uv run --project tools/py --locked python -m unittest
           scripts.ci.tests.test_kubernetes_platform_contract
+          scripts.ci.tests.test_kubernetes_platform_workflow
           scripts.ci.tests.test_staging_cell_runtime_contract
           scripts.ci.tests.test_staging_gateway_contract
           scripts.ci.tests.test_two_operator_cell_pilot
           scripts.ci.tests.test_kubernetes_ha_contract
           scripts.ci.tests.test_trivy_rendered_manifests
           scripts.ci.tests.test_kubernetes_python_bootstrap
+      - name: Run Experiment-B contract tests
+        run: |
+          uv run --project tools/py --locked python scripts/platform/experiment_b_test.py -v
+          uv run --project tools/py --locked python scripts/platform/experiment_b_runtime_test.py -v
       - name: Validate staging evidence-only commit
         run: |
           set -euo pipefail

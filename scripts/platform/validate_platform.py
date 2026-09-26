@@ -16,10 +16,10 @@ ROOT = Path(__file__).resolve().parents[2]
 PLATFORM = ROOT / "platform"
 PROMOTION_SENTINEL = "promotion-required"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-OVERLAYS = ("local", "ha", "ci", "staging", "production")
+OVERLAYS = ("local", "ha", "ci", "staging", "experiment-b", "production")
 NONLOCAL_OVERLAY_TARGETS = frozenset(
     f"platform/apps/weltgewebe/overlays/{name}"
-    for name in ("ci", "staging", "production")
+    for name in ("ci", "staging", "experiment-b", "production")
 )
 LOCAL_FIXTURE_SENTINELS = (
     "weltgewebe-local-fixture",
@@ -29,6 +29,12 @@ HA_TARGETS = (
     "platform/apps/weltgewebe/overlays/ha",
     "platform/apps/weltgewebe/migration/ha",
     "platform/infrastructure/ha-data",
+)
+EXPERIMENT_B_TARGETS = (
+    "platform/clusters/experiment-b/namespaces",
+    "platform/clusters/experiment-b/data",
+    "platform/clusters/experiment-b/gateway",
+    "platform/clusters/experiment-b/migration",
 )
 LOCAL_FIXTURE_ROOTS = (
     PLATFORM / "apps/weltgewebe/migration/local",
@@ -590,6 +596,7 @@ def _render_and_validate() -> dict[str, int]:
         "platform/clusters/local",
         "platform/clusters/staging/data",
         "platform/clusters/staging/gateway",
+        *EXPERIMENT_B_TARGETS,
     ]
     counts: dict[str, int] = {}
     with tempfile.TemporaryDirectory() as tmp:

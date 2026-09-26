@@ -1,0 +1,96 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weltgewebe-api
+spec:
+  replicas: 1
+  template:
+    metadata:
+      annotations:
+        commonthing.net/semantic-search-contract: local-ollama-loopback-v1
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:0.12.6@sha256:352e045b937ac29d3d9550c22fb85525f60a89e064df34c26579bee5a93b3a16
+          imagePullPolicy: IfNotPresent
+          args: ["serve"]
+          env:
+            - name: HOME
+              value: /models
+            - name: OLLAMA_HOST
+              value: 127.0.0.1:11434
+            - name: OLLAMA_MODELS
+              value: /models
+            - name: OLLAMA_KEEP_ALIVE
+              value: 5m
+            - name: OLLAMA_NUM_PARALLEL
+              value: "1"
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "1"
+          startupProbe:
+            exec:
+              command: ["ollama", "list"]
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command: ["ollama", "list"]
+            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["ollama", "list"]
+            failureThreshold: 3
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "3"
+              memory: 5Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            privileged: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: ollama-models
+              mountPath: /models
+            - name: tmp
+              mountPath: /tmp
+        - name: search-worker
+          image: ghcr.io/heimgewebe/commonthing-api@${API_DIGEST}
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/search-worker-loop"]
+          envFrom:
+            - configMapRef:
+                name: weltgewebe-runtime
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: weltgewebe-runtime
+                  key: database-url
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            privileged: false
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: ollama-models
+          persistentVolumeClaim:
+            claimName: ollama-models

@@ -6,13 +6,42 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
-WORKFLOW = ROOT / ".github/workflows/kubernetes-platform-proof.yml"
+PROOF_WORKFLOW = ROOT / ".github/workflows/kubernetes-platform-proof.yml"
+PR_WORKFLOW = ROOT / ".github/workflows/kubernetes-platform.yml"
 UPLOAD_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 
 
 class KubernetesPlatformWorkflowDiagnosticsTests(unittest.TestCase):
+    def test_pull_request_workflow_runs_experiment_b_contract(self) -> None:
+        workflow = yaml.safe_load(PR_WORKFLOW.read_text(encoding="utf-8"))
+        test_path = "scripts/ci/tests/test_kubernetes_platform_workflow.py"
+        self.assertIn(test_path, workflow["on"]["pull_request"]["paths"])
+
+        steps = workflow["jobs"]["contract"]["steps"]
+        named = {step["name"]: step for step in steps if "name" in step}
+
+        compile_step = named["Compile platform tools"]["run"]
+        self.assertIn("scripts/platform/experiment_b.py", compile_step)
+        self.assertIn("scripts/platform/experiment_b_runtime.py", compile_step)
+
+        platform_tests = named["Run platform contract tests"]["run"]
+        self.assertIn(
+            "scripts.ci.tests.test_kubernetes_platform_workflow",
+            platform_tests,
+        )
+
+        experiment_tests = named["Run Experiment-B contract tests"]["run"]
+        self.assertIn("scripts/platform/experiment_b_test.py -v", experiment_tests)
+        self.assertIn(
+            "scripts/platform/experiment_b_runtime_test.py -v",
+            experiment_tests,
+        )
+
+        render = named["Render and validate all platform targets"]["run"]
+        self.assertIn("scripts/platform/validate_platform.py --render", render)
+
     def test_failed_live_package_receipt_is_uploaded_for_both_proof_jobs(self) -> None:
-        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        workflow = yaml.safe_load(PROOF_WORKFLOW.read_text(encoding="utf-8"))
         test_path = "scripts/ci/tests/test_kubernetes_platform_workflow.py"
         self.assertIn(test_path, workflow["on"]["push"]["paths"])
         contract_steps = workflow["jobs"]["contract"]["steps"]
