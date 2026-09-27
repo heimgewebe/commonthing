@@ -1943,11 +1943,14 @@ def _require_httproute_ready(route: Any) -> dict[str, Any]:
         backend = backend_refs[0]
         if set(backend) - {"group", "kind", "name", "namespace", "port", "weight"}:
             raise RuntimeErrorEB("Experiment-B HTTPRoute backend shape drifted")
+        weight = backend.get("weight", 1)
         if (
             str(backend.get("group") or "") != ""
             or str(backend.get("kind") or "Service") != "Service"
             or str(backend.get("namespace") or APP_NAMESPACE) != APP_NAMESPACE
-            or int(backend.get("weight") or 1) != 1
+            or not isinstance(weight, int)
+            or isinstance(weight, bool)
+            or weight != 1
             or not isinstance(backend.get("name"), str)
             or not isinstance(backend.get("port"), int)
             or isinstance(backend.get("port"), bool)

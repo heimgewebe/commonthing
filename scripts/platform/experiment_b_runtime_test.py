@@ -2902,6 +2902,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         wrong_api_port["spec"]["rules"][0]["backendRefs"][0]["port"] = 8081
         cases.append(("wrong-api-port", wrong_api_port))
 
+        zero_backend_weight = json.loads(json.dumps(healthy))
+        zero_backend_weight["spec"]["rules"][0]["backendRefs"][0]["weight"] = 0
+        cases.append(("zero-backend-weight", zero_backend_weight))
+
         extra_filter = json.loads(json.dumps(healthy))
         extra_filter["spec"]["rules"][0]["filters"] = [
             {"type": "RequestHeaderModifier"}
