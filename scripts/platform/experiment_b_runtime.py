@@ -1572,9 +1572,11 @@ def _deployment_availability_snapshot(
     generation = int(metadata.get("generation") or 0)
     desired = int(spec.get("replicas") or 0)
     observed_generation = int(status_obj.get("observedGeneration") or 0)
+    replicas = int(status_obj.get("replicas") or 0)
     updated = int(status_obj.get("updatedReplicas") or 0)
     ready = int(status_obj.get("readyReplicas") or 0)
     available = int(status_obj.get("availableReplicas") or 0)
+    unavailable = int(status_obj.get("unavailableReplicas") or 0)
     available_condition = any(
         condition.get("type") == "Available" and condition.get("status") == "True"
         for condition in status_obj.get("conditions", [])
@@ -1584,9 +1586,11 @@ def _deployment_availability_snapshot(
         generation < 1
         or desired < 1
         or observed_generation < generation
-        or updated < desired
-        or ready < desired
-        or available < desired
+        or replicas != desired
+        or updated != desired
+        or ready != desired
+        or available != desired
+        or unavailable != 0
         or not available_condition
     ):
         raise RuntimeErrorEB(

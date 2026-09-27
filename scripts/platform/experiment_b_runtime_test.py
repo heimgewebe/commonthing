@@ -649,9 +649,11 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             },
             "status": {
                 "observedGeneration": 1,
+                "replicas": 1,
                 "updatedReplicas": 1,
                 "readyReplicas": 1,
                 "availableReplicas": 1,
+                "unavailableReplicas": 0,
                 "conditions": [{"type": "Available", "status": "True"}],
             },
         }
@@ -666,9 +668,11 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             },
             "status": {
                 "observedGeneration": 1,
+                "replicas": 1,
                 "updatedReplicas": 1,
                 "readyReplicas": 1,
                 "availableReplicas": 1,
+                "unavailableReplicas": 0,
                 "conditions": [{"type": "Available", "status": "True"}],
             },
         }
@@ -866,9 +870,11 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             "spec": {"replicas": 1},
             "status": {
                 "observedGeneration": 7,
+                "replicas": 1,
                 "updatedReplicas": 1,
                 "readyReplicas": 1,
                 "availableReplicas": 1,
+                "unavailableReplicas": 0,
                 "conditions": [{"type": "Available", "status": "True"}],
             },
         }
@@ -879,9 +885,14 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
 
         failure_paths = (
             ("observedGeneration", 6),
+            ("replicas", 2),
             ("updatedReplicas", 0),
+            ("updatedReplicas", 2),
             ("readyReplicas", 0),
+            ("readyReplicas", 2),
             ("availableReplicas", 0),
+            ("availableReplicas", 2),
+            ("unavailableReplicas", 1),
         )
         for field, value in failure_paths:
             with self.subTest(field=field):
@@ -2572,8 +2583,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     }.items()
                 ]}}},
                 "status": {
-                    "observedGeneration": 1, "updatedReplicas": 1, "readyReplicas": 1,
-                    "availableReplicas": 1, "conditions": [{"type": "Available", "status": "True"}],
+                    "observedGeneration": 1, "replicas": 1,
+                    "updatedReplicas": 1, "readyReplicas": 1,
+                    "availableReplicas": 1, "unavailableReplicas": 0,
+                    "conditions": [{"type": "Available", "status": "True"}],
                 },
             }
         if "secret" in arguments:
