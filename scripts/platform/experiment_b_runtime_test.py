@@ -3637,6 +3637,31 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 )
                 for index in range(expected["replicas"])
             ]
+            if name == "postgres":
+                resources = runtime._versioned_data_container_resources(
+                    runtime.CLUSTER / "data/postgres.yaml",
+                    "postgres",
+                    "postgres",
+                )
+                deployment_container = next(
+                    item
+                    for item in self.data_deployments[name]["spec"][
+                        "template"
+                    ]["spec"]["containers"]
+                    if item["name"] == "postgres"
+                )
+                deployment_container["resources"] = json.loads(
+                    json.dumps(resources)
+                )
+                for pod in self.data_pods[name]:
+                    pod_container = next(
+                        item
+                        for item in pod["spec"]["containers"]
+                        if item["name"] == "postgres"
+                    )
+                    pod_container["resources"] = json.loads(
+                        json.dumps(resources)
+                    )
 
         self.data_services = {}
         for name in ("postgres", "nats"):
@@ -6160,6 +6185,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertLess(load, second_postgres)
         self.assertIn("kubernetes_target_sha256", source)
         self.assertIn("postgres_runtime_image_ids_sha256", source)
+        self.assertIn("postgres_resources_sha256", source)
 
     def test_t048_postgres_binding_rejects_image_and_runtime_drift(self) -> None:
         self.write_vm_receipt()
@@ -6196,6 +6222,40 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         with self.assertRaisesRegex(
             runtime.RuntimeErrorEB,
             "runtime image ID drifted",
+        ):
+            runtime._require_t048_postgres_runtime_binding(self.root)
+
+        self.data_deployments = json.loads(
+            json.dumps(healthy_deployments)
+        )
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        postgres_container = next(
+            item
+            for item in self.data_deployments["postgres"]["spec"][
+                "template"
+            ]["spec"]["containers"]
+            if item["name"] == "postgres"
+        )
+        postgres_container["resources"]["limits"]["cpu"] = "2"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "PostgreSQL Deployment resources drifted",
+        ):
+            runtime._require_t048_postgres_runtime_binding(self.root)
+
+        self.data_deployments = json.loads(
+            json.dumps(healthy_deployments)
+        )
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        postgres_pod_container = next(
+            item
+            for item in self.data_pods["postgres"][0]["spec"]["containers"]
+            if item["name"] == "postgres"
+        )
+        postgres_pod_container["resources"]["limits"]["memory"] = "1Gi"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "PostgreSQL Pod resources drifted",
         ):
             runtime._require_t048_postgres_runtime_binding(self.root)
 

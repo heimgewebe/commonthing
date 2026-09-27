@@ -3804,6 +3804,82 @@ def _require_live_application_workloads(
     return result
 
 
+def _container_resources_contract(
+    pod_spec: Any,
+    container_name: str,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(pod_spec, dict):
+        raise RuntimeErrorEB(f"{context} Pod spec is invalid")
+    containers = pod_spec.get("containers", [])
+    if not isinstance(containers, list):
+        raise RuntimeErrorEB(f"{context} container inventory is invalid")
+    matches = [
+        item
+        for item in containers
+        if isinstance(item, dict) and item.get("name") == container_name
+    ]
+    if len(matches) != 1:
+        raise RuntimeErrorEB(
+            f"{context} does not contain exactly one container: {container_name}"
+        )
+    resources = matches[0].get("resources")
+    if not isinstance(resources, dict):
+        raise RuntimeErrorEB(
+            f"{context} resources are missing: {container_name}"
+        )
+    requests = resources.get("requests")
+    limits = resources.get("limits")
+    if (
+        not isinstance(requests, dict)
+        or not requests
+        or not isinstance(limits, dict)
+        or not limits
+        or any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, str)
+            or not value
+            for mapping in (requests, limits)
+            for key, value in mapping.items()
+        )
+    ):
+        raise RuntimeErrorEB(
+            f"{context} resource contract is invalid: {container_name}"
+        )
+    return json.loads(json.dumps(resources))
+
+
+def _versioned_data_container_resources(
+    path: Path,
+    deployment_name: str,
+    container_name: str,
+) -> dict[str, Any]:
+    try:
+        documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeErrorEB(
+            f"versioned data resource manifest is invalid: {deployment_name}"
+        ) from exc
+    matches = [
+        document
+        for document in documents
+        if isinstance(document, dict)
+        and document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == deployment_name
+        and document.get("metadata", {}).get("namespace") == DATA_NAMESPACE
+    ]
+    if len(matches) != 1:
+        raise RuntimeErrorEB(
+            f"versioned data resource Deployment is ambiguous: {deployment_name}"
+        )
+    return _container_resources_contract(
+        matches[0].get("spec", {}).get("template", {}).get("spec"),
+        container_name,
+        f"versioned data Deployment {deployment_name}",
+    )
+
+
 def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]:
     try:
         documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
@@ -5932,8 +6008,12 @@ def _require_t048_api_release_binding(
 def _require_t048_postgres_runtime_binding(
     root: Path,
 ) -> dict[str, Any]:
+    postgres_manifest = CLUSTER / "data/postgres.yaml"
     expected = _versioned_data_deployment_contract(
-        CLUSTER / "data/postgres.yaml", "postgres"
+        postgres_manifest, "postgres"
+    )
+    expected_resources = _versioned_data_container_resources(
+        postgres_manifest, "postgres", "postgres"
     )
     deployment = _kubectl_json(
         root, ["-n", DATA_NAMESPACE, "get", "deployment", "postgres"]
@@ -5964,6 +6044,15 @@ def _require_t048_postgres_runtime_binding(
     )
     if live_images != expected["images"]:
         raise RuntimeErrorEB("T048 PostgreSQL Deployment images drifted")
+    live_resources = _container_resources_contract(
+        deployment.get("spec", {}).get("template", {}).get("spec"),
+        "postgres",
+        "T048 PostgreSQL Deployment",
+    )
+    if live_resources != expected_resources:
+        raise RuntimeErrorEB(
+            "T048 PostgreSQL Deployment resources drifted"
+        )
     pods = _kubectl_json(
         root, ["-n", DATA_NAMESPACE, "get", "pods"]
     ).get("items")
@@ -5979,8 +6068,19 @@ def _require_t048_postgres_runtime_binding(
         required_labels=expected["selector_labels"],
         context="T048 PostgreSQL Pod",
     )
+    for pod in matching_pods:
+        pod_resources = _container_resources_contract(
+            pod.get("spec"),
+            "postgres",
+            "T048 PostgreSQL Pod",
+        )
+        if pod_resources != expected_resources:
+            raise RuntimeErrorEB(
+                "T048 PostgreSQL Pod resources drifted"
+            )
     return {
         "images_sha256": _stable_json_sha256(expected["images"]),
+        "resources_sha256": _stable_json_sha256(expected_resources),
         "runtime_image_ids_sha256": pod_readback[
             "runtime_image_ids_sha256"
         ],
@@ -6247,9 +6347,11 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             != postgres_binding_before["runtime_image_ids_sha256"]
             or postgres_binding_after["images_sha256"]
             != postgres_binding_before["images_sha256"]
+            or postgres_binding_after["resources_sha256"]
+            != postgres_binding_before["resources_sha256"]
         ):
             raise RuntimeErrorEB(
-                "PostgreSQL image identity changed during the T048 measurement"
+                "PostgreSQL runtime contract changed during the T048 measurement"
             )
         if target_binding_after != target_binding_before:
             raise RuntimeErrorEB(
@@ -6375,6 +6477,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             ],
             "postgres_runtime_image_ids_sha256": postgres_binding_before[
                 "runtime_image_ids_sha256"
+            ],
+            "postgres_resources_sha256": postgres_binding_before[
+                "resources_sha256"
             ],
             "kubernetes_target_sha256": _stable_json_sha256(
                 target_binding_before
