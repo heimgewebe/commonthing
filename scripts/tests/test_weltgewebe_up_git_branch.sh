@@ -164,7 +164,7 @@ if [[ "$1" == "compose" ]]; then
     if [[ "${MOCK_FAIL_CONFIG_GUARD:-0}" == "1" ]]; then
       echo "{"
     else
-      echo '{"services":{"api":{"ports":[]},"db":{},"nats":{},"caddy":{}}'
+      echo '{"services":{"api":{"ports":[],"networks":{"default":{"aliases":["weltgewebe-api"]}}},"db":{},"nats":{},"caddy":{}}}'
     fi
     exit 0
   fi

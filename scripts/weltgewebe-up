@@ -1124,6 +1124,46 @@ except Exception as e:
   fi
 fi
 
+# Guard: the rendered model must keep the legacy API alias that edge Caddy and
+# Prometheus still consume (docs/deploy/commonthing.naming.md). The static
+# scripts/guard/compose-image-guard.sh only sees the versioned overrides; an
+# OVERRIDE_FILE from elsewhere reaches this merged model, so check it here,
+# before the first container mutation, not only via docker inspect afterwards.
+set +e
+api_alias_error="$(docker compose "${BASE_ARGS[@]}" config --format json 2> /dev/null | python3 -c '
+import json
+import sys
+
+legacy_alias = sys.argv[1]
+try:
+    api = json.load(sys.stdin).get("services", {}).get("api")
+    if not isinstance(api, dict):
+        raise ValueError("services.api is missing")
+    if "network_mode" in api:
+        raise ValueError("services.api uses network_mode and joins no network with aliases")
+    networks = api.get("networks")
+    default = networks.get("default") if isinstance(networks, dict) else None
+    aliases = default.get("aliases") if isinstance(default, dict) else None
+    if not isinstance(aliases, list) or legacy_alias not in aliases:
+        raise ValueError(f"services.api.networks.default.aliases lacks {legacy_alias}")
+except Exception as exc:
+    print(exc)
+    raise SystemExit(2)
+' weltgewebe-api)" # commonthing-naming: legacy
+rc_api_alias=$?
+set -e
+
+if [[ "$rc_api_alias" != "0" ]]; then
+  msg="Rendered Compose drops the legacy API alias weltgewebe-api: ${api_alias_error:-could not evaluate the rendered model}."
+  if [[ "${ALLOW_UNSTABLE_API_DNS:-0}" == "1" ]]; then
+    echo "WARNING: $msg Continuing due to ALLOW_UNSTABLE_API_DNS=1."
+  else
+    echo "ERROR: $msg" >&2
+    generate_failure_bundle "$msg"
+    exit 1
+  fi
+fi
+
 echo "OK"
 
 # 4. Build Decision
