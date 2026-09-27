@@ -41,6 +41,7 @@ import experiment_b as contract
 ROOT = Path(__file__).resolve().parents[2]
 CLUSTER = ROOT / "platform/clusters/experiment-b"
 NAMESPACES = CLUSTER / "namespaces"
+APP_OVERLAY = ROOT / "platform/apps/weltgewebe/overlays/experiment-b"
 DEFAULT_STATE_ROOT = Path.home() / ".local/state/commonthing/experiment-b"
 VM_NAME = "commonthing-experiment-b"
 LIBVIRT_URI = "qemu:///system"
@@ -919,6 +920,51 @@ def _kubeconfig_server(path: Path) -> str:
     return server
 
 
+def _require_kubernetes_target_binding(
+    root: Path,
+    source_commit: str | None = None,
+) -> tuple[dict[str, Any], str, str]:
+    receipt_path = root / "receipts/k3s.json"
+    kubeconfig_path = root / "kubeconfig.yaml"
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B Kubernetes target binding requires valid k3s.json"
+        ) from exc
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema_version") != 1
+        or receipt.get("status") != "ready"
+        or (
+            source_commit is not None
+            and receipt.get("source_commit") != source_commit
+        )
+        or not isinstance(receipt.get("vm_ip"), str)
+        or not receipt.get("vm_ip")
+        or not isinstance(receipt.get("kubeconfig_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt["kubeconfig_sha256"]) is None
+    ):
+        raise RuntimeErrorEB("Experiment-B Kubernetes target receipt binding drifted")
+
+    live_ip = vm_ip()
+    if receipt.get("vm_ip") != live_ip:
+        raise RuntimeErrorEB("Experiment-B k3s VM address drifted")
+    if (
+        not kubeconfig_path.is_file()
+        or kubeconfig_path.is_symlink()
+        or sha256_file(kubeconfig_path) != receipt["kubeconfig_sha256"]
+        or (kubeconfig_path.stat().st_mode & 0o777) != 0o600
+    ):
+        raise RuntimeErrorEB("Experiment-B kubeconfig digest/mode drifted")
+    expected_server = f"https://{live_ip}:6443"
+    if _kubeconfig_server(kubeconfig_path) != expected_server:
+        raise RuntimeErrorEB(
+            "Experiment-B kubeconfig is not bound to the VM API server"
+        )
+    return receipt, live_ip, expected_server
+
+
 def _parse_sha256sum_output(
     stdout: str, expected_paths: tuple[str, ...]
 ) -> dict[str, str]:
@@ -969,46 +1015,23 @@ def _require_live_k3s_runtime(
     config: dict[str, Any],
     source_commit: str,
 ) -> dict[str, Any]:
-    receipt_path = root / "receipts/k3s.json"
-    kubeconfig_path = root / "kubeconfig.yaml"
-    try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeErrorEB("Experiment-B status requires valid k3s.json") from exc
+    receipt, live_ip, expected_server = _require_kubernetes_target_binding(
+        root, source_commit
+    )
     config_path, service_path = _k3s_contract_paths(config)
     expected_binary_sha256 = str(config["kubernetes"]["binary_sha256"])
     expected_config_sha256 = sha256_file(config_path)
     expected_service_sha256 = sha256_file(service_path)
     if (
-        not isinstance(receipt, dict)
-        or receipt.get("schema_version") != 1
-        or receipt.get("status") != "ready"
-        or receipt.get("source_commit") != source_commit
-        or receipt.get("binary_sha256") != expected_binary_sha256
+        receipt.get("binary_sha256") != expected_binary_sha256
         or receipt.get("config_sha256") != expected_config_sha256
         or receipt.get("service_sha256") != expected_service_sha256
         or str(config["kubernetes"]["version"])
         not in str(receipt.get("k3s_version", ""))
         or receipt.get("live_kubelet_version")
         != str(config["kubernetes"]["version"])
-        or not isinstance(receipt.get("kubeconfig_sha256"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", receipt["kubeconfig_sha256"]) is None
     ):
         raise RuntimeErrorEB("Experiment-B k3s receipt binding drifted")
-
-    live_ip = vm_ip()
-    if receipt.get("vm_ip") != live_ip:
-        raise RuntimeErrorEB("Experiment-B k3s VM address drifted")
-    if (
-        not kubeconfig_path.is_file()
-        or kubeconfig_path.is_symlink()
-        or sha256_file(kubeconfig_path) != receipt["kubeconfig_sha256"]
-        or (kubeconfig_path.stat().st_mode & 0o777) != 0o600
-    ):
-        raise RuntimeErrorEB("Experiment-B kubeconfig digest/mode drifted")
-    expected_server = f"https://{live_ip}:6443"
-    if _kubeconfig_server(kubeconfig_path) != expected_server:
-        raise RuntimeErrorEB("Experiment-B kubeconfig is not bound to the VM API server")
 
     guest_paths = (
         "/usr/local/bin/k3s",
@@ -1256,6 +1279,7 @@ def _flux_install_argv(flux: str, *, export: bool = False) -> list[str]:
 def install_platform(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
+    _require_kubernetes_target_binding(root, source_commit)
     receipt = toolchain(root)
     tools = receipt["tools"]
     artifacts = receipt["artifacts"]
@@ -1383,6 +1407,7 @@ def ensure_secret_material(root: Path) -> dict[str, str]:
 def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
+    _require_kubernetes_target_binding(root, source_commit)
     if not registry_config.is_file() or registry_config.is_symlink():
         raise RuntimeErrorEB("registry config must be a regular external file")
     try:
@@ -1456,6 +1481,7 @@ def apply_release(
     )
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("release source is not current protected main")
+    _require_kubernetes_target_binding(root, source_commit)
     config = load_config()
     api_replicas = int(config["semantic_search"]["api_replicas"])
     web_replicas = int(config["runtime_binding"]["web_replicas"])
@@ -1671,6 +1697,7 @@ def semantic_activate(root: Path) -> dict[str, Any]:
     )
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("semantic provider proof is not bound to current protected main")
+    _require_kubernetes_target_binding(root, source_commit)
     config = load_config()
     semantic = config["semantic_search"]
     kubectl = toolchain(root)["tools"]["kubectl"]
@@ -3171,6 +3198,478 @@ def _pod_spec_images(pod_spec: Any, context: str) -> dict[str, dict[str, str]]:
     return result
 
 
+def _data_service_spec_projection(service: Any, context: str) -> dict[str, Any]:
+    if not isinstance(service, dict):
+        raise RuntimeErrorEB(f"{context} Service payload is invalid")
+    spec = service.get("spec", {})
+    if not isinstance(spec, dict):
+        raise RuntimeErrorEB(f"{context} Service spec is invalid")
+    selector = spec.get("selector")
+    ports = spec.get("ports")
+    if (
+        not isinstance(selector, dict)
+        or not selector
+        or any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, str)
+            or not value
+            for key, value in selector.items()
+        )
+        or not isinstance(ports, list)
+        or not ports
+    ):
+        raise RuntimeErrorEB(f"{context} Service selector/ports are invalid")
+    normalized_ports: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for item in ports:
+        if not isinstance(item, dict):
+            raise RuntimeErrorEB(f"{context} Service port inventory is invalid")
+        name = item.get("name")
+        port = item.get("port")
+        target_port = item.get("targetPort")
+        protocol = item.get("protocol", "TCP")
+        app_protocol = item.get("appProtocol")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in seen_names
+            or isinstance(port, bool)
+            or not isinstance(port, int)
+            or port < 1
+            or port > 65535
+            or (
+                isinstance(target_port, bool)
+                or not isinstance(target_port, (int, str))
+                or isinstance(target_port, str)
+                and not target_port
+            )
+            or protocol not in {"TCP", "UDP", "SCTP"}
+            or (
+                app_protocol is not None
+                and (not isinstance(app_protocol, str) or not app_protocol)
+            )
+        ):
+            raise RuntimeErrorEB(f"{context} Service port contract is invalid")
+        seen_names.add(name)
+        normalized_ports.append(
+            {
+                "name": name,
+                "port": port,
+                "targetPort": target_port,
+                "protocol": protocol,
+                "appProtocol": app_protocol,
+            }
+        )
+    return {
+        "selector": {
+            str(key): str(value)
+            for key, value in sorted(selector.items())
+        },
+        "ports": sorted(normalized_ports, key=lambda value: value["name"]),
+    }
+
+
+def _versioned_data_service_contract(path: Path, name: str) -> dict[str, Any]:
+    try:
+        documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeErrorEB(
+            f"versioned data Service manifest is invalid: {name}"
+        ) from exc
+    matches = [
+        document
+        for document in documents
+        if isinstance(document, dict)
+        and document.get("kind") == "Service"
+        and document.get("metadata", {}).get("name") == name
+        and document.get("metadata", {}).get("namespace") == DATA_NAMESPACE
+    ]
+    if len(matches) != 1:
+        raise RuntimeErrorEB(
+            f"versioned data manifest does not contain exactly one Service: {name}"
+        )
+    projection = _data_service_spec_projection(
+        matches[0], f"versioned data Service {name}"
+    )
+    return {
+        "spec": projection,
+        "spec_sha256": _stable_json_sha256(projection),
+    }
+
+
+def _require_live_data_services(root: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name in ("postgres", "nats"):
+        expected = _versioned_data_service_contract(
+            CLUSTER / f"data/{name}.yaml", name
+        )
+        service = _kubectl_json(
+            root, ["-n", DATA_NAMESPACE, "get", "service", name]
+        )
+        metadata = (
+            service.get("metadata", {}) if isinstance(service, dict) else {}
+        )
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or metadata.get("namespace") != DATA_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+        ):
+            raise RuntimeErrorEB(f"live data Service identity drifted: {name}")
+        observed = _data_service_spec_projection(
+            service, f"live data Service {name}"
+        )
+        if observed != expected["spec"]:
+            raise RuntimeErrorEB(
+                f"live data Service spec drifted from versioned manifest: {name}"
+            )
+        result[name] = {
+            "spec": observed,
+            "spec_sha256": expected["spec_sha256"],
+            "canonical": True,
+        }
+    return result
+
+
+def _probe_runtime_contract(value: Any, context: str) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RuntimeErrorEB(f"{context} probe contract is invalid")
+    normalized = json.loads(json.dumps(value))
+    defaults = {
+        "initialDelaySeconds": 0,
+        "timeoutSeconds": 1,
+        "periodSeconds": 10,
+        "successThreshold": 1,
+        "failureThreshold": 3,
+    }
+    for key, default in defaults.items():
+        if normalized.get(key) == default:
+            normalized.pop(key, None)
+    http_get = normalized.get("httpGet")
+    if isinstance(http_get, dict) and http_get.get("scheme") == "HTTP":
+        http_get.pop("scheme", None)
+    return normalized
+
+
+def _container_runtime_contract(
+    container: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(container, dict):
+        raise RuntimeErrorEB(f"{context} container contract is invalid")
+    name = container.get("name")
+    image = container.get("image")
+    if (
+        not isinstance(name, str)
+        or not name
+        or not isinstance(image, str)
+        or not image
+    ):
+        raise RuntimeErrorEB(f"{context} container identity is invalid")
+    fields = (
+        "image",
+        "imagePullPolicy",
+        "command",
+        "args",
+        "env",
+        "envFrom",
+        "ports",
+        "lifecycle",
+        "resources",
+        "securityContext",
+        "volumeMounts",
+        "workingDir",
+    )
+    result = {
+        "name": name,
+        **{field: container.get(field) for field in fields},
+    }
+    for probe_field in (
+        "startupProbe",
+        "readinessProbe",
+        "livenessProbe",
+    ):
+        result[probe_field] = _probe_runtime_contract(
+            container.get(probe_field),
+            f"{context} {name} {probe_field}",
+        )
+    return result
+
+
+def _application_pod_spec_projection(
+    pod_spec: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(pod_spec, dict):
+        raise RuntimeErrorEB(f"{context} Pod spec is invalid")
+    result: dict[str, Any] = {
+        "serviceAccountName": pod_spec.get("serviceAccountName"),
+        "automountServiceAccountToken": pod_spec.get(
+            "automountServiceAccountToken"
+        ),
+        "terminationGracePeriodSeconds": pod_spec.get(
+            "terminationGracePeriodSeconds"
+        ),
+        "securityContext": pod_spec.get("securityContext"),
+        "imagePullSecrets": pod_spec.get("imagePullSecrets"),
+        "volumes": pod_spec.get("volumes"),
+        "topologySpreadConstraints": pod_spec.get(
+            "topologySpreadConstraints"
+        ),
+        "affinity": pod_spec.get("affinity"),
+        "nodeSelector": pod_spec.get("nodeSelector"),
+    }
+    for field, output_key in (
+        ("containers", "containers"),
+        ("initContainers", "init_containers"),
+    ):
+        items = pod_spec.get(field, [])
+        if not isinstance(items, list):
+            raise RuntimeErrorEB(f"{context} {field} inventory is invalid")
+        projected: dict[str, Any] = {}
+        for item in items:
+            value = _container_runtime_contract(item, context)
+            name = value["name"]
+            if name in projected:
+                raise RuntimeErrorEB(
+                    f"{context} contains duplicate container identity: {name}"
+                )
+            projected[name] = value
+        if output_key == "containers" and not projected:
+            raise RuntimeErrorEB(f"{context} contains no containers")
+        result[output_key] = projected
+    return result
+
+
+def _rendered_application_workload_contract(
+    root: Path,
+    release: dict[str, Any],
+) -> dict[str, Any]:
+    api_digest = release.get("api_digest") if isinstance(release, dict) else None
+    web_digest = release.get("web_digest") if isinstance(release, dict) else None
+    if (
+        not isinstance(api_digest, str)
+        or not DIGEST_RE.fullmatch(api_digest)
+        or not isinstance(web_digest, str)
+        or not DIGEST_RE.fullmatch(web_digest)
+    ):
+        raise RuntimeErrorEB(
+            "application workload contract requires exact release digests"
+        )
+    kustomize = toolchain(root)["tools"].get("kustomize")
+    if not isinstance(kustomize, str) or not kustomize:
+        raise RuntimeErrorEB(
+            "application workload contract requires pinned kustomize"
+        )
+    rendered = run([kustomize, "build", str(APP_OVERLAY)]).stdout
+    rendered = rendered.replace("${API_DIGEST}", api_digest).replace(
+        "${WEB_DIGEST}", web_digest
+    )
+    try:
+        documents = [
+            document
+            for document in yaml.safe_load_all(rendered)
+            if isinstance(document, dict)
+        ]
+    except yaml.YAMLError as exc:
+        raise RuntimeErrorEB(
+            "rendered Experiment-B application contract is invalid"
+        ) from exc
+
+    result: dict[str, Any] = {}
+    for name in ("weltgewebe-api", "weltgewebe-web"):
+        matches = [
+            document
+            for document in documents
+            if document.get("kind") == "Deployment"
+            and document.get("metadata", {}).get("name") == name
+            and document.get("metadata", {}).get("namespace") == APP_NAMESPACE
+        ]
+        if len(matches) != 1:
+            raise RuntimeErrorEB(
+                f"rendered application Deployment is ambiguous: {name}"
+            )
+        deployment = matches[0]
+        spec = deployment.get("spec", {})
+        template = spec.get("template", {}) if isinstance(spec, dict) else {}
+        template_metadata = (
+            template.get("metadata", {}) if isinstance(template, dict) else {}
+        )
+        pod_spec = template.get("spec", {}) if isinstance(template, dict) else {}
+        replicas = spec.get("replicas") if isinstance(spec, dict) else None
+        if (
+            isinstance(replicas, bool)
+            or not isinstance(replicas, int)
+            or replicas < 1
+            or not isinstance(template_metadata, dict)
+        ):
+            raise RuntimeErrorEB(
+                f"rendered application Deployment contract is invalid: {name}"
+            )
+        pod_contract = _application_pod_spec_projection(
+            pod_spec, f"rendered application Deployment {name}"
+        )
+        deployment_contract = {
+            "replicas": replicas,
+            "revisionHistoryLimit": spec.get("revisionHistoryLimit"),
+            "strategy": spec.get("strategy"),
+            "selector_labels": _pod_selector_match_labels(
+                deployment, f"rendered application Deployment {name}"
+            ),
+            "template_labels": template_metadata.get("labels", {}),
+            "template_annotations": template_metadata.get("annotations", {}),
+            "pod_spec": pod_contract,
+        }
+        if (
+            not isinstance(deployment_contract["template_labels"], dict)
+            or not isinstance(
+                deployment_contract["template_annotations"], dict
+            )
+        ):
+            raise RuntimeErrorEB(
+                f"rendered application template metadata is invalid: {name}"
+            )
+        result[name] = {
+            "contract": deployment_contract,
+            "contract_sha256": _stable_json_sha256(deployment_contract),
+            "pod_contract_sha256": _stable_json_sha256(pod_contract),
+        }
+    return result
+
+
+def _require_live_application_workloads(
+    root: Path,
+    release: dict[str, Any],
+    deployments: dict[str, Any],
+    pods_by_workload: dict[str, Any],
+) -> dict[str, Any]:
+    expected = _rendered_application_workload_contract(root, release)
+    if (
+        set(deployments) != set(expected)
+        or set(pods_by_workload) != set(expected)
+    ):
+        raise RuntimeErrorEB(
+            "live application workload inventory is incomplete"
+        )
+    result: dict[str, Any] = {}
+    for name, expected_value in expected.items():
+        deployment = deployments[name]
+        contract = expected_value["contract"]
+        metadata = (
+            deployment.get("metadata", {})
+            if isinstance(deployment, dict)
+            else {}
+        )
+        spec = (
+            deployment.get("spec", {})
+            if isinstance(deployment, dict)
+            else {}
+        )
+        template = spec.get("template", {}) if isinstance(spec, dict) else {}
+        template_metadata = (
+            template.get("metadata", {}) if isinstance(template, dict) else {}
+        )
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or metadata.get("namespace") != APP_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+            or not isinstance(spec, dict)
+            or not isinstance(template_metadata, dict)
+        ):
+            raise RuntimeErrorEB(
+                f"live application Deployment identity drifted: {name}"
+            )
+        observed_contract = {
+            "replicas": spec.get("replicas"),
+            "revisionHistoryLimit": spec.get("revisionHistoryLimit"),
+            "strategy": spec.get("strategy"),
+            "selector_labels": _pod_selector_match_labels(
+                deployment, f"live application Deployment {name}"
+            ),
+            "template_labels": template_metadata.get("labels", {}),
+            "template_annotations": template_metadata.get(
+                "annotations", {}
+            ),
+            "pod_spec": _application_pod_spec_projection(
+                template.get("spec", {}),
+                f"live application Deployment {name}",
+            ),
+        }
+        if observed_contract != contract:
+            raise RuntimeErrorEB(
+                f"live application Deployment contract drifted: {name}"
+            )
+
+        pods = pods_by_workload[name]
+        if not isinstance(pods, list) or len(pods) != contract["replicas"]:
+            raise RuntimeErrorEB(
+                f"live application Pod set drifted: {name}"
+            )
+        pod_names: list[str] = []
+        for pod in pods:
+            if not isinstance(pod, dict):
+                raise RuntimeErrorEB(
+                    f"live application Pod inventory is invalid: {name}"
+                )
+            pod_metadata = pod.get("metadata", {})
+            pod_spec = pod.get("spec", {})
+            labels = (
+                pod_metadata.get("labels", {})
+                if isinstance(pod_metadata, dict)
+                else {}
+            )
+            annotations = (
+                pod_metadata.get("annotations", {})
+                if isinstance(pod_metadata, dict)
+                else {}
+            )
+            pod_name = (
+                pod_metadata.get("name")
+                if isinstance(pod_metadata, dict)
+                else None
+            )
+            if (
+                not isinstance(pod_name, str)
+                or not pod_name
+                or pod_name in pod_names
+                or pod_metadata.get("namespace") != APP_NAMESPACE
+                or pod_metadata.get("deletionTimestamp") is not None
+                or not isinstance(labels, dict)
+                or not isinstance(annotations, dict)
+                or any(
+                    labels.get(key) != value
+                    for key, value in contract["template_labels"].items()
+                )
+                or any(
+                    annotations.get(key) != value
+                    for key, value in contract[
+                        "template_annotations"
+                    ].items()
+                )
+                or _application_pod_spec_projection(
+                    pod_spec, f"live application Pod {pod_name}"
+                )
+                != contract["pod_spec"]
+            ):
+                raise RuntimeErrorEB(
+                    f"live application Pod contract drifted: {name}"
+                )
+            pod_names.append(pod_name)
+        result[name] = {
+            "contract_sha256": expected_value["contract_sha256"],
+            "pod_contract_sha256": expected_value[
+                "pod_contract_sha256"
+            ],
+            "pod_names": sorted(pod_names),
+            "canonical": True,
+        }
+    return result
+
+
 def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]:
     try:
         documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
@@ -3860,6 +4359,7 @@ def status(root: Path) -> dict[str, Any]:
     )
     deployment_readback = release_artifacts["deployments"]
     data_deployment_readback = _require_live_data_deployments(root)
+    data_service_readback = _require_live_data_services(root)
     api_containers = _container_images(api, "Experiment-B API Deployment")
     semantic = config["semantic_search"]
     if api_containers.get("ollama") != semantic["ollama_image"]:
@@ -3909,6 +4409,18 @@ def status(root: Path) -> dict[str, Any]:
             expected_web_pod_images,
         ),
     }
+    application_workloads = _require_live_application_workloads(
+        root,
+        release,
+        {
+            "weltgewebe-api": api,
+            "weltgewebe-web": web,
+        },
+        {
+            "weltgewebe-api": api_pods,
+            "weltgewebe-web": web_pods,
+        },
+    )
     semantic_provider = _semantic_provider_live_readback(root, source_commit)
 
     expected_secret_values = _expected_live_secret_values(root, source_commit)
@@ -4012,6 +4524,8 @@ def status(root: Path) -> dict[str, Any]:
         "flux": flux_readback,
         "deployments": deployment_readback,
         "data_deployments": data_deployment_readback,
+        "data_services": data_service_readback,
+        "application_workloads": application_workloads,
         "pods": pod_readback,
         "images": {
             **release_artifacts["images"],
@@ -4109,45 +4623,121 @@ def _require_teardown_state_root(root: Path) -> dict[str, Any]:
     return payload
 
 
+def _require_teardown_live_identity(
+    root: Path,
+    ownership: dict[str, Any],
+) -> dict[str, Any]:
+    domain_present = _libvirt_resource_present("domain", VM_NAME)
+    pool_present = _libvirt_resource_present("pool", POOL_NAME)
+    if ownership.get("status") == "created":
+        source_commit = ownership.get("source_commit")
+        if not isinstance(source_commit, str) or not COMMIT_RE.fullmatch(source_commit):
+            raise RuntimeErrorEB("teardown creation receipt has no exact source commit")
+        config = load_config()
+        _require_vm_create_receipt(ownership, source_commit, config, root)
+        if not domain_present or not pool_present:
+            raise RuntimeErrorEB(
+                "teardown cannot prove the complete live creation substrate"
+            )
+        live = _live_vm_substrate(root, config)
+        if live != ownership.get("substrate"):
+            raise RuntimeErrorEB(
+                "teardown live VM/pool/disk identity drifted from vm-create.json"
+            )
+        return {
+            "identity_verified": True,
+            "domain_present": True,
+            "pool_present": True,
+            "domain_target": str(live["uuid"]),
+            "pool_target": str(live["pool_uuid"]),
+            "substrate_sha256": _stable_json_sha256(live),
+        }
+
+    if domain_present or pool_present:
+        raise RuntimeErrorEB(
+            "teardown refuses same-named libvirt resources from an interrupted "
+            "creation because their UUID/backing identity was never committed"
+        )
+    return {
+        "identity_verified": True,
+        "domain_present": False,
+        "pool_present": False,
+        "domain_target": None,
+        "pool_target": None,
+        "substrate_sha256": None,
+    }
+
+
 def teardown(root: Path) -> dict[str, Any]:
     ownership = _require_teardown_state_root(root)
+    live_identity = _require_teardown_live_identity(root, ownership)
     evidence_hashes: dict[str, str] = {}
     receipts_dir = root / "receipts"
     if receipts_dir.is_dir():
         for path in sorted(receipts_dir.glob("*.json")):
             evidence_hashes[path.name] = sha256_file(path)
 
-    if _libvirt_resource_present("domain", VM_NAME):
-        run(["virsh", "-c", LIBVIRT_URI, "destroy", VM_NAME], check=False)
+    if live_identity["domain_present"]:
+        domain_target = str(live_identity["domain_target"])
+        run(["virsh", "-c", LIBVIRT_URI, "destroy", domain_target], check=False)
         undefine = run(
-            ["virsh", "-c", LIBVIRT_URI, "undefine", VM_NAME, "--nvram"],
+            ["virsh", "-c", LIBVIRT_URI, "undefine", domain_target, "--nvram"],
             check=False,
         )
         if undefine.returncode != 0:
-            run(["virsh", "-c", LIBVIRT_URI, "undefine", VM_NAME], check=False)
+            run(
+                ["virsh", "-c", LIBVIRT_URI, "undefine", domain_target],
+                check=False,
+            )
 
     volume_absence = {
         VOLUME_NAME: False,
         BASE_VOLUME: False,
     }
-    if _libvirt_resource_present("pool", POOL_NAME):
+    if live_identity["pool_present"]:
+        pool_target = str(live_identity["pool_target"])
         run(
-            ["virsh", "-c", LIBVIRT_URI, "vol-delete", VOLUME_NAME, "--pool", POOL_NAME],
+            [
+                "virsh",
+                "-c",
+                LIBVIRT_URI,
+                "vol-delete",
+                VOLUME_NAME,
+                "--pool",
+                pool_target,
+            ],
             check=False,
         )
         run(
-            ["virsh", "-c", LIBVIRT_URI, "vol-delete", BASE_VOLUME, "--pool", POOL_NAME],
+            [
+                "virsh",
+                "-c",
+                LIBVIRT_URI,
+                "vol-delete",
+                BASE_VOLUME,
+                "--pool",
+                pool_target,
+            ],
             check=False,
         )
         for volume_name in volume_absence:
-            if _libvirt_volume_present(POOL_NAME, volume_name):
+            if _libvirt_volume_present(pool_target, volume_name):
                 raise RuntimeErrorEB(
                     f"Experiment-B libvirt volume still exists after deletion: {volume_name}"
                 )
             volume_absence[volume_name] = True
-        run(["virsh", "-c", LIBVIRT_URI, "pool-destroy", POOL_NAME], check=False)
-        run(["virsh", "-c", LIBVIRT_URI, "pool-delete", POOL_NAME], check=False)
-        run(["virsh", "-c", LIBVIRT_URI, "pool-undefine", POOL_NAME], check=False)
+        run(
+            ["virsh", "-c", LIBVIRT_URI, "pool-destroy", pool_target],
+            check=False,
+        )
+        run(
+            ["virsh", "-c", LIBVIRT_URI, "pool-delete", pool_target],
+            check=False,
+        )
+        run(
+            ["virsh", "-c", LIBVIRT_URI, "pool-undefine", pool_target],
+            check=False,
+        )
     else:
         for volume_name in volume_absence:
             volume_absence[volume_name] = True
@@ -4178,6 +4768,8 @@ def teardown(root: Path) -> dict[str, Any]:
         "vm": VM_NAME,
         "pool": POOL_NAME,
         "state_root": ownership["state_root"],
+        "live_identity_verified": live_identity["identity_verified"],
+        "substrate_sha256": live_identity["substrate_sha256"],
         "volumes_absent": volume_absence,
         "volume_paths_absent": {
             name: not path.exists() for name, path in volume_paths.items()
@@ -4769,6 +5361,7 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         or _current_protected_main_commit() != source_commit
     ):
         raise RuntimeErrorEB("T048 fixture release is not current protected main")
+    _require_kubernetes_target_binding(root, source_commit)
     contract_section = evidence.api_runtime_section(
         evidence.load_policy(PERFORMANCE_POLICY)
     )
@@ -5157,6 +5750,47 @@ def _api_pod(root: Path) -> tuple[str, dict[str, Any]]:
     return name, pod
 
 
+def _require_t048_api_release_binding(
+    root: Path,
+    source_commit: str,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    release_path = root / "receipts/release.json"
+    try:
+        release = json.loads(release_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB("T048 proof requires a valid release receipt") from exc
+    api_digest = release.get("api_digest") if isinstance(release, dict) else None
+    if (
+        not isinstance(release, dict)
+        or release.get("schema_version") != 1
+        or release.get("status") != "applied"
+        or release.get("source_commit") != source_commit
+        or not isinstance(api_digest, str)
+        or not DIGEST_RE.fullmatch(api_digest)
+    ):
+        raise RuntimeErrorEB("T048 proof release image binding is invalid")
+
+    pod_name, pod = _api_pod(root)
+    expected_images = {
+        "containers": {
+            "api": f"ghcr.io/heimgewebe/commonthing-api@{api_digest}",
+            "search-worker": f"ghcr.io/heimgewebe/commonthing-api@{api_digest}",
+            "ollama": str(load_config()["semantic_search"]["ollama_image"]),
+        },
+        "init_containers": {},
+    }
+    readback = _require_running_pod_image_contract(
+        [pod],
+        namespace=APP_NAMESPACE,
+        workload="weltgewebe-api",
+        expected_replicas=1,
+        expected_images=expected_images,
+        required_labels={"app.kubernetes.io/name": "weltgewebe-api"},
+        context="T048 API Pod",
+    )
+    return pod_name, pod, readback
+
+
 def _parse_cpu_quantity(value: str) -> float:
     if value.endswith("m"):
         return float(value[:-1]) / 1000.0
@@ -5312,7 +5946,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     resource_path = root / "performance/resource-receipt.json"
     db_path = root / "performance/database-connections.json"
 
-    pod_name, pod = _api_pod(root)
+    pod_name, pod, api_image_binding_before = _require_t048_api_release_binding(
+        root, source_commit
+    )
     declared_cpu, declared_memory = _require_api_resource_limits(
         pod, load_config()
     )
@@ -5373,6 +6009,19 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         resource_samples.append(_sample_api_cgroup(root, pod_name))
         db_samples.append(_database_connection_count(root))
         sampler_finished = time.time_ns() // 1_000_000
+        (
+            post_pod_name,
+            _post_pod,
+            api_image_binding_after,
+        ) = _require_t048_api_release_binding(root, source_commit)
+        if (
+            post_pod_name != pod_name
+            or api_image_binding_after["runtime_image_ids_sha256"]
+            != api_image_binding_before["runtime_image_ids_sha256"]
+        ):
+            raise RuntimeErrorEB(
+                "API Pod image identity changed during the T048 measurement"
+            )
         if load_returncode != 0:
             detail = stderr_path.read_text(encoding="utf-8")[-3000:]
             raise RuntimeErrorEB(f"canonical T048 k6 workload failed: {detail}")
@@ -5488,6 +6137,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "k6_workflow_sha256": k6_workflow_sha256,
             "k6_image": k6_image,
             "fixture_manifest_sha256": manifest_sha,
+            "api_runtime_image_ids_sha256": api_image_binding_before[
+                "runtime_image_ids_sha256"
+            ],
             "scenario": scenario,
             "thresholds": contract_section["thresholds"],
             "http": http_metrics,
@@ -5941,6 +6593,214 @@ def _wait_pods_absent(
     )
 
 
+def _pvc_volume_identity(root: Path, claim_name: str) -> dict[str, str]:
+    pvc = _kubectl_json(
+        root, ["-n", DATA_NAMESPACE, "get", "pvc", claim_name]
+    )
+    metadata = pvc.get("metadata", {}) if isinstance(pvc, dict) else {}
+    spec = pvc.get("spec", {}) if isinstance(pvc, dict) else {}
+    pvc_uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    volume_name = spec.get("volumeName") if isinstance(spec, dict) else None
+    if (
+        metadata.get("name") != claim_name
+        or metadata.get("namespace") != DATA_NAMESPACE
+        or metadata.get("deletionTimestamp") is not None
+        or not isinstance(pvc_uid, str)
+        or not pvc_uid
+        or not isinstance(volume_name, str)
+        or not volume_name
+    ):
+        raise RuntimeErrorEB(
+            f"data PVC identity is invalid or unbound: {claim_name}"
+        )
+    pv = _kubectl_json(root, ["get", "pv", volume_name])
+    pv_metadata = pv.get("metadata", {}) if isinstance(pv, dict) else {}
+    pv_spec = pv.get("spec", {}) if isinstance(pv, dict) else {}
+    claim_ref = pv_spec.get("claimRef", {}) if isinstance(pv_spec, dict) else {}
+    pv_uid = pv_metadata.get("uid") if isinstance(pv_metadata, dict) else None
+    if (
+        pv_metadata.get("name") != volume_name
+        or pv_metadata.get("deletionTimestamp") is not None
+        or not isinstance(pv_uid, str)
+        or not pv_uid
+        or pv_spec.get("storageClassName") != "local-path"
+        or not isinstance(claim_ref, dict)
+        or claim_ref.get("namespace") != DATA_NAMESPACE
+        or claim_ref.get("name") != claim_name
+        or claim_ref.get("uid") != pvc_uid
+    ):
+        raise RuntimeErrorEB(
+            f"data PV identity is not bound to the expected claim: {claim_name}"
+        )
+    return {
+        "pvc_uid": pvc_uid,
+        "pv_name": volume_name,
+        "pv_uid": pv_uid,
+    }
+
+
+def _wait_pv_absent(
+    root: Path,
+    pv_name: str,
+    *,
+    timeout_seconds: int = 180,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        result = _kubectl(
+            root,
+            ["get", "pv", pv_name, "--ignore-not-found=true", "-o", "name"],
+            timeout=30,
+        )
+        if not result.stdout.strip():
+            return
+        time.sleep(2)
+    raise RuntimeErrorEB(
+        f"old persistent volume did not disappear before restore: {pv_name}"
+    )
+
+
+def _require_empty_replacement_pvc(
+    root: Path,
+    claim_name: str,
+    old_identity: dict[str, str],
+) -> dict[str, Any]:
+    workload = "postgres" if claim_name == "postgres-data" else "nats"
+    expected = _versioned_data_deployment_contract(
+        CLUSTER / f"data/{workload}.yaml", workload
+    )
+    image = expected["images"]["containers"].get(workload)
+    if not isinstance(image, str) or not image:
+        raise RuntimeErrorEB(
+            f"replacement PVC probe image is unavailable: {claim_name}"
+        )
+    try:
+        documents = [
+            item
+            for item in yaml.safe_load_all(
+                (CLUSTER / f"data/{workload}.yaml").read_text(encoding="utf-8")
+            )
+            if isinstance(item, dict)
+            and item.get("kind") == "Deployment"
+            and item.get("metadata", {}).get("name") == workload
+        ]
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeErrorEB(
+            f"replacement PVC probe contract is invalid: {claim_name}"
+        ) from exc
+    if len(documents) != 1:
+        raise RuntimeErrorEB(
+            f"replacement PVC probe Deployment is ambiguous: {claim_name}"
+        )
+    security = documents[0].get("spec", {}).get("template", {}).get("spec", {}).get(
+        "securityContext", {}
+    )
+    run_as_user = security.get("runAsUser") if isinstance(security, dict) else None
+    run_as_group = security.get("runAsGroup") if isinstance(security, dict) else None
+    fs_group = security.get("fsGroup") if isinstance(security, dict) else None
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in (run_as_user, run_as_group, fs_group)
+    ):
+        raise RuntimeErrorEB(
+            f"replacement PVC probe security contract is invalid: {claim_name}"
+        )
+
+    pod_name = f"commonthing-experiment-b-{workload}-empty-probe"
+    manifest = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": pod_name, "namespace": DATA_NAMESPACE},
+        "spec": {
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "securityContext": {
+                "runAsNonRoot": True,
+                "runAsUser": run_as_user,
+                "runAsGroup": run_as_group,
+                "fsGroup": fs_group,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [
+                {
+                    "name": "probe",
+                    "image": image,
+                    "command": ["/bin/sh", "-c", "sleep 3600"],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {"drop": ["ALL"]},
+                        "readOnlyRootFilesystem": True,
+                    },
+                    "volumeMounts": [
+                        {"name": "data", "mountPath": "/probe"},
+                        {"name": "tmp", "mountPath": "/tmp"},
+                    ],
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "data",
+                    "persistentVolumeClaim": {"claimName": claim_name},
+                },
+                {"name": "tmp", "emptyDir": {}},
+            ],
+        },
+    }
+    kubectl_apply(root, json.dumps(manifest, sort_keys=True))
+    try:
+        _kubectl(
+            root,
+            [
+                "-n",
+                DATA_NAMESPACE,
+                "wait",
+                "--for=condition=Ready",
+                f"pod/{pod_name}",
+                "--timeout=3m",
+            ],
+            timeout=210,
+        )
+        new_identity = _pvc_volume_identity(root, claim_name)
+        if (
+            new_identity["pvc_uid"] == old_identity["pvc_uid"]
+            or new_identity["pv_name"] == old_identity["pv_name"]
+            or new_identity["pv_uid"] == old_identity["pv_uid"]
+        ):
+            raise RuntimeErrorEB(
+                f"replacement PVC reused the previous storage identity: {claim_name}"
+            )
+        contents = _kubectl(
+            root,
+            [
+                "-n",
+                DATA_NAMESPACE,
+                "exec",
+                pod_name,
+                "--",
+                "find",
+                "/probe",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-print",
+                "-quit",
+            ],
+            timeout=30,
+        )
+        if contents.stdout.strip():
+            raise RuntimeErrorEB(
+                f"replacement PVC is not empty before restore: {claim_name}"
+            )
+        return {
+            "old": old_identity,
+            "new": new_identity,
+            "empty_before_restore": True,
+        }
+    finally:
+        _delete_pod(root, DATA_NAMESPACE, pod_name)
+
+
 def _nats_transfer_pod(root: Path, name: str) -> None:
     deployment = _kubectl_json(
         root, ["-n", DATA_NAMESPACE, "get", "deployment", "nats"]
@@ -6032,9 +6892,16 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     source_commit = str(release.get("source_commit", ""))
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("recovery proof release binding is not exact")
+    recovery_failed_receipt = root / "receipts/recovery-failed.json"
+    if recovery_failed_receipt.is_file():
+        raise RuntimeErrorEB(
+            "recovery proof refuses a retry after a failed attempt; rebuild the "
+            "Experiment-B cell to establish a fresh baseline"
+        )
     _invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("recovery proof release is not current protected main")
+    _require_kubernetes_target_binding(root, source_commit)
     backup_dir = root / "recovery"
     backup_dir.mkdir(parents=True, exist_ok=True)
     db_dump = backup_dir / "postgres.dump"
@@ -6042,7 +6909,6 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     before_db: dict[str, Any] | None = None
     before_nats: dict[str, Any] | None = None
     recovery_receipt = root / "receipts/recovery.json"
-    recovery_failed_receipt = root / "receipts/recovery-failed.json"
 
     _flux_suspend(root, "commonthing-experiment-b-app")
     _flux_suspend(root, "commonthing-experiment-b-data")
@@ -6106,6 +6972,10 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             DATA_NAMESPACE,
             "app.kubernetes.io/name=postgres",
         )
+        old_pvc_identities = {
+            name: _pvc_volume_identity(root, name)
+            for name in ("postgres-data", "nats-data")
+        }
         _kubectl(
             root,
             [
@@ -6114,8 +6984,16 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             ],
             timeout=330,
         )
+        for identity in old_pvc_identities.values():
+            _wait_pv_absent(root, identity["pv_name"])
         storage = (CLUSTER / "data/storage.yaml").read_text(encoding="utf-8")
         kubectl_apply(root, storage)
+        pvc_replacements = {
+            name: _require_empty_replacement_pvc(
+                root, name, old_pvc_identities[name]
+            )
+            for name in ("postgres-data", "nats-data")
+        }
 
         _nats_transfer_pod(root, "commonthing-experiment-b-nats-restore")
         try:
@@ -6200,7 +7078,9 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         "database_after": after_db,
         "jetstream_before": before_nats,
         "jetstream_after": after_nats,
+        "pvc_replacements": pvc_replacements,
         "pvc_delete_to_prove": True,
+        "replacement_pvcs_empty_before_restore": True,
         "production_data_used": False,
     }
     atomic_json(recovery_receipt, receipt)
@@ -6570,6 +7450,30 @@ def portability_report(root: Path) -> dict[str, Any]:
             f"data Pod {name}",
         )
 
+    data_service_status = status_payload.get("data_services")
+    expected_data_services = {
+        name: _versioned_data_service_contract(
+            CLUSTER / f"data/{name}.yaml", name
+        )
+        for name in ("postgres", "nats")
+    }
+    if (
+        not isinstance(data_service_status, dict)
+        or set(data_service_status) != set(expected_data_services)
+    ):
+        raise RuntimeErrorEB("status does not prove the live data Service contract")
+    for name, expected in expected_data_services.items():
+        observed = data_service_status.get(name)
+        if (
+            not isinstance(observed, dict)
+            or observed.get("canonical") is not True
+            or observed.get("spec") != expected["spec"]
+            or observed.get("spec_sha256") != expected["spec_sha256"]
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the live data Service contract: {name}"
+            )
+
     pod_status = status_payload.get("pods")
     api_digest = str(payloads["release.json"].get("api_digest", ""))
     web_digest = str(payloads["release.json"].get("web_digest", ""))
@@ -6628,6 +7532,37 @@ def portability_report(root: Path) -> dict[str, Any]:
         ):
             raise RuntimeErrorEB(
                 f"status does not prove the live application Pod contract: {workload}"
+            )
+
+    application_workload_status = status_payload.get(
+        "application_workloads"
+    )
+    expected_application_workloads = _rendered_application_workload_contract(
+        root, payloads["release.json"]
+    )
+    if (
+        not isinstance(application_workload_status, dict)
+        or set(application_workload_status)
+        != set(expected_application_workloads)
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the complete application workload contract"
+        )
+    for name, expected in expected_application_workloads.items():
+        observed = application_workload_status.get(name)
+        if (
+            not isinstance(observed, dict)
+            or observed.get("canonical") is not True
+            or observed.get("contract_sha256")
+            != expected["contract_sha256"]
+            or observed.get("pod_contract_sha256")
+            != expected["pod_contract_sha256"]
+            or not isinstance(observed.get("pod_names"), list)
+            or len(observed["pod_names"])
+            != expected["contract"]["replicas"]
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the complete application workload contract: {name}"
             )
 
     runtime_status = status_payload.get("runtime_contract")

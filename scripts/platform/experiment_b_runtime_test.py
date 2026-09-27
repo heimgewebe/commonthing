@@ -1655,6 +1655,22 @@ spec:
             }
             for name in runtime.EXPECTED_FLUX_CONTROLLERS
         }
+        application_expected_contract = {
+            "weltgewebe-api": {
+                "contract": {
+                    "replicas": int(config["semantic_search"]["api_replicas"])
+                },
+                "contract_sha256": "7" * 64,
+                "pod_contract_sha256": "8" * 64,
+            },
+            "weltgewebe-web": {
+                "contract": {
+                    "replicas": int(config["runtime_binding"]["web_replicas"])
+                },
+                "contract_sha256": "9" * 64,
+                "pod_contract_sha256": "a" * 64,
+            },
+        }
         statuses = {
             "vm-create.json": "created",
             "k3s.json": "ready",
@@ -1684,6 +1700,11 @@ spec:
                 runtime,
                 "_expected_flux_controller_contract",
                 return_value=flux_expected_contract,
+            ),
+            mock.patch.object(
+                runtime,
+                "_rendered_application_workload_contract",
+                return_value=application_expected_contract,
             ),
         ):
             root = Path(tmp)
@@ -1897,6 +1918,38 @@ spec:
                             )
                             for name in ("postgres", "nats")
                         )
+                    }
+                    payload["data_services"] = {
+                        name: {
+                            "spec": expected["spec"],
+                            "spec_sha256": expected["spec_sha256"],
+                            "canonical": True,
+                        }
+                        for name, expected in (
+                            (
+                                name,
+                                runtime._versioned_data_service_contract(
+                                    runtime.CLUSTER / f"data/{name}.yaml", name
+                                ),
+                            )
+                            for name in ("postgres", "nats")
+                        )
+                    }
+                    payload["application_workloads"] = {
+                        name: {
+                            "contract_sha256": expected["contract_sha256"],
+                            "pod_contract_sha256": expected[
+                                "pod_contract_sha256"
+                            ],
+                            "pod_names": [
+                                f"{name}-{index}"
+                                for index in range(
+                                    expected["contract"]["replicas"]
+                                )
+                            ],
+                            "canonical": True,
+                        }
+                        for name, expected in application_expected_contract.items()
                     }
                     runtime_binding = config["runtime_binding"]
                     api_images = {
@@ -2931,6 +2984,11 @@ spec:
                     "_current_protected_main_commit",
                     return_value=commit,
                 ),
+                mock.patch.object(
+                    runtime,
+                    "_require_kubernetes_target_binding",
+                    return_value=({}, "192.168.122.10", "https://192.168.122.10:6443"),
+                ),
                 mock.patch.object(runtime, "_psql", side_effect=psql_values),
                 mock.patch.object(
                     runtime,
@@ -3164,6 +3222,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.patch("load_config", return_value=self.config)
         self.main = self.patch("_current_protected_main_commit", return_value=self.commit)
         expected = vm_substrate_fixture()
+        self.pool_uuid = expected["pool_uuid"]
         self.xml = {
             "live": f"""<domain type='kvm' id='7'>
               <name>{runtime.VM_NAME}</name><uuid>{expected['uuid']}</uuid>
@@ -3535,6 +3594,21 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 for index in range(expected["replicas"])
             ]
 
+        self.data_services = {}
+        for name in ("postgres", "nats"):
+            expected_service = runtime._versioned_data_service_contract(
+                runtime.CLUSTER / f"data/{name}.yaml", name
+            )
+            self.data_services[name] = {
+                "metadata": {
+                    "name": name,
+                    "namespace": runtime.DATA_NAMESPACE,
+                },
+                "spec": json.loads(
+                    json.dumps(expected_service["spec"])
+                ),
+            }
+
         api_image = "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64
         web_image = "ghcr.io/heimgewebe/commonthing-web@sha256:" + "c" * 64
         api_pod_images = {
@@ -3753,7 +3827,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             elif command == "pool-list":
                 output = f"{runtime.POOL_NAME}\n" if self.pool_present else ""
             elif command == "vol-list":
-                self.assertEqual(argv[4:], [runtime.POOL_NAME])
+                self.assertIn(argv[4], {runtime.POOL_NAME, self.pool_uuid})
                 if not self.pool_present:
                     code = 1
                 else:
@@ -3949,6 +4023,50 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "_expected_flux_controller_contract",
             return_value=json.loads(json.dumps(self.flux_expected_contract)),
         )
+        self.application_workload_expected = {
+            "weltgewebe-api": {
+                "contract": {
+                    "replicas": int(
+                        self.config["semantic_search"]["api_replicas"]
+                    )
+                },
+                "contract_sha256": "7" * 64,
+                "pod_contract_sha256": "8" * 64,
+            },
+            "weltgewebe-web": {
+                "contract": {
+                    "replicas": int(
+                        self.config["runtime_binding"]["web_replicas"]
+                    )
+                },
+                "contract_sha256": "9" * 64,
+                "pod_contract_sha256": "a" * 64,
+            },
+        }
+        self.application_workload_readback = {
+            name: {
+                "contract_sha256": value["contract_sha256"],
+                "pod_contract_sha256": value["pod_contract_sha256"],
+                "pod_names": [
+                    pod["metadata"]["name"]
+                    for pod in self.application_pods[name]
+                ],
+                "canonical": True,
+            }
+            for name, value in self.application_workload_expected.items()
+        }
+        self.application_workload_contract = self.patch(
+            "_rendered_application_workload_contract",
+            return_value=json.loads(
+                json.dumps(self.application_workload_expected)
+            ),
+        )
+        self.application_workload_live = self.patch(
+            "_require_live_application_workloads",
+            return_value=json.loads(
+                json.dumps(self.application_workload_readback)
+            ),
+        )
         self.tools = self.patch(
             "toolchain",
             return_value={
@@ -4125,6 +4243,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             and arguments[-1] in self.data_deployments
         ):
             return self.data_deployments[str(arguments[-1])]
+        if (
+            len(arguments) == 5
+            and arguments[:4]
+            == ["-n", runtime.DATA_NAMESPACE, "get", "service"]
+            and arguments[-1] in self.data_services
+        ):
+            return self.data_services[str(arguments[-1])]
         if "deployment" in arguments:
             deployment_name = str(arguments[-1])
             replicas = (
@@ -4191,6 +4316,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         )
         self.assertTrue(result["pool_target_removed"])
         self.assertTrue(result["state_removed"])
+        self.assertTrue(result["live_identity_verified"])
+        self.assertRegex(result["substrate_sha256"], r"^[0-9a-f]{64}$")
         self.assertFalse(self.domain_present)
         self.assertFalse(self.pool_present)
         self.assertFalse(self.root.exists())
@@ -4211,7 +4338,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertTrue(self.pool_present)
         self.assertTrue(self.root.exists())
 
-    def test_teardown_accepts_bound_create_attempt_after_interrupted_creation(self) -> None:
+    def test_teardown_refuses_unbound_resources_after_interrupted_creation(self) -> None:
         runtime.atomic_json(
             self.root / "receipts/vm-create-attempt.json",
             {
@@ -4224,11 +4351,14 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "pool": runtime.POOL_NAME,
             },
         )
-        result = runtime.teardown(self.root)
-        self.assertEqual(result["status"], "retired")
-        self.assertEqual(result["state_root"], str(self.root.resolve()))
-        self.assertFalse(self.domain_present)
-        self.assertFalse(self.pool_present)
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "refuses same-named libvirt resources",
+        ):
+            runtime.teardown(self.root)
+        self.assertTrue(self.domain_present)
+        self.assertTrue(self.pool_present)
+        self.assertTrue(self.root.exists())
 
     def test_live_readback_captures_actual_substrate_and_base_volume_digest(self) -> None:
         observed = runtime._live_vm_substrate(self.root, self.config)
@@ -5399,6 +5529,552 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                         for call in self.runner.call_args_list
                     )
                 )
+
+    def test_kubernetes_target_binding_rejects_kubeconfig_drift_before_mutation(self) -> None:
+        kubeconfig = self.root / "kubeconfig.yaml"
+        kubeconfig.write_text(
+            yaml.safe_dump(
+                {
+                    "current-context": "experiment-b",
+                    "contexts": [
+                        {
+                            "name": "experiment-b",
+                            "context": {"cluster": "experiment-b"},
+                        }
+                    ],
+                    "clusters": [
+                        {
+                            "name": "experiment-b",
+                            "cluster": {
+                                "server": "https://192.168.122.10:6443"
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        kubeconfig.chmod(0o600)
+        runtime.atomic_json(
+            self.root / "receipts/k3s.json",
+            {
+                "schema_version": 1,
+                "status": "ready",
+                "source_commit": self.commit,
+                "vm_ip": "192.168.122.10",
+                "kubeconfig_sha256": runtime.sha256_file(kubeconfig),
+            },
+        )
+        with mock.patch.object(
+            runtime, "vm_ip", return_value="192.168.122.10"
+        ):
+            receipt, ip, server = runtime._require_kubernetes_target_binding(
+                self.root, self.commit
+            )
+            self.assertEqual(receipt["source_commit"], self.commit)
+            self.assertEqual(ip, "192.168.122.10")
+            self.assertEqual(server, "https://192.168.122.10:6443")
+
+            kubeconfig.write_text(
+                kubeconfig.read_text(encoding="utf-8") + "# drift\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "kubeconfig digest/mode drifted"
+            ):
+                runtime._require_kubernetes_target_binding(
+                    self.root, self.commit
+                )
+
+        for function in (
+            runtime.install_platform,
+            runtime.inject_secrets,
+            runtime.apply_release,
+            runtime.semantic_activate,
+            runtime.seed_t048_fixture,
+            runtime.recovery_proof,
+        ):
+            self.assertIn(
+                "_require_kubernetes_target_binding",
+                inspect.getsource(function),
+            )
+        source = inspect.getsource(runtime.inject_secrets)
+        self.assertLess(
+            source.index("_require_kubernetes_target_binding"),
+            source.index("kubectl_apply"),
+        )
+
+    def test_t048_binds_running_api_pod_to_release_image_identity(self) -> None:
+        api_digest = "sha256:" + "b" * 64
+        runtime.atomic_json(
+            self.root / "receipts/release.json",
+            {
+                "schema_version": 1,
+                "status": "applied",
+                "source_commit": self.commit,
+                "api_digest": api_digest,
+                "web_digest": "sha256:" + "c" * 64,
+            },
+        )
+        config = runtime.load_config()
+        images = {
+            "api": f"ghcr.io/heimgewebe/commonthing-api@{api_digest}",
+            "search-worker": (
+                f"ghcr.io/heimgewebe/commonthing-api@{api_digest}"
+            ),
+            "ollama": config["semantic_search"]["ollama_image"],
+        }
+
+        def image_id(image: str) -> str:
+            digest = image.rsplit("@", 1)[1]
+            return "containerd://" + digest
+
+        pod = {
+            "metadata": {
+                "name": "weltgewebe-api-0",
+                "namespace": runtime.APP_NAMESPACE,
+                "labels": {
+                    "app.kubernetes.io/name": "weltgewebe-api"
+                },
+            },
+            "spec": {
+                "containers": [
+                    {"name": name, "image": image}
+                    for name, image in images.items()
+                ]
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "Ready", "status": "True"}
+                ],
+                "containerStatuses": [
+                    {
+                        "name": name,
+                        "ready": True,
+                        "state": {"running": {}},
+                        "imageID": image_id(image),
+                    }
+                    for name, image in images.items()
+                ],
+            },
+        }
+        with mock.patch.object(
+            runtime,
+            "_api_pod",
+            return_value=("weltgewebe-api-0", pod),
+        ):
+            name, _pod, proof = runtime._require_t048_api_release_binding(
+                self.root, self.commit
+            )
+        self.assertEqual(name, "weltgewebe-api-0")
+        self.assertRegex(
+            proof["runtime_image_ids_sha256"], r"^[0-9a-f]{64}$"
+        )
+
+        requested_drift = json.loads(json.dumps(pod))
+        requested_drift["spec"]["containers"][0]["image"] = (
+            "ghcr.io/heimgewebe/commonthing-api@sha256:" + "0" * 64
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "_api_pod",
+                return_value=("weltgewebe-api-0", requested_drift),
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "requested images drifted"
+            ),
+        ):
+            runtime._require_t048_api_release_binding(
+                self.root, self.commit
+            )
+
+        runtime_drift = json.loads(json.dumps(pod))
+        runtime_drift["status"]["containerStatuses"][0]["imageID"] = (
+            "containerd://sha256:" + "0" * 64
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "_api_pod",
+                return_value=("weltgewebe-api-0", runtime_drift),
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "runtime image ID drifted"
+            ),
+        ):
+            runtime._require_t048_api_release_binding(
+                self.root, self.commit
+            )
+        source = inspect.getsource(runtime.t048_load_proof)
+        self.assertGreaterEqual(
+            source.count("_require_t048_api_release_binding"), 2
+        )
+
+    def test_recovery_refuses_retry_after_failed_attempt(self) -> None:
+        runtime.atomic_json(
+            self.root / "receipts/release.json",
+            {
+                "schema_version": 1,
+                "status": "applied",
+                "source_commit": self.commit,
+            },
+        )
+        failed = {
+            "schema_version": 1,
+            "status": "fail",
+            "source_commit": self.commit,
+            "failure": "restore interrupted",
+        }
+        failed_path = self.root / "receipts/recovery-failed.json"
+        runtime.atomic_json(failed_path, failed)
+        failed_sha = runtime.sha256_file(failed_path)
+        with (
+            mock.patch.object(runtime, "_flux_suspend") as suspend,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "refuses a retry after a failed attempt",
+            ),
+        ):
+            runtime.recovery_proof(self.root)
+        suspend.assert_not_called()
+        self.assertEqual(runtime.sha256_file(failed_path), failed_sha)
+
+    def test_recovery_requires_new_empty_persistent_volume_identity(self) -> None:
+        old_identity = {
+            "pvc_uid": "old-pvc",
+            "pv_name": "old-pv",
+            "pv_uid": "old-pv-uid",
+        }
+        new_identity = {
+            "pvc_uid": "new-pvc",
+            "pv_name": "new-pv",
+            "pv_uid": "new-pv-uid",
+        }
+
+        def kubectl_result(_root, arguments, **_kwargs):
+            stdout = ""
+            if "exec" in arguments:
+                stdout = ""
+            return runtime.subprocess.CompletedProcess(
+                arguments, 0, stdout=stdout, stderr=""
+            )
+
+        with (
+            mock.patch.object(runtime, "kubectl_apply") as apply,
+            mock.patch.object(
+                runtime,
+                "_pvc_volume_identity",
+                return_value=new_identity,
+            ),
+            mock.patch.object(
+                runtime, "_kubectl", side_effect=kubectl_result
+            ),
+            mock.patch.object(runtime, "_delete_pod") as delete,
+        ):
+            result = runtime._require_empty_replacement_pvc(
+                self.root, "postgres-data", old_identity
+            )
+        self.assertEqual(result["old"], old_identity)
+        self.assertEqual(result["new"], new_identity)
+        self.assertTrue(result["empty_before_restore"])
+        apply.assert_called_once()
+        delete.assert_called_once()
+
+        with (
+            mock.patch.object(runtime, "kubectl_apply"),
+            mock.patch.object(
+                runtime,
+                "_pvc_volume_identity",
+                return_value=old_identity,
+            ),
+            mock.patch.object(
+                runtime, "_kubectl", side_effect=kubectl_result
+            ),
+            mock.patch.object(runtime, "_delete_pod"),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "reused the previous storage identity",
+            ),
+        ):
+            runtime._require_empty_replacement_pvc(
+                self.root, "postgres-data", old_identity
+            )
+
+        def nonempty_result(_root, arguments, **_kwargs):
+            stdout = "lost+found\n" if "exec" in arguments else ""
+            return runtime.subprocess.CompletedProcess(
+                arguments, 0, stdout=stdout, stderr=""
+            )
+
+        with (
+            mock.patch.object(runtime, "kubectl_apply"),
+            mock.patch.object(
+                runtime,
+                "_pvc_volume_identity",
+                return_value=new_identity,
+            ),
+            mock.patch.object(
+                runtime, "_kubectl", side_effect=nonempty_result
+            ),
+            mock.patch.object(runtime, "_delete_pod"),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "not empty before restore",
+            ),
+        ):
+            runtime._require_empty_replacement_pvc(
+                self.root, "postgres-data", old_identity
+            )
+
+    def test_teardown_rejects_live_uuid_drift_before_destroy(self) -> None:
+        self.write_vm_receipt()
+        old_uuid = vm_substrate_fixture()["uuid"]
+        new_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        self.xml["live"] = self.xml["live"].replace(old_uuid, new_uuid)
+        self.xml["inactive"] = self.xml["inactive"].replace(
+            old_uuid, new_uuid
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "live VM/pool/disk identity drifted",
+        ):
+            runtime.teardown(self.root)
+        self.assertTrue(self.domain_present)
+        self.assertTrue(self.pool_present)
+        destructive = {
+            call.args[0][3]
+            for call in self.runner.call_args_list
+            if call.args
+            and len(call.args[0]) > 3
+            and call.args[0][0] == "virsh"
+        }
+        self.assertNotIn("destroy", destructive)
+        self.assertNotIn("vol-delete", destructive)
+
+    def test_status_revalidates_data_service_selector_and_ports(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        result = runtime._require_live_data_services(self.root)
+        self.assertEqual(set(result), {"postgres", "nats"})
+        self.assertTrue(result["postgres"]["canonical"])
+
+        healthy = json.loads(json.dumps(self.data_services))
+        self.data_services["postgres"]["spec"]["selector"] = {
+            "app.kubernetes.io/name": "other"
+        }
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "Service spec drifted"
+        ):
+            runtime._require_live_data_services(self.root)
+
+        self.data_services = json.loads(json.dumps(healthy))
+        self.data_services["nats"]["spec"]["ports"][0]["port"] += 1
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "Service spec drifted"
+        ):
+            runtime._require_live_data_services(self.root)
+
+    def test_application_workload_contract_rejects_security_and_env_drift(self) -> None:
+        def workload(name: str, image: str) -> tuple[dict, dict, dict]:
+            labels = {"app.kubernetes.io/name": name}
+            annotations = {"commonthing.test/contract": "v1"}
+            pod_spec = {
+                "serviceAccountName": name,
+                "automountServiceAccountToken": False,
+                "terminationGracePeriodSeconds": 20,
+                "securityContext": {
+                    "runAsNonRoot": True,
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "imagePullSecrets": [{"name": "registry"}],
+                "volumes": [{"name": "tmp", "emptyDir": {}}],
+                "containers": [
+                    {
+                        "name": "app",
+                        "image": image,
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["/app"],
+                        "args": ["serve"],
+                        "envFrom": [
+                            {"configMapRef": {"name": "runtime"}}
+                        ],
+                        "env": [{"name": "MODE", "value": "test"}],
+                        "ports": [
+                            {
+                                "name": "http",
+                                "containerPort": 8080,
+                                "protocol": "TCP",
+                            }
+                        ],
+                        "resources": {
+                            "requests": {"cpu": "10m"},
+                            "limits": {"cpu": "100m"},
+                        },
+                        "securityContext": {
+                            "allowPrivilegeEscalation": False,
+                            "readOnlyRootFilesystem": True,
+                        },
+                        "volumeMounts": [
+                            {"name": "tmp", "mountPath": "/tmp"}
+                        ],
+                    }
+                ],
+            }
+            deployment = {
+                "metadata": {
+                    "name": name,
+                    "namespace": runtime.APP_NAMESPACE,
+                },
+                "spec": {
+                    "replicas": 1,
+                    "revisionHistoryLimit": 3,
+                    "strategy": {
+                        "type": "RollingUpdate",
+                        "rollingUpdate": {
+                            "maxUnavailable": 0,
+                            "maxSurge": 1,
+                        },
+                    },
+                    "selector": {"matchLabels": labels},
+                    "template": {
+                        "metadata": {
+                            "labels": labels,
+                            "annotations": annotations,
+                        },
+                        "spec": json.loads(json.dumps(pod_spec)),
+                    },
+                },
+            }
+            pod = {
+                "metadata": {
+                    "name": f"{name}-0",
+                    "namespace": runtime.APP_NAMESPACE,
+                    "labels": {
+                        **labels,
+                        "pod-template-hash": "generated",
+                    },
+                    "annotations": annotations,
+                },
+                "spec": json.loads(json.dumps(pod_spec)),
+            }
+            contract = {
+                "replicas": 1,
+                "revisionHistoryLimit": 3,
+                "strategy": deployment["spec"]["strategy"],
+                "selector_labels": labels,
+                "template_labels": labels,
+                "template_annotations": annotations,
+                "pod_spec": runtime._application_pod_spec_projection(
+                    pod_spec, name
+                ),
+            }
+            expected = {
+                "contract": contract,
+                "contract_sha256": runtime._stable_json_sha256(
+                    contract
+                ),
+                "pod_contract_sha256": runtime._stable_json_sha256(
+                    contract["pod_spec"]
+                ),
+            }
+            return deployment, pod, expected
+
+        api = workload(
+            "weltgewebe-api",
+            "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64,
+        )
+        web = workload(
+            "weltgewebe-web",
+            "ghcr.io/heimgewebe/commonthing-web@sha256:" + "c" * 64,
+        )
+        expected = {
+            "weltgewebe-api": api[2],
+            "weltgewebe-web": web[2],
+        }
+        deployments = {
+            "weltgewebe-api": api[0],
+            "weltgewebe-web": web[0],
+        }
+        pods = {
+            "weltgewebe-api": [api[1]],
+            "weltgewebe-web": [web[1]],
+        }
+        release = {
+            "api_digest": "sha256:" + "b" * 64,
+            "web_digest": "sha256:" + "c" * 64,
+        }
+        with mock.patch.object(
+            runtime,
+            "_rendered_application_workload_contract",
+            return_value=expected,
+        ):
+            proof = runtime._require_live_application_workloads(
+                self.root, release, deployments, pods
+            )
+            self.assertTrue(proof["weltgewebe-api"]["canonical"])
+
+            deployment_drift = json.loads(json.dumps(deployments))
+            deployment_drift["weltgewebe-api"]["spec"]["template"][
+                "spec"
+            ]["serviceAccountName"] = "default"
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "Deployment contract drifted",
+            ):
+                runtime._require_live_application_workloads(
+                    self.root, release, deployment_drift, pods
+                )
+
+            pod_drift = json.loads(json.dumps(pods))
+            pod_drift["weltgewebe-api"][0]["spec"]["containers"][0][
+                "envFrom"
+            ] = []
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "Pod contract drifted",
+            ):
+                runtime._require_live_application_workloads(
+                    self.root, release, deployments, pod_drift
+                )
+
+        status_source = inspect.getsource(runtime.status)
+        self.assertIn(
+            "_require_live_application_workloads", status_source
+        )
+        portability_source = inspect.getsource(
+            runtime.portability_report
+        )
+        self.assertIn(
+            "_rendered_application_workload_contract",
+            portability_source,
+        )
+
+    def test_application_workload_projection_normalizes_kubernetes_probe_defaults(self) -> None:
+        expected = {
+            "name": "api",
+            "image": "example.invalid/api@sha256:" + "b" * 64,
+            "imagePullPolicy": "IfNotPresent",
+            "readinessProbe": {
+                "httpGet": {"path": "/health", "port": 8080},
+                "periodSeconds": 5,
+                "failureThreshold": 3,
+                "timeoutSeconds": 2,
+            },
+        }
+        live = json.loads(json.dumps(expected))
+        live["readinessProbe"].update(
+            {
+                "initialDelaySeconds": 0,
+                "successThreshold": 1,
+            }
+        )
+        live["readinessProbe"]["httpGet"]["scheme"] = "HTTP"
+        self.assertEqual(
+            runtime._container_runtime_contract(expected, "expected"),
+            runtime._container_runtime_contract(live, "live"),
+        )
 
     def test_create_binds_actual_vm_to_current_source_and_config(self) -> None:
         self.prepare_create()
