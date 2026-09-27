@@ -1736,7 +1736,7 @@ def _require_live_secret(
     secret_type: str,
     required_keys: set[str],
     expected_sha256: dict[str, str],
-) -> dict[str, Any]:
+) -> None:
     if set(expected_sha256) != required_keys or any(
         not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
         for value in expected_sha256.values()
@@ -1784,6 +1784,15 @@ def _require_live_secret(
             raise RuntimeErrorEB(
                 f"Experiment-B Secret content drifted: {namespace}/{name}/{key}"
             )
+    return None
+
+
+def _verified_secret_readback(
+    namespace: str,
+    name: str,
+    secret_type: str,
+    required_keys: set[str],
+) -> dict[str, Any]:
     return {
         "namespace": namespace,
         "name": name,
@@ -2045,30 +2054,48 @@ def status(root: Path) -> dict[str, Any]:
             "commonthing-experiment-b-registry",
         ],
     )
+    _require_live_secret(
+        database_secret,
+        DATA_NAMESPACE,
+        "commonthing-experiment-b-database",
+        "Opaque",
+        {"username", "database", "password"},
+        expected_secret_hashes["database"],
+    )
+    _require_live_secret(
+        runtime_secret,
+        APP_NAMESPACE,
+        "weltgewebe-runtime",
+        "Opaque",
+        {"database-url"},
+        expected_secret_hashes["runtime"],
+    )
+    _require_live_secret(
+        registry_secret,
+        APP_NAMESPACE,
+        "commonthing-experiment-b-registry",
+        "kubernetes.io/dockerconfigjson",
+        {".dockerconfigjson"},
+        expected_secret_hashes["registry"],
+    )
     secret_readback = {
-        "database": _require_live_secret(
-            database_secret,
+        "database": _verified_secret_readback(
             DATA_NAMESPACE,
             "commonthing-experiment-b-database",
             "Opaque",
             {"username", "database", "password"},
-            expected_secret_hashes["database"],
         ),
-        "runtime": _require_live_secret(
-            runtime_secret,
+        "runtime": _verified_secret_readback(
             APP_NAMESPACE,
             "weltgewebe-runtime",
             "Opaque",
             {"database-url"},
-            expected_secret_hashes["runtime"],
         ),
-        "registry": _require_live_secret(
-            registry_secret,
+        "registry": _verified_secret_readback(
             APP_NAMESPACE,
             "commonthing-experiment-b-registry",
             "kubernetes.io/dockerconfigjson",
             {".dockerconfigjson"},
-            expected_secret_hashes["registry"],
         ),
     }
 

@@ -2732,9 +2732,16 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 ).hexdigest()
             },
         )
-        self.assertEqual(observed["required_keys"], ["database-url"])
-        self.assertNotIn("data", observed)
-        self.assertNotIn("c2Vuc2l0aXZlLXZhbHVl", json.dumps(observed))
+        self.assertIsNone(observed)
+        readback = runtime._verified_secret_readback(
+            runtime.APP_NAMESPACE,
+            "weltgewebe-runtime",
+            "Opaque",
+            {"database-url"},
+        )
+        self.assertEqual(readback["required_keys"], ["database-url"])
+        self.assertNotIn("data", readback)
+        self.assertNotIn("c2Vuc2l0aXZlLXZhbHVl", json.dumps(readback))
 
     def test_status_requires_exact_healthy_pvc_set(self) -> None:
         self.write_vm_receipt()
