@@ -121,7 +121,14 @@ if [[ "$joined" == *" config --services "* ]]; then
   exit 0
 fi
 if [[ "$joined" == *" config --format json "* ]]; then
-  printf '%s\n' '{"services":{"api":{},"db":{},"nats":{},"schaubild":{"image":"ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","pull_policy":"missing","read_only":true,"ports":[],"expose":["8765"],"command":["python","-m","schauwerk.visual.standalone_editor","serve","--bind-host","0.0.0.0","--trusted-reverse-proxy","--trusted-proxy-source-cidr","172.16.0.0/12","--public-base-path","/schaubild","--port","8765"]},"caddy":{}}'
+  # Like Compose, drop the API alias when an override resets or replaces it.
+  api_json='{"networks":{"default":{"aliases":["weltgewebe-api"]}}}'
+  for ((i = 0; i < ${#args[@]} - 1; i++)); do
+    if [[ "${args[$i]}" == "-f" ]] && grep -Eq '!(reset|override)' "${args[$i + 1]}"; then
+      api_json='{"networks":{"default":null}}'
+    fi
+  done
+  printf '{"services":{"api":%s,"db":{},"nats":{},"schaubild":{"image":"ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","pull_policy":"missing","read_only":true,"ports":[],"expose":["8765"],"command":["python","-m","schauwerk.visual.standalone_editor","serve","--bind-host","0.0.0.0","--trusted-reverse-proxy","--trusted-proxy-source-cidr","172.16.0.0/12","--public-base-path","/schaubild","--port","8765"]},"caddy":{}}}\n' "$api_json"
   exit 0
 fi
 if [[ "$joined" == *" config "* ]]; then
@@ -395,6 +402,41 @@ exec {held_lock_fd}>&-
 [[ ! -s "$state_lock/mutation.log" ]] || fail "parallel deploy mutated compose"
 assert_contains "$out_lock" "another Weltgewebe deployment is already active"
 echo "PASS: host/project deployment lock rejects parallel effects"
+
+# An OVERRIDE_FILE outside infra/compose escapes the static compose-image-guard,
+# so the rendered model must be checked for the legacy API alias before mutation.
+repo_alias="$(new_repo custom-override)"
+state_alias="$WORK_ROOT/custom-override-state"
+mkdir -p "$state_alias"
+mock_bin_alias="$(setup_mocks "$state_alias")"
+custom_override="$WORK_ROOT/custom-override.yml"
+cat > "$custom_override" << 'YAML'
+services:
+  api:
+    networks: !reset {}
+YAML
+set +e
+out_alias="$( (cd "$repo_alias" && PATH="$mock_bin_alias:/usr/bin:/bin" MOCK_STATE="$state_alias" WELTGEWEBE_DEPLOY_LOCK_FILE="$state_alias/deploy.lock" REPO_DIR="$repo_alias" ENV_FILE="$repo_alias/.env" DEPLOY_TARGET=vps OVERRIDE_FILE="$custom_override" WELTGEWEBE_STATE_DIR="$repo_alias/.ops" bash scripts/weltgewebe-up --no-pull --no-build --deploy-scope api) 2>&1)"
+rc_alias=$?
+set -e
+[[ "$rc_alias" -ne 0 ]] || fail "custom override without the legacy API alias should fail"
+[[ ! -s "$state_alias/mutation.log" ]] || fail "custom override without the legacy API alias mutated compose"
+assert_contains "$out_alias" "Rendered Compose drops the legacy API alias weltgewebe-api"
+
+# The same custom path stays usable while it keeps the alias.
+cat > "$custom_override" << 'YAML'
+services:
+  api:
+    environment:
+      RUST_LOG: debug
+YAML
+state_alias_ok="$WORK_ROOT/custom-override-ok-state"
+mkdir -p "$state_alias_ok"
+mock_bin_alias_ok="$(setup_mocks "$state_alias_ok")"
+out_alias_ok="$( (cd "$repo_alias" && PATH="$mock_bin_alias_ok:/usr/bin:/bin" MOCK_STATE="$state_alias_ok" WELTGEWEBE_DEPLOY_LOCK_FILE="$state_alias_ok/deploy.lock" REPO_DIR="$repo_alias" ENV_FILE="$repo_alias/.env" DEPLOY_TARGET=vps OVERRIDE_FILE="$custom_override" WELTGEWEBE_STATE_DIR="$repo_alias/.ops" bash scripts/weltgewebe-up --no-pull --no-build --deploy-scope api --plan-only) 2>&1)" ||
+  fail "custom override that keeps the legacy API alias should pass: $out_alias_ok"
+assert_not_contains "$out_alias_ok" "drops the legacy API alias"
+echo "PASS: rendered model keeps the legacy API alias before mutation"
 
 # Incompatible frontend/caddy effects are rejected before runtime inspection.
 repo_incompatible="$(new_repo incompatible)"
