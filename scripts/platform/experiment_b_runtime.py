@@ -1200,6 +1200,86 @@ def apply_release(
     return receipt
 
 
+def _semantic_provider_live_readback(
+    root: Path, source_commit: str
+) -> dict[str, Any]:
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB("semantic provider live source commit is not exact")
+    semantic = load_config()["semantic_search"]
+    kubectl = toolchain(root)["tools"]["kubectl"]
+    env = kube_env(root)
+    tags = run(
+        [
+            kubectl, "-n", APP_NAMESPACE,
+            "exec", "deployment/weltgewebe-api",
+            "-c", "search-worker", "--",
+            "wget", "-qO-", "http://127.0.0.1:11434/api/tags",
+        ],
+        env=env,
+    ).stdout
+    payload = json.loads(tags)
+    observed = ""
+    for model in payload.get("models", []):
+        if model.get("name") == semantic["model_id"]:
+            observed = str(model.get("digest", ""))
+            break
+    expected = str(semantic["model_revision"]).removeprefix("sha256:")
+    if observed.removeprefix("sha256:") != expected:
+        raise RuntimeErrorEB(
+            "Ollama model digest differs from the pinned revision"
+        )
+
+    probe_text = "commonThing Experiment B semantic continuity"
+    probe_request = json.dumps(
+        {"model": semantic["model_id"], "input": probe_text},
+        separators=(",", ":"),
+    )
+    embedding_raw = run(
+        [
+            kubectl, "-n", APP_NAMESPACE,
+            "exec", "deployment/weltgewebe-api",
+            "-c", "search-worker", "--",
+            "wget", "-qO-",
+            "--header=Content-Type: application/json",
+            f"--post-data={probe_request}",
+            "http://127.0.0.1:11434/api/embed",
+        ],
+        env=env,
+        timeout=300,
+    ).stdout
+    embedding_payload = json.loads(embedding_raw)
+    embeddings = embedding_payload.get("embeddings")
+    dimension = int(semantic["dimension"])
+    if (
+        not isinstance(embeddings, list)
+        or len(embeddings) != 1
+        or not isinstance(embeddings[0], list)
+        or len(embeddings[0]) != dimension
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in embeddings[0]
+        )
+    ):
+        raise RuntimeErrorEB(
+            "Ollama embedding smoke does not match the pinned finite dimension"
+        )
+    return {
+        "source_commit": source_commit,
+        "provider": semantic["provider"],
+        "model_id": semantic["model_id"],
+        "model_revision": semantic["model_revision"],
+        "runtime_identity": semantic["runtime_identity"],
+        "dimension": semantic["dimension"],
+        "embedding_probe": True,
+        "embedding_probe_sha256": hashlib.sha256(
+            probe_text.encode("utf-8")
+        ).hexdigest(),
+        "literal_loopback": True,
+    }
+
+
 def semantic_activate(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
@@ -1249,63 +1329,7 @@ def semantic_activate(root: Path) -> dict[str, Any]:
             env=env,
             timeout=1800,
         )
-        tags = run(
-            [
-                kubectl, "-n", APP_NAMESPACE,
-                "exec", "deployment/weltgewebe-api",
-                "-c", "search-worker", "--",
-                "wget", "-qO-", "http://127.0.0.1:11434/api/tags",
-            ],
-            env=env,
-        ).stdout
-        payload = json.loads(tags)
-        observed = ""
-        for model in payload.get("models", []):
-            if model.get("name") == semantic["model_id"]:
-                observed = str(model.get("digest", ""))
-                break
-        expected = str(semantic["model_revision"]).removeprefix("sha256:")
-        if observed.removeprefix("sha256:") != expected:
-            raise RuntimeErrorEB(
-                "Ollama model digest differs from the pinned revision"
-            )
-
-        probe_text = "commonThing Experiment B semantic continuity"
-        probe_request = json.dumps(
-            {"model": semantic["model_id"], "input": probe_text},
-            separators=(",", ":"),
-        )
-        embedding_raw = run(
-            [
-                kubectl, "-n", APP_NAMESPACE,
-                "exec", "deployment/weltgewebe-api",
-                "-c", "search-worker", "--",
-                "wget", "-qO-",
-                "--header=Content-Type: application/json",
-                f"--post-data={probe_request}",
-                "http://127.0.0.1:11434/api/embed",
-            ],
-            env=env,
-            timeout=300,
-        ).stdout
-        embedding_payload = json.loads(embedding_raw)
-        embeddings = embedding_payload.get("embeddings")
-        dimension = int(semantic["dimension"])
-        if (
-            not isinstance(embeddings, list)
-            or len(embeddings) != 1
-            or not isinstance(embeddings[0], list)
-            or len(embeddings[0]) != dimension
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                for value in embeddings[0]
-            )
-        ):
-            raise RuntimeErrorEB(
-                "Ollama embedding smoke does not match the pinned finite dimension"
-            )
+        semantic_live = _semantic_provider_live_readback(root, source_commit)
     finally:
         _kubectl(
             root,
@@ -1327,15 +1351,7 @@ def semantic_activate(root: Path) -> dict[str, Any]:
     receipt = {
         "schema_version": 1,
         "status": "pass",
-        "source_commit": source_commit,
-        "provider": semantic["provider"],
-        "model_id": semantic["model_id"],
-        "model_revision": semantic["model_revision"],
-        "runtime_identity": semantic["runtime_identity"],
-        "dimension": semantic["dimension"],
-        "embedding_probe": True,
-        "embedding_probe_sha256": hashlib.sha256(probe_text.encode("utf-8")).hexdigest(),
-        "literal_loopback": True,
+        **semantic_live,
         "temporary_model_egress_removed": True,
         "database_generation_activation": False,
     }
@@ -2044,6 +2060,52 @@ def _require_httproute_ready(route: Any) -> dict[str, Any]:
     }
 
 
+def _final_recovery_state_readback(
+    root: Path, source_commit: str
+) -> dict[str, Any]:
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB("final recovery-state source commit is not exact")
+    recovery_failed_path = root / "receipts/recovery-failed.json"
+    if recovery_failed_path.is_file():
+        raise RuntimeErrorEB(
+            "Experiment-B status is blocked by the latest failed recovery attempt"
+        )
+    recovery_path = root / "receipts/recovery.json"
+    if not recovery_path.is_file():
+        raise RuntimeErrorEB("Experiment-B status requires recovery receipt")
+    try:
+        recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB("Experiment-B recovery receipt is not valid JSON") from exc
+    if (
+        not isinstance(recovery, dict)
+        or recovery.get("status") != "pass"
+        or recovery.get("source_commit") != source_commit
+        or recovery.get("rpo_seconds") != 0
+        or recovery.get("database_before") != recovery.get("database_after")
+        or recovery.get("jetstream_before") != recovery.get("jetstream_after")
+    ):
+        raise RuntimeErrorEB("Experiment-B recovery receipt binding is invalid")
+
+    current_database = _database_signature(root)
+    current_jetstream = _jetstream_signature(root)
+    if current_database != recovery.get("database_after"):
+        raise RuntimeErrorEB("Experiment-B database/search state drifted after recovery")
+    if current_jetstream != recovery.get("jetstream_after"):
+        raise RuntimeErrorEB("Experiment-B JetStream state drifted after recovery")
+
+    fixture_path = root / "receipts/t048-fixture.json"
+    fixture = _validated_t048_fixture_receipt(root, source_commit)
+    return {
+        "recovery_receipt_sha256": sha256_file(recovery_path),
+        "fixture_receipt_sha256": sha256_file(fixture_path),
+        "rpo_seconds": 0,
+        "database_signature": current_database,
+        "jetstream_signature": current_jetstream,
+        "fixture_live_binding": fixture.get("live_binding"),
+    }
+
+
 def status(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
@@ -2114,6 +2176,7 @@ def status(root: Path) -> dict[str, Any]:
     semantic = config["semantic_search"]
     if api_containers.get("ollama") != semantic["ollama_image"]:
         raise RuntimeErrorEB("live Ollama image does not match semantic-search pin")
+    semantic_provider = _semantic_provider_live_readback(root, source_commit)
 
     expected_secret_hashes = _expected_live_secret_hashes(root, source_commit)
     database_secret = _kubectl_json(
@@ -2192,6 +2255,7 @@ def status(root: Path) -> dict[str, Any]:
     )
     httproute_readback = _require_httproute_ready(httproute)
     gateway_data_plane = _gateway_data_plane_readback(root, source_commit)
+    recovery_state = _final_recovery_state_readback(root, source_commit)
 
     result = {
         "schema_version": 1,
@@ -2211,12 +2275,14 @@ def status(root: Path) -> dict[str, Any]:
             "ollama": api_containers.get("ollama"),
         },
         "migration_complete": release_artifacts["migration_complete"],
+        "semantic_provider": semantic_provider,
         "secrets": secret_readback,
         "pvcs": pvc_readback,
         "gateway": gateway_readback,
         "gateway_programmed": True,
         "httproute": httproute_readback,
         "gateway_data_plane": gateway_data_plane,
+        "recovery_state": recovery_state,
         "kind_runtime": False,
         "staging_cell_runtime_controller": False,
     }

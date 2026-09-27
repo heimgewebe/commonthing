@@ -149,10 +149,51 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
 
     def test_semantic_provider_smoke_is_separate_from_t048_generation(self) -> None:
         source = inspect.getsource(runtime.semantic_activate)
-        self.assertIn("/api/embed", source)
+        live = inspect.getsource(runtime._semantic_provider_live_readback)
+        self.assertIn("/api/embed", live)
+        self.assertIn("/api/tags", live)
         self.assertIn('"database_generation_activation": False', source)
         self.assertNotIn("weltgewebe_search_generation_activation_ready", source)
         self.assertNotIn("weltgewebe_activate_search_generation", source)
+
+    def test_semantic_provider_live_readback_requires_pinned_model_and_embedding(self) -> None:
+        commit = "a" * 40
+        config = runtime.load_config()
+        semantic = config["semantic_search"]
+        dimension = int(semantic["dimension"])
+        digest = str(semantic["model_revision"]).removeprefix("sha256:")
+        tags = runtime.subprocess.CompletedProcess(
+            ["kubectl"], 0,
+            stdout=json.dumps({"models": [{"name": semantic["model_id"], "digest": digest}]}),
+            stderr="",
+        )
+        embed = runtime.subprocess.CompletedProcess(
+            ["kubectl"], 0,
+            stdout=json.dumps({"embeddings": [[0.0] * dimension]}),
+            stderr="",
+        )
+        with (
+            mock.patch.object(runtime, "load_config", return_value=config),
+            mock.patch.object(runtime, "toolchain", return_value={"tools": {"kubectl": "kubectl"}}),
+            mock.patch.object(runtime, "kube_env", return_value={}),
+            mock.patch.object(runtime, "run", side_effect=[tags, embed]),
+        ):
+            observed = runtime._semantic_provider_live_readback(Path("."), commit)
+        self.assertEqual(observed["model_revision"], semantic["model_revision"])
+        self.assertEqual(observed["dimension"], dimension)
+        self.assertTrue(observed["embedding_probe"])
+
+        missing = runtime.subprocess.CompletedProcess(
+            ["kubectl"], 0, stdout=json.dumps({"models": []}), stderr=""
+        )
+        with (
+            mock.patch.object(runtime, "load_config", return_value=config),
+            mock.patch.object(runtime, "toolchain", return_value={"tools": {"kubectl": "kubectl"}}),
+            mock.patch.object(runtime, "kube_env", return_value={}),
+            mock.patch.object(runtime, "run", return_value=missing),
+        ):
+            with self.assertRaisesRegex(runtime.RuntimeErrorEB, "model digest"):
+                runtime._semantic_provider_live_readback(Path("."), commit)
 
     def test_live_check_attempt_invalidates_stale_success_and_binds_completion(self) -> None:
         commit = "a" * 40
@@ -2454,6 +2495,31 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 },
             },
         )
+        self.semantic_provider = self.patch(
+            "_semantic_provider_live_readback",
+            return_value={
+                "source_commit": self.commit,
+                "provider": self.config["semantic_search"]["provider"],
+                "model_id": self.config["semantic_search"]["model_id"],
+                "model_revision": self.config["semantic_search"]["model_revision"],
+                "runtime_identity": self.config["semantic_search"]["runtime_identity"],
+                "dimension": self.config["semantic_search"]["dimension"],
+                "embedding_probe": True,
+                "embedding_probe_sha256": "d" * 64,
+                "literal_loopback": True,
+            },
+        )
+        self.recovery_state = self.patch(
+            "_final_recovery_state_readback",
+            return_value={
+                "recovery_receipt_sha256": "e" * 64,
+                "fixture_receipt_sha256": "f" * 64,
+                "rpo_seconds": 0,
+                "database_signature": {"state": "stable"},
+                "jetstream_signature": {"state": "stable"},
+                "fixture_live_binding": {"generation_id": "fixture"},
+            },
+        )
         self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
 
     def kubernetes_fixture(self, _root, arguments):
@@ -2663,6 +2729,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "http://192.168.122.20",
         )
         self.gateway_data_plane.assert_called_once_with(self.root, self.commit)
+        self.semantic_provider.assert_called_once_with(self.root, self.commit)
+        self.recovery_state.assert_called_once_with(self.root, self.commit)
+        self.assertTrue(result["semantic_provider"]["embedding_probe"])
+        self.assertEqual(result["recovery_state"]["rpo_seconds"], 0)
         attempt = json.loads((self.root / "receipts/status-attempt.json").read_text())
         self.assertEqual(attempt["status"], "pass")
         self.assertEqual(attempt["receipt_sha256"], runtime.sha256_file(self.root / "receipts/status.json"))
@@ -2999,6 +3069,86 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "gateway data plane failed"
         )
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "gateway data plane failed"):
+            runtime.status(self.root)
+        self.assertFalse((self.root / "receipts/status.json").exists())
+        self.assertFalse((self.root / "receipts/portability.json").exists())
+
+    def test_final_recovery_state_readback_binds_current_signatures_and_fixture(self) -> None:
+        recovery = {
+            "schema_version": 1,
+            "status": "pass",
+            "source_commit": self.commit,
+            "rpo_seconds": 0,
+            "database_before": {"db": "stable"},
+            "database_after": {"db": "stable"},
+            "jetstream_before": {"nats": "stable"},
+            "jetstream_after": {"nats": "stable"},
+        }
+        runtime.atomic_json(self.root / "receipts/recovery.json", recovery)
+        runtime.atomic_json(
+            self.root / "receipts/t048-fixture.json",
+            {
+                "schema_version": 1,
+                "status": "loaded",
+                "source_commit": self.commit,
+                "live_binding": {"generation_id": "fixture"},
+            },
+        )
+        with (
+            mock.patch.object(runtime, "_database_signature", return_value={"db": "stable"}),
+            mock.patch.object(runtime, "_jetstream_signature", return_value={"nats": "stable"}),
+            mock.patch.object(
+                runtime,
+                "_validated_t048_fixture_receipt",
+                return_value={
+                    "status": "loaded",
+                    "source_commit": self.commit,
+                    "live_binding": {"generation_id": "fixture"},
+                },
+            ) as fixture,
+        ):
+            result = runtime._final_recovery_state_readback(self.root, self.commit)
+        self.assertEqual(result["database_signature"], {"db": "stable"})
+        self.assertEqual(result["jetstream_signature"], {"nats": "stable"})
+        fixture.assert_called_once_with(self.root, self.commit)
+
+        runtime.atomic_json(
+            self.root / "receipts/recovery-failed.json",
+            {
+                "schema_version": 1,
+                "status": "failed",
+                "source_commit": self.commit,
+            },
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "latest failed recovery"):
+            runtime._final_recovery_state_readback(self.root, self.commit)
+        (self.root / "receipts/recovery-failed.json").unlink()
+
+        with (
+            mock.patch.object(runtime, "_database_signature", return_value={"db": "drift"}),
+            mock.patch.object(runtime, "_jetstream_signature", return_value={"nats": "stable"}),
+        ):
+            with self.assertRaisesRegex(runtime.RuntimeErrorEB, "database/search state drifted"):
+                runtime._final_recovery_state_readback(self.root, self.commit)
+
+    def test_status_rechecks_semantic_provider_live(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        self.semantic_provider.side_effect = runtime.RuntimeErrorEB(
+            "Ollama model digest differs from the pinned revision"
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "model digest"):
+            runtime.status(self.root)
+        self.assertFalse((self.root / "receipts/status.json").exists())
+        self.assertFalse((self.root / "receipts/portability.json").exists())
+
+    def test_status_revalidates_recovered_state(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        self.recovery_state.side_effect = runtime.RuntimeErrorEB(
+            "Experiment-B database/search state drifted after recovery"
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "drifted after recovery"):
             runtime.status(self.root)
         self.assertFalse((self.root / "receipts/status.json").exists())
         self.assertFalse((self.root / "receipts/portability.json").exists())
