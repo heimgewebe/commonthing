@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import inspect
 import json
@@ -319,7 +320,9 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             absent = runtime.subprocess.CompletedProcess(
                 ["virsh"], 1, stdout="", stderr=""
             )
+            retirement = root / "experiment-b-retirement.json"
             with (
+                mock.patch.object(runtime, "RETIREMENT_RECEIPT", retirement),
                 mock.patch.object(runtime, "_current_protected_main_commit", return_value="a" * 40),
                 mock.patch.object(runtime, "load_config", return_value={}),
                 mock.patch.object(runtime, "run", return_value=absent),
@@ -334,6 +337,35 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
 
             for name in runtime.VM_ATTEMPT_INVALIDATES:
                 self.assertFalse((receipts / name).exists(), name)
+
+    def test_create_vm_rerun_invalidates_retirement_before_prepare_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            retirement = root / "experiment-b-retirement.json"
+            runtime.atomic_json(
+                retirement,
+                {"schema_version": 1, "status": "retired"},
+            )
+            absent = runtime.subprocess.CompletedProcess(
+                ["virsh"], 1, stdout="", stderr=""
+            )
+            with (
+                mock.patch.object(runtime, "RETIREMENT_RECEIPT", retirement),
+                mock.patch.object(
+                    runtime, "_current_protected_main_commit", return_value="a" * 40
+                ),
+                mock.patch.object(runtime, "load_config", return_value={}),
+                mock.patch.object(runtime, "run", return_value=absent),
+                mock.patch.object(
+                    runtime,
+                    "prepare",
+                    side_effect=runtime.RuntimeErrorEB("prepare failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "prepare failed"):
+                    runtime.create_vm(root)
+
+            self.assertFalse(retirement.exists())
 
     def test_dirty_k3s_rerun_invalidates_stale_chain_before_binding_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2082,6 +2114,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
+        self.patch(
+            "RETIREMENT_RECEIPT",
+            self.root / "experiment-b-retirement.json",
+        )
         self.pool = self.root / "pool"
         self.pool.mkdir()
         self.base_bytes = b"pinned Ubuntu image fixture"
@@ -2173,7 +2209,9 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     "name": "weltgewebe-runtime",
                 },
                 "type": "Opaque",
-                "data": {"database-url": "cG9zdGdyZXM="},
+                "data": {
+                    "database-url": "cG9zdGdyZXNxbDovL3VzZXI6cGFzc0Bwb3N0Z3Jlcy5jb21tb250aGluZy1kYXRhLnN2Yy5jbHVzdGVyLmxvY2FsOjU0MzIvZGI="
+                },
             },
             f"{runtime.APP_NAMESPACE}/commonthing-experiment-b-registry": {
                 "metadata": {
@@ -2349,6 +2387,23 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "source_commit": self.commit, "api_digest": "sha256:" + "b" * 64,
             "web_digest": "sha256:" + "c" * 64,
         })
+        runtime.atomic_json(
+            self.root / "secrets/database.json",
+            {"username": "user", "database": "db", "password": "pass"},
+        )
+        runtime.atomic_json(
+            self.root / "receipts/secrets.json",
+            {
+                "schema_version": 1,
+                "status": "ready",
+                "source_commit": self.commit,
+                "database_secret": "commonthing-experiment-b-database",
+                "runtime_secret": "weltgewebe-runtime",
+                "registry_secret": "commonthing-experiment-b-registry",
+                "registry_source_sha256": hashlib.sha256(b"{}").hexdigest(),
+                "secret_values_recorded": False,
+            },
+        )
         self.tools = self.patch("toolchain", return_value={"tools": {"kubectl": "kubectl"}})
         self.patch("kube_env", return_value={})
         self.patch("vm_ip", return_value="192.168.122.10")
@@ -2575,10 +2630,12 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "dXNlcg==",
             "ZGI=",
             "cGFzcw==",
-            "cG9zdGdyZXM=",
+            "cG9zdGdyZXNxbDovL3VzZXI6cGFzc0Bwb3N0Z3Jlcy5jb21tb250aGluZy1kYXRhLnN2Yy5jbHVzdGVyLmxvY2FsOjU0MzIvZGI=",
             "e30=",
         ):
             self.assertNotIn(encoded_value, rendered)
+        self.assertNotIn("postgresql://user:pass@", rendered)
+        self.assertNotIn('"content_sha256"', rendered)
 
         cases = []
 
@@ -2612,6 +2669,34 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         ]["metadata"]["name"] = "other"
         cases.append(("wrong-identity", wrong_identity))
 
+        wrong_password = json.loads(json.dumps(healthy))
+        wrong_password[
+            f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database"
+        ]["data"]["password"] = base64.b64encode(b"wrong").decode("ascii")
+        cases.append(("wrong-nonempty-password", wrong_password))
+
+        wrong_runtime_url = json.loads(json.dumps(healthy))
+        wrong_runtime_url[
+            f"{runtime.APP_NAMESPACE}/weltgewebe-runtime"
+        ]["data"]["database-url"] = base64.b64encode(
+            b"postgresql://user:pass@postgres.commonthing-data.svc.cluster.local:5432/other"
+        ).decode("ascii")
+        cases.append(("wrong-nonempty-runtime-url", wrong_runtime_url))
+
+        wrong_registry = json.loads(json.dumps(healthy))
+        wrong_registry[
+            f"{runtime.APP_NAMESPACE}/commonthing-experiment-b-registry"
+        ]["data"][".dockerconfigjson"] = base64.b64encode(
+            b'{"auths":{"ghcr.io":{}}}'
+        ).decode("ascii")
+        cases.append(("wrong-nonempty-registry", wrong_registry))
+
+        malformed_base64 = json.loads(json.dumps(healthy))
+        malformed_base64[
+            f"{runtime.APP_NAMESPACE}/weltgewebe-runtime"
+        ]["data"]["database-url"] = "***not-base64***"
+        cases.append(("malformed-base64", malformed_base64))
+
         for name, secrets in cases:
             with self.subTest(case=name):
                 self.live_secrets = secrets
@@ -2641,6 +2726,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "weltgewebe-runtime",
             "Opaque",
             {"database-url"},
+            {
+                "database-url": hashlib.sha256(
+                    b"sensitive-value"
+                ).hexdigest()
+            },
         )
         self.assertEqual(observed["required_keys"], ["database-url"])
         self.assertNotIn("data", observed)

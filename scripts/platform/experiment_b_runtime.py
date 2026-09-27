@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import csv
 import hashlib
 import ipaddress
@@ -624,6 +625,7 @@ def _require_vm_create_receipt(
 
 
 def create_vm(root: Path) -> dict[str, Any]:
+    RETIREMENT_RECEIPT.unlink(missing_ok=True)
     _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
     config = load_config()
@@ -1663,13 +1665,85 @@ def _require_requested_release_artifacts(
     }
 
 
+def _expected_live_secret_hashes(
+    root: Path, source_commit: str
+) -> dict[str, dict[str, str]]:
+    receipt_path = root / "receipts/secrets.json"
+    database_path = root / "secrets/database.json"
+    if not database_path.is_file() or database_path.is_symlink():
+        raise RuntimeErrorEB(
+            "Experiment-B status requires private database Secret source material"
+        )
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        database = json.loads(database_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B status requires valid private Secret source material"
+        ) from exc
+
+    if not isinstance(receipt, dict) or (
+        receipt.get("schema_version") != 1
+        or receipt.get("status") != "ready"
+        or receipt.get("source_commit") != source_commit
+        or receipt.get("database_secret") != "commonthing-experiment-b-database"
+        or receipt.get("runtime_secret") != "weltgewebe-runtime"
+        or receipt.get("registry_secret") != "commonthing-experiment-b-registry"
+        or receipt.get("secret_values_recorded") is not False
+    ):
+        raise RuntimeErrorEB("Experiment-B Secret receipt binding drifted")
+
+    registry_source_sha256 = receipt.get("registry_source_sha256")
+    if (
+        not isinstance(registry_source_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", registry_source_sha256) is None
+    ):
+        raise RuntimeErrorEB("Experiment-B registry Secret source digest is invalid")
+
+    expected_database_keys = {"username", "database", "password"}
+    if (
+        not isinstance(database, dict)
+        or set(database) != expected_database_keys
+        or any(
+            not isinstance(database.get(key), str) or not database[key]
+            for key in expected_database_keys
+        )
+    ):
+        raise RuntimeErrorEB("Experiment-B database Secret source material is invalid")
+
+    database_url = (
+        f"postgresql://{database['username']}:{database['password']}"
+        f"@postgres.{DATA_NAMESPACE}.svc.cluster.local:5432/{database['database']}"
+    )
+
+    def digest_text(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    return {
+        "database": {
+            key: digest_text(database[key])
+            for key in expected_database_keys
+        },
+        "runtime": {"database-url": digest_text(database_url)},
+        "registry": {".dockerconfigjson": registry_source_sha256},
+    }
+
+
 def _require_live_secret(
     secret: Any,
     namespace: str,
     name: str,
     secret_type: str,
     required_keys: set[str],
+    expected_sha256: dict[str, str],
 ) -> dict[str, Any]:
+    if set(expected_sha256) != required_keys or any(
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in expected_sha256.values()
+    ):
+        raise RuntimeErrorEB(
+            f"Experiment-B Secret expected-content contract is invalid: {namespace}/{name}"
+        )
     if not isinstance(secret, dict):
         raise RuntimeErrorEB(f"Experiment-B Secret is not an object: {namespace}/{name}")
     metadata = secret.get("metadata", {})
@@ -1698,6 +1772,18 @@ def _require_live_secret(
         raise RuntimeErrorEB(
             f"Experiment-B Secret is missing required keys: {namespace}/{name}: {missing}"
         )
+    for key in sorted(required_keys):
+        try:
+            decoded = base64.b64decode(data[key], validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise RuntimeErrorEB(
+                f"Experiment-B Secret contains invalid encoded data: {namespace}/{name}/{key}"
+            ) from exc
+        observed_sha256 = hashlib.sha256(decoded).hexdigest()
+        if not secrets.compare_digest(observed_sha256, expected_sha256[key]):
+            raise RuntimeErrorEB(
+                f"Experiment-B Secret content drifted: {namespace}/{name}/{key}"
+            )
     return {
         "namespace": namespace,
         "name": name,
@@ -1705,6 +1791,7 @@ def _require_live_secret(
         "required_keys": sorted(required_keys),
         "present": True,
         "terminating": False,
+        "content_verified": True,
     }
 
 
@@ -1939,6 +2026,7 @@ def status(root: Path) -> dict[str, Any]:
     if api_containers.get("ollama") != semantic["ollama_image"]:
         raise RuntimeErrorEB("live Ollama image does not match semantic-search pin")
 
+    expected_secret_hashes = _expected_live_secret_hashes(root, source_commit)
     database_secret = _kubectl_json(
         root,
         [
@@ -1964,6 +2052,7 @@ def status(root: Path) -> dict[str, Any]:
             "commonthing-experiment-b-database",
             "Opaque",
             {"username", "database", "password"},
+            expected_secret_hashes["database"],
         ),
         "runtime": _require_live_secret(
             runtime_secret,
@@ -1971,6 +2060,7 @@ def status(root: Path) -> dict[str, Any]:
             "weltgewebe-runtime",
             "Opaque",
             {"database-url"},
+            expected_secret_hashes["runtime"],
         ),
         "registry": _require_live_secret(
             registry_secret,
@@ -1978,6 +2068,7 @@ def status(root: Path) -> dict[str, Any]:
             "commonthing-experiment-b-registry",
             "kubernetes.io/dockerconfigjson",
             {".dockerconfigjson"},
+            expected_secret_hashes["registry"],
         ),
     }
 
