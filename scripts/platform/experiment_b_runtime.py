@@ -3510,16 +3510,28 @@ def _container_runtime_contract(
         "args",
         "env",
         "envFrom",
-        "ports",
         "lifecycle",
         "resources",
         "securityContext",
         "volumeMounts",
         "workingDir",
     )
+    ports = container.get("ports", [])
+    if ports is None:
+        ports = []
+    if not isinstance(ports, list) or any(
+        not isinstance(port, dict) for port in ports
+    ):
+        raise RuntimeErrorEB(f"{context} container ports contract is invalid")
+    normalized_ports = json.loads(json.dumps(ports))
+    for port in normalized_ports:
+        port.setdefault("protocol", "TCP")
+        if port.get("hostPort") == 0:
+            port.pop("hostPort", None)
     result = {
         "name": name,
         **{field: container.get(field) for field in fields},
+        "ports": normalized_ports,
     }
     for probe_field in (
         "startupProbe",
@@ -3540,16 +3552,18 @@ def _application_pod_spec_projection(
     if not isinstance(pod_spec, dict):
         raise RuntimeErrorEB(f"{context} Pod spec is invalid")
     result: dict[str, Any] = {
-        "serviceAccountName": pod_spec.get("serviceAccountName"),
+        "serviceAccountName": pod_spec.get(
+            "serviceAccountName", "default"
+        ),
         "automountServiceAccountToken": pod_spec.get(
             "automountServiceAccountToken"
         ),
         "terminationGracePeriodSeconds": pod_spec.get(
-            "terminationGracePeriodSeconds"
+            "terminationGracePeriodSeconds", 30
         ),
         "securityContext": pod_spec.get("securityContext"),
-        "imagePullSecrets": pod_spec.get("imagePullSecrets"),
-        "volumes": pod_spec.get("volumes"),
+        "imagePullSecrets": pod_spec.get("imagePullSecrets") or [],
+        "volumes": pod_spec.get("volumes") or [],
         "topologySpreadConstraints": pod_spec.get(
             "topologySpreadConstraints"
         ),
@@ -3648,7 +3662,7 @@ def _rendered_application_workload_contract(
         )
         deployment_contract = {
             "replicas": replicas,
-            "revisionHistoryLimit": spec.get("revisionHistoryLimit"),
+            "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
             "strategy": spec.get("strategy"),
             "selector_labels": _pod_selector_match_labels(
                 deployment, f"rendered application Deployment {name}"
@@ -3670,6 +3684,191 @@ def _rendered_application_workload_contract(
             "contract": deployment_contract,
             "contract_sha256": _stable_json_sha256(deployment_contract),
             "pod_contract_sha256": _stable_json_sha256(pod_contract),
+        }
+    return result
+
+
+def _service_account_contract_projection(
+    service_account: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(service_account, dict):
+        raise RuntimeErrorEB(f"{context} ServiceAccount payload is invalid")
+    metadata = service_account.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise RuntimeErrorEB(f"{context} ServiceAccount metadata is invalid")
+    labels = metadata.get("labels", {})
+    annotations = metadata.get("annotations", {})
+    if not isinstance(labels, dict) or not isinstance(annotations, dict):
+        raise RuntimeErrorEB(
+            f"{context} ServiceAccount metadata contract is invalid"
+        )
+
+    def ref_names(field: str) -> list[str]:
+        values = service_account.get(field, [])
+        if values is None:
+            values = []
+        if not isinstance(values, list):
+            raise RuntimeErrorEB(
+                f"{context} ServiceAccount {field} contract is invalid"
+            )
+        names: list[str] = []
+        for value in values:
+            name = value.get("name") if isinstance(value, dict) else None
+            if not isinstance(name, str) or not name:
+                raise RuntimeErrorEB(
+                    f"{context} ServiceAccount {field} entry is invalid"
+                )
+            names.append(name)
+        if len(names) != len(set(names)):
+            raise RuntimeErrorEB(
+                f"{context} ServiceAccount {field} contains duplicates"
+            )
+        return sorted(names)
+
+    automount = service_account.get("automountServiceAccountToken")
+    if automount is not None and not isinstance(automount, bool):
+        raise RuntimeErrorEB(
+            f"{context} ServiceAccount automount contract is invalid"
+        )
+    return {
+        "labels": {
+            str(key): str(value)
+            for key, value in sorted(labels.items())
+        },
+        "annotations": {
+            str(key): str(value)
+            for key, value in sorted(annotations.items())
+        },
+        "automountServiceAccountToken": automount,
+        "imagePullSecrets": ref_names("imagePullSecrets"),
+        "secrets": ref_names("secrets"),
+    }
+
+
+def _rendered_application_service_account_contract(
+    root: Path,
+    release: dict[str, Any],
+) -> dict[str, Any]:
+    api_digest = release.get("api_digest") if isinstance(release, dict) else None
+    web_digest = release.get("web_digest") if isinstance(release, dict) else None
+    if (
+        not isinstance(api_digest, str)
+        or not DIGEST_RE.fullmatch(api_digest)
+        or not isinstance(web_digest, str)
+        or not DIGEST_RE.fullmatch(web_digest)
+    ):
+        raise RuntimeErrorEB(
+            "application ServiceAccount contract requires exact release digests"
+        )
+    kustomize = toolchain(root)["tools"].get("kustomize")
+    if not isinstance(kustomize, str) or not kustomize:
+        raise RuntimeErrorEB(
+            "application ServiceAccount contract requires pinned kustomize"
+        )
+    rendered = run([kustomize, "build", str(APP_OVERLAY)]).stdout
+    rendered = rendered.replace("$" + "{API_DIGEST}", api_digest).replace(
+        "$" + "{WEB_DIGEST}", web_digest
+    )
+    try:
+        documents = [
+            document
+            for document in yaml.safe_load_all(rendered)
+            if isinstance(document, dict)
+        ]
+    except yaml.YAMLError as exc:
+        raise RuntimeErrorEB(
+            "rendered Experiment-B ServiceAccount contract is invalid"
+        ) from exc
+
+    referenced: set[str] = set()
+    for workload in ("weltgewebe-api", "weltgewebe-web"):
+        deployments = [
+            document
+            for document in documents
+            if document.get("kind") == "Deployment"
+            and document.get("metadata", {}).get("name") == workload
+            and document.get("metadata", {}).get("namespace") == APP_NAMESPACE
+        ]
+        if len(deployments) != 1:
+            raise RuntimeErrorEB(
+                f"rendered application Deployment is ambiguous: {workload}"
+            )
+        service_account_name = (
+            deployments[0]
+            .get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("serviceAccountName")
+        )
+        if not isinstance(service_account_name, str) or not service_account_name:
+            raise RuntimeErrorEB(
+                f"rendered application Deployment has no ServiceAccount: {workload}"
+            )
+        referenced.add(service_account_name)
+
+    result: dict[str, Any] = {}
+    for name in sorted(referenced):
+        matches = [
+            document
+            for document in documents
+            if document.get("kind") == "ServiceAccount"
+            and document.get("metadata", {}).get("name") == name
+            and document.get("metadata", {}).get("namespace") == APP_NAMESPACE
+        ]
+        if len(matches) != 1:
+            raise RuntimeErrorEB(
+                f"rendered application ServiceAccount is ambiguous: {name}"
+            )
+        contract = _service_account_contract_projection(
+            matches[0], f"rendered application ServiceAccount {name}"
+        )
+        result[name] = {
+            "contract": contract,
+            "contract_sha256": _stable_json_sha256(contract),
+        }
+    if not result:
+        raise RuntimeErrorEB(
+            "rendered application ServiceAccount contract is empty"
+        )
+    return result
+
+
+def _require_live_application_service_accounts(
+    root: Path,
+    release: dict[str, Any],
+) -> dict[str, Any]:
+    expected = _rendered_application_service_account_contract(root, release)
+    result: dict[str, Any] = {}
+    for name, expected_value in expected.items():
+        service_account = _kubectl_json(
+            root,
+            ["-n", APP_NAMESPACE, "get", "serviceaccount", name],
+        )
+        metadata = (
+            service_account.get("metadata", {})
+            if isinstance(service_account, dict)
+            else {}
+        )
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or metadata.get("namespace") != APP_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+        ):
+            raise RuntimeErrorEB(
+                f"live application ServiceAccount identity drifted: {name}"
+            )
+        observed = _service_account_contract_projection(
+            service_account, f"live application ServiceAccount {name}"
+        )
+        if observed != expected_value["contract"]:
+            raise RuntimeErrorEB(
+                f"live application ServiceAccount contract drifted: {name}"
+            )
+        result[name] = {
+            "contract_sha256": expected_value["contract_sha256"],
+            "canonical": True,
         }
     return result
 
@@ -3905,12 +4104,50 @@ def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]
         raise RuntimeErrorEB(
             f"versioned data Deployment replica contract drifted: {name}"
         )
+    deployment = matches[0]
+    template = spec.get("template", {}) if isinstance(spec, dict) else {}
+    template_metadata = (
+        template.get("metadata", {}) if isinstance(template, dict) else {}
+    )
+    pod_spec = template.get("spec", {}) if isinstance(template, dict) else {}
+    if not isinstance(template_metadata, dict):
+        raise RuntimeErrorEB(
+            f"versioned data Deployment template metadata is invalid: {name}"
+        )
     images = _pod_spec_images(
-        spec.get("template", {}).get("spec"),
+        pod_spec,
         f"versioned data Deployment {name}",
     )
-    selector = _pod_selector_match_labels(matches[0], f"versioned data Deployment {name}")
-    return {"replicas": replicas, "images": images, "selector_labels": selector}
+    selector = _pod_selector_match_labels(
+        deployment, f"versioned data Deployment {name}"
+    )
+    pod_contract = _application_pod_spec_projection(
+        pod_spec, f"versioned data Deployment {name}"
+    )
+    deployment_contract = {
+        "replicas": replicas,
+        "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
+        "strategy": spec.get("strategy"),
+        "selector_labels": selector,
+        "template_labels": template_metadata.get("labels", {}),
+        "template_annotations": template_metadata.get("annotations", {}),
+        "pod_spec": pod_contract,
+    }
+    if (
+        not isinstance(deployment_contract["template_labels"], dict)
+        or not isinstance(deployment_contract["template_annotations"], dict)
+    ):
+        raise RuntimeErrorEB(
+            f"versioned data Deployment template metadata is invalid: {name}"
+        )
+    return {
+        "replicas": replicas,
+        "images": images,
+        "selector_labels": selector,
+        "contract": deployment_contract,
+        "contract_sha256": _stable_json_sha256(deployment_contract),
+        "pod_contract_sha256": _stable_json_sha256(pod_contract),
+    }
 
 
 def _require_live_data_deployments(root: Path) -> dict[str, Any]:
@@ -3952,14 +4189,54 @@ def _require_live_data_deployments(root: Path) -> dict[str, Any]:
         availability = _deployment_availability_snapshot(
             deployment, name, expected["replicas"]
         )
+        live_spec = deployment.get("spec", {})
+        live_template = (
+            live_spec.get("template", {})
+            if isinstance(live_spec, dict)
+            else {}
+        )
+        live_template_metadata = (
+            live_template.get("metadata", {})
+            if isinstance(live_template, dict)
+            else {}
+        )
+        if not isinstance(live_template_metadata, dict):
+            raise RuntimeErrorEB(
+                f"live data Deployment template metadata is invalid: {name}"
+            )
+        live_pod_spec = (
+            live_template.get("spec", {})
+            if isinstance(live_template, dict)
+            else {}
+        )
         live_images = _pod_spec_images(
-            deployment.get("spec", {}).get("template", {}).get("spec"),
+            live_pod_spec,
             f"live data Deployment {name}",
         )
         if live_images != expected["images"]:
             raise RuntimeErrorEB(
                 f"live data Deployment images drifted from versioned manifest: {name}"
             )
+        observed_contract = {
+            "replicas": live_spec.get("replicas"),
+            "revisionHistoryLimit": live_spec.get(
+                "revisionHistoryLimit", 10
+            ),
+            "strategy": live_spec.get("strategy"),
+            "selector_labels": live_selector,
+            "template_labels": live_template_metadata.get("labels", {}),
+            "template_annotations": live_template_metadata.get(
+                "annotations", {}
+            ),
+            "pod_spec": _application_pod_spec_projection(
+                live_pod_spec, f"live data Deployment {name}"
+            ),
+        }
+        if observed_contract != expected["contract"]:
+            raise RuntimeErrorEB(
+                f"live data Deployment contract drifted from versioned manifest: {name}"
+            )
+
         matching_pods = _pods_matching_labels(
             pod_items, expected["selector_labels"]
         )
@@ -3972,11 +4249,62 @@ def _require_live_data_deployments(root: Path) -> dict[str, Any]:
             required_labels=expected["selector_labels"],
             context="data Pod",
         )
+        if len(matching_pods) != expected["replicas"]:
+            raise RuntimeErrorEB(
+                f"live data Pod set drifted: {name}"
+            )
+        pod_names: list[str] = []
+        for pod in matching_pods:
+            metadata = pod.get("metadata", {}) if isinstance(pod, dict) else {}
+            pod_spec = pod.get("spec", {}) if isinstance(pod, dict) else {}
+            labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+            annotations = (
+                metadata.get("annotations", {})
+                if isinstance(metadata, dict)
+                else {}
+            )
+            pod_name = metadata.get("name") if isinstance(metadata, dict) else None
+            if (
+                not isinstance(pod_name, str)
+                or not pod_name
+                or pod_name in pod_names
+                or metadata.get("namespace") != DATA_NAMESPACE
+                or metadata.get("deletionTimestamp") is not None
+                or not isinstance(labels, dict)
+                or not isinstance(annotations, dict)
+                or any(
+                    labels.get(key) != value
+                    for key, value in expected["contract"][
+                        "template_labels"
+                    ].items()
+                )
+                or any(
+                    annotations.get(key) != value
+                    for key, value in expected["contract"][
+                        "template_annotations"
+                    ].items()
+                )
+                or _application_pod_spec_projection(
+                    pod_spec, f"live data Pod {pod_name}"
+                )
+                != expected["contract"]["pod_spec"]
+            ):
+                raise RuntimeErrorEB(
+                    f"live data Pod contract drifted: {name}"
+                )
+            pod_names.append(pod_name)
+
         result[name] = {
             **availability,
             "images_sha256": _stable_json_sha256(live_images),
             "images_canonical": True,
             "pods": pod_readback,
+            "contract_sha256": expected["contract_sha256"],
+            "pod_contract_sha256": expected[
+                "pod_contract_sha256"
+            ],
+            "pod_names": sorted(pod_names),
+            "canonical": True,
         }
     return result
 
@@ -4634,6 +4962,9 @@ def status(root: Path) -> dict[str, Any]:
             "weltgewebe-web": web_pods,
         },
     )
+    application_service_accounts = (
+        _require_live_application_service_accounts(root, release)
+    )
     semantic_provider = _semantic_provider_live_readback(root, source_commit)
 
     expected_secret_values = _expected_live_secret_values(root, source_commit)
@@ -4740,6 +5071,7 @@ def status(root: Path) -> dict[str, Any]:
         "data_deployments": data_deployment_readback,
         "data_services": data_service_readback,
         "application_workloads": application_workloads,
+        "application_service_accounts": application_service_accounts,
         "pods": pod_readback,
         "images": {
             **release_artifacts["images"],
@@ -7804,6 +8136,13 @@ def portability_report(root: Path) -> dict[str, Any]:
             or observed.get("images_canonical") is not True
             or observed.get("images_sha256")
             != _stable_json_sha256(expected["images"])
+            or observed.get("canonical") is not True
+            or observed.get("contract_sha256")
+            != expected["contract_sha256"]
+            or observed.get("pod_contract_sha256")
+            != expected["pod_contract_sha256"]
+            or not isinstance(observed.get("pod_names"), list)
+            or len(observed["pod_names"]) != expected["replicas"]
         ):
             raise RuntimeErrorEB(
                 f"status does not prove the live data Deployment contract: {name}"
@@ -7928,6 +8267,33 @@ def portability_report(root: Path) -> dict[str, Any]:
         ):
             raise RuntimeErrorEB(
                 f"status does not prove the complete application workload contract: {name}"
+            )
+
+    service_account_status = status_payload.get(
+        "application_service_accounts"
+    )
+    expected_service_accounts = (
+        _rendered_application_service_account_contract(
+            root, payloads["release.json"]
+        )
+    )
+    if (
+        not isinstance(service_account_status, dict)
+        or set(service_account_status) != set(expected_service_accounts)
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the application ServiceAccount contract"
+        )
+    for name, expected in expected_service_accounts.items():
+        observed = service_account_status.get(name)
+        if (
+            not isinstance(observed, dict)
+            or observed.get("canonical") is not True
+            or observed.get("contract_sha256")
+            != expected["contract_sha256"]
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the application ServiceAccount contract: {name}"
             )
 
     runtime_status = status_payload.get("runtime_contract")

@@ -1688,6 +1688,27 @@ spec:
                 "pod_contract_sha256": "a" * 64,
             },
         }
+        application_service_account_expected_contract = {
+            name: {
+                "contract": {
+                    "labels": {"app.kubernetes.io/name": name},
+                    "annotations": {},
+                    "automountServiceAccountToken": False,
+                    "imagePullSecrets": [],
+                    "secrets": [],
+                },
+                "contract_sha256": runtime._stable_json_sha256(
+                    {
+                        "labels": {"app.kubernetes.io/name": name},
+                        "annotations": {},
+                        "automountServiceAccountToken": False,
+                        "imagePullSecrets": [],
+                        "secrets": [],
+                    }
+                ),
+            }
+            for name in ("weltgewebe-api", "weltgewebe-web")
+        }
         statuses = {
             "vm-create.json": "created",
             "k3s.json": "ready",
@@ -1722,6 +1743,11 @@ spec:
                 runtime,
                 "_rendered_application_workload_contract",
                 return_value=application_expected_contract,
+            ),
+            mock.patch.object(
+                runtime,
+                "_rendered_application_service_account_contract",
+                return_value=application_service_account_expected_contract,
             ),
         ):
             root = Path(tmp)
@@ -1925,6 +1951,17 @@ spec:
                                 expected["images"],
                                 expected["replicas"],
                             ),
+                            "contract_sha256": expected[
+                                "contract_sha256"
+                            ],
+                            "pod_contract_sha256": expected[
+                                "pod_contract_sha256"
+                            ],
+                            "pod_names": [
+                                f"{name}-{index}"
+                                for index in range(expected["replicas"])
+                            ],
+                            "canonical": True,
                         }
                         for name, expected in (
                             (
@@ -1977,6 +2014,17 @@ spec:
                             "canonical": True,
                         }
                         for name, expected in application_expected_contract.items()
+                    }
+                    payload["application_service_accounts"] = {
+                        name: {
+                            "contract_sha256": expected[
+                                "contract_sha256"
+                            ],
+                            "canonical": True,
+                        }
+                        for name, expected in (
+                            application_service_account_expected_contract.items()
+                        )
                     }
                     runtime_binding = config["runtime_binding"]
                     api_images = {
@@ -2139,6 +2187,38 @@ spec:
             status_path.write_text(original_status, encoding="utf-8")
             attempt_path.write_text(original_attempt, encoding="utf-8")
             self.assertEqual(runtime.portability_report(root)["status"], "pass")
+
+            changed_status = json.loads(original_status)
+            changed_status["data_deployments"]["nats"][
+                "contract_sha256"
+            ] = "0" * 64
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "live data Deployment contract",
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["application_service_accounts"][
+                "weltgewebe-api"
+            ]["contract_sha256"] = "0" * 64
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "application ServiceAccount contract",
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
 
             changed_status = json.loads(original_status)
             changed_status["runtime_contract"]["config_map_data_sha256"] = "0" * 64
@@ -3587,36 +3667,33 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.data_deployments = {}
         self.data_pods = {}
         for name in ("postgres", "nats"):
-            expected = runtime._versioned_data_deployment_contract(
-                runtime.CLUSTER / f"data/{name}.yaml", name
+            manifest_path = runtime.CLUSTER / f"data/{name}.yaml"
+            documents = [
+                document
+                for document in yaml.safe_load_all(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                if isinstance(document, dict)
+            ]
+            source_deployment = next(
+                document
+                for document in documents
+                if document.get("kind") == "Deployment"
+                and document.get("metadata", {}).get("name") == name
             )
-            pod_spec = {
-                "containers": [
-                    {"name": container_name, "image": image}
-                    for container_name, image in expected["images"]["containers"].items()
-                ],
-                "initContainers": [
-                    {"name": container_name, "image": image}
-                    for container_name, image in expected["images"][
-                        "init_containers"
-                    ].items()
-                ],
-            }
+            expected = runtime._versioned_data_deployment_contract(
+                manifest_path, name
+            )
+            live_spec = json.loads(
+                json.dumps(source_deployment["spec"])
+            )
             self.data_deployments[name] = {
                 "metadata": {
                     "name": name,
                     "namespace": runtime.DATA_NAMESPACE,
                     "generation": 1,
                 },
-                "spec": {
-                    "replicas": expected["replicas"],
-                    "selector": {
-                        "matchLabels": json.loads(
-                            json.dumps(expected["selector_labels"])
-                        )
-                    },
-                    "template": {"spec": pod_spec},
-                },
+                "spec": live_spec,
                 "status": {
                     "observedGeneration": 1,
                     "replicas": expected["replicas"],
@@ -3627,41 +3704,28 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     "conditions": [{"type": "Available", "status": "True"}],
                 },
             }
-            self.data_pods[name] = [
-                workload_pod(
+            template = live_spec["template"]
+            template_metadata = template.get("metadata", {})
+            template_labels = json.loads(
+                json.dumps(template_metadata.get("labels", {}))
+            )
+            template_annotations = json.loads(
+                json.dumps(template_metadata.get("annotations", {}))
+            )
+            self.data_pods[name] = []
+            for index in range(expected["replicas"]):
+                pod = workload_pod(
                     runtime.DATA_NAMESPACE,
                     name,
                     index,
-                    expected["selector_labels"],
+                    template_labels,
                     expected["images"],
                 )
-                for index in range(expected["replicas"])
-            ]
-            if name == "postgres":
-                resources = runtime._versioned_data_container_resources(
-                    runtime.CLUSTER / "data/postgres.yaml",
-                    "postgres",
-                    "postgres",
+                pod["metadata"]["annotations"] = template_annotations
+                pod["spec"] = json.loads(
+                    json.dumps(template["spec"])
                 )
-                deployment_container = next(
-                    item
-                    for item in self.data_deployments[name]["spec"][
-                        "template"
-                    ]["spec"]["containers"]
-                    if item["name"] == "postgres"
-                )
-                deployment_container["resources"] = json.loads(
-                    json.dumps(resources)
-                )
-                for pod in self.data_pods[name]:
-                    pod_container = next(
-                        item
-                        for item in pod["spec"]["containers"]
-                        if item["name"] == "postgres"
-                    )
-                    pod_container["resources"] = json.loads(
-                        json.dumps(resources)
-                    )
+                self.data_pods[name].append(pod)
 
         self.data_services = {}
         for name in ("postgres", "nats"):
@@ -3688,6 +3752,39 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             for name, value in (
                 runtime._versioned_namespace_security_contract()
             ).items()
+        }
+
+        self.application_service_account_expected = {
+            name: {
+                "contract": {
+                    "labels": {"app.kubernetes.io/name": name},
+                    "annotations": {},
+                    "automountServiceAccountToken": False,
+                    "imagePullSecrets": [],
+                    "secrets": [],
+                },
+                "contract_sha256": runtime._stable_json_sha256(
+                    {
+                        "labels": {"app.kubernetes.io/name": name},
+                        "annotations": {},
+                        "automountServiceAccountToken": False,
+                        "imagePullSecrets": [],
+                        "secrets": [],
+                    }
+                ),
+            }
+            for name in ("weltgewebe-api", "weltgewebe-web")
+        }
+        self.application_service_accounts = {
+            name: {
+                "metadata": {
+                    "name": name,
+                    "namespace": runtime.APP_NAMESPACE,
+                    "labels": {"app.kubernetes.io/name": name},
+                },
+                "automountServiceAccountToken": False,
+            }
+            for name in self.application_service_account_expected
         }
 
         api_image = "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64
@@ -4148,6 +4245,12 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 json.dumps(self.application_workload_readback)
             ),
         )
+        self.application_service_account_contract = self.patch(
+            "_rendered_application_service_account_contract",
+            return_value=json.loads(
+                json.dumps(self.application_service_account_expected)
+            ),
+        )
         self.tools = self.patch(
             "toolchain",
             return_value={
@@ -4221,6 +4324,18 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             and arguments[-1] in self.namespaces
         ):
             return self.namespaces[str(arguments[-1])]
+        if (
+            len(arguments) == 5
+            and arguments[:4]
+            == [
+                "-n",
+                runtime.APP_NAMESPACE,
+                "get",
+                "serviceaccount",
+            ]
+            and arguments[-1] in self.application_service_accounts
+        ):
+            return self.application_service_accounts[str(arguments[-1])]
         if arguments == [
             "-n", runtime.APP_NAMESPACE, "get", "configmap", "weltgewebe-runtime"
         ]:
@@ -4961,6 +5076,161 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             runtime.status(self.root)
 
         self.data_pods = healthy_pods
+
+        self.data_deployments = json.loads(json.dumps(healthy))
+        nats_container = self.data_deployments["nats"]["spec"]["template"][
+            "spec"
+        ]["containers"][0]
+        nats_container["args"] = ["-js", "-sd", "/tmp/drift", "-m", "8222"]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "Deployment contract drifted",
+        ):
+            runtime.status(self.root)
+
+        self.data_deployments = json.loads(json.dumps(healthy))
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        postgres_container = self.data_pods["postgres"][0]["spec"][
+            "containers"
+        ][0]
+        postgres_container["securityContext"]["readOnlyRootFilesystem"] = False
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "data Pod contract drifted: postgres",
+        ):
+            runtime.status(self.root)
+
+        self.data_deployments = healthy
+        self.data_pods = healthy_pods
+
+    def test_status_revalidates_application_service_accounts(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        result = runtime.status(self.root)
+        self.assertEqual(
+            set(result["application_service_accounts"]),
+            {"weltgewebe-api", "weltgewebe-web"},
+        )
+        self.assertTrue(
+            result["application_service_accounts"]["weltgewebe-api"][
+                "canonical"
+            ]
+        )
+
+        self.application_service_accounts["weltgewebe-api"][
+            "automountServiceAccountToken"
+        ] = True
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "ServiceAccount contract drifted: weltgewebe-api",
+        ):
+            runtime.status(self.root)
+
+        self.application_service_accounts["weltgewebe-api"][
+            "automountServiceAccountToken"
+        ] = False
+        original_fixture = self.kubernetes_fixture
+
+        def missing_account(root, arguments):
+            if arguments == [
+                "-n",
+                runtime.APP_NAMESPACE,
+                "get",
+                "serviceaccount",
+                "weltgewebe-web",
+            ]:
+                return {}
+            return original_fixture(root, arguments)
+
+        with mock.patch.object(
+            runtime, "_kubectl_json", side_effect=missing_account
+        ):
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "ServiceAccount identity drifted: weltgewebe-web",
+            ):
+                runtime.status(self.root)
+
+    def test_rendered_service_account_contract_tracks_deployment_references(self) -> None:
+        api_digest = "sha256:" + "b" * 64
+        web_digest = "sha256:" + "c" * 64
+        rendered = """
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weltgewebe-api
+  namespace: commonthing-experiment-b
+  labels:
+    app.kubernetes.io/name: weltgewebe-api
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weltgewebe-web
+  namespace: commonthing-experiment-b
+  labels:
+    app.kubernetes.io/name: weltgewebe-web
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weltgewebe-api
+  namespace: commonthing-experiment-b
+spec:
+  template:
+    spec:
+      serviceAccountName: weltgewebe-api
+      containers:
+        - name: api
+          image: example.invalid/api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weltgewebe-web
+  namespace: commonthing-experiment-b
+spec:
+  template:
+    spec:
+      serviceAccountName: weltgewebe-web
+      containers:
+        - name: web
+          image: example.invalid/web
+"""
+        completed = runtime.subprocess.CompletedProcess(
+            ["kustomize", "build"], 0, stdout=rendered, stderr=""
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "toolchain",
+                return_value={"tools": {"kustomize": "kustomize"}},
+            ),
+            mock.patch.object(runtime, "run", return_value=completed),
+        ):
+            expected = runtime._rendered_application_service_account_contract(
+                self.root,
+                {
+                    "api_digest": api_digest,
+                    "web_digest": web_digest,
+                },
+            )
+        self.assertEqual(
+            set(expected),
+            {"weltgewebe-api", "weltgewebe-web"},
+        )
+        self.assertFalse(
+            expected["weltgewebe-api"]["contract"][
+                "automountServiceAccountToken"
+            ]
+        )
+        self.assertRegex(
+            expected["weltgewebe-web"]["contract_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
 
     def test_status_requires_running_application_pod_images(self) -> None:
         self.write_vm_receipt()
@@ -6143,6 +6413,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "name": "api",
             "image": "example.invalid/api@sha256:" + "b" * 64,
             "imagePullPolicy": "IfNotPresent",
+            "ports": [{"name": "http", "containerPort": 8080}],
             "readinessProbe": {
                 "httpGet": {"path": "/health", "port": 8080},
                 "periodSeconds": 5,
@@ -6158,10 +6429,37 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             }
         )
         live["readinessProbe"]["httpGet"]["scheme"] = "HTTP"
+        live["ports"][0]["protocol"] = "TCP"
         self.assertEqual(
             runtime._container_runtime_contract(expected, "expected"),
             runtime._container_runtime_contract(live, "live"),
         )
+
+        expected_pod = {
+            "automountServiceAccountToken": False,
+            "containers": [expected],
+        }
+        live_pod = json.loads(json.dumps(expected_pod))
+        live_pod["serviceAccountName"] = "default"
+        live_pod["terminationGracePeriodSeconds"] = 30
+        live_pod["containers"][0] = live
+        self.assertEqual(
+            runtime._application_pod_spec_projection(
+                expected_pod, "expected Pod"
+            ),
+            runtime._application_pod_spec_projection(
+                live_pod, "live Pod"
+            ),
+        )
+        for name in ("postgres", "nats"):
+            contract = runtime._versioned_data_deployment_contract(
+                runtime.CLUSTER / f"data/{name}.yaml",
+                name,
+            )
+            self.assertEqual(
+                contract["contract"]["revisionHistoryLimit"],
+                10,
+            )
 
     def test_t048_revalidates_target_and_postgres_before_and_after_measurement(self) -> None:
         source = inspect.getsource(runtime.t048_load_proof)
