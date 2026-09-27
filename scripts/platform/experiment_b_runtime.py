@@ -4456,7 +4456,12 @@ def main() -> int:
     elif args.command == "portability-report":
         result = portability_report(root)
     elif args.command == "status":
-        result = status(root)
+        status(root)
+        result = {
+            "schema_version": 1,
+            "status": "observed",
+            "receipt": "receipts/status.json",
+        }
     elif args.command == "teardown":
         result = teardown(root)
     else:

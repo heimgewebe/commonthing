@@ -2081,6 +2081,15 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("result = inject_secrets(", branch)
         self.assertIn('"receipt": "receipts/secrets.json"', branch)
 
+    def test_status_cli_does_not_forward_secret_tainted_return(self) -> None:
+        source = inspect.getsource(runtime.main)
+        branch = source.split('elif args.command == "status":', 1)[1].split(
+            'elif args.command == "teardown":', 1
+        )[0]
+        self.assertIn("status(root)", branch)
+        self.assertNotIn("result = status(root)", branch)
+        self.assertIn('"receipt": "receipts/status.json"', branch)
+
     def test_cli_exposes_full_t085_proof_sequence(self) -> None:
         parser = runtime.parser()
         commands = {
