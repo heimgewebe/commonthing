@@ -994,12 +994,21 @@ def install_platform(root: Path) -> dict[str, Any]:
         env=env,
         timeout=600,
     )
+    cilium_readback = _require_live_cilium_contract(root, load_config())
     result = {
         "schema_version": 1,
         "status": "ready",
         "source_commit": source_commit,
         "toolchain_lock_sha256": receipt["lock_sha256"],
         "vm_ip": ip,
+        "cilium_runtime_image_ids": {
+            "daemonset": cilium_readback["daemonset_pods"][
+                "runtime_image_ids_sha256"
+            ],
+            "operator": cilium_readback["operator_pods"][
+                "runtime_image_ids_sha256"
+            ],
+        },
     }
     atomic_json(root / "receipts/platform.json", result)
     return result
@@ -1927,66 +1936,164 @@ def _require_requested_release_artifacts(
     }
 
 
+def _runtime_image_id_digest(image_id: Any) -> str | None:
+    if not isinstance(image_id, str) or not image_id:
+        return None
+    candidate = image_id
+    if "@" in candidate:
+        candidate = candidate.rsplit("@", 1)[1]
+    elif "://" in candidate:
+        candidate = candidate.split("://", 1)[1]
+    return candidate if DIGEST_RE.fullmatch(candidate) else None
+
+
 def _runtime_image_id_matches_digest(image_id: Any, expected_digest: str) -> bool:
-    if (
-        not isinstance(image_id, str)
-        or not image_id
-        or not DIGEST_RE.fullmatch(expected_digest)
-    ):
+    if not DIGEST_RE.fullmatch(expected_digest):
         return False
-    if image_id == expected_digest:
-        return True
-    if "@" in image_id and image_id.rsplit("@", 1)[1] == expected_digest:
-        return True
-    if "://" in image_id and image_id.split("://", 1)[1] == expected_digest:
-        return True
-    return False
+    observed_digest = _runtime_image_id_digest(image_id)
+    return (
+        observed_digest is not None
+        and secrets.compare_digest(observed_digest, expected_digest)
+    )
 
 
-def _require_running_pod_images(
+def _pod_selector_match_labels(workload: Any, context: str) -> dict[str, str]:
+    if not isinstance(workload, dict):
+        raise RuntimeErrorEB(f"{context} workload is invalid")
+    selector = workload.get("spec", {}).get("selector", {})
+    if not isinstance(selector, dict):
+        raise RuntimeErrorEB(f"{context} selector is invalid")
+    labels = selector.get("matchLabels")
+    expressions = selector.get("matchExpressions", [])
+    if (
+        not isinstance(labels, dict)
+        or not labels
+        or any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, str)
+            or not value
+            for key, value in labels.items()
+        )
+        or expressions not in (None, [])
+    ):
+        raise RuntimeErrorEB(f"{context} selector is not an exact matchLabels contract")
+    return {str(key): str(value) for key, value in labels.items()}
+
+
+def _pods_matching_labels(pods: Any, required_labels: dict[str, str]) -> list[dict[str, Any]]:
+    if not isinstance(pods, list) or any(not isinstance(item, dict) for item in pods):
+        raise RuntimeErrorEB("Pod inventory is invalid")
+    matches: list[dict[str, Any]] = []
+    for pod in pods:
+        metadata = pod.get("metadata", {})
+        labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+        if (
+            isinstance(labels, dict)
+            and all(labels.get(key) == value for key, value in required_labels.items())
+        ):
+            matches.append(pod)
+    return matches
+
+
+def _pod_runtime_image_ids_sha256(
     pods: Any,
+    expected_images: dict[str, dict[str, str]],
+) -> str:
+    if (
+        not isinstance(pods, dict)
+        or any(not isinstance(pod, dict) for pod in pods.values())
+    ):
+        raise RuntimeErrorEB("Pod runtime image-ID binding is invalid")
+    binding: dict[str, dict[str, list[str]]] = {
+        "containers": {},
+        "init_containers": {},
+    }
+    for group in ("containers", "init_containers"):
+        for container_name in expected_images[group]:
+            values: list[str] = []
+            for pod in pods.values():
+                runtime_ids = pod.get("runtime_image_ids", {})
+                group_ids = (
+                    runtime_ids.get(group, {})
+                    if isinstance(runtime_ids, dict)
+                    else {}
+                )
+                image_id = (
+                    group_ids.get(container_name)
+                    if isinstance(group_ids, dict)
+                    else None
+                )
+                observed_digest = _runtime_image_id_digest(image_id)
+                if observed_digest is None:
+                    raise RuntimeErrorEB("Pod runtime image-ID binding is incomplete")
+                values.append(observed_digest)
+            binding[group][container_name] = sorted(values)
+    return _stable_json_sha256(binding)
+
+
+def _require_running_pod_image_contract(
+    pods: Any,
+    *,
+    namespace: str,
     workload: str,
     expected_replicas: int,
-    expected_images: dict[str, str],
+    expected_images: dict[str, dict[str, str]],
+    required_labels: dict[str, str],
+    context: str,
 ) -> dict[str, Any]:
     if (
-        not isinstance(expected_replicas, int)
+        not isinstance(namespace, str)
+        or not namespace
+        or not isinstance(workload, str)
+        or not workload
+        or not isinstance(expected_replicas, int)
         or isinstance(expected_replicas, bool)
         or expected_replicas < 1
         or not isinstance(expected_images, dict)
-        or not expected_images
-        or any(
+        or set(expected_images) != {"containers", "init_containers"}
+        or not isinstance(expected_images.get("containers"), dict)
+        or not expected_images["containers"]
+        or not isinstance(expected_images.get("init_containers"), dict)
+        or not isinstance(required_labels, dict)
+        or not required_labels
+    ):
+        raise RuntimeErrorEB(f"{context} contract is invalid: {workload}")
+    for group in ("containers", "init_containers"):
+        if any(
             not isinstance(name, str)
             or not name
             or not isinstance(image, str)
             or not image
-            for name, image in expected_images.items()
-        )
-    ):
-        raise RuntimeErrorEB(f"application Pod contract is invalid: {workload}")
+            for name, image in expected_images[group].items()
+        ):
+            raise RuntimeErrorEB(f"{context} image contract is invalid: {workload}/{group}")
     if not isinstance(pods, list) or len(pods) != expected_replicas:
         raise RuntimeErrorEB(
-            f"application Pod set does not match exact replica contract: {workload}"
+            f"{context} set does not match exact replica contract: {workload}"
         )
 
     expected_images_sha256 = _stable_json_sha256(expected_images)
-    expected_digests: dict[str, str] = {}
-    for name, image in expected_images.items():
-        if "@" not in image:
-            raise RuntimeErrorEB(
-                f"application Pod image is not immutable: {workload}/{name}"
-            )
-        _repository, digest = image.rsplit("@", 1)
-        if not DIGEST_RE.fullmatch(digest):
-            raise RuntimeErrorEB(
-                f"application Pod image digest is invalid: {workload}/{name}"
-            )
-        expected_digests[name] = digest
+    expected_digests: dict[str, dict[str, str | None]] = {
+        "containers": {},
+        "init_containers": {},
+    }
+    for group in ("containers", "init_containers"):
+        for name, image in expected_images[group].items():
+            digest: str | None = None
+            if "@" in image:
+                _repository, candidate = image.rsplit("@", 1)
+                if not DIGEST_RE.fullmatch(candidate):
+                    raise RuntimeErrorEB(
+                        f"{context} image digest is invalid: {workload}/{name}"
+                    )
+                digest = candidate
+            expected_digests[group][name] = digest
 
     observed: dict[str, Any] = {}
     for pod in pods:
         if not isinstance(pod, dict):
-            raise RuntimeErrorEB(f"application Pod inventory is invalid: {workload}")
+            raise RuntimeErrorEB(f"{context} inventory is invalid: {workload}")
         metadata = pod.get("metadata", {})
         spec = pod.get("spec", {})
         status_obj = pod.get("status", {})
@@ -1995,20 +2102,20 @@ def _require_running_pod_images(
             or not isinstance(spec, dict)
             or not isinstance(status_obj, dict)
         ):
-            raise RuntimeErrorEB(f"application Pod inventory is invalid: {workload}")
+            raise RuntimeErrorEB(f"{context} inventory is invalid: {workload}")
         name = metadata.get("name")
         labels = metadata.get("labels", {})
         if (
             not isinstance(name, str)
             or not name
             or name in observed
-            or metadata.get("namespace") != APP_NAMESPACE
+            or metadata.get("namespace") != namespace
             or metadata.get("deletionTimestamp") is not None
             or not isinstance(labels, dict)
-            or labels.get("app.kubernetes.io/name") != workload
+            or not all(labels.get(key) == value for key, value in required_labels.items())
             or status_obj.get("phase") != "Running"
         ):
-            raise RuntimeErrorEB(f"application Pod identity/state drifted: {workload}")
+            raise RuntimeErrorEB(f"{context} identity/state drifted: {workload}")
 
         ready = any(
             isinstance(condition, dict)
@@ -2017,69 +2124,125 @@ def _require_running_pod_images(
             for condition in status_obj.get("conditions", [])
         )
         if not ready:
-            raise RuntimeErrorEB(f"application Pod is not Ready: {workload}/{name}")
+            raise RuntimeErrorEB(f"{context} is not Ready: {workload}/{name}")
 
-        live_images = _pod_spec_images(spec, f"application Pod {name}")["containers"]
+        live_images = _pod_spec_images(spec, f"{context} {name}")
         if live_images != expected_images:
             raise RuntimeErrorEB(
-                f"application Pod requested images drifted: {workload}/{name}"
+                f"{context} requested images drifted: {workload}/{name}"
             )
 
-        container_statuses = status_obj.get("containerStatuses")
-        if not isinstance(container_statuses, list):
-            raise RuntimeErrorEB(
-                f"application Pod container status is invalid: {workload}/{name}"
-            )
-        status_by_name: dict[str, dict[str, Any]] = {}
-        for item in container_statuses:
-            if not isinstance(item, dict):
+        runtime_image_ids: dict[str, dict[str, str]] = {
+            "containers": {},
+            "init_containers": {},
+        }
+        for status_field, group, must_be_running in (
+            ("containerStatuses", "containers", True),
+            ("initContainerStatuses", "init_containers", False),
+        ):
+            statuses = status_obj.get(status_field, [])
+            if not isinstance(statuses, list):
                 raise RuntimeErrorEB(
-                    f"application Pod container status is invalid: {workload}/{name}"
+                    f"{context} container status is invalid: {workload}/{name}/{group}"
                 )
-            container_name = item.get("name")
-            if (
-                not isinstance(container_name, str)
-                or not container_name
-                or container_name in status_by_name
-            ):
+            status_by_name: dict[str, dict[str, Any]] = {}
+            for item in statuses:
+                if not isinstance(item, dict):
+                    raise RuntimeErrorEB(
+                        f"{context} container status is invalid: {workload}/{name}/{group}"
+                    )
+                container_name = item.get("name")
+                if (
+                    not isinstance(container_name, str)
+                    or not container_name
+                    or container_name in status_by_name
+                ):
+                    raise RuntimeErrorEB(
+                        f"{context} container status identity is invalid: "
+                        f"{workload}/{name}/{group}"
+                    )
+                status_by_name[container_name] = item
+            if set(status_by_name) != set(expected_images[group]):
                 raise RuntimeErrorEB(
-                    f"application Pod container status identity is invalid: {workload}/{name}"
+                    f"{context} container status set drifted: {workload}/{name}/{group}"
                 )
-            status_by_name[container_name] = item
-        if set(status_by_name) != set(expected_images):
-            raise RuntimeErrorEB(
-                f"application Pod container status set drifted: {workload}/{name}"
-            )
 
-        image_ids: dict[str, str] = {}
-        for container_name, expected_digest in expected_digests.items():
-            item = status_by_name[container_name]
-            state = item.get("state", {})
-            image_id = item.get("imageID")
-            if (
-                item.get("ready") is not True
-                or not isinstance(state, dict)
-                or not isinstance(state.get("running"), dict)
-                or not _runtime_image_id_matches_digest(image_id, expected_digest)
-            ):
-                raise RuntimeErrorEB(
-                    f"application Pod runtime image ID drifted: {workload}/{name}/{container_name}"
-                )
-            image_ids[container_name] = image_id
+            for container_name, requested_image in expected_images[group].items():
+                item = status_by_name[container_name]
+                state = item.get("state", {})
+                image_id = item.get("imageID")
+                observed_digest = _runtime_image_id_digest(image_id)
+                expected_digest = expected_digests[group][container_name]
+                state_valid = False
+                if isinstance(state, dict):
+                    if must_be_running:
+                        state_valid = (
+                            item.get("ready") is True
+                            and isinstance(state.get("running"), dict)
+                        )
+                    else:
+                        terminated = state.get("terminated")
+                        state_valid = (
+                            isinstance(state.get("running"), dict)
+                            or (
+                                isinstance(terminated, dict)
+                                and terminated.get("exitCode") == 0
+                            )
+                        )
+                if (
+                    not state_valid
+                    or observed_digest is None
+                    or (
+                        expected_digest is not None
+                        and not secrets.compare_digest(observed_digest, expected_digest)
+                    )
+                ):
+                    raise RuntimeErrorEB(
+                        f"{context} runtime image ID drifted: "
+                        f"{workload}/{name}/{container_name}"
+                    )
+                runtime_image_ids[group][container_name] = str(image_id)
 
         observed[name] = {
             "ready": True,
             "requested_images_sha256": expected_images_sha256,
-            "runtime_image_ids": image_ids,
+            "runtime_image_ids": runtime_image_ids,
         }
 
     return {
         "expected_replicas": expected_replicas,
         "observed_replicas": len(observed),
         "requested_images_sha256": expected_images_sha256,
+        "runtime_image_ids_sha256": _pod_runtime_image_ids_sha256(
+            observed, expected_images
+        ),
         "images_canonical": True,
         "pods": observed,
     }
+
+
+def _require_running_pod_images(
+    pods: Any,
+    workload: str,
+    expected_replicas: int,
+    expected_images: dict[str, str],
+) -> dict[str, Any]:
+    result = _require_running_pod_image_contract(
+        pods,
+        namespace=APP_NAMESPACE,
+        workload=workload,
+        expected_replicas=expected_replicas,
+        expected_images={"containers": expected_images, "init_containers": {}},
+        required_labels={"app.kubernetes.io/name": workload},
+        context="application Pod",
+    )
+    flat_sha256 = _stable_json_sha256(expected_images)
+    result["requested_images_sha256"] = flat_sha256
+    result.pop("runtime_image_ids_sha256", None)
+    for pod in result["pods"].values():
+        pod["requested_images_sha256"] = flat_sha256
+        pod["runtime_image_ids"] = pod["runtime_image_ids"]["containers"]
+    return result
 
 
 def _expected_live_secret_values(
@@ -2578,7 +2741,8 @@ def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]
         spec.get("template", {}).get("spec"),
         f"versioned data Deployment {name}",
     )
-    return {"replicas": replicas, "images": images}
+    selector = _pod_selector_match_labels(matches[0], f"versioned data Deployment {name}")
+    return {"replicas": replicas, "images": images, "selector_labels": selector}
 
 
 def _require_live_data_deployments(root: Path) -> dict[str, Any]:
@@ -2586,6 +2750,14 @@ def _require_live_data_deployments(root: Path) -> dict[str, Any]:
         "postgres": CLUSTER / "data/postgres.yaml",
         "nats": CLUSTER / "data/nats.yaml",
     }
+    pod_items = _kubectl_json(
+        root, ["-n", DATA_NAMESPACE, "get", "pods"]
+    ).get("items")
+    if not isinstance(pod_items, list) or any(
+        not isinstance(item, dict) for item in pod_items
+    ):
+        raise RuntimeErrorEB("live data Pod inventory is invalid")
+
     result: dict[str, Any] = {}
     for name, path in manifests.items():
         expected = _versioned_data_deployment_contract(path, name)
@@ -2602,6 +2774,13 @@ def _require_live_data_deployments(root: Path) -> dict[str, Any]:
             or metadata.get("deletionTimestamp") is not None
         ):
             raise RuntimeErrorEB(f"live data Deployment identity drifted: {name}")
+        live_selector = _pod_selector_match_labels(
+            deployment, f"live data Deployment {name}"
+        )
+        if live_selector != expected["selector_labels"]:
+            raise RuntimeErrorEB(
+                f"live data Deployment selector drifted from versioned manifest: {name}"
+            )
         availability = _deployment_availability_snapshot(
             deployment, name, expected["replicas"]
         )
@@ -2613,10 +2792,23 @@ def _require_live_data_deployments(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 f"live data Deployment images drifted from versioned manifest: {name}"
             )
+        matching_pods = _pods_matching_labels(
+            pod_items, expected["selector_labels"]
+        )
+        pod_readback = _require_running_pod_image_contract(
+            matching_pods,
+            namespace=DATA_NAMESPACE,
+            workload=name,
+            expected_replicas=expected["replicas"],
+            expected_images=expected["images"],
+            required_labels=expected["selector_labels"],
+            context="data Pod",
+        )
         result[name] = {
             **availability,
             "images_sha256": _stable_json_sha256(live_images),
             "images_canonical": True,
+            "pods": pod_readback,
         }
     return result
 
@@ -2743,6 +2935,13 @@ def _require_live_cilium_contract(
     )
     metadata = daemonset.get("metadata", {})
     status_obj = daemonset.get("status", {})
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != "cilium"
+        or metadata.get("namespace") != "kube-system"
+        or metadata.get("deletionTimestamp") is not None
+    ):
+        raise RuntimeErrorEB("live Cilium DaemonSet identity drifted")
     generation = int(metadata.get("generation") or 0)
     observed_generation = int(status_obj.get("observedGeneration") or 0)
     desired = int(status_obj.get("desiredNumberScheduled") or 0)
@@ -2772,6 +2971,9 @@ def _require_live_cilium_contract(
         raise RuntimeErrorEB(
             "live Cilium DaemonSet images drifted from the pinned chart render"
         )
+    daemonset_selector = _pod_selector_match_labels(
+        daemonset, "live Cilium DaemonSet"
+    )
 
     operator = _kubectl_json(
         root, ["-n", "kube-system", "get", "deployment", "cilium-operator"]
@@ -2795,6 +2997,9 @@ def _require_live_cilium_contract(
         raise RuntimeErrorEB(
             "live Cilium operator images drifted from the pinned chart render"
         )
+    operator_selector = _pod_selector_match_labels(
+        operator, "live Cilium operator Deployment"
+    )
 
     proxy_daemonsets = _kubectl_json(
         root, ["-n", "kube-system", "get", "daemonsets"]
@@ -2811,6 +3016,25 @@ def _require_live_cilium_contract(
         )
     ):
         raise RuntimeErrorEB("kube-system workload inventory is invalid")
+
+    daemonset_pods = _require_running_pod_image_contract(
+        _pods_matching_labels(proxy_pods, daemonset_selector),
+        namespace="kube-system",
+        workload="cilium",
+        expected_replicas=desired,
+        expected_images=expected_workload_images["daemonset"],
+        required_labels=daemonset_selector,
+        context="Cilium DaemonSet Pod",
+    )
+    operator_pods = _require_running_pod_image_contract(
+        _pods_matching_labels(proxy_pods, operator_selector),
+        namespace="kube-system",
+        workload="cilium-operator",
+        expected_replicas=1,
+        expected_images=expected_workload_images["operator"],
+        required_labels=operator_selector,
+        context="Cilium operator Pod",
+    )
 
     def is_kube_proxy(item: dict[str, Any]) -> bool:
         metadata = item.get("metadata", {})
@@ -2836,14 +3060,59 @@ def _require_live_cilium_contract(
         "gateway_api": True,
         "kube_proxy_replacement": True,
         "daemonset_generation": generation,
+        "daemonset_desired": desired,
         "daemonset_ready": ready,
         "daemonset_images": live_images,
         "daemonset_images_canonical": True,
+        "daemonset_pods": daemonset_pods,
         "operator": operator_availability,
         "operator_images": operator_images,
         "operator_images_canonical": True,
+        "operator_pods": operator_pods,
         "kube_proxy_present": False,
     }
+
+
+def _require_cilium_runtime_baseline(
+    root: Path,
+    source_commit: str,
+    cilium_readback: dict[str, Any],
+) -> dict[str, str]:
+    path = root / "receipts/platform.json"
+    try:
+        platform = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B status requires valid platform runtime baseline"
+        ) from exc
+    baseline = platform.get("cilium_runtime_image_ids")
+    if (
+        not isinstance(platform, dict)
+        or platform.get("schema_version") != 1
+        or platform.get("status") != "ready"
+        or platform.get("source_commit") != source_commit
+        or not isinstance(baseline, dict)
+        or set(baseline) != {"daemonset", "operator"}
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in baseline.values()
+        )
+    ):
+        raise RuntimeErrorEB("Experiment-B Cilium runtime baseline is invalid")
+    current = {
+        "daemonset": cilium_readback.get("daemonset_pods", {}).get(
+            "runtime_image_ids_sha256"
+        ),
+        "operator": cilium_readback.get("operator_pods", {}).get(
+            "runtime_image_ids_sha256"
+        ),
+    }
+    if current != baseline:
+        raise RuntimeErrorEB(
+            "live Cilium Pod runtime image IDs drifted from platform installation"
+        )
+    return {str(key): str(value) for key, value in baseline.items()}
 
 
 def _stable_json_sha256(value: Any) -> str:
@@ -3069,6 +3338,9 @@ def status(root: Path) -> dict[str, Any]:
     env = kube_env(root)
     kubectl = tools["kubectl"]
     cilium_readback = _require_live_cilium_contract(root, config)
+    cilium_readback["runtime_image_ids_baseline"] = (
+        _require_cilium_runtime_baseline(root, source_commit, cilium_readback)
+    )
 
     nodes = json.loads(run([kubectl, "get", "nodes", "-o", "json"], env=env).stdout)
     node_readback = _require_exact_k3s_node_inventory(
@@ -5467,6 +5739,74 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     return receipt
 
 
+def _require_stored_pod_image_contract(
+    observed: Any,
+    expected_replicas: int,
+    expected_images: dict[str, dict[str, str]],
+    context: str,
+) -> None:
+    if not isinstance(observed, dict) or not isinstance(
+        observed.get("pods"), dict
+    ):
+        raise RuntimeErrorEB(f"status does not prove the live {context} contract")
+    try:
+        runtime_binding_sha256 = _pod_runtime_image_ids_sha256(
+            observed["pods"], expected_images
+        )
+    except RuntimeErrorEB as exc:
+        raise RuntimeErrorEB(
+            f"status does not prove the live {context} contract"
+        ) from exc
+    if (
+        observed.get("expected_replicas") != expected_replicas
+        or observed.get("observed_replicas") != expected_replicas
+        or observed.get("requested_images_sha256")
+        != _stable_json_sha256(expected_images)
+        or observed.get("runtime_image_ids_sha256")
+        != runtime_binding_sha256
+        or observed.get("images_canonical") is not True
+        or len(observed["pods"]) != expected_replicas
+    ):
+        raise RuntimeErrorEB(f"status does not prove the live {context} contract")
+    for pod in observed["pods"].values():
+        runtime_ids = pod.get("runtime_image_ids") if isinstance(pod, dict) else None
+        if (
+            not isinstance(pod, dict)
+            or pod.get("ready") is not True
+            or pod.get("requested_images_sha256")
+            != _stable_json_sha256(expected_images)
+            or not isinstance(runtime_ids, dict)
+            or set(runtime_ids) != {"containers", "init_containers"}
+        ):
+            raise RuntimeErrorEB(f"status does not prove the live {context} contract")
+        for group in ("containers", "init_containers"):
+            ids = runtime_ids.get(group)
+            if (
+                not isinstance(ids, dict)
+                or set(ids) != set(expected_images[group])
+            ):
+                raise RuntimeErrorEB(
+                    f"status does not prove the live {context} contract"
+                )
+            for name, image in expected_images[group].items():
+                observed_digest = _runtime_image_id_digest(ids.get(name))
+                if observed_digest is None:
+                    raise RuntimeErrorEB(
+                        f"status does not prove the live {context} contract"
+                    )
+                if "@" in image:
+                    expected_digest = image.rsplit("@", 1)[1]
+                    if (
+                        not DIGEST_RE.fullmatch(expected_digest)
+                        or not secrets.compare_digest(
+                            observed_digest, expected_digest
+                        )
+                    ):
+                        raise RuntimeErrorEB(
+                            f"status does not prove the live {context} contract"
+                        )
+
+
 def portability_report(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)
     recovery_failed_receipt = root / "receipts/recovery-failed.json"
@@ -5571,12 +5911,47 @@ def portability_report(root: Path) -> dict[str, Any]:
         or cilium_status.get("kube_proxy_replacement") is not True
         or cilium_status.get("daemonset_images_canonical") is not True
         or cilium_status.get("operator_images_canonical") is not True
+        or not isinstance(cilium_status.get("daemonset_images"), dict)
+        or not isinstance(cilium_status.get("operator_images"), dict)
         or not isinstance(cilium_status.get("operator"), dict)
         or cilium_status["operator"].get("available") is not True
         or cilium_status["operator"].get("desired_replicas") != 1
+        or not isinstance(cilium_status.get("daemonset_desired"), int)
+        or isinstance(cilium_status.get("daemonset_desired"), bool)
+        or cilium_status["daemonset_desired"] < 1
+        or cilium_status.get("daemonset_ready")
+        != cilium_status.get("daemonset_desired")
         or cilium_status.get("kube_proxy_present") is not False
     ):
         raise RuntimeErrorEB("status does not prove the live Cilium contract")
+    _require_stored_pod_image_contract(
+        cilium_status.get("daemonset_pods"),
+        cilium_status["daemonset_desired"],
+        cilium_status["daemonset_images"],
+        "Cilium DaemonSet Pod",
+    )
+    _require_stored_pod_image_contract(
+        cilium_status.get("operator_pods"),
+        1,
+        cilium_status["operator_images"],
+        "Cilium operator Pod",
+    )
+    platform_cilium_baseline = payloads["platform.json"].get(
+        "cilium_runtime_image_ids"
+    )
+    if (
+        not isinstance(platform_cilium_baseline, dict)
+        or set(platform_cilium_baseline) != {"daemonset", "operator"}
+        or cilium_status.get("runtime_image_ids_baseline")
+        != platform_cilium_baseline
+        or cilium_status["daemonset_pods"].get("runtime_image_ids_sha256")
+        != platform_cilium_baseline.get("daemonset")
+        or cilium_status["operator_pods"].get("runtime_image_ids_sha256")
+        != platform_cilium_baseline.get("operator")
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the installed Cilium runtime image baseline"
+        )
 
     status_payload = payloads["status.json"]
     if (
@@ -5642,6 +6017,12 @@ def portability_report(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 f"status does not prove the live data Deployment contract: {name}"
             )
+        _require_stored_pod_image_contract(
+            observed.get("pods"),
+            expected["replicas"],
+            expected["images"],
+            f"data Pod {name}",
+        )
 
     pod_status = status_payload.get("pods")
     api_digest = str(payloads["release.json"].get("api_digest", ""))

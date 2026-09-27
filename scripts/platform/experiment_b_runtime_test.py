@@ -1419,12 +1419,87 @@ spec:
                 if name == "status.json":
                     payload["vm_create_sha256"] = runtime.sha256_file(receipts / "vm-create.json")
                     payload["vm_substrate"] = vm_substrate_fixture()
+                    def stored_pod_proof(
+                        workload: str,
+                        expected_images: dict[str, dict[str, str]],
+                        replicas: int = 1,
+                    ) -> dict:
+                        def runtime_id(image: str) -> str:
+                            if "@" in image:
+                                digest = image.rsplit("@", 1)[1]
+                            else:
+                                digest = (
+                                    "sha256:"
+                                    + hashlib.sha256(
+                                        image.encode("utf-8")
+                                    ).hexdigest()
+                                )
+                            return "containerd://" + digest
+
+                        image_sha256 = runtime._stable_json_sha256(expected_images)
+                        pods = {
+                            f"{workload}-{index}": {
+                                "ready": True,
+                                "requested_images_sha256": image_sha256,
+                                "runtime_image_ids": {
+                                    group: {
+                                        container_name: runtime_id(image)
+                                        for container_name, image
+                                        in expected_images[group].items()
+                                    }
+                                    for group in (
+                                        "containers",
+                                        "init_containers",
+                                    )
+                                },
+                            }
+                            for index in range(replicas)
+                        }
+                        return {
+                            "expected_replicas": replicas,
+                            "observed_replicas": replicas,
+                            "requested_images_sha256": image_sha256,
+                            "runtime_image_ids_sha256": (
+                                runtime._pod_runtime_image_ids_sha256(
+                                    pods, expected_images
+                                )
+                            ),
+                            "images_canonical": True,
+                            "pods": pods,
+                        }
+
+                    cilium_images = {
+                        "containers": {
+                            "cilium-agent": "quay.io/cilium/cilium:v1.19.5",
+                        },
+                        "init_containers": {
+                            "config": "quay.io/cilium/startup-script:1",
+                        },
+                    }
+                    cilium_operator_images = {
+                        "containers": {
+                            "cilium-operator": (
+                                "quay.io/cilium/operator-generic:v1.19.5"
+                            ),
+                        },
+                        "init_containers": {},
+                    }
                     payload["cilium"] = {
                         "chart_version": runtime.load_config()["cilium"]["chart_version"],
                         "gateway_api": True,
                         "kube_proxy_replacement": True,
+                        "daemonset_desired": 1,
+                        "daemonset_ready": 1,
+                        "daemonset_images": cilium_images,
                         "daemonset_images_canonical": True,
+                        "daemonset_pods": stored_pod_proof(
+                            "cilium", cilium_images
+                        ),
+                        "operator_images": cilium_operator_images,
                         "operator_images_canonical": True,
+                        "operator_pods": stored_pod_proof(
+                            "cilium-operator", cilium_operator_images
+                        ),
                         "operator": {
                             "available": True,
                             "desired_replicas": 1,
@@ -1457,6 +1532,11 @@ spec:
                             "images_canonical": True,
                             "images_sha256": runtime._stable_json_sha256(
                                 expected["images"]
+                            ),
+                            "pods": stored_pod_proof(
+                                name,
+                                expected["images"],
+                                expected["replicas"],
                             ),
                         }
                         for name, expected in (
@@ -1560,6 +1640,33 @@ spec:
                     json.dumps(payload) + "\n", encoding="utf-8"
                 )
 
+            status_path = receipts / "status.json"
+            status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+            cilium_baseline = {
+                "daemonset": status_payload["cilium"]["daemonset_pods"][
+                    "runtime_image_ids_sha256"
+                ],
+                "operator": status_payload["cilium"]["operator_pods"][
+                    "runtime_image_ids_sha256"
+                ],
+            }
+            status_payload["cilium"]["runtime_image_ids_baseline"] = (
+                cilium_baseline
+            )
+            runtime.atomic_json(status_path, status_payload)
+            platform_path = receipts / "platform.json"
+            platform_payload = json.loads(
+                platform_path.read_text(encoding="utf-8")
+            )
+            platform_payload["cilium_runtime_image_ids"] = cilium_baseline
+            runtime.atomic_json(platform_path, platform_payload)
+            status_attempt_path = receipts / "status-attempt.json"
+            status_attempt = json.loads(
+                status_attempt_path.read_text(encoding="utf-8")
+            )
+            status_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(status_attempt_path, status_attempt)
+
             baseline = runtime.portability_report(root)
             self.assertEqual(baseline["status"], "pass")
             self.assertIn("vm-create.json", baseline["receipts"])
@@ -1623,6 +1730,54 @@ spec:
             runtime.atomic_json(attempt_path, changed_attempt)
             with self.assertRaisesRegex(
                 runtime.RuntimeErrorEB, "live Cilium contract"
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["cilium"]["runtime_image_ids_baseline"][
+                "daemonset"
+            ] = "0" * 64
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "installed Cilium runtime image baseline",
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["cilium"]["daemonset_pods"]["pods"]["cilium-0"][
+                "runtime_image_ids"
+            ]["containers"]["cilium-agent"] = "containerd://not-a-digest"
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "Cilium DaemonSet Pod contract"
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["data_deployments"]["postgres"]["pods"]["pods"][
+                "postgres-0"
+            ]["runtime_image_ids"]["containers"]["postgres"] = (
+                "containerd://sha256:" + "0" * 64
+            )
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "data Pod postgres contract"
             ):
                 runtime.portability_report(root)
             status_path.write_text(original_status, encoding="utf-8")
@@ -2743,6 +2898,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             },
             "spec": {
                 "replicas": 1,
+                "selector": {"matchLabels": {"io.cilium/app": "operator"}},
                 "template": {
                     "spec": {
                         "containers": [
@@ -2768,8 +2924,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             },
         }
         self.cilium_daemonset = {
-            "metadata": {"name": "cilium", "generation": 1},
+            "metadata": {
+                "name": "cilium",
+                "namespace": "kube-system",
+                "generation": 1,
+            },
             "spec": {
+                "selector": {"matchLabels": {"k8s-app": "cilium"}},
                 "template": {
                     "spec": {
                         "initContainers": [
@@ -2866,7 +3027,69 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "cilium_network_policy_specs"
             ].items()
         ]
+        def fixture_runtime_image_id(image: str) -> str:
+            if "@" in image:
+                digest = image.rsplit("@", 1)[1]
+            else:
+                digest = "sha256:" + hashlib.sha256(image.encode("utf-8")).hexdigest()
+            return "containerd://" + digest
+
+        def workload_pod(
+            namespace: str,
+            workload: str,
+            ordinal: int,
+            labels: dict[str, str],
+            images: dict[str, dict[str, str]],
+        ) -> dict:
+            return {
+                "metadata": {
+                    "name": f"{workload}-{ordinal}",
+                    "namespace": namespace,
+                    "labels": json.loads(json.dumps(labels)),
+                },
+                "spec": {
+                    "containers": [
+                        {"name": name, "image": image}
+                        for name, image in images["containers"].items()
+                    ],
+                    "initContainers": [
+                        {"name": name, "image": image}
+                        for name, image in images["init_containers"].items()
+                    ],
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [
+                        {
+                            "name": name,
+                            "ready": True,
+                            "state": {
+                                "running": {"startedAt": "2026-09-27T00:00:00Z"}
+                            },
+                            "imageID": fixture_runtime_image_id(image),
+                        }
+                        for name, image in images["containers"].items()
+                    ],
+                    "initContainerStatuses": [
+                        {
+                            "name": name,
+                            "ready": False,
+                            "state": {
+                                "terminated": {
+                                    "exitCode": 0,
+                                    "finishedAt": "2026-09-27T00:00:00Z",
+                                }
+                            },
+                            "imageID": fixture_runtime_image_id(image),
+                        }
+                        for name, image in images["init_containers"].items()
+                    ],
+                },
+            }
+
         self.data_deployments = {}
+        self.data_pods = {}
         for name in ("postgres", "nats"):
             expected = runtime._versioned_data_deployment_contract(
                 runtime.CLUSTER / f"data/{name}.yaml", name
@@ -2891,6 +3114,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 },
                 "spec": {
                     "replicas": expected["replicas"],
+                    "selector": {
+                        "matchLabels": json.loads(
+                            json.dumps(expected["selector_labels"])
+                        )
+                    },
                     "template": {"spec": pod_spec},
                 },
                 "status": {
@@ -2903,58 +3131,72 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     "conditions": [{"type": "Available", "status": "True"}],
                 },
             }
+            self.data_pods[name] = [
+                workload_pod(
+                    runtime.DATA_NAMESPACE,
+                    name,
+                    index,
+                    expected["selector_labels"],
+                    expected["images"],
+                )
+                for index in range(expected["replicas"])
+            ]
 
         api_image = "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64
         web_image = "ghcr.io/heimgewebe/commonthing-web@sha256:" + "c" * 64
         api_pod_images = {
-            "api": api_image,
-            "search-worker": api_image,
-            "ollama": self.config["semantic_search"]["ollama_image"],
+            "containers": {
+                "api": api_image,
+                "search-worker": api_image,
+                "ollama": self.config["semantic_search"]["ollama_image"],
+            },
+            "init_containers": {},
         }
-        web_pod_images = {"web": web_image}
-
-        def application_pod(
-            workload: str,
-            ordinal: int,
-            images: dict[str, str],
-        ) -> dict:
-            return {
-                "metadata": {
-                    "name": f"{workload}-{ordinal}",
-                    "namespace": runtime.APP_NAMESPACE,
-                    "labels": {"app.kubernetes.io/name": workload},
-                },
-                "spec": {
-                    "containers": [
-                        {"name": name, "image": image}
-                        for name, image in images.items()
-                    ],
-                },
-                "status": {
-                    "phase": "Running",
-                    "conditions": [{"type": "Ready", "status": "True"}],
-                    "containerStatuses": [
-                        {
-                            "name": name,
-                            "ready": True,
-                            "state": {"running": {"startedAt": "2026-09-27T00:00:00Z"}},
-                            "imageID": f"docker-pullable://{image}",
-                        }
-                        for name, image in images.items()
-                    ],
-                },
-            }
-
+        web_pod_images = {
+            "containers": {"web": web_image},
+            "init_containers": {},
+        }
         self.application_pods = {
             "weltgewebe-api": [
-                application_pod("weltgewebe-api", index, api_pod_images)
+                workload_pod(
+                    runtime.APP_NAMESPACE,
+                    "weltgewebe-api",
+                    index,
+                    {"app.kubernetes.io/name": "weltgewebe-api"},
+                    api_pod_images,
+                )
                 for index in range(int(self.config["semantic_search"]["api_replicas"]))
             ],
             "weltgewebe-web": [
-                application_pod("weltgewebe-web", index, web_pod_images)
+                workload_pod(
+                    runtime.APP_NAMESPACE,
+                    "weltgewebe-web",
+                    index,
+                    {"app.kubernetes.io/name": "weltgewebe-web"},
+                    web_pod_images,
+                )
                 for index in range(int(self.config["runtime_binding"]["web_replicas"]))
             ],
         }
+
+        self.cilium_pods = [
+            workload_pod(
+                "kube-system",
+                "cilium",
+                0,
+                {"k8s-app": "cilium"},
+                self.cilium_expected_images,
+            )
+        ]
+        self.cilium_operator_pods = [
+            workload_pod(
+                "kube-system",
+                "cilium-operator",
+                0,
+                {"io.cilium/app": "operator"},
+                self.cilium_expected_operator_images,
+            )
+        ]
 
         self.live_secrets = {
             f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database": {
@@ -3211,6 +3453,40 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         )
         self.registry_source = self.root / "secrets/registry.json"
         runtime.atomic_bytes(self.registry_source, b"{}")
+        daemonset_proof = runtime._require_running_pod_image_contract(
+            self.cilium_pods,
+            namespace="kube-system",
+            workload="cilium",
+            expected_replicas=1,
+            expected_images=self.cilium_expected_images,
+            required_labels={"k8s-app": "cilium"},
+            context="Cilium DaemonSet Pod",
+        )
+        operator_proof = runtime._require_running_pod_image_contract(
+            self.cilium_operator_pods,
+            namespace="kube-system",
+            workload="cilium-operator",
+            expected_replicas=1,
+            expected_images=self.cilium_expected_operator_images,
+            required_labels={"io.cilium/app": "operator"},
+            context="Cilium operator Pod",
+        )
+        runtime.atomic_json(
+            self.root / "receipts/platform.json",
+            {
+                "schema_version": 1,
+                "status": "ready",
+                "source_commit": self.commit,
+                "cilium_runtime_image_ids": {
+                    "daemonset": daemonset_proof[
+                        "runtime_image_ids_sha256"
+                    ],
+                    "operator": operator_proof[
+                        "runtime_image_ids_sha256"
+                    ],
+                },
+            },
+        )
         runtime.atomic_json(
             self.root / "receipts/secrets.json",
             {
@@ -3309,7 +3585,22 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         if arguments == ["-n", "kube-system", "get", "daemonsets"]:
             return {"items": self.kube_proxy_daemonsets}
         if arguments == ["-n", "kube-system", "get", "pods"]:
-            return {"items": self.kube_proxy_pods}
+            return {
+                "items": [
+                    *self.cilium_pods,
+                    *self.cilium_operator_pods,
+                    *self.kube_proxy_pods,
+                ]
+            }
+        if arguments == [
+            "-n", runtime.DATA_NAMESPACE, "get", "pods"
+        ]:
+            return {
+                "items": [
+                    *self.data_pods["postgres"],
+                    *self.data_pods["nats"],
+                ]
+            }
         if arguments == [
             "-n",
             runtime.APP_NAMESPACE,
@@ -3588,6 +3879,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertEqual(result["cilium"]["chart"], self.cilium_chart)
         self.assertFalse(result["cilium"]["kube_proxy_present"])
         self.assertTrue(result["cilium"]["daemonset_images_canonical"])
+        self.assertTrue(result["cilium"]["daemonset_pods"]["images_canonical"])
+        self.assertTrue(result["cilium"]["operator_pods"]["images_canonical"])
         self.assertEqual(
             set(result["flux_controllers"]),
             runtime.EXPECTED_FLUX_CONTROLLERS,
@@ -3623,6 +3916,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         healthy_chart = self.cilium_chart
         healthy_values = json.loads(json.dumps(self.cilium_values))
         healthy_daemonset = json.loads(json.dumps(self.cilium_daemonset))
+        healthy_cilium_pods = json.loads(json.dumps(self.cilium_pods))
+        healthy_operator_pods = json.loads(json.dumps(self.cilium_operator_pods))
 
         self.cilium_chart = "cilium-9.9.9"
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "Helm release"):
@@ -3681,6 +3976,37 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "operator images drifted"):
             runtime.status(self.root)
         self.cilium_operator = healthy_operator
+
+        self.cilium_pods = json.loads(json.dumps(healthy_cilium_pods))
+        self.cilium_pods[0]["spec"]["containers"][0]["image"] = (
+            "quay.io/cilium/cilium:v9.9.9"
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "requested images drifted"):
+            runtime.status(self.root)
+        self.cilium_pods = json.loads(json.dumps(healthy_cilium_pods))
+        self.cilium_pods[0]["status"]["initContainerStatuses"][0]["imageID"] = (
+            "containerd://not-a-digest"
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "runtime image ID drifted"):
+            runtime.status(self.root)
+
+        self.cilium_pods = json.loads(json.dumps(healthy_cilium_pods))
+        self.cilium_pods[0]["status"]["containerStatuses"][0]["imageID"] = (
+            "containerd://sha256:" + "0" * 64
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "drifted from platform installation"
+        ):
+            runtime.status(self.root)
+        self.cilium_pods = healthy_cilium_pods
+
+        self.cilium_operator_pods = json.loads(json.dumps(healthy_operator_pods))
+        self.cilium_operator_pods[0]["status"]["containerStatuses"][0][
+            "imageID"
+        ] = "containerd://not-a-digest"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "runtime image ID drifted"):
+            runtime.status(self.root)
+        self.cilium_operator_pods = healthy_operator_pods
 
         self.kube_proxy_daemonsets = [{"metadata": {"name": "kube-proxy"}}]
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "kube-proxy is present"):
@@ -3864,6 +4190,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.write_vm_receipt()
         self.prepare_status()
         healthy = json.loads(json.dumps(self.data_deployments))
+        healthy_pods = json.loads(json.dumps(self.data_pods))
 
         result = runtime.status(self.root)
         self.assertEqual(set(result["data_deployments"]), {"postgres", "nats"})
@@ -3883,6 +4210,27 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             runtime.status(self.root)
 
         self.data_deployments = healthy
+
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        self.data_pods["postgres"][0]["spec"]["containers"][0]["image"] = (
+            "postgres:16@sha256:" + "0" * 64
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "requested images drifted"):
+            runtime.status(self.root)
+
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        self.data_pods["nats"][0]["status"]["containerStatuses"][0]["imageID"] = (
+            "containerd://sha256:" + "0" * 64
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "runtime image ID drifted"):
+            runtime.status(self.root)
+
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        self.data_pods["postgres"] = []
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "exact replica contract"):
+            runtime.status(self.root)
+
+        self.data_pods = healthy_pods
 
     def test_status_requires_running_application_pod_images(self) -> None:
         self.write_vm_receipt()
