@@ -1663,6 +1663,51 @@ def _require_requested_release_artifacts(
     }
 
 
+def _require_live_secret(
+    secret: Any,
+    namespace: str,
+    name: str,
+    secret_type: str,
+    required_keys: set[str],
+) -> dict[str, Any]:
+    if not isinstance(secret, dict):
+        raise RuntimeErrorEB(f"Experiment-B Secret is not an object: {namespace}/{name}")
+    metadata = secret.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise RuntimeErrorEB(f"Experiment-B Secret metadata is invalid: {namespace}/{name}")
+    if (
+        metadata.get("name") != name
+        or metadata.get("namespace") != namespace
+        or metadata.get("deletionTimestamp")
+    ):
+        raise RuntimeErrorEB(
+            f"Experiment-B Secret identity/deletion state is invalid: {namespace}/{name}"
+        )
+    if secret.get("type") != secret_type:
+        raise RuntimeErrorEB(f"Experiment-B Secret type drifted: {namespace}/{name}")
+    data = secret.get("data", {})
+    if not isinstance(data, dict):
+        raise RuntimeErrorEB(f"Experiment-B Secret data shape is invalid: {namespace}/{name}")
+    present_keys = {
+        str(key)
+        for key, value in data.items()
+        if isinstance(key, str) and isinstance(value, str) and bool(value)
+    }
+    missing = sorted(required_keys - present_keys)
+    if missing:
+        raise RuntimeErrorEB(
+            f"Experiment-B Secret is missing required keys: {namespace}/{name}: {missing}"
+        )
+    return {
+        "namespace": namespace,
+        "name": name,
+        "type": secret_type,
+        "required_keys": sorted(required_keys),
+        "present": True,
+        "terminating": False,
+    }
+
+
 def _require_gateway_ready(gateway: Any) -> dict[str, Any]:
     if not isinstance(gateway, dict):
         raise RuntimeErrorEB("Experiment-B Gateway payload is not an object")
@@ -1894,6 +1939,48 @@ def status(root: Path) -> dict[str, Any]:
     if api_containers.get("ollama") != semantic["ollama_image"]:
         raise RuntimeErrorEB("live Ollama image does not match semantic-search pin")
 
+    database_secret = _kubectl_json(
+        root,
+        [
+            "-n", DATA_NAMESPACE, "get", "secret",
+            "commonthing-experiment-b-database",
+        ],
+    )
+    runtime_secret = _kubectl_json(
+        root,
+        ["-n", APP_NAMESPACE, "get", "secret", "weltgewebe-runtime"],
+    )
+    registry_secret = _kubectl_json(
+        root,
+        [
+            "-n", APP_NAMESPACE, "get", "secret",
+            "commonthing-experiment-b-registry",
+        ],
+    )
+    secret_readback = {
+        "database": _require_live_secret(
+            database_secret,
+            DATA_NAMESPACE,
+            "commonthing-experiment-b-database",
+            "Opaque",
+            {"username", "database", "password"},
+        ),
+        "runtime": _require_live_secret(
+            runtime_secret,
+            APP_NAMESPACE,
+            "weltgewebe-runtime",
+            "Opaque",
+            {"database-url"},
+        ),
+        "registry": _require_live_secret(
+            registry_secret,
+            APP_NAMESPACE,
+            "commonthing-experiment-b-registry",
+            "kubernetes.io/dockerconfigjson",
+            {".dockerconfigjson"},
+        ),
+    }
+
     pvc_items = _kubectl_json(root, ["-A", "get", "pvc"]).get("items", [])
     pvc_readback = _require_exact_healthy_pvcs(pvc_items)
 
@@ -1925,6 +2012,7 @@ def status(root: Path) -> dict[str, Any]:
             "ollama": api_containers.get("ollama"),
         },
         "migration_complete": release_artifacts["migration_complete"],
+        "secrets": secret_readback,
         "pvcs": pvc_readback,
         "gateway": gateway_readback,
         "gateway_programmed": True,

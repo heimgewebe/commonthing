@@ -2154,6 +2154,36 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "kind": "NodeList",
             "items": [self.node],
         }
+        self.live_secrets = {
+            f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database": {
+                "metadata": {
+                    "namespace": runtime.DATA_NAMESPACE,
+                    "name": "commonthing-experiment-b-database",
+                },
+                "type": "Opaque",
+                "data": {
+                    "username": "dXNlcg==",
+                    "database": "ZGI=",
+                    "password": "cGFzcw==",
+                },
+            },
+            f"{runtime.APP_NAMESPACE}/weltgewebe-runtime": {
+                "metadata": {
+                    "namespace": runtime.APP_NAMESPACE,
+                    "name": "weltgewebe-runtime",
+                },
+                "type": "Opaque",
+                "data": {"database-url": "cG9zdGdyZXM="},
+            },
+            f"{runtime.APP_NAMESPACE}/commonthing-experiment-b-registry": {
+                "metadata": {
+                    "namespace": runtime.APP_NAMESPACE,
+                    "name": "commonthing-experiment-b-registry",
+                },
+                "type": "kubernetes.io/dockerconfigjson",
+                "data": {".dockerconfigjson": "e30="},
+            },
+        }
         self.pvcs = [
             {
                 "metadata": {"namespace": runtime.DATA_NAMESPACE, "name": "postgres-data"},
@@ -2378,6 +2408,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     "availableReplicas": 1, "conditions": [{"type": "Available", "status": "True"}],
                 },
             }
+        if "secret" in arguments:
+            namespace = arguments[arguments.index("-n") + 1]
+            name = arguments[-1]
+            key = f"{namespace}/{name}"
+            if key not in self.live_secrets:
+                raise runtime.RuntimeErrorEB(f"unexpected Secret fixture lookup: {key}")
+            return self.live_secrets[key]
         if "pvc" in arguments:
             return {"items": self.pvcs}
         if "httproute" in arguments:
@@ -2522,6 +2559,92 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         attempt = json.loads((self.root / "receipts/status-attempt.json").read_text())
         self.assertEqual(attempt["status"], "pass")
         self.assertEqual(attempt["receipt_sha256"], runtime.sha256_file(self.root / "receipts/status.json"))
+
+    def test_status_requires_live_expected_secrets_without_recording_values(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        healthy = json.loads(json.dumps(self.live_secrets))
+        result = runtime.status(self.root)
+        self.assertEqual(
+            set(result["secrets"]),
+            {"database", "runtime", "registry"},
+        )
+        rendered = json.dumps(result["secrets"], sort_keys=True)
+        for encoded_value in (
+            "dXNlcg==",
+            "ZGI=",
+            "cGFzcw==",
+            "cG9zdGdyZXM=",
+            "e30=",
+        ):
+            self.assertNotIn(encoded_value, rendered)
+
+        cases = []
+
+        missing_key = json.loads(json.dumps(healthy))
+        del missing_key[
+            f"{runtime.APP_NAMESPACE}/weltgewebe-runtime"
+        ]["data"]["database-url"]
+        cases.append(("missing-key", missing_key))
+
+        empty_key = json.loads(json.dumps(healthy))
+        empty_key[
+            f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database"
+        ]["data"]["password"] = ""
+        cases.append(("empty-key", empty_key))
+
+        wrong_type = json.loads(json.dumps(healthy))
+        wrong_type[
+            f"{runtime.APP_NAMESPACE}/commonthing-experiment-b-registry"
+        ]["type"] = "Opaque"
+        cases.append(("wrong-type", wrong_type))
+
+        deleting = json.loads(json.dumps(healthy))
+        deleting[
+            f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database"
+        ]["metadata"]["deletionTimestamp"] = "2026-09-27T03:54:28Z"
+        cases.append(("deleting", deleting))
+
+        wrong_identity = json.loads(json.dumps(healthy))
+        wrong_identity[
+            f"{runtime.APP_NAMESPACE}/weltgewebe-runtime"
+        ]["metadata"]["name"] = "other"
+        cases.append(("wrong-identity", wrong_identity))
+
+        for name, secrets in cases:
+            with self.subTest(case=name):
+                self.live_secrets = secrets
+                for receipt in ("status.json", "portability.json"):
+                    runtime.atomic_json(
+                        self.root / "receipts" / receipt, {"status": "stale"}
+                    )
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime.status(self.root)
+                self.assertFalse((self.root / "receipts/status.json").exists())
+                self.assertFalse((self.root / "receipts/portability.json").exists())
+
+        self.live_secrets = healthy
+
+    def test_live_secret_readback_never_returns_secret_values(self) -> None:
+        secret = {
+            "metadata": {
+                "namespace": runtime.APP_NAMESPACE,
+                "name": "weltgewebe-runtime",
+            },
+            "type": "Opaque",
+            "data": {"database-url": "c2Vuc2l0aXZlLXZhbHVl"},
+        }
+        observed = runtime._require_live_secret(
+            secret,
+            runtime.APP_NAMESPACE,
+            "weltgewebe-runtime",
+            "Opaque",
+            {"database-url"},
+        )
+        self.assertEqual(observed["required_keys"], ["database-url"])
+        self.assertNotIn("data", observed)
+        self.assertNotIn("c2Vuc2l0aXZlLXZhbHVl", json.dumps(observed))
 
     def test_status_requires_exact_healthy_pvc_set(self) -> None:
         self.write_vm_receipt()
