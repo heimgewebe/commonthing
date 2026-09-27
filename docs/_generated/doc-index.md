@@ -50,6 +50,7 @@ Generated automatically. Do not edit.
 | deploy.heim-first-phase0 | Heim-First Phase 0 | reference | deprecated | docs/deploy/heim-first-phase0.md |
 | deploy.heimserver.deployment | Heimserver Deployment | reference | deprecated | docs/deploy/heimserver.deployment.md |
 | deploy.heimserver.integration | Heimserver Integration | reference | deprecated | docs/deploy/heimserver.integration.md |
+| deploy.kubernetes-production-cutover-t044 | T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates | runbook | active | docs/deploy/kubernetes-production-cutover-t044.md |
 | deploy.map-html-canonical-route | Canonical Map Route Contract | runbook | active | docs/deploy/map-html-canonical-route.md |
 | deploy.public-app-base-url | Public APP_BASE_URL Contract | reference | active | docs/deploy/public-app-base-url.md |
 | deploy.public-metrics-boundary | Public Metrics Boundary | reference | active | docs/deploy/public-metrics-boundary.md |

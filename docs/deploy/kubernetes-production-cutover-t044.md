@@ -1,0 +1,961 @@
+---
+id: deploy.kubernetes-production-cutover-t044
+title: "T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates"
+doc_type: runbook
+status: active
+canonicality: operational
+lifecycle_state: active
+owner_task: WELTGEWEBE-OS-V1-T044
+last_reviewed: 2026-09-25
+review_after: 2026-10-07
+summary: >
+  Revisionsgebundener R5-Preflight für den Wechsel von Compose/Caddy-Blue auf
+  Kubernetes-Green. Bindet die am 25.09.2026 frisch rückgelesene Produktions- und
+  Referenzplattformwahrheit und blockiert jede Produktionswirkung bis Zielplattform,
+  Capability-Parität, Datenübergang, Backup und Rollback konkret belegt sind.
+relations:
+  - type: depends_on
+    target: docs/reports/kubernetes-platform-foundation-status.md
+  - type: relates_to
+    target: docs/deploy/vps.md
+  - type: relates_to
+    target: architecture/semantic-search.md
+  - type: relates_to
+    target: docs/adr/ADR-0010__kubernetes-kanonische-plattform.md
+---
+
+# T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates
+
+## 1. Zweck und Autorität
+
+Dieses Dokument ist der versionierte Cutover-Vertrag für
+`WELTGEWEBE-OS-V1-T044`. Es beschreibt den frisch beobachteten Zustand und die
+Eintritts-, Stop- und Abschlussbedingungen für den Produktionswechsel.
+
+Es ist **keine Aktivierungsfreigabe**. Insbesondere autorisiert es weder DNS-,
+Traffic-, Writer-, Datenbank- noch Kubernetes-Produktionsmutationen.
+
+Beobachtungsbasis:
+
+- Liveinventur und Zielplattform-Gegencheck: 2026-09-25
+- beim Readback geschützter Repo-`main`: `85ebdd71846f8d6a2de1076745de20725ebcb48a`
+- produktiv ausgelieferte Blue-Revision: `85ebdd71846f8d6a2de1076745de20725ebcb48a`
+- T044: Revision 5, kein aktueller Verification-Stamp
+- T084: Referenz-/Recovery-Evidenz vorhanden; der letzte vollständige E2E-Proof
+  ist älter als der heutige Legacy-Staging-Controller
+- produktive Blue-Runtime: `commonserver`
+- Referenz-Green: `commonthing-staging`
+
+Diese Angaben sind **zeitgebundene Evidenzanker**, keine fortlaufend gültige
+„Current Truth“. Vor jedem R6- oder späteren Eintrittsgate werden `main`,
+Blue-Release, Green-Revision/-Digests und Zielidentität erneut live gelesen.
+Abweichungen aktualisieren den Preflight; ältere erfolgreiche Readbacks
+autorisieren keine Mutation.
+
+## 2. Dialektische Disposition
+
+**These:** Die Kubernetes-/GitOps-Plattform ist hinreichend belegt, um den
+Produktionscutover vorzubereiten.
+
+**Antithese:** Der vorhandene `commonthing-staging`-Cluster ist ausdrücklich
+kein Produktionscluster. Er belegt weder öffentliches DNS/TLS noch einen
+produktiven Load Balancer. Außerdem fehlen dort heute produktive Fähigkeiten,
+die Blue real ausführt.
+
+**Disposition:** R5 ist begonnen, aber noch nicht bestanden. Blue bleibt alleinige
+Produktions- und Writer-Autorität. R6 darf erst beginnen, wenn die unten
+markierten BLOCKED-Gates geschlossen sind.
+
+## 3. Blue — reale Produktion
+
+Frischer Readback vom VPS `commonserver`:
+
+### 3.1 Revision und Frontdoor
+
+- Compose-Projekt: `weltgewebe`
+- ausgelieferter Build: `85ebdd71`
+- exakter Blue-Release-Commit: `85ebdd71846f8d6a2de1076745de20725ebcb48a`
+- kanonischer Web-Origin: `https://commonthing.net`
+- kanonischer API-Origin: `https://api.commonthing.net`
+- Legacy-Web/API bleiben Kompatibilitätspfade
+<!-- commonthing-naming: legacy -->
+- DNS für `commonthing.net`, `api.commonthing.net`, `weltgewebe.net` und
+  `api.weltgewebe.net` zeigte auf `94.16.121.119`
+- Web-Readback: HTTP 200
+- API-Readiness: HTTP 200, Datenbank/Event-Chain/NATS/Policy = ready
+- Web-`version.json` und API-`/version` binden beide exakt
+  `85ebdd71846f8d6a2de1076745de20725ebcb48a`
+
+### 3.2 Laufende Fähigkeiten
+
+Blue führt real aus:
+
+- Caddy/Public TLS/Hostrouting
+- statisches Web
+- API
+- PostgreSQL
+- NATS JetStream
+- lokalen Ollama-Embedding-Runtimepfad
+- persistenten Search-Worker
+- Schauwerk/Schaubild-Editor
+- lokale Basemap-/Style-/Glyph-/PMTiles-Auslieferung
+- Public Login/Auth-Vertrag
+
+### 3.3 Daten- und Writer-Wahrheit
+
+API-Konfiguration:
+
+- Domain-Read-Source: PostgreSQL
+- Account-/Node-/Edge-Write-Source: PostgreSQL
+- Passkey-Credential-Source: PostgreSQL
+- `AUTH_PUBLIC_LOGIN=1`
+- NATS: `nats://nats:4222`
+
+Am 25.09.2026 erneut read-only geprüfte PostgreSQL-Zustände, nicht als SLO oder Sollwert zu lesen:
+
+- `domain_accounts=13`
+- `domain_nodes=4`
+- `domain_edges=16`
+- `domain_outbox=292`
+- `domain_event_consumptions=292`
+- `search_index_generations=1`
+- `search_node_projections=4`
+- `search_projection_jobs=23`
+
+Zuletzt separat beobachteter JetStream-Zustand aus dem 23.09.2026-Readback:
+
+- Stream: `WELTGEWEBE_DOMAIN`
+- Consumers: 2
+- Messages: 7
+- letzter beobachteter Stream-Seq: 292
+
+### 3.4 Semantic Search
+
+Aktiv:
+
+- Provider: `local:ollama`
+- Modell: `qwen3-embedding:4b`
+- Modellrevision:
+  `sha256:df5bd2e3c74cd8d069d21dc038f1b359fcdc9458fce1c99bd43c9eb1518ff907`
+- Dimension: 2560
+- Runtime: `ollama:0.12.6@http://127.0.0.1:11434`
+- Provider-URL: exakt `http://127.0.0.1:11434/`
+
+Der Search-Worker-Vertrag akzeptiert absichtlich nur literal Loopback. Ein
+clusterweiter Ollama-Service ist daher **keine** äquivalente Kleinänderung.
+
+### 3.5 Hostkapazität
+
+Am Beobachtungszeitpunkt:
+
+- 4 vCPU
+- ca. 8,33 GB RAM, davon beim Readback ca. 6,37 GB verfügbar
+- kein Swap
+- ca. 136,7 GB freier Plattenspeicher
+
+Der bestehende Produktions-Search-Vertrag verlangt vor seinem Rollout mindestens
+3 Online-CPUs, 5 GiB verfügbaren Arbeitsspeicher und 8 GiB freien Speicher.
+Darum gilt ein zweiter vollständiger Green-Stack auf demselben VPS **nicht** als
+kapazitiv bewiesen. Co-Residence benötigt einen eigenen Messbeweis und darf nicht
+aus dem aktuellen Idle-Readback abgeleitet werden.
+
+## 4. Green — heutige Kubernetes-Referenz
+
+`commonthing-staging` wurde am 25.09.2026 direkt über die im Staging-State
+gepinnten `kind`-/`kubectl`-Binärdateien rückgelesen. Der Cluster existiert;
+Control-Plane und beide Worker melden `Ready` unter Kubernetes v1.36.1.
+
+Dieser Live-Readback belegt den heutigen Laufzeitzustand der Referenzzelle,
+aber **keinen neuen vollständigen T084-E2E-Proof** für den inzwischen
+weiterentwickelten Legacy-Staging-Controller; der im Foundation-Status
+dokumentierte Proof-Lag bleibt damit ausdrücklich sichtbar.
+
+### 4.1 Bindungen
+
+- Cluster: `commonthing-staging`
+- aktiver App-Commit:
+  `bb1e26d47b50d38ec720b123d55255c05436100b`
+- Bootstrap-/Datenrevision:
+  `6a10c76666b9769fdfddb62ecb3fbf0c2c5df935`
+
+Damit ist Green aktuell **weder** auf derselben App-Revision wie Blue noch auf dem aktuellen Repo-`main`.
+
+### 4.2 Workloads
+
+Bereit:
+
+- API: 2/2
+- Web: 2/2
+- PostgreSQL: 1/1
+- NATS: 1/1
+- Flux-Controller: alle vier Deployments 1/1 ready
+- Flux-Kustomization `commonthing-staging-app`: Ready auf
+  `sha1:bb1e26d47b50d38ec720b123d55255c05436100b`
+- Flux-Kustomization `commonthing-staging-data`: Ready auf
+  `sha1:6a10c76666b9769fdfddb62ecb3fbf0c2c5df935`
+- Cilium Gateway API
+- PostgreSQL-PVC: Bound, 10 Gi
+- NATS-PVC: Bound, 5 Gi
+- Runtime-/Database-Secrets: ready
+- Registry-Pull-Secret: ready
+
+Gateway:
+
+- Cilium Gateway Accepted/Programmed
+- HTTPRoute: `/health` + `/api` -> API, `/` -> Web
+- lokaler T084-Hostproof erfolgt über `127.0.0.1:18084`
+
+Nicht dadurch belegt:
+
+- öffentliches DNS
+- öffentliches TLS
+- produktiver Load Balancer
+- Produktionswriter
+- Produktionsdatenparität
+
+### 4.3 Fehlende produktive Fähigkeiten
+
+Im heutigen Green-Readback fehlen:
+
+- Ollama
+- Search-Worker
+- Schauwerk/Schaubild
+- öffentlich belegter Basemap-/PMTiles-Frontdoor
+- öffentliches TLS/DNS
+- produktionsgebundene Secret-/Edge-Autorität
+
+Außerdem steht Green auf `AUTH_PUBLIC_LOGIN=0`, während Blue produktiv
+`AUTH_PUBLIC_LOGIN=1` verwendet.
+
+## 5. Blue-vs-Green-Matrix
+
+| Capability | Blue | Green heute | R5-Disposition |
+| --- | --- | --- | --- |
+| Web | aktiv, öffentlich | 2/2 ready | offen: exakte Revision + Public Frontdoor |
+| API | aktiv, öffentlich | 2/2 ready | offen: exakte Revision + Public Frontdoor |
+| PostgreSQL | produktive Wahrheit | persistent ready | BLOCKED: Produktionsdatenübergang fehlt |
+| NATS/JetStream | produktiv | persistent ready | BLOCKED: Stream-/Consumer-Übergang fehlt |
+| Auth/Public Login | aktiv, `1` | `0` | BLOCKED: Parität/Entscheidung fehlt |
+| Ollama | aktiv | fehlt | BLOCKED |
+| Search-Worker | aktiv | fehlt | BLOCKED |
+| Semantic Search | aktiv | nicht vollständig lauffähig | BLOCKED |
+| Schauwerk/Schaubild | aktiv | fehlt | BLOCKED |
+| Basemap/PMTiles | öffentlich über Caddy | kein öffentlicher Beweis | BLOCKED |
+| DNS/TLS/Public Edge | aktiv | kein Produktionsziel | BLOCKED |
+| Backup/Restore | Compose-Pfad + T084-Evidenz getrennt | T084 belegt | BLOCKED für konkretes Produktionsziel |
+| Writer-Autorität | Blue | keine | korrekt: Blue bleibt alleiniger Writer |
+
+## 6. Harte R5-Blocker
+
+### B1 — reale Green-Zielplattform fehlt
+
+Der lokale T084-kind-Cluster ist Referenz-/Abnahmeumgebung und darf nicht als
+Produktionscluster umetikettiert werden.
+
+Für T044 fehlt ein konkret beobachtbares Produktionsziel mit mindestens:
+
+- Host/Provider bzw. Clusteridentität
+- CPU/RAM/Storage-Kapazität
+- Fehlerdomäne
+- öffentlicher Edge-/Load-Balancer-Pfad
+- DNS-/TLS-Verantwortung
+- Secretbereitstellung
+- Backupziel
+- Restorepfad
+- Operator-/Writer-Autorität
+
+Bis diese Zielidentität feststeht, wird **keine** Produktions-Kubernetes-Topologie
+aus der lokalen Staging-Implementierung extrapoliert.
+
+Frischer Gegencheck vom 25.09.2026:
+
+- Im aktuellen Grabowski-Fleetregister ist `commonserver` als erreichbarer
+  Produktionshost registriert. Ein eigenständiger zweiter Kubernetes-
+  Produktionshost bzw. ein konkretes Production-Green-Ziel ist dort nicht
+  registriert. Der Systemkatalog führt `host:wg-prod-1` weiterhin als
+  Failure-Domain-Bezeichner; dies etabliert keinen separat adressierbaren
+  Fleet-Host und keinen Green-Cluster.
+- Auf dem am 25.09.2026 frisch gebundenen Public-Main
+  `85ebdd71846f8d6a2de1076745de20725ebcb48a` existiert kein
+  `platform/clusters/production`. Deklarierte Clusterkompositionen sind
+  `local`, `staging` und `ha`.
+- `platform/apps/weltgewebe/overlays/production` ist ein Anwendungs-Overlay;
+  seine Existenz belegt keinen provisionierten oder betriebsbereiten
+  Produktionscluster.
+- Ein In-place-Wechsel auf `commonserver` bleibt ein möglicher Alternativpfad,
+  ist aber **nicht freigegeben oder belegt**. Vor einer solchen Festlegung
+  müssten mindestens Kapazität unter realer Blue-Last, Port-/Edge-Kollisionen,
+  Storage-Isolation, progressive Traffic-Steuerung, Writer-Fencing, Search/Ollama,
+  Rollback und Recovery auf demselben Host separat bewiesen werden.
+
+Damit ist B1 nach dem Gegencheck enger: Es fehlt nicht nur die Zielidentität auf
+dem Papier; im heute registrierten und erreichbaren Bestand wurde **kein zweiter
+externer Green-Host gefunden**. Daraus folgt weder die Erlaubnis, neue
+kostenpflichtige Infrastruktur zu beschaffen, noch die Freigabe für einen
+In-place-Cutover.
+
+### B2 — Semantic-Search-Parität fehlt
+
+Blue führt Ollama und Search-Worker real aus; Green nicht.
+
+Der Fix muss den heutigen Vertrag erhalten oder ihn ausdrücklich mit eigener
+Evidenz ersetzen. Insbesondere darf `127.0.0.1:11434` nicht still durch einen
+clusterweiten Providerpfad ersetzt werden.
+
+Die Workerlogik ist für parallele Worker lease-/claimgebunden ausgelegt
+(`FOR UPDATE SKIP LOCKED`), aber daraus folgt noch keine geeignete
+Ollama-/Storage-Topologie für den unbekannten Produktionscluster.
+
+### B3 — Frontdoor-/Schauwerk-Parität fehlt
+
+Blue besitzt zusätzliche produktive Edge-Fähigkeiten, die nicht durch
+API/Web-Gateway-Readiness abgedeckt sind:
+
+- Schauwerk/Schaubild
+- Basemap/PMTiles/Styles/Glyphs
+- Redirect-/Legacy-Hostvertrag
+- Sicherheitsheader
+- öffentliches TLS
+
+Diese müssen vor R6 entweder Kubernetes-native sein, explizit extern
+weiterbetrieben werden oder mit eigener Evidenz retired werden.
+
+### B4 — Datenparität fehlt
+
+Die T084-Daten sind Recovery-/Staging-Evidenz, nicht automatisch der aktuelle
+Produktionsdatenstand. Vor Writer-Fencing müssen PostgreSQL, JetStream,
+Suchprojektion und sonstiger persistenter Fachzustand aus Blue gegen das konkrete
+Green-Ziel abgeglichen werden.
+
+### B5 — reale Staging-/Zieltestbed-Abnahme fehlt
+
+Das in §4 beobachtete `commonthing-staging` ist der lokale T084-Referenzcluster
+und erfüllt **nicht** das T044-Akzeptanzkriterium einer realen, vom lokalen
+Referenzcluster und vom Produktions-Green getrennten Abnahmeumgebung.
+
+Bevor R6 gegen einen Produktionskandidaten beginnen darf, muss eine solche reale
+Umgebung live beobachtet und für die gewünschte Release-Revision erfolgreich
+abgenommen sein. Sie darf **zeitlich begrenzt und ausschließlich für diesen
+Proof** betrieben werden. Damit bleibt T044 mit ADR-0010 vereinbar: Das dort
+definierte Experiment B kann diese Abnahme liefern; ein permanenter
+Staging-Dauerbetrieb wird dadurch ausdrücklich **nicht** beschlossen.
+
+Die revisionsgebundene Staging-/Zieltestbed-Abnahme umfasst mindestens:
+
+- externe Secrets und deren Bereitstellungspfad;
+- commit-/digestgebundene Imagepromotion für API und Web;
+- produktionsnahe Last mit numerischen Pass/Fail-Grenzen;
+- Backup-, Restore- und Recovery-Probe samt gemessener Recovery-Evidenz;
+- fachliche Readbacks für Web, API, Auth, Fachdaten, Events/Projektionen und die
+  dort aktivierten Zusatzfähigkeiten.
+
+Ein lokaler Referenzproof, ein Produktionskandidat oder eine bloße
+Manifestexistenz darf diese separate reale Abnahmephase nicht ersetzen. Aus
+einer bestandenen Staging-/Zieltestbed-Abnahme folgt außerdem **keine**
+Produktionsfreigabe.
+
+### B6 — Zwei-Betreiber-Aktivierungsvertrag fehlt
+
+T044 verlangt vor R6 den vorhandenen fail-closed Zwei-Betreiber-Zellvertrag als
+eigene Vorstufe. Kanonisch sind
+`platform/cell-pilot/two-operator-pilot.contract.json` und
+`scripts/platform/validate_two_operator_pilot.py`.
+
+Das Gate ist erst geschlossen, wenn für **dieselbe gewünschte Release-Revision**
+ein konkretes Aktivierungsdokument vorliegt und folgende Evidenz gemeinsam
+gebunden ist:
+
+- `document_mode=activation` und `activation.approved=true`;
+- `activation.source_commit` entspricht der gewünschten Release-Revision und
+  bindet über den Vertrag beide Zellen auf denselben Source-Commit sowie
+  dieselben API-/Web-Image-Digests;
+- `activation.approved_by` enthält beide Operator-IDs; kein Einzeloperator darf
+  die Aktivierung allein attestieren;
+- Identitäts-, Peer-, Egress-, DNS/TLS-, Backup-/Restore-, Betriebs-,
+  Upgrade-/Rollback- und Mutual-Proof-Receipts sind konkret und eindeutig;
+- der Aktivierungsbeleg besteht
+  `python3 scripts/platform/validate_two_operator_pilot.py <activation.json> --mode activation`;
+- **zusätzlich** sind sämtliche referenzierten Receipts gegen ihre externen
+  Autoritäten verifiziert und gegen ein autoritatives Replay-Ledger geprüft.
+
+Der statische Validator beweist ausdrücklich **keine** Aktivierungsbereitschaft,
+Operatorunabhängigkeit oder externe Receipt-Gültigkeit. Ein nur strukturell
+gültiges Dokument, bloße SHA-256-Werte oder das vorhandene `.invalid`-Beispiel
+schließen B6 deshalb nicht. Fehlt auch nur ein Teil der gemeinsamen Freigabe
+oder externen Receipt-/Replay-Verifikation, bleibt R6 BLOCKED.
+
+## 7. Eintrittsgates für R6
+
+R6 darf erst starten, wenn **alle** folgenden Bedingungen erfüllt sind:
+
+1. der Zwei-Betreiber-Aktivierungsvertrag aus B6 ist für die gewünschte
+   Release-Revision vollständig bestanden: gemeinsame Freigabe beider
+   Operatoren, `--mode activation` erfolgreich, externe Receipt-Verifikation
+   vollständig und autoritatives Replay-Ledger ohne Konflikt;
+2. die separate reale, gegebenenfalls temporäre Staging-/Experiment-B-Abnahme
+   aus B5 ist für die gewünschte Release-Revision live beobachtet und mit
+   externer Secretbereitstellung, digestgebundener Promotion, produktionsnaher
+   Last sowie Backup-/Restore-/Recovery-Evidenz erfolgreich abgenommen;
+3. ein konkretes Produktions-Green ist identifiziert und live beobachtet;
+4. dessen Kapazität und Fehlerdomäne sind dokumentiert;
+5. Current Main und gewünschte Release-Revision sind erneut frisch bestimmt;
+6. digestgebundene API-/Web-Promotion für die gewünschte Revision liegt vor;
+7. Search/Ollama/Schauwerk/Basemap/Auth sind jeweils als
+   Kubernetes-native, explizit extern oder retired entschieden und belegt;
+8. Green kann aktuelle Produktionsdaten aufnehmen, ohne Blue-Writer zu berühren;
+9. frisches Blue-Backup und konkreter Restorepfad sind belegt;
+10. Pre-Write-Rollback auf Blue und Post-Write-Recovery mit
+    Reverse-Reconciliation plus erneutem Writer-Fencing sind getrennt belegt;
+11. keine fremde T044-/Produktionswriter-Lane ist aktiv;
+12. keine reale Produktionsmutation wurde aus einem älteren Preflight abgeleitet.
+
+## 8. R6 — Generalprobe
+
+### R6-Request-Safety-Gate
+
+**Vor der ersten R6-Anfrage überhaupt** wird jede benötigte Vergleichs- und
+Readback-Klasse für die exakte Green-Revision samt aktiver Konfiguration
+revisionsgebunden klassifiziert. Die Bezeichnung `read-only` ist dabei kein
+Name, sondern eine zu beweisende Wirkungseigenschaft.
+
+Eine Requestklasse darf nur dann als **read-only** gegen den späteren
+Produktionskandidaten ausgeführt werden, wenn belegt ist, dass sie weder direkt
+noch über Worker, Retry-/Cleanup-Pfade oder ausgelöste Folgearbeit
+
+- PostgreSQL-Fachdaten, Auth-/Session-/Token-/Credential-Zustand,
+  Outbox/Consumption, JetStream oder Suchjobs/-projektionen/-indexgenerationen
+  persistent verändert;
+- noch Web Push, SMTP/Magic-Link/Step-up-Mail, Federation, Webhooks, Callbacks
+  oder andere externe Delivery auslösen kann.
+
+Insbesondere sind Login-/Magic-Link-Anfragen, Auto-Provisioning,
+credential-/sessionverändernde Auth-Flows und andere Endpunkte mit möglicher
+Persistenz- oder Delivery-Wirkung **nicht** allein deshalb read-only, weil sie in
+einem Auth-Readback verwendet werden. Für solche Klassen ist entweder ein
+nachweislich nebenwirkungsfreier Inspektions-/Readiness-Pfad zu verwenden oder
+vor ihrer Ausführung der unten definierte isolierte Rehearsal-Zustand samt
+External-Side-Effect-Fence herzustellen.
+
+Kann für eine der benötigten Klassen weder Nebenwirkungsfreiheit noch ein
+isolierter und extern gefenceter Rehearsal-Pfad bewiesen werden, bleibt **R6
+insgesamt BLOCKED**; die betreffende Prüfung darf nicht still übersprungen oder
+als read-only umetikettiert werden.
+
+Erst nach diesem Gate werden die benötigten Vergleiche ausgeführt:
+
+1. Web
+2. API
+3. Auth
+4. Karten-/Basemapdaten
+5. Fachdaten
+6. Suche
+7. Schauwerk/Schaubild
+8. Event-/Projektionsreadback
+
+### R6-Write-Isolation und Cleanup
+
+Nur revisionsgebunden als nebenwirkungsfrei belegte Readbacks dürfen unmittelbar
+gegen den späteren Produktionskandidaten laufen. **Jede mutierende oder nicht
+als nebenwirkungsfrei belegte R6-Anfrage** wird als Rehearsal-Mutation behandelt
+und darf dessen späteren produktiven Daten-, Ereignis- oder externen
+Wirkungszustand nicht verunreinigen.
+
+Vor der ersten solchen R6-Anfrage muss für **jeden betroffenen persistenten
+Zustand** ein zielplattformgebundener Isolations- oder vollständiger
+Rücksetzungsnachweis vorliegen. Er umfasst mindestens:
+
+- PostgreSQL-Fachdaten und gegebenenfalls Auth-Zustand;
+- Domain-Outbox und Consumption-Positionen;
+- NATS/JetStream-Streams, Consumer und Sequenzfortschritt;
+- Suchjobs, Suchprojektionen und aktive Indexgenerationen;
+- eindeutige Testobjekt- und Korrelationskennungen sowie einen gebundenen
+  Ausgangszustand.
+
+Zusätzlich gilt eine eigenständige **External-Side-Effect-Fence**. Bereits
+vor der ersten aktiven R6-Probe wird für die exakte Green-Revision und ihre
+aktive Konfiguration revisionsgebunden inventarisiert, welche Request-, Worker-,
+Retry-, Cleanup- oder Delivery-Pfade die Rehearsal-Grenze nach außen verlassen
+und dort nicht vollständig rücksetzbare Wirkung erzeugen können. Dazu gehören
+mindestens, soweit in dieser Revision aktivierbar oder aktiviert:
+
+- Web-Push-/Notification-Delivery;
+- SMTP-/Magic-Link-/Step-up-Mail;
+- Federation-Delivery zu Remote-Zellen;
+- weitere release-spezifische Webhook-, Message-, Mail- oder externe
+  Delivery-/Callback-Pfade.
+
+Jeder inventarisierte externe Seiteneffektpfad muss **vor jeder R6-Anfrage,
+die ihn erreichen oder auslösen könnte**, genau einen belegten Zustand haben:
+
+1. technisch fail-closed deaktiviert, sodass zugehöriger Worker, Transport und
+   Egress kein externes Ziel erreichen können; **oder**
+2. auf einen verifizierten Rehearsal-Sink umgeleitet, dessen Identität,
+   Zieladresse, Empfänger-/Peer-Menge und Egresspfad nachweislich nicht
+   produktiv sind.
+
+Eine kopierte Produktionsdatenbank, Produktions-Subscriptions,
+Produktions-Peer-Endpunkte oder vorhandene Produktions-Credentials sind
+ausdrücklich **kein** Isolationsbeweis. Solche Daten dürfen nur vorhanden sein,
+wenn der zugehörige externe Pfad trotzdem technisch gefenced ist und eine reale
+Produktionszustellung fail-closed unmöglich bleibt.
+
+Das Side-Effect-Gate verlangt vor der ersten betroffenen R6-Anfrage mindestens
+einen gemeinsamen Readback aus Runtime-Konfiguration, Worker-/Delivery-Zustand
+und Netzwerk-/Egressentscheidung. Ist ein externer Wirkungspfad unbekannt,
+nicht inventarisiert oder kann er noch ein Produktionsziel erreichen, bleibt
+**R6 insgesamt BLOCKED**. Eine Anfrage mit unbewiesener Persistenz- oder
+Delivery-Wirkung darf nicht als read-only fortgeführt werden.
+
+Bevorzugt wird ein **disposable/isolierter Rehearsal-Datenpfad** derselben
+Revision und Konfiguration, zum Beispiel über eine getrennte Datenkopie,
+Namespace-/Schema-/Stream-/Index-Isolation oder eine äquivalente
+zielplattformnative Trennung. Eine bloße Löschung des fachlichen Testobjekts
+genügt ausdrücklich nicht, wenn append-only Ereignisse, Sequenzen oder
+Projektionen zurückbleiben.
+
+Nach jeder mutierenden oder isolierten R6-Generalprobe gilt fail-closed:
+
+1. der isolierte Rehearsal-Zustand wird vollständig verworfen oder jeder
+   betroffene Store nachweislich auf den gebundenen Ausgangszustand
+   zurückgesetzt;
+2. im späteren Produktionskandidaten sind Testobjekt- und Korrelationskennungen
+   in PostgreSQL, Outbox/Consumption, JetStream und Suche nachweislich abwesend;
+3. für jeden zuvor inventarisierten externen Seiteneffektpfad wird
+   zielgebunden zurückgelesen, dass nur der erwartete Rehearsal-Sink erreicht
+   wurde oder der Pfad vollständig deaktiviert blieb; ein Kontakt zu einem
+   Produktionsziel ist ein harter Abbruch und kann **nicht** durch nachträgliches
+   Store-Cleanup geheilt werden;
+4. Green erhält danach einen frischen finalen Datenabgleich aus der weiterhin
+   autoritativen Blue-Wahrheit;
+5. Daten-, Ereignis- und Projektionsgleichheit werden erneut read-only
+   zurückgelesen.
+
+Kann auch nur ein betroffener Store nicht isoliert oder vollständig
+zurückgesetzt werden, ist ein externer Side-Effect-Pfad nicht vollständig
+gefenced oder fehlt dessen zielgebundener Readback, bleibt R6 auf read-only
+beschränkt. **R7 darf erst nach diesem Cleanup-/Isolations- und
+Side-Effect-Beweis sowie dem anschließenden frischen Blue-zu-Green-Abgleich
+beginnen.**
+
+Für jedes Szenario werden Blue und Green unter demselben fachlichen Vertrag
+verglichen. HTTP 200 allein genügt nicht; Daten-, Auth-, Event- und
+Projektionssemantik müssen übereinstimmen.
+
+## 9. R7 — Writer-Fencing
+
+Unveränderliche Invariante:
+
+> Eine Schreibklasse hat genau einen autoritativen Writer.
+
+R7 bindet und beweist den Umschaltmechanismus, führt ihn aber noch **nicht**
+produktiv aus:
+
+```text
+Blue Writer
+  -> Fencing-/Blockiermechanismus revisionsgebunden beweisen
+  -> finalen Konvergenz- und Green-Readback-Pfad beweisen
+  -> kontrollierten Green-Probe-Write-Pfad ohne produktive Ausführung beweisen
+  -> Blue bleibt alleiniger Writer
+```
+
+R7 endet ausdrücklich **ohne** Writer-Transfer und ohne persistenten
+Green-Probe-Write. Der Probe-Pfad wird hier nur hinsichtlich Routing, Fencing,
+Isolation und erwarteter Readbacks belegt; seine produktive Ausführung erfolgt
+erst in R8 hinter der Write-Cutover-Grenze. Blue bleibt bis zur in R8
+definierten Writer-Transition alleinige Schreibautorität. Keine Phase darf Blue
+und Green gleichzeitig als unabhängige Writer zulassen.
+
+### Write-Cutover-Grenze und Rückweg
+
+Die **Write-Cutover-Grenze** ist der revisions- und zeitgebundene Zeitpunkt
+unmittelbar **vor dem ersten möglichen persistenten Green-Mutationspfad**. Sie
+wird also nicht erst durch einen später erfolgreich verifizierten Probe-Write
+definiert.
+
+Die Grenze darf erst gebunden werden, wenn der finale Blue-zu-Green-Abgleich
+und Gleichheits-Readback bestanden sind, Blue als Writer gefenced ist und Green
+noch technisch write-inhibited bleibt. Bei Continuous-Sync muss zusätzlich der
+Zero-Lag-/Drain-Checkpoint bestanden und der Blue-zu-Green-Replikationswriter
+nachweislich gefenced sein. Während die Grenze festgehalten wird, darf weder ein
+öffentlicher Green-Write, ein Replikations-Apply noch ein persistenzmutierender
+Green-Hintergrundpfad laufen.
+
+Bis **vor** diese dauerhaft festgehaltene Grenze darf Blue nur mit frischem
+Gleichheits-Readback und intaktem Writer-Fence reaktiviert werden. Ab der Grenze
+gilt Blue als potenziell veraltet und darf nicht direkt Writer werden — auch
+dann nicht, wenn der kontrollierte Probe-Write noch nicht erfolgreich
+abgeschlossen ist. Sobald Green-Mutatoren freigegeben werden, können unter
+anderem Outbox-, Receipt-/Notification- oder andere Hintergrundworker vor dem
+Probe-Write persistenten Zustand verändern. Eine Rückkehr ist dann Recovery:
+
+1. Green als Writer fencen und letzten autoritativen Zustand binden;
+2. PostgreSQL-/Auth-Zustand, Outbox-/Consumption-Positionen, JetStream und aktive
+   Suchprojektionen in Richtung Blue reconciliieren;
+3. Gleichheit und Ereigniskontinuität read-only zurücklesen;
+4. erst danach Blue erneut Writer-Autorität erteilen.
+
+Fehlt vollständige Reverse-Reconciliation, bleibt Green die einzige
+Datenwahrheit und wird vorwärts repariert. Bloßes Zurückschalten auf Compose ist
+nach der Write-Cutover-Grenze verboten.
+
+## 10. R8 — Traffic-Cutover
+
+### R8-Eintrittsgate — gemessene Betriebsgrenzen
+
+R8 bleibt blockiert, bis für das konkrete Green revisionsgebundene Mess- und
+Entscheidungsevidenz vorliegt:
+
+- cutoverkritische SLO-Schwellen und Messfenster für Verfügbarkeit, Fehler und
+  Latenz sind numerische Pass/Fail-Bedingungen, und Green besteht sie;
+- RTO ist durch einen Ziel-Recovery-/Restorelauf numerisch gemessen und liegt
+  innerhalb der vor R8 gebundenen Höchstgrenze;
+- RPO ist am wiederhergestellten Daten- und Ereignisstand numerisch gemessen und
+  liegt innerhalb der vor R8 gebundenen Höchstgrenze;
+- Messzeitpunkt, Green-Revision/Digests, Datenstand und Evidenzreferenzen sind
+  gemeinsam gebunden.
+
+Fehlt eine Zahl, ist sie nur qualitativ oder der Green-Bezug nicht mehr frisch,
+bleibt R8 blockiert. Vor Existenz der realen Zielplattform werden keine Werte
+erfunden.
+
+### R8-Eintrittsgate — Produktions-Green-Wirkungsbeweise
+
+Die Referenz- und Staging-Proofs werden nicht auf das konkrete Produktions-Green
+hochgerechnet. Vor R8 müssen die Produktions-Akzeptanzbedingungen aus ADR-0010
+für **genau das identifizierte Green**, die gewünschte Release-Revision und die
+gebundenen API-/Web-Image-Digests als frische Wirkungsevidenz vorliegen.
+
+Für **jeden** nachfolgenden Proof, der schreibt, Worker ausführt, einen
+Restart/Failover erzwingt oder Restore-/PITR-Zustand erzeugt, gilt vor seiner
+ersten Mutation zusätzlich dieselbe Sicherheitsgrenze wie für R6-Testwrites:
+
+- Release, Kubernetes-/Datenbank-/Messaging-Topologie, Fehlerdomäne,
+  Storageklasse und der konkret zu beweisende Failovermechanismus bleiben an
+  das Produktions-Green gebunden; die Isolation darf den zu prüfenden
+  Wirkungsmechanismus nicht durch eine vereinfachte Ersatzarchitektur ersetzen;
+- Fach-, Auth-, Outbox-/Consumption-, JetStream- und Such-/Projektionszustand
+  des Proofs liegen in einem disposable bzw. vollständig isolierten
+  Rehearsal-Datenpfad mit gebundenem Ausgangszustand und eindeutigen
+  Test-/Korrelationskennungen;
+- sämtliche externen Side-Effect-Pfade einschließlich Web Push, Mail,
+  Federation, Webhooks und sonstiger Delivery sind vor dem Proof fail-closed
+  deaktiviert oder auf verifizierte nichtproduktive Rehearsal-Sinks gebunden;
+- Produktions-Credentials, kopierte Subscriptions oder reale Peer-/Empfängerziele
+  sind **kein** Sicherheitsbeweis und dürfen keinen tatsächlichen externen
+  Kontakt ermöglichen;
+- nach jedem mutierenden/destruktiven Proof wird der Rehearsal-Zustand
+  verworfen oder vollständig auf den gebundenen Ausgangszustand zurückgesetzt.
+  Testkennungen müssen in PostgreSQL/Auth, Outbox/Consumption, JetStream und
+  Suche abwesend sein; externe Delivery wird zielgebunden als ausschließlich
+  gefenced bzw. am erwarteten Rehearsal-Sink zurückgelesen;
+- vor dem öffentlichen Canary folgen ein frischer finaler Blue-zu-Green-Abgleich
+  und read-only Daten-/Event-/Projektionsgleichheit auf dem späteren
+  Produktionsdatenpfad.
+
+Kann die notwendige Isolation nur dadurch erreicht werden, dass der tatsächlich
+zu beweisende Multi-Instanz-, Datenbank-, Messaging-, Storage- oder
+Failovermechanismus verändert wird, ist der Proof **nicht repräsentativ** und
+schließt das Gate nicht. Ein Proof darf also die Produktions-Topologie isoliert
+testen, aber vor der Write-Cutover-Grenze weder den späteren produktiven
+Datenpfad mit synthetischem Zustand verunreinigen noch reale externe Empfänger
+erreichen.
+
+Erst innerhalb dieser Sicherheitsgrenze gelten die folgenden Wirkungsgates:
+
+- mindestens zwei Green-API-Instanzen werden unter demselben Daten-, Auth-,
+  Event- und Projektionsvertrag gleichzeitig betrieben; revisionsgebundene
+  Cross-Instance-Read-/Write- und Restart-Readbacks **im isolierten
+  Proof-Datenpfad** belegen fachliche Kohärenz statt nur `2/2 ready`;
+- ein Datenbankausfall bzw. der für das konkrete Green vorgesehene
+  Datenbank-Failover wird real geprobt. Writer-Autorität, Fencing,
+  Wiederanlauf, Datenkontinuität und anschließende Read-/Write-Fähigkeit werden
+  zielgebunden zurückgelesen;
+- ein Messaging-/JetStream-Ausfall bzw. der vorgesehene Messaging-Failover wird
+  real geprobt. Stream-/Consumer-Fortschritt, Wiederanlauf,
+  At-least-once-/Idempotenzvertrag und Event-/Projektionskontinuität werden
+  zielgebunden zurückgelesen;
+- Backup **und Point-in-Time-Recovery** werden für das konkrete Green
+  ausgeführt. Wiederherstellter Daten-, Auth-, Outbox-/Consumption-,
+  JetStream- und Such-/Projektionsstand werden fachlich gelesen und gemeinsam
+  mit den gemessenen RTO-/RPO-Werten gebunden;
+- ein leerer Zielcluster bzw. eine äquivalente leere Zielumgebung ist aus den
+  registrierten versionierten Artefakten, gebundenen externen
+  Secret-/Infrastrukturreferenzen und der gewünschten Release-Revision
+  reproduzierbar aufgebaut und mit den für R8 benötigten Kernfähigkeiten
+  zurückgelesen;
+- Zielidentität, Fehlerdomäne, Release-Commit, Image-Digests, Messzeitpunkt,
+  Ausgangs-/Endzustand und Evidenzreferenzen sind in jedem Proof gemeinsam
+  gebunden.
+
+Ein lokaler HA-Proof, ein Staging-Failover, bloße Pod-Readiness oder ein
+generischer Restorebeleg schließen dieses Gate nicht. Fehlt einer der
+zielgebundenen Wirkungsbeweise, bleibt R8 BLOCKED.
+
+### R8-Eintrittsgate — deklarative Herkunft und Driftfreiheit
+
+Vor jeder öffentlichen Produktionswirkung muss zusätzlich bewiesen sein, dass
+der **effektiv laufende Green-Zustand** keine unregistrierte manuelle
+Konfigurationswahrheit enthält. Für das konkrete Ziel werden deshalb
+revisionsgebunden mindestens folgende Belege gemeinsam erfasst:
+
+- die registrierte deklarative Soll-Wahrheit: Repo-Commit sowie die tatsächlich
+  verwendeten Kubernetes-/Kustomize-/GitOps-Artefakte, Image-Digests und
+  referenzierten externen Secret-/Infrastrukturquellen;
+- der vom GitOps-/Reconciliation-Pfad beobachtete angewendete Source-Stand samt
+  Ziel-/Namespace-/Objektinventar;
+- ein zielseitiger Desired-vs-Live-Readback der effektiven relevanten
+  Workloads, Services, Gateway-/Routingobjekte, Policies, ConfigMaps,
+  Secret-Referenzen, Storage-/Datenbank-/Messaging-Konfiguration und sonstigen
+  cutoverkritischen Objekte;
+- eine enge, revisionsgebundene Allowlist ausschließlich für
+  controller-/runtimegenerierte Felder, die keine fachliche Konfiguration,
+  Writer-Autorität, Routing-, Policy-, Secret-, Storage- oder
+  Delivery-Wahrheit verändern;
+- der Nachweis, dass ein Neuaufbau aus derselben registrierten Soll-Wahrheit
+  denselben cutoverrelevanten Zustand erzeugt.
+
+Ein manuelles `kubectl patch`, ein ad-hoc angelegtes oder verändertes
+cutoverrelevantes Objekt, eine nur auf dem Ziel vorhandene ConfigMap-/
+Secret-Referenz, eine nicht registrierte Host-/Load-Balancer-/Routinganpassung
+oder sonstiger wirksamer Drift blockiert R8, bis die Änderung entweder in die
+deklarative Wahrheit übernommen und erneut reconciliiert oder vollständig
+entfernt ist. Secrets selbst müssen dabei nicht im Git liegen; ihre
+**registrierte Quelle, Zielbindung und Materialisierung** müssen jedoch
+reproduzierbar und revisionsgebunden belegt sein.
+
+Kann der effektive Green-Zustand nicht vollständig gegen seine registrierte
+Soll-Wahrheit zurückgelesen werden, gilt Driftfreiheit als **nicht bewiesen** und
+R8 bleibt fail-closed.
+
+Erst nach **allen drei** R8-Eintrittsgates darf der öffentliche Canary beginnen.
+Bis zur expliziten Writer-Transition bleibt Blue alleiniger Writer; ein Canary
+erzeugt keine zweite Schreibautorität.
+
+### R8-Canary und progressive Traffic-Steuerung
+
+Vor dem ersten öffentlichen Green-Traffic wird ein revisionsgebundener
+Canary-Plan festgehalten. Er enthält mindestens:
+
+- die kleinste technisch erzwingbare Nutzerkohorte oder Traffic-Fraktion;
+- jede als read-only bezeichnete Requestklasse ist vorab als frei von
+  persistenten Nebenwirkungen auf PostgreSQL/Auth-Session, Outbox/Consumption,
+  JetStream und Suche belegt;
+- der Green-Canary-Pfad ist bis zur Writer-Transition für **öffentliche,
+  applikative, operatorische und Green-interne Hintergrundmutatoren**
+  write-inhibited. Ein persistenter Green-Write außerhalb der nachfolgend für
+  Modus 1 exakt gebundenen Replikationsausnahme muss fail-closed scheitern und
+  den Canary stoppen. Nach der Writer-Transition bleibt zusätzlich jeder
+  **extern auslösbare Write-Ingress** außer dem exakt gebundenen Probe-Ingress
+  bis zur vollständig bestandenen Probe-Verifikation aus Schritt 7 fail-closed
+  gesperrt;
+- vor dem ersten Canary-Read ist genau ein revisionsgebundener
+  Datenstabilitätsmodus belegt:
+  1. kontinuierliche Blue-zu-Green-Synchronisierung für PostgreSQL/Auth,
+     Outbox/Consumption, JetStream und Suche mit gemessener Lag-Grenze und
+     automatischem Canary-Abbruch bei deren Überschreitung. **Genau ein**
+     Blue-zu-Green-Replikationswriter darf dabei als einzige persistente
+     Green-Mutationsausnahme aktiv sein. Vor dem Canary werden seine Identität,
+     Source, Ziel und eine mechanismusspezifische, wildcardfreie Allowlist der
+     von ihm veränderbaren Stores/Tabellen bzw. Schemas, Streams/
+     Consumerpositionen und Such-/Indexgenerationen revisionsgebunden
+     festgehalten. Jeder Apply wird dieser Identität und Allowlist zugerechnet;
+     jede Green-Mutation durch einen anderen Writer oder außerhalb der Allowlist
+     stoppt den Canary. Green-API-Writer, Outbox-/Notification-/Receipt-Worker,
+     Retry-/Cleanup-/Fristen-Sweeper und Search-Worker bleiben gefenced, sofern
+     sie nicht selbst der ausdrücklich gebundene Replikationsmechanismus sind.
+     Zusätzlich ist für die spätere Writer-Transition ein revisionsgebundener
+     Stop-Pfad belegt:
+     nach Fencing aller Blue-Zustandsmutatoren muss die Synchronisierung
+     Zero-Lag erreichen, queued/in-flight Forward-Apply vollständig drainen und
+     ihr Green-schreibender Replikationspfad explizit gefenced werden; **oder**
+  2. vollständige **Blue-Quiescence-Barriere** vom finalen
+     Blue-zu-Green-Abgleich bis zum Ende des Read-Canary. Sie blockiert nicht
+     nur gewöhnliche öffentliche Writes, sondern jeden Blue-Pfad, der
+     PostgreSQL/Auth, Outbox/Consumption, JetStream, Suchjobs/-projektionen oder
+     sonstigen persistenten Fachzustand verändern kann;
+- ohne Beleg für Modus 1 gilt verpflichtend Modus 2. Vor seinem finalen
+  Datenabgleich muss revisionsgebunden bewiesen sein, dass
+  - öffentlicher, Operator- und Admin-Write-Ingress fail-closed blockiert ist,
+  - bereits angenommene/in-flight Mutationen vollständig beendet oder sicher
+    abgebrochen sind,
+  - DB-/NATS-/Search-mutierende Hintergrundpfade gefenced sind, insbesondere
+    Outbox-Relay, Receipt-/Notification-Consumer und Retry-Worker,
+    Cleanup-/Fristen-Sweeper sowie der Search-Worker,
+  - ein gebundener Blue-Quieszenzanker für Fachdaten, Outbox/Consumption,
+    JetStream und Suche während des gesamten Canary unverändert bleiben muss;
+- für Modus 2 werden maximale Quieszenzdauer und Abort-/Rückkehraktion vorab
+  gebunden. Kann ein Blue-Mutationspfad nicht nachweislich gefenced werden,
+  darf Modus 2 nicht beginnen;
+- der konkrete Routingmechanismus ist vor der ersten öffentlichen Wirkung
+  zielplattformgebunden belegt und kann Canary-Stufe, weitere Inkremente und
+  Abort deterministisch erzwingen;
+- die geplanten weiteren Stufen bis 100 %;
+- ein Mess- und Beobachtungsfenster pro Stufe;
+- dieselben numerischen SLO-Schwellen wie das R8-Eintrittsgate sowie
+  stufenspezifische Fehler-, Latenz- und Datenintegritäts-Abbruchbedingungen;
+- die konkrete Abort-/Recovery-Aktion für jede Stufe.
+
+Read-only-Routing allein hält Green **nicht** frisch. Solange irgendein
+Blue-Mutationspfad aktiv ist, darf Green zustandsabhängige Canary-Reads deshalb
+nur bedienen, wenn Modus 1 nachweislich läuft und innerhalb seiner Lag-Grenze
+bleibt. Ohne diesen Synchronisationsbeweis muss Blue während des gesamten
+Read-Canary quieszent sein. Eine reine Ingress-Sperre bei weiterlaufendem
+Outbox-, Consumer-, Sweeper- oder Search-Worker ist ausdrücklich **keine**
+Quieszenz und keine Canary-Option.
+
+Die Sequenz ist fail-closed:
+
+1. Green-Revision/Digests prüfen und den Datenstabilitätsmodus aktivieren.
+   Bei Modus 2 zuerst die vollständige Blue-Quiescence-Barriere herstellen:
+   Write-Ingress blockieren, in-flight Mutationen drainen/stoppen und sämtliche
+   persistenzmutierenden Hintergrund-/Operatorpfade fencen. **Erst danach**
+   Quieszenzanker erfassen, final Blue nach Green abgleichen und Daten-, Event-
+   und Projektionsgleichheit read-only bestätigen. Bei Modus 1 muss die laufende
+   Synchronisierung bereits vor dem ersten Canary-Read innerhalb der gebundenen
+   Lag-Grenze liegen;
+2. Blue bleibt bis zur Writer-Transition alleinige Writer-Autorität. Nur die
+   gebundene kleinste Canary-Kohorte bzw. Traffic-Fraktion wird für öffentliche
+   Reads auf Green geroutet. In Modus 1 erreichen gewöhnliche Writes weiterhin
+   ausschließlich Blue; auf Green bleiben alle Mutatoren außer dem exakt
+   gebundenen Replikationswriter gefenced. In Modus 2 darf **kein** Blue-Pfad
+   persistenten Zustand verändern und Green bleibt vollständig
+   write-inhibited;
+3. Web/API/Auth/Fachdaten/Search/Schauwerk/Basemap für die Canary-Stufe lesen
+   und das vollständige Beobachtungsfenster auswerten. Modus 1 verlangt
+   zusätzlich fortlaufend belegten Synchronisations-Lag innerhalb der Grenze
+   sowie einen Audit-Readback, dass **jede** persistente Green-Mutation vom
+   gebundenen Replikationswriter stammt und ausschließlich dessen erlaubte
+   Zielmenge betrifft; jede andere Green-Mutation gilt als Write-Leak und stoppt
+   den Canary. Modus 2 verlangt die vollständige Abwesenheit persistenter
+   Green-Writes sowie den fortlaufenden Nachweis, dass alle gebundenen
+   Blue-Quieszenzanker unverändert sind;
+4. Read-Traffic nur stufenweise erhöhen. Zwischen zwei Stufen müssen
+   Beobachtungsfenster, SLOs, Datenfrische und fachliche Readbacks vollständig
+   bestanden sein. Lag-Grenzverletzung, Änderung eines Quieszenzankers oder
+   Überschreitung der gebundenen Quieszenzdauer stoppt den Canary vor der
+   nächsten Stufe;
+5. erst nach bestandener Read-Canary-Sequenz die Writer-Transition beginnen.
+   Bei Modus 1 werden jetzt alle Blue-Zustandsmutatoren über dieselbe
+   Quiescence-Barriere gefenced. Danach muss die Blue-zu-Green-Synchronisierung
+   den gebundenen **Zero-Lag-Checkpoint** erreichen; queued und in-flight
+   Forward-Apply werden vollständig beendet, anschließend wird der
+   Green-schreibende Replikationspfad explizit gefenced. Ein Readback muss
+   belegen, dass kein Replikationswriter und kein ausstehender Apply mehr Green
+   verändern kann. Bei Modus 2 bleibt die bestehende Quieszenz aktiv. **Erst
+   danach** finalen Gleichheits-Readback auf Green durchführen und Blue als
+   Writer fencen. Green bleibt dabei noch vollständig write-inhibited. Solange
+   dieser Zustand nicht belegt ist, darf die Transition nicht fortgesetzt
+   werden;
+6. jetzt — während Blue gefenced und Green noch write-inhibited ist — die
+   **Write-Cutover-Grenze** revisions- und zeitgebunden festhalten. Ab diesem
+   Moment gilt der Post-Write-Recoveryvertrag, noch bevor irgendein
+   Green-API-/Worker-Mutator freigegeben wird. Erst nach erfolgreicher Bindung
+   der Grenze Green Writer-Autorität erteilen und die dafür erforderlichen
+   Green-Mutatoren aktivieren. Alle **zustandsabhängigen Reads** müssen ab dann
+   Green erreichen. Jeder extern auslösbare Schreibpfad bleibt jedoch weiterhin
+   fail-closed gesperrt — ausdrücklich öffentliche/applikative Writes,
+   Operator-/Admin-Ingress, Automation/Batch/Maintenance und sonstige
+   nicht-Probe-Writer. **Genau eine Ausnahme** ist der revisionsgebundene
+   Probe-Ingress aus Schritt 7. Interne Green-Mutatoren dürfen nur soweit laufen,
+   wie sie für die Verarbeitung dieses Probe-Writes oder bereits gebundene
+   interne Nachzüge erforderlich sind; sie eröffnen keinen zweiten externen
+   Write-Ingress. Blue darf ohne zusätzlich belegte Rückreplikation nur noch
+   statische/immutable Pfade bedienen;
+7. genau einen kontrollierten produktiven Probe-Write über den gebundenen
+   Probe-Ingress ausführen und dessen Fachdatenzustand, Outbox-/Eventfortschritt,
+   JetStream sowie Such-/Projektionsnachzug vollständig zurücklesen. Bis dieser
+   Readback vollständig bestanden und revisionsgebunden festgehalten ist, muss
+   der Fence aller nicht-Probe-Ingresspfade unverändert aktiv bleiben. Jede
+   persistente Green-Mutation, die über einen anderen externen Ingress ausgelöst
+   wird, ist ein harter Abbruch und fällt wie jede interne Green-Mutation nach
+   Schritt 6 unter den Post-Write-Recoveryvertrag. Scheitert irgendein Teil des
+   Probe-Readbacks, wird **kein** nicht-Probe-Write-Ingress freigegeben;
+8. **erst nach vollständig bestandenem Schritt 7** die Probe-Verifikation
+   revisionsgebunden festhalten. Alle nicht-Probe-Write-Ingresspfade bleiben
+   zunächst weiterhin gefenced. Vor der Freigabe **jeder** Ingressklasse wird
+   revisionsgebunden festgehalten, welche Green-Mutatoren/Worker und externen
+   Deliverypfade für deren vollständige fachliche Verarbeitung erforderlich
+   sind. Diese Mutator-Readiness-Zuordnung umfasst mindestens, soweit für die
+   konkrete Release-Revision und Ingressklasse relevant:
+   - Green-API-/Domain-Writer;
+   - Domain-Outbox und Receipt-/Consumption-Consumer;
+   - Notification-/Web-Push-Consumer und Retry-/Delivery-Worker;
+   - Cleanup-/Fristen- und Governance-Sweeper;
+   - Search-Worker sowie Such-/Projektionsnachzug;
+   - Federation-/Mail-/sonstige externe Deliverypfade und weitere
+     release-spezifische Hintergrundmutatoren.
+   Jeder für die Ingressklasse erforderliche Pfad muss **vor deren Öffnung**
+   aktiviert und mit exakter Revision/Konfiguration, erreichbaren Abhängigkeiten,
+   erfolgreichem Readiness-/Health-Readback sowie einem gebundenen
+   Backlog-/Catch-up-Zustand belegt sein. Externe Deliverypfade müssen dabei
+   bewusst vom Rehearsal-Fence auf die korrekten Produktionsziele umgebunden und
+   zielgebunden zurückgelesen sein. Persistente Mutationen, die bereits bei
+   Aktivierung oder Catch-up entstehen, liegen hinter der Write-Cutover-Grenze
+   und müssen vor der Ingressfreigabe vollständig auf Daten-, Event- und
+   Projektionskonsistenz zurückgelesen werden.
+
+   Ist ein für die Ingressklasse erforderlicher Worker weiterhin gefenced,
+   nicht ready, auf einen Rehearsal-Sink gebunden oder sein Catch-up nicht
+   innerhalb der vorab gebundenen Grenze, bleibt **genau diese Ingressklasse**
+   fail-closed. Erst nach bestandenem Mutator-Readiness-Gate werden die
+   zugehörigen zuvor gefenceten nicht-Probe-Write-Ingresspfade gemäß dem
+   gebundenen Cutover-Plan freigegeben. Gewöhnliche öffentliche Writes auf Green
+   werden erst dann aktiviert, wenn ihr vollständiger erforderlicher
+   API-/Outbox-/Receipt-/Notification-/Search-/Sweeper-Pfad belegt ready ist;
+   anschließend werden ihre Fehler-/Latenz-/Datenintegritätsgrenzen erneut
+   beobachtet;
+9. verbleibenden statischen/Edge-Traffic erst danach weiter stufenweise bis
+   100 % verschieben; jede Stufe benötigt erneut ihr vollständiges
+   Beobachtungsfenster.
+
+Ein alternatives post-write-progressives Routing zustandsabhängiger Reads ist
+nur zulässig, wenn das konkrete Produktionsziel vorab einen revisionsgebundenen
+Green-zu-Blue-Kohärenz-/Replikationsbeweis samt Lag-Grenze und Abortpfad besitzt.
+Ohne diesen Beweis ist dieser Alternativpfad BLOCKED.
+
+Bei falscher Revision/Digest, unklarer Writer-Autorität, Daten- oder
+Auth-Abweichung, Eventverlust/-duplikation, Search-/Schauwerk-/Basemap-Verlust,
+Überschreitung einer vor R8 gebundenen SLO-/RTO-/RPO-Grenze oder einer
+stufenspezifischen Canary-Schwelle wird **nicht** in die nächste Traffic-Stufe
+gewechselt.
+
+Während des read-only Canary kann Traffic ohne Writer-Wechsel auf Blue
+zurückgeführt werden. In Modus 2 werden die gefenceten Blue-Mutationspfade erst
+nach abgebrochenem Green-Traffic, unverändertem Quieszenzanker und gebundenem
+Abort-Readback kontrolliert wieder aktiviert.
+
+Während der Writer-Transition darf Blue nur **vor** der dauerhaft festgehaltenen
+Write-Cutover-Grenze und nur mit frischer Gleichheits- und Writer-Fence-Evidenz
+reaktiviert werden. Sobald die Grenze gebunden ist, ist direkter Blue-Rollback
+verboten — unabhängig davon, ob bereits der kontrollierte Probe-Write oder ein
+Green-Hintergrundworker die erste bestätigte Mutation erzeugt hat. Bei jedem
+Fehler nach dieser Grenze wird die weitere Traffic-/Write-Freigabe gestoppt und
+es gilt ausschließlich Post-Write-Recovery mit Reverse-Reconciliation und
+erneutem Writer-Fencing.
+
+## 11. R9 — Abschluss
+
+T044 darf erst terminalisiert werden, wenn seine elf Acceptance-Kriterien
+revisionsgebunden gegen die tatsächlich laufende Produktion authentifiziert
+wurden und `verification-stamp WELTGEWEBE-OS-V1-T044` erfolgreich ist.
+
+Der alte Compose-Pfad bleibt während der Beobachtungs- und Recoveryfrist
+erhalten und wird nicht sofort gelöscht. Nach der Write-Cutover-Grenze ist er
+keine direkt aktivierbare zweite Produktionswahrheit: Rückkehr zu Blue erfordert
+Reverse-Reconciliation und erneutes Writer-Fencing.
+
+## 12. Aktuelle Entscheidung
+
+Stand dieses R5-Preflights:
+
+- **Blue bleibt Produktion.**
+- **Blue bleibt alleiniger Writer.**
+- **T084-Staging bleibt Referenz, nicht Produktionsziel.**
+- **Die separate reale Staging-/Zieltestbed-Abnahme aus B5 fehlt weiterhin.**
+- **Kein Traffic-/DNS-/Writer-Cutover.**
+- **Keine neue Plattformschicht.**
+- Nächster harter Hebel ist zuerst ein zeitlich begrenztes reales
+  Kubernetes-Zieltestbed als T044-Staging-/Experiment-B-Abnahme samt
+  produktionsnaher Last-/Recovery-Evidenz. Erst danach folgt die konkrete,
+  kapazitiv belegte Produktions-Green-Zielidentität und die Schließung der
+  Capability-Lücken gegen genau dieses Ziel.
