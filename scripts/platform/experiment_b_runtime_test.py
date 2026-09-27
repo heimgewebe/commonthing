@@ -434,7 +434,16 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
 
         commit = "a" * 40
         git_source = {
-            "status": {"artifact": {"revision": f"main@sha1:{commit}"}}
+            "metadata": {"generation": 1},
+            "spec": {"suspend": False},
+            "status": {
+                "artifact": {"revision": f"main@sha1:{commit}"},
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "observedGeneration": 1,
+                }],
+            },
         }
         self.assertIn(
             commit, runtime._require_flux_source_revision(git_source, commit)
@@ -444,13 +453,25 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 self.assertIn(
                     commit,
                     runtime._require_flux_source_revision(
-                        {"status": {"artifact": {"revision": exact_revision}}},
+                        {
+                            **git_source,
+                            "status": {
+                                **git_source["status"],
+                                "artifact": {"revision": exact_revision},
+                            },
+                        },
                         commit,
                     ),
                 )
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "GitRepository"):
             runtime._require_flux_source_revision(
-                {"status": {"artifact": {"revision": "main@sha1:" + "b" * 40}}},
+                {
+                    **git_source,
+                    "status": {
+                        **git_source["status"],
+                        "artifact": {"revision": "main@sha1:" + "b" * 40},
+                    },
+                },
                 commit,
             )
         for malformed in (
@@ -461,17 +482,42 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             with self.subTest(malformed_revision=malformed):
                 with self.assertRaises(runtime.RuntimeErrorEB):
                     runtime._require_flux_source_revision(
-                        {"status": {"artifact": {"revision": malformed}}},
+                        {
+                            **git_source,
+                            "status": {
+                                **git_source["status"],
+                                "artifact": {"revision": malformed},
+                            },
+                        },
                         commit,
                     )
+
+        for name, source in (
+            ("suspended", {**git_source, "spec": {"suspend": True}}),
+            (
+                "stale-generation",
+                {
+                    **git_source,
+                    "metadata": {"generation": 2},
+                },
+            ),
+        ):
+            with self.subTest(source_state=name):
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime._require_flux_source_revision(source, commit)
 
         items = []
         for name in sorted(runtime.EXPECTED_FLUX_KUSTOMIZATIONS):
             items.append(
                 {
-                    "metadata": {"name": name},
+                    "metadata": {"name": name, "generation": 1},
+                    "spec": {"suspend": False},
                     "status": {
-                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "conditions": [{
+                            "type": "Ready",
+                            "status": "True",
+                            "observedGeneration": 1,
+                        }],
                         "lastAppliedRevision": f"main@sha1:{commit}",
                     },
                 }
@@ -491,6 +537,107 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "set mismatch"):
             runtime._require_exact_flux_revision_ready(items[:-1], commit)
+
+        suspended_items = json.loads(json.dumps(items))
+        suspended_items[0]["spec"]["suspend"] = True
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "suspended"):
+            runtime._require_exact_flux_revision_ready(suspended_items, commit)
+
+        stale_generation_items = json.loads(json.dumps(items))
+        stale_generation_items[0]["metadata"]["generation"] = 2
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "current generation"):
+            runtime._require_exact_flux_revision_ready(stale_generation_items, commit)
+
+    def test_apply_release_requires_requested_live_artifacts(self) -> None:
+        source = inspect.getsource(runtime.apply_release)
+        self.assertIn("_require_requested_release_artifacts(", source)
+        self.assertIn('"commonthing-experiment-b-migration"', source)
+        self.assertLess(
+            source.index("_require_requested_release_artifacts("),
+            source.index("receipt = {"),
+        )
+
+        api_digest = "sha256:" + "b" * 64
+        web_digest = "sha256:" + "c" * 64
+        api = {
+            "metadata": {"generation": 1},
+            "spec": {
+                "replicas": 1,
+                "template": {"spec": {"containers": [
+                    {
+                        "name": "api",
+                        "image": "ghcr.io/heimgewebe/commonthing-api@" + api_digest,
+                    },
+                    {
+                        "name": "search-worker",
+                        "image": "ghcr.io/heimgewebe/commonthing-api@" + api_digest,
+                    },
+                ]}},
+            },
+            "status": {
+                "observedGeneration": 1,
+                "updatedReplicas": 1,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+                "conditions": [{"type": "Available", "status": "True"}],
+            },
+        }
+        web = {
+            "metadata": {"generation": 1},
+            "spec": {
+                "replicas": 1,
+                "template": {"spec": {"containers": [{
+                    "name": "web",
+                    "image": "ghcr.io/heimgewebe/commonthing-web@" + web_digest,
+                }]}},
+            },
+            "status": {
+                "observedGeneration": 1,
+                "updatedReplicas": 1,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+                "conditions": [{"type": "Available", "status": "True"}],
+            },
+        }
+        migration = {
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "migration",
+                "image": "ghcr.io/heimgewebe/commonthing-api@" + api_digest,
+            }]}}},
+            "status": {
+                "succeeded": 1,
+                "conditions": [{"type": "Complete", "status": "True"}],
+            },
+        }
+        observed = runtime._require_requested_release_artifacts(
+            api, web, migration, api_digest, web_digest
+        )
+        self.assertTrue(observed["migration_complete"])
+
+        stale_api = json.loads(json.dumps(api))
+        stale_api["spec"]["template"]["spec"]["containers"][0]["image"] = (
+            "ghcr.io/heimgewebe/commonthing-api@sha256:" + "d" * 64
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "live API image"):
+            runtime._require_requested_release_artifacts(
+                stale_api, web, migration, api_digest, web_digest
+            )
+
+        stale_migration = json.loads(json.dumps(migration))
+        stale_migration["spec"]["template"]["spec"]["containers"][0]["image"] = (
+            "ghcr.io/heimgewebe/commonthing-api@sha256:" + "d" * 64
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "migration image"):
+            runtime._require_requested_release_artifacts(
+                api, web, stale_migration, api_digest, web_digest
+            )
+
+        incomplete = json.loads(json.dumps(migration))
+        incomplete["status"] = {"succeeded": 0, "conditions": []}
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not complete"):
+            runtime._require_requested_release_artifacts(
+                api, web, incomplete, api_digest, web_digest
+            )
 
     def test_recovery_attempt_invalidates_post_recovery_evidence(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
@@ -2029,6 +2176,33 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "namespace": runtime.APP_NAMESPACE,
             "sectionName": "http",
         }
+        self.gateway = {
+            "metadata": {
+                "name": "commonthing-experiment-b",
+                "namespace": runtime.APP_NAMESPACE,
+                "generation": 1,
+            },
+            "spec": {
+                "gatewayClassName": "cilium",
+                "listeners": [{
+                    "name": "http",
+                    "protocol": "HTTP",
+                    "port": 80,
+                    "allowedRoutes": {
+                        "namespaces": {"from": "Same"},
+                        "kinds": [{
+                            "group": "gateway.networking.k8s.io",
+                            "kind": "HTTPRoute",
+                        }],
+                    },
+                }],
+            },
+            "status": {"conditions": [{
+                "type": "Programmed",
+                "status": "True",
+                "observedGeneration": 1,
+            }]},
+        }
         self.httproute = {
             "metadata": {
                 "name": "commonthing-experiment-b",
@@ -2153,19 +2327,41 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
     def kubernetes_fixture(self, _root, arguments):
         if "gitrepository" in arguments:
             return {
+                "metadata": {"generation": 1},
+                "spec": {"suspend": False},
                 "status": {
-                    "artifact": {"revision": f"main@sha1:{self.commit}"}
-                }
+                    "artifact": {"revision": f"main@sha1:{self.commit}"},
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "True",
+                        "observedGeneration": 1,
+                    }],
+                },
             }
         if "kustomizations" in arguments:
             return {"items": [{
-                "metadata": {"name": name},
+                "metadata": {"name": name, "generation": 1},
+                "spec": {"suspend": False},
                 "status": {
                     "lastAppliedRevision": f"main@sha1:{self.commit}",
-                    "conditions": [
-                    {"type": "Ready", "status": "True"},
-                ]},
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "True",
+                        "observedGeneration": 1,
+                    }],
+                },
             } for name in runtime.EXPECTED_FLUX_KUSTOMIZATIONS]}
+        if "job" in arguments:
+            return {
+                "spec": {"template": {"spec": {"containers": [{
+                    "name": "migration",
+                    "image": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64,
+                }]}}},
+                "status": {
+                    "succeeded": 1,
+                    "conditions": [{"type": "Complete", "status": "True"}],
+                },
+            }
         if "deployment" in arguments:
             return {
                 "metadata": {"generation": 1},
@@ -2187,7 +2383,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         if "httproute" in arguments:
             return self.httproute
         self.assertIn("gateway", arguments)
-        return {"status": {"conditions": [{"type": "Programmed", "status": "True"}]}}
+        return self.gateway
 
     def test_teardown_proves_domain_pool_volume_and_state_absence(self) -> None:
         retirement = self.root.with_name(self.root.name + "-retirement.json")
@@ -2373,6 +2569,46 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 self.assertFalse((self.root / "receipts/portability.json").exists())
 
         self.pvcs = healthy
+
+    def test_status_requires_current_expected_gateway(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        healthy = json.loads(json.dumps(self.gateway))
+        result = runtime.status(self.root)
+        self.assertTrue(result["gateway"]["programmed"])
+        self.assertEqual(result["gateway"]["generation"], 1)
+
+        cases = []
+        stale_generation = json.loads(json.dumps(healthy))
+        stale_generation["metadata"]["generation"] = 2
+        cases.append(("stale-generation", stale_generation))
+
+        false_programmed = json.loads(json.dumps(healthy))
+        false_programmed["status"]["conditions"][0]["status"] = "False"
+        cases.append(("not-programmed", false_programmed))
+
+        wrong_class = json.loads(json.dumps(healthy))
+        wrong_class["spec"]["gatewayClassName"] = "other"
+        cases.append(("wrong-class", wrong_class))
+
+        wrong_listener = json.loads(json.dumps(healthy))
+        wrong_listener["spec"]["listeners"][0]["port"] = 443
+        cases.append(("wrong-listener", wrong_listener))
+
+        for name, gateway in cases:
+            with self.subTest(case=name):
+                self.gateway = gateway
+                for receipt in ("status.json", "portability.json"):
+                    runtime.atomic_json(
+                        self.root / "receipts" / receipt, {"status": "stale"}
+                    )
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime.status(self.root)
+                self.assertFalse((self.root / "receipts/status.json").exists())
+                self.assertFalse((self.root / "receipts/portability.json").exists())
+
+        self.gateway = healthy
 
     def test_status_requires_live_httproute_accepted_and_resolved(self) -> None:
         self.write_vm_receipt()

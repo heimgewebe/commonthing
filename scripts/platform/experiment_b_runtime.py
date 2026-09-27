@@ -1134,6 +1134,43 @@ def apply_release(
                 _require_exact_flux_revision_ready(
                     flux_payload.get("items", []), source_commit
                 )
+                live_results = {
+                    "api": run(
+                        [
+                            kubectl, "-n", APP_NAMESPACE, "get", "deployment",
+                            "weltgewebe-api", "-o", "json",
+                        ],
+                        env=env,
+                        check=False,
+                    ),
+                    "web": run(
+                        [
+                            kubectl, "-n", APP_NAMESPACE, "get", "deployment",
+                            "weltgewebe-web", "-o", "json",
+                        ],
+                        env=env,
+                        check=False,
+                    ),
+                    "migration": run(
+                        [
+                            kubectl, "-n", APP_NAMESPACE, "get", "job",
+                            "commonthing-experiment-b-migration", "-o", "json",
+                        ],
+                        env=env,
+                        check=False,
+                    ),
+                }
+                if any(result.returncode != 0 for result in live_results.values()):
+                    raise RuntimeErrorEB(
+                        "Experiment-B release artifacts are not all queryable"
+                    )
+                _require_requested_release_artifacts(
+                    json.loads(live_results["api"].stdout),
+                    json.loads(live_results["web"].stdout),
+                    json.loads(live_results["migration"].stdout),
+                    api_digest,
+                    web_digest,
+                )
             except (json.JSONDecodeError, RuntimeErrorEB):
                 pass
             else:
@@ -1343,11 +1380,55 @@ def _flux_revision_matches_commit(revision: Any, source_commit: str) -> bool:
     )
 
 
+def _require_current_condition(
+    document: Any,
+    condition_type: str,
+    context: str,
+    *,
+    conditions: Any = None,
+) -> int:
+    if not isinstance(document, dict):
+        raise RuntimeErrorEB(f"{context} payload is not an object")
+    metadata = document.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise RuntimeErrorEB(f"{context} metadata is not an object")
+    try:
+        generation = int(metadata.get("generation") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeErrorEB(f"{context} generation is invalid") from exc
+    if generation < 1:
+        raise RuntimeErrorEB(f"{context} generation is invalid")
+    status_obj = document.get("status", {})
+    selected = (
+        conditions
+        if conditions is not None
+        else status_obj.get("conditions", []) if isinstance(status_obj, dict) else []
+    )
+    if not isinstance(selected, list):
+        raise RuntimeErrorEB(f"{context} conditions are invalid")
+    current = any(
+        isinstance(condition, dict)
+        and condition.get("type") == condition_type
+        and condition.get("status") == "True"
+        and condition.get("observedGeneration") == generation
+        for condition in selected
+    )
+    if not current:
+        raise RuntimeErrorEB(
+            f"{context} is not currently {condition_type} at its current generation"
+        )
+    return generation
+
+
 def _require_flux_source_revision(
     source: Any, source_commit: str
 ) -> str:
     if not isinstance(source, dict):
         raise RuntimeErrorEB("Flux GitRepository payload is not an object")
+    spec = source.get("spec", {})
+    if not isinstance(spec, dict) or spec.get("suspend") is True:
+        raise RuntimeErrorEB("Flux GitRepository is suspended or malformed")
+    _require_current_condition(source, "Ready", "Flux GitRepository")
     revision = str(
         source.get("status", {}).get("artifact", {}).get("revision", "")
     )
@@ -1371,19 +1452,23 @@ def _require_exact_flux_revision_ready(
             continue
         if name in flux_readback:
             raise RuntimeErrorEB(f"duplicate Flux Kustomization: {name}")
-        status_obj = item.get("status", {})
-        conditions = status_obj.get("conditions", [])
-        ready = any(
-            condition.get("type") == "Ready" and condition.get("status") == "True"
-            for condition in conditions
-            if isinstance(condition, dict)
+        spec = item.get("spec", {})
+        if not isinstance(spec, dict) or spec.get("suspend") is True:
+            raise RuntimeErrorEB(f"Flux Kustomization is suspended or malformed: {name}")
+        generation = _require_current_condition(
+            item, "Ready", f"Flux Kustomization {name}"
         )
+        status_obj = item.get("status", {})
         revision = str(status_obj.get("lastAppliedRevision", ""))
-        if not ready or not _flux_revision_matches_commit(revision, source_commit):
+        if not _flux_revision_matches_commit(revision, source_commit):
             raise RuntimeErrorEB(
                 f"Flux Kustomization is not exact-revision Ready: {name}"
             )
-        flux_readback[name] = {"ready": True, "revision": revision}
+        flux_readback[name] = {
+            "ready": True,
+            "revision": revision,
+            "generation": generation,
+        }
 
     _require_exact_flux_kustomizations(flux_readback)
     return flux_readback
@@ -1496,6 +1581,136 @@ def _deployment_availability_snapshot(
         "ready_replicas": ready,
         "available_replicas": available,
         "available": True,
+    }
+
+
+def _container_images(document: Any, context: str) -> dict[str, str]:
+    if not isinstance(document, dict):
+        raise RuntimeErrorEB(f"{context} payload is not an object")
+    containers = (
+        document.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    if not isinstance(containers, list):
+        raise RuntimeErrorEB(f"{context} container inventory is invalid")
+    images: dict[str, str] = {}
+    for item in containers:
+        if not isinstance(item, dict):
+            raise RuntimeErrorEB(f"{context} container inventory is invalid")
+        name = str(item.get("name", ""))
+        image = str(item.get("image", ""))
+        if not name or not image or name in images:
+            raise RuntimeErrorEB(f"{context} container identity is invalid")
+        images[name] = image
+    return images
+
+
+def _require_requested_release_artifacts(
+    api: Any,
+    web: Any,
+    migration: Any,
+    api_digest: str,
+    web_digest: str,
+) -> dict[str, Any]:
+    expected_api = f"ghcr.io/heimgewebe/commonthing-api@{api_digest}"
+    expected_web = f"ghcr.io/heimgewebe/commonthing-web@{web_digest}"
+    api_images = _container_images(api, "Experiment-B API Deployment")
+    web_images = _container_images(web, "Experiment-B Web Deployment")
+    migration_images = _container_images(migration, "Experiment-B migration Job")
+
+    if api_images.get("api") != expected_api:
+        raise RuntimeErrorEB("live API image does not match immutable release digest")
+    if api_images.get("search-worker") != expected_api:
+        raise RuntimeErrorEB("live search-worker image does not match API release digest")
+    if web_images.get("web") != expected_web:
+        raise RuntimeErrorEB("live Web image does not match immutable release digest")
+    if migration_images.get("migration") != expected_api:
+        raise RuntimeErrorEB("live migration image does not match API release digest")
+
+    deployments = {
+        "weltgewebe-api": _deployment_availability_snapshot(
+            api, "weltgewebe-api"
+        ),
+        "weltgewebe-web": _deployment_availability_snapshot(
+            web, "weltgewebe-web"
+        ),
+    }
+    migration_status = migration.get("status", {}) if isinstance(migration, dict) else {}
+    migration_complete = (
+        isinstance(migration_status, dict)
+        and int(migration_status.get("succeeded") or 0) >= 1
+        and any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Complete"
+            and condition.get("status") == "True"
+            for condition in migration_status.get("conditions", [])
+        )
+    )
+    if not migration_complete:
+        raise RuntimeErrorEB("Experiment-B migration Job is not complete")
+
+    return {
+        "deployments": deployments,
+        "images": {
+            "api": api_images.get("api"),
+            "web": web_images.get("web"),
+            "search_worker": api_images.get("search-worker"),
+            "migration": migration_images.get("migration"),
+        },
+        "migration_complete": True,
+    }
+
+
+def _require_gateway_ready(gateway: Any) -> dict[str, Any]:
+    if not isinstance(gateway, dict):
+        raise RuntimeErrorEB("Experiment-B Gateway payload is not an object")
+    metadata = gateway.get("metadata", {})
+    spec = gateway.get("spec", {})
+    if not isinstance(metadata, dict) or not isinstance(spec, dict):
+        raise RuntimeErrorEB("Experiment-B Gateway metadata/spec is invalid")
+    if (
+        metadata.get("name") != "commonthing-experiment-b"
+        or metadata.get("namespace") != APP_NAMESPACE
+        or spec.get("gatewayClassName") != "cilium"
+    ):
+        raise RuntimeErrorEB("Experiment-B Gateway identity/class drifted")
+
+    listeners = spec.get("listeners")
+    if (
+        not isinstance(listeners, list)
+        or len(listeners) != 1
+        or not isinstance(listeners[0], dict)
+    ):
+        raise RuntimeErrorEB("Experiment-B Gateway listener set drifted")
+    listener = listeners[0]
+    allowed = listener.get("allowedRoutes", {})
+    namespaces = allowed.get("namespaces", {}) if isinstance(allowed, dict) else {}
+    kinds = allowed.get("kinds", []) if isinstance(allowed, dict) else []
+    expected_kind = {
+        "group": "gateway.networking.k8s.io",
+        "kind": "HTTPRoute",
+    }
+    if (
+        listener.get("name") != "http"
+        or listener.get("protocol") != "HTTP"
+        or listener.get("port") != 80
+        or not isinstance(namespaces, dict)
+        or namespaces.get("from") != "Same"
+        or not isinstance(kinds, list)
+        or kinds != [expected_kind]
+    ):
+        raise RuntimeErrorEB("Experiment-B Gateway listener contract drifted")
+
+    generation = _require_current_condition(
+        gateway, "Programmed", "Experiment-B Gateway"
+    )
+    return {
+        "generation": generation,
+        "gateway_class": "cilium",
+        "listener": "http",
+        "programmed": True,
     }
 
 
@@ -1642,9 +1857,6 @@ def status(root: Path) -> dict[str, Any]:
     kubelet = node_readback["kubelet_version"]
     os_image = node_readback["os_image"]
 
-    expected_api = f"ghcr.io/heimgewebe/commonthing-api@{release.get('api_digest', '')}"
-    expected_web = f"ghcr.io/heimgewebe/commonthing-web@{release.get('web_digest', '')}"
-
     source = _kubectl_json(
         root,
         ["-n", "flux-system", "get", "gitrepository", "commonthing-experiment-b"],
@@ -1662,33 +1874,25 @@ def status(root: Path) -> dict[str, Any]:
     web = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-web"]
     )
-    deployment_readback = {
-        "weltgewebe-api": _deployment_availability_snapshot(
-            api, "weltgewebe-api"
-        ),
-        "weltgewebe-web": _deployment_availability_snapshot(
-            web, "weltgewebe-web"
-        ),
-    }
-    api_containers = {
-        item.get("name"): item.get("image")
-        for item in api.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
-        if isinstance(item, dict)
-    }
-    web_containers = {
-        item.get("name"): item.get("image")
-        for item in web.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
-        if isinstance(item, dict)
-    }
-    if api_containers.get("api") != expected_api:
-        raise RuntimeErrorEB("live API image does not match immutable release digest")
-    if web_containers.get("web") != expected_web:
-        raise RuntimeErrorEB("live Web image does not match immutable release digest")
+    migration = _kubectl_json(
+        root,
+        [
+            "-n", APP_NAMESPACE, "get", "job",
+            "commonthing-experiment-b-migration",
+        ],
+    )
+    release_artifacts = _require_requested_release_artifacts(
+        api,
+        web,
+        migration,
+        str(release.get("api_digest", "")),
+        str(release.get("web_digest", "")),
+    )
+    deployment_readback = release_artifacts["deployments"]
+    api_containers = _container_images(api, "Experiment-B API Deployment")
     semantic = config["semantic_search"]
     if api_containers.get("ollama") != semantic["ollama_image"]:
         raise RuntimeErrorEB("live Ollama image does not match semantic-search pin")
-    if api_containers.get("search-worker") != expected_api:
-        raise RuntimeErrorEB("live search-worker image does not match API release digest")
 
     pvc_items = _kubectl_json(root, ["-A", "get", "pvc"]).get("items", [])
     pvc_readback = _require_exact_healthy_pvcs(pvc_items)
@@ -1696,13 +1900,7 @@ def status(root: Path) -> dict[str, Any]:
     gateway = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "gateway", "commonthing-experiment-b"]
     )
-    gateway_ready = any(
-        condition.get("type") == "Programmed" and condition.get("status") == "True"
-        for condition in gateway.get("status", {}).get("conditions", [])
-        if isinstance(condition, dict)
-    )
-    if not gateway_ready:
-        raise RuntimeErrorEB("Cilium Gateway is not Programmed")
+    gateway_readback = _require_gateway_ready(gateway)
 
     httproute = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "httproute", "commonthing-experiment-b"]
@@ -1723,12 +1921,12 @@ def status(root: Path) -> dict[str, Any]:
         "flux": flux_readback,
         "deployments": deployment_readback,
         "images": {
-            "api": api_containers.get("api"),
-            "web": web_containers.get("web"),
+            **release_artifacts["images"],
             "ollama": api_containers.get("ollama"),
-            "search_worker": api_containers.get("search-worker"),
         },
+        "migration_complete": release_artifacts["migration_complete"],
         "pvcs": pvc_readback,
+        "gateway": gateway_readback,
         "gateway_programmed": True,
         "httproute": httproute_readback,
         "kind_runtime": False,
