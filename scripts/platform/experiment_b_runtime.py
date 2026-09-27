@@ -1067,6 +1067,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         "database_secret": "commonthing-experiment-b-database",
         "runtime_secret": "weltgewebe-runtime",
         "registry_secret": "commonthing-experiment-b-registry",
+        "database_source_sha256": sha256_file(root / "secrets/database.json"),
         "registry_source_sha256": sha256_file(registry_config),
         "secret_values_recorded": False,
     }
@@ -1693,6 +1694,15 @@ def _expected_live_secret_hashes(
     ):
         raise RuntimeErrorEB("Experiment-B Secret receipt binding drifted")
 
+    database_source_sha256 = receipt.get("database_source_sha256")
+    if (
+        not isinstance(database_source_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", database_source_sha256) is None
+    ):
+        raise RuntimeErrorEB("Experiment-B database Secret source digest is invalid")
+    if not secrets.compare_digest(sha256_file(database_path), database_source_sha256):
+        raise RuntimeErrorEB("Experiment-B database Secret source digest drifted")
+
     registry_source_sha256 = receipt.get("registry_source_sha256")
     if (
         not isinstance(registry_source_sha256, str)
@@ -2181,6 +2191,7 @@ def status(root: Path) -> dict[str, Any]:
         root, ["-n", APP_NAMESPACE, "get", "httproute", "commonthing-experiment-b"]
     )
     httproute_readback = _require_httproute_ready(httproute)
+    gateway_data_plane = _gateway_data_plane_readback(root, source_commit)
 
     result = {
         "schema_version": 1,
@@ -2205,6 +2216,7 @@ def status(root: Path) -> dict[str, Any]:
         "gateway": gateway_readback,
         "gateway_programmed": True,
         "httproute": httproute_readback,
+        "gateway_data_plane": gateway_data_plane,
         "kind_runtime": False,
         "staging_cell_runtime_controller": False,
     }
@@ -3663,14 +3675,11 @@ def _gateway_base_url(root: Path) -> str:
     return f"http://{value}"
 
 
-def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
+def _gateway_data_plane_readback(
+    root: Path, source_commit: str
+) -> dict[str, Any]:
     if not COMMIT_RE.fullmatch(source_commit):
-        raise RuntimeErrorEB("functional readback source commit is not exact")
-    receipt_path, attempt_path, attempt_started_at_unix_ms = (
-        _begin_live_check_attempt(root, "functional-readback", source_commit)
-    )
-    if _current_protected_main_commit() != source_commit:
-        raise RuntimeErrorEB("functional readback source is not current protected main")
+        raise RuntimeErrorEB("Gateway data-plane source commit is not exact")
     base = _gateway_base_url(root)
     checks: dict[str, Any] = {}
     status_code, body, elapsed = _http_read(base + "/")
@@ -3729,6 +3738,20 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
     ):
         raise RuntimeErrorEB("Experiment-B anonymous auth boundary is not fail-closed")
 
+    return {"gateway": base, "checks": checks}
+
+
+def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB("functional readback source commit is not exact")
+    receipt_path, attempt_path, attempt_started_at_unix_ms = (
+        _begin_live_check_attempt(root, "functional-readback", source_commit)
+    )
+    if _current_protected_main_commit() != source_commit:
+        raise RuntimeErrorEB("functional readback source is not current protected main")
+    data_plane = _gateway_data_plane_readback(root, source_commit)
+    base = str(data_plane["gateway"])
+    checks = data_plane["checks"]
     jetstream = _jetstream_signature(root)
     if jetstream["messages"] < 1:
         raise RuntimeErrorEB("Experiment-B JetStream contains no persisted test messages")

@@ -728,7 +728,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         functional = inspect.getsource(runtime.functional_readback)
         self.assertLess(
             functional.index("_begin_live_check_attempt("),
-            functional.index("_gateway_base_url(root)"),
+            functional.index("_gateway_data_plane_readback(root, source_commit)"),
         )
         self.assertIn("_complete_live_check_attempt(", functional)
 
@@ -2426,6 +2426,9 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "database_secret": "commonthing-experiment-b-database",
                 "runtime_secret": "weltgewebe-runtime",
                 "registry_secret": "commonthing-experiment-b-registry",
+                "database_source_sha256": runtime.sha256_file(
+                    self.root / "secrets/database.json"
+                ),
                 "registry_source_sha256": hashlib.sha256(b"{}").hexdigest(),
                 "secret_values_recorded": False,
             },
@@ -2433,6 +2436,24 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.tools = self.patch("toolchain", return_value={"tools": {"kubectl": "kubectl"}})
         self.patch("kube_env", return_value={})
         self.patch("vm_ip", return_value="192.168.122.10")
+        self.gateway_data_plane = self.patch(
+            "_gateway_data_plane_readback",
+            return_value={
+                "gateway": "http://192.168.122.20",
+                "checks": {
+                    "web_root": {"status": 200},
+                    "web_revision": {"status": 200, "commit": self.commit},
+                    "api_ready": {"status": 200},
+                    "domain_nodes": {"status": 200},
+                    "search": {"status": 200, "items": 1},
+                    "anonymous_auth_boundary": {
+                        "status": 200,
+                        "authenticated": False,
+                        "role": "gast",
+                    },
+                },
+            },
+        )
         self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
 
     def kubernetes_fixture(self, _root, arguments):
@@ -2637,6 +2658,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertEqual(result["vm_create_sha256"], runtime.sha256_file(
             self.root / "receipts/vm-create.json",
         ))
+        self.assertEqual(
+            result["gateway_data_plane"]["gateway"],
+            "http://192.168.122.20",
+        )
+        self.gateway_data_plane.assert_called_once_with(self.root, self.commit)
         attempt = json.loads((self.root / "receipts/status-attempt.json").read_text())
         self.assertEqual(attempt["status"], "pass")
         self.assertEqual(attempt["receipt_sha256"], runtime.sha256_file(self.root / "receipts/status.json"))
@@ -2735,6 +2761,41 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 self.assertFalse((self.root / "receipts/status.json").exists())
                 self.assertFalse((self.root / "receipts/portability.json").exists())
 
+        changed_db = {
+            "username": "user2",
+            "database": "db2",
+            "password": "pass2",
+        }
+        runtime.atomic_json(self.root / "secrets/database.json", changed_db)
+        changed_secrets = json.loads(json.dumps(healthy))
+        changed_secrets[
+            f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database"
+        ]["data"] = {
+            key: base64.b64encode(value.encode("utf-8")).decode("ascii")
+            for key, value in changed_db.items()
+        }
+        changed_url = (
+            "postgresql://user2:pass2"
+            f"@postgres.{runtime.DATA_NAMESPACE}.svc.cluster.local:5432/db2"
+        )
+        changed_secrets[
+            f"{runtime.APP_NAMESPACE}/weltgewebe-runtime"
+        ]["data"]["database-url"] = base64.b64encode(
+            changed_url.encode("utf-8")
+        ).decode("ascii")
+        self.live_secrets = changed_secrets
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "database Secret source digest drifted",
+        ):
+            runtime.status(self.root)
+        self.assertFalse((self.root / "receipts/status.json").exists())
+        self.assertFalse((self.root / "receipts/portability.json").exists())
+
+        runtime.atomic_json(
+            self.root / "secrets/database.json",
+            {"username": "user", "database": "db", "password": "pass"},
+        )
         self.live_secrets = healthy
 
     def test_live_secret_readback_never_returns_secret_values(self) -> None:
@@ -2930,6 +2991,17 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 self.assertFalse((self.root / "receipts/portability.json").exists())
 
         self.httproute = healthy
+
+    def test_status_requires_fresh_gateway_data_plane_readback(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        self.gateway_data_plane.side_effect = runtime.RuntimeErrorEB(
+            "gateway data plane failed"
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "gateway data plane failed"):
+            runtime.status(self.root)
+        self.assertFalse((self.root / "receipts/status.json").exists())
+        self.assertFalse((self.root / "receipts/portability.json").exists())
 
     def test_status_accepts_node_typemeta_with_exact_configured_k3s_version(self) -> None:
         self.write_vm_receipt()
