@@ -1446,6 +1446,23 @@ spec:
                 ),
                 mock.patch.object(
                     runtime,
+                    "_require_kubernetes_target_binding",
+                    return_value=(
+                        {"kubeconfig_sha256": "1" * 64},
+                        "192.168.122.10",
+                        "https://192.168.122.10:6443",
+                    ),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_t048_postgres_runtime_binding",
+                    return_value={
+                        "images_sha256": "2" * 64,
+                        "runtime_image_ids_sha256": "3" * 64,
+                    },
+                ),
+                mock.patch.object(
+                    runtime,
                     "seed_t048_fixture",
                     side_effect=runtime.RuntimeErrorEB("fixture failed"),
                 ),
@@ -1918,6 +1935,16 @@ spec:
                             )
                             for name in ("postgres", "nats")
                         )
+                    }
+                    payload["namespace_security"] = {
+                        name: {
+                            "labels": expected["labels"],
+                            "labels_sha256": expected["labels_sha256"],
+                            "canonical": True,
+                        }
+                        for name, expected in (
+                            runtime._versioned_namespace_security_contract()
+                        ).items()
                     }
                     payload["data_services"] = {
                         name: {
@@ -2487,6 +2514,23 @@ spec:
                     runtime,
                     "_current_protected_main_commit",
                     return_value=commit,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_kubernetes_target_binding",
+                    return_value=(
+                        {"kubeconfig_sha256": "1" * 64},
+                        "192.168.122.10",
+                        "https://192.168.122.10:6443",
+                    ),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_t048_postgres_runtime_binding",
+                    return_value={
+                        "images_sha256": "2" * 64,
+                        "runtime_image_ids_sha256": "3" * 64,
+                    },
                 ),
                 mock.patch.object(
                     runtime,
@@ -3609,6 +3653,18 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 ),
             }
 
+        self.namespaces = {
+            name: {
+                "metadata": {
+                    "name": name,
+                    "labels": json.loads(json.dumps(value["labels"])),
+                }
+            }
+            for name, value in (
+                runtime._versioned_namespace_security_contract()
+            ).items()
+        }
+
         api_image = "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64
         web_image = "ghcr.io/heimgewebe/commonthing-web@sha256:" + "c" * 64
         api_pod_images = {
@@ -4134,6 +4190,12 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
 
     def kubernetes_fixture(self, _root, arguments):
+        if (
+            len(arguments) == 3
+            and arguments[:2] == ["get", "namespace"]
+            and arguments[-1] in self.namespaces
+        ):
+            return self.namespaces[str(arguments[-1])]
         if arguments == [
             "-n", runtime.APP_NAMESPACE, "get", "configmap", "weltgewebe-runtime"
         ]:
@@ -6074,6 +6136,117 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertEqual(
             runtime._container_runtime_contract(expected, "expected"),
             runtime._container_runtime_contract(live, "live"),
+        )
+
+    def test_t048_revalidates_target_and_postgres_before_and_after_measurement(self) -> None:
+        source = inspect.getsource(runtime.t048_load_proof)
+        first_target = source.index("_require_kubernetes_target_binding")
+        fixture = source.index("_validated_t048_fixture_receipt")
+        load = source.index("_sample_t048_load")
+        second_target = source.index(
+            "_require_kubernetes_target_binding",
+            first_target + 1,
+        )
+        first_postgres = source.index(
+            "_require_t048_postgres_runtime_binding"
+        )
+        second_postgres = source.index(
+            "_require_t048_postgres_runtime_binding",
+            first_postgres + 1,
+        )
+        self.assertLess(first_target, fixture)
+        self.assertLess(first_postgres, fixture)
+        self.assertLess(load, second_target)
+        self.assertLess(load, second_postgres)
+        self.assertIn("kubernetes_target_sha256", source)
+        self.assertIn("postgres_runtime_image_ids_sha256", source)
+
+    def test_t048_postgres_binding_rejects_image_and_runtime_drift(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        healthy_deployments = json.loads(
+            json.dumps(self.data_deployments)
+        )
+        healthy_pods = json.loads(json.dumps(self.data_pods))
+
+        proof = runtime._require_t048_postgres_runtime_binding(
+            self.root
+        )
+        self.assertTrue(proof["canonical"])
+        self.assertRegex(
+            proof["runtime_image_ids_sha256"], r"^[0-9a-f]{64}$"
+        )
+
+        self.data_deployments["postgres"]["spec"]["template"]["spec"][
+            "containers"
+        ][0]["image"] = "postgres:16@sha256:" + "0" * 64
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "PostgreSQL Deployment images drifted",
+        ):
+            runtime._require_t048_postgres_runtime_binding(self.root)
+
+        self.data_deployments = json.loads(
+            json.dumps(healthy_deployments)
+        )
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        self.data_pods["postgres"][0]["status"]["containerStatuses"][0][
+            "imageID"
+        ] = "containerd://sha256:" + "0" * 64
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "runtime image ID drifted",
+        ):
+            runtime._require_t048_postgres_runtime_binding(self.root)
+
+    def test_status_revalidates_namespace_restricted_security_labels(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        expected = runtime._versioned_namespace_security_contract()
+        result = runtime._require_live_namespace_security_contract(
+            self.root
+        )
+        self.assertEqual(set(result), {runtime.APP_NAMESPACE, runtime.DATA_NAMESPACE})
+        self.assertEqual(
+            result[runtime.APP_NAMESPACE]["labels"],
+            expected[runtime.APP_NAMESPACE]["labels"],
+        )
+
+        healthy = json.loads(json.dumps(self.namespaces))
+        del self.namespaces[runtime.APP_NAMESPACE]["metadata"]["labels"][
+            "pod-security.kubernetes.io/enforce"
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "Namespace security labels drifted",
+        ):
+            runtime._require_live_namespace_security_contract(
+                self.root
+            )
+
+        self.namespaces = json.loads(json.dumps(healthy))
+        self.namespaces[runtime.DATA_NAMESPACE]["metadata"]["labels"][
+            "unexpected.example/label"
+        ] = "drift"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "Namespace security labels drifted",
+        ):
+            runtime._require_live_namespace_security_contract(
+                self.root
+            )
+
+        status_source = inspect.getsource(runtime.status)
+        portability_source = inspect.getsource(
+            runtime.portability_report
+        )
+        self.assertIn(
+            "_require_live_namespace_security_contract",
+            status_source,
+        )
+        self.assertIn(
+            "_versioned_namespace_security_contract",
+            portability_source,
         )
 
     def test_create_binds_actual_vm_to_current_source_and_config(self) -> None:

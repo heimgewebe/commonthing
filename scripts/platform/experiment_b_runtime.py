@@ -3198,6 +3198,140 @@ def _pod_spec_images(pod_spec: Any, context: str) -> dict[str, dict[str, str]]:
     return result
 
 
+def _versioned_namespace_security_contract() -> dict[str, Any]:
+    namespace_path = NAMESPACES / "namespaces.yaml"
+    kustomization_path = NAMESPACES / "kustomization.yaml"
+    try:
+        documents = [
+            item
+            for item in yaml.safe_load_all(
+                namespace_path.read_text(encoding="utf-8")
+            )
+            if isinstance(item, dict)
+        ]
+        kustomization = yaml.safe_load(
+            kustomization_path.read_text(encoding="utf-8")
+        )
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeErrorEB(
+            "versioned Experiment-B Namespace contract is invalid"
+        ) from exc
+    expected_names = {APP_NAMESPACE, DATA_NAMESPACE}
+    namespaces = [
+        document
+        for document in documents
+        if document.get("kind") == "Namespace"
+        and document.get("metadata", {}).get("name") in expected_names
+    ]
+    if (
+        len(namespaces) != len(expected_names)
+        or {
+            str(item.get("metadata", {}).get("name", ""))
+            for item in namespaces
+        }
+        != expected_names
+        or not isinstance(kustomization, dict)
+    ):
+        raise RuntimeErrorEB(
+            "versioned Experiment-B Namespace set is incomplete or duplicated"
+        )
+
+    common_labels: dict[str, str] = {}
+    label_blocks = kustomization.get("labels", [])
+    if not isinstance(label_blocks, list):
+        raise RuntimeErrorEB(
+            "Experiment-B Namespace Kustomize labels are invalid"
+        )
+    for block in label_blocks:
+        pairs = block.get("pairs") if isinstance(block, dict) else None
+        if (
+            not isinstance(pairs, dict)
+            or any(
+                not isinstance(key, str)
+                or not key
+                or not isinstance(value, str)
+                or not value
+                for key, value in pairs.items()
+            )
+        ):
+            raise RuntimeErrorEB(
+                "Experiment-B Namespace Kustomize label block is invalid"
+            )
+        for key, value in pairs.items():
+            if key in common_labels and common_labels[key] != value:
+                raise RuntimeErrorEB(
+                    "Experiment-B Namespace Kustomize labels conflict"
+                )
+            common_labels[str(key)] = str(value)
+
+    result: dict[str, Any] = {}
+    for namespace in namespaces:
+        metadata = namespace.get("metadata", {})
+        name = str(metadata.get("name", ""))
+        labels = metadata.get("labels", {})
+        if (
+            not isinstance(labels, dict)
+            or any(
+                not isinstance(key, str)
+                or not key
+                or not isinstance(value, str)
+                or not value
+                for key, value in labels.items()
+            )
+        ):
+            raise RuntimeErrorEB(
+                f"versioned Namespace labels are invalid: {name}"
+            )
+        expected_labels = {
+            **{str(key): str(value) for key, value in labels.items()},
+            **common_labels,
+            "kubernetes.io/metadata.name": name,
+        }
+        for required in (
+            "pod-security.kubernetes.io/enforce",
+            "pod-security.kubernetes.io/audit",
+            "pod-security.kubernetes.io/warn",
+        ):
+            if expected_labels.get(required) != "restricted":
+                raise RuntimeErrorEB(
+                    f"versioned Namespace loses restricted Pod Security: {name}"
+                )
+        result[name] = {
+            "labels": expected_labels,
+            "labels_sha256": _stable_json_sha256(expected_labels),
+        }
+    return result
+
+
+def _require_live_namespace_security_contract(root: Path) -> dict[str, Any]:
+    expected = _versioned_namespace_security_contract()
+    result: dict[str, Any] = {}
+    for name, contract_value in expected.items():
+        namespace = _kubectl_json(root, ["get", "namespace", name])
+        metadata = (
+            namespace.get("metadata", {})
+            if isinstance(namespace, dict)
+            else {}
+        )
+        labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or metadata.get("deletionTimestamp") is not None
+            or not isinstance(labels, dict)
+            or labels != contract_value["labels"]
+        ):
+            raise RuntimeErrorEB(
+                f"live Namespace security labels drifted: {name}"
+            )
+        result[name] = {
+            "labels": {str(key): str(value) for key, value in labels.items()},
+            "labels_sha256": contract_value["labels_sha256"],
+            "canonical": True,
+        }
+    return result
+
+
 def _data_service_spec_projection(service: Any, context: str) -> dict[str, Any]:
     if not isinstance(service, dict):
         raise RuntimeErrorEB(f"{context} Service payload is invalid")
@@ -4358,6 +4492,9 @@ def status(root: Path) -> dict[str, Any]:
         int(config["runtime_binding"]["web_replicas"]),
     )
     deployment_readback = release_artifacts["deployments"]
+    namespace_security_readback = _require_live_namespace_security_contract(
+        root
+    )
     data_deployment_readback = _require_live_data_deployments(root)
     data_service_readback = _require_live_data_services(root)
     api_containers = _container_images(api, "Experiment-B API Deployment")
@@ -4523,6 +4660,7 @@ def status(root: Path) -> dict[str, Any]:
         "flux_runtime_image_ids_baseline": flux_runtime_baseline,
         "flux": flux_readback,
         "deployments": deployment_readback,
+        "namespace_security": namespace_security_readback,
         "data_deployments": data_deployment_readback,
         "data_services": data_service_readback,
         "application_workloads": application_workloads,
@@ -5791,6 +5929,66 @@ def _require_t048_api_release_binding(
     return pod_name, pod, readback
 
 
+def _require_t048_postgres_runtime_binding(
+    root: Path,
+) -> dict[str, Any]:
+    expected = _versioned_data_deployment_contract(
+        CLUSTER / "data/postgres.yaml", "postgres"
+    )
+    deployment = _kubectl_json(
+        root, ["-n", DATA_NAMESPACE, "get", "deployment", "postgres"]
+    )
+    metadata = (
+        deployment.get("metadata", {})
+        if isinstance(deployment, dict)
+        else {}
+    )
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != "postgres"
+        or metadata.get("namespace") != DATA_NAMESPACE
+        or metadata.get("deletionTimestamp") is not None
+    ):
+        raise RuntimeErrorEB("T048 PostgreSQL Deployment identity drifted")
+    selector = _pod_selector_match_labels(
+        deployment, "T048 PostgreSQL Deployment"
+    )
+    if selector != expected["selector_labels"]:
+        raise RuntimeErrorEB("T048 PostgreSQL selector drifted")
+    _deployment_availability_snapshot(
+        deployment, "postgres", expected["replicas"]
+    )
+    live_images = _pod_spec_images(
+        deployment.get("spec", {}).get("template", {}).get("spec"),
+        "T048 PostgreSQL Deployment",
+    )
+    if live_images != expected["images"]:
+        raise RuntimeErrorEB("T048 PostgreSQL Deployment images drifted")
+    pods = _kubectl_json(
+        root, ["-n", DATA_NAMESPACE, "get", "pods"]
+    ).get("items")
+    matching_pods = _pods_matching_labels(
+        pods, expected["selector_labels"]
+    )
+    pod_readback = _require_running_pod_image_contract(
+        matching_pods,
+        namespace=DATA_NAMESPACE,
+        workload="postgres",
+        expected_replicas=expected["replicas"],
+        expected_images=expected["images"],
+        required_labels=expected["selector_labels"],
+        context="T048 PostgreSQL Pod",
+    )
+    return {
+        "images_sha256": _stable_json_sha256(expected["images"]),
+        "runtime_image_ids_sha256": pod_readback[
+            "runtime_image_ids_sha256"
+        ],
+        "pods": pod_readback,
+        "canonical": True,
+    }
+
+
 def _parse_cpu_quantity(value: str) -> float:
     if value.endswith("m"):
         return float(value[:-1]) / 1000.0
@@ -5933,6 +6131,17 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     )
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("T048 proof source is not current protected main")
+    (
+        target_receipt_before,
+        target_ip_before,
+        target_server_before,
+    ) = _require_kubernetes_target_binding(root, source_commit)
+    target_binding_before = {
+        "vm_ip": target_ip_before,
+        "kubeconfig_sha256": target_receipt_before["kubeconfig_sha256"],
+        "server": target_server_before,
+    }
+    postgres_binding_before = _require_t048_postgres_runtime_binding(root)
     fixture_receipt = _validated_t048_fixture_receipt(root, source_commit)
     evidence, _domain_scale = _performance_modules()
     manifest = Path(fixture_receipt["manifest"])
@@ -6014,6 +6223,17 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             _post_pod,
             api_image_binding_after,
         ) = _require_t048_api_release_binding(root, source_commit)
+        postgres_binding_after = _require_t048_postgres_runtime_binding(root)
+        (
+            target_receipt_after,
+            target_ip_after,
+            target_server_after,
+        ) = _require_kubernetes_target_binding(root, source_commit)
+        target_binding_after = {
+            "vm_ip": target_ip_after,
+            "kubeconfig_sha256": target_receipt_after["kubeconfig_sha256"],
+            "server": target_server_after,
+        }
         if (
             post_pod_name != pod_name
             or api_image_binding_after["runtime_image_ids_sha256"]
@@ -6021,6 +6241,19 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         ):
             raise RuntimeErrorEB(
                 "API Pod image identity changed during the T048 measurement"
+            )
+        if (
+            postgres_binding_after["runtime_image_ids_sha256"]
+            != postgres_binding_before["runtime_image_ids_sha256"]
+            or postgres_binding_after["images_sha256"]
+            != postgres_binding_before["images_sha256"]
+        ):
+            raise RuntimeErrorEB(
+                "PostgreSQL image identity changed during the T048 measurement"
+            )
+        if target_binding_after != target_binding_before:
+            raise RuntimeErrorEB(
+                "Kubernetes target identity changed during the T048 measurement"
             )
         if load_returncode != 0:
             detail = stderr_path.read_text(encoding="utf-8")[-3000:]
@@ -6140,6 +6373,12 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "api_runtime_image_ids_sha256": api_image_binding_before[
                 "runtime_image_ids_sha256"
             ],
+            "postgres_runtime_image_ids_sha256": postgres_binding_before[
+                "runtime_image_ids_sha256"
+            ],
+            "kubernetes_target_sha256": _stable_json_sha256(
+                target_binding_before
+            ),
             "scenario": scenario,
             "thresholds": contract_section["thresholds"],
             "http": http_metrics,
@@ -7417,6 +7656,27 @@ def portability_report(root: Path) -> dict[str, Any]:
             expected["images"],
             f"Flux controller Pod {name}",
         )
+
+    namespace_status = status_payload.get("namespace_security")
+    expected_namespaces = _versioned_namespace_security_contract()
+    if (
+        not isinstance(namespace_status, dict)
+        or set(namespace_status) != set(expected_namespaces)
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the live Namespace security contract"
+        )
+    for name, expected in expected_namespaces.items():
+        observed = namespace_status.get(name)
+        if (
+            not isinstance(observed, dict)
+            or observed.get("canonical") is not True
+            or observed.get("labels") != expected["labels"]
+            or observed.get("labels_sha256") != expected["labels_sha256"]
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the live Namespace security contract: {name}"
+            )
 
     data_deployment_status = status_payload.get("data_deployments")
     expected_data_deployments = {
