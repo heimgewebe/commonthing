@@ -849,6 +849,289 @@ def scp_to(root: Path, ip: str, source: Path, destination: str) -> None:
     )
 
 
+def _k3s_contract_paths(config: dict[str, Any]) -> tuple[Path, Path]:
+    binding = config.get("runtime_binding", {})
+    if not isinstance(binding, dict):
+        raise RuntimeErrorEB("Experiment-B runtime binding is invalid")
+    config_value = binding.get("k3s_config")
+    service_value = binding.get("k3s_service")
+    if not isinstance(config_value, str) or not isinstance(service_value, str):
+        raise RuntimeErrorEB("Experiment-B k3s file binding is invalid")
+    config_path = (ROOT / config_value).resolve()
+    service_path = (ROOT / service_value).resolve()
+    if (
+        config_path != (CLUSTER / "k3s-config.yaml").resolve()
+        or service_path != (CLUSTER / "k3s.service").resolve()
+        or not config_path.is_file()
+        or not service_path.is_file()
+    ):
+        raise RuntimeErrorEB("Experiment-B k3s file binding drifted")
+    return config_path, service_path
+
+
+def _kubeconfig_server(path: Path) -> str:
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeErrorEB("Experiment-B kubeconfig must be a regular file")
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise RuntimeErrorEB("Experiment-B kubeconfig is invalid") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeErrorEB("Experiment-B kubeconfig is invalid")
+    current = payload.get("current-context")
+    contexts = payload.get("contexts")
+    clusters = payload.get("clusters")
+    if (
+        not isinstance(current, str)
+        or not current
+        or not isinstance(contexts, list)
+        or not isinstance(clusters, list)
+    ):
+        raise RuntimeErrorEB("Experiment-B kubeconfig context binding is invalid")
+    matching_contexts = [
+        item
+        for item in contexts
+        if isinstance(item, dict) and item.get("name") == current
+    ]
+    if len(matching_contexts) != 1:
+        raise RuntimeErrorEB("Experiment-B kubeconfig current context is ambiguous")
+    context_value = matching_contexts[0].get("context")
+    cluster_name = (
+        context_value.get("cluster")
+        if isinstance(context_value, dict)
+        else None
+    )
+    matching_clusters = [
+        item
+        for item in clusters
+        if isinstance(item, dict) and item.get("name") == cluster_name
+    ]
+    if len(matching_clusters) != 1:
+        raise RuntimeErrorEB("Experiment-B kubeconfig cluster binding is ambiguous")
+    cluster_value = matching_clusters[0].get("cluster")
+    server = (
+        cluster_value.get("server")
+        if isinstance(cluster_value, dict)
+        else None
+    )
+    if not isinstance(server, str) or not server:
+        raise RuntimeErrorEB("Experiment-B kubeconfig server binding is invalid")
+    return server
+
+
+def _parse_sha256sum_output(
+    stdout: str, expected_paths: tuple[str, ...]
+) -> dict[str, str]:
+    observed: dict[str, str] = {}
+    for raw_line in stdout.splitlines():
+        fields = raw_line.strip().split(maxsplit=1)
+        if len(fields) != 2:
+            raise RuntimeErrorEB("guest k3s file digest output is malformed")
+        digest, path = fields
+        path = path.lstrip("*")
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or path not in expected_paths
+            or path in observed
+        ):
+            raise RuntimeErrorEB("guest k3s file digest output is invalid")
+        observed[path] = digest
+    if set(observed) != set(expected_paths):
+        raise RuntimeErrorEB("guest k3s file digest set is incomplete")
+    return observed
+
+
+def _parse_systemctl_properties(stdout: str) -> dict[str, str]:
+    properties: dict[str, str] = {}
+    for raw_line in stdout.splitlines():
+        if "=" not in raw_line:
+            raise RuntimeErrorEB("k3s systemd readback is malformed")
+        key, value = raw_line.split("=", 1)
+        if not key or key in properties:
+            raise RuntimeErrorEB("k3s systemd readback is invalid")
+        properties[key] = value
+    expected = {
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "UnitFileState",
+        "FragmentPath",
+        "DropInPaths",
+        "MainPID",
+    }
+    if set(properties) != expected:
+        raise RuntimeErrorEB("k3s systemd readback is incomplete")
+    return properties
+
+
+def _require_live_k3s_runtime(
+    root: Path,
+    config: dict[str, Any],
+    source_commit: str,
+) -> dict[str, Any]:
+    receipt_path = root / "receipts/k3s.json"
+    kubeconfig_path = root / "kubeconfig.yaml"
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB("Experiment-B status requires valid k3s.json") from exc
+    config_path, service_path = _k3s_contract_paths(config)
+    expected_binary_sha256 = str(config["kubernetes"]["binary_sha256"])
+    expected_config_sha256 = sha256_file(config_path)
+    expected_service_sha256 = sha256_file(service_path)
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema_version") != 1
+        or receipt.get("status") != "ready"
+        or receipt.get("source_commit") != source_commit
+        or receipt.get("binary_sha256") != expected_binary_sha256
+        or receipt.get("config_sha256") != expected_config_sha256
+        or receipt.get("service_sha256") != expected_service_sha256
+        or str(config["kubernetes"]["version"])
+        not in str(receipt.get("k3s_version", ""))
+        or receipt.get("live_kubelet_version")
+        != str(config["kubernetes"]["version"])
+        or not isinstance(receipt.get("kubeconfig_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt["kubeconfig_sha256"]) is None
+    ):
+        raise RuntimeErrorEB("Experiment-B k3s receipt binding drifted")
+
+    live_ip = vm_ip()
+    if receipt.get("vm_ip") != live_ip:
+        raise RuntimeErrorEB("Experiment-B k3s VM address drifted")
+    if (
+        not kubeconfig_path.is_file()
+        or kubeconfig_path.is_symlink()
+        or sha256_file(kubeconfig_path) != receipt["kubeconfig_sha256"]
+        or (kubeconfig_path.stat().st_mode & 0o777) != 0o600
+    ):
+        raise RuntimeErrorEB("Experiment-B kubeconfig digest/mode drifted")
+    expected_server = f"https://{live_ip}:6443"
+    if _kubeconfig_server(kubeconfig_path) != expected_server:
+        raise RuntimeErrorEB("Experiment-B kubeconfig is not bound to the VM API server")
+
+    guest_paths = (
+        "/usr/local/bin/k3s",
+        "/etc/rancher/k3s/config.yaml",
+        "/etc/systemd/system/k3s.service",
+    )
+    digest_result = run(
+        [
+            *ssh_argv(root, live_ip),
+            "sudo",
+            "sha256sum",
+            "--",
+            *guest_paths,
+        ],
+        timeout=30,
+    )
+    guest_digests = _parse_sha256sum_output(
+        digest_result.stdout, guest_paths
+    )
+    expected_guest_digests = {
+        "/usr/local/bin/k3s": expected_binary_sha256,
+        "/etc/rancher/k3s/config.yaml": expected_config_sha256,
+        "/etc/systemd/system/k3s.service": expected_service_sha256,
+    }
+    if guest_digests != expected_guest_digests:
+        raise RuntimeErrorEB("installed k3s files drifted from the pinned contract")
+
+    systemctl = run(
+        [
+            *ssh_argv(root, live_ip),
+            "sudo",
+            "systemctl",
+            "show",
+            "k3s.service",
+            "--no-pager",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=UnitFileState",
+            "--property=FragmentPath",
+            "--property=DropInPaths",
+            "--property=MainPID",
+        ],
+        timeout=30,
+    )
+    properties = _parse_systemctl_properties(systemctl.stdout)
+    try:
+        main_pid = int(properties["MainPID"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeErrorEB("k3s systemd MainPID is invalid") from exc
+    if (
+        properties["LoadState"] != "loaded"
+        or properties["ActiveState"] != "active"
+        or properties["SubState"] != "running"
+        or properties["UnitFileState"] != "enabled"
+        or properties["FragmentPath"] != "/etc/systemd/system/k3s.service"
+        or properties["DropInPaths"] != ""
+        or main_pid <= 0
+    ):
+        raise RuntimeErrorEB("k3s systemd service is not the pinned active unit")
+    process_exe = run(
+        [
+            *ssh_argv(root, live_ip),
+            "sudo",
+            "readlink",
+            "-f",
+            f"/proc/{main_pid}/exe",
+        ],
+        timeout=30,
+    ).stdout.strip()
+    process_cmdline = run(
+        [
+            *ssh_argv(root, live_ip),
+            "sudo",
+            "cat",
+            f"/proc/{main_pid}/cmdline",
+        ],
+        timeout=30,
+    ).stdout
+    argv = [value for value in process_cmdline.split("\0") if value]
+    if (
+        process_exe != "/usr/local/bin/k3s"
+        or argv != ["/usr/local/bin/k3s", "server"]
+    ):
+        raise RuntimeErrorEB("active k3s process identity drifted")
+    process_environment = run(
+        [
+            *ssh_argv(root, live_ip),
+            "sudo",
+            "cat",
+            f"/proc/{main_pid}/environ",
+        ],
+        timeout=30,
+    ).stdout
+    environment_entries = [
+        value for value in process_environment.split("\0") if value
+    ]
+    if any(
+        entry.split("=", 1)[0].startswith("K3S_")
+        for entry in environment_entries
+        if "=" in entry
+    ):
+        raise RuntimeErrorEB("active k3s process has unexpected K3S environment overrides")
+
+    return {
+        "vm_ip": live_ip,
+        "kubeconfig_sha256": receipt["kubeconfig_sha256"],
+        "kubeconfig_server": expected_server,
+        "binary_sha256": expected_binary_sha256,
+        "config_sha256": expected_config_sha256,
+        "service_sha256": expected_service_sha256,
+        "service_active": True,
+        "service_substate": "running",
+        "unit_file_state": "enabled",
+        "fragment_path": "/etc/systemd/system/k3s.service",
+        "drop_ins_absent": True,
+        "main_pid": main_pid,
+        "process_exe": process_exe,
+        "process_argv": argv,
+        "environment_overrides_absent": True,
+    }
+
+
 def install_k3s(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
@@ -912,6 +1195,7 @@ def install_k3s(root: Path) -> dict[str, Any]:
     ).stdout.splitlines()[0]
     if config["kubernetes"]["version"] not in version:
         raise RuntimeErrorEB(f"k3s version mismatch: {version}")
+    config_path, service_path = _k3s_contract_paths(config)
     receipt = {
         "schema_version": 1,
         "status": "ready",
@@ -919,6 +1203,9 @@ def install_k3s(root: Path) -> dict[str, Any]:
         "vm_ip": ip,
         "k3s_version": version,
         "live_kubelet_version": live_node["kubelet_version"],
+        "binary_sha256": expected_k3s_sha256,
+        "config_sha256": sha256_file(config_path),
+        "service_sha256": sha256_file(service_path),
         "kubeconfig_sha256": sha256_file(kubeconfig_path),
     }
     atomic_json(root / "receipts/k3s.json", receipt)
@@ -954,6 +1241,18 @@ def _cilium_helm_value_args(ip: str) -> list[str]:
     ]
 
 
+def _flux_install_argv(flux: str, *, export: bool = False) -> list[str]:
+    argv = [
+        flux,
+        "install",
+        "--namespace=flux-system",
+        "--components=source-controller,kustomize-controller,helm-controller,notification-controller",
+    ]
+    if export:
+        argv.append("--export")
+    return argv
+
+
 def install_platform(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
@@ -986,15 +1285,25 @@ def install_platform(root: Path) -> dict[str, Any]:
         timeout=900,
     )
     run(
-        [
-            flux, "install",
-            "--namespace=flux-system",
-            "--components=source-controller,kustomize-controller,helm-controller,notification-controller",
-        ],
+        _flux_install_argv(flux),
         env=env,
         timeout=600,
     )
     cilium_readback = _require_live_cilium_contract(root, load_config())
+    flux_readback: dict[str, Any] | None = None
+    last_flux_error: RuntimeErrorEB | None = None
+    for _ in range(90):
+        try:
+            flux_readback = _require_live_flux_controller_contract(root, receipt)
+        except RuntimeErrorEB as exc:
+            last_flux_error = exc
+            time.sleep(2)
+        else:
+            break
+    if flux_readback is None:
+        raise RuntimeErrorEB(
+            "Flux controllers did not converge to the pinned runtime contract"
+        ) from last_flux_error
     result = {
         "schema_version": 1,
         "status": "ready",
@@ -1008,6 +1317,10 @@ def install_platform(root: Path) -> dict[str, Any]:
             "operator": cilium_readback["operator_pods"][
                 "runtime_image_ids_sha256"
             ],
+        },
+        "flux_runtime_image_ids": {
+            name: controller["pods"]["runtime_image_ids_sha256"]
+            for name, controller in flux_readback.items()
         },
     }
     atomic_json(root / "receipts/platform.json", result)
@@ -1833,26 +2146,172 @@ EXPECTED_FLUX_CONTROLLERS = frozenset(
 )
 
 
-def _require_flux_controller_availability(root: Path) -> dict[str, Any]:
+def _expected_flux_controller_contract(
+    root: Path,
+    toolchain_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    receipt = toolchain_receipt or toolchain(root)
+    tools = receipt.get("tools", {}) if isinstance(receipt, dict) else {}
+    flux = tools.get("flux") if isinstance(tools, dict) else None
+    if not isinstance(flux, str) or not flux:
+        raise RuntimeErrorEB("pinned Flux toolchain binding is unavailable")
+    rendered = run(_flux_install_argv(flux, export=True)).stdout
+    try:
+        documents = [
+            item
+            for item in yaml.safe_load_all(rendered)
+            if isinstance(item, dict)
+        ]
+    except yaml.YAMLError as exc:
+        raise RuntimeErrorEB("pinned Flux install render is invalid") from exc
+    deployments = [
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("namespace") == "flux-system"
+    ]
+    names = {
+        str(document.get("metadata", {}).get("name", ""))
+        for document in deployments
+    }
+    if names != EXPECTED_FLUX_CONTROLLERS or len(deployments) != len(names):
+        raise RuntimeErrorEB("pinned Flux controller Deployment set drifted")
+    result: dict[str, Any] = {}
+    for deployment in deployments:
+        name = str(deployment["metadata"]["name"])
+        spec = deployment.get("spec", {})
+        replicas = spec.get("replicas", 1)
+        if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas != 1:
+            raise RuntimeErrorEB(
+                f"pinned Flux controller replica contract drifted: {name}"
+            )
+        result[name] = {
+            "replicas": 1,
+            "selector_labels": _pod_selector_match_labels(
+                deployment, f"pinned Flux Deployment {name}"
+            ),
+            "images": _pod_spec_images(
+                spec.get("template", {}).get("spec"),
+                f"pinned Flux Deployment {name}",
+            ),
+        }
+    return result
+
+
+def _require_live_flux_controller_contract(
+    root: Path,
+    toolchain_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    expected = _expected_flux_controller_contract(root, toolchain_receipt)
     items = _kubectl_json(
         root, ["-n", "flux-system", "get", "deployments"]
     ).get("items")
-    if not isinstance(items, list):
-        raise RuntimeErrorEB("Flux controller Deployment inventory is invalid")
-    observed: dict[str, Any] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            raise RuntimeErrorEB("Flux controller Deployment inventory is invalid")
-        name = str(item.get("metadata", {}).get("name", ""))
-        if name not in EXPECTED_FLUX_CONTROLLERS:
-            continue
-        if name in observed:
-            raise RuntimeErrorEB(f"duplicate Flux controller Deployment: {name}")
-        observed[name] = _deployment_availability_snapshot(item, name, 1)
-    if set(observed) != EXPECTED_FLUX_CONTROLLERS:
-        missing = sorted(EXPECTED_FLUX_CONTROLLERS - set(observed))
-        raise RuntimeErrorEB(f"Flux controller Deployment set is incomplete: {missing}")
-    return observed
+    pods = _kubectl_json(
+        root, ["-n", "flux-system", "get", "pods"]
+    ).get("items")
+    if (
+        not isinstance(items, list)
+        or any(not isinstance(item, dict) for item in items)
+        or not isinstance(pods, list)
+        or any(not isinstance(item, dict) for item in pods)
+    ):
+        raise RuntimeErrorEB("Flux controller live inventory is invalid")
+    selected = [
+        item
+        for item in items
+        if str(item.get("metadata", {}).get("name", ""))
+        in EXPECTED_FLUX_CONTROLLERS
+    ]
+    by_name = {
+        str(item.get("metadata", {}).get("name", "")): item
+        for item in selected
+    }
+    if (
+        len(selected) != len(EXPECTED_FLUX_CONTROLLERS)
+        or set(by_name) != EXPECTED_FLUX_CONTROLLERS
+    ):
+        missing = sorted(EXPECTED_FLUX_CONTROLLERS - set(by_name))
+        raise RuntimeErrorEB(
+            "Flux controller Deployment set is incomplete or duplicated: "
+            f"{missing}"
+        )
+    result: dict[str, Any] = {}
+    for name, contract_value in expected.items():
+        deployment = by_name[name]
+        metadata = deployment.get("metadata", {})
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("namespace") != "flux-system"
+            or metadata.get("deletionTimestamp") is not None
+        ):
+            raise RuntimeErrorEB(f"Flux controller identity drifted: {name}")
+        selector = _pod_selector_match_labels(
+            deployment, f"live Flux Deployment {name}"
+        )
+        if selector != contract_value["selector_labels"]:
+            raise RuntimeErrorEB(f"Flux controller selector drifted: {name}")
+        live_images = _pod_spec_images(
+            deployment.get("spec", {}).get("template", {}).get("spec"),
+            f"live Flux Deployment {name}",
+        )
+        if live_images != contract_value["images"]:
+            raise RuntimeErrorEB(f"Flux controller images drifted: {name}")
+        availability = _deployment_availability_snapshot(deployment, name, 1)
+        pod_readback = _require_running_pod_image_contract(
+            _pods_matching_labels(pods, selector),
+            namespace="flux-system",
+            workload=name,
+            expected_replicas=1,
+            expected_images=contract_value["images"],
+            required_labels=selector,
+            context="Flux controller Pod",
+        )
+        result[name] = {
+            **availability,
+            "images": live_images,
+            "images_sha256": _stable_json_sha256(live_images),
+            "images_canonical": True,
+            "pods": pod_readback,
+        }
+    return result
+
+
+def _require_flux_runtime_baseline(
+    root: Path,
+    source_commit: str,
+    flux_readback: dict[str, Any],
+) -> dict[str, str]:
+    path = root / "receipts/platform.json"
+    try:
+        platform = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B status requires valid Flux runtime baseline"
+        ) from exc
+    baseline = platform.get("flux_runtime_image_ids")
+    if (
+        not isinstance(platform, dict)
+        or platform.get("schema_version") != 1
+        or platform.get("status") != "ready"
+        or platform.get("source_commit") != source_commit
+        or not isinstance(baseline, dict)
+        or set(baseline) != EXPECTED_FLUX_CONTROLLERS
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in baseline.values()
+        )
+    ):
+        raise RuntimeErrorEB("Experiment-B Flux runtime baseline is invalid")
+    current = {
+        name: controller.get("pods", {}).get("runtime_image_ids_sha256")
+        for name, controller in flux_readback.items()
+    }
+    if current != baseline:
+        raise RuntimeErrorEB(
+            "live Flux controller runtime image IDs drifted from platform installation"
+        )
+    return {str(key): str(value) for key, value in baseline.items()}
 
 
 def _container_images(document: Any, context: str) -> dict[str, str]:
@@ -3334,7 +3793,9 @@ def status(root: Path) -> dict[str, Any]:
     vm_substrate = _live_vm_substrate(root, config)
     if vm_substrate != vm_create["substrate"]:
         raise RuntimeErrorEB("VM substrate drifted from creation receipt")
-    tools = toolchain(root)["tools"]
+    k3s_runtime = _require_live_k3s_runtime(root, config, source_commit)
+    toolchain_receipt = toolchain(root)
+    tools = toolchain_receipt["tools"]
     env = kube_env(root)
     kubectl = tools["kubectl"]
     cilium_readback = _require_live_cilium_contract(root, config)
@@ -3350,7 +3811,12 @@ def status(root: Path) -> dict[str, Any]:
     os_image = node_readback["os_image"]
 
     flux_contract = _flux_bootstrap_contract(root, release)
-    flux_controllers = _require_flux_controller_availability(root)
+    flux_controllers = _require_live_flux_controller_contract(
+        root, toolchain_receipt
+    )
+    flux_runtime_baseline = _require_flux_runtime_baseline(
+        root, source_commit, flux_controllers
+    )
     source = _kubectl_json(
         root,
         ["-n", "flux-system", "get", "gitrepository", "commonthing-experiment-b"],
@@ -3531,7 +3997,8 @@ def status(root: Path) -> dict[str, Any]:
         "source_commit": source_commit,
         "vm_create_sha256": sha256_file(vm_create_path),
         "vm_substrate": vm_substrate,
-        "vm_ip": vm_ip(),
+        "vm_ip": k3s_runtime["vm_ip"],
+        "k3s_runtime": k3s_runtime,
         "node": node_readback["node"],
         "kubelet_version": kubelet,
         "node_ready": node_readback["ready"],
@@ -3541,6 +4008,7 @@ def status(root: Path) -> dict[str, Any]:
         "flux_bootstrap_sha256": flux_contract["bootstrap_sha256"],
         "flux_source_revision": source_revision,
         "flux_controllers": flux_controllers,
+        "flux_runtime_image_ids_baseline": flux_runtime_baseline,
         "flux": flux_readback,
         "deployments": deployment_readback,
         "data_deployments": data_deployment_readback,
@@ -5954,6 +6422,48 @@ def portability_report(root: Path) -> dict[str, Any]:
         )
 
     status_payload = payloads["status.json"]
+    k3s_receipt = payloads["k3s.json"]
+    k3s_status = status_payload.get("k3s_runtime")
+    expected_k3s_config, expected_k3s_service = _k3s_contract_paths(config)
+    expected_k3s_values = {
+        "binary_sha256": str(config["kubernetes"]["binary_sha256"]),
+        "config_sha256": sha256_file(expected_k3s_config),
+        "service_sha256": sha256_file(expected_k3s_service),
+    }
+    if (
+        not isinstance(k3s_status, dict)
+        or status_payload.get("vm_ip") != k3s_status.get("vm_ip")
+        or k3s_receipt.get("vm_ip") != k3s_status.get("vm_ip")
+        or k3s_status.get("kubeconfig_sha256")
+        != k3s_receipt.get("kubeconfig_sha256")
+        or not isinstance(k3s_status.get("kubeconfig_sha256"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", k3s_status["kubeconfig_sha256"]
+        )
+        is None
+        or k3s_status.get("kubeconfig_server")
+        != f"https://{k3s_status.get('vm_ip')}:6443"
+        or any(
+            k3s_status.get(key) != value
+            or k3s_receipt.get(key) != value
+            for key, value in expected_k3s_values.items()
+        )
+        or k3s_status.get("service_active") is not True
+        or k3s_status.get("service_substate") != "running"
+        or k3s_status.get("unit_file_state") != "enabled"
+        or k3s_status.get("fragment_path")
+        != "/etc/systemd/system/k3s.service"
+        or k3s_status.get("drop_ins_absent") is not True
+        or not isinstance(k3s_status.get("main_pid"), int)
+        or isinstance(k3s_status.get("main_pid"), bool)
+        or k3s_status["main_pid"] <= 0
+        or k3s_status.get("process_exe") != "/usr/local/bin/k3s"
+        or k3s_status.get("process_argv")
+        != ["/usr/local/bin/k3s", "server"]
+        or k3s_status.get("environment_overrides_absent") is not True
+    ):
+        raise RuntimeErrorEB("status does not prove the live pinned k3s runtime")
+
     if (
         status_payload.get("node_ready") is not True
         or status_payload.get("kubelet_version")
@@ -5978,6 +6488,10 @@ def portability_report(root: Path) -> dict[str, Any]:
             not isinstance(value, dict)
             or value.get("available") is not True
             or value.get("desired_replicas") != 1
+            or value.get("images_canonical") is not True
+            or not isinstance(value.get("images"), dict)
+            or value.get("images_sha256")
+            != _stable_json_sha256(value["images"])
             for value in flux_controllers.values()
         )
         or not isinstance(flux_readback, dict)
@@ -5991,6 +6505,38 @@ def portability_report(root: Path) -> dict[str, Any]:
         )
     ):
         raise RuntimeErrorEB("status does not prove the live Flux contract")
+    expected_flux_controllers = _expected_flux_controller_contract(root)
+    flux_baseline = payloads["platform.json"].get("flux_runtime_image_ids")
+    if (
+        not isinstance(flux_baseline, dict)
+        or set(flux_baseline) != EXPECTED_FLUX_CONTROLLERS
+        or status_payload.get("flux_runtime_image_ids_baseline")
+        != flux_baseline
+        or set(expected_flux_controllers) != EXPECTED_FLUX_CONTROLLERS
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the installed Flux runtime image baseline"
+        )
+    for name, expected in expected_flux_controllers.items():
+        observed = flux_controllers.get(name)
+        if (
+            not isinstance(observed, dict)
+            or observed.get("images") != expected["images"]
+            or observed.get("images_sha256")
+            != _stable_json_sha256(expected["images"])
+            or not isinstance(observed.get("pods"), dict)
+            or observed["pods"].get("runtime_image_ids_sha256")
+            != flux_baseline.get(name)
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the live Flux controller contract: {name}"
+            )
+        _require_stored_pod_image_contract(
+            observed["pods"],
+            1,
+            expected["images"],
+            f"Flux controller Pod {name}",
+        )
 
     data_deployment_status = status_payload.get("data_deployments")
     expected_data_deployments = {

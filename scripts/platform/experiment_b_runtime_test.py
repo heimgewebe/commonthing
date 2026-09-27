@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 import experiment_b_runtime as runtime
 
 
@@ -617,6 +619,289 @@ spec:
         stale["items"][0]["status"]["nodeInfo"]["kubeletVersion"] = "v1.35.0+k3s1"
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "pinned k3s version"):
             runtime._require_exact_k3s_node_inventory(stale, expected)
+
+    def test_live_k3s_runtime_binds_vm_kubeconfig_guest_files_and_process(self) -> None:
+        commit = "a" * 40
+        ip = "192.168.122.10"
+        config = runtime.load_config()
+        config_path, service_path = runtime._k3s_contract_paths(config)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "receipts").mkdir()
+            kubeconfig = root / "kubeconfig.yaml"
+
+            def write_kubeconfig(server: str) -> None:
+                kubeconfig.write_text(
+                    yaml.safe_dump(
+                        {
+                            "apiVersion": "v1",
+                            "kind": "Config",
+                            "current-context": "default",
+                            "contexts": [
+                                {
+                                    "name": "default",
+                                    "context": {
+                                        "cluster": "default",
+                                        "user": "default",
+                                    },
+                                }
+                            ],
+                            "clusters": [
+                                {
+                                    "name": "default",
+                                    "cluster": {"server": server},
+                                }
+                            ],
+                            "users": [{"name": "default", "user": {}}],
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                kubeconfig.chmod(0o600)
+
+            def write_receipt() -> None:
+                runtime.atomic_json(
+                    root / "receipts/k3s.json",
+                    {
+                        "schema_version": 1,
+                        "status": "ready",
+                        "source_commit": commit,
+                        "vm_ip": ip,
+                        "k3s_version": (
+                            f"k3s version {config['kubernetes']['version']}"
+                        ),
+                        "live_kubelet_version": config["kubernetes"]["version"],
+                        "binary_sha256": config["kubernetes"]["binary_sha256"],
+                        "config_sha256": runtime.sha256_file(config_path),
+                        "service_sha256": runtime.sha256_file(service_path),
+                        "kubeconfig_sha256": runtime.sha256_file(kubeconfig),
+                    },
+                )
+
+            write_kubeconfig(f"https://{ip}:6443")
+            write_receipt()
+            guest_digests = {
+                "/usr/local/bin/k3s": config["kubernetes"]["binary_sha256"],
+                "/etc/rancher/k3s/config.yaml": runtime.sha256_file(config_path),
+                "/etc/systemd/system/k3s.service": runtime.sha256_file(service_path),
+            }
+            systemctl = {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+                "UnitFileState": "enabled",
+                "FragmentPath": "/etc/systemd/system/k3s.service",
+                "DropInPaths": "",
+                "MainPID": "4321",
+            }
+            process_exe = "/usr/local/bin/k3s"
+            process_cmdline = "/usr/local/bin/k3s\0server\0"
+            process_environment = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin\0"
+
+            def runner(argv: list[str], **_kwargs):
+                nonlocal process_exe, process_cmdline, process_environment
+                if "sha256sum" in argv:
+                    stdout = "".join(
+                        f"{guest_digests[path]}  {path}\n"
+                        for path in (
+                            "/usr/local/bin/k3s",
+                            "/etc/rancher/k3s/config.yaml",
+                            "/etc/systemd/system/k3s.service",
+                        )
+                    )
+                elif "systemctl" in argv:
+                    stdout = "".join(
+                        f"{key}={systemctl[key]}\n"
+                        for key in (
+                            "LoadState",
+                            "ActiveState",
+                            "SubState",
+                            "UnitFileState",
+                            "FragmentPath",
+                            "DropInPaths",
+                            "MainPID",
+                        )
+                    )
+                elif "readlink" in argv:
+                    stdout = process_exe + "\n"
+                elif "cat" in argv and any("/cmdline" in item for item in argv):
+                    stdout = process_cmdline
+                elif "cat" in argv and any("/environ" in item for item in argv):
+                    stdout = process_environment
+                else:
+                    raise AssertionError(f"unexpected k3s readback command: {argv}")
+                return runtime.subprocess.CompletedProcess(
+                    argv, 0, stdout=stdout, stderr=""
+                )
+
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                observed = runtime._require_live_k3s_runtime(
+                    root, config, commit
+                )
+            self.assertEqual(observed["vm_ip"], ip)
+            self.assertEqual(observed["process_exe"], "/usr/local/bin/k3s")
+            self.assertEqual(
+                observed["binary_sha256"],
+                config["kubernetes"]["binary_sha256"],
+            )
+
+            write_kubeconfig("https://192.168.122.99:6443")
+            write_receipt()
+            with mock.patch.object(runtime, "vm_ip", return_value=ip):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB, "VM API server"
+                ):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+
+            write_kubeconfig(f"https://{ip}:6443")
+            write_receipt()
+            guest_digests["/usr/local/bin/k3s"] = "0" * 64
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB, "installed k3s files drifted"
+                ):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            guest_digests["/usr/local/bin/k3s"] = config["kubernetes"][
+                "binary_sha256"
+            ]
+
+            systemctl["ActiveState"] = "inactive"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB, "systemd service"
+                ):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            systemctl["ActiveState"] = "active"
+
+            systemctl["DropInPaths"] = "/etc/systemd/system/k3s.service.d/override.conf"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB, "systemd service"
+                ):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            systemctl["DropInPaths"] = ""
+
+            process_cmdline = "/usr/local/bin/k3s\0server\0--disable=metrics-server\0"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB, "process identity"
+                ):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            process_cmdline = "/usr/local/bin/k3s\0server\0"
+
+            process_environment = "PATH=/usr/bin\0K3S_DISABLE=traefik\0"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB, "environment overrides"
+                ):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            process_environment = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin\0"
+
+            process_exe = "/usr/local/bin/other"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB, "process identity"
+                ):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+
+        source = inspect.getsource(runtime.status)
+        self.assertLess(
+            source.index("_require_live_k3s_runtime("),
+            source.index("toolchain(root)"),
+        )
+
+    def test_flux_controller_contract_comes_from_pinned_install_export(self) -> None:
+        documents = []
+        for name in sorted(runtime.EXPECTED_FLUX_CONTROLLERS):
+            documents.append(
+                {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": name,
+                        "namespace": "flux-system",
+                    },
+                    "spec": {
+                        "replicas": 1,
+                        "selector": {
+                            "matchLabels": {
+                                "app.kubernetes.io/name": name,
+                            }
+                        },
+                        "template": {
+                            "spec": {
+                                "containers": [
+                                    {
+                                        "name": "manager",
+                                        "image": f"ghcr.io/fluxcd/{name}:vfixture",
+                                    }
+                                ]
+                            }
+                        },
+                    },
+                }
+            )
+        rendered = yaml.safe_dump_all(documents, sort_keys=True)
+        completed = runtime.subprocess.CompletedProcess(
+            ["flux"], 0, stdout=rendered, stderr=""
+        )
+        with mock.patch.object(runtime, "run", return_value=completed) as runner:
+            observed = runtime._expected_flux_controller_contract(
+                Path("/tmp/unused"),
+                {"tools": {"flux": "/verified/flux"}},
+            )
+        self.assertEqual(set(observed), runtime.EXPECTED_FLUX_CONTROLLERS)
+        runner.assert_called_once_with(
+            runtime._flux_install_argv("/verified/flux", export=True)
+        )
+        for name, value in observed.items():
+            self.assertEqual(value["replicas"], 1)
+            self.assertEqual(
+                value["selector_labels"],
+                {"app.kubernetes.io/name": name},
+            )
+            self.assertEqual(
+                value["images"]["containers"]["manager"],
+                f"ghcr.io/fluxcd/{name}:vfixture",
+            )
+
+        missing = yaml.safe_dump_all(documents[:-1], sort_keys=True)
+        with mock.patch.object(
+            runtime,
+            "run",
+            return_value=runtime.subprocess.CompletedProcess(
+                ["flux"], 0, stdout=missing, stderr=""
+            ),
+        ):
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "Deployment set drifted"
+            ):
+                runtime._expected_flux_controller_contract(
+                    Path("/tmp/unused"),
+                    {"tools": {"flux": "/verified/flux"}},
+                )
 
     def test_apply_release_requires_exact_flux_revision_and_set(self) -> None:
         source = inspect.getsource(runtime.apply_release)
@@ -1352,6 +1637,24 @@ spec:
 
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
         commit = "a" * 40
+        config = runtime.load_config()
+        k3s_config_path, k3s_service_path = runtime._k3s_contract_paths(config)
+        k3s_config_sha256 = runtime.sha256_file(k3s_config_path)
+        k3s_service_sha256 = runtime.sha256_file(k3s_service_path)
+        kubeconfig_sha256 = "3" * 64
+        flux_expected_contract = {
+            name: {
+                "replicas": 1,
+                "selector_labels": {"app.kubernetes.io/name": name},
+                "images": {
+                    "containers": {
+                        "manager": f"ghcr.io/fluxcd/{name}:vfixture",
+                    },
+                    "init_containers": {},
+                },
+            }
+            for name in runtime.EXPECTED_FLUX_CONTROLLERS
+        }
         statuses = {
             "vm-create.json": "created",
             "k3s.json": "ready",
@@ -1377,6 +1680,11 @@ spec:
                 "_current_protected_main_commit",
                 return_value=commit,
             ),
+            mock.patch.object(
+                runtime,
+                "_expected_flux_controller_contract",
+                return_value=flux_expected_contract,
+            ),
         ):
             root = Path(tmp)
             receipts = root / "receipts"
@@ -1385,13 +1693,23 @@ spec:
                 payload: dict[str, object] = {"schema_version": 1, "status": status}
                 if name == "vm-create.json":
                     payload.update(vm_receipt_fixture(state_root=root))
+                elif name == "k3s.json":
+                    payload.update(
+                        {
+                            "source_commit": commit,
+                            "vm_ip": "192.168.122.10",
+                            "binary_sha256": config["kubernetes"]["binary_sha256"],
+                            "config_sha256": k3s_config_sha256,
+                            "service_sha256": k3s_service_sha256,
+                            "kubeconfig_sha256": kubeconfig_sha256,
+                        }
+                    )
                 elif name == "release.json":
                     payload["source_commit"] = commit
                     payload["sha256"] = "1" * 64
                     payload["api_digest"] = "sha256:" + "b" * 64
                     payload["web_digest"] = "sha256:" + "c" * 64
                 elif name in {
-                    "k3s.json",
                     "platform.json",
                     "secrets.json",
                     "t048-fixture.json",
@@ -1419,6 +1737,24 @@ spec:
                 if name == "status.json":
                     payload["vm_create_sha256"] = runtime.sha256_file(receipts / "vm-create.json")
                     payload["vm_substrate"] = vm_substrate_fixture()
+                    payload["vm_ip"] = "192.168.122.10"
+                    payload["k3s_runtime"] = {
+                        "vm_ip": "192.168.122.10",
+                        "kubeconfig_sha256": kubeconfig_sha256,
+                        "kubeconfig_server": "https://192.168.122.10:6443",
+                        "binary_sha256": config["kubernetes"]["binary_sha256"],
+                        "config_sha256": k3s_config_sha256,
+                        "service_sha256": k3s_service_sha256,
+                        "service_active": True,
+                        "service_substate": "running",
+                        "unit_file_state": "enabled",
+                        "fragment_path": "/etc/systemd/system/k3s.service",
+                        "drop_ins_absent": True,
+                        "main_pid": 1234,
+                        "process_exe": "/usr/local/bin/k3s",
+                        "process_argv": ["/usr/local/bin/k3s", "server"],
+                        "environment_overrides_absent": True,
+                    }
                     def stored_pod_proof(
                         workload: str,
                         expected_images: dict[str, dict[str, str]],
@@ -1512,8 +1848,21 @@ spec:
                         name: {
                             "available": True,
                             "desired_replicas": 1,
+                            "images": expected["images"],
+                            "images_sha256": runtime._stable_json_sha256(
+                                expected["images"]
+                            ),
+                            "images_canonical": True,
+                            "pods": stored_pod_proof(
+                                name,
+                                expected["images"],
+                            ),
                         }
-                        for name in runtime.EXPECTED_FLUX_CONTROLLERS
+                        for name, expected in flux_expected_contract.items()
+                    }
+                    payload["flux_runtime_image_ids_baseline"] = {
+                        name: controller["pods"]["runtime_image_ids_sha256"]
+                        for name, controller in payload["flux_controllers"].items()
                     }
                     payload["flux"] = {
                         name: {
@@ -1659,6 +2008,9 @@ spec:
                 platform_path.read_text(encoding="utf-8")
             )
             platform_payload["cilium_runtime_image_ids"] = cilium_baseline
+            platform_payload["flux_runtime_image_ids"] = status_payload[
+                "flux_runtime_image_ids_baseline"
+            ]
             runtime.atomic_json(platform_path, platform_payload)
             status_attempt_path = receipts / "status-attempt.json"
             status_attempt = json.loads(
@@ -2963,24 +3315,9 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "numberUnavailable": 0,
             },
         }
-        self.flux_controller_deployments = [
-            {
-                "metadata": {"name": name, "generation": 1},
-                "spec": {"replicas": 1},
-                "status": {
-                    "observedGeneration": 1,
-                    "replicas": 1,
-                    "updatedReplicas": 1,
-                    "readyReplicas": 1,
-                    "availableReplicas": 1,
-                    "unavailableReplicas": 0,
-                    "conditions": [
-                        {"type": "Available", "status": "True"}
-                    ],
-                },
-            }
-            for name in sorted(runtime.EXPECTED_FLUX_CONTROLLERS)
-        ]
+        self.flux_controller_deployments = []
+        self.flux_controller_pods = []
+        self.flux_expected_contract = {}
         self.kube_proxy_daemonsets = []
         self.kube_proxy_pods = []
         runtime_binding = self.config["runtime_binding"]
@@ -3087,6 +3424,62 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     ],
                 },
             }
+
+        for name in sorted(runtime.EXPECTED_FLUX_CONTROLLERS):
+            images = {
+                "containers": {
+                    "manager": f"ghcr.io/fluxcd/{name}:vfixture",
+                },
+                "init_containers": {},
+            }
+            labels = {"app.kubernetes.io/name": name}
+            self.flux_expected_contract[name] = {
+                "replicas": 1,
+                "selector_labels": json.loads(json.dumps(labels)),
+                "images": json.loads(json.dumps(images)),
+            }
+            self.flux_controller_deployments.append(
+                {
+                    "metadata": {
+                        "name": name,
+                        "namespace": "flux-system",
+                        "generation": 1,
+                    },
+                    "spec": {
+                        "replicas": 1,
+                        "selector": {
+                            "matchLabels": json.loads(json.dumps(labels))
+                        },
+                        "template": {
+                            "spec": {
+                                "containers": [
+                                    {"name": key, "image": value}
+                                    for key, value in images["containers"].items()
+                                ],
+                                "initContainers": [],
+                            }
+                        },
+                    },
+                    "status": {
+                        "observedGeneration": 1,
+                        "replicas": 1,
+                        "updatedReplicas": 1,
+                        "readyReplicas": 1,
+                        "availableReplicas": 1,
+                        "unavailableReplicas": 0,
+                        "conditions": [{"type": "Available", "status": "True"}],
+                    },
+                }
+            )
+            self.flux_controller_pods.append(
+                workload_pod(
+                    "flux-system",
+                    name,
+                    0,
+                    labels,
+                    images,
+                )
+            )
 
         self.data_deployments = {}
         self.data_pods = {}
@@ -3471,6 +3864,24 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             required_labels={"io.cilium/app": "operator"},
             context="Cilium operator Pod",
         )
+        flux_proofs = {
+            name: runtime._require_running_pod_image_contract(
+                [
+                    pod
+                    for pod in self.flux_controller_pods
+                    if pod["metadata"]["labels"].get(
+                        "app.kubernetes.io/name"
+                    ) == name
+                ],
+                namespace="flux-system",
+                workload=name,
+                expected_replicas=1,
+                expected_images=expected["images"],
+                required_labels=expected["selector_labels"],
+                context="Flux controller Pod",
+            )
+            for name, expected in self.flux_expected_contract.items()
+        }
         runtime.atomic_json(
             self.root / "receipts/platform.json",
             {
@@ -3484,6 +3895,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     "operator": operator_proof[
                         "runtime_image_ids_sha256"
                     ],
+                },
+                "flux_runtime_image_ids": {
+                    name: proof["runtime_image_ids_sha256"]
+                    for name, proof in flux_proofs.items()
                 },
             },
         )
@@ -3505,9 +3920,44 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "secret_values_recorded": False,
             },
         )
+        self.k3s_runtime = {
+            "vm_ip": "192.168.122.10",
+            "kubeconfig_sha256": "3" * 64,
+            "kubeconfig_server": "https://192.168.122.10:6443",
+            "binary_sha256": self.config["kubernetes"]["binary_sha256"],
+            "config_sha256": runtime.sha256_file(
+                runtime.CLUSTER / "k3s-config.yaml"
+            ),
+            "service_sha256": runtime.sha256_file(
+                runtime.CLUSTER / "k3s.service"
+            ),
+            "service_active": True,
+            "service_substate": "running",
+            "unit_file_state": "enabled",
+            "fragment_path": "/etc/systemd/system/k3s.service",
+            "drop_ins_absent": True,
+            "main_pid": 1234,
+            "process_exe": "/usr/local/bin/k3s",
+            "process_argv": ["/usr/local/bin/k3s", "server"],
+            "environment_overrides_absent": True,
+        }
+        self.k3s_readback = self.patch(
+            "_require_live_k3s_runtime",
+            return_value=json.loads(json.dumps(self.k3s_runtime)),
+        )
+        self.expected_flux_controllers = self.patch(
+            "_expected_flux_controller_contract",
+            return_value=json.loads(json.dumps(self.flux_expected_contract)),
+        )
         self.tools = self.patch(
             "toolchain",
-            return_value={"tools": {"kubectl": "kubectl", "helm": "helm"}},
+            return_value={
+                "tools": {
+                    "kubectl": "kubectl",
+                    "helm": "helm",
+                    "flux": "flux",
+                }
+            },
         )
         self.patch("kube_env", return_value={})
         self.patch("vm_ip", return_value="192.168.122.10")
@@ -3627,6 +4077,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             return self.cilium_operator
         if arguments == ["-n", "flux-system", "get", "deployments"]:
             return {"items": self.flux_controller_deployments}
+        if arguments == ["-n", "flux-system", "get", "pods"]:
+            return {"items": self.flux_controller_pods}
         if "gitrepository" in arguments:
             return {
                 "metadata": {"generation": 1},
@@ -3881,9 +4333,21 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertTrue(result["cilium"]["daemonset_images_canonical"])
         self.assertTrue(result["cilium"]["daemonset_pods"]["images_canonical"])
         self.assertTrue(result["cilium"]["operator_pods"]["images_canonical"])
+        self.assertEqual(result["k3s_runtime"], self.k3s_runtime)
         self.assertEqual(
             set(result["flux_controllers"]),
             runtime.EXPECTED_FLUX_CONTROLLERS,
+        )
+        self.assertEqual(
+            set(result["flux_runtime_image_ids_baseline"]),
+            runtime.EXPECTED_FLUX_CONTROLLERS,
+        )
+        self.assertTrue(
+            all(
+                controller["images_canonical"]
+                and controller["pods"]["images_canonical"]
+                for controller in result["flux_controllers"].values()
+            )
         )
         self.assertEqual(
             result["flux_bootstrap_sha256"],
@@ -4023,8 +4487,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.prepare_status()
 
         healthy = json.loads(json.dumps(self.flux_controller_deployments))
+        healthy_pods = json.loads(json.dumps(self.flux_controller_pods))
         self.flux_controller_deployments = healthy[:-1]
-        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "set is incomplete"):
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "incomplete or duplicated"
+        ):
             runtime.status(self.root)
 
         self.flux_controller_deployments = json.loads(json.dumps(healthy))
@@ -4032,11 +4499,57 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not currently available"):
             runtime.status(self.root)
 
+        self.flux_controller_deployments = json.loads(json.dumps(healthy))
+        self.flux_controller_deployments[0]["spec"]["template"]["spec"][
+            "containers"
+        ][0]["image"] = "ghcr.io/fluxcd/other:vfixture"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "images drifted"):
+            runtime.status(self.root)
+
+        self.flux_controller_deployments = json.loads(json.dumps(healthy))
+        self.flux_controller_pods = json.loads(json.dumps(healthy_pods))
+        self.flux_controller_pods[0]["spec"]["containers"][0]["image"] = (
+            "ghcr.io/fluxcd/other:vfixture"
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "requested images drifted"
+        ):
+            runtime.status(self.root)
+
+        self.flux_controller_pods = json.loads(json.dumps(healthy_pods))
+        self.flux_controller_pods[0]["status"]["containerStatuses"][0][
+            "imageID"
+        ] = "containerd://sha256:" + "0" * 64
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "drifted from platform installation"
+        ):
+            runtime.status(self.root)
+
+        first_name = self.flux_controller_pods[0]["metadata"]["labels"][
+            "app.kubernetes.io/name"
+        ]
+        self.flux_controller_pods = [
+            pod
+            for pod in json.loads(json.dumps(healthy_pods))
+            if pod["metadata"]["labels"]["app.kubernetes.io/name"] != first_name
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "exact replica contract"
+        ):
+            runtime.status(self.root)
+
         self.flux_controller_deployments = healthy
+        self.flux_controller_pods = healthy_pods
         result = runtime.status(self.root)
         self.assertEqual(
             set(result["flux_controllers"]),
             runtime.EXPECTED_FLUX_CONTROLLERS,
+        )
+        self.assertTrue(
+            all(
+                controller["pods"]["images_canonical"]
+                for controller in result["flux_controllers"].values()
+            )
         )
 
     def test_status_revalidates_flux_specs_against_bootstrap(self) -> None:
