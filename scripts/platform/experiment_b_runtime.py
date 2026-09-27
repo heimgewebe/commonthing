@@ -33,6 +33,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 import bootstrap_tools
 import experiment_b as contract
 
@@ -921,6 +923,21 @@ def kube_env(root: Path) -> dict[str, str]:
     return env
 
 
+def _cilium_helm_value_args(ip: str) -> list[str]:
+    return [
+        "--set", "gatewayAPI.enabled=true",
+        "--set", "nodeIPAM.enabled=true",
+        "--set", "defaultLBServiceIPAM=nodeipam",
+        "--set", "kubeProxyReplacement=true",
+        "--set", f"k8sServiceHost={ip}",
+        "--set", "k8sServicePort=6443",
+        "--set", "ipam.operator.clusterPoolIPv4PodCIDRList={10.42.0.0/16}",
+        "--set", "hubble.relay.enabled=true",
+        "--set", "hubble.ui.enabled=false",
+        "--set", "operator.replicas=1",
+    ]
+
+
 def install_platform(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
@@ -946,16 +963,7 @@ def install_platform(root: Path) -> dict[str, Any]:
         [
             helm, "upgrade", "--install", "cilium", artifacts["cilium_chart"],
             "--namespace", "kube-system",
-            "--set", "gatewayAPI.enabled=true",
-            "--set", "nodeIPAM.enabled=true",
-            "--set", "defaultLBServiceIPAM=nodeipam",
-            "--set", "kubeProxyReplacement=true",
-            "--set", f"k8sServiceHost={ip}",
-            "--set", "k8sServicePort=6443",
-            "--set", "ipam.operator.clusterPoolIPv4PodCIDRList={10.42.0.0/16}",
-            "--set", "hubble.relay.enabled=true",
-            "--set", "hubble.ui.enabled=false",
-            "--set", "operator.replicas=1",
+            *_cilium_helm_value_args(ip),
             "--wait", "--timeout", "10m",
         ],
         env=env,
@@ -1086,6 +1094,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         "registry_secret": "commonthing-experiment-b-registry",
         "database_source_sha256": sha256_file(root / "secrets/database.json"),
         "registry_source_sha256": sha256_file(registry_config),
+        "registry_source_path": str(registry_config.resolve()),
         "secret_values_recorded": False,
     }
     atomic_json(root / "receipts/secrets.json", receipt)
@@ -1114,6 +1123,7 @@ def apply_release(
     binding = contract.render_bootstrap(
         source_commit, api_digest, web_digest, output
     )
+    flux_contract = _flux_bootstrap_contract(root, binding)
     kubectl_apply(root, output.read_text(encoding="utf-8"))
     kubectl = toolchain(root)["tools"]["kubectl"]
     env = kube_env(root)
@@ -1153,9 +1163,15 @@ def apply_release(
                     flux_payload, dict
                 ):
                     raise RuntimeErrorEB("Flux readiness payload is not an object")
-                _require_flux_source_revision(source_payload, source_commit)
+                _require_flux_source_revision(
+                    source_payload,
+                    source_commit,
+                    flux_contract["source_spec"],
+                )
                 _require_exact_flux_revision_ready(
-                    flux_payload.get("items", []), source_commit
+                    flux_payload.get("items", []),
+                    source_commit,
+                    flux_contract["kustomization_specs"],
                 )
                 live_results = {
                     "api": run(
@@ -1421,6 +1437,124 @@ def _flux_revision_matches_commit(revision: Any, source_commit: str) -> bool:
     )
 
 
+def _canonical_flux_spec(spec: Any) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        raise RuntimeErrorEB("Flux spec is not an object")
+    canonical = json.loads(json.dumps(spec))
+    for key, default in (
+        ("suspend", False),
+        ("force", False),
+        ("deletionPolicy", "MirrorPrune"),
+        ("provider", "generic"),
+        ("timeout", "60s"),
+    ):
+        if canonical.get(key) == default:
+            canonical.pop(key, None)
+
+    source_ref = canonical.get("sourceRef")
+    if isinstance(source_ref, dict) and source_ref.get("namespace") == "flux-system":
+        source_ref.pop("namespace", None)
+
+    ref = canonical.get("ref")
+    if isinstance(ref, dict) and ref.get("recurseSubmodules") is False:
+        ref.pop("recurseSubmodules", None)
+
+    post_build = canonical.get("postBuild")
+    if isinstance(post_build, dict):
+        substitute_from = post_build.get("substituteFrom")
+        if isinstance(substitute_from, list):
+            for item in substitute_from:
+                if isinstance(item, dict) and item.get("optional") is False:
+                    item.pop("optional", None)
+
+    duration_pattern = re.compile(
+        r"^(?:(?P<hours>[0-9]+)h)?(?:(?P<minutes>[0-9]+)m)?(?:(?P<seconds>[0-9]+)s)?$"
+    )
+    for key in ("interval", "retryInterval", "timeout"):
+        value = canonical.get(key)
+        if not isinstance(value, str):
+            continue
+        match = duration_pattern.fullmatch(value)
+        if match and any(match.groupdict().values()):
+            canonical[key] = (
+                int(match.group("hours") or 0) * 3600
+                + int(match.group("minutes") or 0) * 60
+                + int(match.group("seconds") or 0)
+            )
+    return canonical
+
+
+def _require_flux_spec(
+    live_spec: Any,
+    expected_spec: Any,
+    context: str,
+) -> None:
+    if _canonical_flux_spec(live_spec) != _canonical_flux_spec(expected_spec):
+        raise RuntimeErrorEB(f"{context} spec drifted from the rendered bootstrap contract")
+
+
+def _flux_bootstrap_contract(
+    root: Path,
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    bootstrap_path = root / "bootstrap.yaml"
+    expected_sha256 = binding.get("sha256")
+    if (
+        not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or not bootstrap_path.is_file()
+        or bootstrap_path.is_symlink()
+        or not secrets.compare_digest(sha256_file(bootstrap_path), expected_sha256)
+    ):
+        raise RuntimeErrorEB("Experiment-B rendered bootstrap binding drifted")
+    try:
+        documents = list(
+            yaml.safe_load_all(bootstrap_path.read_text(encoding="utf-8"))
+        )
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeErrorEB("Experiment-B rendered bootstrap is invalid") from exc
+
+    source_spec: dict[str, Any] | None = None
+    kustomization_specs: dict[str, dict[str, Any]] = {}
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        metadata = document.get("metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        name = metadata.get("name")
+        namespace = metadata.get("namespace")
+        spec = document.get("spec")
+        if (
+            document.get("kind") == "GitRepository"
+            and name == "commonthing-experiment-b"
+            and namespace == "flux-system"
+        ):
+            if source_spec is not None or not isinstance(spec, dict):
+                raise RuntimeErrorEB("Experiment-B bootstrap GitRepository is duplicated")
+            source_spec = spec
+        elif (
+            document.get("kind") == "Kustomization"
+            and namespace == "flux-system"
+            and isinstance(name, str)
+            and name.startswith("commonthing-experiment-b-")
+        ):
+            if name in kustomization_specs or not isinstance(spec, dict):
+                raise RuntimeErrorEB(
+                    f"Experiment-B bootstrap Kustomization is duplicated: {name}"
+                )
+            kustomization_specs[name] = spec
+
+    if source_spec is None:
+        raise RuntimeErrorEB("Experiment-B bootstrap GitRepository contract is missing")
+    _require_exact_flux_kustomizations(kustomization_specs)
+    return {
+        "bootstrap_sha256": expected_sha256,
+        "source_spec": source_spec,
+        "kustomization_specs": kustomization_specs,
+    }
+
+
 def _require_current_condition(
     document: Any,
     condition_type: str,
@@ -1462,13 +1596,16 @@ def _require_current_condition(
 
 
 def _require_flux_source_revision(
-    source: Any, source_commit: str
+    source: Any,
+    source_commit: str,
+    expected_spec: dict[str, Any],
 ) -> str:
     if not isinstance(source, dict):
         raise RuntimeErrorEB("Flux GitRepository payload is not an object")
     spec = source.get("spec", {})
     if not isinstance(spec, dict) or spec.get("suspend") is True:
         raise RuntimeErrorEB("Flux GitRepository is suspended or malformed")
+    _require_flux_spec(spec, expected_spec, "Flux GitRepository")
     _require_current_condition(source, "Ready", "Flux GitRepository")
     revision = str(
         source.get("status", {}).get("artifact", {}).get("revision", "")
@@ -1479,10 +1616,13 @@ def _require_flux_source_revision(
 
 
 def _require_exact_flux_revision_ready(
-    flux_items: Any, source_commit: str
+    flux_items: Any,
+    source_commit: str,
+    expected_specs: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     if not isinstance(flux_items, list):
         raise RuntimeErrorEB("Flux Kustomization inventory is not a list")
+    _require_exact_flux_kustomizations(expected_specs)
 
     flux_readback: dict[str, Any] = {}
     for item in flux_items:
@@ -1493,9 +1633,13 @@ def _require_exact_flux_revision_ready(
             continue
         if name in flux_readback:
             raise RuntimeErrorEB(f"duplicate Flux Kustomization: {name}")
+        expected_spec = expected_specs.get(name)
+        if not isinstance(expected_spec, dict):
+            raise RuntimeErrorEB(f"unexpected Flux Kustomization: {name}")
         spec = item.get("spec", {})
         if not isinstance(spec, dict) or spec.get("suspend") is True:
             raise RuntimeErrorEB(f"Flux Kustomization is suspended or malformed: {name}")
+        _require_flux_spec(spec, expected_spec, f"Flux Kustomization {name}")
         generation = _require_current_condition(
             item, "Ready", f"Flux Kustomization {name}"
         )
@@ -1509,6 +1653,7 @@ def _require_exact_flux_revision_ready(
             "ready": True,
             "revision": revision,
             "generation": generation,
+            "spec_sha256": _stable_json_sha256(_canonical_flux_spec(spec)),
         }
 
     _require_exact_flux_kustomizations(flux_readback)
@@ -1632,6 +1777,38 @@ def _deployment_availability_snapshot(
     }
 
 
+EXPECTED_FLUX_CONTROLLERS = frozenset(
+    {
+        "source-controller",
+        "kustomize-controller",
+        "helm-controller",
+        "notification-controller",
+    }
+)
+
+
+def _require_flux_controller_availability(root: Path) -> dict[str, Any]:
+    items = _kubectl_json(
+        root, ["-n", "flux-system", "get", "deployments"]
+    ).get("items")
+    if not isinstance(items, list):
+        raise RuntimeErrorEB("Flux controller Deployment inventory is invalid")
+    observed: dict[str, Any] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise RuntimeErrorEB("Flux controller Deployment inventory is invalid")
+        name = str(item.get("metadata", {}).get("name", ""))
+        if name not in EXPECTED_FLUX_CONTROLLERS:
+            continue
+        if name in observed:
+            raise RuntimeErrorEB(f"duplicate Flux controller Deployment: {name}")
+        observed[name] = _deployment_availability_snapshot(item, name, 1)
+    if set(observed) != EXPECTED_FLUX_CONTROLLERS:
+        missing = sorted(EXPECTED_FLUX_CONTROLLERS - set(observed))
+        raise RuntimeErrorEB(f"Flux controller Deployment set is incomplete: {missing}")
+    return observed
+
+
 def _container_images(document: Any, context: str) -> dict[str, str]:
     if not isinstance(document, dict):
         raise RuntimeErrorEB(f"{context} payload is not an object")
@@ -1713,9 +1890,9 @@ def _require_requested_release_artifacts(
     }
 
 
-def _expected_live_secret_hashes(
+def _expected_live_secret_values(
     root: Path, source_commit: str
-) -> dict[str, dict[str, str]]:
+) -> dict[str, dict[str, bytes]]:
     receipt_path = root / "receipts/secrets.json"
     database_path = root / "secrets/database.json"
     if not database_path.is_file() or database_path.is_symlink():
@@ -1729,6 +1906,15 @@ def _expected_live_secret_hashes(
         raise RuntimeErrorEB(
             "Experiment-B status requires valid private Secret source material"
         ) from exc
+
+    registry_source_path = (
+        receipt.get("registry_source_path") if isinstance(receipt, dict) else None
+    )
+    if not isinstance(registry_source_path, str) or not registry_source_path:
+        raise RuntimeErrorEB("Experiment-B registry Secret source path is invalid")
+    registry_path = Path(registry_source_path)
+    if not registry_path.is_file() or registry_path.is_symlink():
+        raise RuntimeErrorEB("Experiment-B registry Secret source material is unavailable")
 
     if not isinstance(receipt, dict) or (
         receipt.get("schema_version") != 1
@@ -1754,8 +1940,11 @@ def _expected_live_secret_hashes(
     if (
         not isinstance(registry_source_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", registry_source_sha256) is None
+        or not secrets.compare_digest(
+            sha256_file(registry_path), registry_source_sha256
+        )
     ):
-        raise RuntimeErrorEB("Experiment-B registry Secret source digest is invalid")
+        raise RuntimeErrorEB("Experiment-B registry Secret source digest drifted")
 
     expected_database_keys = {"username", "database", "password"}
     if (
@@ -1772,17 +1961,13 @@ def _expected_live_secret_hashes(
         f"postgresql://{database['username']}:{database['password']}"
         f"@postgres.{DATA_NAMESPACE}.svc.cluster.local:5432/{database['database']}"
     )
-
-    def digest_text(value: str) -> str:
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
     return {
         "database": {
-            key: digest_text(database[key])
+            key: database[key].encode("utf-8")
             for key in expected_database_keys
         },
-        "runtime": {"database-url": digest_text(database_url)},
-        "registry": {".dockerconfigjson": registry_source_sha256},
+        "runtime": {"database-url": database_url.encode("utf-8")},
+        "registry": {".dockerconfigjson": registry_path.read_bytes()},
     }
 
 
@@ -1792,11 +1977,11 @@ def _require_live_secret(
     name: str,
     secret_type: str,
     required_keys: set[str],
-    expected_sha256: dict[str, str],
+    expected_values: dict[str, bytes],
 ) -> None:
-    if set(expected_sha256) != required_keys or any(
-        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
-        for value in expected_sha256.values()
+    if set(expected_values) != required_keys or any(
+        not isinstance(value, bytes) or not value
+        for value in expected_values.values()
     ):
         raise RuntimeErrorEB(
             f"Experiment-B Secret expected-content contract is invalid: {namespace}/{name}"
@@ -1836,8 +2021,7 @@ def _require_live_secret(
             raise RuntimeErrorEB(
                 f"Experiment-B Secret contains invalid encoded data: {namespace}/{name}/{key}"
             ) from exc
-        observed_sha256 = hashlib.sha256(decoded).hexdigest()
-        if not secrets.compare_digest(observed_sha256, expected_sha256[key]):
+        if not secrets.compare_digest(decoded, expected_values[key]):
             raise RuntimeErrorEB(
                 f"Experiment-B Secret content drifted: {namespace}/{name}/{key}"
             )
@@ -2137,10 +2321,88 @@ def _final_recovery_state_readback(
     }
 
 
+def _pod_spec_images(pod_spec: Any, context: str) -> dict[str, dict[str, str]]:
+    if not isinstance(pod_spec, dict):
+        raise RuntimeErrorEB(f"{context} pod spec is invalid")
+    result: dict[str, dict[str, str]] = {}
+    for field, output_key in (
+        ("containers", "containers"),
+        ("initContainers", "init_containers"),
+    ):
+        items = pod_spec.get(field, [])
+        if not isinstance(items, list):
+            raise RuntimeErrorEB(f"{context} {field} inventory is invalid")
+        images: dict[str, str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                raise RuntimeErrorEB(f"{context} {field} inventory is invalid")
+            name = item.get("name")
+            image = item.get("image")
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(image, str)
+                or not image
+                or name in images
+            ):
+                raise RuntimeErrorEB(f"{context} {field} image binding is invalid")
+            images[name] = image
+        result[output_key] = images
+    if not result["containers"]:
+        raise RuntimeErrorEB(f"{context} has no containers")
+    return result
+
+
+def _expected_cilium_daemonset_images(
+    root: Path,
+    config: dict[str, Any],
+    toolchain_receipt: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    tools = toolchain_receipt.get("tools", {})
+    artifacts = toolchain_receipt.get("artifacts", {})
+    helm = tools.get("helm") if isinstance(tools, dict) else None
+    chart = artifacts.get("cilium_chart") if isinstance(artifacts, dict) else None
+    if not isinstance(helm, str) or not isinstance(chart, str):
+        raise RuntimeErrorEB("pinned Cilium chart/toolchain binding is unavailable")
+
+    rendered = run(
+        [
+            helm,
+            "template",
+            "cilium",
+            chart,
+            "--namespace",
+            "kube-system",
+            "--kube-version",
+            str(config["kubernetes"]["kubernetes_version"]),
+            *_cilium_helm_value_args(vm_ip()),
+        ],
+        env=kube_env(root),
+    ).stdout
+    try:
+        documents = list(yaml.safe_load_all(rendered))
+    except yaml.YAMLError as exc:
+        raise RuntimeErrorEB("pinned Cilium chart render is invalid") from exc
+    daemonsets = [
+        document
+        for document in documents
+        if isinstance(document, dict)
+        and document.get("kind") == "DaemonSet"
+        and document.get("metadata", {}).get("name") == "cilium"
+    ]
+    if len(daemonsets) != 1:
+        raise RuntimeErrorEB(
+            "pinned Cilium chart does not render exactly one cilium DaemonSet"
+        )
+    pod_spec = daemonsets[0].get("spec", {}).get("template", {}).get("spec")
+    return _pod_spec_images(pod_spec, "pinned Cilium DaemonSet")
+
+
 def _require_live_cilium_contract(
     root: Path, config: dict[str, Any]
 ) -> dict[str, Any]:
-    tools = toolchain(root)["tools"]
+    toolchain_receipt = toolchain(root)
+    tools = toolchain_receipt["tools"]
     helm = tools["helm"]
     env = kube_env(root)
     try:
@@ -2221,6 +2483,18 @@ def _require_live_cilium_contract(
     ):
         raise RuntimeErrorEB("live Cilium DaemonSet is not fully converged")
 
+    expected_images = _expected_cilium_daemonset_images(
+        root, config, toolchain_receipt
+    )
+    live_images = _pod_spec_images(
+        daemonset.get("spec", {}).get("template", {}).get("spec"),
+        "live Cilium DaemonSet",
+    )
+    if live_images != expected_images:
+        raise RuntimeErrorEB(
+            "live Cilium DaemonSet images drifted from the pinned chart render"
+        )
+
     proxy_daemonsets = _kubectl_json(
         root, ["-n", "kube-system", "get", "daemonsets"]
     ).get("items")
@@ -2262,6 +2536,8 @@ def _require_live_cilium_contract(
         "kube_proxy_replacement": True,
         "daemonset_generation": generation,
         "daemonset_ready": ready,
+        "daemonset_images": live_images,
+        "daemonset_images_canonical": True,
         "kube_proxy_present": False,
     }
 
@@ -2419,16 +2695,26 @@ def status(root: Path) -> dict[str, Any]:
     kubelet = node_readback["kubelet_version"]
     os_image = node_readback["os_image"]
 
+    flux_contract = _flux_bootstrap_contract(root, release)
+    flux_controllers = _require_flux_controller_availability(root)
     source = _kubectl_json(
         root,
         ["-n", "flux-system", "get", "gitrepository", "commonthing-experiment-b"],
     )
-    source_revision = _require_flux_source_revision(source, source_commit)
+    source_revision = _require_flux_source_revision(
+        source,
+        source_commit,
+        flux_contract["source_spec"],
+    )
 
     flux_items = _kubectl_json(
         root, ["-n", "flux-system", "get", "kustomizations"]
     ).get("items", [])
-    flux_readback = _require_exact_flux_revision_ready(flux_items, source_commit)
+    flux_readback = _require_exact_flux_revision_ready(
+        flux_items,
+        source_commit,
+        flux_contract["kustomization_specs"],
+    )
 
     api = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-api"]
@@ -2459,7 +2745,7 @@ def status(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("live Ollama image does not match semantic-search pin")
     semantic_provider = _semantic_provider_live_readback(root, source_commit)
 
-    expected_secret_hashes = _expected_live_secret_hashes(root, source_commit)
+    expected_secret_values = _expected_live_secret_values(root, source_commit)
     database_secret = _kubectl_json(
         root,
         [
@@ -2484,7 +2770,7 @@ def status(root: Path) -> dict[str, Any]:
         "commonthing-experiment-b-database",
         "Opaque",
         {"username", "database", "password"},
-        expected_secret_hashes["database"],
+        expected_secret_values["database"],
     )
     _require_live_secret(
         runtime_secret,
@@ -2492,7 +2778,7 @@ def status(root: Path) -> dict[str, Any]:
         "weltgewebe-runtime",
         "Opaque",
         {"database-url"},
-        expected_secret_hashes["runtime"],
+        expected_secret_values["runtime"],
     )
     _require_live_secret(
         registry_secret,
@@ -2500,7 +2786,7 @@ def status(root: Path) -> dict[str, Any]:
         "commonthing-experiment-b-registry",
         "kubernetes.io/dockerconfigjson",
         {".dockerconfigjson"},
-        expected_secret_hashes["registry"],
+        expected_secret_values["registry"],
     )
     secret_readback = {
         "database": _verified_secret_readback(
@@ -2551,7 +2837,9 @@ def status(root: Path) -> dict[str, Any]:
         "os_image": os_image,
         "cilium": cilium_readback,
         "runtime_contract": runtime_contract_readback,
+        "flux_bootstrap_sha256": flux_contract["bootstrap_sha256"],
         "flux_source_revision": source_revision,
+        "flux_controllers": flux_controllers,
         "flux": flux_readback,
         "deployments": deployment_readback,
         "images": {
@@ -4850,11 +5138,44 @@ def portability_report(root: Path) -> dict[str, Any]:
         or cilium_status.get("chart_version") != config["cilium"]["chart_version"]
         or cilium_status.get("gateway_api") is not True
         or cilium_status.get("kube_proxy_replacement") is not True
+        or cilium_status.get("daemonset_images_canonical") is not True
         or cilium_status.get("kube_proxy_present") is not False
     ):
         raise RuntimeErrorEB("status does not prove the live Cilium contract")
 
-    runtime_status = payloads["status.json"].get("runtime_contract")
+    status_payload = payloads["status.json"]
+    release_bootstrap_sha256 = payloads["release.json"].get("sha256")
+    flux_controllers = status_payload.get("flux_controllers")
+    flux_readback = status_payload.get("flux")
+    if (
+        not isinstance(release_bootstrap_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", release_bootstrap_sha256) is None
+        or status_payload.get("flux_bootstrap_sha256")
+        != release_bootstrap_sha256
+        or not _flux_revision_matches_commit(
+            status_payload.get("flux_source_revision"), source_commit
+        )
+        or not isinstance(flux_controllers, dict)
+        or set(flux_controllers) != EXPECTED_FLUX_CONTROLLERS
+        or any(
+            not isinstance(value, dict)
+            or value.get("available") is not True
+            or value.get("desired_replicas") != 1
+            for value in flux_controllers.values()
+        )
+        or not isinstance(flux_readback, dict)
+        or set(flux_readback) != EXPECTED_FLUX_KUSTOMIZATIONS
+        or any(
+            not isinstance(value, dict)
+            or value.get("ready") is not True
+            or re.fullmatch(r"[0-9a-f]{64}", str(value.get("spec_sha256") or ""))
+            is None
+            for value in flux_readback.values()
+        )
+    ):
+        raise RuntimeErrorEB("status does not prove the live Flux contract")
+
+    runtime_status = status_payload.get("runtime_contract")
     runtime_binding = config["runtime_binding"]
     if (
         not isinstance(runtime_status, dict)

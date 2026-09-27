@@ -37,6 +37,15 @@ class ExperimentBContractTests(unittest.TestCase):
         )
         self.assertTrue(all(config["forbidden"].values()))
 
+    def test_cilium_pin_matches_verified_toolchain_artifact(self) -> None:
+        config = json.loads((CLUSTER / "config.json").read_text(encoding="utf-8"))
+        lock = json.loads(
+            (ROOT / "platform/toolchain.lock.json").read_text(encoding="utf-8")
+        )
+        artifact = lock["artifacts"]["cilium_chart"]
+        self.assertEqual(config["cilium"]["chart_version"], artifact["version"])
+        self.assertEqual(config["cilium"]["chart_sha256"], artifact["sha256"])
+
     def test_renderer_state_root_is_scoped_to_experiment_b_subtree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "experiment-b"

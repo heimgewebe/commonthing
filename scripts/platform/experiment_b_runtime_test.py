@@ -169,6 +169,63 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             runtime._wait_http_200("http://127.0.0.1:1/health/live")
         self.assertEqual(responses, [])
 
+    def test_cilium_expected_images_come_from_pinned_chart_render(self) -> None:
+        config = runtime.load_config()
+        manifest = """apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cilium
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: config
+          image: quay.io/cilium/startup-script:1
+      containers:
+        - name: cilium-agent
+          image: quay.io/cilium/cilium:v1.19.5
+"""
+        runner = mock.Mock(
+            return_value=runtime.subprocess.CompletedProcess(
+                ["helm"], 0, stdout=manifest, stderr=""
+            )
+        )
+        receipt = {
+            "tools": {"helm": "helm"},
+            "artifacts": {"cilium_chart": "/verified/cilium-1.19.5.tgz"},
+        }
+        with (
+            mock.patch.object(runtime, "run", runner),
+            mock.patch.object(runtime, "kube_env", return_value={}),
+            mock.patch.object(runtime, "vm_ip", return_value="192.168.122.10"),
+        ):
+            images = runtime._expected_cilium_daemonset_images(
+                Path("."), config, receipt
+            )
+        self.assertEqual(
+            images,
+            {
+                "containers": {
+                    "cilium-agent": "quay.io/cilium/cilium:v1.19.5"
+                },
+                "init_containers": {
+                    "config": "quay.io/cilium/startup-script:1"
+                },
+            },
+        )
+        argv = runner.call_args.args[0]
+        self.assertEqual(argv[:4], [
+            "helm",
+            "template",
+            "cilium",
+            "/verified/cilium-1.19.5.tgz",
+        ])
+        self.assertIn("--kube-version", argv)
+        self.assertIn("gatewayAPI.enabled=true", argv)
+        self.assertIn("kubeProxyReplacement=true", argv)
+
+
     def test_t048_fixture_activates_canonical_synthetic_projections_atomically(self) -> None:
         source = inspect.getsource(runtime.seed_t048_fixture)
         self.assertIn("INSERT INTO search_node_projections", source)
@@ -544,14 +601,33 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         source = inspect.getsource(runtime.apply_release)
         self.assertIn("_require_flux_source_revision(", source)
         self.assertIn("_require_exact_flux_revision_ready(", source)
+        self.assertIn("_flux_bootstrap_contract(", source)
         self.assertIn('"gitrepository"', source)
         self.assertIn('"kustomizations"', source)
         self.assertNotIn('flux, "get", "kustomizations"', source)
 
         commit = "a" * 40
+        api_digest = "sha256:" + "b" * 64
+        web_digest = "sha256:" + "c" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binding = runtime.contract.render_bootstrap(
+                commit,
+                api_digest,
+                web_digest,
+                root / "bootstrap.yaml",
+            )
+            expected = runtime._flux_bootstrap_contract(root, binding)
+
+        source_spec = json.loads(json.dumps(expected["source_spec"]))
         git_source = {
             "metadata": {"generation": 1},
-            "spec": {"suspend": False},
+            "spec": {
+                **source_spec,
+                "suspend": False,
+                "provider": "generic",
+                "timeout": "60s",
+            },
             "status": {
                 "artifact": {"revision": f"main@sha1:{commit}"},
                 "conditions": [{
@@ -562,7 +638,10 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             },
         }
         self.assertIn(
-            commit, runtime._require_flux_source_revision(git_source, commit)
+            commit,
+            runtime._require_flux_source_revision(
+                git_source, commit, source_spec
+            ),
         )
         for exact_revision in (commit, f"sha1:{commit}", f"main@sha1:{commit}"):
             with self.subTest(exact_revision=exact_revision):
@@ -577,8 +656,17 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                             },
                         },
                         commit,
+                        source_spec,
                     ),
                 )
+
+        drifted_source = json.loads(json.dumps(git_source))
+        drifted_source["spec"]["url"] = "https://example.invalid/other"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "spec drifted"):
+            runtime._require_flux_source_revision(
+                drifted_source, commit, source_spec
+            )
+
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "GitRepository"):
             runtime._require_flux_source_revision(
                 {
@@ -589,6 +677,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                     },
                 },
                 commit,
+                source_spec,
             )
         for malformed in (
             f"main@sha1:{commit}00",
@@ -606,10 +695,11 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                             },
                         },
                         commit,
+                        source_spec,
                     )
 
-        for name, source in (
-            ("suspended", {**git_source, "spec": {"suspend": True}}),
+        for name, source_item in (
+            ("suspended", {**git_source, "spec": {**git_source["spec"], "suspend": True}}),
             (
                 "stale-generation",
                 {
@@ -620,14 +710,21 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         ):
             with self.subTest(source_state=name):
                 with self.assertRaises(runtime.RuntimeErrorEB):
-                    runtime._require_flux_source_revision(source, commit)
+                    runtime._require_flux_source_revision(
+                        source_item, commit, source_spec
+                    )
 
+        expected_specs = expected["kustomization_specs"]
         items = []
         for name in sorted(runtime.EXPECTED_FLUX_KUSTOMIZATIONS):
+            live_spec = json.loads(json.dumps(expected_specs[name]))
+            live_spec["suspend"] = False
+            live_spec["deletionPolicy"] = "MirrorPrune"
+            live_spec.setdefault("force", False)
             items.append(
                 {
                     "metadata": {"name": name, "generation": 1},
-                    "spec": {"suspend": False},
+                    "spec": live_spec,
                     "status": {
                         "conditions": [{
                             "type": "Ready",
@@ -638,31 +735,71 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                     },
                 }
             )
-        readback = runtime._require_exact_flux_revision_ready(items, commit)
+        readback = runtime._require_exact_flux_revision_ready(
+            items, commit, expected_specs
+        )
         self.assertEqual(set(readback), runtime.EXPECTED_FLUX_KUSTOMIZATIONS)
+        self.assertTrue(
+            all("spec_sha256" in value for value in readback.values())
+        )
+
+        drifted_items = json.loads(json.dumps(items))
+        app_item = next(
+            item
+            for item in drifted_items
+            if item["metadata"]["name"] == "commonthing-experiment-b-app"
+        )
+        app_item["spec"]["path"] = "./platform/clusters/experiment-b/namespaces"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "spec drifted"):
+            runtime._require_exact_flux_revision_ready(
+                drifted_items, commit, expected_specs
+            )
+
+        drifted_items = json.loads(json.dumps(items))
+        app_item = next(
+            item
+            for item in drifted_items
+            if item["metadata"]["name"] == "commonthing-experiment-b-app"
+        )
+        app_item["spec"]["prune"] = False
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "spec drifted"):
+            runtime._require_exact_flux_revision_ready(
+                drifted_items, commit, expected_specs
+            )
 
         stale_items = json.loads(json.dumps(items))
         stale_items[0]["status"]["lastAppliedRevision"] = "main@sha1:" + "b" * 40
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "exact-revision Ready"):
-            runtime._require_exact_flux_revision_ready(stale_items, commit)
+            runtime._require_exact_flux_revision_ready(
+                stale_items, commit, expected_specs
+            )
 
         malformed_items = json.loads(json.dumps(items))
         malformed_items[0]["status"]["lastAppliedRevision"] = f"main@sha1:{commit}00"
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "exact-revision Ready"):
-            runtime._require_exact_flux_revision_ready(malformed_items, commit)
+            runtime._require_exact_flux_revision_ready(
+                malformed_items, commit, expected_specs
+            )
 
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "set mismatch"):
-            runtime._require_exact_flux_revision_ready(items[:-1], commit)
+            runtime._require_exact_flux_revision_ready(
+                items[:-1], commit, expected_specs
+            )
 
         suspended_items = json.loads(json.dumps(items))
         suspended_items[0]["spec"]["suspend"] = True
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "suspended"):
-            runtime._require_exact_flux_revision_ready(suspended_items, commit)
+            runtime._require_exact_flux_revision_ready(
+                suspended_items, commit, expected_specs
+            )
 
         stale_generation_items = json.loads(json.dumps(items))
         stale_generation_items[0]["metadata"]["generation"] = 2
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "current generation"):
-            runtime._require_exact_flux_revision_ready(stale_generation_items, commit)
+            runtime._require_exact_flux_revision_ready(
+                stale_generation_items, commit, expected_specs
+            )
+
 
     def test_apply_release_requires_requested_live_artifacts(self) -> None:
         source = inspect.getsource(runtime.apply_release)
@@ -1229,6 +1366,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                     payload.update(vm_receipt_fixture(state_root=root))
                 elif name == "release.json":
                     payload["source_commit"] = commit
+                    payload["sha256"] = "1" * 64
                 elif name in {
                     "k3s.json",
                     "platform.json",
@@ -1262,7 +1400,24 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                         "chart_version": runtime.load_config()["cilium"]["chart_version"],
                         "gateway_api": True,
                         "kube_proxy_replacement": True,
+                        "daemonset_images_canonical": True,
                         "kube_proxy_present": False,
+                    }
+                    payload["flux_bootstrap_sha256"] = "1" * 64
+                    payload["flux_source_revision"] = f"main@sha1:{commit}"
+                    payload["flux_controllers"] = {
+                        name: {
+                            "available": True,
+                            "desired_replicas": 1,
+                        }
+                        for name in runtime.EXPECTED_FLUX_CONTROLLERS
+                    }
+                    payload["flux"] = {
+                        name: {
+                            "ready": True,
+                            "spec_sha256": "2" * 64,
+                        }
+                        for name in runtime.EXPECTED_FLUX_KUSTOMIZATIONS
                     }
                     runtime_binding = runtime.load_config()["runtime_binding"]
                     payload["runtime_contract"] = {
@@ -1342,6 +1497,33 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 runtime.portability_report(root)
             status_path.write_text(original_status, encoding="utf-8")
             attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["cilium"]["daemonset_images_canonical"] = False
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "live Cilium contract"
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["flux_bootstrap_sha256"] = "0" * 64
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "live Flux contract"
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
             # A replacement receipt with a valid identity still needs a new live status.
             changed = json.loads(vm_receipt)
             changed["substrate"]["uuid"] = "44444444-4444-4444-8444-444444444444"
@@ -2361,8 +2543,40 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "gatewayAPI": {"enabled": True},
             "kubeProxyReplacement": True,
         }
+        self.cilium_expected_images = {
+            "containers": {
+                "cilium-agent": "quay.io/cilium/cilium:v1.19.5",
+            },
+            "init_containers": {
+                "config": "quay.io/cilium/startup-script:1",
+            },
+        }
         self.cilium_daemonset = {
             "metadata": {"name": "cilium", "generation": 1},
+            "spec": {
+                "template": {
+                    "spec": {
+                        "initContainers": [
+                            {
+                                "name": name,
+                                "image": image,
+                            }
+                            for name, image in self.cilium_expected_images[
+                                "init_containers"
+                            ].items()
+                        ],
+                        "containers": [
+                            {
+                                "name": name,
+                                "image": image,
+                            }
+                            for name, image in self.cilium_expected_images[
+                                "containers"
+                            ].items()
+                        ],
+                    }
+                }
+            },
             "status": {
                 "observedGeneration": 1,
                 "desiredNumberScheduled": 1,
@@ -2372,6 +2586,24 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "numberUnavailable": 0,
             },
         }
+        self.flux_controller_deployments = [
+            {
+                "metadata": {"name": name, "generation": 1},
+                "spec": {"replicas": 1},
+                "status": {
+                    "observedGeneration": 1,
+                    "replicas": 1,
+                    "updatedReplicas": 1,
+                    "readyReplicas": 1,
+                    "availableReplicas": 1,
+                    "unavailableReplicas": 0,
+                    "conditions": [
+                        {"type": "Available", "status": "True"}
+                    ],
+                },
+            }
+            for name in sorted(runtime.EXPECTED_FLUX_CONTROLLERS)
+        ]
         self.kube_proxy_daemonsets = []
         self.kube_proxy_pods = []
         runtime_binding = self.config["runtime_binding"]
@@ -2627,14 +2859,38 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         })
 
     def prepare_status(self) -> None:
-        runtime.atomic_json(self.root / "receipts/release.json", {
-            "source_commit": self.commit, "api_digest": "sha256:" + "b" * 64,
-            "web_digest": "sha256:" + "c" * 64,
-        })
+        api_digest = "sha256:" + "b" * 64
+        web_digest = "sha256:" + "c" * 64
+        binding = runtime.contract.render_bootstrap(
+            self.commit,
+            api_digest,
+            web_digest,
+            self.root / "bootstrap.yaml",
+        )
+        self.flux_contract = runtime._flux_bootstrap_contract(self.root, binding)
+        self.live_flux_source_spec = json.loads(
+            json.dumps(self.flux_contract["source_spec"])
+        )
+        self.live_flux_source_spec.update(
+            {"suspend": False, "provider": "generic", "timeout": "60s"}
+        )
+        self.live_flux_kustomization_specs = json.loads(
+            json.dumps(self.flux_contract["kustomization_specs"])
+        )
+        for spec in self.live_flux_kustomization_specs.values():
+            spec["suspend"] = False
+            spec["deletionPolicy"] = "MirrorPrune"
+            spec.setdefault("force", False)
+        runtime.atomic_json(
+            self.root / "receipts/release.json",
+            {"schema_version": 1, "status": "applied", **binding},
+        )
         runtime.atomic_json(
             self.root / "secrets/database.json",
             {"username": "user", "database": "db", "password": "pass"},
         )
+        self.registry_source = self.root / "registry-source.json"
+        self.registry_source.write_bytes(b"{}")
         runtime.atomic_json(
             self.root / "receipts/secrets.json",
             {
@@ -2647,7 +2903,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "database_source_sha256": runtime.sha256_file(
                     self.root / "secrets/database.json"
                 ),
-                "registry_source_sha256": hashlib.sha256(b"{}").hexdigest(),
+                "registry_source_sha256": runtime.sha256_file(
+                    self.registry_source
+                ),
+                "registry_source_path": str(self.registry_source.resolve()),
                 "secret_values_recorded": False,
             },
         )
@@ -2700,6 +2959,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "fixture_live_binding": {"generation_id": "fixture"},
             },
         )
+        self.expected_cilium_images = self.patch(
+            "_expected_cilium_daemonset_images",
+            return_value=json.loads(json.dumps(self.cilium_expected_images)),
+        )
         self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
 
     def kubernetes_fixture(self, _root, arguments):
@@ -2721,10 +2984,12 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             return {"items": self.kube_proxy_pods}
         if "daemonset" in arguments and arguments[-1] == "cilium":
             return self.cilium_daemonset
+        if arguments == ["-n", "flux-system", "get", "deployments"]:
+            return {"items": self.flux_controller_deployments}
         if "gitrepository" in arguments:
             return {
                 "metadata": {"generation": 1},
-                "spec": {"suspend": False},
+                "spec": json.loads(json.dumps(self.live_flux_source_spec)),
                 "status": {
                     "artifact": {"revision": f"main@sha1:{self.commit}"},
                     "conditions": [{
@@ -2737,7 +3002,9 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         if "kustomizations" in arguments:
             return {"items": [{
                 "metadata": {"name": name, "generation": 1},
-                "spec": {"suspend": False},
+                "spec": json.loads(
+                    json.dumps(self.live_flux_kustomization_specs[name])
+                ),
                 "status": {
                     "lastAppliedRevision": f"main@sha1:{self.commit}",
                     "conditions": [{
@@ -2963,6 +3230,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertEqual(result["vm_substrate"], receipt["substrate"])
         self.assertEqual(result["cilium"]["chart"], self.cilium_chart)
         self.assertFalse(result["cilium"]["kube_proxy_present"])
+        self.assertTrue(result["cilium"]["daemonset_images_canonical"])
+        self.assertEqual(
+            set(result["flux_controllers"]),
+            runtime.EXPECTED_FLUX_CONTROLLERS,
+        )
+        self.assertEqual(
+            result["flux_bootstrap_sha256"],
+            self.flux_contract["bootstrap_sha256"],
+        )
         self.assertTrue(result["runtime_contract"]["policy_specs_canonical"])
         self.assertTrue(
             result["runtime_contract"]["temporary_model_egress_absent"]
@@ -3027,6 +3303,12 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.cilium_daemonset["status"]["observedGeneration"] = 2
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "DaemonSet"):
             runtime.status(self.root)
+        self.cilium_daemonset = json.loads(json.dumps(healthy_daemonset))
+        self.cilium_daemonset["spec"]["template"]["spec"]["containers"][0][
+            "image"
+        ] = "quay.io/cilium/cilium:v9.9.9"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "images drifted"):
+            runtime.status(self.root)
         self.cilium_daemonset = healthy_daemonset
 
         self.kube_proxy_daemonsets = [{"metadata": {"name": "kube-proxy"}}]
@@ -3038,6 +3320,64 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "kube-proxy is present"):
             runtime.status(self.root)
         self.kube_proxy_pods = []
+
+    def test_status_requires_live_flux_controllers(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        healthy = json.loads(json.dumps(self.flux_controller_deployments))
+        self.flux_controller_deployments = healthy[:-1]
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "set is incomplete"):
+            runtime.status(self.root)
+
+        self.flux_controller_deployments = json.loads(json.dumps(healthy))
+        self.flux_controller_deployments[0]["status"]["readyReplicas"] = 0
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not currently available"):
+            runtime.status(self.root)
+
+        self.flux_controller_deployments = healthy
+        result = runtime.status(self.root)
+        self.assertEqual(
+            set(result["flux_controllers"]),
+            runtime.EXPECTED_FLUX_CONTROLLERS,
+        )
+
+    def test_status_revalidates_flux_specs_against_bootstrap(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        healthy_source = json.loads(json.dumps(self.live_flux_source_spec))
+        healthy_kustomizations = json.loads(
+            json.dumps(self.live_flux_kustomization_specs)
+        )
+
+        self.live_flux_source_spec["url"] = "https://example.invalid/other"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "spec drifted"):
+            runtime.status(self.root)
+        self.live_flux_source_spec = healthy_source
+
+        self.live_flux_kustomization_specs[
+            "commonthing-experiment-b-app"
+        ]["path"] = "./platform/clusters/experiment-b/namespaces"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "spec drifted"):
+            runtime.status(self.root)
+        self.live_flux_kustomization_specs = json.loads(
+            json.dumps(healthy_kustomizations)
+        )
+
+        self.live_flux_kustomization_specs[
+            "commonthing-experiment-b-app"
+        ]["prune"] = False
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "spec drifted"):
+            runtime.status(self.root)
+        self.live_flux_kustomization_specs = healthy_kustomizations
+
+        result = runtime.status(self.root)
+        self.assertEqual(
+            set(result["flux"]),
+            runtime.EXPECTED_FLUX_KUSTOMIZATIONS,
+        )
+
 
     def test_status_revalidates_runtime_config_and_network_policy_contract(self) -> None:
         self.write_vm_receipt()
@@ -3242,11 +3582,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "weltgewebe-runtime",
             "Opaque",
             {"database-url"},
-            {
-                "database-url": hashlib.sha256(
-                    b"sensitive-value"
-                ).hexdigest()
-            },
+            {"database-url": b"sensitive-value"},
         )
         self.assertIsNone(observed)
         readback = runtime._verified_secret_readback(
