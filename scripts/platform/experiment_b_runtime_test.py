@@ -2286,7 +2286,24 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "namespace": runtime.APP_NAMESPACE,
                 "generation": 1,
             },
-            "spec": {"parentRefs": [route_parent]},
+            "spec": {
+                "parentRefs": [route_parent],
+                "rules": [
+                    {
+                        "matches": [
+                            {"path": {"type": "PathPrefix", "value": "/health"}},
+                            {"path": {"type": "PathPrefix", "value": "/api"}},
+                        ],
+                        "backendRefs": [{"name": "weltgewebe-api", "port": 8080}],
+                    },
+                    {
+                        "matches": [
+                            {"path": {"type": "PathPrefix", "value": "/"}},
+                        ],
+                        "backendRefs": [{"name": "weltgewebe-web", "port": 8080}],
+                    },
+                ],
+            },
             "status": {
                 "parents": [{
                     "parentRef": route_parent,
@@ -2870,6 +2887,26 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         wrong_controller = json.loads(json.dumps(healthy))
         wrong_controller["status"]["parents"][0]["controllerName"] = "example.invalid/controller"
         cases.append(("controller", wrong_controller))
+
+        missing_api = json.loads(json.dumps(healthy))
+        missing_api["spec"]["rules"][0]["matches"] = [
+            {"path": {"type": "PathPrefix", "value": "/health"}}
+        ]
+        cases.append(("missing-api", missing_api))
+
+        wrong_root_backend = json.loads(json.dumps(healthy))
+        wrong_root_backend["spec"]["rules"][1]["backendRefs"][0]["name"] = "weltgewebe-api"
+        cases.append(("wrong-root-backend", wrong_root_backend))
+
+        wrong_api_port = json.loads(json.dumps(healthy))
+        wrong_api_port["spec"]["rules"][0]["backendRefs"][0]["port"] = 8081
+        cases.append(("wrong-api-port", wrong_api_port))
+
+        extra_filter = json.loads(json.dumps(healthy))
+        extra_filter["spec"]["rules"][0]["filters"] = [
+            {"type": "RequestHeaderModifier"}
+        ]
+        cases.append(("extra-filter", extra_filter))
 
         future_generation = json.loads(json.dumps(healthy))
         future_generation["status"]["parents"][0]["conditions"][0]["observedGeneration"] = 2

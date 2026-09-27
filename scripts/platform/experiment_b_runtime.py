@@ -1898,6 +1898,73 @@ def _require_httproute_ready(route: Any) -> dict[str, Any]:
     ):
         raise RuntimeErrorEB("Experiment-B HTTPRoute parentRef drifted")
 
+    expected_rules = [
+        {
+            "paths": ["/health", "/api"],
+            "backend": {"name": "weltgewebe-api", "port": 8080},
+        },
+        {
+            "paths": ["/"],
+            "backend": {"name": "weltgewebe-web", "port": 8080},
+        },
+    ]
+    rules = spec.get("rules")
+    if not isinstance(rules, list) or len(rules) != len(expected_rules):
+        raise RuntimeErrorEB("Experiment-B HTTPRoute rule set drifted")
+    normalized_rules: list[dict[str, Any]] = []
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) - {"matches", "backendRefs"}:
+            raise RuntimeErrorEB("Experiment-B HTTPRoute rule shape drifted")
+        matches = rule.get("matches")
+        backend_refs = rule.get("backendRefs")
+        if not isinstance(matches, list) or not matches:
+            raise RuntimeErrorEB("Experiment-B HTTPRoute matches drifted")
+        if (
+            not isinstance(backend_refs, list)
+            or len(backend_refs) != 1
+            or not isinstance(backend_refs[0], dict)
+        ):
+            raise RuntimeErrorEB("Experiment-B HTTPRoute backend set drifted")
+
+        paths: list[str] = []
+        for match in matches:
+            if not isinstance(match, dict) or set(match) != {"path"}:
+                raise RuntimeErrorEB("Experiment-B HTTPRoute match shape drifted")
+            path = match.get("path")
+            if (
+                not isinstance(path, dict)
+                or set(path) != {"type", "value"}
+                or path.get("type") != "PathPrefix"
+                or not isinstance(path.get("value"), str)
+            ):
+                raise RuntimeErrorEB("Experiment-B HTTPRoute path match drifted")
+            paths.append(path["value"])
+
+        backend = backend_refs[0]
+        if set(backend) - {"group", "kind", "name", "namespace", "port", "weight"}:
+            raise RuntimeErrorEB("Experiment-B HTTPRoute backend shape drifted")
+        if (
+            str(backend.get("group") or "") != ""
+            or str(backend.get("kind") or "Service") != "Service"
+            or str(backend.get("namespace") or APP_NAMESPACE) != APP_NAMESPACE
+            or int(backend.get("weight") or 1) != 1
+            or not isinstance(backend.get("name"), str)
+            or not isinstance(backend.get("port"), int)
+            or isinstance(backend.get("port"), bool)
+        ):
+            raise RuntimeErrorEB("Experiment-B HTTPRoute backend contract drifted")
+        normalized_rules.append(
+            {
+                "paths": paths,
+                "backend": {
+                    "name": backend["name"],
+                    "port": backend["port"],
+                },
+            }
+        )
+    if normalized_rules != expected_rules:
+        raise RuntimeErrorEB("Experiment-B HTTPRoute routing contract drifted")
+
     status_obj = route.get("status", {})
     parents = status_obj.get("parents", []) if isinstance(status_obj, dict) else []
     if not isinstance(parents, list):
