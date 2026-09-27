@@ -49,11 +49,14 @@ def vm_substrate_fixture() -> dict:
     }
 
 
-def vm_receipt_fixture(substrate: dict | None = None) -> dict:
+def vm_receipt_fixture(
+    substrate: dict | None = None, state_root: Path | None = None
+) -> dict:
     return {
         "schema_version": 1,
         "status": "created",
         "source_commit": "a" * 40,
+        "state_root": str((state_root or runtime.DEFAULT_STATE_ROOT).resolve()),
         "config_sha256": runtime.sha256_file(runtime.CLUSTER / "config.json"),
         "vm": runtime.VM_NAME,
         "pool": runtime.POOL_NAME,
@@ -80,6 +83,34 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         self.assertEqual(runtime._parse_cpu_quantity("500m"), 0.5)
         self.assertEqual(runtime._parse_memory_quantity("512Mi"), 512 * 1024 * 1024)
         self.assertEqual(runtime._parse_memory_quantity("2Gi"), 2 * 1024 * 1024 * 1024)
+
+    def test_t048_api_resource_contract_rejects_live_limit_drift(self) -> None:
+        config = runtime.load_config()
+        pod = {
+            "spec": {
+                "containers": [
+                    {
+                        "name": "api",
+                        "resources": {
+                            "limits": {"cpu": "1", "memory": "512Mi"}
+                        },
+                    }
+                ]
+            }
+        }
+        self.assertEqual(
+            runtime._require_api_resource_limits(pod, config),
+            (1.0, 512 * 1024 * 1024),
+        )
+        for key, value in (("cpu", "2"), ("memory", "1Gi")):
+            with self.subTest(limit=key):
+                drifted = json.loads(json.dumps(pod))
+                drifted["spec"]["containers"][0]["resources"]["limits"][key] = value
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "resource limits drifted",
+                ):
+                    runtime._require_api_resource_limits(drifted, config)
 
     def test_fixture_stream_rewrites_only_psql_client_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -297,7 +328,11 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         )
         self.assertEqual(
             set(runtime.VM_ATTEMPT_INVALIDATES),
-            {"vm-create.json", *runtime.K3S_ATTEMPT_INVALIDATES},
+            {
+                "vm-create.json",
+                "vm-create-attempt.json",
+                *runtime.K3S_ATTEMPT_INVALIDATES,
+            },
         )
 
         create_vm = inspect.getsource(runtime.create_vm)
@@ -376,8 +411,16 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(runtime.RuntimeErrorEB, "prepare failed"):
                     runtime.create_vm(root)
 
-            for name in runtime.VM_ATTEMPT_INVALIDATES:
+            for name in set(runtime.VM_ATTEMPT_INVALIDATES) - {"vm-create-attempt.json"}:
                 self.assertFalse((receipts / name).exists(), name)
+            attempt = json.loads(
+                (receipts / "vm-create-attempt.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(attempt["status"], "running")
+            self.assertEqual(attempt["source_commit"], "a" * 40)
+            self.assertEqual(attempt["state_root"], str(root.resolve()))
+            self.assertEqual(attempt["vm"], runtime.VM_NAME)
+            self.assertEqual(attempt["pool"], runtime.POOL_NAME)
 
     def test_create_vm_rerun_invalidates_retirement_before_prepare_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1175,7 +1218,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             for name, status in statuses.items():
                 payload: dict[str, object] = {"schema_version": 1, "status": status}
                 if name == "vm-create.json":
-                    payload.update(vm_receipt_fixture())
+                    payload.update(vm_receipt_fixture(state_root=root))
                 elif name == "release.json":
                     payload["source_commit"] = commit
                 elif name in {
@@ -1207,6 +1250,12 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 if name == "status.json":
                     payload["vm_create_sha256"] = runtime.sha256_file(receipts / "vm-create.json")
                     payload["vm_substrate"] = vm_substrate_fixture()
+                    payload["cilium"] = {
+                        "chart_version": runtime.load_config()["cilium"]["chart_version"],
+                        "gateway_api": True,
+                        "kube_proxy_replacement": True,
+                        "kube_proxy_present": False,
+                    }
                 (receipts / name).write_text(
                     json.dumps(payload) + "\n", encoding="utf-8"
                 )
@@ -2265,6 +2314,24 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "kind": "NodeList",
             "items": [self.node],
         }
+        self.cilium_chart = f"cilium-{self.config['cilium']['chart_version']}"
+        self.cilium_values = {
+            "gatewayAPI": {"enabled": True},
+            "kubeProxyReplacement": True,
+        }
+        self.cilium_daemonset = {
+            "metadata": {"name": "cilium", "generation": 1},
+            "status": {
+                "observedGeneration": 1,
+                "desiredNumberScheduled": 1,
+                "updatedNumberScheduled": 1,
+                "numberReady": 1,
+                "numberAvailable": 1,
+                "numberUnavailable": 0,
+            },
+        }
+        self.kube_proxy_daemonsets = []
+        self.kube_proxy_pods = []
         self.live_secrets = {
             f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database": {
                 "metadata": {
@@ -2401,6 +2468,17 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         output, code = "", 0
         if argv[0] == "virt-install":
             self.domain_present = True
+        elif argv[0] == "helm":
+            if argv[1] == "list":
+                output = json.dumps([{
+                    "name": "cilium",
+                    "namespace": "kube-system",
+                    "status": "deployed",
+                    "chart": self.cilium_chart,
+                }])
+            else:
+                self.assertEqual(argv[1:3], ["get", "values"])
+                output = json.dumps(self.cilium_values)
         elif argv[0] == "kubectl":
             self.assertEqual(argv[1:], ["get", "nodes", "-o", "json"])
             output = json.dumps(self.node_inventory)
@@ -2461,7 +2539,9 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         return runtime.subprocess.CompletedProcess(argv, code, stdout=output, stderr="")
 
     def write_vm_receipt(self) -> dict:
-        receipt = vm_receipt_fixture(runtime._live_vm_substrate(self.root, self.config))
+        receipt = vm_receipt_fixture(
+            runtime._live_vm_substrate(self.root, self.config), self.root
+        )
         runtime.atomic_json(self.root / "receipts/vm-create.json", receipt)
         return receipt
 
@@ -2499,7 +2579,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "secret_values_recorded": False,
             },
         )
-        self.tools = self.patch("toolchain", return_value={"tools": {"kubectl": "kubectl"}})
+        self.tools = self.patch(
+            "toolchain",
+            return_value={"tools": {"kubectl": "kubectl", "helm": "helm"}},
+        )
         self.patch("kube_env", return_value={})
         self.patch("vm_ip", return_value="192.168.122.10")
         self.gateway_data_plane = self.patch(
@@ -2548,6 +2631,12 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
 
     def kubernetes_fixture(self, _root, arguments):
+        if arguments == ["-n", "kube-system", "get", "daemonsets"]:
+            return {"items": self.kube_proxy_daemonsets}
+        if arguments == ["-n", "kube-system", "get", "pods"]:
+            return {"items": self.kube_proxy_pods}
+        if "daemonset" in arguments and arguments[-1] == "cilium":
+            return self.cilium_daemonset
         if "gitrepository" in arguments:
             return {
                 "metadata": {"generation": 1},
@@ -2626,6 +2715,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
     def test_teardown_proves_domain_pool_volume_and_state_absence(self) -> None:
         retirement = self.root.with_name(self.root.name + "-retirement.json")
         self.addCleanup(retirement.unlink, missing_ok=True)
+        self.write_vm_receipt()
         runtime.atomic_json(
             self.root / "receipts/example.json",
             {"schema_version": 1, "status": "pass"},
@@ -2656,6 +2746,38 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         stored = json.loads(retirement.read_text(encoding="utf-8"))
         self.assertEqual(stored, result)
         self.assertIn("example.json", stored["evidence_receipts"])
+
+    def test_teardown_rejects_wrong_state_root_before_global_mutation(self) -> None:
+        wrong_root = self.root / "wrong-root"
+        (wrong_root / "receipts").mkdir(parents=True)
+        self.write_vm_receipt()
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "state-root ownership",
+        ):
+            runtime.teardown(wrong_root)
+        self.assertTrue(self.domain_present)
+        self.assertTrue(self.pool_present)
+        self.assertTrue(self.root.exists())
+
+    def test_teardown_accepts_bound_create_attempt_after_interrupted_creation(self) -> None:
+        runtime.atomic_json(
+            self.root / "receipts/vm-create-attempt.json",
+            {
+                "schema_version": 1,
+                "status": "running",
+                "source_commit": self.commit,
+                "config_sha256": runtime.sha256_file(runtime.CLUSTER / "config.json"),
+                "state_root": str(self.root.resolve()),
+                "vm": runtime.VM_NAME,
+                "pool": runtime.POOL_NAME,
+            },
+        )
+        result = runtime.teardown(self.root)
+        self.assertEqual(result["status"], "retired")
+        self.assertEqual(result["state_root"], str(self.root.resolve()))
+        self.assertFalse(self.domain_present)
+        self.assertFalse(self.pool_present)
 
     def test_live_readback_captures_actual_substrate_and_base_volume_digest(self) -> None:
         observed = runtime._live_vm_substrate(self.root, self.config)
@@ -2729,7 +2851,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         vm_path = self.root / "receipts/vm-create.json"
         cases = [None, [], {}, {**receipt, "source_commit": None},
                  {**receipt, "source_commit": "main"}, {**receipt, "source_commit": "b" * 40},
-                 {**receipt, "status": "failed"}, {**receipt, "config_sha256": "0" * 64},
+                 {**receipt, "status": "failed"}, {**receipt, "state_root": "/wrong/root"},
+                 {**receipt, "config_sha256": "0" * 64},
                  {**receipt, "substrate": {}},
                  {**receipt, "substrate": {**receipt["substrate"], "vcpu": 4}},
                  {**receipt, "substrate": {**receipt["substrate"], "base_image_sha256": "0" * 64}}]
@@ -2754,6 +2877,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         result = runtime.status(self.root)
         self.assertEqual(result["status"], "observed")
         self.assertEqual(result["vm_substrate"], receipt["substrate"])
+        self.assertEqual(result["cilium"]["chart"], self.cilium_chart)
+        self.assertFalse(result["cilium"]["kube_proxy_present"])
         self.assertEqual(result["vm_create_sha256"], runtime.sha256_file(
             self.root / "receipts/vm-create.json",
         ))
@@ -2769,6 +2894,62 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         attempt = json.loads((self.root / "receipts/status-attempt.json").read_text())
         self.assertEqual(attempt["status"], "pass")
         self.assertEqual(attempt["receipt_sha256"], runtime.sha256_file(self.root / "receipts/status.json"))
+
+    def test_status_revalidates_live_cilium_contract(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        healthy_chart = self.cilium_chart
+        healthy_values = json.loads(json.dumps(self.cilium_values))
+        healthy_daemonset = json.loads(json.dumps(self.cilium_daemonset))
+
+        self.cilium_chart = "cilium-9.9.9"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "Helm release"):
+            runtime.status(self.root)
+        self.cilium_chart = healthy_chart
+
+        self.cilium_values = {
+            "gatewayAPI": {"enabled": False},
+            "kubeProxyReplacement": True,
+        }
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "configuration drifted"):
+            runtime.status(self.root)
+
+        self.cilium_values = {
+            "gatewayAPI": {"enabled": True},
+            "kubeProxyReplacement": False,
+        }
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "configuration drifted"):
+            runtime.status(self.root)
+
+        self.cilium_values = {
+            "gatewayAPI": {"enabled": "true"},
+            "kubeProxyReplacement": "true",
+        }
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "configuration drifted"):
+            runtime.status(self.root)
+        self.cilium_values = healthy_values
+
+        self.cilium_daemonset = json.loads(json.dumps(healthy_daemonset))
+        self.cilium_daemonset["status"]["numberReady"] = 0
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "DaemonSet"):
+            runtime.status(self.root)
+
+        self.cilium_daemonset = json.loads(json.dumps(healthy_daemonset))
+        self.cilium_daemonset["status"]["observedGeneration"] = 2
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "DaemonSet"):
+            runtime.status(self.root)
+        self.cilium_daemonset = healthy_daemonset
+
+        self.kube_proxy_daemonsets = [{"metadata": {"name": "kube-proxy"}}]
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "kube-proxy is present"):
+            runtime.status(self.root)
+        self.kube_proxy_daemonsets = []
+
+        self.kube_proxy_pods = [{"metadata": {"name": "kube-proxy-node"}}]
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "kube-proxy is present"):
+            runtime.status(self.root)
+        self.kube_proxy_pods = []
 
     def test_status_requires_live_expected_secrets_without_recording_values(self) -> None:
         self.write_vm_receipt()
@@ -3300,8 +3481,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 self.tools.assert_not_called()
 
     def test_create_invalidates_before_revision_or_config_failure(self) -> None:
+        self.domain_present = False
+        self.pool_present = False
         for failed_check in ("_current_protected_main_commit", "load_config"):
             with self.subTest(failed_check=failed_check):
+                self.runner.reset_mock()
                 for name in runtime.VM_ATTEMPT_INVALIDATES:
                     runtime.atomic_json(self.root / "receipts" / name, {"status": "stale"})
                 with mock.patch.object(runtime, failed_check, side_effect=runtime.RuntimeErrorEB("binding failed")):
@@ -3309,22 +3493,54 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                         runtime.create_vm(self.root)
                 for name in runtime.VM_ATTEMPT_INVALIDATES:
                     self.assertFalse((self.root / "receipts" / name).exists(), name)
-                self.runner.assert_not_called()
+                self.assertEqual(
+                    [call.args[0][3] for call in self.runner.call_args_list],
+                    ["dominfo", "pool-info"],
+                )
 
     def test_create_refuses_retained_vm_or_pool_without_cleanup(self) -> None:
+        ownership_path = self.root / "receipts/vm-create-attempt.json"
+        retirement_path = runtime.RETIREMENT_RECEIPT
         for present_domain in (True, False):
             with self.subTest(present_domain=present_domain):
                 self.domain_present = present_domain
+                self.pool_present = True
+                runtime.atomic_json(
+                    ownership_path,
+                    {
+                        "schema_version": 1,
+                        "status": "running",
+                        "source_commit": self.commit,
+                        "config_sha256": runtime.sha256_file(runtime.CLUSTER / "config.json"),
+                        "state_root": str(self.root.resolve()),
+                        "vm": runtime.VM_NAME,
+                        "pool": runtime.POOL_NAME,
+                    },
+                )
+                runtime.atomic_json(
+                    retirement_path,
+                    {"schema_version": 1, "status": "retired"},
+                )
+                ownership_sha = runtime.sha256_file(ownership_path)
+                retirement_sha = runtime.sha256_file(retirement_path)
                 self.runner.reset_mock()
                 with self.assertRaisesRegex(runtime.RuntimeErrorEB, "already exists"):
                     runtime.create_vm(self.root)
-                self.assertTrue(all(call.args[0][3] in {"dominfo", "pool-info"}
-                                    for call in self.runner.call_args_list))
+                self.assertEqual(runtime.sha256_file(ownership_path), ownership_sha)
+                self.assertEqual(runtime.sha256_file(retirement_path), retirement_sha)
+                self.assertTrue(
+                    all(
+                        call.args[0][3] in {"dominfo", "pool-info"}
+                        for call in self.runner.call_args_list
+                    )
+                )
 
     def test_create_binds_actual_vm_to_current_source_and_config(self) -> None:
         self.prepare_create()
         result = runtime.create_vm(self.root)
-        self.assertEqual(result, vm_receipt_fixture(result["substrate"]))
+        self.assertEqual(
+            result, vm_receipt_fixture(result["substrate"], self.root)
+        )
         self.assertEqual(result["substrate"], runtime._live_vm_substrate(self.root, self.config))
         self.assertEqual(json.loads((self.root / "receipts/vm-create.json").read_text()), result)
         self.assertEqual(self.main.call_count, 2)
@@ -3350,7 +3566,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     return original_sha256(path)
 
                 def write(path, payload):
-                    if failure == "receipt_write":
+                    if failure == "receipt_write" and path.name == "vm-create.json":
                         raise OSError("receipt write failed")
                     original_write(path, payload)
 

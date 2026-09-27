@@ -166,6 +166,11 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ContractError("Experiment-B runtime binding paths drifted")
     if runtime_binding.get("web_replicas") != 2:
         raise ContractError("Experiment-B Web replica contract drifted")
+    if runtime_binding.get("api_resource_limits") != {
+        "cpu": "1",
+        "memory": "512Mi",
+    }:
+        raise ContractError("Experiment-B API resource-limit contract drifted")
     for value in expected_runtime_paths.values():
         if not (ROOT / value).is_file():
             raise ContractError(f"Experiment-B runtime binding is missing: {value}")

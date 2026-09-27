@@ -74,6 +74,10 @@
     "k3s_config": "platform/clusters/experiment-b/k3s-config.yaml",
     "k3s_service": "platform/clusters/experiment-b/k3s.service",
     "web_replicas": 2,
+    "api_resource_limits": {
+      "cpu": "1",
+      "memory": "512Mi"
+    },
     "required_values": ["SOURCE_COMMIT", "API_DIGEST", "WEB_DIGEST"]
   },
   "forbidden": {

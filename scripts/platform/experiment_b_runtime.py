@@ -255,6 +255,7 @@ K3S_ATTEMPT_INVALIDATES = (
 )
 VM_ATTEMPT_INVALIDATES = (
     "vm-create.json",
+    "vm-create-attempt.json",
     *K3S_ATTEMPT_INVALIDATES,
 )
 
@@ -608,12 +609,13 @@ def _live_vm_substrate(root: Path, config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _require_vm_create_receipt(
-    receipt: Any, source_commit: str, config: dict[str, Any]
+    receipt: Any, source_commit: str, config: dict[str, Any], root: Path
 ) -> None:
     if not isinstance(receipt, dict) or (
         receipt.get("schema_version") != 1
         or receipt.get("status") != "created"
         or receipt.get("source_commit") != source_commit
+        or receipt.get("state_root") != str(root.resolve())
         or receipt.get("config_sha256") != sha256_file(CLUSTER / "config.json")
         or receipt.get("vm") != VM_NAME
         or receipt.get("pool") != POOL_NAME
@@ -625,11 +627,6 @@ def _require_vm_create_receipt(
 
 
 def create_vm(root: Path) -> dict[str, Any]:
-    RETIREMENT_RECEIPT.unlink(missing_ok=True)
-    _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
-    source_commit = _current_protected_main_commit()
-    config = load_config()
-    config_sha256 = sha256_file(CLUSTER / "config.json")
     if run(
         ["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME],
         check=False,
@@ -644,6 +641,25 @@ def create_vm(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB(
             "Experiment-B libvirt pool already exists; run bounded teardown first"
         )
+
+    RETIREMENT_RECEIPT.unlink(missing_ok=True)
+    _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
+    source_commit = _current_protected_main_commit()
+    config = load_config()
+    config_sha256 = sha256_file(CLUSTER / "config.json")
+    root_identity = str(root.resolve())
+    atomic_json(
+        root / "receipts/vm-create-attempt.json",
+        {
+            "schema_version": 1,
+            "status": "running",
+            "source_commit": source_commit,
+            "config_sha256": config_sha256,
+            "state_root": root_identity,
+            "vm": VM_NAME,
+            "pool": POOL_NAME,
+        },
+    )
 
     prepared = prepare(root)
     cloud_image = Path(prepared["cloud_image"])
@@ -718,6 +734,7 @@ def create_vm(root: Path) -> dict[str, Any]:
             "schema_version": 1,
             "status": "created",
             "source_commit": source_commit,
+            "state_root": root_identity,
             "config_sha256": config_sha256,
             "vm": VM_NAME,
             "pool": POOL_NAME,
@@ -2120,6 +2137,135 @@ def _final_recovery_state_readback(
     }
 
 
+def _require_live_cilium_contract(
+    root: Path, config: dict[str, Any]
+) -> dict[str, Any]:
+    tools = toolchain(root)["tools"]
+    helm = tools["helm"]
+    env = kube_env(root)
+    try:
+        releases = json.loads(
+            run(
+                [
+                    helm,
+                    "list",
+                    "--namespace",
+                    "kube-system",
+                    "--filter",
+                    "^cilium$",
+                    "--output",
+                    "json",
+                ],
+                env=env,
+            ).stdout
+        )
+        values = json.loads(
+            run(
+                [
+                    helm,
+                    "get",
+                    "values",
+                    "cilium",
+                    "--namespace",
+                    "kube-system",
+                    "--all",
+                    "--output",
+                    "json",
+                ],
+                env=env,
+            ).stdout
+        )
+    except json.JSONDecodeError as exc:
+        raise RuntimeErrorEB("live Cilium Helm state is not valid JSON") from exc
+    expected_chart = f"cilium-{config['cilium']['chart_version']}"
+    if (
+        not isinstance(releases, list)
+        or len(releases) != 1
+        or not isinstance(releases[0], dict)
+        or releases[0].get("name") != "cilium"
+        or releases[0].get("namespace") != "kube-system"
+        or releases[0].get("status") != "deployed"
+        or releases[0].get("chart") != expected_chart
+    ):
+        raise RuntimeErrorEB("live Cilium Helm release differs from the pinned contract")
+    if (
+        not isinstance(values, dict)
+        or values.get("kubeProxyReplacement") is not True
+        or not isinstance(values.get("gatewayAPI"), dict)
+        or values["gatewayAPI"].get("enabled") is not True
+    ):
+        raise RuntimeErrorEB(
+            "live Cilium Gateway API/kube-proxy replacement configuration drifted"
+        )
+
+    daemonset = _kubectl_json(
+        root, ["-n", "kube-system", "get", "daemonset", "cilium"]
+    )
+    metadata = daemonset.get("metadata", {})
+    status_obj = daemonset.get("status", {})
+    generation = int(metadata.get("generation") or 0)
+    observed_generation = int(status_obj.get("observedGeneration") or 0)
+    desired = int(status_obj.get("desiredNumberScheduled") or 0)
+    updated = int(status_obj.get("updatedNumberScheduled") or 0)
+    ready = int(status_obj.get("numberReady") or 0)
+    available = int(status_obj.get("numberAvailable") or 0)
+    unavailable = int(status_obj.get("numberUnavailable") or 0)
+    if (
+        generation < 1
+        or observed_generation != generation
+        or desired < 1
+        or updated != desired
+        or ready != desired
+        or available != desired
+        or unavailable != 0
+    ):
+        raise RuntimeErrorEB("live Cilium DaemonSet is not fully converged")
+
+    proxy_daemonsets = _kubectl_json(
+        root, ["-n", "kube-system", "get", "daemonsets"]
+    ).get("items")
+    proxy_pods = _kubectl_json(
+        root, ["-n", "kube-system", "get", "pods"]
+    ).get("items")
+    if (
+        not isinstance(proxy_daemonsets, list)
+        or not isinstance(proxy_pods, list)
+        or not all(
+            isinstance(item, dict)
+            for item in (*proxy_daemonsets, *proxy_pods)
+        )
+    ):
+        raise RuntimeErrorEB("kube-system workload inventory is invalid")
+
+    def is_kube_proxy(item: dict[str, Any]) -> bool:
+        metadata = item.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return False
+        name = str(metadata.get("name") or "")
+        labels = metadata.get("labels", {})
+        if not isinstance(labels, dict):
+            labels = {}
+        return (
+            name == "kube-proxy"
+            or name.startswith("kube-proxy-")
+            or labels.get("k8s-app") == "kube-proxy"
+            or labels.get("component") == "kube-proxy"
+        )
+
+    if any(is_kube_proxy(item) for item in (*proxy_daemonsets, *proxy_pods)):
+        raise RuntimeErrorEB("kube-proxy is present in Experiment B")
+
+    return {
+        "chart": expected_chart,
+        "chart_version": config["cilium"]["chart_version"],
+        "gateway_api": True,
+        "kube_proxy_replacement": True,
+        "daemonset_generation": generation,
+        "daemonset_ready": ready,
+        "kube_proxy_present": False,
+    }
+
+
 def status(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
@@ -2139,13 +2285,14 @@ def status(root: Path) -> dict[str, Any]:
         vm_create = json.loads(vm_create_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeErrorEB("Experiment-B status requires valid vm-create.json") from exc
-    _require_vm_create_receipt(vm_create, source_commit, config)
+    _require_vm_create_receipt(vm_create, source_commit, config, root)
     vm_substrate = _live_vm_substrate(root, config)
     if vm_substrate != vm_create["substrate"]:
         raise RuntimeErrorEB("VM substrate drifted from creation receipt")
     tools = toolchain(root)["tools"]
     env = kube_env(root)
     kubectl = tools["kubectl"]
+    cilium_readback = _require_live_cilium_contract(root, config)
 
     nodes = json.loads(run([kubectl, "get", "nodes", "-o", "json"], env=env).stdout)
     node_readback = _require_exact_k3s_node_inventory(
@@ -2283,6 +2430,7 @@ def status(root: Path) -> dict[str, Any]:
         "node": node_readback["node"],
         "kubelet_version": kubelet,
         "os_image": os_image,
+        "cilium": cilium_readback,
         "flux_source_revision": source_revision,
         "flux": flux_readback,
         "deployments": deployment_readback,
@@ -2348,7 +2496,42 @@ def _libvirt_volume_present(pool: str, name: str) -> bool:
     return name in volume_names
 
 
+def _require_teardown_state_root(root: Path) -> dict[str, Any]:
+    root_identity = str(root.resolve())
+    creation_path = root / "receipts/vm-create.json"
+    attempt_path = root / "receipts/vm-create-attempt.json"
+    if creation_path.is_file():
+        path = creation_path
+        allowed_statuses = {"created"}
+    elif attempt_path.is_file():
+        path = attempt_path
+        allowed_statuses = {"running"}
+    else:
+        raise RuntimeErrorEB(
+            "Experiment-B teardown has no state-root ownership receipt"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B teardown state-root ownership receipt is invalid"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("status") not in allowed_statuses
+        or payload.get("state_root") != root_identity
+        or payload.get("vm") != VM_NAME
+        or payload.get("pool") != POOL_NAME
+    ):
+        raise RuntimeErrorEB(
+            "Experiment-B teardown state root does not own the VM resources"
+        )
+    return payload
+
+
 def teardown(root: Path) -> dict[str, Any]:
+    ownership = _require_teardown_state_root(root)
     evidence_hashes: dict[str, str] = {}
     receipts_dir = root / "receipts"
     if receipts_dir.is_dir():
@@ -2415,6 +2598,7 @@ def teardown(root: Path) -> dict[str, Any]:
         "status": "retired",
         "vm": VM_NAME,
         "pool": POOL_NAME,
+        "state_root": ownership["state_root"],
         "volumes_absent": volume_absence,
         "volume_paths_absent": {
             name: not path.exists() for name, path in volume_paths.items()
@@ -3415,6 +3599,38 @@ def _parse_memory_quantity(value: str) -> int:
     return int(value)
 
 
+def _require_api_resource_limits(
+    pod: Any, config: dict[str, Any]
+) -> tuple[float, int]:
+    if not isinstance(pod, dict):
+        raise RuntimeErrorEB("API pod resource contract payload is not an object")
+    containers = pod.get("spec", {}).get("containers", [])
+    if not isinstance(containers, list):
+        raise RuntimeErrorEB("API pod container inventory is invalid")
+    api_containers = [
+        item for item in containers
+        if isinstance(item, dict) and item.get("name") == "api"
+    ]
+    if len(api_containers) != 1:
+        raise RuntimeErrorEB("API pod must contain exactly one api container")
+    live_limits = api_containers[0].get("resources", {}).get("limits", {})
+    expected_limits = config.get("runtime_binding", {}).get("api_resource_limits")
+    if not isinstance(live_limits, dict) or not isinstance(expected_limits, dict):
+        raise RuntimeErrorEB("Experiment-B API resource limits are missing")
+    try:
+        live_cpu = _parse_cpu_quantity(str(live_limits.get("cpu", "")))
+        live_memory = _parse_memory_quantity(str(live_limits.get("memory", "")))
+        expected_cpu = _parse_cpu_quantity(str(expected_limits.get("cpu", "")))
+        expected_memory = _parse_memory_quantity(str(expected_limits.get("memory", "")))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeErrorEB("Experiment-B API resource limits are invalid") from exc
+    if live_cpu != expected_cpu or live_memory != expected_memory:
+        raise RuntimeErrorEB(
+            "live API resource limits drifted from the Experiment-B contract"
+        )
+    return expected_cpu, expected_memory
+
+
 def _sample_api_cgroup(root: Path, pod_name: str) -> dict[str, Any]:
     script = (
         "cat /sys/fs/cgroup/cpu.stat; "
@@ -3518,18 +3734,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     db_path = root / "performance/database-connections.json"
 
     pod_name, pod = _api_pod(root)
-    api_container = next(
-        (
-            item for item in pod.get("spec", {}).get("containers", [])
-            if item.get("name") == "api"
-        ),
-        None,
+    declared_cpu, declared_memory = _require_api_resource_limits(
+        pod, load_config()
     )
-    if not isinstance(api_container, dict):
-        raise RuntimeErrorEB("API pod has no api container")
-    limits = api_container.get("resources", {}).get("limits", {})
-    declared_cpu = _parse_cpu_quantity(str(limits.get("cpu", "")))
-    declared_memory = _parse_memory_quantity(str(limits.get("memory", "")))
 
     process, port, pf_stdout, pf_stderr = _start_api_port_forward(root)
     base_url = f"http://127.0.0.1:{port}"
@@ -4507,13 +4714,25 @@ def portability_report(root: Path) -> dict[str, Any]:
                 f"latest {receipt_stem} attempt is not bound to its current success receipt"
             )
 
-    _require_vm_create_receipt(payloads["vm-create.json"], source_commit, load_config())
+    config = load_config()
+    _require_vm_create_receipt(
+        payloads["vm-create.json"], source_commit, config, root
+    )
     if (
         payloads["status.json"].get("vm_create_sha256") != receipts["vm-create.json"]
         or payloads["status.json"].get("vm_substrate")
         != payloads["vm-create.json"]["substrate"]
     ):
         raise RuntimeErrorEB("status is not bound to the current VM creation substrate receipt")
+    cilium_status = payloads["status.json"].get("cilium")
+    if (
+        not isinstance(cilium_status, dict)
+        or cilium_status.get("chart_version") != config["cilium"]["chart_version"]
+        or cilium_status.get("gateway_api") is not True
+        or cilium_status.get("kube_proxy_replacement") is not True
+        or cilium_status.get("kube_proxy_present") is not False
+    ):
+        raise RuntimeErrorEB("status does not prove the live Cilium contract")
 
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB(

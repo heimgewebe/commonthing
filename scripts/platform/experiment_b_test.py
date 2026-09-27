@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 import experiment_b as eb
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -187,6 +189,10 @@ class ExperimentBContractTests(unittest.TestCase):
         self.assertEqual(semantic["topology"], "api-pod-sidecars")
         self.assertEqual(semantic["api_replicas"], 1)
         self.assertEqual(runtime_binding["web_replicas"], 2)
+        self.assertEqual(
+            runtime_binding["api_resource_limits"],
+            {"cpu": "1", "memory": "512Mi"},
+        )
         self.assertEqual(semantic["ollama_url"], "http://127.0.0.1:11434/")
         self.assertEqual(semantic["dimension"], 2560)
         self.assertIn(
@@ -203,6 +209,47 @@ class ExperimentBContractTests(unittest.TestCase):
         self.assertNotIn("kind: Service", patch)
         self.assertIn("storageClassName: local-path", storage)
         self.assertIn("storage: 10Gi", storage)
+
+
+    def test_t048_api_limits_match_release_manifest_contract(self) -> None:
+        config = json.loads((CLUSTER / "config.json").read_text(encoding="utf-8"))
+        expected = config["runtime_binding"]["api_resource_limits"]
+        deployment = yaml.safe_load(
+            (
+                ROOT / "platform/apps/weltgewebe/base/api-deployment.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        containers = deployment["spec"]["template"]["spec"]["containers"]
+        api_containers = [
+            item
+            for item in containers
+            if isinstance(item, dict) and item.get("name") == "api"
+        ]
+        self.assertEqual(len(api_containers), 1)
+        self.assertEqual(api_containers[0]["resources"]["limits"], expected)
+
+        kustomization = yaml.safe_load(
+            (OVERLAY / "kustomization.yaml").read_text(encoding="utf-8")
+        )
+        for patch_entry in kustomization["patches"]:
+            patch_path = OVERLAY / patch_entry["path"]
+            for patch in yaml.safe_load_all(patch_path.read_text(encoding="utf-8")):
+                if (
+                    not isinstance(patch, dict)
+                    or patch.get("kind") != "Deployment"
+                    or patch.get("metadata", {}).get("name") != "weltgewebe-api"
+                ):
+                    continue
+                for container in (
+                    patch.get("spec", {})
+                    .get("template", {})
+                    .get("spec", {})
+                    .get("containers", [])
+                ):
+                    if container.get("name") == "api" and "resources" in container:
+                        self.assertEqual(
+                            container["resources"].get("limits"), expected
+                        )
 
 
 if __name__ == "__main__":
