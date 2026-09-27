@@ -660,7 +660,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         web = {
             "metadata": {"generation": 1},
             "spec": {
-                "replicas": 1,
+                "replicas": 2,
                 "template": {"spec": {"containers": [{
                     "name": "web",
                     "image": "ghcr.io/heimgewebe/commonthing-web@" + web_digest,
@@ -668,10 +668,10 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             },
             "status": {
                 "observedGeneration": 1,
-                "replicas": 1,
-                "updatedReplicas": 1,
-                "readyReplicas": 1,
-                "availableReplicas": 1,
+                "replicas": 2,
+                "updatedReplicas": 2,
+                "readyReplicas": 2,
+                "availableReplicas": 2,
                 "unavailableReplicas": 0,
                 "conditions": [{"type": "Available", "status": "True"}],
             },
@@ -687,7 +687,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             },
         }
         observed = runtime._require_requested_release_artifacts(
-            api, web, migration, api_digest, web_digest
+            api, web, migration, api_digest, web_digest, 1, 2
         )
         self.assertTrue(observed["migration_complete"])
 
@@ -697,7 +697,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "live API image"):
             runtime._require_requested_release_artifacts(
-                stale_api, web, migration, api_digest, web_digest
+                stale_api, web, migration, api_digest, web_digest, 1, 2
             )
 
         stale_migration = json.loads(json.dumps(migration))
@@ -706,14 +706,14 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "migration image"):
             runtime._require_requested_release_artifacts(
-                api, web, stale_migration, api_digest, web_digest
+                api, web, stale_migration, api_digest, web_digest, 1, 2
             )
 
         incomplete = json.loads(json.dumps(migration))
         incomplete["status"] = {"succeeded": 0, "conditions": []}
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not complete"):
             runtime._require_requested_release_artifacts(
-                api, web, incomplete, api_digest, web_digest
+                api, web, incomplete, api_digest, web_digest, 1, 2
             )
 
     def test_recovery_attempt_invalidates_post_recovery_evidence(self) -> None:
@@ -879,7 +879,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             },
         }
         snapshot = runtime._deployment_availability_snapshot(
-            healthy, "weltgewebe-api"
+            healthy, "weltgewebe-api", 1
         )
         self.assertTrue(snapshot["available"])
 
@@ -900,7 +900,7 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 broken["status"][field] = value
                 with self.assertRaises(runtime.RuntimeErrorEB):
                     runtime._deployment_availability_snapshot(
-                        broken, "weltgewebe-api"
+                        broken, "weltgewebe-api", 1
                     )
 
         no_available_condition = json.loads(json.dumps(healthy))
@@ -909,7 +909,21 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
         ]
         with self.assertRaises(runtime.RuntimeErrorEB):
             runtime._deployment_availability_snapshot(
-                no_available_condition, "weltgewebe-api"
+                no_available_condition, "weltgewebe-api", 1
+            )
+
+        scaled_live_spec = json.loads(json.dumps(healthy))
+        scaled_live_spec["spec"]["replicas"] = 2
+        for field in (
+            "replicas",
+            "updatedReplicas",
+            "readyReplicas",
+            "availableReplicas",
+        ):
+            scaled_live_spec["status"][field] = 2
+        with self.assertRaises(runtime.RuntimeErrorEB):
+            runtime._deployment_availability_snapshot(
+                scaled_live_spec, "weltgewebe-api", 1
             )
 
     def test_t048_rerun_invalidates_stale_success_before_early_failure(self) -> None:
@@ -2572,9 +2586,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 },
             }
         if "deployment" in arguments:
+            deployment_name = str(arguments[-1])
+            replicas = (
+                int(self.config["semantic_search"]["api_replicas"])
+                if deployment_name == "weltgewebe-api"
+                else int(self.config["runtime_binding"]["web_replicas"])
+            )
             return {
                 "metadata": {"generation": 1},
-                "spec": {"replicas": 1, "template": {"spec": {"containers": [
+                "spec": {"replicas": replicas, "template": {"spec": {"containers": [
                     {"name": name, "image": image} for name, image in {
                         "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64,
                         "web": "ghcr.io/heimgewebe/commonthing-web@sha256:" + "c" * 64,
@@ -2583,9 +2603,9 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     }.items()
                 ]}}},
                 "status": {
-                    "observedGeneration": 1, "replicas": 1,
-                    "updatedReplicas": 1, "readyReplicas": 1,
-                    "availableReplicas": 1, "unavailableReplicas": 0,
+                    "observedGeneration": 1, "replicas": replicas,
+                    "updatedReplicas": replicas, "readyReplicas": replicas,
+                    "availableReplicas": replicas, "unavailableReplicas": 0,
                     "conditions": [{"type": "Available", "status": "True"}],
                 },
             }

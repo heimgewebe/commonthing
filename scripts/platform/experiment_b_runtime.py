@@ -1090,6 +1090,9 @@ def apply_release(
     )
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("release source is not current protected main")
+    config = load_config()
+    api_replicas = int(config["semantic_search"]["api_replicas"])
+    web_replicas = int(config["runtime_binding"]["web_replicas"])
     output = root / "bootstrap.yaml"
     binding = contract.render_bootstrap(
         source_commit, api_digest, web_digest, output
@@ -1173,6 +1176,8 @@ def apply_release(
                     json.loads(live_results["migration"].stdout),
                     api_digest,
                     web_digest,
+                    api_replicas,
+                    web_replicas,
                 )
             except (json.JSONDecodeError, RuntimeErrorEB):
                 pass
@@ -1564,7 +1569,7 @@ def _require_exact_healthy_pvcs(pvc_items: Any) -> dict[str, Any]:
 
 
 def _deployment_availability_snapshot(
-    deployment: dict[str, Any], name: str
+    deployment: dict[str, Any], name: str, expected_replicas: int
 ) -> dict[str, Any]:
     metadata = deployment.get("metadata", {})
     spec = deployment.get("spec", {})
@@ -1583,8 +1588,11 @@ def _deployment_availability_snapshot(
         if isinstance(condition, dict)
     )
     if (
-        generation < 1
-        or desired < 1
+        not isinstance(expected_replicas, int)
+        or isinstance(expected_replicas, bool)
+        or expected_replicas < 1
+        or generation < 1
+        or desired != expected_replicas
         or observed_generation < generation
         or replicas != desired
         or updated != desired
@@ -1636,6 +1644,8 @@ def _require_requested_release_artifacts(
     migration: Any,
     api_digest: str,
     web_digest: str,
+    api_replicas: int,
+    web_replicas: int,
 ) -> dict[str, Any]:
     expected_api = f"ghcr.io/heimgewebe/commonthing-api@{api_digest}"
     expected_web = f"ghcr.io/heimgewebe/commonthing-web@{web_digest}"
@@ -1654,10 +1664,10 @@ def _require_requested_release_artifacts(
 
     deployments = {
         "weltgewebe-api": _deployment_availability_snapshot(
-            api, "weltgewebe-api"
+            api, "weltgewebe-api", api_replicas
         ),
         "weltgewebe-web": _deployment_availability_snapshot(
-            web, "weltgewebe-web"
+            web, "weltgewebe-web", web_replicas
         ),
     }
     migration_status = migration.get("status", {}) if isinstance(migration, dict) else {}
@@ -2174,6 +2184,8 @@ def status(root: Path) -> dict[str, Any]:
         migration,
         str(release.get("api_digest", "")),
         str(release.get("web_digest", "")),
+        int(config["semantic_search"]["api_replicas"]),
+        int(config["runtime_binding"]["web_replicas"]),
     )
     deployment_readback = release_artifacts["deployments"]
     api_containers = _container_images(api, "Experiment-B API Deployment")

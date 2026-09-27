@@ -179,12 +179,14 @@ class ExperimentBContractTests(unittest.TestCase):
     def test_semantic_search_preserves_literal_loopback_contract(self) -> None:
         config = json.loads((CLUSTER / "config.json").read_text(encoding="utf-8"))
         semantic = config["semantic_search"]
+        runtime_binding = config["runtime_binding"]
         patch = (OVERLAY / "semantic-search-patch.yaml").read_text(encoding="utf-8")
         runtime = (OVERLAY / "config-map-patch.yaml").read_text(encoding="utf-8")
         storage = (OVERLAY / "semantic-search-storage.yaml").read_text(encoding="utf-8")
 
         self.assertEqual(semantic["topology"], "api-pod-sidecars")
         self.assertEqual(semantic["api_replicas"], 1)
+        self.assertEqual(runtime_binding["web_replicas"], 2)
         self.assertEqual(semantic["ollama_url"], "http://127.0.0.1:11434/")
         self.assertEqual(semantic["dimension"], 2560)
         self.assertIn(
