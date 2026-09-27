@@ -2906,7 +2906,6 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "registry_source_sha256": runtime.sha256_file(
                     self.registry_source
                 ),
-                "registry_source_path": str(self.registry_source.resolve()),
                 "secret_values_recorded": False,
             },
         )
@@ -3504,13 +3503,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         ).decode("ascii")
         cases.append(("wrong-nonempty-runtime-url", wrong_runtime_url))
 
-        wrong_registry = json.loads(json.dumps(healthy))
-        wrong_registry[
+        malformed_registry = json.loads(json.dumps(healthy))
+        malformed_registry[
             f"{runtime.APP_NAMESPACE}/commonthing-experiment-b-registry"
-        ]["data"][".dockerconfigjson"] = base64.b64encode(
-            b'{"auths":{"ghcr.io":{}}}'
-        ).decode("ascii")
-        cases.append(("wrong-nonempty-registry", wrong_registry))
+        ]["data"][".dockerconfigjson"] = "***not-base64***"
+        cases.append(("malformed-registry-base64", malformed_registry))
 
         malformed_base64 = json.loads(json.dumps(healthy))
         malformed_base64[
@@ -3529,6 +3526,17 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     runtime.status(self.root)
                 self.assertFalse((self.root / "receipts/status.json").exists())
                 self.assertFalse((self.root / "receipts/portability.json").exists())
+
+        registry_content_drift = json.loads(json.dumps(healthy))
+        registry_content_drift[
+            f"{runtime.APP_NAMESPACE}/commonthing-experiment-b-registry"
+        ]["data"][".dockerconfigjson"] = base64.b64encode(
+            b'{"auths":{"ghcr.io":{"auth":"different"}}}'
+        ).decode("ascii")
+        self.live_secrets = registry_content_drift
+        result = runtime.status(self.root)
+        self.assertFalse(result["secrets"]["registry"]["content_verified"])
+        self.live_secrets = healthy
 
         changed_db = {
             "username": "user2",

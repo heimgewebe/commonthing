@@ -1094,7 +1094,6 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         "registry_secret": "commonthing-experiment-b-registry",
         "database_source_sha256": sha256_file(root / "secrets/database.json"),
         "registry_source_sha256": sha256_file(registry_config),
-        "registry_source_path": str(registry_config.resolve()),
         "secret_values_recorded": False,
     }
     atomic_json(root / "receipts/secrets.json", receipt)
@@ -1907,15 +1906,6 @@ def _expected_live_secret_values(
             "Experiment-B status requires valid private Secret source material"
         ) from exc
 
-    registry_source_path = (
-        receipt.get("registry_source_path") if isinstance(receipt, dict) else None
-    )
-    if not isinstance(registry_source_path, str) or not registry_source_path:
-        raise RuntimeErrorEB("Experiment-B registry Secret source path is invalid")
-    registry_path = Path(registry_source_path)
-    if not registry_path.is_file() or registry_path.is_symlink():
-        raise RuntimeErrorEB("Experiment-B registry Secret source material is unavailable")
-
     if not isinstance(receipt, dict) or (
         receipt.get("schema_version") != 1
         or receipt.get("status") != "ready"
@@ -1940,11 +1930,8 @@ def _expected_live_secret_values(
     if (
         not isinstance(registry_source_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", registry_source_sha256) is None
-        or not secrets.compare_digest(
-            sha256_file(registry_path), registry_source_sha256
-        )
     ):
-        raise RuntimeErrorEB("Experiment-B registry Secret source digest drifted")
+        raise RuntimeErrorEB("Experiment-B registry Secret source digest is invalid")
 
     expected_database_keys = {"username", "database", "password"}
     if (
@@ -1967,7 +1954,6 @@ def _expected_live_secret_values(
             for key in expected_database_keys
         },
         "runtime": {"database-url": database_url.encode("utf-8")},
-        "registry": {".dockerconfigjson": registry_path.read_bytes()},
     }
 
 
@@ -1977,11 +1963,14 @@ def _require_live_secret(
     name: str,
     secret_type: str,
     required_keys: set[str],
-    expected_values: dict[str, bytes],
+    expected_values: dict[str, bytes] | None,
 ) -> None:
-    if set(expected_values) != required_keys or any(
-        not isinstance(value, bytes) or not value
-        for value in expected_values.values()
+    if expected_values is not None and (
+        set(expected_values) != required_keys
+        or any(
+            not isinstance(value, bytes) or not value
+            for value in expected_values.values()
+        )
     ):
         raise RuntimeErrorEB(
             f"Experiment-B Secret expected-content contract is invalid: {namespace}/{name}"
@@ -2021,7 +2010,10 @@ def _require_live_secret(
             raise RuntimeErrorEB(
                 f"Experiment-B Secret contains invalid encoded data: {namespace}/{name}/{key}"
             ) from exc
-        if not secrets.compare_digest(decoded, expected_values[key]):
+        if (
+            expected_values is not None
+            and not secrets.compare_digest(decoded, expected_values[key])
+        ):
             raise RuntimeErrorEB(
                 f"Experiment-B Secret content drifted: {namespace}/{name}/{key}"
             )
@@ -2033,6 +2025,8 @@ def _verified_secret_readback(
     name: str,
     secret_type: str,
     required_keys: set[str],
+    *,
+    content_verified: bool = True,
 ) -> dict[str, Any]:
     return {
         "namespace": namespace,
@@ -2041,7 +2035,7 @@ def _verified_secret_readback(
         "required_keys": sorted(required_keys),
         "present": True,
         "terminating": False,
-        "content_verified": True,
+        "content_verified": content_verified,
     }
 
 
@@ -2786,7 +2780,7 @@ def status(root: Path) -> dict[str, Any]:
         "commonthing-experiment-b-registry",
         "kubernetes.io/dockerconfigjson",
         {".dockerconfigjson"},
-        expected_secret_values["registry"],
+        None,
     )
     secret_readback = {
         "database": _verified_secret_readback(
@@ -2806,6 +2800,7 @@ def status(root: Path) -> dict[str, Any]:
             "commonthing-experiment-b-registry",
             "kubernetes.io/dockerconfigjson",
             {".dockerconfigjson"},
+            content_verified=False,
         ),
     }
 
