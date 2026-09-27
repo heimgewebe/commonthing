@@ -152,6 +152,22 @@ def atomic_json(path: Path, payload: dict[str, Any], mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
+def atomic_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+        mode="wb",
+    ) as handle:
+        tmp = Path(handle.name)
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
 PORTABILITY_DERIVED_RECEIPTS = ("portability.json",)
 RECOVERY_ATTEMPT_INVALIDATES = (
     "recovery.json",
@@ -1048,11 +1064,14 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     if not registry_config.is_file() or registry_config.is_symlink():
         raise RuntimeErrorEB("registry config must be a regular external file")
     try:
-        registry_payload = json.loads(registry_config.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        registry_bytes = registry_config.read_bytes()
+        registry_payload = json.loads(registry_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeErrorEB("registry config is not valid JSON") from exc
     if "ghcr.io" not in registry_payload.get("auths", {}):
         raise RuntimeErrorEB("registry config has no ghcr.io credential")
+    registry_state = root / "secrets/registry.json"
+    atomic_bytes(registry_state, registry_bytes)
     kubectl_apply(root, render_namespaces(root))
     db = ensure_secret_material(root)
     database_url = (
@@ -1082,7 +1101,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
             "commonthing-experiment-b-registry",
             {},
             secret_type="kubernetes.io/dockerconfigjson",
-            binary_data={".dockerconfigjson": registry_config.read_bytes()},
+            binary_data={".dockerconfigjson": registry_bytes},
         ),
     )
     receipt = {
@@ -1093,7 +1112,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         "runtime_secret": "weltgewebe-runtime",
         "registry_secret": "commonthing-experiment-b-registry",
         "database_source_sha256": sha256_file(root / "secrets/database.json"),
-        "registry_source_sha256": sha256_file(registry_config),
+        "registry_source_sha256": sha256_file(registry_state),
         "secret_values_recorded": False,
     }
     atomic_json(root / "receipts/secrets.json", receipt)
@@ -1661,7 +1680,7 @@ def _require_exact_flux_revision_ready(
 
 def _require_exact_k3s_node_inventory(
     nodes: Any, expected_version: str
-) -> dict[str, str]:
+) -> dict[str, Any]:
     if not isinstance(nodes, dict) or nodes.get("kind") not in {"NodeList", "List"}:
         raise RuntimeErrorEB("Experiment B node inventory is not a Kubernetes node list")
     items = nodes.get("items")
@@ -1671,9 +1690,27 @@ def _require_exact_k3s_node_inventory(
     if not isinstance(node, dict) or node.get("kind") != "Node":
         raise RuntimeErrorEB("Experiment B node inventory item is not a Kubernetes Node")
     metadata = node.get("metadata", {})
-    if not isinstance(metadata, dict) or not metadata.get("name"):
-        raise RuntimeErrorEB("Experiment B node inventory item has no node name")
-    info = node.get("status", {}).get("nodeInfo", {})
+    status_obj = node.get("status", {})
+    if (
+        not isinstance(metadata, dict)
+        or not metadata.get("name")
+        or metadata.get("deletionTimestamp") is not None
+        or not isinstance(status_obj, dict)
+    ):
+        raise RuntimeErrorEB("Experiment B node identity/deletion state is invalid")
+    conditions = status_obj.get("conditions")
+    ready_conditions = (
+        [
+            condition
+            for condition in conditions
+            if isinstance(condition, dict) and condition.get("type") == "Ready"
+        ]
+        if isinstance(conditions, list)
+        else []
+    )
+    if len(ready_conditions) != 1 or ready_conditions[0].get("status") != "True":
+        raise RuntimeErrorEB("Experiment B k3s node is not Ready")
+    info = status_obj.get("nodeInfo", {})
     kubelet = str(info.get("kubeletVersion", ""))
     os_image = str(info.get("osImage", ""))
     if "k3s" not in kubelet:
@@ -1684,6 +1721,7 @@ def _require_exact_k3s_node_inventory(
         "node": str(metadata["name"]),
         "kubelet_version": kubelet,
         "os_image": os_image,
+        "ready": True,
     }
 
 
@@ -1889,18 +1927,179 @@ def _require_requested_release_artifacts(
     }
 
 
+def _runtime_image_id_matches_digest(image_id: Any, expected_digest: str) -> bool:
+    if (
+        not isinstance(image_id, str)
+        or not image_id
+        or not DIGEST_RE.fullmatch(expected_digest)
+    ):
+        return False
+    if image_id == expected_digest:
+        return True
+    if "@" in image_id and image_id.rsplit("@", 1)[1] == expected_digest:
+        return True
+    if "://" in image_id and image_id.split("://", 1)[1] == expected_digest:
+        return True
+    return False
+
+
+def _require_running_pod_images(
+    pods: Any,
+    workload: str,
+    expected_replicas: int,
+    expected_images: dict[str, str],
+) -> dict[str, Any]:
+    if (
+        not isinstance(expected_replicas, int)
+        or isinstance(expected_replicas, bool)
+        or expected_replicas < 1
+        or not isinstance(expected_images, dict)
+        or not expected_images
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(image, str)
+            or not image
+            for name, image in expected_images.items()
+        )
+    ):
+        raise RuntimeErrorEB(f"application Pod contract is invalid: {workload}")
+    if not isinstance(pods, list) or len(pods) != expected_replicas:
+        raise RuntimeErrorEB(
+            f"application Pod set does not match exact replica contract: {workload}"
+        )
+
+    expected_images_sha256 = _stable_json_sha256(expected_images)
+    expected_digests: dict[str, str] = {}
+    for name, image in expected_images.items():
+        if "@" not in image:
+            raise RuntimeErrorEB(
+                f"application Pod image is not immutable: {workload}/{name}"
+            )
+        _repository, digest = image.rsplit("@", 1)
+        if not DIGEST_RE.fullmatch(digest):
+            raise RuntimeErrorEB(
+                f"application Pod image digest is invalid: {workload}/{name}"
+            )
+        expected_digests[name] = digest
+
+    observed: dict[str, Any] = {}
+    for pod in pods:
+        if not isinstance(pod, dict):
+            raise RuntimeErrorEB(f"application Pod inventory is invalid: {workload}")
+        metadata = pod.get("metadata", {})
+        spec = pod.get("spec", {})
+        status_obj = pod.get("status", {})
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(spec, dict)
+            or not isinstance(status_obj, dict)
+        ):
+            raise RuntimeErrorEB(f"application Pod inventory is invalid: {workload}")
+        name = metadata.get("name")
+        labels = metadata.get("labels", {})
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in observed
+            or metadata.get("namespace") != APP_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+            or not isinstance(labels, dict)
+            or labels.get("app.kubernetes.io/name") != workload
+            or status_obj.get("phase") != "Running"
+        ):
+            raise RuntimeErrorEB(f"application Pod identity/state drifted: {workload}")
+
+        ready = any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in status_obj.get("conditions", [])
+        )
+        if not ready:
+            raise RuntimeErrorEB(f"application Pod is not Ready: {workload}/{name}")
+
+        live_images = _pod_spec_images(spec, f"application Pod {name}")["containers"]
+        if live_images != expected_images:
+            raise RuntimeErrorEB(
+                f"application Pod requested images drifted: {workload}/{name}"
+            )
+
+        container_statuses = status_obj.get("containerStatuses")
+        if not isinstance(container_statuses, list):
+            raise RuntimeErrorEB(
+                f"application Pod container status is invalid: {workload}/{name}"
+            )
+        status_by_name: dict[str, dict[str, Any]] = {}
+        for item in container_statuses:
+            if not isinstance(item, dict):
+                raise RuntimeErrorEB(
+                    f"application Pod container status is invalid: {workload}/{name}"
+                )
+            container_name = item.get("name")
+            if (
+                not isinstance(container_name, str)
+                or not container_name
+                or container_name in status_by_name
+            ):
+                raise RuntimeErrorEB(
+                    f"application Pod container status identity is invalid: {workload}/{name}"
+                )
+            status_by_name[container_name] = item
+        if set(status_by_name) != set(expected_images):
+            raise RuntimeErrorEB(
+                f"application Pod container status set drifted: {workload}/{name}"
+            )
+
+        image_ids: dict[str, str] = {}
+        for container_name, expected_digest in expected_digests.items():
+            item = status_by_name[container_name]
+            state = item.get("state", {})
+            image_id = item.get("imageID")
+            if (
+                item.get("ready") is not True
+                or not isinstance(state, dict)
+                or not isinstance(state.get("running"), dict)
+                or not _runtime_image_id_matches_digest(image_id, expected_digest)
+            ):
+                raise RuntimeErrorEB(
+                    f"application Pod runtime image ID drifted: {workload}/{name}/{container_name}"
+                )
+            image_ids[container_name] = image_id
+
+        observed[name] = {
+            "ready": True,
+            "requested_images_sha256": expected_images_sha256,
+            "runtime_image_ids": image_ids,
+        }
+
+    return {
+        "expected_replicas": expected_replicas,
+        "observed_replicas": len(observed),
+        "requested_images_sha256": expected_images_sha256,
+        "images_canonical": True,
+        "pods": observed,
+    }
+
+
 def _expected_live_secret_values(
     root: Path, source_commit: str
-) -> dict[str, dict[str, bytes]]:
+) -> dict[str, Any]:
     receipt_path = root / "receipts/secrets.json"
     database_path = root / "secrets/database.json"
+    registry_path = root / "secrets/registry.json"
     if not database_path.is_file() or database_path.is_symlink():
         raise RuntimeErrorEB(
             "Experiment-B status requires private database Secret source material"
         )
+    if not registry_path.is_file() or registry_path.is_symlink():
+        raise RuntimeErrorEB(
+            "Experiment-B status requires private registry Secret source material"
+        )
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         database = json.loads(database_path.read_text(encoding="utf-8"))
+        registry_bytes = registry_path.read_bytes()
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeErrorEB(
             "Experiment-B status requires valid private Secret source material"
@@ -1932,6 +2131,8 @@ def _expected_live_secret_values(
         or re.fullmatch(r"[0-9a-f]{64}", registry_source_sha256) is None
     ):
         raise RuntimeErrorEB("Experiment-B registry Secret source digest is invalid")
+    if not secrets.compare_digest(sha256_file(registry_path), registry_source_sha256):
+        raise RuntimeErrorEB("Experiment-B registry Secret source digest drifted")
 
     expected_database_keys = {"username", "database", "password"}
     if (
@@ -1954,6 +2155,7 @@ def _expected_live_secret_values(
             for key in expected_database_keys
         },
         "runtime": {"database-url": database_url.encode("utf-8")},
+        "registry": {".dockerconfigjson": registry_bytes},
     }
 
 
@@ -2344,6 +2546,78 @@ def _pod_spec_images(pod_spec: Any, context: str) -> dict[str, dict[str, str]]:
         result[output_key] = images
     if not result["containers"]:
         raise RuntimeErrorEB(f"{context} has no containers")
+    return result
+
+
+def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]:
+    try:
+        documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeErrorEB(
+            f"versioned data Deployment manifest is invalid: {name}"
+        ) from exc
+    matches = [
+        document
+        for document in documents
+        if isinstance(document, dict)
+        and document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == name
+        and document.get("metadata", {}).get("namespace") == DATA_NAMESPACE
+    ]
+    if len(matches) != 1:
+        raise RuntimeErrorEB(
+            f"versioned data manifest does not contain exactly one Deployment: {name}"
+        )
+    spec = matches[0].get("spec", {})
+    replicas = spec.get("replicas")
+    if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas != 1:
+        raise RuntimeErrorEB(
+            f"versioned data Deployment replica contract drifted: {name}"
+        )
+    images = _pod_spec_images(
+        spec.get("template", {}).get("spec"),
+        f"versioned data Deployment {name}",
+    )
+    return {"replicas": replicas, "images": images}
+
+
+def _require_live_data_deployments(root: Path) -> dict[str, Any]:
+    manifests = {
+        "postgres": CLUSTER / "data/postgres.yaml",
+        "nats": CLUSTER / "data/nats.yaml",
+    }
+    result: dict[str, Any] = {}
+    for name, path in manifests.items():
+        expected = _versioned_data_deployment_contract(path, name)
+        deployment = _kubectl_json(
+            root, ["-n", DATA_NAMESPACE, "get", "deployment", name]
+        )
+        metadata = (
+            deployment.get("metadata", {}) if isinstance(deployment, dict) else {}
+        )
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or metadata.get("namespace") != DATA_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+        ):
+            raise RuntimeErrorEB(f"live data Deployment identity drifted: {name}")
+        availability = _deployment_availability_snapshot(
+            deployment, name, expected["replicas"]
+        )
+        live_images = _pod_spec_images(
+            deployment.get("spec", {}).get("template", {}).get("spec"),
+            f"live data Deployment {name}",
+        )
+        if live_images != expected["images"]:
+            raise RuntimeErrorEB(
+                f"live data Deployment images drifted from versioned manifest: {name}"
+            )
+        result[name] = {
+            **availability,
+            "images_sha256": _stable_json_sha256(live_images),
+            "images_canonical": True,
+        }
     return result
 
 
@@ -2847,10 +3121,56 @@ def status(root: Path) -> dict[str, Any]:
         int(config["runtime_binding"]["web_replicas"]),
     )
     deployment_readback = release_artifacts["deployments"]
+    data_deployment_readback = _require_live_data_deployments(root)
     api_containers = _container_images(api, "Experiment-B API Deployment")
     semantic = config["semantic_search"]
     if api_containers.get("ollama") != semantic["ollama_image"]:
         raise RuntimeErrorEB("live Ollama image does not match semantic-search pin")
+
+    expected_api_pod_images = {
+        "api": str(release_artifacts["images"]["api"]),
+        "search-worker": str(release_artifacts["images"]["search_worker"]),
+        "ollama": str(semantic["ollama_image"]),
+    }
+    expected_web_pod_images = {
+        "web": str(release_artifacts["images"]["web"]),
+    }
+    api_pods = _kubectl_json(
+        root,
+        [
+            "-n",
+            APP_NAMESPACE,
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=weltgewebe-api",
+        ],
+    ).get("items")
+    web_pods = _kubectl_json(
+        root,
+        [
+            "-n",
+            APP_NAMESPACE,
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=weltgewebe-web",
+        ],
+    ).get("items")
+    pod_readback = {
+        "weltgewebe-api": _require_running_pod_images(
+            api_pods,
+            "weltgewebe-api",
+            int(config["semantic_search"]["api_replicas"]),
+            expected_api_pod_images,
+        ),
+        "weltgewebe-web": _require_running_pod_images(
+            web_pods,
+            "weltgewebe-web",
+            int(config["runtime_binding"]["web_replicas"]),
+            expected_web_pod_images,
+        ),
+    }
     semantic_provider = _semantic_provider_live_readback(root, source_commit)
 
     expected_secret_values = _expected_live_secret_values(root, source_commit)
@@ -2894,7 +3214,7 @@ def status(root: Path) -> dict[str, Any]:
         "commonthing-experiment-b-registry",
         "kubernetes.io/dockerconfigjson",
         {".dockerconfigjson"},
-        None,
+        expected_secret_values["registry"],
     )
     secret_readback = {
         "database": _verified_secret_readback(
@@ -2914,7 +3234,6 @@ def status(root: Path) -> dict[str, Any]:
             "commonthing-experiment-b-registry",
             "kubernetes.io/dockerconfigjson",
             {".dockerconfigjson"},
-            content_verified=False,
         ),
     }
 
@@ -2943,6 +3262,7 @@ def status(root: Path) -> dict[str, Any]:
         "vm_ip": vm_ip(),
         "node": node_readback["node"],
         "kubelet_version": kubelet,
+        "node_ready": node_readback["ready"],
         "os_image": os_image,
         "cilium": cilium_readback,
         "runtime_contract": runtime_contract_readback,
@@ -2951,6 +3271,8 @@ def status(root: Path) -> dict[str, Any]:
         "flux_controllers": flux_controllers,
         "flux": flux_readback,
         "deployments": deployment_readback,
+        "data_deployments": data_deployment_readback,
+        "pods": pod_readback,
         "images": {
             **release_artifacts["images"],
             "ollama": api_containers.get("ollama"),
@@ -5257,6 +5579,13 @@ def portability_report(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("status does not prove the live Cilium contract")
 
     status_payload = payloads["status.json"]
+    if (
+        status_payload.get("node_ready") is not True
+        or status_payload.get("kubelet_version")
+        != str(config["kubernetes"]["version"])
+    ):
+        raise RuntimeErrorEB("status does not prove a Ready pinned k3s node")
+
     release_bootstrap_sha256 = payloads["release.json"].get("sha256")
     flux_controllers = status_payload.get("flux_controllers")
     flux_readback = status_payload.get("flux")
@@ -5287,6 +5616,92 @@ def portability_report(root: Path) -> dict[str, Any]:
         )
     ):
         raise RuntimeErrorEB("status does not prove the live Flux contract")
+
+    data_deployment_status = status_payload.get("data_deployments")
+    expected_data_deployments = {
+        name: _versioned_data_deployment_contract(
+            CLUSTER / f"data/{name}.yaml", name
+        )
+        for name in ("postgres", "nats")
+    }
+    if (
+        not isinstance(data_deployment_status, dict)
+        or set(data_deployment_status) != set(expected_data_deployments)
+    ):
+        raise RuntimeErrorEB("status does not prove the live data Deployment contract")
+    for name, expected in expected_data_deployments.items():
+        observed = data_deployment_status.get(name)
+        if (
+            not isinstance(observed, dict)
+            or observed.get("available") is not True
+            or observed.get("desired_replicas") != expected["replicas"]
+            or observed.get("images_canonical") is not True
+            or observed.get("images_sha256")
+            != _stable_json_sha256(expected["images"])
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the live data Deployment contract: {name}"
+            )
+
+    pod_status = status_payload.get("pods")
+    api_digest = str(payloads["release.json"].get("api_digest", ""))
+    web_digest = str(payloads["release.json"].get("web_digest", ""))
+    expected_pod_contracts = {
+        "weltgewebe-api": {
+            "replicas": int(config["semantic_search"]["api_replicas"]),
+            "images": {
+                "api": f"ghcr.io/heimgewebe/commonthing-api@{api_digest}",
+                "search-worker": f"ghcr.io/heimgewebe/commonthing-api@{api_digest}",
+                "ollama": str(config["semantic_search"]["ollama_image"]),
+            },
+        },
+        "weltgewebe-web": {
+            "replicas": int(config["runtime_binding"]["web_replicas"]),
+            "images": {
+                "web": f"ghcr.io/heimgewebe/commonthing-web@{web_digest}",
+            },
+        },
+    }
+    if (
+        not isinstance(pod_status, dict)
+        or set(pod_status) != set(expected_pod_contracts)
+    ):
+        raise RuntimeErrorEB("status does not prove the live application Pod contract")
+    for workload, expected in expected_pod_contracts.items():
+        observed = pod_status.get(workload)
+        expected_digests = {
+            name: image.rsplit("@", 1)[1]
+            for name, image in expected["images"].items()
+        }
+        if (
+            not isinstance(observed, dict)
+            or observed.get("expected_replicas") != expected["replicas"]
+            or observed.get("observed_replicas") != expected["replicas"]
+            or observed.get("requested_images_sha256")
+            != _stable_json_sha256(expected["images"])
+            or observed.get("images_canonical") is not True
+            or not isinstance(observed.get("pods"), dict)
+            or len(observed["pods"]) != expected["replicas"]
+            or any(
+                not isinstance(pod, dict)
+                or pod.get("ready") is not True
+                or pod.get("requested_images_sha256")
+                != _stable_json_sha256(expected["images"])
+                or not isinstance(pod.get("runtime_image_ids"), dict)
+                or set(pod["runtime_image_ids"]) != set(expected_digests)
+                or any(
+                    not _runtime_image_id_matches_digest(
+                        pod["runtime_image_ids"].get(container_name),
+                        expected_digest,
+                    )
+                    for container_name, expected_digest in expected_digests.items()
+                )
+                for pod in observed["pods"].values()
+            )
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the live application Pod contract: {workload}"
+            )
 
     runtime_status = status_payload.get("runtime_contract")
     runtime_binding = config["runtime_binding"]

@@ -601,10 +601,11 @@ spec:
                     "kind": "Node",
                     "metadata": {"name": runtime.VM_NAME},
                     "status": {
+                        "conditions": [{"type": "Ready", "status": "True"}],
                         "nodeInfo": {
                             "kubeletVersion": expected,
                             "osImage": "Ubuntu 24.04 LTS",
-                        }
+                        },
                     },
                 }
             ],
@@ -1387,6 +1388,8 @@ spec:
                 elif name == "release.json":
                     payload["source_commit"] = commit
                     payload["sha256"] = "1" * 64
+                    payload["api_digest"] = "sha256:" + "b" * 64
+                    payload["web_digest"] = "sha256:" + "c" * 64
                 elif name in {
                     "k3s.json",
                     "platform.json",
@@ -1444,7 +1447,84 @@ spec:
                         }
                         for name in runtime.EXPECTED_FLUX_KUSTOMIZATIONS
                     }
-                    runtime_binding = runtime.load_config()["runtime_binding"]
+                    config = runtime.load_config()
+                    payload["node_ready"] = True
+                    payload["kubelet_version"] = config["kubernetes"]["version"]
+                    payload["data_deployments"] = {
+                        name: {
+                            "available": True,
+                            "desired_replicas": expected["replicas"],
+                            "images_canonical": True,
+                            "images_sha256": runtime._stable_json_sha256(
+                                expected["images"]
+                            ),
+                        }
+                        for name, expected in (
+                            (
+                                name,
+                                runtime._versioned_data_deployment_contract(
+                                    runtime.CLUSTER / f"data/{name}.yaml", name
+                                ),
+                            )
+                            for name in ("postgres", "nats")
+                        )
+                    }
+                    runtime_binding = config["runtime_binding"]
+                    api_images = {
+                        "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64,
+                        "search-worker": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64,
+                        "ollama": config["semantic_search"]["ollama_image"],
+                    }
+                    web_images = {
+                        "web": "ghcr.io/heimgewebe/commonthing-web@sha256:" + "c" * 64,
+                    }
+                    payload["pods"] = {
+                        "weltgewebe-api": {
+                            "expected_replicas": int(
+                                config["semantic_search"]["api_replicas"]
+                            ),
+                            "observed_replicas": int(
+                                config["semantic_search"]["api_replicas"]
+                            ),
+                            "requested_images_sha256": runtime._stable_json_sha256(
+                                api_images
+                            ),
+                            "images_canonical": True,
+                            "pods": {
+                                "weltgewebe-api-0": {
+                                    "ready": True,
+                                    "requested_images_sha256": runtime._stable_json_sha256(
+                                        api_images
+                                    ),
+                                    "runtime_image_ids": {
+                                        name: "containerd://" + image.rsplit("@", 1)[1]
+                                        for name, image in api_images.items()
+                                    },
+                                }
+                            },
+                        },
+                        "weltgewebe-web": {
+                            "expected_replicas": int(runtime_binding["web_replicas"]),
+                            "observed_replicas": int(runtime_binding["web_replicas"]),
+                            "requested_images_sha256": runtime._stable_json_sha256(
+                                web_images
+                            ),
+                            "images_canonical": True,
+                            "pods": {
+                                f"weltgewebe-web-{index}": {
+                                    "ready": True,
+                                    "requested_images_sha256": runtime._stable_json_sha256(
+                                        web_images
+                                    ),
+                                    "runtime_image_ids": {
+                                        name: "containerd://" + image.rsplit("@", 1)[1]
+                                        for name, image in web_images.items()
+                                    },
+                                }
+                                for index in range(int(runtime_binding["web_replicas"]))
+                            },
+                        },
+                    }
                     payload["runtime_contract"] = {
                         "config_map_data_sha256": runtime._stable_json_sha256(
                             runtime_binding["config_map_data"]
@@ -1571,6 +1651,36 @@ spec:
             runtime.atomic_json(attempt_path, changed_attempt)
             with self.assertRaisesRegex(
                 runtime.RuntimeErrorEB, "live runtime configuration contract"
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["pods"]["weltgewebe-api"]["requested_images_sha256"] = (
+                "0" * 64
+            )
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "live application Pod contract"
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["pods"]["weltgewebe-api"]["pods"]["weltgewebe-api-0"][
+                "runtime_image_ids"
+            ]["api"] = "containerd://sha256:" + "0" * 64
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "live application Pod contract"
             ):
                 runtime.portability_report(root)
             status_path.write_text(original_status, encoding="utf-8")
@@ -2593,10 +2703,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "apiVersion": "v1",
             "kind": "Node",
             "metadata": {"name": runtime.VM_NAME},
-            "status": {"nodeInfo": {
-                "kubeletVersion": self.config["kubernetes"]["version"],
-                "osImage": "Ubuntu 24.04.3 LTS",
-            }},
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "nodeInfo": {
+                    "kubeletVersion": self.config["kubernetes"]["version"],
+                    "osImage": "Ubuntu 24.04.3 LTS",
+                },
+            },
         }
         self.node_inventory = {
             "apiVersion": "v1",
@@ -2753,6 +2866,96 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "cilium_network_policy_specs"
             ].items()
         ]
+        self.data_deployments = {}
+        for name in ("postgres", "nats"):
+            expected = runtime._versioned_data_deployment_contract(
+                runtime.CLUSTER / f"data/{name}.yaml", name
+            )
+            pod_spec = {
+                "containers": [
+                    {"name": container_name, "image": image}
+                    for container_name, image in expected["images"]["containers"].items()
+                ],
+                "initContainers": [
+                    {"name": container_name, "image": image}
+                    for container_name, image in expected["images"][
+                        "init_containers"
+                    ].items()
+                ],
+            }
+            self.data_deployments[name] = {
+                "metadata": {
+                    "name": name,
+                    "namespace": runtime.DATA_NAMESPACE,
+                    "generation": 1,
+                },
+                "spec": {
+                    "replicas": expected["replicas"],
+                    "template": {"spec": pod_spec},
+                },
+                "status": {
+                    "observedGeneration": 1,
+                    "replicas": expected["replicas"],
+                    "updatedReplicas": expected["replicas"],
+                    "readyReplicas": expected["replicas"],
+                    "availableReplicas": expected["replicas"],
+                    "unavailableReplicas": 0,
+                    "conditions": [{"type": "Available", "status": "True"}],
+                },
+            }
+
+        api_image = "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64
+        web_image = "ghcr.io/heimgewebe/commonthing-web@sha256:" + "c" * 64
+        api_pod_images = {
+            "api": api_image,
+            "search-worker": api_image,
+            "ollama": self.config["semantic_search"]["ollama_image"],
+        }
+        web_pod_images = {"web": web_image}
+
+        def application_pod(
+            workload: str,
+            ordinal: int,
+            images: dict[str, str],
+        ) -> dict:
+            return {
+                "metadata": {
+                    "name": f"{workload}-{ordinal}",
+                    "namespace": runtime.APP_NAMESPACE,
+                    "labels": {"app.kubernetes.io/name": workload},
+                },
+                "spec": {
+                    "containers": [
+                        {"name": name, "image": image}
+                        for name, image in images.items()
+                    ],
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [
+                        {
+                            "name": name,
+                            "ready": True,
+                            "state": {"running": {"startedAt": "2026-09-27T00:00:00Z"}},
+                            "imageID": f"docker-pullable://{image}",
+                        }
+                        for name, image in images.items()
+                    ],
+                },
+            }
+
+        self.application_pods = {
+            "weltgewebe-api": [
+                application_pod("weltgewebe-api", index, api_pod_images)
+                for index in range(int(self.config["semantic_search"]["api_replicas"]))
+            ],
+            "weltgewebe-web": [
+                application_pod("weltgewebe-web", index, web_pod_images)
+                for index in range(int(self.config["runtime_binding"]["web_replicas"]))
+            ],
+        }
+
         self.live_secrets = {
             f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database": {
                 "metadata": {
@@ -3006,8 +3209,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             self.root / "secrets/database.json",
             {"username": "user", "database": "db", "password": "pass"},
         )
-        self.registry_source = self.root / "registry-source.json"
-        self.registry_source.write_bytes(b"{}")
+        self.registry_source = self.root / "secrets/registry.json"
+        runtime.atomic_bytes(self.registry_source, b"{}")
         runtime.atomic_json(
             self.root / "receipts/secrets.json",
             {
@@ -3107,6 +3310,24 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             return {"items": self.kube_proxy_daemonsets}
         if arguments == ["-n", "kube-system", "get", "pods"]:
             return {"items": self.kube_proxy_pods}
+        if arguments == [
+            "-n",
+            runtime.APP_NAMESPACE,
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=weltgewebe-api",
+        ]:
+            return {"items": self.application_pods["weltgewebe-api"]}
+        if arguments == [
+            "-n",
+            runtime.APP_NAMESPACE,
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=weltgewebe-web",
+        ]:
+            return {"items": self.application_pods["weltgewebe-web"]}
         if "daemonset" in arguments and arguments[-1] == "cilium":
             return self.cilium_daemonset
         if arguments == [
@@ -3154,6 +3375,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     "conditions": [{"type": "Complete", "status": "True"}],
                 },
             }
+        if (
+            len(arguments) == 5
+            and arguments[:4]
+            == ["-n", runtime.DATA_NAMESPACE, "get", "deployment"]
+            and arguments[-1] in self.data_deployments
+        ):
+            return self.data_deployments[str(arguments[-1])]
         if "deployment" in arguments:
             deployment_name = str(arguments[-1])
             replicas = (
@@ -3608,6 +3836,119 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             },
         )
 
+    def test_status_requires_ready_nonterminating_node(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        healthy = json.loads(json.dumps(self.node))
+
+        self.node["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not Ready"):
+            runtime.status(self.root)
+
+        self.node = json.loads(json.dumps(healthy))
+        self.node_inventory["items"] = [self.node]
+        self.node["status"]["conditions"] = []
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not Ready"):
+            runtime.status(self.root)
+
+        self.node = json.loads(json.dumps(healthy))
+        self.node_inventory["items"] = [self.node]
+        self.node["metadata"]["deletionTimestamp"] = "2026-09-27T00:00:00Z"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "identity/deletion"):
+            runtime.status(self.root)
+
+        self.node = healthy
+        self.node_inventory["items"] = [self.node]
+
+    def test_status_requires_live_data_deployments(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        healthy = json.loads(json.dumps(self.data_deployments))
+
+        result = runtime.status(self.root)
+        self.assertEqual(set(result["data_deployments"]), {"postgres", "nats"})
+        self.assertTrue(result["data_deployments"]["postgres"]["images_canonical"])
+        self.assertTrue(result["data_deployments"]["nats"]["images_canonical"])
+
+        self.data_deployments = json.loads(json.dumps(healthy))
+        self.data_deployments["postgres"]["spec"]["replicas"] = 2
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not currently available"):
+            runtime.status(self.root)
+
+        self.data_deployments = json.loads(json.dumps(healthy))
+        self.data_deployments["nats"]["spec"]["template"]["spec"]["containers"][0][
+            "image"
+        ] = "nats:2.10-alpine@sha256:" + "0" * 64
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "images drifted"):
+            runtime.status(self.root)
+
+        self.data_deployments = healthy
+
+    def test_status_requires_running_application_pod_images(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        healthy_pods = json.loads(json.dumps(self.application_pods))
+        result = runtime.status(self.root)
+        self.assertEqual(
+            set(result["pods"]),
+            {"weltgewebe-api", "weltgewebe-web"},
+        )
+        self.assertTrue(result["pods"]["weltgewebe-api"]["images_canonical"])
+        self.assertTrue(result["pods"]["weltgewebe-web"]["images_canonical"])
+
+        self.application_pods = json.loads(json.dumps(healthy_pods))
+        api_pod = self.application_pods["weltgewebe-api"][0]
+        next(
+            container
+            for container in api_pod["spec"]["containers"]
+            if container["name"] == "api"
+        )["image"] = "ghcr.io/heimgewebe/commonthing-api@sha256:" + "0" * 64
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "requested images drifted"
+        ):
+            runtime.status(self.root)
+
+        self.application_pods = json.loads(json.dumps(healthy_pods))
+        self.application_pods["weltgewebe-web"] = self.application_pods[
+            "weltgewebe-web"
+        ][:-1]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "exact replica contract"
+        ):
+            runtime.status(self.root)
+
+        self.application_pods = json.loads(json.dumps(healthy_pods))
+        api_status = next(
+            item
+            for item in self.application_pods["weltgewebe-api"][0]["status"][
+                "containerStatuses"
+            ]
+            if item["name"] == "api"
+        )
+        api_status["imageID"] = (
+            "docker-pullable://ghcr.io/heimgewebe/commonthing-api@sha256:"
+            + "0" * 64
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "runtime image ID drifted"
+        ):
+            runtime.status(self.root)
+
+        self.application_pods = json.loads(json.dumps(healthy_pods))
+        api_status = next(
+            item
+            for item in self.application_pods["weltgewebe-api"][0]["status"][
+                "containerStatuses"
+            ]
+            if item["name"] == "api"
+        )
+        api_status["imageID"] = "containerd://sha256:" + "b" * 64
+        result = runtime.status(self.root)
+        self.assertTrue(result["pods"]["weltgewebe-api"]["images_canonical"])
+
+        self.application_pods = healthy_pods
+
     def test_status_requires_live_expected_secrets_without_recording_values(self) -> None:
         self.write_vm_receipt()
         self.prepare_status()
@@ -3682,6 +4023,14 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         ]["data"][".dockerconfigjson"] = "***not-base64***"
         cases.append(("malformed-registry-base64", malformed_registry))
 
+        wrong_registry = json.loads(json.dumps(healthy))
+        wrong_registry[
+            f"{runtime.APP_NAMESPACE}/commonthing-experiment-b-registry"
+        ]["data"][".dockerconfigjson"] = base64.b64encode(
+            b'{"auths":{"ghcr.io":{"auth":"different"}}}'
+        ).decode("ascii")
+        cases.append(("wrong-valid-registry-payload", wrong_registry))
+
         malformed_base64 = json.loads(json.dumps(healthy))
         malformed_base64[
             f"{runtime.APP_NAMESPACE}/weltgewebe-runtime"
@@ -3700,16 +4049,9 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 self.assertFalse((self.root / "receipts/status.json").exists())
                 self.assertFalse((self.root / "receipts/portability.json").exists())
 
-        registry_content_drift = json.loads(json.dumps(healthy))
-        registry_content_drift[
-            f"{runtime.APP_NAMESPACE}/commonthing-experiment-b-registry"
-        ]["data"][".dockerconfigjson"] = base64.b64encode(
-            b'{"auths":{"ghcr.io":{"auth":"different"}}}'
-        ).decode("ascii")
-        self.live_secrets = registry_content_drift
-        result = runtime.status(self.root)
-        self.assertFalse(result["secrets"]["registry"]["content_verified"])
         self.live_secrets = healthy
+        result = runtime.status(self.root)
+        self.assertTrue(result["secrets"]["registry"]["content_verified"])
 
         changed_db = {
             "username": "user2",
