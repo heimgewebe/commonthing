@@ -826,6 +826,14 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             status.index('run([kubectl, "get", "nodes", "-o", "json"]'),
         )
         self.assertIn("_complete_live_check_attempt(", status)
+        self.assertGreater(
+            status.index("_require_live_runtime_contract(root, config)"),
+            status.index("_final_recovery_state_readback(root, source_commit)"),
+        )
+        self.assertLess(
+            status.index("_require_live_runtime_contract(root, config)"),
+            status.index("result = {"),
+        )
 
         for function, begin_marker in (
             (runtime.apply_release, "_begin_release_attempt("),
@@ -1256,6 +1264,26 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                         "kube_proxy_replacement": True,
                         "kube_proxy_present": False,
                     }
+                    runtime_binding = runtime.load_config()["runtime_binding"]
+                    payload["runtime_contract"] = {
+                        "config_map_data_sha256": runtime._stable_json_sha256(
+                            runtime_binding["config_map_data"]
+                        ),
+                        "network_policy_specs_sha256": runtime._stable_json_sha256(
+                            runtime_binding["network_policy_specs"]
+                        ),
+                        "network_policy_names": sorted(
+                            runtime_binding["network_policy_specs"]
+                        ),
+                        "cilium_network_policy_specs_sha256": runtime._stable_json_sha256(
+                            runtime_binding["cilium_network_policy_specs"]
+                        ),
+                        "cilium_network_policy_names": sorted(
+                            runtime_binding["cilium_network_policy_specs"]
+                        ),
+                        "temporary_model_egress_absent": True,
+                        "policy_specs_canonical": True,
+                    }
                 (receipts / name).write_text(
                     json.dumps(payload) + "\n", encoding="utf-8"
                 )
@@ -1300,6 +1328,20 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             status_path.write_text(original_status, encoding="utf-8")
             attempt_path.write_text(original_attempt, encoding="utf-8")
             self.assertEqual(runtime.portability_report(root)["status"], "pass")
+
+            changed_status = json.loads(original_status)
+            changed_status["runtime_contract"]["config_map_data_sha256"] = "0" * 64
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "live runtime configuration contract",
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
             # A replacement receipt with a valid identity still needs a new live status.
             changed = json.loads(vm_receipt)
             changed["substrate"]["uuid"] = "44444444-4444-4444-8444-444444444444"
@@ -2332,6 +2374,36 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         }
         self.kube_proxy_daemonsets = []
         self.kube_proxy_pods = []
+        runtime_binding = self.config["runtime_binding"]
+        self.runtime_config_map = {
+            "metadata": {
+                "namespace": runtime.APP_NAMESPACE,
+                "name": "weltgewebe-runtime",
+            },
+            "data": json.loads(json.dumps(runtime_binding["config_map_data"])),
+        }
+        self.network_policies = [
+            {
+                "metadata": {
+                    "namespace": runtime.APP_NAMESPACE,
+                    "name": name,
+                },
+                "spec": json.loads(json.dumps(spec)),
+            }
+            for name, spec in runtime_binding["network_policy_specs"].items()
+        ]
+        self.cilium_network_policies = [
+            {
+                "metadata": {
+                    "namespace": runtime.APP_NAMESPACE,
+                    "name": name,
+                },
+                "spec": json.loads(json.dumps(spec)),
+            }
+            for name, spec in runtime_binding[
+                "cilium_network_policy_specs"
+            ].items()
+        ]
         self.live_secrets = {
             f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database": {
                 "metadata": {
@@ -2631,6 +2703,18 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
 
     def kubernetes_fixture(self, _root, arguments):
+        if arguments == [
+            "-n", runtime.APP_NAMESPACE, "get", "configmap", "weltgewebe-runtime"
+        ]:
+            return self.runtime_config_map
+        if arguments == [
+            "-n", runtime.APP_NAMESPACE, "get", "networkpolicies"
+        ]:
+            return {"items": self.network_policies}
+        if arguments == [
+            "-n", runtime.APP_NAMESPACE, "get", "ciliumnetworkpolicies"
+        ]:
+            return {"items": self.cilium_network_policies}
         if arguments == ["-n", "kube-system", "get", "daemonsets"]:
             return {"items": self.kube_proxy_daemonsets}
         if arguments == ["-n", "kube-system", "get", "pods"]:
@@ -2879,6 +2963,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertEqual(result["vm_substrate"], receipt["substrate"])
         self.assertEqual(result["cilium"]["chart"], self.cilium_chart)
         self.assertFalse(result["cilium"]["kube_proxy_present"])
+        self.assertTrue(result["runtime_contract"]["policy_specs_canonical"])
+        self.assertTrue(
+            result["runtime_contract"]["temporary_model_egress_absent"]
+        )
         self.assertEqual(result["vm_create_sha256"], runtime.sha256_file(
             self.root / "receipts/vm-create.json",
         ))
@@ -2950,6 +3038,63 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "kube-proxy is present"):
             runtime.status(self.root)
         self.kube_proxy_pods = []
+
+    def test_status_revalidates_runtime_config_and_network_policy_contract(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        healthy_config_map = json.loads(json.dumps(self.runtime_config_map))
+        healthy_policies = json.loads(json.dumps(self.network_policies))
+        healthy_cilium = json.loads(json.dumps(self.cilium_network_policies))
+
+        self.runtime_config_map["data"]["NATS_URL"] = "nats://drift.invalid:4222"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "runtime ConfigMap drifted"):
+            runtime.status(self.root)
+        self.runtime_config_map = healthy_config_map
+
+        self.network_policies.append(
+            {
+                "metadata": {
+                    "namespace": runtime.APP_NAMESPACE,
+                    "name": "commonthing-experiment-b-model-bootstrap-egress",
+                },
+                "spec": {
+                    "podSelector": {},
+                    "policyTypes": ["Egress"],
+                    "egress": [
+                        {
+                            "to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}],
+                            "ports": [{"protocol": "TCP", "port": 443}],
+                        }
+                    ],
+                },
+            }
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "NetworkPolicy contract drifted"):
+            runtime.status(self.root)
+        self.network_policies = json.loads(json.dumps(healthy_policies))
+
+        self.network_policies[0]["spec"] = {
+            "podSelector": {},
+            "policyTypes": ["Egress"],
+            "egress": [{"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}]}],
+        }
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "NetworkPolicy contract drifted"):
+            runtime.status(self.root)
+        self.network_policies = healthy_policies
+
+        self.cilium_network_policies[0]["spec"]["egress"] = [
+            {"toEntities": ["world"]}
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "CiliumNetworkPolicy contract drifted"
+        ):
+            runtime.status(self.root)
+        self.cilium_network_policies = healthy_cilium
+
+        result = runtime.status(self.root)
+        self.assertTrue(result["runtime_contract"]["policy_specs_canonical"])
+        self.assertTrue(result["runtime_contract"]["temporary_model_egress_absent"])
 
     def test_status_requires_live_expected_secrets_without_recording_values(self) -> None:
         self.write_vm_receipt()

@@ -171,6 +171,57 @@ def validate_config(config: dict[str, Any]) -> None:
         "memory": "512Mi",
     }:
         raise ContractError("Experiment-B API resource-limit contract drifted")
+    runtime_config = runtime_binding.get("config_map_data")
+    if (
+        not isinstance(runtime_config, dict)
+        or not runtime_config
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in runtime_config.items()
+        )
+    ):
+        raise ContractError("Experiment-B runtime ConfigMap contract is invalid")
+    expected_runtime_config = {
+        "APP_BASE_URL": "http://commonthing-experiment-b.invalid",
+        "AUTH_COOKIE_SECURE": "0",
+        "AUTH_PUBLIC_LOGIN": "0",
+        "NATS_URL": "nats://nats.commonthing-data.svc.cluster.local:4222",
+        "WELTGEWEBE_SEARCH_GENERATION_ID": semantic["generation_id"],
+        "WELTGEWEBE_SEARCH_BACKFILL_MAX_JOBS": "100",
+        "WELTGEWEBE_SEARCH_OLLAMA_URL": semantic["ollama_url"],
+        "WELTGEWEBE_SEARCH_PROVIDER": semantic["provider"],
+        "WELTGEWEBE_SEARCH_MODEL_ID": semantic["model_id"],
+        "WELTGEWEBE_SEARCH_MODEL_REVISION": semantic["model_revision"],
+        "WELTGEWEBE_SEARCH_RUNTIME_IDENTITY": semantic["runtime_identity"],
+        "WELTGEWEBE_SEARCH_DIMENSION": str(semantic["dimension"]),
+        "WELTGEWEBE_SEARCH_WORKER_INTERVAL_SECONDS": "15",
+    }
+    if any(
+        runtime_config.get(key) != value
+        for key, value in expected_runtime_config.items()
+    ):
+        raise ContractError("Experiment-B runtime ConfigMap values drifted")
+    network_policy_specs = runtime_binding.get("network_policy_specs")
+    if (
+        not isinstance(network_policy_specs, dict)
+        or set(network_policy_specs)
+        != {
+            "allow-api-data-egress",
+            "allow-dns",
+            "allow-migration-postgres-egress",
+            "allow-same-namespace",
+            "default-deny",
+        }
+        or any(not isinstance(spec, dict) for spec in network_policy_specs.values())
+    ):
+        raise ContractError("Experiment-B NetworkPolicy contract drifted")
+    cilium_policy_specs = runtime_binding.get("cilium_network_policy_specs")
+    if (
+        not isinstance(cilium_policy_specs, dict)
+        or set(cilium_policy_specs) != {"allow-cilium-gateway"}
+        or any(not isinstance(spec, dict) for spec in cilium_policy_specs.values())
+    ):
+        raise ContractError("Experiment-B CiliumNetworkPolicy contract drifted")
     for value in expected_runtime_paths.values():
         if not (ROOT / value).is_file():
             raise ContractError(f"Experiment-B runtime binding is missing: {value}")

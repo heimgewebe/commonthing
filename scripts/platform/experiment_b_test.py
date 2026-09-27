@@ -13,6 +13,7 @@ import experiment_b as eb
 ROOT = Path(__file__).resolve().parents[2]
 CLUSTER = ROOT / "platform/clusters/experiment-b"
 OVERLAY = ROOT / "platform/apps/weltgewebe/overlays/experiment-b"
+BASE = ROOT / "platform/apps/weltgewebe/base"
 
 
 class ExperimentBContractTests(unittest.TestCase):
@@ -210,6 +211,66 @@ class ExperimentBContractTests(unittest.TestCase):
         self.assertIn("storageClassName: local-path", storage)
         self.assertIn("storage: 10Gi", storage)
 
+
+    def test_final_runtime_contract_matches_base_and_experiment_b_sources(self) -> None:
+        config = json.loads((CLUSTER / "config.json").read_text(encoding="utf-8"))
+        runtime_binding = config["runtime_binding"]
+
+        base_config_map = yaml.safe_load(
+            (BASE / "config-map.yaml").read_text(encoding="utf-8")
+        )
+        patch_config_map = yaml.safe_load(
+            (OVERLAY / "config-map-patch.yaml").read_text(encoding="utf-8")
+        )
+        expected_config_data = {
+            **base_config_map["data"],
+            **patch_config_map["data"],
+        }
+        self.assertEqual(runtime_binding["config_map_data"], expected_config_data)
+
+        expected_specs = {}
+        expected_cilium_specs = {}
+        base_kustomization = yaml.safe_load(
+            (BASE / "kustomization.yaml").read_text(encoding="utf-8")
+        )
+        for resource in base_kustomization["resources"]:
+            for document in yaml.safe_load_all(
+                (BASE / resource).read_text(encoding="utf-8")
+            ):
+                if not isinstance(document, dict):
+                    continue
+                name = document.get("metadata", {}).get("name")
+                if document.get("kind") == "NetworkPolicy":
+                    expected_specs[name] = document["spec"]
+                elif document.get("kind") == "CiliumNetworkPolicy":
+                    expected_cilium_specs[name] = document["spec"]
+
+        network_patch = yaml.safe_load(
+            (OVERLAY / "network-policy-api-data-egress-patch.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        patch_name = network_patch["metadata"]["name"]
+        expected_specs[patch_name] = {
+            **expected_specs[patch_name],
+            **network_patch["spec"],
+        }
+        migration_policy = yaml.safe_load(
+            (
+                CLUSTER / "namespaces/migration-postgres-egress.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        expected_specs[migration_policy["metadata"]["name"]] = migration_policy["spec"]
+
+        self.assertEqual(runtime_binding["network_policy_specs"], expected_specs)
+        self.assertEqual(
+            runtime_binding["cilium_network_policy_specs"],
+            expected_cilium_specs,
+        )
+        self.assertNotIn(
+            "commonthing-experiment-b-model-bootstrap-egress",
+            runtime_binding["network_policy_specs"],
+        )
 
     def test_t048_api_limits_match_release_manifest_contract(self) -> None:
         config = json.loads((CLUSTER / "config.json").read_text(encoding="utf-8"))

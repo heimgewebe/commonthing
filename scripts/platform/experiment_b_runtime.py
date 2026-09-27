@@ -2266,6 +2266,124 @@ def _require_live_cilium_contract(
     }
 
 
+def _stable_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _require_live_runtime_contract(
+    root: Path, config: dict[str, Any]
+) -> dict[str, Any]:
+    runtime_binding = config.get("runtime_binding", {})
+    expected_config_data = runtime_binding.get("config_map_data")
+    expected_network_specs = runtime_binding.get("network_policy_specs")
+    expected_cilium_specs = runtime_binding.get("cilium_network_policy_specs")
+    if (
+        not isinstance(expected_config_data, dict)
+        or not isinstance(expected_network_specs, dict)
+        or not isinstance(expected_cilium_specs, dict)
+    ):
+        raise RuntimeErrorEB("Experiment-B runtime contract configuration is invalid")
+
+    config_map = _kubectl_json(
+        root,
+        ["-n", APP_NAMESPACE, "get", "configmap", "weltgewebe-runtime"],
+    )
+    config_metadata = config_map.get("metadata", {})
+    live_config_data = config_map.get("data")
+    if (
+        not isinstance(config_metadata, dict)
+        or config_metadata.get("namespace") != APP_NAMESPACE
+        or config_metadata.get("name") != "weltgewebe-runtime"
+        or config_metadata.get("deletionTimestamp") is not None
+        or config_map.get("immutable") not in (None, False)
+        or config_map.get("binaryData") not in (None, {})
+        or not isinstance(live_config_data, dict)
+        or live_config_data != expected_config_data
+    ):
+        raise RuntimeErrorEB("live Experiment-B runtime ConfigMap drifted")
+
+    policy_items = _kubectl_json(
+        root, ["-n", APP_NAMESPACE, "get", "networkpolicies"]
+    ).get("items")
+    if not isinstance(policy_items, list):
+        raise RuntimeErrorEB("live Experiment-B NetworkPolicy inventory is invalid")
+    live_network_specs: dict[str, Any] = {}
+    for item in policy_items:
+        if not isinstance(item, dict):
+            raise RuntimeErrorEB("live Experiment-B NetworkPolicy inventory is invalid")
+        metadata = item.get("metadata", {})
+        spec = item.get("spec")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("namespace") != APP_NAMESPACE
+            or not isinstance(metadata.get("name"), str)
+            or metadata.get("deletionTimestamp") is not None
+            or not isinstance(spec, dict)
+        ):
+            raise RuntimeErrorEB("live Experiment-B NetworkPolicy inventory is invalid")
+        name = str(metadata["name"])
+        if name in live_network_specs:
+            raise RuntimeErrorEB("live Experiment-B NetworkPolicy inventory is duplicated")
+        live_network_specs[name] = spec
+    if live_network_specs != expected_network_specs:
+        raise RuntimeErrorEB("live Experiment-B NetworkPolicy contract drifted")
+
+    cilium_items = _kubectl_json(
+        root, ["-n", APP_NAMESPACE, "get", "ciliumnetworkpolicies"]
+    ).get("items")
+    if not isinstance(cilium_items, list):
+        raise RuntimeErrorEB("live Experiment-B CiliumNetworkPolicy inventory is invalid")
+    live_cilium_specs: dict[str, Any] = {}
+    for item in cilium_items:
+        if not isinstance(item, dict):
+            raise RuntimeErrorEB(
+                "live Experiment-B CiliumNetworkPolicy inventory is invalid"
+            )
+        metadata = item.get("metadata", {})
+        spec = item.get("spec")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("namespace") != APP_NAMESPACE
+            or not isinstance(metadata.get("name"), str)
+            or metadata.get("deletionTimestamp") is not None
+            or not isinstance(spec, dict)
+        ):
+            raise RuntimeErrorEB(
+                "live Experiment-B CiliumNetworkPolicy inventory is invalid"
+            )
+        name = str(metadata["name"])
+        if name in live_cilium_specs:
+            raise RuntimeErrorEB(
+                "live Experiment-B CiliumNetworkPolicy inventory is duplicated"
+            )
+        live_cilium_specs[name] = spec
+    if live_cilium_specs != expected_cilium_specs:
+        raise RuntimeErrorEB(
+            "live Experiment-B CiliumNetworkPolicy contract drifted"
+        )
+
+    return {
+        "config_map_data_sha256": _stable_json_sha256(live_config_data),
+        "network_policy_specs_sha256": _stable_json_sha256(live_network_specs),
+        "network_policy_names": sorted(live_network_specs),
+        "cilium_network_policy_specs_sha256": _stable_json_sha256(
+            live_cilium_specs
+        ),
+        "cilium_network_policy_names": sorted(live_cilium_specs),
+        "temporary_model_egress_absent": (
+            "commonthing-experiment-b-model-bootstrap-egress"
+            not in live_network_specs
+        ),
+        "policy_specs_canonical": True,
+    }
+
+
 def status(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
@@ -2419,6 +2537,7 @@ def status(root: Path) -> dict[str, Any]:
     httproute_readback = _require_httproute_ready(httproute)
     gateway_data_plane = _gateway_data_plane_readback(root, source_commit)
     recovery_state = _final_recovery_state_readback(root, source_commit)
+    runtime_contract_readback = _require_live_runtime_contract(root, config)
 
     result = {
         "schema_version": 1,
@@ -2431,6 +2550,7 @@ def status(root: Path) -> dict[str, Any]:
         "kubelet_version": kubelet,
         "os_image": os_image,
         "cilium": cilium_readback,
+        "runtime_contract": runtime_contract_readback,
         "flux_source_revision": source_revision,
         "flux": flux_readback,
         "deployments": deployment_readback,
@@ -4733,6 +4853,27 @@ def portability_report(root: Path) -> dict[str, Any]:
         or cilium_status.get("kube_proxy_present") is not False
     ):
         raise RuntimeErrorEB("status does not prove the live Cilium contract")
+
+    runtime_status = payloads["status.json"].get("runtime_contract")
+    runtime_binding = config["runtime_binding"]
+    if (
+        not isinstance(runtime_status, dict)
+        or runtime_status.get("config_map_data_sha256")
+        != _stable_json_sha256(runtime_binding["config_map_data"])
+        or runtime_status.get("network_policy_specs_sha256")
+        != _stable_json_sha256(runtime_binding["network_policy_specs"])
+        or runtime_status.get("network_policy_names")
+        != sorted(runtime_binding["network_policy_specs"])
+        or runtime_status.get("cilium_network_policy_specs_sha256")
+        != _stable_json_sha256(runtime_binding["cilium_network_policy_specs"])
+        or runtime_status.get("cilium_network_policy_names")
+        != sorted(runtime_binding["cilium_network_policy_specs"])
+        or runtime_status.get("temporary_model_egress_absent") is not True
+        or runtime_status.get("policy_specs_canonical") is not True
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the live runtime configuration contract"
+        )
 
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB(
