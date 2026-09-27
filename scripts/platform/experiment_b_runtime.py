@@ -2347,11 +2347,11 @@ def _pod_spec_images(pod_spec: Any, context: str) -> dict[str, dict[str, str]]:
     return result
 
 
-def _expected_cilium_daemonset_images(
+def _expected_cilium_workload_images(
     root: Path,
     config: dict[str, Any],
     toolchain_receipt: dict[str, Any],
-) -> dict[str, dict[str, str]]:
+) -> dict[str, dict[str, dict[str, str]]]:
     tools = toolchain_receipt.get("tools", {})
     artifacts = toolchain_receipt.get("artifacts", {})
     helm = tools.get("helm") if isinstance(tools, dict) else None
@@ -2377,19 +2377,29 @@ def _expected_cilium_daemonset_images(
         documents = list(yaml.safe_load_all(rendered))
     except yaml.YAMLError as exc:
         raise RuntimeErrorEB("pinned Cilium chart render is invalid") from exc
-    daemonsets = [
-        document
-        for document in documents
-        if isinstance(document, dict)
-        and document.get("kind") == "DaemonSet"
-        and document.get("metadata", {}).get("name") == "cilium"
-    ]
-    if len(daemonsets) != 1:
-        raise RuntimeErrorEB(
-            "pinned Cilium chart does not render exactly one cilium DaemonSet"
-        )
-    pod_spec = daemonsets[0].get("spec", {}).get("template", {}).get("spec")
-    return _pod_spec_images(pod_spec, "pinned Cilium DaemonSet")
+    def workload_images(kind: str, name: str, context: str) -> dict[str, dict[str, str]]:
+        workloads = [
+            document
+            for document in documents
+            if isinstance(document, dict)
+            and document.get("kind") == kind
+            and document.get("metadata", {}).get("name") == name
+        ]
+        if len(workloads) != 1:
+            raise RuntimeErrorEB(
+                f"pinned Cilium chart does not render exactly one {kind} {name}"
+            )
+        pod_spec = workloads[0].get("spec", {}).get("template", {}).get("spec")
+        return _pod_spec_images(pod_spec, context)
+
+    return {
+        "daemonset": workload_images(
+            "DaemonSet", "cilium", "pinned Cilium DaemonSet"
+        ),
+        "operator": workload_images(
+            "Deployment", "cilium-operator", "pinned Cilium operator Deployment"
+        ),
+    }
 
 
 def _require_live_cilium_contract(
@@ -2477,16 +2487,39 @@ def _require_live_cilium_contract(
     ):
         raise RuntimeErrorEB("live Cilium DaemonSet is not fully converged")
 
-    expected_images = _expected_cilium_daemonset_images(
+    expected_workload_images = _expected_cilium_workload_images(
         root, config, toolchain_receipt
     )
     live_images = _pod_spec_images(
         daemonset.get("spec", {}).get("template", {}).get("spec"),
         "live Cilium DaemonSet",
     )
-    if live_images != expected_images:
+    if live_images != expected_workload_images["daemonset"]:
         raise RuntimeErrorEB(
             "live Cilium DaemonSet images drifted from the pinned chart render"
+        )
+
+    operator = _kubectl_json(
+        root, ["-n", "kube-system", "get", "deployment", "cilium-operator"]
+    )
+    operator_metadata = operator.get("metadata", {})
+    if (
+        not isinstance(operator_metadata, dict)
+        or operator_metadata.get("name") != "cilium-operator"
+        or operator_metadata.get("namespace") != "kube-system"
+        or operator_metadata.get("deletionTimestamp") is not None
+    ):
+        raise RuntimeErrorEB("live Cilium operator Deployment identity drifted")
+    operator_availability = _deployment_availability_snapshot(
+        operator, "cilium-operator", 1
+    )
+    operator_images = _pod_spec_images(
+        operator.get("spec", {}).get("template", {}).get("spec"),
+        "live Cilium operator Deployment",
+    )
+    if operator_images != expected_workload_images["operator"]:
+        raise RuntimeErrorEB(
+            "live Cilium operator images drifted from the pinned chart render"
         )
 
     proxy_daemonsets = _kubectl_json(
@@ -2532,6 +2565,9 @@ def _require_live_cilium_contract(
         "daemonset_ready": ready,
         "daemonset_images": live_images,
         "daemonset_images_canonical": True,
+        "operator": operator_availability,
+        "operator_images": operator_images,
+        "operator_images_canonical": True,
         "kube_proxy_present": False,
     }
 
@@ -2546,6 +2582,41 @@ def _stable_json_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _versioned_network_policy_specs(path: Path, namespace: str) -> dict[str, Any]:
+    try:
+        documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeErrorEB(
+            f"versioned NetworkPolicy contract is unreadable: {namespace}"
+        ) from exc
+    specs: dict[str, Any] = {}
+    for document in documents:
+        if not isinstance(document, dict) or document.get("kind") != "NetworkPolicy":
+            continue
+        metadata = document.get("metadata", {})
+        spec = document.get("spec")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("namespace") != namespace
+            or not isinstance(metadata.get("name"), str)
+            or not isinstance(spec, dict)
+        ):
+            raise RuntimeErrorEB(
+                f"versioned NetworkPolicy contract is invalid: {namespace}"
+            )
+        name = str(metadata["name"])
+        if name in specs:
+            raise RuntimeErrorEB(
+                f"versioned NetworkPolicy contract contains duplicate: {namespace}/{name}"
+            )
+        specs[name] = spec
+    if not specs:
+        raise RuntimeErrorEB(
+            f"versioned NetworkPolicy contract is empty: {namespace}"
+        )
+    return specs
+
+
 def _require_live_runtime_contract(
     root: Path, config: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2553,6 +2624,9 @@ def _require_live_runtime_contract(
     expected_config_data = runtime_binding.get("config_map_data")
     expected_network_specs = runtime_binding.get("network_policy_specs")
     expected_cilium_specs = runtime_binding.get("cilium_network_policy_specs")
+    expected_data_network_specs = _versioned_network_policy_specs(
+        CLUSTER / "data/network-policy.yaml", DATA_NAMESPACE
+    )
     if (
         not isinstance(expected_config_data, dict)
         or not isinstance(expected_network_specs, dict)
@@ -2604,6 +2678,42 @@ def _require_live_runtime_contract(
     if live_network_specs != expected_network_specs:
         raise RuntimeErrorEB("live Experiment-B NetworkPolicy contract drifted")
 
+    data_policy_items = _kubectl_json(
+        root, ["-n", DATA_NAMESPACE, "get", "networkpolicies"]
+    ).get("items")
+    if not isinstance(data_policy_items, list):
+        raise RuntimeErrorEB(
+            "live Experiment-B data NetworkPolicy inventory is invalid"
+        )
+    live_data_network_specs: dict[str, Any] = {}
+    for item in data_policy_items:
+        if not isinstance(item, dict):
+            raise RuntimeErrorEB(
+                "live Experiment-B data NetworkPolicy inventory is invalid"
+            )
+        metadata = item.get("metadata", {})
+        spec = item.get("spec")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("namespace") != DATA_NAMESPACE
+            or not isinstance(metadata.get("name"), str)
+            or metadata.get("deletionTimestamp") is not None
+            or not isinstance(spec, dict)
+        ):
+            raise RuntimeErrorEB(
+                "live Experiment-B data NetworkPolicy inventory is invalid"
+            )
+        name = str(metadata["name"])
+        if name in live_data_network_specs:
+            raise RuntimeErrorEB(
+                "live Experiment-B data NetworkPolicy inventory is duplicated"
+            )
+        live_data_network_specs[name] = spec
+    if live_data_network_specs != expected_data_network_specs:
+        raise RuntimeErrorEB(
+            "live Experiment-B data NetworkPolicy contract drifted"
+        )
+
     cilium_items = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "ciliumnetworkpolicies"]
     ).get("items")
@@ -2642,6 +2752,10 @@ def _require_live_runtime_contract(
         "config_map_data_sha256": _stable_json_sha256(live_config_data),
         "network_policy_specs_sha256": _stable_json_sha256(live_network_specs),
         "network_policy_names": sorted(live_network_specs),
+        "data_network_policy_specs_sha256": _stable_json_sha256(
+            live_data_network_specs
+        ),
+        "data_network_policy_names": sorted(live_data_network_specs),
         "cilium_network_policy_specs_sha256": _stable_json_sha256(
             live_cilium_specs
         ),
@@ -5134,6 +5248,10 @@ def portability_report(root: Path) -> dict[str, Any]:
         or cilium_status.get("gateway_api") is not True
         or cilium_status.get("kube_proxy_replacement") is not True
         or cilium_status.get("daemonset_images_canonical") is not True
+        or cilium_status.get("operator_images_canonical") is not True
+        or not isinstance(cilium_status.get("operator"), dict)
+        or cilium_status["operator"].get("available") is not True
+        or cilium_status["operator"].get("desired_replicas") != 1
         or cilium_status.get("kube_proxy_present") is not False
     ):
         raise RuntimeErrorEB("status does not prove the live Cilium contract")
@@ -5172,6 +5290,9 @@ def portability_report(root: Path) -> dict[str, Any]:
 
     runtime_status = status_payload.get("runtime_contract")
     runtime_binding = config["runtime_binding"]
+    data_network_specs = _versioned_network_policy_specs(
+        CLUSTER / "data/network-policy.yaml", DATA_NAMESPACE
+    )
     if (
         not isinstance(runtime_status, dict)
         or runtime_status.get("config_map_data_sha256")
@@ -5180,6 +5301,10 @@ def portability_report(root: Path) -> dict[str, Any]:
         != _stable_json_sha256(runtime_binding["network_policy_specs"])
         or runtime_status.get("network_policy_names")
         != sorted(runtime_binding["network_policy_specs"])
+        or runtime_status.get("data_network_policy_specs_sha256")
+        != _stable_json_sha256(data_network_specs)
+        or runtime_status.get("data_network_policy_names")
+        != sorted(data_network_specs)
         or runtime_status.get("cilium_network_policy_specs_sha256")
         != _stable_json_sha256(runtime_binding["cilium_network_policy_specs"])
         or runtime_status.get("cilium_network_policy_names")

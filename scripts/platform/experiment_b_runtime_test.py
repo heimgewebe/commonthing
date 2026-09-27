@@ -185,6 +185,18 @@ spec:
       containers:
         - name: cilium-agent
           image: quay.io/cilium/cilium:v1.19.5
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cilium-operator
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: cilium-operator
+          image: quay.io/cilium/operator-generic:v1.19.5
 """
         runner = mock.Mock(
             return_value=runtime.subprocess.CompletedProcess(
@@ -200,17 +212,25 @@ spec:
             mock.patch.object(runtime, "kube_env", return_value={}),
             mock.patch.object(runtime, "vm_ip", return_value="192.168.122.10"),
         ):
-            images = runtime._expected_cilium_daemonset_images(
+            images = runtime._expected_cilium_workload_images(
                 Path("."), config, receipt
             )
         self.assertEqual(
             images,
             {
-                "containers": {
-                    "cilium-agent": "quay.io/cilium/cilium:v1.19.5"
+                "daemonset": {
+                    "containers": {
+                        "cilium-agent": "quay.io/cilium/cilium:v1.19.5"
+                    },
+                    "init_containers": {
+                        "config": "quay.io/cilium/startup-script:1"
+                    },
                 },
-                "init_containers": {
-                    "config": "quay.io/cilium/startup-script:1"
+                "operator": {
+                    "containers": {
+                        "cilium-operator": "quay.io/cilium/operator-generic:v1.19.5"
+                    },
+                    "init_containers": {},
                 },
             },
         )
@@ -1401,6 +1421,11 @@ spec:
                         "gateway_api": True,
                         "kube_proxy_replacement": True,
                         "daemonset_images_canonical": True,
+                        "operator_images_canonical": True,
+                        "operator": {
+                            "available": True,
+                            "desired_replicas": 1,
+                        },
                         "kube_proxy_present": False,
                     }
                     payload["flux_bootstrap_sha256"] = "1" * 64
@@ -1429,6 +1454,18 @@ spec:
                         ),
                         "network_policy_names": sorted(
                             runtime_binding["network_policy_specs"]
+                        ),
+                        "data_network_policy_specs_sha256": runtime._stable_json_sha256(
+                            runtime._versioned_network_policy_specs(
+                                runtime.CLUSTER / "data/network-policy.yaml",
+                                runtime.DATA_NAMESPACE,
+                            )
+                        ),
+                        "data_network_policy_names": sorted(
+                            runtime._versioned_network_policy_specs(
+                                runtime.CLUSTER / "data/network-policy.yaml",
+                                runtime.DATA_NAMESPACE,
+                            )
                         ),
                         "cilium_network_policy_specs_sha256": runtime._stable_json_sha256(
                             runtime_binding["cilium_network_policy_specs"]
@@ -1506,6 +1543,34 @@ spec:
             runtime.atomic_json(attempt_path, changed_attempt)
             with self.assertRaisesRegex(
                 runtime.RuntimeErrorEB, "live Cilium contract"
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["cilium"]["operator_images_canonical"] = False
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "live Cilium contract"
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["runtime_contract"]["data_network_policy_specs_sha256"] = (
+                "0" * 64
+            )
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "live runtime configuration contract"
             ):
                 runtime.portability_report(root)
             status_path.write_text(original_status, encoding="utf-8")
@@ -2551,6 +2616,44 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "config": "quay.io/cilium/startup-script:1",
             },
         }
+        self.cilium_expected_operator_images = {
+            "containers": {
+                "cilium-operator": "quay.io/cilium/operator-generic:v1.19.5",
+            },
+            "init_containers": {},
+        }
+        self.cilium_operator = {
+            "metadata": {
+                "name": "cilium-operator",
+                "namespace": "kube-system",
+                "generation": 1,
+            },
+            "spec": {
+                "replicas": 1,
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": name,
+                                "image": image,
+                            }
+                            for name, image in self.cilium_expected_operator_images[
+                                "containers"
+                            ].items()
+                        ],
+                    }
+                },
+            },
+            "status": {
+                "observedGeneration": 1,
+                "replicas": 1,
+                "updatedReplicas": 1,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+                "unavailableReplicas": 0,
+                "conditions": [{"type": "Available", "status": "True"}],
+            },
+        }
         self.cilium_daemonset = {
             "metadata": {"name": "cilium", "generation": 1},
             "spec": {
@@ -2623,6 +2726,20 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "spec": json.loads(json.dumps(spec)),
             }
             for name, spec in runtime_binding["network_policy_specs"].items()
+        ]
+        data_network_specs = runtime._versioned_network_policy_specs(
+            runtime.CLUSTER / "data/network-policy.yaml",
+            runtime.DATA_NAMESPACE,
+        )
+        self.data_network_policies = [
+            {
+                "metadata": {
+                    "namespace": runtime.DATA_NAMESPACE,
+                    "name": name,
+                },
+                "spec": json.loads(json.dumps(spec)),
+            }
+            for name, spec in data_network_specs.items()
         ]
         self.cilium_network_policies = [
             {
@@ -2959,8 +3076,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             },
         )
         self.expected_cilium_images = self.patch(
-            "_expected_cilium_daemonset_images",
-            return_value=json.loads(json.dumps(self.cilium_expected_images)),
+            "_expected_cilium_workload_images",
+            return_value={
+                "daemonset": json.loads(json.dumps(self.cilium_expected_images)),
+                "operator": json.loads(
+                    json.dumps(self.cilium_expected_operator_images)
+                ),
+            },
         )
         self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
 
@@ -2974,6 +3096,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         ]:
             return {"items": self.network_policies}
         if arguments == [
+            "-n", runtime.DATA_NAMESPACE, "get", "networkpolicies"
+        ]:
+            return {"items": self.data_network_policies}
+        if arguments == [
             "-n", runtime.APP_NAMESPACE, "get", "ciliumnetworkpolicies"
         ]:
             return {"items": self.cilium_network_policies}
@@ -2983,6 +3109,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             return {"items": self.kube_proxy_pods}
         if "daemonset" in arguments and arguments[-1] == "cilium":
             return self.cilium_daemonset
+        if arguments == [
+            "-n", "kube-system", "get", "deployment", "cilium-operator"
+        ]:
+            return self.cilium_operator
         if arguments == ["-n", "flux-system", "get", "deployments"]:
             return {"items": self.flux_controller_deployments}
         if "gitrepository" in arguments:
@@ -3310,6 +3440,20 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             runtime.status(self.root)
         self.cilium_daemonset = healthy_daemonset
 
+        healthy_operator = json.loads(json.dumps(self.cilium_operator))
+        self.cilium_operator = json.loads(json.dumps(healthy_operator))
+        self.cilium_operator["status"]["readyReplicas"] = 0
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not currently available"):
+            runtime.status(self.root)
+
+        self.cilium_operator = json.loads(json.dumps(healthy_operator))
+        self.cilium_operator["spec"]["template"]["spec"]["containers"][0][
+            "image"
+        ] = "quay.io/cilium/operator-generic:v9.9.9"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "operator images drifted"):
+            runtime.status(self.root)
+        self.cilium_operator = healthy_operator
+
         self.kube_proxy_daemonsets = [{"metadata": {"name": "kube-proxy"}}]
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "kube-proxy is present"):
             runtime.status(self.root)
@@ -3384,6 +3528,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
 
         healthy_config_map = json.loads(json.dumps(self.runtime_config_map))
         healthy_policies = json.loads(json.dumps(self.network_policies))
+        healthy_data_policies = json.loads(json.dumps(self.data_network_policies))
         healthy_cilium = json.loads(json.dumps(self.cilium_network_policies))
 
         self.runtime_config_map["data"]["NATS_URL"] = "nats://drift.invalid:4222"
@@ -3422,6 +3567,25 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             runtime.status(self.root)
         self.network_policies = healthy_policies
 
+        self.data_network_policies = json.loads(json.dumps(healthy_data_policies[:-1]))
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "data NetworkPolicy contract drifted"
+        ):
+            runtime.status(self.root)
+
+        self.data_network_policies = json.loads(json.dumps(healthy_data_policies))
+        postgres_policy = next(
+            item
+            for item in self.data_network_policies
+            if item["metadata"]["name"] == "allow-app-postgres-access"
+        )
+        postgres_policy["spec"]["ingress"] = [{"from": [{}]}]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "data NetworkPolicy contract drifted"
+        ):
+            runtime.status(self.root)
+        self.data_network_policies = healthy_data_policies
+
         self.cilium_network_policies[0]["spec"]["egress"] = [
             {"toEntities": ["world"]}
         ]
@@ -3434,6 +3598,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         result = runtime.status(self.root)
         self.assertTrue(result["runtime_contract"]["policy_specs_canonical"])
         self.assertTrue(result["runtime_contract"]["temporary_model_egress_absent"])
+        self.assertEqual(
+            set(result["runtime_contract"]["data_network_policy_names"]),
+            {
+                "default-deny",
+                "allow-app-postgres-access",
+                "allow-app-nats-access",
+                "allow-dns",
+            },
+        )
 
     def test_status_requires_live_expected_secrets_without_recording_values(self) -> None:
         self.write_vm_receipt()
