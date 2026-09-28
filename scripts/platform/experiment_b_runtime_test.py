@@ -1312,10 +1312,25 @@ spec:
         self.assertIn("_complete_live_check_attempt(", semantic)
 
         functional = inspect.getsource(runtime.functional_readback)
+        first_functional_target = functional.index(
+            "_require_kubernetes_target_binding"
+        )
+        gateway_readback = functional.index(
+            "_gateway_data_plane_readback(root, source_commit)"
+        )
+        jetstream_readback = functional.index("_jetstream_signature(root)")
+        second_functional_target = functional.index(
+            "_require_kubernetes_target_binding",
+            first_functional_target + 1,
+        )
         self.assertLess(
             functional.index("_begin_live_check_attempt("),
-            functional.index("_gateway_data_plane_readback(root, source_commit)"),
+            first_functional_target,
         )
+        self.assertLess(first_functional_target, gateway_readback)
+        self.assertLess(gateway_readback, jetstream_readback)
+        self.assertLess(jetstream_readback, second_functional_target)
+        self.assertIn("kubernetes_target_sha256", functional)
         self.assertIn("_complete_live_check_attempt(", functional)
 
         status = inspect.getsource(runtime.status)
@@ -1393,6 +1408,63 @@ spec:
             )
             self.assertEqual(attempt["status"], "running")
             self.assertEqual(attempt["source_commit"], commit)
+
+    def test_functional_readback_rejects_target_change_during_live_work(
+        self,
+    ) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "receipts").mkdir()
+            target = mock.Mock(
+                side_effect=[
+                    (
+                        {"kubeconfig_sha256": "1" * 64},
+                        "192.168.122.10",
+                        "https://192.168.122.10:6443",
+                    ),
+                    (
+                        {"kubeconfig_sha256": "2" * 64},
+                        "192.168.122.10",
+                        "https://192.168.122.10:6443",
+                    ),
+                ]
+            )
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=commit,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_kubernetes_target_binding",
+                    target,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_gateway_data_plane_readback",
+                    return_value={
+                        "gateway": "http://192.0.2.10",
+                        "checks": {"fixture": True},
+                    },
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_jetstream_signature",
+                    return_value={"messages": 1},
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "target identity changed",
+                ):
+                    runtime.functional_readback(root, commit)
+
+            self.assertEqual(target.call_count, 2)
+            self.assertFalse(
+                (root / "receipts/functional-readback.json").exists()
+            )
 
     def test_status_requires_exact_flux_kustomization_set(self) -> None:
         complete = {
@@ -1746,18 +1818,22 @@ spec:
 
         application_service_expected_contract = {}
         for name in ("weltgewebe-api", "weltgewebe-web"):
-            spec = {
-                "selector": {"app.kubernetes.io/name": name},
-                "ports": [
-                    {
-                        "name": "http",
-                        "port": 8080,
-                        "targetPort": "http",
-                        "protocol": "TCP",
-                        "appProtocol": None,
+            spec = runtime._service_spec_projection(
+                {
+                    "spec": {
+                        "selector": {"app.kubernetes.io/name": name},
+                        "ports": [
+                            {
+                                "name": "http",
+                                "port": 8080,
+                                "targetPort": "http",
+                                "protocol": "TCP",
+                            }
+                        ],
                     }
-                ],
-            }
+                },
+                f"fixture application Service {name}",
+            )
             application_service_expected_contract[name] = {
                 "spec": spec,
                 "spec_sha256": runtime._stable_json_sha256(spec),
@@ -3868,18 +3944,22 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.application_service_expected = {}
         self.application_services = {}
         for name in ("weltgewebe-api", "weltgewebe-web"):
-            spec = {
-                "selector": {"app.kubernetes.io/name": name},
-                "ports": [
-                    {
-                        "name": "http",
-                        "port": 8080,
-                        "targetPort": "http",
-                        "protocol": "TCP",
-                        "appProtocol": None,
+            spec = runtime._service_spec_projection(
+                {
+                    "spec": {
+                        "selector": {"app.kubernetes.io/name": name},
+                        "ports": [
+                            {
+                                "name": "http",
+                                "port": 8080,
+                                "targetPort": "http",
+                                "protocol": "TCP",
+                            }
+                        ],
                     }
-                ],
-            }
+                },
+                f"fixture application Service {name}",
+            )
             self.application_service_expected[name] = {
                 "spec": spec,
                 "spec_sha256": runtime._stable_json_sha256(spec),
@@ -5351,6 +5431,29 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "application Service spec drifted: weltgewebe-web",
         ):
             runtime.status(self.root)
+
+        self.application_services = json.loads(json.dumps(healthy))
+        self.application_services["weltgewebe-api"]["spec"]["type"] = (
+            "NodePort"
+        )
+        self.application_services["weltgewebe-api"]["spec"]["ports"][0][
+            "nodePort"
+        ] = 30080
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "application Service spec drifted: weltgewebe-api",
+        ):
+            runtime.status(self.root)
+
+        self.application_services = json.loads(json.dumps(healthy))
+        self.application_services["weltgewebe-web"]["spec"][
+            "externalIPs"
+        ] = ["203.0.113.42"]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "application Service spec drifted: weltgewebe-web",
+        ):
+            runtime.status(self.root)
         self.application_services = healthy
 
     def test_rendered_application_service_contract_tracks_overlay_services(self) -> None:
@@ -5409,6 +5512,15 @@ spec:
         self.assertEqual(
             result["weltgewebe-web"]["spec"]["ports"][0]["targetPort"],
             "web-http",
+        )
+        self.assertEqual(
+            result["weltgewebe-api"]["spec"]["type"], "ClusterIP"
+        )
+        self.assertIsNone(
+            result["weltgewebe-api"]["spec"]["ports"][0]["nodePort"]
+        )
+        self.assertEqual(
+            result["weltgewebe-api"]["spec"]["externalIPs"], []
         )
 
     def test_status_revalidates_application_service_accounts(self) -> None:

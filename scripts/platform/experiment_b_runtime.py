@@ -3342,6 +3342,20 @@ def _service_spec_projection(service: Any, context: str) -> dict[str, Any]:
         raise RuntimeErrorEB(f"{context} Service spec is invalid")
     selector = spec.get("selector")
     ports = spec.get("ports")
+    service_type = spec.get("type", "ClusterIP")
+    external_ips = spec.get("externalIPs") or []
+    load_balancer_source_ranges = spec.get("loadBalancerSourceRanges") or []
+    external_traffic_policy = spec.get("externalTrafficPolicy")
+    internal_traffic_policy = spec.get("internalTrafficPolicy", "Cluster")
+    session_affinity = spec.get("sessionAffinity", "None")
+    session_affinity_config = spec.get("sessionAffinityConfig")
+    publish_not_ready = spec.get("publishNotReadyAddresses", False)
+    allocate_lb_node_ports = spec.get("allocateLoadBalancerNodePorts")
+    load_balancer_class = spec.get("loadBalancerClass")
+    load_balancer_ip = spec.get("loadBalancerIP")
+    external_name = spec.get("externalName")
+    traffic_distribution = spec.get("trafficDistribution")
+    health_check_node_port = spec.get("healthCheckNodePort")
     if (
         not isinstance(selector, dict)
         or not selector
@@ -3354,8 +3368,65 @@ def _service_spec_projection(service: Any, context: str) -> dict[str, Any]:
         )
         or not isinstance(ports, list)
         or not ports
+        or service_type not in {"ClusterIP", "NodePort", "LoadBalancer"}
+        or not isinstance(external_ips, list)
+        or any(not isinstance(value, str) or not value for value in external_ips)
+        or len(set(external_ips)) != len(external_ips)
+        or not isinstance(load_balancer_source_ranges, list)
+        or any(
+            not isinstance(value, str) or not value
+            for value in load_balancer_source_ranges
+        )
+        or len(set(load_balancer_source_ranges))
+        != len(load_balancer_source_ranges)
+        or external_traffic_policy not in {None, "Cluster", "Local"}
+        or internal_traffic_policy not in {"Cluster", "Local"}
+        or session_affinity not in {"None", "ClientIP"}
+        or (
+            session_affinity_config is not None
+            and not isinstance(session_affinity_config, dict)
+        )
+        or not isinstance(publish_not_ready, bool)
+        or (
+            allocate_lb_node_ports is not None
+            and not isinstance(allocate_lb_node_ports, bool)
+        )
+        or (
+            load_balancer_class is not None
+            and (
+                not isinstance(load_balancer_class, str)
+                or not load_balancer_class
+            )
+        )
+        or (
+            load_balancer_ip is not None
+            and (not isinstance(load_balancer_ip, str) or not load_balancer_ip)
+        )
+        or (
+            external_name is not None
+            and (not isinstance(external_name, str) or not external_name)
+        )
+        or (
+            traffic_distribution is not None
+            and (
+                not isinstance(traffic_distribution, str)
+                or not traffic_distribution
+            )
+        )
+        or (
+            health_check_node_port is not None
+            and (
+                isinstance(health_check_node_port, bool)
+                or not isinstance(health_check_node_port, int)
+                or health_check_node_port < 1
+                or health_check_node_port > 65535
+            )
+        )
     ):
-        raise RuntimeErrorEB(f"{context} Service selector/ports are invalid")
+        raise RuntimeErrorEB(
+            f"{context} Service selector/exposure contract is invalid"
+        )
+
     normalized_ports: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     for item in ports:
@@ -3366,6 +3437,7 @@ def _service_spec_projection(service: Any, context: str) -> dict[str, Any]:
         target_port = item.get("targetPort")
         protocol = item.get("protocol", "TCP")
         app_protocol = item.get("appProtocol")
+        node_port = item.get("nodePort")
         if (
             not isinstance(name, str)
             or not name
@@ -3385,6 +3457,15 @@ def _service_spec_projection(service: Any, context: str) -> dict[str, Any]:
                 app_protocol is not None
                 and (not isinstance(app_protocol, str) or not app_protocol)
             )
+            or (
+                node_port is not None
+                and (
+                    isinstance(node_port, bool)
+                    or not isinstance(node_port, int)
+                    or node_port < 1
+                    or node_port > 65535
+                )
+            )
         ):
             raise RuntimeErrorEB(f"{context} Service port contract is invalid")
         seen_names.add(name)
@@ -3395,14 +3476,35 @@ def _service_spec_projection(service: Any, context: str) -> dict[str, Any]:
                 "targetPort": target_port,
                 "protocol": protocol,
                 "appProtocol": app_protocol,
+                "nodePort": node_port,
             }
         )
+
     return {
+        "type": service_type,
+        "headless": spec.get("clusterIP") == "None",
         "selector": {
             str(key): str(value)
             for key, value in sorted(selector.items())
         },
         "ports": sorted(normalized_ports, key=lambda value: value["name"]),
+        "externalIPs": sorted(external_ips),
+        "externalTrafficPolicy": external_traffic_policy,
+        "internalTrafficPolicy": internal_traffic_policy,
+        "publishNotReadyAddresses": publish_not_ready,
+        "sessionAffinity": session_affinity,
+        "sessionAffinityConfig": json.loads(
+            json.dumps(session_affinity_config)
+        )
+        if session_affinity_config is not None
+        else None,
+        "loadBalancerSourceRanges": sorted(load_balancer_source_ranges),
+        "loadBalancerClass": load_balancer_class,
+        "loadBalancerIP": load_balancer_ip,
+        "allocateLoadBalancerNodePorts": allocate_lb_node_ports,
+        "healthCheckNodePort": health_check_node_port,
+        "externalName": external_name,
+        "trafficDistribution": traffic_distribution,
     }
 
 
@@ -7221,12 +7323,36 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
     )
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("functional readback source is not current protected main")
+    (
+        target_receipt_before,
+        target_ip_before,
+        target_server_before,
+    ) = _require_kubernetes_target_binding(root, source_commit)
+    target_binding_before = {
+        "vm_ip": target_ip_before,
+        "kubeconfig_sha256": target_receipt_before["kubeconfig_sha256"],
+        "server": target_server_before,
+    }
     data_plane = _gateway_data_plane_readback(root, source_commit)
     base = str(data_plane["gateway"])
     checks = data_plane["checks"]
     jetstream = _jetstream_signature(root)
     if jetstream["messages"] < 1:
         raise RuntimeErrorEB("Experiment-B JetStream contains no persisted test messages")
+    (
+        target_receipt_after,
+        target_ip_after,
+        target_server_after,
+    ) = _require_kubernetes_target_binding(root, source_commit)
+    target_binding_after = {
+        "vm_ip": target_ip_after,
+        "kubeconfig_sha256": target_receipt_after["kubeconfig_sha256"],
+        "server": target_server_after,
+    }
+    if target_binding_after != target_binding_before:
+        raise RuntimeErrorEB(
+            "Kubernetes target identity changed during functional readback"
+        )
     receipt = {
         "schema_version": 1,
         "status": "pass",
@@ -7234,6 +7360,9 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
         "gateway": base,
         "checks": checks,
         "jetstream": jetstream,
+        "kubernetes_target_sha256": _stable_json_sha256(
+            target_binding_before
+        ),
         "production_endpoint_used": False,
     }
     atomic_json(receipt_path, receipt)
