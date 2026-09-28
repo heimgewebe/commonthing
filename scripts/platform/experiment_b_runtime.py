@@ -2900,6 +2900,7 @@ def _require_gateway_ready(gateway: Any) -> dict[str, Any]:
     if (
         metadata.get("name") != "commonthing-experiment-b"
         or metadata.get("namespace") != APP_NAMESPACE
+        or metadata.get("deletionTimestamp") is not None
         or spec.get("gatewayClassName") != "cilium"
     ):
         raise RuntimeErrorEB("Experiment-B Gateway identity/class drifted")
@@ -2952,6 +2953,7 @@ def _require_httproute_ready(route: Any) -> dict[str, Any]:
     if (
         metadata.get("name") != "commonthing-experiment-b"
         or metadata.get("namespace") != APP_NAMESPACE
+        or metadata.get("deletionTimestamp") is not None
     ):
         raise RuntimeErrorEB("Experiment-B HTTPRoute identity is invalid")
     generation = int(metadata.get("generation") or 0)
@@ -4244,11 +4246,20 @@ def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]
     }
 
 
-def _require_live_data_deployments(root: Path) -> dict[str, Any]:
+def _require_live_data_deployments(
+    root: Path,
+    names: tuple[str, ...] = ("postgres", "nats"),
+) -> dict[str, Any]:
     manifests = {
         "postgres": CLUSTER / "data/postgres.yaml",
         "nats": CLUSTER / "data/nats.yaml",
     }
+    if (
+        not names
+        or len(set(names)) != len(names)
+        or any(name not in manifests for name in names)
+    ):
+        raise RuntimeErrorEB("live data Deployment selection is invalid")
     pod_items = _kubectl_json(
         root, ["-n", DATA_NAMESPACE, "get", "pods"]
     ).get("items")
@@ -4258,7 +4269,8 @@ def _require_live_data_deployments(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("live data Pod inventory is invalid")
 
     result: dict[str, Any] = {}
-    for name, path in manifests.items():
+    for name in names:
+        path = manifests[name]
         expected = _versioned_data_deployment_contract(path, name)
         deployment = _kubectl_json(
             root, ["-n", DATA_NAMESPACE, "get", "deployment", name]
@@ -4403,17 +4415,47 @@ def _require_live_data_deployments(root: Path) -> dict[str, Any]:
     return result
 
 
-def _expected_cilium_workload_images(
+def _cilium_pod_spec_projection(
+    pod_spec: Any,
+    context: str,
+) -> dict[str, Any]:
+    projection = _application_pod_spec_projection(pod_spec, context)
+    assert isinstance(pod_spec, dict)
+    projection.update(
+        {
+            "hostNetwork": pod_spec.get("hostNetwork", False),
+            "hostPID": pod_spec.get("hostPID", False),
+            "hostIPC": pod_spec.get("hostIPC", False),
+            "dnsPolicy": pod_spec.get("dnsPolicy", "ClusterFirst"),
+            "dnsConfig": pod_spec.get("dnsConfig"),
+            "priorityClassName": pod_spec.get("priorityClassName", ""),
+            "tolerations": pod_spec.get("tolerations") or [],
+            "restartPolicy": pod_spec.get("restartPolicy", "Always"),
+            "schedulerName": pod_spec.get(
+                "schedulerName", "default-scheduler"
+            ),
+            "enableServiceLinks": pod_spec.get("enableServiceLinks", True),
+            "shareProcessNamespace": pod_spec.get(
+                "shareProcessNamespace", False
+            ),
+        }
+    )
+    return projection
+
+
+def _expected_cilium_runtime_contract(
     root: Path,
     config: dict[str, Any],
     toolchain_receipt: dict[str, Any],
-) -> dict[str, dict[str, dict[str, str]]]:
+) -> dict[str, Any]:
     tools = toolchain_receipt.get("tools", {})
     artifacts = toolchain_receipt.get("artifacts", {})
     helm = tools.get("helm") if isinstance(tools, dict) else None
     chart = artifacts.get("cilium_chart") if isinstance(artifacts, dict) else None
     if not isinstance(helm, str) or not isinstance(chart, str):
-        raise RuntimeErrorEB("pinned Cilium chart/toolchain binding is unavailable")
+        raise RuntimeErrorEB(
+            "pinned Cilium chart/toolchain binding is unavailable"
+        )
 
     rendered = run(
         [
@@ -4430,30 +4472,82 @@ def _expected_cilium_workload_images(
         env=kube_env(root),
     ).stdout
     try:
-        documents = list(yaml.safe_load_all(rendered))
+        documents = [
+            document
+            for document in yaml.safe_load_all(rendered)
+            if isinstance(document, dict)
+        ]
     except yaml.YAMLError as exc:
         raise RuntimeErrorEB("pinned Cilium chart render is invalid") from exc
-    def workload_images(kind: str, name: str, context: str) -> dict[str, dict[str, str]]:
+
+    config_maps = [
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "cilium-config"
+        and document.get("metadata", {}).get("namespace") == "kube-system"
+    ]
+    if len(config_maps) != 1:
+        raise RuntimeErrorEB(
+            "pinned Cilium chart does not render exactly one "
+            "kube-system ConfigMap cilium-config"
+        )
+    config_map = config_maps[0]
+    config_data = config_map.get("data", {})
+    config_binary_data = config_map.get("binaryData", {})
+    config_immutable = config_map.get("immutable", False)
+    if (
+        not isinstance(config_data, dict)
+        or not isinstance(config_binary_data, dict)
+        or not isinstance(config_immutable, bool)
+    ):
+        raise RuntimeErrorEB("pinned Cilium ConfigMap contract is invalid")
+    config_map_contract = {
+        "data": json.loads(json.dumps(config_data)),
+        "binaryData": json.loads(json.dumps(config_binary_data)),
+        "immutable": config_immutable,
+    }
+
+    def workload_contract(
+        kind: str,
+        name: str,
+        context: str,
+    ) -> dict[str, Any]:
         workloads = [
             document
             for document in documents
-            if isinstance(document, dict)
-            and document.get("kind") == kind
+            if document.get("kind") == kind
             and document.get("metadata", {}).get("name") == name
+            and document.get("metadata", {}).get("namespace") == "kube-system"
         ]
         if len(workloads) != 1:
             raise RuntimeErrorEB(
-                f"pinned Cilium chart does not render exactly one {kind} {name}"
+                f"pinned Cilium chart does not render exactly one "
+                f"kube-system {kind} {name}"
             )
-        pod_spec = workloads[0].get("spec", {}).get("template", {}).get("spec")
-        return _pod_spec_images(pod_spec, context)
+        workload = workloads[0]
+        pod_spec = (
+            workload.get("spec", {}).get("template", {}).get("spec")
+        )
+        return {
+            "images": _pod_spec_images(pod_spec, context),
+            "selector_labels": _pod_selector_match_labels(
+                workload, context
+            ),
+            "pod_spec": _cilium_pod_spec_projection(
+                pod_spec, context
+            ),
+        }
 
     return {
-        "daemonset": workload_images(
+        "config_map": config_map_contract,
+        "daemonset": workload_contract(
             "DaemonSet", "cilium", "pinned Cilium DaemonSet"
         ),
-        "operator": workload_images(
-            "Deployment", "cilium-operator", "pinned Cilium operator Deployment"
+        "operator": workload_contract(
+            "Deployment",
+            "cilium-operator",
+            "pinned Cilium operator Deployment",
         ),
     }
 
@@ -4498,7 +4592,9 @@ def _require_live_cilium_contract(
             ).stdout
         )
     except json.JSONDecodeError as exc:
-        raise RuntimeErrorEB("live Cilium Helm state is not valid JSON") from exc
+        raise RuntimeErrorEB(
+            "live Cilium Helm state is not valid JSON"
+        ) from exc
     expected_chart = f"cilium-{config['cilium']['chart_version']}"
     if (
         not isinstance(releases, list)
@@ -4509,7 +4605,9 @@ def _require_live_cilium_contract(
         or releases[0].get("status") != "deployed"
         or releases[0].get("chart") != expected_chart
     ):
-        raise RuntimeErrorEB("live Cilium Helm release differs from the pinned contract")
+        raise RuntimeErrorEB(
+            "live Cilium Helm release differs from the pinned contract"
+        )
     if (
         not isinstance(values, dict)
         or values.get("kubeProxyReplacement") is not True
@@ -4517,7 +4615,58 @@ def _require_live_cilium_contract(
         or values["gatewayAPI"].get("enabled") is not True
     ):
         raise RuntimeErrorEB(
-            "live Cilium Gateway API/kube-proxy replacement configuration drifted"
+            "live Cilium Gateway API/kube-proxy replacement "
+            "configuration drifted"
+        )
+
+    expected_runtime = _expected_cilium_runtime_contract(
+        root, config, toolchain_receipt
+    )
+    expected_config_map = expected_runtime["config_map"]
+    live_config_map = _kubectl_json(
+        root,
+        ["-n", "kube-system", "get", "configmap", "cilium-config"],
+    )
+    config_metadata = (
+        live_config_map.get("metadata", {})
+        if isinstance(live_config_map, dict)
+        else {}
+    )
+    live_config_data = (
+        live_config_map.get("data", {})
+        if isinstance(live_config_map, dict)
+        else None
+    )
+    live_config_binary_data = (
+        live_config_map.get("binaryData", {})
+        if isinstance(live_config_map, dict)
+        else None
+    )
+    live_config_immutable = (
+        live_config_map.get("immutable", False)
+        if isinstance(live_config_map, dict)
+        else None
+    )
+    if (
+        not isinstance(config_metadata, dict)
+        or config_metadata.get("name") != "cilium-config"
+        or config_metadata.get("namespace") != "kube-system"
+        or config_metadata.get("deletionTimestamp") is not None
+        or not isinstance(live_config_data, dict)
+        or not isinstance(live_config_binary_data, dict)
+        or not isinstance(live_config_immutable, bool)
+    ):
+        raise RuntimeErrorEB(
+            "live Cilium ConfigMap identity/shape drifted"
+        )
+    live_config_contract = {
+        "data": live_config_data,
+        "binaryData": live_config_binary_data,
+        "immutable": live_config_immutable,
+    }
+    if live_config_contract != expected_config_map:
+        raise RuntimeErrorEB(
+            "live Cilium ConfigMap drifted from the pinned chart render"
         )
 
     daemonset = _kubectl_json(
@@ -4548,25 +4697,41 @@ def _require_live_cilium_contract(
         or available != desired
         or unavailable != 0
     ):
-        raise RuntimeErrorEB("live Cilium DaemonSet is not fully converged")
+        raise RuntimeErrorEB(
+            "live Cilium DaemonSet is not fully converged"
+        )
 
-    expected_workload_images = _expected_cilium_workload_images(
-        root, config, toolchain_receipt
+    expected_daemonset = expected_runtime["daemonset"]
+    daemonset_pod_spec = (
+        daemonset.get("spec", {}).get("template", {}).get("spec")
     )
     live_images = _pod_spec_images(
-        daemonset.get("spec", {}).get("template", {}).get("spec"),
+        daemonset_pod_spec,
         "live Cilium DaemonSet",
     )
-    if live_images != expected_workload_images["daemonset"]:
+    if live_images != expected_daemonset["images"]:
         raise RuntimeErrorEB(
-            "live Cilium DaemonSet images drifted from the pinned chart render"
+            "live Cilium DaemonSet images drifted from the "
+            "pinned chart render"
         )
     daemonset_selector = _pod_selector_match_labels(
         daemonset, "live Cilium DaemonSet"
     )
+    if (
+        daemonset_selector != expected_daemonset["selector_labels"]
+        or _cilium_pod_spec_projection(
+            daemonset_pod_spec, "live Cilium DaemonSet"
+        )
+        != expected_daemonset["pod_spec"]
+    ):
+        raise RuntimeErrorEB(
+            "live Cilium DaemonSet pod contract drifted from the "
+            "pinned chart render"
+        )
 
     operator = _kubectl_json(
-        root, ["-n", "kube-system", "get", "deployment", "cilium-operator"]
+        root,
+        ["-n", "kube-system", "get", "deployment", "cilium-operator"],
     )
     operator_metadata = operator.get("metadata", {})
     if (
@@ -4575,21 +4740,39 @@ def _require_live_cilium_contract(
         or operator_metadata.get("namespace") != "kube-system"
         or operator_metadata.get("deletionTimestamp") is not None
     ):
-        raise RuntimeErrorEB("live Cilium operator Deployment identity drifted")
+        raise RuntimeErrorEB(
+            "live Cilium operator Deployment identity drifted"
+        )
     operator_availability = _deployment_availability_snapshot(
         operator, "cilium-operator", 1
     )
+    expected_operator = expected_runtime["operator"]
+    operator_pod_spec = (
+        operator.get("spec", {}).get("template", {}).get("spec")
+    )
     operator_images = _pod_spec_images(
-        operator.get("spec", {}).get("template", {}).get("spec"),
+        operator_pod_spec,
         "live Cilium operator Deployment",
     )
-    if operator_images != expected_workload_images["operator"]:
+    if operator_images != expected_operator["images"]:
         raise RuntimeErrorEB(
-            "live Cilium operator images drifted from the pinned chart render"
+            "live Cilium operator images drifted from the "
+            "pinned chart render"
         )
     operator_selector = _pod_selector_match_labels(
         operator, "live Cilium operator Deployment"
     )
+    if (
+        operator_selector != expected_operator["selector_labels"]
+        or _cilium_pod_spec_projection(
+            operator_pod_spec, "live Cilium operator Deployment"
+        )
+        != expected_operator["pod_spec"]
+    ):
+        raise RuntimeErrorEB(
+            "live Cilium operator pod contract drifted from the "
+            "pinned chart render"
+        )
 
     proxy_daemonsets = _kubectl_json(
         root, ["-n", "kube-system", "get", "daemonsets"]
@@ -4612,7 +4795,7 @@ def _require_live_cilium_contract(
         namespace="kube-system",
         workload="cilium",
         expected_replicas=desired,
-        expected_images=expected_workload_images["daemonset"],
+        expected_images=expected_daemonset["images"],
         required_labels=daemonset_selector,
         context="Cilium DaemonSet Pod",
     )
@@ -4621,7 +4804,7 @@ def _require_live_cilium_contract(
         namespace="kube-system",
         workload="cilium-operator",
         expected_replicas=1,
-        expected_images=expected_workload_images["operator"],
+        expected_images=expected_operator["images"],
         required_labels=operator_selector,
         context="Cilium operator Pod",
     )
@@ -4641,7 +4824,10 @@ def _require_live_cilium_contract(
             or labels.get("component") == "kube-proxy"
         )
 
-    if any(is_kube_proxy(item) for item in (*proxy_daemonsets, *proxy_pods)):
+    if any(
+        is_kube_proxy(item)
+        for item in (*proxy_daemonsets, *proxy_pods)
+    ):
         raise RuntimeErrorEB("kube-proxy is present in Experiment B")
 
     return {
@@ -4649,15 +4835,25 @@ def _require_live_cilium_contract(
         "chart_version": config["cilium"]["chart_version"],
         "gateway_api": True,
         "kube_proxy_replacement": True,
+        "config_map_sha256": _stable_json_sha256(
+            live_config_contract
+        ),
+        "config_map_canonical": True,
         "daemonset_generation": generation,
         "daemonset_desired": desired,
         "daemonset_ready": ready,
         "daemonset_images": live_images,
         "daemonset_images_canonical": True,
+        "daemonset_contract_sha256": _stable_json_sha256(
+            expected_daemonset
+        ),
         "daemonset_pods": daemonset_pods,
         "operator": operator_availability,
         "operator_images": operator_images,
         "operator_images_canonical": True,
+        "operator_contract_sha256": _stable_json_sha256(
+            expected_operator
+        ),
         "operator_pods": operator_pods,
         "kube_proxy_present": False,
     }
@@ -6443,75 +6639,49 @@ def _require_t048_postgres_runtime_binding(
     expected_resources = _versioned_data_container_resources(
         postgres_manifest, "postgres", "postgres"
     )
-    deployment = _kubectl_json(
-        root, ["-n", DATA_NAMESPACE, "get", "deployment", "postgres"]
+    live_data = _require_live_data_deployments(
+        root, ("postgres",)
     )
-    metadata = (
-        deployment.get("metadata", {})
-        if isinstance(deployment, dict)
-        else {}
+    postgres = live_data.get("postgres")
+    if (
+        not isinstance(postgres, dict)
+        or postgres.get("canonical") is not True
+        or postgres.get("contract_sha256")
+        != expected["contract_sha256"]
+        or postgres.get("pod_contract_sha256")
+        != expected["pod_contract_sha256"]
+        or postgres.get("images_sha256")
+        != _stable_json_sha256(expected["images"])
+    ):
+        raise RuntimeErrorEB(
+            "T048 PostgreSQL full runtime contract drifted"
+        )
+    pod_readback = postgres.get("pods")
+    if not isinstance(pod_readback, dict):
+        raise RuntimeErrorEB(
+            "T048 PostgreSQL Pod runtime contract is missing"
+        )
+    runtime_image_ids_sha256 = pod_readback.get(
+        "runtime_image_ids_sha256"
     )
     if (
-        not isinstance(metadata, dict)
-        or metadata.get("name") != "postgres"
-        or metadata.get("namespace") != DATA_NAMESPACE
-        or metadata.get("deletionTimestamp") is not None
+        not isinstance(runtime_image_ids_sha256, str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", runtime_image_ids_sha256
+        )
+        is None
     ):
-        raise RuntimeErrorEB("T048 PostgreSQL Deployment identity drifted")
-    selector = _pod_selector_match_labels(
-        deployment, "T048 PostgreSQL Deployment"
-    )
-    if selector != expected["selector_labels"]:
-        raise RuntimeErrorEB("T048 PostgreSQL selector drifted")
-    _deployment_availability_snapshot(
-        deployment, "postgres", expected["replicas"]
-    )
-    live_images = _pod_spec_images(
-        deployment.get("spec", {}).get("template", {}).get("spec"),
-        "T048 PostgreSQL Deployment",
-    )
-    if live_images != expected["images"]:
-        raise RuntimeErrorEB("T048 PostgreSQL Deployment images drifted")
-    live_resources = _container_resources_contract(
-        deployment.get("spec", {}).get("template", {}).get("spec"),
-        "postgres",
-        "T048 PostgreSQL Deployment",
-    )
-    if live_resources != expected_resources:
         raise RuntimeErrorEB(
-            "T048 PostgreSQL Deployment resources drifted"
+            "T048 PostgreSQL runtime image identity is invalid"
         )
-    pods = _kubectl_json(
-        root, ["-n", DATA_NAMESPACE, "get", "pods"]
-    ).get("items")
-    matching_pods = _pods_matching_labels(
-        pods, expected["selector_labels"]
-    )
-    pod_readback = _require_running_pod_image_contract(
-        matching_pods,
-        namespace=DATA_NAMESPACE,
-        workload="postgres",
-        expected_replicas=expected["replicas"],
-        expected_images=expected["images"],
-        required_labels=expected["selector_labels"],
-        context="T048 PostgreSQL Pod",
-    )
-    for pod in matching_pods:
-        pod_resources = _container_resources_contract(
-            pod.get("spec"),
-            "postgres",
-            "T048 PostgreSQL Pod",
-        )
-        if pod_resources != expected_resources:
-            raise RuntimeErrorEB(
-                "T048 PostgreSQL Pod resources drifted"
-            )
     return {
-        "images_sha256": _stable_json_sha256(expected["images"]),
-        "resources_sha256": _stable_json_sha256(expected_resources),
-        "runtime_image_ids_sha256": pod_readback[
-            "runtime_image_ids_sha256"
-        ],
+        "images_sha256": postgres["images_sha256"],
+        "resources_sha256": _stable_json_sha256(
+            expected_resources
+        ),
+        "contract_sha256": postgres["contract_sha256"],
+        "pod_contract_sha256": postgres["pod_contract_sha256"],
+        "runtime_image_ids_sha256": runtime_image_ids_sha256,
         "pods": pod_readback,
         "canonical": True,
     }
@@ -6777,6 +6947,10 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             != postgres_binding_before["images_sha256"]
             or postgres_binding_after["resources_sha256"]
             != postgres_binding_before["resources_sha256"]
+            or postgres_binding_after["contract_sha256"]
+            != postgres_binding_before["contract_sha256"]
+            or postgres_binding_after["pod_contract_sha256"]
+            != postgres_binding_before["pod_contract_sha256"]
         ):
             raise RuntimeErrorEB(
                 "PostgreSQL runtime contract changed during the T048 measurement"
@@ -6908,6 +7082,12 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             ],
             "postgres_resources_sha256": postgres_binding_before[
                 "resources_sha256"
+            ],
+            "postgres_contract_sha256": postgres_binding_before[
+                "contract_sha256"
+            ],
+            "postgres_pod_contract_sha256": postgres_binding_before[
+                "pod_contract_sha256"
             ],
             "kubernetes_target_sha256": _stable_json_sha256(
                 target_binding_before

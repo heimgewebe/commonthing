@@ -171,22 +171,41 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
             runtime._wait_http_200("http://127.0.0.1:1/health/live")
         self.assertEqual(responses, [])
 
-    def test_cilium_expected_images_come_from_pinned_chart_render(self) -> None:
+    def test_cilium_expected_runtime_contract_comes_from_pinned_chart_render(
+        self,
+    ) -> None:
         config = runtime.load_config()
-        manifest = """apiVersion: apps/v1
+        manifest = """apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cilium-config
+  namespace: kube-system
+data:
+  enable-policy: default
+  enable-gateway-api: "true"
+  kube-proxy-replacement: "true"
+---
+apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: cilium
   namespace: kube-system
 spec:
+  selector:
+    matchLabels:
+      k8s-app: cilium
   template:
     spec:
+      serviceAccountName: cilium
+      hostNetwork: true
       initContainers:
         - name: config
           image: quay.io/cilium/startup-script:1
       containers:
         - name: cilium-agent
           image: quay.io/cilium/cilium:v1.19.5
+          securityContext:
+            privileged: true
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -194,8 +213,12 @@ metadata:
   name: cilium-operator
   namespace: kube-system
 spec:
+  selector:
+    matchLabels:
+      io.cilium/app: operator
   template:
     spec:
+      serviceAccountName: cilium-operator
       containers:
         - name: cilium-operator
           image: quay.io/cilium/operator-generic:v1.19.5
@@ -207,42 +230,74 @@ spec:
         )
         receipt = {
             "tools": {"helm": "helm"},
-            "artifacts": {"cilium_chart": "/verified/cilium-1.19.5.tgz"},
+            "artifacts": {
+                "cilium_chart": "/verified/cilium-1.19.5.tgz"
+            },
         }
         with (
             mock.patch.object(runtime, "run", runner),
             mock.patch.object(runtime, "kube_env", return_value={}),
-            mock.patch.object(runtime, "vm_ip", return_value="192.168.122.10"),
+            mock.patch.object(
+                runtime, "vm_ip", return_value="192.168.122.10"
+            ),
         ):
-            images = runtime._expected_cilium_workload_images(
+            contract = runtime._expected_cilium_runtime_contract(
                 Path("."), config, receipt
             )
         self.assertEqual(
-            images,
+            contract["config_map"],
             {
-                "daemonset": {
-                    "containers": {
-                        "cilium-agent": "quay.io/cilium/cilium:v1.19.5"
-                    },
-                    "init_containers": {
-                        "config": "quay.io/cilium/startup-script:1"
-                    },
+                "data": {
+                    "enable-policy": "default",
+                    "enable-gateway-api": "true",
+                    "kube-proxy-replacement": "true",
                 },
-                "operator": {
-                    "containers": {
-                        "cilium-operator": "quay.io/cilium/operator-generic:v1.19.5"
-                    },
-                    "init_containers": {},
+                "binaryData": {},
+                "immutable": False,
+            },
+        )
+        self.assertEqual(
+            contract["daemonset"]["images"],
+            {
+                "containers": {
+                    "cilium-agent": "quay.io/cilium/cilium:v1.19.5"
+                },
+                "init_containers": {
+                    "config": "quay.io/cilium/startup-script:1"
                 },
             },
         )
+        self.assertEqual(
+            contract["daemonset"]["selector_labels"],
+            {"k8s-app": "cilium"},
+        )
+        self.assertTrue(
+            contract["daemonset"]["pod_spec"]["hostNetwork"]
+        )
+        self.assertEqual(
+            contract["daemonset"]["pod_spec"]["containers"][
+                "cilium-agent"
+            ]["securityContext"],
+            {"privileged": True},
+        )
+        self.assertEqual(
+            contract["operator"]["selector_labels"],
+            {"io.cilium/app": "operator"},
+        )
+        self.assertEqual(
+            contract["operator"]["pod_spec"]["serviceAccountName"],
+            "cilium-operator",
+        )
         argv = runner.call_args.args[0]
-        self.assertEqual(argv[:4], [
-            "helm",
-            "template",
-            "cilium",
-            "/verified/cilium-1.19.5.tgz",
-        ])
+        self.assertEqual(
+            argv[:4],
+            [
+                "helm",
+                "template",
+                "cilium",
+                "/verified/cilium-1.19.5.tgz",
+            ],
+        )
         self.assertIn("--kube-version", argv)
         self.assertIn("gatewayAPI.enabled=true", argv)
         self.assertIn("kubeProxyReplacement=true", argv)
@@ -3462,6 +3517,22 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "gatewayAPI": {"enabled": True},
             "kubeProxyReplacement": True,
         }
+        self.cilium_config_contract = {
+            "data": {
+                "enable-policy": "default",
+                "enable-gateway-api": "true",
+                "kube-proxy-replacement": "true",
+            },
+            "binaryData": {},
+            "immutable": False,
+        }
+        self.cilium_config = {
+            "metadata": {
+                "name": "cilium-config",
+                "namespace": "kube-system",
+            },
+            **json.loads(json.dumps(self.cilium_config_contract)),
+        }
         self.cilium_expected_images = {
             "containers": {
                 "cilium-agent": "quay.io/cilium/cilium:v1.19.5",
@@ -4391,13 +4462,36 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "fixture_live_binding": {"generation_id": "fixture"},
             },
         )
-        self.expected_cilium_images = self.patch(
-            "_expected_cilium_workload_images",
+        self.expected_cilium_runtime = self.patch(
+            "_expected_cilium_runtime_contract",
             return_value={
-                "daemonset": json.loads(json.dumps(self.cilium_expected_images)),
-                "operator": json.loads(
-                    json.dumps(self.cilium_expected_operator_images)
+                "config_map": json.loads(
+                    json.dumps(self.cilium_config_contract)
                 ),
+                "daemonset": {
+                    "images": json.loads(
+                        json.dumps(self.cilium_expected_images)
+                    ),
+                    "selector_labels": {"k8s-app": "cilium"},
+                    "pod_spec": runtime._cilium_pod_spec_projection(
+                        self.cilium_daemonset["spec"]["template"]["spec"],
+                        "expected Cilium DaemonSet",
+                    ),
+                },
+                "operator": {
+                    "images": json.loads(
+                        json.dumps(
+                            self.cilium_expected_operator_images
+                        )
+                    ),
+                    "selector_labels": {
+                        "io.cilium/app": "operator"
+                    },
+                    "pod_spec": runtime._cilium_pod_spec_projection(
+                        self.cilium_operator["spec"]["template"]["spec"],
+                        "expected Cilium operator Deployment",
+                    ),
+                },
             },
         )
         self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
@@ -4432,6 +4526,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "-n", runtime.APP_NAMESPACE, "get", "configmap", "weltgewebe-runtime"
         ]:
             return self.runtime_config_map
+        if arguments == [
+            "-n", "kube-system", "get", "configmap", "cilium-config"
+        ]:
+            return self.cilium_config
         if arguments == [
             "-n", runtime.APP_NAMESPACE, "get", "networkpolicies"
         ]:
@@ -4803,6 +4901,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
 
         healthy_chart = self.cilium_chart
         healthy_values = json.loads(json.dumps(self.cilium_values))
+        healthy_config = json.loads(json.dumps(self.cilium_config))
         healthy_daemonset = json.loads(json.dumps(self.cilium_daemonset))
         healthy_cilium_pods = json.loads(json.dumps(self.cilium_pods))
         healthy_operator_pods = json.loads(json.dumps(self.cilium_operator_pods))
@@ -4834,6 +4933,14 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             runtime.status(self.root)
         self.cilium_values = healthy_values
 
+        self.cilium_config = json.loads(json.dumps(healthy_config))
+        self.cilium_config["data"]["enable-policy"] = "never"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "ConfigMap drifted"
+        ):
+            runtime.status(self.root)
+        self.cilium_config = json.loads(json.dumps(healthy_config))
+
         self.cilium_daemonset = json.loads(json.dumps(healthy_daemonset))
         self.cilium_daemonset["status"]["numberReady"] = 0
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "DaemonSet"):
@@ -4849,6 +4956,14 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         ] = "quay.io/cilium/cilium:v9.9.9"
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "images drifted"):
             runtime.status(self.root)
+        self.cilium_daemonset = json.loads(json.dumps(healthy_daemonset))
+        self.cilium_daemonset["spec"]["template"]["spec"]["containers"][0][
+            "args"
+        ] = ["--shadow-runtime-mode"]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "DaemonSet pod contract drifted"
+        ):
+            runtime.status(self.root)
         self.cilium_daemonset = healthy_daemonset
 
         healthy_operator = json.loads(json.dumps(self.cilium_operator))
@@ -4862,6 +4977,14 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "image"
         ] = "quay.io/cilium/operator-generic:v9.9.9"
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "operator images drifted"):
+            runtime.status(self.root)
+        self.cilium_operator = json.loads(json.dumps(healthy_operator))
+        self.cilium_operator["spec"]["template"]["spec"][
+            "serviceAccountName"
+        ] = "shadow-operator"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "operator pod contract drifted"
+        ):
             runtime.status(self.root)
         self.cilium_operator = healthy_operator
 
@@ -5724,6 +5847,12 @@ spec:
         wrong_listener["spec"]["listeners"][0]["port"] = 443
         cases.append(("wrong-listener", wrong_listener))
 
+        deleting = json.loads(json.dumps(healthy))
+        deleting["metadata"]["deletionTimestamp"] = (
+            "2026-09-28T07:24:37Z"
+        )
+        cases.append(("deleting", deleting))
+
         for name, gateway in cases:
             with self.subTest(case=name):
                 self.gateway = gateway
@@ -5761,6 +5890,12 @@ spec:
         stale_generation = json.loads(json.dumps(healthy))
         stale_generation["metadata"]["generation"] = 2
         cases.append(("generation", stale_generation))
+
+        deleting = json.loads(json.dumps(healthy))
+        deleting["metadata"]["deletionTimestamp"] = (
+            "2026-09-28T07:24:37Z"
+        )
+        cases.append(("deleting", deleting))
 
         wrong_parent = json.loads(json.dumps(healthy))
         wrong_parent["spec"]["parentRefs"][0]["sectionName"] = "other"
@@ -6669,8 +6804,12 @@ spec:
         self.assertIn("kubernetes_target_sha256", source)
         self.assertIn("postgres_runtime_image_ids_sha256", source)
         self.assertIn("postgres_resources_sha256", source)
+        self.assertIn("postgres_contract_sha256", source)
+        self.assertIn("postgres_pod_contract_sha256", source)
 
-    def test_t048_postgres_binding_rejects_image_and_runtime_drift(self) -> None:
+    def test_t048_postgres_binding_rejects_full_runtime_drift(
+        self,
+    ) -> None:
         self.write_vm_receipt()
         self.prepare_status()
         healthy_deployments = json.loads(
@@ -6685,13 +6824,19 @@ spec:
         self.assertRegex(
             proof["runtime_image_ids_sha256"], r"^[0-9a-f]{64}$"
         )
+        self.assertRegex(
+            proof["contract_sha256"], r"^[0-9a-f]{64}$"
+        )
+        self.assertRegex(
+            proof["pod_contract_sha256"], r"^[0-9a-f]{64}$"
+        )
 
         self.data_deployments["postgres"]["spec"]["template"]["spec"][
             "containers"
         ][0]["image"] = "postgres:16@sha256:" + "0" * 64
         with self.assertRaisesRegex(
             runtime.RuntimeErrorEB,
-            "PostgreSQL Deployment images drifted",
+            "live data Deployment images drifted",
         ):
             runtime._require_t048_postgres_runtime_binding(self.root)
 
@@ -6722,7 +6867,7 @@ spec:
         postgres_container["resources"]["limits"]["cpu"] = "2"
         with self.assertRaisesRegex(
             runtime.RuntimeErrorEB,
-            "PostgreSQL Deployment resources drifted",
+            "live data Deployment contract drifted",
         ):
             runtime._require_t048_postgres_runtime_binding(self.root)
 
@@ -6732,15 +6877,64 @@ spec:
         self.data_pods = json.loads(json.dumps(healthy_pods))
         postgres_pod_container = next(
             item
-            for item in self.data_pods["postgres"][0]["spec"]["containers"]
+            for item in self.data_pods["postgres"][0]["spec"][
+                "containers"
+            ]
             if item["name"] == "postgres"
         )
-        postgres_pod_container["resources"]["limits"]["memory"] = "1Gi"
+        postgres_pod_container["resources"]["limits"][
+            "memory"
+        ] = "1Gi"
         with self.assertRaisesRegex(
             runtime.RuntimeErrorEB,
-            "PostgreSQL Pod resources drifted",
+            "live data Pod contract drifted",
         ):
             runtime._require_t048_postgres_runtime_binding(self.root)
+
+        self.data_deployments = json.loads(
+            json.dumps(healthy_deployments)
+        )
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        postgres_container = next(
+            item
+            for item in self.data_deployments["postgres"]["spec"][
+                "template"
+            ]["spec"]["containers"]
+            if item["name"] == "postgres"
+        )
+        postgres_container["args"] = [
+            "-c",
+            "max_connections=999",
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "live data Deployment contract drifted",
+        ):
+            runtime._require_t048_postgres_runtime_binding(self.root)
+
+        self.data_deployments = json.loads(
+            json.dumps(healthy_deployments)
+        )
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        postgres_pod_container = next(
+            item
+            for item in self.data_pods["postgres"][0]["spec"][
+                "containers"
+            ]
+            if item["name"] == "postgres"
+        )
+        postgres_pod_container["env"] = [
+            {
+                "name": "PGOPTIONS",
+                "value": "-c fsync=off",
+            }
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "live data Pod contract drifted",
+        ):
+            runtime._require_t048_postgres_runtime_binding(self.root)
+
 
     def test_status_revalidates_namespace_restricted_security_labels(self) -> None:
         self.write_vm_receipt()
