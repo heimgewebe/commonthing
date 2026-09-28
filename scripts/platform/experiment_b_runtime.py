@@ -41,6 +41,7 @@ import experiment_b as contract
 ROOT = Path(__file__).resolve().parents[2]
 CLUSTER = ROOT / "platform/clusters/experiment-b"
 NAMESPACES = CLUSTER / "namespaces"
+MIGRATION = CLUSTER / "migration"
 APP_OVERLAY = ROOT / "platform/apps/weltgewebe/overlays/experiment-b"
 DEFAULT_STATE_ROOT = Path.home() / ".local/state/commonthing/experiment-b"
 VM_NAME = "commonthing-experiment-b"
@@ -1604,7 +1605,16 @@ def apply_release(
                     "migration": run(
                         [
                             kubectl, "-n", APP_NAMESPACE, "get", "job",
-                            "commonthing-experiment-b-migration", "-o", "json",
+                            MIGRATION_JOB_NAME, "-o", "json",
+                        ],
+                        env=env,
+                        check=False,
+                    ),
+                    "migration_pods": run(
+                        [
+                            kubectl, "-n", APP_NAMESPACE, "get", "pods",
+                            "-l", f"batch.kubernetes.io/job-name={MIGRATION_JOB_NAME}",
+                            "-o", "json",
                         ],
                         env=env,
                         check=False,
@@ -1614,10 +1624,19 @@ def apply_release(
                     raise RuntimeErrorEB(
                         "Experiment-B release artifacts are not all queryable"
                     )
+                migration_pods_payload = json.loads(
+                    live_results["migration_pods"].stdout
+                )
+                if not isinstance(migration_pods_payload, dict):
+                    raise RuntimeErrorEB(
+                        "Experiment-B migration Pod inventory is not an object"
+                    )
                 _require_requested_release_artifacts(
+                    root,
                     json.loads(live_results["api"].stdout),
                     json.loads(live_results["web"].stdout),
                     json.loads(live_results["migration"].stdout),
+                    migration_pods_payload.get("items"),
                     api_digest,
                     web_digest,
                     api_replicas,
@@ -2817,10 +2836,352 @@ def _container_images(document: Any, context: str) -> dict[str, str]:
     return images
 
 
+MIGRATION_JOB_NAME = "commonthing-experiment-b-migration"
+_MIGRATION_CONTROLLER_LABELS = frozenset(
+    {
+        "batch.kubernetes.io/controller-uid",
+        "batch.kubernetes.io/job-name",
+        "controller-uid",
+        "job-name",
+    }
+)
+
+
+def _migration_template_metadata_projection(
+    metadata: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        raise RuntimeErrorEB(f"{context} template metadata is invalid")
+    labels = metadata.get("labels", {})
+    annotations = metadata.get("annotations", {})
+    if not isinstance(labels, dict) or not isinstance(annotations, dict):
+        raise RuntimeErrorEB(f"{context} template metadata contract is invalid")
+    return {
+        "labels": {
+            str(key): str(value)
+            for key, value in sorted(labels.items())
+            if key not in _MIGRATION_CONTROLLER_LABELS
+        },
+        "annotations": {
+            str(key): str(value)
+            for key, value in sorted(annotations.items())
+        },
+    }
+
+
+def _migration_job_contract(
+    job: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(job, dict):
+        raise RuntimeErrorEB(f"{context} Job payload is invalid")
+    spec = job.get("spec", {})
+    template = spec.get("template", {}) if isinstance(spec, dict) else {}
+    template_metadata = (
+        template.get("metadata", {}) if isinstance(template, dict) else {}
+    )
+    pod_spec = template.get("spec", {}) if isinstance(template, dict) else {}
+    if not isinstance(spec, dict) or not isinstance(template, dict):
+        raise RuntimeErrorEB(f"{context} Job spec/template is invalid")
+
+    parallelism = spec.get("parallelism", 1)
+    completions = spec.get("completions", 1)
+    backoff_limit = spec.get("backoffLimit", 6)
+    suspend = spec.get("suspend", False)
+    manual_selector = spec.get("manualSelector", False)
+    if suspend is None:
+        suspend = False
+    if manual_selector is None:
+        manual_selector = False
+    if (
+        isinstance(parallelism, bool)
+        or not isinstance(parallelism, int)
+        or parallelism < 1
+        or isinstance(completions, bool)
+        or not isinstance(completions, int)
+        or completions < 1
+        or isinstance(backoff_limit, bool)
+        or not isinstance(backoff_limit, int)
+        or backoff_limit < 0
+        or not isinstance(suspend, bool)
+        or not isinstance(manual_selector, bool)
+    ):
+        raise RuntimeErrorEB(f"{context} Job execution contract is invalid")
+    metadata_contract = _migration_template_metadata_projection(
+        template_metadata, context
+    )
+    pod_contract = _application_pod_spec_projection(
+        pod_spec, f"{context} Pod template"
+    )
+    return {
+        "parallelism": parallelism,
+        "completions": completions,
+        "backoffLimit": backoff_limit,
+        "activeDeadlineSeconds": spec.get("activeDeadlineSeconds"),
+        "ttlSecondsAfterFinished": spec.get("ttlSecondsAfterFinished"),
+        "completionMode": spec.get("completionMode", "NonIndexed"),
+        "suspend": suspend,
+        "manualSelector": manual_selector,
+        "podFailurePolicy": spec.get("podFailurePolicy"),
+        "successPolicy": spec.get("successPolicy"),
+        "backoffLimitPerIndex": spec.get("backoffLimitPerIndex"),
+        "maxFailedIndexes": spec.get("maxFailedIndexes"),
+        "managedBy": spec.get("managedBy"),
+        "template_labels": metadata_contract["labels"],
+        "template_annotations": metadata_contract["annotations"],
+        "pod_spec": pod_contract,
+    }
+
+
+def _rendered_migration_job_contract(
+    root: Path,
+    api_digest: str,
+) -> dict[str, Any]:
+    if not DIGEST_RE.fullmatch(api_digest):
+        raise RuntimeErrorEB(
+            "migration Job contract requires an exact API digest"
+        )
+    kustomize = toolchain(root)["tools"].get("kustomize")
+    if not isinstance(kustomize, str) or not kustomize:
+        raise RuntimeErrorEB(
+            "migration Job contract requires pinned kustomize"
+        )
+    rendered = run([kustomize, "build", str(MIGRATION)]).stdout
+    rendered = rendered.replace("$" + "{API_DIGEST}", api_digest)
+    try:
+        documents = [
+            document
+            for document in yaml.safe_load_all(rendered)
+            if isinstance(document, dict)
+        ]
+    except yaml.YAMLError as exc:
+        raise RuntimeErrorEB(
+            "rendered Experiment-B migration contract is invalid"
+        ) from exc
+    matches = [
+        document
+        for document in documents
+        if document.get("kind") == "Job"
+        and document.get("metadata", {}).get("name")
+        == MIGRATION_JOB_NAME
+        and document.get("metadata", {}).get("namespace")
+        == APP_NAMESPACE
+    ]
+    if len(matches) != 1:
+        raise RuntimeErrorEB(
+            "rendered Experiment-B migration Job is ambiguous"
+        )
+    contract = _migration_job_contract(
+        matches[0], "rendered Experiment-B migration Job"
+    )
+    return {
+        "contract": contract,
+        "contract_sha256": _stable_json_sha256(contract),
+        "pod_contract_sha256": _stable_json_sha256(
+            contract["pod_spec"]
+        ),
+    }
+
+
+def _require_migration_job_runtime_contract(
+    root: Path,
+    migration: Any,
+    migration_pods: Any,
+    api_digest: str,
+) -> dict[str, Any]:
+    expected = _rendered_migration_job_contract(root, api_digest)
+    if not isinstance(migration, dict):
+        raise RuntimeErrorEB("Experiment-B migration Job is invalid")
+    metadata = migration.get("metadata", {})
+    status = migration.get("status", {})
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != MIGRATION_JOB_NAME
+        or metadata.get("namespace") != APP_NAMESPACE
+        or metadata.get("deletionTimestamp") is not None
+        or not isinstance(metadata.get("uid"), str)
+        or not metadata.get("uid")
+        or not isinstance(status, dict)
+    ):
+        raise RuntimeErrorEB(
+            "Experiment-B migration Job identity/status drifted"
+        )
+    observed_contract = _migration_job_contract(
+        migration, "live Experiment-B migration Job"
+    )
+    if observed_contract != expected["contract"]:
+        raise RuntimeErrorEB(
+            "Experiment-B migration Job contract drifted"
+        )
+    complete = any(
+        isinstance(condition, dict)
+        and condition.get("type") == "Complete"
+        and condition.get("status") == "True"
+        for condition in status.get("conditions", [])
+    )
+    succeeded = status.get("succeeded", 0) or 0
+    if (
+        isinstance(succeeded, bool)
+        or not isinstance(succeeded, int)
+        or succeeded != expected["contract"]["completions"]
+        or not complete
+    ):
+        raise RuntimeErrorEB(
+            "Experiment-B migration Job is not canonically complete"
+        )
+    if not isinstance(migration_pods, list) or not migration_pods:
+        raise RuntimeErrorEB(
+            "Experiment-B migration Pod inventory is empty or invalid"
+        )
+    job_uid = metadata["uid"]
+    expected_labels = expected["contract"]["template_labels"]
+    expected_annotations = expected["contract"]["template_annotations"]
+    expected_pod_spec = expected["contract"]["pod_spec"]
+    expected_containers = expected_pod_spec["containers"]
+    expected_init = expected_pod_spec["init_containers"]
+    pod_names: list[str] = []
+    succeeded_pods = 0
+    for pod in migration_pods:
+        if not isinstance(pod, dict):
+            raise RuntimeErrorEB(
+                "Experiment-B migration Pod inventory is invalid"
+            )
+        pod_metadata = pod.get("metadata", {})
+        pod_spec = pod.get("spec", {})
+        pod_status = pod.get("status", {})
+        if (
+            not isinstance(pod_metadata, dict)
+            or not isinstance(pod_status, dict)
+        ):
+            raise RuntimeErrorEB(
+                "Experiment-B migration Pod metadata/status is invalid"
+            )
+        pod_name = pod_metadata.get("name")
+        if (
+            not isinstance(pod_name, str)
+            or not pod_name
+            or pod_name in pod_names
+            or pod_metadata.get("namespace") != APP_NAMESPACE
+            or pod_metadata.get("deletionTimestamp") is not None
+        ):
+            raise RuntimeErrorEB(
+                "Experiment-B migration Pod identity drifted"
+            )
+        owners = pod_metadata.get("ownerReferences", [])
+        owner_matches = [
+            owner
+            for owner in owners
+            if isinstance(owner, dict)
+            and owner.get("apiVersion") == "batch/v1"
+            and owner.get("kind") == "Job"
+            and owner.get("name") == MIGRATION_JOB_NAME
+            and owner.get("uid") == job_uid
+            and owner.get("controller") is True
+        ] if isinstance(owners, list) else []
+        if len(owner_matches) != 1:
+            raise RuntimeErrorEB(
+                "Experiment-B migration Pod owner binding drifted"
+            )
+        pod_metadata_contract = _migration_template_metadata_projection(
+            pod_metadata, f"live Experiment-B migration Pod {pod_name}"
+        )
+        if any(
+            pod_metadata_contract["labels"].get(key) != value
+            for key, value in expected_labels.items()
+        ) or any(
+            pod_metadata_contract["annotations"].get(key) != value
+            for key, value in expected_annotations.items()
+        ):
+            raise RuntimeErrorEB(
+                "Experiment-B migration Pod metadata contract drifted"
+            )
+        if (
+            _application_pod_spec_projection(
+                pod_spec, f"live Experiment-B migration Pod {pod_name}"
+            )
+            != expected_pod_spec
+        ):
+            raise RuntimeErrorEB(
+                "Experiment-B migration Pod contract drifted"
+            )
+        phase = pod_status.get("phase")
+        if phase not in {"Succeeded", "Failed"}:
+            raise RuntimeErrorEB(
+                "Experiment-B migration Pod is not terminal"
+            )
+        if phase == "Succeeded":
+            succeeded_pods += 1
+            for field, expected_group in (
+                ("containerStatuses", expected_containers),
+                ("initContainerStatuses", expected_init),
+            ):
+                statuses = pod_status.get(field, [])
+                if statuses is None:
+                    statuses = []
+                if (
+                    not isinstance(statuses, list)
+                    or any(not isinstance(item, dict) for item in statuses)
+                ):
+                    raise RuntimeErrorEB(
+                        "Experiment-B migration Pod runtime status is invalid"
+                    )
+                by_name = {
+                    str(item.get("name", "")): item
+                    for item in statuses
+                    if item.get("name")
+                }
+                if set(by_name) != set(expected_group):
+                    raise RuntimeErrorEB(
+                        "Experiment-B migration Pod container set drifted"
+                    )
+                for name, expected_container in expected_group.items():
+                    runtime_status = by_name[name]
+                    image = expected_container.get("image")
+                    image_id = runtime_status.get("imageID")
+                    if (
+                        isinstance(image, str)
+                        and "@" in image
+                        and not _runtime_image_id_matches_digest(
+                            image_id, image.rsplit("@", 1)[1]
+                        )
+                    ):
+                        raise RuntimeErrorEB(
+                            "Experiment-B migration Pod runtime image drifted"
+                        )
+                    terminated = (
+                        runtime_status.get("state", {}).get("terminated")
+                        if isinstance(runtime_status.get("state"), dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(terminated, dict)
+                        or terminated.get("exitCode") != 0
+                    ):
+                        raise RuntimeErrorEB(
+                            "Experiment-B migration Pod did not terminate cleanly"
+                        )
+        pod_names.append(pod_name)
+
+    if succeeded_pods != expected["contract"]["completions"]:
+        raise RuntimeErrorEB(
+            "Experiment-B migration succeeded Pod count drifted"
+        )
+    return {
+        "contract_sha256": expected["contract_sha256"],
+        "pod_contract_sha256": expected["pod_contract_sha256"],
+        "pod_names": sorted(pod_names),
+        "succeeded_pods": succeeded_pods,
+        "canonical": True,
+    }
+
+
 def _require_requested_release_artifacts(
+    root: Path,
     api: Any,
     web: Any,
     migration: Any,
+    migration_pods: Any,
     api_digest: str,
     web_digest: str,
     api_replicas: int,
@@ -2849,19 +3210,12 @@ def _require_requested_release_artifacts(
             web, "weltgewebe-web", web_replicas
         ),
     }
-    migration_status = migration.get("status", {}) if isinstance(migration, dict) else {}
-    migration_complete = (
-        isinstance(migration_status, dict)
-        and int(migration_status.get("succeeded") or 0) >= 1
-        and any(
-            isinstance(condition, dict)
-            and condition.get("type") == "Complete"
-            and condition.get("status") == "True"
-            for condition in migration_status.get("conditions", [])
-        )
+    migration_readback = _require_migration_job_runtime_contract(
+        root,
+        migration,
+        migration_pods,
+        api_digest,
     )
-    if not migration_complete:
-        raise RuntimeErrorEB("Experiment-B migration Job is not complete")
 
     return {
         "deployments": deployments,
@@ -2871,6 +3225,7 @@ def _require_requested_release_artifacts(
             "search_worker": api_images.get("search-worker"),
             "migration": migration_images.get("migration"),
         },
+        "migration": migration_readback,
         "migration_complete": True,
     }
 
@@ -4202,6 +4557,42 @@ def _application_pod_spec_projection(
 ) -> dict[str, Any]:
     if not isinstance(pod_spec, dict):
         raise RuntimeErrorEB(f"{context} Pod spec is invalid")
+
+    tolerations = pod_spec.get("tolerations") or []
+    if not isinstance(tolerations, list) or any(
+        not isinstance(item, dict) for item in tolerations
+    ):
+        raise RuntimeErrorEB(f"{context} toleration contract is invalid")
+    normalized_tolerations = json.loads(json.dumps(tolerations))
+    for default_toleration in (
+        {
+            "effect": "NoExecute",
+            "key": "node.kubernetes.io/not-ready",
+            "operator": "Exists",
+            "tolerationSeconds": 300,
+        },
+        {
+            "effect": "NoExecute",
+            "key": "node.kubernetes.io/unreachable",
+            "operator": "Exists",
+            "tolerationSeconds": 300,
+        },
+    ):
+        if default_toleration in normalized_tolerations:
+            normalized_tolerations.remove(default_toleration)
+
+    host_aliases = pod_spec.get("hostAliases") or []
+    readiness_gates = pod_spec.get("readinessGates") or []
+    if (
+        not isinstance(host_aliases, list)
+        or any(not isinstance(item, dict) for item in host_aliases)
+        or not isinstance(readiness_gates, list)
+        or any(not isinstance(item, dict) for item in readiness_gates)
+    ):
+        raise RuntimeErrorEB(
+            f"{context} Pod hostAliases/readinessGates contract is invalid"
+        )
+
     result: dict[str, Any] = {
         "serviceAccountName": pod_spec.get(
             "serviceAccountName", "default"
@@ -4220,6 +4611,31 @@ def _application_pod_spec_projection(
         ),
         "affinity": pod_spec.get("affinity"),
         "nodeSelector": pod_spec.get("nodeSelector"),
+        "hostNetwork": pod_spec.get("hostNetwork", False),
+        "hostPID": pod_spec.get("hostPID", False),
+        "hostIPC": pod_spec.get("hostIPC", False),
+        "dnsPolicy": pod_spec.get("dnsPolicy", "ClusterFirst"),
+        "dnsConfig": pod_spec.get("dnsConfig"),
+        "priorityClassName": pod_spec.get("priorityClassName", ""),
+        "tolerations": normalized_tolerations,
+        "restartPolicy": pod_spec.get("restartPolicy", "Always"),
+        "schedulerName": pod_spec.get(
+            "schedulerName", "default-scheduler"
+        ),
+        "enableServiceLinks": pod_spec.get("enableServiceLinks", True),
+        "shareProcessNamespace": pod_spec.get(
+            "shareProcessNamespace", False
+        ),
+        "runtimeClassName": pod_spec.get("runtimeClassName"),
+        "hostname": pod_spec.get("hostname"),
+        "subdomain": pod_spec.get("subdomain"),
+        "setHostnameAsFQDN": pod_spec.get("setHostnameAsFQDN", False),
+        "hostAliases": json.loads(json.dumps(host_aliases)),
+        "readinessGates": json.loads(json.dumps(readiness_gates)),
+        "preemptionPolicy": pod_spec.get(
+            "preemptionPolicy", "PreemptLowerPriority"
+        ),
+        "priority": pod_spec.get("priority", 0),
     }
     for field, output_key in (
         ("containers", "containers"),
@@ -5738,13 +6154,22 @@ def status(root: Path) -> dict[str, Any]:
         root,
         [
             "-n", APP_NAMESPACE, "get", "job",
-            "commonthing-experiment-b-migration",
+            MIGRATION_JOB_NAME,
         ],
     )
+    migration_pods = _kubectl_json(
+        root,
+        [
+            "-n", APP_NAMESPACE, "get", "pods",
+            "-l", f"batch.kubernetes.io/job-name={MIGRATION_JOB_NAME}",
+        ],
+    ).get("items")
     release_artifacts = _require_requested_release_artifacts(
+        root,
         api,
         web,
         migration,
+        migration_pods,
         str(release.get("api_digest", "")),
         str(release.get("web_digest", "")),
         int(config["semantic_search"]["api_replicas"]),
@@ -5934,6 +6359,7 @@ def status(root: Path) -> dict[str, Any]:
             **release_artifacts["images"],
             "ollama": api_containers.get("ollama"),
         },
+        "migration": release_artifacts["migration"],
         "migration_complete": release_artifacts["migration_complete"],
         "semantic_provider": semantic_provider,
         "secrets": secret_readback,
@@ -9142,6 +9568,28 @@ def portability_report(root: Path) -> dict[str, Any]:
                 f"status does not prove the live data Service contract: {name}"
             )
 
+
+    migration_status = status_payload.get("migration")
+    expected_migration = _rendered_migration_job_contract(
+        root, str(payloads["release.json"].get("api_digest", ""))
+    )
+    if (
+        status_payload.get("migration_complete") is not True
+        or not isinstance(migration_status, dict)
+        or migration_status.get("canonical") is not True
+        or migration_status.get("contract_sha256")
+        != expected_migration["contract_sha256"]
+        or migration_status.get("pod_contract_sha256")
+        != expected_migration["pod_contract_sha256"]
+        or migration_status.get("succeeded_pods")
+        != expected_migration["contract"]["completions"]
+        or not isinstance(migration_status.get("pod_names"), list)
+        or len(migration_status["pod_names"])
+        < expected_migration["contract"]["completions"]
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the complete migration Job/Pod contract"
+        )
 
     application_service_status = status_payload.get("application_services")
     expected_application_services = _rendered_application_service_contract(

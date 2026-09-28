@@ -1467,7 +1467,8 @@ spec:
     def test_apply_release_requires_requested_live_artifacts(self) -> None:
         source = inspect.getsource(runtime.apply_release)
         self.assertIn("_require_requested_release_artifacts(", source)
-        self.assertIn('"commonthing-experiment-b-migration"', source)
+        self.assertIn("MIGRATION_JOB_NAME", source)
+        self.assertIn('"migration_pods"', source)
         self.assertLess(
             source.index("_require_requested_release_artifacts("),
             source.index("receipt = {"),
@@ -1529,10 +1530,32 @@ spec:
                 "conditions": [{"type": "Complete", "status": "True"}],
             },
         }
-        observed = runtime._require_requested_release_artifacts(
-            api, web, migration, api_digest, web_digest, 1, 2
-        )
+        migration_readback = {
+            "contract_sha256": "a" * 64,
+            "pod_contract_sha256": "b" * 64,
+            "pod_names": ["migration-0"],
+            "succeeded_pods": 1,
+            "canonical": True,
+        }
+        with mock.patch.object(
+            runtime,
+            "_require_migration_job_runtime_contract",
+            return_value=migration_readback,
+        ) as migration_contract:
+            observed = runtime._require_requested_release_artifacts(
+                Path("/tmp"),
+                api,
+                web,
+                migration,
+                [],
+                api_digest,
+                web_digest,
+                1,
+                2,
+            )
         self.assertTrue(observed["migration_complete"])
+        self.assertEqual(observed["migration"], migration_readback)
+        migration_contract.assert_called_once()
 
         stale_api = json.loads(json.dumps(api))
         stale_api["spec"]["template"]["spec"]["containers"][0]["image"] = (
@@ -1540,7 +1563,15 @@ spec:
         )
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "live API image"):
             runtime._require_requested_release_artifacts(
-                stale_api, web, migration, api_digest, web_digest, 1, 2
+                Path("/tmp"),
+                stale_api,
+                web,
+                migration,
+                [],
+                api_digest,
+                web_digest,
+                1,
+                2,
             )
 
         stale_migration = json.loads(json.dumps(migration))
@@ -1549,14 +1580,41 @@ spec:
         )
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "migration image"):
             runtime._require_requested_release_artifacts(
-                api, web, stale_migration, api_digest, web_digest, 1, 2
+                Path("/tmp"),
+                api,
+                web,
+                stale_migration,
+                [],
+                api_digest,
+                web_digest,
+                1,
+                2,
             )
 
         incomplete = json.loads(json.dumps(migration))
         incomplete["status"] = {"succeeded": 0, "conditions": []}
-        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not complete"):
+        with (
+            mock.patch.object(
+                runtime,
+                "_require_migration_job_runtime_contract",
+                side_effect=runtime.RuntimeErrorEB(
+                    "Experiment-B migration Job is not canonically complete"
+                ),
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "not canonically complete"
+            ),
+        ):
             runtime._require_requested_release_artifacts(
-                api, web, incomplete, api_digest, web_digest, 1, 2
+                Path("/tmp"),
+                api,
+                web,
+                incomplete,
+                [],
+                api_digest,
+                web_digest,
+                1,
+                2,
             )
 
     def test_recovery_attempt_invalidates_post_recovery_evidence(self) -> None:
@@ -2161,6 +2219,18 @@ spec:
             }
             for name in ("weltgewebe-api", "weltgewebe-web")
         }
+        migration_expected_contract = {
+            "contract": {"completions": 1},
+            "contract_sha256": "b" * 64,
+            "pod_contract_sha256": "c" * 64,
+        }
+        migration_status = {
+            "contract_sha256": "b" * 64,
+            "pod_contract_sha256": "c" * 64,
+            "pod_names": ["migration-pod-0"],
+            "succeeded_pods": 1,
+            "canonical": True,
+        }
         statuses = {
             "vm-create.json": "created",
             "k3s.json": "ready",
@@ -2206,6 +2276,11 @@ spec:
                 runtime,
                 "_rendered_application_service_account_contract",
                 return_value=application_service_account_expected_contract,
+            ),
+            mock.patch.object(
+                runtime,
+                "_rendered_migration_job_contract",
+                return_value=migration_expected_contract,
             ),
         ):
             root = Path(tmp)
@@ -2495,6 +2570,10 @@ spec:
                             application_service_account_expected_contract.items()
                         )
                     }
+                    payload["migration"] = json.loads(
+                        json.dumps(migration_status)
+                    )
+                    payload["migration_complete"] = True
                     runtime_binding = config["runtime_binding"]
                     api_images = {
                         "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64,
@@ -2673,6 +2752,20 @@ spec:
             status_path.write_text(original_status, encoding="utf-8")
             attempt_path.write_text(original_attempt, encoding="utf-8")
 
+
+            changed_status = json.loads(original_status)
+            changed_status["migration"]["contract_sha256"] = "0" * 64
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "migration Job/Pod contract",
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
 
             changed_status = json.loads(original_status)
             changed_status["application_services"]["weltgewebe-api"][
@@ -4809,6 +4902,30 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 json.dumps(self.application_workload_expected)
             ),
         )
+        self.migration_contract_expected = {
+            "contract": {"completions": 1},
+            "contract_sha256": "b" * 64,
+            "pod_contract_sha256": "c" * 64,
+        }
+        self.migration_readback = {
+            "contract_sha256": "b" * 64,
+            "pod_contract_sha256": "c" * 64,
+            "pod_names": ["migration-pod-0"],
+            "succeeded_pods": 1,
+            "canonical": True,
+        }
+        self.migration_contract = self.patch(
+            "_rendered_migration_job_contract",
+            return_value=json.loads(
+                json.dumps(self.migration_contract_expected)
+            ),
+        )
+        self.migration_live = self.patch(
+            "_require_migration_job_runtime_contract",
+            return_value=json.loads(
+                json.dumps(self.migration_readback)
+            ),
+        )
         self.application_workload_live = self.patch(
             "_require_live_application_workloads",
             return_value=json.loads(
@@ -4981,6 +5098,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     *self.data_pods["nats"],
                 ]
             }
+        if arguments == [
+            "-n",
+            runtime.APP_NAMESPACE,
+            "get",
+            "pods",
+            "-l",
+            f"batch.kubernetes.io/job-name={runtime.MIGRATION_JOB_NAME}",
+        ]:
+            return {"items": [{"metadata": {"name": "migration-pod-0"}}]}
         if arguments == [
             "-n",
             runtime.APP_NAMESPACE,
@@ -7809,6 +7935,254 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
         )
         self.assertIn("api_contract_sha256", source)
         self.assertIn("api_pod_contract_sha256", source)
+
+    def test_application_pod_spec_projection_binds_behavior_fields(self) -> None:
+        base = {
+            "containers": [
+                {
+                    "name": "api",
+                    "image": "example.invalid/api@sha256:" + "a" * 64,
+                }
+            ]
+        }
+        expected = runtime._application_pod_spec_projection(
+            base, "canonical Pod"
+        )
+        drifts = {
+            "shareProcessNamespace": True,
+            "dnsPolicy": "None",
+            "dnsConfig": {"nameservers": ["192.0.2.53"]},
+            "runtimeClassName": "sandboxed",
+            "enableServiceLinks": False,
+            "hostPID": True,
+        }
+        for field, value in drifts.items():
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(base))
+                changed[field] = value
+                self.assertNotEqual(
+                    expected,
+                    runtime._application_pod_spec_projection(
+                        changed, f"drifted {field}"
+                    ),
+                )
+
+        live_defaults = json.loads(json.dumps(base))
+        live_defaults["tolerations"] = [
+            {
+                "effect": "NoExecute",
+                "key": "node.kubernetes.io/not-ready",
+                "operator": "Exists",
+                "tolerationSeconds": 300,
+            },
+            {
+                "effect": "NoExecute",
+                "key": "node.kubernetes.io/unreachable",
+                "operator": "Exists",
+                "tolerationSeconds": 300,
+            },
+        ]
+        self.assertEqual(
+            expected,
+            runtime._application_pod_spec_projection(
+                live_defaults, "live defaulted Pod"
+            ),
+        )
+
+    def test_migration_job_and_completed_pod_are_fully_bound(self) -> None:
+        api_digest = "sha256:" + "b" * 64
+        image = "ghcr.io/heimgewebe/commonthing-api@" + api_digest
+        template_labels = {
+            "app.kubernetes.io/name": runtime.MIGRATION_JOB_NAME,
+            "app.kubernetes.io/component": "database-migration",
+        }
+        pod_spec = {
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "containers": [
+                {
+                    "name": "migration",
+                    "image": image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "env": [{"name": "MODE", "value": "canonical"}],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                    },
+                }
+            ],
+        }
+        rendered_job = {
+            "metadata": {
+                "name": runtime.MIGRATION_JOB_NAME,
+                "namespace": runtime.APP_NAMESPACE,
+            },
+            "spec": {
+                "backoffLimit": 4,
+                "activeDeadlineSeconds": 480,
+                "template": {
+                    "metadata": {"labels": template_labels},
+                    "spec": pod_spec,
+                },
+            },
+        }
+        expected_contract = runtime._migration_job_contract(
+            rendered_job, "rendered migration"
+        )
+        expected = {
+            "contract": expected_contract,
+            "contract_sha256": runtime._stable_json_sha256(
+                expected_contract
+            ),
+            "pod_contract_sha256": runtime._stable_json_sha256(
+                expected_contract["pod_spec"]
+            ),
+        }
+        live_job = json.loads(json.dumps(rendered_job))
+        live_job["metadata"]["uid"] = "job-uid-1"
+        live_job["spec"]["parallelism"] = 1
+        live_job["spec"]["completions"] = 1
+        live_job["spec"]["completionMode"] = "NonIndexed"
+        live_job["spec"]["selector"] = {
+            "matchLabels": {
+                "batch.kubernetes.io/controller-uid": "job-uid-1"
+            }
+        }
+        live_job["spec"]["template"]["metadata"]["labels"].update(
+            {
+                "batch.kubernetes.io/controller-uid": "job-uid-1",
+                "batch.kubernetes.io/job-name": runtime.MIGRATION_JOB_NAME,
+                "controller-uid": "job-uid-1",
+                "job-name": runtime.MIGRATION_JOB_NAME,
+            }
+        )
+        live_job["status"] = {
+            "succeeded": 1,
+            "conditions": [{"type": "Complete", "status": "True"}],
+        }
+
+        live_pod_spec = json.loads(json.dumps(pod_spec))
+        live_pod_spec.update(
+            {
+                "dnsPolicy": "ClusterFirst",
+                "schedulerName": "default-scheduler",
+                "enableServiceLinks": True,
+                "preemptionPolicy": "PreemptLowerPriority",
+                "priority": 0,
+                "tolerations": [
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/not-ready",
+                        "operator": "Exists",
+                        "tolerationSeconds": 300,
+                    },
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/unreachable",
+                        "operator": "Exists",
+                        "tolerationSeconds": 300,
+                    },
+                ],
+            }
+        )
+        live_pod = {
+            "metadata": {
+                "name": "migration-pod-1",
+                "namespace": runtime.APP_NAMESPACE,
+                "labels": {
+                    **template_labels,
+                    "batch.kubernetes.io/controller-uid": "job-uid-1",
+                    "batch.kubernetes.io/job-name": runtime.MIGRATION_JOB_NAME,
+                    "controller-uid": "job-uid-1",
+                    "job-name": runtime.MIGRATION_JOB_NAME,
+                },
+                "ownerReferences": [
+                    {
+                        "apiVersion": "batch/v1",
+                        "kind": "Job",
+                        "name": runtime.MIGRATION_JOB_NAME,
+                        "uid": "job-uid-1",
+                        "controller": True,
+                    }
+                ],
+            },
+            "spec": live_pod_spec,
+            "status": {
+                "phase": "Succeeded",
+                "containerStatuses": [
+                    {
+                        "name": "migration",
+                        "imageID": "containerd://" + api_digest,
+                        "state": {"terminated": {"exitCode": 0}},
+                    }
+                ],
+            },
+        }
+        with mock.patch.object(
+            runtime,
+            "_rendered_migration_job_contract",
+            return_value=expected,
+        ):
+            observed = runtime._require_migration_job_runtime_contract(
+                Path("/tmp"),
+                live_job,
+                [live_pod],
+                api_digest,
+            )
+        self.assertTrue(observed["canonical"])
+        self.assertEqual(observed["succeeded_pods"], 1)
+
+        job_drift = json.loads(json.dumps(live_job))
+        job_drift["spec"]["template"]["spec"]["containers"][0][
+            "args"
+        ] = ["shadow"]
+        with (
+            mock.patch.object(
+                runtime,
+                "_rendered_migration_job_contract",
+                return_value=expected,
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "migration Job contract drifted"
+            ),
+        ):
+            runtime._require_migration_job_runtime_contract(
+                Path("/tmp"),
+                job_drift,
+                [live_pod],
+                api_digest,
+            )
+
+        pod_drift = json.loads(json.dumps(live_pod))
+        pod_drift["spec"]["containers"].append(
+            {
+                "name": "sidecar",
+                "image": image,
+                "imagePullPolicy": "IfNotPresent",
+            }
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "_rendered_migration_job_contract",
+                return_value=expected,
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "migration Pod contract drifted"
+            ),
+        ):
+            runtime._require_migration_job_runtime_contract(
+                Path("/tmp"),
+                live_job,
+                [pod_drift],
+                api_digest,
+            )
+
+        portability = inspect.getsource(runtime.portability_report)
+        self.assertIn(
+            "complete migration Job/Pod contract",
+            portability,
+        )
 
     def test_t048_port_forward_targets_verified_api_pod(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
