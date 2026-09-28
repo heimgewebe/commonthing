@@ -7106,7 +7106,12 @@ def _wait_http_200(url: str, process: subprocess.Popen[Any] | None = None) -> No
     raise RuntimeErrorEB(f"HTTP target did not become ready: {url}")
 
 
-def _start_api_port_forward(root: Path) -> tuple[subprocess.Popen[Any], int, Any, Any]:
+def _start_api_port_forward(
+    root: Path,
+    pod_name: str,
+) -> tuple[subprocess.Popen[Any], int, Any, Any]:
+    if not isinstance(pod_name, str) or not pod_name:
+        raise RuntimeErrorEB("API port-forward requires a verified Pod name")
     port = _reserve_loopback_port()
     evidence_dir = root / "performance"
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -7116,7 +7121,7 @@ def _start_api_port_forward(root: Path) -> tuple[subprocess.Popen[Any], int, Any
     process = subprocess.Popen(
         [
             kubectl, "-n", APP_NAMESPACE, "port-forward",
-            "service/weltgewebe-api", f"{port}:8080", "--address=127.0.0.1",
+            f"pod/{pod_name}", f"{port}:8080", "--address=127.0.0.1",
         ],
         cwd=ROOT,
         stdout=stdout,
@@ -7477,7 +7482,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         pod, load_config()
     )
 
-    process, port, pf_stdout, pf_stderr = _start_api_port_forward(root)
+    process, port, pf_stdout, pf_stderr = _start_api_port_forward(
+        root, pod_name
+    )
     base_url = f"http://127.0.0.1:{port}"
     try:
         before_status, before_body, _elapsed = _http_read(f"{base_url}/metrics")

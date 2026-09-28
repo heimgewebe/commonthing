@@ -7810,6 +7810,53 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
         self.assertIn("api_contract_sha256", source)
         self.assertIn("api_pod_contract_sha256", source)
 
+    def test_t048_port_forward_targets_verified_api_pod(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            process = mock.Mock()
+            process.poll.return_value = None
+            with (
+                mock.patch.object(
+                    runtime, "_reserve_loopback_port", return_value=43123
+                ),
+                mock.patch.object(
+                    runtime,
+                    "toolchain",
+                    return_value={"tools": {"kubectl": "/verified/kubectl"}},
+                ),
+                mock.patch.object(runtime, "kube_env", return_value={}),
+                mock.patch.object(
+                    runtime.subprocess,
+                    "Popen",
+                    return_value=process,
+                ) as popen,
+                mock.patch.object(runtime, "_wait_http_200") as wait_http,
+            ):
+                returned, port, stdout, stderr = (
+                    runtime._start_api_port_forward(
+                        root, "weltgewebe-api-verified"
+                    )
+                )
+            try:
+                self.assertIs(returned, process)
+                self.assertEqual(port, 43123)
+                argv = popen.call_args.args[0]
+                self.assertIn("pod/weltgewebe-api-verified", argv)
+                self.assertNotIn("service/weltgewebe-api", argv)
+                wait_http.assert_called_once_with(
+                    "http://127.0.0.1:43123/health/live",
+                    process,
+                )
+            finally:
+                stdout.close()
+                stderr.close()
+
+        t048_source = inspect.getsource(runtime.t048_load_proof)
+        self.assertIn(
+            "_start_api_port_forward(\n        root, pod_name\n    )",
+            t048_source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
