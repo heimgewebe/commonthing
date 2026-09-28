@@ -1736,9 +1736,26 @@ def secret_manifest(
 def ensure_secret_material(root: Path) -> tuple[dict[str, str], bytes]:
     path = root / "secrets/database.json"
     if path.is_file():
-        source_bytes = path.read_bytes()
-        data = json.loads(source_bytes.decode("utf-8"))
-        return {str(k): str(v) for k, v in data.items()}, source_bytes
+        try:
+            source_bytes = path.read_bytes()
+            data = json.loads(source_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeErrorEB(
+                "Experiment-B database Secret source material is invalid"
+            ) from exc
+        expected_keys = ("username", "database", "password")
+        if (
+            not isinstance(data, dict)
+            or set(data) != set(expected_keys)
+            or any(
+                not isinstance(data.get(key), str) or not data[key]
+                for key in expected_keys
+            )
+        ):
+            raise RuntimeErrorEB(
+                "Experiment-B database Secret source material is invalid"
+            )
+        return {key: data[key] for key in expected_keys}, source_bytes
     data = {
         "username": "commonthing",
         "database": "commonthing",
@@ -1775,12 +1792,12 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("registry config is not valid JSON") from exc
     if "ghcr.io" not in registry_payload.get("auths", {}):
         raise RuntimeErrorEB("registry config has no ghcr.io credential")
+    db, database_bytes = ensure_secret_material(root)
+    database_url = _database_url(db)
     registry_state = root / "secrets/registry.json"
     atomic_bytes(registry_state, registry_bytes)
     with _bound_kube_env(root, secrets_target):
         kubectl_apply(root, render_namespaces(root))
-        db, database_bytes = ensure_secret_material(root)
-        database_url = _database_url(db)
         kubectl_apply(
             root,
             secret_manifest(
@@ -5249,6 +5266,18 @@ def _application_pod_spec_projection(
     host_aliases = pod_spec.get("hostAliases") or []
     readiness_gates = pod_spec.get("readinessGates") or []
     ephemeral_containers = pod_spec.get("ephemeralContainers") or []
+    active_deadline_seconds = pod_spec.get("activeDeadlineSeconds")
+    if (
+        active_deadline_seconds is not None
+        and (
+            isinstance(active_deadline_seconds, bool)
+            or not isinstance(active_deadline_seconds, int)
+            or active_deadline_seconds < 1
+        )
+    ):
+        raise RuntimeErrorEB(
+            f"{context} Pod activeDeadlineSeconds contract is invalid"
+        )
     if (
         not isinstance(host_aliases, list)
         or any(not isinstance(item, dict) for item in host_aliases)
@@ -5276,6 +5305,7 @@ def _application_pod_spec_projection(
         "terminationGracePeriodSeconds": pod_spec.get(
             "terminationGracePeriodSeconds", 30
         ),
+        "activeDeadlineSeconds": active_deadline_seconds,
         "securityContext": pod_spec.get("securityContext"),
         "imagePullSecrets": pod_spec.get("imagePullSecrets") or [],
         "volumes": pod_spec.get("volumes") or [],

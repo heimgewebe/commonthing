@@ -4328,6 +4328,88 @@ spec:
                 created,
             )
 
+            invalid_payloads = (
+                {
+                    "username": "proof_user",
+                    "database": "proof_database",
+                    "password": "proof_password",
+                    "extra": "forbidden",
+                },
+                {
+                    "username": 7,
+                    "database": "proof_database",
+                    "password": "proof_password",
+                },
+                {
+                    "username": "proof_user",
+                    "database": "",
+                    "password": "proof_password",
+                },
+            )
+            for payload in invalid_payloads:
+                with self.subTest(payload=payload):
+                    runtime.atomic_json(database_path, payload)
+                    before = database_path.read_bytes()
+                    with self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB,
+                        "database Secret source material is invalid",
+                    ):
+                        runtime.ensure_secret_material(root)
+                    self.assertEqual(database_path.read_bytes(), before)
+
+    def test_inject_secrets_rejects_invalid_database_before_kubernetes_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "secrets").mkdir()
+            database_path = root / "secrets/database.json"
+            registry_config = root / "registry-source.json"
+            runtime.atomic_json(
+                database_path,
+                {
+                    "username": ["not", "a", "string"],
+                    "database": "proof_database",
+                    "password": "proof_password",
+                },
+            )
+            registry_config.write_text(
+                '{"auths":{"ghcr.io":{"auth":"proof"}}}\n',
+                encoding="utf-8",
+            )
+            source_commit = "d" * 40
+            target = {
+                "vm_ip": "192.0.2.11",
+                "kubeconfig_sha256": "e" * 64,
+                "server": "https://192.0.2.11:6443",
+            }
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=source_commit,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_kubernetes_target_binding",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_kubernetes_target_identity",
+                    return_value=target,
+                ),
+                mock.patch.object(runtime, "kubectl_apply") as kubectl_apply,
+                mock.patch.object(runtime, "_bound_kube_env") as bound_kube_env,
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "database Secret source material is invalid",
+                ):
+                    runtime.inject_secrets(root, registry_config)
+
+            kubectl_apply.assert_not_called()
+            bound_kube_env.assert_not_called()
+            self.assertFalse((root / "secrets/registry.json").exists())
+
     def test_inject_secrets_receipt_hashes_the_applied_source_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -8482,6 +8564,18 @@ spec:
                     self.root, release, deployments, pod_drift
                 )
 
+            pod_deadline_drift = json.loads(json.dumps(pods))
+            pod_deadline_drift["weltgewebe-api"][0]["spec"][
+                "activeDeadlineSeconds"
+            ] = 120
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "Pod contract drifted",
+            ):
+                runtime._require_live_application_workloads(
+                    self.root, release, deployments, pod_deadline_drift
+                )
+
         status_source = inspect.getsource(runtime.status)
         self.assertIn(
             "_require_live_application_workloads", status_source
@@ -8529,14 +8623,43 @@ spec:
         live_pod["serviceAccountName"] = "default"
         live_pod["terminationGracePeriodSeconds"] = 30
         live_pod["containers"][0] = live
-        self.assertEqual(
-            runtime._application_pod_spec_projection(
-                expected_pod, "expected Pod"
-            ),
-            runtime._application_pod_spec_projection(
-                live_pod, "live Pod"
-            ),
+        expected_projection = runtime._application_pod_spec_projection(
+            expected_pod, "expected Pod"
         )
+        live_projection = runtime._application_pod_spec_projection(
+            live_pod, "live Pod"
+        )
+        self.assertEqual(expected_projection, live_projection)
+        self.assertIsNone(expected_projection["activeDeadlineSeconds"])
+
+        deadline_pod = json.loads(json.dumps(live_pod))
+        deadline_pod["activeDeadlineSeconds"] = 120
+        deadline_projection = runtime._application_pod_spec_projection(
+            deadline_pod, "deadline Pod"
+        )
+        self.assertEqual(deadline_projection["activeDeadlineSeconds"], 120)
+        self.assertNotEqual(expected_projection, deadline_projection)
+        for invalid_deadline in (0, True, "120"):
+            invalid_pod = json.loads(json.dumps(live_pod))
+            invalid_pod["activeDeadlineSeconds"] = invalid_deadline
+            with self.subTest(active_deadline_seconds=invalid_deadline):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "activeDeadlineSeconds contract is invalid",
+                ):
+                    runtime._application_pod_spec_projection(
+                        invalid_pod, "invalid deadline Pod"
+                    )
+
+        self.assertIn(
+            "_application_pod_spec_projection",
+            inspect.getsource(runtime._flux_pod_spec_projection),
+        )
+        self.assertIn(
+            "_application_pod_spec_projection",
+            inspect.getsource(runtime._cilium_pod_spec_projection),
+        )
+
         for name in ("postgres", "nats"):
             contract = runtime._versioned_data_deployment_contract(
                 runtime.CLUSTER / f"data/{name}.yaml",
