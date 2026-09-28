@@ -517,6 +517,26 @@ spec:
             inject_secrets.index("kubectl_apply(root, render_namespaces(root))"),
         )
 
+    def test_preflight_parses_exact_libvirt_active_field(self) -> None:
+        payload = (
+            "Name: default\n"
+            "Active: no\n"
+            "Autostart: yes\n"
+            "Persistent: yes\n"
+        )
+        self.assertEqual(
+            runtime._virsh_info_field(
+                payload,
+                "Active",
+                "test network",
+            ),
+            "no",
+        )
+        source = inspect.getsource(runtime.preflight)
+        self.assertIn("_virsh_info_field(", source)
+        self.assertIn(".casefold()", source)
+        self.assertNotIn('"yes" not in network', source)
+
     def test_create_vm_rerun_invalidates_stale_chain_before_prepare_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2231,6 +2251,42 @@ spec:
             "succeeded_pods": 1,
             "canonical": True,
         }
+        release_config_map_contract = {
+            "data": {
+                "SOURCE_COMMIT": commit,
+                "API_DIGEST": "sha256:" + "b" * 64,
+                "WEB_DIGEST": "sha256:" + "c" * 64,
+            },
+            "binaryData": {},
+            "immutable": False,
+        }
+        portability_flux_contract = {
+            "bootstrap_sha256": "1" * 64,
+            "source_spec": {},
+            "release_config_map": release_config_map_contract,
+            "kustomization_specs": {},
+        }
+        application_pdb_expected_contract = {}
+        for pdb_name in ("weltgewebe-api", "weltgewebe-web"):
+            contract = runtime._pdb_spec_projection(
+                {
+                    "spec": {
+                        "minAvailable": 1,
+                        "selector": {
+                            "matchLabels": {
+                                "app.kubernetes.io/name": pdb_name
+                            }
+                        },
+                    }
+                },
+                f"portability fixture PDB {pdb_name}",
+            )
+            application_pdb_expected_contract[pdb_name] = {
+                "contract": contract,
+                "contract_sha256": runtime._stable_json_sha256(
+                    contract
+                ),
+            }
         pvc_documents = [
             {
                 "metadata": {
@@ -2334,6 +2390,16 @@ spec:
                 runtime,
                 "_rendered_pvc_contract",
                 return_value=pvc_expected_contract,
+            ),
+            mock.patch.object(
+                runtime,
+                "_flux_bootstrap_contract",
+                return_value=portability_flux_contract,
+            ),
+            mock.patch.object(
+                runtime,
+                "_rendered_application_pdb_contract",
+                return_value=application_pdb_expected_contract,
             ),
         ):
             root = Path(tmp)
@@ -2515,6 +2581,12 @@ spec:
                         name: controller["pods"]["runtime_image_ids_sha256"]
                         for name, controller in payload["flux_controllers"].items()
                     }
+                    payload["flux_release_config_map"] = {
+                        "contract_sha256": runtime._stable_json_sha256(
+                            release_config_map_contract
+                        ),
+                        "canonical": True,
+                    }
                     payload["flux"] = {
                         name: {
                             "ready": True,
@@ -2621,6 +2693,17 @@ spec:
                         }
                         for name, expected in (
                             application_service_account_expected_contract.items()
+                        )
+                    }
+                    payload["application_disruption_budgets"] = {
+                        name: {
+                            "contract_sha256": expected[
+                                "contract_sha256"
+                            ],
+                            "canonical": True,
+                        }
+                        for name, expected in (
+                            application_pdb_expected_contract.items()
                         )
                     }
                     payload["migration"] = json.loads(
@@ -4035,6 +4118,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.config["vm"]["image"]["sha256"] = hashlib.sha256(self.base_bytes).hexdigest()
         self.commit = "a" * 40
         self.domain_present = True
+        self.domain_active = True
         self.pool_present = True
         self.patch("POOL_TARGET", self.pool)
         self.patch("load_config", return_value=self.config)
@@ -4526,6 +4610,43 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             }
             for name in self.application_service_account_expected
         }
+        self.application_pdb_expected = {}
+        self.application_pdbs = {}
+        for name in ("weltgewebe-api", "weltgewebe-web"):
+            contract = runtime._pdb_spec_projection(
+                {
+                    "spec": {
+                        "minAvailable": 1,
+                        "selector": {
+                            "matchLabels": {
+                                "app.kubernetes.io/name": name
+                            }
+                        },
+                    }
+                },
+                f"fixture application PDB {name}",
+            )
+            self.application_pdb_expected[name] = {
+                "contract": contract,
+                "contract_sha256": runtime._stable_json_sha256(
+                    contract
+                ),
+            }
+            self.application_pdbs[name] = {
+                "metadata": {
+                    "name": name,
+                    "namespace": runtime.APP_NAMESPACE,
+                },
+                "spec": {
+                    "minAvailable": 1,
+                    "selector": {
+                        "matchLabels": {
+                            "app.kubernetes.io/name": name
+                        }
+                    },
+                    "unhealthyPodEvictionPolicy": "IfHealthyBudget",
+                },
+            }
 
         api_image = "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64
         web_image = "ghcr.io/heimgewebe/commonthing-web@sha256:" + "c" * 64
@@ -4744,6 +4865,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         output, code = "", 0
         if argv[0] == "virt-install":
             self.domain_present = True
+            self.domain_active = True
         elif argv[0] == "helm":
             if argv[1] == "list":
                 output = json.dumps([{
@@ -4763,6 +4885,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             command = argv[3]
             if command == "dominfo":
                 code = 0 if self.domain_present else 1
+            elif command == "domstate":
+                if self.domain_present:
+                    output = "running\n" if self.domain_active else "shut off\n"
+                else:
+                    code = 1
             elif command == "list":
                 output = f"{runtime.VM_NAME}\n" if self.domain_present else ""
             elif command == "pool-info":
@@ -4803,14 +4930,22 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 (self.pool / argv[5]).write_bytes(b"created volume")
             elif command == "vol-delete":
                 (self.pool / argv[4]).unlink()
+            elif command == "destroy":
+                if self.domain_present and self.domain_active:
+                    self.domain_active = False
+                else:
+                    code = 1
             elif command == "undefine":
-                self.domain_present = False
+                if self.domain_present and not self.domain_active:
+                    self.domain_present = False
+                else:
+                    code = 1
             elif command == "pool-undefine":
                 self.pool_present = False
             else:
                 self.assertIn(command, {
                     "pool-build", "pool-start", "vol-upload", "pool-refresh",
-                    "destroy", "pool-destroy", "pool-delete",
+                    "pool-destroy", "pool-delete",
                 })
         return runtime.subprocess.CompletedProcess(argv, code, stdout=output, stderr="")
 
@@ -4826,6 +4961,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.base.unlink()
         self.pool.rmdir()
         self.domain_present = self.pool_present = False
+        self.domain_active = False
         self.patch("prepare", return_value={
             "cloud_image": str(self.root / "ubuntu.img"), "cloud_image_virtual_size": 4 * 1024**3,
         })
@@ -4840,6 +4976,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             self.root / "bootstrap.yaml",
         )
         self.flux_contract = runtime._flux_bootstrap_contract(self.root, binding)
+        self.release_config_map = {
+            "metadata": {
+                "name": "commonthing-experiment-b-release",
+                "namespace": "flux-system",
+            },
+            **json.loads(
+                json.dumps(self.flux_contract["release_config_map"])
+            ),
+        }
         self.live_flux_source_spec = json.loads(
             json.dumps(self.flux_contract["source_spec"])
         )
@@ -5046,6 +5191,12 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 json.dumps(self.application_service_account_expected)
             ),
         )
+        self.application_pdb_contract = self.patch(
+            "_rendered_application_pdb_contract",
+            return_value=json.loads(
+                json.dumps(self.application_pdb_expected)
+            ),
+        )
         self.pvc_contract = self.patch(
             "_rendered_pvc_contract",
             return_value=json.loads(json.dumps(self.pvc_expected)),
@@ -5165,6 +5316,26 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             and arguments[-1] in self.application_service_accounts
         ):
             return self.application_service_accounts[str(arguments[-1])]
+        if (
+            len(arguments) == 5
+            and arguments[:4]
+            == [
+                "-n",
+                runtime.APP_NAMESPACE,
+                "get",
+                "poddisruptionbudget",
+            ]
+            and arguments[-1] in self.application_pdbs
+        ):
+            return self.application_pdbs[str(arguments[-1])]
+        if arguments == [
+            "-n",
+            "flux-system",
+            "get",
+            "configmap",
+            "commonthing-experiment-b-release",
+        ]:
+            return self.release_config_map
         if arguments == [
             "-n", runtime.APP_NAMESPACE, "get", "configmap", "weltgewebe-runtime"
         ]:
@@ -5368,6 +5539,33 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         stored = json.loads(retirement.read_text(encoding="utf-8"))
         self.assertEqual(stored, result)
         self.assertIn("example.json", stored["evidence_receipts"])
+
+    def test_teardown_stops_before_storage_when_destroy_fails(self) -> None:
+        self.write_vm_receipt()
+        original = self.run_fixture
+
+        def fail_destroy(argv, **kwargs):
+            if (
+                argv[:3] == ["virsh", "-c", runtime.LIBVIRT_URI]
+                and argv[3] == "destroy"
+            ):
+                return runtime.subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="destroy failed"
+                )
+            return original(argv, **kwargs)
+
+        self.runner.side_effect = fail_destroy
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "storage cleanup is forbidden",
+        ):
+            runtime.teardown(self.root)
+        self.assertTrue(self.domain_present)
+        self.assertTrue(self.domain_active)
+        self.assertTrue(self.pool_present)
+        self.assertTrue(self.disk.exists())
+        self.assertTrue(self.base.exists())
+        self.assertTrue(self.root.exists())
 
     def test_teardown_rejects_wrong_state_root_before_global_mutation(self) -> None:
         wrong_root = self.root / "wrong-root"
@@ -6154,6 +6352,44 @@ spec:
         self.assertEqual(
             result["weltgewebe-api"]["spec"]["externalIPs"], []
         )
+
+    def test_status_revalidates_flux_release_config_map(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        result = runtime.status(self.root)
+        self.assertTrue(
+            result["flux_release_config_map"]["canonical"]
+        )
+        self.release_config_map["data"]["API_DIGEST"] = (
+            "sha256:" + "0" * 64
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "release ConfigMap contract drifted",
+        ):
+            runtime.status(self.root)
+
+    def test_status_revalidates_application_pdbs(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        result = runtime.status(self.root)
+        self.assertEqual(
+            set(result["application_disruption_budgets"]),
+            {"weltgewebe-api", "weltgewebe-web"},
+        )
+        self.assertTrue(
+            result["application_disruption_budgets"][
+                "weltgewebe-api"
+            ]["canonical"]
+        )
+        self.application_pdbs["weltgewebe-api"]["spec"][
+            "minAvailable"
+        ] = 0
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "PDB contract drifted: weltgewebe-api",
+        ):
+            runtime.status(self.root)
 
     def test_status_revalidates_application_service_accounts(self) -> None:
         self.write_vm_receipt()
@@ -7030,12 +7266,15 @@ spec:
             runtime.apply_release,
             runtime.semantic_activate,
             runtime.seed_t048_fixture,
-            runtime.recovery_proof,
         ):
             self.assertIn(
                 "_require_kubernetes_target_binding",
                 inspect.getsource(function),
             )
+        self.assertIn(
+            "_kubernetes_target_identity",
+            inspect.getsource(runtime.recovery_proof),
+        )
         source = inspect.getsource(runtime.inject_secrets)
         self.assertLess(
             source.index("_require_kubernetes_target_binding"),
@@ -7762,6 +8001,33 @@ spec:
             portability_source,
         )
 
+    def test_create_rollback_stops_before_storage_when_destroy_fails(self) -> None:
+        self.prepare_create()
+        self.main.side_effect = [self.commit, "b" * 40]
+        original = self.run_fixture
+
+        def fail_destroy(argv, **kwargs):
+            if (
+                argv[:3] == ["virsh", "-c", runtime.LIBVIRT_URI]
+                and argv[3] == "destroy"
+            ):
+                return runtime.subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="destroy failed"
+                )
+            return original(argv, **kwargs)
+
+        self.runner.side_effect = fail_destroy
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "storage cleanup is forbidden",
+        ):
+            runtime.create_vm(self.root)
+        self.assertTrue(self.domain_present)
+        self.assertTrue(self.domain_active)
+        self.assertTrue(self.pool_present)
+        self.assertTrue(self.disk.exists())
+        self.assertTrue(self.base.exists())
+
     def test_create_binds_actual_vm_to_current_source_and_config(self) -> None:
         self.prepare_create()
         result = runtime.create_vm(self.root)
@@ -7810,6 +8076,136 @@ spec:
 
 
 class ExperimentBLatestP1RegressionTests(unittest.TestCase):
+    def test_same_kubernetes_target_rejects_identity_drift(self) -> None:
+        expected = {
+            "vm_ip": "192.168.122.10",
+            "kubeconfig_sha256": "a" * 64,
+            "server": "https://192.168.122.10:6443",
+        }
+        with mock.patch.object(
+            runtime,
+            "_kubernetes_target_identity",
+            return_value=json.loads(json.dumps(expected)),
+        ):
+            self.assertEqual(
+                runtime._require_same_kubernetes_target(
+                    Path("/tmp/unused"),
+                    "b" * 40,
+                    expected,
+                    "test recovery boundary",
+                ),
+                expected,
+            )
+
+        drifted = json.loads(json.dumps(expected))
+        drifted["vm_ip"] = "192.168.122.99"
+        with (
+            mock.patch.object(
+                runtime,
+                "_kubernetes_target_identity",
+                return_value=drifted,
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "Kubernetes target identity changed",
+            ),
+        ):
+            runtime._require_same_kubernetes_target(
+                Path("/tmp/unused"),
+                "b" * 40,
+                expected,
+                "test recovery boundary",
+            )
+
+    def test_gateway_base_url_is_bound_to_verified_vm_target(self) -> None:
+        commit = "a" * 40
+        target = {
+            "vm_ip": "192.168.122.10",
+            "kubeconfig_sha256": "b" * 64,
+            "server": "https://192.168.122.10:6443",
+        }
+        healthy = {
+            "status": {
+                "addresses": [
+                    {
+                        "type": "IPAddress",
+                        "value": "192.168.122.10",
+                    }
+                ]
+            }
+        }
+        with (
+            mock.patch.object(
+                runtime,
+                "_kubernetes_target_identity",
+                return_value=target,
+            ),
+            mock.patch.object(
+                runtime,
+                "_kubectl_json",
+                return_value=healthy,
+            ),
+        ):
+            self.assertEqual(
+                runtime._gateway_base_url(Path("/tmp/unused"), commit),
+                "http://192.168.122.10",
+            )
+
+        external = json.loads(json.dumps(healthy))
+        external["status"]["addresses"][0]["value"] = "203.0.113.80"
+        with (
+            mock.patch.object(
+                runtime,
+                "_kubernetes_target_identity",
+                return_value=target,
+            ),
+            mock.patch.object(
+                runtime,
+                "_kubectl_json",
+                return_value=external,
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "not bound to the verified VM target",
+            ),
+        ):
+            runtime._gateway_base_url(Path("/tmp/unused"), commit)
+
+    def test_recovery_revalidates_target_around_destructive_boundaries(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        self.assertGreaterEqual(
+            source.count("_require_same_kubernetes_target"),
+            12,
+        )
+        delete_pvc = source.index('"delete", "pvc"')
+        self.assertNotEqual(
+            source.rfind(
+                "_require_same_kubernetes_target",
+                0,
+                delete_pvc,
+            ),
+            -1,
+        )
+        self.assertNotEqual(
+            source.find(
+                "_require_same_kubernetes_target",
+                delete_pvc,
+            ),
+            -1,
+        )
+        failure_cleanup = source.index("except Exception:")
+        cleanup_guard = source.index(
+            "_require_same_kubernetes_target",
+            failure_cleanup,
+        )
+        cleanup_suspend = source.index(
+            "_flux_suspend",
+            failure_cleanup,
+        )
+        self.assertLess(cleanup_guard, cleanup_suspend)
+        self.assertIn("target_safe_for_cleanup", source)
+        self.assertIn('"kubernetes_target_sha256"', source)
+
     def test_flux_source_and_kustomization_reject_termination(self) -> None:
         commit = "a" * 40
         source_spec = {

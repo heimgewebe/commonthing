@@ -376,6 +376,25 @@ def _current_protected_main_commit() -> str:
     return head
 
 
+def _virsh_info_field(
+    payload: str,
+    field: str,
+    context: str,
+) -> str:
+    values: list[str] = []
+    for line in payload.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip() == field:
+            values.append(value.strip())
+    if len(values) != 1 or not values[0]:
+        raise RuntimeErrorEB(
+            f"{context} does not contain exactly one {field} field"
+        )
+    return values[0]
+
+
 def preflight(expected_source_commit: str | None = None) -> dict[str, Any]:
     config = load_config()
     for command in (
@@ -397,7 +416,14 @@ def preflight(expected_source_commit: str | None = None) -> dict[str, Any]:
     network = run(
         ["virsh", "-c", LIBVIRT_URI, "net-info", config["vm"]["network"]]
     ).stdout
-    if "Active:" not in network or "yes" not in network:
+    if (
+        _virsh_info_field(
+            network,
+            "Active",
+            "libvirt default network",
+        ).casefold()
+        != "yes"
+    ):
         raise RuntimeErrorEB("libvirt default network is not active")
 
     domain = run(
@@ -678,6 +704,71 @@ def _require_vm_create_receipt(
     _validate_vm_substrate(receipt.get("substrate"), config)
 
 
+def _retire_domain_before_storage(
+    target: str,
+    context: str,
+) -> None:
+    state_result = run(
+        ["virsh", "-c", LIBVIRT_URI, "domstate", target],
+        check=False,
+    )
+    if state_result.returncode != 0:
+        raise RuntimeErrorEB(
+            f"{context} cannot prove the libvirt domain state"
+        )
+    state = " ".join(state_result.stdout.strip().casefold().split())
+    if not state:
+        raise RuntimeErrorEB(
+            f"{context} returned an empty libvirt domain state"
+        )
+    if state != "shut off":
+        destroyed = run(
+            ["virsh", "-c", LIBVIRT_URI, "destroy", target],
+            check=False,
+        )
+        if destroyed.returncode != 0:
+            raise RuntimeErrorEB(
+                f"{context} could not stop the libvirt domain; "
+                "storage cleanup is forbidden"
+            )
+        state_result = run(
+            ["virsh", "-c", LIBVIRT_URI, "domstate", target],
+            check=False,
+        )
+        if state_result.returncode != 0:
+            raise RuntimeErrorEB(
+                f"{context} cannot prove the stopped libvirt domain state"
+            )
+        state = " ".join(
+            state_result.stdout.strip().casefold().split()
+        )
+        if state != "shut off":
+            raise RuntimeErrorEB(
+                f"{context} libvirt domain is still active after destroy"
+            )
+
+    undefine = run(
+        ["virsh", "-c", LIBVIRT_URI, "undefine", target, "--nvram"],
+        check=False,
+    )
+    if undefine.returncode != 0:
+        undefine = run(
+            ["virsh", "-c", LIBVIRT_URI, "undefine", target],
+            check=False,
+        )
+    if undefine.returncode != 0:
+        raise RuntimeErrorEB(
+            f"{context} could not undefine the stopped libvirt domain"
+        )
+    if run(
+        ["virsh", "-c", LIBVIRT_URI, "dominfo", target],
+        check=False,
+    ).returncode == 0:
+        raise RuntimeErrorEB(
+            f"{context} libvirt domain still exists after undefine"
+        )
+
+
 def create_vm(root: Path) -> dict[str, Any]:
     if run(
         ["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME],
@@ -800,13 +891,10 @@ def create_vm(root: Path) -> dict[str, Any]:
             ["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME],
             check=False,
         ).returncode == 0:
-            run(["virsh", "-c", LIBVIRT_URI, "destroy", VM_NAME], check=False)
-            undefine = run(
-                ["virsh", "-c", LIBVIRT_URI, "undefine", VM_NAME, "--nvram"],
-                check=False,
+            _retire_domain_before_storage(
+                VM_NAME,
+                "Experiment-B VM creation rollback",
             )
-            if undefine.returncode != 0:
-                run(["virsh", "-c", LIBVIRT_URI, "undefine", VM_NAME], check=False)
         if pool_defined:
             run(
                 ["virsh", "-c", LIBVIRT_URI, "vol-delete", VOLUME_NAME, "--pool", POOL_NAME],
@@ -996,6 +1084,34 @@ def _require_kubernetes_target_binding(
             "Experiment-B kubeconfig is not bound to the VM API server"
         )
     return receipt, live_ip, expected_server
+
+
+def _kubernetes_target_identity(
+    root: Path,
+    source_commit: str,
+) -> dict[str, str]:
+    receipt, live_ip, expected_server = _require_kubernetes_target_binding(
+        root, source_commit
+    )
+    return {
+        "vm_ip": live_ip,
+        "kubeconfig_sha256": str(receipt["kubeconfig_sha256"]),
+        "server": expected_server,
+    }
+
+
+def _require_same_kubernetes_target(
+    root: Path,
+    source_commit: str,
+    expected: dict[str, str],
+    context: str,
+) -> dict[str, str]:
+    observed = _kubernetes_target_identity(root, source_commit)
+    if observed != expected:
+        raise RuntimeErrorEB(
+            f"Kubernetes target identity changed during {context}"
+        )
+    return observed
 
 
 def _parse_sha256sum_output(
@@ -1924,6 +2040,52 @@ def _require_flux_spec(
         raise RuntimeErrorEB(f"{context} spec drifted from the rendered bootstrap contract")
 
 
+def _release_config_map_contract_projection(
+    config_map: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(config_map, dict):
+        raise RuntimeErrorEB(f"{context} ConfigMap payload is invalid")
+    data = config_map.get("data", {})
+    binary_data = config_map.get("binaryData", {})
+    immutable = config_map.get("immutable", False)
+    if data is None:
+        data = {}
+    if binary_data is None:
+        binary_data = {}
+    if immutable is None:
+        immutable = False
+    if (
+        not isinstance(data, dict)
+        or not isinstance(binary_data, dict)
+        or not isinstance(immutable, bool)
+        or any(
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            for key, value in data.items()
+        )
+        or any(
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            for key, value in binary_data.items()
+        )
+    ):
+        raise RuntimeErrorEB(
+            f"{context} ConfigMap data contract is invalid"
+        )
+    return {
+        "data": {
+            str(key): str(value)
+            for key, value in sorted(data.items())
+        },
+        "binaryData": {
+            str(key): str(value)
+            for key, value in sorted(binary_data.items())
+        },
+        "immutable": immutable,
+    }
+
+
 def _flux_bootstrap_contract(
     root: Path,
     binding: dict[str, Any],
@@ -1946,6 +2108,7 @@ def _flux_bootstrap_contract(
         raise RuntimeErrorEB("Experiment-B rendered bootstrap is invalid") from exc
 
     source_spec: dict[str, Any] | None = None
+    release_config_map: dict[str, Any] | None = None
     kustomization_specs: dict[str, dict[str, Any]] = {}
     for document in documents:
         if not isinstance(document, dict):
@@ -1965,6 +2128,19 @@ def _flux_bootstrap_contract(
                 raise RuntimeErrorEB("Experiment-B bootstrap GitRepository is duplicated")
             source_spec = spec
         elif (
+            document.get("kind") == "ConfigMap"
+            and name == "commonthing-experiment-b-release"
+            and namespace == "flux-system"
+        ):
+            if release_config_map is not None:
+                raise RuntimeErrorEB(
+                    "Experiment-B bootstrap release ConfigMap is duplicated"
+                )
+            release_config_map = _release_config_map_contract_projection(
+                document,
+                "Experiment-B bootstrap release ConfigMap",
+            )
+        elif (
             document.get("kind") == "Kustomization"
             and namespace == "flux-system"
             and isinstance(name, str)
@@ -1978,11 +2154,58 @@ def _flux_bootstrap_contract(
 
     if source_spec is None:
         raise RuntimeErrorEB("Experiment-B bootstrap GitRepository contract is missing")
+    if release_config_map is None:
+        raise RuntimeErrorEB(
+            "Experiment-B bootstrap release ConfigMap contract is missing"
+        )
     _require_exact_flux_kustomizations(kustomization_specs)
     return {
         "bootstrap_sha256": expected_sha256,
         "source_spec": source_spec,
+        "release_config_map": release_config_map,
         "kustomization_specs": kustomization_specs,
+    }
+
+
+def _require_live_release_config_map(
+    root: Path,
+    expected: dict[str, Any],
+) -> dict[str, Any]:
+    config_map = _kubectl_json(
+        root,
+        [
+            "-n",
+            "flux-system",
+            "get",
+            "configmap",
+            "commonthing-experiment-b-release",
+        ],
+    )
+    metadata = (
+        config_map.get("metadata", {})
+        if isinstance(config_map, dict)
+        else {}
+    )
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != "commonthing-experiment-b-release"
+        or metadata.get("namespace") != "flux-system"
+        or metadata.get("deletionTimestamp") is not None
+    ):
+        raise RuntimeErrorEB(
+            "live Experiment-B release ConfigMap identity drifted"
+        )
+    observed = _release_config_map_contract_projection(
+        config_map,
+        "live Experiment-B release ConfigMap",
+    )
+    if observed != expected:
+        raise RuntimeErrorEB(
+            "live Experiment-B release ConfigMap contract drifted"
+        )
+    return {
+        "contract_sha256": _stable_json_sha256(expected),
+        "canonical": True,
     }
 
 
@@ -4922,6 +5145,147 @@ def _service_account_contract_projection(
     }
 
 
+def _pdb_spec_projection(
+    pdb: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(pdb, dict):
+        raise RuntimeErrorEB(f"{context} PodDisruptionBudget payload is invalid")
+    spec = pdb.get("spec", {})
+    if not isinstance(spec, dict):
+        raise RuntimeErrorEB(f"{context} PodDisruptionBudget spec is invalid")
+    selector = spec.get("selector")
+    min_available = spec.get("minAvailable")
+    max_unavailable = spec.get("maxUnavailable")
+    unhealthy_policy = spec.get(
+        "unhealthyPodEvictionPolicy",
+        "IfHealthyBudget",
+    )
+    if (
+        not isinstance(selector, dict)
+        or not selector
+        or (min_available is None and max_unavailable is None)
+        or (min_available is not None and max_unavailable is not None)
+        or unhealthy_policy
+        not in {"IfHealthyBudget", "AlwaysAllow"}
+    ):
+        raise RuntimeErrorEB(
+            f"{context} PodDisruptionBudget contract is invalid"
+        )
+    return {
+        "minAvailable": min_available,
+        "maxUnavailable": max_unavailable,
+        "selector": json.loads(json.dumps(selector)),
+        "unhealthyPodEvictionPolicy": unhealthy_policy,
+    }
+
+
+def _rendered_application_pdb_contract(
+    root: Path,
+    release: dict[str, Any],
+) -> dict[str, Any]:
+    api_digest = release.get("api_digest") if isinstance(release, dict) else None
+    web_digest = release.get("web_digest") if isinstance(release, dict) else None
+    if (
+        not isinstance(api_digest, str)
+        or not DIGEST_RE.fullmatch(api_digest)
+        or not isinstance(web_digest, str)
+        or not DIGEST_RE.fullmatch(web_digest)
+    ):
+        raise RuntimeErrorEB(
+            "application PDB contract requires exact release digests"
+        )
+    kustomize = toolchain(root)["tools"].get("kustomize")
+    if not isinstance(kustomize, str) or not kustomize:
+        raise RuntimeErrorEB(
+            "application PDB contract requires pinned kustomize"
+        )
+    rendered = run([kustomize, "build", str(APP_OVERLAY)]).stdout
+    rendered = rendered.replace("$" + "{API_DIGEST}", api_digest).replace(
+        "$" + "{WEB_DIGEST}", web_digest
+    )
+    try:
+        documents = [
+            document
+            for document in yaml.safe_load_all(rendered)
+            if isinstance(document, dict)
+        ]
+    except yaml.YAMLError as exc:
+        raise RuntimeErrorEB(
+            "rendered Experiment-B PDB contract is invalid"
+        ) from exc
+
+    expected_names = {"weltgewebe-api", "weltgewebe-web"}
+    result: dict[str, Any] = {}
+    for document in documents:
+        if (
+            document.get("kind") != "PodDisruptionBudget"
+            or document.get("metadata", {}).get("namespace")
+            != APP_NAMESPACE
+        ):
+            continue
+        name = document.get("metadata", {}).get("name")
+        if not isinstance(name, str) or name not in expected_names:
+            continue
+        if name in result:
+            raise RuntimeErrorEB(
+                f"rendered application PDB is duplicated: {name}"
+            )
+        contract = _pdb_spec_projection(
+            document, f"rendered application PDB {name}"
+        )
+        result[name] = {
+            "contract": contract,
+            "contract_sha256": _stable_json_sha256(contract),
+        }
+    if set(result) != expected_names:
+        raise RuntimeErrorEB(
+            "rendered application PDB set is incomplete"
+        )
+    return result
+
+
+def _require_live_application_pdbs(
+    root: Path,
+    release: dict[str, Any],
+) -> dict[str, Any]:
+    expected = _rendered_application_pdb_contract(root, release)
+    result: dict[str, Any] = {}
+    for name, expected_value in expected.items():
+        pdb = _kubectl_json(
+            root,
+            [
+                "-n",
+                APP_NAMESPACE,
+                "get",
+                "poddisruptionbudget",
+                name,
+            ],
+        )
+        metadata = pdb.get("metadata", {}) if isinstance(pdb, dict) else {}
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or metadata.get("namespace") != APP_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+        ):
+            raise RuntimeErrorEB(
+                f"live application PDB identity drifted: {name}"
+            )
+        observed = _pdb_spec_projection(
+            pdb, f"live application PDB {name}"
+        )
+        if observed != expected_value["contract"]:
+            raise RuntimeErrorEB(
+                f"live application PDB contract drifted: {name}"
+            )
+        result[name] = {
+            "contract_sha256": expected_value["contract_sha256"],
+            "canonical": True,
+        }
+    return result
+
+
 def _rendered_application_service_account_contract(
     root: Path,
     release: dict[str, Any],
@@ -6243,6 +6607,10 @@ def status(root: Path) -> dict[str, Any]:
         source_commit,
         flux_contract["source_spec"],
     )
+    release_config_map_readback = _require_live_release_config_map(
+        root,
+        flux_contract["release_config_map"],
+    )
 
     flux_items = _kubectl_json(
         root, ["-n", "flux-system", "get", "kustomizations"]
@@ -6355,6 +6723,10 @@ def status(root: Path) -> dict[str, Any]:
     application_service_accounts = (
         _require_live_application_service_accounts(root, release)
     )
+    application_disruption_budgets = _require_live_application_pdbs(
+        root,
+        release,
+    )
     semantic_provider = _semantic_provider_live_readback(root, source_commit)
 
     expected_secret_values = _expected_live_secret_values(root, source_commit)
@@ -6453,6 +6825,7 @@ def status(root: Path) -> dict[str, Any]:
         "runtime_contract": runtime_contract_readback,
         "flux_bootstrap_sha256": flux_contract["bootstrap_sha256"],
         "flux_source_revision": source_revision,
+        "flux_release_config_map": release_config_map_readback,
         "flux_controllers": flux_controllers,
         "flux_runtime_image_ids_baseline": flux_runtime_baseline,
         "flux": flux_readback,
@@ -6463,6 +6836,7 @@ def status(root: Path) -> dict[str, Any]:
         "application_workloads": application_workloads,
         "application_services": application_services,
         "application_service_accounts": application_service_accounts,
+        "application_disruption_budgets": application_disruption_budgets,
         "pods": pod_readback,
         "images": {
             **release_artifacts["images"],
@@ -6617,16 +6991,10 @@ def teardown(root: Path) -> dict[str, Any]:
 
     if live_identity["domain_present"]:
         domain_target = str(live_identity["domain_target"])
-        run(["virsh", "-c", LIBVIRT_URI, "destroy", domain_target], check=False)
-        undefine = run(
-            ["virsh", "-c", LIBVIRT_URI, "undefine", domain_target, "--nvram"],
-            check=False,
+        _retire_domain_before_storage(
+            domain_target,
+            "Experiment-B teardown",
         )
-        if undefine.returncode != 0:
-            run(
-                ["virsh", "-c", LIBVIRT_URI, "undefine", domain_target],
-                check=False,
-            )
 
     volume_absence = {
         VOLUME_NAME: False,
@@ -8324,17 +8692,32 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         pf_stderr.close()
 
 
-def _gateway_base_url(root: Path) -> str:
+def _gateway_base_url(root: Path, source_commit: str) -> str:
+    target = _kubernetes_target_identity(root, source_commit)
     gateway = _kubectl_json(
         root,
         ["-n", APP_NAMESPACE, "get", "gateway", "commonthing-experiment-b"],
     )
     addresses = gateway.get("status", {}).get("addresses")
-    if not isinstance(addresses, list) or not addresses:
-        raise RuntimeErrorEB("Experiment-B Gateway has no admitted address")
-    value = addresses[0].get("value") if isinstance(addresses[0], dict) else None
-    if not isinstance(value, str) or not value:
-        raise RuntimeErrorEB("Experiment-B Gateway address is invalid")
+    if not isinstance(addresses, list) or len(addresses) != 1:
+        raise RuntimeErrorEB(
+            "Experiment-B Gateway must expose exactly one admitted address"
+        )
+    address = addresses[0]
+    value = address.get("value") if isinstance(address, dict) else None
+    address_type = (
+        address.get("type", "IPAddress")
+        if isinstance(address, dict)
+        else None
+    )
+    if (
+        address_type != "IPAddress"
+        or not isinstance(value, str)
+        or value != target["vm_ip"]
+    ):
+        raise RuntimeErrorEB(
+            "Experiment-B Gateway address is not bound to the verified VM target"
+        )
     return f"http://{value}"
 
 
@@ -8343,7 +8726,7 @@ def _gateway_data_plane_readback(
 ) -> dict[str, Any]:
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("Gateway data-plane source commit is not exact")
-    base = _gateway_base_url(root)
+    base = _gateway_base_url(root, source_commit)
     checks: dict[str, Any] = {}
     status_code, body, elapsed = _http_read(base + "/")
     checks["web_root"] = {"status": status_code, "elapsed_ms": elapsed}
@@ -9072,7 +9455,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("recovery proof release is not current protected main")
-    _require_kubernetes_target_binding(root, source_commit)
+    recovery_target = _kubernetes_target_identity(root, source_commit)
     backup_dir = root / "recovery"
     backup_dir.mkdir(parents=True, exist_ok=True)
     db_dump = backup_dir / "postgres.dump"
@@ -9085,8 +9468,14 @@ def recovery_proof(root: Path) -> dict[str, Any]:
 
     destructive_started = time.monotonic()
     try:
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery pre-suspend"
+        )
         _flux_suspend(root, "commonthing-experiment-b-app")
         _flux_suspend(root, "commonthing-experiment-b-data")
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery Flux suspension"
+        )
         _scale_deployment(root, APP_NAMESPACE, "weltgewebe-api", 0)
         _scale_deployment(root, APP_NAMESPACE, "weltgewebe-web", 0)
         _wait_pods_absent(
@@ -9099,6 +9488,9 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             APP_NAMESPACE,
             "app.kubernetes.io/name=weltgewebe-web",
         )
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery application quiescence"
+        )
 
         before_db = _database_signature(root)
         before_nats = _jetstream_signature(root)
@@ -9106,6 +9498,9 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB("JetStream test state is empty before recovery proof")
 
         kubectl = toolchain(root)["tools"]["kubectl"]
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery PostgreSQL backup"
+        )
         _run_binary_to_file(
             [
                 kubectl, "-n", DATA_NAMESPACE, "exec", "deployment/postgres", "--",
@@ -9116,11 +9511,17 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             timeout=900,
         )
 
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery pre-NATS shutdown"
+        )
         _scale_deployment(root, DATA_NAMESPACE, "nats", 0)
         _wait_pods_absent(
             root,
             DATA_NAMESPACE,
             "app.kubernetes.io/name=nats",
+        )
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery NATS shutdown"
         )
         _nats_transfer_pod(root, "commonthing-experiment-b-nats-backup")
         try:
@@ -9139,16 +9540,25 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 root, DATA_NAMESPACE, "commonthing-experiment-b-nats-backup"
             )
 
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery post-backup"
+        )
         _scale_deployment(root, DATA_NAMESPACE, "postgres", 0)
         _wait_pods_absent(
             root,
             DATA_NAMESPACE,
             "app.kubernetes.io/name=postgres",
         )
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery PostgreSQL shutdown"
+        )
         old_pvc_identities = {
             name: _pvc_volume_identity(root, name)
             for name in ("postgres-data", "nats-data")
         }
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery pre-PVC deletion"
+        )
         _kubectl(
             root,
             [
@@ -9157,9 +9567,15 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             ],
             timeout=330,
         )
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery PVC deletion"
+        )
         for identity in old_pvc_identities.values():
             _wait_pv_absent(root, identity["pv_name"])
         storage = (CLUSTER / "data/storage.yaml").read_text(encoding="utf-8")
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery pre-storage recreation"
+        )
         kubectl_apply(root, storage)
         pvc_replacements = {
             name: _require_empty_replacement_pvc(
@@ -9168,6 +9584,9 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             for name in ("postgres-data", "nats-data")
         }
 
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery replacement PVC verification"
+        )
         _nats_transfer_pod(root, "commonthing-experiment-b-nats-restore")
         try:
             _run_input_file(
@@ -9185,8 +9604,14 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 root, DATA_NAMESPACE, "commonthing-experiment-b-nats-restore"
             )
 
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery pre-PostgreSQL restore"
+        )
         _scale_deployment(root, DATA_NAMESPACE, "postgres", 1)
         _wait_deployment(root, DATA_NAMESPACE, "postgres", "5m")
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery PostgreSQL restore"
+        )
         _run_input_file(
             [
                 kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
@@ -9198,8 +9623,14 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             env=kube_env(root),
             timeout=1200,
         )
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery post-PostgreSQL restore"
+        )
         _scale_deployment(root, DATA_NAMESPACE, "nats", 1)
         _wait_deployment(root, DATA_NAMESPACE, "nats", "5m")
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery data restoration"
+        )
 
         after_db = _database_signature(root)
         after_nats = _jetstream_signature(root)
@@ -9209,22 +9640,43 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 "JetStream stream/durable-consumer continuity signature changed across restore"
             )
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery pre-Flux resume"
+        )
         _flux_resume(root, "commonthing-experiment-b-data")
         _flux_resume(root, "commonthing-experiment-b-app")
         _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")
         _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")
+        _require_same_kubernetes_target(
+            root, source_commit, recovery_target, "recovery completion"
+        )
         rto_seconds = time.monotonic() - destructive_started
     except Exception:
-        resuspended: dict[str, bool] = {}
-        for name in (
-            "commonthing-experiment-b-app",
-            "commonthing-experiment-b-data",
-        ):
-            try:
-                _flux_suspend(root, name)
-                resuspended[name] = True
-            except Exception:
-                resuspended[name] = False
+        resuspended: dict[str, bool] = {
+            "commonthing-experiment-b-app": False,
+            "commonthing-experiment-b-data": False,
+        }
+        target_safe_for_cleanup = False
+        try:
+            _require_same_kubernetes_target(
+                root,
+                source_commit,
+                recovery_target,
+                "recovery failure cleanup",
+            )
+            target_safe_for_cleanup = True
+        except Exception:
+            target_safe_for_cleanup = False
+        if target_safe_for_cleanup:
+            for name in (
+                "commonthing-experiment-b-app",
+                "commonthing-experiment-b-data",
+            ):
+                try:
+                    _flux_suspend(root, name)
+                    resuspended[name] = True
+                except Exception:
+                    resuspended[name] = False
         atomic_json(
             recovery_failed_receipt,
             {
@@ -9233,6 +9685,10 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 "source_commit": source_commit,
                 "database_before": before_db,
                 "jetstream_before": before_nats,
+                "kubernetes_target_sha256": _stable_json_sha256(
+                    recovery_target
+                ),
+                "target_safe_for_cleanup": target_safe_for_cleanup,
                 "flux_resuspended": resuspended,
             },
         )
@@ -9258,6 +9714,9 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         "schema_version": 1,
         "status": "pass",
         "source_commit": source_commit,
+        "kubernetes_target_sha256": _stable_json_sha256(
+            recovery_target
+        ),
         "rpo_seconds": 0,
         "rto_seconds": round(rto_seconds, 3),
         "postgres_dump_sha256": sha256_file(db_dump),
@@ -9549,13 +10008,28 @@ def portability_report(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("status does not prove a Ready pinned k3s node")
 
     release_bootstrap_sha256 = payloads["release.json"].get("sha256")
+    expected_flux_bootstrap = _flux_bootstrap_contract(
+        root,
+        payloads["release.json"],
+    )
+    release_config_map_status = status_payload.get(
+        "flux_release_config_map"
+    )
     flux_controllers = status_payload.get("flux_controllers")
     flux_readback = status_payload.get("flux")
     if (
         not isinstance(release_bootstrap_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", release_bootstrap_sha256) is None
+        or expected_flux_bootstrap.get("bootstrap_sha256")
+        != release_bootstrap_sha256
         or status_payload.get("flux_bootstrap_sha256")
         != release_bootstrap_sha256
+        or not isinstance(release_config_map_status, dict)
+        or release_config_map_status.get("canonical") is not True
+        or release_config_map_status.get("contract_sha256")
+        != _stable_json_sha256(
+            expected_flux_bootstrap["release_config_map"]
+        )
         or not _flux_revision_matches_commit(
             status_payload.get("flux_source_revision"), source_commit
         )
@@ -9882,6 +10356,32 @@ def portability_report(root: Path) -> dict[str, Any]:
         ):
             raise RuntimeErrorEB(
                 f"status does not prove the application ServiceAccount contract: {name}"
+            )
+
+    pdb_status = status_payload.get(
+        "application_disruption_budgets"
+    )
+    expected_pdbs = _rendered_application_pdb_contract(
+        root,
+        payloads["release.json"],
+    )
+    if (
+        not isinstance(pdb_status, dict)
+        or set(pdb_status) != set(expected_pdbs)
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the application PDB contract"
+        )
+    for name, expected in expected_pdbs.items():
+        observed = pdb_status.get(name)
+        if (
+            not isinstance(observed, dict)
+            or observed.get("canonical") is not True
+            or observed.get("contract_sha256")
+            != expected["contract_sha256"]
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the application PDB contract: {name}"
             )
 
     runtime_status = status_payload.get("runtime_contract")
