@@ -288,6 +288,20 @@ spec:
             contract["daemonset"]["selector_labels"],
             {"k8s-app": "cilium"},
         )
+        self.assertEqual(
+            contract["daemonset"]["rollout"],
+            {
+                "minReadySeconds": 0,
+                "revisionHistoryLimit": 10,
+                "updateStrategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": {
+                        "maxUnavailable": 1,
+                        "maxSurge": 0,
+                    },
+                },
+            },
+        )
         self.assertTrue(
             contract["daemonset"]["pod_spec"]["hostNetwork"]
         )
@@ -306,10 +320,36 @@ spec:
             "cilium-operator",
         )
         self.assertEqual(
+            contract["operator"]["rollout"],
+            {
+                "revisionHistoryLimit": 10,
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": {
+                        "maxSurge": "25%",
+                        "maxUnavailable": "25%",
+                    },
+                },
+            },
+        )
+        self.assertEqual(
             contract["relay"]["selector_labels"],
             {"k8s-app": "hubble-relay"},
         )
         self.assertEqual(contract["relay"]["replicas"], 1)
+        self.assertEqual(
+            contract["relay"]["rollout"],
+            {
+                "revisionHistoryLimit": 10,
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": {
+                        "maxSurge": "25%",
+                        "maxUnavailable": "25%",
+                    },
+                },
+            },
+        )
         self.assertEqual(
             contract["relay"]["pod_spec"]["serviceAccountName"],
             "hubble-relay",
@@ -4003,6 +4043,79 @@ spec:
             run_command.assert_not_called()
             load_fixture.assert_not_called()
 
+    def test_postgresql_clients_follow_injected_database_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            secrets_dir = root / "secrets"
+            secrets_dir.mkdir()
+            (secrets_dir / "database.json").write_text(
+                json.dumps(
+                    {
+                        "username": "proof_user",
+                        "database": "proof_database",
+                        "password": "unused-by-client-argv",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                runtime._database_client_argv(root, "psql"),
+                [
+                    "psql",
+                    "-U",
+                    "proof_user",
+                    "-d",
+                    "proof_database",
+                ],
+            )
+
+            completed = runtime.subprocess.CompletedProcess(
+                ["kubectl"],
+                0,
+                stdout="1\n",
+                stderr="",
+            )
+            with mock.patch.object(
+                runtime, "_kubectl", return_value=completed
+            ) as kubectl:
+                self.assertEqual(runtime._psql(root, "SELECT 1;"), "1")
+            self.assertEqual(
+                kubectl.call_args.args[1],
+                [
+                    "-n",
+                    runtime.DATA_NAMESPACE,
+                    "exec",
+                    "-i",
+                    "deployment/postgres",
+                    "--",
+                    "psql",
+                    "-U",
+                    "proof_user",
+                    "-d",
+                    "proof_database",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-At",
+                ],
+            )
+
+        seed_source = inspect.getsource(runtime.seed_t048_fixture)
+        recovery_source = inspect.getsource(runtime.recovery_proof)
+        self.assertIn(
+            '*_database_client_argv(root, "psql")',
+            seed_source,
+        )
+        self.assertIn(
+            '*_database_client_argv(root, "pg_dump")',
+            recovery_source,
+        )
+        self.assertIn(
+            '*_database_client_argv(root, "pg_restore")',
+            recovery_source,
+        )
+
     def test_database_signature_hashes_complete_persisted_domain_and_search_rows(self) -> None:
         source = inspect.getsource(runtime._database_signature)
         self.assertIn("md5(to_jsonb(n)::text)", source)
@@ -5441,6 +5554,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                         self.cilium_daemonset["spec"]["template"]["spec"],
                         "expected Cilium DaemonSet",
                     ),
+                    "rollout": runtime._daemonset_rollout_projection(
+                        self.cilium_daemonset["spec"],
+                        "expected Cilium DaemonSet",
+                    ),
                 },
                 "operator": {
                     "images": json.loads(
@@ -5461,6 +5578,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                         "minReadySeconds": 0,
                         "progressDeadlineSeconds": 600,
                     },
+                    "rollout": runtime._deployment_rollout_projection(
+                        self.cilium_operator["spec"],
+                        "expected Cilium operator Deployment",
+                    ),
                 },
                 "relay": {
                     "images": json.loads(
@@ -5479,6 +5600,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                         "minReadySeconds": 0,
                         "progressDeadlineSeconds": 600,
                     },
+                    "rollout": runtime._deployment_rollout_projection(
+                        self.cilium_relay["spec"],
+                        "expected Hubble Relay Deployment",
+                    ),
                 },
             },
         )
@@ -6022,6 +6147,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             runtime.RuntimeErrorEB, "DaemonSet pod contract drifted"
         ):
             runtime.status(self.root)
+
+        self.cilium_daemonset = json.loads(json.dumps(healthy_daemonset))
+        self.cilium_daemonset["spec"]["updateStrategy"] = {"type": "OnDelete"}
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "DaemonSet rollout drifted"
+        ):
+            runtime.status(self.root)
         self.cilium_daemonset = healthy_daemonset
 
         healthy_operator = json.loads(json.dumps(self.cilium_operator))
@@ -6042,6 +6174,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         ] = "shadow-operator"
         with self.assertRaisesRegex(
             runtime.RuntimeErrorEB, "operator pod contract drifted"
+        ):
+            runtime.status(self.root)
+
+        self.cilium_operator = json.loads(json.dumps(healthy_operator))
+        self.cilium_operator["spec"]["strategy"] = {"type": "Recreate"}
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "operator lifecycle drifted"
         ):
             runtime.status(self.root)
         self.cilium_operator = healthy_operator
@@ -6086,6 +6225,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
 
         self.cilium_relay = json.loads(json.dumps(healthy_relay))
         self.cilium_relay["spec"]["progressDeadlineSeconds"] = 42
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "Hubble Relay lifecycle drifted"
+        ):
+            runtime.status(self.root)
+
+        self.cilium_relay = json.loads(json.dumps(healthy_relay))
+        self.cilium_relay["spec"]["revisionHistoryLimit"] = 3
         with self.assertRaisesRegex(
             runtime.RuntimeErrorEB, "Hubble Relay lifecycle drifted"
         ):

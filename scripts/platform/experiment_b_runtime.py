@@ -3118,6 +3118,78 @@ def _deployment_lifecycle_projection(
     }
 
 
+def _deployment_rollout_projection(
+    spec: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        raise RuntimeErrorEB(f"{context} Deployment spec is invalid")
+    revision_history_limit = spec.get("revisionHistoryLimit", 10)
+    if (
+        isinstance(revision_history_limit, bool)
+        or not isinstance(revision_history_limit, int)
+        or revision_history_limit < 0
+    ):
+        raise RuntimeErrorEB(
+            f"{context} Deployment rollout contract is invalid"
+        )
+    return {
+        "revisionHistoryLimit": revision_history_limit,
+        "strategy": _flux_strategy_projection(spec, context),
+    }
+
+
+def _daemonset_rollout_projection(
+    spec: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        raise RuntimeErrorEB(f"{context} DaemonSet spec is invalid")
+    min_ready_seconds = spec.get("minReadySeconds", 0)
+    revision_history_limit = spec.get("revisionHistoryLimit", 10)
+    update_strategy = spec.get("updateStrategy")
+    if update_strategy is None:
+        update_strategy = {}
+    if (
+        isinstance(min_ready_seconds, bool)
+        or not isinstance(min_ready_seconds, int)
+        or min_ready_seconds < 0
+        or isinstance(revision_history_limit, bool)
+        or not isinstance(revision_history_limit, int)
+        or revision_history_limit < 0
+        or not isinstance(update_strategy, dict)
+    ):
+        raise RuntimeErrorEB(
+            f"{context} DaemonSet rollout contract is invalid"
+        )
+    update_strategy = json.loads(json.dumps(update_strategy))
+    strategy_type = update_strategy.get("type", "RollingUpdate")
+    if not isinstance(strategy_type, str) or not strategy_type:
+        raise RuntimeErrorEB(
+            f"{context} DaemonSet update strategy contract is invalid"
+        )
+    if strategy_type == "RollingUpdate":
+        rolling = update_strategy.get("rollingUpdate")
+        if rolling is None:
+            rolling = {}
+        if not isinstance(rolling, dict):
+            raise RuntimeErrorEB(
+                f"{context} DaemonSet rolling update contract is invalid"
+            )
+        update_strategy = {
+            "type": "RollingUpdate",
+            "rollingUpdate": {
+                "maxUnavailable": rolling.get("maxUnavailable", 1),
+                "maxSurge": rolling.get("maxSurge", 0),
+            },
+        }
+    return {
+        "minReadySeconds": min_ready_seconds,
+        "revisionHistoryLimit": revision_history_limit,
+        "updateStrategy": update_strategy,
+    }
+
+
 def _flux_deployment_contract(
     deployment: Any,
     context: str,
@@ -6261,6 +6333,10 @@ def _expected_cilium_runtime_contract(
                 pod_spec, context
             ),
         }
+        if kind == "DaemonSet":
+            result["rollout"] = _daemonset_rollout_projection(
+                workload_spec, context
+            )
         if kind == "Deployment":
             replicas = (
                 workload_spec.get("replicas", 1)
@@ -6277,6 +6353,9 @@ def _expected_cilium_runtime_contract(
                 )
             result["replicas"] = replicas
             result["lifecycle"] = _deployment_lifecycle_projection(
+                workload_spec, context
+            )
+            result["rollout"] = _deployment_rollout_projection(
                 workload_spec, context
             )
         return result
@@ -6452,8 +6531,19 @@ def _require_live_cilium_contract(
         )
 
     expected_daemonset = expected_runtime["daemonset"]
+    daemonset_spec = daemonset.get("spec", {})
+    if (
+        not isinstance(daemonset_spec, dict)
+        or _daemonset_rollout_projection(
+            daemonset_spec, "live Cilium DaemonSet"
+        )
+        != expected_daemonset["rollout"]
+    ):
+        raise RuntimeErrorEB(
+            "live Cilium DaemonSet rollout drifted from the pinned chart render"
+        )
     daemonset_pod_spec = (
-        daemonset.get("spec", {}).get("template", {}).get("spec")
+        daemonset_spec.get("template", {}).get("spec")
     )
     live_images = _pod_spec_images(
         daemonset_pod_spec,
@@ -6504,6 +6594,10 @@ def _require_live_cilium_contract(
             operator_spec, "live Cilium operator Deployment"
         )
         != expected_operator["lifecycle"]
+        or _deployment_rollout_projection(
+            operator_spec, "live Cilium operator Deployment"
+        )
+        != expected_operator["rollout"]
     ):
         raise RuntimeErrorEB(
             "live Cilium operator lifecycle drifted from the pinned chart render"
@@ -6562,6 +6656,10 @@ def _require_live_cilium_contract(
             relay_spec, "live Hubble Relay Deployment"
         )
         != expected_relay["lifecycle"]
+        or _deployment_rollout_projection(
+            relay_spec, "live Hubble Relay Deployment"
+        )
+        != expected_relay["rollout"]
     ):
         raise RuntimeErrorEB(
             "live Hubble Relay lifecycle drifted from the pinned chart render"
@@ -7610,11 +7708,43 @@ def _kubectl_json(root: Path, arguments: list[str]) -> dict[str, Any]:
     return value
 
 
+def _database_client_argv(root: Path, executable: str) -> list[str]:
+    database_path = root / "secrets/database.json"
+    if not database_path.is_file() or database_path.is_symlink():
+        raise RuntimeErrorEB(
+            "Experiment-B PostgreSQL client requires database Secret source material"
+        )
+    try:
+        database = json.loads(database_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B PostgreSQL client requires valid database Secret source material"
+        ) from exc
+    if (
+        not isinstance(database, dict)
+        or not isinstance(database.get("username"), str)
+        or not database["username"]
+        or not isinstance(database.get("database"), str)
+        or not database["database"]
+    ):
+        raise RuntimeErrorEB(
+            "Experiment-B PostgreSQL client database identity is invalid"
+        )
+    return [
+        executable,
+        "-U",
+        database["username"],
+        "-d",
+        database["database"],
+    ]
+
+
 def _psql(root: Path, sql: str, *, tuples_only: bool = True) -> str:
     argv = [
         "-n", DATA_NAMESPACE,
         "exec", "-i", "deployment/postgres", "--",
-        "psql", "-U", "commonthing", "-d", "commonthing", "-v", "ON_ERROR_STOP=1",
+        *_database_client_argv(root, "psql"),
+        "-v", "ON_ERROR_STOP=1",
     ]
     if tuples_only:
         argv.extend(["-At"])
@@ -8295,7 +8425,7 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
             [
                 kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
                 "deployment/postgres", "--",
-                "psql", "-U", "commonthing", "-d", "commonthing",
+                *_database_client_argv(root, "psql"),
                 "-v", "ON_ERROR_STOP=1",
             ],
             streamed,
@@ -9996,7 +10126,8 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         _run_binary_to_file(
             [
                 kubectl, "-n", DATA_NAMESPACE, "exec", "deployment/postgres", "--",
-                "pg_dump", "-U", "commonthing", "-d", "commonthing", "-Fc",
+                *_database_client_argv(root, "pg_dump"),
+                "-Fc",
             ],
             db_dump,
             env=kube_env(root),
@@ -10108,7 +10239,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             [
                 kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
                 "deployment/postgres", "--",
-                "pg_restore", "-U", "commonthing", "-d", "commonthing",
+                *_database_client_argv(root, "pg_restore"),
                 "--clean", "--if-exists", "--no-owner",
             ],
             db_dump,
