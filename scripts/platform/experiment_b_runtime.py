@@ -30,6 +30,8 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -769,6 +771,94 @@ def _retire_domain_before_storage(
         )
 
 
+def _cleanup_pool_after_domain_retirement(
+    pool_target: str,
+    context: str,
+) -> None:
+    volume_paths = {
+        VOLUME_NAME: POOL_TARGET / VOLUME_NAME,
+        BASE_VOLUME: POOL_TARGET / BASE_VOLUME,
+    }
+    for volume_name, path in volume_paths.items():
+        if not path.exists():
+            continue
+        last_result: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(3):
+            last_result = run(
+                [
+                    "virsh",
+                    "-c",
+                    LIBVIRT_URI,
+                    "vol-delete",
+                    volume_name,
+                    "--pool",
+                    pool_target,
+                ],
+                check=False,
+            )
+            if not path.exists():
+                break
+            if attempt < 2:
+                time.sleep(1)
+        if path.exists():
+            detail = (
+                ((last_result.stderr if last_result is not None else "") or "")
+                .strip()
+            )
+            raise RuntimeErrorEB(
+                f"{context} could not remove libvirt volume {volume_name}: "
+                f"{detail[-1000:]}"
+            )
+
+    if POOL_TARGET.exists():
+        unexpected = sorted(path.name for path in POOL_TARGET.iterdir())
+        if unexpected:
+            raise RuntimeErrorEB(
+                f"{context} refuses unexpected libvirt pool contents: {unexpected}"
+            )
+
+    last_results: dict[str, subprocess.CompletedProcess[str]] = {}
+    for attempt in range(3):
+        if not _libvirt_resource_present("pool", POOL_NAME):
+            break
+        for command in ("pool-destroy", "pool-delete", "pool-undefine"):
+            result = run(
+                ["virsh", "-c", LIBVIRT_URI, command, pool_target],
+                check=False,
+            )
+            last_results[command] = result
+            if not _libvirt_resource_present("pool", POOL_NAME):
+                break
+        if not _libvirt_resource_present("pool", POOL_NAME):
+            break
+        if attempt < 2:
+            time.sleep(1)
+
+    if _libvirt_resource_present("pool", POOL_NAME):
+        detail = "; ".join(
+            f"{command}=rc{result.returncode}:"
+            f"{((result.stderr or '').strip())[-300:]}"
+            for command, result in sorted(last_results.items())
+        )
+        raise RuntimeErrorEB(
+            f"{context} could not retire the libvirt storage pool after "
+            f"bounded retries: {detail}"
+        )
+
+    for volume_name, path in volume_paths.items():
+        if path.exists():
+            raise RuntimeErrorEB(
+                f"{context} volume path still exists after pool cleanup: "
+                f"{volume_name}"
+            )
+    if POOL_TARGET.exists():
+        if any(POOL_TARGET.iterdir()):
+            raise RuntimeErrorEB(
+                f"{context} libvirt pool directory is not empty after cleanup"
+            )
+        POOL_TARGET.rmdir()
+
+
 def create_vm(root: Path) -> dict[str, Any]:
     if run(
         ["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME],
@@ -896,17 +986,10 @@ def create_vm(root: Path) -> dict[str, Any]:
                 "Experiment-B VM creation rollback",
             )
         if pool_defined:
-            run(
-                ["virsh", "-c", LIBVIRT_URI, "vol-delete", VOLUME_NAME, "--pool", POOL_NAME],
-                check=False,
+            _cleanup_pool_after_domain_retirement(
+                POOL_NAME,
+                "Experiment-B VM creation rollback",
             )
-            run(
-                ["virsh", "-c", LIBVIRT_URI, "vol-delete", BASE_VOLUME, "--pool", POOL_NAME],
-                check=False,
-            )
-            run(["virsh", "-c", LIBVIRT_URI, "pool-destroy", POOL_NAME], check=False)
-            run(["virsh", "-c", LIBVIRT_URI, "pool-delete", POOL_NAME], check=False)
-            run(["virsh", "-c", LIBVIRT_URI, "pool-undefine", POOL_NAME], check=False)
         if POOL_TARGET.exists() and not any(POOL_TARGET.iterdir()):
             POOL_TARGET.rmdir()
         raise
@@ -1411,6 +1494,42 @@ def kube_env(root: Path) -> dict[str, str]:
     return env
 
 
+@contextmanager
+def _bound_kube_env(
+    root: Path,
+    expected_target: dict[str, str],
+) -> Iterator[dict[str, str]]:
+    source = root / "kubeconfig.yaml"
+    try:
+        payload = source.read_bytes()
+    except OSError as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B platform install cannot snapshot kubeconfig"
+        ) from exc
+    if hashlib.sha256(payload).hexdigest() != expected_target["kubeconfig_sha256"]:
+        raise RuntimeErrorEB(
+            "Experiment-B platform install kubeconfig changed before snapshot"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix=".platform-kubeconfig-",
+        dir=root,
+    ) as temporary:
+        snapshot = Path(temporary) / "kubeconfig.yaml"
+        snapshot.write_bytes(payload)
+        os.chmod(snapshot, 0o400)
+        if (
+            sha256_file(snapshot) != expected_target["kubeconfig_sha256"]
+            or _kubeconfig_server(snapshot) != expected_target["server"]
+        ):
+            raise RuntimeErrorEB(
+                "Experiment-B platform install kubeconfig snapshot drifted"
+            )
+        env = os.environ.copy()
+        env["KUBECONFIG"] = str(snapshot)
+        yield env
+
+
 def _cilium_helm_value_args(ip: str) -> list[str]:
     return [
         "--set", "gatewayAPI.enabled=true",
@@ -1442,39 +1561,78 @@ def install_platform(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
     _require_kubernetes_target_binding(root, source_commit)
+    platform_target = _kubernetes_target_identity(root, source_commit)
     receipt = toolchain(root)
     tools = receipt["tools"]
     artifacts = receipt["artifacts"]
-    env = kube_env(root)
     kubectl = tools["kubectl"]
     helm = tools["helm"]
     flux = tools["flux"]
 
-    for name in (
-        "gateway_api_gatewayclasses",
-        "gateway_api_gateways",
-        "gateway_api_httproutes",
-        "gateway_api_referencegrants",
-        "gateway_api_grpcroutes",
-    ):
-        run([kubectl, "apply", "-f", artifacts[name]], env=env)
+    with _bound_kube_env(root, platform_target) as env:
+        _require_same_kubernetes_target(
+            root,
+            source_commit,
+            platform_target,
+            "platform installation before Gateway API CRDs",
+        )
+        for name in (
+            "gateway_api_gatewayclasses",
+            "gateway_api_gateways",
+            "gateway_api_httproutes",
+            "gateway_api_referencegrants",
+            "gateway_api_grpcroutes",
+        ):
+            run([kubectl, "apply", "-f", artifacts[name]], env=env)
+        _require_same_kubernetes_target(
+            root,
+            source_commit,
+            platform_target,
+            "platform installation after Gateway API CRDs",
+        )
 
-    ip = vm_ip()
-    run(
-        [
-            helm, "upgrade", "--install", "cilium", artifacts["cilium_chart"],
-            "--namespace", "kube-system",
-            *_cilium_helm_value_args(ip),
-            "--wait", "--timeout", "10m",
-        ],
-        env=env,
-        timeout=900,
-    )
-    run(
-        _flux_install_argv(flux),
-        env=env,
-        timeout=600,
-    )
+        ip = platform_target["vm_ip"]
+        _require_same_kubernetes_target(
+            root,
+            source_commit,
+            platform_target,
+            "platform installation before Cilium",
+        )
+        run(
+            [
+                helm, "upgrade", "--install", "cilium", artifacts["cilium_chart"],
+                "--namespace", "kube-system",
+                *_cilium_helm_value_args(ip),
+                "--wait", "--timeout", "10m",
+            ],
+            env=env,
+            timeout=900,
+        )
+        _require_same_kubernetes_target(
+            root,
+            source_commit,
+            platform_target,
+            "platform installation after Cilium",
+        )
+
+        _require_same_kubernetes_target(
+            root,
+            source_commit,
+            platform_target,
+            "platform installation before Flux",
+        )
+        run(
+            _flux_install_argv(flux),
+            env=env,
+            timeout=600,
+        )
+        _require_same_kubernetes_target(
+            root,
+            source_commit,
+            platform_target,
+            "platform installation after Flux",
+        )
+
     cilium_readback = _require_live_cilium_contract(root, load_config())
     flux_readback: dict[str, Any] | None = None
     last_flux_error: RuntimeErrorEB | None = None
@@ -1490,12 +1648,19 @@ def install_platform(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB(
             "Flux controllers did not converge to the pinned runtime contract"
         ) from last_flux_error
+    _require_same_kubernetes_target(
+        root,
+        source_commit,
+        platform_target,
+        "platform success receipt",
+    )
     result = {
         "schema_version": 1,
         "status": "ready",
         "source_commit": source_commit,
         "toolchain_lock_sha256": receipt["lock_sha256"],
         "vm_ip": ip,
+        "kubernetes_target_sha256": _stable_json_sha256(platform_target),
         "cilium_runtime_image_ids": {
             "daemonset": cilium_readback["daemonset_pods"][
                 "runtime_image_ids_sha256"
@@ -7010,48 +7175,12 @@ def teardown(root: Path) -> dict[str, Any]:
     }
     if live_identity["pool_present"]:
         pool_target = str(live_identity["pool_target"])
-        run(
-            [
-                "virsh",
-                "-c",
-                LIBVIRT_URI,
-                "vol-delete",
-                VOLUME_NAME,
-                "--pool",
-                pool_target,
-            ],
-            check=False,
-        )
-        run(
-            [
-                "virsh",
-                "-c",
-                LIBVIRT_URI,
-                "vol-delete",
-                BASE_VOLUME,
-                "--pool",
-                pool_target,
-            ],
-            check=False,
+        _cleanup_pool_after_domain_retirement(
+            pool_target,
+            "Experiment-B teardown",
         )
         for volume_name in volume_absence:
-            if _libvirt_volume_present(pool_target, volume_name):
-                raise RuntimeErrorEB(
-                    f"Experiment-B libvirt volume still exists after deletion: {volume_name}"
-                )
             volume_absence[volume_name] = True
-        run(
-            ["virsh", "-c", LIBVIRT_URI, "pool-destroy", pool_target],
-            check=False,
-        )
-        run(
-            ["virsh", "-c", LIBVIRT_URI, "pool-delete", pool_target],
-            check=False,
-        )
-        run(
-            ["virsh", "-c", LIBVIRT_URI, "pool-undefine", pool_target],
-            check=False,
-        )
     else:
         for volume_name in volume_absence:
             volume_absence[volume_name] = True

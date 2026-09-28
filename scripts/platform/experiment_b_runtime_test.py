@@ -8037,6 +8037,49 @@ spec:
         self.assertTrue(self.disk.exists())
         self.assertTrue(self.base.exists())
 
+    def test_create_rollback_retries_transient_storage_cleanup_failures(self) -> None:
+        self.prepare_create()
+        self.main.side_effect = [self.commit, "b" * 40]
+        original = self.run_fixture
+        failures = {
+            "vol-delete": 1,
+            "pool-destroy": 1,
+            "pool-undefine": 1,
+        }
+
+        def transient_cleanup_failures(argv, **kwargs):
+            if argv[:3] == ["virsh", "-c", runtime.LIBVIRT_URI]:
+                command = argv[3]
+                if failures.get(command, 0):
+                    failures[command] -= 1
+                    return runtime.subprocess.CompletedProcess(
+                        argv,
+                        1,
+                        stdout="",
+                        stderr=f"transient {command} failure",
+                    )
+            return original(argv, **kwargs)
+
+        self.runner.side_effect = transient_cleanup_failures
+        with (
+            mock.patch.object(runtime.time, "sleep"),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "VM creation source/config changed",
+            ),
+        ):
+            runtime.create_vm(self.root)
+        self.assertEqual(failures, {
+            "vol-delete": 0,
+            "pool-destroy": 0,
+            "pool-undefine": 0,
+        })
+        self.assertFalse(self.domain_present)
+        self.assertFalse(self.pool_present)
+        self.assertFalse(self.disk.exists())
+        self.assertFalse(self.base.exists())
+        self.assertFalse(self.pool.exists())
+
     def test_create_binds_actual_vm_to_current_source_and_config(self) -> None:
         self.prepare_create()
         result = runtime.create_vm(self.root)
@@ -8085,6 +8128,74 @@ spec:
 
 
 class ExperimentBLatestP1RegressionTests(unittest.TestCase):
+    def test_bound_kube_env_freezes_verified_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kubeconfig.yaml"
+            source.write_text(
+                yaml.safe_dump(
+                    {
+                        "current-context": "experiment-b",
+                        "contexts": [
+                            {
+                                "name": "experiment-b",
+                                "context": {"cluster": "experiment-b"},
+                            }
+                        ],
+                        "clusters": [
+                            {
+                                "name": "experiment-b",
+                                "cluster": {
+                                    "server": "https://192.168.122.10:6443"
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source.chmod(0o600)
+            expected = {
+                "vm_ip": "192.168.122.10",
+                "kubeconfig_sha256": runtime.sha256_file(source),
+                "server": "https://192.168.122.10:6443",
+            }
+            with runtime._bound_kube_env(root, expected) as env:
+                snapshot = Path(env["KUBECONFIG"])
+                self.assertNotEqual(snapshot, source)
+                self.assertEqual(runtime.sha256_file(snapshot), expected["kubeconfig_sha256"])
+                self.assertEqual(runtime._kubeconfig_server(snapshot), expected["server"])
+                source.write_text("drifted", encoding="utf-8")
+                self.assertEqual(runtime.sha256_file(snapshot), expected["kubeconfig_sha256"])
+            self.assertFalse(snapshot.exists())
+
+    def test_platform_install_mutations_are_bound_to_snapshot_and_rechecked(self) -> None:
+        source = inspect.getsource(runtime.install_platform)
+        target_capture = source.index(
+            "platform_target = _kubernetes_target_identity"
+        )
+        snapshot = source.index("with _bound_kube_env")
+        gateway_apply = source.index(
+            'run([kubectl, "apply", "-f", artifacts[name]], env=env)'
+        )
+        cilium_install = source.index(
+            'helm, "upgrade", "--install", "cilium"'
+        )
+        flux_install = source.index("_flux_install_argv(flux)")
+        final_target_check = source.rindex("_require_same_kubernetes_target")
+        receipt_write = source.index('atomic_json(root / "receipts/platform.json", result)')
+        self.assertLess(target_capture, snapshot)
+        self.assertLess(snapshot, gateway_apply)
+        self.assertLess(gateway_apply, cilium_install)
+        self.assertLess(cilium_install, flux_install)
+        self.assertLess(flux_install, final_target_check)
+        self.assertLess(final_target_check, receipt_write)
+        self.assertGreaterEqual(
+            source.count("_require_same_kubernetes_target"),
+            7,
+        )
+        self.assertIn('"kubernetes_target_sha256"', source)
+
     def test_same_kubernetes_target_rejects_identity_drift(self) -> None:
         expected = {
             "vm_ip": "192.168.122.10",
