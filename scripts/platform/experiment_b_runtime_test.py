@@ -222,6 +222,23 @@ spec:
       containers:
         - name: cilium-operator
           image: quay.io/cilium/operator-generic:v1.19.5
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hubble-relay
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: hubble-relay
+  template:
+    spec:
+      serviceAccountName: hubble-relay
+      containers:
+        - name: hubble-relay
+          image: quay.io/cilium/hubble-relay:v1.19.5
 """
         runner = mock.Mock(
             return_value=runtime.subprocess.CompletedProcess(
@@ -287,6 +304,19 @@ spec:
         self.assertEqual(
             contract["operator"]["pod_spec"]["serviceAccountName"],
             "cilium-operator",
+        )
+        self.assertEqual(
+            contract["relay"]["selector_labels"],
+            {"k8s-app": "hubble-relay"},
+        )
+        self.assertEqual(contract["relay"]["replicas"], 1)
+        self.assertEqual(
+            contract["relay"]["pod_spec"]["serviceAccountName"],
+            "hubble-relay",
+        )
+        self.assertEqual(
+            contract["relay"]["images"]["containers"]["hubble-relay"],
+            "quay.io/cilium/hubble-relay:v1.19.5",
         )
         argv = runner.call_args.args[0]
         self.assertEqual(
@@ -4203,6 +4233,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.cilium_values = {
             "gatewayAPI": {"enabled": True},
             "kubeProxyReplacement": True,
+            "hubble": {"relay": {"enabled": True}},
         }
         self.cilium_config_contract = {
             "data": {
@@ -4234,6 +4265,12 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             },
             "init_containers": {},
         }
+        self.cilium_expected_relay_images = {
+            "containers": {
+                "hubble-relay": "quay.io/cilium/hubble-relay:v1.19.5",
+            },
+            "init_containers": {},
+        }
         self.cilium_operator = {
             "metadata": {
                 "name": "cilium-operator",
@@ -4251,6 +4288,39 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                                 "image": image,
                             }
                             for name, image in self.cilium_expected_operator_images[
+                                "containers"
+                            ].items()
+                        ],
+                    }
+                },
+            },
+            "status": {
+                "observedGeneration": 1,
+                "replicas": 1,
+                "updatedReplicas": 1,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+                "unavailableReplicas": 0,
+                "conditions": [{"type": "Available", "status": "True"}],
+            },
+        }
+        self.cilium_relay = {
+            "metadata": {
+                "name": "hubble-relay",
+                "namespace": "kube-system",
+                "generation": 1,
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"k8s-app": "hubble-relay"}},
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": name,
+                                "image": image,
+                            }
+                            for name, image in self.cilium_expected_relay_images[
                                 "containers"
                             ].items()
                         ],
@@ -4718,6 +4788,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 self.cilium_expected_operator_images,
             )
         ]
+        self.cilium_relay_pods = [
+            workload_pod(
+                "kube-system",
+                "hubble-relay",
+                0,
+                {"k8s-app": "hubble-relay"},
+                self.cilium_expected_relay_images,
+            )
+        ]
 
         self.live_secrets = {
             f"{runtime.DATA_NAMESPACE}/commonthing-experiment-b-database": {
@@ -5082,6 +5161,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     "operator": operator_proof[
                         "runtime_image_ids_sha256"
                     ],
+                    "relay": runtime._require_running_pod_image_contract(
+                        self.cilium_relay_pods,
+                        namespace="kube-system",
+                        workload="hubble-relay",
+                        expected_replicas=1,
+                        expected_images=self.cilium_expected_relay_images,
+                        required_labels={"k8s-app": "hubble-relay"},
+                        context="Hubble Relay Pod",
+                    )["runtime_image_ids_sha256"],
                 },
                 "flux_runtime_image_ids": {
                     name: proof["runtime_image_ids_sha256"]
@@ -5319,6 +5407,30 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                         self.cilium_operator["spec"]["template"]["spec"],
                         "expected Cilium operator Deployment",
                     ),
+                    "replicas": 1,
+                    "lifecycle": {
+                        "paused": False,
+                        "minReadySeconds": 0,
+                        "progressDeadlineSeconds": 600,
+                    },
+                },
+                "relay": {
+                    "images": json.loads(
+                        json.dumps(self.cilium_expected_relay_images)
+                    ),
+                    "selector_labels": {
+                        "k8s-app": "hubble-relay"
+                    },
+                    "pod_spec": runtime._cilium_pod_spec_projection(
+                        self.cilium_relay["spec"]["template"]["spec"],
+                        "expected Hubble Relay Deployment",
+                    ),
+                    "replicas": 1,
+                    "lifecycle": {
+                        "paused": False,
+                        "minReadySeconds": 0,
+                        "progressDeadlineSeconds": 600,
+                    },
                 },
             },
         )
@@ -5397,6 +5509,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "items": [
                     *self.cilium_pods,
                     *self.cilium_operator_pods,
+                    *self.cilium_relay_pods,
                     *self.kube_proxy_pods,
                 ]
             }
@@ -5442,6 +5555,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "-n", "kube-system", "get", "deployment", "cilium-operator"
         ]:
             return self.cilium_operator
+        if arguments == [
+            "-n", "kube-system", "get", "deployment", "hubble-relay"
+        ]:
+            return self.cilium_relay
         if arguments == ["-n", "flux-system", "get", "deployments"]:
             return {"items": self.flux_controller_deployments}
         if arguments == ["-n", "flux-system", "get", "pods"]:
@@ -5789,6 +5906,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         healthy_daemonset = json.loads(json.dumps(self.cilium_daemonset))
         healthy_cilium_pods = json.loads(json.dumps(self.cilium_pods))
         healthy_operator_pods = json.loads(json.dumps(self.cilium_operator_pods))
+        healthy_relay = json.loads(json.dumps(self.cilium_relay))
+        healthy_relay_pods = json.loads(json.dumps(self.cilium_relay_pods))
 
         self.cilium_chart = "cilium-9.9.9"
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "Helm release"):
@@ -5813,6 +5932,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "gatewayAPI": {"enabled": "true"},
             "kubeProxyReplacement": "true",
         }
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "configuration drifted"):
+            runtime.status(self.root)
+
+        self.cilium_values = json.loads(json.dumps(healthy_values))
+        self.cilium_values["hubble"]["relay"]["enabled"] = False
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "configuration drifted"):
             runtime.status(self.root)
         self.cilium_values = healthy_values
@@ -5904,6 +6028,31 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "runtime image ID drifted"):
             runtime.status(self.root)
         self.cilium_operator_pods = healthy_operator_pods
+
+        self.cilium_relay = json.loads(json.dumps(healthy_relay))
+        self.cilium_relay["status"]["readyReplicas"] = 0
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "not currently available"
+        ):
+            runtime.status(self.root)
+
+        self.cilium_relay = json.loads(json.dumps(healthy_relay))
+        self.cilium_relay["spec"]["progressDeadlineSeconds"] = 42
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "Hubble Relay lifecycle drifted"
+        ):
+            runtime.status(self.root)
+        self.cilium_relay = healthy_relay
+
+        self.cilium_relay_pods = json.loads(json.dumps(healthy_relay_pods))
+        self.cilium_relay_pods[0]["status"]["containerStatuses"][0][
+            "imageID"
+        ] = "containerd://not-a-digest"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "runtime image ID drifted"
+        ):
+            runtime.status(self.root)
+        self.cilium_relay_pods = healthy_relay_pods
 
         self.kube_proxy_daemonsets = [{"metadata": {"name": "kube-proxy"}}]
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "kube-proxy is present"):
@@ -6211,6 +6360,16 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "image"
         ] = "nats:2.10-alpine@sha256:" + "0" * 64
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "images drifted"):
+            runtime.status(self.root)
+
+        self.data_deployments = json.loads(json.dumps(healthy))
+        self.data_deployments["postgres"]["spec"][
+            "minReadySeconds"
+        ] = 17
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "Deployment contract drifted",
+        ):
             runtime.status(self.root)
 
         self.data_deployments = healthy
@@ -7674,6 +7833,9 @@ spec:
                 "replicas": 1,
                 "revisionHistoryLimit": 3,
                 "strategy": deployment["spec"]["strategy"],
+                "paused": False,
+                "minReadySeconds": 0,
+                "progressDeadlineSeconds": 600,
                 "selector_labels": labels,
                 "template_labels": labels,
                 "template_annotations": annotations,
@@ -7725,6 +7887,16 @@ spec:
                 self.root, release, deployments, pods
             )
             self.assertTrue(proof["weltgewebe-api"]["canonical"])
+
+            deployment_drift = json.loads(json.dumps(deployments))
+            deployment_drift["weltgewebe-api"]["spec"]["paused"] = True
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "Deployment contract drifted",
+            ):
+                runtime._require_live_application_workloads(
+                    self.root, release, deployment_drift, pods
+                )
 
             deployment_drift = json.loads(json.dumps(deployments))
             deployment_drift["weltgewebe-api"]["spec"]["template"][
@@ -7813,6 +7985,11 @@ spec:
             self.assertEqual(
                 contract["contract"]["revisionHistoryLimit"],
                 10,
+            )
+            self.assertFalse(contract["contract"]["paused"])
+            self.assertEqual(contract["contract"]["minReadySeconds"], 0)
+            self.assertEqual(
+                contract["contract"]["progressDeadlineSeconds"], 600
             )
 
     def test_t048_revalidates_target_and_postgres_before_and_after_measurement(self) -> None:
@@ -8651,6 +8828,9 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
             "replicas": 1,
             "revisionHistoryLimit": 10,
             "strategy": None,
+            "paused": False,
+            "minReadySeconds": 0,
+            "progressDeadlineSeconds": 600,
             "selector_labels": labels,
             "template_labels": labels,
             "template_annotations": {},

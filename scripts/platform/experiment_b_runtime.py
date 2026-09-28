@@ -1681,6 +1681,9 @@ def install_platform(root: Path) -> dict[str, Any]:
             "operator": cilium_readback["operator_pods"][
                 "runtime_image_ids_sha256"
             ],
+            "relay": cilium_readback["relay_pods"][
+                "runtime_image_ids_sha256"
+            ],
         },
         "flux_runtime_image_ids": {
             name: controller["pods"]["runtime_image_ids_sha256"]
@@ -3086,6 +3089,35 @@ def _flux_pod_spec_projection(
     return projection
 
 
+def _deployment_lifecycle_projection(
+    spec: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        raise RuntimeErrorEB(f"{context} Deployment spec is invalid")
+    paused = spec.get("paused", False)
+    min_ready_seconds = spec.get("minReadySeconds", 0)
+    progress_deadline_seconds = spec.get("progressDeadlineSeconds", 600)
+    if (
+        not isinstance(paused, bool)
+        or isinstance(min_ready_seconds, bool)
+        or not isinstance(min_ready_seconds, int)
+        or min_ready_seconds < 0
+        or isinstance(progress_deadline_seconds, bool)
+        or not isinstance(progress_deadline_seconds, int)
+        or progress_deadline_seconds < 1
+        or progress_deadline_seconds <= min_ready_seconds
+    ):
+        raise RuntimeErrorEB(
+            f"{context} Deployment lifecycle contract is invalid"
+        )
+    return {
+        "paused": paused,
+        "minReadySeconds": min_ready_seconds,
+        "progressDeadlineSeconds": progress_deadline_seconds,
+    }
+
+
 def _flux_deployment_contract(
     deployment: Any,
     context: str,
@@ -3115,8 +3147,7 @@ def _flux_deployment_contract(
         "replicas": replicas,
         "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
         "strategy": _flux_strategy_projection(spec, context),
-        "minReadySeconds": spec.get("minReadySeconds", 0),
-        "progressDeadlineSeconds": spec.get("progressDeadlineSeconds", 600),
+        **_deployment_lifecycle_projection(spec, context),
         "selector_labels": _pod_selector_match_labels(deployment, context),
         "template_labels": labels,
         "template_annotations": annotations,
@@ -5286,6 +5317,9 @@ def _rendered_application_workload_contract(
             "replicas": replicas,
             "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
             "strategy": spec.get("strategy"),
+            **_deployment_lifecycle_projection(
+                spec, f"rendered application Deployment {name}"
+            ),
             "selector_labels": _pod_selector_match_labels(
                 deployment, f"rendered application Deployment {name}"
             ),
@@ -5691,8 +5725,11 @@ def _require_live_application_workloads(
             )
         observed_contract = {
             "replicas": spec.get("replicas"),
-            "revisionHistoryLimit": spec.get("revisionHistoryLimit"),
+            "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
             "strategy": spec.get("strategy"),
+            **_deployment_lifecycle_projection(
+                spec, f"live application Deployment {name}"
+            ),
             "selector_labels": _pod_selector_match_labels(
                 deployment, f"live application Deployment {name}"
             ),
@@ -5901,6 +5938,9 @@ def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]
         "replicas": replicas,
         "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
         "strategy": spec.get("strategy"),
+        **_deployment_lifecycle_projection(
+            spec, f"versioned data Deployment {name}"
+        ),
         "selector_labels": selector,
         "template_labels": template_metadata.get("labels", {}),
         "template_annotations": template_metadata.get("annotations", {}),
@@ -6006,6 +6046,9 @@ def _require_live_data_deployments(
                 "revisionHistoryLimit", 10
             ),
             "strategy": live_spec.get("strategy"),
+            **_deployment_lifecycle_projection(
+                live_spec, f"live data Deployment {name}"
+            ),
             "selector_labels": live_selector,
             "template_labels": live_template_metadata.get("labels", {}),
             "template_annotations": live_template_metadata.get(
@@ -6203,10 +6246,13 @@ def _expected_cilium_runtime_contract(
                 f"kube-system {kind} {name}"
             )
         workload = workloads[0]
+        workload_spec = workload.get("spec", {})
         pod_spec = (
-            workload.get("spec", {}).get("template", {}).get("spec")
+            workload_spec.get("template", {}).get("spec")
+            if isinstance(workload_spec, dict)
+            else None
         )
-        return {
+        result = {
             "images": _pod_spec_images(pod_spec, context),
             "selector_labels": _pod_selector_match_labels(
                 workload, context
@@ -6215,6 +6261,25 @@ def _expected_cilium_runtime_contract(
                 pod_spec, context
             ),
         }
+        if kind == "Deployment":
+            replicas = (
+                workload_spec.get("replicas", 1)
+                if isinstance(workload_spec, dict)
+                else None
+            )
+            if (
+                isinstance(replicas, bool)
+                or not isinstance(replicas, int)
+                or replicas < 1
+            ):
+                raise RuntimeErrorEB(
+                    f"{context} Deployment replica contract is invalid"
+                )
+            result["replicas"] = replicas
+            result["lifecycle"] = _deployment_lifecycle_projection(
+                workload_spec, context
+            )
+        return result
 
     return {
         "config_map": config_map_contract,
@@ -6225,6 +6290,11 @@ def _expected_cilium_runtime_contract(
             "Deployment",
             "cilium-operator",
             "pinned Cilium operator Deployment",
+        ),
+        "relay": workload_contract(
+            "Deployment",
+            "hubble-relay",
+            "pinned Hubble Relay Deployment",
         ),
     }
 
@@ -6290,9 +6360,12 @@ def _require_live_cilium_contract(
         or values.get("kubeProxyReplacement") is not True
         or not isinstance(values.get("gatewayAPI"), dict)
         or values["gatewayAPI"].get("enabled") is not True
+        or not isinstance(values.get("hubble"), dict)
+        or not isinstance(values["hubble"].get("relay"), dict)
+        or values["hubble"]["relay"].get("enabled") is not True
     ):
         raise RuntimeErrorEB(
-            "live Cilium Gateway API/kube-proxy replacement "
+            "live Cilium Gateway API/kube-proxy replacement/Hubble Relay "
             "configuration drifted"
         )
 
@@ -6420,12 +6493,25 @@ def _require_live_cilium_contract(
         raise RuntimeErrorEB(
             "live Cilium operator Deployment identity drifted"
         )
-    operator_availability = _deployment_availability_snapshot(
-        operator, "cilium-operator", 1
-    )
     expected_operator = expected_runtime["operator"]
+    operator_spec = operator.get("spec", {})
+    operator_availability = _deployment_availability_snapshot(
+        operator, "cilium-operator", expected_operator["replicas"]
+    )
+    if (
+        not isinstance(operator_spec, dict)
+        or _deployment_lifecycle_projection(
+            operator_spec, "live Cilium operator Deployment"
+        )
+        != expected_operator["lifecycle"]
+    ):
+        raise RuntimeErrorEB(
+            "live Cilium operator lifecycle drifted from the pinned chart render"
+        )
     operator_pod_spec = (
-        operator.get("spec", {}).get("template", {}).get("spec")
+        operator_spec.get("template", {}).get("spec")
+        if isinstance(operator_spec, dict)
+        else None
     )
     operator_images = _pod_spec_images(
         operator_pod_spec,
@@ -6449,6 +6535,62 @@ def _require_live_cilium_contract(
         raise RuntimeErrorEB(
             "live Cilium operator pod contract drifted from the "
             "pinned chart render"
+        )
+
+    relay = _kubectl_json(
+        root,
+        ["-n", "kube-system", "get", "deployment", "hubble-relay"],
+    )
+    relay_metadata = relay.get("metadata", {})
+    if (
+        not isinstance(relay_metadata, dict)
+        or relay_metadata.get("name") != "hubble-relay"
+        or relay_metadata.get("namespace") != "kube-system"
+        or relay_metadata.get("deletionTimestamp") is not None
+    ):
+        raise RuntimeErrorEB(
+            "live Hubble Relay Deployment identity drifted"
+        )
+    expected_relay = expected_runtime["relay"]
+    relay_spec = relay.get("spec", {})
+    relay_availability = _deployment_availability_snapshot(
+        relay, "hubble-relay", expected_relay["replicas"]
+    )
+    if (
+        not isinstance(relay_spec, dict)
+        or _deployment_lifecycle_projection(
+            relay_spec, "live Hubble Relay Deployment"
+        )
+        != expected_relay["lifecycle"]
+    ):
+        raise RuntimeErrorEB(
+            "live Hubble Relay lifecycle drifted from the pinned chart render"
+        )
+    relay_pod_spec = (
+        relay_spec.get("template", {}).get("spec")
+        if isinstance(relay_spec, dict)
+        else None
+    )
+    relay_images = _pod_spec_images(
+        relay_pod_spec,
+        "live Hubble Relay Deployment",
+    )
+    if relay_images != expected_relay["images"]:
+        raise RuntimeErrorEB(
+            "live Hubble Relay images drifted from the pinned chart render"
+        )
+    relay_selector = _pod_selector_match_labels(
+        relay, "live Hubble Relay Deployment"
+    )
+    if (
+        relay_selector != expected_relay["selector_labels"]
+        or _cilium_pod_spec_projection(
+            relay_pod_spec, "live Hubble Relay Deployment"
+        )
+        != expected_relay["pod_spec"]
+    ):
+        raise RuntimeErrorEB(
+            "live Hubble Relay pod contract drifted from the pinned chart render"
         )
 
     proxy_daemonsets = _kubectl_json(
@@ -6480,10 +6622,19 @@ def _require_live_cilium_contract(
         _pods_matching_labels(proxy_pods, operator_selector),
         namespace="kube-system",
         workload="cilium-operator",
-        expected_replicas=1,
+        expected_replicas=expected_operator["replicas"],
         expected_images=expected_operator["images"],
         required_labels=operator_selector,
         context="Cilium operator Pod",
+    )
+    relay_pods = _require_running_pod_image_contract(
+        _pods_matching_labels(proxy_pods, relay_selector),
+        namespace="kube-system",
+        workload="hubble-relay",
+        expected_replicas=expected_relay["replicas"],
+        expected_images=expected_relay["images"],
+        required_labels=relay_selector,
+        context="Hubble Relay Pod",
     )
 
     def is_kube_proxy(item: dict[str, Any]) -> bool:
@@ -6532,6 +6683,13 @@ def _require_live_cilium_contract(
             expected_operator
         ),
         "operator_pods": operator_pods,
+        "relay": relay_availability,
+        "relay_images": relay_images,
+        "relay_images_canonical": True,
+        "relay_contract_sha256": _stable_json_sha256(
+            expected_relay
+        ),
+        "relay_pods": relay_pods,
         "kube_proxy_present": False,
     }
 
@@ -6555,7 +6713,7 @@ def _require_cilium_runtime_baseline(
         or platform.get("status") != "ready"
         or platform.get("source_commit") != source_commit
         or not isinstance(baseline, dict)
-        or set(baseline) != {"daemonset", "operator"}
+        or set(baseline) != {"daemonset", "operator", "relay"}
         or any(
             not isinstance(value, str)
             or re.fullmatch(r"[0-9a-f]{64}", value) is None
@@ -6568,6 +6726,9 @@ def _require_cilium_runtime_baseline(
             "runtime_image_ids_sha256"
         ),
         "operator": cilium_readback.get("operator_pods", {}).get(
+            "runtime_image_ids_sha256"
+        ),
+        "relay": cilium_readback.get("relay_pods", {}).get(
             "runtime_image_ids_sha256"
         ),
     }
