@@ -10407,11 +10407,16 @@ def portability_report(root: Path) -> dict[str, Any]:
         or cilium_status.get("kube_proxy_replacement") is not True
         or cilium_status.get("daemonset_images_canonical") is not True
         or cilium_status.get("operator_images_canonical") is not True
+        or cilium_status.get("relay_images_canonical") is not True
         or not isinstance(cilium_status.get("daemonset_images"), dict)
         or not isinstance(cilium_status.get("operator_images"), dict)
+        or not isinstance(cilium_status.get("relay_images"), dict)
         or not isinstance(cilium_status.get("operator"), dict)
         or cilium_status["operator"].get("available") is not True
         or cilium_status["operator"].get("desired_replicas") != 1
+        or not isinstance(cilium_status.get("relay"), dict)
+        or cilium_status["relay"].get("available") is not True
+        or cilium_status["relay"].get("desired_replicas") != 1
         or not isinstance(cilium_status.get("daemonset_desired"), int)
         or isinstance(cilium_status.get("daemonset_desired"), bool)
         or cilium_status["daemonset_desired"] < 1
@@ -10432,18 +10437,26 @@ def portability_report(root: Path) -> dict[str, Any]:
         cilium_status["operator_images"],
         "Cilium operator Pod",
     )
+    _require_stored_pod_image_contract(
+        cilium_status.get("relay_pods"),
+        1,
+        cilium_status["relay_images"],
+        "Hubble Relay Pod",
+    )
     platform_cilium_baseline = payloads["platform.json"].get(
         "cilium_runtime_image_ids"
     )
     if (
         not isinstance(platform_cilium_baseline, dict)
-        or set(platform_cilium_baseline) != {"daemonset", "operator"}
+        or set(platform_cilium_baseline) != {"daemonset", "operator", "relay"}
         or cilium_status.get("runtime_image_ids_baseline")
         != platform_cilium_baseline
         or cilium_status["daemonset_pods"].get("runtime_image_ids_sha256")
         != platform_cilium_baseline.get("daemonset")
         or cilium_status["operator_pods"].get("runtime_image_ids_sha256")
         != platform_cilium_baseline.get("operator")
+        or cilium_status["relay_pods"].get("runtime_image_ids_sha256")
+        != platform_cilium_baseline.get("relay")
     ):
         raise RuntimeErrorEB(
             "status does not prove the installed Cilium runtime image baseline"

@@ -2567,6 +2567,14 @@ spec:
                         },
                         "init_containers": {},
                     }
+                    cilium_relay_images = {
+                        "containers": {
+                            "hubble-relay": (
+                                "quay.io/cilium/hubble-relay:v1.19.5"
+                            ),
+                        },
+                        "init_containers": {},
+                    }
                     payload["cilium"] = {
                         "chart_version": runtime.load_config()["cilium"]["chart_version"],
                         "gateway_api": True,
@@ -2584,6 +2592,15 @@ spec:
                             "cilium-operator", cilium_operator_images
                         ),
                         "operator": {
+                            "available": True,
+                            "desired_replicas": 1,
+                        },
+                        "relay_images": cilium_relay_images,
+                        "relay_images_canonical": True,
+                        "relay_pods": stored_pod_proof(
+                            "hubble-relay", cilium_relay_images
+                        ),
+                        "relay": {
                             "available": True,
                             "desired_replicas": 1,
                         },
@@ -2848,6 +2865,9 @@ spec:
                 "operator": status_payload["cilium"]["operator_pods"][
                     "runtime_image_ids_sha256"
                 ],
+                "relay": status_payload["cilium"]["relay_pods"][
+                    "runtime_image_ids_sha256"
+                ],
             }
             status_payload["cilium"]["runtime_image_ids_baseline"] = (
                 cilium_baseline
@@ -3017,8 +3037,21 @@ spec:
             attempt_path.write_text(original_attempt, encoding="utf-8")
 
             changed_status = json.loads(original_status)
+            changed_status["cilium"]["relay_images_canonical"] = False
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "live Cilium contract"
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
             changed_status["cilium"]["runtime_image_ids_baseline"][
-                "daemonset"
+                "relay"
             ] = "0" * 64
             runtime.atomic_json(status_path, changed_status)
             changed_attempt = json.loads(original_attempt)
@@ -3027,6 +3060,21 @@ spec:
             with self.assertRaisesRegex(
                 runtime.RuntimeErrorEB,
                 "installed Cilium runtime image baseline",
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+            changed_status = json.loads(original_status)
+            changed_status["cilium"]["relay_pods"]["pods"]["hubble-relay-0"][
+                "runtime_image_ids"
+            ]["containers"]["hubble-relay"] = "containerd://not-a-digest"
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB, "Hubble Relay Pod contract"
             ):
                 runtime.portability_report(root)
             status_path.write_text(original_status, encoding="utf-8")
