@@ -1747,6 +1747,16 @@ def ensure_secret_material(root: Path) -> dict[str, str]:
     return data
 
 
+def _database_url(database: dict[str, str]) -> str:
+    return (
+        "postgresql://"
+        f"{urllib.parse.quote(database['username'], safe='')}:"
+        f"{urllib.parse.quote(database['password'], safe='')}"
+        f"@postgres.{DATA_NAMESPACE}.svc.cluster.local:5432/"
+        f"{urllib.parse.quote(database['database'], safe='')}"
+    )
+
+
 def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
@@ -1766,10 +1776,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     with _bound_kube_env(root, secrets_target):
         kubectl_apply(root, render_namespaces(root))
         db = ensure_secret_material(root)
-        database_url = (
-            f"postgresql://{db['username']}:{db['password']}"
-            f"@postgres.{DATA_NAMESPACE}.svc.cluster.local:5432/{db['database']}"
-        )
+        database_url = _database_url(db)
         kubectl_apply(
             root,
             secret_manifest(
@@ -4245,10 +4252,7 @@ def _expected_live_secret_values(
     ):
         raise RuntimeErrorEB("Experiment-B database Secret source material is invalid")
 
-    database_url = (
-        f"postgresql://{database['username']}:{database['password']}"
-        f"@postgres.{DATA_NAMESPACE}.svc.cluster.local:5432/{database['database']}"
-    )
+    database_url = _database_url(database)
     return {
         "database": {
             key: database[key].encode("utf-8")
@@ -7708,7 +7712,7 @@ def _kubectl_json(root: Path, arguments: list[str]) -> dict[str, Any]:
     return value
 
 
-def _database_client_argv(root: Path, executable: str) -> list[str]:
+def _database_client_identity(root: Path) -> tuple[str, str]:
     database_path = root / "secrets/database.json"
     if not database_path.is_file() or database_path.is_symlink():
         raise RuntimeErrorEB(
@@ -7730,20 +7734,55 @@ def _database_client_argv(root: Path, executable: str) -> list[str]:
         raise RuntimeErrorEB(
             "Experiment-B PostgreSQL client database identity is invalid"
         )
+    return database["username"], database["database"]
+
+
+def _verified_database_client_identity(
+    root: Path,
+    source_commit: str,
+) -> tuple[str, str]:
+    expected = _expected_live_secret_values(root, source_commit)
+    database = expected["database"]
+    return (
+        database["username"].decode("utf-8"),
+        database["database"].decode("utf-8"),
+    )
+
+
+def _database_client_argv(
+    executable: str,
+    database_identity: tuple[str, str],
+) -> list[str]:
+    username, database = database_identity
+    if not username or not database:
+        raise RuntimeErrorEB(
+            "Experiment-B PostgreSQL client database identity is invalid"
+        )
     return [
         executable,
         "-U",
-        database["username"],
+        username,
         "-d",
-        database["database"],
+        database,
     ]
 
 
-def _psql(root: Path, sql: str, *, tuples_only: bool = True) -> str:
+def _psql(
+    root: Path,
+    sql: str,
+    *,
+    tuples_only: bool = True,
+    database_identity: tuple[str, str] | None = None,
+) -> str:
+    identity = (
+        _database_client_identity(root)
+        if database_identity is None
+        else database_identity
+    )
     argv = [
         "-n", DATA_NAMESPACE,
         "exec", "-i", "deployment/postgres", "--",
-        *_database_client_argv(root, "psql"),
+        *_database_client_argv("psql", identity),
         "-v", "ON_ERROR_STOP=1",
     ]
     if tuples_only:
@@ -8425,7 +8464,9 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
             [
                 kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
                 "deployment/postgres", "--",
-                *_database_client_argv(root, "psql"),
+                *_database_client_argv(
+                    "psql", _database_client_identity(root)
+                ),
                 "-v", "ON_ERROR_STOP=1",
             ],
             streamed,
@@ -9470,7 +9511,11 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
     return receipt
 
 
-def _database_signature(root: Path) -> dict[str, Any]:
+def _database_signature(
+    root: Path,
+    *,
+    database_identity: tuple[str, str] | None = None,
+) -> dict[str, Any]:
     sql = r"""
 SELECT json_build_object(
   'nodes_count', (SELECT count(*) FROM domain_nodes),
@@ -9545,7 +9590,7 @@ SELECT json_build_object(
   )
 )::text;
 """
-    raw = _psql(root, sql)
+    raw = _psql(root, sql, database_identity=database_identity)
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -10077,6 +10122,13 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("recovery proof release is not current protected main")
+    database_identity = _verified_database_client_identity(root, source_commit)
+    database_identity_sha256 = _stable_json_sha256(
+        {
+            "username": database_identity[0],
+            "database": database_identity[1],
+        }
+    )
     recovery_target = _kubernetes_target_identity(root, source_commit)
     backup_dir = root / "recovery"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -10114,7 +10166,9 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             root, source_commit, recovery_target, "recovery application quiescence"
         )
 
-        before_db = _database_signature(root)
+        before_db = _database_signature(
+            root, database_identity=database_identity
+        )
         before_nats = _jetstream_signature(root)
         if before_nats["streams"] < 1 or before_nats["messages"] < 1:
             raise RuntimeErrorEB("JetStream test state is empty before recovery proof")
@@ -10126,7 +10180,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         _run_binary_to_file(
             [
                 kubectl, "-n", DATA_NAMESPACE, "exec", "deployment/postgres", "--",
-                *_database_client_argv(root, "pg_dump"),
+                *_database_client_argv("pg_dump", database_identity),
                 "-Fc",
             ],
             db_dump,
@@ -10239,7 +10293,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             [
                 kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
                 "deployment/postgres", "--",
-                *_database_client_argv(root, "pg_restore"),
+                *_database_client_argv("pg_restore", database_identity),
                 "--clean", "--if-exists", "--no-owner",
             ],
             db_dump,
@@ -10255,7 +10309,9 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             root, source_commit, recovery_target, "recovery data restoration"
         )
 
-        after_db = _database_signature(root)
+        after_db = _database_signature(
+            root, database_identity=database_identity
+        )
         after_nats = _jetstream_signature(root)
         if after_db != before_db:
             raise RuntimeErrorEB("PostgreSQL/search signature changed across delete-to-prove")
@@ -10306,6 +10362,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 "schema_version": 1,
                 "status": "failed",
                 "source_commit": source_commit,
+                "database_identity_sha256": database_identity_sha256,
                 "database_before": before_db,
                 "jetstream_before": before_nats,
                 "kubernetes_target_sha256": _stable_json_sha256(
@@ -10337,6 +10394,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         "schema_version": 1,
         "status": "pass",
         "source_commit": source_commit,
+        "database_identity_sha256": database_identity_sha256,
         "kubernetes_target_sha256": _stable_json_sha256(
             recovery_target
         ),

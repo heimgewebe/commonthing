@@ -4060,8 +4060,13 @@ spec:
                 encoding="utf-8",
             )
 
+            database_identity = runtime._database_client_identity(root)
             self.assertEqual(
-                runtime._database_client_argv(root, "psql"),
+                database_identity,
+                ("proof_user", "proof_database"),
+            )
+            self.assertEqual(
+                runtime._database_client_argv("psql", database_identity),
                 [
                     "psql",
                     "-U",
@@ -4071,6 +4076,14 @@ spec:
                 ],
             )
 
+            runtime.atomic_json(
+                secrets_dir / "database.json",
+                {
+                    "username": "changed_user",
+                    "database": "changed_database",
+                    "password": "changed_password",
+                },
+            )
             completed = runtime.subprocess.CompletedProcess(
                 ["kubectl"],
                 0,
@@ -4080,7 +4093,14 @@ spec:
             with mock.patch.object(
                 runtime, "_kubectl", return_value=completed
             ) as kubectl:
-                self.assertEqual(runtime._psql(root, "SELECT 1;"), "1")
+                self.assertEqual(
+                    runtime._psql(
+                        root,
+                        "SELECT 1;",
+                        database_identity=database_identity,
+                    ),
+                    "1",
+                )
             self.assertEqual(
                 kubectl.call_args.args[1],
                 [
@@ -4100,20 +4120,128 @@ spec:
                     "-At",
                 ],
             )
+            self.assertEqual(
+                runtime._database_client_identity(root),
+                ("changed_user", "changed_database"),
+            )
 
         seed_source = inspect.getsource(runtime.seed_t048_fixture)
         recovery_source = inspect.getsource(runtime.recovery_proof)
         self.assertIn(
-            '*_database_client_argv(root, "psql")',
+            '*_database_client_argv(\n'
+            '                    "psql", _database_client_identity(root)\n'
+            "                )",
             seed_source,
         )
+        self.assertEqual(
+            recovery_source.count(
+                "_verified_database_client_identity(root, source_commit)"
+            ),
+            1,
+        )
+        identity_capture = recovery_source.index(
+            "_verified_database_client_identity(root, source_commit)"
+        )
+        first_suspend = recovery_source.index(
+            '_flux_suspend(root, "commonthing-experiment-b-app")'
+        )
+        self.assertLess(identity_capture, first_suspend)
+        self.assertGreaterEqual(
+            recovery_source.count("database_identity=database_identity"),
+            2,
+        )
         self.assertIn(
-            '*_database_client_argv(root, "pg_dump")',
+            '*_database_client_argv("pg_dump", database_identity)',
             recovery_source,
         )
         self.assertIn(
-            '*_database_client_argv(root, "pg_restore")',
+            '*_database_client_argv("pg_restore", database_identity)',
             recovery_source,
+        )
+        self.assertGreaterEqual(
+            recovery_source.count(
+                '"database_identity_sha256": database_identity_sha256'
+            ),
+            2,
+        )
+
+    def test_verified_database_identity_is_bound_to_secret_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "secrets").mkdir()
+            (root / "receipts").mkdir()
+            database_path = root / "secrets/database.json"
+            registry_path = root / "secrets/registry.json"
+            database = {
+                "username": "proof_user",
+                "database": "proof_database",
+                "password": "proof_password",
+            }
+            runtime.atomic_json(database_path, database)
+            registry_path.write_text(
+                '{"auths":{"ghcr.io":{"auth":"proof"}}}\n',
+                encoding="utf-8",
+            )
+            source_commit = "a" * 40
+            runtime.atomic_json(
+                root / "receipts/secrets.json",
+                {
+                    "schema_version": 1,
+                    "status": "ready",
+                    "source_commit": source_commit,
+                    "database_secret": "commonthing-experiment-b-database",
+                    "runtime_secret": "weltgewebe-runtime",
+                    "registry_secret": "commonthing-experiment-b-registry",
+                    "database_source_sha256": runtime.sha256_file(database_path),
+                    "registry_source_sha256": runtime.sha256_file(registry_path),
+                    "secret_values_recorded": False,
+                },
+            )
+
+            self.assertEqual(
+                runtime._verified_database_client_identity(
+                    root, source_commit
+                ),
+                ("proof_user", "proof_database"),
+            )
+
+            runtime.atomic_json(
+                database_path,
+                {
+                    "username": "changed_user",
+                    "database": "changed_database",
+                    "password": "changed_password",
+                },
+            )
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "database Secret source digest drifted",
+            ):
+                runtime._verified_database_client_identity(
+                    root, source_commit
+                )
+
+    def test_database_url_percent_encodes_reserved_components(self) -> None:
+        database = {
+            "username": "user@name",
+            "password": "p:a/s#s%",
+            "database": "db/name#one",
+        }
+        self.assertEqual(
+            runtime._database_url(database),
+            (
+                "postgresql://user%40name:p%3Aa%2Fs%23s%25"
+                f"@postgres.{runtime.DATA_NAMESPACE}.svc.cluster.local:5432/"
+                "db%2Fname%23one"
+            ),
+        )
+        self.assertIn(
+            "database_url = _database_url(db)",
+            inspect.getsource(runtime.inject_secrets),
+        )
+        self.assertIn(
+            "database_url = _database_url(database)",
+            inspect.getsource(runtime._expected_live_secret_values),
         )
 
     def test_database_signature_hashes_complete_persisted_domain_and_search_rows(self) -> None:
@@ -4149,7 +4277,7 @@ spec:
         web_wait = source.index(
             '"app.kubernetes.io/name=weltgewebe-web"', web_scale
         )
-        db_signature = source.index("before_db = _database_signature(root)")
+        db_signature = source.index("before_db = _database_signature(")
         nats_signature = source.index("before_nats = _jetstream_signature(root)")
         dump = source.index('"pg_dump"')
         self.assertLess(api_scale, api_wait)
