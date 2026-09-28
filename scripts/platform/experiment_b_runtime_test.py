@@ -4295,6 +4295,170 @@ spec:
             self.assertNotIn("sha256_file(database_path)", secret_source)
             self.assertNotIn("sha256_file(registry_path)", secret_source)
 
+    def test_secret_material_returns_the_exact_source_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "secrets").mkdir()
+            database_path = root / "secrets/database.json"
+            existing_bytes = (
+                b'{\n'
+                b'  "database": "proof_database",\n'
+                b'  "password": "proof_password",\n'
+                b'  "username": "proof_user"\n'
+                b'}\n'
+            )
+            database_path.write_bytes(existing_bytes)
+
+            existing, captured = runtime.ensure_secret_material(root)
+            self.assertEqual(captured, existing_bytes)
+            self.assertEqual(
+                existing,
+                {
+                    "username": "proof_user",
+                    "database": "proof_database",
+                    "password": "proof_password",
+                },
+            )
+
+            database_path.unlink()
+            created, created_bytes = runtime.ensure_secret_material(root)
+            self.assertEqual(database_path.read_bytes(), created_bytes)
+            self.assertEqual(
+                json.loads(created_bytes.decode("utf-8")),
+                created,
+            )
+
+    def test_inject_secrets_receipt_hashes_the_applied_source_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "secrets").mkdir()
+            (root / "receipts").mkdir()
+            database_path = root / "secrets/database.json"
+            registry_state = root / "secrets/registry.json"
+            registry_config = root / "registry-source.json"
+            original_database = {
+                "username": "proof_user",
+                "database": "proof_database",
+                "password": "proof_password",
+            }
+            changed_database = {
+                "username": "changed_user",
+                "database": "changed_database",
+                "password": "changed_password",
+            }
+            runtime.atomic_json(database_path, original_database)
+            original_database_bytes = database_path.read_bytes()
+            original_registry_bytes = (
+                b'{"auths":{"ghcr.io":{"auth":"proof-original"}}}\n'
+            )
+            changed_registry_bytes = (
+                b'{"auths":{"ghcr.io":{"auth":"proof-changed"}}}\n'
+            )
+            registry_config.write_bytes(original_registry_bytes)
+            source_commit = "c" * 40
+            target = {
+                "vm_ip": "192.0.2.10",
+                "kubeconfig_sha256": "d" * 64,
+                "server": "https://192.0.2.10:6443",
+            }
+            applied_manifests: list[dict[str, object]] = []
+
+            def capture_apply(_root: Path, manifest: str) -> None:
+                applied_manifests.append(json.loads(manifest))
+
+            def swap_sources_before_receipt(*_args: object, **_kwargs: object) -> None:
+                runtime.atomic_json(database_path, changed_database)
+                runtime.atomic_bytes(registry_state, changed_registry_bytes)
+
+            bound_context = mock.MagicMock()
+            bound_context.__enter__.return_value = None
+            bound_context.__exit__.return_value = False
+
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=source_commit,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_kubernetes_target_binding",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_kubernetes_target_identity",
+                    return_value=target,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_bound_kube_env",
+                    return_value=bound_context,
+                ),
+                mock.patch.object(runtime, "render_namespaces", return_value="{}"),
+                mock.patch.object(
+                    runtime,
+                    "kubectl_apply",
+                    side_effect=capture_apply,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_same_kubernetes_target",
+                    side_effect=swap_sources_before_receipt,
+                ),
+            ):
+                receipt = runtime.inject_secrets(root, registry_config)
+
+            self.assertEqual(
+                receipt["database_source_sha256"],
+                hashlib.sha256(original_database_bytes).hexdigest(),
+            )
+            self.assertEqual(
+                receipt["registry_source_sha256"],
+                hashlib.sha256(original_registry_bytes).hexdigest(),
+            )
+            self.assertNotEqual(
+                receipt["database_source_sha256"],
+                runtime.sha256_file(database_path),
+            )
+            self.assertNotEqual(
+                receipt["registry_source_sha256"],
+                runtime.sha256_file(registry_state),
+            )
+
+            database_manifest = next(
+                manifest
+                for manifest in applied_manifests
+                if manifest.get("metadata", {}).get("name")
+                == "commonthing-experiment-b-database"
+            )
+            self.assertEqual(
+                base64.b64decode(database_manifest["data"]["username"]),
+                b"proof_user",
+            )
+            self.assertEqual(
+                base64.b64decode(database_manifest["data"]["database"]),
+                b"proof_database",
+            )
+            registry_manifest = next(
+                manifest
+                for manifest in applied_manifests
+                if manifest.get("metadata", {}).get("name")
+                == "commonthing-experiment-b-registry"
+            )
+            self.assertEqual(
+                base64.b64decode(
+                    registry_manifest["data"][".dockerconfigjson"]
+                ),
+                original_registry_bytes,
+            )
+            source = inspect.getsource(runtime.inject_secrets)
+            self.assertNotIn(
+                'sha256_file(root / "secrets/database.json")',
+                source,
+            )
+            self.assertNotIn("sha256_file(registry_state)", source)
+
     def test_database_url_percent_encodes_reserved_components(self) -> None:
         database = {
             "username": "user@name",

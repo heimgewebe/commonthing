@@ -1733,18 +1733,22 @@ def secret_manifest(
     return json.dumps(payload, sort_keys=True)
 
 
-def ensure_secret_material(root: Path) -> dict[str, str]:
+def ensure_secret_material(root: Path) -> tuple[dict[str, str], bytes]:
     path = root / "secrets/database.json"
     if path.is_file():
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return {str(k): str(v) for k, v in data.items()}
+        source_bytes = path.read_bytes()
+        data = json.loads(source_bytes.decode("utf-8"))
+        return {str(k): str(v) for k, v in data.items()}, source_bytes
     data = {
         "username": "commonthing",
         "database": "commonthing",
         "password": secrets.token_hex(32),
     }
-    atomic_json(path, data)
-    return data
+    source_bytes = (
+        json.dumps(data, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    atomic_bytes(path, source_bytes)
+    return data, source_bytes
 
 
 def _database_url(database: dict[str, str]) -> str:
@@ -1775,7 +1779,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     atomic_bytes(registry_state, registry_bytes)
     with _bound_kube_env(root, secrets_target):
         kubectl_apply(root, render_namespaces(root))
-        db = ensure_secret_material(root)
+        db, database_bytes = ensure_secret_material(root)
         database_url = _database_url(db)
         kubectl_apply(
             root,
@@ -1817,8 +1821,8 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         "database_secret": "commonthing-experiment-b-database",
         "runtime_secret": "weltgewebe-runtime",
         "registry_secret": "commonthing-experiment-b-registry",
-        "database_source_sha256": sha256_file(root / "secrets/database.json"),
-        "registry_source_sha256": sha256_file(registry_state),
+        "database_source_sha256": hashlib.sha256(database_bytes).hexdigest(),
+        "registry_source_sha256": hashlib.sha256(registry_bytes).hexdigest(),
         "secret_values_recorded": False,
     }
     atomic_json(root / "receipts/secrets.json", receipt)
