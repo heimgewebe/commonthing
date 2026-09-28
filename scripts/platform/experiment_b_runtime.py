@@ -4205,9 +4205,10 @@ def _expected_live_secret_values(
         )
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        database = json.loads(database_path.read_text(encoding="utf-8"))
+        database_bytes = database_path.read_bytes()
         registry_bytes = registry_path.read_bytes()
-    except (OSError, json.JSONDecodeError) as exc:
+        database = json.loads(database_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeErrorEB(
             "Experiment-B status requires valid private Secret source material"
         ) from exc
@@ -4229,7 +4230,10 @@ def _expected_live_secret_values(
         or re.fullmatch(r"[0-9a-f]{64}", database_source_sha256) is None
     ):
         raise RuntimeErrorEB("Experiment-B database Secret source digest is invalid")
-    if not secrets.compare_digest(sha256_file(database_path), database_source_sha256):
+    if not secrets.compare_digest(
+        hashlib.sha256(database_bytes).hexdigest(),
+        database_source_sha256,
+    ):
         raise RuntimeErrorEB("Experiment-B database Secret source digest drifted")
 
     registry_source_sha256 = receipt.get("registry_source_sha256")
@@ -4238,7 +4242,10 @@ def _expected_live_secret_values(
         or re.fullmatch(r"[0-9a-f]{64}", registry_source_sha256) is None
     ):
         raise RuntimeErrorEB("Experiment-B registry Secret source digest is invalid")
-    if not secrets.compare_digest(sha256_file(registry_path), registry_source_sha256):
+    if not secrets.compare_digest(
+        hashlib.sha256(registry_bytes).hexdigest(),
+        registry_source_sha256,
+    ):
         raise RuntimeErrorEB("Experiment-B registry Secret source digest drifted")
 
     expected_database_keys = {"username", "database", "password"}

@@ -4221,6 +4221,80 @@ spec:
                     root, source_commit
                 )
 
+    def test_verified_database_identity_hashes_the_captured_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "secrets").mkdir()
+            (root / "receipts").mkdir()
+            database_path = root / "secrets/database.json"
+            registry_path = root / "secrets/registry.json"
+            original_database = {
+                "username": "proof_user",
+                "database": "proof_database",
+                "password": "proof_password",
+            }
+            changed_database = {
+                "username": "changed_user",
+                "database": "changed_database",
+                "password": "changed_password",
+            }
+            runtime.atomic_json(database_path, original_database)
+            registry_path.write_text(
+                '{"auths":{"ghcr.io":{"auth":"proof"}}}\n',
+                encoding="utf-8",
+            )
+            source_commit = "b" * 40
+            runtime.atomic_json(
+                root / "receipts/secrets.json",
+                {
+                    "schema_version": 1,
+                    "status": "ready",
+                    "source_commit": source_commit,
+                    "database_secret": "commonthing-experiment-b-database",
+                    "runtime_secret": "weltgewebe-runtime",
+                    "registry_secret": "commonthing-experiment-b-registry",
+                    "database_source_sha256": runtime.sha256_file(database_path),
+                    "registry_source_sha256": runtime.sha256_file(registry_path),
+                    "secret_values_recorded": False,
+                },
+            )
+
+            path_type = type(database_path)
+            original_read_bytes = path_type.read_bytes
+            database_swapped = False
+
+            def read_bytes_and_swap(path: Path) -> bytes:
+                nonlocal database_swapped
+                captured = original_read_bytes(path)
+                if path == database_path and not database_swapped:
+                    database_swapped = True
+                    runtime.atomic_json(database_path, changed_database)
+                return captured
+
+            with mock.patch.object(
+                path_type,
+                "read_bytes",
+                autospec=True,
+                side_effect=read_bytes_and_swap,
+            ):
+                self.assertEqual(
+                    runtime._verified_database_client_identity(
+                        root, source_commit
+                    ),
+                    ("proof_user", "proof_database"),
+                )
+
+            self.assertTrue(database_swapped)
+            self.assertEqual(
+                runtime._database_client_identity(root),
+                ("changed_user", "changed_database"),
+            )
+            secret_source = inspect.getsource(
+                runtime._expected_live_secret_values
+            )
+            self.assertNotIn("sha256_file(database_path)", secret_source)
+            self.assertNotIn("sha256_file(registry_path)", secret_source)
+
     def test_database_url_percent_encodes_reserved_components(self) -> None:
         database = {
             "username": "user@name",
