@@ -1735,6 +1735,14 @@ def secret_manifest(
 
 def ensure_secret_material(root: Path) -> tuple[dict[str, str], bytes]:
     path = root / "secrets/database.json"
+    if path.is_symlink():
+        raise RuntimeErrorEB(
+            "Experiment-B database Secret source material is invalid"
+        )
+    if path.exists() and not path.is_file():
+        raise RuntimeErrorEB(
+            "Experiment-B database Secret source material is invalid"
+        )
     if path.is_file():
         try:
             source_bytes = path.read_bytes()
@@ -3986,6 +3994,30 @@ def _pod_runtime_image_ids_sha256(
     return _stable_json_sha256(binding)
 
 
+def _require_running_pod_active_deadline_contract(
+    pods: Any,
+    *,
+    expected_active_deadline_seconds: int | None,
+    context: str,
+) -> None:
+    if not isinstance(pods, list):
+        raise RuntimeErrorEB(f"{context} inventory is invalid")
+    for pod in pods:
+        if not isinstance(pod, dict):
+            raise RuntimeErrorEB(f"{context} inventory is invalid")
+        metadata = pod.get("metadata", {})
+        spec = pod.get("spec", {})
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        observed = _pod_active_deadline_seconds(
+            spec,
+            f"{context} {name or '<unknown>'}",
+        )
+        if observed != expected_active_deadline_seconds:
+            raise RuntimeErrorEB(
+                f"{context} activeDeadlineSeconds drifted from workload contract"
+            )
+
+
 def _require_running_pod_image_contract(
     pods: Any,
     *,
@@ -5203,6 +5235,7 @@ def _container_runtime_contract(
         "securityContext",
         "volumeMounts",
         "workingDir",
+        "restartPolicy",
     )
     ports = container.get("ports", [])
     if ports is None:
@@ -5231,6 +5264,27 @@ def _container_runtime_contract(
             f"{context} {name} {probe_field}",
         )
     return result
+
+
+def _pod_active_deadline_seconds(
+    pod_spec: Any,
+    context: str,
+) -> int | None:
+    if not isinstance(pod_spec, dict):
+        raise RuntimeErrorEB(f"{context} Pod spec is invalid")
+    active_deadline_seconds = pod_spec.get("activeDeadlineSeconds")
+    if (
+        active_deadline_seconds is not None
+        and (
+            isinstance(active_deadline_seconds, bool)
+            or not isinstance(active_deadline_seconds, int)
+            or active_deadline_seconds < 1
+        )
+    ):
+        raise RuntimeErrorEB(
+            f"{context} Pod activeDeadlineSeconds contract is invalid"
+        )
+    return active_deadline_seconds
 
 
 def _application_pod_spec_projection(
@@ -5266,18 +5320,9 @@ def _application_pod_spec_projection(
     host_aliases = pod_spec.get("hostAliases") or []
     readiness_gates = pod_spec.get("readinessGates") or []
     ephemeral_containers = pod_spec.get("ephemeralContainers") or []
-    active_deadline_seconds = pod_spec.get("activeDeadlineSeconds")
-    if (
-        active_deadline_seconds is not None
-        and (
-            isinstance(active_deadline_seconds, bool)
-            or not isinstance(active_deadline_seconds, int)
-            or active_deadline_seconds < 1
-        )
-    ):
-        raise RuntimeErrorEB(
-            f"{context} Pod activeDeadlineSeconds contract is invalid"
-        )
+    active_deadline_seconds = _pod_active_deadline_seconds(
+        pod_spec, context
+    )
     if (
         not isinstance(host_aliases, list)
         or any(not isinstance(item, dict) for item in host_aliases)
@@ -6752,8 +6797,38 @@ def _require_live_cilium_contract(
     ):
         raise RuntimeErrorEB("kube-system workload inventory is invalid")
 
+    daemonset_pod_items = _pods_matching_labels(
+        proxy_pods, daemonset_selector
+    )
+    operator_pod_items = _pods_matching_labels(
+        proxy_pods, operator_selector
+    )
+    relay_pod_items = _pods_matching_labels(proxy_pods, relay_selector)
+
+    _require_running_pod_active_deadline_contract(
+        daemonset_pod_items,
+        expected_active_deadline_seconds=expected_daemonset["pod_spec"][
+            "activeDeadlineSeconds"
+        ],
+        context="Cilium DaemonSet Pod",
+    )
+    _require_running_pod_active_deadline_contract(
+        operator_pod_items,
+        expected_active_deadline_seconds=expected_operator["pod_spec"][
+            "activeDeadlineSeconds"
+        ],
+        context="Cilium operator Pod",
+    )
+    _require_running_pod_active_deadline_contract(
+        relay_pod_items,
+        expected_active_deadline_seconds=expected_relay["pod_spec"][
+            "activeDeadlineSeconds"
+        ],
+        context="Hubble Relay Pod",
+    )
+
     daemonset_pods = _require_running_pod_image_contract(
-        _pods_matching_labels(proxy_pods, daemonset_selector),
+        daemonset_pod_items,
         namespace="kube-system",
         workload="cilium",
         expected_replicas=desired,
@@ -6762,7 +6837,7 @@ def _require_live_cilium_contract(
         context="Cilium DaemonSet Pod",
     )
     operator_pods = _require_running_pod_image_contract(
-        _pods_matching_labels(proxy_pods, operator_selector),
+        operator_pod_items,
         namespace="kube-system",
         workload="cilium-operator",
         expected_replicas=expected_operator["replicas"],
@@ -6771,7 +6846,7 @@ def _require_live_cilium_contract(
         context="Cilium operator Pod",
     )
     relay_pods = _require_running_pod_image_contract(
-        _pods_matching_labels(proxy_pods, relay_selector),
+        relay_pod_items,
         namespace="kube-system",
         workload="hubble-relay",
         expected_replicas=expected_relay["replicas"],

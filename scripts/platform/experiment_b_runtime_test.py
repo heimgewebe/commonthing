@@ -4357,6 +4357,23 @@ spec:
                         runtime.ensure_secret_material(root)
                     self.assertEqual(database_path.read_bytes(), before)
 
+            target_path = root / "database-target.json"
+            runtime.atomic_json(
+                target_path,
+                {
+                    "username": "proof_user",
+                    "database": "proof_database",
+                    "password": "proof_password",
+                },
+            )
+            database_path.unlink()
+            database_path.symlink_to(target_path)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "database Secret source material is invalid",
+            ):
+                runtime.ensure_secret_material(root)
+
     def test_inject_secrets_rejects_invalid_database_before_kubernetes_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4406,6 +4423,45 @@ spec:
                 ):
                     runtime.inject_secrets(root, registry_config)
 
+            kubectl_apply.assert_not_called()
+            bound_kube_env.assert_not_called()
+            self.assertFalse((root / "secrets/registry.json").exists())
+
+            target_path = root / "database-target.json"
+            runtime.atomic_json(
+                target_path,
+                {
+                    "username": "proof_user",
+                    "database": "proof_database",
+                    "password": "proof_password",
+                },
+            )
+            database_path.unlink()
+            database_path.symlink_to(target_path)
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=source_commit,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_kubernetes_target_binding",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_kubernetes_target_identity",
+                    return_value=target,
+                ),
+                mock.patch.object(runtime, "kubectl_apply") as kubectl_apply,
+                mock.patch.object(runtime, "_bound_kube_env") as bound_kube_env,
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "database Secret source material is invalid",
+                ):
+                    runtime.inject_secrets(root, registry_config)
             kubectl_apply.assert_not_called()
             bound_kube_env.assert_not_called()
             self.assertFalse((root / "secrets/registry.json").exists())
@@ -6597,6 +6653,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             runtime.status(self.root)
 
         self.cilium_daemonset = json.loads(json.dumps(healthy_daemonset))
+        self.cilium_daemonset["spec"]["template"]["spec"]["initContainers"][0][
+            "restartPolicy"
+        ] = "Always"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "DaemonSet pod contract drifted"
+        ):
+            runtime.status(self.root)
+
+        self.cilium_daemonset = json.loads(json.dumps(healthy_daemonset))
         self.cilium_daemonset["spec"]["updateStrategy"] = {"type": "OnDelete"}
         with self.assertRaisesRegex(
             runtime.RuntimeErrorEB, "DaemonSet rollout drifted"
@@ -6632,6 +6697,14 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         ):
             runtime.status(self.root)
         self.cilium_operator = healthy_operator
+
+        self.cilium_pods = json.loads(json.dumps(healthy_cilium_pods))
+        self.cilium_pods[0]["spec"]["activeDeadlineSeconds"] = 120
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "activeDeadlineSeconds drifted from workload contract",
+        ):
+            runtime.status(self.root)
 
         self.cilium_pods = json.loads(json.dumps(healthy_cilium_pods))
         self.cilium_pods[0]["spec"]["containers"][0]["image"] = (
@@ -8613,6 +8686,35 @@ spec:
         self.assertEqual(
             runtime._container_runtime_contract(expected, "expected"),
             runtime._container_runtime_contract(live, "live"),
+        )
+        self.assertIsNone(
+            runtime._container_runtime_contract(expected, "expected")[
+                "restartPolicy"
+            ]
+        )
+        native_sidecar = {
+            "name": "bootstrap",
+            "image": "example.invalid/init@sha256:" + "d" * 64,
+            "restartPolicy": "Always",
+        }
+        self.assertEqual(
+            runtime._container_runtime_contract(
+                native_sidecar, "native sidecar"
+            )["restartPolicy"],
+            "Always",
+        )
+        native_sidecar_without_policy = json.loads(
+            json.dumps(native_sidecar)
+        )
+        native_sidecar_without_policy.pop("restartPolicy")
+        self.assertNotEqual(
+            runtime._container_runtime_contract(
+                native_sidecar, "native sidecar"
+            ),
+            runtime._container_runtime_contract(
+                native_sidecar_without_policy,
+                "plain init container",
+            ),
         )
 
         expected_pod = {
