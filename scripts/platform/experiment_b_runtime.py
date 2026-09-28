@@ -6574,6 +6574,7 @@ def status(root: Path) -> dict[str, Any]:
     vm_substrate = _live_vm_substrate(root, config)
     if vm_substrate != vm_create["substrate"]:
         raise RuntimeErrorEB("VM substrate drifted from creation receipt")
+    status_target = _kubernetes_target_identity(root, source_commit)
     k3s_runtime = _require_live_k3s_runtime(root, config, source_commit)
     toolchain_receipt = toolchain(root)
     tools = toolchain_receipt["tools"]
@@ -6808,11 +6809,18 @@ def status(root: Path) -> dict[str, Any]:
     gateway_data_plane = _gateway_data_plane_readback(root, source_commit)
     recovery_state = _final_recovery_state_readback(root, source_commit)
     runtime_contract_readback = _require_live_runtime_contract(root, config)
+    _require_same_kubernetes_target(
+        root,
+        source_commit,
+        status_target,
+        "status live readback",
+    )
 
     result = {
         "schema_version": 1,
         "status": "observed",
         "source_commit": source_commit,
+        "kubernetes_target_sha256": _stable_json_sha256(status_target),
         "vm_create_sha256": sha256_file(vm_create_path),
         "vm_substrate": vm_substrate,
         "vm_ip": k3s_runtime["vm_ip"],

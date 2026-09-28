@@ -5107,6 +5107,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "_require_live_k3s_runtime",
             return_value=json.loads(json.dumps(self.k3s_runtime)),
         )
+        self.kubernetes_target = {
+            "vm_ip": self.k3s_runtime["vm_ip"],
+            "kubeconfig_sha256": self.k3s_runtime["kubeconfig_sha256"],
+            "server": self.k3s_runtime["kubeconfig_server"],
+        }
+        self.kubernetes_target_identity = self.patch(
+            "_kubernetes_target_identity",
+            return_value=json.loads(json.dumps(self.kubernetes_target)),
+        )
         self.expected_flux_controllers = self.patch(
             "_expected_flux_controller_contract",
             return_value=json.loads(json.dumps(self.flux_expected_contract)),
@@ -8204,6 +8213,23 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
         )
         self.assertLess(cleanup_guard, cleanup_suspend)
         self.assertIn("target_safe_for_cleanup", source)
+        self.assertIn('"kubernetes_target_sha256"', source)
+
+    def test_status_revalidates_target_before_success_receipt(self) -> None:
+        source = inspect.getsource(runtime.status)
+        target_capture = source.index(
+            "status_target = _kubernetes_target_identity"
+        )
+        k3s_runtime = source.index("_require_live_k3s_runtime")
+        final_target_check = source.rindex(
+            "_require_same_kubernetes_target"
+        )
+        result_start = source.index("result = {")
+        receipt_write = source.index("atomic_json(receipt_path, result)")
+        self.assertLess(target_capture, k3s_runtime)
+        self.assertLess(k3s_runtime, final_target_check)
+        self.assertLess(final_target_check, result_start)
+        self.assertLess(result_start, receipt_write)
         self.assertIn('"kubernetes_target_sha256"', source)
 
     def test_flux_source_and_kustomization_reject_termination(self) -> None:
