@@ -1688,6 +1688,25 @@ spec:
                 "pod_contract_sha256": "a" * 64,
             },
         }
+
+        application_service_expected_contract = {}
+        for name in ("weltgewebe-api", "weltgewebe-web"):
+            spec = {
+                "selector": {"app.kubernetes.io/name": name},
+                "ports": [
+                    {
+                        "name": "http",
+                        "port": 8080,
+                        "targetPort": "http",
+                        "protocol": "TCP",
+                        "appProtocol": None,
+                    }
+                ],
+            }
+            application_service_expected_contract[name] = {
+                "spec": spec,
+                "spec_sha256": runtime._stable_json_sha256(spec),
+            }
         application_service_account_expected_contract = {
             name: {
                 "contract": {
@@ -1743,6 +1762,11 @@ spec:
                 runtime,
                 "_rendered_application_workload_contract",
                 return_value=application_expected_contract,
+            ),
+            mock.patch.object(
+                runtime,
+                "_rendered_application_service_contract",
+                return_value=application_service_expected_contract,
             ),
             mock.patch.object(
                 runtime,
@@ -2015,6 +2039,16 @@ spec:
                         }
                         for name, expected in application_expected_contract.items()
                     }
+                    payload["application_services"] = {
+                        name: {
+                            "spec": expected["spec"],
+                            "spec_sha256": expected["spec_sha256"],
+                            "canonical": True,
+                        }
+                        for name, expected in (
+                            application_service_expected_contract.items()
+                        )
+                    }
                     payload["application_service_accounts"] = {
                         name: {
                             "contract_sha256": expected[
@@ -2199,6 +2233,23 @@ spec:
             with self.assertRaisesRegex(
                 runtime.RuntimeErrorEB,
                 "live data Deployment contract",
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+
+
+            changed_status = json.loads(original_status)
+            changed_status["application_services"]["weltgewebe-api"][
+                "spec_sha256"
+            ] = "0" * 64
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "application Service contract",
             ):
                 runtime.portability_report(root)
             status_path.write_text(original_status, encoding="utf-8")
@@ -3742,6 +3793,34 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 ),
             }
 
+
+        self.application_service_expected = {}
+        self.application_services = {}
+        for name in ("weltgewebe-api", "weltgewebe-web"):
+            spec = {
+                "selector": {"app.kubernetes.io/name": name},
+                "ports": [
+                    {
+                        "name": "http",
+                        "port": 8080,
+                        "targetPort": "http",
+                        "protocol": "TCP",
+                        "appProtocol": None,
+                    }
+                ],
+            }
+            self.application_service_expected[name] = {
+                "spec": spec,
+                "spec_sha256": runtime._stable_json_sha256(spec),
+            }
+            self.application_services[name] = {
+                "metadata": {
+                    "name": name,
+                    "namespace": runtime.APP_NAMESPACE,
+                },
+                "spec": json.loads(json.dumps(spec)),
+            }
+
         self.namespaces = {
             name: {
                 "metadata": {
@@ -4245,6 +4324,12 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 json.dumps(self.application_workload_readback)
             ),
         )
+        self.application_service_contract = self.patch(
+            "_rendered_application_service_contract",
+            return_value=json.loads(
+                json.dumps(self.application_service_expected)
+            ),
+        )
         self.application_service_account_contract = self.patch(
             "_rendered_application_service_account_contract",
             return_value=json.loads(
@@ -4324,6 +4409,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             and arguments[-1] in self.namespaces
         ):
             return self.namespaces[str(arguments[-1])]
+        if (
+            len(arguments) == 5
+            and arguments[:4]
+            == ["-n", runtime.APP_NAMESPACE, "get", "service"]
+            and arguments[-1] in self.application_services
+        ):
+            return self.application_services[str(arguments[-1])]
         if (
             len(arguments) == 5
             and arguments[:4]
@@ -5102,6 +5194,99 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
 
         self.data_deployments = healthy
         self.data_pods = healthy_pods
+
+
+    def test_status_revalidates_application_service_selector_and_ports(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+
+        result = runtime.status(self.root)
+        self.assertEqual(
+            set(result["application_services"]),
+            {"weltgewebe-api", "weltgewebe-web"},
+        )
+        self.assertTrue(
+            result["application_services"]["weltgewebe-api"]["canonical"]
+        )
+
+        healthy = json.loads(json.dumps(self.application_services))
+        self.application_services["weltgewebe-api"]["spec"]["selector"] = {
+            "app.kubernetes.io/name": "other"
+        }
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "application Service spec drifted: weltgewebe-api",
+        ):
+            runtime.status(self.root)
+
+        self.application_services = json.loads(json.dumps(healthy))
+        self.application_services["weltgewebe-web"]["spec"]["ports"][0][
+            "port"
+        ] += 1
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "application Service spec drifted: weltgewebe-web",
+        ):
+            runtime.status(self.root)
+        self.application_services = healthy
+
+    def test_rendered_application_service_contract_tracks_overlay_services(self) -> None:
+        api_digest = "sha256:" + "b" * 64
+        web_digest = "sha256:" + "c" * 64
+        rendered = """
+apiVersion: v1
+kind: Service
+metadata:
+  name: weltgewebe-api
+  namespace: commonthing-experiment-b
+spec:
+  selector:
+    app.kubernetes.io/name: weltgewebe-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: api-http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weltgewebe-web
+  namespace: commonthing-experiment-b
+spec:
+  selector:
+    app.kubernetes.io/name: weltgewebe-web
+  ports:
+    - name: http
+      port: 8080
+      targetPort: web-http
+      protocol: TCP
+"""
+        completed = runtime.subprocess.CompletedProcess(
+            ["kustomize", "build"], 0, stdout=rendered, stderr=""
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "toolchain",
+                return_value={"tools": {"kustomize": "kustomize"}},
+            ),
+            mock.patch.object(runtime, "run", return_value=completed),
+        ):
+            result = runtime._rendered_application_service_contract(
+                self.root,
+                {"api_digest": api_digest, "web_digest": web_digest},
+            )
+        self.assertEqual(
+            result["weltgewebe-api"]["spec"]["targetPort"]
+            if "targetPort" in result["weltgewebe-api"]["spec"]
+            else result["weltgewebe-api"]["spec"]["ports"][0]["targetPort"],
+            "api-http",
+        )
+        self.assertEqual(
+            result["weltgewebe-web"]["spec"]["ports"][0]["targetPort"],
+            "web-http",
+        )
 
     def test_status_revalidates_application_service_accounts(self) -> None:
         self.write_vm_receipt()

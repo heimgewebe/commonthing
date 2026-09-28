@@ -3332,7 +3332,7 @@ def _require_live_namespace_security_contract(root: Path) -> dict[str, Any]:
     return result
 
 
-def _data_service_spec_projection(service: Any, context: str) -> dict[str, Any]:
+def _service_spec_projection(service: Any, context: str) -> dict[str, Any]:
     if not isinstance(service, dict):
         raise RuntimeErrorEB(f"{context} Service payload is invalid")
     spec = service.get("spec", {})
@@ -3423,7 +3423,7 @@ def _versioned_data_service_contract(path: Path, name: str) -> dict[str, Any]:
         raise RuntimeErrorEB(
             f"versioned data manifest does not contain exactly one Service: {name}"
         )
-    projection = _data_service_spec_projection(
+    projection = _service_spec_projection(
         matches[0], f"versioned data Service {name}"
     )
     return {
@@ -3451,7 +3451,7 @@ def _require_live_data_services(root: Path) -> dict[str, Any]:
             or metadata.get("deletionTimestamp") is not None
         ):
             raise RuntimeErrorEB(f"live data Service identity drifted: {name}")
-        observed = _data_service_spec_projection(
+        observed = _service_spec_projection(
             service, f"live data Service {name}"
         )
         if observed != expected["spec"]:
@@ -3461,6 +3461,100 @@ def _require_live_data_services(root: Path) -> dict[str, Any]:
         result[name] = {
             "spec": observed,
             "spec_sha256": expected["spec_sha256"],
+            "canonical": True,
+        }
+    return result
+
+
+
+def _rendered_application_service_contract(
+    root: Path,
+    release: dict[str, Any],
+) -> dict[str, Any]:
+    api_digest = release.get("api_digest") if isinstance(release, dict) else None
+    web_digest = release.get("web_digest") if isinstance(release, dict) else None
+    if (
+        not isinstance(api_digest, str)
+        or not DIGEST_RE.fullmatch(api_digest)
+        or not isinstance(web_digest, str)
+        or not DIGEST_RE.fullmatch(web_digest)
+    ):
+        raise RuntimeErrorEB(
+            "application Service contract requires exact release digests"
+        )
+    kustomize = toolchain(root)["tools"].get("kustomize")
+    if not isinstance(kustomize, str) or not kustomize:
+        raise RuntimeErrorEB(
+            "application Service contract requires pinned kustomize"
+        )
+    rendered = run([kustomize, "build", str(APP_OVERLAY)]).stdout
+    rendered = rendered.replace("${API_DIGEST}", api_digest).replace(
+        "${WEB_DIGEST}", web_digest
+    )
+    try:
+        documents = [
+            document
+            for document in yaml.safe_load_all(rendered)
+            if isinstance(document, dict)
+        ]
+    except yaml.YAMLError as exc:
+        raise RuntimeErrorEB(
+            "rendered Experiment-B application Service contract is invalid"
+        ) from exc
+
+    result: dict[str, Any] = {}
+    for name in ("weltgewebe-api", "weltgewebe-web"):
+        matches = [
+            document
+            for document in documents
+            if document.get("kind") == "Service"
+            and document.get("metadata", {}).get("name") == name
+            and document.get("metadata", {}).get("namespace") == APP_NAMESPACE
+        ]
+        if len(matches) != 1:
+            raise RuntimeErrorEB(
+                f"rendered application Service is ambiguous: {name}"
+            )
+        projection = _service_spec_projection(
+            matches[0], f"rendered application Service {name}"
+        )
+        result[name] = {
+            "spec": projection,
+            "spec_sha256": _stable_json_sha256(projection),
+        }
+    return result
+
+
+def _require_live_application_services(
+    root: Path,
+    release: dict[str, Any],
+) -> dict[str, Any]:
+    expected = _rendered_application_service_contract(root, release)
+    result: dict[str, Any] = {}
+    for name, expected_value in expected.items():
+        service = _kubectl_json(
+            root, ["-n", APP_NAMESPACE, "get", "service", name]
+        )
+        metadata = service.get("metadata", {}) if isinstance(service, dict) else {}
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or metadata.get("namespace") != APP_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+        ):
+            raise RuntimeErrorEB(
+                f"live application Service identity drifted: {name}"
+            )
+        observed = _service_spec_projection(
+            service, f"live application Service {name}"
+        )
+        if observed != expected_value["spec"]:
+            raise RuntimeErrorEB(
+                f"live application Service spec drifted: {name}"
+            )
+        result[name] = {
+            "spec": observed,
+            "spec_sha256": expected_value["spec_sha256"],
             "canonical": True,
         }
     return result
@@ -4962,6 +5056,7 @@ def status(root: Path) -> dict[str, Any]:
             "weltgewebe-web": web_pods,
         },
     )
+    application_services = _require_live_application_services(root, release)
     application_service_accounts = (
         _require_live_application_service_accounts(root, release)
     )
@@ -5071,6 +5166,7 @@ def status(root: Path) -> dict[str, Any]:
         "data_deployments": data_deployment_readback,
         "data_services": data_service_readback,
         "application_workloads": application_workloads,
+        "application_services": application_services,
         "application_service_accounts": application_service_accounts,
         "pods": pod_readback,
         "images": {
@@ -8176,6 +8272,30 @@ def portability_report(root: Path) -> dict[str, Any]:
         ):
             raise RuntimeErrorEB(
                 f"status does not prove the live data Service contract: {name}"
+            )
+
+
+    application_service_status = status_payload.get("application_services")
+    expected_application_services = _rendered_application_service_contract(
+        root, payloads["release.json"]
+    )
+    if (
+        not isinstance(application_service_status, dict)
+        or set(application_service_status) != set(expected_application_services)
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the application Service contract"
+        )
+    for name, expected in expected_application_services.items():
+        observed = application_service_status.get(name)
+        if (
+            not isinstance(observed, dict)
+            or observed.get("canonical") is not True
+            or observed.get("spec") != expected["spec"]
+            or observed.get("spec_sha256") != expected["spec_sha256"]
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the application Service contract: {name}"
             )
 
     pod_status = status_payload.get("pods")
