@@ -172,6 +172,7 @@ def atomic_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
 PORTABILITY_DERIVED_RECEIPTS = ("portability.json",)
 RECOVERY_ATTEMPT_INVALIDATES = (
     "recovery.json",
+    "recovery-attempt.json",
     "recovery-failed.json",
     "status.json",
     "status-attempt.json",
@@ -184,6 +185,7 @@ FIXTURE_ATTEMPT_INVALIDATES = (
     "t048-load.json",
     "t048-load-attempt.json",
     "recovery.json",
+    "recovery-attempt.json",
     "recovery-failed.json",
     "status.json",
     "status-attempt.json",
@@ -242,6 +244,35 @@ def _complete_live_check_attempt(
     )
 
 
+def _require_recovery_attempt_clear(root: Path) -> None:
+    attempt_path = root / "receipts/recovery-attempt.json"
+    if not attempt_path.is_file():
+        return
+    try:
+        attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "recovery proof refuses an unreadable previous attempt; rebuild the "
+            "Experiment-B cell to establish a fresh baseline"
+        ) from exc
+    if not isinstance(attempt, dict) or attempt.get("schema_version") != 1:
+        raise RuntimeErrorEB(
+            "recovery proof refuses an invalid previous attempt; rebuild the "
+            "Experiment-B cell to establish a fresh baseline"
+        )
+    status = attempt.get("status")
+    if status in {"running", "failed"}:
+        raise RuntimeErrorEB(
+            "recovery proof refuses a retry after an incomplete or failed attempt; "
+            "rebuild the Experiment-B cell to establish a fresh baseline"
+        )
+    if status != "pass":
+        raise RuntimeErrorEB(
+            "recovery proof refuses an unknown previous attempt state; rebuild the "
+            "Experiment-B cell to establish a fresh baseline"
+        )
+
+
 RELEASE_DEPENDENT_RECEIPTS = (
     "t048-fixture.json",
     "semantic-search.json",
@@ -251,6 +282,7 @@ RELEASE_DEPENDENT_RECEIPTS = (
     "t048-load.json",
     "t048-load-attempt.json",
     "recovery.json",
+    "recovery-attempt.json",
     "recovery-failed.json",
     "status.json",
     "status-attempt.json",
@@ -1159,6 +1191,19 @@ def install_k3s(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
     config = load_config()
+    vm_create_path = root / "receipts/vm-create.json"
+    try:
+        vm_create = json.loads(vm_create_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "k3s installation requires a valid VM creation receipt"
+        ) from exc
+    _require_vm_create_receipt(vm_create, source_commit, config, root)
+    live_substrate = _live_vm_substrate(root, config)
+    if live_substrate != vm_create["substrate"]:
+        raise RuntimeErrorEB(
+            "k3s installation refuses VM substrate drift from creation receipt"
+        )
     ip = vm_ip()
     wait_ssh(root, ip)
     k3s_binary = root / "downloads/k3s"
@@ -1969,6 +2014,14 @@ def _require_flux_source_revision(
 ) -> str:
     if not isinstance(source, dict):
         raise RuntimeErrorEB("Flux GitRepository payload is not an object")
+    metadata = source.get("metadata", {})
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("deletionTimestamp") is not None
+    ):
+        raise RuntimeErrorEB(
+            "Flux GitRepository is pending deletion or malformed"
+        )
     spec = source.get("spec", {})
     if not isinstance(spec, dict) or spec.get("suspend") is True:
         raise RuntimeErrorEB("Flux GitRepository is suspended or malformed")
@@ -1995,9 +2048,18 @@ def _require_exact_flux_revision_ready(
     for item in flux_items:
         if not isinstance(item, dict):
             raise RuntimeErrorEB("Flux Kustomization inventory contains a non-object item")
-        name = str(item.get("metadata", {}).get("name", ""))
+        metadata = item.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise RuntimeErrorEB(
+                "Flux Kustomization metadata is not an object"
+            )
+        name = str(metadata.get("name", ""))
         if not name.startswith("commonthing-experiment-b-"):
             continue
+        if metadata.get("deletionTimestamp") is not None:
+            raise RuntimeErrorEB(
+                f"Flux Kustomization is pending deletion: {name}"
+            )
         if name in flux_readback:
             raise RuntimeErrorEB(f"duplicate Flux Kustomization: {name}")
         expected_spec = expected_specs.get(name)
@@ -2173,6 +2235,355 @@ EXPECTED_FLUX_CONTROLLERS = frozenset(
 )
 
 
+def _normalize_flux_env(
+    value: Any,
+    context: str,
+) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, list) or any(
+        not isinstance(item, dict) for item in value
+    ):
+        raise RuntimeErrorEB(f"{context} env contract is invalid")
+    normalized = json.loads(json.dumps(value))
+    for item in normalized:
+        value_from = item.get("valueFrom")
+        if not isinstance(value_from, dict):
+            continue
+        field_ref = value_from.get("fieldRef")
+        if isinstance(field_ref, dict) and field_ref.get("apiVersion") == "v1":
+            field_ref.pop("apiVersion", None)
+        resource_ref = value_from.get("resourceFieldRef")
+        if (
+            isinstance(resource_ref, dict)
+            and resource_ref.get("divisor") == "0"
+        ):
+            resource_ref.pop("divisor", None)
+    return normalized
+
+
+def _normalize_flux_resources(
+    value: Any,
+    context: str,
+) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RuntimeErrorEB(f"{context} resources contract is invalid")
+    normalized = json.loads(json.dumps(value))
+    for bucket_name in ("limits", "requests"):
+        bucket = normalized.get(bucket_name)
+        if bucket is None:
+            continue
+        if not isinstance(bucket, dict):
+            raise RuntimeErrorEB(
+                f"{context} {bucket_name} resources contract is invalid"
+            )
+        cpu = bucket.get("cpu")
+        if cpu is not None:
+            if not isinstance(cpu, str):
+                raise RuntimeErrorEB(
+                    f"{context} CPU resource quantity is invalid"
+                )
+            bucket["cpu"] = _parse_cpu_quantity(cpu)
+        memory = bucket.get("memory")
+        if memory is not None:
+            if not isinstance(memory, str):
+                raise RuntimeErrorEB(
+                    f"{context} memory resource quantity is invalid"
+                )
+            bucket["memory"] = _parse_memory_quantity(memory)
+    return normalized
+
+
+def _kube_api_access_volume_name(value: Any) -> str | None:
+    if not isinstance(value, dict) or set(value) != {"name", "projected"}:
+        return None
+    name = value.get("name")
+    if not isinstance(name, str) or not name.startswith("kube-api-access-"):
+        return None
+    suffix = name.removeprefix("kube-api-access-")
+    if len(suffix) != 5 or not suffix.isalnum():
+        return None
+    projected = value.get("projected")
+    if (
+        not isinstance(projected, dict)
+        or set(projected) != {"defaultMode", "sources"}
+        or projected.get("defaultMode") != 420
+    ):
+        return None
+    sources = projected.get("sources")
+    if not isinstance(sources, list) or len(sources) != 3:
+        return None
+    by_kind: dict[str, dict[str, Any]] = {}
+    for source in sources:
+        if not isinstance(source, dict) or len(source) != 1:
+            return None
+        kind = next(iter(source))
+        if kind in by_kind or not isinstance(source[kind], dict):
+            return None
+        by_kind[kind] = source[kind]
+    if set(by_kind) != {
+        "serviceAccountToken",
+        "configMap",
+        "downwardAPI",
+    }:
+        return None
+    token = by_kind["serviceAccountToken"]
+    expiration = token.get("expirationSeconds")
+    if (
+        set(token) != {"expirationSeconds", "path"}
+        or token.get("path") != "token"
+        or isinstance(expiration, bool)
+        or not isinstance(expiration, int)
+        or expiration <= 0
+    ):
+        return None
+    if by_kind["configMap"] != {
+        "name": "kube-root-ca.crt",
+        "items": [{"key": "ca.crt", "path": "ca.crt"}],
+    }:
+        return None
+    if by_kind["downwardAPI"] != {
+        "items": [
+            {
+                "path": "namespace",
+                "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": "metadata.namespace",
+                },
+            }
+        ]
+    }:
+        return None
+    return name
+
+
+def _normalize_flux_pod_spec(
+    pod_spec: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(pod_spec, dict):
+        raise RuntimeErrorEB(f"{context} Pod spec is invalid")
+    normalized = json.loads(json.dumps(pod_spec))
+    volumes = normalized.get("volumes")
+    if volumes is None:
+        volumes = []
+        normalized["volumes"] = volumes
+    if not isinstance(volumes, list) or any(
+        not isinstance(volume, dict) for volume in volumes
+    ):
+        raise RuntimeErrorEB(f"{context} volume contract is invalid")
+
+    injected_names = [
+        name
+        for volume in volumes
+        if (name := _kube_api_access_volume_name(volume)) is not None
+    ]
+    if len(injected_names) == 1:
+        injected_name = injected_names[0]
+        containers: list[dict[str, Any]] = []
+        valid_mounts = True
+        for field in ("containers", "initContainers"):
+            items = normalized.get(field, [])
+            if not isinstance(items, list) or any(
+                not isinstance(item, dict) for item in items
+            ):
+                raise RuntimeErrorEB(
+                    f"{context} {field} inventory is invalid"
+                )
+            containers.extend(items)
+        for container in containers:
+            mounts = container.get("volumeMounts") or []
+            if not isinstance(mounts, list) or any(
+                not isinstance(mount, dict) for mount in mounts
+            ):
+                raise RuntimeErrorEB(
+                    f"{context} container volumeMounts contract is invalid"
+                )
+            matches = [
+                mount
+                for mount in mounts
+                if mount.get("name") == injected_name
+            ]
+            if matches != [
+                {
+                    "mountPath": (
+                        "/var/run/secrets/kubernetes.io/serviceaccount"
+                    ),
+                    "name": injected_name,
+                    "readOnly": True,
+                }
+            ]:
+                valid_mounts = False
+                break
+        if valid_mounts and containers:
+            normalized["volumes"] = [
+                volume
+                for volume in volumes
+                if volume.get("name") != injected_name
+            ]
+            for container in containers:
+                mounts = container.get("volumeMounts") or []
+                remaining = [
+                    mount
+                    for mount in mounts
+                    if mount.get("name") != injected_name
+                ]
+                if remaining:
+                    container["volumeMounts"] = remaining
+                else:
+                    container.pop("volumeMounts", None)
+
+    tolerations = normalized.get("tolerations") or []
+    if not isinstance(tolerations, list) or any(
+        not isinstance(item, dict) for item in tolerations
+    ):
+        raise RuntimeErrorEB(f"{context} toleration contract is invalid")
+    remaining_tolerations = json.loads(json.dumps(tolerations))
+    for default_toleration in (
+        {
+            "effect": "NoExecute",
+            "key": "node.kubernetes.io/not-ready",
+            "operator": "Exists",
+            "tolerationSeconds": 300,
+        },
+        {
+            "effect": "NoExecute",
+            "key": "node.kubernetes.io/unreachable",
+            "operator": "Exists",
+            "tolerationSeconds": 300,
+        },
+    ):
+        if default_toleration in remaining_tolerations:
+            remaining_tolerations.remove(default_toleration)
+    normalized["tolerations"] = remaining_tolerations
+
+    for field in ("containers", "initContainers"):
+        items = normalized.get(field, [])
+        if not isinstance(items, list):
+            raise RuntimeErrorEB(f"{context} {field} inventory is invalid")
+        for container in items:
+            if not isinstance(container, dict):
+                raise RuntimeErrorEB(
+                    f"{context} {field} container contract is invalid"
+                )
+            container["env"] = _normalize_flux_env(
+                container.get("env"), context
+            )
+            container["resources"] = _normalize_flux_resources(
+                container.get("resources"), context
+            )
+    return normalized
+
+
+def _flux_strategy_projection(
+    spec: dict[str, Any],
+    context: str,
+) -> dict[str, Any]:
+    value = spec.get("strategy")
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise RuntimeErrorEB(f"{context} strategy contract is invalid")
+    strategy = json.loads(json.dumps(value))
+    strategy_type = strategy.get("type", "RollingUpdate")
+    if strategy_type == "RollingUpdate":
+        rolling = strategy.get("rollingUpdate")
+        if rolling is None:
+            rolling = {}
+        if not isinstance(rolling, dict):
+            raise RuntimeErrorEB(
+                f"{context} rolling update contract is invalid"
+            )
+        strategy = {
+            "type": "RollingUpdate",
+            "rollingUpdate": {
+                "maxSurge": rolling.get("maxSurge", "25%"),
+                "maxUnavailable": rolling.get(
+                    "maxUnavailable", "25%"
+                ),
+            },
+        }
+    return strategy
+
+
+def _flux_pod_spec_projection(
+    pod_spec: Any,
+    context: str,
+) -> dict[str, Any]:
+    normalized = _normalize_flux_pod_spec(pod_spec, context)
+    projection = _application_pod_spec_projection(normalized, context)
+    pod_spec = normalized
+    projection.update(
+        {
+            "hostNetwork": pod_spec.get("hostNetwork", False),
+            "hostPID": pod_spec.get("hostPID", False),
+            "hostIPC": pod_spec.get("hostIPC", False),
+            "dnsPolicy": pod_spec.get("dnsPolicy", "ClusterFirst"),
+            "dnsConfig": pod_spec.get("dnsConfig"),
+            "priorityClassName": pod_spec.get("priorityClassName", ""),
+            "tolerations": pod_spec.get("tolerations") or [],
+            "restartPolicy": pod_spec.get("restartPolicy", "Always"),
+            "schedulerName": pod_spec.get(
+                "schedulerName", "default-scheduler"
+            ),
+            "enableServiceLinks": pod_spec.get("enableServiceLinks", True),
+            "shareProcessNamespace": pod_spec.get(
+                "shareProcessNamespace", False
+            ),
+            "runtimeClassName": pod_spec.get("runtimeClassName"),
+        }
+    )
+    return projection
+
+
+def _flux_deployment_contract(
+    deployment: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(deployment, dict):
+        raise RuntimeErrorEB(f"{context} Deployment is invalid")
+    spec = deployment.get("spec", {})
+    template = spec.get("template", {}) if isinstance(spec, dict) else {}
+    template_metadata = (
+        template.get("metadata", {}) if isinstance(template, dict) else {}
+    )
+    pod_spec = template.get("spec", {}) if isinstance(template, dict) else {}
+    replicas = spec.get("replicas", 1) if isinstance(spec, dict) else None
+    if (
+        isinstance(replicas, bool)
+        or not isinstance(replicas, int)
+        or replicas != 1
+        or not isinstance(template_metadata, dict)
+    ):
+        raise RuntimeErrorEB(f"{context} replica/template contract is invalid")
+    labels = template_metadata.get("labels", {})
+    annotations = template_metadata.get("annotations", {})
+    if not isinstance(labels, dict) or not isinstance(annotations, dict):
+        raise RuntimeErrorEB(f"{context} template metadata contract is invalid")
+    pod_contract = _flux_pod_spec_projection(pod_spec, context)
+    deployment_contract = {
+        "replicas": replicas,
+        "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
+        "strategy": _flux_strategy_projection(spec, context),
+        "minReadySeconds": spec.get("minReadySeconds", 0),
+        "progressDeadlineSeconds": spec.get("progressDeadlineSeconds", 600),
+        "selector_labels": _pod_selector_match_labels(deployment, context),
+        "template_labels": labels,
+        "template_annotations": annotations,
+        "pod_spec": pod_contract,
+    }
+    return {
+        "replicas": replicas,
+        "selector_labels": deployment_contract["selector_labels"],
+        "images": _pod_spec_images(pod_spec, context),
+        "contract": deployment_contract,
+        "contract_sha256": _stable_json_sha256(deployment_contract),
+        "pod_contract_sha256": _stable_json_sha256(pod_contract),
+    }
+
+
 def _expected_flux_controller_contract(
     root: Path,
     toolchain_receipt: dict[str, Any] | None = None,
@@ -2203,26 +2614,13 @@ def _expected_flux_controller_contract(
     }
     if names != EXPECTED_FLUX_CONTROLLERS or len(deployments) != len(names):
         raise RuntimeErrorEB("pinned Flux controller Deployment set drifted")
-    result: dict[str, Any] = {}
-    for deployment in deployments:
-        name = str(deployment["metadata"]["name"])
-        spec = deployment.get("spec", {})
-        replicas = spec.get("replicas", 1)
-        if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas != 1:
-            raise RuntimeErrorEB(
-                f"pinned Flux controller replica contract drifted: {name}"
-            )
-        result[name] = {
-            "replicas": 1,
-            "selector_labels": _pod_selector_match_labels(
-                deployment, f"pinned Flux Deployment {name}"
-            ),
-            "images": _pod_spec_images(
-                spec.get("template", {}).get("spec"),
-                f"pinned Flux Deployment {name}",
-            ),
-        }
-    return result
+    return {
+        str(deployment["metadata"]["name"]): _flux_deployment_contract(
+            deployment,
+            f"pinned Flux Deployment {deployment['metadata']['name']}",
+        )
+        for deployment in deployments
+    }
 
 
 def _require_live_flux_controller_contract(
@@ -2272,33 +2670,88 @@ def _require_live_flux_controller_contract(
             or metadata.get("deletionTimestamp") is not None
         ):
             raise RuntimeErrorEB(f"Flux controller identity drifted: {name}")
-        selector = _pod_selector_match_labels(
+        observed = _flux_deployment_contract(
             deployment, f"live Flux Deployment {name}"
         )
-        if selector != contract_value["selector_labels"]:
-            raise RuntimeErrorEB(f"Flux controller selector drifted: {name}")
-        live_images = _pod_spec_images(
-            deployment.get("spec", {}).get("template", {}).get("spec"),
-            f"live Flux Deployment {name}",
-        )
-        if live_images != contract_value["images"]:
-            raise RuntimeErrorEB(f"Flux controller images drifted: {name}")
+        if observed["contract"] != contract_value["contract"]:
+            raise RuntimeErrorEB(
+                f"Flux controller Deployment contract drifted: {name}"
+            )
         availability = _deployment_availability_snapshot(deployment, name, 1)
+        matching_pods = _pods_matching_labels(
+            pods, contract_value["selector_labels"]
+        )
         pod_readback = _require_running_pod_image_contract(
-            _pods_matching_labels(pods, selector),
+            matching_pods,
             namespace="flux-system",
             workload=name,
             expected_replicas=1,
             expected_images=contract_value["images"],
-            required_labels=selector,
+            required_labels=contract_value["selector_labels"],
             context="Flux controller Pod",
         )
+        pod_names: list[str] = []
+        for pod in matching_pods:
+            pod_metadata = (
+                pod.get("metadata", {}) if isinstance(pod, dict) else {}
+            )
+            pod_spec = pod.get("spec", {}) if isinstance(pod, dict) else {}
+            labels = (
+                pod_metadata.get("labels", {})
+                if isinstance(pod_metadata, dict)
+                else {}
+            )
+            annotations = (
+                pod_metadata.get("annotations", {})
+                if isinstance(pod_metadata, dict)
+                else {}
+            )
+            pod_name = (
+                pod_metadata.get("name")
+                if isinstance(pod_metadata, dict)
+                else None
+            )
+            if (
+                not isinstance(pod_name, str)
+                or not pod_name
+                or pod_name in pod_names
+                or pod_metadata.get("namespace") != "flux-system"
+                or pod_metadata.get("deletionTimestamp") is not None
+                or not isinstance(labels, dict)
+                or not isinstance(annotations, dict)
+                or any(
+                    labels.get(key) != value
+                    for key, value in contract_value["contract"][
+                        "template_labels"
+                    ].items()
+                )
+                or any(
+                    annotations.get(key) != value
+                    for key, value in contract_value["contract"][
+                        "template_annotations"
+                    ].items()
+                )
+                or _flux_pod_spec_projection(
+                    pod_spec, f"live Flux Pod {pod_name}"
+                )
+                != contract_value["contract"]["pod_spec"]
+            ):
+                raise RuntimeErrorEB(
+                    f"Flux controller Pod contract drifted: {name}"
+                )
+            pod_names.append(pod_name)
         result[name] = {
             **availability,
-            "images": live_images,
-            "images_sha256": _stable_json_sha256(live_images),
+            "images": observed["images"],
+            "images_sha256": _stable_json_sha256(observed["images"]),
             "images_canonical": True,
             "pods": pod_readback,
+            "contract_sha256": contract_value["contract_sha256"],
+            "pod_contract_sha256": contract_value[
+                "pod_contract_sha256"
+            ],
+            "pod_names": sorted(pod_names),
+            "canonical": True,
         }
     return result
 
@@ -4076,8 +4529,18 @@ def _require_live_application_workloads(
     release: dict[str, Any],
     deployments: dict[str, Any],
     pods_by_workload: dict[str, Any],
+    names: tuple[str, ...] = ("weltgewebe-api", "weltgewebe-web"),
 ) -> dict[str, Any]:
-    expected = _rendered_application_workload_contract(root, release)
+    rendered = _rendered_application_workload_contract(root, release)
+    if (
+        not names
+        or len(set(names)) != len(names)
+        or any(name not in rendered for name in names)
+    ):
+        raise RuntimeErrorEB(
+            "live application workload selection is invalid"
+        )
+    expected = {name: rendered[name] for name in names}
     if (
         set(deployments) != set(expected)
         or set(pods_by_workload) != set(expected)
@@ -6731,6 +7194,58 @@ def _require_t048_api_release_binding(
     return pod_name, pod, readback
 
 
+def _require_t048_api_runtime_binding(
+    root: Path,
+    source_commit: str,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    pod_name, pod, image_readback = _require_t048_api_release_binding(
+        root, source_commit
+    )
+    release_path = root / "receipts/release.json"
+    try:
+        release = json.loads(release_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "T048 proof requires a valid release receipt"
+        ) from exc
+    deployment = _kubectl_json(
+        root,
+        [
+            "-n",
+            APP_NAMESPACE,
+            "get",
+            "deployment",
+            "weltgewebe-api",
+        ],
+    )
+    workload = _require_live_application_workloads(
+        root,
+        release,
+        {"weltgewebe-api": deployment},
+        {"weltgewebe-api": [pod]},
+        names=("weltgewebe-api",),
+    ).get("weltgewebe-api")
+    if (
+        not isinstance(workload, dict)
+        or workload.get("canonical") is not True
+        or not isinstance(workload.get("contract_sha256"), str)
+        or not isinstance(workload.get("pod_contract_sha256"), str)
+    ):
+        raise RuntimeErrorEB(
+            "T048 API full runtime contract is invalid"
+        )
+    return (
+        pod_name,
+        pod,
+        {
+            **image_readback,
+            "contract_sha256": workload["contract_sha256"],
+            "pod_contract_sha256": workload["pod_contract_sha256"],
+            "canonical": True,
+        },
+    )
+
+
 def _require_t048_postgres_runtime_binding(
     root: Path,
 ) -> dict[str, Any]:
@@ -6955,7 +7470,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     resource_path = root / "performance/resource-receipt.json"
     db_path = root / "performance/database-connections.json"
 
-    pod_name, pod, api_image_binding_before = _require_t048_api_release_binding(
+    pod_name, pod, api_image_binding_before = _require_t048_api_runtime_binding(
         root, source_commit
     )
     declared_cpu, declared_memory = _require_api_resource_limits(
@@ -7022,7 +7537,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             post_pod_name,
             _post_pod,
             api_image_binding_after,
-        ) = _require_t048_api_release_binding(root, source_commit)
+        ) = _require_t048_api_runtime_binding(root, source_commit)
         postgres_binding_after = _require_t048_postgres_runtime_binding(root)
         (
             target_receipt_after,
@@ -7038,9 +7553,13 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             post_pod_name != pod_name
             or api_image_binding_after["runtime_image_ids_sha256"]
             != api_image_binding_before["runtime_image_ids_sha256"]
+            or api_image_binding_after["contract_sha256"]
+            != api_image_binding_before["contract_sha256"]
+            or api_image_binding_after["pod_contract_sha256"]
+            != api_image_binding_before["pod_contract_sha256"]
         ):
             raise RuntimeErrorEB(
-                "API Pod image identity changed during the T048 measurement"
+                "API runtime contract changed during the T048 measurement"
             )
         if (
             postgres_binding_after["runtime_image_ids_sha256"]
@@ -7178,6 +7697,12 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "fixture_manifest_sha256": manifest_sha,
             "api_runtime_image_ids_sha256": api_image_binding_before[
                 "runtime_image_ids_sha256"
+            ],
+            "api_contract_sha256": api_image_binding_before[
+                "contract_sha256"
+            ],
+            "api_pod_contract_sha256": api_image_binding_before[
+                "pod_contract_sha256"
             ],
             "postgres_runtime_image_ids_sha256": postgres_binding_before[
                 "runtime_image_ids_sha256"
@@ -7979,6 +8504,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             "recovery proof refuses a retry after a failed attempt; rebuild the "
             "Experiment-B cell to establish a fresh baseline"
         )
+    _require_recovery_attempt_clear(root)
     _invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("recovery proof release is not current protected main")
@@ -7989,12 +8515,14 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     nats_tar = backup_dir / "nats.tar"
     before_db: dict[str, Any] | None = None
     before_nats: dict[str, Any] | None = None
-    recovery_receipt = root / "receipts/recovery.json"
+    recovery_receipt, recovery_attempt, recovery_started_at = (
+        _begin_live_check_attempt(root, "recovery", source_commit)
+    )
 
-    _flux_suspend(root, "commonthing-experiment-b-app")
-    _flux_suspend(root, "commonthing-experiment-b-data")
     destructive_started = time.monotonic()
     try:
+        _flux_suspend(root, "commonthing-experiment-b-app")
+        _flux_suspend(root, "commonthing-experiment-b-data")
         _scale_deployment(root, APP_NAMESPACE, "weltgewebe-api", 0)
         _scale_deployment(root, APP_NAMESPACE, "weltgewebe-web", 0)
         _wait_pods_absent(
@@ -8144,6 +8672,21 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 "flux_resuspended": resuspended,
             },
         )
+        atomic_json(
+            recovery_attempt,
+            {
+                "schema_version": 1,
+                "status": "failed",
+                "source_commit": source_commit,
+                "receipt": recovery_receipt.name,
+                "started_at_unix_ms": recovery_started_at,
+                "finished_at_unix_ms": time.time_ns() // 1_000_000,
+                "failure_receipt": recovery_failed_receipt.name,
+                "failure_receipt_sha256": sha256_file(
+                    recovery_failed_receipt
+                ),
+            },
+        )
         raise
     if before_db is None or before_nats is None:
         raise RuntimeErrorEB("recovery proof has no quiesced before-signature")
@@ -8165,6 +8708,13 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         "production_data_used": False,
     }
     atomic_json(recovery_receipt, receipt)
+    _complete_live_check_attempt(
+        recovery_attempt,
+        recovery_receipt,
+        source_commit,
+        recovery_started_at,
+        "pass",
+    )
     return receipt
 
 
@@ -8258,6 +8808,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         "t048-load.json": "pass",
         "t048-load-attempt.json": "pass",
         "recovery.json": "pass",
+        "recovery-attempt.json": "pass",
         "status.json": "observed",
         "status-attempt.json": "pass",
     }
@@ -8309,6 +8860,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         "semantic-search",
         "functional-readback",
         "t048-load",
+        "recovery",
         "status",
     ):
         attempt_name = f"{receipt_stem}-attempt.json"

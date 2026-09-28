@@ -609,14 +609,15 @@ spec:
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
             binary = root / "downloads/k3s"
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"tampered-k3s")
-            config = {
-                "kubernetes": {
-                    "binary_sha256": "0" * 64,
-                }
-            }
+            config = json.loads(json.dumps(runtime.load_config()))
+            config["kubernetes"]["binary_sha256"] = "0" * 64
+            receipt = vm_receipt_fixture(state_root=root)
+            runtime.atomic_json(receipts / "vm-create.json", receipt)
             with (
                 mock.patch.object(
                     runtime,
@@ -624,6 +625,11 @@ spec:
                     return_value=commit,
                 ),
                 mock.patch.object(runtime, "load_config", return_value=config),
+                mock.patch.object(
+                    runtime,
+                    "_live_vm_substrate",
+                    return_value=json.loads(json.dumps(receipt["substrate"])),
+                ),
                 mock.patch.object(runtime, "vm_ip", return_value="192.0.2.10"),
                 mock.patch.object(runtime, "wait_ssh"),
                 mock.patch.object(runtime, "scp_to") as copy_to_vm,
@@ -640,6 +646,42 @@ spec:
             source.index("observed_k3s_sha256 = sha256_file(k3s_binary)"),
             source.index('scp_to(root, ip, k3s_binary, "/tmp/k3s")'),
         )
+
+    def test_install_k3s_rejects_vm_substrate_drift_before_ssh(self) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            config = runtime.load_config()
+            receipt = vm_receipt_fixture(state_root=root)
+            runtime.atomic_json(receipts / "vm-create.json", receipt)
+            drifted = json.loads(json.dumps(receipt["substrate"]))
+            drifted["uuid"] = "44444444-4444-4444-8444-444444444444"
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=commit,
+                ),
+                mock.patch.object(runtime, "load_config", return_value=config),
+                mock.patch.object(
+                    runtime,
+                    "_live_vm_substrate",
+                    return_value=drifted,
+                ),
+                mock.patch.object(runtime, "vm_ip") as vm_ip,
+                mock.patch.object(runtime, "wait_ssh") as wait_ssh,
+                mock.patch.object(runtime, "scp_to") as copy_to_vm,
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "VM substrate drift",
+                ):
+                    runtime.install_k3s(root)
+            vm_ip.assert_not_called()
+            wait_ssh.assert_not_called()
+            copy_to_vm.assert_not_called()
 
     def test_install_k3s_restarts_and_requires_live_pinned_node(self) -> None:
         source = inspect.getsource(runtime.install_k3s)
@@ -907,12 +949,53 @@ spec:
                         },
                         "template": {
                             "spec": {
+                                "serviceAccountName": name,
+                                "securityContext": {"fsGroup": 1337},
+                                "volumes": [
+                                    {"name": "tmp", "emptyDir": {}},
+                                ],
                                 "containers": [
                                     {
                                         "name": "manager",
                                         "image": f"ghcr.io/fluxcd/{name}:vfixture",
+                                        "args": ["--enable-leader-election"],
+                                        "env": [
+                                            {
+                                                "name": "RUNTIME_NAMESPACE",
+                                                "valueFrom": {
+                                                    "fieldRef": {
+                                                        "fieldPath": "metadata.namespace"
+                                                    }
+                                                },
+                                            },
+                                            {
+                                                "name": "GOMEMLIMIT",
+                                                "valueFrom": {
+                                                    "resourceFieldRef": {
+                                                        "containerName": "manager",
+                                                        "resource": "limits.memory",
+                                                    }
+                                                },
+                                            },
+                                        ],
+                                        "resources": {
+                                            "limits": {
+                                                "cpu": "1000m",
+                                                "memory": "1Gi",
+                                            }
+                                        },
+                                        "securityContext": {
+                                            "allowPrivilegeEscalation": False,
+                                            "runAsNonRoot": True,
+                                        },
+                                        "volumeMounts": [
+                                            {
+                                                "name": "tmp",
+                                                "mountPath": "/tmp",
+                                            }
+                                        ],
                                     }
-                                ]
+                                ],
                             }
                         },
                     },
@@ -941,6 +1024,39 @@ spec:
                 value["images"]["containers"]["manager"],
                 f"ghcr.io/fluxcd/{name}:vfixture",
             )
+            pod_contract = value["contract"]["pod_spec"]
+            self.assertEqual(pod_contract["serviceAccountName"], name)
+            self.assertEqual(
+                pod_contract["containers"]["manager"]["args"],
+                ["--enable-leader-election"],
+            )
+            self.assertEqual(
+                pod_contract["containers"]["manager"]["env"][0]["name"],
+                "RUNTIME_NAMESPACE",
+            )
+            self.assertEqual(
+                pod_contract["containers"]["manager"]["securityContext"],
+                {
+                    "allowPrivilegeEscalation": False,
+                    "runAsNonRoot": True,
+                },
+            )
+            self.assertEqual(
+                pod_contract["volumes"],
+                [{"name": "tmp", "emptyDir": {}}],
+            )
+            self.assertEqual(
+                pod_contract["containers"]["manager"]["volumeMounts"],
+                [{"name": "tmp", "mountPath": "/tmp"}],
+            )
+            self.assertEqual(
+                value["contract_sha256"],
+                runtime._stable_json_sha256(value["contract"]),
+            )
+            self.assertEqual(
+                value["pod_contract_sha256"],
+                runtime._stable_json_sha256(pod_contract),
+            )
 
         missing = yaml.safe_dump_all(documents[:-1], sort_keys=True)
         with mock.patch.object(
@@ -957,6 +1073,192 @@ spec:
                     Path("/tmp/unused"),
                     {"tools": {"flux": "/verified/flux"}},
                 )
+
+    def test_flux_contract_normalizes_only_kubernetes_runtime_defaults(self) -> None:
+        expected = {
+            "metadata": {"name": "helm-controller", "namespace": "flux-system"},
+            "spec": {
+                "replicas": 1,
+                "selector": {
+                    "matchLabels": {"app.kubernetes.io/name": "helm-controller"}
+                },
+                "template": {
+                    "spec": {
+                        "serviceAccountName": "helm-controller",
+                        "securityContext": {"fsGroup": 1337},
+                        "volumes": [{"name": "temp", "emptyDir": {}}],
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "image": "ghcr.io/fluxcd/helm-controller:vfixture",
+                                "args": ["--enable-leader-election"],
+                                "env": [
+                                    {
+                                        "name": "RUNTIME_NAMESPACE",
+                                        "valueFrom": {
+                                            "fieldRef": {
+                                                "fieldPath": "metadata.namespace"
+                                            }
+                                        },
+                                    },
+                                    {
+                                        "name": "GOMEMLIMIT",
+                                        "valueFrom": {
+                                            "resourceFieldRef": {
+                                                "containerName": "manager",
+                                                "resource": "limits.memory",
+                                            }
+                                        },
+                                    },
+                                ],
+                                "resources": {
+                                    "limits": {
+                                        "cpu": "1000m",
+                                        "memory": "1Gi",
+                                    }
+                                },
+                                "securityContext": {
+                                    "allowPrivilegeEscalation": False,
+                                    "runAsNonRoot": True,
+                                },
+                                "volumeMounts": [
+                                    {"name": "temp", "mountPath": "/tmp"}
+                                ],
+                            }
+                        ],
+                    }
+                },
+            },
+        }
+        live_deployment = json.loads(json.dumps(expected))
+        live_deployment["spec"]["strategy"] = {
+            "type": "RollingUpdate",
+            "rollingUpdate": {
+                "maxSurge": "25%",
+                "maxUnavailable": "25%",
+            },
+        }
+        live_container = live_deployment["spec"]["template"]["spec"][
+            "containers"
+        ][0]
+        live_container["env"][0]["valueFrom"]["fieldRef"]["apiVersion"] = "v1"
+        live_container["env"][1]["valueFrom"]["resourceFieldRef"][
+            "divisor"
+        ] = "0"
+        live_container["resources"]["limits"]["cpu"] = "1"
+
+        expected_contract = runtime._flux_deployment_contract(
+            expected, "expected Flux Deployment"
+        )
+        live_contract = runtime._flux_deployment_contract(
+            live_deployment, "live Flux Deployment"
+        )
+        self.assertEqual(expected_contract["contract"], live_contract["contract"])
+
+        expected_pod = expected["spec"]["template"]["spec"]
+        live_pod = json.loads(json.dumps(live_deployment["spec"]["template"]["spec"]))
+        injected_name = "kube-api-access-abc12"
+        live_pod["volumes"].append(
+            {
+                "name": injected_name,
+                "projected": {
+                    "defaultMode": 420,
+                    "sources": [
+                        {
+                            "serviceAccountToken": {
+                                "expirationSeconds": 3607,
+                                "path": "token",
+                            }
+                        },
+                        {
+                            "configMap": {
+                                "name": "kube-root-ca.crt",
+                                "items": [{"key": "ca.crt", "path": "ca.crt"}],
+                            }
+                        },
+                        {
+                            "downwardAPI": {
+                                "items": [
+                                    {
+                                        "path": "namespace",
+                                        "fieldRef": {
+                                            "apiVersion": "v1",
+                                            "fieldPath": "metadata.namespace",
+                                        },
+                                    }
+                                ]
+                            }
+                        },
+                    ],
+                },
+            }
+        )
+        live_pod["containers"][0]["volumeMounts"].append(
+            {
+                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                "name": injected_name,
+                "readOnly": True,
+            }
+        )
+        live_pod["tolerations"] = [
+            {
+                "effect": "NoExecute",
+                "key": "node.kubernetes.io/not-ready",
+                "operator": "Exists",
+                "tolerationSeconds": 300,
+            },
+            {
+                "effect": "NoExecute",
+                "key": "node.kubernetes.io/unreachable",
+                "operator": "Exists",
+                "tolerationSeconds": 300,
+            },
+        ]
+        expected_projection = runtime._flux_pod_spec_projection(
+            expected_pod, "expected Flux Pod"
+        )
+        live_projection = runtime._flux_pod_spec_projection(
+            live_pod, "live Flux Pod"
+        )
+        self.assertEqual(expected_projection, live_projection)
+
+        for field, value in (
+            ("args", ["--shadow-mode"]),
+            ("env", [{"name": "SHADOW", "value": "1"}]),
+            (
+                "securityContext",
+                {"allowPrivilegeEscalation": True, "runAsNonRoot": True},
+            ),
+        ):
+            with self.subTest(container_field=field):
+                drifted = json.loads(json.dumps(live_pod))
+                drifted["containers"][0][field] = value
+                self.assertNotEqual(
+                    expected_projection,
+                    runtime._flux_pod_spec_projection(
+                        drifted, "drifted Flux Pod"
+                    ),
+                )
+
+        service_account_drift = json.loads(json.dumps(live_pod))
+        service_account_drift["serviceAccountName"] = "shadow-account"
+        self.assertNotEqual(
+            expected_projection,
+            runtime._flux_pod_spec_projection(
+                service_account_drift, "drifted Flux Pod"
+            ),
+        )
+
+        volume_drift = json.loads(json.dumps(live_pod))
+        volume_drift["volumes"].append(
+            {"name": "shadow", "emptyDir": {"medium": "Memory"}}
+        )
+        self.assertNotEqual(
+            expected_projection,
+            runtime._flux_pod_spec_projection(
+                volume_drift, "drifted Flux Pod"
+            ),
+        )
 
     def test_apply_release_requires_exact_flux_revision_and_set(self) -> None:
         source = inspect.getsource(runtime.apply_release)
@@ -1874,6 +2176,7 @@ spec:
             "t048-load.json": "pass",
             "t048-load-attempt.json": "pass",
             "recovery.json": "pass",
+            "recovery-attempt.json": "pass",
             "status.json": "observed",
             "status-attempt.json": "pass",
         }
@@ -1945,6 +2248,7 @@ spec:
                     "semantic-search-attempt.json",
                     "functional-readback-attempt.json",
                     "t048-load-attempt.json",
+                    "recovery-attempt.json",
                     "status-attempt.json",
                 }:
                     receipt_name = name.removesuffix("-attempt.json") + ".json"
@@ -2657,6 +2961,7 @@ spec:
             set(runtime.RECOVERY_ATTEMPT_INVALIDATES),
             {
                 "recovery.json",
+                "recovery-attempt.json",
                 "recovery-failed.json",
                 "status.json",
                 "status-attempt.json",
@@ -2669,6 +2974,42 @@ spec:
         portability = inspect.getsource(runtime.portability_report)
         self.assertIn("recovery_failed_receipt.is_file()", portability)
 
+    def test_recovery_running_attempt_blocks_retry_before_live_work(self) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            runtime.atomic_json(
+                receipts / "release.json",
+                {
+                    "schema_version": 1,
+                    "status": "applied",
+                    "source_commit": commit,
+                },
+            )
+            runtime.atomic_json(
+                receipts / "recovery-attempt.json",
+                {
+                    "schema_version": 1,
+                    "status": "running",
+                    "source_commit": commit,
+                    "receipt": "recovery.json",
+                    "started_at_unix_ms": 1,
+                },
+            )
+            with mock.patch.object(runtime, "_flux_suspend") as suspend:
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "incomplete or failed attempt",
+                ):
+                    runtime.recovery_proof(root)
+            suspend.assert_not_called()
+            attempt = json.loads(
+                (receipts / "recovery-attempt.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(attempt["status"], "running")
+
     def test_fixture_rerun_invalidates_its_downstream_chain_only(self) -> None:
         self.assertEqual(
             set(runtime.FIXTURE_ATTEMPT_INVALIDATES),
@@ -2679,6 +3020,7 @@ spec:
                 "t048-load.json",
                 "t048-load-attempt.json",
                 "recovery.json",
+                "recovery-attempt.json",
                 "recovery-failed.json",
                 "status.json",
                 "status-attempt.json",
@@ -3814,43 +4156,41 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "init_containers": {},
             }
             labels = {"app.kubernetes.io/name": name}
-            self.flux_expected_contract[name] = {
-                "replicas": 1,
-                "selector_labels": json.loads(json.dumps(labels)),
-                "images": json.loads(json.dumps(images)),
+            deployment = {
+                "metadata": {
+                    "name": name,
+                    "namespace": "flux-system",
+                    "generation": 1,
+                },
+                "spec": {
+                    "replicas": 1,
+                    "selector": {
+                        "matchLabels": json.loads(json.dumps(labels))
+                    },
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {"name": key, "image": value}
+                                for key, value in images["containers"].items()
+                            ],
+                            "initContainers": [],
+                        }
+                    },
+                },
+                "status": {
+                    "observedGeneration": 1,
+                    "replicas": 1,
+                    "updatedReplicas": 1,
+                    "readyReplicas": 1,
+                    "availableReplicas": 1,
+                    "unavailableReplicas": 0,
+                    "conditions": [{"type": "Available", "status": "True"}],
+                },
             }
-            self.flux_controller_deployments.append(
-                {
-                    "metadata": {
-                        "name": name,
-                        "namespace": "flux-system",
-                        "generation": 1,
-                    },
-                    "spec": {
-                        "replicas": 1,
-                        "selector": {
-                            "matchLabels": json.loads(json.dumps(labels))
-                        },
-                        "template": {
-                            "spec": {
-                                "containers": [
-                                    {"name": key, "image": value}
-                                    for key, value in images["containers"].items()
-                                ],
-                                "initContainers": [],
-                            }
-                        },
-                    },
-                    "status": {
-                        "observedGeneration": 1,
-                        "replicas": 1,
-                        "updatedReplicas": 1,
-                        "readyReplicas": 1,
-                        "availableReplicas": 1,
-                        "unavailableReplicas": 0,
-                        "conditions": [{"type": "Available", "status": "True"}],
-                    },
-                }
+            self.flux_controller_deployments.append(deployment)
+            self.flux_expected_contract[name] = runtime._flux_deployment_contract(
+                deployment,
+                f"fixture Flux Deployment {name}",
             )
             self.flux_controller_pods.append(
                 workload_pod(
@@ -5034,7 +5374,9 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.cilium_daemonset["spec"]["template"]["spec"]["containers"][0][
             "image"
         ] = "quay.io/cilium/cilium:v9.9.9"
-        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "images drifted"):
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "DaemonSet images drifted"
+        ):
             runtime.status(self.root)
         self.cilium_daemonset = json.loads(json.dumps(healthy_daemonset))
         self.cilium_daemonset["spec"]["template"]["spec"]["containers"][0][
@@ -5130,10 +5472,68 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.flux_controller_deployments[0]["spec"]["template"]["spec"][
             "containers"
         ][0]["image"] = "ghcr.io/fluxcd/other:vfixture"
-        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "images drifted"):
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "Deployment contract drifted"
+        ):
+            runtime.status(self.root)
+
+        for field, value in (
+            ("args", ["--shadow-mode"]),
+            ("env", [{"name": "SHADOW", "value": "1"}]),
+            (
+                "securityContext",
+                {"allowPrivilegeEscalation": True},
+            ),
+        ):
+            with self.subTest(deployment_container_field=field):
+                self.flux_controller_deployments = json.loads(
+                    json.dumps(healthy)
+                )
+                self.flux_controller_deployments[0]["spec"]["template"]["spec"][
+                    "containers"
+                ][0][field] = value
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB, "Deployment contract drifted"
+                ):
+                    runtime.status(self.root)
+
+        self.flux_controller_deployments = json.loads(json.dumps(healthy))
+        self.flux_controller_deployments[0]["spec"]["template"]["spec"][
+            "serviceAccountName"
+        ] = "shadow-account"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "Deployment contract drifted"
+        ):
             runtime.status(self.root)
 
         self.flux_controller_deployments = json.loads(json.dumps(healthy))
+        self.flux_controller_deployments[0]["spec"]["template"]["spec"][
+            "volumes"
+        ] = [{"name": "shadow", "emptyDir": {}}]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "Deployment contract drifted"
+        ):
+            runtime.status(self.root)
+
+        self.flux_controller_deployments = json.loads(json.dumps(healthy))
+        self.flux_controller_pods = json.loads(json.dumps(healthy_pods))
+        self.flux_controller_pods[0]["spec"]["containers"][0]["env"] = [
+            {"name": "SHADOW", "value": "1"}
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "Pod contract drifted"
+        ):
+            runtime.status(self.root)
+
+        self.flux_controller_pods = json.loads(json.dumps(healthy_pods))
+        self.flux_controller_pods[0]["spec"]["volumes"] = [
+            {"name": "shadow", "emptyDir": {}}
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "Pod contract drifted"
+        ):
+            runtime.status(self.root)
+
         self.flux_controller_pods = json.loads(json.dumps(healthy_pods))
         self.flux_controller_pods[0]["spec"]["containers"][0]["image"] = (
             "ghcr.io/fluxcd/other:vfixture"
@@ -6498,7 +6898,7 @@ spec:
             )
         source = inspect.getsource(runtime.t048_load_proof)
         self.assertGreaterEqual(
-            source.count("_require_t048_api_release_binding"), 2
+            source.count("_require_t048_api_runtime_binding"), 2
         )
 
     def test_recovery_refuses_retry_after_failed_attempt(self) -> None:
@@ -7143,6 +7543,272 @@ spec:
                 self.assertFalse(self.pool.exists())
                 self.assertFalse((self.root / "receipts/vm-create.json").exists())
                 self.assertFalse(list(self.root.glob(".vm-substrate-*")))
+
+
+class ExperimentBLatestP1RegressionTests(unittest.TestCase):
+    def test_flux_source_and_kustomization_reject_termination(self) -> None:
+        commit = "a" * 40
+        source_spec = {
+            "url": "https://example.invalid/commonthing.git",
+            "interval": "1m",
+        }
+        source = {
+            "metadata": {
+                "generation": 1,
+                "deletionTimestamp": "2026-09-28T09:00:00Z",
+            },
+            "spec": json.loads(json.dumps(source_spec)),
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "observedGeneration": 1,
+                    }
+                ],
+                "artifact": {"revision": f"sha1:{commit}"},
+            },
+        }
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "pending deletion"
+        ):
+            runtime._require_flux_source_revision(
+                source, commit, source_spec
+            )
+
+        expected_specs = {
+            name: {
+                "interval": "1m",
+                "path": f"./{name}",
+            }
+            for name in runtime.EXPECTED_FLUX_KUSTOMIZATIONS
+        }
+        items = []
+        for name, spec in expected_specs.items():
+            items.append(
+                {
+                    "metadata": {
+                        "name": name,
+                        "generation": 1,
+                    },
+                    "spec": json.loads(json.dumps(spec)),
+                    "status": {
+                        "conditions": [
+                            {
+                                "type": "Ready",
+                                "status": "True",
+                                "observedGeneration": 1,
+                            }
+                        ],
+                        "lastAppliedRevision": f"sha1:{commit}",
+                    },
+                }
+            )
+        items[0]["metadata"]["deletionTimestamp"] = (
+            "2026-09-28T09:00:00Z"
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB, "pending deletion"
+        ):
+            runtime._require_exact_flux_revision_ready(
+                items, commit, expected_specs
+            )
+
+    def test_t048_api_binding_uses_complete_application_contract(self) -> None:
+        commit = "a" * 40
+        labels = {"app.kubernetes.io/name": "weltgewebe-api"}
+        pod_spec = {
+            "serviceAccountName": "weltgewebe-api",
+            "automountServiceAccountToken": False,
+            "volumes": [{"name": "tmp", "emptyDir": {}}],
+            "containers": [
+                {
+                    "name": "api",
+                    "image": "example.invalid/api@sha256:" + "a" * 64,
+                    "args": ["serve"],
+                    "env": [{"name": "MODE", "value": "experiment-b"}],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False
+                    },
+                    "volumeMounts": [
+                        {"name": "tmp", "mountPath": "/tmp"}
+                    ],
+                }
+            ],
+        }
+        deployment = {
+            "metadata": {
+                "name": "weltgewebe-api",
+                "namespace": runtime.APP_NAMESPACE,
+            },
+            "spec": {
+                "replicas": 1,
+                "revisionHistoryLimit": 10,
+                "strategy": None,
+                "selector": {"matchLabels": labels},
+                "template": {
+                    "metadata": {
+                        "labels": labels,
+                        "annotations": {},
+                    },
+                    "spec": json.loads(json.dumps(pod_spec)),
+                },
+            },
+        }
+        pod = {
+            "metadata": {
+                "name": "weltgewebe-api-0",
+                "namespace": runtime.APP_NAMESPACE,
+                "labels": labels,
+                "annotations": {},
+            },
+            "spec": json.loads(json.dumps(pod_spec)),
+        }
+        contract = {
+            "replicas": 1,
+            "revisionHistoryLimit": 10,
+            "strategy": None,
+            "selector_labels": labels,
+            "template_labels": labels,
+            "template_annotations": {},
+            "pod_spec": runtime._application_pod_spec_projection(
+                pod_spec, "expected API"
+            ),
+        }
+        rendered = {
+            "weltgewebe-api": {
+                "contract": contract,
+                "contract_sha256": runtime._stable_json_sha256(contract),
+                "pod_contract_sha256": runtime._stable_json_sha256(
+                    contract["pod_spec"]
+                ),
+            },
+            "weltgewebe-web": {
+                "contract": {},
+                "contract_sha256": "f" * 64,
+                "pod_contract_sha256": "e" * 64,
+            },
+        }
+        image_readback = {
+            "runtime_image_ids_sha256": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "receipts").mkdir()
+            runtime.atomic_json(
+                root / "receipts/release.json",
+                {
+                    "schema_version": 1,
+                    "status": "applied",
+                    "source_commit": commit,
+                    "api_digest": "sha256:" + "b" * 64,
+                    "web_digest": "sha256:" + "c" * 64,
+                },
+            )
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_require_t048_api_release_binding",
+                    return_value=(
+                        "weltgewebe-api-0",
+                        pod,
+                        image_readback,
+                    ),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_rendered_application_workload_contract",
+                    return_value=rendered,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_kubectl_json",
+                    return_value=deployment,
+                ),
+            ):
+                _, _, result = (
+                    runtime._require_t048_api_runtime_binding(
+                        root, commit
+                    )
+                )
+            self.assertTrue(result["canonical"])
+            self.assertEqual(
+                result["contract_sha256"],
+                rendered["weltgewebe-api"]["contract_sha256"],
+            )
+
+            deployment_drift = json.loads(json.dumps(deployment))
+            deployment_drift["spec"]["template"]["spec"][
+                "containers"
+            ][0]["args"] = ["shadow"]
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_require_t048_api_release_binding",
+                    return_value=(
+                        "weltgewebe-api-0",
+                        pod,
+                        image_readback,
+                    ),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_rendered_application_workload_contract",
+                    return_value=rendered,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_kubectl_json",
+                    return_value=deployment_drift,
+                ),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "Deployment contract drifted",
+                ),
+            ):
+                runtime._require_t048_api_runtime_binding(
+                    root, commit
+                )
+
+            pod_drift = json.loads(json.dumps(pod))
+            pod_drift["spec"]["containers"][0]["env"] = [
+                {"name": "MODE", "value": "shadow"}
+            ]
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_require_t048_api_release_binding",
+                    return_value=(
+                        "weltgewebe-api-0",
+                        pod_drift,
+                        image_readback,
+                    ),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_rendered_application_workload_contract",
+                    return_value=rendered,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_kubectl_json",
+                    return_value=deployment,
+                ),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "Pod contract drifted",
+                ),
+            ):
+                runtime._require_t048_api_runtime_binding(
+                    root, commit
+                )
+
+        source = inspect.getsource(runtime.t048_load_proof)
+        self.assertEqual(
+            source.count("_require_t048_api_runtime_binding"), 2
+        )
+        self.assertIn("api_contract_sha256", source)
+        self.assertIn("api_pod_contract_sha256", source)
 
 
 if __name__ == "__main__":
