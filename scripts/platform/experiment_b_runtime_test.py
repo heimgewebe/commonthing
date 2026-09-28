@@ -7967,6 +7967,22 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                     ),
                 )
 
+        ephemeral = json.loads(json.dumps(base))
+        ephemeral["ephemeralContainers"] = [
+            {
+                "name": "debugger",
+                "image": "example.invalid/debug@sha256:" + "d" * 64,
+                "command": ["sh"],
+            }
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "ephemeral containers are forbidden",
+        ):
+            runtime._application_pod_spec_projection(
+                ephemeral, "debugged Pod"
+            )
+
         live_defaults = json.loads(json.dumps(base))
         live_defaults["tolerations"] = [
             {

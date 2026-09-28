@@ -4583,14 +4583,22 @@ def _application_pod_spec_projection(
 
     host_aliases = pod_spec.get("hostAliases") or []
     readiness_gates = pod_spec.get("readinessGates") or []
+    ephemeral_containers = pod_spec.get("ephemeralContainers") or []
     if (
         not isinstance(host_aliases, list)
         or any(not isinstance(item, dict) for item in host_aliases)
         or not isinstance(readiness_gates, list)
         or any(not isinstance(item, dict) for item in readiness_gates)
+        or not isinstance(ephemeral_containers, list)
+        or any(not isinstance(item, dict) for item in ephemeral_containers)
     ):
         raise RuntimeErrorEB(
-            f"{context} Pod hostAliases/readinessGates contract is invalid"
+            f"{context} Pod hostAliases/readinessGates/ephemeralContainers "
+            "contract is invalid"
+        )
+    if ephemeral_containers:
+        raise RuntimeErrorEB(
+            f"{context} Pod ephemeral containers are forbidden"
         )
 
     result: dict[str, Any] = {
