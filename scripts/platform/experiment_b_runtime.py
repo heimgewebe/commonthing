@@ -2155,11 +2155,100 @@ def _require_exact_k3s_node_inventory(
     }
 
 
-def _require_exact_healthy_pvcs(pvc_items: Any) -> dict[str, Any]:
+def _pvc_spec_projection(
+    pvc: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(pvc, dict):
+        raise RuntimeErrorEB(f"{context} PVC payload is invalid")
+    spec = pvc.get("spec", {})
+    if not isinstance(spec, dict):
+        raise RuntimeErrorEB(f"{context} PVC spec is invalid")
+    access_modes = spec.get("accessModes") or []
+    resources = spec.get("resources") or {}
+    if (
+        not isinstance(access_modes, list)
+        or any(not isinstance(value, str) or not value for value in access_modes)
+        or not isinstance(resources, dict)
+    ):
+        raise RuntimeErrorEB(f"{context} PVC access/resource contract is invalid")
+    storage_class = spec.get("storageClassName")
+    if storage_class is not None and (
+        not isinstance(storage_class, str) or not storage_class
+    ):
+        raise RuntimeErrorEB(f"{context} PVC storageClassName is invalid")
+    volume_mode = spec.get("volumeMode", "Filesystem")
+    if volume_mode not in {"Filesystem", "Block"}:
+        raise RuntimeErrorEB(f"{context} PVC volumeMode is invalid")
+    return {
+        "accessModes": sorted(access_modes),
+        "storageClassName": storage_class,
+        "volumeMode": volume_mode,
+        "resources": json.loads(json.dumps(resources)),
+        "selector": spec.get("selector"),
+        "dataSource": spec.get("dataSource"),
+        "dataSourceRef": spec.get("dataSourceRef"),
+        "volumeAttributesClassName": spec.get("volumeAttributesClassName"),
+    }
+
+
+def _rendered_pvc_contract(root: Path) -> dict[str, Any]:
+    kustomize = toolchain(root)["tools"].get("kustomize")
+    if not isinstance(kustomize, str) or not kustomize:
+        raise RuntimeErrorEB("PVC contract requires pinned kustomize")
+    documents: list[dict[str, Any]] = []
+    for target in (CLUSTER / "data", APP_OVERLAY):
+        rendered = run([kustomize, "build", str(target)]).stdout
+        try:
+            documents.extend(
+                document
+                for document in yaml.safe_load_all(rendered)
+                if isinstance(document, dict)
+            )
+        except yaml.YAMLError as exc:
+            raise RuntimeErrorEB(
+                f"rendered Experiment-B PVC contract is invalid: {target}"
+            ) from exc
+
+    result: dict[str, Any] = {}
+    for document in documents:
+        if document.get("kind") != "PersistentVolumeClaim":
+            continue
+        metadata = document.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise RuntimeErrorEB("rendered Experiment-B PVC metadata is invalid")
+        namespace = str(metadata.get("namespace", ""))
+        name = str(metadata.get("name", ""))
+        if namespace not in {APP_NAMESPACE, DATA_NAMESPACE}:
+            continue
+        key = f"{namespace}/{name}"
+        if key in result:
+            raise RuntimeErrorEB(
+                f"rendered Experiment-B PVC is duplicated: {key}"
+            )
+        spec = _pvc_spec_projection(
+            document, f"rendered Experiment-B PVC {key}"
+        )
+        result[key] = {
+            "spec": spec,
+            "spec_sha256": _stable_json_sha256(spec),
+        }
+    if set(result) != EXPECTED_PVCS:
+        raise RuntimeErrorEB(
+            "rendered Experiment-B PVC set drifted from the expected contract"
+        )
+    return result
+
+
+def _require_exact_healthy_pvcs(
+    root: Path,
+    pvc_items: Any,
+) -> dict[str, Any]:
     if not isinstance(pvc_items, list):
         raise RuntimeErrorEB("Experiment-B PVC inventory is not a list")
+    expected = _rendered_pvc_contract(root)
 
-    pvc_readback: dict[str, Any] = {}
+    live: dict[str, dict[str, Any]] = {}
     for item in pvc_items:
         if not isinstance(item, dict):
             raise RuntimeErrorEB("Experiment-B PVC inventory contains a non-object item")
@@ -2170,30 +2259,42 @@ def _require_exact_healthy_pvcs(pvc_items: Any) -> dict[str, Any]:
         name = str(metadata.get("name", ""))
         if namespace not in {APP_NAMESPACE, DATA_NAMESPACE}:
             continue
-
         key = f"{namespace}/{name}"
-        if key in pvc_readback:
+        if key in live:
             raise RuntimeErrorEB(f"Experiment-B PVC inventory contains duplicate: {key}")
-        if metadata.get("deletionTimestamp"):
-            raise RuntimeErrorEB(f"Experiment-B PVC is pending deletion: {key}")
+        live[key] = item
 
-        phase = str(item.get("status", {}).get("phase", ""))
-        storage_class = str(item.get("spec", {}).get("storageClassName", ""))
-        if phase != "Bound" or storage_class != "local-path":
-            raise RuntimeErrorEB(f"Experiment-B PVC is not Bound/local-path: {key}")
-        pvc_readback[key] = {
-            "phase": phase,
-            "storage_class": storage_class,
-        }
-
-    observed = set(pvc_readback)
-    if observed != EXPECTED_PVCS:
-        missing = sorted(EXPECTED_PVCS - observed)
-        unexpected = sorted(observed - EXPECTED_PVCS)
+    observed = set(live)
+    if observed != set(expected):
+        missing = sorted(set(expected) - observed)
+        unexpected = sorted(observed - set(expected))
         raise RuntimeErrorEB(
             "Experiment-B PVC set mismatch: "
             f"missing={missing}; unexpected={unexpected}"
         )
+
+    pvc_readback: dict[str, Any] = {}
+    for key, expected_value in expected.items():
+        item = live[key]
+        metadata = item.get("metadata", {})
+        if metadata.get("deletionTimestamp"):
+            raise RuntimeErrorEB(f"Experiment-B PVC is pending deletion: {key}")
+        status = item.get("status", {})
+        phase = status.get("phase") if isinstance(status, dict) else None
+        if phase != "Bound":
+            raise RuntimeErrorEB(f"Experiment-B PVC is not Bound: {key}")
+        observed_spec = _pvc_spec_projection(
+            item, f"live Experiment-B PVC {key}"
+        )
+        if observed_spec != expected_value["spec"]:
+            raise RuntimeErrorEB(
+                f"Experiment-B PVC contract drifted: {key}"
+            )
+        pvc_readback[key] = {
+            "phase": "Bound",
+            "spec_sha256": expected_value["spec_sha256"],
+            "canonical": True,
+        }
     return pvc_readback
 
 
@@ -6321,7 +6422,7 @@ def status(root: Path) -> dict[str, Any]:
     }
 
     pvc_items = _kubectl_json(root, ["-A", "get", "pvc"]).get("items", [])
-    pvc_readback = _require_exact_healthy_pvcs(pvc_items)
+    pvc_readback = _require_exact_healthy_pvcs(root, pvc_items)
 
     gateway = _kubectl_json(
         root, ["-n", APP_NAMESPACE, "get", "gateway", "commonthing-experiment-b"]
@@ -7897,6 +7998,12 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     }
     postgres_binding_before = _require_t048_postgres_runtime_binding(root)
     fixture_receipt = _validated_t048_fixture_receipt(root, source_commit)
+    fixture_binding_before = {
+        "manifest": fixture_receipt.get("manifest"),
+        "manifest_sha256": fixture_receipt.get("manifest_sha256"),
+        "generation_id": fixture_receipt.get("generation_id"),
+        "live_binding": fixture_receipt.get("live_binding"),
+    }
     evidence, _domain_scale = _performance_modules()
     manifest = Path(fixture_receipt["manifest"])
     policy = evidence.load_policy(PERFORMANCE_POLICY)
@@ -8021,6 +8128,19 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 "Kubernetes target identity changed during the T048 measurement"
             )
+        fixture_receipt_after = _validated_t048_fixture_receipt(
+            root, source_commit
+        )
+        fixture_binding_after = {
+            "manifest": fixture_receipt_after.get("manifest"),
+            "manifest_sha256": fixture_receipt_after.get("manifest_sha256"),
+            "generation_id": fixture_receipt_after.get("generation_id"),
+            "live_binding": fixture_receipt_after.get("live_binding"),
+        }
+        if fixture_binding_after != fixture_binding_before:
+            raise RuntimeErrorEB(
+                "T048 fixture changed during the load measurement"
+            )
         if load_returncode != 0:
             detail = stderr_path.read_text(encoding="utf-8")[-3000:]
             raise RuntimeErrorEB(f"canonical T048 k6 workload failed: {detail}")
@@ -8136,6 +8256,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "k6_workflow_sha256": k6_workflow_sha256,
             "k6_image": k6_image,
             "fixture_manifest_sha256": manifest_sha,
+            "fixture_live_binding_sha256": _stable_json_sha256(
+                fixture_binding_before
+            ),
             "api_runtime_image_ids_sha256": api_image_binding_before[
                 "runtime_image_ids_sha256"
             ],
@@ -9551,6 +9674,27 @@ def portability_report(root: Path) -> dict[str, Any]:
             expected["images"],
             f"data Pod {name}",
         )
+
+    pvc_status = status_payload.get("pvcs")
+    expected_pvcs = _rendered_pvc_contract(root)
+    if (
+        not isinstance(pvc_status, dict)
+        or set(pvc_status) != set(expected_pvcs)
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the complete PVC contract"
+        )
+    for key, expected in expected_pvcs.items():
+        observed = pvc_status.get(key)
+        if (
+            not isinstance(observed, dict)
+            or observed.get("phase") != "Bound"
+            or observed.get("canonical") is not True
+            or observed.get("spec_sha256") != expected["spec_sha256"]
+        ):
+            raise RuntimeErrorEB(
+                f"status does not prove the complete PVC contract: {key}"
+            )
 
     data_service_status = status_payload.get("data_services")
     expected_data_services = {

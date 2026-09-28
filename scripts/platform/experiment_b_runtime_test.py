@@ -2231,6 +2231,54 @@ spec:
             "succeeded_pods": 1,
             "canonical": True,
         }
+        pvc_documents = [
+            {
+                "metadata": {
+                    "namespace": runtime.DATA_NAMESPACE,
+                    "name": "postgres-data",
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "local-path",
+                    "resources": {"requests": {"storage": "10Gi"}},
+                },
+            },
+            {
+                "metadata": {
+                    "namespace": runtime.DATA_NAMESPACE,
+                    "name": "nats-data",
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "local-path",
+                    "resources": {"requests": {"storage": "5Gi"}},
+                },
+            },
+            {
+                "metadata": {
+                    "namespace": runtime.APP_NAMESPACE,
+                    "name": "ollama-models",
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "local-path",
+                    "resources": {"requests": {"storage": "10Gi"}},
+                },
+            },
+        ]
+        pvc_expected_contract = {}
+        for pvc in pvc_documents:
+            key = (
+                f"{pvc['metadata']['namespace']}/"
+                f"{pvc['metadata']['name']}"
+            )
+            spec = runtime._pvc_spec_projection(
+                pvc, f"portability fixture PVC {key}"
+            )
+            pvc_expected_contract[key] = {
+                "spec": spec,
+                "spec_sha256": runtime._stable_json_sha256(spec),
+            }
         statuses = {
             "vm-create.json": "created",
             "k3s.json": "ready",
@@ -2281,6 +2329,11 @@ spec:
                 runtime,
                 "_rendered_migration_job_contract",
                 return_value=migration_expected_contract,
+            ),
+            mock.patch.object(
+                runtime,
+                "_rendered_pvc_contract",
+                return_value=pvc_expected_contract,
             ),
         ):
             root = Path(tmp)
@@ -2574,6 +2627,14 @@ spec:
                         json.dumps(migration_status)
                     )
                     payload["migration_complete"] = True
+                    payload["pvcs"] = {
+                        key: {
+                            "phase": "Bound",
+                            "spec_sha256": value["spec_sha256"],
+                            "canonical": True,
+                        }
+                        for key, value in pvc_expected_contract.items()
+                    }
                     runtime_binding = config["runtime_binding"]
                     api_images = {
                         "api": "ghcr.io/heimgewebe/commonthing-api@sha256:" + "b" * 64,
@@ -2752,6 +2813,22 @@ spec:
             status_path.write_text(original_status, encoding="utf-8")
             attempt_path.write_text(original_attempt, encoding="utf-8")
 
+
+            changed_status = json.loads(original_status)
+            changed_status["pvcs"][
+                f"{runtime.DATA_NAMESPACE}/postgres-data"
+            ]["spec_sha256"] = "0" * 64
+            runtime.atomic_json(status_path, changed_status)
+            changed_attempt = json.loads(original_attempt)
+            changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, changed_attempt)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "PVC contract",
+            ):
+                runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
 
             changed_status = json.loads(original_status)
             changed_status["migration"]["contract_sha256"] = "0" * 64
@@ -4541,20 +4618,45 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.pvcs = [
             {
                 "metadata": {"namespace": runtime.DATA_NAMESPACE, "name": "postgres-data"},
-                "spec": {"storageClassName": "local-path"},
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "local-path",
+                    "resources": {"requests": {"storage": "10Gi"}},
+                },
                 "status": {"phase": "Bound"},
             },
             {
                 "metadata": {"namespace": runtime.DATA_NAMESPACE, "name": "nats-data"},
-                "spec": {"storageClassName": "local-path"},
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "local-path",
+                    "resources": {"requests": {"storage": "5Gi"}},
+                },
                 "status": {"phase": "Bound"},
             },
             {
                 "metadata": {"namespace": runtime.APP_NAMESPACE, "name": "ollama-models"},
-                "spec": {"storageClassName": "local-path"},
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": "local-path",
+                    "resources": {"requests": {"storage": "10Gi"}},
+                },
                 "status": {"phase": "Bound"},
             },
         ]
+        self.pvc_expected = {}
+        for pvc in self.pvcs:
+            key = (
+                f"{pvc['metadata']['namespace']}/"
+                f"{pvc['metadata']['name']}"
+            )
+            spec = runtime._pvc_spec_projection(
+                pvc, f"fixture PVC {key}"
+            )
+            self.pvc_expected[key] = {
+                "spec": spec,
+                "spec_sha256": runtime._stable_json_sha256(spec),
+            }
         route_parent = {
             "name": "commonthing-experiment-b",
             "namespace": runtime.APP_NAMESPACE,
@@ -4943,6 +5045,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             return_value=json.loads(
                 json.dumps(self.application_service_account_expected)
             ),
+        )
+        self.pvc_contract = self.patch(
+            "_rendered_pvc_contract",
+            return_value=json.loads(json.dumps(self.pvc_expected)),
         )
         self.tools = self.patch(
             "toolchain",
@@ -6418,8 +6524,21 @@ spec:
 
         result = runtime.status(self.root)
         self.assertEqual(set(result["pvcs"]), runtime.EXPECTED_PVCS)
+        for value in result["pvcs"].values():
+            self.assertTrue(value["canonical"])
+            self.assertRegex(value["spec_sha256"], r"^[0-9a-f]{64}$")
 
-        healthy = list(self.pvcs)
+        healthy = json.loads(json.dumps(self.pvcs))
+        wrong_capacity = json.loads(json.dumps(healthy))
+        wrong_capacity[0]["spec"]["resources"]["requests"]["storage"] = "1Gi"
+        wrong_access = json.loads(json.dumps(healthy))
+        wrong_access[1]["spec"]["accessModes"] = ["ReadWriteMany"]
+        wrong_volume_mode = json.loads(json.dumps(healthy))
+        wrong_volume_mode[2]["spec"]["volumeMode"] = "Block"
+        wrong_selector = json.loads(json.dumps(healthy))
+        wrong_selector[0]["spec"]["selector"] = {
+            "matchLabels": {"storage": "shadow"}
+        }
         cases = [
             ("missing", healthy[:-1], "PVC set mismatch"),
             (
@@ -6443,6 +6562,10 @@ spec:
                 "pending deletion",
             ),
             ("duplicate", healthy + [healthy[0]], "duplicate"),
+            ("wrong-capacity", wrong_capacity, "PVC contract drifted"),
+            ("wrong-access-mode", wrong_access, "PVC contract drifted"),
+            ("wrong-volume-mode", wrong_volume_mode, "PVC contract drifted"),
+            ("wrong-selector", wrong_selector, "PVC contract drifted"),
         ]
 
         for name, pvcs, message in cases:
@@ -7422,8 +7545,12 @@ spec:
     def test_t048_revalidates_target_and_postgres_before_and_after_measurement(self) -> None:
         source = inspect.getsource(runtime.t048_load_proof)
         first_target = source.index("_require_kubernetes_target_binding")
-        fixture = source.index("_validated_t048_fixture_receipt")
+        first_fixture = source.index("_validated_t048_fixture_receipt")
         load = source.index("_sample_t048_load")
+        second_fixture = source.index(
+            "_validated_t048_fixture_receipt",
+            first_fixture + 1,
+        )
         second_target = source.index(
             "_require_kubernetes_target_binding",
             first_target + 1,
@@ -7435,10 +7562,21 @@ spec:
             "_require_t048_postgres_runtime_binding",
             first_postgres + 1,
         )
-        self.assertLess(first_target, fixture)
-        self.assertLess(first_postgres, fixture)
+        self.assertLess(first_target, first_fixture)
+        self.assertLess(first_postgres, first_fixture)
+        self.assertLess(first_fixture, load)
+        self.assertLess(load, second_fixture)
         self.assertLess(load, second_target)
         self.assertLess(load, second_postgres)
+        self.assertIn(
+            "fixture_binding_after != fixture_binding_before",
+            source,
+        )
+        self.assertIn("fixture_live_binding_sha256", source)
+        self.assertEqual(
+            source.count("_validated_t048_fixture_receipt"),
+            2,
+        )
         self.assertIn("kubernetes_target_sha256", source)
         self.assertIn("postgres_runtime_image_ids_sha256", source)
         self.assertIn("postgres_resources_sha256", source)
