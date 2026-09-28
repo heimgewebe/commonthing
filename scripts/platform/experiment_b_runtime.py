@@ -32,6 +32,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,12 @@ T048_REDACTED_TEXT = "[nicht öffentlich]"
 
 class RuntimeErrorEB(RuntimeError):
     pass
+
+
+_BOUND_KUBECONFIG: ContextVar[str | None] = ContextVar(
+    "experiment_b_bound_kubeconfig",
+    default=None,
+)
 
 
 def run(
@@ -876,6 +883,7 @@ def create_vm(root: Path) -> dict[str, Any]:
         )
 
     RETIREMENT_RECEIPT.unlink(missing_ok=True)
+    _retirement_attempt_path().unlink(missing_ok=True)
     _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
     config = load_config()
@@ -1490,7 +1498,10 @@ def toolchain(root: Path) -> dict[str, Any]:
 
 def kube_env(root: Path) -> dict[str, str]:
     env = os.environ.copy()
-    env["KUBECONFIG"] = str(root / "kubeconfig.yaml")
+    bound = _BOUND_KUBECONFIG.get()
+    env["KUBECONFIG"] = (
+        bound if bound is not None else str(root / "kubeconfig.yaml")
+    )
     return env
 
 
@@ -1504,11 +1515,11 @@ def _bound_kube_env(
         payload = source.read_bytes()
     except OSError as exc:
         raise RuntimeErrorEB(
-            "Experiment-B platform install cannot snapshot kubeconfig"
+            "Experiment-B Kubernetes workflow cannot snapshot kubeconfig"
         ) from exc
     if hashlib.sha256(payload).hexdigest() != expected_target["kubeconfig_sha256"]:
         raise RuntimeErrorEB(
-            "Experiment-B platform install kubeconfig changed before snapshot"
+            "Experiment-B Kubernetes workflow kubeconfig changed before snapshot"
         )
 
     with tempfile.TemporaryDirectory(
@@ -1523,11 +1534,13 @@ def _bound_kube_env(
             or _kubeconfig_server(snapshot) != expected_target["server"]
         ):
             raise RuntimeErrorEB(
-                "Experiment-B platform install kubeconfig snapshot drifted"
+                "Experiment-B Kubernetes workflow kubeconfig snapshot drifted"
             )
-        env = os.environ.copy()
-        env["KUBECONFIG"] = str(snapshot)
-        yield env
+        token = _BOUND_KUBECONFIG.set(str(snapshot))
+        try:
+            yield kube_env(root)
+        finally:
+            _BOUND_KUBECONFIG.reset(token)
 
 
 def _cilium_helm_value_args(ip: str) -> list[str]:
@@ -1735,6 +1748,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
     _require_kubernetes_target_binding(root, source_commit)
+    secrets_target = _kubernetes_target_identity(root, source_commit)
     if not registry_config.is_file() or registry_config.is_symlink():
         raise RuntimeErrorEB("registry config must be a regular external file")
     try:
@@ -1746,42 +1760,50 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("registry config has no ghcr.io credential")
     registry_state = root / "secrets/registry.json"
     atomic_bytes(registry_state, registry_bytes)
-    kubectl_apply(root, render_namespaces(root))
-    db = ensure_secret_material(root)
-    database_url = (
-        f"postgresql://{db['username']}:{db['password']}"
-        f"@postgres.{DATA_NAMESPACE}.svc.cluster.local:5432/{db['database']}"
-    )
-    kubectl_apply(
+    with _bound_kube_env(root, secrets_target):
+        kubectl_apply(root, render_namespaces(root))
+        db = ensure_secret_material(root)
+        database_url = (
+            f"postgresql://{db['username']}:{db['password']}"
+            f"@postgres.{DATA_NAMESPACE}.svc.cluster.local:5432/{db['database']}"
+        )
+        kubectl_apply(
+            root,
+            secret_manifest(
+                DATA_NAMESPACE,
+                "commonthing-experiment-b-database",
+                db,
+            ),
+        )
+        kubectl_apply(
+            root,
+            secret_manifest(
+                APP_NAMESPACE,
+                "weltgewebe-runtime",
+                {"database-url": database_url},
+            ),
+        )
+        kubectl_apply(
+            root,
+            secret_manifest(
+                APP_NAMESPACE,
+                "commonthing-experiment-b-registry",
+                {},
+                secret_type="kubernetes.io/dockerconfigjson",
+                binary_data={".dockerconfigjson": registry_bytes},
+            ),
+        )
+    _require_same_kubernetes_target(
         root,
-        secret_manifest(
-            DATA_NAMESPACE,
-            "commonthing-experiment-b-database",
-            db,
-        ),
-    )
-    kubectl_apply(
-        root,
-        secret_manifest(
-            APP_NAMESPACE,
-            "weltgewebe-runtime",
-            {"database-url": database_url},
-        ),
-    )
-    kubectl_apply(
-        root,
-        secret_manifest(
-            APP_NAMESPACE,
-            "commonthing-experiment-b-registry",
-            {},
-            secret_type="kubernetes.io/dockerconfigjson",
-            binary_data={".dockerconfigjson": registry_bytes},
-        ),
+        source_commit,
+        secrets_target,
+        "secret injection success receipt",
     )
     receipt = {
         "schema_version": 1,
         "status": "ready",
         "source_commit": source_commit,
+        "kubernetes_target_sha256": _stable_json_sha256(secrets_target),
         "database_secret": "commonthing-experiment-b-database",
         "runtime_secret": "weltgewebe-runtime",
         "registry_secret": "commonthing-experiment-b-registry",
@@ -1809,6 +1831,7 @@ def apply_release(
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("release source is not current protected main")
     _require_kubernetes_target_binding(root, source_commit)
+    release_target = _kubernetes_target_identity(root, source_commit)
     config = load_config()
     api_replicas = int(config["semantic_search"]["api_replicas"])
     web_replicas = int(config["runtime_binding"]["web_replicas"])
@@ -1817,125 +1840,133 @@ def apply_release(
         source_commit, api_digest, web_digest, output
     )
     flux_contract = _flux_bootstrap_contract(root, binding)
-    kubectl_apply(root, output.read_text(encoding="utf-8"))
-    kubectl = toolchain(root)["tools"]["kubectl"]
-    env = kube_env(root)
-    for _ in range(120):
-        source_result = run(
-            [
-                kubectl,
-                "-n",
-                "flux-system",
-                "get",
-                "gitrepository",
-                "commonthing-experiment-b",
-                "-o",
-                "json",
-            ],
-            env=env,
-            check=False,
-        )
-        flux_result = run(
-            [
-                kubectl,
-                "-n",
-                "flux-system",
-                "get",
-                "kustomizations",
-                "-o",
-                "json",
-            ],
-            env=env,
-            check=False,
-        )
-        if source_result.returncode == 0 and flux_result.returncode == 0:
-            try:
-                source_payload = json.loads(source_result.stdout)
-                flux_payload = json.loads(flux_result.stdout)
-                if not isinstance(source_payload, dict) or not isinstance(
-                    flux_payload, dict
-                ):
-                    raise RuntimeErrorEB("Flux readiness payload is not an object")
-                _require_flux_source_revision(
-                    source_payload,
-                    source_commit,
-                    flux_contract["source_spec"],
-                )
-                _require_exact_flux_revision_ready(
-                    flux_payload.get("items", []),
-                    source_commit,
-                    flux_contract["kustomization_specs"],
-                )
-                live_results = {
-                    "api": run(
-                        [
-                            kubectl, "-n", APP_NAMESPACE, "get", "deployment",
-                            "weltgewebe-api", "-o", "json",
-                        ],
-                        env=env,
-                        check=False,
-                    ),
-                    "web": run(
-                        [
-                            kubectl, "-n", APP_NAMESPACE, "get", "deployment",
-                            "weltgewebe-web", "-o", "json",
-                        ],
-                        env=env,
-                        check=False,
-                    ),
-                    "migration": run(
-                        [
-                            kubectl, "-n", APP_NAMESPACE, "get", "job",
-                            MIGRATION_JOB_NAME, "-o", "json",
-                        ],
-                        env=env,
-                        check=False,
-                    ),
-                    "migration_pods": run(
-                        [
-                            kubectl, "-n", APP_NAMESPACE, "get", "pods",
-                            "-l", f"batch.kubernetes.io/job-name={MIGRATION_JOB_NAME}",
-                            "-o", "json",
-                        ],
-                        env=env,
-                        check=False,
-                    ),
-                }
-                if any(result.returncode != 0 for result in live_results.values()):
-                    raise RuntimeErrorEB(
-                        "Experiment-B release artifacts are not all queryable"
+    with _bound_kube_env(root, release_target):
+        kubectl_apply(root, output.read_text(encoding="utf-8"))
+        kubectl = toolchain(root)["tools"]["kubectl"]
+        env = kube_env(root)
+        for _ in range(120):
+            source_result = run(
+                [
+                    kubectl,
+                    "-n",
+                    "flux-system",
+                    "get",
+                    "gitrepository",
+                    "commonthing-experiment-b",
+                    "-o",
+                    "json",
+                ],
+                env=env,
+                check=False,
+            )
+            flux_result = run(
+                [
+                    kubectl,
+                    "-n",
+                    "flux-system",
+                    "get",
+                    "kustomizations",
+                    "-o",
+                    "json",
+                ],
+                env=env,
+                check=False,
+            )
+            if source_result.returncode == 0 and flux_result.returncode == 0:
+                try:
+                    source_payload = json.loads(source_result.stdout)
+                    flux_payload = json.loads(flux_result.stdout)
+                    if not isinstance(source_payload, dict) or not isinstance(
+                        flux_payload, dict
+                    ):
+                        raise RuntimeErrorEB("Flux readiness payload is not an object")
+                    _require_flux_source_revision(
+                        source_payload,
+                        source_commit,
+                        flux_contract["source_spec"],
                     )
-                migration_pods_payload = json.loads(
-                    live_results["migration_pods"].stdout
-                )
-                if not isinstance(migration_pods_payload, dict):
-                    raise RuntimeErrorEB(
-                        "Experiment-B migration Pod inventory is not an object"
+                    _require_exact_flux_revision_ready(
+                        flux_payload.get("items", []),
+                        source_commit,
+                        flux_contract["kustomization_specs"],
                     )
-                _require_requested_release_artifacts(
-                    root,
-                    json.loads(live_results["api"].stdout),
-                    json.loads(live_results["web"].stdout),
-                    json.loads(live_results["migration"].stdout),
-                    migration_pods_payload.get("items"),
-                    api_digest,
-                    web_digest,
-                    api_replicas,
-                    web_replicas,
-                )
-            except (json.JSONDecodeError, RuntimeErrorEB):
-                pass
-            else:
-                break
-        time.sleep(5)
-    else:
-        raise RuntimeErrorEB(
-            "Flux Experiment-B source and kustomizations did not converge "
-            "to the exact release revision"
-        )
+                    live_results = {
+                        "api": run(
+                            [
+                                kubectl, "-n", APP_NAMESPACE, "get", "deployment",
+                                "weltgewebe-api", "-o", "json",
+                            ],
+                            env=env,
+                            check=False,
+                        ),
+                        "web": run(
+                            [
+                                kubectl, "-n", APP_NAMESPACE, "get", "deployment",
+                                "weltgewebe-web", "-o", "json",
+                            ],
+                            env=env,
+                            check=False,
+                        ),
+                        "migration": run(
+                            [
+                                kubectl, "-n", APP_NAMESPACE, "get", "job",
+                                MIGRATION_JOB_NAME, "-o", "json",
+                            ],
+                            env=env,
+                            check=False,
+                        ),
+                        "migration_pods": run(
+                            [
+                                kubectl, "-n", APP_NAMESPACE, "get", "pods",
+                                "-l", f"batch.kubernetes.io/job-name={MIGRATION_JOB_NAME}",
+                                "-o", "json",
+                            ],
+                            env=env,
+                            check=False,
+                        ),
+                    }
+                    if any(result.returncode != 0 for result in live_results.values()):
+                        raise RuntimeErrorEB(
+                            "Experiment-B release artifacts are not all queryable"
+                        )
+                    migration_pods_payload = json.loads(
+                        live_results["migration_pods"].stdout
+                    )
+                    if not isinstance(migration_pods_payload, dict):
+                        raise RuntimeErrorEB(
+                            "Experiment-B migration Pod inventory is not an object"
+                        )
+                    _require_requested_release_artifacts(
+                        root,
+                        json.loads(live_results["api"].stdout),
+                        json.loads(live_results["web"].stdout),
+                        json.loads(live_results["migration"].stdout),
+                        migration_pods_payload.get("items"),
+                        api_digest,
+                        web_digest,
+                        api_replicas,
+                        web_replicas,
+                    )
+                except (json.JSONDecodeError, RuntimeErrorEB):
+                    pass
+                else:
+                    break
+            time.sleep(5)
+        else:
+            raise RuntimeErrorEB(
+                "Flux Experiment-B source and kustomizations did not converge "
+                "to the exact release revision"
+            )
+    _require_same_kubernetes_target(
+        root,
+        source_commit,
+        release_target,
+        "release success receipt",
+    )
     receipt = {
         "schema_version": 1,
         "status": "applied",
+        "kubernetes_target_sha256": _stable_json_sha256(release_target),
         **binding,
     }
     atomic_json(receipt_path, receipt)
@@ -2043,64 +2074,73 @@ def semantic_activate(root: Path) -> dict[str, Any]:
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("semantic provider proof is not bound to current protected main")
     _require_kubernetes_target_binding(root, source_commit)
-    config = load_config()
-    semantic = config["semantic_search"]
-    kubectl = toolchain(root)["tools"]["kubectl"]
-    env = kube_env(root)
-    egress_name = "commonthing-experiment-b-model-bootstrap-egress"
-    temporary_egress = json.dumps(
-        {
-            "apiVersion": "networking.k8s.io/v1",
-            "kind": "NetworkPolicy",
-            "metadata": {"name": egress_name, "namespace": APP_NAMESPACE},
-            "spec": {
-                "podSelector": {
-                    "matchLabels": {"app.kubernetes.io/name": "weltgewebe-api"}
+    semantic_target = _kubernetes_target_identity(root, source_commit)
+    with _bound_kube_env(root, semantic_target):
+        config = load_config()
+        semantic = config["semantic_search"]
+        kubectl = toolchain(root)["tools"]["kubectl"]
+        env = kube_env(root)
+        egress_name = "commonthing-experiment-b-model-bootstrap-egress"
+        temporary_egress = json.dumps(
+            {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {"name": egress_name, "namespace": APP_NAMESPACE},
+                "spec": {
+                    "podSelector": {
+                        "matchLabels": {"app.kubernetes.io/name": "weltgewebe-api"}
+                    },
+                    "policyTypes": ["Egress"],
+                    "egress": [
+                        {
+                            "to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}],
+                            "ports": [{"protocol": "TCP", "port": 443}],
+                        }
+                    ],
                 },
-                "policyTypes": ["Egress"],
-                "egress": [
-                    {
-                        "to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}],
-                        "ports": [{"protocol": "TCP", "port": 443}],
-                    }
-                ],
             },
-        },
-        sort_keys=True,
-    )
-    kubectl_apply(root, temporary_egress)
-    try:
-        run(
-            [
-                kubectl, "-n", APP_NAMESPACE,
-                "exec", "deployment/weltgewebe-api",
-                "-c", "ollama", "--", "ollama", "pull", semantic["model_id"],
-            ],
-            env=env,
-            timeout=1800,
+            sort_keys=True,
         )
-        semantic_live = _semantic_provider_live_readback(root, source_commit)
-    finally:
-        _kubectl(
+        kubectl_apply(root, temporary_egress)
+        try:
+            run(
+                [
+                    kubectl, "-n", APP_NAMESPACE,
+                    "exec", "deployment/weltgewebe-api",
+                    "-c", "ollama", "--", "ollama", "pull", semantic["model_id"],
+                ],
+                env=env,
+                timeout=1800,
+            )
+            semantic_live = _semantic_provider_live_readback(root, source_commit)
+        finally:
+            _kubectl(
+                root,
+                [
+                    "-n", APP_NAMESPACE, "delete", "networkpolicy",
+                    egress_name, "--ignore-not-found=true",
+                ],
+            )
+        remaining_egress = _kubectl(
             root,
             [
-                "-n", APP_NAMESPACE, "delete", "networkpolicy",
-                egress_name, "--ignore-not-found=true",
+                "-n", APP_NAMESPACE, "get", "networkpolicy",
+                egress_name, "--ignore-not-found=true", "-o", "name",
             ],
         )
-    remaining_egress = _kubectl(
-        root,
-        [
-            "-n", APP_NAMESPACE, "get", "networkpolicy",
-            egress_name, "--ignore-not-found=true", "-o", "name",
-        ],
-    )
-    if remaining_egress.stdout.strip():
-        raise RuntimeErrorEB("temporary model-bootstrap egress policy still exists")
+        if remaining_egress.stdout.strip():
+            raise RuntimeErrorEB("temporary model-bootstrap egress policy still exists")
 
+    _require_same_kubernetes_target(
+        root,
+        source_commit,
+        semantic_target,
+        "semantic activation success receipt",
+    )
     receipt = {
         "schema_version": 1,
         "status": "pass",
+        "kubernetes_target_sha256": _stable_json_sha256(semantic_target),
         **semantic_live,
         "temporary_model_egress_removed": True,
         "database_generation_activation": False,
@@ -7055,6 +7095,35 @@ def _libvirt_resource_present(kind: str, name: str) -> bool:
     return name in {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+def _libvirt_resource_uuid(kind: str, name: str) -> str:
+    if kind == "domain":
+        argv = ["virsh", "-c", LIBVIRT_URI, "domuuid", name]
+    elif kind == "pool":
+        argv = ["virsh", "-c", LIBVIRT_URI, "pool-uuid", name]
+    else:
+        raise RuntimeErrorEB(f"unsupported libvirt resource kind: {kind}")
+    result = run(argv, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeErrorEB(
+            f"cannot prove libvirt {kind} UUID for {name}: {detail[-1000:]}"
+        )
+    value = result.stdout.strip()
+    try:
+        parsed = str(uuid.UUID(value))
+    except ValueError as exc:
+        raise RuntimeErrorEB(
+            f"libvirt {kind} UUID for {name} is invalid"
+        ) from exc
+    return parsed
+
+
+def _retirement_attempt_path() -> Path:
+    return RETIREMENT_RECEIPT.with_name(
+        f"{RETIREMENT_RECEIPT.stem}-attempt{RETIREMENT_RECEIPT.suffix}"
+    )
+
+
 def _libvirt_volume_present(pool: str, name: str) -> bool:
     result = run(
         ["virsh", "-c", LIBVIRT_URI, "vol-list", pool],
@@ -7076,6 +7145,53 @@ def _libvirt_volume_present(pool: str, name: str) -> bool:
 
 def _require_teardown_state_root(root: Path) -> dict[str, Any]:
     root_identity = str(root.resolve())
+    retirement_attempt = _retirement_attempt_path()
+    if retirement_attempt.is_file():
+        try:
+            payload = json.loads(retirement_attempt.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeErrorEB(
+                "Experiment-B teardown resume receipt is invalid"
+            ) from exc
+        domain_target = payload.get("domain_target") if isinstance(payload, dict) else None
+        pool_target = payload.get("pool_target") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("status") != "running"
+            or payload.get("operation") != "teardown"
+            or payload.get("state_root") != root_identity
+            or payload.get("vm") != VM_NAME
+            or payload.get("pool") != POOL_NAME
+            or (
+                domain_target is not None
+                and (
+                    not isinstance(domain_target, str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                        domain_target,
+                    )
+                    is None
+                )
+            )
+            or (
+                pool_target is not None
+                and (
+                    not isinstance(pool_target, str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                        pool_target,
+                    )
+                    is None
+                )
+            )
+            or not isinstance(payload.get("evidence_receipts"), dict)
+        ):
+            raise RuntimeErrorEB(
+                "Experiment-B teardown resume receipt does not own the VM resources"
+            )
+        return payload
+
     creation_path = root / "receipts/vm-create.json"
     attempt_path = root / "receipts/vm-create-attempt.json"
     if creation_path.is_file():
@@ -7114,6 +7230,36 @@ def _require_teardown_live_identity(
 ) -> dict[str, Any]:
     domain_present = _libvirt_resource_present("domain", VM_NAME)
     pool_present = _libvirt_resource_present("pool", POOL_NAME)
+    if ownership.get("operation") == "teardown":
+        domain_target = ownership.get("domain_target")
+        pool_target = ownership.get("pool_target")
+        if domain_present:
+            if not isinstance(domain_target, str):
+                raise RuntimeErrorEB(
+                    "teardown resume has no verified domain identity"
+                )
+            if _libvirt_resource_uuid("domain", VM_NAME) != domain_target:
+                raise RuntimeErrorEB(
+                    "teardown resume domain UUID drifted from the verified attempt"
+                )
+        if pool_present:
+            if not isinstance(pool_target, str):
+                raise RuntimeErrorEB(
+                    "teardown resume has no verified pool identity"
+                )
+            if _libvirt_resource_uuid("pool", POOL_NAME) != pool_target:
+                raise RuntimeErrorEB(
+                    "teardown resume pool UUID drifted from the verified attempt"
+                )
+        return {
+            "identity_verified": True,
+            "domain_present": domain_present,
+            "pool_present": pool_present,
+            "domain_target": domain_target,
+            "pool_target": pool_target,
+            "substrate_sha256": ownership.get("substrate_sha256"),
+        }
+
     if ownership.get("status") == "created":
         source_commit = ownership.get("source_commit")
         if not isinstance(source_commit, str) or not COMMIT_RE.fullmatch(source_commit):
@@ -7156,11 +7302,30 @@ def _require_teardown_live_identity(
 def teardown(root: Path) -> dict[str, Any]:
     ownership = _require_teardown_state_root(root)
     live_identity = _require_teardown_live_identity(root, ownership)
-    evidence_hashes: dict[str, str] = {}
-    receipts_dir = root / "receipts"
-    if receipts_dir.is_dir():
-        for path in sorted(receipts_dir.glob("*.json")):
-            evidence_hashes[path.name] = sha256_file(path)
+    if ownership.get("operation") == "teardown":
+        evidence_hashes = {
+            str(name): str(value)
+            for name, value in ownership["evidence_receipts"].items()
+        }
+    else:
+        evidence_hashes: dict[str, str] = {}
+        receipts_dir = root / "receipts"
+        if receipts_dir.is_dir():
+            for path in sorted(receipts_dir.glob("*.json")):
+                evidence_hashes[path.name] = sha256_file(path)
+        ownership = {
+            "schema_version": 1,
+            "status": "running",
+            "operation": "teardown",
+            "state_root": ownership["state_root"],
+            "vm": VM_NAME,
+            "pool": POOL_NAME,
+            "domain_target": live_identity["domain_target"],
+            "pool_target": live_identity["pool_target"],
+            "substrate_sha256": live_identity["substrate_sha256"],
+            "evidence_receipts": evidence_hashes,
+        }
+        atomic_json(_retirement_attempt_path(), ownership)
 
     if live_identity["domain_present"]:
         domain_target = str(live_identity["domain_target"])
@@ -7204,7 +7369,8 @@ def teardown(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB("Experiment-B libvirt pool directory is not empty after teardown")
         POOL_TARGET.rmdir()
 
-    shutil.rmtree(root, ignore_errors=False)
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=False)
     result = {
         "schema_version": 1,
         "status": "retired",
@@ -7222,6 +7388,7 @@ def teardown(root: Path) -> dict[str, Any]:
         "evidence_receipts": evidence_hashes,
     }
     atomic_json(RETIREMENT_RECEIPT, result)
+    _retirement_attempt_path().unlink(missing_ok=True)
     return result
 
 
@@ -7805,297 +7972,306 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
     ):
         raise RuntimeErrorEB("T048 fixture release is not current protected main")
     _require_kubernetes_target_binding(root, source_commit)
-    contract_section = evidence.api_runtime_section(
-        evidence.load_policy(PERFORMANCE_POLICY)
-    )
-    proof = contract_section["dataset_proof"]
-    profile = str(proof["profile"])
-    evidence_dir = root / "performance"
-    fixture = evidence_dir / "fixture"
-    manifest = fixture / "manifest.json"
-    if not manifest.is_file():
-        if fixture.exists():
-            raise RuntimeErrorEB(
-                "partial T048 fixture directory exists; refusing implicit replacement"
-            )
-        run(
-            [
-                sys.executable, "-B", str(DOMAIN_SCALE), "generate",
-                "--profile", profile,
-                "--output-dir", str(fixture),
-            ],
-            timeout=900,
+    fixture_target = _kubernetes_target_identity(root, source_commit)
+    with _bound_kube_env(root, fixture_target):
+        contract_section = evidence.api_runtime_section(
+            evidence.load_policy(PERFORMANCE_POLICY)
         )
-    binding = evidence.load_dataset_binding(
-        manifest,
-        contract_section,
-        repo_root=ROOT,
-    )
-    counts = binding["counts"]
-    node_count = int(counts["nodes"])
-    edge_count = int(counts["edges"])
+        proof = contract_section["dataset_proof"]
+        profile = str(proof["profile"])
+        evidence_dir = root / "performance"
+        fixture = evidence_dir / "fixture"
+        manifest = fixture / "manifest.json"
+        if not manifest.is_file():
+            if fixture.exists():
+                raise RuntimeErrorEB(
+                    "partial T048 fixture directory exists; refusing implicit replacement"
+                )
+            run(
+                [
+                    sys.executable, "-B", str(DOMAIN_SCALE), "generate",
+                    "--profile", profile,
+                    "--output-dir", str(fixture),
+                ],
+                timeout=900,
+            )
+        binding = evidence.load_dataset_binding(
+            manifest,
+            contract_section,
+            repo_root=ROOT,
+        )
+        counts = binding["counts"]
+        node_count = int(counts["nodes"])
+        edge_count = int(counts["edges"])
 
-    existing_nodes = int(_psql(root, "SELECT count(*) FROM domain_nodes;"))
-    existing_edges = int(_psql(root, "SELECT count(*) FROM domain_edges;"))
-    generation_id = str(config["semantic_search"]["generation_id"])
-    existing_generation = int(
-        _psql(
-            root,
-            "SELECT count(*) FROM search_index_generations "
-            f"WHERE generation_id = '{generation_id}';",
-        )
-    )
-    receipt_path = root / "receipts/t048-fixture.json"
-
-    def emit_receipt() -> dict[str, Any]:
-        observed_nodes = int(_psql(root, "SELECT count(*) FROM domain_nodes;"))
-        observed_edges = int(_psql(root, "SELECT count(*) FROM domain_edges;"))
-        public_nodes = int(
-            _psql(
-                root,
-                "SELECT count(*) FROM domain_nodes WHERE search_visibility='public';",
-            )
-        )
-        observed_projections = int(
-            _psql(
-                root,
-                "SELECT count(*) FROM search_node_projections "
-                f"WHERE generation_id = '{generation_id}';",
-            )
-        )
-        active_generation = int(
+        existing_nodes = int(_psql(root, "SELECT count(*) FROM domain_nodes;"))
+        existing_edges = int(_psql(root, "SELECT count(*) FROM domain_edges;"))
+        generation_id = str(config["semantic_search"]["generation_id"])
+        existing_generation = int(
             _psql(
                 root,
                 "SELECT count(*) FROM search_index_generations "
-                f"WHERE generation_id = '{generation_id}' AND state = 'active';",
+                f"WHERE generation_id = '{generation_id}';",
             )
         )
-        pending_jobs = int(
-            _psql(
+        receipt_path = root / "receipts/t048-fixture.json"
+
+        def emit_receipt() -> dict[str, Any]:
+            observed_nodes = int(_psql(root, "SELECT count(*) FROM domain_nodes;"))
+            observed_edges = int(_psql(root, "SELECT count(*) FROM domain_edges;"))
+            public_nodes = int(
+                _psql(
+                    root,
+                    "SELECT count(*) FROM domain_nodes WHERE search_visibility='public';",
+                )
+            )
+            observed_projections = int(
+                _psql(
+                    root,
+                    "SELECT count(*) FROM search_node_projections "
+                    f"WHERE generation_id = '{generation_id}';",
+                )
+            )
+            active_generation = int(
+                _psql(
+                    root,
+                    "SELECT count(*) FROM search_index_generations "
+                    f"WHERE generation_id = '{generation_id}' AND state = 'active';",
+                )
+            )
+            pending_jobs = int(
+                _psql(
+                    root,
+                    "SELECT count(*) FROM search_projection_jobs "
+                    f"WHERE generation_id = '{generation_id}' AND state <> 'done';",
+                )
+            )
+            if (
+                observed_nodes != node_count
+                or observed_edges != edge_count
+                or public_nodes < 1
+                or observed_projections != node_count
+                or active_generation != 1
+                or pending_jobs != 0
+            ):
+                raise RuntimeErrorEB(
+                    "T048 fixture/search projection counts do not match the canonical manifest"
+                )
+            live_binding = _t048_live_fixture_binding(root, manifest, generation_id)
+            _require_same_kubernetes_target(
                 root,
-                "SELECT count(*) FROM search_projection_jobs "
-                f"WHERE generation_id = '{generation_id}' AND state <> 'done';",
+                source_commit,
+                fixture_target,
+                "T048 fixture success receipt",
             )
-        )
+            receipt = {
+                "schema_version": 1,
+                "status": "loaded",
+                "source_commit": source_commit,
+                "kubernetes_target_sha256": _stable_json_sha256(fixture_target),
+                "profile": profile,
+                "manifest": str(manifest),
+                "manifest_sha256": binding["manifest_sha256"],
+                "nodes": observed_nodes,
+                "edges": observed_edges,
+                "public_semantic_nodes": public_nodes,
+                "search_projections": observed_projections,
+                "generation_id": generation_id,
+                "generation_state": "active",
+                "projection_mode": "synthetic-canonical-t048",
+                "pending_projection_jobs": pending_jobs,
+                "live_binding": live_binding,
+                "production_data_used": False,
+            }
+            atomic_json(receipt_path, receipt)
+            return receipt
+
         if (
-            observed_nodes != node_count
-            or observed_edges != edge_count
-            or public_nodes < 1
-            or observed_projections != node_count
-            or active_generation != 1
-            or pending_jobs != 0
+            existing_nodes == node_count
+            and existing_edges == edge_count
+            and existing_generation == 1
+            and not receipt_path.is_file()
         ):
+            return emit_receipt()
+        if existing_nodes or existing_edges:
             raise RuntimeErrorEB(
-                "T048 fixture/search projection counts do not match the canonical manifest"
+                "target database is not empty enough for a fresh T048 fixture load"
             )
-        live_binding = _t048_live_fixture_binding(root, manifest, generation_id)
-        receipt = {
-            "schema_version": 1,
-            "status": "loaded",
-            "source_commit": source_commit,
-            "profile": profile,
-            "manifest": str(manifest),
-            "manifest_sha256": binding["manifest_sha256"],
-            "nodes": observed_nodes,
-            "edges": observed_edges,
-            "public_semantic_nodes": public_nodes,
-            "search_projections": observed_projections,
-            "generation_id": generation_id,
-            "generation_state": "active",
-            "projection_mode": "synthetic-canonical-t048",
-            "pending_projection_jobs": pending_jobs,
-            "live_binding": live_binding,
-            "production_data_used": False,
-        }
-        atomic_json(receipt_path, receipt)
-        return receipt
 
-    if (
-        existing_nodes == node_count
-        and existing_edges == edge_count
-        and existing_generation == 1
-        and not receipt_path.is_file()
-    ):
-        return emit_receipt()
-    if existing_nodes or existing_edges:
-        raise RuntimeErrorEB(
-            "target database is not empty enough for a fresh T048 fixture load"
+        load_sql = evidence_dir / "load.sql"
+        run(
+            [
+                sys.executable, "-B", str(DOMAIN_SCALE), "render-load",
+                "--manifest", str(manifest),
+                "--output", str(load_sql),
+            ]
+        )
+        files = binding["files"]
+        nodes_csv = fixture / str(files["nodes"]["name"])
+        edges_csv = fixture / str(files["edges"]["name"])
+        streamed = evidence_dir / "kubernetes-load.sql"
+        _write_streamed_fixture_sql(load_sql, nodes_csv, edges_csv, streamed)
+        kubectl = toolchain(root)["tools"]["kubectl"]
+        _run_input_file(
+            [
+                kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
+                "deployment/postgres", "--",
+                "psql", "-U", "commonthing", "-d", "commonthing",
+                "-v", "ON_ERROR_STOP=1",
+            ],
+            streamed,
+            env=kube_env(root),
+            timeout=1800,
         )
 
-    load_sql = evidence_dir / "load.sql"
-    run(
-        [
-            sys.executable, "-B", str(DOMAIN_SCALE), "render-load",
-            "--manifest", str(manifest),
-            "--output", str(load_sql),
-        ]
-    )
-    files = binding["files"]
-    nodes_csv = fixture / str(files["nodes"]["name"])
-    edges_csv = fixture / str(files["edges"]["name"])
-    streamed = evidence_dir / "kubernetes-load.sql"
-    _write_streamed_fixture_sql(load_sql, nodes_csv, edges_csv, streamed)
-    kubectl = toolchain(root)["tools"]["kubectl"]
-    _run_input_file(
-        [
-            kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
-            "deployment/postgres", "--",
-            "psql", "-U", "commonthing", "-d", "commonthing",
-            "-v", "ON_ERROR_STOP=1",
-        ],
-        streamed,
-        env=kube_env(root),
-        timeout=1800,
-    )
-
-    semantic = config["semantic_search"]
-    seed_sql = f"""
-BEGIN;
-SELECT pg_advisory_xact_lock(
-    hashtextextended('weltgewebe.search.generation.activation', 0)
-);
-DO $$
-DECLARE
-    generation_count BIGINT;
-BEGIN
-    IF EXISTS (SELECT 1 FROM domain_nodes)
-       OR EXISTS (SELECT 1 FROM domain_edges) THEN
-        RAISE EXCEPTION 'Experiment-B T048 target domain changed before seed lock';
-    END IF;
-    IF EXISTS (SELECT 1 FROM search_node_versions)
-       OR EXISTS (SELECT 1 FROM search_projection_jobs)
-       OR EXISTS (SELECT 1 FROM search_node_projections) THEN
-        RAISE EXCEPTION 'Experiment-B T048 search ledger is not empty before fresh seed';
-    END IF;
-    SELECT count(*) INTO generation_count FROM search_index_generations;
-    IF generation_count > 1 THEN
-        RAISE EXCEPTION 'Experiment-B T048 has unexpected pre-seed generations';
-    END IF;
-    IF generation_count = 1 THEN
-        IF NOT EXISTS (
-            SELECT 1
-              FROM search_index_generations
-             WHERE generation_id = '{semantic["generation_id"]}'
-               AND provider = '{semantic["provider"]}'
-               AND model_id = '{semantic["model_id"]}'
-               AND model_revision = '{semantic["model_revision"]}'
-               AND runtime_identity = '{semantic["runtime_identity"]}'
-               AND dimension = {int(semantic["dimension"])}
-               AND document_revision = '{T048_DOCUMENT_REVISION}'
-               AND normalization_revision = '{T048_NORMALIZATION_REVISION}'
-               AND ranking_revision = '{T048_RANKING_REVISION}'
-               AND state = 'building'
-               AND expected_nodes = 0
-               AND completed_nodes = 0
-               AND activated_at IS NULL
-        ) THEN
-            RAISE EXCEPTION 'Experiment-B T048 pre-seed generation is not the empty worker generation';
+        semantic = config["semantic_search"]
+        seed_sql = f"""
+    BEGIN;
+    SELECT pg_advisory_xact_lock(
+        hashtextextended('weltgewebe.search.generation.activation', 0)
+    );
+    DO $$
+    DECLARE
+        generation_count BIGINT;
+    BEGIN
+        IF EXISTS (SELECT 1 FROM domain_nodes)
+           OR EXISTS (SELECT 1 FROM domain_edges) THEN
+            RAISE EXCEPTION 'Experiment-B T048 target domain changed before seed lock';
         END IF;
-        DELETE FROM search_index_generations
-         WHERE generation_id = '{semantic["generation_id"]}';
-    END IF;
-END
-$$;
-INSERT INTO search_index_generations (
-    generation_id, provider, model_id, model_revision, runtime_identity,
-    dimension, document_revision, normalization_revision, ranking_revision,
-    state, expected_nodes
-) VALUES (
-    '{semantic["generation_id"]}',
-    '{semantic["provider"]}',
-    '{semantic["model_id"]}',
-    '{semantic["model_revision"]}',
-    '{semantic["runtime_identity"]}',
-    {int(semantic["dimension"])},
-    '{T048_DOCUMENT_REVISION}',
-    '{T048_NORMALIZATION_REVISION}',
-    '{T048_RANKING_REVISION}',
-    'building',
-    (SELECT count(*) FROM weltgewebe_perf.domain_nodes)
-);
-
-INSERT INTO domain_nodes (
-    id, kind, title, lat, lon, created_at, updated_at, payload, search_visibility
-)
-SELECT id, kind, title, lat, lon, created_at, updated_at, payload,
-       CASE WHEN kind = 'Projekt' THEN 'public' ELSE 'hidden' END
-  FROM weltgewebe_perf.domain_nodes
- ORDER BY id;
-
-INSERT INTO domain_edges (id, source_id, target_id, edge_kind, created_at, payload)
-SELECT id, source_id, target_id, edge_kind, created_at, payload
-  FROM weltgewebe_perf.domain_edges
- ORDER BY id;
-
-INSERT INTO search_node_projections (
-    generation_id, node_id, source_version, source_revision, content_sha256,
-    title, tags, searchable_text, language, kind, status, visibility_scopes,
-    semantic_state, embedding
-)
-SELECT
-    g.generation_id,
-    n.id,
-    v.source_version,
-    v.source_revision,
-    CASE
-        WHEN n.search_visibility = 'public' THEN '{T048_PUBLIC_CONTENT_SHA256}'
-        ELSE '{T048_HIDDEN_CONTENT_SHA256}'
-    END,
-    CASE WHEN n.search_visibility = 'public' THEN n.title ELSE '[nicht öffentlich]' END,
-    CASE
-        WHEN n.search_visibility = 'public'
-        THEN ARRAY(SELECT jsonb_array_elements_text(n.payload -> 'tags'))
-        ELSE '{{}}'::TEXT[]
-    END,
-    CASE
-        WHEN n.search_visibility = 'public'
-        THEN coalesce(n.payload ->> 'summary', n.title)
-        ELSE '[nicht öffentlich]'
-    END,
-    CASE WHEN n.search_visibility = 'public' THEN 'de' ELSE 'und' END,
-    CASE WHEN n.search_visibility = 'public' THEN n.kind ELSE '[nicht öffentlich]' END,
-    CASE WHEN n.search_visibility = 'public' THEN 'active' ELSE 'hidden' END,
-    CASE
-        WHEN n.search_visibility = 'public' THEN ARRAY['public']::TEXT[]
-        ELSE '{{}}'::TEXT[]
-    END,
-    CASE WHEN n.search_visibility = 'public' THEN 'ready' ELSE 'unavailable' END,
-    CASE
-        WHEN n.search_visibility = 'public'
-        THEN array_fill(0.0::DOUBLE PRECISION, ARRAY[g.dimension])
-        ELSE NULL
+        IF EXISTS (SELECT 1 FROM search_node_versions)
+           OR EXISTS (SELECT 1 FROM search_projection_jobs)
+           OR EXISTS (SELECT 1 FROM search_node_projections) THEN
+            RAISE EXCEPTION 'Experiment-B T048 search ledger is not empty before fresh seed';
+        END IF;
+        SELECT count(*) INTO generation_count FROM search_index_generations;
+        IF generation_count > 1 THEN
+            RAISE EXCEPTION 'Experiment-B T048 has unexpected pre-seed generations';
+        END IF;
+        IF generation_count = 1 THEN
+            IF NOT EXISTS (
+                SELECT 1
+                  FROM search_index_generations
+                 WHERE generation_id = '{semantic["generation_id"]}'
+                   AND provider = '{semantic["provider"]}'
+                   AND model_id = '{semantic["model_id"]}'
+                   AND model_revision = '{semantic["model_revision"]}'
+                   AND runtime_identity = '{semantic["runtime_identity"]}'
+                   AND dimension = {int(semantic["dimension"])}
+                   AND document_revision = '{T048_DOCUMENT_REVISION}'
+                   AND normalization_revision = '{T048_NORMALIZATION_REVISION}'
+                   AND ranking_revision = '{T048_RANKING_REVISION}'
+                   AND state = 'building'
+                   AND expected_nodes = 0
+                   AND completed_nodes = 0
+                   AND activated_at IS NULL
+            ) THEN
+                RAISE EXCEPTION 'Experiment-B T048 pre-seed generation is not the empty worker generation';
+            END IF;
+            DELETE FROM search_index_generations
+             WHERE generation_id = '{semantic["generation_id"]}';
+        END IF;
     END
-  FROM domain_nodes n
-  JOIN search_node_versions v ON v.node_id = n.id
-  CROSS JOIN search_index_generations g
- WHERE g.state = 'building'
- ORDER BY n.id;
+    $$;
+    INSERT INTO search_index_generations (
+        generation_id, provider, model_id, model_revision, runtime_identity,
+        dimension, document_revision, normalization_revision, ranking_revision,
+        state, expected_nodes
+    ) VALUES (
+        '{semantic["generation_id"]}',
+        '{semantic["provider"]}',
+        '{semantic["model_id"]}',
+        '{semantic["model_revision"]}',
+        '{semantic["runtime_identity"]}',
+        {int(semantic["dimension"])},
+        '{T048_DOCUMENT_REVISION}',
+        '{T048_NORMALIZATION_REVISION}',
+        '{T048_RANKING_REVISION}',
+        'building',
+        (SELECT count(*) FROM weltgewebe_perf.domain_nodes)
+    );
 
-UPDATE search_projection_jobs
-   SET state = 'done', completed_at = clock_timestamp()
- WHERE generation_id = '{semantic["generation_id"]}';
+    INSERT INTO domain_nodes (
+        id, kind, title, lat, lon, created_at, updated_at, payload, search_visibility
+    )
+    SELECT id, kind, title, lat, lon, created_at, updated_at, payload,
+           CASE WHEN kind = 'Projekt' THEN 'public' ELSE 'hidden' END
+      FROM weltgewebe_perf.domain_nodes
+     ORDER BY id;
 
-UPDATE search_index_generations
-   SET expected_nodes = (SELECT count(*) FROM domain_nodes),
-       completed_nodes = (
-           SELECT count(*) FROM search_node_versions WHERE deleted_at IS NULL
-       )
- WHERE generation_id = '{semantic["generation_id"]}';
+    INSERT INTO domain_edges (id, source_id, target_id, edge_kind, created_at, payload)
+    SELECT id, source_id, target_id, edge_kind, created_at, payload
+      FROM weltgewebe_perf.domain_edges
+     ORDER BY id;
 
-DO $$
-BEGIN
-    IF NOT weltgewebe_search_generation_activation_ready(
-        '{semantic["generation_id"]}'
-    ) THEN
-        RAISE EXCEPTION 'Experiment-B T048 search generation is not activation-ready';
-    END IF;
-END
-$$;
-SELECT weltgewebe_activate_search_generation('{semantic["generation_id"]}');
-COMMIT;
-"""
-    _psql(root, seed_sql, tuples_only=False)
-    return emit_receipt()
+    INSERT INTO search_node_projections (
+        generation_id, node_id, source_version, source_revision, content_sha256,
+        title, tags, searchable_text, language, kind, status, visibility_scopes,
+        semantic_state, embedding
+    )
+    SELECT
+        g.generation_id,
+        n.id,
+        v.source_version,
+        v.source_revision,
+        CASE
+            WHEN n.search_visibility = 'public' THEN '{T048_PUBLIC_CONTENT_SHA256}'
+            ELSE '{T048_HIDDEN_CONTENT_SHA256}'
+        END,
+        CASE WHEN n.search_visibility = 'public' THEN n.title ELSE '[nicht öffentlich]' END,
+        CASE
+            WHEN n.search_visibility = 'public'
+            THEN ARRAY(SELECT jsonb_array_elements_text(n.payload -> 'tags'))
+            ELSE '{{}}'::TEXT[]
+        END,
+        CASE
+            WHEN n.search_visibility = 'public'
+            THEN coalesce(n.payload ->> 'summary', n.title)
+            ELSE '[nicht öffentlich]'
+        END,
+        CASE WHEN n.search_visibility = 'public' THEN 'de' ELSE 'und' END,
+        CASE WHEN n.search_visibility = 'public' THEN n.kind ELSE '[nicht öffentlich]' END,
+        CASE WHEN n.search_visibility = 'public' THEN 'active' ELSE 'hidden' END,
+        CASE
+            WHEN n.search_visibility = 'public' THEN ARRAY['public']::TEXT[]
+            ELSE '{{}}'::TEXT[]
+        END,
+        CASE WHEN n.search_visibility = 'public' THEN 'ready' ELSE 'unavailable' END,
+        CASE
+            WHEN n.search_visibility = 'public'
+            THEN array_fill(0.0::DOUBLE PRECISION, ARRAY[g.dimension])
+            ELSE NULL
+        END
+      FROM domain_nodes n
+      JOIN search_node_versions v ON v.node_id = n.id
+      CROSS JOIN search_index_generations g
+     WHERE g.state = 'building'
+     ORDER BY n.id;
+
+    UPDATE search_projection_jobs
+       SET state = 'done', completed_at = clock_timestamp()
+     WHERE generation_id = '{semantic["generation_id"]}';
+
+    UPDATE search_index_generations
+       SET expected_nodes = (SELECT count(*) FROM domain_nodes),
+           completed_nodes = (
+               SELECT count(*) FROM search_node_versions WHERE deleted_at IS NULL
+           )
+     WHERE generation_id = '{semantic["generation_id"]}';
+
+    DO $$
+    BEGIN
+        IF NOT weltgewebe_search_generation_activation_ready(
+            '{semantic["generation_id"]}'
+        ) THEN
+            RAISE EXCEPTION 'Experiment-B T048 search generation is not activation-ready';
+        END IF;
+    END
+    $$;
+    SELECT weltgewebe_activate_search_generation('{semantic["generation_id"]}');
+    COMMIT;
+    """
+        _psql(root, seed_sql, tuples_only=False)
+        return emit_receipt()
 
 
 def _k6_image_binding() -> tuple[str, str]:

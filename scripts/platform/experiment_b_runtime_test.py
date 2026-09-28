@@ -3890,6 +3890,20 @@ spec:
                     "_require_kubernetes_target_binding",
                     return_value=({}, "192.168.122.10", "https://192.168.122.10:6443"),
                 ),
+                mock.patch.object(
+                    runtime,
+                    "_kubernetes_target_identity",
+                    return_value={
+                        "vm_ip": "192.168.122.10",
+                        "kubeconfig_sha256": "a" * 64,
+                        "server": "https://192.168.122.10:6443",
+                    },
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_bound_kube_env",
+                    return_value=mock.MagicMock(),
+                ),
                 mock.patch.object(runtime, "_psql", side_effect=psql_values),
                 mock.patch.object(
                     runtime,
@@ -4124,6 +4138,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.patch("load_config", return_value=self.config)
         self.main = self.patch("_current_protected_main_commit", return_value=self.commit)
         expected = vm_substrate_fixture()
+        self.domain_uuid = expected["uuid"]
         self.pool_uuid = expected["pool_uuid"]
         self.xml = {
             "live": f"""<domain type='kvm' id='7'>
@@ -4890,10 +4905,20 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                     output = "running\n" if self.domain_active else "shut off\n"
                 else:
                     code = 1
+            elif command == "domuuid":
+                if self.domain_present:
+                    output = f"{self.domain_uuid}\n"
+                else:
+                    code = 1
             elif command == "list":
                 output = f"{runtime.VM_NAME}\n" if self.domain_present else ""
             elif command == "pool-info":
                 code = 0 if self.pool_present else 1
+            elif command == "pool-uuid":
+                if self.pool_present:
+                    output = f"{self.pool_uuid}\n"
+                else:
+                    code = 1
             elif command == "pool-list":
                 output = f"{runtime.POOL_NAME}\n" if self.pool_present else ""
             elif command == "vol-list":
@@ -8126,6 +8151,64 @@ spec:
                 self.assertFalse((self.root / "receipts/vm-create.json").exists())
                 self.assertFalse(list(self.root.glob(".vm-substrate-*")))
 
+    def test_teardown_resumes_exact_partial_retirement(self) -> None:
+        retirement = self.root.with_name(
+            self.root.name + "-resume-retirement.json"
+        )
+        attempt = retirement.with_name(
+            f"{retirement.stem}-attempt{retirement.suffix}"
+        )
+        self.addCleanup(retirement.unlink, missing_ok=True)
+        self.addCleanup(attempt.unlink, missing_ok=True)
+        self.write_vm_receipt()
+        original = self.run_fixture
+
+        def fail_base_volume_cleanup(argv, **kwargs):
+            if (
+                argv[:3] == ["virsh", "-c", runtime.LIBVIRT_URI]
+                and argv[3] == "vol-delete"
+                and argv[4] == runtime.BASE_VOLUME
+            ):
+                return runtime.subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    stdout="",
+                    stderr="persistent base-volume failure",
+                )
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch.object(runtime, "RETIREMENT_RECEIPT", retirement),
+            mock.patch.object(runtime.time, "sleep"),
+        ):
+            self.runner.side_effect = fail_base_volume_cleanup
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "could not remove libvirt volume",
+            ):
+                runtime.teardown(self.root)
+            self.assertTrue(attempt.is_file())
+            self.assertFalse(self.domain_present)
+            self.assertTrue(self.pool_present)
+            self.assertFalse(self.disk.exists())
+            self.assertTrue(self.base.exists())
+
+            payload = json.loads(attempt.read_text(encoding="utf-8"))
+            self.assertEqual(payload["operation"], "teardown")
+            self.assertEqual(payload["domain_target"], self.domain_uuid)
+            self.assertEqual(payload["pool_target"], self.pool_uuid)
+
+            self.runner.side_effect = original
+            result = runtime.teardown(self.root)
+
+        self.assertEqual(result["status"], "retired")
+        self.assertFalse(self.domain_present)
+        self.assertFalse(self.pool_present)
+        self.assertFalse(self.root.exists())
+        self.assertFalse(attempt.exists())
+        self.assertTrue(retirement.is_file())
+
+
 
 class ExperimentBLatestP1RegressionTests(unittest.TestCase):
     def test_bound_kube_env_freezes_verified_target(self) -> None:
@@ -8165,7 +8248,9 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                 self.assertNotEqual(snapshot, source)
                 self.assertEqual(runtime.sha256_file(snapshot), expected["kubeconfig_sha256"])
                 self.assertEqual(runtime._kubeconfig_server(snapshot), expected["server"])
+                self.assertEqual(runtime.kube_env(root)["KUBECONFIG"], str(snapshot))
                 source.write_text("drifted", encoding="utf-8")
+                self.assertEqual(runtime.kube_env(root)["KUBECONFIG"], str(snapshot))
                 self.assertEqual(runtime.sha256_file(snapshot), expected["kubeconfig_sha256"])
             self.assertFalse(snapshot.exists())
 
@@ -8195,6 +8280,29 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
             7,
         )
         self.assertIn('"kubernetes_target_sha256"', source)
+
+    def test_all_mutating_workflows_freeze_target_and_revalidate_success(self) -> None:
+        for function, target_name in (
+            (runtime.inject_secrets, "secrets_target"),
+            (runtime.apply_release, "release_target"),
+            (runtime.semantic_activate, "semantic_target"),
+            (runtime.seed_t048_fixture, "fixture_target"),
+        ):
+            source = inspect.getsource(function)
+            with self.subTest(function=function.__name__):
+                capture = source.index(
+                    f"{target_name} = _kubernetes_target_identity"
+                )
+                snapshot = source.index(
+                    f"with _bound_kube_env(root, {target_name})"
+                )
+                final = source.rindex("_require_same_kubernetes_target")
+                self.assertLess(capture, snapshot)
+                self.assertLess(snapshot, final)
+                self.assertIn(
+                    f"_stable_json_sha256({target_name})",
+                    source,
+                )
 
     def test_same_kubernetes_target_rejects_identity_drift(self) -> None:
         expected = {
