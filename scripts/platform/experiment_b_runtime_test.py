@@ -8304,6 +8304,84 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                     source,
                 )
 
+    def test_controller_pod_contract_rejects_ephemeral_debug_containers(self) -> None:
+        digest = "sha256:" + "a" * 64
+        image = "example.invalid/controller@" + digest
+        expected_images = {
+            "containers": {"manager": image},
+            "init_containers": {},
+        }
+        pod = {
+            "metadata": {
+                "name": "controller-0",
+                "namespace": "kube-system",
+                "labels": {"k8s-app": "controller"},
+            },
+            "spec": {
+                "containers": [{"name": "manager", "image": image}],
+                "initContainers": [],
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [
+                    {
+                        "name": "manager",
+                        "ready": True,
+                        "state": {"running": {"startedAt": "2026-09-28T00:00:00Z"}},
+                        "imageID": "containerd://" + digest,
+                    }
+                ],
+                "initContainerStatuses": [],
+            },
+        }
+
+        def validate(candidate: dict) -> dict:
+            return runtime._require_running_pod_image_contract(
+                [candidate],
+                namespace="kube-system",
+                workload="controller",
+                expected_replicas=1,
+                expected_images=expected_images,
+                required_labels={"k8s-app": "controller"},
+                context="controller Pod",
+            )
+
+        self.assertTrue(validate(pod)["images_canonical"])
+
+        debugged_spec = json.loads(json.dumps(pod))
+        debugged_spec["spec"]["ephemeralContainers"] = [
+            {
+                "name": "debugger",
+                "image": "example.invalid/debug@sha256:" + "d" * 64,
+                "command": ["sh"],
+            }
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "ephemeral containers are forbidden",
+        ):
+            validate(debugged_spec)
+
+        debugged_status = json.loads(json.dumps(pod))
+        debugged_status["status"]["ephemeralContainerStatuses"] = [
+            {"name": "debugger"}
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "ephemeral container statuses are forbidden",
+        ):
+            validate(debugged_status)
+
+        for function in (
+            runtime._require_live_cilium_contract,
+            runtime._require_live_flux_controller_contract,
+        ):
+            self.assertIn(
+                "_require_running_pod_image_contract",
+                inspect.getsource(function),
+            )
+
     def test_same_kubernetes_target_rejects_identity_drift(self) -> None:
         expected = {
             "vm_ip": "192.168.122.10",

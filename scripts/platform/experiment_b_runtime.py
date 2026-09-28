@@ -3926,6 +3926,17 @@ def _require_running_pod_image_contract(
             or not isinstance(status_obj, dict)
         ):
             raise RuntimeErrorEB(f"{context} inventory is invalid: {workload}")
+        ephemeral_statuses = status_obj.get("ephemeralContainerStatuses", [])
+        if not isinstance(ephemeral_statuses, list):
+            raise RuntimeErrorEB(
+                f"{context} ephemeral container status inventory is invalid: "
+                f"{workload}"
+            )
+        if ephemeral_statuses:
+            raise RuntimeErrorEB(
+                f"{context} ephemeral container statuses are forbidden: "
+                f"{workload}"
+            )
         name = metadata.get("name")
         labels = metadata.get("labels", {})
         if (
@@ -4508,6 +4519,13 @@ def _final_recovery_state_readback(
 def _pod_spec_images(pod_spec: Any, context: str) -> dict[str, dict[str, str]]:
     if not isinstance(pod_spec, dict):
         raise RuntimeErrorEB(f"{context} pod spec is invalid")
+    ephemeral_containers = pod_spec.get("ephemeralContainers", [])
+    if not isinstance(ephemeral_containers, list):
+        raise RuntimeErrorEB(
+            f"{context} ephemeral container inventory is invalid"
+        )
+    if ephemeral_containers:
+        raise RuntimeErrorEB(f"{context} ephemeral containers are forbidden")
     result: dict[str, dict[str, str]] = {}
     for field, output_key in (
         ("containers", "containers"),
