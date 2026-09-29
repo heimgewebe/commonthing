@@ -548,6 +548,13 @@ spec:
             create_vm.index("_invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)"),
             create_vm.index("POOL_TARGET.mkdir"),
         )
+        self.assertLess(
+            create_vm.index("_libvirt_volume_sha256(root, BASE_VOLUME)"),
+            create_vm.index('"virt-install"'),
+        )
+        self.assertIn(
+            "uploaded cloud image digest drifted before VM boot", create_vm
+        )
 
         install_k3s = inspect.getsource(runtime.install_k3s)
         self.assertLess(
@@ -742,6 +749,27 @@ spec:
         self.assertIn("pass_fds=(source_fd,)", helper_source)
         self.assertIn('f"/proc/self/fd/{source_fd}"', helper_source)
 
+        self.assertNotIn(
+            'scp_to(root, ip, CLUSTER / "k3s-config.yaml"', source
+        )
+        self.assertNotIn(
+            'scp_to(root, ip, CLUSTER / "k3s.service"', source
+        )
+        self.assertIn("_git_blob_sha256(source_commit, config_path)", source)
+        self.assertIn("_git_blob_sha256(source_commit, service_path)", source)
+        self.assertLess(
+            source.index("staged_digests = _parse_sha256sum_output("),
+            source.index("install_command = ("),
+        )
+        self.assertLess(
+            source.index("installed_digests = _parse_sha256sum_output("),
+            source.index("service_command = ("),
+        )
+        self.assertLess(
+            source.index("installed k3s files drifted before service restart"),
+            source.index("sudo systemctl restart k3s"),
+        )
+
     def test_open_verified_k3s_binary_binds_the_opened_inode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "k3s"
@@ -770,6 +798,24 @@ spec:
                 "missing or unsafe",
             ):
                 runtime._open_verified_k3s_binary(path, expected)
+
+    def test_git_blob_sha256_binds_k3s_sources_to_exact_commit(self) -> None:
+        head = runtime.git_head()
+        config = runtime.load_config()
+        config_path, service_path = runtime._k3s_contract_paths(config)
+        self.assertEqual(
+            runtime._git_blob_sha256(head, config_path),
+            runtime.sha256_file(config_path),
+        )
+        self.assertEqual(
+            runtime._git_blob_sha256(head, service_path),
+            runtime.sha256_file(service_path),
+        )
+
+        source = inspect.getsource(runtime._k3s_contract_paths)
+        self.assertIn("config_path.is_symlink()", source)
+        self.assertIn("service_path.is_symlink()", source)
+        self.assertNotIn(".resolve()", source)
 
     def test_install_k3s_rejects_vm_substrate_drift_before_ssh(self) -> None:
         commit = "a" * 40
@@ -812,6 +858,10 @@ spec:
         self.assertIn("sudo systemctl enable k3s && ", source)
         self.assertIn("sudo systemctl restart k3s", source)
         self.assertNotIn("sudo systemctl enable --now k3s", source)
+        self.assertLess(
+            source.index("installed_digests = _parse_sha256sum_output("),
+            source.index("sudo systemctl restart k3s"),
+        )
         self.assertIn("kubectl get nodes -o json", source)
         self.assertIn("_require_exact_k3s_node_inventory(", source)
 

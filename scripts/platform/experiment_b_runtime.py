@@ -131,6 +131,29 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _git_blob_sha256(source_commit: str, path: Path) -> str:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB("Git blob binding requires an exact source commit")
+    try:
+        relative = path.relative_to(ROOT)
+    except ValueError as exc:
+        raise RuntimeErrorEB("Git blob binding path escapes the repository") from exc
+    try:
+        result = subprocess.run(
+            ["git", "cat-file", "blob", f"{source_commit}:{relative.as_posix()}"],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeErrorEB("Git blob binding timed out") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeErrorEB(f"Git blob binding failed: {stderr[-1000:]}")
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
 def state_root(value: str | None) -> Path:
     root = (Path(value).expanduser() if value else DEFAULT_STATE_ROOT).resolve()
     allowed_root = DEFAULT_STATE_ROOT.resolve()
@@ -512,6 +535,16 @@ def _libvirt_xml(*arguments: str) -> ET.Element:
     return ET.fromstring(run(["virsh", "-c", LIBVIRT_URI, *arguments]).stdout)
 
 
+def _libvirt_volume_sha256(root: Path, volume_name: str) -> str:
+    with tempfile.TemporaryDirectory(dir=root, prefix=".vm-substrate-") as tmp:
+        downloaded = Path(tmp) / volume_name
+        run([
+            "virsh", "-c", LIBVIRT_URI, "vol-download", volume_name,
+            str(downloaded), "--pool", POOL_NAME, "--sparse",
+        ])
+        return sha256_file(downloaded)
+
+
 def _xml_bytes(element: ET.Element) -> int:
     units = {"bytes": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
     return int(element.text or "0") * units[element.get("unit", "KiB")]
@@ -663,13 +696,7 @@ def _live_vm_substrate(root: Path, config: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeErrorEB("VM substrate QEMU capacity/backing relation drifted")
         # Hash the uploaded base volume itself through libvirt, not the download
         # cache or the guest's mutable overlay; volume permissions stay unchanged.
-        with tempfile.TemporaryDirectory(dir=root, prefix=".vm-substrate-") as tmp:
-            downloaded_base = Path(tmp) / BASE_VOLUME
-            run([
-                "virsh", "-c", LIBVIRT_URI, "vol-download", BASE_VOLUME,
-                str(downloaded_base), "--pool", POOL_NAME, "--sparse",
-            ])
-            base_sha256 = sha256_file(downloaded_base)
+        base_sha256 = _libvirt_volume_sha256(root, BASE_VOLUME)
         disk_stat = (POOL_TARGET / VOLUME_NAME).stat()
         substrate.update({
             "network_uuid": network.findtext("uuid"),
@@ -935,6 +962,13 @@ def create_vm(root: Path) -> dict[str, Any]:
             ],
             timeout=300,
         )
+        if (
+            _libvirt_volume_sha256(root, BASE_VOLUME)
+            != str(config["vm"]["image"]["sha256"])
+        ):
+            raise RuntimeErrorEB(
+                "uploaded cloud image digest drifted before VM boot"
+            )
         run(["virsh", "-c", LIBVIRT_URI, "pool-refresh", POOL_NAME])
         run(
             [
@@ -1097,19 +1131,21 @@ def scp_fd_to(
         )
 
 
-def _open_verified_k3s_binary(path: Path, expected_sha256: str) -> int:
+def _open_verified_file(
+    path: Path, expected_sha256: str, context: str
+) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     cloexec = getattr(os, "O_CLOEXEC", None)
     if not isinstance(nofollow, int) or not isinstance(cloexec, int):
-        raise RuntimeErrorEB("prepared k3s binary cannot be opened safely")
+        raise RuntimeErrorEB(f"{context} cannot be opened safely")
     try:
         file_fd = os.open(path, os.O_RDONLY | cloexec | nofollow)
     except OSError as exc:
-        raise RuntimeErrorEB("prepared k3s binary is missing or unsafe") from exc
+        raise RuntimeErrorEB(f"{context} is missing or unsafe") from exc
     try:
         metadata = os.fstat(file_fd)
         if not stat.S_ISREG(metadata.st_mode):
-            raise RuntimeErrorEB("prepared k3s binary is not a regular file")
+            raise RuntimeErrorEB(f"{context} is not a regular file")
         digest = hashlib.sha256()
         while True:
             chunk = os.read(file_fd, 1024 * 1024)
@@ -1118,13 +1154,19 @@ def _open_verified_k3s_binary(path: Path, expected_sha256: str) -> int:
             digest.update(chunk)
         if digest.hexdigest() != expected_sha256:
             raise RuntimeErrorEB(
-                "prepared k3s binary digest does not match current config"
+                f"{context} digest does not match expected source"
             )
         os.lseek(file_fd, 0, os.SEEK_SET)
     except Exception:
         os.close(file_fd)
         raise
     return file_fd
+
+
+def _open_verified_k3s_binary(path: Path, expected_sha256: str) -> int:
+    return _open_verified_file(
+        path, expected_sha256, "prepared k3s binary"
+    )
 
 
 def _k3s_contract_paths(config: dict[str, Any]) -> tuple[Path, Path]:
@@ -1135,13 +1177,15 @@ def _k3s_contract_paths(config: dict[str, Any]) -> tuple[Path, Path]:
     service_value = binding.get("k3s_service")
     if not isinstance(config_value, str) or not isinstance(service_value, str):
         raise RuntimeErrorEB("Experiment-B k3s file binding is invalid")
-    config_path = (ROOT / config_value).resolve()
-    service_path = (ROOT / service_value).resolve()
+    config_path = ROOT / config_value
+    service_path = ROOT / service_value
     if (
-        config_path != (CLUSTER / "k3s-config.yaml").resolve()
-        or service_path != (CLUSTER / "k3s.service").resolve()
+        config_path != CLUSTER / "k3s-config.yaml"
+        or service_path != CLUSTER / "k3s.service"
         or not config_path.is_file()
         or not service_path.is_file()
+        or config_path.is_symlink()
+        or service_path.is_symlink()
     ):
         raise RuntimeErrorEB("Experiment-B k3s file binding drifted")
     return config_path, service_path
@@ -1483,21 +1527,81 @@ def install_k3s(root: Path) -> dict[str, Any]:
     expected_k3s_sha256 = str(config["kubernetes"]["binary_sha256"])
     k3s_fd = _open_verified_k3s_binary(k3s_binary, expected_k3s_sha256)
     try:
+        config_path, service_path = _k3s_contract_paths(config)
+        expected_config_sha256 = _git_blob_sha256(source_commit, config_path)
+        expected_service_sha256 = _git_blob_sha256(source_commit, service_path)
         scp_fd_to(root, ip, k3s_fd, "/tmp/k3s")
     finally:
         os.close(k3s_fd)
-    scp_to(root, ip, CLUSTER / "k3s-config.yaml", "/tmp/config.yaml")
-    scp_to(root, ip, CLUSTER / "k3s.service", "/tmp/k3s.service")
-    command = (
+
+    for source, expected_sha256, context, destination in (
+        (
+            config_path,
+            expected_config_sha256,
+            "k3s config source",
+            "/tmp/config.yaml",
+        ),
+        (
+            service_path,
+            expected_service_sha256,
+            "k3s service source",
+            "/tmp/k3s.service",
+        ),
+    ):
+        source_fd = _open_verified_file(source, expected_sha256, context)
+        try:
+            scp_fd_to(root, ip, source_fd, destination)
+        finally:
+            os.close(source_fd)
+
+    staged_paths = ("/tmp/k3s", "/tmp/config.yaml", "/tmp/k3s.service")
+    staged_digests = _parse_sha256sum_output(
+        run(
+            [*ssh_argv(root, ip), "sha256sum", "--", *staged_paths],
+            timeout=30,
+        ).stdout,
+        staged_paths,
+    )
+    if staged_digests != {
+        "/tmp/k3s": expected_k3s_sha256,
+        "/tmp/config.yaml": expected_config_sha256,
+        "/tmp/k3s.service": expected_service_sha256,
+    }:
+        raise RuntimeErrorEB("staged k3s files drifted before root install")
+
+    install_command = (
         "sudo install -m 0755 /tmp/k3s /usr/local/bin/k3s && "
         "sudo install -d -m 0755 /etc/rancher/k3s && "
         "sudo install -m 0600 /tmp/config.yaml /etc/rancher/k3s/config.yaml && "
-        "sudo install -m 0644 /tmp/k3s.service /etc/systemd/system/k3s.service && "
+        "sudo install -m 0644 /tmp/k3s.service /etc/systemd/system/k3s.service"
+    )
+    run([*ssh_argv(root, ip), install_command], timeout=180)
+
+    installed_paths = (
+        "/usr/local/bin/k3s",
+        "/etc/rancher/k3s/config.yaml",
+        "/etc/systemd/system/k3s.service",
+    )
+    installed_digests = _parse_sha256sum_output(
+        run(
+            [*ssh_argv(root, ip), "sudo", "sha256sum", "--", *installed_paths],
+            timeout=30,
+        ).stdout,
+        installed_paths,
+    )
+    if installed_digests != {
+        "/usr/local/bin/k3s": expected_k3s_sha256,
+        "/etc/rancher/k3s/config.yaml": expected_config_sha256,
+        "/etc/systemd/system/k3s.service": expected_service_sha256,
+    }:
+        raise RuntimeErrorEB("installed k3s files drifted before service restart")
+
+    service_command = (
         "sudo systemctl daemon-reload && "
         "sudo systemctl enable k3s && "
         "sudo systemctl restart k3s"
     )
-    run([*ssh_argv(root, ip), command], timeout=180)
+    run([*ssh_argv(root, ip), service_command], timeout=180)
     live_node: dict[str, Any] | None = None
     for _ in range(90):
         result = run(
@@ -1535,7 +1639,6 @@ def install_k3s(root: Path) -> dict[str, Any]:
     ).stdout.splitlines()[0]
     if config["kubernetes"]["version"] not in version:
         raise RuntimeErrorEB(f"k3s version mismatch: {version}")
-    config_path, service_path = _k3s_contract_paths(config)
     receipt = {
         "schema_version": 1,
         "status": "ready",
@@ -1544,8 +1647,8 @@ def install_k3s(root: Path) -> dict[str, Any]:
         "k3s_version": version,
         "live_kubelet_version": live_node["kubelet_version"],
         "binary_sha256": expected_k3s_sha256,
-        "config_sha256": sha256_file(config_path),
-        "service_sha256": sha256_file(service_path),
+        "config_sha256": expected_config_sha256,
+        "service_sha256": expected_service_sha256,
         "kubeconfig_sha256": sha256_file(kubeconfig_path),
     }
     atomic_json(root / "receipts/k3s.json", receipt)
