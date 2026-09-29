@@ -175,6 +175,68 @@ def _git_blob_sha256(source_commit: str, path: Path) -> str:
     return hashlib.sha256(_git_blob_bytes(source_commit, path)).hexdigest()
 
 
+def _git_tree_regular_blob_paths(
+    source_commit: str,
+    subtree: Path,
+) -> list[Path]:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB("Git tree binding requires an exact source commit")
+    try:
+        relative_subtree = subtree.relative_to(ROOT)
+    except ValueError as exc:
+        raise RuntimeErrorEB("Git tree binding path escapes the repository") from exc
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "ls-tree",
+                "-r",
+                "-z",
+                source_commit,
+                "--",
+                relative_subtree.as_posix(),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeErrorEB("Git tree binding timed out") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeErrorEB(f"Git tree binding failed: {stderr[-1000:]}")
+    paths: list[Path] = []
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, raw_path = raw.split(b"\t", 1)
+            mode, object_type, _object_id = metadata.decode("ascii").split()
+            relative = Path(raw_path.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise RuntimeErrorEB("Git tree binding returned an invalid entry") from exc
+        if (
+            mode not in {"100644", "100755"}
+            or object_type != "blob"
+            or relative.is_absolute()
+            or ".." in relative.parts
+        ):
+            raise RuntimeErrorEB(
+                "Git tree binding contains a non-regular or unsafe entry"
+            )
+        try:
+            relative.relative_to(relative_subtree)
+        except ValueError as exc:
+            raise RuntimeErrorEB(
+                "Git tree binding entry escapes the requested subtree"
+            ) from exc
+        paths.append(relative)
+    if not paths or len(paths) != len(set(paths)):
+        raise RuntimeErrorEB("Git tree binding is empty or duplicated")
+    return sorted(paths, key=lambda item: item.as_posix())
+
+
 def state_root(value: str | None) -> Path:
     root = (Path(value).expanduser() if value else DEFAULT_STATE_ROOT).resolve()
     allowed_root = DEFAULT_STATE_ROOT.resolve()
@@ -399,6 +461,7 @@ def download(url: str, expected_sha256: str, destination: Path) -> None:
         tmp.unlink(missing_ok=True)
 
 
+
 def load_config() -> dict[str, Any]:
     config = contract.load_config()
     contract.validate_config(config)
@@ -406,6 +469,20 @@ def load_config() -> dict[str, Any]:
         raise RuntimeErrorEB("unexpected VM name")
     return config
 
+
+def _source_commit_config(source_commit: str) -> dict[str, Any]:
+    try:
+        config = json.loads(
+            _git_blob_bytes(source_commit, contract.CONFIG_PATH).decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "source-commit Experiment-B config is invalid"
+        ) from exc
+    contract.validate_config(config)
+    if config["vm"]["name"] != VM_NAME:
+        raise RuntimeErrorEB("unexpected VM name")
+    return config
 
 def git_head() -> str:
     return run(["git", "rev-parse", "HEAD"]).stdout.strip()
@@ -1275,36 +1352,16 @@ def _open_verified_file(
 
 
 @contextmanager
-def _verified_snapshot_fd(
-    path: Path,
-    expected_sha256: str,
+def _sealed_snapshot_fd(
+    payload: bytes,
     context: str,
+    *,
+    mode: int = 0o400,
 ) -> Iterator[int]:
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    cloexec = getattr(os, "O_CLOEXEC", None)
-    if not isinstance(nofollow, int) or not isinstance(cloexec, int):
-        raise RuntimeErrorEB(f"{context} cannot be opened safely")
-    try:
-        source_fd = os.open(path, os.O_RDONLY | cloexec | nofollow)
-    except OSError as exc:
-        raise RuntimeErrorEB(f"{context} is missing or unsafe") from exc
-    try:
-        metadata = os.fstat(source_fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RuntimeErrorEB(f"{context} is not a regular file")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(source_fd, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        payload = b"".join(chunks)
-    finally:
-        os.close(source_fd)
-    if hashlib.sha256(payload).hexdigest() != expected_sha256:
-        raise RuntimeErrorEB(
-            f"{context} digest does not match prepared source"
-        )
+    if not isinstance(payload, bytes):
+        raise RuntimeErrorEB(f"{context} immutable snapshot payload is invalid")
+    if not isinstance(mode, int) or mode < 0 or mode > 0o777:
+        raise RuntimeErrorEB(f"{context} immutable snapshot mode is invalid")
     if not sys.platform.startswith("linux"):
         raise RuntimeErrorEB(f"{context} cannot create an immutable snapshot")
     memfd_create = getattr(os, "memfd_create", None)
@@ -1346,7 +1403,7 @@ def _verified_snapshot_fd(
             if written <= 0:
                 raise RuntimeErrorEB(f"{context} immutable snapshot write failed")
             offset += written
-        os.fchmod(snapshot_fd, 0o400)
+        os.fchmod(snapshot_fd, mode)
         required_seals = (
             f_seal_seal
             | f_seal_shrink
@@ -1363,6 +1420,137 @@ def _verified_snapshot_fd(
         yield snapshot_fd
     finally:
         os.close(snapshot_fd)
+
+
+@contextmanager
+def _verified_snapshot_fd(
+    path: Path,
+    expected_sha256: str,
+    context: str,
+) -> Iterator[int]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+        raise RuntimeErrorEB(f"{context} cannot be opened safely")
+    try:
+        source_fd = os.open(path, os.O_RDONLY | cloexec | nofollow)
+    except OSError as exc:
+        raise RuntimeErrorEB(f"{context} is missing or unsafe") from exc
+    try:
+        metadata = os.fstat(source_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeErrorEB(f"{context} is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+    finally:
+        os.close(source_fd)
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise RuntimeErrorEB(
+            f"{context} digest does not match prepared source"
+        )
+    with _sealed_snapshot_fd(payload, context) as snapshot_fd:
+        yield snapshot_fd
+
+
+def _source_commit_kustomize_build(
+    root: Path,
+    source_commit: str,
+    target: Path,
+    snapshot_root: Path,
+) -> str:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB(
+            "source-commit kustomize render requires an exact commit"
+        )
+    try:
+        target_relative = target.relative_to(ROOT)
+        target.relative_to(snapshot_root)
+        snapshot_root.relative_to(ROOT)
+    except ValueError as exc:
+        raise RuntimeErrorEB(
+            "source-commit kustomize render target escapes its snapshot root"
+        ) from exc
+
+    paths = _git_tree_regular_blob_paths(source_commit, snapshot_root)
+    if target_relative / "kustomization.yaml" not in {
+        path for path in paths
+    }:
+        raise RuntimeErrorEB(
+            "source-commit kustomize render has no bound kustomization"
+        )
+    toolchain_receipt = toolchain(root)
+    kustomize = toolchain_receipt.get("tools", {}).get("kustomize")
+    if not isinstance(kustomize, str) or not kustomize:
+        raise RuntimeErrorEB(
+            "source-commit kustomize render requires pinned kustomize"
+        )
+    bwrap = require_binary("bwrap")
+    sandbox_root = Path("/tmp/commonthing-source-snapshot")
+    directory_paths: set[Path] = {sandbox_root}
+    for relative in paths:
+        parent = relative.parent
+        while parent != Path("."):
+            directory_paths.add(sandbox_root / parent)
+            parent = parent.parent
+
+    argv = [
+        bwrap,
+        "--unshare-all",
+        "--share-net",
+        "--die-with-parent",
+        "--ro-bind",
+        "/",
+        "/",
+        "--tmpfs",
+        "/tmp",
+    ]
+    for directory in sorted(
+        directory_paths,
+        key=lambda value: (len(value.parts), value.as_posix()),
+    ):
+        argv.extend(["--dir", directory.as_posix()])
+
+    snapshot_fds: list[int] = []
+    with ExitStack() as stack:
+        for relative in paths:
+            payload = _git_blob_bytes(source_commit, ROOT / relative)
+            snapshot_fd = stack.enter_context(
+                _sealed_snapshot_fd(
+                    payload,
+                    f"source-commit kustomize blob {relative.as_posix()}",
+                )
+            )
+            snapshot_fds.append(snapshot_fd)
+            argv.extend(
+                [
+                    "--ro-bind-data",
+                    str(snapshot_fd),
+                    (sandbox_root / relative).as_posix(),
+                ]
+            )
+        argv.extend(
+            [
+                "--chdir",
+                sandbox_root.as_posix(),
+                "--",
+                kustomize,
+                "build",
+                (sandbox_root / target_relative).as_posix(),
+            ]
+        )
+        result = run(
+            argv,
+            timeout=120,
+            pass_fds=tuple(snapshot_fds),
+        )
+    return result.stdout
+
+
 
 
 def _verified_snapshot_bytes(
@@ -2395,6 +2583,7 @@ def apply_release(
                         web_digest,
                         api_replicas,
                         web_replicas,
+                        source_commit,
                     )
                 except (json.JSONDecodeError, RuntimeErrorEB):
                     pass
@@ -3071,13 +3260,43 @@ def _pvc_spec_projection(
     }
 
 
-def _rendered_pvc_contract(root: Path) -> dict[str, Any]:
-    kustomize = toolchain(root)["tools"].get("kustomize")
-    if not isinstance(kustomize, str) or not kustomize:
-        raise RuntimeErrorEB("PVC contract requires pinned kustomize")
+def _rendered_pvc_contract(
+    root: Path,
+    source_commit: str | None = None,
+) -> dict[str, Any]:
     documents: list[dict[str, Any]] = []
-    for target in (CLUSTER / "data", APP_OVERLAY):
-        rendered = run([kustomize, "build", str(target)]).stdout
+    if source_commit is None:
+        kustomize = toolchain(root)["tools"].get("kustomize")
+        if not isinstance(kustomize, str) or not kustomize:
+            raise RuntimeErrorEB("PVC contract requires pinned kustomize")
+        rendered_targets = [
+            (target, run([kustomize, "build", str(target)]).stdout)
+            for target in (CLUSTER / "data", APP_OVERLAY)
+        ]
+    else:
+        if COMMIT_RE.fullmatch(source_commit) is None:
+            raise RuntimeErrorEB("PVC contract source commit is not exact")
+        rendered_targets = [
+            (
+                CLUSTER / "data",
+                _source_commit_kustomize_build(
+                    root,
+                    source_commit,
+                    CLUSTER / "data",
+                    CLUSTER / "data",
+                ),
+            ),
+            (
+                APP_OVERLAY,
+                _source_commit_kustomize_build(
+                    root,
+                    source_commit,
+                    APP_OVERLAY,
+                    ROOT / "platform/apps/weltgewebe",
+                ),
+            ),
+        ]
+    for target, rendered in rendered_targets:
         try:
             documents.extend(
                 document
@@ -3122,10 +3341,11 @@ def _rendered_pvc_contract(root: Path) -> dict[str, Any]:
 def _require_exact_healthy_pvcs(
     root: Path,
     pvc_items: Any,
+    source_commit: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(pvc_items, list):
         raise RuntimeErrorEB("Experiment-B PVC inventory is not a list")
-    expected = _rendered_pvc_contract(root)
+    expected = _rendered_pvc_contract(root, source_commit)
 
     live: dict[str, dict[str, Any]] = {}
     for item in pvc_items:
@@ -4014,20 +4234,30 @@ def _migration_job_contract(
     }
 
 
+
 def _rendered_migration_job_contract(
     root: Path,
     api_digest: str,
+    source_commit: str | None = None,
 ) -> dict[str, Any]:
     if not DIGEST_RE.fullmatch(api_digest):
         raise RuntimeErrorEB(
             "migration Job contract requires an exact API digest"
         )
-    kustomize = toolchain(root)["tools"].get("kustomize")
-    if not isinstance(kustomize, str) or not kustomize:
-        raise RuntimeErrorEB(
-            "migration Job contract requires pinned kustomize"
+    if source_commit is None:
+        kustomize = toolchain(root)["tools"].get("kustomize")
+        if not isinstance(kustomize, str) or not kustomize:
+            raise RuntimeErrorEB(
+                "migration Job contract requires pinned kustomize"
+            )
+        rendered = run([kustomize, "build", str(MIGRATION)]).stdout
+    else:
+        rendered = _source_commit_kustomize_build(
+            root,
+            source_commit,
+            MIGRATION,
+            MIGRATION,
         )
-    rendered = run([kustomize, "build", str(MIGRATION)]).stdout
     rendered = rendered.replace("$" + "{API_DIGEST}", api_digest)
     try:
         documents = [
@@ -4052,25 +4282,29 @@ def _rendered_migration_job_contract(
         raise RuntimeErrorEB(
             "rendered Experiment-B migration Job is ambiguous"
         )
-    contract = _migration_job_contract(
+    contract_value = _migration_job_contract(
         matches[0], "rendered Experiment-B migration Job"
     )
     return {
-        "contract": contract,
-        "contract_sha256": _stable_json_sha256(contract),
+        "contract": contract_value,
+        "contract_sha256": _stable_json_sha256(contract_value),
         "pod_contract_sha256": _stable_json_sha256(
-            contract["pod_spec"]
+            contract_value["pod_spec"]
         ),
     }
-
 
 def _require_migration_job_runtime_contract(
     root: Path,
     migration: Any,
     migration_pods: Any,
     api_digest: str,
+    source_commit: str | None = None,
 ) -> dict[str, Any]:
-    expected = _rendered_migration_job_contract(root, api_digest)
+    expected = _rendered_migration_job_contract(
+        root,
+        api_digest,
+        source_commit,
+    )
     if not isinstance(migration, dict):
         raise RuntimeErrorEB("Experiment-B migration Job is invalid")
     metadata = migration.get("metadata", {})
@@ -4266,6 +4500,7 @@ def _require_requested_release_artifacts(
     web_digest: str,
     api_replicas: int,
     web_replicas: int,
+    source_commit: str | None = None,
 ) -> dict[str, Any]:
     expected_api = f"ghcr.io/heimgewebe/commonthing-api@{api_digest}"
     expected_web = f"ghcr.io/heimgewebe/commonthing-web@{web_digest}"
@@ -4295,6 +4530,7 @@ def _require_requested_release_artifacts(
         migration,
         migration_pods,
         api_digest,
+        source_commit,
     )
 
     return {
@@ -5134,24 +5370,25 @@ def _pod_spec_images(pod_spec: Any, context: str) -> dict[str, dict[str, str]]:
     return result
 
 
-def _versioned_namespace_security_contract() -> dict[str, Any]:
-    namespace_path = NAMESPACES / "namespaces.yaml"
-    kustomization_path = NAMESPACES / "kustomization.yaml"
+
+def _namespace_security_contract_from_bytes(
+    namespace_bytes: bytes,
+    kustomization_bytes: bytes,
+) -> dict[str, Any]:
     try:
         documents = [
             item
-            for item in yaml.safe_load_all(
-                namespace_path.read_text(encoding="utf-8")
-            )
+            for item in yaml.safe_load_all(namespace_bytes.decode("utf-8"))
             if isinstance(item, dict)
         ]
         kustomization = yaml.safe_load(
-            kustomization_path.read_text(encoding="utf-8")
+            kustomization_bytes.decode("utf-8")
         )
-    except (OSError, yaml.YAMLError) as exc:
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise RuntimeErrorEB(
             "versioned Experiment-B Namespace contract is invalid"
         ) from exc
+
     expected_names = {APP_NAMESPACE, DATA_NAMESPACE}
     namespaces = [
         document
@@ -5239,8 +5476,34 @@ def _versioned_namespace_security_contract() -> dict[str, Any]:
     return result
 
 
-def _require_live_namespace_security_contract(root: Path) -> dict[str, Any]:
-    expected = _versioned_namespace_security_contract()
+def _versioned_namespace_security_contract(
+    source_commit: str | None = None,
+) -> dict[str, Any]:
+    if source_commit is None:
+        try:
+            namespace_bytes = (NAMESPACES / "namespaces.yaml").read_bytes()
+            kustomization_bytes = (NAMESPACES / "kustomization.yaml").read_bytes()
+        except OSError as exc:
+            raise RuntimeErrorEB(
+                "versioned Experiment-B Namespace contract is invalid"
+            ) from exc
+    else:
+        namespace_bytes = _git_blob_bytes(
+            source_commit, NAMESPACES / "namespaces.yaml"
+        )
+        kustomization_bytes = _git_blob_bytes(
+            source_commit, NAMESPACES / "kustomization.yaml"
+        )
+    return _namespace_security_contract_from_bytes(
+        namespace_bytes,
+        kustomization_bytes,
+    )
+
+def _require_live_namespace_security_contract(
+    root: Path,
+    source_commit: str | None = None,
+) -> dict[str, Any]:
+    expected = _versioned_namespace_security_contract(source_commit)
     result: dict[str, Any] = {}
     for name, contract_value in expected.items():
         namespace = _kubectl_json(root, ["get", "namespace", name])
@@ -5442,12 +5705,19 @@ def _service_spec_projection(service: Any, context: str) -> dict[str, Any]:
     }
 
 
-def _versioned_data_service_contract(path: Path, name: str) -> dict[str, Any]:
+
+def _data_service_contract_from_bytes(
+    manifest_bytes: bytes,
+    name: str,
+    context: str,
+) -> dict[str, Any]:
     try:
-        documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
-    except (OSError, yaml.YAMLError) as exc:
+        documents = list(
+            yaml.safe_load_all(manifest_bytes.decode("utf-8"))
+        )
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise RuntimeErrorEB(
-            f"versioned data Service manifest is invalid: {name}"
+            f"{context} manifest is invalid: {name}"
         ) from exc
     matches = [
         document
@@ -5459,10 +5729,10 @@ def _versioned_data_service_contract(path: Path, name: str) -> dict[str, Any]:
     ]
     if len(matches) != 1:
         raise RuntimeErrorEB(
-            f"versioned data manifest does not contain exactly one Service: {name}"
+            f"{context} does not contain exactly one Service: {name}"
         )
     projection = _service_spec_projection(
-        matches[0], f"versioned data Service {name}"
+        matches[0], f"{context} {name}"
     )
     return {
         "spec": projection,
@@ -5470,11 +5740,49 @@ def _versioned_data_service_contract(path: Path, name: str) -> dict[str, Any]:
     }
 
 
-def _require_live_data_services(root: Path) -> dict[str, Any]:
+def _versioned_data_service_contract(
+    path: Path,
+    name: str,
+) -> dict[str, Any]:
+    try:
+        manifest_bytes = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeErrorEB(
+            f"versioned data Service manifest is invalid: {name}"
+        ) from exc
+    return _data_service_contract_from_bytes(
+        manifest_bytes,
+        name,
+        "versioned data Service",
+    )
+
+
+def _source_commit_data_service_contract(
+    source_commit: str,
+    path: Path,
+    name: str,
+) -> dict[str, Any]:
+    return _data_service_contract_from_bytes(
+        _git_blob_bytes(source_commit, path),
+        name,
+        "source-commit data Service",
+    )
+
+def _require_live_data_services(
+    root: Path,
+    source_commit: str | None = None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for name in ("postgres", "nats"):
-        expected = _versioned_data_service_contract(
-            CLUSTER / f"data/{name}.yaml", name
+        path = CLUSTER / f"data/{name}.yaml"
+        expected = (
+            _versioned_data_service_contract(path, name)
+            if source_commit is None
+            else _source_commit_data_service_contract(
+                source_commit,
+                path,
+                name,
+            )
         )
         service = _kubectl_json(
             root, ["-n", DATA_NAMESPACE, "get", "service", name]
@@ -5505,6 +5813,27 @@ def _require_live_data_services(root: Path) -> dict[str, Any]:
 
 
 
+def _source_commit_application_render(
+    root: Path,
+    release: dict[str, Any],
+) -> str:
+    source_commit = (
+        release.get("source_commit")
+        if isinstance(release, dict)
+        else None
+    )
+    if not isinstance(source_commit, str) or COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB(
+            "application contract requires an exact source commit"
+        )
+    return _source_commit_kustomize_build(
+        root,
+        source_commit,
+        APP_OVERLAY,
+        ROOT / "platform/apps/weltgewebe",
+    )
+
+
 def _rendered_application_service_contract(
     root: Path,
     release: dict[str, Any],
@@ -5520,12 +5849,7 @@ def _rendered_application_service_contract(
         raise RuntimeErrorEB(
             "application Service contract requires exact release digests"
         )
-    kustomize = toolchain(root)["tools"].get("kustomize")
-    if not isinstance(kustomize, str) or not kustomize:
-        raise RuntimeErrorEB(
-            "application Service contract requires pinned kustomize"
-        )
-    rendered = run([kustomize, "build", str(APP_OVERLAY)]).stdout
+    rendered = _source_commit_application_render(root, release)
     rendered = rendered.replace("${API_DIGEST}", api_digest).replace(
         "${WEB_DIGEST}", web_digest
     )
@@ -5834,12 +6158,7 @@ def _rendered_application_workload_contract(
         raise RuntimeErrorEB(
             "application workload contract requires exact release digests"
         )
-    kustomize = toolchain(root)["tools"].get("kustomize")
-    if not isinstance(kustomize, str) or not kustomize:
-        raise RuntimeErrorEB(
-            "application workload contract requires pinned kustomize"
-        )
-    rendered = run([kustomize, "build", str(APP_OVERLAY)]).stdout
+    rendered = _source_commit_application_render(root, release)
     rendered = rendered.replace("${API_DIGEST}", api_digest).replace(
         "${WEB_DIGEST}", web_digest
     )
@@ -6026,12 +6345,7 @@ def _rendered_application_pdb_contract(
         raise RuntimeErrorEB(
             "application PDB contract requires exact release digests"
         )
-    kustomize = toolchain(root)["tools"].get("kustomize")
-    if not isinstance(kustomize, str) or not kustomize:
-        raise RuntimeErrorEB(
-            "application PDB contract requires pinned kustomize"
-        )
-    rendered = run([kustomize, "build", str(APP_OVERLAY)]).stdout
+    rendered = _source_commit_application_render(root, release)
     rendered = rendered.replace("$" + "{API_DIGEST}", api_digest).replace(
         "$" + "{WEB_DIGEST}", web_digest
     )
@@ -6132,12 +6446,7 @@ def _rendered_application_service_account_contract(
         raise RuntimeErrorEB(
             "application ServiceAccount contract requires exact release digests"
         )
-    kustomize = toolchain(root)["tools"].get("kustomize")
-    if not isinstance(kustomize, str) or not kustomize:
-        raise RuntimeErrorEB(
-            "application ServiceAccount contract requires pinned kustomize"
-        )
-    rendered = run([kustomize, "build", str(APP_OVERLAY)]).stdout
+    rendered = _source_commit_application_render(root, release)
     rendered = rendered.replace("$" + "{API_DIGEST}", api_digest).replace(
         "$" + "{WEB_DIGEST}", web_digest
     )
@@ -6433,16 +6742,20 @@ def _container_resources_contract(
     return json.loads(json.dumps(resources))
 
 
-def _versioned_data_container_resources(
-    path: Path,
+
+def _data_container_resources_from_bytes(
+    manifest_bytes: bytes,
     deployment_name: str,
     container_name: str,
+    context: str,
 ) -> dict[str, Any]:
     try:
-        documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
-    except (OSError, yaml.YAMLError) as exc:
+        documents = list(
+            yaml.safe_load_all(manifest_bytes.decode("utf-8"))
+        )
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise RuntimeErrorEB(
-            f"versioned data resource manifest is invalid: {deployment_name}"
+            f"{context} resource manifest is invalid: {deployment_name}"
         ) from exc
     matches = [
         document
@@ -6454,21 +6767,59 @@ def _versioned_data_container_resources(
     ]
     if len(matches) != 1:
         raise RuntimeErrorEB(
-            f"versioned data resource Deployment is ambiguous: {deployment_name}"
+            f"{context} is ambiguous: {deployment_name}"
         )
     return _container_resources_contract(
         matches[0].get("spec", {}).get("template", {}).get("spec"),
         container_name,
-        f"versioned data Deployment {deployment_name}",
+        f"{context} {deployment_name}",
     )
 
 
-def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]:
+def _versioned_data_container_resources(
+    path: Path,
+    deployment_name: str,
+    container_name: str,
+) -> dict[str, Any]:
     try:
-        documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
-    except (OSError, yaml.YAMLError) as exc:
+        manifest_bytes = path.read_bytes()
+    except OSError as exc:
         raise RuntimeErrorEB(
-            f"versioned data Deployment manifest is invalid: {name}"
+            f"versioned data resource manifest is invalid: {deployment_name}"
+        ) from exc
+    return _data_container_resources_from_bytes(
+        manifest_bytes,
+        deployment_name,
+        container_name,
+        "versioned data Deployment",
+    )
+
+
+def _source_commit_data_container_resources(
+    source_commit: str,
+    path: Path,
+    deployment_name: str,
+    container_name: str,
+) -> dict[str, Any]:
+    return _data_container_resources_from_bytes(
+        _git_blob_bytes(source_commit, path),
+        deployment_name,
+        container_name,
+        "source-commit data Deployment",
+    )
+
+def _data_deployment_contract_from_bytes(
+    manifest_bytes: bytes,
+    name: str,
+    context: str,
+) -> dict[str, Any]:
+    try:
+        documents = list(
+            yaml.safe_load_all(manifest_bytes.decode("utf-8"))
+        )
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise RuntimeErrorEB(
+            f"{context} manifest is invalid: {name}"
         ) from exc
     matches = [
         document
@@ -6480,13 +6831,13 @@ def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]
     ]
     if len(matches) != 1:
         raise RuntimeErrorEB(
-            f"versioned data manifest does not contain exactly one Deployment: {name}"
+            f"{context} does not contain exactly one Deployment: {name}"
         )
     spec = matches[0].get("spec", {})
     replicas = spec.get("replicas")
     if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas != 1:
         raise RuntimeErrorEB(
-            f"versioned data Deployment replica contract drifted: {name}"
+            f"{context} replica contract drifted: {name}"
         )
     deployment = matches[0]
     template = spec.get("template", {}) if isinstance(spec, dict) else {}
@@ -6496,24 +6847,24 @@ def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]
     pod_spec = template.get("spec", {}) if isinstance(template, dict) else {}
     if not isinstance(template_metadata, dict):
         raise RuntimeErrorEB(
-            f"versioned data Deployment template metadata is invalid: {name}"
+            f"{context} template metadata is invalid: {name}"
         )
     images = _pod_spec_images(
         pod_spec,
-        f"versioned data Deployment {name}",
+        f"{context} {name}",
     )
     selector = _pod_selector_match_labels(
-        deployment, f"versioned data Deployment {name}"
+        deployment, f"{context} {name}"
     )
     pod_contract = _application_pod_spec_projection(
-        pod_spec, f"versioned data Deployment {name}"
+        pod_spec, f"{context} {name}"
     )
     deployment_contract = {
         "replicas": replicas,
         "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
         "strategy": spec.get("strategy"),
         **_deployment_lifecycle_projection(
-            spec, f"versioned data Deployment {name}"
+            spec, f"{context} {name}"
         ),
         "selector_labels": selector,
         "template_labels": template_metadata.get("labels", {}),
@@ -6525,7 +6876,7 @@ def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]
         or not isinstance(deployment_contract["template_annotations"], dict)
     ):
         raise RuntimeErrorEB(
-            f"versioned data Deployment template metadata is invalid: {name}"
+            f"{context} template metadata is invalid: {name}"
         )
     return {
         "replicas": replicas,
@@ -6537,9 +6888,36 @@ def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]
     }
 
 
+def _versioned_data_deployment_contract(path: Path, name: str) -> dict[str, Any]:
+    try:
+        manifest_bytes = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeErrorEB(
+            f"versioned data Deployment manifest is invalid: {name}"
+        ) from exc
+    return _data_deployment_contract_from_bytes(
+        manifest_bytes,
+        name,
+        "versioned data Deployment",
+    )
+
+
+def _source_commit_data_deployment_contract(
+    source_commit: str,
+    path: Path,
+    name: str,
+) -> dict[str, Any]:
+    return _data_deployment_contract_from_bytes(
+        _git_blob_bytes(source_commit, path),
+        name,
+        "source-commit data Deployment",
+    )
+
 def _require_live_data_deployments(
     root: Path,
     names: tuple[str, ...] = ("postgres", "nats"),
+    *,
+    source_commit: str | None = None,
 ) -> dict[str, Any]:
     manifests = {
         "postgres": CLUSTER / "data/postgres.yaml",
@@ -6562,7 +6940,13 @@ def _require_live_data_deployments(
     result: dict[str, Any] = {}
     for name in names:
         path = manifests[name]
-        expected = _versioned_data_deployment_contract(path, name)
+        expected = (
+            _versioned_data_deployment_contract(path, name)
+            if source_commit is None
+            else _source_commit_data_deployment_contract(
+                source_commit, path, name
+            )
+        )
         deployment = _kubectl_json(
             root, ["-n", DATA_NAMESPACE, "get", "deployment", name]
         )
@@ -6706,6 +7090,34 @@ def _require_live_data_deployments(
             "pod_names": sorted(pod_names),
             "canonical": True,
         }
+
+    if set(names) == set(manifests):
+        expected_pod_names = {
+            pod_name
+            for value in result.values()
+            for pod_name in value["pod_names"]
+        }
+        observed_pod_names: set[str] = set()
+        for pod in pod_items:
+            metadata = pod.get("metadata", {}) if isinstance(pod, dict) else {}
+            pod_name = metadata.get("name") if isinstance(metadata, dict) else None
+            if (
+                not isinstance(pod_name, str)
+                or not pod_name
+                or metadata.get("namespace") != DATA_NAMESPACE
+                or pod_name in observed_pod_names
+            ):
+                raise RuntimeErrorEB(
+                    "live data Pod inventory contains invalid or duplicate Pods"
+                )
+            observed_pod_names.add(pod_name)
+        if observed_pod_names != expected_pod_names:
+            missing = sorted(expected_pod_names - observed_pod_names)
+            unexpected = sorted(observed_pod_names - expected_pod_names)
+            raise RuntimeErrorEB(
+                "live data Pod inventory contains noncanonical Pods: "
+                f"missing={missing}; unexpected={unexpected}"
+            )
     return result
 
 
@@ -7379,12 +7791,19 @@ def _stable_json_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _versioned_network_policy_specs(path: Path, namespace: str) -> dict[str, Any]:
+
+def _network_policy_specs_from_bytes(
+    manifest_bytes: bytes,
+    namespace: str,
+    context: str,
+) -> dict[str, Any]:
     try:
-        documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
-    except (OSError, yaml.YAMLError) as exc:
+        documents = list(
+            yaml.safe_load_all(manifest_bytes.decode("utf-8"))
+        )
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise RuntimeErrorEB(
-            f"versioned NetworkPolicy contract is unreadable: {namespace}"
+            f"{context} NetworkPolicy contract is unreadable: {namespace}"
         ) from exc
     specs: dict[str, Any] = {}
     for document in documents:
@@ -7399,30 +7818,71 @@ def _versioned_network_policy_specs(path: Path, namespace: str) -> dict[str, Any
             or not isinstance(spec, dict)
         ):
             raise RuntimeErrorEB(
-                f"versioned NetworkPolicy contract is invalid: {namespace}"
+                f"{context} NetworkPolicy contract is invalid: {namespace}"
             )
         name = str(metadata["name"])
         if name in specs:
             raise RuntimeErrorEB(
-                f"versioned NetworkPolicy contract contains duplicate: {namespace}/{name}"
+                f"{context} NetworkPolicy contract contains duplicate: "
+                f"{namespace}/{name}"
             )
         specs[name] = spec
     if not specs:
         raise RuntimeErrorEB(
-            f"versioned NetworkPolicy contract is empty: {namespace}"
+            f"{context} NetworkPolicy contract is empty: {namespace}"
         )
     return specs
 
 
+def _versioned_network_policy_specs(
+    path: Path,
+    namespace: str,
+) -> dict[str, Any]:
+    try:
+        manifest_bytes = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeErrorEB(
+            f"versioned NetworkPolicy contract is unreadable: {namespace}"
+        ) from exc
+    return _network_policy_specs_from_bytes(
+        manifest_bytes,
+        namespace,
+        "versioned",
+    )
+
+
+def _source_commit_network_policy_specs(
+    source_commit: str,
+    path: Path,
+    namespace: str,
+) -> dict[str, Any]:
+    return _network_policy_specs_from_bytes(
+        _git_blob_bytes(source_commit, path),
+        namespace,
+        "source-commit",
+    )
+
 def _require_live_runtime_contract(
-    root: Path, config: dict[str, Any]
+    root: Path,
+    config: dict[str, Any],
+    source_commit: str | None = None,
 ) -> dict[str, Any]:
     runtime_binding = config.get("runtime_binding", {})
     expected_config_data = runtime_binding.get("config_map_data")
     expected_network_specs = runtime_binding.get("network_policy_specs")
     expected_cilium_specs = runtime_binding.get("cilium_network_policy_specs")
-    expected_data_network_specs = _versioned_network_policy_specs(
-        CLUSTER / "data/network-policy.yaml", DATA_NAMESPACE
+    data_network_policy_path = CLUSTER / "data/network-policy.yaml"
+    expected_data_network_specs = (
+        _versioned_network_policy_specs(
+            data_network_policy_path,
+            DATA_NAMESPACE,
+        )
+        if source_commit is None
+        else _source_commit_network_policy_specs(
+            source_commit,
+            data_network_policy_path,
+            DATA_NAMESPACE,
+        )
     )
     if (
         not isinstance(expected_config_data, dict)
@@ -7578,7 +8038,7 @@ def status(root: Path) -> dict[str, Any]:
     )
     if _current_protected_main_commit() != source_commit:
         raise RuntimeErrorEB("Experiment-B status release is not current protected main")
-    config = load_config()
+    config = _source_commit_config(source_commit)
     vm_create_path = root / "receipts/vm-create.json"
     try:
         vm_create = json.loads(vm_create_path.read_text(encoding="utf-8"))
@@ -7667,13 +8127,21 @@ def status(root: Path) -> dict[str, Any]:
             str(release.get("web_digest", "")),
             int(config["semantic_search"]["api_replicas"]),
             int(config["runtime_binding"]["web_replicas"]),
+            source_commit,
         )
         deployment_readback = release_artifacts["deployments"]
         namespace_security_readback = _require_live_namespace_security_contract(
-            root
+            root,
+            source_commit,
         )
-        data_deployment_readback = _require_live_data_deployments(root)
-        data_service_readback = _require_live_data_services(root)
+        data_deployment_readback = _require_live_data_deployments(
+            root,
+            source_commit=source_commit,
+        )
+        data_service_readback = _require_live_data_services(
+            root,
+            source_commit,
+        )
         api_containers = _container_images(api, "Experiment-B API Deployment")
         semantic = config["semantic_search"]
         if api_containers.get("ollama") != semantic["ollama_image"]:
@@ -7810,7 +8278,11 @@ def status(root: Path) -> dict[str, Any]:
         }
 
         pvc_items = _kubectl_json(root, ["-A", "get", "pvc"]).get("items", [])
-        pvc_readback = _require_exact_healthy_pvcs(root, pvc_items)
+        pvc_readback = _require_exact_healthy_pvcs(
+            root,
+            pvc_items,
+            source_commit,
+        )
 
         gateway = _kubectl_json(
             root, ["-n", APP_NAMESPACE, "get", "gateway", "commonthing-experiment-b"]
@@ -7823,7 +8295,11 @@ def status(root: Path) -> dict[str, Any]:
         httproute_readback = _require_httproute_ready(httproute)
         gateway_data_plane = _gateway_data_plane_readback(root, source_commit)
         recovery_state = _final_recovery_state_readback(root, source_commit)
-        runtime_contract_readback = _require_live_runtime_contract(root, config)
+        runtime_contract_readback = _require_live_runtime_contract(
+            root,
+            config,
+            source_commit,
+        )
     _require_same_kubernetes_target(
         root,
         source_commit,
@@ -9440,7 +9916,11 @@ def _require_t048_api_release_binding(
         "containers": {
             "api": f"ghcr.io/heimgewebe/commonthing-api@{api_digest}",
             "search-worker": f"ghcr.io/heimgewebe/commonthing-api@{api_digest}",
-            "ollama": str(load_config()["semantic_search"]["ollama_image"]),
+            "ollama": str(
+                _source_commit_config(source_commit)[
+                    "semantic_search"
+                ]["ollama_image"]
+            ),
         },
         "init_containers": {},
     }
@@ -9508,18 +9988,39 @@ def _require_t048_api_runtime_binding(
     )
 
 
+
 def _require_t048_postgres_runtime_binding(
     root: Path,
+    source_commit: str | None = None,
 ) -> dict[str, Any]:
     postgres_manifest = CLUSTER / "data/postgres.yaml"
-    expected = _versioned_data_deployment_contract(
-        postgres_manifest, "postgres"
+    expected = (
+        _versioned_data_deployment_contract(
+            postgres_manifest, "postgres"
+        )
+        if source_commit is None
+        else _source_commit_data_deployment_contract(
+            source_commit,
+            postgres_manifest,
+            "postgres",
+        )
     )
-    expected_resources = _versioned_data_container_resources(
-        postgres_manifest, "postgres", "postgres"
+    expected_resources = (
+        _versioned_data_container_resources(
+            postgres_manifest, "postgres", "postgres"
+        )
+        if source_commit is None
+        else _source_commit_data_container_resources(
+            source_commit,
+            postgres_manifest,
+            "postgres",
+            "postgres",
+        )
     )
     live_data = _require_live_data_deployments(
-        root, ("postgres",)
+        root,
+        ("postgres",),
+        source_commit=source_commit,
     )
     postgres = live_data.get("postgres")
     if (
@@ -9564,7 +10065,6 @@ def _require_t048_postgres_runtime_binding(
         "pods": pod_readback,
         "canonical": True,
     }
-
 
 def _parse_cpu_quantity(value: str) -> float:
     if value.endswith("m"):
@@ -9721,7 +10221,10 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     bound_stack = ExitStack()
     bound_stack.enter_context(_bound_kube_env(root, target_binding_before))
     try:
-        postgres_binding_before = _require_t048_postgres_runtime_binding(root)
+        postgres_binding_before = _require_t048_postgres_runtime_binding(
+            root,
+            source_commit,
+        )
         fixture_receipt = _validated_t048_fixture_receipt(root, source_commit)
         fixture_binding_before = {
             "manifest": fixture_receipt.get("manifest"),
@@ -9750,7 +10253,8 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             root, source_commit
         )
         declared_cpu, declared_memory = _require_api_resource_limits(
-            pod, load_config()
+            pod,
+            _source_commit_config(source_commit),
         )
 
         process, port, pf_stdout, pf_stderr = _start_api_port_forward(
@@ -9830,7 +10334,10 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             _post_pod,
             api_image_binding_after,
         ) = _require_t048_api_runtime_binding(root, source_commit)
-        postgres_binding_after = _require_t048_postgres_runtime_binding(root)
+        postgres_binding_after = _require_t048_postgres_runtime_binding(
+            root,
+            source_commit,
+        )
         (
             target_receipt_after,
             target_ip_after,
@@ -10798,19 +11305,18 @@ def _require_empty_replacement_pvc(
         _delete_pod(root, DATA_NAMESPACE, pod_name)
 
 
-def _nats_transfer_pod(root: Path, name: str) -> None:
-    deployment = _kubectl_json(
-        root, ["-n", DATA_NAMESPACE, "get", "deployment", "nats"]
-    )
-    containers = deployment.get("spec", {}).get("template", {}).get("spec", {}).get(
-        "containers", []
-    )
-    image = next(
-        (item.get("image") for item in containers if item.get("name") == "nats"),
-        None,
-    )
-    if not isinstance(image, str) or "@sha256:" not in image:
-        raise RuntimeErrorEB("NATS restore pod cannot bind the live immutable image")
+def _nats_transfer_pod(
+    root: Path,
+    name: str,
+    image: str,
+) -> None:
+    if (
+        not isinstance(image, str)
+        or re.search(r"@sha256:[0-9a-f]{64}$", image) is None
+    ):
+        raise RuntimeErrorEB(
+            "NATS transfer pod requires the source-commit-bound immutable image"
+        )
     manifest = {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -10925,6 +11431,21 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     recovery_receipt, recovery_attempt, recovery_started_at = (
         _begin_live_check_attempt(root, "recovery", source_commit)
     )
+    nats_source_contract = _source_commit_data_deployment_contract(
+        source_commit,
+        CLUSTER / "data/nats.yaml",
+        "nats",
+    )
+    nats_transfer_image = nats_source_contract["images"]["containers"].get(
+        "nats"
+    )
+    if (
+        not isinstance(nats_transfer_image, str)
+        or re.search(r"@sha256:[0-9a-f]{64}$", nats_transfer_image) is None
+    ):
+        raise RuntimeErrorEB(
+            "source-commit NATS Deployment has no immutable transfer image"
+        )
 
     with _bound_kube_env(root, recovery_target):
         destructive_started = time.monotonic()
@@ -10978,6 +11499,23 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery pre-NATS shutdown"
             )
+            nats_runtime_binding = _require_live_data_deployments(
+                root,
+                ("nats",),
+                source_commit=source_commit,
+            )["nats"]
+            if (
+                nats_runtime_binding.get("canonical") is not True
+                or nats_runtime_binding.get("contract_sha256")
+                != nats_source_contract["contract_sha256"]
+                or nats_runtime_binding.get("pod_contract_sha256")
+                != nats_source_contract["pod_contract_sha256"]
+                or nats_runtime_binding.get("images_sha256")
+                != _stable_json_sha256(nats_source_contract["images"])
+            ):
+                raise RuntimeErrorEB(
+                    "live NATS workload is not bound to the source-commit contract"
+                )
             _scale_deployment(root, DATA_NAMESPACE, "nats", 0)
             _wait_pods_absent(
                 root,
@@ -10987,7 +11525,11 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery NATS shutdown"
             )
-            _nats_transfer_pod(root, "commonthing-experiment-b-nats-backup")
+            _nats_transfer_pod(
+                root,
+                "commonthing-experiment-b-nats-backup",
+                nats_transfer_image,
+            )
             try:
                 _run_binary_to_file(
                     [
@@ -11050,7 +11592,11 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery replacement PVC verification"
             )
-            _nats_transfer_pod(root, "commonthing-experiment-b-nats-restore")
+            _nats_transfer_pod(
+                root,
+                "commonthing-experiment-b-nats-restore",
+                nats_transfer_image,
+            )
             try:
                 _run_input_file(
                     [
@@ -11155,6 +11701,12 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                         recovery_target
                     ),
                     "storage_manifest_sha256": storage_manifest_sha256,
+                    "nats_source_contract_sha256": nats_source_contract[
+                        "contract_sha256"
+                    ],
+                    "nats_transfer_image_sha256": hashlib.sha256(
+                        nats_transfer_image.encode("utf-8")
+                    ).hexdigest(),
                     "target_safe_for_cleanup": target_safe_for_cleanup,
                     "flux_resuspended": resuspended,
                 },
@@ -11186,6 +11738,12 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             recovery_target
         ),
         "storage_manifest_sha256": storage_manifest_sha256,
+        "nats_source_contract_sha256": nats_source_contract[
+            "contract_sha256"
+        ],
+        "nats_transfer_image_sha256": hashlib.sha256(
+            nats_transfer_image.encode("utf-8")
+        ).hexdigest(),
         "rpo_seconds": 0,
         "rto_seconds": round(rto_seconds, 3),
         "postgres_dump_sha256": sha256_file(db_dump),
@@ -11366,7 +11924,7 @@ def portability_report(root: Path) -> dict[str, Any]:
                 f"latest {receipt_stem} attempt is not bound to its current success receipt"
             )
 
-    config = load_config()
+    config = _source_commit_config(source_commit)
     _require_vm_create_receipt(
         payloads["vm-create.json"], source_commit, config, root
     )
@@ -11572,7 +12130,9 @@ def portability_report(root: Path) -> dict[str, Any]:
         )
 
     namespace_status = status_payload.get("namespace_security")
-    expected_namespaces = _versioned_namespace_security_contract()
+    expected_namespaces = _versioned_namespace_security_contract(
+        source_commit
+    )
     if (
         not isinstance(namespace_status, dict)
         or set(namespace_status) != set(expected_namespaces)
@@ -11594,8 +12154,10 @@ def portability_report(root: Path) -> dict[str, Any]:
 
     data_deployment_status = status_payload.get("data_deployments")
     expected_data_deployments = {
-        name: _versioned_data_deployment_contract(
-            CLUSTER / f"data/{name}.yaml", name
+        name: _source_commit_data_deployment_contract(
+            source_commit,
+            CLUSTER / f"data/{name}.yaml",
+            name,
         )
         for name in ("postgres", "nats")
     }
@@ -11632,7 +12194,7 @@ def portability_report(root: Path) -> dict[str, Any]:
         )
 
     pvc_status = status_payload.get("pvcs")
-    expected_pvcs = _rendered_pvc_contract(root)
+    expected_pvcs = _rendered_pvc_contract(root, source_commit)
     if (
         not isinstance(pvc_status, dict)
         or set(pvc_status) != set(expected_pvcs)
@@ -11654,8 +12216,10 @@ def portability_report(root: Path) -> dict[str, Any]:
 
     data_service_status = status_payload.get("data_services")
     expected_data_services = {
-        name: _versioned_data_service_contract(
-            CLUSTER / f"data/{name}.yaml", name
+        name: _source_commit_data_service_contract(
+            source_commit,
+            CLUSTER / f"data/{name}.yaml",
+            name,
         )
         for name in ("postgres", "nats")
     }
@@ -11679,7 +12243,9 @@ def portability_report(root: Path) -> dict[str, Any]:
 
     migration_status = status_payload.get("migration")
     expected_migration = _rendered_migration_job_contract(
-        root, str(payloads["release.json"].get("api_digest", ""))
+        root,
+        str(payloads["release.json"].get("api_digest", "")),
+        source_commit,
     )
     if (
         status_payload.get("migration_complete") is not True
@@ -11868,8 +12434,10 @@ def portability_report(root: Path) -> dict[str, Any]:
 
     runtime_status = status_payload.get("runtime_contract")
     runtime_binding = config["runtime_binding"]
-    data_network_specs = _versioned_network_policy_specs(
-        CLUSTER / "data/network-policy.yaml", DATA_NAMESPACE
+    data_network_specs = _source_commit_network_policy_specs(
+        source_commit,
+        CLUSTER / "data/network-policy.yaml",
+        DATA_NAMESPACE,
     )
     if (
         not isinstance(runtime_status, dict)

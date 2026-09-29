@@ -1900,11 +1900,11 @@ spec:
         )
         self.assertIn("_complete_live_check_attempt(", status)
         self.assertGreater(
-            status.index("_require_live_runtime_contract(root, config)"),
+            status.index("_require_live_runtime_contract("),
             status.index("_final_recovery_state_readback(root, source_commit)"),
         )
         self.assertLess(
-            status.index("_require_live_runtime_contract(root, config)"),
+            status.index("_require_live_runtime_contract("),
             status.index("result = {"),
         )
 
@@ -2569,8 +2569,39 @@ spec:
             ),
             mock.patch.object(
                 runtime,
+                "_source_commit_config",
+                return_value=json.loads(json.dumps(config)),
+            ),
+            mock.patch.object(
+                runtime,
+                "_versioned_namespace_security_contract",
+                return_value=runtime._versioned_namespace_security_contract(),
+            ),
+            mock.patch.object(
+                runtime,
+                "_source_commit_data_service_contract",
+                side_effect=lambda _source_commit, path, name: (
+                    runtime._versioned_data_service_contract(path, name)
+                ),
+            ),
+            mock.patch.object(
+                runtime,
+                "_source_commit_network_policy_specs",
+                side_effect=lambda _source_commit, path, namespace: (
+                    runtime._versioned_network_policy_specs(path, namespace)
+                ),
+            ),
+            mock.patch.object(
+                runtime,
                 "_expected_flux_controller_contract",
                 return_value=flux_expected_contract,
+            ),
+            mock.patch.object(
+                runtime,
+                "_source_commit_data_deployment_contract",
+                side_effect=lambda _source_commit, path, name: (
+                    runtime._versioned_data_deployment_contract(path, name)
+                ),
             ),
             mock.patch.object(
                 runtime,
@@ -4822,6 +4853,40 @@ spec:
         self.assertIn("search_projection_jobs", source)
         self.assertIn("md5(to_jsonb(j)::text)", source)
 
+    def test_application_contract_render_uses_sealed_source_commit_tree(
+        self,
+    ) -> None:
+        source = inspect.getsource(runtime._source_commit_kustomize_build)
+        self.assertIn("_git_tree_regular_blob_paths", source)
+        self.assertIn("_git_blob_bytes", source)
+        self.assertIn("_sealed_snapshot_fd", source)
+        self.assertIn('"--ro-bind-data"', source)
+        self.assertIn('"--tmpfs"', source)
+        self.assertIn('"--unshare-all"', source)
+        self.assertIn('"--share-net"', source)
+        self.assertNotIn("TemporaryDirectory", source)
+
+        application_source = inspect.getsource(
+            runtime._source_commit_application_render
+        )
+        self.assertIn('release.get("source_commit")', application_source)
+        self.assertIn("_source_commit_kustomize_build", application_source)
+        for helper in (
+            runtime._rendered_application_workload_contract,
+            runtime._rendered_application_service_contract,
+            runtime._rendered_application_pdb_contract,
+            runtime._rendered_application_service_account_contract,
+        ):
+            helper_source = inspect.getsource(helper)
+            self.assertIn(
+                "_source_commit_application_render(root, release)",
+                helper_source,
+            )
+            self.assertNotIn(
+                'run([kustomize, "build", str(APP_OVERLAY)])',
+                helper_source,
+            )
+
     def test_recovery_captures_signatures_after_application_quiescence(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         api_scale = source.index(
@@ -4851,10 +4916,71 @@ spec:
         scaled = source.index('_scale_deployment(root, DATA_NAMESPACE, "nats", 0)')
         waited = source.index("_wait_pods_absent(", scaled)
         transfer = source.index(
-            '_nats_transfer_pod(root, "commonthing-experiment-b-nats-backup")'
+            '"commonthing-experiment-b-nats-backup",'
         )
         self.assertLess(scaled, waited)
         self.assertLess(waited, transfer)
+
+    def test_nats_transfer_pod_uses_only_explicit_canonical_image(self) -> None:
+        root = Path("/tmp/experiment-b-nats-transfer-test")
+        image = "nats@sha256:" + "a" * 64
+        waited = runtime.subprocess.CompletedProcess(
+            ["kubectl"], 0, stdout="", stderr=""
+        )
+        with (
+            mock.patch.object(runtime, "kubectl_apply") as apply_manifest,
+            mock.patch.object(runtime, "_kubectl", return_value=waited),
+            mock.patch.object(
+                runtime,
+                "_kubectl_json",
+                side_effect=AssertionError(
+                    "transfer helper must not reread the live NATS Deployment"
+                ),
+            ),
+        ):
+            runtime._nats_transfer_pod(root, "transfer", image)
+
+        manifest = json.loads(apply_manifest.call_args.args[1])
+        self.assertEqual(
+            manifest["spec"]["containers"][0]["image"],
+            image,
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "source-commit-bound immutable image",
+        ):
+            runtime._nats_transfer_pod(root, "transfer", "nats:latest")
+
+    def test_recovery_binds_nats_transfer_to_source_commit_contract(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        source_contract = source.index(
+            "nats_source_contract = _source_commit_data_deployment_contract("
+        )
+        live_contract = source.index(
+            "nats_runtime_binding = _require_live_data_deployments("
+        )
+        scale_down = source.index(
+            '_scale_deployment(root, DATA_NAMESPACE, "nats", 0)'
+        )
+        backup = source.index(
+            '"commonthing-experiment-b-nats-backup",'
+        )
+        restore = source.index(
+            '"commonthing-experiment-b-nats-restore",'
+        )
+        self.assertLess(source_contract, live_contract)
+        self.assertLess(live_contract, scale_down)
+        self.assertLess(scale_down, backup)
+        self.assertLess(backup, restore)
+        self.assertIn("source_commit=source_commit", source)
+        self.assertGreaterEqual(
+            source.count("nats_transfer_image"),
+            6,
+        )
+        self.assertNotIn(
+            '"NATS restore pod cannot bind the live immutable image"',
+            inspect.getsource(runtime._nats_transfer_pod),
+        )
 
     def test_recovery_waits_for_postgres_quiescence_before_pvc_delete(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
@@ -4924,7 +5050,7 @@ spec:
     def test_recovery_deletes_restore_transfer_before_nats_restart(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         restore = source.index(
-            '_nats_transfer_pod(root, "commonthing-experiment-b-nats-restore")'
+            '"commonthing-experiment-b-nats-restore",'
         )
         deleted = source.index("_delete_pod(", restore)
         restarted = source.index(
@@ -5967,6 +6093,45 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertEqual(observed, self.cloud_user_data_bytes)
 
     def prepare_status(self) -> None:
+        namespace_contract = runtime._versioned_namespace_security_contract()
+        self.source_commit_config = self.patch(
+            "_source_commit_config",
+            side_effect=lambda _source_commit: json.loads(
+                json.dumps(self.config)
+            ),
+        )
+        self.namespace_contract = self.patch(
+            "_versioned_namespace_security_contract",
+            return_value=json.loads(json.dumps(namespace_contract)),
+        )
+        self.source_commit_data_service = self.patch(
+            "_source_commit_data_service_contract",
+            side_effect=lambda _source_commit, path, name: (
+                runtime._versioned_data_service_contract(path, name)
+            ),
+        )
+        self.source_commit_network_policy = self.patch(
+            "_source_commit_network_policy_specs",
+            side_effect=lambda _source_commit, path, namespace: (
+                runtime._versioned_network_policy_specs(path, namespace)
+            ),
+        )
+        self.source_commit_data_resources = self.patch(
+            "_source_commit_data_container_resources",
+            side_effect=lambda _source_commit, path, deployment, container: (
+                runtime._versioned_data_container_resources(
+                    path,
+                    deployment,
+                    container,
+                )
+            ),
+        )
+        self.source_commit_data_contract = self.patch(
+            "_source_commit_data_deployment_contract",
+            side_effect=lambda _source_commit, path, name: (
+                runtime._versioned_data_deployment_contract(path, name)
+            ),
+        )
         api_digest = "sha256:" + "b" * 64
         web_digest = "sha256:" + "c" * 64
         binding = runtime.contract.render_bootstrap(
@@ -7430,6 +7595,18 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertTrue(result["data_deployments"]["postgres"]["images_canonical"])
         self.assertTrue(result["data_deployments"]["nats"]["images_canonical"])
 
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+        extra_pod = json.loads(json.dumps(healthy_pods["nats"][0]))
+        extra_pod["metadata"]["name"] = "unversioned-data-writer"
+        extra_pod["metadata"]["labels"] = {"app": "unversioned-writer"}
+        self.data_pods["nats"].append(extra_pod)
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "noncanonical Pods",
+        ):
+            runtime.status(self.root)
+        self.data_pods = json.loads(json.dumps(healthy_pods))
+
         self.data_deployments = json.loads(json.dumps(healthy))
         self.data_deployments["postgres"]["spec"]["replicas"] = 2
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not currently available"):
@@ -7591,16 +7768,10 @@ spec:
       targetPort: web-http
       protocol: TCP
 """
-        completed = runtime.subprocess.CompletedProcess(
-            ["kustomize", "build"], 0, stdout=rendered, stderr=""
-        )
-        with (
-            mock.patch.object(
-                runtime,
-                "toolchain",
-                return_value={"tools": {"kustomize": "kustomize"}},
-            ),
-            mock.patch.object(runtime, "run", return_value=completed),
+        with mock.patch.object(
+            runtime,
+            "_source_commit_application_render",
+            return_value=rendered,
         ):
             result = runtime._rendered_application_service_contract(
                 self.root,
@@ -7761,16 +7932,10 @@ spec:
         - name: web
           image: example.invalid/web
 """
-        completed = runtime.subprocess.CompletedProcess(
-            ["kustomize", "build"], 0, stdout=rendered, stderr=""
-        )
-        with (
-            mock.patch.object(
-                runtime,
-                "toolchain",
-                return_value={"tools": {"kustomize": "kustomize"}},
-            ),
-            mock.patch.object(runtime, "run", return_value=completed),
+        with mock.patch.object(
+            runtime,
+            "_source_commit_application_render",
+            return_value=rendered,
         ):
             expected = runtime._rendered_application_service_account_contract(
                 self.root,
@@ -8567,6 +8732,10 @@ spec:
             },
         )
         config = runtime.load_config()
+        self.patch(
+            "_source_commit_config",
+            return_value=json.loads(json.dumps(config)),
+        )
         images = {
             "api": f"ghcr.io/heimgewebe/commonthing-api@{api_digest}",
             "search-worker": (
@@ -9353,6 +9522,44 @@ spec:
             runtime._require_t048_postgres_runtime_binding(self.root)
 
 
+    def test_source_commit_nats_contract_rejects_live_image_drift(self) -> None:
+        source_bytes = (runtime.CLUSTER / "data/nats.yaml").read_bytes()
+        nats_container = next(
+            item
+            for item in self.data_deployments["nats"]["spec"]["template"][
+                "spec"
+            ]["containers"]
+            if item["name"] == "nats"
+        )
+        nats_container["image"] = "nats@sha256:" + "d" * 64
+
+        with (
+            mock.patch.object(
+                runtime,
+                "_git_blob_bytes",
+                return_value=source_bytes,
+            ) as git_blob,
+            mock.patch.object(
+                runtime,
+                "_kubectl_json",
+                side_effect=self.kubernetes_fixture,
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "images drifted from versioned manifest",
+            ),
+        ):
+            runtime._require_live_data_deployments(
+                self.root,
+                ("nats",),
+                source_commit=self.commit,
+            )
+
+        git_blob.assert_called_once_with(
+            self.commit,
+            runtime.CLUSTER / "data/nats.yaml",
+        )
+
     def test_status_revalidates_namespace_restricted_security_labels(self) -> None:
         self.write_vm_receipt()
         self.prepare_status()
@@ -9898,7 +10105,6 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                     f"_stable_json_sha256({target_name})",
                     source,
                 )
-
     def test_controller_pod_contract_rejects_ephemeral_debug_containers(self) -> None:
         digest = "sha256:" + "a" * 64
         image = "example.invalid/controller@" + digest
