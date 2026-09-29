@@ -97,6 +97,7 @@ def run(
     capture: bool = True,
     check: bool = True,
     timeout: int = 900,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         argv,
@@ -107,6 +108,7 @@ def run(
         capture_output=capture,
         timeout=timeout,
         check=False,
+        pass_fds=pass_fds,
     )
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
@@ -131,7 +133,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _git_blob_sha256(source_commit: str, path: Path) -> str:
+def _git_blob_bytes(source_commit: str, path: Path) -> bytes:
     if COMMIT_RE.fullmatch(source_commit) is None:
         raise RuntimeErrorEB("Git blob binding requires an exact source commit")
     try:
@@ -151,7 +153,11 @@ def _git_blob_sha256(source_commit: str, path: Path) -> str:
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeErrorEB(f"Git blob binding failed: {stderr[-1000:]}")
-    return hashlib.sha256(result.stdout).hexdigest()
+    return result.stdout
+
+
+def _git_blob_sha256(source_commit: str, path: Path) -> str:
+    return hashlib.sha256(_git_blob_bytes(source_commit, path)).hexdigest()
 
 
 def state_root(value: str | None) -> Path:
@@ -999,28 +1005,70 @@ def create_vm(root: Path) -> dict[str, Any]:
             volume_inode=volume_stat.st_ino,
         )
         atomic_json(attempt_path, attempt)
-        run(
-            [
-                "virt-install",
-                "--connect", LIBVIRT_URI,
-                "--name", VM_NAME,
-                "--uuid", domain_target,
-                "--memory", str(config["vm"]["memory_mib"]),
-                "--vcpus", str(config["vm"]["vcpu"]),
-                "--import",
-                "--disk", f"vol={POOL_NAME}/{VOLUME_NAME},bus=virtio",
-                "--network", f"network={config['vm']['network']},model=virtio",
-                "--graphics", "none",
-                "--noautoconsole",
-                "--os-variant", config["vm"]["os_variant"],
-                "--cloud-init",
-                (
-                    f"user-data={root / 'cloud-init/user-data.yaml'},"
-                    f"meta-data={root / 'cloud-init/meta-data.yaml'}"
-                ),
-            ],
-            timeout=120,
-        )
+        cloud_init = prepared.get("cloud_init")
+        user_data_path = root / "cloud-init/user-data.yaml"
+        meta_data_path = root / "cloud-init/meta-data.yaml"
+        if (
+            not isinstance(cloud_init, dict)
+            or cloud_init.get("user_data") != str(user_data_path)
+            or cloud_init.get("meta_data") != str(meta_data_path)
+            or not isinstance(cloud_init.get("user_data_sha256"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(cloud_init["user_data_sha256"])
+            )
+            is None
+            or not isinstance(cloud_init.get("meta_data_sha256"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(cloud_init["meta_data_sha256"])
+            )
+            is None
+        ):
+            raise RuntimeErrorEB("prepared cloud-init binding is invalid")
+        user_data_sha256 = str(cloud_init["user_data_sha256"])
+        meta_data_sha256 = str(cloud_init["meta_data_sha256"])
+        attempt["cloud_init_sha256"] = {
+            "user_data": user_data_sha256,
+            "meta_data": meta_data_sha256,
+        }
+        atomic_json(attempt_path, attempt)
+        virt_install_argv = [
+            "virt-install",
+            "--connect", LIBVIRT_URI,
+            "--name", VM_NAME,
+            "--uuid", domain_target,
+            "--memory", str(config["vm"]["memory_mib"]),
+            "--vcpus", str(config["vm"]["vcpu"]),
+            "--import",
+            "--disk", f"vol={POOL_NAME}/{VOLUME_NAME},bus=virtio",
+            "--network", f"network={config['vm']['network']},model=virtio",
+            "--graphics", "none",
+            "--noautoconsole",
+            "--os-variant", config["vm"]["os_variant"],
+        ]
+        with (
+            _verified_snapshot_fd(
+                user_data_path,
+                user_data_sha256,
+                "prepared cloud-init user-data",
+            ) as user_data_fd,
+            _verified_snapshot_fd(
+                meta_data_path,
+                meta_data_sha256,
+                "prepared cloud-init meta-data",
+            ) as meta_data_fd,
+        ):
+            run(
+                [
+                    *virt_install_argv,
+                    "--cloud-init",
+                    (
+                        f"user-data=/proc/self/fd/{user_data_fd},"
+                        f"meta-data=/proc/self/fd/{meta_data_fd}"
+                    ),
+                ],
+                timeout=120,
+                pass_fds=(user_data_fd, meta_data_fd),
+            )
         if _libvirt_resource_uuid("domain", VM_NAME) != domain_target:
             raise RuntimeErrorEB(
                 "created VM UUID differs from the persisted creation identity"
@@ -1193,6 +1241,44 @@ def _open_verified_file(
         os.close(file_fd)
         raise
     return file_fd
+
+
+@contextmanager
+def _verified_snapshot_fd(
+    path: Path,
+    expected_sha256: str,
+    context: str,
+) -> Iterator[int]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+        raise RuntimeErrorEB(f"{context} cannot be opened safely")
+    try:
+        source_fd = os.open(path, os.O_RDONLY | cloexec | nofollow)
+    except OSError as exc:
+        raise RuntimeErrorEB(f"{context} is missing or unsafe") from exc
+    try:
+        metadata = os.fstat(source_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeErrorEB(f"{context} is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+    finally:
+        os.close(source_fd)
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise RuntimeErrorEB(
+            f"{context} digest does not match prepared source"
+        )
+    with tempfile.TemporaryFile(mode="w+b") as snapshot:
+        snapshot.write(payload)
+        snapshot.flush()
+        snapshot.seek(0)
+        yield snapshot.fileno()
 
 
 def _open_verified_k3s_binary(path: Path, expected_sha256: str) -> int:
@@ -10634,6 +10720,15 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         }
     )
     recovery_target = _kubernetes_target_identity(root, source_commit)
+    storage_path = CLUSTER / "data/storage.yaml"
+    storage_bytes = _git_blob_bytes(source_commit, storage_path)
+    try:
+        storage_manifest = storage_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeErrorEB(
+            "recovery storage manifest is not valid UTF-8"
+        ) from exc
+    storage_manifest_sha256 = hashlib.sha256(storage_bytes).hexdigest()
     backup_dir = root / "recovery"
     backup_dir.mkdir(parents=True, exist_ok=True)
     db_dump = backup_dir / "postgres.dump"
@@ -10644,254 +10739,255 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         _begin_live_check_attempt(root, "recovery", source_commit)
     )
 
-    destructive_started = time.monotonic()
-    try:
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery pre-suspend"
-        )
-        _flux_suspend(root, "commonthing-experiment-b-app")
-        _flux_suspend(root, "commonthing-experiment-b-data")
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery Flux suspension"
-        )
-        _scale_deployment(root, APP_NAMESPACE, "weltgewebe-api", 0)
-        _scale_deployment(root, APP_NAMESPACE, "weltgewebe-web", 0)
-        _wait_pods_absent(
-            root,
-            APP_NAMESPACE,
-            "app.kubernetes.io/name=weltgewebe-api",
-        )
-        _wait_pods_absent(
-            root,
-            APP_NAMESPACE,
-            "app.kubernetes.io/name=weltgewebe-web",
-        )
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery application quiescence"
-        )
-
-        before_db = _database_signature(
-            root, database_identity=database_identity
-        )
-        before_nats = _jetstream_signature(root)
-        if before_nats["streams"] < 1 or before_nats["messages"] < 1:
-            raise RuntimeErrorEB("JetStream test state is empty before recovery proof")
-
-        kubectl = toolchain(root)["tools"]["kubectl"]
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery PostgreSQL backup"
-        )
-        _run_binary_to_file(
-            [
-                kubectl, "-n", DATA_NAMESPACE, "exec", "deployment/postgres", "--",
-                *_database_client_argv("pg_dump", database_identity),
-                "-Fc",
-            ],
-            db_dump,
-            env=kube_env(root),
-            timeout=900,
-        )
-
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery pre-NATS shutdown"
-        )
-        _scale_deployment(root, DATA_NAMESPACE, "nats", 0)
-        _wait_pods_absent(
-            root,
-            DATA_NAMESPACE,
-            "app.kubernetes.io/name=nats",
-        )
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery NATS shutdown"
-        )
-        _nats_transfer_pod(root, "commonthing-experiment-b-nats-backup")
+    with _bound_kube_env(root, recovery_target):
+        destructive_started = time.monotonic()
         try:
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery pre-suspend"
+            )
+            _flux_suspend(root, "commonthing-experiment-b-app")
+            _flux_suspend(root, "commonthing-experiment-b-data")
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery Flux suspension"
+            )
+            _scale_deployment(root, APP_NAMESPACE, "weltgewebe-api", 0)
+            _scale_deployment(root, APP_NAMESPACE, "weltgewebe-web", 0)
+            _wait_pods_absent(
+                root,
+                APP_NAMESPACE,
+                "app.kubernetes.io/name=weltgewebe-api",
+            )
+            _wait_pods_absent(
+                root,
+                APP_NAMESPACE,
+                "app.kubernetes.io/name=weltgewebe-web",
+            )
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery application quiescence"
+            )
+
+            before_db = _database_signature(
+                root, database_identity=database_identity
+            )
+            before_nats = _jetstream_signature(root)
+            if before_nats["streams"] < 1 or before_nats["messages"] < 1:
+                raise RuntimeErrorEB("JetStream test state is empty before recovery proof")
+
+            kubectl = toolchain(root)["tools"]["kubectl"]
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery PostgreSQL backup"
+            )
             _run_binary_to_file(
                 [
-                    kubectl, "-n", DATA_NAMESPACE, "exec",
-                    "commonthing-experiment-b-nats-backup", "--",
-                    "tar", "-C", "/data", "-cf", "-", ".",
+                    kubectl, "-n", DATA_NAMESPACE, "exec", "deployment/postgres", "--",
+                    *_database_client_argv("pg_dump", database_identity),
+                    "-Fc",
                 ],
-                nats_tar,
+                db_dump,
                 env=kube_env(root),
                 timeout=900,
             )
-        finally:
-            _delete_pod(
-                root, DATA_NAMESPACE, "commonthing-experiment-b-nats-backup"
-            )
 
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery post-backup"
-        )
-        _scale_deployment(root, DATA_NAMESPACE, "postgres", 0)
-        _wait_pods_absent(
-            root,
-            DATA_NAMESPACE,
-            "app.kubernetes.io/name=postgres",
-        )
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery PostgreSQL shutdown"
-        )
-        old_pvc_identities = {
-            name: _pvc_volume_identity(root, name)
-            for name in ("postgres-data", "nats-data")
-        }
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery pre-PVC deletion"
-        )
-        _kubectl(
-            root,
-            [
-                "-n", DATA_NAMESPACE, "delete", "pvc",
-                "postgres-data", "nats-data", "--wait=true", "--timeout=5m",
-            ],
-            timeout=330,
-        )
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery PVC deletion"
-        )
-        for identity in old_pvc_identities.values():
-            _wait_pv_absent(root, identity["pv_name"])
-        storage = (CLUSTER / "data/storage.yaml").read_text(encoding="utf-8")
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery pre-storage recreation"
-        )
-        kubectl_apply(root, storage)
-        pvc_replacements = {
-            name: _require_empty_replacement_pvc(
-                root, name, old_pvc_identities[name]
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery pre-NATS shutdown"
             )
-            for name in ("postgres-data", "nats-data")
-        }
+            _scale_deployment(root, DATA_NAMESPACE, "nats", 0)
+            _wait_pods_absent(
+                root,
+                DATA_NAMESPACE,
+                "app.kubernetes.io/name=nats",
+            )
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery NATS shutdown"
+            )
+            _nats_transfer_pod(root, "commonthing-experiment-b-nats-backup")
+            try:
+                _run_binary_to_file(
+                    [
+                        kubectl, "-n", DATA_NAMESPACE, "exec",
+                        "commonthing-experiment-b-nats-backup", "--",
+                        "tar", "-C", "/data", "-cf", "-", ".",
+                    ],
+                    nats_tar,
+                    env=kube_env(root),
+                    timeout=900,
+                )
+            finally:
+                _delete_pod(
+                    root, DATA_NAMESPACE, "commonthing-experiment-b-nats-backup"
+                )
 
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery replacement PVC verification"
-        )
-        _nats_transfer_pod(root, "commonthing-experiment-b-nats-restore")
-        try:
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery post-backup"
+            )
+            _scale_deployment(root, DATA_NAMESPACE, "postgres", 0)
+            _wait_pods_absent(
+                root,
+                DATA_NAMESPACE,
+                "app.kubernetes.io/name=postgres",
+            )
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery PostgreSQL shutdown"
+            )
+            old_pvc_identities = {
+                name: _pvc_volume_identity(root, name)
+                for name in ("postgres-data", "nats-data")
+            }
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery pre-PVC deletion"
+            )
+            _kubectl(
+                root,
+                [
+                    "-n", DATA_NAMESPACE, "delete", "pvc",
+                    "postgres-data", "nats-data", "--wait=true", "--timeout=5m",
+                ],
+                timeout=330,
+            )
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery PVC deletion"
+            )
+            for identity in old_pvc_identities.values():
+                _wait_pv_absent(root, identity["pv_name"])
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery pre-storage recreation"
+            )
+            kubectl_apply(root, storage_manifest)
+            pvc_replacements = {
+                name: _require_empty_replacement_pvc(
+                    root, name, old_pvc_identities[name]
+                )
+                for name in ("postgres-data", "nats-data")
+            }
+
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery replacement PVC verification"
+            )
+            _nats_transfer_pod(root, "commonthing-experiment-b-nats-restore")
+            try:
+                _run_input_file(
+                    [
+                        kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
+                        "commonthing-experiment-b-nats-restore", "--",
+                        "tar", "-C", "/data", "-xf", "-",
+                    ],
+                    nats_tar,
+                    env=kube_env(root),
+                    timeout=900,
+                )
+            finally:
+                _delete_pod(
+                    root, DATA_NAMESPACE, "commonthing-experiment-b-nats-restore"
+                )
+
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery pre-PostgreSQL restore"
+            )
+            _scale_deployment(root, DATA_NAMESPACE, "postgres", 1)
+            _wait_deployment(root, DATA_NAMESPACE, "postgres", "5m")
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery PostgreSQL restore"
+            )
             _run_input_file(
                 [
                     kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
-                    "commonthing-experiment-b-nats-restore", "--",
-                    "tar", "-C", "/data", "-xf", "-",
+                    "deployment/postgres", "--",
+                    *_database_client_argv("pg_restore", database_identity),
+                    "--clean", "--if-exists", "--no-owner",
                 ],
-                nats_tar,
+                db_dump,
                 env=kube_env(root),
-                timeout=900,
+                timeout=1200,
             )
-        finally:
-            _delete_pod(
-                root, DATA_NAMESPACE, "commonthing-experiment-b-nats-restore"
-            )
-
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery pre-PostgreSQL restore"
-        )
-        _scale_deployment(root, DATA_NAMESPACE, "postgres", 1)
-        _wait_deployment(root, DATA_NAMESPACE, "postgres", "5m")
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery PostgreSQL restore"
-        )
-        _run_input_file(
-            [
-                kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
-                "deployment/postgres", "--",
-                *_database_client_argv("pg_restore", database_identity),
-                "--clean", "--if-exists", "--no-owner",
-            ],
-            db_dump,
-            env=kube_env(root),
-            timeout=1200,
-        )
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery post-PostgreSQL restore"
-        )
-        _scale_deployment(root, DATA_NAMESPACE, "nats", 1)
-        _wait_deployment(root, DATA_NAMESPACE, "nats", "5m")
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery data restoration"
-        )
-
-        after_db = _database_signature(
-            root, database_identity=database_identity
-        )
-        after_nats = _jetstream_signature(root)
-        if after_db != before_db:
-            raise RuntimeErrorEB("PostgreSQL/search signature changed across delete-to-prove")
-        if after_nats != before_nats:
-            raise RuntimeErrorEB(
-                "JetStream stream/message-store/durable-consumer continuity signature changed across restore"
-            )
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery pre-Flux resume"
-        )
-        _flux_resume(root, "commonthing-experiment-b-data")
-        _flux_resume(root, "commonthing-experiment-b-app")
-        _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")
-        _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")
-        _require_same_kubernetes_target(
-            root, source_commit, recovery_target, "recovery completion"
-        )
-        rto_seconds = time.monotonic() - destructive_started
-    except Exception:
-        resuspended: dict[str, bool] = {
-            "commonthing-experiment-b-app": False,
-            "commonthing-experiment-b-data": False,
-        }
-        target_safe_for_cleanup = False
-        try:
             _require_same_kubernetes_target(
-                root,
-                source_commit,
-                recovery_target,
-                "recovery failure cleanup",
+                root, source_commit, recovery_target, "recovery post-PostgreSQL restore"
             )
-            target_safe_for_cleanup = True
+            _scale_deployment(root, DATA_NAMESPACE, "nats", 1)
+            _wait_deployment(root, DATA_NAMESPACE, "nats", "5m")
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery data restoration"
+            )
+
+            after_db = _database_signature(
+                root, database_identity=database_identity
+            )
+            after_nats = _jetstream_signature(root)
+            if after_db != before_db:
+                raise RuntimeErrorEB("PostgreSQL/search signature changed across delete-to-prove")
+            if after_nats != before_nats:
+                raise RuntimeErrorEB(
+                    "JetStream stream/message-store/durable-consumer continuity signature changed across restore"
+                )
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery pre-Flux resume"
+            )
+            _flux_resume(root, "commonthing-experiment-b-data")
+            _flux_resume(root, "commonthing-experiment-b-app")
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery completion"
+            )
+            rto_seconds = time.monotonic() - destructive_started
         except Exception:
+            resuspended: dict[str, bool] = {
+                "commonthing-experiment-b-app": False,
+                "commonthing-experiment-b-data": False,
+            }
             target_safe_for_cleanup = False
-        if target_safe_for_cleanup:
-            for name in (
-                "commonthing-experiment-b-app",
-                "commonthing-experiment-b-data",
-            ):
-                try:
-                    _flux_suspend(root, name)
-                    resuspended[name] = True
-                except Exception:
-                    resuspended[name] = False
-        atomic_json(
-            recovery_failed_receipt,
-            {
-                "schema_version": 1,
-                "status": "failed",
-                "source_commit": source_commit,
-                "database_identity_sha256": database_identity_sha256,
-                "database_before": before_db,
-                "jetstream_before": before_nats,
-                "kubernetes_target_sha256": _stable_json_sha256(
-                    recovery_target
-                ),
-                "target_safe_for_cleanup": target_safe_for_cleanup,
-                "flux_resuspended": resuspended,
-            },
-        )
-        atomic_json(
-            recovery_attempt,
-            {
-                "schema_version": 1,
-                "status": "failed",
-                "source_commit": source_commit,
-                "receipt": recovery_receipt.name,
-                "started_at_unix_ms": recovery_started_at,
-                "finished_at_unix_ms": time.time_ns() // 1_000_000,
-                "failure_receipt": recovery_failed_receipt.name,
-                "failure_receipt_sha256": sha256_file(
-                    recovery_failed_receipt
-                ),
-            },
-        )
-        raise
+            try:
+                _require_same_kubernetes_target(
+                    root,
+                    source_commit,
+                    recovery_target,
+                    "recovery failure cleanup",
+                )
+                target_safe_for_cleanup = True
+            except Exception:
+                target_safe_for_cleanup = False
+            if target_safe_for_cleanup:
+                for name in (
+                    "commonthing-experiment-b-app",
+                    "commonthing-experiment-b-data",
+                ):
+                    try:
+                        _flux_suspend(root, name)
+                        resuspended[name] = True
+                    except Exception:
+                        resuspended[name] = False
+            atomic_json(
+                recovery_failed_receipt,
+                {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "source_commit": source_commit,
+                    "database_identity_sha256": database_identity_sha256,
+                    "database_before": before_db,
+                    "jetstream_before": before_nats,
+                    "kubernetes_target_sha256": _stable_json_sha256(
+                        recovery_target
+                    ),
+                    "storage_manifest_sha256": storage_manifest_sha256,
+                    "target_safe_for_cleanup": target_safe_for_cleanup,
+                    "flux_resuspended": resuspended,
+                },
+            )
+            atomic_json(
+                recovery_attempt,
+                {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "source_commit": source_commit,
+                    "receipt": recovery_receipt.name,
+                    "started_at_unix_ms": recovery_started_at,
+                    "finished_at_unix_ms": time.time_ns() // 1_000_000,
+                    "failure_receipt": recovery_failed_receipt.name,
+                    "failure_receipt_sha256": sha256_file(
+                        recovery_failed_receipt
+                    ),
+                },
+            )
+            raise
     if before_db is None or before_nats is None:
         raise RuntimeErrorEB("recovery proof has no quiesced before-signature")
     receipt = {
@@ -10902,6 +10998,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         "kubernetes_target_sha256": _stable_json_sha256(
             recovery_target
         ),
+        "storage_manifest_sha256": storage_manifest_sha256,
         "rpo_seconds": 0,
         "rto_seconds": round(rto_seconds, 3),
         "postgres_dump_sha256": sha256_file(db_dump),

@@ -817,6 +817,12 @@ spec:
         self.assertIn("service_path.is_symlink()", source)
         self.assertNotIn(".resolve()", source)
 
+        storage_path = runtime.CLUSTER / "data/storage.yaml"
+        self.assertEqual(
+            runtime._git_blob_bytes(head, storage_path),
+            storage_path.read_bytes(),
+        )
+
     def test_install_k3s_rejects_vm_substrate_drift_before_ssh(self) -> None:
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as tmp:
@@ -5880,9 +5886,49 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.pool.rmdir()
         self.domain_present = self.pool_present = False
         self.domain_active = False
-        self.patch("prepare", return_value={
-            "cloud_image": str(self.root / "ubuntu.img"), "cloud_image_virtual_size": 4 * 1024**3,
-        })
+        cloud_dir = self.root / "cloud-init"
+        cloud_dir.mkdir(parents=True, exist_ok=True)
+        self.cloud_user_data = cloud_dir / "user-data.yaml"
+        self.cloud_meta_data = cloud_dir / "meta-data.yaml"
+        self.cloud_user_data_bytes = b"#cloud-config\nhostname: fixture\n"
+        self.cloud_meta_data_bytes = b"instance-id: fixture\n"
+        self.cloud_user_data.write_bytes(self.cloud_user_data_bytes)
+        self.cloud_meta_data.write_bytes(self.cloud_meta_data_bytes)
+        self.patch(
+            "prepare",
+            return_value={
+                "cloud_image": str(self.root / "ubuntu.img"),
+                "cloud_image_virtual_size": 4 * 1024**3,
+                "cloud_init": {
+                    "user_data": str(self.cloud_user_data),
+                    "user_data_sha256": hashlib.sha256(
+                        self.cloud_user_data_bytes
+                    ).hexdigest(),
+                    "meta_data": str(self.cloud_meta_data),
+                    "meta_data_sha256": hashlib.sha256(
+                        self.cloud_meta_data_bytes
+                    ).hexdigest(),
+                },
+            },
+        )
+
+    def test_verified_snapshot_fd_freezes_exact_source_bytes(self) -> None:
+        self.prepare_create()
+        expected = hashlib.sha256(self.cloud_user_data_bytes).hexdigest()
+        with runtime._verified_snapshot_fd(
+            self.cloud_user_data,
+            expected,
+            "cloud-init fixture",
+        ) as snapshot_fd:
+            replacement = self.root / "replacement-user-data"
+            replacement.write_bytes(b"tampered cloud-init\n")
+            runtime.os.replace(replacement, self.cloud_user_data)
+            observed = runtime.os.pread(
+                snapshot_fd,
+                len(self.cloud_user_data_bytes) + 32,
+                0,
+            )
+        self.assertEqual(observed, self.cloud_user_data_bytes)
 
     def prepare_status(self) -> None:
         api_digest = "sha256:" + "b" * 64
@@ -9350,6 +9396,53 @@ spec:
         )
         self.assertRegex(attempt["substrate_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_create_passes_only_verified_cloud_init_snapshots_to_virt_install(
+        self,
+    ) -> None:
+        self.prepare_create()
+        original = self.run_fixture
+        observed: dict[str, bytes] = {}
+
+        def capture_cloud_init(argv, **kwargs):
+            if argv[0] == "virt-install":
+                cloud_init_arg = argv[argv.index("--cloud-init") + 1]
+                fields = dict(
+                    item.split("=", 1)
+                    for item in cloud_init_arg.split(",")
+                )
+                self.assertEqual(set(fields), {"user-data", "meta-data"})
+                pass_fds = tuple(kwargs.get("pass_fds", ()))
+                fd_by_field = {
+                    name: int(value.rsplit("/", 1)[1])
+                    for name, value in fields.items()
+                }
+                self.assertEqual(set(fd_by_field.values()), set(pass_fds))
+                self.assertTrue(
+                    all(
+                        value.startswith("/proc/self/fd/")
+                        for value in fields.values()
+                    )
+                )
+                self.cloud_user_data.write_bytes(b"tampered user-data\n")
+                self.cloud_meta_data.write_bytes(b"tampered meta-data\n")
+                observed["user-data"] = runtime.os.pread(
+                    fd_by_field["user-data"],
+                    len(self.cloud_user_data_bytes) + 32,
+                    0,
+                )
+                observed["meta-data"] = runtime.os.pread(
+                    fd_by_field["meta-data"],
+                    len(self.cloud_meta_data_bytes) + 32,
+                    0,
+                )
+            return original(argv, **kwargs)
+
+        self.runner.side_effect = capture_cloud_init
+        result = runtime.create_vm(self.root)
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(observed["user-data"], self.cloud_user_data_bytes)
+        self.assertEqual(observed["meta-data"], self.cloud_meta_data_bytes)
+
     def test_post_create_validation_and_binding_failures_cleanup_vm_and_pool(self) -> None:
         for failure in ("substrate", "base_digest", "source", "config", "receipt_write"):
             with self.subTest(failure=failure):
@@ -9714,11 +9807,24 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
 
     def test_recovery_revalidates_target_around_destructive_boundaries(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
+        bound_context = source.index(
+            "with _bound_kube_env(root, recovery_target):"
+        )
+        storage_capture = source.index(
+            "_git_blob_bytes(source_commit, storage_path)"
+        )
+        self.assertNotIn(
+            '(CLUSTER / "data/storage.yaml").read_text',
+            source,
+        )
+        self.assertIn('"storage_manifest_sha256"', source)
         self.assertGreaterEqual(
             source.count("_require_same_kubernetes_target"),
             12,
         )
         delete_pvc = source.index('"delete", "pvc"')
+        self.assertLess(storage_capture, bound_context)
+        self.assertLess(bound_context, delete_pvc)
         self.assertNotEqual(
             source.rfind(
                 "_require_same_kubernetes_target",
@@ -9733,6 +9839,10 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                 delete_pvc,
             ),
             -1,
+        )
+        self.assertIn(
+            "\n        except Exception:\n",
+            source,
         )
         failure_cleanup = source.index("except Exception:")
         cleanup_guard = source.index(
