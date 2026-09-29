@@ -1843,7 +1843,7 @@ spec:
         seed = inspect.getsource(runtime.seed_t048_fixture)
         self.assertLess(
             seed.index("_invalidate_receipts(root, FIXTURE_ATTEMPT_INVALIDATES)"),
-            seed.index("_performance_modules()"),
+            seed.index("_performance_modules(source_commit)"),
         )
 
         portability = inspect.getsource(runtime.portability_report)
@@ -2000,6 +2000,11 @@ spec:
                     runtime,
                     "_require_kubernetes_target_binding",
                     target,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_bound_kube_env",
+                    return_value=mock.MagicMock(),
                 ),
                 mock.patch.object(
                     runtime,
@@ -3886,13 +3891,18 @@ spec:
                     }
                     with (
                         mock.patch.object(
+                            runtime,
+                            "_source_bound_live_binding",
+                            return_value=live_binding,
+                        ),
+                        mock.patch.object(
                             live_binding,
                             "_manifest_and_fixture",
                             return_value=(manifest, [fixture_node]),
                         ),
                         mock.patch.object(
                             runtime,
-                            "load_config",
+                            "_source_commit_config",
                             return_value={"semantic_search": semantic},
                         ),
                         mock.patch.object(
@@ -3915,6 +3925,7 @@ spec:
                                 Path("/unused-root"),
                                 manifest_path,
                                 generation_id,
+                                "a" * 40,
                             )
 
     def test_t048_live_binding_rejects_version_drift(self) -> None:
@@ -3968,6 +3979,11 @@ spec:
             }
             with (
                 mock.patch.object(
+                    runtime,
+                    "_source_bound_live_binding",
+                    return_value=live_binding,
+                ),
+                mock.patch.object(
                     live_binding,
                     "_manifest_and_fixture",
                     return_value=(manifest, [fixture_node]),
@@ -3990,6 +4006,7 @@ spec:
                         Path("/unused-root"),
                         manifest_path,
                         "experiment-b-t048",
+                        "a" * 40,
                     )
 
     def test_t048_live_binding_rejects_edge_content_drift(self) -> None:
@@ -4039,6 +4056,11 @@ spec:
             }
             with (
                 mock.patch.object(
+                    runtime,
+                    "_source_bound_live_binding",
+                    return_value=live_binding,
+                ),
+                mock.patch.object(
                     live_binding,
                     "_manifest_and_fixture",
                     return_value=(manifest, [fixture_node]),
@@ -4060,6 +4082,7 @@ spec:
                         Path("/unused-root"),
                         manifest_path,
                         "experiment-b-t048",
+                        "a" * 40,
                     )
 
     def test_t048_canonical_visibility_is_fixture_derived(self) -> None:
@@ -4096,6 +4119,11 @@ spec:
 
         with (
             mock.patch.object(
+                runtime,
+                "_source_bound_live_binding",
+                return_value=live_binding,
+            ),
+            mock.patch.object(
                 live_binding,
                 "_manifest_and_fixture",
                 return_value=({}, [fixture_row]),
@@ -4114,6 +4142,7 @@ spec:
                     Path("/unused-root"),
                     Path("/unused-manifest.json"),
                     "experiment-b-t048",
+                    "a" * 40,
                 )
 
     def test_fixture_rebinds_canonical_live_state_without_stale_receipt(self) -> None:
@@ -4185,11 +4214,19 @@ spec:
                 mock.patch.object(
                     runtime,
                     "_performance_modules",
-                    return_value=(evidence, Path("/unused/domain_scale.py")),
+                    return_value=(evidence, mock.Mock()),
                 ),
                 mock.patch.object(
                     runtime,
-                    "load_config",
+                    "_source_bound_dataset_binding",
+                    return_value={
+                        "counts": {"nodes": 20000, "edges": 100000},
+                        "manifest_sha256": "b" * 64,
+                    },
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_source_commit_config",
                     return_value={"semantic_search": {"generation_id": generation_id}},
                 ),
                 mock.patch.object(
@@ -4350,9 +4387,7 @@ spec:
         seed_source = inspect.getsource(runtime.seed_t048_fixture)
         recovery_source = inspect.getsource(runtime.recovery_proof)
         self.assertIn(
-            '*_database_client_argv(\n'
-            '                    "psql", _database_client_identity(root)\n'
-            "                )",
+            '"psql", _database_client_identity(root)',
             seed_source,
         )
         self.assertEqual(
@@ -10350,6 +10385,219 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                 )
             bound_tools.assert_called_once_with(root, commit)
 
+    def test_performance_helpers_are_loaded_from_source_commit(self) -> None:
+        commit = "a" * 40
+        live_path = (
+            runtime.ROOT / "scripts/performance/api_runtime_live_binding.py"
+        )
+        evidence_path = (
+            runtime.ROOT / "scripts/performance/api_runtime_evidence.py"
+        )
+        payloads = {
+            live_path: (
+                b"from pathlib import Path\n"
+                b"REPO_ROOT = Path(__file__).resolve().parents[2]\n"
+                b'MARKER = "live-from-source-commit"\n'
+            ),
+            runtime.DOMAIN_SCALE: (
+                b"from pathlib import Path\n"
+                b"ROOT = Path(__file__).resolve().parents[2]\n"
+                b'MARKER = "domain-from-source-commit"\n'
+            ),
+            evidence_path: (
+                b"from pathlib import Path\n"
+                b"from scripts.performance import api_runtime_live_binding as live_binding\n"
+                b"REPO_ROOT = Path(__file__).resolve().parents[2]\n"
+                b"MARKER = live_binding.MARKER\n"
+            ),
+        }
+
+        def blob(source_commit: str, source_path: Path) -> bytes:
+            self.assertEqual(source_commit, commit)
+            return payloads[source_path]
+
+        with mock.patch.object(
+            runtime,
+            "_git_blob_bytes",
+            side_effect=blob,
+        ) as git_blob:
+            evidence, domain_scale = runtime._performance_modules(commit)
+
+        expected_source_root = Path(
+            f"/__experiment_b_source_commit__/{commit}"
+        )
+        self.assertEqual(evidence.MARKER, "live-from-source-commit")
+        self.assertEqual(domain_scale.MARKER, "domain-from-source-commit")
+        self.assertEqual(evidence.live_binding.MARKER, "live-from-source-commit")
+        self.assertEqual(evidence.REPO_ROOT, expected_source_root)
+        self.assertEqual(domain_scale.ROOT, expected_source_root)
+        self.assertEqual(evidence.live_binding.REPO_ROOT, expected_source_root)
+        self.assertNotEqual(evidence.REPO_ROOT, runtime.ROOT)
+        self.assertNotEqual(domain_scale.ROOT, runtime.ROOT)
+        self.assertNotEqual(evidence.live_binding.REPO_ROOT, runtime.ROOT)
+        self.assertEqual(git_blob.call_count, 3)
+
+    def test_mutated_worktree_performance_modules_are_not_executed(self) -> None:
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            performance = repo_root / "scripts/performance"
+            performance.mkdir(parents=True)
+            live_path = performance / "api_runtime_live_binding.py"
+            domain_path = performance / "domain_scale.py"
+            evidence_path = performance / "api_runtime_evidence.py"
+            for worktree_path in (live_path, domain_path, evidence_path):
+                worktree_path.write_text(
+                    'raise RuntimeError("mutable worktree module executed")\n',
+                    encoding="utf-8",
+                )
+            payloads = {
+                live_path: b'MARKER = "live-from-commit"\n',
+                domain_path: b'MARKER = "domain-from-commit"\n',
+                evidence_path: (
+                    b"from scripts.performance import api_runtime_live_binding as live_binding\n"
+                    b"MARKER = live_binding.MARKER\n"
+                ),
+            }
+
+            def blob(source_commit: str, source_path: Path) -> bytes:
+                self.assertEqual(source_commit, commit)
+                return payloads[source_path]
+
+            with (
+                mock.patch.object(runtime, "ROOT", repo_root),
+                mock.patch.object(runtime, "DOMAIN_SCALE", domain_path),
+                mock.patch.object(
+                    runtime,
+                    "_git_blob_bytes",
+                    side_effect=blob,
+                ),
+            ):
+                evidence, domain_scale = runtime._performance_modules(commit)
+
+        self.assertEqual(evidence.MARKER, "live-from-commit")
+        self.assertEqual(domain_scale.MARKER, "domain-from-commit")
+        self.assertEqual(evidence.live_binding.MARKER, "live-from-commit")
+
+    def test_source_bound_dataset_binding_uses_commit_config_snapshot(self) -> None:
+        commit = "a" * 40
+        config_bytes = b'{"authority":"source-commit"}\n'
+        manifest_bytes = b'{"fixture":"runtime-generated"}\n'
+        returned_manifest = {
+            "generator": "scripts/performance/domain_scale.py",
+            "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "database_schema": "weltgewebe_perf",
+            "profile": "ci",
+            "counts": {"nodes": 2, "edges": 1},
+            "files": {
+                "nodes": {"name": "domain_nodes.csv", "sha256": "b" * 64},
+                "edges": {"name": "domain_edges.csv", "sha256": "c" * 64},
+            },
+        }
+
+        class FakeDomainScale:
+            DomainScaleError = RuntimeError
+
+            @staticmethod
+            def load_bound_manifest(
+                manifest_path: Path,
+                config_path: Path,
+            ) -> tuple[dict, dict]:
+                self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+                self.assertTrue(str(config_path).startswith("/proc/self/fd/"))
+                self.assertEqual(config_path.read_bytes(), config_bytes)
+                return {}, returned_manifest
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir) / "repo"
+            domain_path = repo_root / "scripts/performance/domain_scale.py"
+            config_path = repo_root / "configs/performance/domain-scale.v1.json"
+            domain_path.parent.mkdir(parents=True)
+            config_path.parent.mkdir(parents=True)
+            domain_path.write_text(
+                'raise RuntimeError("mutable worktree generator executed")\n',
+                encoding="utf-8",
+            )
+            config_path.write_bytes(b'{"authority":"mutable-worktree"}\n')
+            manifest = repo_root / "fixture/manifest.json"
+            manifest.parent.mkdir()
+            manifest.write_bytes(manifest_bytes)
+            contract = {
+                "dataset_proof": {
+                    "generator": "scripts/performance/domain_scale.py",
+                    "config": "configs/performance/domain-scale.v1.json",
+                    "profile": "ci",
+                }
+            }
+            with (
+                mock.patch.object(runtime, "ROOT", repo_root),
+                mock.patch.object(runtime, "DOMAIN_SCALE", domain_path),
+                mock.patch.object(runtime, "DOMAIN_SCALE_CONFIG", config_path),
+                mock.patch.object(
+                    runtime,
+                    "_git_blob_bytes",
+                    return_value=config_bytes,
+                ) as git_blob,
+            ):
+                binding = runtime._source_bound_dataset_binding(
+                    commit,
+                    manifest,
+                    contract,
+                    FakeDomainScale,
+                )
+
+        git_blob.assert_called_once_with(commit, config_path)
+        self.assertEqual(binding["config_sha256"], returned_manifest["config_sha256"])
+        self.assertEqual(binding["profile"], "ci")
+        self.assertEqual(binding["counts"], {"nodes": 2, "edges": 1})
+
+    def test_t048_runtime_config_authority_is_source_commit_bound(self) -> None:
+        seed_source = inspect.getsource(runtime.seed_t048_fixture)
+        receipt_source = inspect.getsource(runtime._validated_t048_fixture_receipt)
+        live_source = inspect.getsource(runtime._t048_live_fixture_binding)
+        install_source = inspect.getsource(runtime.install_platform)
+
+        self.assertIn("_source_commit_config(source_commit)", seed_source)
+        self.assertNotIn("config = load_config()", seed_source)
+        self.assertIn("_source_commit_config(source_commit)", receipt_source)
+        self.assertNotIn("load_config()", receipt_source)
+        self.assertIn("_source_commit_config(source_commit)", live_source)
+        self.assertNotIn("load_config()", live_source)
+        self.assertIn(
+            "_source_commit_config(source_commit)",
+            install_source,
+        )
+        self.assertNotIn(
+            "_require_live_cilium_contract(root, load_config())",
+            install_source,
+        )
+
+    def test_t048_fixture_generation_and_load_are_source_commit_bound(self) -> None:
+        source = inspect.getsource(runtime.seed_t048_fixture)
+        self.assertIn("_performance_modules(source_commit)", source)
+        self.assertIn("domain_scale.generate_fixture(", source)
+        self.assertIn("_source_bound_dataset_binding(", source)
+        self.assertIn("domain_scale.render_load_sql(", source)
+        self.assertGreaterEqual(source.count("_verified_snapshot_fd("), 2)
+        self.assertIn('"source-commit T048 load SQL"', source)
+        self.assertIn('"source-commit T048 streamed SQL"', source)
+        self.assertNotIn("str(DOMAIN_SCALE)", source)
+        self.assertNotIn("evidence.load_dataset_binding(", source)
+
+    def test_functional_readback_lives_inside_bound_kube_context(self) -> None:
+        source = inspect.getsource(runtime.functional_readback)
+        bound = source.index("with _bound_kube_env(")
+        gateway = source.index(
+            "_gateway_data_plane_readback(root, source_commit)"
+        )
+        jetstream = source.index("_jetstream_signature(root)")
+        final_target = source.rindex("_require_kubernetes_target_binding")
+        receipt = source.index("receipt = {")
+        self.assertLess(bound, gateway)
+        self.assertLess(gateway, jetstream)
+        self.assertLess(jetstream, final_target)
+        self.assertLess(final_target, receipt)
+
     def test_t048_authority_inputs_are_source_commit_bound(self) -> None:
         commit = "a" * 40
         workflow = (
@@ -10434,13 +10682,19 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
             'helm, "upgrade", "--install", "cilium"'
         )
         flux_install = source.index("_flux_install_argv(flux)")
+        cilium_readback = source.index("_require_live_cilium_contract(")
+        flux_readback = source.index("_require_live_flux_controller_contract(")
         final_target_check = source.rindex("_require_same_kubernetes_target")
         receipt_write = source.index('atomic_json(root / "receipts/platform.json", result)')
         self.assertLess(target_capture, snapshot)
         self.assertLess(snapshot, gateway_apply)
         self.assertLess(gateway_apply, cilium_install)
         self.assertLess(cilium_install, flux_install)
-        self.assertLess(flux_install, final_target_check)
+        self.assertLess(flux_install, cilium_readback)
+        self.assertLess(cilium_readback, flux_readback)
+        self.assertLess(flux_readback, final_target_check)
+        self.assertIn("\n        cilium_readback =", source)
+        self.assertIn("\n                flux_readback =", source)
         self.assertLess(final_target_check, receipt_write)
         self.assertGreaterEqual(
             source.count("_require_same_kubernetes_target"),

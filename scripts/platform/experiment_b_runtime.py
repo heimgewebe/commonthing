@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2400,52 +2401,55 @@ def install_platform(root: Path) -> dict[str, Any]:
             "platform installation after Flux",
         )
 
-    cilium_readback = _require_live_cilium_contract(root, load_config())
-    flux_readback: dict[str, Any] | None = None
-    last_flux_error: RuntimeErrorEB | None = None
-    for _ in range(90):
-        try:
-            flux_readback = _require_live_flux_controller_contract(root, receipt)
-        except RuntimeErrorEB as exc:
-            last_flux_error = exc
-            time.sleep(2)
-        else:
-            break
-    if flux_readback is None:
-        raise RuntimeErrorEB(
-            "Flux controllers did not converge to the pinned runtime contract"
-        ) from last_flux_error
-    _require_same_kubernetes_target(
-        root,
-        source_commit,
-        platform_target,
-        "platform success receipt",
-    )
-    result = {
-        "schema_version": 1,
-        "status": "ready",
-        "source_commit": source_commit,
-        "toolchain_lock_sha256": receipt["lock_sha256"],
-        "vm_ip": ip,
-        "kubernetes_target_sha256": _stable_json_sha256(platform_target),
-        "cilium_runtime_image_ids": {
-            "daemonset": cilium_readback["daemonset_pods"][
-                "runtime_image_ids_sha256"
-            ],
-            "operator": cilium_readback["operator_pods"][
-                "runtime_image_ids_sha256"
-            ],
-            "relay": cilium_readback["relay_pods"][
-                "runtime_image_ids_sha256"
-            ],
-        },
-        "flux_runtime_image_ids": {
-            name: controller["pods"]["runtime_image_ids_sha256"]
-            for name, controller in flux_readback.items()
-        },
-    }
-    atomic_json(root / "receipts/platform.json", result)
-    return result
+        cilium_readback = _require_live_cilium_contract(
+            root,
+            _source_commit_config(source_commit),
+        )
+        flux_readback: dict[str, Any] | None = None
+        last_flux_error: RuntimeErrorEB | None = None
+        for _ in range(90):
+            try:
+                flux_readback = _require_live_flux_controller_contract(root, receipt)
+            except RuntimeErrorEB as exc:
+                last_flux_error = exc
+                time.sleep(2)
+            else:
+                break
+        if flux_readback is None:
+            raise RuntimeErrorEB(
+                "Flux controllers did not converge to the pinned runtime contract"
+            ) from last_flux_error
+        _require_same_kubernetes_target(
+            root,
+            source_commit,
+            platform_target,
+            "platform success receipt",
+        )
+        result = {
+            "schema_version": 1,
+            "status": "ready",
+            "source_commit": source_commit,
+            "toolchain_lock_sha256": receipt["lock_sha256"],
+            "vm_ip": ip,
+            "kubernetes_target_sha256": _stable_json_sha256(platform_target),
+            "cilium_runtime_image_ids": {
+                "daemonset": cilium_readback["daemonset_pods"][
+                    "runtime_image_ids_sha256"
+                ],
+                "operator": cilium_readback["operator_pods"][
+                    "runtime_image_ids_sha256"
+                ],
+                "relay": cilium_readback["relay_pods"][
+                    "runtime_image_ids_sha256"
+                ],
+            },
+            "flux_runtime_image_ids": {
+                name: controller["pods"]["runtime_image_ids_sha256"]
+                for name, controller in flux_readback.items()
+            },
+        }
+        atomic_json(root / "receipts/platform.json", result)
+        return result
 
 
 def render_namespaces(root: Path) -> str:
@@ -9126,14 +9130,151 @@ def teardown(root: Path) -> dict[str, Any]:
     return result
 
 
-def _performance_modules() -> tuple[Any, Any]:
-    root_text = str(ROOT)
-    if root_text not in sys.path:
-        sys.path.insert(0, root_text)
-    from scripts.performance import api_runtime_evidence as evidence
-    from scripts.performance import domain_scale
+def _source_commit_python_module(
+    source_commit: str,
+    path: Path,
+    module_name: str,
+) -> Any:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB("source-commit Python module requires an exact commit")
+    try:
+        relative = path.relative_to(ROOT)
+    except ValueError as exc:
+        raise RuntimeErrorEB("source-commit Python module escapes repository root") from exc
+    payload = _git_blob_bytes(source_commit, path)
+    try:
+        source = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeErrorEB(
+            f"source-commit Python module is not UTF-8: {relative.as_posix()}"
+        ) from exc
+    filename = (
+        f"/__experiment_b_source_commit__/{source_commit}/"
+        f"{relative.as_posix()}"
+    )
+    module = types.ModuleType(module_name)
+    module.__file__ = filename
+    module.__package__ = module_name.rpartition(".")[0]
+    missing = object()
+    previous = sys.modules.get(module_name, missing)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(source, filename, "exec"), module.__dict__)
+    except Exception as exc:
+        raise RuntimeErrorEB(
+            f"source-commit Python module failed to load: {relative.as_posix()}"
+        ) from exc
+    finally:
+        if previous is missing:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+    return module
 
+
+def _source_bound_live_binding(source_commit: str) -> Any:
+    return _source_commit_python_module(
+        source_commit,
+        ROOT / "scripts/performance/api_runtime_live_binding.py",
+        "_experiment_b_source_api_runtime_live_binding",
+    )
+
+
+def _performance_modules(source_commit: str) -> tuple[Any, Any]:
+    live_binding = _source_bound_live_binding(source_commit)
+    domain_scale = _source_commit_python_module(
+        source_commit,
+        DOMAIN_SCALE,
+        "_experiment_b_source_domain_scale",
+    )
+
+    scripts_package = types.ModuleType("scripts")
+    scripts_package.__path__ = []
+    performance_package = types.ModuleType("scripts.performance")
+    performance_package.__path__ = []
+    performance_package.api_runtime_live_binding = live_binding
+    scripts_package.performance = performance_package
+
+    bindings = {
+        "scripts": scripts_package,
+        "scripts.performance": performance_package,
+        "scripts.performance.api_runtime_live_binding": live_binding,
+    }
+    missing = object()
+    previous = {
+        name: sys.modules.get(name, missing)
+        for name in bindings
+    }
+    try:
+        sys.modules.update(bindings)
+        evidence = _source_commit_python_module(
+            source_commit,
+            ROOT / "scripts/performance/api_runtime_evidence.py",
+            "_experiment_b_source_api_runtime_evidence",
+        )
+    finally:
+        for name, value in previous.items():
+            if value is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
     return evidence, domain_scale
+
+
+def _source_bound_dataset_binding(
+    source_commit: str,
+    manifest_path: Path,
+    contract: dict[str, Any],
+    domain_scale: Any,
+) -> dict[str, Any]:
+    proof = contract.get("dataset_proof")
+    if not isinstance(proof, dict):
+        raise RuntimeErrorEB("T048 dataset proof contract is invalid")
+    expected_generator = DOMAIN_SCALE.relative_to(ROOT).as_posix()
+    expected_config = DOMAIN_SCALE_CONFIG.relative_to(ROOT).as_posix()
+    if (
+        proof.get("generator") != expected_generator
+        or proof.get("config") != expected_config
+        or not isinstance(proof.get("profile"), str)
+    ):
+        raise RuntimeErrorEB("T048 dataset proof authority paths drifted")
+
+    config_bytes = _git_blob_bytes(source_commit, DOMAIN_SCALE_CONFIG)
+    with _sealed_snapshot_fd(
+        config_bytes,
+        "source-commit T048 domain-scale config",
+    ) as config_fd:
+        config_path = Path(f"/proc/self/fd/{config_fd}")
+        try:
+            _config, manifest = domain_scale.load_bound_manifest(
+                manifest_path,
+                config_path,
+            )
+        except Exception as exc:
+            error_type = getattr(domain_scale, "DomainScaleError", None)
+            if error_type is not None and isinstance(exc, error_type):
+                raise RuntimeErrorEB(
+                    "T048 dataset manifest is not bound to source-commit config"
+                ) from exc
+            raise
+    if manifest.get("profile") != proof["profile"]:
+        raise RuntimeErrorEB("T048 dataset manifest profile drifted")
+    files = manifest.get("files")
+    counts = manifest.get("counts")
+    if not isinstance(files, dict) or not isinstance(counts, dict):
+        raise RuntimeErrorEB("T048 dataset manifest binding is incomplete")
+    return {
+        "manifest_sha256": sha256_file(manifest_path),
+        "generator": manifest["generator"],
+        "config_sha256": manifest["config_sha256"],
+        "database_schema": manifest["database_schema"],
+        "profile": manifest["profile"],
+        "counts": dict(counts),
+        "files": {
+            "nodes": dict(files["nodes"]),
+            "edges": dict(files["edges"]),
+        },
+    }
 
 
 def _kubectl(
@@ -9700,12 +9841,12 @@ def _t048_fixture_edge_rows(
 
 
 def _t048_live_fixture_binding(
-    root: Path, manifest: Path, generation_id: str
+    root: Path,
+    manifest: Path,
+    generation_id: str,
+    source_commit: str,
 ) -> dict[str, Any]:
-    root_text = str(ROOT)
-    if root_text not in sys.path:
-        sys.path.insert(0, root_text)
-    from scripts.performance import api_runtime_live_binding as live_binding
+    live_binding = _source_bound_live_binding(source_commit)
 
     _manifest, fixture_rows = live_binding._manifest_and_fixture(manifest)
     db_rows = live_binding._json_lines(
@@ -9832,7 +9973,7 @@ WHERE generation_id = {generation_literal} AND state = 'active';
     if len(generation_rows) != 1:
         raise RuntimeErrorEB("Experiment-B requires exactly one active T048 generation")
     generation = generation_rows[0]
-    semantic = load_config()["semantic_search"]
+    semantic = _source_commit_config(source_commit)["semantic_search"]
     expected_generation_identity = {
         "generation_id": generation_id,
         "provider": semantic["provider"],
@@ -9966,14 +10107,19 @@ def _validated_t048_fixture_receipt(
         raise RuntimeErrorEB("T048 fixture receipt manifest digest is stale")
 
     generation_id = receipt.get("generation_id")
-    expected_generation = str(load_config()["semantic_search"]["generation_id"])
+    expected_generation = str(
+        _source_commit_config(source_commit)["semantic_search"]["generation_id"]
+    )
     if (
         not isinstance(generation_id, str)
         or generation_id != expected_generation
     ):
         raise RuntimeErrorEB("T048 fixture receipt generation is not current")
     current_live_binding = _t048_live_fixture_binding(
-        root, manifest, generation_id
+        root,
+        manifest,
+        generation_id,
+        source_commit,
     )
     if receipt.get("live_binding") != current_live_binding:
         raise RuntimeErrorEB(
@@ -9984,8 +10130,6 @@ def _validated_t048_fixture_receipt(
 
 def seed_t048_fixture(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, FIXTURE_ATTEMPT_INVALIDATES)
-    evidence, _domain_scale = _performance_modules()
-    config = load_config()
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
         raise RuntimeErrorEB("T048 fixture load requires an applied release receipt")
@@ -9997,9 +10141,11 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         or _current_protected_main_commit() != source_commit
     ):
         raise RuntimeErrorEB("T048 fixture release is not current protected main")
+    config = _source_commit_config(source_commit)
     _require_kubernetes_target_binding(root, source_commit)
     fixture_target = _kubernetes_target_identity(root, source_commit)
     with _bound_kube_env(root, fixture_target, source_commit):
+        evidence, domain_scale = _performance_modules(source_commit)
         policy, _policy_sha256 = _source_bound_performance_policy(
             source_commit
         )
@@ -10014,18 +10160,26 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
                 raise RuntimeErrorEB(
                     "partial T048 fixture directory exists; refusing implicit replacement"
                 )
-            run(
-                [
-                    sys.executable, "-B", str(DOMAIN_SCALE), "generate",
-                    "--profile", profile,
-                    "--output-dir", str(fixture),
-                ],
-                timeout=900,
-            )
-        binding = evidence.load_dataset_binding(
+            config_bytes = _git_blob_bytes(source_commit, DOMAIN_SCALE_CONFIG)
+            with _sealed_snapshot_fd(
+                config_bytes,
+                "source-commit T048 domain-scale config",
+            ) as config_fd:
+                try:
+                    domain_scale.generate_fixture(
+                        Path(f"/proc/self/fd/{config_fd}"),
+                        profile,
+                        fixture,
+                    )
+                except domain_scale.DomainScaleError as exc:
+                    raise RuntimeErrorEB(
+                        "source-commit T048 fixture generator failed"
+                    ) from exc
+        binding = _source_bound_dataset_binding(
+            source_commit,
             manifest,
             contract_section,
-            repo_root=ROOT,
+            domain_scale,
         )
         counts = binding["counts"]
         node_count = int(counts["nodes"])
@@ -10084,7 +10238,12 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
                 raise RuntimeErrorEB(
                     "T048 fixture/search projection counts do not match the canonical manifest"
                 )
-            live_binding = _t048_live_fixture_binding(root, manifest, generation_id)
+            live_binding = _t048_live_fixture_binding(
+                root,
+                manifest,
+                generation_id,
+                source_commit,
+            )
             _require_same_kubernetes_target(
                 root,
                 source_commit,
@@ -10125,33 +10284,82 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
                 "target database is not empty enough for a fresh T048 fixture load"
             )
 
-        load_sql = evidence_dir / "load.sql"
-        run(
-            [
-                sys.executable, "-B", str(DOMAIN_SCALE), "render-load",
-                "--manifest", str(manifest),
-                "--output", str(load_sql),
-            ]
-        )
         files = binding["files"]
         nodes_csv = fixture / str(files["nodes"]["name"])
         edges_csv = fixture / str(files["edges"]["name"])
-        streamed = evidence_dir / "kubernetes-load.sql"
-        _write_streamed_fixture_sql(load_sql, nodes_csv, edges_csv, streamed)
-        kubectl = toolchain(root)["tools"]["kubectl"]
-        _run_input_file(
-            [
-                kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
-                "deployment/postgres", "--",
-                *_database_client_argv(
-                    "psql", _database_client_identity(root)
-                ),
-                "-v", "ON_ERROR_STOP=1",
-            ],
-            streamed,
-            env=kube_env(root),
-            timeout=1800,
-        )
+        config_bytes = _git_blob_bytes(source_commit, DOMAIN_SCALE_CONFIG)
+        with (
+            _sealed_snapshot_fd(
+                config_bytes,
+                "source-commit T048 domain-scale config",
+            ) as config_fd,
+            _verified_snapshot_fd(
+                nodes_csv,
+                str(files["nodes"]["sha256"]),
+                "source-commit T048 nodes fixture",
+            ) as nodes_fd,
+            _verified_snapshot_fd(
+                edges_csv,
+                str(files["edges"]["sha256"]),
+                "source-commit T048 edges fixture",
+            ) as edges_fd,
+            tempfile.TemporaryFile() as load_output,
+        ):
+            try:
+                domain_scale.render_load_sql(
+                    manifest,
+                    Path(f"/proc/self/fd/{load_output.fileno()}"),
+                    Path(f"/proc/self/fd/{config_fd}"),
+                )
+            except domain_scale.DomainScaleError as exc:
+                raise RuntimeErrorEB(
+                    "source-commit T048 load SQL generation failed"
+                ) from exc
+            load_size = os.fstat(load_output.fileno()).st_size
+            load_payload = os.pread(load_output.fileno(), load_size, 0)
+            if len(load_payload) != load_size or not load_payload:
+                raise RuntimeErrorEB("source-commit T048 load SQL snapshot is invalid")
+            with (
+                _sealed_snapshot_fd(
+                    load_payload,
+                    "source-commit T048 load SQL",
+                ) as load_fd,
+                tempfile.TemporaryFile() as streamed_output,
+            ):
+                _write_streamed_fixture_sql(
+                    Path(f"/proc/self/fd/{load_fd}"),
+                    Path(f"/proc/self/fd/{nodes_fd}"),
+                    Path(f"/proc/self/fd/{edges_fd}"),
+                    Path(f"/proc/self/fd/{streamed_output.fileno()}"),
+                )
+                streamed_size = os.fstat(streamed_output.fileno()).st_size
+                streamed_payload = os.pread(
+                    streamed_output.fileno(),
+                    streamed_size,
+                    0,
+                )
+                if len(streamed_payload) != streamed_size or not streamed_payload:
+                    raise RuntimeErrorEB(
+                        "source-commit T048 streamed SQL snapshot is invalid"
+                    )
+                with _sealed_snapshot_fd(
+                    streamed_payload,
+                    "source-commit T048 streamed SQL",
+                ) as streamed_fd:
+                    kubectl = toolchain(root)["tools"]["kubectl"]
+                    _run_input_file(
+                        [
+                            kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
+                            "deployment/postgres", "--",
+                            *_database_client_argv(
+                                "psql", _database_client_identity(root)
+                            ),
+                            "-v", "ON_ERROR_STOP=1",
+                        ],
+                        Path(f"/proc/self/fd/{streamed_fd}"),
+                        env=kube_env(root),
+                        timeout=1800,
+                    )
 
         semantic = config["semantic_search"]
         seed_sql = f"""
@@ -10953,7 +11161,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "generation_id": fixture_receipt.get("generation_id"),
             "live_binding": fixture_receipt.get("live_binding"),
         }
-        evidence, _domain_scale = _performance_modules()
+        evidence, _domain_scale = _performance_modules(source_commit)
         manifest = Path(fixture_receipt["manifest"])
         policy, policy_sha256 = _source_bound_performance_policy(
             source_commit
@@ -11411,26 +11619,33 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
         "kubeconfig_sha256": target_receipt_before["kubeconfig_sha256"],
         "server": target_server_before,
     }
-    data_plane = _gateway_data_plane_readback(root, source_commit)
-    base = str(data_plane["gateway"])
-    checks = data_plane["checks"]
-    jetstream = _jetstream_signature(root)
-    if jetstream["messages"] < 1:
-        raise RuntimeErrorEB("Experiment-B JetStream contains no persisted test messages")
-    (
-        target_receipt_after,
-        target_ip_after,
-        target_server_after,
-    ) = _require_kubernetes_target_binding(root, source_commit)
-    target_binding_after = {
-        "vm_ip": target_ip_after,
-        "kubeconfig_sha256": target_receipt_after["kubeconfig_sha256"],
-        "server": target_server_after,
-    }
-    if target_binding_after != target_binding_before:
-        raise RuntimeErrorEB(
-            "Kubernetes target identity changed during functional readback"
-        )
+    with _bound_kube_env(
+        root,
+        target_binding_before,
+        source_commit,
+    ):
+        data_plane = _gateway_data_plane_readback(root, source_commit)
+        base = str(data_plane["gateway"])
+        checks = data_plane["checks"]
+        jetstream = _jetstream_signature(root)
+        if jetstream["messages"] < 1:
+            raise RuntimeErrorEB(
+                "Experiment-B JetStream contains no persisted test messages"
+            )
+        (
+            target_receipt_after,
+            target_ip_after,
+            target_server_after,
+        ) = _require_kubernetes_target_binding(root, source_commit)
+        target_binding_after = {
+            "vm_ip": target_ip_after,
+            "kubeconfig_sha256": target_receipt_after["kubeconfig_sha256"],
+            "server": target_server_after,
+        }
+        if target_binding_after != target_binding_before:
+            raise RuntimeErrorEB(
+                "Kubernetes target identity changed during functional readback"
+            )
     receipt = {
         "schema_version": 1,
         "status": "pass",
