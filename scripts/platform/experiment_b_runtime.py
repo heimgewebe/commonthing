@@ -21,6 +21,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import stat
@@ -93,15 +94,25 @@ _BOUND_KUBECONFIG_FD: ContextVar[int | None] = ContextVar(
     "experiment_b_bound_kubeconfig_fd",
     default=None,
 )
+_BOUND_SOURCE_COMMIT: ContextVar[str | None] = ContextVar(
+    "experiment_b_bound_source_commit",
+    default=None,
+)
+_TOOLCHAIN_SNAPSHOT_FDS: set[int] = set()
+_TOOLCHAIN_SNAPSHOT_RECEIPTS: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
 def _bound_subprocess_pass_fds(
     pass_fds: tuple[int, ...] = (),
 ) -> tuple[int, ...]:
+    values = list(pass_fds)
     bound_fd = _BOUND_KUBECONFIG_FD.get()
-    if bound_fd is None or bound_fd in pass_fds:
-        return pass_fds
-    return (*pass_fds, bound_fd)
+    if bound_fd is not None and bound_fd not in values:
+        values.append(bound_fd)
+    for snapshot_fd in sorted(_TOOLCHAIN_SNAPSHOT_FDS):
+        if snapshot_fd not in values:
+            values.append(snapshot_fd)
+    return tuple(values)
 
 
 def run(
@@ -1351,13 +1362,13 @@ def _open_verified_file(
     return file_fd
 
 
-@contextmanager
-def _sealed_snapshot_fd(
+
+def _create_sealed_snapshot_fd(
     payload: bytes,
     context: str,
     *,
     mode: int = 0o400,
-) -> Iterator[int]:
+) -> int:
     if not isinstance(payload, bytes):
         raise RuntimeErrorEB(f"{context} immutable snapshot payload is invalid")
     if not isinstance(mode, int) or mode < 0 or mode > 0o777:
@@ -1401,7 +1412,9 @@ def _sealed_snapshot_fd(
         while offset < len(view):
             written = os.write(snapshot_fd, view[offset:])
             if written <= 0:
-                raise RuntimeErrorEB(f"{context} immutable snapshot write failed")
+                raise RuntimeErrorEB(
+                    f"{context} immutable snapshot write failed"
+                )
             offset += written
         os.fchmod(snapshot_fd, mode)
         required_seals = (
@@ -1413,10 +1426,33 @@ def _sealed_snapshot_fd(
         fcntl.fcntl(snapshot_fd, f_add_seals, required_seals)
         observed_seals = fcntl.fcntl(snapshot_fd, f_get_seals)
         if observed_seals & required_seals != required_seals:
-            raise RuntimeErrorEB(f"{context} immutable snapshot sealing failed")
+            raise RuntimeErrorEB(
+                f"{context} immutable snapshot sealing failed"
+            )
         os.lseek(snapshot_fd, 0, os.SEEK_SET)
         if os.pread(snapshot_fd, len(payload), 0) != payload:
-            raise RuntimeErrorEB(f"{context} immutable snapshot verification failed")
+            raise RuntimeErrorEB(
+                f"{context} immutable snapshot verification failed"
+            )
+        return snapshot_fd
+    except Exception:
+        os.close(snapshot_fd)
+        raise
+
+
+@contextmanager
+def _sealed_snapshot_fd(
+    payload: bytes,
+    context: str,
+    *,
+    mode: int = 0o400,
+) -> Iterator[int]:
+    snapshot_fd = _create_sealed_snapshot_fd(
+        payload,
+        context,
+        mode=mode,
+    )
+    try:
         yield snapshot_fd
     finally:
         os.close(snapshot_fd)
@@ -1483,7 +1519,7 @@ def _source_commit_kustomize_build(
         raise RuntimeErrorEB(
             "source-commit kustomize render has no bound kustomization"
         )
-    toolchain_receipt = toolchain(root)
+    toolchain_receipt = toolchain(root, source_commit)
     kustomize = toolchain_receipt.get("tools", {}).get("kustomize")
     if not isinstance(kustomize, str) or not kustomize:
         raise RuntimeErrorEB(
@@ -2066,13 +2102,153 @@ def install_k3s(root: Path) -> dict[str, Any]:
     return receipt
 
 
-def toolchain(root: Path) -> dict[str, Any]:
-    return bootstrap_tools.install(
+
+def toolchain(
+    root: Path,
+    source_commit: str | None = None,
+) -> dict[str, Any]:
+    commit = (
+        source_commit
+        if source_commit is not None
+        else _BOUND_SOURCE_COMMIT.get()
+    )
+    if commit is None:
+        return bootstrap_tools.install(
+            root / "toolchain",
+            tool_names=["kubectl", "kustomize", "flux", "helm"],
+            include_artifacts=True,
+        )
+    if COMMIT_RE.fullmatch(commit) is None:
+        raise RuntimeErrorEB(
+            "toolchain source commit must be exact"
+        )
+    lock_bytes = _git_blob_bytes(
+        commit,
+        bootstrap_tools.LOCK_PATH,
+    )
+    try:
+        lock = json.loads(lock_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "source-commit toolchain lock is invalid"
+        ) from exc
+    if not isinstance(lock, dict) or lock.get("schema_version") != 1:
+        raise RuntimeErrorEB(
+            "source-commit toolchain lock schema is invalid"
+        )
+    lock_sha256 = hashlib.sha256(lock_bytes).hexdigest()
+    cache_key = (
+        str((root / "toolchain").resolve()),
+        commit,
+        lock_sha256,
+    )
+    cached = _TOOLCHAIN_SNAPSHOT_RECEIPTS.get(cache_key)
+    if cached is not None:
+        return cached
+
+    receipt = bootstrap_tools.install(
         root / "toolchain",
         tool_names=["kubectl", "kustomize", "flux", "helm"],
         include_artifacts=True,
+        lock_bytes=lock_bytes,
     )
+    if receipt.get("lock_sha256") != lock_sha256:
+        raise RuntimeErrorEB(
+            "installed toolchain receipt is not source-commit-bound"
+        )
 
+    bound_tools: dict[str, str] = {}
+    bound_artifacts: dict[str, str] = {}
+    new_fds: list[int] = []
+    try:
+        for name, path_value in receipt.get("tools", {}).items():
+            spec = lock.get("tools", {}).get(name)
+            expected_sha256 = (
+                spec.get("binary_sha256")
+                if isinstance(spec, dict)
+                else None
+            )
+            if (
+                not isinstance(path_value, str)
+                or not isinstance(expected_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+                is None
+            ):
+                raise RuntimeErrorEB(
+                    f"source-commit tool contract is invalid: {name}"
+                )
+            source_fd = _open_verified_file(
+                Path(path_value),
+                expected_sha256,
+                f"source-commit tool {name}",
+            )
+            try:
+                size = os.fstat(source_fd).st_size
+                payload = os.pread(source_fd, size, 0)
+            finally:
+                os.close(source_fd)
+            if len(payload) != size:
+                raise RuntimeErrorEB(
+                    f"source-commit tool snapshot is incomplete: {name}"
+                )
+            snapshot_fd = _create_sealed_snapshot_fd(
+                payload,
+                f"source-commit tool {name}",
+                mode=0o500,
+            )
+            new_fds.append(snapshot_fd)
+            bound_tools[name] = f"/proc/self/fd/{snapshot_fd}"
+
+        for name, path_value in receipt.get("artifacts", {}).items():
+            spec = lock.get("artifacts", {}).get(name)
+            expected_sha256 = (
+                spec.get("sha256")
+                if isinstance(spec, dict)
+                else None
+            )
+            if (
+                not isinstance(path_value, str)
+                or not isinstance(expected_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+                is None
+            ):
+                raise RuntimeErrorEB(
+                    f"source-commit artifact contract is invalid: {name}"
+                )
+            source_fd = _open_verified_file(
+                Path(path_value),
+                expected_sha256,
+                f"source-commit artifact {name}",
+            )
+            try:
+                size = os.fstat(source_fd).st_size
+                payload = os.pread(source_fd, size, 0)
+            finally:
+                os.close(source_fd)
+            if len(payload) != size:
+                raise RuntimeErrorEB(
+                    f"source-commit artifact snapshot is incomplete: {name}"
+                )
+            snapshot_fd = _create_sealed_snapshot_fd(
+                payload,
+                f"source-commit artifact {name}",
+            )
+            new_fds.append(snapshot_fd)
+            bound_artifacts[name] = f"/proc/self/fd/{snapshot_fd}"
+    except Exception:
+        for snapshot_fd in new_fds:
+            os.close(snapshot_fd)
+        raise
+
+    _TOOLCHAIN_SNAPSHOT_FDS.update(new_fds)
+    bound_receipt = {
+        **receipt,
+        "source_commit": commit,
+        "tools": bound_tools,
+        "artifacts": bound_artifacts,
+    }
+    _TOOLCHAIN_SNAPSHOT_RECEIPTS[cache_key] = bound_receipt
+    return bound_receipt
 
 def kube_env(root: Path) -> dict[str, str]:
     env = os.environ.copy()
@@ -2087,7 +2263,12 @@ def kube_env(root: Path) -> dict[str, str]:
 def _bound_kube_env(
     root: Path,
     expected_target: dict[str, str],
+    source_commit: str,
 ) -> Iterator[dict[str, str]]:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB(
+            "Experiment-B Kubernetes workflow source commit is invalid"
+        )
     source = root / "kubeconfig.yaml"
     with _verified_snapshot_fd(
         source,
@@ -2105,6 +2286,8 @@ def _bound_kube_env(
             raise RuntimeErrorEB(
                 "Experiment-B Kubernetes workflow kubeconfig snapshot drifted"
             )
+        toolchain(root, source_commit)
+        source_token = _BOUND_SOURCE_COMMIT.set(source_commit)
         path_token = _BOUND_KUBECONFIG.set(str(snapshot))
         fd_token = _BOUND_KUBECONFIG_FD.set(snapshot_fd)
         try:
@@ -2112,7 +2295,7 @@ def _bound_kube_env(
         finally:
             _BOUND_KUBECONFIG_FD.reset(fd_token)
             _BOUND_KUBECONFIG.reset(path_token)
-
+            _BOUND_SOURCE_COMMIT.reset(source_token)
 
 def _cilium_helm_value_args(ip: str) -> list[str]:
     return [
@@ -2146,14 +2329,14 @@ def install_platform(root: Path) -> dict[str, Any]:
     source_commit = _current_protected_main_commit()
     _require_kubernetes_target_binding(root, source_commit)
     platform_target = _kubernetes_target_identity(root, source_commit)
-    receipt = toolchain(root)
+    receipt = toolchain(root, source_commit)
     tools = receipt["tools"]
     artifacts = receipt["artifacts"]
     kubectl = tools["kubectl"]
     helm = tools["helm"]
     flux = tools["flux"]
 
-    with _bound_kube_env(root, platform_target) as env:
+    with _bound_kube_env(root, platform_target, source_commit) as env:
         _require_same_kubernetes_target(
             root,
             source_commit,
@@ -2402,7 +2585,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     database_url = _database_url(db)
     registry_state = root / "secrets/registry.json"
     atomic_bytes(registry_state, registry_bytes)
-    with _bound_kube_env(root, secrets_target):
+    with _bound_kube_env(root, secrets_target, source_commit):
         kubectl_apply(root, render_namespaces(root))
         kubectl_apply(
             root,
@@ -2477,7 +2660,7 @@ def apply_release(
         source_commit, api_digest, web_digest, output
     )
     flux_contract = _flux_bootstrap_contract(root, binding)
-    with _bound_kube_env(root, release_target):
+    with _bound_kube_env(root, release_target, source_commit):
         kubectl_apply(root, str(flux_contract["bootstrap_manifest"]))
         kubectl = toolchain(root)["tools"]["kubectl"]
         env = kube_env(root)
@@ -2713,7 +2896,7 @@ def semantic_activate(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("semantic provider proof is not bound to current protected main")
     _require_kubernetes_target_binding(root, source_commit)
     semantic_target = _kubernetes_target_identity(root, source_commit)
-    with _bound_kube_env(root, semantic_target):
+    with _bound_kube_env(root, semantic_target, source_commit):
         config = load_config()
         semantic = config["semantic_search"]
         kubectl = toolchain(root)["tools"]["kubectl"]
@@ -3906,8 +4089,9 @@ def _flux_deployment_contract(
 def _expected_flux_controller_contract(
     root: Path,
     toolchain_receipt: dict[str, Any] | None = None,
+    source_commit: str | None = None,
 ) -> dict[str, Any]:
-    receipt = toolchain_receipt or toolchain(root)
+    receipt = toolchain_receipt or toolchain(root, source_commit)
     tools = receipt.get("tools", {}) if isinstance(receipt, dict) else {}
     flux = tools.get("flux") if isinstance(tools, dict) else None
     if not isinstance(flux, str) or not flux:
@@ -4072,6 +4256,39 @@ def _require_live_flux_controller_contract(
             "pod_names": sorted(pod_names),
             "canonical": True,
         }
+
+    expected_pod_names = {
+        pod_name
+        for controller in result.values()
+        for pod_name in controller["pod_names"]
+    }
+    observed_pod_names: set[str] = set()
+    for pod in pods:
+        metadata = pod.get("metadata", {})
+        pod_name = (
+            metadata.get("name")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(pod_name, str)
+            or not pod_name
+            or metadata.get("namespace") != "flux-system"
+            or metadata.get("deletionTimestamp") is not None
+            or pod_name in observed_pod_names
+        ):
+            raise RuntimeErrorEB(
+                "Flux controller Pod inventory contains invalid or duplicate Pods"
+            )
+        observed_pod_names.add(pod_name)
+    if observed_pod_names != expected_pod_names:
+        missing = sorted(expected_pod_names - observed_pod_names)
+        unexpected = sorted(observed_pod_names - expected_pod_names)
+        raise RuntimeErrorEB(
+            "Flux controller Pod inventory contains noncanonical Pods: "
+            f"missing={missing}; unexpected={unexpected}"
+        )
     return result
 
 
@@ -5363,8 +5580,29 @@ def _final_recovery_state_readback(
     ):
         raise RuntimeErrorEB("Experiment-B recovery receipt binding is invalid")
 
-    current_database = _database_signature(root)
-    current_jetstream = _jetstream_signature(root)
+    database_identity = _verified_database_client_identity(
+        root,
+        source_commit,
+    )
+    postgres_binding = _require_postgres_runtime_binding(
+        root,
+        source_commit,
+    )
+    current_database = _database_signature(
+        root,
+        database_identity=database_identity,
+        source_commit=source_commit,
+        postgres_binding=postgres_binding,
+    )
+    nats_binding = _require_nats_runtime_binding(
+        root,
+        source_commit,
+    )
+    current_jetstream = _jetstream_signature(
+        root,
+        source_commit=source_commit,
+        nats_binding=nats_binding,
+    )
     if current_database != recovery.get("database_after"):
         raise RuntimeErrorEB("Experiment-B database/search state drifted after recovery")
     if current_jetstream != recovery.get("jetstream_after"):
@@ -7089,6 +7327,7 @@ def _require_live_data_deployments(
                 f"live data Pod set drifted: {name}"
             )
         pod_names: list[str] = []
+        pod_container_ids: dict[str, dict[str, str]] = {}
         for pod in matching_pods:
             metadata = pod.get("metadata", {}) if isinstance(pod, dict) else {}
             pod_spec = pod.get("spec", {}) if isinstance(pod, dict) else {}
@@ -7127,6 +7366,47 @@ def _require_live_data_deployments(
                 raise RuntimeErrorEB(
                     f"live data Pod contract drifted: {name}"
                 )
+            status_obj = (
+                pod.get("status", {})
+                if isinstance(pod, dict)
+                else {}
+            )
+            statuses = (
+                status_obj.get("containerStatuses", [])
+                if isinstance(status_obj, dict)
+                else []
+            )
+            if not isinstance(statuses, list):
+                raise RuntimeErrorEB(
+                    f"live data Pod container runtime inventory is invalid: {name}"
+                )
+            status_by_name = {
+                str(item.get("name", "")): item
+                for item in statuses
+                if isinstance(item, dict) and item.get("name")
+            }
+            runtime_ids: dict[str, str] = {}
+            for container_name in expected["images"]["containers"]:
+                item = status_by_name.get(container_name)
+                container_id = (
+                    item.get("containerID")
+                    if isinstance(item, dict)
+                    else None
+                )
+                if (
+                    not isinstance(container_id, str)
+                    or re.fullmatch(
+                        r"containerd://[0-9a-f]{64}",
+                        container_id,
+                    )
+                    is None
+                ):
+                    raise RuntimeErrorEB(
+                        f"live data Pod containerID is invalid: "
+                        f"{name}/{pod_name}/{container_name}"
+                    )
+                runtime_ids[container_name] = container_id
+            pod_container_ids[pod_name] = runtime_ids
             pod_names.append(pod_name)
 
         result[name] = {
@@ -7139,6 +7419,7 @@ def _require_live_data_deployments(
                 "pod_contract_sha256"
             ],
             "pod_names": sorted(pod_names),
+            "container_ids": pod_container_ids,
             "canonical": True,
         }
 
@@ -8100,7 +8381,7 @@ def status(root: Path) -> dict[str, Any]:
     if vm_substrate != vm_create["substrate"]:
         raise RuntimeErrorEB("VM substrate drifted from creation receipt")
     status_target = _kubernetes_target_identity(root, source_commit)
-    with _bound_kube_env(root, status_target):
+    with _bound_kube_env(root, status_target, source_commit):
         k3s_runtime = _require_live_k3s_runtime(root, config, source_commit)
         toolchain_receipt = toolchain(root)
         tools = toolchain_receipt["tools"]
@@ -8161,13 +8442,31 @@ def status(root: Path) -> dict[str, Any]:
                 MIGRATION_JOB_NAME,
             ],
         )
-        migration_pods = _kubectl_json(
+        application_pod_items = _kubectl_json(
             root,
-            [
-                "-n", APP_NAMESPACE, "get", "pods",
-                "-l", f"batch.kubernetes.io/job-name={MIGRATION_JOB_NAME}",
-            ],
+            ["-n", APP_NAMESPACE, "get", "pods"],
         ).get("items")
+        if not isinstance(application_pod_items, list) or any(
+            not isinstance(item, dict)
+            for item in application_pod_items
+        ):
+            raise RuntimeErrorEB(
+                "live application Pod inventory is invalid"
+            )
+        api_pods = _pods_matching_labels(
+            application_pod_items,
+            {"app.kubernetes.io/name": "weltgewebe-api"},
+        )
+        web_pods = _pods_matching_labels(
+            application_pod_items,
+            {"app.kubernetes.io/name": "weltgewebe-web"},
+        )
+        migration_pods = _pods_matching_labels(
+            application_pod_items,
+            {
+                "batch.kubernetes.io/job-name": MIGRATION_JOB_NAME,
+            },
+        )
         release_artifacts = _require_requested_release_artifacts(
             root,
             api,
@@ -8206,28 +8505,6 @@ def status(root: Path) -> dict[str, Any]:
         expected_web_pod_images = {
             "web": str(release_artifacts["images"]["web"]),
         }
-        api_pods = _kubectl_json(
-            root,
-            [
-                "-n",
-                APP_NAMESPACE,
-                "get",
-                "pods",
-                "-l",
-                "app.kubernetes.io/name=weltgewebe-api",
-            ],
-        ).get("items")
-        web_pods = _kubectl_json(
-            root,
-            [
-                "-n",
-                APP_NAMESPACE,
-                "get",
-                "pods",
-                "-l",
-                "app.kubernetes.io/name=weltgewebe-web",
-            ],
-        ).get("items")
         pod_readback = {
             "weltgewebe-api": _require_running_pod_images(
                 api_pods,
@@ -8262,10 +8539,6 @@ def status(root: Path) -> dict[str, Any]:
         expected_application_pod_names.update(
             release_artifacts["migration"]["pod_names"]
         )
-        application_pod_items = _kubectl_json(
-            root,
-            ["-n", APP_NAMESPACE, "get", "pods"],
-        ).get("items")
         application_pod_inventory = (
             _require_exact_application_pod_inventory(
                 application_pod_items,
@@ -8947,6 +9220,217 @@ def _database_client_argv(
     ]
 
 
+def _postgres_runtime_binding_identity(
+    binding: dict[str, Any],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for field in (
+        "container_id",
+        "contract_sha256",
+        "pod_contract_sha256",
+        "runtime_image_ids_sha256",
+    ):
+        value = binding.get(field)
+        if not isinstance(value, str) or not value:
+            raise RuntimeErrorEB(
+                f"PostgreSQL runtime binding field is invalid: {field}"
+            )
+        result[field] = value
+    return result
+
+
+
+def _run_bound_container_command(
+    root: Path,
+    source_commit: str,
+    container_id: str,
+    command: list[str],
+    *,
+    input_bytes: bytes = b"",
+    timeout: int = 900,
+    context: str,
+) -> bytes:
+    if (
+        COMMIT_RE.fullmatch(source_commit) is None
+        or not isinstance(container_id, str)
+        or re.fullmatch(
+            r"containerd://[0-9a-f]{64}",
+            container_id,
+        )
+        is None
+        or not isinstance(command, list)
+        or not command
+        or any(
+            not isinstance(value, str) or not value
+            for value in command
+        )
+        or not isinstance(input_bytes, bytes)
+        or not isinstance(context, str)
+        or not context
+    ):
+        raise RuntimeErrorEB(
+            f"{context or 'bound container'} invocation is invalid"
+        )
+    raw_container_id = container_id.removeprefix(
+        "containerd://"
+    )
+    config = _source_commit_config(source_commit)
+    expected_k3s_sha256 = config.get("kubernetes", {}).get(
+        "binary_sha256"
+    )
+    if (
+        not isinstance(expected_k3s_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_k3s_sha256)
+        is None
+    ):
+        raise RuntimeErrorEB(
+            "source-commit k3s binary digest is invalid"
+        )
+    target = _kubernetes_target_identity(root, source_commit)
+    _require_same_kubernetes_target(
+        root,
+        source_commit,
+        target,
+        f"{context} pre-exec",
+    )
+
+    runtime_argv = [
+        "/proc/self/fd/9",
+        "crictl",
+        "exec",
+        "-i",
+        raw_container_id,
+        *command,
+    ]
+    parameter_trim = "$" + "{actual%% *}"
+    script = (
+        "exec 9</usr/local/bin/k3s || exit 95; "
+        "actual=\"$(sha256sum /proc/self/fd/9)\" || exit 95; "
+        + "actual=\"" + parameter_trim + "\"; "
+        + f"[ \"$actual\" = {shlex.quote(expected_k3s_sha256)} ] "
+        + "|| exit 96; "
+        + f"exec {shlex.join(runtime_argv)}"
+    )
+    remote_command = shlex.join(
+        ["sudo", "/bin/sh", "-c", script]
+    )
+    result = subprocess.run(
+        [
+            *ssh_argv(root, target["vm_ip"]),
+            remote_command,
+        ],
+        cwd=ROOT,
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+        pass_fds=_bound_subprocess_pass_fds(),
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(
+            "utf-8", "replace"
+        )[-3000:]
+        raise RuntimeErrorEB(
+            f"{context} failed ({result.returncode}): {detail}"
+        )
+    _require_same_kubernetes_target(
+        root,
+        source_commit,
+        target,
+        f"{context} post-exec",
+    )
+    return result.stdout
+
+
+def _run_bound_postgres_client(
+    root: Path,
+    source_commit: str,
+    binding: dict[str, Any],
+    command: list[str],
+    *,
+    input_bytes: bytes = b"",
+    timeout: int = 900,
+) -> bytes:
+    if (
+        COMMIT_RE.fullmatch(source_commit) is None
+        or not isinstance(command, list)
+        or not command
+        or any(
+            not isinstance(value, str) or not value
+            for value in command
+        )
+        or not isinstance(input_bytes, bytes)
+    ):
+        raise RuntimeErrorEB(
+            "bound PostgreSQL client invocation is invalid"
+        )
+    expected_identity = _postgres_runtime_binding_identity(binding)
+    current = _require_postgres_runtime_binding(
+        root,
+        source_commit,
+    )
+    if (
+        _postgres_runtime_binding_identity(current)
+        != expected_identity
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL runtime changed before bound client execution"
+        )
+    return _run_bound_container_command(
+        root,
+        source_commit,
+        expected_identity["container_id"],
+        command,
+        input_bytes=input_bytes,
+        timeout=timeout,
+        context="bound PostgreSQL client",
+    )
+
+
+def _run_bound_nats_client(
+    root: Path,
+    source_commit: str,
+    binding: dict[str, Any],
+    command: list[str],
+    *,
+    input_bytes: bytes = b"",
+    timeout: int = 900,
+) -> bytes:
+    if (
+        COMMIT_RE.fullmatch(source_commit) is None
+        or not isinstance(command, list)
+        or not command
+        or any(
+            not isinstance(value, str) or not value
+            for value in command
+        )
+        or not isinstance(input_bytes, bytes)
+    ):
+        raise RuntimeErrorEB(
+            "bound NATS client invocation is invalid"
+        )
+    expected_identity = _nats_runtime_binding_identity(binding)
+    current = _require_nats_runtime_binding(
+        root,
+        source_commit,
+    )
+    if (
+        _nats_runtime_binding_identity(current)
+        != expected_identity
+    ):
+        raise RuntimeErrorEB(
+            "NATS runtime changed before bound client execution"
+        )
+    return _run_bound_container_command(
+        root,
+        source_commit,
+        expected_identity["container_id"],
+        command,
+        input_bytes=input_bytes,
+        timeout=timeout,
+        context="bound NATS client",
+    )
 
 def _psql(
     root: Path,
@@ -9515,7 +9999,7 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("T048 fixture release is not current protected main")
     _require_kubernetes_target_binding(root, source_commit)
     fixture_target = _kubernetes_target_identity(root, source_commit)
-    with _bound_kube_env(root, fixture_target):
+    with _bound_kube_env(root, fixture_target, source_commit):
         policy, _policy_sha256 = _source_bound_performance_policy(
             source_commit
         )
@@ -10149,15 +10633,145 @@ def _require_postgres_runtime_binding(
             "PostgreSQL runtime binding does not identify exactly one Pod"
         )
     pod_name = next(iter(observed_pods))
+    container_ids = postgres.get("container_ids")
+    pod_container_ids = (
+        container_ids.get(pod_name)
+        if isinstance(container_ids, dict)
+        else None
+    )
+    container_id = (
+        pod_container_ids.get("postgres")
+        if isinstance(pod_container_ids, dict)
+        else None
+    )
+    if (
+        not isinstance(container_id, str)
+        or re.fullmatch(
+            r"containerd://[0-9a-f]{64}",
+            container_id,
+        )
+        is None
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL runtime binding has no exact containerID"
+        )
 
     return {
         "pod_name": pod_name,
+        "container_id": container_id,
         "images_sha256": postgres["images_sha256"],
         "resources_sha256": _stable_json_sha256(
             expected_resources
         ),
         "contract_sha256": postgres["contract_sha256"],
         "pod_contract_sha256": postgres["pod_contract_sha256"],
+        "runtime_image_ids_sha256": runtime_image_ids_sha256,
+        "pods": pod_readback,
+        "canonical": True,
+    }
+
+
+
+def _nats_runtime_binding_identity(
+    binding: dict[str, Any],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for field in (
+        "container_id",
+        "contract_sha256",
+        "pod_contract_sha256",
+        "runtime_image_ids_sha256",
+    ):
+        value = binding.get(field)
+        if not isinstance(value, str) or not value:
+            raise RuntimeErrorEB(
+                f"NATS runtime binding field is invalid: {field}"
+            )
+        result[field] = value
+    return result
+
+
+def _require_nats_runtime_binding(
+    root: Path,
+    source_commit: str,
+) -> dict[str, Any]:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB(
+            "NATS runtime binding requires exact source commit"
+        )
+    nats_manifest = CLUSTER / "data/nats.yaml"
+    expected = _source_commit_data_deployment_contract(
+        source_commit,
+        nats_manifest,
+        "nats",
+    )
+    live_data = _require_live_data_deployments(
+        root,
+        ("nats",),
+        source_commit=source_commit,
+    )
+    nats = live_data.get("nats")
+    if (
+        not isinstance(nats, dict)
+        or nats.get("canonical") is not True
+        or nats.get("contract_sha256")
+        != expected["contract_sha256"]
+        or nats.get("pod_contract_sha256")
+        != expected["pod_contract_sha256"]
+        or nats.get("images_sha256")
+        != _stable_json_sha256(expected["images"])
+    ):
+        raise RuntimeErrorEB(
+            "NATS full runtime contract drifted"
+        )
+    pod_readback = nats.get("pods")
+    if not isinstance(pod_readback, dict):
+        raise RuntimeErrorEB(
+            "NATS Pod runtime contract is missing"
+        )
+    runtime_image_ids_sha256 = pod_readback.get(
+        "runtime_image_ids_sha256"
+    )
+    observed_pods = pod_readback.get("pods")
+    if (
+        not isinstance(runtime_image_ids_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", runtime_image_ids_sha256)
+        is None
+        or not isinstance(observed_pods, dict)
+        or len(observed_pods) != 1
+    ):
+        raise RuntimeErrorEB(
+            "NATS runtime identity is invalid"
+        )
+    pod_name = next(iter(observed_pods))
+    container_ids = nats.get("container_ids")
+    pod_container_ids = (
+        container_ids.get(pod_name)
+        if isinstance(container_ids, dict)
+        else None
+    )
+    container_id = (
+        pod_container_ids.get("nats")
+        if isinstance(pod_container_ids, dict)
+        else None
+    )
+    if (
+        not isinstance(container_id, str)
+        or re.fullmatch(
+            r"containerd://[0-9a-f]{64}",
+            container_id,
+        )
+        is None
+    ):
+        raise RuntimeErrorEB(
+            "NATS runtime binding has no exact containerID"
+        )
+    return {
+        "pod_name": pod_name,
+        "container_id": container_id,
+        "images_sha256": nats["images_sha256"],
+        "contract_sha256": nats["contract_sha256"],
+        "pod_contract_sha256": nats["pod_contract_sha256"],
         "runtime_image_ids_sha256": runtime_image_ids_sha256,
         "pods": pod_readback,
         "canonical": True,
@@ -10326,7 +10940,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         "server": target_server_before,
     }
     bound_stack = ExitStack()
-    bound_stack.enter_context(_bound_kube_env(root, target_binding_before))
+    bound_stack.enter_context(_bound_kube_env(root, target_binding_before, source_commit))
     try:
         postgres_binding_before = _require_t048_postgres_runtime_binding(
             root,
@@ -10841,98 +11455,267 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
 
 
 
+
 def _database_signature(
     root: Path,
     *,
     database_identity: tuple[str, str] | None = None,
-    postgres_pod_name: str | None = None,
+    source_commit: str | None = None,
+    postgres_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sql = r"""
+CREATE TEMP TABLE commonthing_signature_tables (
+  schema_name text NOT NULL,
+  relation_name text NOT NULL,
+  row_count bigint NOT NULL,
+  row_md5 text NOT NULL
+);
+
+DO $commonthing$
+DECLARE
+  item record;
+  observed_count bigint;
+  observed_md5 text;
+BEGIN
+  FOR item IN
+    SELECT n.nspname AS schema_name, c.relname AS relation_name
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind IN ('r', 'p')
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+       AND n.nspname !~ '^pg_toast'
+       AND n.nspname !~ '^pg_temp_'
+     ORDER BY n.nspname, c.relname
+  LOOP
+    EXECUTE format(
+      'SELECT count(*), md5(coalesce(string_agg(md5(to_jsonb(t)::text), '''' '
+      'ORDER BY md5(to_jsonb(t)::text), to_jsonb(t)::text), '''')) '
+      'FROM %I.%I AS t',
+      item.schema_name,
+      item.relation_name
+    )
+    INTO observed_count, observed_md5;
+
+    INSERT INTO commonthing_signature_tables
+      (schema_name, relation_name, row_count, row_md5)
+    VALUES
+      (item.schema_name, item.relation_name, observed_count, observed_md5);
+  END LOOP;
+END
+$commonthing$;
+
+CREATE TEMP TABLE commonthing_signature_sequences (
+  schema_name text NOT NULL,
+  sequence_name text NOT NULL,
+  last_value text,
+  is_called boolean NOT NULL,
+  start_value text NOT NULL,
+  increment_by text NOT NULL,
+  min_value text NOT NULL,
+  max_value text NOT NULL,
+  cache_size text NOT NULL,
+  cycle boolean NOT NULL
+);
+
+DO $commonthing$
+DECLARE
+  item record;
+  observed_last text;
+  observed_called boolean;
+BEGIN
+  FOR item IN
+    SELECT
+      n.nspname AS schema_name,
+      c.relname AS sequence_name,
+      s.seqstart::text AS start_value,
+      s.seqincrement::text AS increment_by,
+      s.seqmin::text AS min_value,
+      s.seqmax::text AS max_value,
+      s.seqcache::text AS cache_size,
+      s.seqcycle AS cycle
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid
+    WHERE c.relkind = 'S'
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND n.nspname !~ '^pg_toast'
+      AND n.nspname !~ '^pg_temp_'
+    ORDER BY n.nspname, c.relname
+  LOOP
+    EXECUTE format(
+      'SELECT last_value::text, is_called FROM %I.%I',
+      item.schema_name,
+      item.sequence_name
+    )
+    INTO observed_last, observed_called;
+
+    INSERT INTO commonthing_signature_sequences (
+      schema_name,
+      sequence_name,
+      last_value,
+      is_called,
+      start_value,
+      increment_by,
+      min_value,
+      max_value,
+      cache_size,
+      cycle
+    )
+    VALUES (
+      item.schema_name,
+      item.sequence_name,
+      observed_last,
+      observed_called,
+      item.start_value,
+      item.increment_by,
+      item.min_value,
+      item.max_value,
+      item.cache_size,
+      item.cycle
+    );
+  END LOOP;
+END
+$commonthing$;
+
 SELECT json_build_object(
-  'nodes_count', (SELECT count(*) FROM domain_nodes),
-  'nodes_md5', (
-      SELECT md5(coalesce(string_agg(md5(to_jsonb(n)::text), '' ORDER BY n.id), ''))
-      FROM domain_nodes n
+  'tables',
+  COALESCE(
+    (
+      SELECT json_agg(
+        json_build_object(
+          'schema', schema_name,
+          'name', relation_name,
+          'rows', row_count,
+          'md5', row_md5
+        )
+        ORDER BY schema_name, relation_name
+      )
+      FROM commonthing_signature_tables
+    ),
+    '[]'::json
   ),
-  'edges_count', (SELECT count(*) FROM domain_edges),
-  'edges_md5', (
-      SELECT md5(coalesce(string_agg(md5(to_jsonb(e)::text), '' ORDER BY e.id), ''))
-      FROM domain_edges e
-  ),
-  'outbox_count', (SELECT count(*) FROM domain_outbox),
-  'outbox_md5', (
-      SELECT md5(coalesce(string_agg(md5(to_jsonb(o)::text), '' ORDER BY o.id), ''))
-      FROM domain_outbox o
-  ),
-  'event_consumptions_count', (SELECT count(*) FROM domain_event_consumptions),
-  'event_consumptions_md5', (
-      SELECT md5(coalesce(
-          string_agg(md5(to_jsonb(c)::text), '' ORDER BY c.consumer_name, c.event_id),
-          ''
-      ))
-      FROM domain_event_consumptions c
-  ),
-  'projection_state_count', (SELECT count(*) FROM domain_projection_state),
-  'projection_state_md5', (
-      SELECT md5(coalesce(
-          string_agg(md5(to_jsonb(s)::text), '' ORDER BY s.singleton),
-          ''
-      ))
-      FROM domain_projection_state s
-  ),
-  'search_versions_count', (SELECT count(*) FROM search_node_versions),
-  'search_versions_md5', (
-      SELECT md5(coalesce(string_agg(md5(to_jsonb(v)::text), '' ORDER BY v.node_id), ''))
-      FROM search_node_versions v
-  ),
-  'search_generations_count', (SELECT count(*) FROM search_index_generations),
-  'search_generations_md5', (
-      SELECT md5(coalesce(string_agg(md5(to_jsonb(g)::text), '' ORDER BY g.generation_id), ''))
-      FROM search_index_generations g
-  ),
-  'projection_count', (SELECT count(*) FROM search_node_projections),
-  'projection_md5', (
-      SELECT md5(coalesce(
-          string_agg(
-              md5(to_jsonb(p)::text),
-              '' ORDER BY p.generation_id, p.node_id
-          ),
-          ''
-      ))
-      FROM search_node_projections p
-  ),
-  'projection_jobs_count', (SELECT count(*) FROM search_projection_jobs),
-  'projection_jobs_md5', (
-      SELECT md5(coalesce(
-          string_agg(
-              md5(to_jsonb(j)::text),
-              '' ORDER BY j.generation_id, j.node_id, j.source_version, j.operation
-          ),
-          ''
-      ))
-      FROM search_projection_jobs j
-  ),
-  'active_generation', (
-      SELECT generation_id
-      FROM search_index_generations
-      WHERE state='active'
-      ORDER BY activated_at DESC NULLS LAST
-      LIMIT 1
+  'sequences',
+  COALESCE(
+    (
+      SELECT json_agg(
+        json_build_object(
+          'schema', schema_name,
+          'name', sequence_name,
+          'last_value', last_value,
+          'is_called', is_called,
+          'start_value', start_value,
+          'increment_by', increment_by,
+          'min_value', min_value,
+          'max_value', max_value,
+          'cache_size', cache_size,
+          'cycle', cycle
+        )
+        ORDER BY schema_name, sequence_name
+      )
+      FROM commonthing_signature_sequences
+    ),
+    '[]'::json
   )
 )::text;
 """
-    raw = _psql(
-        root,
-        sql,
-        database_identity=database_identity,
-        postgres_pod_name=postgres_pod_name,
+    identity = (
+        _database_client_identity(root)
+        if database_identity is None
+        else database_identity
     )
+    if postgres_binding is None:
+        raw = _psql(
+            root,
+            sql,
+            database_identity=identity,
+        )
+        schema_sha256: str | None = None
+    else:
+        if source_commit is None:
+            raise RuntimeErrorEB(
+                "bound database signature requires source commit"
+            )
+        raw_bytes = _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            [
+                *_database_client_argv("psql", identity),
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-qAt",
+            ],
+            input_bytes=sql.encode("utf-8"),
+            timeout=900,
+        )
+        try:
+            raw = raw_bytes.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise RuntimeErrorEB(
+                "database continuity signature is not UTF-8"
+            ) from exc
+        schema_bytes = _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            [
+                *_database_client_argv("pg_dump", identity),
+                "--schema-only",
+                "--no-owner",
+                "--no-privileges",
+                "--quote-all-identifiers",
+            ],
+            timeout=900,
+        )
+        try:
+            schema_text = schema_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeErrorEB(
+                "database schema signature is not UTF-8"
+            ) from exc
+        normalized_schema = "\n".join(
+            line
+            for line in schema_text.splitlines()
+            if not line.startswith("\\restrict ")
+            and not line.startswith("\\unrestrict ")
+        ) + "\n"
+        schema_sha256 = hashlib.sha256(
+            normalized_schema.encode("utf-8")
+        ).hexdigest()
+
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeErrorEB("database continuity signature is not JSON") from exc
-    if not isinstance(value, dict) or int(value.get("nodes_count", 0)) < 1:
-        raise RuntimeErrorEB("database continuity signature is incomplete")
+        raise RuntimeErrorEB(
+            "database continuity signature is not JSON"
+        ) from exc
+    tables = value.get("tables") if isinstance(value, dict) else None
+    sequences = value.get("sequences") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or not isinstance(tables, list)
+        or not tables
+        or not isinstance(sequences, list)
+    ):
+        raise RuntimeErrorEB(
+            "database continuity signature is incomplete"
+        )
+    domain_nodes = [
+        item
+        for item in tables
+        if isinstance(item, dict)
+        and item.get("name") == "domain_nodes"
+    ]
+    if (
+        len(domain_nodes) != 1
+        or not isinstance(domain_nodes[0].get("rows"), int)
+        or domain_nodes[0]["rows"] < 1
+    ):
+        raise RuntimeErrorEB(
+            "database continuity signature has no canonical domain state"
+        )
+    if schema_sha256 is not None:
+        value["schema_sha256"] = schema_sha256
     return value
 
 def _jetstream_sequence_progress(value: Any, context: str) -> dict[str, int]:
@@ -11062,25 +11845,55 @@ def _jetstream_signature_from_monitoring(value: Any) -> dict[str, Any]:
     return result
 
 
-def _jetstream_monitoring_signature(root: Path) -> dict[str, Any]:
-    raw = _kubectl(
-        root,
-        [
-            "-n", DATA_NAMESPACE, "exec", "deployment/nats", "--",
-            "/bin/sh", "-c",
-            (
-                "wget -qO- "
-                "'http://127.0.0.1:8222/jsz?"
-                "accounts=true&streams=true&consumers=true&config=true'"
-            ),
-        ],
-    ).stdout
+
+def _jetstream_monitoring_signature(
+    root: Path,
+    *,
+    source_commit: str | None = None,
+    nats_binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    command = [
+        "/bin/sh",
+        "-c",
+        (
+            "wget -qO- "
+            "'http://127.0.0.1:8222/jsz?"
+            "accounts=true&streams=true&consumers=true&config=true'"
+        ),
+    ]
+    if nats_binding is None:
+        raw = _kubectl(
+            root,
+            [
+                "-n", DATA_NAMESPACE, "exec", "deployment/nats", "--",
+                *command,
+            ],
+        ).stdout
+    else:
+        if source_commit is None:
+            raise RuntimeErrorEB(
+                "bound NATS monitoring signature requires source commit"
+            )
+        raw_bytes = _run_bound_nats_client(
+            root,
+            source_commit,
+            nats_binding,
+            command,
+            timeout=120,
+        )
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeErrorEB(
+                "NATS JetStream monitoring output is not UTF-8"
+            ) from exc
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeErrorEB("NATS JetStream monitoring output is not JSON") from exc
+        raise RuntimeErrorEB(
+            "NATS JetStream monitoring output is not JSON"
+        ) from exc
     return _jetstream_signature_from_monitoring(value)
-
 
 def _nats_message_store_sha256_from_output(output: str) -> str:
     entries: list[dict[str, str]] = []
@@ -11112,32 +11925,80 @@ def _nats_message_store_sha256_from_output(output: str) -> str:
     return _stable_json_sha256(entries)
 
 
-def _nats_message_store_sha256(root: Path) -> str:
-    output = _kubectl(
-        root,
-        [
-            "-n", DATA_NAMESPACE, "exec", "deployment/nats", "--",
-            "/bin/sh", "-c",
-            (
-                "find /data -type f -path '*/streams/*/msgs/*.blk' "
-                "-exec sha256sum '{}' ';'"
-            ),
-        ],
-        timeout=120,
-    ).stdout
+
+def _nats_message_store_sha256(
+    root: Path,
+    *,
+    source_commit: str | None = None,
+    nats_binding: dict[str, Any] | None = None,
+) -> str:
+    command = [
+        "/bin/sh",
+        "-c",
+        (
+            "find /data -type f -path '*/streams/*/msgs/*.blk' "
+            "-exec sha256sum '{}' ';'"
+        ),
+    ]
+    if nats_binding is None:
+        output = _kubectl(
+            root,
+            [
+                "-n", DATA_NAMESPACE, "exec", "deployment/nats", "--",
+                *command,
+            ],
+            timeout=120,
+        ).stdout
+    else:
+        if source_commit is None:
+            raise RuntimeErrorEB(
+                "bound NATS message-store signature requires source commit"
+            )
+        output_bytes = _run_bound_nats_client(
+            root,
+            source_commit,
+            nats_binding,
+            command,
+            timeout=120,
+        )
+        try:
+            output = output_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeErrorEB(
+                "NATS JetStream message-store output is not UTF-8"
+            ) from exc
     return _nats_message_store_sha256_from_output(output)
 
 
-def _jetstream_signature(root: Path) -> dict[str, Any]:
-    before = _jetstream_monitoring_signature(root)
-    message_store_sha256 = _nats_message_store_sha256(root)
-    after = _jetstream_monitoring_signature(root)
+def _jetstream_signature(
+    root: Path,
+    *,
+    source_commit: str | None = None,
+    nats_binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    before = _jetstream_monitoring_signature(
+        root,
+        source_commit=source_commit,
+        nats_binding=nats_binding,
+    )
+    message_store_sha256 = _nats_message_store_sha256(
+        root,
+        source_commit=source_commit,
+        nats_binding=nats_binding,
+    )
+    after = _jetstream_monitoring_signature(
+        root,
+        source_commit=source_commit,
+        nats_binding=nats_binding,
+    )
     if after != before:
         raise RuntimeErrorEB(
             "NATS JetStream state changed while hashing persisted message contents"
         )
-    return {**before, "message_store_sha256": message_store_sha256}
-
+    return {
+        **before,
+        "message_store_sha256": message_store_sha256,
+    }
 
 def _scale_deployment(root: Path, namespace: str, name: str, replicas: int) -> None:
     _kubectl(
@@ -11418,11 +12279,12 @@ def _require_empty_replacement_pvc(
         _delete_pod(root, DATA_NAMESPACE, pod_name)
 
 
+
 def _nats_transfer_pod(
     root: Path,
     name: str,
     image: str,
-) -> None:
+) -> dict[str, str]:
     if (
         not isinstance(image, str)
         or re.search(r"@sha256:[0-9a-f]{64}$", image) is None
@@ -11461,7 +12323,12 @@ def _nats_transfer_pod(
                 }
             ],
             "volumes": [
-                {"name": "data", "persistentVolumeClaim": {"claimName": "nats-data"}},
+                {
+                    "name": "data",
+                    "persistentVolumeClaim": {
+                        "claimName": "nats-data"
+                    },
+                },
                 {"name": "tmp", "emptyDir": {}},
             ],
         },
@@ -11475,7 +12342,77 @@ def _nats_transfer_pod(
         ],
         timeout=210,
     )
-
+    pod = _kubectl_json(
+        root,
+        ["-n", DATA_NAMESPACE, "get", "pod", name],
+    )
+    metadata = pod.get("metadata", {}) if isinstance(pod, dict) else {}
+    live_spec = pod.get("spec", {}) if isinstance(pod, dict) else {}
+    status = pod.get("status", {}) if isinstance(pod, dict) else {}
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != name
+        or metadata.get("namespace") != DATA_NAMESPACE
+        or metadata.get("deletionTimestamp") is not None
+        or not isinstance(live_spec, dict)
+        or not isinstance(status, dict)
+        or status.get("phase") != "Running"
+        or _application_pod_spec_projection(
+            live_spec,
+            f"live NATS transfer Pod {name}",
+        )
+        != _application_pod_spec_projection(
+            manifest["spec"],
+            f"expected NATS transfer Pod {name}",
+        )
+    ):
+        raise RuntimeErrorEB(
+            "NATS transfer Pod runtime contract drifted"
+        )
+    ready = any(
+        isinstance(condition, dict)
+        and condition.get("type") == "Ready"
+        and condition.get("status") == "True"
+        for condition in status.get("conditions", [])
+    )
+    statuses = status.get("containerStatuses", [])
+    if (
+        not ready
+        or not isinstance(statuses, list)
+        or len(statuses) != 1
+        or not isinstance(statuses[0], dict)
+        or statuses[0].get("name") != "transfer"
+        or statuses[0].get("ready") is not True
+        or not isinstance(
+            statuses[0].get("state", {}).get("running"),
+            dict,
+        )
+    ):
+        raise RuntimeErrorEB(
+            "NATS transfer Pod is not running and Ready"
+        )
+    image_id = statuses[0].get("imageID")
+    container_id = statuses[0].get("containerID")
+    expected_digest = image.rsplit("@", 1)[1]
+    if (
+        not _runtime_image_id_matches_digest(
+            image_id,
+            expected_digest,
+        )
+        or not isinstance(container_id, str)
+        or re.fullmatch(
+            r"containerd://[0-9a-f]{64}",
+            container_id,
+        )
+        is None
+    ):
+        raise RuntimeErrorEB(
+            "NATS transfer Pod runtime image identity drifted"
+        )
+    return {
+        "container_id": container_id,
+        "runtime_image_id": str(image_id),
+    }
 
 def _delete_pod(root: Path, namespace: str, name: str) -> None:
     _kubectl(
@@ -11541,6 +12478,10 @@ def recovery_proof(root: Path) -> dict[str, Any]:
     nats_tar = backup_dir / "nats.tar"
     before_db: dict[str, Any] | None = None
     before_nats: dict[str, Any] | None = None
+    postgres_dump_snapshot_fd: int | None = None
+    postgres_dump_sha256: str | None = None
+    nats_backup_snapshot_fd: int | None = None
+    nats_backup_sha256: str | None = None
     recovery_receipt, recovery_attempt, recovery_started_at = (
         _begin_live_check_attempt(root, "recovery", source_commit)
     )
@@ -11560,7 +12501,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             "source-commit NATS Deployment has no immutable transfer image"
         )
 
-    with _bound_kube_env(root, recovery_target):
+    with _bound_kube_env(root, recovery_target, source_commit):
         destructive_started = time.monotonic()
         try:
             _require_same_kubernetes_target(
@@ -11594,13 +12535,23 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             before_db = _database_signature(
                 root,
                 database_identity=database_identity,
-                postgres_pod_name=postgres_signature_before["pod_name"],
+                source_commit=source_commit,
+                postgres_binding=postgres_signature_before,
             )
-            before_nats = _jetstream_signature(root)
+            nats_signature_before_binding = (
+                _require_nats_runtime_binding(
+                    root,
+                    source_commit,
+                )
+            )
+            before_nats = _jetstream_signature(
+                root,
+                source_commit=source_commit,
+                nats_binding=nats_signature_before_binding,
+            )
             if before_nats["streams"] < 1 or before_nats["messages"] < 1:
                 raise RuntimeErrorEB("JetStream test state is empty before recovery proof")
 
-            kubectl = toolchain(root)["tools"]["kubectl"]
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery PostgreSQL backup"
             )
@@ -11615,37 +12566,49 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 raise RuntimeErrorEB(
                     "PostgreSQL Pod changed between pre-recovery signature and backup"
                 )
-            _run_binary_to_file(
+            dump_payload = _run_bound_postgres_client(
+                root,
+                source_commit,
+                postgres_backup_binding,
                 [
-                    kubectl, "-n", DATA_NAMESPACE, "exec",
-                    postgres_backup_binding["pod_name"], "--",
-                    *_database_client_argv("pg_dump", database_identity),
+                    *_database_client_argv(
+                        "pg_dump",
+                        database_identity,
+                    ),
                     "-Fc",
                 ],
-                db_dump,
-                env=kube_env(root),
                 timeout=900,
             )
+            if not dump_payload:
+                raise RuntimeErrorEB(
+                    "PostgreSQL recovery dump is empty"
+                )
+            postgres_dump_snapshot_fd = _create_sealed_snapshot_fd(
+                dump_payload,
+                "PostgreSQL recovery dump",
+            )
+            postgres_dump_sha256 = hashlib.sha256(
+                dump_payload
+            ).hexdigest()
+            atomic_bytes(db_dump, dump_payload)
 
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery pre-NATS shutdown"
             )
-            nats_runtime_binding = _require_live_data_deployments(
+            nats_runtime_binding = _require_nats_runtime_binding(
                 root,
-                ("nats",),
-                source_commit=source_commit,
-            )["nats"]
+                source_commit,
+            )
             if (
-                nats_runtime_binding.get("canonical") is not True
-                or nats_runtime_binding.get("contract_sha256")
-                != nats_source_contract["contract_sha256"]
-                or nats_runtime_binding.get("pod_contract_sha256")
-                != nats_source_contract["pod_contract_sha256"]
-                or nats_runtime_binding.get("images_sha256")
-                != _stable_json_sha256(nats_source_contract["images"])
+                _nats_runtime_binding_identity(
+                    nats_runtime_binding
+                )
+                != _nats_runtime_binding_identity(
+                    nats_signature_before_binding
+                )
             ):
                 raise RuntimeErrorEB(
-                    "live NATS workload is not bound to the source-commit contract"
+                    "NATS runtime changed between continuity signature and shutdown"
                 )
             _scale_deployment(root, DATA_NAMESPACE, "nats", 0)
             _wait_pods_absent(
@@ -11656,22 +12619,32 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery NATS shutdown"
             )
-            _nats_transfer_pod(
+            nats_backup_transfer = _nats_transfer_pod(
                 root,
                 "commonthing-experiment-b-nats-backup",
                 nats_transfer_image,
             )
             try:
-                _run_binary_to_file(
-                    [
-                        kubectl, "-n", DATA_NAMESPACE, "exec",
-                        "commonthing-experiment-b-nats-backup", "--",
-                        "tar", "-C", "/data", "-cf", "-", ".",
-                    ],
-                    nats_tar,
-                    env=kube_env(root),
+                nats_backup_payload = _run_bound_container_command(
+                    root,
+                    source_commit,
+                    nats_backup_transfer["container_id"],
+                    ["tar", "-C", "/data", "-cf", "-", "."],
                     timeout=900,
+                    context="NATS backup transfer",
                 )
+                if not nats_backup_payload:
+                    raise RuntimeErrorEB(
+                        "NATS recovery backup is empty"
+                    )
+                nats_backup_snapshot_fd = _create_sealed_snapshot_fd(
+                    nats_backup_payload,
+                    "NATS recovery backup",
+                )
+                nats_backup_sha256 = hashlib.sha256(
+                    nats_backup_payload
+                ).hexdigest()
+                atomic_bytes(nats_tar, nats_backup_payload)
             finally:
                 _delete_pod(
                     root, DATA_NAMESPACE, "commonthing-experiment-b-nats-backup"
@@ -11723,21 +12696,42 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery replacement PVC verification"
             )
-            _nats_transfer_pod(
+            nats_restore_transfer = _nats_transfer_pod(
                 root,
                 "commonthing-experiment-b-nats-restore",
                 nats_transfer_image,
             )
             try:
-                _run_input_file(
-                    [
-                        kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
-                        "commonthing-experiment-b-nats-restore", "--",
-                        "tar", "-C", "/data", "-xf", "-",
-                    ],
-                    nats_tar,
-                    env=kube_env(root),
+                if nats_backup_snapshot_fd is None:
+                    raise RuntimeErrorEB(
+                        "NATS recovery backup snapshot is missing"
+                    )
+                nats_backup_size = os.fstat(
+                    nats_backup_snapshot_fd
+                ).st_size
+                nats_restore_payload = os.pread(
+                    nats_backup_snapshot_fd,
+                    nats_backup_size,
+                    0,
+                )
+                if (
+                    len(nats_restore_payload) != nats_backup_size
+                    or hashlib.sha256(
+                        nats_restore_payload
+                    ).hexdigest()
+                    != nats_backup_sha256
+                ):
+                    raise RuntimeErrorEB(
+                        "NATS recovery backup snapshot drifted"
+                    )
+                _run_bound_container_command(
+                    root,
+                    source_commit,
+                    nats_restore_transfer["container_id"],
+                    ["tar", "-C", "/data", "-xf", "-"],
+                    input_bytes=nats_restore_payload,
                     timeout=900,
+                    context="NATS restore transfer",
                 )
             finally:
                 _delete_pod(
@@ -11756,15 +12750,40 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 root,
                 source_commit,
             )
-            _run_input_file(
+            if postgres_dump_snapshot_fd is None:
+                raise RuntimeErrorEB(
+                    "PostgreSQL recovery dump snapshot is missing"
+                )
+            dump_size = os.fstat(
+                postgres_dump_snapshot_fd
+            ).st_size
+            restore_payload = os.pread(
+                postgres_dump_snapshot_fd,
+                dump_size,
+                0,
+            )
+            if (
+                len(restore_payload) != dump_size
+                or hashlib.sha256(restore_payload).hexdigest()
+                != postgres_dump_sha256
+            ):
+                raise RuntimeErrorEB(
+                    "PostgreSQL recovery dump snapshot drifted"
+                )
+            _run_bound_postgres_client(
+                root,
+                source_commit,
+                postgres_restore_binding,
                 [
-                    kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
-                    postgres_restore_binding["pod_name"], "--",
-                    *_database_client_argv("pg_restore", database_identity),
-                    "--clean", "--if-exists", "--no-owner",
+                    *_database_client_argv(
+                        "pg_restore",
+                        database_identity,
+                    ),
+                    "--clean",
+                    "--if-exists",
+                    "--no-owner",
                 ],
-                db_dump,
-                env=kube_env(root),
+                input_bytes=restore_payload,
                 timeout=1200,
             )
             _require_same_kubernetes_target(
@@ -11790,9 +12809,26 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             after_db = _database_signature(
                 root,
                 database_identity=database_identity,
-                postgres_pod_name=postgres_signature_after["pod_name"],
+                source_commit=source_commit,
+                postgres_binding=postgres_signature_after,
             )
-            after_nats = _jetstream_signature(root)
+            nats_signature_after_binding = (
+                _require_nats_runtime_binding(
+                    root,
+                    source_commit,
+                )
+            )
+            after_nats = _jetstream_signature(
+                root,
+                source_commit=source_commit,
+                nats_binding=nats_signature_after_binding,
+            )
+            if postgres_dump_snapshot_fd is not None:
+                os.close(postgres_dump_snapshot_fd)
+                postgres_dump_snapshot_fd = None
+            if nats_backup_snapshot_fd is not None:
+                os.close(nats_backup_snapshot_fd)
+                nats_backup_snapshot_fd = None
             if after_db != before_db:
                 raise RuntimeErrorEB("PostgreSQL/search signature changed across delete-to-prove")
             if after_nats != before_nats:
@@ -11811,6 +12847,12 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             )
             rto_seconds = time.monotonic() - destructive_started
         except Exception:
+            if postgres_dump_snapshot_fd is not None:
+                os.close(postgres_dump_snapshot_fd)
+                postgres_dump_snapshot_fd = None
+            if nats_backup_snapshot_fd is not None:
+                os.close(nats_backup_snapshot_fd)
+                nats_backup_snapshot_fd = None
             resuspended: dict[str, bool] = {
                 "commonthing-experiment-b-app": False,
                 "commonthing-experiment-b-data": False,
@@ -11894,8 +12936,8 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         ).hexdigest(),
         "rpo_seconds": 0,
         "rto_seconds": round(rto_seconds, 3),
-        "postgres_dump_sha256": sha256_file(db_dump),
-        "nats_backup_sha256": sha256_file(nats_tar),
+        "postgres_dump_sha256": postgres_dump_sha256,
+        "nats_backup_sha256": nats_backup_sha256,
         "database_before": before_db,
         "database_after": after_db,
         "jetstream_before": before_nats,
@@ -12244,7 +13286,10 @@ def portability_report(root: Path) -> dict[str, Any]:
         )
     ):
         raise RuntimeErrorEB("status does not prove the live Flux contract")
-    expected_flux_controllers = _expected_flux_controller_contract(root)
+    expected_flux_controllers = _expected_flux_controller_contract(
+        root,
+        source_commit=source_commit,
+    )
     flux_baseline = payloads["platform.json"].get("flux_runtime_image_ids")
     if (
         not isinstance(flux_baseline, dict)

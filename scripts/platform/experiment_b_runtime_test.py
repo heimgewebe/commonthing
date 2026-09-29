@@ -2289,8 +2289,13 @@ spec:
         self.assertNotEqual(first, changed)
 
         source = inspect.getsource(runtime._jetstream_signature)
-        self.assertEqual(source.count("_jetstream_monitoring_signature(root)"), 2)
-        self.assertIn("_nats_message_store_sha256(root)", source)
+        self.assertEqual(
+            source.count("_jetstream_monitoring_signature("),
+            2,
+        )
+        self.assertIn("_nats_message_store_sha256(", source)
+        self.assertIn("source_commit=source_commit", source)
+        self.assertIn("nats_binding=nats_binding", source)
         self.assertIn("state changed while hashing", source)
 
     def test_recovery_rto_includes_application_rollout(self) -> None:
@@ -4367,12 +4372,14 @@ spec:
             recovery_source.count("database_identity=database_identity"),
             2,
         )
-        self.assertIn(
-            '*_database_client_argv("pg_dump", database_identity)',
-            recovery_source,
+        self.assertIn('"pg_dump"', recovery_source)
+        self.assertIn('"pg_restore"', recovery_source)
+        self.assertGreaterEqual(
+            recovery_source.count("_run_bound_postgres_client("),
+            2,
         )
         self.assertIn(
-            '*_database_client_argv("pg_restore", database_identity)',
+            "postgres_dump_snapshot_fd",
             recovery_source,
         )
         self.assertGreaterEqual(
@@ -4873,24 +4880,22 @@ spec:
             inspect.getsource(runtime._expected_live_secret_values),
         )
 
-    def test_database_signature_hashes_complete_persisted_domain_and_search_rows(self) -> None:
+
+    def test_database_signature_hashes_complete_persisted_domain_and_search_rows(
+        self,
+    ) -> None:
         source = inspect.getsource(runtime._database_signature)
-        self.assertIn("md5(to_jsonb(n)::text)", source)
-        self.assertIn("md5(to_jsonb(e)::text)", source)
-        self.assertIn("domain_outbox", source)
-        self.assertIn("md5(to_jsonb(o)::text)", source)
-        self.assertIn("domain_event_consumptions", source)
-        self.assertIn("md5(to_jsonb(c)::text)", source)
-        self.assertIn("domain_projection_state", source)
-        self.assertIn("md5(to_jsonb(s)::text)", source)
-        self.assertIn("search_node_versions", source)
-        self.assertIn("md5(to_jsonb(v)::text)", source)
-        self.assertIn("search_index_generations", source)
-        self.assertIn("md5(to_jsonb(g)::text)", source)
-        self.assertIn("search_node_projections", source)
-        self.assertIn("md5(to_jsonb(p)::text)", source)
-        self.assertIn("search_projection_jobs", source)
-        self.assertIn("md5(to_jsonb(j)::text)", source)
+        self.assertIn("pg_catalog.pg_class", source)
+        self.assertIn("pg_catalog.pg_namespace", source)
+        self.assertIn("c.relkind IN ('r', 'p')", source)
+        self.assertIn("md5(to_jsonb(t)::text)", source)
+        self.assertIn("commonthing_signature_sequences", source)
+        self.assertIn("pg_catalog.pg_sequence", source)
+        self.assertIn("last_value::text, is_called", source)
+        self.assertIn('"--schema-only"', source)
+        self.assertIn('"--quote-all-identifiers"', source)
+        self.assertIn("schema_sha256", source)
+        self.assertIn("_run_bound_postgres_client", source)
 
     def test_application_contract_render_uses_sealed_source_commit_tree(
         self,
@@ -4941,7 +4946,9 @@ spec:
             '"app.kubernetes.io/name=weltgewebe-web"', web_scale
         )
         db_signature = source.index("before_db = _database_signature(")
-        nats_signature = source.index("before_nats = _jetstream_signature(root)")
+        nats_signature = source.index(
+            "before_nats = _jetstream_signature("
+        )
         dump = source.index('"pg_dump"')
         self.assertLess(api_scale, api_wait)
         self.assertLess(web_scale, web_wait)
@@ -4950,23 +4957,11 @@ spec:
         self.assertLess(db_signature, nats_signature)
         self.assertLess(nats_signature, dump)
 
+
     def test_recovery_binds_postgres_clients_to_validated_source_pod(
         self,
     ) -> None:
         source = inspect.getsource(runtime.recovery_proof)
-        bindings: list[int] = []
-        cursor = 0
-        while True:
-            index = source.find(
-                "_require_postgres_runtime_binding(",
-                cursor,
-            )
-            if index == -1:
-                break
-            bindings.append(index)
-            cursor = index + 1
-
-        self.assertEqual(len(bindings), 4)
         before_signature = source.index(
             "before_db = _database_signature("
         )
@@ -4975,29 +4970,44 @@ spec:
         after_signature = source.index(
             "after_db = _database_signature("
         )
-        self.assertLess(bindings[0], before_signature)
-        self.assertLess(before_signature, bindings[1])
-        self.assertLess(bindings[1], dump)
-        self.assertLess(dump, bindings[2])
-        self.assertLess(bindings[2], restore)
-        self.assertLess(restore, bindings[3])
-        self.assertLess(bindings[3], after_signature)
+        self.assertLess(before_signature, dump)
+        self.assertLess(dump, restore)
+        self.assertLess(restore, after_signature)
+        self.assertGreaterEqual(
+            source.count("_run_bound_postgres_client("),
+            2,
+        )
+        self.assertIn(
+            "postgres_binding=postgres_signature_before",
+            source,
+        )
+        self.assertIn(
+            "postgres_binding=postgres_signature_after",
+            source,
+        )
+        self.assertIn("postgres_dump_snapshot_fd", source)
+        self.assertIn("_create_sealed_snapshot_fd(", source)
         self.assertNotIn('"deployment/postgres"', source)
+
+        binding_source = inspect.getsource(
+            runtime._require_postgres_runtime_binding
+        )
+        client_source = inspect.getsource(
+            runtime._run_bound_postgres_client
+        )
+        container_source = inspect.getsource(
+            runtime._run_bound_container_command
+        )
+        self.assertIn('"container_id": container_id', binding_source)
+        self.assertIn('"crictl"', container_source)
+        self.assertIn('"exec"', container_source)
         self.assertIn(
-            'postgres_backup_binding["pod_name"]',
-            source,
+            '_postgres_runtime_binding_identity(current)',
+            client_source,
         )
         self.assertIn(
-            'postgres_restore_binding["pod_name"]',
-            source,
-        )
-        self.assertIn(
-            'postgres_pod_name=postgres_signature_before["pod_name"]',
-            source,
-        )
-        self.assertIn(
-            'postgres_pod_name=postgres_signature_after["pod_name"]',
-            source,
+            'expected_identity["container_id"]',
+            client_source,
         )
 
     def test_recovery_waits_for_nats_quiescence_before_pvc_backup(self) -> None:
@@ -5016,29 +5026,98 @@ spec:
         waited = runtime.subprocess.CompletedProcess(
             ["kubectl"], 0, stdout="", stderr=""
         )
+        captured: dict[str, dict] = {}
+
+        def capture_apply(_root, payload):
+            captured["manifest"] = json.loads(payload)
+
+        def pod_readback(_root, arguments):
+            self.assertEqual(
+                arguments,
+                [
+                    "-n",
+                    runtime.DATA_NAMESPACE,
+                    "get",
+                    "pod",
+                    "transfer",
+                ],
+            )
+            manifest = captured["manifest"]
+            return {
+                "metadata": {
+                    "name": "transfer",
+                    "namespace": runtime.DATA_NAMESPACE,
+                },
+                "spec": json.loads(
+                    json.dumps(manifest["spec"])
+                ),
+                "status": {
+                    "phase": "Running",
+                    "conditions": [
+                        {"type": "Ready", "status": "True"}
+                    ],
+                    "containerStatuses": [
+                        {
+                            "name": "transfer",
+                            "ready": True,
+                            "state": {
+                                "running": {
+                                    "startedAt": "2026-09-29T00:00:00Z"
+                                }
+                            },
+                            "imageID": (
+                                "containerd://sha256:" + "a" * 64
+                            ),
+                            "containerID": (
+                                "containerd://" + "b" * 64
+                            ),
+                        }
+                    ],
+                },
+            }
+
         with (
-            mock.patch.object(runtime, "kubectl_apply") as apply_manifest,
-            mock.patch.object(runtime, "_kubectl", return_value=waited),
+            mock.patch.object(
+                runtime,
+                "kubectl_apply",
+                side_effect=capture_apply,
+            ) as apply_manifest,
+            mock.patch.object(
+                runtime,
+                "_kubectl",
+                return_value=waited,
+            ),
             mock.patch.object(
                 runtime,
                 "_kubectl_json",
-                side_effect=AssertionError(
-                    "transfer helper must not reread the live NATS Deployment"
-                ),
+                side_effect=pod_readback,
             ),
         ):
-            runtime._nats_transfer_pod(root, "transfer", image)
+            binding = runtime._nats_transfer_pod(
+                root,
+                "transfer",
+                image,
+            )
 
-        manifest = json.loads(apply_manifest.call_args.args[1])
+        manifest = captured["manifest"]
         self.assertEqual(
             manifest["spec"]["containers"][0]["image"],
             image,
         )
+        self.assertEqual(
+            binding["container_id"],
+            "containerd://" + "b" * 64,
+        )
+        self.assertEqual(apply_manifest.call_count, 1)
         with self.assertRaisesRegex(
             runtime.RuntimeErrorEB,
             "source-commit-bound immutable image",
         ):
-            runtime._nats_transfer_pod(root, "transfer", "nats:latest")
+            runtime._nats_transfer_pod(
+                root,
+                "transfer",
+                "nats:latest",
+            )
 
     def test_recovery_binds_nats_transfer_to_source_commit_contract(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
@@ -5046,7 +5125,7 @@ spec:
             "nats_source_contract = _source_commit_data_deployment_contract("
         )
         live_contract = source.index(
-            "nats_runtime_binding = _require_live_data_deployments("
+            "nats_runtime_binding = _require_nats_runtime_binding("
         )
         scale_down = source.index(
             '_scale_deployment(root, DATA_NAMESPACE, "nats", 0)'
@@ -5062,6 +5141,18 @@ spec:
         self.assertLess(scale_down, backup)
         self.assertLess(backup, restore)
         self.assertIn("source_commit=source_commit", source)
+        self.assertIn(
+            'nats_backup_transfer["container_id"]',
+            source,
+        )
+        self.assertIn(
+            'nats_restore_transfer["container_id"]',
+            source,
+        )
+        self.assertGreaterEqual(
+            source.count("_run_bound_container_command("),
+            2,
+        )
         self.assertGreaterEqual(
             source.count("nats_transfer_image"),
             6,
@@ -5530,6 +5621,14 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                                 "running": {"startedAt": "2026-09-27T00:00:00Z"}
                             },
                             "imageID": fixture_runtime_image_id(image),
+                            "containerID": (
+                                "containerd://"
+                                + hashlib.sha256(
+                                    f"{workload}:{ordinal}:{name}".encode(
+                                        "utf-8"
+                                    )
+                                ).hexdigest()
+                            ),
                         }
                         for name, image in images["containers"].items()
                     ],
@@ -7536,6 +7635,23 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         ):
             runtime.status(self.root)
 
+        self.flux_controller_pods = json.loads(
+            json.dumps(healthy_pods)
+        )
+        extra_flux_pod = json.loads(
+            json.dumps(healthy_pods[0])
+        )
+        extra_flux_pod["metadata"]["name"] = "shadow-controller-0"
+        extra_flux_pod["metadata"]["labels"] = {
+            "app.kubernetes.io/name": "shadow-controller"
+        }
+        self.flux_controller_pods.append(extra_flux_pod)
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "Pod inventory contains noncanonical Pods",
+        ):
+            runtime.status(self.root)
+
         self.flux_controller_deployments = healthy
         self.flux_controller_pods = healthy_pods
         result = runtime.status(self.root)
@@ -8533,7 +8649,11 @@ spec:
         self.assertFalse((self.root / "receipts/status.json").exists())
         self.assertFalse((self.root / "receipts/portability.json").exists())
 
-    def test_final_recovery_state_readback_binds_current_signatures_and_fixture(self) -> None:
+
+
+    def test_final_recovery_state_readback_binds_current_signatures_and_fixture(
+        self,
+    ) -> None:
         recovery = {
             "schema_version": 1,
             "status": "pass",
@@ -8544,7 +8664,10 @@ spec:
             "jetstream_before": {"nats": "stable"},
             "jetstream_after": {"nats": "stable"},
         }
-        runtime.atomic_json(self.root / "receipts/recovery.json", recovery)
+        runtime.atomic_json(
+            self.root / "receipts/recovery.json",
+            recovery,
+        )
         runtime.atomic_json(
             self.root / "receipts/t048-fixture.json",
             {
@@ -8554,9 +8677,34 @@ spec:
                 "live_binding": {"generation_id": "fixture"},
             },
         )
+        postgres_binding = {"binding": "stable"}
+        nats_binding = {"binding": "nats-stable"}
         with (
-            mock.patch.object(runtime, "_database_signature", return_value={"db": "stable"}),
-            mock.patch.object(runtime, "_jetstream_signature", return_value={"nats": "stable"}),
+            mock.patch.object(
+                runtime,
+                "_verified_database_client_identity",
+                return_value=("user", "db"),
+            ),
+            mock.patch.object(
+                runtime,
+                "_require_postgres_runtime_binding",
+                return_value=postgres_binding,
+            ),
+            mock.patch.object(
+                runtime,
+                "_require_nats_runtime_binding",
+                return_value=nats_binding,
+            ),
+            mock.patch.object(
+                runtime,
+                "_database_signature",
+                return_value={"db": "stable"},
+            ) as database_signature,
+            mock.patch.object(
+                runtime,
+                "_jetstream_signature",
+                return_value={"nats": "stable"},
+            ) as jetstream_signature,
             mock.patch.object(
                 runtime,
                 "_validated_t048_fixture_receipt",
@@ -8567,9 +8715,29 @@ spec:
                 },
             ) as fixture,
         ):
-            result = runtime._final_recovery_state_readback(self.root, self.commit)
-        self.assertEqual(result["database_signature"], {"db": "stable"})
-        self.assertEqual(result["jetstream_signature"], {"nats": "stable"})
+            result = runtime._final_recovery_state_readback(
+                self.root,
+                self.commit,
+            )
+        self.assertEqual(
+            result["database_signature"],
+            {"db": "stable"},
+        )
+        self.assertEqual(
+            result["jetstream_signature"],
+            {"nats": "stable"},
+        )
+        database_signature.assert_called_once_with(
+            self.root,
+            database_identity=("user", "db"),
+            source_commit=self.commit,
+            postgres_binding=postgres_binding,
+        )
+        jetstream_signature.assert_called_once_with(
+            self.root,
+            source_commit=self.commit,
+            nats_binding=nats_binding,
+        )
         fixture.assert_called_once_with(self.root, self.commit)
 
         runtime.atomic_json(
@@ -8580,16 +8748,51 @@ spec:
                 "source_commit": self.commit,
             },
         )
-        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "latest failed recovery"):
-            runtime._final_recovery_state_readback(self.root, self.commit)
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "latest failed recovery",
+        ):
+            runtime._final_recovery_state_readback(
+                self.root,
+                self.commit,
+            )
         (self.root / "receipts/recovery-failed.json").unlink()
 
         with (
-            mock.patch.object(runtime, "_database_signature", return_value={"db": "drift"}),
-            mock.patch.object(runtime, "_jetstream_signature", return_value={"nats": "stable"}),
+            mock.patch.object(
+                runtime,
+                "_verified_database_client_identity",
+                return_value=("user", "db"),
+            ),
+            mock.patch.object(
+                runtime,
+                "_require_postgres_runtime_binding",
+                return_value=postgres_binding,
+            ),
+            mock.patch.object(
+                runtime,
+                "_require_nats_runtime_binding",
+                return_value=nats_binding,
+            ),
+            mock.patch.object(
+                runtime,
+                "_database_signature",
+                return_value={"db": "drift"},
+            ),
+            mock.patch.object(
+                runtime,
+                "_jetstream_signature",
+                return_value={"nats": "stable"},
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "database/search state drifted",
+            ),
         ):
-            with self.assertRaisesRegex(runtime.RuntimeErrorEB, "database/search state drifted"):
-                runtime._final_recovery_state_readback(self.root, self.commit)
+            runtime._final_recovery_state_readback(
+                self.root,
+                self.commit,
+            )
 
     def test_status_rechecks_semantic_provider_live(self) -> None:
         self.write_vm_receipt()
@@ -9501,7 +9704,7 @@ spec:
             first_postgres + 1,
         )
         bound_snapshot = source.index(
-            "bound_stack.enter_context(_bound_kube_env(root, target_binding_before))"
+            "bound_stack.enter_context(_bound_kube_env(root, target_binding_before, source_commit))"
         )
         port_forward = source.index("_start_api_port_forward")
         final_bound_close = source.rindex("bound_stack.close()")
@@ -9902,7 +10105,6 @@ spec:
             attempt["volume_inode"], result["substrate"]["disk_inode"]
         )
         self.assertRegex(attempt["substrate_sha256"], r"^[0-9a-f]{64}$")
-
     def test_create_passes_only_verified_cloud_init_snapshots_to_virt_install(
         self,
     ) -> None:
@@ -9997,7 +10199,6 @@ spec:
         self.addCleanup(attempt.unlink, missing_ok=True)
         self.write_vm_receipt()
         original = self.run_fixture
-
         def fail_base_volume_cleanup(argv, **kwargs):
             if (
                 argv[:3] == ["virsh", "-c", runtime.LIBVIRT_URI]
@@ -10046,6 +10247,7 @@ spec:
 
 
 class ExperimentBLatestP1RegressionTests(unittest.TestCase):
+
     def test_bound_kube_env_freezes_verified_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -10078,51 +10280,75 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                 "kubeconfig_sha256": runtime.sha256_file(source),
                 "server": "https://192.168.122.10:6443",
             }
-            with runtime._bound_kube_env(root, expected) as env:
-                snapshot = Path(env["KUBECONFIG"])
-                self.assertNotEqual(snapshot, source)
-                self.assertTrue(str(snapshot).startswith("/proc/self/fd/"))
-                snapshot_fd = int(snapshot.name)
-                self.assertEqual(
-                    runtime._bound_subprocess_pass_fds(),
-                    (snapshot_fd,),
-                )
-                self.assertEqual(
-                    runtime.sha256_file(snapshot),
-                    expected["kubeconfig_sha256"],
-                )
-                snapshot_size = runtime.os.fstat(snapshot_fd).st_size
-                self.assertEqual(
-                    runtime._kubeconfig_server_payload(
-                        runtime.os.pread(snapshot_fd, snapshot_size, 0)
-                    ),
-                    expected["server"],
-                )
-                self.assertEqual(
-                    runtime.kube_env(root)["KUBECONFIG"],
-                    str(snapshot),
-                )
-                with self.assertRaises(OSError):
-                    snapshot.write_bytes(b"forged kubeconfig")
-                source.write_text("drifted", encoding="utf-8")
-                child = runtime.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        (
-                            "import os; from pathlib import Path; "
-                            "print(Path(os.environ['KUBECONFIG']).read_text())"
+            commit = "a" * 40
+            with mock.patch.object(
+                runtime,
+                "toolchain",
+                return_value={"tools": {}, "artifacts": {}},
+            ) as bound_tools:
+                with runtime._bound_kube_env(
+                    root,
+                    expected,
+                    commit,
+                ) as env:
+                    snapshot = Path(env["KUBECONFIG"])
+                    self.assertNotEqual(snapshot, source)
+                    self.assertTrue(
+                        str(snapshot).startswith("/proc/self/fd/")
+                    )
+                    snapshot_fd = int(snapshot.name)
+                    self.assertIn(
+                        snapshot_fd,
+                        runtime._bound_subprocess_pass_fds(),
+                    )
+                    self.assertEqual(
+                        runtime._BOUND_SOURCE_COMMIT.get(),
+                        commit,
+                    )
+                    self.assertEqual(
+                        runtime.sha256_file(snapshot),
+                        expected["kubeconfig_sha256"],
+                    )
+                    snapshot_size = runtime.os.fstat(snapshot_fd).st_size
+                    self.assertEqual(
+                        runtime._kubeconfig_server_payload(
+                            runtime.os.pread(
+                                snapshot_fd,
+                                snapshot_size,
+                                0,
+                            )
                         ),
-                    ],
-                    env=env,
+                        expected["server"],
+                    )
+                    self.assertEqual(
+                        runtime.kube_env(root)["KUBECONFIG"],
+                        str(snapshot),
+                    )
+                    with self.assertRaises(OSError):
+                        snapshot.write_bytes(b"forged kubeconfig")
+                    source.write_text("drifted", encoding="utf-8")
+                    child = runtime.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            (
+                                "import os; from pathlib import Path; "
+                                "print(Path(os.environ['KUBECONFIG']).read_text())"
+                            ),
+                        ],
+                        env=env,
+                    )
+                    self.assertIn("experiment-b", child.stdout)
+                    self.assertNotIn("drifted", child.stdout)
+                    self.assertEqual(
+                        runtime.sha256_file(snapshot),
+                        expected["kubeconfig_sha256"],
+                    )
+                self.assertFalse(snapshot.exists())
+                self.assertIsNone(
+                    runtime._BOUND_SOURCE_COMMIT.get()
                 )
-                self.assertIn("experiment-b", child.stdout)
-                self.assertNotIn("drifted", child.stdout)
-                self.assertEqual(
-                    runtime.sha256_file(snapshot),
-                    expected["kubeconfig_sha256"],
-                )
-            self.assertFalse(snapshot.exists())
+            bound_tools.assert_called_once_with(root, commit)
 
     def test_t048_authority_inputs_are_source_commit_bound(self) -> None:
         commit = "a" * 40
@@ -10222,7 +10448,10 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
         )
         self.assertIn('"kubernetes_target_sha256"', source)
 
-    def test_all_mutating_workflows_freeze_target_and_revalidate_success(self) -> None:
+
+    def test_all_mutating_workflows_freeze_target_and_revalidate_success(
+        self,
+    ) -> None:
         for function, target_name in (
             (runtime.inject_secrets, "secrets_target"),
             (runtime.apply_release, "release_target"),
@@ -10235,15 +10464,88 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                     f"{target_name} = _kubernetes_target_identity"
                 )
                 snapshot = source.index(
-                    f"with _bound_kube_env(root, {target_name})"
+                    f"with _bound_kube_env(root, {target_name}, source_commit)"
                 )
-                final = source.rindex("_require_same_kubernetes_target")
+                final = source.rindex(
+                    "_require_same_kubernetes_target"
+                )
                 self.assertLess(capture, snapshot)
                 self.assertLess(snapshot, final)
                 self.assertIn(
                     f"_stable_json_sha256({target_name})",
                     source,
                 )
+
+    def test_toolchain_authority_is_source_commit_bound(self) -> None:
+        source = inspect.getsource(runtime.toolchain)
+        self.assertIn("_git_blob_bytes(", source)
+        self.assertIn("bootstrap_tools.LOCK_PATH", source)
+        self.assertIn("lock_bytes=lock_bytes", source)
+        self.assertIn("_open_verified_file(", source)
+        self.assertIn("_create_sealed_snapshot_fd(", source)
+        self.assertIn('f"/proc/self/fd/{snapshot_fd}"', source)
+        self.assertIn('"source_commit": commit', source)
+
+        install_source = inspect.getsource(
+            runtime.bootstrap_tools.install
+        )
+        self.assertIn("lock_bytes: bytes | None = None", install_source)
+        self.assertIn(
+            "hashlib.sha256(lock_bytes).hexdigest()",
+            install_source,
+        )
+
+        bound_source = inspect.getsource(runtime._bound_kube_env)
+        self.assertIn(
+            "toolchain(root, source_commit)",
+            bound_source,
+        )
+        self.assertIn(
+            "_BOUND_SOURCE_COMMIT.set(source_commit)",
+            bound_source,
+        )
+
+    def test_status_uses_one_application_pod_snapshot_for_contracts(
+        self,
+    ) -> None:
+        source = inspect.getsource(runtime.status)
+        self.assertEqual(
+            source.count(
+                '["-n", APP_NAMESPACE, "get", "pods"]'
+            ),
+            1,
+        )
+        snapshot = source.index(
+            "application_pod_items = _kubectl_json("
+        )
+        api_partition = source.index(
+            "api_pods = _pods_matching_labels(",
+            snapshot,
+        )
+        web_partition = source.index(
+            "web_pods = _pods_matching_labels(",
+            snapshot,
+        )
+        migration_partition = source.index(
+            "migration_pods = _pods_matching_labels(",
+            snapshot,
+        )
+        workload_check = source.index(
+            "_require_live_application_workloads(",
+            snapshot,
+        )
+        inventory_check = source.index(
+            "_require_exact_application_pod_inventory(",
+            snapshot,
+        )
+        self.assertLess(snapshot, api_partition)
+        self.assertLess(snapshot, web_partition)
+        self.assertLess(snapshot, migration_partition)
+        self.assertLess(api_partition, workload_check)
+        self.assertLess(web_partition, workload_check)
+        self.assertLess(migration_partition, workload_check)
+        self.assertLess(workload_check, inventory_check)
+
     def test_controller_pod_contract_rejects_ephemeral_debug_containers(self) -> None:
         digest = "sha256:" + "a" * 64
         image = "example.invalid/controller@" + digest
@@ -10420,7 +10722,7 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
     def test_recovery_revalidates_target_around_destructive_boundaries(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         bound_context = source.index(
-            "with _bound_kube_env(root, recovery_target):"
+            "with _bound_kube_env(root, recovery_target, source_commit):"
         )
         storage_capture = source.index(
             "_git_blob_bytes(source_commit, storage_path)"
@@ -10475,7 +10777,7 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
             "status_target = _kubernetes_target_identity"
         )
         snapshot = source.index(
-            "with _bound_kube_env(root, status_target):"
+            "with _bound_kube_env(root, status_target, source_commit):"
         )
         k3s_runtime = source.index("_require_live_k3s_runtime")
         final_kubernetes_readback = source.index(
@@ -11069,7 +11371,7 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
         t048_source = inspect.getsource(runtime.t048_load_proof)
         port_forward = t048_source.index("_start_api_port_forward(")
         bound_snapshot = t048_source.index(
-            "bound_stack.enter_context(_bound_kube_env(root, target_binding_before))"
+            "bound_stack.enter_context(_bound_kube_env(root, target_binding_before, source_commit))"
         )
         self.assertLess(bound_snapshot, port_forward)
         self.assertIn("root, pod_name", t048_source[port_forward:port_forward + 160])
