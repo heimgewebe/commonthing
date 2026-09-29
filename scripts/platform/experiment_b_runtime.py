@@ -1063,6 +1063,70 @@ def scp_to(root: Path, ip: str, source: Path, destination: str) -> None:
     )
 
 
+def scp_fd_to(
+    root: Path,
+    ip: str,
+    source_fd: int,
+    destination: str,
+) -> None:
+    known_hosts = root / "ssh/known_hosts"
+    try:
+        result = subprocess.run(
+            [
+                "scp",
+                "-i", str(root / "ssh/id_ed25519"),
+                "-o", f"UserKnownHostsFile={known_hosts}",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "BatchMode=yes",
+                f"/proc/self/fd/{source_fd}",
+                f"commonthing@{ip}:{destination}",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=900,
+            check=False,
+            pass_fds=(source_fd,),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeErrorEB("command timed out: scp") from exc
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeErrorEB(
+            f"command failed ({result.returncode}): scp: {stderr[-2000:]}"
+        )
+
+
+def _open_verified_k3s_binary(path: Path, expected_sha256: str) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+        raise RuntimeErrorEB("prepared k3s binary cannot be opened safely")
+    try:
+        file_fd = os.open(path, os.O_RDONLY | cloexec | nofollow)
+    except OSError as exc:
+        raise RuntimeErrorEB("prepared k3s binary is missing or unsafe") from exc
+    try:
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeErrorEB("prepared k3s binary is not a regular file")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if digest.hexdigest() != expected_sha256:
+            raise RuntimeErrorEB(
+                "prepared k3s binary digest does not match current config"
+            )
+        os.lseek(file_fd, 0, os.SEEK_SET)
+    except Exception:
+        os.close(file_fd)
+        raise
+    return file_fd
+
+
 def _k3s_contract_paths(config: dict[str, Any]) -> tuple[Path, Path]:
     binding = config.get("runtime_binding", {})
     if not isinstance(binding, dict):
@@ -1416,13 +1480,12 @@ def install_k3s(root: Path) -> dict[str, Any]:
     ip = vm_ip()
     wait_ssh(root, ip)
     k3s_binary = root / "downloads/k3s"
-    if not k3s_binary.is_file():
-        raise RuntimeErrorEB("prepared k3s binary is missing")
     expected_k3s_sha256 = str(config["kubernetes"]["binary_sha256"])
-    observed_k3s_sha256 = sha256_file(k3s_binary)
-    if observed_k3s_sha256 != expected_k3s_sha256:
-        raise RuntimeErrorEB("prepared k3s binary digest does not match current config")
-    scp_to(root, ip, k3s_binary, "/tmp/k3s")
+    k3s_fd = _open_verified_k3s_binary(k3s_binary, expected_k3s_sha256)
+    try:
+        scp_fd_to(root, ip, k3s_fd, "/tmp/k3s")
+    finally:
+        os.close(k3s_fd)
     scp_to(root, ip, CLUSTER / "k3s-config.yaml", "/tmp/config.yaml")
     scp_to(root, ip, CLUSTER / "k3s.service", "/tmp/k3s.service")
     command = (
@@ -9871,7 +9934,7 @@ def _jetstream_signature_from_monitoring(value: Any) -> dict[str, Any]:
     return result
 
 
-def _jetstream_signature(root: Path) -> dict[str, Any]:
+def _jetstream_monitoring_signature(root: Path) -> dict[str, Any]:
     raw = _kubectl(
         root,
         [
@@ -9889,6 +9952,63 @@ def _jetstream_signature(root: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise RuntimeErrorEB("NATS JetStream monitoring output is not JSON") from exc
     return _jetstream_signature_from_monitoring(value)
+
+
+def _nats_message_store_sha256_from_output(output: str) -> str:
+    entries: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            raise RuntimeErrorEB("NATS JetStream message-store digest output is invalid")
+        digest, path = parts[0].lower(), parts[1].strip()
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not path.startswith("/data/")
+            or "/streams/" not in path
+            or "/msgs/" not in path
+            or not path.endswith(".blk")
+        ):
+            raise RuntimeErrorEB("NATS JetStream message-store digest output is invalid")
+        relative = path.removeprefix("/data/")
+        if relative in seen_paths:
+            raise RuntimeErrorEB("NATS JetStream message-store path is duplicated")
+        seen_paths.add(relative)
+        entries.append({"path": relative, "sha256": digest})
+    if not entries:
+        raise RuntimeErrorEB("NATS JetStream message store has no message blocks")
+    entries.sort(key=lambda item: item["path"])
+    return _stable_json_sha256(entries)
+
+
+def _nats_message_store_sha256(root: Path) -> str:
+    output = _kubectl(
+        root,
+        [
+            "-n", DATA_NAMESPACE, "exec", "deployment/nats", "--",
+            "/bin/sh", "-c",
+            (
+                "find /data -type f -path '*/streams/*/msgs/*.blk' "
+                "-exec sha256sum '{}' ';'"
+            ),
+        ],
+        timeout=120,
+    ).stdout
+    return _nats_message_store_sha256_from_output(output)
+
+
+def _jetstream_signature(root: Path) -> dict[str, Any]:
+    before = _jetstream_monitoring_signature(root)
+    message_store_sha256 = _nats_message_store_sha256(root)
+    after = _jetstream_monitoring_signature(root)
+    if after != before:
+        raise RuntimeErrorEB(
+            "NATS JetStream state changed while hashing persisted message contents"
+        )
+    return {**before, "message_store_sha256": message_store_sha256}
 
 
 def _scale_deployment(root: Path, namespace: str, name: str, replicas: int) -> None:
@@ -10461,7 +10581,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB("PostgreSQL/search signature changed across delete-to-prove")
         if after_nats != before_nats:
             raise RuntimeErrorEB(
-                "JetStream stream/durable-consumer continuity signature changed across restore"
+                "JetStream stream/message-store/durable-consumer continuity signature changed across restore"
             )
         _require_same_kubernetes_target(
             root, source_commit, recovery_target, "recovery pre-Flux resume"

@@ -556,7 +556,7 @@ spec:
         )
         self.assertLess(
             install_k3s.index("_invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)"),
-            install_k3s.index('scp_to(root, ip, k3s_binary, "/tmp/k3s")'),
+            install_k3s.index('scp_fd_to(root, ip, k3s_fd, "/tmp/k3s")'),
         )
 
         install_platform = inspect.getsource(runtime.install_platform)
@@ -722,7 +722,7 @@ spec:
                 ),
                 mock.patch.object(runtime, "vm_ip", return_value="192.0.2.10"),
                 mock.patch.object(runtime, "wait_ssh"),
-                mock.patch.object(runtime, "scp_to") as copy_to_vm,
+                mock.patch.object(runtime, "scp_fd_to") as copy_to_vm,
             ):
                 with self.assertRaisesRegex(
                     runtime.RuntimeErrorEB,
@@ -733,9 +733,43 @@ spec:
 
         source = inspect.getsource(runtime.install_k3s)
         self.assertLess(
-            source.index("observed_k3s_sha256 = sha256_file(k3s_binary)"),
-            source.index('scp_to(root, ip, k3s_binary, "/tmp/k3s")'),
+            source.index("_open_verified_k3s_binary(k3s_binary, expected_k3s_sha256)"),
+            source.index('scp_fd_to(root, ip, k3s_fd, "/tmp/k3s")'),
         )
+        self.assertNotIn('scp_to(root, ip, k3s_binary, "/tmp/k3s")', source)
+
+        helper_source = inspect.getsource(runtime.scp_fd_to)
+        self.assertIn("pass_fds=(source_fd,)", helper_source)
+        self.assertIn('f"/proc/self/fd/{source_fd}"', helper_source)
+
+    def test_open_verified_k3s_binary_binds_the_opened_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "k3s"
+            trusted = b"trusted-k3s-bytes"
+            path.write_bytes(trusted)
+            expected = hashlib.sha256(trusted).hexdigest()
+            file_fd = runtime._open_verified_k3s_binary(path, expected)
+            try:
+                replacement = Path(tmp) / "replacement"
+                replacement.write_bytes(b"tampered-k3s-bytes")
+                runtime.os.replace(replacement, path)
+                self.assertEqual(runtime.os.read(file_fd, len(trusted)), trusted)
+            finally:
+                runtime.os.close(file_fd)
+
+    def test_open_verified_k3s_binary_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            target.write_bytes(b"trusted-k3s-bytes")
+            path = root / "k3s"
+            path.symlink_to(target)
+            expected = hashlib.sha256(target.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "missing or unsafe",
+            ):
+                runtime._open_verified_k3s_binary(path, expected)
 
     def test_install_k3s_rejects_vm_substrate_drift_before_ssh(self) -> None:
         commit = "a" * 40
@@ -2156,6 +2190,27 @@ spec:
             signature,
             runtime._jetstream_signature_from_monitoring(changed),
         )
+
+    def test_jetstream_message_store_digest_binds_message_block_bytes(self) -> None:
+        first = runtime._nats_message_store_sha256_from_output(
+            f"{'a' * 64}  /data/jetstream/$G/streams/events/msgs/1.blk\n"
+            f"{'b' * 64}  /data/jetstream/$G/streams/events/msgs/2.blk\n"
+        )
+        reordered = runtime._nats_message_store_sha256_from_output(
+            f"{'b' * 64}  /data/jetstream/$G/streams/events/msgs/2.blk\n"
+            f"{'a' * 64}  /data/jetstream/$G/streams/events/msgs/1.blk\n"
+        )
+        changed = runtime._nats_message_store_sha256_from_output(
+            f"{'a' * 64}  /data/jetstream/$G/streams/events/msgs/1.blk\n"
+            f"{'c' * 64}  /data/jetstream/$G/streams/events/msgs/2.blk\n"
+        )
+        self.assertEqual(first, reordered)
+        self.assertNotEqual(first, changed)
+
+        source = inspect.getsource(runtime._jetstream_signature)
+        self.assertEqual(source.count("_jetstream_monitoring_signature(root)"), 2)
+        self.assertIn("_nats_message_store_sha256(root)", source)
+        self.assertIn("state changed while hashing", source)
 
     def test_recovery_rto_includes_application_rollout(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
@@ -4723,7 +4778,7 @@ spec:
     def test_recovery_compares_complete_jetstream_signature(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         self.assertIn("if after_nats != before_nats:", source)
-        self.assertIn("stream/durable-consumer continuity signature", source)
+        self.assertIn("stream/message-store/durable-consumer continuity signature", source)
 
     def test_delete_pod_fails_closed_and_verifies_absence(self) -> None:
         root = Path("/tmp/experiment-b-delete-pod-test")
