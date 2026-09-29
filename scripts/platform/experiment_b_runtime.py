@@ -4890,6 +4890,57 @@ def _require_running_pod_images(
     return result
 
 
+
+def _require_exact_application_pod_inventory(
+    pod_items: Any,
+    expected_pod_names: set[str],
+) -> list[str]:
+    if (
+        not isinstance(expected_pod_names, set)
+        or not expected_pod_names
+        or any(
+            not isinstance(name, str) or not name
+            for name in expected_pod_names
+        )
+    ):
+        raise RuntimeErrorEB(
+            "live application Pod inventory expected set is invalid"
+        )
+    if not isinstance(pod_items, list) or any(
+        not isinstance(item, dict) for item in pod_items
+    ):
+        raise RuntimeErrorEB("live application Pod inventory is invalid")
+
+    observed_pod_names: set[str] = set()
+    for pod in pod_items:
+        metadata = pod.get("metadata", {})
+        pod_name = (
+            metadata.get("name")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(pod_name, str)
+            or not pod_name
+            or metadata.get("namespace") != APP_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+            or pod_name in observed_pod_names
+        ):
+            raise RuntimeErrorEB(
+                "live application Pod inventory contains invalid or duplicate Pods"
+            )
+        observed_pod_names.add(pod_name)
+
+    if observed_pod_names != expected_pod_names:
+        missing = sorted(expected_pod_names - observed_pod_names)
+        unexpected = sorted(observed_pod_names - expected_pod_names)
+        raise RuntimeErrorEB(
+            "live application Pod inventory contains noncanonical Pods: "
+            f"missing={missing}; unexpected={unexpected}"
+        )
+    return sorted(observed_pod_names)
+
 def _expected_live_secret_values(
     root: Path, source_commit: str
 ) -> dict[str, Any]:
@@ -8203,6 +8254,24 @@ def status(root: Path) -> dict[str, Any]:
                 "weltgewebe-web": web_pods,
             },
         )
+        expected_application_pod_names = {
+            pod_name
+            for workload in application_workloads.values()
+            for pod_name in workload["pod_names"]
+        }
+        expected_application_pod_names.update(
+            release_artifacts["migration"]["pod_names"]
+        )
+        application_pod_items = _kubectl_json(
+            root,
+            ["-n", APP_NAMESPACE, "get", "pods"],
+        ).get("items")
+        application_pod_inventory = (
+            _require_exact_application_pod_inventory(
+                application_pod_items,
+                expected_application_pod_names,
+            )
+        )
         application_services = _require_live_application_services(root, release)
         application_service_accounts = (
             _require_live_application_service_accounts(root, release)
@@ -8333,6 +8402,7 @@ def status(root: Path) -> dict[str, Any]:
         "data_deployments": data_deployment_readback,
         "data_services": data_service_readback,
         "application_workloads": application_workloads,
+        "application_pod_inventory": application_pod_inventory,
         "application_services": application_services,
         "application_service_accounts": application_service_accounts,
         "application_disruption_budgets": application_disruption_budgets,
@@ -8877,28 +8947,40 @@ def _database_client_argv(
     ]
 
 
+
 def _psql(
     root: Path,
     sql: str,
     *,
     tuples_only: bool = True,
     database_identity: tuple[str, str] | None = None,
+    postgres_pod_name: str | None = None,
 ) -> str:
     identity = (
         _database_client_identity(root)
         if database_identity is None
         else database_identity
     )
+    target = "deployment/postgres"
+    if postgres_pod_name is not None:
+        if (
+            not isinstance(postgres_pod_name, str)
+            or not postgres_pod_name
+            or "/" in postgres_pod_name
+        ):
+            raise RuntimeErrorEB(
+                "Experiment-B PostgreSQL client Pod identity is invalid"
+            )
+        target = postgres_pod_name
     argv = [
         "-n", DATA_NAMESPACE,
-        "exec", "-i", "deployment/postgres", "--",
+        "exec", "-i", target, "--",
         *_database_client_argv("psql", identity),
         "-v", "ON_ERROR_STOP=1",
     ]
     if tuples_only:
         argv.extend(["-At"])
     return _kubectl(root, argv, input_text=sql, timeout=600).stdout.strip()
-
 
 def _run_input_file(
     argv: list[str],
@@ -9989,7 +10071,7 @@ def _require_t048_api_runtime_binding(
 
 
 
-def _require_t048_postgres_runtime_binding(
+def _require_postgres_runtime_binding(
     root: Path,
     source_commit: str | None = None,
 ) -> dict[str, Any]:
@@ -10034,12 +10116,12 @@ def _require_t048_postgres_runtime_binding(
         != _stable_json_sha256(expected["images"])
     ):
         raise RuntimeErrorEB(
-            "T048 PostgreSQL full runtime contract drifted"
+            "PostgreSQL full runtime contract drifted"
         )
     pod_readback = postgres.get("pods")
     if not isinstance(pod_readback, dict):
         raise RuntimeErrorEB(
-            "T048 PostgreSQL Pod runtime contract is missing"
+            "PostgreSQL Pod runtime contract is missing"
         )
     runtime_image_ids_sha256 = pod_readback.get(
         "runtime_image_ids_sha256"
@@ -10052,9 +10134,24 @@ def _require_t048_postgres_runtime_binding(
         is None
     ):
         raise RuntimeErrorEB(
-            "T048 PostgreSQL runtime image identity is invalid"
+            "PostgreSQL runtime image identity is invalid"
         )
+    observed_pods = pod_readback.get("pods")
+    if (
+        not isinstance(observed_pods, dict)
+        or len(observed_pods) != 1
+        or any(
+            not isinstance(name, str) or not name
+            for name in observed_pods
+        )
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL runtime binding does not identify exactly one Pod"
+        )
+    pod_name = next(iter(observed_pods))
+
     return {
+        "pod_name": pod_name,
         "images_sha256": postgres["images_sha256"],
         "resources_sha256": _stable_json_sha256(
             expected_resources
@@ -10065,6 +10162,16 @@ def _require_t048_postgres_runtime_binding(
         "pods": pod_readback,
         "canonical": True,
     }
+
+
+def _require_t048_postgres_runtime_binding(
+    root: Path,
+    source_commit: str | None = None,
+) -> dict[str, Any]:
+    return _require_postgres_runtime_binding(
+        root,
+        source_commit,
+    )
 
 def _parse_cpu_quantity(value: str) -> float:
     if value.endswith("m"):
@@ -10733,10 +10840,12 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
     return receipt
 
 
+
 def _database_signature(
     root: Path,
     *,
     database_identity: tuple[str, str] | None = None,
+    postgres_pod_name: str | None = None,
 ) -> dict[str, Any]:
     sql = r"""
 SELECT json_build_object(
@@ -10812,7 +10921,12 @@ SELECT json_build_object(
   )
 )::text;
 """
-    raw = _psql(root, sql, database_identity=database_identity)
+    raw = _psql(
+        root,
+        sql,
+        database_identity=database_identity,
+        postgres_pod_name=postgres_pod_name,
+    )
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -10820,7 +10934,6 @@ SELECT json_build_object(
     if not isinstance(value, dict) or int(value.get("nodes_count", 0)) < 1:
         raise RuntimeErrorEB("database continuity signature is incomplete")
     return value
-
 
 def _jetstream_sequence_progress(value: Any, context: str) -> dict[str, int]:
     if not isinstance(value, dict):
@@ -11474,8 +11587,14 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 root, source_commit, recovery_target, "recovery application quiescence"
             )
 
+            postgres_signature_before = _require_postgres_runtime_binding(
+                root,
+                source_commit,
+            )
             before_db = _database_signature(
-                root, database_identity=database_identity
+                root,
+                database_identity=database_identity,
+                postgres_pod_name=postgres_signature_before["pod_name"],
             )
             before_nats = _jetstream_signature(root)
             if before_nats["streams"] < 1 or before_nats["messages"] < 1:
@@ -11485,9 +11604,21 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery PostgreSQL backup"
             )
+            postgres_backup_binding = _require_postgres_runtime_binding(
+                root,
+                source_commit,
+            )
+            if (
+                postgres_backup_binding["pod_name"]
+                != postgres_signature_before["pod_name"]
+            ):
+                raise RuntimeErrorEB(
+                    "PostgreSQL Pod changed between pre-recovery signature and backup"
+                )
             _run_binary_to_file(
                 [
-                    kubectl, "-n", DATA_NAMESPACE, "exec", "deployment/postgres", "--",
+                    kubectl, "-n", DATA_NAMESPACE, "exec",
+                    postgres_backup_binding["pod_name"], "--",
                     *_database_client_argv("pg_dump", database_identity),
                     "-Fc",
                 ],
@@ -11621,10 +11752,14 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery PostgreSQL restore"
             )
+            postgres_restore_binding = _require_postgres_runtime_binding(
+                root,
+                source_commit,
+            )
             _run_input_file(
                 [
                     kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
-                    "deployment/postgres", "--",
+                    postgres_restore_binding["pod_name"], "--",
                     *_database_client_argv("pg_restore", database_identity),
                     "--clean", "--if-exists", "--no-owner",
                 ],
@@ -11641,8 +11776,21 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 root, source_commit, recovery_target, "recovery data restoration"
             )
 
+            postgres_signature_after = _require_postgres_runtime_binding(
+                root,
+                source_commit,
+            )
+            if (
+                postgres_signature_after["pod_name"]
+                != postgres_restore_binding["pod_name"]
+            ):
+                raise RuntimeErrorEB(
+                    "PostgreSQL Pod changed between restore and continuity signature"
+                )
             after_db = _database_signature(
-                root, database_identity=database_identity
+                root,
+                database_identity=database_identity,
+                postgres_pod_name=postgres_signature_after["pod_name"],
             )
             after_nats = _jetstream_signature(root)
             if after_db != before_db:
@@ -12378,6 +12526,24 @@ def portability_report(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 f"status does not prove the complete application workload contract: {name}"
             )
+
+    expected_application_pod_inventory = sorted(
+        {
+            *migration_status["pod_names"],
+            *(
+                pod_name
+                for workload in application_workload_status.values()
+                for pod_name in workload["pod_names"]
+            ),
+        }
+    )
+    if (
+        status_payload.get("application_pod_inventory")
+        != expected_application_pod_inventory
+    ):
+        raise RuntimeErrorEB(
+            "status does not prove the complete application Pod inventory"
+        )
 
     service_account_status = status_payload.get(
         "application_service_accounts"

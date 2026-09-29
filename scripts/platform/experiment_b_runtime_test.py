@@ -2928,6 +2928,18 @@ spec:
                         }
                         for name, expected in application_expected_contract.items()
                     }
+                    payload["application_pod_inventory"] = sorted(
+                        [
+                            *(
+                                pod_name
+                                for workload in payload[
+                                    "application_workloads"
+                                ].values()
+                                for pod_name in workload["pod_names"]
+                            ),
+                            *migration_status["pod_names"],
+                        ]
+                    )
                     payload["application_services"] = {
                         name: {
                             "spec": expected["spec"],
@@ -4303,6 +4315,33 @@ spec:
                 ("changed_user", "changed_database"),
             )
 
+            with mock.patch.object(
+                runtime, "_kubectl", return_value=completed
+            ) as kubectl:
+                self.assertEqual(
+                    runtime._psql(
+                        root,
+                        "SELECT 1;",
+                        database_identity=database_identity,
+                        postgres_pod_name="postgres-bound-0",
+                    ),
+                    "1",
+                )
+            self.assertEqual(
+                kubectl.call_args.args[1][:5],
+                [
+                    "-n",
+                    runtime.DATA_NAMESPACE,
+                    "exec",
+                    "-i",
+                    "postgres-bound-0",
+                ],
+            )
+            self.assertNotIn(
+                "deployment/postgres",
+                kubectl.call_args.args[1],
+            )
+
         seed_source = inspect.getsource(runtime.seed_t048_fixture)
         recovery_source = inspect.getsource(runtime.recovery_proof)
         self.assertIn(
@@ -4910,6 +4949,56 @@ spec:
         self.assertLess(web_wait, db_signature)
         self.assertLess(db_signature, nats_signature)
         self.assertLess(nats_signature, dump)
+
+    def test_recovery_binds_postgres_clients_to_validated_source_pod(
+        self,
+    ) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        bindings: list[int] = []
+        cursor = 0
+        while True:
+            index = source.find(
+                "_require_postgres_runtime_binding(",
+                cursor,
+            )
+            if index == -1:
+                break
+            bindings.append(index)
+            cursor = index + 1
+
+        self.assertEqual(len(bindings), 4)
+        before_signature = source.index(
+            "before_db = _database_signature("
+        )
+        dump = source.index('"pg_dump"')
+        restore = source.index('"pg_restore"')
+        after_signature = source.index(
+            "after_db = _database_signature("
+        )
+        self.assertLess(bindings[0], before_signature)
+        self.assertLess(before_signature, bindings[1])
+        self.assertLess(bindings[1], dump)
+        self.assertLess(dump, bindings[2])
+        self.assertLess(bindings[2], restore)
+        self.assertLess(restore, bindings[3])
+        self.assertLess(bindings[3], after_signature)
+        self.assertNotIn('"deployment/postgres"', source)
+        self.assertIn(
+            'postgres_backup_binding["pod_name"]',
+            source,
+        )
+        self.assertIn(
+            'postgres_restore_binding["pod_name"]',
+            source,
+        )
+        self.assertIn(
+            'postgres_pod_name=postgres_signature_before["pod_name"]',
+            source,
+        )
+        self.assertIn(
+            'postgres_pod_name=postgres_signature_after["pod_name"]',
+            source,
+        )
 
     def test_recovery_waits_for_nats_quiescence_before_pvc_backup(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
@@ -5743,6 +5832,16 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 for index in range(int(self.config["runtime_binding"]["web_replicas"]))
             ],
         }
+        self.migration_pods = [
+            {
+                "metadata": {
+                    "name": "migration-pod-0",
+                    "namespace": runtime.APP_NAMESPACE,
+                }
+            }
+        ]
+        self.application_extra_pods: list[dict] = []
+
 
         self.cilium_pods = [
             workload_pod(
@@ -6629,10 +6728,24 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             runtime.APP_NAMESPACE,
             "get",
             "pods",
+        ]:
+            return {
+                "items": [
+                    *self.application_pods["weltgewebe-api"],
+                    *self.application_pods["weltgewebe-web"],
+                    *self.migration_pods,
+                    *self.application_extra_pods,
+                ]
+            }
+        if arguments == [
+            "-n",
+            runtime.APP_NAMESPACE,
+            "get",
+            "pods",
             "-l",
             f"batch.kubernetes.io/job-name={runtime.MIGRATION_JOB_NAME}",
         ]:
-            return {"items": [{"metadata": {"name": "migration-pod-0"}}]}
+            return {"items": self.migration_pods}
         if arguments == [
             "-n",
             runtime.APP_NAMESPACE,
@@ -7970,6 +8083,32 @@ spec:
         )
         self.assertTrue(result["pods"]["weltgewebe-api"]["images_canonical"])
         self.assertTrue(result["pods"]["weltgewebe-web"]["images_canonical"])
+        self.assertEqual(
+            result["application_pod_inventory"],
+            sorted(
+                [
+                    *result["application_workloads"]["weltgewebe-api"]["pod_names"],
+                    *result["application_workloads"]["weltgewebe-web"]["pod_names"],
+                    *result["migration"]["pod_names"],
+                ]
+            ),
+        )
+
+        self.application_extra_pods = [
+            {
+                "metadata": {
+                    "name": "unversioned-app-writer",
+                    "namespace": runtime.APP_NAMESPACE,
+                    "labels": {"app": "unversioned-writer"},
+                }
+            }
+        ]
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "application Pod inventory contains noncanonical Pods",
+        ):
+            runtime.status(self.root)
+        self.application_extra_pods = []
 
         self.application_pods = json.loads(json.dumps(healthy_pods))
         api_pod = self.application_pods["weltgewebe-api"][0]
