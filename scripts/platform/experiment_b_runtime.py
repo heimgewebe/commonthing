@@ -21,6 +21,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1733,21 +1734,49 @@ def secret_manifest(
     return json.dumps(payload, sort_keys=True)
 
 
+def _read_existing_database_secret_bytes(path: Path) -> bytes | None:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+        raise RuntimeErrorEB(
+            "Experiment-B database Secret source material is invalid"
+        )
+    try:
+        file_fd = os.open(path, os.O_RDONLY | cloexec | nofollow)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B database Secret source material is invalid"
+        ) from exc
+    try:
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeErrorEB(
+                "Experiment-B database Secret source material is invalid"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B database Secret source material is invalid"
+        ) from exc
+    finally:
+        os.close(file_fd)
+
+
 def ensure_secret_material(root: Path) -> tuple[dict[str, str], bytes]:
     path = root / "secrets/database.json"
-    if path.is_symlink():
-        raise RuntimeErrorEB(
-            "Experiment-B database Secret source material is invalid"
-        )
-    if path.exists() and not path.is_file():
-        raise RuntimeErrorEB(
-            "Experiment-B database Secret source material is invalid"
-        )
-    if path.is_file():
+    source_bytes = _read_existing_database_secret_bytes(path)
+    if source_bytes is not None:
         try:
-            source_bytes = path.read_bytes()
             data = json.loads(source_bytes.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeErrorEB(
                 "Experiment-B database Secret source material is invalid"
             ) from exc
@@ -1774,7 +1803,6 @@ def ensure_secret_material(root: Path) -> tuple[dict[str, str], bytes]:
     ).encode("utf-8")
     atomic_bytes(path, source_bytes)
     return data, source_bytes
-
 
 def _database_url(database: dict[str, str]) -> str:
     return (

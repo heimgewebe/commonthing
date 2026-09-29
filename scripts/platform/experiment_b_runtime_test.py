@@ -4374,6 +4374,42 @@ spec:
             ):
                 runtime.ensure_secret_material(root)
 
+    def test_secret_material_rejects_symlink_swap_at_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "secrets").mkdir()
+            database_path = root / "secrets/database.json"
+            target_path = root / "database-target.json"
+            payload = {
+                "username": "proof_user",
+                "database": "proof_database",
+                "password": "proof_password",
+            }
+            runtime.atomic_json(database_path, payload)
+            runtime.atomic_json(target_path, payload)
+            real_open = runtime.os.open
+            swapped = False
+
+            def swap_before_open(candidate, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and Path(candidate) == database_path:
+                    swapped = True
+                    database_path.unlink()
+                    database_path.symlink_to(target_path)
+                return real_open(candidate, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                runtime.os, "open", side_effect=swap_before_open
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "database Secret source material is invalid",
+                ):
+                    runtime.ensure_secret_material(root)
+
+            self.assertTrue(swapped)
+            self.assertTrue(database_path.is_symlink())
+
     def test_inject_secrets_rejects_invalid_database_before_kubernetes_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
