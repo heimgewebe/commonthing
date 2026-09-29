@@ -773,15 +773,15 @@ spec:
     def test_open_verified_k3s_binary_binds_the_opened_inode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "k3s"
-            trusted = b"trusted-k3s-bytes"
-            path.write_bytes(trusted)
-            expected = hashlib.sha256(trusted).hexdigest()
+            fixture_bytes = b"k3s-fixture-bytes"
+            path.write_bytes(fixture_bytes)
+            expected = hashlib.sha256(fixture_bytes).hexdigest()
             file_fd = runtime._open_verified_k3s_binary(path, expected)
             try:
                 replacement = Path(tmp) / "replacement"
                 replacement.write_bytes(b"tampered-k3s-bytes")
                 runtime.os.replace(replacement, path)
-                self.assertEqual(runtime.os.read(file_fd, len(trusted)), trusted)
+                self.assertEqual(runtime.os.read(file_fd, len(fixture_bytes)), fixture_bytes)
             finally:
                 runtime.os.close(file_fd)
 
@@ -789,7 +789,7 @@ spec:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             target = root / "target"
-            target.write_bytes(b"trusted-k3s-bytes")
+            target.write_bytes(b"k3s-fixture-bytes")
             path = root / "k3s"
             path.symlink_to(target)
             expected = hashlib.sha256(target.read_bytes()).hexdigest()
