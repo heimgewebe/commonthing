@@ -917,17 +917,21 @@ def create_vm(root: Path) -> dict[str, Any]:
     config = load_config()
     config_sha256 = sha256_file(CLUSTER / "config.json")
     root_identity = str(root.resolve())
+    attempt_path = root / "receipts/vm-create-attempt.json"
+    domain_target = str(uuid.uuid4())
+    attempt = {
+        "schema_version": 1,
+        "status": "running",
+        "source_commit": source_commit,
+        "config_sha256": config_sha256,
+        "state_root": root_identity,
+        "vm": VM_NAME,
+        "pool": POOL_NAME,
+        "domain_target": domain_target,
+    }
     atomic_json(
-        root / "receipts/vm-create-attempt.json",
-        {
-            "schema_version": 1,
-            "status": "running",
-            "source_commit": source_commit,
-            "config_sha256": config_sha256,
-            "state_root": root_identity,
-            "vm": VM_NAME,
-            "pool": POOL_NAME,
-        },
+        attempt_path,
+        attempt,
     )
 
     prepared = prepare(root)
@@ -936,6 +940,12 @@ def create_vm(root: Path) -> dict[str, Any]:
     if POOL_TARGET.exists() and any(POOL_TARGET.iterdir()):
         raise RuntimeErrorEB("Experiment-B libvirt pool target already contains files")
     POOL_TARGET.mkdir(parents=True, exist_ok=True)
+    pool_target_stat = POOL_TARGET.stat()
+    attempt.update(
+        pool_target_device=pool_target_stat.st_dev,
+        pool_target_inode=pool_target_stat.st_ino,
+    )
+    atomic_json(attempt_path, attempt)
 
     pool_defined = False
     try:
@@ -948,6 +958,8 @@ def create_vm(root: Path) -> dict[str, Any]:
         pool_defined = True
         run(["virsh", "-c", LIBVIRT_URI, "pool-build", POOL_NAME])
         run(["virsh", "-c", LIBVIRT_URI, "pool-start", POOL_NAME])
+        attempt["pool_target"] = _libvirt_resource_uuid("pool", POOL_NAME)
+        atomic_json(attempt_path, attempt)
         run(
             [
                 "virsh", "-c", LIBVIRT_URI, "vol-create-as",
@@ -969,6 +981,8 @@ def create_vm(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 "uploaded cloud image digest drifted before VM boot"
             )
+        attempt["base_image_sha256"] = str(config["vm"]["image"]["sha256"])
+        atomic_json(attempt_path, attempt)
         run(["virsh", "-c", LIBVIRT_URI, "pool-refresh", POOL_NAME])
         run(
             [
@@ -979,11 +993,18 @@ def create_vm(root: Path) -> dict[str, Any]:
                 "--backing-vol-format", "qcow2",
             ]
         )
+        volume_stat = (POOL_TARGET / VOLUME_NAME).stat()
+        attempt.update(
+            volume_device=volume_stat.st_dev,
+            volume_inode=volume_stat.st_ino,
+        )
+        atomic_json(attempt_path, attempt)
         run(
             [
                 "virt-install",
                 "--connect", LIBVIRT_URI,
                 "--name", VM_NAME,
+                "--uuid", domain_target,
                 "--memory", str(config["vm"]["memory_mib"]),
                 "--vcpus", str(config["vm"]["vcpu"]),
                 "--import",
@@ -1000,7 +1021,18 @@ def create_vm(root: Path) -> dict[str, Any]:
             ],
             timeout=120,
         )
+        if _libvirt_resource_uuid("domain", VM_NAME) != domain_target:
+            raise RuntimeErrorEB(
+                "created VM UUID differs from the persisted creation identity"
+            )
         substrate = _live_vm_substrate(root, config)
+        if (
+            substrate.get("uuid") != domain_target
+            or substrate.get("pool_uuid") != attempt["pool_target"]
+        ):
+            raise RuntimeErrorEB("created VM substrate identity drifted from attempt")
+        attempt["substrate_sha256"] = _stable_json_sha256(substrate)
+        atomic_json(attempt_path, attempt)
         if (
             _current_protected_main_commit() != source_commit
             or sha256_file(CLUSTER / "config.json") != config_sha256
@@ -7848,6 +7880,111 @@ def _require_teardown_live_identity(
             "pool_present": pool_present,
             "domain_target": domain_target,
             "pool_target": pool_target,
+            "substrate_sha256": ownership.get("substrate_sha256"),
+        }
+
+    if ownership.get("status") == "running":
+        domain_target = ownership.get("domain_target")
+        pool_target = ownership.get("pool_target")
+        pool_device = ownership.get("pool_target_device")
+        pool_inode = ownership.get("pool_target_inode")
+
+        if pool_present:
+            if (
+                type(pool_device) is not int
+                or pool_device < 0
+                or type(pool_inode) is not int
+                or pool_inode < 0
+            ):
+                raise RuntimeErrorEB(
+                    "interrupted creation has no verified pool directory identity"
+                )
+            try:
+                pool_stat = POOL_TARGET.stat()
+                pool_xml = _libvirt_xml("pool-dumpxml", POOL_NAME)
+            except (OSError, ET.ParseError, AttributeError) as exc:
+                raise RuntimeErrorEB(
+                    "interrupted creation pool identity cannot be read"
+                ) from exc
+            if (
+                pool_stat.st_dev != pool_device
+                or pool_stat.st_ino != pool_inode
+                or pool_xml.findtext("target/path") != str(POOL_TARGET)
+            ):
+                raise RuntimeErrorEB(
+                    "interrupted creation pool directory identity drifted"
+                )
+            live_pool_uuid = _libvirt_resource_uuid("pool", POOL_NAME)
+            if pool_target is not None:
+                try:
+                    normalized_pool_target = str(uuid.UUID(str(pool_target)))
+                except ValueError as exc:
+                    raise RuntimeErrorEB(
+                        "interrupted creation pool UUID is invalid"
+                    ) from exc
+                if live_pool_uuid != normalized_pool_target:
+                    raise RuntimeErrorEB(
+                        "interrupted creation pool UUID drifted"
+                    )
+            pool_target = live_pool_uuid
+
+        if domain_present:
+            try:
+                normalized_domain_target = str(uuid.UUID(str(domain_target)))
+            except ValueError as exc:
+                raise RuntimeErrorEB(
+                    "interrupted creation has no valid domain UUID"
+                ) from exc
+            if _libvirt_resource_uuid("domain", VM_NAME) != normalized_domain_target:
+                raise RuntimeErrorEB(
+                    "interrupted creation domain UUID drifted"
+                )
+            if not pool_present:
+                raise RuntimeErrorEB(
+                    "interrupted creation domain has no owned storage pool"
+                )
+            volume_device = ownership.get("volume_device")
+            volume_inode = ownership.get("volume_inode")
+            base_image_sha256 = ownership.get("base_image_sha256")
+            if (
+                type(volume_device) is not int
+                or volume_device < 0
+                or type(volume_inode) is not int
+                or volume_inode < 0
+                or not isinstance(base_image_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", base_image_sha256) is None
+            ):
+                raise RuntimeErrorEB(
+                    "interrupted creation has no verified disk/backing identity"
+                )
+            try:
+                volume_stat = (POOL_TARGET / VOLUME_NAME).stat()
+                domain_definition = _vm_definition(
+                    _libvirt_xml("dumpxml", VM_NAME)
+                )
+            except (OSError, ET.ParseError, AttributeError) as exc:
+                raise RuntimeErrorEB(
+                    "interrupted creation disk identity cannot be read"
+                ) from exc
+            if (
+                volume_stat.st_dev != volume_device
+                or volume_stat.st_ino != volume_inode
+                or domain_definition.get("disk_path")
+                != str(POOL_TARGET / VOLUME_NAME)
+                or _libvirt_volume_sha256(root, BASE_VOLUME)
+                != base_image_sha256
+            ):
+                raise RuntimeErrorEB(
+                    "interrupted creation disk/backing identity drifted"
+                )
+            domain_target = normalized_domain_target
+
+        return {
+            "identity_verified": True,
+            "domain_present": domain_present,
+            "pool_present": pool_present,
+            "domain_target": domain_target if domain_present else None,
+            "pool_target": pool_target if pool_present else None,
             "substrate_sha256": ownership.get("substrate_sha256"),
         }
 

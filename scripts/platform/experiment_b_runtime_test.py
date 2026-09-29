@@ -5764,6 +5764,14 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
     def run_fixture(self, argv: list[str], **_kwargs):
         output, code = "", 0
         if argv[0] == "virt-install":
+            if "--uuid" in argv:
+                planned_uuid = argv[argv.index("--uuid") + 1]
+                old_uuid = self.domain_uuid
+                self.domain_uuid = planned_uuid
+                for key in ("live", "inactive"):
+                    self.xml[key] = self.xml[key].replace(
+                        old_uuid, planned_uuid
+                    )
             self.domain_present = True
             self.domain_active = True
         elif argv[0] == "helm":
@@ -6564,12 +6572,117 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             runtime.RuntimeErrorEB,
-            "refuses same-named libvirt resources",
+            "no verified pool directory identity",
         ):
             runtime.teardown(self.root)
         self.assertTrue(self.domain_present)
         self.assertTrue(self.pool_present)
         self.assertTrue(self.root.exists())
+
+    def test_teardown_recovers_pool_only_interrupted_creation(self) -> None:
+        self.prepare_create()
+        original = self.run_fixture
+
+        def interrupt_before_first_volume(argv, **kwargs):
+            if (
+                argv[:3] == ["virsh", "-c", runtime.LIBVIRT_URI]
+                and argv[3] == "vol-create-as"
+            ):
+                raise KeyboardInterrupt("simulated pool-only interruption")
+            return original(argv, **kwargs)
+
+        self.runner.side_effect = interrupt_before_first_volume
+        with self.assertRaisesRegex(
+            KeyboardInterrupt,
+            "simulated pool-only interruption",
+        ):
+            runtime.create_vm(self.root)
+
+        attempt = json.loads(
+            (self.root / "receipts/vm-create-attempt.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(self.domain_present)
+        self.assertTrue(self.pool_present)
+        self.assertEqual(attempt["pool_target"], self.pool_uuid)
+        self.assertNotIn("volume_device", attempt)
+
+        self.runner.side_effect = original
+        result = runtime.teardown(self.root)
+        self.assertEqual(result["status"], "retired")
+        self.assertTrue(result["live_identity_verified"])
+        self.assertFalse(self.pool_present)
+        self.assertFalse(self.pool.exists())
+
+    def test_teardown_recovers_exact_interrupted_creation(self) -> None:
+        self.prepare_create()
+        original_live_substrate = runtime._live_vm_substrate
+
+        with mock.patch.object(
+            runtime,
+            "_live_vm_substrate",
+            side_effect=KeyboardInterrupt("simulated hard interruption"),
+        ):
+            with self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "simulated hard interruption",
+            ):
+                runtime.create_vm(self.root)
+
+        attempt = json.loads(
+            (self.root / "receipts/vm-create-attempt.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(self.domain_present)
+        self.assertTrue(self.pool_present)
+        self.assertFalse((self.root / "receipts/vm-create.json").exists())
+        self.assertEqual(attempt["domain_target"], self.domain_uuid)
+        self.assertEqual(attempt["pool_target"], self.pool_uuid)
+        self.assertEqual(
+            attempt["base_image_sha256"],
+            self.config["vm"]["image"]["sha256"],
+        )
+        self.assertEqual(attempt["volume_device"], self.disk.stat().st_dev)
+        self.assertEqual(attempt["volume_inode"], self.disk.stat().st_ino)
+        self.assertEqual(
+            attempt["pool_target_device"], self.pool.stat().st_dev
+        )
+        self.assertEqual(
+            attempt["pool_target_inode"], self.pool.stat().st_ino
+        )
+
+        with mock.patch.object(
+            runtime,
+            "_live_vm_substrate",
+            side_effect=original_live_substrate,
+        ):
+            result = runtime.teardown(self.root)
+        self.assertEqual(result["status"], "retired")
+        self.assertTrue(result["live_identity_verified"])
+        self.assertFalse(self.domain_present)
+        self.assertFalse(self.pool_present)
+        self.assertFalse(self.disk.exists())
+        self.assertFalse(self.base.exists())
+
+    def test_teardown_rejects_interrupted_creation_identity_drift(self) -> None:
+        self.prepare_create()
+        with mock.patch.object(
+            runtime,
+            "_live_vm_substrate",
+            side_effect=KeyboardInterrupt("simulated hard interruption"),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                runtime.create_vm(self.root)
+        self.domain_uuid = "44444444-4444-4444-8444-444444444444"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "domain UUID drifted",
+        ):
+            runtime.teardown(self.root)
+        self.assertTrue(self.domain_present)
+        self.assertTrue(self.pool_present)
 
     def test_live_readback_captures_actual_substrate_and_base_volume_digest(self) -> None:
         observed = runtime._live_vm_substrate(self.root, self.config)
@@ -9217,6 +9330,25 @@ spec:
         self.assertEqual(result["substrate"], runtime._live_vm_substrate(self.root, self.config))
         self.assertEqual(json.loads((self.root / "receipts/vm-create.json").read_text()), result)
         self.assertEqual(self.main.call_count, 2)
+
+        attempt = json.loads(
+            (self.root / "receipts/vm-create-attempt.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(attempt["domain_target"], result["substrate"]["uuid"])
+        self.assertEqual(attempt["pool_target"], result["substrate"]["pool_uuid"])
+        self.assertEqual(
+            attempt["base_image_sha256"],
+            result["substrate"]["base_image_sha256"],
+        )
+        self.assertEqual(
+            attempt["volume_device"], result["substrate"]["disk_device"]
+        )
+        self.assertEqual(
+            attempt["volume_inode"], result["substrate"]["disk_inode"]
+        )
+        self.assertRegex(attempt["substrate_sha256"], r"^[0-9a-f]{64}$")
 
     def test_post_create_validation_and_binding_failures_cleanup_vm_and_pool(self) -> None:
         for failure in ("substrate", "base_digest", "source", "config", "receipt_write"):
