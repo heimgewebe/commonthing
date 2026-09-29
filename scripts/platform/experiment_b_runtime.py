@@ -7504,240 +7504,241 @@ def status(root: Path) -> dict[str, Any]:
     if vm_substrate != vm_create["substrate"]:
         raise RuntimeErrorEB("VM substrate drifted from creation receipt")
     status_target = _kubernetes_target_identity(root, source_commit)
-    k3s_runtime = _require_live_k3s_runtime(root, config, source_commit)
-    toolchain_receipt = toolchain(root)
-    tools = toolchain_receipt["tools"]
-    env = kube_env(root)
-    kubectl = tools["kubectl"]
-    cilium_readback = _require_live_cilium_contract(root, config)
-    cilium_readback["runtime_image_ids_baseline"] = (
-        _require_cilium_runtime_baseline(root, source_commit, cilium_readback)
-    )
+    with _bound_kube_env(root, status_target):
+        k3s_runtime = _require_live_k3s_runtime(root, config, source_commit)
+        toolchain_receipt = toolchain(root)
+        tools = toolchain_receipt["tools"]
+        env = kube_env(root)
+        kubectl = tools["kubectl"]
+        cilium_readback = _require_live_cilium_contract(root, config)
+        cilium_readback["runtime_image_ids_baseline"] = (
+            _require_cilium_runtime_baseline(root, source_commit, cilium_readback)
+        )
 
-    nodes = json.loads(run([kubectl, "get", "nodes", "-o", "json"], env=env).stdout)
-    node_readback = _require_exact_k3s_node_inventory(
-        nodes, str(config["kubernetes"]["version"])
-    )
-    kubelet = node_readback["kubelet_version"]
-    os_image = node_readback["os_image"]
+        nodes = json.loads(run([kubectl, "get", "nodes", "-o", "json"], env=env).stdout)
+        node_readback = _require_exact_k3s_node_inventory(
+            nodes, str(config["kubernetes"]["version"])
+        )
+        kubelet = node_readback["kubelet_version"]
+        os_image = node_readback["os_image"]
 
-    flux_contract = _flux_bootstrap_contract(root, release)
-    flux_controllers = _require_live_flux_controller_contract(
-        root, toolchain_receipt
-    )
-    flux_runtime_baseline = _require_flux_runtime_baseline(
-        root, source_commit, flux_controllers
-    )
-    source = _kubectl_json(
-        root,
-        ["-n", "flux-system", "get", "gitrepository", "commonthing-experiment-b"],
-    )
-    source_revision = _require_flux_source_revision(
-        source,
-        source_commit,
-        flux_contract["source_spec"],
-    )
-    release_config_map_readback = _require_live_release_config_map(
-        root,
-        flux_contract["release_config_map"],
-    )
+        flux_contract = _flux_bootstrap_contract(root, release)
+        flux_controllers = _require_live_flux_controller_contract(
+            root, toolchain_receipt
+        )
+        flux_runtime_baseline = _require_flux_runtime_baseline(
+            root, source_commit, flux_controllers
+        )
+        source = _kubectl_json(
+            root,
+            ["-n", "flux-system", "get", "gitrepository", "commonthing-experiment-b"],
+        )
+        source_revision = _require_flux_source_revision(
+            source,
+            source_commit,
+            flux_contract["source_spec"],
+        )
+        release_config_map_readback = _require_live_release_config_map(
+            root,
+            flux_contract["release_config_map"],
+        )
 
-    flux_items = _kubectl_json(
-        root, ["-n", "flux-system", "get", "kustomizations"]
-    ).get("items", [])
-    flux_readback = _require_exact_flux_revision_ready(
-        flux_items,
-        source_commit,
-        flux_contract["kustomization_specs"],
-    )
+        flux_items = _kubectl_json(
+            root, ["-n", "flux-system", "get", "kustomizations"]
+        ).get("items", [])
+        flux_readback = _require_exact_flux_revision_ready(
+            flux_items,
+            source_commit,
+            flux_contract["kustomization_specs"],
+        )
 
-    api = _kubectl_json(
-        root, ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-api"]
-    )
-    web = _kubectl_json(
-        root, ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-web"]
-    )
-    migration = _kubectl_json(
-        root,
-        [
-            "-n", APP_NAMESPACE, "get", "job",
-            MIGRATION_JOB_NAME,
-        ],
-    )
-    migration_pods = _kubectl_json(
-        root,
-        [
-            "-n", APP_NAMESPACE, "get", "pods",
-            "-l", f"batch.kubernetes.io/job-name={MIGRATION_JOB_NAME}",
-        ],
-    ).get("items")
-    release_artifacts = _require_requested_release_artifacts(
-        root,
-        api,
-        web,
-        migration,
-        migration_pods,
-        str(release.get("api_digest", "")),
-        str(release.get("web_digest", "")),
-        int(config["semantic_search"]["api_replicas"]),
-        int(config["runtime_binding"]["web_replicas"]),
-    )
-    deployment_readback = release_artifacts["deployments"]
-    namespace_security_readback = _require_live_namespace_security_contract(
-        root
-    )
-    data_deployment_readback = _require_live_data_deployments(root)
-    data_service_readback = _require_live_data_services(root)
-    api_containers = _container_images(api, "Experiment-B API Deployment")
-    semantic = config["semantic_search"]
-    if api_containers.get("ollama") != semantic["ollama_image"]:
-        raise RuntimeErrorEB("live Ollama image does not match semantic-search pin")
-
-    expected_api_pod_images = {
-        "api": str(release_artifacts["images"]["api"]),
-        "search-worker": str(release_artifacts["images"]["search_worker"]),
-        "ollama": str(semantic["ollama_image"]),
-    }
-    expected_web_pod_images = {
-        "web": str(release_artifacts["images"]["web"]),
-    }
-    api_pods = _kubectl_json(
-        root,
-        [
-            "-n",
-            APP_NAMESPACE,
-            "get",
-            "pods",
-            "-l",
-            "app.kubernetes.io/name=weltgewebe-api",
-        ],
-    ).get("items")
-    web_pods = _kubectl_json(
-        root,
-        [
-            "-n",
-            APP_NAMESPACE,
-            "get",
-            "pods",
-            "-l",
-            "app.kubernetes.io/name=weltgewebe-web",
-        ],
-    ).get("items")
-    pod_readback = {
-        "weltgewebe-api": _require_running_pod_images(
-            api_pods,
-            "weltgewebe-api",
+        api = _kubectl_json(
+            root, ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-api"]
+        )
+        web = _kubectl_json(
+            root, ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-web"]
+        )
+        migration = _kubectl_json(
+            root,
+            [
+                "-n", APP_NAMESPACE, "get", "job",
+                MIGRATION_JOB_NAME,
+            ],
+        )
+        migration_pods = _kubectl_json(
+            root,
+            [
+                "-n", APP_NAMESPACE, "get", "pods",
+                "-l", f"batch.kubernetes.io/job-name={MIGRATION_JOB_NAME}",
+            ],
+        ).get("items")
+        release_artifacts = _require_requested_release_artifacts(
+            root,
+            api,
+            web,
+            migration,
+            migration_pods,
+            str(release.get("api_digest", "")),
+            str(release.get("web_digest", "")),
             int(config["semantic_search"]["api_replicas"]),
-            expected_api_pod_images,
-        ),
-        "weltgewebe-web": _require_running_pod_images(
-            web_pods,
-            "weltgewebe-web",
             int(config["runtime_binding"]["web_replicas"]),
-            expected_web_pod_images,
-        ),
-    }
-    application_workloads = _require_live_application_workloads(
-        root,
-        release,
-        {
-            "weltgewebe-api": api,
-            "weltgewebe-web": web,
-        },
-        {
-            "weltgewebe-api": api_pods,
-            "weltgewebe-web": web_pods,
-        },
-    )
-    application_services = _require_live_application_services(root, release)
-    application_service_accounts = (
-        _require_live_application_service_accounts(root, release)
-    )
-    application_disruption_budgets = _require_live_application_pdbs(
-        root,
-        release,
-    )
-    semantic_provider = _semantic_provider_live_readback(root, source_commit)
+        )
+        deployment_readback = release_artifacts["deployments"]
+        namespace_security_readback = _require_live_namespace_security_contract(
+            root
+        )
+        data_deployment_readback = _require_live_data_deployments(root)
+        data_service_readback = _require_live_data_services(root)
+        api_containers = _container_images(api, "Experiment-B API Deployment")
+        semantic = config["semantic_search"]
+        if api_containers.get("ollama") != semantic["ollama_image"]:
+            raise RuntimeErrorEB("live Ollama image does not match semantic-search pin")
 
-    expected_secret_values = _expected_live_secret_values(root, source_commit)
-    database_secret = _kubectl_json(
-        root,
-        [
-            "-n", DATA_NAMESPACE, "get", "secret",
-            "commonthing-experiment-b-database",
-        ],
-    )
-    runtime_secret = _kubectl_json(
-        root,
-        ["-n", APP_NAMESPACE, "get", "secret", "weltgewebe-runtime"],
-    )
-    registry_secret = _kubectl_json(
-        root,
-        [
-            "-n", APP_NAMESPACE, "get", "secret",
-            "commonthing-experiment-b-registry",
-        ],
-    )
-    _require_live_secret(
-        database_secret,
-        DATA_NAMESPACE,
-        "commonthing-experiment-b-database",
-        "Opaque",
-        {"username", "database", "password"},
-        expected_secret_values["database"],
-    )
-    _require_live_secret(
-        runtime_secret,
-        APP_NAMESPACE,
-        "weltgewebe-runtime",
-        "Opaque",
-        {"database-url"},
-        expected_secret_values["runtime"],
-    )
-    _require_live_secret(
-        registry_secret,
-        APP_NAMESPACE,
-        "commonthing-experiment-b-registry",
-        "kubernetes.io/dockerconfigjson",
-        {".dockerconfigjson"},
-        expected_secret_values["registry"],
-    )
-    secret_readback = {
-        "database": _verified_secret_readback(
+        expected_api_pod_images = {
+            "api": str(release_artifacts["images"]["api"]),
+            "search-worker": str(release_artifacts["images"]["search_worker"]),
+            "ollama": str(semantic["ollama_image"]),
+        }
+        expected_web_pod_images = {
+            "web": str(release_artifacts["images"]["web"]),
+        }
+        api_pods = _kubectl_json(
+            root,
+            [
+                "-n",
+                APP_NAMESPACE,
+                "get",
+                "pods",
+                "-l",
+                "app.kubernetes.io/name=weltgewebe-api",
+            ],
+        ).get("items")
+        web_pods = _kubectl_json(
+            root,
+            [
+                "-n",
+                APP_NAMESPACE,
+                "get",
+                "pods",
+                "-l",
+                "app.kubernetes.io/name=weltgewebe-web",
+            ],
+        ).get("items")
+        pod_readback = {
+            "weltgewebe-api": _require_running_pod_images(
+                api_pods,
+                "weltgewebe-api",
+                int(config["semantic_search"]["api_replicas"]),
+                expected_api_pod_images,
+            ),
+            "weltgewebe-web": _require_running_pod_images(
+                web_pods,
+                "weltgewebe-web",
+                int(config["runtime_binding"]["web_replicas"]),
+                expected_web_pod_images,
+            ),
+        }
+        application_workloads = _require_live_application_workloads(
+            root,
+            release,
+            {
+                "weltgewebe-api": api,
+                "weltgewebe-web": web,
+            },
+            {
+                "weltgewebe-api": api_pods,
+                "weltgewebe-web": web_pods,
+            },
+        )
+        application_services = _require_live_application_services(root, release)
+        application_service_accounts = (
+            _require_live_application_service_accounts(root, release)
+        )
+        application_disruption_budgets = _require_live_application_pdbs(
+            root,
+            release,
+        )
+        semantic_provider = _semantic_provider_live_readback(root, source_commit)
+
+        expected_secret_values = _expected_live_secret_values(root, source_commit)
+        database_secret = _kubectl_json(
+            root,
+            [
+                "-n", DATA_NAMESPACE, "get", "secret",
+                "commonthing-experiment-b-database",
+            ],
+        )
+        runtime_secret = _kubectl_json(
+            root,
+            ["-n", APP_NAMESPACE, "get", "secret", "weltgewebe-runtime"],
+        )
+        registry_secret = _kubectl_json(
+            root,
+            [
+                "-n", APP_NAMESPACE, "get", "secret",
+                "commonthing-experiment-b-registry",
+            ],
+        )
+        _require_live_secret(
+            database_secret,
             DATA_NAMESPACE,
             "commonthing-experiment-b-database",
             "Opaque",
             {"username", "database", "password"},
-        ),
-        "runtime": _verified_secret_readback(
+            expected_secret_values["database"],
+        )
+        _require_live_secret(
+            runtime_secret,
             APP_NAMESPACE,
             "weltgewebe-runtime",
             "Opaque",
             {"database-url"},
-        ),
-        "registry": _verified_secret_readback(
+            expected_secret_values["runtime"],
+        )
+        _require_live_secret(
+            registry_secret,
             APP_NAMESPACE,
             "commonthing-experiment-b-registry",
             "kubernetes.io/dockerconfigjson",
             {".dockerconfigjson"},
-        ),
-    }
+            expected_secret_values["registry"],
+        )
+        secret_readback = {
+            "database": _verified_secret_readback(
+                DATA_NAMESPACE,
+                "commonthing-experiment-b-database",
+                "Opaque",
+                {"username", "database", "password"},
+            ),
+            "runtime": _verified_secret_readback(
+                APP_NAMESPACE,
+                "weltgewebe-runtime",
+                "Opaque",
+                {"database-url"},
+            ),
+            "registry": _verified_secret_readback(
+                APP_NAMESPACE,
+                "commonthing-experiment-b-registry",
+                "kubernetes.io/dockerconfigjson",
+                {".dockerconfigjson"},
+            ),
+        }
 
-    pvc_items = _kubectl_json(root, ["-A", "get", "pvc"]).get("items", [])
-    pvc_readback = _require_exact_healthy_pvcs(root, pvc_items)
+        pvc_items = _kubectl_json(root, ["-A", "get", "pvc"]).get("items", [])
+        pvc_readback = _require_exact_healthy_pvcs(root, pvc_items)
 
-    gateway = _kubectl_json(
-        root, ["-n", APP_NAMESPACE, "get", "gateway", "commonthing-experiment-b"]
-    )
-    gateway_readback = _require_gateway_ready(gateway)
+        gateway = _kubectl_json(
+            root, ["-n", APP_NAMESPACE, "get", "gateway", "commonthing-experiment-b"]
+        )
+        gateway_readback = _require_gateway_ready(gateway)
 
-    httproute = _kubectl_json(
-        root, ["-n", APP_NAMESPACE, "get", "httproute", "commonthing-experiment-b"]
-    )
-    httproute_readback = _require_httproute_ready(httproute)
-    gateway_data_plane = _gateway_data_plane_readback(root, source_commit)
-    recovery_state = _final_recovery_state_readback(root, source_commit)
-    runtime_contract_readback = _require_live_runtime_contract(root, config)
+        httproute = _kubectl_json(
+            root, ["-n", APP_NAMESPACE, "get", "httproute", "commonthing-experiment-b"]
+        )
+        httproute_readback = _require_httproute_ready(httproute)
+        gateway_data_plane = _gateway_data_plane_readback(root, source_commit)
+        recovery_state = _final_recovery_state_readback(root, source_commit)
+        runtime_contract_readback = _require_live_runtime_contract(root, config)
     _require_same_kubernetes_target(
         root,
         source_commit,
@@ -10496,27 +10497,22 @@ def _require_empty_replacement_pvc(
     root: Path,
     claim_name: str,
     old_identity: dict[str, str],
+    source_commit: str,
 ) -> dict[str, Any]:
     workload = "postgres" if claim_name == "postgres-data" else "nats"
-    expected = _versioned_data_deployment_contract(
-        CLUSTER / f"data/{workload}.yaml", workload
-    )
-    image = expected["images"]["containers"].get(workload)
-    if not isinstance(image, str) or not image:
-        raise RuntimeErrorEB(
-            f"replacement PVC probe image is unavailable: {claim_name}"
-        )
+    manifest_path = CLUSTER / f"data/{workload}.yaml"
+    manifest_bytes = _git_blob_bytes(source_commit, manifest_path)
     try:
+        manifest_text = manifest_bytes.decode("utf-8")
         documents = [
             item
-            for item in yaml.safe_load_all(
-                (CLUSTER / f"data/{workload}.yaml").read_text(encoding="utf-8")
-            )
+            for item in yaml.safe_load_all(manifest_text)
             if isinstance(item, dict)
             and item.get("kind") == "Deployment"
             and item.get("metadata", {}).get("name") == workload
+            and item.get("metadata", {}).get("namespace") == DATA_NAMESPACE
         ]
-    except (OSError, yaml.YAMLError) as exc:
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise RuntimeErrorEB(
             f"replacement PVC probe contract is invalid: {claim_name}"
         ) from exc
@@ -10524,9 +10520,19 @@ def _require_empty_replacement_pvc(
         raise RuntimeErrorEB(
             f"replacement PVC probe Deployment is ambiguous: {claim_name}"
         )
-    security = documents[0].get("spec", {}).get("template", {}).get("spec", {}).get(
-        "securityContext", {}
+    pod_spec = (
+        documents[0].get("spec", {}).get("template", {}).get("spec", {})
     )
+    images = _pod_spec_images(
+        pod_spec,
+        f"source-commit replacement PVC probe Deployment {workload}",
+    )
+    image = images["containers"].get(workload)
+    if not isinstance(image, str) or not image:
+        raise RuntimeErrorEB(
+            f"replacement PVC probe image is unavailable: {claim_name}"
+        )
+    security = pod_spec.get("securityContext", {})
     run_as_user = security.get("runAsUser") if isinstance(security, dict) else None
     run_as_group = security.get("runAsGroup") if isinstance(security, dict) else None
     fs_group = security.get("fsGroup") if isinstance(security, dict) else None
@@ -10877,7 +10883,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             kubectl_apply(root, storage_manifest)
             pvc_replacements = {
                 name: _require_empty_replacement_pvc(
-                    root, name, old_pvc_identities[name]
+                    root, name, old_pvc_identities[name], source_commit
                 )
                 for name in ("postgres-data", "nats-data")
             }

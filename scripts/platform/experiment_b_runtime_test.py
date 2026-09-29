@@ -6104,6 +6104,35 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             "process_argv": ["/usr/local/bin/k3s", "server"],
             "environment_overrides_absent": True,
         }
+        kubeconfig = self.root / "kubeconfig.yaml"
+        kubeconfig.write_text(
+            yaml.safe_dump(
+                {
+                    "current-context": "experiment-b",
+                    "contexts": [
+                        {
+                            "name": "experiment-b",
+                            "context": {"cluster": "experiment-b"},
+                        }
+                    ],
+                    "clusters": [
+                        {
+                            "name": "experiment-b",
+                            "cluster": {
+                                "server": self.k3s_runtime[
+                                    "kubeconfig_server"
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        kubeconfig.chmod(0o600)
+        self.k3s_runtime["kubeconfig_sha256"] = runtime.sha256_file(
+            kubeconfig
+        )
         self.k3s_readback = self.patch(
             "_require_live_k3s_runtime",
             return_value=json.loads(json.dumps(self.k3s_runtime)),
@@ -8655,6 +8684,14 @@ spec:
         self.assertEqual(runtime.sha256_file(failed_path), failed_sha)
 
     def test_recovery_requires_new_empty_persistent_volume_identity(self) -> None:
+        source = inspect.getsource(runtime._require_empty_replacement_pvc)
+        self.assertIn(
+            "_git_blob_bytes(source_commit, manifest_path)",
+            source,
+        )
+        self.assertNotIn("_versioned_data_deployment_contract(", source)
+        self.assertNotIn(".read_text(", source)
+
         old_identity = {
             "pvc_uid": "old-pvc",
             "pv_name": "old-pv",
@@ -8666,6 +8703,10 @@ spec:
             "pv_uid": "new-pv-uid",
         }
 
+        def source_blob(source_commit, path):
+            self.assertEqual(source_commit, self.commit)
+            return path.read_bytes()
+
         def kubectl_result(_root, arguments, **_kwargs):
             stdout = ""
             if "exec" in arguments:
@@ -8675,6 +8716,9 @@ spec:
             )
 
         with (
+            mock.patch.object(
+                runtime, "_git_blob_bytes", side_effect=source_blob
+            ),
             mock.patch.object(runtime, "kubectl_apply") as apply,
             mock.patch.object(
                 runtime,
@@ -8687,7 +8731,10 @@ spec:
             mock.patch.object(runtime, "_delete_pod") as delete,
         ):
             result = runtime._require_empty_replacement_pvc(
-                self.root, "postgres-data", old_identity
+                self.root,
+                "postgres-data",
+                old_identity,
+                self.commit,
             )
         self.assertEqual(result["old"], old_identity)
         self.assertEqual(result["new"], new_identity)
@@ -8696,6 +8743,9 @@ spec:
         delete.assert_called_once()
 
         with (
+            mock.patch.object(
+                runtime, "_git_blob_bytes", side_effect=source_blob
+            ),
             mock.patch.object(runtime, "kubectl_apply"),
             mock.patch.object(
                 runtime,
@@ -8712,7 +8762,10 @@ spec:
             ),
         ):
             runtime._require_empty_replacement_pvc(
-                self.root, "postgres-data", old_identity
+                self.root,
+                "postgres-data",
+                old_identity,
+                self.commit,
             )
 
         def nonempty_result(_root, arguments, **_kwargs):
@@ -8722,6 +8775,9 @@ spec:
             )
 
         with (
+            mock.patch.object(
+                runtime, "_git_blob_bytes", side_effect=source_blob
+            ),
             mock.patch.object(runtime, "kubectl_apply"),
             mock.patch.object(
                 runtime,
@@ -8738,7 +8794,10 @@ spec:
             ),
         ):
             runtime._require_empty_replacement_pvc(
-                self.root, "postgres-data", old_identity
+                self.root,
+                "postgres-data",
+                old_identity,
+                self.commit,
             )
 
     def test_teardown_rejects_live_uuid_drift_before_destroy(self) -> None:
@@ -9901,14 +9960,22 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
         target_capture = source.index(
             "status_target = _kubernetes_target_identity"
         )
+        snapshot = source.index(
+            "with _bound_kube_env(root, status_target):"
+        )
         k3s_runtime = source.index("_require_live_k3s_runtime")
+        final_kubernetes_readback = source.index(
+            "_require_live_runtime_contract"
+        )
         final_target_check = source.rindex(
             "_require_same_kubernetes_target"
         )
         result_start = source.index("result = {")
         receipt_write = source.index("atomic_json(receipt_path, result)")
-        self.assertLess(target_capture, k3s_runtime)
-        self.assertLess(k3s_runtime, final_target_check)
+        self.assertLess(target_capture, snapshot)
+        self.assertLess(snapshot, k3s_runtime)
+        self.assertLess(k3s_runtime, final_kubernetes_readback)
+        self.assertLess(final_kubernetes_readback, final_target_check)
         self.assertLess(final_target_check, result_start)
         self.assertLess(result_start, receipt_write)
         self.assertIn('"kubernetes_target_sha256"', source)
