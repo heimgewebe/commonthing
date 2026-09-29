@@ -12,6 +12,8 @@ import argparse
 import base64
 import binascii
 import csv
+import ctypes
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -87,6 +89,19 @@ _BOUND_KUBECONFIG: ContextVar[str | None] = ContextVar(
     "experiment_b_bound_kubeconfig",
     default=None,
 )
+_BOUND_KUBECONFIG_FD: ContextVar[int | None] = ContextVar(
+    "experiment_b_bound_kubeconfig_fd",
+    default=None,
+)
+
+
+def _bound_subprocess_pass_fds(
+    pass_fds: tuple[int, ...] = (),
+) -> tuple[int, ...]:
+    bound_fd = _BOUND_KUBECONFIG_FD.get()
+    if bound_fd is None or bound_fd in pass_fds:
+        return pass_fds
+    return (*pass_fds, bound_fd)
 
 
 def run(
@@ -108,7 +123,7 @@ def run(
         capture_output=capture,
         timeout=timeout,
         check=False,
-        pass_fds=pass_fds,
+        pass_fds=_bound_subprocess_pass_fds(pass_fds),
     )
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
@@ -1104,13 +1119,29 @@ def create_vm(root: Path) -> dict[str, Any]:
             ["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME],
             check=False,
         ).returncode == 0:
+            if _libvirt_resource_uuid("domain", VM_NAME) != domain_target:
+                raise RuntimeErrorEB(
+                    "Experiment-B VM creation rollback domain UUID drifted; "
+                    "storage cleanup is forbidden"
+                )
             _retire_domain_before_storage(
-                VM_NAME,
+                domain_target,
                 "Experiment-B VM creation rollback",
             )
         if pool_defined:
+            pool_target = attempt.get("pool_target")
+            if not isinstance(pool_target, str):
+                raise RuntimeErrorEB(
+                    "Experiment-B VM creation rollback has no verified pool UUID; "
+                    "storage cleanup is forbidden"
+                )
+            if _libvirt_resource_uuid("pool", POOL_NAME) != pool_target:
+                raise RuntimeErrorEB(
+                    "Experiment-B VM creation rollback pool UUID drifted; "
+                    "storage cleanup is forbidden"
+                )
             _cleanup_pool_after_domain_retirement(
-                POOL_NAME,
+                pool_target,
                 "Experiment-B VM creation rollback",
             )
         if POOL_TARGET.exists() and not any(POOL_TARGET.iterdir()):
@@ -1274,11 +1305,64 @@ def _verified_snapshot_fd(
         raise RuntimeErrorEB(
             f"{context} digest does not match prepared source"
         )
-    with tempfile.TemporaryFile(mode="w+b") as snapshot:
-        snapshot.write(payload)
-        snapshot.flush()
-        snapshot.seek(0)
-        yield snapshot.fileno()
+    if not sys.platform.startswith("linux"):
+        raise RuntimeErrorEB(f"{context} cannot create an immutable snapshot")
+    memfd_create = getattr(os, "memfd_create", None)
+    allow_sealing = int(getattr(os, "MFD_ALLOW_SEALING", 0x0002))
+    cloexec = int(getattr(os, "MFD_CLOEXEC", 0x0001))
+    try:
+        if callable(memfd_create):
+            snapshot_fd = memfd_create(
+                "commonthing-experiment-b-snapshot",
+                flags=allow_sealing | cloexec,
+            )
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            native_memfd_create = libc.memfd_create
+            native_memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+            native_memfd_create.restype = ctypes.c_int
+            snapshot_fd = native_memfd_create(
+                b"commonthing-experiment-b-snapshot",
+                allow_sealing | cloexec,
+            )
+            if snapshot_fd < 0:
+                error_number = ctypes.get_errno()
+                raise OSError(error_number, os.strerror(error_number))
+    except (AttributeError, OSError) as exc:
+        raise RuntimeErrorEB(
+            f"{context} cannot create an immutable snapshot"
+        ) from exc
+    f_add_seals = int(getattr(fcntl, "F_ADD_SEALS", 1033))
+    f_get_seals = int(getattr(fcntl, "F_GET_SEALS", 1034))
+    f_seal_seal = int(getattr(fcntl, "F_SEAL_SEAL", 0x0001))
+    f_seal_shrink = int(getattr(fcntl, "F_SEAL_SHRINK", 0x0002))
+    f_seal_grow = int(getattr(fcntl, "F_SEAL_GROW", 0x0004))
+    f_seal_write = int(getattr(fcntl, "F_SEAL_WRITE", 0x0008))
+    try:
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            written = os.write(snapshot_fd, view[offset:])
+            if written <= 0:
+                raise RuntimeErrorEB(f"{context} immutable snapshot write failed")
+            offset += written
+        os.fchmod(snapshot_fd, 0o400)
+        required_seals = (
+            f_seal_seal
+            | f_seal_shrink
+            | f_seal_grow
+            | f_seal_write
+        )
+        fcntl.fcntl(snapshot_fd, f_add_seals, required_seals)
+        observed_seals = fcntl.fcntl(snapshot_fd, f_get_seals)
+        if observed_seals & required_seals != required_seals:
+            raise RuntimeErrorEB(f"{context} immutable snapshot sealing failed")
+        os.lseek(snapshot_fd, 0, os.SEEK_SET)
+        if os.pread(snapshot_fd, len(payload), 0) != payload:
+            raise RuntimeErrorEB(f"{context} immutable snapshot verification failed")
+        yield snapshot_fd
+    finally:
+        os.close(snapshot_fd)
 
 
 def _verified_snapshot_bytes(
@@ -1322,12 +1406,10 @@ def _k3s_contract_paths(config: dict[str, Any]) -> tuple[Path, Path]:
     return config_path, service_path
 
 
-def _kubeconfig_server(path: Path) -> str:
-    if not path.is_file() or path.is_symlink():
-        raise RuntimeErrorEB("Experiment-B kubeconfig must be a regular file")
+def _kubeconfig_server_payload(payload: bytes) -> str:
     try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        payload = yaml.safe_load(payload.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise RuntimeErrorEB("Experiment-B kubeconfig is invalid") from exc
     if not isinstance(payload, dict):
         raise RuntimeErrorEB("Experiment-B kubeconfig is invalid")
@@ -1370,6 +1452,16 @@ def _kubeconfig_server(path: Path) -> str:
     if not isinstance(server, str) or not server:
         raise RuntimeErrorEB("Experiment-B kubeconfig server binding is invalid")
     return server
+
+
+def _kubeconfig_server(path: Path) -> str:
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeErrorEB("Experiment-B kubeconfig must be a regular file")
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeErrorEB("Experiment-B kubeconfig is invalid") from exc
+    return _kubeconfig_server_payload(payload)
 
 
 def _require_kubernetes_target_binding(
@@ -1809,36 +1901,29 @@ def _bound_kube_env(
     expected_target: dict[str, str],
 ) -> Iterator[dict[str, str]]:
     source = root / "kubeconfig.yaml"
-    try:
-        payload = source.read_bytes()
-    except OSError as exc:
-        raise RuntimeErrorEB(
-            "Experiment-B Kubernetes workflow cannot snapshot kubeconfig"
-        ) from exc
-    if hashlib.sha256(payload).hexdigest() != expected_target["kubeconfig_sha256"]:
-        raise RuntimeErrorEB(
-            "Experiment-B Kubernetes workflow kubeconfig changed before snapshot"
-        )
-
-    with tempfile.TemporaryDirectory(
-        prefix=".platform-kubeconfig-",
-        dir=root,
-    ) as temporary:
-        snapshot = Path(temporary) / "kubeconfig.yaml"
-        snapshot.write_bytes(payload)
-        os.chmod(snapshot, 0o400)
+    with _verified_snapshot_fd(
+        source,
+        expected_target["kubeconfig_sha256"],
+        "Experiment-B Kubernetes workflow kubeconfig",
+    ) as snapshot_fd:
+        snapshot = Path(f"/proc/self/fd/{snapshot_fd}")
+        snapshot_size = os.fstat(snapshot_fd).st_size
+        snapshot_bytes = os.pread(snapshot_fd, snapshot_size, 0)
         if (
-            sha256_file(snapshot) != expected_target["kubeconfig_sha256"]
-            or _kubeconfig_server(snapshot) != expected_target["server"]
+            len(snapshot_bytes) != snapshot_size
+            or _kubeconfig_server_payload(snapshot_bytes)
+            != expected_target["server"]
         ):
             raise RuntimeErrorEB(
                 "Experiment-B Kubernetes workflow kubeconfig snapshot drifted"
             )
-        token = _BOUND_KUBECONFIG.set(str(snapshot))
+        path_token = _BOUND_KUBECONFIG.set(str(snapshot))
+        fd_token = _BOUND_KUBECONFIG_FD.set(snapshot_fd)
         try:
             yield kube_env(root)
         finally:
-            _BOUND_KUBECONFIG.reset(token)
+            _BOUND_KUBECONFIG_FD.reset(fd_token)
+            _BOUND_KUBECONFIG.reset(path_token)
 
 
 def _cilium_helm_value_args(ip: str) -> list[str]:
@@ -8356,6 +8441,7 @@ def _run_input_file(
             env=env,
             timeout=timeout,
             check=False,
+            pass_fds=_bound_subprocess_pass_fds(),
         )
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", "replace")[-3000:]
@@ -8384,6 +8470,7 @@ def _run_binary_to_file(
                 env=env,
                 timeout=timeout,
                 check=False,
+                pass_fds=_bound_subprocess_pass_fds(),
             )
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", "replace")[-3000:]
@@ -8871,9 +8958,10 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
     _require_kubernetes_target_binding(root, source_commit)
     fixture_target = _kubernetes_target_identity(root, source_commit)
     with _bound_kube_env(root, fixture_target):
-        contract_section = evidence.api_runtime_section(
-            evidence.load_policy(PERFORMANCE_POLICY)
+        policy, _policy_sha256 = _source_bound_performance_policy(
+            source_commit
         )
+        contract_section = evidence.api_runtime_section(policy)
         proof = contract_section["dataset_proof"]
         profile = str(proof["profile"])
         evidence_dir = root / "performance"
@@ -9173,15 +9261,68 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         return emit_receipt()
 
 
-def _k6_image_binding() -> tuple[str, str]:
-    text = K6_WORKFLOW.read_text(encoding="utf-8")
+def _k6_image_binding(source_commit: str) -> tuple[str, str]:
+    workflow_bytes = _git_blob_bytes(source_commit, K6_WORKFLOW)
+    try:
+        text = workflow_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeErrorEB("canonical T048 workflow is not UTF-8") from exc
     match = re.search(
         r"(?m)^\s*K6_IMAGE:\s*(grafana/k6@sha256:[0-9a-f]{64})\s*$",
         text,
     )
     if match is None:
         raise RuntimeErrorEB("canonical T048 workflow has no digest-bound K6_IMAGE")
-    return match.group(1), hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return match.group(1), hashlib.sha256(workflow_bytes).hexdigest()
+
+
+def _source_bound_performance_policy(
+    source_commit: str,
+) -> tuple[dict[str, Any], str]:
+    policy_bytes = _git_blob_bytes(source_commit, PERFORMANCE_POLICY)
+    try:
+        parsed = json.loads(policy_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "source-bound T048 performance policy is not valid UTF-8 JSON"
+        ) from exc
+    if (
+        not isinstance(parsed, dict)
+        or parsed.get("contract_id") != "weltgewebe-performance-v1"
+        or not isinstance(parsed.get("measurements"), dict)
+    ):
+        raise RuntimeErrorEB("source-bound T048 performance policy is invalid")
+    return parsed, hashlib.sha256(policy_bytes).hexdigest()
+
+
+def _source_bound_k6_workload(source_commit: str) -> tuple[str, str]:
+    workload_bytes = _git_blob_bytes(source_commit, K6_WORKLOAD)
+    try:
+        text = workload_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeErrorEB("source-bound T048 k6 workload is not UTF-8") from exc
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("import "):
+            continue
+        match = re.search(
+            r"(?:from\s+)?[\"']([^\"']+)[\"']\s*;?\s*$",
+            stripped,
+        )
+        if match is None:
+            raise RuntimeErrorEB(
+                "source-bound T048 k6 workload uses unsupported import syntax"
+            )
+        module = match.group(1)
+        if module != "k6" and not module.startswith("k6/"):
+            raise RuntimeErrorEB(
+                "source-bound T048 k6 workload imports an unbound module"
+            )
+    if re.search(r"\b(?:open|require|import)\s*\(", text):
+        raise RuntimeErrorEB(
+            "source-bound T048 k6 workload performs unbound runtime loading"
+        )
+    return text, hashlib.sha256(workload_bytes).hexdigest()
 
 
 def _reserve_loopback_port() -> int:
@@ -9243,6 +9384,7 @@ def _start_api_port_forward(
         stderr=stderr,
         env=kube_env(root),
         text=True,
+        pass_fds=_bound_subprocess_pass_fds(),
     )
     try:
         _wait_http_200(f"http://127.0.0.1:{port}/health/live", process)
@@ -9589,10 +9731,15 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         }
         evidence, _domain_scale = _performance_modules()
         manifest = Path(fixture_receipt["manifest"])
-        policy = evidence.load_policy(PERFORMANCE_POLICY)
+        policy, policy_sha256 = _source_bound_performance_policy(
+            source_commit
+        )
         contract_section = evidence.api_runtime_section(policy)
         scenario = contract_section["scenario"]
-        k6_image, k6_workflow_sha256 = _k6_image_binding()
+        k6_image, k6_workflow_sha256 = _k6_image_binding(source_commit)
+        k6_workload_text, k6_workload_sha256 = _source_bound_k6_workload(
+            source_commit
+        )
         k6_summary_path = root / "performance/k6-summary.json"
         metrics_before_path = root / "performance/metrics-before.prom"
         metrics_after_path = root / "performance/metrics-after.prom"
@@ -9629,11 +9776,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         stdout_path = evidence_dir / "k6.stdout"
         stderr_path = evidence_dir / "k6.stderr"
         docker_args = [
-            "docker", "run", "--rm", "--network", "host",
+            "docker", "run", "--rm", "--interactive", "--network", "host",
             "--user", f"{os.getuid()}:{os.getgid()}",
-            "--volume", f"{ROOT}:/workspace:ro",
             "--volume", f"{evidence_dir}:/evidence",
-            "--workdir", "/workspace",
             "--env", f"BASE_URL={base_url}",
             "--env", f"API_RUNTIME_VUS={scenario['virtual_users']}",
             "--env", f"API_RUNTIME_DURATION_SECONDS={scenario['duration_seconds']}",
@@ -9644,7 +9789,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "--env", f"API_RUNTIME_RUN_ID={run_id}",
             "--env", f"API_RUNTIME_K6_IMAGE={k6_image}",
             "--env", "API_RUNTIME_SUMMARY_PATH=/evidence/k6-summary.json",
-            k6_image, "run", str(K6_WORKLOAD.relative_to(ROOT)),
+            k6_image, "run", "-",
         ]
 
         initial_cgroup = _sample_api_cgroup(root, pod_name)
@@ -9655,8 +9800,21 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "w", encoding="utf-8"
         ) as err:
             load = subprocess.Popen(
-                docker_args, cwd=ROOT, stdout=out, stderr=err, text=True
+                docker_args,
+                cwd=ROOT,
+                stdin=subprocess.PIPE,
+                stdout=out,
+                stderr=err,
+                text=True,
             )
+            if load.stdin is None:
+                raise RuntimeErrorEB("canonical T048 k6 workload stdin is unavailable")
+            try:
+                load.stdin.write(k6_workload_text)
+            except BrokenPipeError:
+                pass
+            finally:
+                load.stdin.close()
             load_returncode = _sample_t048_load(
                 root,
                 pod_name,
@@ -9838,8 +9996,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "schema_version": 1,
             "status": "fail" if failures else "pass",
             "source_commit": source_commit,
-            "policy_sha256": sha256_file(PERFORMANCE_POLICY),
+            "policy_sha256": policy_sha256,
             "k6_workflow_sha256": k6_workflow_sha256,
+            "k6_workload_sha256": k6_workload_sha256,
             "k6_image": k6_image,
             "fixture_manifest_sha256": manifest_sha,
             "fixture_live_binding_sha256": _stable_json_sha256(

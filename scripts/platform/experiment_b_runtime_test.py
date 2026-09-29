@@ -70,14 +70,16 @@ def vm_receipt_fixture(
 
 class ExperimentBRuntimeContractTests(unittest.TestCase):
     def test_canonical_k6_image_is_digest_bound_from_workflow(self) -> None:
-        image, workflow_sha = runtime._k6_image_binding()
+        commit = runtime.run(["git", "rev-parse", "HEAD"]).stdout.strip()
+        image, workflow_sha = runtime._k6_image_binding(commit)
+        workflow_bytes = runtime._git_blob_bytes(commit, runtime.K6_WORKFLOW)
         self.assertEqual(
             image,
             "grafana/k6@sha256:65c920dc067d5e2e00befbf982af6ad6ad0117034e8b1c65817c7975c52d4669",
         )
         self.assertEqual(
             workflow_sha,
-            hashlib.sha256(runtime.K6_WORKFLOW.read_bytes()).hexdigest(),
+            hashlib.sha256(workflow_bytes).hexdigest(),
         )
 
     def test_kubernetes_quantity_parsers_bind_declared_hard_limits(self) -> None:
@@ -4129,6 +4131,11 @@ spec:
             with (
                 mock.patch.object(
                     runtime,
+                    "_source_bound_performance_policy",
+                    return_value=({"policy": "test"}, "f" * 64),
+                ) as source_policy,
+                mock.patch.object(
+                    runtime,
                     "_performance_modules",
                     return_value=(evidence, Path("/unused/domain_scale.py")),
                 ),
@@ -4172,6 +4179,7 @@ spec:
             ):
                 receipt = runtime.seed_t048_fixture(root)
 
+            source_policy.assert_called_once_with(commit)
             self.assertEqual(receipt["status"], "loaded")
             self.assertEqual(receipt["source_commit"], commit)
             self.assertEqual(receipt["live_binding"], live_binding)
@@ -9395,6 +9403,61 @@ spec:
             portability_source,
         )
 
+    def test_create_rollback_refuses_foreign_same_name_domain(self) -> None:
+        self.prepare_create()
+        original = self.run_fixture
+        foreign_uuid = "44444444-4444-4444-8444-444444444444"
+
+        def collide_before_virt_install(argv, **kwargs):
+            if argv[0] == "virt-install":
+                self.domain_present = True
+                self.domain_active = True
+                self.domain_uuid = foreign_uuid
+                raise runtime.RuntimeErrorEB("simulated create collision")
+            return original(argv, **kwargs)
+
+        self.runner.side_effect = collide_before_virt_install
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "rollback domain UUID drifted",
+        ):
+            runtime.create_vm(self.root)
+        self.assertTrue(self.domain_present)
+        self.assertEqual(self.domain_uuid, foreign_uuid)
+        self.assertTrue(self.pool_present)
+        self.assertTrue(self.disk.exists())
+        self.assertTrue(self.base.exists())
+
+    def test_create_rollback_refuses_pool_uuid_drift_before_storage_cleanup(
+        self,
+    ) -> None:
+        self.prepare_create()
+        self.main.side_effect = [self.commit, "b" * 40]
+        original = self.run_fixture
+        foreign_pool_uuid = "55555555-5555-4555-8555-555555555555"
+
+        def drift_pool_after_domain_retirement(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if (
+                argv[:3] == ["virsh", "-c", runtime.LIBVIRT_URI]
+                and argv[3] == "undefine"
+                and result.returncode == 0
+            ):
+                self.pool_uuid = foreign_pool_uuid
+            return result
+
+        self.runner.side_effect = drift_pool_after_domain_retirement
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "rollback pool UUID drifted",
+        ):
+            runtime.create_vm(self.root)
+        self.assertFalse(self.domain_present)
+        self.assertTrue(self.pool_present)
+        self.assertEqual(self.pool_uuid, foreign_pool_uuid)
+        self.assertTrue(self.disk.exists())
+        self.assertTrue(self.base.exists())
+
     def test_create_rollback_stops_before_storage_when_destroy_fails(self) -> None:
         self.prepare_create()
         self.main.side_effect = [self.commit, "b" * 40]
@@ -9672,13 +9735,119 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
             with runtime._bound_kube_env(root, expected) as env:
                 snapshot = Path(env["KUBECONFIG"])
                 self.assertNotEqual(snapshot, source)
-                self.assertEqual(runtime.sha256_file(snapshot), expected["kubeconfig_sha256"])
-                self.assertEqual(runtime._kubeconfig_server(snapshot), expected["server"])
-                self.assertEqual(runtime.kube_env(root)["KUBECONFIG"], str(snapshot))
+                self.assertTrue(str(snapshot).startswith("/proc/self/fd/"))
+                snapshot_fd = int(snapshot.name)
+                self.assertEqual(
+                    runtime._bound_subprocess_pass_fds(),
+                    (snapshot_fd,),
+                )
+                self.assertEqual(
+                    runtime.sha256_file(snapshot),
+                    expected["kubeconfig_sha256"],
+                )
+                snapshot_size = runtime.os.fstat(snapshot_fd).st_size
+                self.assertEqual(
+                    runtime._kubeconfig_server_payload(
+                        runtime.os.pread(snapshot_fd, snapshot_size, 0)
+                    ),
+                    expected["server"],
+                )
+                self.assertEqual(
+                    runtime.kube_env(root)["KUBECONFIG"],
+                    str(snapshot),
+                )
+                with self.assertRaises(OSError):
+                    snapshot.write_bytes(b"forged kubeconfig")
                 source.write_text("drifted", encoding="utf-8")
-                self.assertEqual(runtime.kube_env(root)["KUBECONFIG"], str(snapshot))
-                self.assertEqual(runtime.sha256_file(snapshot), expected["kubeconfig_sha256"])
+                child = runtime.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os; from pathlib import Path; "
+                            "print(Path(os.environ['KUBECONFIG']).read_text())"
+                        ),
+                    ],
+                    env=env,
+                )
+                self.assertIn("experiment-b", child.stdout)
+                self.assertNotIn("drifted", child.stdout)
+                self.assertEqual(
+                    runtime.sha256_file(snapshot),
+                    expected["kubeconfig_sha256"],
+                )
             self.assertFalse(snapshot.exists())
+
+    def test_t048_authority_inputs_are_source_commit_bound(self) -> None:
+        commit = "a" * 40
+        workflow = (
+            "env:\n"
+            "  K6_IMAGE: "
+            "grafana/k6@sha256:"
+            + "b" * 64
+            + "\n"
+        ).encode()
+        workload = b"import http from 'k6/http';\nimport { check } from 'k6';\n"
+        policy = json.dumps(
+            {
+                "contract_id": "weltgewebe-performance-v1",
+                "measurements": {},
+            }
+        ).encode()
+
+        def blob(source_commit, path):
+            self.assertEqual(source_commit, commit)
+            return {
+                runtime.K6_WORKFLOW: workflow,
+                runtime.K6_WORKLOAD: workload,
+                runtime.PERFORMANCE_POLICY: policy,
+            }[path]
+
+        with mock.patch.object(runtime, "_git_blob_bytes", side_effect=blob):
+            image, workflow_sha = runtime._k6_image_binding(commit)
+            workload_text, workload_sha = runtime._source_bound_k6_workload(
+                commit
+            )
+            parsed_policy, policy_sha = (
+                runtime._source_bound_performance_policy(commit)
+            )
+
+        self.assertEqual(
+            image,
+            "grafana/k6@sha256:" + "b" * 64,
+        )
+        self.assertEqual(workflow_sha, hashlib.sha256(workflow).hexdigest())
+        self.assertEqual(workload_text.encode(), workload)
+        self.assertEqual(workload_sha, hashlib.sha256(workload).hexdigest())
+        self.assertEqual(
+            parsed_policy["contract_id"],
+            "weltgewebe-performance-v1",
+        )
+        self.assertEqual(policy_sha, hashlib.sha256(policy).hexdigest())
+
+        with mock.patch.object(
+            runtime,
+            "_git_blob_bytes",
+            return_value=b"import helper from './helper.js';\n",
+        ), self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "imports an unbound module",
+        ):
+            runtime._source_bound_k6_workload(commit)
+
+        load_source = inspect.getsource(runtime.t048_load_proof)
+        self.assertIn("_source_bound_performance_policy", load_source)
+        self.assertIn("_k6_image_binding(source_commit)", load_source)
+        self.assertIn("_source_bound_k6_workload", load_source)
+        self.assertIn('"--interactive"', load_source)
+        self.assertIn('k6_image, "run", "-"', load_source)
+        self.assertIn("stdin=subprocess.PIPE", load_source)
+        self.assertNotIn("/workspace", load_source)
+        self.assertNotIn("sha256_file(PERFORMANCE_POLICY)", load_source)
+
+        seed_source = inspect.getsource(runtime.seed_t048_fixture)
+        self.assertIn("_source_bound_performance_policy", seed_source)
+        self.assertNotIn("load_policy(PERFORMANCE_POLICY)", seed_source)
 
     def test_platform_install_mutations_are_bound_to_snapshot_and_rechecked(self) -> None:
         source = inspect.getsource(runtime.install_platform)
