@@ -12,6 +12,7 @@ from unittest import mock
 
 import yaml
 
+import experiment_b as contract
 import experiment_b_runtime as runtime
 
 
@@ -544,7 +545,7 @@ spec:
         create_vm = inspect.getsource(runtime.create_vm)
         self.assertLess(
             create_vm.index("_invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)"),
-            create_vm.index("prepared = prepare(root)"),
+            create_vm.index("prepared = prepare(root, source_commit)"),
         )
         self.assertLess(
             create_vm.index("_invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)"),
@@ -634,6 +635,11 @@ spec:
                 mock.patch.object(runtime, "RETIREMENT_RECEIPT", retirement),
                 mock.patch.object(runtime, "_current_protected_main_commit", return_value="a" * 40),
                 mock.patch.object(runtime, "load_config", return_value={}),
+                mock.patch.object(
+                    runtime,
+                    "_git_blob_sha256",
+                    return_value=runtime.sha256_file(runtime.CONFIG_PATH),
+                ),
                 mock.patch.object(runtime, "run", return_value=absent),
                 mock.patch.object(
                     runtime,
@@ -672,6 +678,11 @@ spec:
                     runtime, "_current_protected_main_commit", return_value="a" * 40
                 ),
                 mock.patch.object(runtime, "load_config", return_value={}),
+                mock.patch.object(
+                    runtime,
+                    "_git_blob_sha256",
+                    return_value=runtime.sha256_file(runtime.CONFIG_PATH),
+                ),
                 mock.patch.object(runtime, "run", return_value=absent),
                 mock.patch.object(
                     runtime,
@@ -1449,7 +1460,7 @@ spec:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bootstrap = root / "bootstrap.yaml"
-            binding = runtime.contract.render_bootstrap(
+            binding = contract.render_bootstrap(
                 commit,
                 api_digest,
                 web_digest,
@@ -1504,7 +1515,7 @@ spec:
         web_digest = "sha256:" + "c" * 64
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            binding = runtime.contract.render_bootstrap(
+            binding = contract.render_bootstrap(
                 commit,
                 api_digest,
                 web_digest,
@@ -5468,6 +5479,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.patch("POOL_TARGET", self.pool)
         self.patch("load_config", return_value=self.config)
         self.main = self.patch("_current_protected_main_commit", return_value=self.commit)
+        self.patch(
+            "_git_blob_sha256",
+            side_effect=lambda _source_commit, path: runtime.sha256_file(path),
+        )
         expected = vm_substrate_fixture()
         self.domain_uuid = expected["uuid"]
         self.pool_uuid = expected["pool_uuid"]
@@ -6479,7 +6494,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         )
         api_digest = "sha256:" + "b" * 64
         web_digest = "sha256:" + "c" * 64
-        binding = runtime.contract.render_bootstrap(
+        binding = contract.render_bootstrap(
             self.commit,
             api_digest,
             web_digest,
@@ -10591,6 +10606,85 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
         self.assertEqual(domain_scale.MARKER, "domain-from-commit")
         self.assertEqual(evidence.live_binding.MARKER, "live-from-commit")
 
+    def test_runtime_local_helpers_are_not_eager_imported(self) -> None:
+        source = Path(runtime.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("import experiment_b as contract", source)
+        self.assertNotIn("import bootstrap_tools", source)
+        self.assertIn("_source_bound_contract(source_commit)", source)
+        self.assertIn("_source_bound_bootstrap_tools(commit)", source)
+
+    def test_mutated_worktree_contract_helper_is_not_executed(self) -> None:
+        commit = "a" * 40
+        payload = b"""
+def validate_config(config):
+    return None
+
+def render_cloud_init(public_key_file, output_dir, hostname):
+    return {"authority": "source-commit"}
+
+def render_bootstrap_from_template(
+    source_commit,
+    api_digest,
+    web_digest,
+    output,
+    template_bytes,
+):
+    return {"authority": "source-commit"}
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            helper = repo_root / "scripts/platform/experiment_b.py"
+            helper.parent.mkdir(parents=True)
+            helper.write_text(
+                'raise RuntimeError("mutable contract helper executed")\n',
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(runtime, "ROOT", repo_root),
+                mock.patch.object(runtime, "CONTRACT_HELPER", helper),
+                mock.patch.object(
+                    runtime,
+                    "_git_blob_bytes",
+                    return_value=payload,
+                ),
+            ):
+                bound = runtime._source_bound_contract(commit)
+                rendered = bound.render_cloud_init(
+                    Path("unused"),
+                    Path("unused"),
+                    "unused",
+                )
+
+        self.assertEqual(rendered["authority"], "source-commit")
+
+    def test_mutated_worktree_bootstrap_helper_is_not_executed(self) -> None:
+        commit = "a" * 40
+        payload = b"""
+def install(*args, **kwargs):
+    return {"authority": "source-commit"}
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            helper = repo_root / "scripts/platform/bootstrap_tools.py"
+            helper.parent.mkdir(parents=True)
+            helper.write_text(
+                'raise RuntimeError("mutable bootstrap helper executed")\n',
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(runtime, "ROOT", repo_root),
+                mock.patch.object(runtime, "BOOTSTRAP_TOOLS_HELPER", helper),
+                mock.patch.object(
+                    runtime,
+                    "_git_blob_bytes",
+                    return_value=payload,
+                ),
+            ):
+                bound = runtime._source_bound_bootstrap_tools(commit)
+                receipt = bound.install()
+
+        self.assertEqual(receipt["authority"], "source-commit")
+
     def test_source_bound_dataset_binding_uses_commit_config_snapshot(self) -> None:
         commit = "a" * 40
         config_bytes = b'{"authority":"source-commit"}\n'
@@ -10964,21 +11058,20 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
     def test_toolchain_authority_is_source_commit_bound(self) -> None:
         source = inspect.getsource(runtime.toolchain)
         self.assertIn("_git_blob_bytes(", source)
-        self.assertIn("bootstrap_tools.LOCK_PATH", source)
+        self.assertIn("TOOLCHAIN_LOCK_PATH", source)
+        self.assertIn("_source_bound_bootstrap_tools(commit)", source)
         self.assertIn("lock_bytes=lock_bytes", source)
         self.assertIn("_open_verified_file(", source)
         self.assertIn("_create_sealed_snapshot_fd(", source)
         self.assertIn('f"/proc/self/fd/{snapshot_fd}"', source)
         self.assertIn('"source_commit": commit', source)
+        self.assertNotIn("bootstrap_tools.", source)
 
-        install_source = inspect.getsource(
-            runtime.bootstrap_tools.install
+        helper_source = inspect.getsource(
+            runtime._source_bound_bootstrap_tools
         )
-        self.assertIn("lock_bytes: bytes | None = None", install_source)
-        self.assertIn(
-            "hashlib.sha256(lock_bytes).hexdigest()",
-            install_source,
-        )
+        self.assertIn("_source_commit_python_module(", helper_source)
+        self.assertIn("BOOTSTRAP_TOOLS_HELPER", helper_source)
 
         bound_source = inspect.getsource(runtime._bound_kube_env)
         self.assertIn(

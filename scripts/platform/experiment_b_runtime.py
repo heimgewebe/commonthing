@@ -43,10 +43,11 @@ from typing import Any
 
 import yaml
 
-import bootstrap_tools
-import experiment_b as contract
-
 ROOT = Path(__file__).resolve().parents[2]
+CONTRACT_HELPER = ROOT / "scripts/platform/experiment_b.py"
+BOOTSTRAP_TOOLS_HELPER = ROOT / "scripts/platform/bootstrap_tools.py"
+TOOLCHAIN_LOCK_PATH = ROOT / "platform/toolchain.lock.json"
+CONFIG_PATH = ROOT / "platform/clusters/experiment-b/config.json"
 CLUSTER = ROOT / "platform/clusters/experiment-b"
 BOOTSTRAP_TEMPLATE = CLUSTER / "bootstrap-template.yaml"
 NAMESPACES = CLUSTER / "namespaces"
@@ -87,6 +88,10 @@ K6_SUMMARY_MAX_BYTES = 4 * 1024 * 1024
 
 
 class RuntimeErrorEB(RuntimeError):
+    pass
+
+
+class ContractError(RuntimeError):
     pass
 
 
@@ -477,18 +482,16 @@ def download(url: str, expected_sha256: str, destination: Path) -> None:
 
 
 
-def load_config() -> dict[str, Any]:
-    config = contract.load_config()
-    contract.validate_config(config)
-    if config["vm"]["name"] != VM_NAME:
-        raise RuntimeErrorEB("unexpected VM name")
-    return config
+def load_config(source_commit: str | None = None) -> dict[str, Any]:
+    commit = source_commit if source_commit is not None else git_head()
+    return _source_commit_config(commit)
 
 
 def _source_commit_config(source_commit: str) -> dict[str, Any]:
+    contract = _source_bound_contract(source_commit)
     try:
         config = json.loads(
-            _git_blob_bytes(source_commit, contract.CONFIG_PATH).decode("utf-8")
+            _git_blob_bytes(source_commit, CONFIG_PATH).decode("utf-8")
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeErrorEB(
@@ -608,8 +611,17 @@ def ensure_ssh_key(root: Path) -> tuple[Path, Path]:
     return private, public
 
 
-def prepare(root: Path) -> dict[str, Any]:
-    config = load_config()
+def prepare(
+    root: Path,
+    source_commit: str | None = None,
+) -> dict[str, Any]:
+    commit = (
+        source_commit
+        if source_commit is not None
+        else _current_protected_main_commit()
+    )
+    config = load_config(commit)
+    contract = _source_bound_contract(commit)
     _private_key, public_key = ensure_ssh_key(root)
     image = config["vm"]["image"]
     cloud_image = root / "downloads" / Path(image["url"]).name
@@ -632,7 +644,7 @@ def prepare(root: Path) -> dict[str, Any]:
     receipt = {
         "schema_version": 1,
         "status": "prepared",
-        "config_sha256": sha256_file(CLUSTER / "config.json"),
+        "config_sha256": _git_blob_sha256(commit, CONFIG_PATH),
         "cloud_image": str(cloud_image),
         "cloud_image_sha256": sha256_file(cloud_image),
         "cloud_image_virtual_size": source_virtual_size,
@@ -1027,8 +1039,8 @@ def create_vm(root: Path) -> dict[str, Any]:
     _retirement_attempt_path().unlink(missing_ok=True)
     _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
-    config = load_config()
-    config_sha256 = sha256_file(CLUSTER / "config.json")
+    config = load_config(source_commit)
+    config_sha256 = _git_blob_sha256(source_commit, CONFIG_PATH)
     root_identity = str(root.resolve())
     attempt_path = root / "receipts/vm-create-attempt.json"
     domain_target = str(uuid.uuid4())
@@ -1047,7 +1059,7 @@ def create_vm(root: Path) -> dict[str, Any]:
         attempt,
     )
 
-    prepared = prepare(root)
+    prepared = prepare(root, source_commit)
     cloud_image = Path(prepared["cloud_image"])
     source_virtual_size = int(prepared["cloud_image_virtual_size"])
     if POOL_TARGET.exists() and any(POOL_TARGET.iterdir()):
@@ -1190,7 +1202,7 @@ def create_vm(root: Path) -> dict[str, Any]:
         atomic_json(attempt_path, attempt)
         if (
             _current_protected_main_commit() != source_commit
-            or sha256_file(CLUSTER / "config.json") != config_sha256
+            or sha256_file(CONFIG_PATH) != config_sha256
         ):
             raise RuntimeErrorEB("VM creation source/config changed during creation")
         receipt = {
@@ -1958,7 +1970,7 @@ def _require_live_k3s_runtime(
 def install_k3s(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
-    config = load_config()
+    config = load_config(source_commit)
     vm_create_path = root / "receipts/vm-create.json"
     try:
         vm_create = json.loads(vm_create_path.read_text(encoding="utf-8"))
@@ -2114,21 +2126,16 @@ def toolchain(
     commit = (
         source_commit
         if source_commit is not None
-        else _BOUND_SOURCE_COMMIT.get()
+        else (_BOUND_SOURCE_COMMIT.get() or git_head())
     )
-    if commit is None:
-        return bootstrap_tools.install(
-            root / "toolchain",
-            tool_names=["kubectl", "kustomize", "flux", "helm"],
-            include_artifacts=True,
-        )
     if COMMIT_RE.fullmatch(commit) is None:
         raise RuntimeErrorEB(
             "toolchain source commit must be exact"
         )
+    bootstrap = _source_bound_bootstrap_tools(commit)
     lock_bytes = _git_blob_bytes(
         commit,
-        bootstrap_tools.LOCK_PATH,
+        TOOLCHAIN_LOCK_PATH,
     )
     try:
         lock = json.loads(lock_bytes.decode("utf-8"))
@@ -2150,7 +2157,7 @@ def toolchain(
     if cached is not None:
         return cached
 
-    receipt = bootstrap_tools.install(
+    receipt = bootstrap.install(
         root / "toolchain",
         tool_names=["kubectl", "kustomize", "flux", "helm"],
         include_artifacts=True,
@@ -2659,7 +2666,7 @@ def apply_release(
         raise RuntimeErrorEB("release source is not current protected main")
     _require_kubernetes_target_binding(root, source_commit)
     release_target = _kubernetes_target_identity(root, source_commit)
-    config = load_config()
+    config = load_config(source_commit)
     api_replicas = int(config["semantic_search"]["api_replicas"])
     web_replicas = int(config["runtime_binding"]["web_replicas"])
     output = root / "bootstrap.yaml"
@@ -2667,6 +2674,7 @@ def apply_release(
         source_commit,
         BOOTSTRAP_TEMPLATE,
     )
+    contract = _source_bound_contract(source_commit)
     binding = contract.render_bootstrap_from_template(
         source_commit,
         api_digest,
@@ -2821,7 +2829,7 @@ def _semantic_provider_live_readback(
 ) -> dict[str, Any]:
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("semantic provider live source commit is not exact")
-    semantic = load_config()["semantic_search"]
+    semantic = load_config(source_commit)["semantic_search"]
     kubectl = toolchain(root)["tools"]["kubectl"]
     env = kube_env(root)
     tags = run(
@@ -2912,7 +2920,7 @@ def semantic_activate(root: Path) -> dict[str, Any]:
     _require_kubernetes_target_binding(root, source_commit)
     semantic_target = _kubernetes_target_identity(root, source_commit)
     with _bound_kube_env(root, semantic_target, source_commit):
-        config = load_config()
+        config = load_config(source_commit)
         semantic = config["semantic_search"]
         kubectl = toolchain(root)["tools"]["kubectl"]
         env = kube_env(root)
@@ -9021,7 +9029,7 @@ def _require_teardown_live_identity(
         source_commit = ownership.get("source_commit")
         if not isinstance(source_commit, str) or not COMMIT_RE.fullmatch(source_commit):
             raise RuntimeErrorEB("teardown creation receipt has no exact source commit")
-        config = load_config()
+        config = load_config(source_commit)
         _require_vm_create_receipt(ownership, source_commit, config, root)
         if not domain_present or not pool_present:
             raise RuntimeErrorEB(
@@ -9188,6 +9196,43 @@ def _source_commit_python_module(
             sys.modules.pop(module_name, None)
         else:
             sys.modules[module_name] = previous
+    return module
+
+
+def _source_bound_contract(source_commit: str) -> Any:
+    module = _source_commit_python_module(
+        source_commit,
+        CONTRACT_HELPER,
+        "_experiment_b_source_contract",
+    )
+    required = (
+        "validate_config",
+        "render_cloud_init",
+        "render_bootstrap_from_template",
+    )
+    if any(not callable(getattr(module, name, None)) for name in required):
+        raise RuntimeErrorEB(
+            "source-commit Experiment-B contract helper is incomplete"
+        )
+    module.ROOT = ROOT
+    module.CONFIG_PATH = CONFIG_PATH
+    module.BOOTSTRAP_TEMPLATE = BOOTSTRAP_TEMPLATE
+    module.ContractError = ContractError
+    return module
+
+
+def _source_bound_bootstrap_tools(source_commit: str) -> Any:
+    module = _source_commit_python_module(
+        source_commit,
+        BOOTSTRAP_TOOLS_HELPER,
+        "_experiment_b_source_bootstrap_tools",
+    )
+    if not callable(getattr(module, "install", None)):
+        raise RuntimeErrorEB(
+            "source-commit bootstrap-tools helper is incomplete"
+        )
+    module.ROOT = ROOT
+    module.LOCK_PATH = TOOLCHAIN_LOCK_PATH
     return module
 
 
@@ -14153,6 +14198,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (RuntimeErrorEB, contract.ContractError) as exc:
+    except (RuntimeErrorEB, ContractError) as exc:
         print(json.dumps({"status": "error", "error_class": type(exc).__name__}, sort_keys=True))
         raise SystemExit(2)
