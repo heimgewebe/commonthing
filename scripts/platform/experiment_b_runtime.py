@@ -48,6 +48,7 @@ import experiment_b as contract
 
 ROOT = Path(__file__).resolve().parents[2]
 CLUSTER = ROOT / "platform/clusters/experiment-b"
+BOOTSTRAP_TEMPLATE = CLUSTER / "bootstrap-template.yaml"
 NAMESPACES = CLUSTER / "namespaces"
 MIGRATION = CLUSTER / "migration"
 APP_OVERLAY = ROOT / "platform/apps/weltgewebe/overlays/experiment-b"
@@ -2660,8 +2661,16 @@ def apply_release(
     api_replicas = int(config["semantic_search"]["api_replicas"])
     web_replicas = int(config["runtime_binding"]["web_replicas"])
     output = root / "bootstrap.yaml"
-    binding = contract.render_bootstrap(
-        source_commit, api_digest, web_digest, output
+    bootstrap_template = _git_blob_bytes(
+        source_commit,
+        BOOTSTRAP_TEMPLATE,
+    )
+    binding = contract.render_bootstrap_from_template(
+        source_commit,
+        api_digest,
+        web_digest,
+        output,
+        bootstrap_template,
     )
     flux_contract = _flux_bootstrap_contract(root, binding)
     with _bound_kube_env(root, release_target, source_commit):
@@ -3143,10 +3152,14 @@ def _flux_bootstrap_contract(
     kustomization_specs: dict[str, dict[str, Any]] = {}
     for document in documents:
         if not isinstance(document, dict):
-            continue
+            raise RuntimeErrorEB(
+                "Experiment-B bootstrap contains an unexpected document"
+            )
         metadata = document.get("metadata", {})
         if not isinstance(metadata, dict):
-            continue
+            raise RuntimeErrorEB(
+                "Experiment-B bootstrap contains an unexpected document"
+            )
         name = metadata.get("name")
         namespace = metadata.get("namespace")
         spec = document.get("spec")
@@ -3182,6 +3195,10 @@ def _flux_bootstrap_contract(
                     f"Experiment-B bootstrap Kustomization is duplicated: {name}"
                 )
             kustomization_specs[name] = spec
+        else:
+            raise RuntimeErrorEB(
+                "Experiment-B bootstrap contains an unexpected document"
+            )
 
     if source_spec is None:
         raise RuntimeErrorEB("Experiment-B bootstrap GitRepository contract is missing")
@@ -9257,6 +9274,26 @@ def _source_bound_dataset_binding(
                     "T048 dataset manifest is not bound to source-commit config"
                 ) from exc
             raise
+        with tempfile.TemporaryDirectory(
+            prefix="experiment-b-t048-canonical-"
+        ) as temporary:
+            try:
+                expected_manifest = domain_scale.generate_fixture(
+                    config_path,
+                    str(proof["profile"]),
+                    Path(temporary) / "fixture",
+                )
+            except Exception as exc:
+                error_type = getattr(domain_scale, "DomainScaleError", None)
+                if error_type is not None and isinstance(exc, error_type):
+                    raise RuntimeErrorEB(
+                        "source-commit T048 canonical fixture generation failed"
+                    ) from exc
+                raise
+        if not isinstance(expected_manifest, dict) or manifest != expected_manifest:
+            raise RuntimeErrorEB(
+                "T048 retained fixture is not canonical source-commit generator output"
+            )
     if manifest.get("profile") != proof["profile"]:
         raise RuntimeErrorEB("T048 dataset manifest profile drifted")
     files = manifest.get("files")
@@ -11919,6 +11956,7 @@ SELECT json_build_object(
         item
         for item in tables
         if isinstance(item, dict)
+        and item.get("schema") == "public"
         and item.get("name") == "domain_nodes"
     ]
     if (

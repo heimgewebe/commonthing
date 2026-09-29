@@ -1442,6 +1442,32 @@ spec:
             ),
         )
 
+    def test_flux_bootstrap_contract_rejects_unexpected_document(self) -> None:
+        commit = "a" * 40
+        api_digest = "sha256:" + "b" * 64
+        web_digest = "sha256:" + "c" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap = root / "bootstrap.yaml"
+            binding = runtime.contract.render_bootstrap(
+                commit,
+                api_digest,
+                web_digest,
+                bootstrap,
+            )
+            bootstrap.write_text(
+                bootstrap.read_text(encoding="utf-8")
+                + "\n---\napiVersion: v1\nkind: ConfigMap\n"
+                + "metadata:\n  name: injected\n  namespace: flux-system\n",
+                encoding="utf-8",
+            )
+            binding["sha256"] = runtime.sha256_file(bootstrap)
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "unexpected document",
+            ):
+                runtime._flux_bootstrap_contract(root, binding)
+
     def test_apply_release_requires_exact_flux_revision_and_set(self) -> None:
         source = inspect.getsource(runtime.apply_release)
         self.assertIn("_require_flux_source_revision(", source)
@@ -1451,6 +1477,12 @@ spec:
             'kubectl_apply(root, str(flux_contract["bootstrap_manifest"]))',
             source,
         )
+        self.assertIn(
+            "_git_blob_bytes(\n        source_commit,\n        BOOTSTRAP_TEMPLATE,",
+            source,
+        )
+        self.assertIn("render_bootstrap_from_template(", source)
+        self.assertNotIn("contract.render_bootstrap(", source)
         self.assertNotIn("output.read_text", source)
         bootstrap_contract_source = inspect.getsource(
             runtime._flux_bootstrap_contract
@@ -4931,6 +4963,57 @@ spec:
         self.assertIn('"--quote-all-identifiers"', source)
         self.assertIn("schema_sha256", source)
         self.assertIn("_run_bound_postgres_client", source)
+
+    def test_database_signature_uses_public_domain_nodes_as_canonical_state(
+        self,
+    ) -> None:
+        payload = {
+            "tables": [
+                {
+                    "schema": "public",
+                    "name": "domain_nodes",
+                    "rows": 2,
+                    "md5": "a" * 32,
+                },
+                {
+                    "schema": "weltgewebe_perf",
+                    "name": "domain_nodes",
+                    "rows": 2,
+                    "md5": "b" * 32,
+                },
+            ],
+            "sequences": [],
+        }
+        with mock.patch.object(
+            runtime,
+            "_psql",
+            return_value=json.dumps(payload),
+        ):
+            signature = runtime._database_signature(
+                Path("/unused"),
+                database_identity=("user", "db"),
+            )
+        self.assertEqual(signature, payload)
+
+        fixture_only = {
+            **payload,
+            "tables": [payload["tables"][1]],
+        }
+        with (
+            mock.patch.object(
+                runtime,
+                "_psql",
+                return_value=json.dumps(fixture_only),
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "no canonical domain state",
+            ),
+        ):
+            runtime._database_signature(
+                Path("/unused"),
+                database_identity=("user", "db"),
+            )
 
     def test_application_contract_render_uses_sealed_source_commit_tree(
         self,
@@ -10508,6 +10591,18 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                 self.assertEqual(config_path.read_bytes(), config_bytes)
                 return {}, returned_manifest
 
+            @staticmethod
+            def generate_fixture(
+                config_path: Path,
+                profile_name: str,
+                output_dir: Path,
+            ) -> dict:
+                self.assertTrue(str(config_path).startswith("/proc/self/fd/"))
+                self.assertEqual(config_path.read_bytes(), config_bytes)
+                self.assertEqual(profile_name, "ci")
+                self.assertEqual(output_dir.name, "fixture")
+                return returned_manifest
+
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir) / "repo"
             domain_path = repo_root / "scripts/performance/domain_scale.py"
@@ -10550,6 +10645,99 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
         self.assertEqual(binding["config_sha256"], returned_manifest["config_sha256"])
         self.assertEqual(binding["profile"], "ci")
         self.assertEqual(binding["counts"], {"nodes": 2, "edges": 1})
+
+    def test_source_bound_dataset_binding_rejects_self_consistent_mutation(
+        self,
+    ) -> None:
+        commit = "a" * 40
+        config_bytes = b'{"authority":"source-commit"}\n'
+        canonical_manifest = {
+            "generator": "scripts/performance/domain_scale.py",
+            "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "database_schema": "weltgewebe_perf",
+            "profile": "ci",
+            "counts": {"nodes": 2, "edges": 1},
+            "files": {
+                "nodes": {
+                    "name": "domain_nodes.csv",
+                    "sha256": "b" * 64,
+                },
+                "edges": {
+                    "name": "domain_edges.csv",
+                    "sha256": "c" * 64,
+                },
+            },
+        }
+        retained_manifest = json.loads(json.dumps(canonical_manifest))
+        retained_manifest["files"]["nodes"]["sha256"] = "d" * 64
+
+        class FakeDomainScale:
+            DomainScaleError = RuntimeError
+
+            @staticmethod
+            def load_bound_manifest(
+                manifest_path: Path,
+                config_path: Path,
+            ) -> tuple[dict, dict]:
+                self.assertTrue(manifest_path.is_file())
+                self.assertEqual(config_path.read_bytes(), config_bytes)
+                return {}, retained_manifest
+
+            @staticmethod
+            def generate_fixture(
+                config_path: Path,
+                profile_name: str,
+                output_dir: Path,
+            ) -> dict:
+                self.assertEqual(config_path.read_bytes(), config_bytes)
+                self.assertEqual(profile_name, "ci")
+                self.assertEqual(output_dir.name, "fixture")
+                return canonical_manifest
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir) / "repo"
+            domain_path = repo_root / "scripts/performance/domain_scale.py"
+            config_path = repo_root / "configs/performance/domain-scale.v1.json"
+            domain_path.parent.mkdir(parents=True)
+            config_path.parent.mkdir(parents=True)
+            domain_path.write_text(
+                'raise RuntimeError("mutable worktree generator executed")\n',
+                encoding="utf-8",
+            )
+            config_path.write_bytes(b'{"authority":"mutable-worktree"}\n')
+            manifest = repo_root / "fixture/manifest.json"
+            manifest.parent.mkdir()
+            manifest.write_text(
+                json.dumps(retained_manifest) + "\n",
+                encoding="utf-8",
+            )
+            contract = {
+                "dataset_proof": {
+                    "generator": "scripts/performance/domain_scale.py",
+                    "config": "configs/performance/domain-scale.v1.json",
+                    "profile": "ci",
+                }
+            }
+            with (
+                mock.patch.object(runtime, "ROOT", repo_root),
+                mock.patch.object(runtime, "DOMAIN_SCALE", domain_path),
+                mock.patch.object(runtime, "DOMAIN_SCALE_CONFIG", config_path),
+                mock.patch.object(
+                    runtime,
+                    "_git_blob_bytes",
+                    return_value=config_bytes,
+                ),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "not canonical source-commit generator output",
+                ),
+            ):
+                runtime._source_bound_dataset_binding(
+                    commit,
+                    manifest,
+                    contract,
+                    FakeDomainScale,
+                )
 
     def test_t048_runtime_config_authority_is_source_commit_bound(self) -> None:
         seed_source = inspect.getsource(runtime.seed_t048_fixture)

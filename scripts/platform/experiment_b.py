@@ -260,11 +260,12 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
-def render_bootstrap(
+def render_bootstrap_from_template(
     source_commit: str,
     api_digest: str,
     web_digest: str,
     output: Path,
+    template_bytes: bytes,
 ) -> dict[str, str]:
     if not COMMIT_RE.fullmatch(source_commit):
         raise ContractError("source commit must be exactly 40 lowercase hex characters")
@@ -273,7 +274,10 @@ def render_bootstrap(
     if not DIGEST_RE.fullmatch(web_digest):
         raise ContractError("Web digest must be sha256:<64 lowercase hex>")
 
-    template = BOOTSTRAP_TEMPLATE.read_text(encoding="utf-8")
+    try:
+        template = template_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContractError("bootstrap template must be UTF-8") from exc
     expected_tokens = {"SOURCE_COMMIT", "API_DIGEST", "WEB_DIGEST"}
     if set(TOKEN_RE.findall(template)) != expected_tokens:
         raise ContractError("bootstrap template token set drifted")
@@ -296,6 +300,21 @@ def render_bootstrap(
         "api_digest": api_digest,
         "web_digest": web_digest,
     }
+
+
+def render_bootstrap(
+    source_commit: str,
+    api_digest: str,
+    web_digest: str,
+    output: Path,
+) -> dict[str, str]:
+    return render_bootstrap_from_template(
+        source_commit,
+        api_digest,
+        web_digest,
+        output,
+        BOOTSTRAP_TEMPLATE.read_bytes(),
+    )
 
 
 def render_cloud_init(public_key_file: Path, output_dir: Path, hostname: str) -> dict[str, str]:

@@ -77,6 +77,32 @@ class ExperimentBContractTests(unittest.TestCase):
             self.assertIn("sha256:" + "c" * 64, rendered)
             self.assertEqual(result["sha256"], eb.sha256_file(output))
 
+    def test_bootstrap_can_render_authoritative_template_bytes(self) -> None:
+        template_bytes = (CLUSTER / "bootstrap-template.yaml").read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mutable_template = root / "bootstrap-template.yaml"
+            mutable_template.write_text(
+                "kind: ConfigMap\nmetadata:\n  name: mutable-worktree\n",
+                encoding="utf-8",
+            )
+            output = root / "bootstrap.yaml"
+            with mock.patch.object(
+                eb,
+                "BOOTSTRAP_TEMPLATE",
+                mutable_template,
+            ):
+                eb.render_bootstrap_from_template(
+                    "a" * 40,
+                    "sha256:" + "b" * 64,
+                    "sha256:" + "c" * 64,
+                    output,
+                    template_bytes,
+                )
+            rendered = output.read_text(encoding="utf-8")
+            self.assertIn("commonthing-experiment-b", rendered)
+            self.assertNotIn("mutable-worktree", rendered)
+
     def test_migration_flux_recreates_digest_changed_job(self) -> None:
         template = (CLUSTER / "bootstrap-template.yaml").read_text(encoding="utf-8")
         migration = template.split(
