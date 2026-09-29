@@ -1445,6 +1445,22 @@ spec:
         self.assertIn("_require_flux_source_revision(", source)
         self.assertIn("_require_exact_flux_revision_ready(", source)
         self.assertIn("_flux_bootstrap_contract(", source)
+        self.assertIn(
+            'kubectl_apply(root, str(flux_contract["bootstrap_manifest"]))',
+            source,
+        )
+        self.assertNotIn("output.read_text", source)
+        bootstrap_contract_source = inspect.getsource(
+            runtime._flux_bootstrap_contract
+        )
+        self.assertIn(
+            "_verified_snapshot_bytes(",
+            bootstrap_contract_source,
+        )
+        self.assertNotIn(
+            "bootstrap_path.read_text",
+            bootstrap_contract_source,
+        )
         self.assertIn('"gitrepository"', source)
         self.assertIn('"kustomizations"', source)
         self.assertNotIn('flux, "get", "kustomizations"', source)
@@ -1840,7 +1856,9 @@ spec:
         release = inspect.getsource(runtime.apply_release)
         self.assertLess(
             release.index("_begin_release_attempt("),
-            release.index("kubectl_apply(root, output.read_text"),
+            release.index(
+                'kubectl_apply(root, str(flux_contract["bootstrap_manifest"]))'
+            ),
         )
         self.assertIn("_complete_live_check_attempt(", release)
 
@@ -2119,6 +2137,11 @@ spec:
                         "192.168.122.10",
                         "https://192.168.122.10:6443",
                     ),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_bound_kube_env",
+                    return_value=mock.MagicMock(),
                 ),
                 mock.patch.object(
                     runtime,
@@ -3617,6 +3640,11 @@ spec:
                         "images_sha256": "2" * 64,
                         "runtime_image_ids_sha256": "3" * 64,
                     },
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_bound_kube_env",
+                    return_value=mock.MagicMock(),
                 ),
                 mock.patch.object(
                     runtime,
@@ -9097,6 +9125,17 @@ spec:
             "_require_t048_postgres_runtime_binding",
             first_postgres + 1,
         )
+        bound_snapshot = source.index(
+            "bound_stack.enter_context(_bound_kube_env(root, target_binding_before))"
+        )
+        port_forward = source.index("_start_api_port_forward")
+        final_bound_close = source.rindex("bound_stack.close()")
+        self.assertLess(first_target, bound_snapshot)
+        self.assertLess(bound_snapshot, first_postgres)
+        self.assertLess(bound_snapshot, first_fixture)
+        self.assertLess(bound_snapshot, port_forward)
+        self.assertLess(port_forward, load)
+        self.assertGreater(final_bound_close, load)
         self.assertLess(first_target, first_fixture)
         self.assertLess(first_postgres, first_fixture)
         self.assertLess(first_fixture, load)
@@ -10447,10 +10486,12 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
                 stderr.close()
 
         t048_source = inspect.getsource(runtime.t048_load_proof)
-        self.assertIn(
-            "_start_api_port_forward(\n        root, pod_name\n    )",
-            t048_source,
+        port_forward = t048_source.index("_start_api_port_forward(")
+        bound_snapshot = t048_source.index(
+            "bound_stack.enter_context(_bound_kube_env(root, target_binding_before))"
         )
+        self.assertLess(bound_snapshot, port_forward)
+        self.assertIn("root, pod_name", t048_source[port_forward:port_forward + 160])
 
 
 if __name__ == "__main__":

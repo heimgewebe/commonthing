@@ -32,7 +32,7 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -1281,6 +1281,19 @@ def _verified_snapshot_fd(
         yield snapshot.fileno()
 
 
+def _verified_snapshot_bytes(
+    path: Path,
+    expected_sha256: str,
+    context: str,
+) -> bytes:
+    with _verified_snapshot_fd(path, expected_sha256, context) as snapshot_fd:
+        size = os.fstat(snapshot_fd).st_size
+        payload = os.pread(snapshot_fd, size, 0)
+    if len(payload) != size:
+        raise RuntimeErrorEB(f"{context} snapshot read was incomplete")
+    return payload
+
+
 def _open_verified_k3s_binary(path: Path, expected_sha256: str) -> int:
     return _open_verified_file(
         path, expected_sha256, "prepared k3s binary"
@@ -2192,7 +2205,7 @@ def apply_release(
     )
     flux_contract = _flux_bootstrap_contract(root, binding)
     with _bound_kube_env(root, release_target):
-        kubectl_apply(root, output.read_text(encoding="utf-8"))
+        kubectl_apply(root, str(flux_contract["bootstrap_manifest"]))
         kubectl = toolchain(root)["tools"]["kubectl"]
         env = kube_env(root)
         for _ in range(120):
@@ -2651,16 +2664,17 @@ def _flux_bootstrap_contract(
     if (
         not isinstance(expected_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
-        or not bootstrap_path.is_file()
-        or bootstrap_path.is_symlink()
-        or not secrets.compare_digest(sha256_file(bootstrap_path), expected_sha256)
     ):
         raise RuntimeErrorEB("Experiment-B rendered bootstrap binding drifted")
+    bootstrap_bytes = _verified_snapshot_bytes(
+        bootstrap_path,
+        expected_sha256,
+        "rendered Experiment-B bootstrap",
+    )
     try:
-        documents = list(
-            yaml.safe_load_all(bootstrap_path.read_text(encoding="utf-8"))
-        )
-    except (OSError, yaml.YAMLError) as exc:
+        bootstrap_manifest = bootstrap_bytes.decode("utf-8")
+        documents = list(yaml.safe_load_all(bootstrap_manifest))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise RuntimeErrorEB("Experiment-B rendered bootstrap is invalid") from exc
 
     source_spec: dict[str, Any] | None = None
@@ -2717,6 +2731,7 @@ def _flux_bootstrap_contract(
     _require_exact_flux_kustomizations(kustomization_specs)
     return {
         "bootstrap_sha256": expected_sha256,
+        "bootstrap_manifest": bootstrap_manifest,
         "source_spec": source_spec,
         "release_config_map": release_config_map,
         "kustomization_specs": kustomization_specs,
@@ -9560,36 +9575,42 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         "kubeconfig_sha256": target_receipt_before["kubeconfig_sha256"],
         "server": target_server_before,
     }
-    postgres_binding_before = _require_t048_postgres_runtime_binding(root)
-    fixture_receipt = _validated_t048_fixture_receipt(root, source_commit)
-    fixture_binding_before = {
-        "manifest": fixture_receipt.get("manifest"),
-        "manifest_sha256": fixture_receipt.get("manifest_sha256"),
-        "generation_id": fixture_receipt.get("generation_id"),
-        "live_binding": fixture_receipt.get("live_binding"),
-    }
-    evidence, _domain_scale = _performance_modules()
-    manifest = Path(fixture_receipt["manifest"])
-    policy = evidence.load_policy(PERFORMANCE_POLICY)
-    contract_section = evidence.api_runtime_section(policy)
-    scenario = contract_section["scenario"]
-    k6_image, k6_workflow_sha256 = _k6_image_binding()
-    k6_summary_path = root / "performance/k6-summary.json"
-    metrics_before_path = root / "performance/metrics-before.prom"
-    metrics_after_path = root / "performance/metrics-after.prom"
-    resource_path = root / "performance/resource-receipt.json"
-    db_path = root / "performance/database-connections.json"
+    bound_stack = ExitStack()
+    bound_stack.enter_context(_bound_kube_env(root, target_binding_before))
+    try:
+        postgres_binding_before = _require_t048_postgres_runtime_binding(root)
+        fixture_receipt = _validated_t048_fixture_receipt(root, source_commit)
+        fixture_binding_before = {
+            "manifest": fixture_receipt.get("manifest"),
+            "manifest_sha256": fixture_receipt.get("manifest_sha256"),
+            "generation_id": fixture_receipt.get("generation_id"),
+            "live_binding": fixture_receipt.get("live_binding"),
+        }
+        evidence, _domain_scale = _performance_modules()
+        manifest = Path(fixture_receipt["manifest"])
+        policy = evidence.load_policy(PERFORMANCE_POLICY)
+        contract_section = evidence.api_runtime_section(policy)
+        scenario = contract_section["scenario"]
+        k6_image, k6_workflow_sha256 = _k6_image_binding()
+        k6_summary_path = root / "performance/k6-summary.json"
+        metrics_before_path = root / "performance/metrics-before.prom"
+        metrics_after_path = root / "performance/metrics-after.prom"
+        resource_path = root / "performance/resource-receipt.json"
+        db_path = root / "performance/database-connections.json"
 
-    pod_name, pod, api_image_binding_before = _require_t048_api_runtime_binding(
-        root, source_commit
-    )
-    declared_cpu, declared_memory = _require_api_resource_limits(
-        pod, load_config()
-    )
+        pod_name, pod, api_image_binding_before = _require_t048_api_runtime_binding(
+            root, source_commit
+        )
+        declared_cpu, declared_memory = _require_api_resource_limits(
+            pod, load_config()
+        )
 
-    process, port, pf_stdout, pf_stderr = _start_api_port_forward(
-        root, pod_name
-    )
+        process, port, pf_stdout, pf_stderr = _start_api_port_forward(
+            root, pod_name
+        )
+    except BaseException:
+        bound_stack.close()
+        raise
     base_url = f"http://127.0.0.1:{port}"
     try:
         before_status, before_body, _elapsed = _http_read(f"{base_url}/metrics")
@@ -9886,6 +9907,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             process.wait(timeout=5)
         pf_stdout.close()
         pf_stderr.close()
+        bound_stack.close()
 
 
 def _gateway_base_url(root: Path, source_commit: str) -> str:
