@@ -2232,6 +2232,35 @@ spec:
         load.wait.assert_called_once_with(timeout=10)
         load.kill.assert_not_called()
 
+    def test_k6_summary_output_channel_is_pathless_and_sealed(self) -> None:
+        canonical = {"canonical": True}
+        encoded = json.dumps(canonical, separators=(",", ":")).encode("utf-8")
+        with runtime._k6_summary_output_channel() as summary_fd:
+            target = runtime.os.readlink(f"/proc/self/fd/{summary_fd}")
+            self.assertIn("memfd:commonthing-experiment-b-k6-summary", target)
+            runtime.os.write(
+                summary_fd,
+                b"k6 progress\n"
+                + runtime.K6_SUMMARY_STDOUT_MARKER.encode("utf-8")
+                + encoded
+                + b"\n",
+            )
+            self.assertEqual(
+                json.loads(runtime._seal_k6_summary_output(summary_fd)),
+                canonical,
+            )
+            with self.assertRaises(OSError):
+                runtime.os.write(summary_fd, b"forged")
+
+        with runtime._k6_summary_output_channel() as duplicate_fd:
+            marker = runtime.K6_SUMMARY_STDOUT_MARKER.encode("utf-8")
+            runtime.os.write(duplicate_fd, marker + b"{}" + marker + b"{}")
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "no unique authority marker",
+            ):
+                runtime._seal_k6_summary_output(duplicate_fd)
+
     def test_jetstream_signature_tracks_durable_consumer_continuity_only(self) -> None:
         monitoring = {
             "streams": 1,
@@ -10850,6 +10879,20 @@ class ExperimentBLatestP1RegressionTests(unittest.TestCase):
         self.assertIn('"--interactive"', load_source)
         self.assertIn('k6_image, "run", "-"', load_source)
         self.assertIn("stdin=subprocess.PIPE", load_source)
+        self.assertIn("_k6_summary_output_channel()", load_source)
+        self.assertIn("_seal_k6_summary_output(", load_source)
+        self.assertIn("stdout=k6_summary_output_fd", load_source)
+        self.assertIn('"API_RUNTIME_SUMMARY_PATH=stdout"', load_source)
+        self.assertIn(
+            'Path(f"/proc/self/fd/{k6_summary_snapshot_fd}")',
+            load_source,
+        )
+        self.assertNotIn('"--volume"', load_source)
+        self.assertNotIn("k6-summary.json", load_source)
+        self.assertNotIn("load_k6_summary(k6_summary_path)", load_source)
+        workload_source = runtime.K6_WORKLOAD.read_text(encoding="utf-8")
+        self.assertIn("outputPath === 'stdout'", workload_source)
+        self.assertIn(runtime.K6_SUMMARY_STDOUT_MARKER, workload_source)
         self.assertNotIn("/workspace", load_source)
         self.assertNotIn("sha256_file(PERFORMANCE_POLICY)", load_source)
 

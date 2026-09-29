@@ -118,5 +118,9 @@ export function handleSummary(data) {
   });
   const outputPath =
     __ENV.API_RUNTIME_SUMMARY_PATH || 'api-runtime-summary.json';
-  return { [outputPath]: JSON.stringify(enriched) };
+  const encoded = JSON.stringify(enriched);
+  if (outputPath === 'stdout') {
+    return { stdout: `__WELTGEWEBE_K6_SUMMARY_V1__${encoded}\n` };
+  }
+  return { [outputPath]: encoded };
 }

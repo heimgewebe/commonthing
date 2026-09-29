@@ -82,6 +82,8 @@ T048_RANKING_REVISION = "weltgewebe-hybrid-ranking-v2"
 T048_PUBLIC_CONTENT_SHA256 = "0" * 64
 T048_HIDDEN_CONTENT_SHA256 = "e0f631f5602e764ef8a5f14e36d2d81663b20cd305a30af0dad6c0d759e5a955"
 T048_REDACTED_TEXT = "[nicht öffentlich]"
+K6_SUMMARY_STDOUT_MARKER = "__WELTGEWEBE_K6_SUMMARY_V1__"
+K6_SUMMARY_MAX_BYTES = 4 * 1024 * 1024
 
 
 class RuntimeErrorEB(RuntimeError):
@@ -11149,6 +11151,85 @@ def _stop_process(process: subprocess.Popen[Any]) -> None:
         process.wait(timeout=5)
 
 
+@contextmanager
+def _k6_summary_output_channel() -> Iterator[int]:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeErrorEB("k6 summary output requires an anonymous Linux memfd")
+    memfd_create = getattr(os, "memfd_create", None)
+    allow_sealing = int(getattr(os, "MFD_ALLOW_SEALING", 0x0002))
+    cloexec = int(getattr(os, "MFD_CLOEXEC", 0x0001))
+    try:
+        if callable(memfd_create):
+            summary_fd = memfd_create(
+                "commonthing-experiment-b-k6-summary",
+                flags=allow_sealing | cloexec,
+            )
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            native_memfd_create = libc.memfd_create
+            native_memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+            native_memfd_create.restype = ctypes.c_int
+            summary_fd = native_memfd_create(
+                b"commonthing-experiment-b-k6-summary",
+                allow_sealing | cloexec,
+            )
+            if summary_fd < 0:
+                error_number = ctypes.get_errno()
+                raise OSError(error_number, os.strerror(error_number))
+    except (AttributeError, OSError) as exc:
+        raise RuntimeErrorEB("k6 summary output memfd creation failed") from exc
+    try:
+        os.fchmod(summary_fd, 0o600)
+        yield summary_fd
+    finally:
+        os.close(summary_fd)
+
+
+def _seal_k6_summary_output(summary_fd: int) -> bytes:
+    try:
+        metadata = os.fstat(summary_fd)
+    except OSError as exc:
+        raise RuntimeErrorEB("k6 summary output descriptor is invalid") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size <= 0
+        or metadata.st_size > K6_SUMMARY_MAX_BYTES
+    ):
+        raise RuntimeErrorEB("k6 summary output size is invalid")
+    f_add_seals = int(getattr(fcntl, "F_ADD_SEALS", 1033))
+    f_get_seals = int(getattr(fcntl, "F_GET_SEALS", 1034))
+    required_seals = (
+        int(getattr(fcntl, "F_SEAL_SEAL", 0x0001))
+        | int(getattr(fcntl, "F_SEAL_SHRINK", 0x0002))
+        | int(getattr(fcntl, "F_SEAL_GROW", 0x0004))
+        | int(getattr(fcntl, "F_SEAL_WRITE", 0x0008))
+    )
+    try:
+        fcntl.fcntl(summary_fd, f_add_seals, required_seals)
+        observed_seals = fcntl.fcntl(summary_fd, f_get_seals)
+    except OSError as exc:
+        raise RuntimeErrorEB("k6 summary output sealing failed") from exc
+    if observed_seals & required_seals != required_seals:
+        raise RuntimeErrorEB("k6 summary output sealing is incomplete")
+    payload = os.pread(summary_fd, metadata.st_size, 0)
+    if len(payload) != metadata.st_size:
+        raise RuntimeErrorEB("k6 summary output descriptor read is incomplete")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeErrorEB("k6 summary output is not UTF-8") from exc
+    if text.count(K6_SUMMARY_STDOUT_MARKER) != 1:
+        raise RuntimeErrorEB("k6 summary output has no unique authority marker")
+    _prefix, encoded = text.split(K6_SUMMARY_STDOUT_MARKER, 1)
+    encoded = encoded.lstrip()
+    try:
+        summary, end = json.JSONDecoder().raw_decode(encoded)
+    except json.JSONDecodeError as exc:
+        raise RuntimeErrorEB("k6 summary output is invalid JSON") from exc
+    if not isinstance(summary, dict) or encoded[end:].strip():
+        raise RuntimeErrorEB("k6 summary output has invalid trailing content")
+    return encoded[:end].encode("utf-8")
+
 def _sample_t048_load(
     root: Path,
     pod_name: str,
@@ -11209,11 +11290,13 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         k6_workload_text, k6_workload_sha256 = _source_bound_k6_workload(
             source_commit
         )
-        k6_summary_path = root / "performance/k6-summary.json"
         metrics_before_path = root / "performance/metrics-before.prom"
         metrics_after_path = root / "performance/metrics-after.prom"
         resource_path = root / "performance/resource-receipt.json"
         db_path = root / "performance/database-connections.json"
+        k6_summary_output_fd = bound_stack.enter_context(
+            _k6_summary_output_channel()
+        )
 
         pod_name, pod, api_image_binding_before = _require_t048_api_runtime_binding(
             root, source_commit
@@ -11243,12 +11326,10 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         run_id = f"t085-{source_commit[:12]}-{int(time.time())}"
         manifest_sha = sha256_file(manifest)
         evidence_dir = root / "performance"
-        stdout_path = evidence_dir / "k6.stdout"
         stderr_path = evidence_dir / "k6.stderr"
         docker_args = [
             "docker", "run", "--rm", "--interactive", "--network", "host",
             "--user", f"{os.getuid()}:{os.getgid()}",
-            "--volume", f"{evidence_dir}:/evidence",
             "--env", f"BASE_URL={base_url}",
             "--env", f"API_RUNTIME_VUS={scenario['virtual_users']}",
             "--env", f"API_RUNTIME_DURATION_SECONDS={scenario['duration_seconds']}",
@@ -11258,7 +11339,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "--env", f"API_RUNTIME_SEARCH_QUERY={scenario['search_query']}",
             "--env", f"API_RUNTIME_RUN_ID={run_id}",
             "--env", f"API_RUNTIME_K6_IMAGE={k6_image}",
-            "--env", "API_RUNTIME_SUMMARY_PATH=/evidence/k6-summary.json",
+            "--env", "API_RUNTIME_SUMMARY_PATH=stdout",
             k6_image, "run", "-",
         ]
 
@@ -11266,14 +11347,13 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         resource_samples = [initial_cgroup]
         db_samples = [_database_connection_count(root)]
         sampler_started = time.time_ns() // 1_000_000
-        with stdout_path.open("w", encoding="utf-8") as out, stderr_path.open(
-            "w", encoding="utf-8"
-        ) as err:
+        k6_summary_snapshot_fd: int | None = None
+        with stderr_path.open("w", encoding="utf-8") as err:
             load = subprocess.Popen(
                 docker_args,
                 cwd=ROOT,
                 stdin=subprocess.PIPE,
-                stdout=out,
+                stdout=k6_summary_output_fd,
                 stderr=err,
                 text=True,
             )
@@ -11292,6 +11372,16 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
                 resource_samples,
                 db_samples,
             )
+            if load_returncode == 0:
+                k6_summary_payload = _seal_k6_summary_output(
+                    k6_summary_output_fd
+                )
+                k6_summary_snapshot_fd = bound_stack.enter_context(
+                    _sealed_snapshot_fd(
+                        k6_summary_payload,
+                        "canonical T048 k6 summary",
+                    )
+                )
         resource_samples.append(_sample_api_cgroup(root, pod_name))
         db_samples.append(_database_connection_count(root))
         sampler_finished = time.time_ns() // 1_000_000
@@ -11361,6 +11451,8 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         if load_returncode != 0:
             detail = stderr_path.read_text(encoding="utf-8")[-3000:]
             raise RuntimeErrorEB(f"canonical T048 k6 workload failed: {detail}")
+        if k6_summary_snapshot_fd is None:
+            raise RuntimeErrorEB("canonical T048 k6 summary snapshot is unavailable")
 
         after_status, after_body, _elapsed = _http_read(f"{base_url}/metrics")
         if after_status != 200:
@@ -11416,7 +11508,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         evidence.load_resource_receipt(resource_path)
         evidence.load_database_connection_receipt(db_path)
 
-        summary = evidence.load_k6_summary(k6_summary_path)
+        summary = evidence.load_k6_summary(
+            Path(f"/proc/self/fd/{k6_summary_snapshot_fd}")
+        )
         if evidence.extract_declared_scenario(summary) != scenario:
             raise RuntimeErrorEB("k6 scenario drifted from the canonical T048 policy")
         http_metrics = evidence.extract_http_metrics(summary)
