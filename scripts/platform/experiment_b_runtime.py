@@ -15192,6 +15192,51 @@ def portability_report(root: Path) -> dict[str, Any]:
             "fresh T048 load attempt is not bound to its current success receipt"
         )
 
+    fresh_status = status(root)
+    if (
+        not isinstance(fresh_status, dict)
+        or fresh_status.get("status") != "observed"
+        or fresh_status.get("source_commit") != source_commit
+    ):
+        raise RuntimeErrorEB(
+            "fresh status did not return source-bound live evidence"
+        )
+    for name, required_status in (
+        ("status.json", "observed"),
+        ("status-attempt.json", "pass"),
+    ):
+        path = root / "receipts" / name
+        try:
+            raw = path.read_bytes()
+            payload = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeErrorEB(
+                f"fresh status portability receipt is invalid: {name}"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("status") != required_status
+            or payload.get("source_commit") != source_commit
+        ):
+            raise RuntimeErrorEB(
+                f"fresh status portability receipt is invalid: {name}"
+            )
+        if name == "status.json" and payload != fresh_status:
+            raise RuntimeErrorEB(
+                "status receipt changed after fresh live validation"
+            )
+        payloads[name] = payload
+        receipts[name] = hashlib.sha256(raw).hexdigest()
+    status_attempt = payloads["status-attempt.json"]
+    if (
+        status_attempt.get("receipt") != "status.json"
+        or status_attempt.get("receipt_sha256")
+        != receipts["status.json"]
+    ):
+        raise RuntimeErrorEB(
+            "fresh status attempt is not bound to its current live receipt"
+        )
+
     config = _source_commit_config(source_commit)
     _require_vm_create_receipt(
         payloads["vm-create.json"], source_commit, config, root

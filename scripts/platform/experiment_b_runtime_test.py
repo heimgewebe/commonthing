@@ -2983,6 +2983,43 @@ spec:
             fresh_functional.assert_called_once_with(root, commit)
             fresh_load.assert_called_once_with(root, commit)
 
+            t048_receipt = json.loads(
+                (receipts / "t048-load.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            fresh_status = {
+                "schema_version": 1,
+                "status": "observed",
+                "source_commit": commit,
+                "cilium": {"gateway_api": True},
+            }
+            with (
+                mock.patch.object(
+                    runtime,
+                    "functional_readback",
+                    return_value=functional_receipt,
+                ) as fresh_functional,
+                mock.patch.object(
+                    runtime,
+                    "t048_load_proof",
+                    return_value=t048_receipt,
+                ) as fresh_load,
+                mock.patch.object(
+                    runtime,
+                    "status",
+                    return_value=fresh_status,
+                ) as fresh_status_readback,
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "status receipt changed after fresh live validation",
+                ),
+            ):
+                runtime.portability_report(root)
+            fresh_functional.assert_called_once_with(root, commit)
+            fresh_load.assert_called_once_with(root, commit)
+            fresh_status_readback.assert_called_once_with(root)
+
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
         commit = "a" * 40
         config = runtime.load_config()
@@ -3203,6 +3240,13 @@ spec:
                         "status": "pass",
                         "source_commit": commit,
                     }
+                ),
+                status=mock.Mock(
+                    side_effect=lambda state_root: json.loads(
+                        (
+                            state_root / "receipts/status.json"
+                        ).read_text(encoding="utf-8")
+                    )
                 ),
             ),
             mock.patch.object(
