@@ -9783,6 +9783,39 @@ def _run_bound_postgres_client(
     )
 
 
+def _run_bound_postgres_sql(
+    root: Path,
+    source_commit: str,
+    binding: dict[str, Any],
+    database_identity: tuple[str, str],
+    sql: str,
+    *,
+    tuples_only: bool = True,
+    timeout: int = 900,
+) -> str:
+    command = [
+        *_database_client_argv("psql", database_identity),
+        "-v",
+        "ON_ERROR_STOP=1",
+    ]
+    if tuples_only:
+        command.extend(["-At"])
+    raw = _run_bound_postgres_client(
+        root,
+        source_commit,
+        binding,
+        command,
+        input_bytes=sql.encode("utf-8"),
+        timeout=timeout,
+    )
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise RuntimeErrorEB(
+            "bound PostgreSQL client output is not UTF-8"
+        ) from exc
+
+
 def _run_bound_nats_client(
     root: Path,
     source_commit: str,
@@ -10099,13 +10132,34 @@ def _t048_live_fixture_binding(
     manifest: Path,
     generation_id: str,
     source_commit: str,
+    *,
+    postgres_binding: dict[str, Any] | None = None,
+    database_identity: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     live_binding = _source_bound_live_binding(source_commit)
+    bound_postgres = (
+        _require_postgres_runtime_binding(root, source_commit)
+        if postgres_binding is None
+        else postgres_binding
+    )
+    bound_database_identity = (
+        _database_client_identity(root)
+        if database_identity is None
+        else database_identity
+    )
+
+    def bound_psql(sql: str) -> str:
+        return _run_bound_postgres_sql(
+            root,
+            source_commit,
+            bound_postgres,
+            bound_database_identity,
+            sql,
+        )
 
     _manifest, fixture_rows = live_binding._manifest_and_fixture(manifest)
     db_rows = live_binding._json_lines(
-        _psql(
-            root,
+        bound_psql(
             r"""
 SELECT json_build_object(
   'id', id,
@@ -10137,8 +10191,7 @@ ORDER BY id;
 
     fixture_edge_rows = _t048_fixture_edge_rows(manifest, _manifest)
     database_edge_rows = live_binding._json_lines(
-        _psql(
-            root,
+        bound_psql(
             r"""
 SELECT json_build_object(
   'id', id,
@@ -10165,8 +10218,7 @@ ORDER BY id;
         )
 
     version_rows = live_binding._json_lines(
-        _psql(
-            root,
+        bound_psql(
             r"""
 SELECT json_build_object(
   'node_id', node_id,
@@ -10201,8 +10253,7 @@ ORDER BY node_id;
 
     generation_literal = live_binding._sql_literal(generation_id)
     generation_rows = live_binding._json_lines(
-        _psql(
-            root,
+        bound_psql(
             f"""
 SELECT json_build_object(
   'generation_id', generation_id,
@@ -10250,8 +10301,7 @@ WHERE generation_id = {generation_literal} AND state = 'active';
     dimension = int(semantic["dimension"])
 
     projection_rows = live_binding._json_lines(
-        _psql(
-            root,
+        bound_psql(
             f"""
 SELECT json_build_object(
   'generation_id', p.generation_id,
@@ -10399,6 +10449,28 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
     _require_kubernetes_target_binding(root, source_commit)
     fixture_target = _kubernetes_target_identity(root, source_commit)
     with _bound_kube_env(root, fixture_target, source_commit):
+        postgres_binding = _require_postgres_runtime_binding(
+            root,
+            source_commit,
+        )
+        database_identity = _database_client_identity(root)
+
+        def bound_psql(
+            sql: str,
+            *,
+            tuples_only: bool = True,
+            timeout: int = 900,
+        ) -> str:
+            return _run_bound_postgres_sql(
+                root,
+                source_commit,
+                postgres_binding,
+                database_identity,
+                sql,
+                tuples_only=tuples_only,
+                timeout=timeout,
+            )
+
         evidence, domain_scale = _performance_modules(source_commit)
         policy, _policy_sha256 = _source_bound_performance_policy(
             source_commit
@@ -10439,45 +10511,35 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         node_count = int(counts["nodes"])
         edge_count = int(counts["edges"])
 
-        existing_nodes = int(_psql(root, "SELECT count(*) FROM domain_nodes;"))
-        existing_edges = int(_psql(root, "SELECT count(*) FROM domain_edges;"))
+        existing_nodes = int(bound_psql("SELECT count(*) FROM domain_nodes;"))
+        existing_edges = int(bound_psql("SELECT count(*) FROM domain_edges;"))
         generation_id = str(config["semantic_search"]["generation_id"])
         existing_generation = int(
-            _psql(
-                root,
-                "SELECT count(*) FROM search_index_generations "
+            bound_psql("SELECT count(*) FROM search_index_generations "
                 f"WHERE generation_id = '{generation_id}';",
             )
         )
         receipt_path = root / "receipts/t048-fixture.json"
 
         def emit_receipt() -> dict[str, Any]:
-            observed_nodes = int(_psql(root, "SELECT count(*) FROM domain_nodes;"))
-            observed_edges = int(_psql(root, "SELECT count(*) FROM domain_edges;"))
+            observed_nodes = int(bound_psql("SELECT count(*) FROM domain_nodes;"))
+            observed_edges = int(bound_psql("SELECT count(*) FROM domain_edges;"))
             public_nodes = int(
-                _psql(
-                    root,
-                    "SELECT count(*) FROM domain_nodes WHERE search_visibility='public';",
+                bound_psql("SELECT count(*) FROM domain_nodes WHERE search_visibility='public';",
                 )
             )
             observed_projections = int(
-                _psql(
-                    root,
-                    "SELECT count(*) FROM search_node_projections "
+                bound_psql("SELECT count(*) FROM search_node_projections "
                     f"WHERE generation_id = '{generation_id}';",
                 )
             )
             active_generation = int(
-                _psql(
-                    root,
-                    "SELECT count(*) FROM search_index_generations "
+                bound_psql("SELECT count(*) FROM search_index_generations "
                     f"WHERE generation_id = '{generation_id}' AND state = 'active';",
                 )
             )
             pending_jobs = int(
-                _psql(
-                    root,
-                    "SELECT count(*) FROM search_projection_jobs "
+                bound_psql("SELECT count(*) FROM search_projection_jobs "
                     f"WHERE generation_id = '{generation_id}' AND state <> 'done';",
                 )
             )
@@ -10497,7 +10559,21 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
                 manifest,
                 generation_id,
                 source_commit,
+                postgres_binding=postgres_binding,
+                database_identity=database_identity,
             )
+            if (
+                _postgres_runtime_binding_identity(
+                    _require_postgres_runtime_binding(
+                        root,
+                        source_commit,
+                    )
+                )
+                != _postgres_runtime_binding_identity(postgres_binding)
+            ):
+                raise RuntimeErrorEB(
+                    "PostgreSQL runtime changed during T048 fixture load"
+                )
             _require_same_kubernetes_target(
                 root,
                 source_commit,
@@ -10600,18 +10676,28 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
                     streamed_payload,
                     "source-commit T048 streamed SQL",
                 ) as streamed_fd:
-                    kubectl = toolchain(root)["tools"]["kubectl"]
-                    _run_input_file(
+                    sealed_streamed_payload = os.pread(
+                        streamed_fd,
+                        streamed_size,
+                        0,
+                    )
+                    if sealed_streamed_payload != streamed_payload:
+                        raise RuntimeErrorEB(
+                            "source-commit T048 sealed streamed SQL changed"
+                        )
+                    _run_bound_postgres_client(
+                        root,
+                        source_commit,
+                        postgres_binding,
                         [
-                            kubectl, "-n", DATA_NAMESPACE, "exec", "-i",
-                            "deployment/postgres", "--",
                             *_database_client_argv(
-                                "psql", _database_client_identity(root)
+                                "psql",
+                                database_identity,
                             ),
-                            "-v", "ON_ERROR_STOP=1",
+                            "-v",
+                            "ON_ERROR_STOP=1",
                         ],
-                        Path(f"/proc/self/fd/{streamed_fd}"),
-                        env=kube_env(root),
+                        input_bytes=sealed_streamed_payload,
                         timeout=1800,
                     )
 
@@ -10761,7 +10847,7 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
     SELECT weltgewebe_activate_search_generation('{semantic["generation_id"]}');
     COMMIT;
     """
-        _psql(root, seed_sql, tuples_only=False)
+        bound_psql(seed_sql, tuples_only=False)
         return emit_receipt()
 
 
@@ -10869,10 +10955,18 @@ def _wait_http_200(url: str, process: subprocess.Popen[Any] | None = None) -> No
 
 def _start_api_port_forward(
     root: Path,
-    pod_name: str,
+    source_commit: str,
+    expected_binding: dict[str, str],
 ) -> tuple[subprocess.Popen[Any], int, Any, Any]:
-    if not isinstance(pod_name, str) or not pod_name:
-        raise RuntimeErrorEB("API port-forward requires a verified Pod name")
+    pod_name = expected_binding.get("pod_name")
+    if (
+        COMMIT_RE.fullmatch(source_commit) is None
+        or not isinstance(pod_name, str)
+        or not pod_name
+    ):
+        raise RuntimeErrorEB(
+            "API port-forward requires an exact source and verified Pod"
+        )
     port = _reserve_loopback_port()
     evidence_dir = root / "performance"
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -10881,8 +10975,13 @@ def _start_api_port_forward(
     kubectl = toolchain(root)["tools"]["kubectl"]
     process = subprocess.Popen(
         [
-            kubectl, "-n", APP_NAMESPACE, "port-forward",
-            f"pod/{pod_name}", f"{port}:8080", "--address=127.0.0.1",
+            kubectl,
+            "-n",
+            APP_NAMESPACE,
+            "port-forward",
+            f"pod/{pod_name}",
+            f"{port}:8080",
+            "--address=127.0.0.1",
         ],
         cwd=ROOT,
         stdout=stdout,
@@ -10892,15 +10991,35 @@ def _start_api_port_forward(
         pass_fds=_bound_subprocess_pass_fds(),
     )
     try:
-        _wait_http_200(f"http://127.0.0.1:{port}/health/live", process)
-    except Exception:
-        process.terminate()
-        process.wait(timeout=10)
+        _wait_http_200(
+            f"http://127.0.0.1:{port}/health/live",
+            process,
+        )
+        (
+            current_pod_name,
+            current_pod,
+            current_binding,
+        ) = _require_t048_api_runtime_binding(
+            root,
+            source_commit,
+        )
+        if (
+            _t048_api_runtime_binding_identity(
+                current_pod_name,
+                current_pod,
+                current_binding,
+            )
+            != expected_binding
+        ):
+            raise RuntimeErrorEB(
+                "API runtime changed while establishing T048 port-forward"
+            )
+    except BaseException:
+        _stop_process(process)
         stdout.close()
         stderr.close()
         raise
     return process, port, stdout, stderr
-
 
 def _api_pod(root: Path) -> tuple[str, dict[str, Any]]:
     pods = _kubectl_json(
@@ -11016,6 +11135,59 @@ def _require_t048_api_runtime_binding(
         },
     )
 
+
+
+def _t048_api_runtime_binding_identity(
+    pod_name: str,
+    pod: dict[str, Any],
+    binding: dict[str, Any],
+) -> dict[str, str]:
+    metadata = pod.get("metadata")
+    status = pod.get("status")
+    pod_uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    statuses = (
+        status.get("containerStatuses")
+        if isinstance(status, dict)
+        else None
+    )
+    api_container_id: str | None = None
+    if isinstance(statuses, list):
+        for item in statuses:
+            if isinstance(item, dict) and item.get("name") == "api":
+                value = item.get("containerID")
+                if isinstance(value, str):
+                    api_container_id = value
+                break
+    if (
+        not isinstance(pod_name, str)
+        or not pod_name
+        or not isinstance(pod_uid, str)
+        or not pod_uid
+        or not isinstance(api_container_id, str)
+        or re.fullmatch(
+            r"containerd://[0-9a-f]{64}",
+            api_container_id,
+        )
+        is None
+    ):
+        raise RuntimeErrorEB("T048 API runtime identity is incomplete")
+    result = {
+        "pod_name": pod_name,
+        "pod_uid": pod_uid,
+        "api_container_id": api_container_id,
+    }
+    for field in (
+        "runtime_image_ids_sha256",
+        "contract_sha256",
+        "pod_contract_sha256",
+    ):
+        value = binding.get(field)
+        if not isinstance(value, str) or not value:
+            raise RuntimeErrorEB(
+                f"T048 API runtime binding field is invalid: {field}"
+            )
+        result[field] = value
+    return result
 
 
 def _require_postgres_runtime_binding(
@@ -11345,8 +11517,19 @@ def _sample_api_cgroup(root: Path, pod_name: str) -> dict[str, Any]:
     }
 
 
-def _database_connection_count(root: Path) -> int:
-    value = _psql(root, "SELECT count(*) FROM pg_stat_activity;")
+def _database_connection_count(
+    root: Path,
+    source_commit: str,
+    postgres_binding: dict[str, Any],
+    database_identity: tuple[str, str],
+) -> int:
+    value = _run_bound_postgres_sql(
+        root,
+        source_commit,
+        postgres_binding,
+        database_identity,
+        "SELECT count(*) FROM pg_stat_activity;",
+    )
     try:
         count = int(value)
     except ValueError as exc:
@@ -11448,7 +11631,10 @@ def _seal_k6_summary_output(summary_fd: int) -> bytes:
 
 def _sample_t048_load(
     root: Path,
+    source_commit: str,
     pod_name: str,
+    postgres_binding: dict[str, Any],
+    database_identity: tuple[str, str],
     load: subprocess.Popen[Any],
     resource_samples: list[dict[str, Any]],
     db_samples: list[int],
@@ -11469,7 +11655,14 @@ def _sample_t048_load(
                 )
             time.sleep(1)
             resource_samples.append(_sample_api_cgroup(root, pod_name))
-            db_samples.append(_database_connection_count(root))
+            db_samples.append(
+                _database_connection_count(
+                    root,
+                    source_commit,
+                    postgres_binding,
+                    database_identity,
+                )
+            )
         if load.returncode is None:
             raise RuntimeErrorEB("canonical T048 k6 workload has no terminal return code")
         return int(load.returncode)
@@ -11500,6 +11693,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             root,
             source_commit,
         )
+        database_identity = _database_client_identity(root)
         fixture_receipt = _validated_t048_fixture_receipt(root, source_commit)
         fixture_binding_before = {
             "manifest": fixture_receipt.get("manifest"),
@@ -11537,13 +11731,20 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         pod_name, pod, api_image_binding_before = _require_t048_api_runtime_binding(
             root, source_commit
         )
+        api_runtime_binding_before = _t048_api_runtime_binding_identity(
+            pod_name,
+            pod,
+            api_image_binding_before,
+        )
         declared_cpu, declared_memory = _require_api_resource_limits(
             pod,
             _source_commit_config(source_commit),
         )
 
         process, port, pf_stdout, pf_stderr = _start_api_port_forward(
-            root, pod_name
+            root,
+            source_commit,
+            api_runtime_binding_before,
         )
     except BaseException:
         bound_stack.close()
@@ -11581,7 +11782,12 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
 
         initial_cgroup = _sample_api_cgroup(root, pod_name)
         resource_samples = [initial_cgroup]
-        db_samples = [_database_connection_count(root)]
+        db_samples = [_database_connection_count(
+            root,
+            source_commit,
+            postgres_binding_before,
+            database_identity,
+        )]
         sampler_started = time.time_ns() // 1_000_000
         k6_summary_snapshot_fd: int | None = None
         with stderr_path.open("w", encoding="utf-8") as err:
@@ -11603,7 +11809,10 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
                 load.stdin.close()
             load_returncode = _sample_t048_load(
                 root,
+                source_commit,
                 pod_name,
+                postgres_binding_before,
+                database_identity,
                 load,
                 resource_samples,
                 db_samples,
@@ -11620,11 +11829,16 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
                     )
                 )
         resource_samples.append(_sample_api_cgroup(root, pod_name))
-        db_samples.append(_database_connection_count(root))
+        db_samples.append(_database_connection_count(
+            root,
+            source_commit,
+            postgres_binding_before,
+            database_identity,
+        ))
         sampler_finished = time.time_ns() // 1_000_000
         (
             post_pod_name,
-            _post_pod,
+            post_pod,
             api_image_binding_after,
         ) = _require_t048_api_runtime_binding(root, source_commit)
         postgres_binding_after = _require_t048_postgres_runtime_binding(
@@ -11641,29 +11855,22 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "kubeconfig_sha256": target_receipt_after["kubeconfig_sha256"],
             "server": target_server_after,
         }
-        if (
-            post_pod_name != pod_name
-            or api_image_binding_after["runtime_image_ids_sha256"]
-            != api_image_binding_before["runtime_image_ids_sha256"]
-            or api_image_binding_after["contract_sha256"]
-            != api_image_binding_before["contract_sha256"]
-            or api_image_binding_after["pod_contract_sha256"]
-            != api_image_binding_before["pod_contract_sha256"]
-        ):
+        api_runtime_binding_after = _t048_api_runtime_binding_identity(
+            post_pod_name,
+            post_pod,
+            api_image_binding_after,
+        )
+        if api_runtime_binding_after != api_runtime_binding_before:
             raise RuntimeErrorEB(
                 "API runtime contract changed during the T048 measurement"
             )
         if (
-            postgres_binding_after["runtime_image_ids_sha256"]
-            != postgres_binding_before["runtime_image_ids_sha256"]
+            _postgres_runtime_binding_identity(postgres_binding_after)
+            != _postgres_runtime_binding_identity(postgres_binding_before)
             or postgres_binding_after["images_sha256"]
             != postgres_binding_before["images_sha256"]
             or postgres_binding_after["resources_sha256"]
             != postgres_binding_before["resources_sha256"]
-            or postgres_binding_after["contract_sha256"]
-            != postgres_binding_before["contract_sha256"]
-            or postgres_binding_after["pod_contract_sha256"]
-            != postgres_binding_before["pod_contract_sha256"]
         ):
             raise RuntimeErrorEB(
                 "PostgreSQL runtime contract changed during the T048 measurement"
@@ -13145,85 +13352,94 @@ def _nats_transfer_pod(
         },
     }
     kubectl_apply(root, json.dumps(manifest, sort_keys=True))
-    _kubectl(
-        root,
-        [
-            "-n", DATA_NAMESPACE, "wait", "--for=condition=Ready",
-            f"pod/{name}", "--timeout=3m",
-        ],
-        timeout=210,
-    )
-    pod = _kubectl_json(
-        root,
-        ["-n", DATA_NAMESPACE, "get", "pod", name],
-    )
-    metadata = pod.get("metadata", {}) if isinstance(pod, dict) else {}
-    live_spec = pod.get("spec", {}) if isinstance(pod, dict) else {}
-    status = pod.get("status", {}) if isinstance(pod, dict) else {}
-    if (
-        not isinstance(metadata, dict)
-        or metadata.get("name") != name
-        or metadata.get("namespace") != DATA_NAMESPACE
-        or metadata.get("deletionTimestamp") is not None
-        or not isinstance(live_spec, dict)
-        or not isinstance(status, dict)
-        or status.get("phase") != "Running"
-        or _application_pod_spec_projection(
-            live_spec,
-            f"live NATS transfer Pod {name}",
+    try:
+        _kubectl(
+            root,
+            [
+                "-n", DATA_NAMESPACE, "wait", "--for=condition=Ready",
+                f"pod/{name}", "--timeout=3m",
+            ],
+            timeout=210,
         )
-        != _application_pod_spec_projection(
-            manifest["spec"],
-            f"expected NATS transfer Pod {name}",
+        pod = _kubectl_json(
+            root,
+            ["-n", DATA_NAMESPACE, "get", "pod", name],
         )
-    ):
-        raise RuntimeErrorEB(
-            "NATS transfer Pod runtime contract drifted"
+        metadata = pod.get("metadata", {}) if isinstance(pod, dict) else {}
+        live_spec = pod.get("spec", {}) if isinstance(pod, dict) else {}
+        status = pod.get("status", {}) if isinstance(pod, dict) else {}
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or metadata.get("namespace") != DATA_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+            or not isinstance(live_spec, dict)
+            or not isinstance(status, dict)
+            or status.get("phase") != "Running"
+            or _application_pod_spec_projection(
+                live_spec,
+                f"live NATS transfer Pod {name}",
+            )
+            != _application_pod_spec_projection(
+                manifest["spec"],
+                f"expected NATS transfer Pod {name}",
+            )
+        ):
+            raise RuntimeErrorEB(
+                "NATS transfer Pod runtime contract drifted"
+            )
+        ready = any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in status.get("conditions", [])
         )
-    ready = any(
-        isinstance(condition, dict)
-        and condition.get("type") == "Ready"
-        and condition.get("status") == "True"
-        for condition in status.get("conditions", [])
-    )
-    statuses = status.get("containerStatuses", [])
-    if (
-        not ready
-        or not isinstance(statuses, list)
-        or len(statuses) != 1
-        or not isinstance(statuses[0], dict)
-        or statuses[0].get("name") != "transfer"
-        or statuses[0].get("ready") is not True
-        or not isinstance(
-            statuses[0].get("state", {}).get("running"),
-            dict,
-        )
-    ):
-        raise RuntimeErrorEB(
-            "NATS transfer Pod is not running and Ready"
-        )
-    image_id = statuses[0].get("imageID")
-    container_id = statuses[0].get("containerID")
-    expected_digest = image.rsplit("@", 1)[1]
-    if (
-        not _runtime_image_id_matches_digest(
-            image_id,
-            expected_digest,
-        )
-        or not isinstance(container_id, str)
-        or re.fullmatch(
-            r"containerd://[0-9a-f]{64}",
-            container_id,
-        )
-        is None
-    ):
-        raise RuntimeErrorEB(
-            "NATS transfer Pod runtime image identity drifted"
-        )
-    return {
-        "container_id": container_id,
-        "runtime_image_id": str(image_id),
-    }
+        statuses = status.get("containerStatuses", [])
+        if (
+            not ready
+            or not isinstance(statuses, list)
+            or len(statuses) != 1
+            or not isinstance(statuses[0], dict)
+            or statuses[0].get("name") != "transfer"
+            or statuses[0].get("ready") is not True
+            or not isinstance(
+                statuses[0].get("state", {}).get("running"),
+                dict,
+            )
+        ):
+            raise RuntimeErrorEB(
+                "NATS transfer Pod is not running and Ready"
+            )
+        image_id = statuses[0].get("imageID")
+        container_id = statuses[0].get("containerID")
+        expected_digest = image.rsplit("@", 1)[1]
+        if (
+            not _runtime_image_id_matches_digest(
+                image_id,
+                expected_digest,
+            )
+            or not isinstance(container_id, str)
+            or re.fullmatch(
+                r"containerd://[0-9a-f]{64}",
+                container_id,
+            )
+            is None
+        ):
+            raise RuntimeErrorEB(
+                "NATS transfer Pod runtime image identity drifted"
+            )
+        return {
+            "container_id": container_id,
+            "runtime_image_id": str(image_id),
+        }
+    except BaseException:
+        try:
+            _delete_pod(root, DATA_NAMESPACE, name)
+        except BaseException as cleanup_exc:
+            raise RuntimeErrorEB(
+                "NATS transfer Pod validation failed and cleanup did not complete"
+            ) from cleanup_exc
+        raise
 
 def _delete_pod(root: Path, namespace: str, name: str) -> None:
     _kubectl(

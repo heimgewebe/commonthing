@@ -2471,7 +2471,15 @@ spec:
             with self.assertRaises(runtime.RuntimeErrorEB):
                 runtime._sample_t048_load(
                     Path("/tmp"),
+                    "a" * 40,
                     "api-pod",
+                    {
+                        "container_id": "containerd://" + "b" * 64,
+                        "contract_sha256": "c" * 64,
+                        "pod_contract_sha256": "d" * 64,
+                        "runtime_image_ids_sha256": "e" * 64,
+                    },
+                    ("proof_user", "proof_database"),
                     load,
                     resource_samples,
                     db_samples,
@@ -2501,7 +2509,15 @@ spec:
             ):
                 runtime._sample_t048_load(
                     Path("/tmp"),
+                    "a" * 40,
                     "api-pod",
+                    {
+                        "container_id": "containerd://" + "b" * 64,
+                        "contract_sha256": "c" * 64,
+                        "pod_contract_sha256": "d" * 64,
+                        "runtime_image_ids_sha256": "e" * 64,
+                    },
+                    ("proof_user", "proof_database"),
                     load,
                     resource_samples,
                     db_samples,
@@ -4138,6 +4154,11 @@ spec:
                 ),
                 mock.patch.object(
                     runtime,
+                    "_database_client_identity",
+                    return_value=("proof_user", "proof_database"),
+                ),
+                mock.patch.object(
+                    runtime,
                     "_validated_t048_fixture_receipt",
                     side_effect=runtime.RuntimeErrorEB("fixture validation stop"),
                 ),
@@ -4342,7 +4363,7 @@ spec:
                         ),
                         mock.patch.object(
                             runtime,
-                            "_psql",
+                            "_run_bound_postgres_sql",
                             side_effect=[
                                 json.dumps(database_node) + "\n",
                                 json.dumps(canonical_edge) + "\n",
@@ -4361,6 +4382,8 @@ spec:
                                 manifest_path,
                                 generation_id,
                                 "a" * 40,
+                                postgres_binding={},
+                                database_identity=("proof_user", "proof_database"),
                             )
 
     def test_t048_live_binding_rejects_version_drift(self) -> None:
@@ -4425,7 +4448,7 @@ spec:
                 ),
                 mock.patch.object(
                     runtime,
-                    "_psql",
+                    "_run_bound_postgres_sql",
                     side_effect=[
                         json.dumps(database_node) + "\n",
                         json.dumps(canonical_edge) + "\n",
@@ -4442,6 +4465,8 @@ spec:
                         manifest_path,
                         "experiment-b-t048",
                         "a" * 40,
+                        postgres_binding={},
+                        database_identity=("proof_user", "proof_database"),
                     )
 
     def test_t048_live_binding_rejects_edge_content_drift(self) -> None:
@@ -4502,7 +4527,7 @@ spec:
                 ),
                 mock.patch.object(
                     runtime,
-                    "_psql",
+                    "_run_bound_postgres_sql",
                     side_effect=[
                         json.dumps(database_node) + "\n",
                         json.dumps(drifted_edge) + "\n",
@@ -4518,6 +4543,8 @@ spec:
                         manifest_path,
                         "experiment-b-t048",
                         "a" * 40,
+                        postgres_binding={},
+                        database_identity=("proof_user", "proof_database"),
                     )
 
     def test_t048_canonical_visibility_is_fixture_derived(self) -> None:
@@ -4565,7 +4592,7 @@ spec:
             ),
             mock.patch.object(
                 runtime,
-                "_psql",
+                "_run_bound_postgres_sql",
                 return_value=json.dumps(drifted_database_row) + "\n",
             ),
         ):
@@ -4578,6 +4605,8 @@ spec:
                     Path("/unused-manifest.json"),
                     "experiment-b-t048",
                     "a" * 40,
+                    postgres_binding={},
+                    database_identity=("proof_user", "proof_database"),
                 )
 
     def test_fixture_rebinds_canonical_live_state_without_stale_receipt(self) -> None:
@@ -4640,6 +4669,12 @@ spec:
                 "1",
                 "0",
             ]
+            postgres_binding = {
+                "container_id": "containerd://" + "1" * 64,
+                "contract_sha256": "2" * 64,
+                "pod_contract_sha256": "3" * 64,
+                "runtime_image_ids_sha256": "4" * 64,
+            }
             with (
                 mock.patch.object(
                     runtime,
@@ -4688,7 +4723,21 @@ spec:
                     "_bound_kube_env",
                     return_value=mock.MagicMock(),
                 ),
-                mock.patch.object(runtime, "_psql", side_effect=psql_values),
+                mock.patch.object(
+                    runtime,
+                    "_require_postgres_runtime_binding",
+                    return_value=postgres_binding,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_database_client_identity",
+                    return_value=("proof_user", "proof_database"),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_run_bound_postgres_sql",
+                    side_effect=psql_values,
+                ),
                 mock.patch.object(
                     runtime,
                     "_t048_live_fixture_binding",
@@ -4822,9 +4871,12 @@ spec:
         seed_source = inspect.getsource(runtime.seed_t048_fixture)
         recovery_source = inspect.getsource(runtime.recovery_proof)
         self.assertIn(
-            '"psql", _database_client_identity(root)',
+            "database_identity = _database_client_identity(root)",
             seed_source,
         )
+        self.assertIn("_require_postgres_runtime_binding(", seed_source)
+        self.assertIn("_run_bound_postgres_client(", seed_source)
+        self.assertNotIn('"deployment/postgres"', seed_source)
         self.assertEqual(
             recovery_source.count(
                 "_verified_database_client_identity(root, source_commit)"
@@ -5799,6 +5851,37 @@ spec:
                 "transfer",
                 "nats:latest",
             )
+
+
+    def test_nats_transfer_pod_cleans_up_post_apply_validation_failure(
+        self,
+    ) -> None:
+        root = Path("/tmp/experiment-b-nats-transfer-cleanup-test")
+        image = "nats@sha256:" + "a" * 64
+        with (
+            mock.patch.object(runtime, "kubectl_apply") as apply_manifest,
+            mock.patch.object(
+                runtime,
+                "_kubectl",
+                side_effect=runtime.RuntimeErrorEB("ready wait failed"),
+            ),
+            mock.patch.object(runtime, "_delete_pod") as delete_pod,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "ready wait failed",
+            ),
+        ):
+            runtime._nats_transfer_pod(
+                root,
+                "transfer",
+                image,
+            )
+        apply_manifest.assert_called_once()
+        delete_pod.assert_called_once_with(
+            root,
+            runtime.DATA_NAMESPACE,
+            "transfer",
+        )
 
     def test_recovery_binds_nats_transfer_to_source_commit_contract(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
@@ -10528,6 +10611,14 @@ spec:
         self.assertIn("postgres_resources_sha256", source)
         self.assertIn("postgres_contract_sha256", source)
         self.assertIn("postgres_pod_contract_sha256", source)
+        self.assertIn(
+            "_postgres_runtime_binding_identity(postgres_binding_after)",
+            source,
+        )
+        self.assertIn(
+            "database_identity = _database_client_identity(root)",
+            source,
+        )
 
     def test_t048_postgres_binding_rejects_full_runtime_drift(
         self,
@@ -11524,6 +11615,22 @@ def install(*args, **kwargs):
         self.assertGreaterEqual(source.count("_verified_snapshot_fd("), 2)
         self.assertIn('"source-commit T048 load SQL"', source)
         self.assertIn('"source-commit T048 streamed SQL"', source)
+        self.assertEqual(
+            source.count(
+                "postgres_binding = _require_postgres_runtime_binding("
+            ),
+            1,
+        )
+        self.assertIn("_run_bound_postgres_client(", source)
+        self.assertNotIn(
+            "_psql(",
+            source.replace("bound_psql(", ""),
+        )
+        self.assertNotIn('"deployment/postgres"', source)
+        self.assertIn(
+            "PostgreSQL runtime changed during T048 fixture load",
+            source,
+        )
         self.assertNotIn("str(DOMAIN_SCALE)", source)
         self.assertNotIn("evidence.load_dataset_binding(", source)
 
@@ -12538,6 +12645,31 @@ def install(*args, **kwargs):
         )
 
     def test_t048_port_forward_targets_verified_api_pod(self) -> None:
+        source_commit = "a" * 40
+        pod = {
+            "metadata": {
+                "name": "weltgewebe-api-verified",
+                "uid": "pod-uid",
+            },
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "api",
+                        "containerID": "containerd://" + "b" * 64,
+                    }
+                ]
+            },
+        }
+        api_binding = {
+            "runtime_image_ids_sha256": "c" * 64,
+            "contract_sha256": "d" * 64,
+            "pod_contract_sha256": "e" * 64,
+        }
+        expected_binding = runtime._t048_api_runtime_binding_identity(
+            "weltgewebe-api-verified",
+            pod,
+            api_binding,
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             process = mock.Mock()
@@ -12558,10 +12690,21 @@ def install(*args, **kwargs):
                     return_value=process,
                 ) as popen,
                 mock.patch.object(runtime, "_wait_http_200") as wait_http,
+                mock.patch.object(
+                    runtime,
+                    "_require_t048_api_runtime_binding",
+                    return_value=(
+                        "weltgewebe-api-verified",
+                        pod,
+                        api_binding,
+                    ),
+                ) as live_binding,
             ):
                 returned, port, stdout, stderr = (
                     runtime._start_api_port_forward(
-                        root, "weltgewebe-api-verified"
+                        root,
+                        source_commit,
+                        expected_binding,
                     )
                 )
             try:
@@ -12574,9 +12717,58 @@ def install(*args, **kwargs):
                     "http://127.0.0.1:43123/health/live",
                     process,
                 )
+                live_binding.assert_called_once_with(
+                    root,
+                    source_commit,
+                )
             finally:
                 stdout.close()
                 stderr.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            drifted_pod = json.loads(json.dumps(pod))
+            drifted_pod["metadata"]["uid"] = "replacement-pod-uid"
+            process = mock.Mock()
+            process.poll.return_value = None
+            process.wait.return_value = -15
+            with (
+                mock.patch.object(
+                    runtime, "_reserve_loopback_port", return_value=43124
+                ),
+                mock.patch.object(
+                    runtime,
+                    "toolchain",
+                    return_value={"tools": {"kubectl": "/verified/kubectl"}},
+                ),
+                mock.patch.object(runtime, "kube_env", return_value={}),
+                mock.patch.object(
+                    runtime.subprocess,
+                    "Popen",
+                    return_value=process,
+                ),
+                mock.patch.object(runtime, "_wait_http_200"),
+                mock.patch.object(
+                    runtime,
+                    "_require_t048_api_runtime_binding",
+                    return_value=(
+                        "weltgewebe-api-verified",
+                        drifted_pod,
+                        api_binding,
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "changed while establishing T048 port-forward",
+                ),
+            ):
+                runtime._start_api_port_forward(
+                    root,
+                    source_commit,
+                    expected_binding,
+                )
+            process.terminate.assert_called_once_with()
+            process.wait.assert_called_once_with(timeout=10)
 
         t048_source = inspect.getsource(runtime.t048_load_proof)
         port_forward = t048_source.index("_start_api_port_forward(")
@@ -12584,7 +12776,25 @@ def install(*args, **kwargs):
             "bound_stack.enter_context(_bound_kube_env(root, target_binding_before, source_commit))"
         )
         self.assertLess(bound_snapshot, port_forward)
-        self.assertIn("root, pod_name", t048_source[port_forward:port_forward + 160])
+        self.assertIn(
+            "api_runtime_binding_before",
+            t048_source[port_forward : port_forward + 240],
+        )
+        self.assertIn(
+            "api_runtime_binding_after != api_runtime_binding_before",
+            t048_source,
+        )
+
+    def test_t048_database_sampler_uses_bound_postgres_container(self) -> None:
+        source = inspect.getsource(runtime._database_connection_count)
+        self.assertIn("_run_bound_postgres_sql(", source)
+        self.assertNotIn(
+            "_psql(",
+            source.replace("bound_psql(", ""),
+        )
+        sampler = inspect.getsource(runtime._sample_t048_load)
+        self.assertIn("postgres_binding", sampler)
+        self.assertIn("database_identity", sampler)
 
 
 if __name__ == "__main__":
