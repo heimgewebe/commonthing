@@ -3,7 +3,7 @@ id: deploy.dev-entrypoints
 title: Lokale Entwicklungs-Einstiegspunkte
 doc_type: reference
 status: active
-summary: Kanonische lokalen URLs für UI und Proxy-Pfade im Entwicklungsprofil.
+summary: Kanonische lokale URLs für UI und Proxy-Pfade im Entwicklungsprofil.
 relations:
   - type: relates_to
     target: docs/deploy/README.md
