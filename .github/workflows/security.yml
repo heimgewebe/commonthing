@@ -221,8 +221,9 @@ jobs:
           fi
           # Anything but a list of layer ids, e.g. partial output of a failed
           # inspect, counts as unknown instead of breaking --argjson below.
-          if ! jq -e 'type == "array" and length > 0 and all(type == "string")' <<< "${base_layers}" \
-            > /dev/null 2>&1; then
+          if [[ -z "${base_layers}" ]] || \
+            ! jq -e 'type == "array" and length > 0 and all(type == "string")' <<< "${base_layers}" \
+              > /dev/null 2>&1; then
             base_layers=null
           fi
           if [[ ! -s "${TRIVY_REPORT}" ]]; then
