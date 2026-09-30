@@ -12153,6 +12153,317 @@ def _gateway_base_url(root: Path, source_commit: str) -> str:
     return f"http://{value}"
 
 
+def _application_pod_runtime_identity(
+    pod: dict[str, Any],
+    expected_container_names: set[str],
+    context: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(expected_container_names, set)
+        or not expected_container_names
+        or any(
+            not isinstance(name, str) or not name
+            for name in expected_container_names
+        )
+    ):
+        raise RuntimeErrorEB(f"{context} expected container set is invalid")
+    metadata = pod.get("metadata")
+    status = pod.get("status")
+    pod_name = metadata.get("name") if isinstance(metadata, dict) else None
+    pod_uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    statuses = (
+        status.get("containerStatuses")
+        if isinstance(status, dict)
+        else None
+    )
+    if (
+        not isinstance(pod_name, str)
+        or not pod_name
+        or not isinstance(pod_uid, str)
+        or not pod_uid
+        or not isinstance(statuses, list)
+    ):
+        raise RuntimeErrorEB(f"{context} Pod runtime identity is incomplete")
+
+    status_by_name: dict[str, dict[str, Any]] = {}
+    for item in statuses:
+        container_name = item.get("name") if isinstance(item, dict) else None
+        if (
+            not isinstance(container_name, str)
+            or not container_name
+            or container_name in status_by_name
+        ):
+            raise RuntimeErrorEB(
+                f"{context} container runtime identity is invalid"
+            )
+        status_by_name[container_name] = item
+    if set(status_by_name) != expected_container_names:
+        raise RuntimeErrorEB(
+            f"{context} container runtime identity set drifted"
+        )
+
+    container_ids: dict[str, str] = {}
+    for container_name in sorted(expected_container_names):
+        container_id = status_by_name[container_name].get("containerID")
+        if (
+            not isinstance(container_id, str)
+            or re.fullmatch(
+                r"containerd://[0-9a-f]{64}",
+                container_id,
+            )
+            is None
+        ):
+            raise RuntimeErrorEB(
+                f"{context} container ID is invalid: {container_name}"
+            )
+        container_ids[container_name] = container_id
+    return {
+        "pod_name": pod_name,
+        "pod_uid": pod_uid,
+        "container_ids": container_ids,
+    }
+
+
+def _functional_serving_runtime_binding(
+    root: Path,
+    source_commit: str,
+) -> dict[str, Any]:
+    if not COMMIT_RE.fullmatch(source_commit):
+        raise RuntimeErrorEB(
+            "functional serving runtime source commit is not exact"
+        )
+    release_path = root / "receipts/release.json"
+    try:
+        release = json.loads(release_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeErrorEB(
+            "functional serving runtime requires a valid release receipt"
+        ) from exc
+    api_digest = release.get("api_digest") if isinstance(release, dict) else None
+    web_digest = release.get("web_digest") if isinstance(release, dict) else None
+    if (
+        not isinstance(release, dict)
+        or release.get("schema_version") != 1
+        or release.get("status") != "applied"
+        or release.get("source_commit") != source_commit
+        or not isinstance(api_digest, str)
+        or not DIGEST_RE.fullmatch(api_digest)
+        or not isinstance(web_digest, str)
+        or not DIGEST_RE.fullmatch(web_digest)
+    ):
+        raise RuntimeErrorEB(
+            "functional serving runtime release binding is invalid"
+        )
+
+    config = _source_commit_config(source_commit)
+    api_replicas = int(config["semantic_search"]["api_replicas"])
+    web_replicas = int(config["runtime_binding"]["web_replicas"])
+    api = _kubectl_json(
+        root,
+        ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-api"],
+    )
+    web = _kubectl_json(
+        root,
+        ["-n", APP_NAMESPACE, "get", "deployment", "weltgewebe-web"],
+    )
+    pod_items = _kubectl_json(
+        root,
+        ["-n", APP_NAMESPACE, "get", "pods"],
+    ).get("items")
+    if not isinstance(pod_items, list) or any(
+        not isinstance(item, dict) for item in pod_items
+    ):
+        raise RuntimeErrorEB(
+            "functional serving runtime Pod inventory is invalid"
+        )
+    pods_by_workload = {
+        "weltgewebe-api": _pods_matching_labels(
+            pod_items,
+            {"app.kubernetes.io/name": "weltgewebe-api"},
+        ),
+        "weltgewebe-web": _pods_matching_labels(
+            pod_items,
+            {"app.kubernetes.io/name": "weltgewebe-web"},
+        ),
+    }
+    workloads = _require_live_application_workloads(
+        root,
+        release,
+        {
+            "weltgewebe-api": api,
+            "weltgewebe-web": web,
+        },
+        pods_by_workload,
+    )
+
+    semantic = config["semantic_search"]
+    expected_images = {
+        "weltgewebe-api": {
+            "api": f"ghcr.io/heimgewebe/commonthing-api@{api_digest}",
+            "search-worker": (
+                f"ghcr.io/heimgewebe/commonthing-api@{api_digest}"
+            ),
+            "ollama": str(semantic["ollama_image"]),
+        },
+        "weltgewebe-web": {
+            "web": f"ghcr.io/heimgewebe/commonthing-web@{web_digest}",
+        },
+    }
+    pod_readback = {
+        "weltgewebe-api": _require_running_pod_images(
+            pods_by_workload["weltgewebe-api"],
+            "weltgewebe-api",
+            api_replicas,
+            expected_images["weltgewebe-api"],
+        ),
+        "weltgewebe-web": _require_running_pod_images(
+            pods_by_workload["weltgewebe-web"],
+            "weltgewebe-web",
+            web_replicas,
+            expected_images["weltgewebe-web"],
+        ),
+    }
+
+    workload_binding: dict[str, Any] = {}
+    for workload_name in ("weltgewebe-api", "weltgewebe-web"):
+        workload = workloads.get(workload_name)
+        image_binding = pod_readback.get(workload_name)
+        if (
+            not isinstance(workload, dict)
+            or workload.get("canonical") is not True
+            or not isinstance(workload.get("contract_sha256"), str)
+            or not workload["contract_sha256"]
+            or not isinstance(workload.get("pod_contract_sha256"), str)
+            or not workload["pod_contract_sha256"]
+            or not isinstance(image_binding, dict)
+            or image_binding.get("images_canonical") is not True
+            or not isinstance(
+                image_binding.get("requested_images_sha256"), str
+            )
+            or not image_binding["requested_images_sha256"]
+            or not isinstance(image_binding.get("pods"), dict)
+        ):
+            raise RuntimeErrorEB(
+                f"functional serving runtime binding is invalid: "
+                f"{workload_name}"
+            )
+
+        live_by_name: dict[str, dict[str, Any]] = {}
+        for pod in pods_by_workload[workload_name]:
+            metadata = pod.get("metadata")
+            name = (
+                metadata.get("name")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in live_by_name
+            ):
+                raise RuntimeErrorEB(
+                    "functional serving runtime Pod identity is invalid"
+                )
+            live_by_name[name] = pod
+        if set(live_by_name) != set(image_binding["pods"]):
+            raise RuntimeErrorEB(
+                f"functional serving runtime Pod set drifted: "
+                f"{workload_name}"
+            )
+
+        pod_identities: dict[str, Any] = {}
+        for pod_name in sorted(live_by_name):
+            identity = _application_pod_runtime_identity(
+                live_by_name[pod_name],
+                set(expected_images[workload_name]),
+                f"functional serving {workload_name}/{pod_name}",
+            )
+            image_identity = image_binding["pods"].get(pod_name)
+            runtime_image_ids = (
+                image_identity.get("runtime_image_ids")
+                if isinstance(image_identity, dict)
+                else None
+            )
+            if (
+                not isinstance(runtime_image_ids, dict)
+                or set(runtime_image_ids)
+                != set(expected_images[workload_name])
+                or any(
+                    not isinstance(value, str) or not value
+                    for value in runtime_image_ids.values()
+                )
+            ):
+                raise RuntimeErrorEB(
+                    f"functional serving runtime image identity is invalid: "
+                    f"{workload_name}/{pod_name}"
+                )
+            identity["runtime_image_ids"] = dict(
+                sorted(runtime_image_ids.items())
+            )
+            pod_identities[pod_name] = identity
+
+        workload_binding[workload_name] = {
+            "contract_sha256": workload["contract_sha256"],
+            "pod_contract_sha256": workload["pod_contract_sha256"],
+            "requested_images_sha256": image_binding[
+                "requested_images_sha256"
+            ],
+            "pods": pod_identities,
+        }
+
+    services = _require_live_application_services(root, release)
+    service_binding: dict[str, str] = {}
+    for name in ("weltgewebe-api", "weltgewebe-web"):
+        value = services.get(name)
+        spec_sha256 = (
+            value.get("spec_sha256")
+            if isinstance(value, dict)
+            else None
+        )
+        if (
+            not isinstance(value, dict)
+            or value.get("canonical") is not True
+            or not isinstance(spec_sha256, str)
+            or not spec_sha256
+        ):
+            raise RuntimeErrorEB(
+                f"functional serving Service binding is invalid: {name}"
+            )
+        service_binding[name] = spec_sha256
+
+    gateway_readback = _require_gateway_ready(
+        _kubectl_json(
+            root,
+            [
+                "-n",
+                APP_NAMESPACE,
+                "get",
+                "gateway",
+                "commonthing-experiment-b",
+            ],
+        )
+    )
+    httproute_readback = _require_httproute_ready(
+        _kubectl_json(
+            root,
+            [
+                "-n",
+                APP_NAMESPACE,
+                "get",
+                "httproute",
+                "commonthing-experiment-b",
+            ],
+        )
+    )
+    return {
+        "workloads": workload_binding,
+        "services": service_binding,
+        "gateway": gateway_readback,
+        "httproute": httproute_readback,
+        "gateway_base_url": _gateway_base_url(root, source_commit),
+    }
+
+
 def _gateway_data_plane_readback(
     root: Path, source_commit: str
 ) -> dict[str, Any]:
@@ -12242,7 +12553,19 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
         target_binding_before,
         source_commit,
     ):
+        serving_runtime_before = _functional_serving_runtime_binding(
+            root,
+            source_commit,
+        )
         data_plane = _gateway_data_plane_readback(root, source_commit)
+        serving_runtime_after = _functional_serving_runtime_binding(
+            root,
+            source_commit,
+        )
+        if serving_runtime_after != serving_runtime_before:
+            raise RuntimeErrorEB(
+                "application serving runtime changed during functional readback"
+            )
         base = str(data_plane["gateway"])
         checks = data_plane["checks"]
         jetstream = _jetstream_signature(root)
@@ -12273,6 +12596,9 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
         "jetstream": jetstream,
         "kubernetes_target_sha256": _stable_json_sha256(
             target_binding_before
+        ),
+        "serving_runtime_sha256": _stable_json_sha256(
+            serving_runtime_before
         ),
         "production_endpoint_used": False,
     }

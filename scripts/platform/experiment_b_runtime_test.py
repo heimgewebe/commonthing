@@ -2264,6 +2264,11 @@ spec:
                 ),
                 mock.patch.object(
                     runtime,
+                    "_functional_serving_runtime_binding",
+                    return_value={"stable": True},
+                ),
+                mock.patch.object(
+                    runtime,
                     "_gateway_data_plane_readback",
                     return_value={
                         "gateway": "http://192.0.2.10",
@@ -12889,6 +12894,161 @@ def install(*args, **kwargs):
             "api_runtime_binding_after != api_runtime_binding_before",
             t048_source,
         )
+
+    def test_application_pod_runtime_identity_binds_uid_and_container_ids(
+        self,
+    ) -> None:
+        pod = {
+            "metadata": {
+                "name": "weltgewebe-api-serving",
+                "uid": "pod-uid-serving",
+            },
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "api",
+                        "containerID": "containerd://" + "a" * 64,
+                    },
+                    {
+                        "name": "search-worker",
+                        "containerID": "containerd://" + "b" * 64,
+                    },
+                    {
+                        "name": "ollama",
+                        "containerID": "containerd://" + "c" * 64,
+                    },
+                ]
+            },
+        }
+        observed = runtime._application_pod_runtime_identity(
+            pod,
+            {"api", "search-worker", "ollama"},
+            "functional serving test",
+        )
+        self.assertEqual(observed["pod_name"], "weltgewebe-api-serving")
+        self.assertEqual(observed["pod_uid"], "pod-uid-serving")
+        self.assertEqual(
+            observed["container_ids"],
+            {
+                "api": "containerd://" + "a" * 64,
+                "ollama": "containerd://" + "c" * 64,
+                "search-worker": "containerd://" + "b" * 64,
+            },
+        )
+
+        drifted = json.loads(json.dumps(pod))
+        drifted["status"]["containerStatuses"][0]["containerID"] = (
+            "containerd://" + "d" * 63
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "container ID is invalid",
+        ):
+            runtime._application_pod_runtime_identity(
+                drifted,
+                {"api", "search-worker", "ollama"},
+                "functional serving test",
+            )
+
+        binding_source = inspect.getsource(
+            runtime._functional_serving_runtime_binding
+        )
+        for required in (
+            "_require_live_application_workloads(",
+            "_require_running_pod_images(",
+            "_require_live_application_services(",
+            "_require_gateway_ready(",
+            "_require_httproute_ready(",
+            "_application_pod_runtime_identity(",
+        ):
+            self.assertIn(required, binding_source)
+
+    def test_functional_readback_rejects_serving_runtime_drift(
+        self,
+    ) -> None:
+        source_commit = "a" * 40
+        target_receipt = {"kubeconfig_sha256": "b" * 64}
+        target = (
+            target_receipt,
+            "192.0.2.23",
+            "https://192.0.2.23:6443",
+        )
+        before = {
+            "workloads": {
+                "weltgewebe-api": {
+                    "pods": {
+                        "api-1": {
+                            "pod_uid": "api-before",
+                            "container_ids": {
+                                "api": "containerd://" + "c" * 64,
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        after = json.loads(json.dumps(before))
+        after["workloads"]["weltgewebe-api"]["pods"]["api-1"][
+            "pod_uid"
+        ] = "api-after"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bound_context = mock.MagicMock()
+            bound_context.__enter__.return_value = None
+            bound_context.__exit__.return_value = False
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_begin_live_check_attempt",
+                    return_value=(
+                        root / "functional-readback.json",
+                        root / "functional-readback-attempt.json",
+                        1,
+                    ),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=source_commit,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_kubernetes_target_binding",
+                    return_value=target,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_bound_kube_env",
+                    return_value=bound_context,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_functional_serving_runtime_binding",
+                    side_effect=[before, after],
+                ) as serving_binding,
+                mock.patch.object(
+                    runtime,
+                    "_gateway_data_plane_readback",
+                    return_value={
+                        "gateway": "http://192.0.2.23",
+                        "checks": {},
+                    },
+                ) as gateway_readback,
+                mock.patch.object(
+                    runtime,
+                    "_jetstream_signature",
+                ) as jetstream,
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "application serving runtime changed during functional readback",
+                ),
+            ):
+                runtime.functional_readback(root, source_commit)
+
+            self.assertEqual(serving_binding.call_count, 2)
+            gateway_readback.assert_called_once_with(root, source_commit)
+            jetstream.assert_not_called()
 
     def test_t048_database_sampler_uses_bound_postgres_container(self) -> None:
         source = inspect.getsource(runtime._database_connection_count)
