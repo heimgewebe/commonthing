@@ -2464,10 +2464,13 @@ def install_platform(root: Path) -> dict[str, Any]:
         return result
 
 
-def render_namespaces(root: Path) -> str:
-    receipt = toolchain(root)
-    kustomize = receipt["tools"]["kustomize"]
-    return run([kustomize, "build", str(NAMESPACES)]).stdout
+def render_namespaces(root: Path, source_commit: str) -> str:
+    return _source_commit_kustomize_build(
+        root,
+        source_commit,
+        NAMESPACES,
+        NAMESPACES,
+    )
 
 
 def kubectl_apply(root: Path, manifest: str) -> None:
@@ -2583,17 +2586,47 @@ def _database_url(database: dict[str, str]) -> str:
     )
 
 
+def _read_registry_config_bytes(path: Path) -> bytes:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+        raise RuntimeErrorEB("registry config must be a regular external file")
+    try:
+        file_fd = os.open(path, os.O_RDONLY | cloexec | nofollow)
+    except OSError as exc:
+        raise RuntimeErrorEB(
+            "registry config must be a regular external file"
+        ) from exc
+    try:
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeErrorEB(
+                "registry config must be a regular external file"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise RuntimeErrorEB(
+            "registry config must be a regular external file"
+        ) from exc
+    finally:
+        os.close(file_fd)
+
+
 def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
     _require_kubernetes_target_binding(root, source_commit)
     secrets_target = _kubernetes_target_identity(root, source_commit)
-    if not registry_config.is_file() or registry_config.is_symlink():
-        raise RuntimeErrorEB("registry config must be a regular external file")
+    registry_bytes = _read_registry_config_bytes(registry_config)
     try:
-        registry_bytes = registry_config.read_bytes()
         registry_payload = json.loads(registry_bytes.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeErrorEB("registry config is not valid JSON") from exc
     if "ghcr.io" not in registry_payload.get("auths", {}):
         raise RuntimeErrorEB("registry config has no ghcr.io credential")
@@ -2602,7 +2635,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     registry_state = root / "secrets/registry.json"
     atomic_bytes(registry_state, registry_bytes)
     with _bound_kube_env(root, secrets_target, source_commit):
-        kubectl_apply(root, render_namespaces(root))
+        kubectl_apply(root, render_namespaces(root, source_commit))
         kubectl_apply(
             root,
             secret_manifest(

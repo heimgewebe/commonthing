@@ -594,8 +594,33 @@ spec:
             inject_secrets.index(
                 "_invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)"
             ),
-            inject_secrets.index("kubectl_apply(root, render_namespaces(root))"),
+            inject_secrets.index(
+                "kubectl_apply(root, render_namespaces(root, source_commit))"
+            ),
         )
+
+    def test_render_namespaces_is_source_commit_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_commit = "a" * 40
+            with mock.patch.object(
+                runtime,
+                "_source_commit_kustomize_build",
+                return_value="rendered",
+            ) as render:
+                self.assertEqual(
+                    runtime.render_namespaces(root, source_commit),
+                    "rendered",
+                )
+            render.assert_called_once_with(
+                root,
+                source_commit,
+                runtime.NAMESPACES,
+                runtime.NAMESPACES,
+            )
+        source = inspect.getsource(runtime.render_namespaces)
+        self.assertIn("_source_commit_kustomize_build(", source)
+        self.assertNotIn('run([kustomize, "build", str(NAMESPACES)]', source)
 
     def test_preflight_parses_exact_libvirt_active_field(self) -> None:
         payload = (
@@ -4837,6 +4862,55 @@ spec:
 
             self.assertTrue(swapped)
             self.assertTrue(database_path.is_symlink())
+
+    def test_registry_config_read_rejects_symlink_swap_at_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry_config = root / "registry.json"
+            replacement = root / "replacement.json"
+            registry_config.write_text(
+                '{"auths":{"ghcr.io":{"auth":"original"}}}\n',
+                encoding="utf-8",
+            )
+            replacement.write_text(
+                '{"auths":{"ghcr.io":{"auth":"replacement"}}}\n',
+                encoding="utf-8",
+            )
+            real_open = runtime.os.open
+            swapped = False
+
+            def swap_before_open(
+                path: str | Path,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal swapped
+                if Path(path) == registry_config and not swapped:
+                    swapped = True
+                    registry_config.unlink()
+                    registry_config.symlink_to(replacement)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                runtime.os,
+                "open",
+                side_effect=swap_before_open,
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "registry config must be a regular external file",
+                ):
+                    runtime._read_registry_config_bytes(registry_config)
+
+            self.assertTrue(swapped)
+            self.assertTrue(registry_config.is_symlink())
+        source = inspect.getsource(runtime.inject_secrets)
+        self.assertIn(
+            "_read_registry_config_bytes(registry_config)",
+            source,
+        )
+        self.assertNotIn("registry_config.read_bytes()", source)
 
     def test_inject_secrets_rejects_invalid_database_before_kubernetes_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
