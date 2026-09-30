@@ -390,6 +390,8 @@ spec:
         live = inspect.getsource(runtime._semantic_provider_live_readback)
         self.assertIn("/api/embed", live)
         self.assertIn("/api/tags", live)
+        self.assertIn("_run_bound_container_command(", live)
+        self.assertNotIn("deployment/weltgewebe-api", live)
         self.assertIn('"database_generation_activation": False', source)
         self.assertNotIn("weltgewebe_search_generation_activation_ready", source)
         self.assertNotIn("weltgewebe_activate_search_generation", source)
@@ -400,38 +402,179 @@ spec:
         semantic = config["semantic_search"]
         dimension = int(semantic["dimension"])
         digest = str(semantic["model_revision"]).removeprefix("sha256:")
-        tags = runtime.subprocess.CompletedProcess(
-            ["kubectl"], 0,
-            stdout=json.dumps({"models": [{"name": semantic["model_id"], "digest": digest}]}),
-            stderr="",
-        )
-        embed = runtime.subprocess.CompletedProcess(
-            ["kubectl"], 0,
-            stdout=json.dumps({"embeddings": [[0.0] * dimension]}),
-            stderr="",
-        )
+        binding = {
+            "pod_name": "weltgewebe-api-test",
+            "pod_uid": "pod-uid",
+            "contract_sha256": "b" * 64,
+            "pod_contract_sha256": "c" * 64,
+            "runtime_image_ids_sha256": "d" * 64,
+            "search_worker_container_id": "containerd://" + "e" * 64,
+            "ollama_container_id": "containerd://" + "f" * 64,
+        }
+        tags = json.dumps(
+            {
+                "models": [
+                    {
+                        "name": semantic["model_id"],
+                        "digest": digest,
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        embed = json.dumps(
+            {"embeddings": [[0.0] * dimension]}
+        ).encode("utf-8")
         with (
             mock.patch.object(runtime, "load_config", return_value=config),
-            mock.patch.object(runtime, "toolchain", return_value={"tools": {"kubectl": "kubectl"}}),
-            mock.patch.object(runtime, "kube_env", return_value={}),
-            mock.patch.object(runtime, "run", side_effect=[tags, embed]),
+            mock.patch.object(
+                runtime,
+                "_semantic_provider_runtime_binding",
+                side_effect=[binding, binding],
+            ) as runtime_binding,
+            mock.patch.object(
+                runtime,
+                "_run_bound_container_command",
+                side_effect=[tags, embed],
+            ) as bound_exec,
         ):
-            observed = runtime._semantic_provider_live_readback(Path("."), commit)
-        self.assertEqual(observed["model_revision"], semantic["model_revision"])
+            observed = runtime._semantic_provider_live_readback(
+                Path("."),
+                commit,
+            )
+        self.assertEqual(
+            observed["model_revision"],
+            semantic["model_revision"],
+        )
         self.assertEqual(observed["dimension"], dimension)
         self.assertTrue(observed["embedding_probe"])
-
-        missing = runtime.subprocess.CompletedProcess(
-            ["kubectl"], 0, stdout=json.dumps({"models": []}), stderr=""
+        self.assertEqual(
+            observed["runtime_binding_sha256"],
+            runtime._stable_json_sha256(binding),
         )
+        self.assertEqual(runtime_binding.call_count, 2)
+        self.assertEqual(bound_exec.call_count, 2)
+        for call in bound_exec.call_args_list:
+            self.assertEqual(
+                call.args[2],
+                binding["search_worker_container_id"],
+            )
+
+        drifted_binding = {
+            **binding,
+            "ollama_container_id": "containerd://" + "1" * 64,
+        }
         with (
             mock.patch.object(runtime, "load_config", return_value=config),
-            mock.patch.object(runtime, "toolchain", return_value={"tools": {"kubectl": "kubectl"}}),
-            mock.patch.object(runtime, "kube_env", return_value={}),
-            mock.patch.object(runtime, "run", return_value=missing),
+            mock.patch.object(
+                runtime,
+                "_semantic_provider_runtime_binding",
+                side_effect=[binding, drifted_binding],
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_container_command",
+                side_effect=[tags, embed],
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "runtime changed during probe",
+            ),
         ):
-            with self.assertRaisesRegex(runtime.RuntimeErrorEB, "model digest"):
-                runtime._semantic_provider_live_readback(Path("."), commit)
+            runtime._semantic_provider_live_readback(
+                Path("."),
+                commit,
+            )
+
+        missing = json.dumps({"models": []}).encode("utf-8")
+        with (
+            mock.patch.object(runtime, "load_config", return_value=config),
+            mock.patch.object(
+                runtime,
+                "_semantic_provider_runtime_binding",
+                return_value=binding,
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_container_command",
+                return_value=missing,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "model digest",
+            ):
+                runtime._semantic_provider_live_readback(
+                    Path("."),
+                    commit,
+                )
+
+    def test_semantic_provider_runtime_binding_requires_exact_container_ids(self) -> None:
+        pod = {
+            "metadata": {
+                "name": "weltgewebe-api-test",
+                "uid": "pod-uid",
+            },
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "search-worker",
+                        "containerID": "containerd://" + "a" * 64,
+                    },
+                    {
+                        "name": "ollama",
+                        "containerID": "containerd://" + "b" * 64,
+                    },
+                ]
+            },
+        }
+        runtime_binding = {
+            "contract_sha256": "c" * 64,
+            "pod_contract_sha256": "d" * 64,
+            "runtime_image_ids_sha256": "e" * 64,
+        }
+        with mock.patch.object(
+            runtime,
+            "_require_t048_api_runtime_binding",
+            return_value=(
+                "weltgewebe-api-test",
+                pod,
+                runtime_binding,
+            ),
+        ):
+            observed = runtime._semantic_provider_runtime_binding(
+                Path("."),
+                "f" * 40,
+            )
+        self.assertEqual(observed["pod_uid"], "pod-uid")
+        self.assertEqual(
+            observed["search_worker_container_id"],
+            "containerd://" + "a" * 64,
+        )
+        self.assertEqual(
+            observed["ollama_container_id"],
+            "containerd://" + "b" * 64,
+        )
+
+        pod["status"]["containerStatuses"][0]["containerID"] = "broken"
+        with (
+            mock.patch.object(
+                runtime,
+                "_require_t048_api_runtime_binding",
+                return_value=(
+                    "weltgewebe-api-test",
+                    pod,
+                    runtime_binding,
+                ),
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "search-worker containerID",
+            ),
+        ):
+            runtime._semantic_provider_runtime_binding(
+                Path("."),
+                "f" * 40,
+            )
 
     def test_live_check_attempt_invalidates_stale_success_and_binds_completion(self) -> None:
         commit = "a" * 40

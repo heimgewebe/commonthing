@@ -2891,23 +2891,116 @@ def apply_release(
     return receipt
 
 
+def _semantic_provider_runtime_binding(
+    root: Path, source_commit: str
+) -> dict[str, str]:
+    pod_name, pod, runtime_binding = _require_t048_api_runtime_binding(
+        root,
+        source_commit,
+    )
+    metadata = pod.get("metadata")
+    status_obj = pod.get("status")
+    pod_uid = (
+        metadata.get("uid")
+        if isinstance(metadata, dict)
+        else None
+    )
+    statuses = (
+        status_obj.get("containerStatuses")
+        if isinstance(status_obj, dict)
+        else None
+    )
+    if not isinstance(pod_uid, str) or not pod_uid:
+        raise RuntimeErrorEB(
+            "semantic provider Pod UID is invalid"
+        )
+    if not isinstance(statuses, list):
+        raise RuntimeErrorEB(
+            "semantic provider container status inventory is invalid"
+        )
+    status_by_name: dict[str, dict[str, Any]] = {}
+    for item in statuses:
+        if not isinstance(item, dict):
+            raise RuntimeErrorEB(
+                "semantic provider container status inventory is invalid"
+            )
+        name = item.get("name")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in status_by_name
+        ):
+            raise RuntimeErrorEB(
+                "semantic provider container status identity is invalid"
+            )
+        status_by_name[name] = item
+
+    result: dict[str, str] = {
+        "pod_name": pod_name,
+        "pod_uid": pod_uid,
+    }
+    for field in (
+        "contract_sha256",
+        "pod_contract_sha256",
+        "runtime_image_ids_sha256",
+    ):
+        value = runtime_binding.get(field)
+        if not isinstance(value, str) or not value:
+            raise RuntimeErrorEB(
+                "semantic provider runtime binding field is invalid: "
+                f"{field}"
+            )
+        result[field] = value
+    for container_name, result_field in (
+        ("search-worker", "search_worker_container_id"),
+        ("ollama", "ollama_container_id"),
+    ):
+        item = status_by_name.get(container_name)
+        container_id = (
+            item.get("containerID")
+            if isinstance(item, dict)
+            else None
+        )
+        if (
+            not isinstance(container_id, str)
+            or re.fullmatch(
+                r"containerd://[0-9a-f]{64}",
+                container_id,
+            )
+            is None
+        ):
+            raise RuntimeErrorEB(
+                "semantic provider runtime binding has no exact "
+                f"{container_name} containerID"
+            )
+        result[result_field] = container_id
+    return result
+
+
 def _semantic_provider_live_readback(
     root: Path, source_commit: str
 ) -> dict[str, Any]:
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("semantic provider live source commit is not exact")
     semantic = load_config(source_commit)["semantic_search"]
-    kubectl = toolchain(root)["tools"]["kubectl"]
-    env = kube_env(root)
-    tags = run(
+    runtime_binding = _semantic_provider_runtime_binding(
+        root,
+        source_commit,
+    )
+    probe_container_id = runtime_binding[
+        "search_worker_container_id"
+    ]
+    tags = _run_bound_container_command(
+        root,
+        source_commit,
+        probe_container_id,
         [
-            kubectl, "-n", APP_NAMESPACE,
-            "exec", "deployment/weltgewebe-api",
-            "-c", "search-worker", "--",
-            "wget", "-qO-", "http://127.0.0.1:11434/api/tags",
+            "wget",
+            "-qO-",
+            "http://127.0.0.1:11434/api/tags",
         ],
-        env=env,
-    ).stdout
+        context="semantic provider tags probe",
+    ).decode("utf-8")
     payload = json.loads(tags)
     observed = ""
     for model in payload.get("models", []):
@@ -2925,19 +3018,20 @@ def _semantic_provider_live_readback(
         {"model": semantic["model_id"], "input": probe_text},
         separators=(",", ":"),
     )
-    embedding_raw = run(
+    embedding_raw = _run_bound_container_command(
+        root,
+        source_commit,
+        probe_container_id,
         [
-            kubectl, "-n", APP_NAMESPACE,
-            "exec", "deployment/weltgewebe-api",
-            "-c", "search-worker", "--",
-            "wget", "-qO-",
+            "wget",
+            "-qO-",
             "--header=Content-Type: application/json",
             f"--post-data={probe_request}",
             "http://127.0.0.1:11434/api/embed",
         ],
-        env=env,
         timeout=300,
-    ).stdout
+        context="semantic provider embedding probe",
+    ).decode("utf-8")
     embedding_payload = json.loads(embedding_raw)
     embeddings = embedding_payload.get("embeddings")
     dimension = int(semantic["dimension"])
@@ -2956,6 +3050,13 @@ def _semantic_provider_live_readback(
         raise RuntimeErrorEB(
             "Ollama embedding smoke does not match the pinned finite dimension"
         )
+    if (
+        _semantic_provider_runtime_binding(root, source_commit)
+        != runtime_binding
+    ):
+        raise RuntimeErrorEB(
+            "semantic provider runtime changed during probe"
+        )
     return {
         "source_commit": source_commit,
         "provider": semantic["provider"],
@@ -2967,9 +3068,11 @@ def _semantic_provider_live_readback(
         "embedding_probe_sha256": hashlib.sha256(
             probe_text.encode("utf-8")
         ).hexdigest(),
+        "runtime_binding_sha256": _stable_json_sha256(
+            runtime_binding
+        ),
         "literal_loopback": True,
     }
-
 
 def semantic_activate(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
