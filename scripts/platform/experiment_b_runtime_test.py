@@ -617,6 +617,21 @@ spec:
         self.assertIn(".casefold()", source)
         self.assertNotIn('"yes" not in network', source)
 
+    def test_preflight_rejects_missing_bwrap_before_runtime_effects(self) -> None:
+        def require(command: str) -> str:
+            if command == "bwrap":
+                raise runtime.RuntimeErrorEB("missing bwrap")
+            return f"/usr/bin/{command}"
+
+        with (
+            mock.patch.object(runtime, "load_config", return_value={}),
+            mock.patch.object(runtime, "require_binary", side_effect=require),
+            mock.patch.object(runtime, "run") as run,
+        ):
+            with self.assertRaisesRegex(runtime.RuntimeErrorEB, "missing bwrap"):
+                runtime.preflight()
+        run.assert_not_called()
+
     def test_create_vm_rerun_invalidates_stale_chain_before_prepare_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2374,6 +2389,88 @@ spec:
         self.assertIn("source_commit=source_commit", source)
         self.assertIn("nats_binding=nats_binding", source)
         self.assertIn("state changed while hashing", source)
+
+    def test_event_pipeline_quiescence_requires_stable_full_drain(self) -> None:
+        drained = {
+            "database": {
+                "unpublished_nonquarantined": 0,
+                "published_without_receipt": 0,
+            },
+            "jetstream": {
+                "stream_detail": [
+                    {
+                        "durable_consumers": [
+                            {
+                                "name": runtime.DOMAIN_EVENT_CONSUMER,
+                                "num_pending": 0,
+                                "num_ack_pending": 0,
+                            }
+                        ]
+                    }
+                ]
+            },
+        }
+        pending = json.loads(json.dumps(drained))
+        pending["database"]["unpublished_nonquarantined"] = 1
+        with (
+            mock.patch.object(
+                runtime,
+                "_event_pipeline_quiescence_sample",
+                side_effect=[pending, drained, drained],
+            ) as sample,
+            mock.patch.object(runtime.time, "monotonic", return_value=0.0),
+            mock.patch.object(runtime.time, "sleep") as sleep,
+        ):
+            observed = runtime._wait_event_pipeline_quiescent(
+                Path("/tmp/experiment-b-event-drain"),
+                source_commit="a" * 40,
+                database_identity=("user", "database"),
+                timeout_seconds=10,
+            )
+        self.assertEqual(observed, drained)
+        self.assertEqual(sample.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+        ack_pending = json.loads(json.dumps(drained))
+        ack_pending["jetstream"]["stream_detail"][0]["durable_consumers"][0][
+            "num_ack_pending"
+        ] = 1
+        self.assertFalse(
+            runtime._event_pipeline_snapshot_is_drained(ack_pending)
+        )
+
+    def test_recovery_drains_pipeline_before_and_after_restore(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        flux_suspend = source.index(
+            '_flux_suspend(root, "commonthing-experiment-b-data")'
+        )
+        pre_drain = source.index(
+            "_wait_event_pipeline_quiescent(",
+            flux_suspend,
+        )
+        api_scale = source.index(
+            '_scale_deployment(root, APP_NAMESPACE, "weltgewebe-api", 0)'
+        )
+        frozen = source.index(
+            "frozen_pipeline = _event_pipeline_quiescence_sample(",
+            api_scale,
+        )
+        before_db = source.index("before_db = _database_signature(", frozen)
+        app_resume = source.index(
+            '_flux_resume(root, "commonthing-experiment-b-app")'
+        )
+        post_drain = source.index(
+            "_wait_event_pipeline_quiescent(",
+            app_resume,
+        )
+        after_db = source.index("after_db = _database_signature(", post_drain)
+        self.assertLess(flux_suspend, pre_drain)
+        self.assertLess(pre_drain, api_scale)
+        self.assertLess(api_scale, frozen)
+        self.assertLess(frozen, before_db)
+        self.assertLess(before_db, app_resume)
+        self.assertLess(app_resume, post_drain)
+        self.assertLess(post_drain, after_db)
 
     def test_recovery_rto_includes_application_rollout(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)

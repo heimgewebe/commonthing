@@ -62,6 +62,7 @@ BASE_VOLUME = "commonthing-experiment-b-base.qcow2"
 VOLUME_NAME = "commonthing-experiment-b.qcow2"
 APP_NAMESPACE = "commonthing-experiment-b"
 DATA_NAMESPACE = "commonthing-data"
+DOMAIN_EVENT_CONSUMER = "weltgewebe-api-domain-receipts-v1"
 EXPECTED_PVCS = frozenset(
     {
         f"{DATA_NAMESPACE}/postgres-data",
@@ -547,7 +548,8 @@ def _virsh_info_field(
 def preflight(expected_source_commit: str | None = None) -> dict[str, Any]:
     config = load_config()
     for command in (
-        "virsh", "virt-install", "qemu-img", "ssh", "scp", "ssh-keygen", "docker"
+        "virsh", "virt-install", "qemu-img", "ssh", "scp", "ssh-keygen", "docker",
+        "bwrap",
     ):
         require_binary(command)
     if not Path("/dev/kvm").exists():
@@ -12392,6 +12394,152 @@ def _jetstream_signature(
         "message_store_sha256": message_store_sha256,
     }
 
+def _event_pipeline_quiescence_sample(
+    root: Path,
+    *,
+    source_commit: str,
+    database_identity: tuple[str, str],
+) -> dict[str, Any]:
+    postgres_binding = _require_postgres_runtime_binding(
+        root,
+        source_commit,
+    )
+    sql = f"""
+SELECT json_build_object(
+  'unpublished_nonquarantined',
+  (
+    SELECT count(*)::bigint
+    FROM domain_outbox
+    WHERE published_at IS NULL
+      AND quarantined_at IS NULL
+  ),
+  'published_without_receipt',
+  (
+    SELECT count(*)::bigint
+    FROM domain_outbox AS event
+    WHERE event.published_at IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM domain_event_consumptions AS receipt
+        WHERE receipt.consumer_name = '{DOMAIN_EVENT_CONSUMER}'
+          AND receipt.event_id = event.id
+      )
+  )
+)::text;
+"""
+    raw_bytes = _run_bound_postgres_client(
+        root,
+        source_commit,
+        postgres_binding,
+        [
+            *_database_client_argv("psql", database_identity),
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-qAt",
+        ],
+        input_bytes=sql.encode("utf-8"),
+        timeout=120,
+    )
+    try:
+        database = json.loads(raw_bytes.decode("utf-8").strip())
+        unpublished = int(database["unpublished_nonquarantined"])
+        missing_receipts = int(database["published_without_receipt"])
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise RuntimeErrorEB(
+            "event-pipeline PostgreSQL drain state is invalid"
+        ) from exc
+    if unpublished < 0 or missing_receipts < 0:
+        raise RuntimeErrorEB(
+            "event-pipeline PostgreSQL drain counts are invalid"
+        )
+
+    nats_binding = _require_nats_runtime_binding(
+        root,
+        source_commit,
+    )
+    jetstream = _jetstream_monitoring_signature(
+        root,
+        source_commit=source_commit,
+        nats_binding=nats_binding,
+    )
+    return {
+        "database": {
+            "unpublished_nonquarantined": unpublished,
+            "published_without_receipt": missing_receipts,
+        },
+        "jetstream": jetstream,
+    }
+
+
+def _event_pipeline_snapshot_is_drained(snapshot: Any) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    database = snapshot.get("database")
+    jetstream = snapshot.get("jetstream")
+    if (
+        not isinstance(database, dict)
+        or database.get("unpublished_nonquarantined") != 0
+        or database.get("published_without_receipt") != 0
+        or not isinstance(jetstream, dict)
+    ):
+        return False
+
+    expected_consumers = 0
+    stream_detail = jetstream.get("stream_detail")
+    if not isinstance(stream_detail, list):
+        return False
+    for stream in stream_detail:
+        if not isinstance(stream, dict):
+            return False
+        consumers = stream.get("durable_consumers")
+        if not isinstance(consumers, list):
+            return False
+        for consumer in consumers:
+            if not isinstance(consumer, dict):
+                return False
+            if consumer.get("name") == DOMAIN_EVENT_CONSUMER:
+                expected_consumers += 1
+            if (
+                consumer.get("num_pending") != 0
+                or consumer.get("num_ack_pending") != 0
+            ):
+                return False
+    return expected_consumers == 1
+
+
+def _wait_event_pipeline_quiescent(
+    root: Path,
+    *,
+    source_commit: str,
+    database_identity: tuple[str, str],
+    timeout_seconds: int = 600,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    previous: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        current = _event_pipeline_quiescence_sample(
+            root,
+            source_commit=source_commit,
+            database_identity=database_identity,
+        )
+        if _event_pipeline_snapshot_is_drained(current):
+            if current == previous:
+                return current
+            previous = current
+        else:
+            previous = None
+        time.sleep(1)
+    raise RuntimeErrorEB(
+        "event pipeline did not reach a stable fully drained state"
+    )
+
+
 def _scale_deployment(root: Path, namespace: str, name: str, replicas: int) -> None:
     _kubectl(
         root,
@@ -12904,6 +13052,11 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery Flux suspension"
             )
+            _wait_event_pipeline_quiescent(
+                root,
+                source_commit=source_commit,
+                database_identity=database_identity,
+            )
             _scale_deployment(root, APP_NAMESPACE, "weltgewebe-api", 0)
             _scale_deployment(root, APP_NAMESPACE, "weltgewebe-web", 0)
             _wait_pods_absent(
@@ -12919,6 +13072,15 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery application quiescence"
             )
+            frozen_pipeline = _event_pipeline_quiescence_sample(
+                root,
+                source_commit=source_commit,
+                database_identity=database_identity,
+            )
+            if not _event_pipeline_snapshot_is_drained(frozen_pipeline):
+                raise RuntimeErrorEB(
+                    "event pipeline changed while application workers were stopping"
+                )
 
             postgres_signature_before = _require_postgres_runtime_binding(
                 root,
@@ -13187,6 +13349,31 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 root, source_commit, recovery_target, "recovery data restoration"
             )
 
+            if postgres_dump_snapshot_fd is not None:
+                os.close(postgres_dump_snapshot_fd)
+                postgres_dump_snapshot_fd = None
+            if nats_backup_snapshot_fd is not None:
+                os.close(nats_backup_snapshot_fd)
+                nats_backup_snapshot_fd = None
+            _require_same_kubernetes_target(
+                root, source_commit, recovery_target, "recovery pre-Flux resume"
+            )
+            _flux_resume(root, "commonthing-experiment-b-data")
+            _flux_resume(root, "commonthing-experiment-b-app")
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")
+            _wait_event_pipeline_quiescent(
+                root,
+                source_commit=source_commit,
+                database_identity=database_identity,
+            )
+            _require_same_kubernetes_target(
+                root,
+                source_commit,
+                recovery_target,
+                "recovery post-resume event quiescence",
+            )
+
             postgres_signature_after = _require_postgres_runtime_binding(
                 root,
                 source_commit,
@@ -13215,25 +13402,14 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 source_commit=source_commit,
                 nats_binding=nats_signature_after_binding,
             )
-            if postgres_dump_snapshot_fd is not None:
-                os.close(postgres_dump_snapshot_fd)
-                postgres_dump_snapshot_fd = None
-            if nats_backup_snapshot_fd is not None:
-                os.close(nats_backup_snapshot_fd)
-                nats_backup_snapshot_fd = None
             if after_db != before_db:
-                raise RuntimeErrorEB("PostgreSQL/search signature changed across delete-to-prove")
+                raise RuntimeErrorEB(
+                    "PostgreSQL/search signature changed across delete-to-prove"
+                )
             if after_nats != before_nats:
                 raise RuntimeErrorEB(
                     "JetStream stream/message-store/durable-consumer continuity signature changed across restore"
                 )
-            _require_same_kubernetes_target(
-                root, source_commit, recovery_target, "recovery pre-Flux resume"
-            )
-            _flux_resume(root, "commonthing-experiment-b-data")
-            _flux_resume(root, "commonthing-experiment-b-app")
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery completion"
             )
