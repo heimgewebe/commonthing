@@ -1834,8 +1834,8 @@ def _require_live_k3s_runtime(
     )
     config_path, service_path = _k3s_contract_paths(config)
     expected_binary_sha256 = str(config["kubernetes"]["binary_sha256"])
-    expected_config_sha256 = sha256_file(config_path)
-    expected_service_sha256 = sha256_file(service_path)
+    expected_config_sha256 = _git_blob_sha256(source_commit, config_path)
+    expected_service_sha256 = _git_blob_sha256(source_commit, service_path)
     if (
         receipt.get("binary_sha256") != expected_binary_sha256
         or receipt.get("config_sha256") != expected_config_sha256
@@ -2628,8 +2628,21 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         registry_payload = json.loads(registry_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeErrorEB("registry config is not valid JSON") from exc
-    if "ghcr.io" not in registry_payload.get("auths", {}):
-        raise RuntimeErrorEB("registry config has no ghcr.io credential")
+    auths = registry_payload.get("auths") if isinstance(registry_payload, dict) else None
+    credential = auths.get("ghcr.io") if isinstance(auths, dict) else None
+    auth = credential.get("auth") if isinstance(credential, dict) else None
+    username = credential.get("username") if isinstance(credential, dict) else None
+    password = credential.get("password") if isinstance(credential, dict) else None
+    if not (
+        (isinstance(auth, str) and bool(auth))
+        or (
+            isinstance(username, str)
+            and bool(username)
+            and isinstance(password, str)
+            and bool(password)
+        )
+    ):
+        raise RuntimeErrorEB("registry config has no usable ghcr.io credential")
     db, database_bytes = ensure_secret_material(root)
     database_url = _database_url(db)
     registry_state = root / "secrets/registry.json"
@@ -13794,8 +13807,8 @@ def portability_report(root: Path) -> dict[str, Any]:
     expected_k3s_config, expected_k3s_service = _k3s_contract_paths(config)
     expected_k3s_values = {
         "binary_sha256": str(config["kubernetes"]["binary_sha256"]),
-        "config_sha256": sha256_file(expected_k3s_config),
-        "service_sha256": sha256_file(expected_k3s_service),
+        "config_sha256": _git_blob_sha256(source_commit, expected_k3s_config),
+        "service_sha256": _git_blob_sha256(source_commit, expected_k3s_service),
     }
     if (
         not isinstance(k3s_status, dict)

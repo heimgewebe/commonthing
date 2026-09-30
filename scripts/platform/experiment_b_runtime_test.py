@@ -865,6 +865,36 @@ spec:
             runtime.sha256_file(service_path),
         )
 
+        live_runtime_source = inspect.getsource(runtime._require_live_k3s_runtime)
+        self.assertIn(
+            "_git_blob_sha256(source_commit, config_path)",
+            live_runtime_source,
+        )
+        self.assertIn(
+            "_git_blob_sha256(source_commit, service_path)",
+            live_runtime_source,
+        )
+        self.assertNotIn("sha256_file(config_path)", live_runtime_source)
+        self.assertNotIn("sha256_file(service_path)", live_runtime_source)
+
+        portability_source = inspect.getsource(runtime.portability_report)
+        self.assertIn(
+            "_git_blob_sha256(source_commit, expected_k3s_config)",
+            portability_source,
+        )
+        self.assertIn(
+            "_git_blob_sha256(source_commit, expected_k3s_service)",
+            portability_source,
+        )
+        self.assertNotIn(
+            "sha256_file(expected_k3s_config)",
+            portability_source,
+        )
+        self.assertNotIn(
+            "sha256_file(expected_k3s_service)",
+            portability_source,
+        )
+
         source = inspect.getsource(runtime._k3s_contract_paths)
         self.assertIn("config_path.is_symlink()", source)
         self.assertIn("service_path.is_symlink()", source)
@@ -951,7 +981,7 @@ spec:
             runtime._require_exact_k3s_node_inventory(stale, expected)
 
     def test_live_k3s_runtime_binds_vm_kubeconfig_guest_files_and_process(self) -> None:
-        commit = "a" * 40
+        commit = runtime.git_head()
         ip = "192.168.122.10"
         config = runtime.load_config()
         config_path, service_path = runtime._k3s_contract_paths(config)
@@ -2570,11 +2600,11 @@ spec:
                 )
 
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
-        commit = "a" * 40
+        commit = runtime.git_head()
         config = runtime.load_config()
         k3s_config_path, k3s_service_path = runtime._k3s_contract_paths(config)
-        k3s_config_sha256 = runtime.sha256_file(k3s_config_path)
-        k3s_service_sha256 = runtime.sha256_file(k3s_service_path)
+        k3s_config_sha256 = runtime._git_blob_sha256(commit, k3s_config_path)
+        k3s_service_sha256 = runtime._git_blob_sha256(commit, k3s_service_path)
         kubeconfig_sha256 = "3" * 64
         flux_expected_contract = {
             name: {
@@ -4911,6 +4941,83 @@ spec:
             source,
         )
         self.assertNotIn("registry_config.read_bytes()", source)
+
+    def test_inject_secrets_rejects_malformed_registry_before_kubernetes_mutation(self) -> None:
+        invalid_payloads = (
+            [],
+            {"auths": []},
+            {"auths": {"ghcr.io": []}},
+            {"auths": {"ghcr.io": {}}},
+            {"auths": {"ghcr.io": {"auth": ""}}},
+            {"auths": {"ghcr.io": {"username": "proof-user"}}},
+            {"auths": {"ghcr.io": {"password": "proof-token"}}},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "secrets").mkdir()
+                registry_config = root / "registry-source.json"
+                registry_config.write_text(
+                    json.dumps(payload) + "\n",
+                    encoding="utf-8",
+                )
+                source_commit = "d" * 40
+                target = {
+                    "vm_ip": "192.0.2.11",
+                    "kubeconfig_sha256": "e" * 64,
+                    "server": "https://192.0.2.11:6443",
+                }
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "_current_protected_main_commit",
+                        return_value=source_commit,
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "_require_kubernetes_target_binding",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "_kubernetes_target_identity",
+                        return_value=target,
+                    ),
+                    mock.patch.object(
+                        runtime, "ensure_secret_material"
+                    ) as ensure_secret_material,
+                    mock.patch.object(runtime, "kubectl_apply") as kubectl_apply,
+                    mock.patch.object(
+                        runtime, "_bound_kube_env"
+                    ) as bound_kube_env,
+                ):
+                    with self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB,
+                        "registry config has no usable ghcr.io credential",
+                    ):
+                        runtime.inject_secrets(root, registry_config)
+
+                ensure_secret_material.assert_not_called()
+                kubectl_apply.assert_not_called()
+                bound_kube_env.assert_not_called()
+                self.assertFalse((root / "secrets/registry.json").exists())
+
+        valid_payloads = (
+            {"auths": {"ghcr.io": {"auth": "proof-auth"}}},
+            {
+                "auths": {
+                    "ghcr.io": {
+                        "username": "proof-user",
+                        "password": "proof-token",
+                    }
+                }
+            },
+        )
+        for payload in valid_payloads:
+            with self.subTest(valid_payload=payload):
+                auths = payload.get("auths")
+                credential = auths.get("ghcr.io") if isinstance(auths, dict) else None
+                self.assertIsInstance(credential, dict)
 
     def test_inject_secrets_rejects_invalid_database_before_kubernetes_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
