@@ -14,13 +14,13 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Dokumente gesamt | 204 |
-| Dokumente mit ausgehenden Relationen | 203 |
+| Dokumente gesamt | 205 |
+| Dokumente mit ausgehenden Relationen | 204 |
 | Dokumente als Ziel referenziert | 153 |
-| Relationen gesamt | 740 |
+| Relationen gesamt | 742 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 683 |
+| — relates_to | 685 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | Isolierte Dokumente | 0 |
@@ -40,13 +40,13 @@ Generated automatically. Do not edit.
 - ⚠️ High outbound count (8): `docs/reference/agent-operability-fixture-matrix.md` — possible over-linking
 - ⚠️ High outbound count (8): `docs/reports/domain-edge-write-path-proof.md` — possible over-linking
 - ⚠️ High inbound count (25): `docs/tasks/board.md` — central dependency, review carefully
-- ⚠️ High inbound count (16): `docs/deploy/README.md` — central dependency, review carefully
+- ⚠️ High inbound count (17): `docs/deploy/README.md` — central dependency, review carefully
 - ⚠️ High inbound count (15): `docs/adr/ADR-0006__auth-magic-link-session-passkey.md` — central dependency, review carefully
 - ⚠️ High inbound count (14): `docs/reports/auth-status-matrix.md` — central dependency, review carefully
 - ⚠️ High inbound count (14): `docs/reports/optimierungsstatus.md` — central dependency, review carefully
 - ⚠️ High inbound count (13): `docs/adr/ADR-0007__auth-persistence-production-db-path.md` — central dependency, review carefully
+- ⚠️ High inbound count (13): `docs/deployment.md` — central dependency, review carefully
 - ⚠️ High inbound count (12): `docs/blueprints/domain-data-postgres-cutover.md` — central dependency, review carefully
-- ⚠️ High inbound count (12): `docs/deployment.md` — central dependency, review carefully
 - ⚠️ High inbound count (12): `docs/roadmap.md` — central dependency, review carefully
 - ⚠️ High inbound count (11): `docs/blueprints/auth-roadmap.md` — central dependency, review carefully
 - ⚠️ High inbound count (11): `docs/datenmodell.md` — central dependency, review carefully
@@ -73,13 +73,13 @@ _Keine Zyklen gefunden._
 **Eingehend (inbound):**
 
 - `docs/tasks/board.md` — 25 eingehende Relationen
-- `docs/deploy/README.md` — 16 eingehende Relationen
+- `docs/deploy/README.md` — 17 eingehende Relationen
 - `docs/adr/ADR-0006__auth-magic-link-session-passkey.md` — 15 eingehende Relationen
 - `docs/reports/auth-status-matrix.md` — 14 eingehende Relationen
 - `docs/reports/optimierungsstatus.md` — 14 eingehende Relationen
 - `docs/adr/ADR-0007__auth-persistence-production-db-path.md` — 13 eingehende Relationen
+- `docs/deployment.md` — 13 eingehende Relationen
 - `docs/blueprints/domain-data-postgres-cutover.md` — 12 eingehende Relationen
-- `docs/deployment.md` — 12 eingehende Relationen
 - `docs/roadmap.md` — 12 eingehende Relationen
 - `docs/blueprints/auth-roadmap.md` — 11 eingehende Relationen
 - `docs/datenmodell.md` — 11 eingehende Relationen

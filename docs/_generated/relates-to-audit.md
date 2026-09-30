@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 740 |
+| Relationen gesamt | 742 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 683 |
+| — relates_to | 685 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |
@@ -32,7 +32,7 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (292 Dokumente):
+**Cluster 1** (293 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
@@ -123,6 +123,7 @@ _Keine Lücken erkannt._
 - `docs/deploy/DRIFT_POLICY.md`
 - `docs/deploy/README.md`
 - `docs/deploy/commonthing.naming.md`
+- `docs/deploy/dev-entrypoints.md`
 - `docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md`
 - `docs/deploy/heim-first-phase0.md`
 - `docs/deploy/heimserver.deployment.md`

@@ -82,9 +82,14 @@ just up
 
 Prüfen:
 
-- Web/Frontdoor: <http://localhost:8081>
+- Frontend-/Hydrationsansicht: <http://localhost:5173> (im Compose-Stack kein Nachweis für API-gestützte UI-/E2E-Flows)
+- Entwicklungsproxy: <http://localhost:8081> (kein unterstützter UI-Einstieg; vorgesehen für `/api/*` und `/basemap/*`)
 - API-Liveness: <http://localhost:8081/api/health/live>
 - API-Readiness: <http://localhost:8081/api/health/ready>
+
+Die genaue Trennung der lokalen Einstiegspunkte und die Einschränkung des
+containerisierten Vite-`/api`-Proxys sind in
+[`docs/deploy/dev-entrypoints.md`](docs/deploy/dev-entrypoints.md) beschrieben.
 
 Stoppen:
 
