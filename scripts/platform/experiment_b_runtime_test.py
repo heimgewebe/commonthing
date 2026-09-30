@@ -2287,6 +2287,30 @@ spec:
             self.assertEqual(attempt["status"], "running")
             self.assertEqual(attempt["source_commit"], commit)
 
+    def test_http_read_disables_ambient_proxy(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.status = 200
+        response.read.return_value = b"ok"
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(
+            runtime.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ) as build_opener:
+            status, body, _elapsed = runtime._http_read(
+                "http://127.0.0.1:8080/health",
+                timeout=2,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"ok")
+        handler = build_opener.call_args.args[0]
+        self.assertIsInstance(handler, runtime.urllib.request.ProxyHandler)
+        self.assertEqual(handler.proxies, {})
+        opener.open.assert_called_once()
+
     def test_t048_sampler_failure_terminates_and_reaps_k6(self) -> None:
         load = mock.Mock()
         load.poll.return_value = None
@@ -2308,6 +2332,37 @@ spec:
                     load,
                     resource_samples,
                     db_samples,
+                    30,
+                )
+        load.terminate.assert_called_once_with()
+        load.wait.assert_called_once_with(timeout=10)
+        load.kill.assert_not_called()
+
+    def test_t048_sampler_deadline_terminates_and_reaps_k6(self) -> None:
+        load = mock.Mock()
+        load.poll.return_value = None
+        load.wait.return_value = -15
+        resource_samples = [{"sample": "initial"}]
+        db_samples = [1]
+        with (
+            mock.patch.object(runtime.time, "sleep"),
+            mock.patch.object(
+                runtime.time,
+                "monotonic",
+                side_effect=[10.0, 16.0],
+            ),
+        ):
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "exceeded bounded runtime",
+            ):
+                runtime._sample_t048_load(
+                    Path("/tmp"),
+                    "api-pod",
+                    load,
+                    resource_samples,
+                    db_samples,
+                    5,
                 )
         load.terminate.assert_called_once_with()
         load.wait.assert_called_once_with(timeout=10)
@@ -4675,7 +4730,7 @@ spec:
             }
             runtime.atomic_json(database_path, database)
             registry_path.write_text(
-                '{"auths":{"ghcr.io":{"auth":"proof"}}}\n',
+                '{"auths":{"ghcr.io":{"username":"proof-user","password":"proof-token"}}}\n',
                 encoding="utf-8",
             )
             source_commit = "a" * 40
@@ -4736,7 +4791,7 @@ spec:
             }
             runtime.atomic_json(database_path, original_database)
             registry_path.write_text(
-                '{"auths":{"ghcr.io":{"auth":"proof"}}}\n',
+                '{"auths":{"ghcr.io":{"username":"proof-user","password":"proof-token"}}}\n',
                 encoding="utf-8",
             )
             source_commit = "b" * 40
@@ -4962,6 +5017,28 @@ spec:
             {"auths": {"ghcr.io": []}},
             {"auths": {"ghcr.io": {}}},
             {"auths": {"ghcr.io": {"auth": ""}}},
+            {"auths": {"ghcr.io": {"auth": "%%%"}}},
+            {
+                "auths": {
+                    "ghcr.io": {
+                        "auth": base64.b64encode(b"no-colon").decode("ascii")
+                    }
+                }
+            },
+            {
+                "auths": {
+                    "ghcr.io": {
+                        "auth": base64.b64encode(b":proof-token").decode("ascii")
+                    }
+                }
+            },
+            {
+                "auths": {
+                    "ghcr.io": {
+                        "auth": base64.b64encode(b"proof-user:").decode("ascii")
+                    }
+                }
+            },
             {"auths": {"ghcr.io": {"username": "proof-user"}}},
             {"auths": {"ghcr.io": {"password": "proof-token"}}},
         )
@@ -5016,7 +5093,15 @@ spec:
                 self.assertFalse((root / "secrets/registry.json").exists())
 
         valid_payloads = (
-            {"auths": {"ghcr.io": {"auth": "proof-auth"}}},
+            {
+                "auths": {
+                    "ghcr.io": {
+                        "auth": base64.b64encode(
+                            b"proof-user:proof-token"
+                        ).decode("ascii")
+                    }
+                }
+            },
             {
                 "auths": {
                     "ghcr.io": {
@@ -5047,7 +5132,7 @@ spec:
                 },
             )
             registry_config.write_text(
-                '{"auths":{"ghcr.io":{"auth":"proof"}}}\n',
+                '{"auths":{"ghcr.io":{"username":"proof-user","password":"proof-token"}}}\n',
                 encoding="utf-8",
             )
             source_commit = "d" * 40
@@ -5145,10 +5230,10 @@ spec:
             runtime.atomic_json(database_path, original_database)
             original_database_bytes = database_path.read_bytes()
             original_registry_bytes = (
-                b'{"auths":{"ghcr.io":{"auth":"proof-original"}}}\n'
+                b'{"auths":{"ghcr.io":{"username":"proof-user","password":"proof-original"}}}\n'
             )
             changed_registry_bytes = (
-                b'{"auths":{"ghcr.io":{"auth":"proof-changed"}}}\n'
+                b'{"auths":{"ghcr.io":{"username":"proof-user","password":"proof-changed"}}}\n'
             )
             registry_config.write_bytes(original_registry_bytes)
             source_commit = "c" * 40
@@ -9680,12 +9765,11 @@ spec:
             return path.read_bytes()
 
         def kubectl_result(_root, arguments, **_kwargs):
-            stdout = ""
-            if "exec" in arguments:
-                stdout = ""
             return runtime.subprocess.CompletedProcess(
-                arguments, 0, stdout=stdout, stderr=""
+                arguments, 0, stdout="", stderr=""
             )
+
+        probe_container_id = "containerd://" + "a" * 64
 
         with (
             mock.patch.object(
@@ -9700,6 +9784,16 @@ spec:
             mock.patch.object(
                 runtime, "_kubectl", side_effect=kubectl_result
             ),
+            mock.patch.object(
+                runtime,
+                "_require_running_probe_container",
+                return_value=probe_container_id,
+            ) as bind_probe,
+            mock.patch.object(
+                runtime,
+                "_run_bound_container_command",
+                return_value=b"",
+            ) as bound_exec,
             mock.patch.object(runtime, "_delete_pod") as delete,
         ):
             result = runtime._require_empty_replacement_pvc(
@@ -9712,6 +9806,9 @@ spec:
         self.assertEqual(result["new"], new_identity)
         self.assertTrue(result["empty_before_restore"])
         apply.assert_called_once()
+        bind_probe.assert_called_once()
+        bound_exec.assert_called_once()
+        self.assertEqual(bound_exec.call_args.args[2], probe_container_id)
         delete.assert_called_once()
 
         with (
@@ -9727,6 +9824,16 @@ spec:
             mock.patch.object(
                 runtime, "_kubectl", side_effect=kubectl_result
             ),
+            mock.patch.object(
+                runtime,
+                "_require_running_probe_container",
+                return_value=probe_container_id,
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_container_command",
+                return_value=b"",
+            ),
             mock.patch.object(runtime, "_delete_pod"),
             self.assertRaisesRegex(
                 runtime.RuntimeErrorEB,
@@ -9740,12 +9847,6 @@ spec:
                 self.commit,
             )
 
-        def nonempty_result(_root, arguments, **_kwargs):
-            stdout = "lost+found\n" if "exec" in arguments else ""
-            return runtime.subprocess.CompletedProcess(
-                arguments, 0, stdout=stdout, stderr=""
-            )
-
         with (
             mock.patch.object(
                 runtime, "_git_blob_bytes", side_effect=source_blob
@@ -9757,7 +9858,17 @@ spec:
                 return_value=new_identity,
             ),
             mock.patch.object(
-                runtime, "_kubectl", side_effect=nonempty_result
+                runtime, "_kubectl", side_effect=kubectl_result
+            ),
+            mock.patch.object(
+                runtime,
+                "_require_running_probe_container",
+                return_value=probe_container_id,
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_container_command",
+                return_value=b"lost+found\n",
             ),
             mock.patch.object(runtime, "_delete_pod"),
             self.assertRaisesRegex(
@@ -9771,6 +9882,87 @@ spec:
                 old_identity,
                 self.commit,
             )
+
+    def test_replacement_pvc_probe_binds_live_container_identity(self) -> None:
+        image = "example.invalid/probe@sha256:" + "b" * 64
+        expected_spec = {
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "containers": [
+                {
+                    "name": "probe",
+                    "image": image,
+                    "command": ["/bin/sh", "-c", "sleep 3600"],
+                }
+            ],
+        }
+        container_id = "containerd://" + "c" * 64
+        pod = {
+            "metadata": {
+                "name": "probe-pod",
+                "namespace": runtime.DATA_NAMESPACE,
+            },
+            "spec": json.loads(json.dumps(expected_spec)),
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [
+                    {
+                        "name": "probe",
+                        "ready": True,
+                        "state": {"running": {}},
+                        "imageID": (
+                            "docker-pullable://example.invalid/probe@sha256:"
+                            + "b" * 64
+                        ),
+                        "containerID": container_id,
+                    }
+                ],
+            },
+        }
+        with mock.patch.object(
+            runtime,
+            "_kubectl_json",
+            return_value=pod,
+        ):
+            self.assertEqual(
+                runtime._require_running_probe_container(
+                    self.root,
+                    "probe-pod",
+                    expected_spec,
+                    image,
+                    "replacement PVC probe",
+                ),
+                container_id,
+            )
+
+        drifted = json.loads(json.dumps(pod))
+        drifted["status"]["containerStatuses"][0]["containerID"] = (
+            "containerd://not-a-valid-id"
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "_kubectl_json",
+                return_value=drifted,
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "container identity drifted",
+            ),
+        ):
+            runtime._require_running_probe_container(
+                self.root,
+                "probe-pod",
+                expected_spec,
+                image,
+                "replacement PVC probe",
+            )
+
+        source = inspect.getsource(runtime._require_empty_replacement_pvc)
+        self.assertIn("_require_running_probe_container(", source)
+        self.assertIn("_run_bound_container_command(", source)
+        self.assertNotIn('"exec",\n                pod_name', source)
 
     def test_teardown_rejects_live_uuid_drift_before_destroy(self) -> None:
         self.write_vm_receipt()

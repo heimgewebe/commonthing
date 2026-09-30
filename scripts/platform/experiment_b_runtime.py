@@ -2618,6 +2618,36 @@ def _read_registry_config_bytes(path: Path) -> bytes:
         os.close(file_fd)
 
 
+def _registry_credential_is_usable(credential: Any) -> bool:
+    if not isinstance(credential, dict):
+        return False
+    if "auth" in credential:
+        auth = credential.get("auth")
+        if not isinstance(auth, str) or not auth:
+            return False
+        try:
+            decoded = base64.b64decode(auth.encode("ascii"), validate=True).decode(
+                "utf-8"
+            )
+            username, password = decoded.split(":", 1)
+        except (
+            UnicodeEncodeError,
+            UnicodeDecodeError,
+            binascii.Error,
+            ValueError,
+        ):
+            return False
+        return bool(username) and bool(password)
+    username = credential.get("username")
+    password = credential.get("password")
+    return (
+        isinstance(username, str)
+        and bool(username)
+        and isinstance(password, str)
+        and bool(password)
+    )
+
+
 def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
@@ -2630,18 +2660,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
         raise RuntimeErrorEB("registry config is not valid JSON") from exc
     auths = registry_payload.get("auths") if isinstance(registry_payload, dict) else None
     credential = auths.get("ghcr.io") if isinstance(auths, dict) else None
-    auth = credential.get("auth") if isinstance(credential, dict) else None
-    username = credential.get("username") if isinstance(credential, dict) else None
-    password = credential.get("password") if isinstance(credential, dict) else None
-    if not (
-        (isinstance(auth, str) and bool(auth))
-        or (
-            isinstance(username, str)
-            and bool(username)
-            and isinstance(password, str)
-            and bool(password)
-        )
-    ):
+    if not _registry_credential_is_usable(credential):
         raise RuntimeErrorEB("registry config has no usable ghcr.io credential")
     db, database_bytes = ensure_secret_material(root)
     database_url = _database_url(db)
@@ -10718,8 +10737,9 @@ def _http_read(url: str, *, timeout: int = 10) -> tuple[int, bytes, float]:
     request = urllib.request.Request(
         url, headers={"Accept": "application/json,text/html,text/plain,*/*"}
     )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             body = response.read()
             status_code = int(response.status)
     except urllib.error.HTTPError as exc:
@@ -11329,9 +11349,21 @@ def _sample_t048_load(
     load: subprocess.Popen[Any],
     resource_samples: list[dict[str, Any]],
     db_samples: list[int],
+    timeout_seconds: int,
 ) -> int:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or timeout_seconds <= 0
+    ):
+        raise RuntimeErrorEB("canonical T048 k6 workload timeout is invalid")
+    deadline = time.monotonic() + timeout_seconds
     try:
         while load.poll() is None:
+            if time.monotonic() >= deadline:
+                raise RuntimeErrorEB(
+                    "canonical T048 k6 workload exceeded bounded runtime"
+                )
             time.sleep(1)
             resource_samples.append(_sample_api_cgroup(root, pod_name))
             db_samples.append(_database_connection_count(root))
@@ -11379,6 +11411,14 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         )
         contract_section = evidence.api_runtime_section(policy)
         scenario = contract_section["scenario"]
+        scenario_duration_seconds = scenario.get("duration_seconds")
+        if (
+            isinstance(scenario_duration_seconds, bool)
+            or not isinstance(scenario_duration_seconds, int)
+            or scenario_duration_seconds <= 0
+        ):
+            raise RuntimeErrorEB("canonical T048 scenario duration is invalid")
+        load_timeout_seconds = scenario_duration_seconds + 120
         k6_image, k6_workflow_sha256 = _k6_image_binding(source_commit)
         k6_workload_text, k6_workload_sha256 = _source_bound_k6_workload(
             source_commit
@@ -11464,6 +11504,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
                 load,
                 resource_samples,
                 db_samples,
+                load_timeout_seconds,
             )
             if load_returncode == 0:
                 k6_summary_payload = _seal_k6_summary_output(
@@ -12719,6 +12760,77 @@ def _wait_pv_absent(
     )
 
 
+def _require_running_probe_container(
+    root: Path,
+    pod_name: str,
+    expected_spec: dict[str, Any],
+    expected_image: str,
+    context: str,
+) -> str:
+    if (
+        not isinstance(pod_name, str)
+        or not pod_name
+        or not isinstance(expected_spec, dict)
+        or not isinstance(expected_image, str)
+        or re.search(r"@sha256:[0-9a-f]{64}$", expected_image) is None
+        or not isinstance(context, str)
+        or not context
+    ):
+        raise RuntimeErrorEB(f"{context or 'probe'} runtime contract is invalid")
+    pod = _kubectl_json(
+        root,
+        ["-n", DATA_NAMESPACE, "get", "pod", pod_name],
+    )
+    metadata = pod.get("metadata", {}) if isinstance(pod, dict) else {}
+    live_spec = pod.get("spec", {}) if isinstance(pod, dict) else {}
+    status = pod.get("status", {}) if isinstance(pod, dict) else {}
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != pod_name
+        or metadata.get("namespace") != DATA_NAMESPACE
+        or metadata.get("deletionTimestamp") is not None
+        or not isinstance(live_spec, dict)
+        or not isinstance(status, dict)
+        or status.get("phase") != "Running"
+        or _application_pod_spec_projection(
+            live_spec,
+            f"live {context}",
+        )
+        != _application_pod_spec_projection(
+            expected_spec,
+            f"expected {context}",
+        )
+    ):
+        raise RuntimeErrorEB(f"{context} runtime contract drifted")
+    ready = any(
+        isinstance(condition, dict)
+        and condition.get("type") == "Ready"
+        and condition.get("status") == "True"
+        for condition in status.get("conditions", [])
+    )
+    statuses = status.get("containerStatuses", [])
+    if (
+        not ready
+        or not isinstance(statuses, list)
+        or len(statuses) != 1
+        or not isinstance(statuses[0], dict)
+        or statuses[0].get("name") != "probe"
+        or statuses[0].get("ready") is not True
+        or not isinstance(statuses[0].get("state", {}).get("running"), dict)
+    ):
+        raise RuntimeErrorEB(f"{context} is not running and Ready")
+    image_id = statuses[0].get("imageID")
+    container_id = statuses[0].get("containerID")
+    expected_digest = expected_image.rsplit("@", 1)[1]
+    if (
+        not _runtime_image_id_matches_digest(image_id, expected_digest)
+        or not isinstance(container_id, str)
+        or re.fullmatch(r"containerd://[0-9a-f]{64}", container_id) is None
+    ):
+        raise RuntimeErrorEB(f"{context} container identity drifted")
+    return container_id
+
+
 def _require_empty_replacement_pvc(
     root: Path,
     claim_name: str,
@@ -12754,7 +12866,10 @@ def _require_empty_replacement_pvc(
         f"source-commit replacement PVC probe Deployment {workload}",
     )
     image = images["containers"].get(workload)
-    if not isinstance(image, str) or not image:
+    if (
+        not isinstance(image, str)
+        or re.search(r"@sha256:[0-9a-f]{64}$", image) is None
+    ):
         raise RuntimeErrorEB(
             f"replacement PVC probe image is unavailable: {claim_name}"
         )
@@ -12824,6 +12939,13 @@ def _require_empty_replacement_pvc(
             ],
             timeout=210,
         )
+        probe_container_id = _require_running_probe_container(
+            root,
+            pod_name,
+            manifest["spec"],
+            image,
+            f"replacement PVC probe {claim_name}",
+        )
         new_identity = _pvc_volume_identity(root, claim_name)
         if (
             new_identity["pvc_uid"] == old_identity["pvc_uid"]
@@ -12833,14 +12955,11 @@ def _require_empty_replacement_pvc(
             raise RuntimeErrorEB(
                 f"replacement PVC reused the previous storage identity: {claim_name}"
             )
-        contents = _kubectl(
+        contents = _run_bound_container_command(
             root,
+            source_commit,
+            probe_container_id,
             [
-                "-n",
-                DATA_NAMESPACE,
-                "exec",
-                pod_name,
-                "--",
                 "find",
                 "/probe",
                 "-mindepth",
@@ -12851,8 +12970,9 @@ def _require_empty_replacement_pvc(
                 "-quit",
             ],
             timeout=30,
+            context=f"replacement PVC empty probe {claim_name}",
         )
-        if contents.stdout.strip():
+        if contents.strip():
             raise RuntimeErrorEB(
                 f"replacement PVC is not empty before restore: {claim_name}"
             )
