@@ -2600,12 +2600,20 @@ spec:
                 )
 
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
-        commit = runtime.git_head()
+        commit = "a" * 40
         config = runtime.load_config()
         k3s_config_path, k3s_service_path = runtime._k3s_contract_paths(config)
-        k3s_config_sha256 = runtime._git_blob_sha256(commit, k3s_config_path)
-        k3s_service_sha256 = runtime._git_blob_sha256(commit, k3s_service_path)
+        k3s_config_sha256 = runtime.sha256_file(k3s_config_path)
+        k3s_service_sha256 = runtime.sha256_file(k3s_service_path)
         kubeconfig_sha256 = "3" * 64
+
+        def source_k3s_sha256(source_commit: str, path: Path) -> str:
+            self.assertEqual(source_commit, commit)
+            if path == k3s_config_path:
+                return k3s_config_sha256
+            if path == k3s_service_path:
+                return k3s_service_sha256
+            raise AssertionError(f"unexpected source-bound k3s path: {path}")
         flux_expected_contract = {
             name: {
                 "replicas": 1,
@@ -2805,6 +2813,11 @@ spec:
                 runtime,
                 "_source_commit_config",
                 return_value=json.loads(json.dumps(config)),
+            ),
+            mock.patch.object(
+                runtime,
+                "_git_blob_sha256",
+                side_effect=source_k3s_sha256,
             ),
             mock.patch.object(
                 runtime,
