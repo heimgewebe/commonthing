@@ -11904,6 +11904,21 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         metrics_after = after_body.decode("utf-8")
         metrics_after_path.write_text(metrics_after, encoding="utf-8")
 
+        (
+            final_pod_name,
+            final_pod,
+            final_api_image_binding,
+        ) = _require_t048_api_runtime_binding(root, source_commit)
+        final_api_runtime_binding = _t048_api_runtime_binding_identity(
+            final_pod_name,
+            final_pod,
+            final_api_image_binding,
+        )
+        if final_api_runtime_binding != api_runtime_binding_before:
+            raise RuntimeErrorEB(
+                "API runtime contract changed after T048 metrics snapshot"
+            )
+
         cpu_percentages: list[float] = []
         for first, second in zip(resource_samples, resource_samples[1:]):
             elapsed_us = (

@@ -10583,6 +10583,19 @@ spec:
         bound_snapshot = source.index(
             "bound_stack.enter_context(_bound_kube_env(root, target_binding_before, source_commit))"
         )
+        first_api = source.index("_require_t048_api_runtime_binding")
+        second_api = source.index(
+            "_require_t048_api_runtime_binding",
+            first_api + 1,
+        )
+        post_metrics = source.index(
+            'after_status, after_body, _elapsed = _http_read(f"{base_url}/metrics")'
+        )
+        final_api = source.index(
+            "_require_t048_api_runtime_binding",
+            second_api + 1,
+        )
+        report = source.index("report = {", post_metrics)
         port_forward = source.index("_start_api_port_forward")
         final_bound_close = source.rindex("bound_stack.close()")
         self.assertLess(first_target, bound_snapshot)
@@ -10597,6 +10610,13 @@ spec:
         self.assertLess(load, second_fixture)
         self.assertLess(load, second_target)
         self.assertLess(load, second_postgres)
+        self.assertLess(second_api, post_metrics)
+        self.assertLess(post_metrics, final_api)
+        self.assertLess(final_api, report)
+        self.assertIn(
+            "final_api_runtime_binding != api_runtime_binding_before",
+            source,
+        )
         self.assertIn(
             "fixture_binding_after != fixture_binding_before",
             source,
@@ -12375,7 +12395,7 @@ def install(*args, **kwargs):
 
         source = inspect.getsource(runtime.t048_load_proof)
         self.assertEqual(
-            source.count("_require_t048_api_runtime_binding"), 2
+            source.count("_require_t048_api_runtime_binding"), 3
         )
         self.assertIn("api_contract_sha256", source)
         self.assertIn("api_pod_contract_sha256", source)
