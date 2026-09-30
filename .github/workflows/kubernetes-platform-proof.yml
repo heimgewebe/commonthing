@@ -33,6 +33,7 @@ permissions:
       - "infra/compose/compose.prod.yml"
       - "platform/**"
       - "scripts/platform/**"
+      - "scripts/performance/**"
       - "scripts/security/**"
       - "scripts/ci/tests/test_kubernetes_platform_contract.py"
       - "scripts/ci/tests/test_kubernetes_platform_workflow.py"

@@ -40,6 +40,19 @@ class KubernetesPlatformWorkflowDiagnosticsTests(unittest.TestCase):
         render = named["Render and validate all platform targets"]["run"]
         self.assertIn("scripts/platform/validate_platform.py --render", render)
 
+    def test_experiment_b_performance_helpers_trigger_both_workflows(self) -> None:
+        pr_workflow = yaml.safe_load(PR_WORKFLOW.read_text(encoding="utf-8"))
+        proof_workflow = yaml.safe_load(PROOF_WORKFLOW.read_text(encoding="utf-8"))
+
+        self.assertIn(
+            "scripts/performance/**",
+            pr_workflow["on"]["pull_request"]["paths"],
+        )
+        self.assertIn(
+            "scripts/performance/**",
+            proof_workflow["on"]["push"]["paths"],
+        )
+
     def test_failed_live_package_receipt_is_uploaded_for_both_proof_jobs(self) -> None:
         workflow = yaml.safe_load(PROOF_WORKFLOW.read_text(encoding="utf-8"))
         test_path = "scripts/ci/tests/test_kubernetes_platform_workflow.py"
