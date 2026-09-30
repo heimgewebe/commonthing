@@ -5639,6 +5639,10 @@ spec:
             image,
         )
         self.assertEqual(
+            manifest["spec"]["containers"][0]["imagePullPolicy"],
+            "IfNotPresent",
+        )
+        self.assertEqual(
             binding["container_id"],
             "containerd://" + "b" * 64,
         )
@@ -9892,6 +9896,7 @@ spec:
                 {
                     "name": "probe",
                     "image": image,
+                    "imagePullPolicy": "IfNotPresent",
                     "command": ["/bin/sh", "-c", "sleep 3600"],
                 }
             ],
@@ -9960,6 +9965,7 @@ spec:
             )
 
         source = inspect.getsource(runtime._require_empty_replacement_pvc)
+        self.assertIn('"imagePullPolicy": "IfNotPresent"', source)
         self.assertIn("_require_running_probe_container(", source)
         self.assertIn("_run_bound_container_command(", source)
         self.assertNotIn('"exec",\n                pod_name', source)

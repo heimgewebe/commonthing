@@ -12904,6 +12904,7 @@ def _require_empty_replacement_pvc(
                 {
                     "name": "probe",
                     "image": image,
+                    "imagePullPolicy": "IfNotPresent",
                     "command": ["/bin/sh", "-c", "sleep 3600"],
                     "securityContext": {
                         "allowPrivilegeEscalation": False,
@@ -13016,6 +13017,7 @@ def _nats_transfer_pod(
                 {
                     "name": "transfer",
                     "image": image,
+                    "imagePullPolicy": "IfNotPresent",
                     "command": ["/bin/sh", "-c", "sleep 3600"],
                     "securityContext": {
                         "allowPrivilegeEscalation": False,
