@@ -2131,10 +2131,16 @@ spec:
         first_functional_target = functional.index(
             "_require_kubernetes_target_binding"
         )
-        gateway_readback = functional.index(
-            "_gateway_data_plane_readback(root, source_commit)"
+        endpoint_guard = functional.index(
+            "with _guard_functional_service_endpoints("
         )
-        jetstream_readback = functional.index("_jetstream_signature(root)")
+        gateway_readback = functional.index(
+            "_gateway_data_plane_readback("
+        )
+        nats_binding = functional.index(
+            "nats_binding_before = _require_nats_runtime_binding("
+        )
+        jetstream_readback = functional.index("_jetstream_signature(")
         second_functional_target = functional.index(
             "_require_kubernetes_target_binding",
             first_functional_target + 1,
@@ -2143,9 +2149,16 @@ spec:
             functional.index("_begin_live_check_attempt("),
             first_functional_target,
         )
-        self.assertLess(first_functional_target, gateway_readback)
-        self.assertLess(gateway_readback, jetstream_readback)
+        self.assertLess(first_functional_target, endpoint_guard)
+        self.assertLess(endpoint_guard, gateway_readback)
+        self.assertLess(gateway_readback, nats_binding)
+        self.assertLess(nats_binding, jetstream_readback)
         self.assertLess(jetstream_readback, second_functional_target)
+        self.assertGreaterEqual(
+            functional.count("_require_nats_runtime_binding("),
+            2,
+        )
+        self.assertIn("nats_binding=nats_binding_before", functional)
         self.assertIn("kubernetes_target_sha256", functional)
         self.assertIn("_complete_live_check_attempt(", functional)
 
@@ -2183,6 +2196,36 @@ spec:
             recovery.index("_invalidate_receipts(root, RECOVERY_ATTEMPT_INVALIDATES)"),
             recovery.index("_current_protected_main_commit()"),
         )
+
+    def test_recovery_proof_is_serialized_per_state_root(self) -> None:
+        self.assertTrue(hasattr(runtime.recovery_proof, "__wrapped__"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = root / ".recovery-proof.lock"
+            flags = (
+                runtime.os.O_RDWR
+                | runtime.os.O_CREAT
+                | int(getattr(runtime.os, "O_CLOEXEC", 0))
+                | int(getattr(runtime.os, "O_NOFOLLOW", 0))
+            )
+            lock_fd = runtime.os.open(lock_path, flags, 0o600)
+            runtime.fcntl.flock(
+                lock_fd,
+                runtime.fcntl.LOCK_EX | runtime.fcntl.LOCK_NB,
+            )
+            try:
+                @runtime._serialize_recovery_proof
+                def second_recovery(_root: Path) -> None:
+                    raise AssertionError("second recovery must not start")
+
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "already running for this state root",
+                ):
+                    second_recovery(root)
+            finally:
+                runtime.fcntl.flock(lock_fd, runtime.fcntl.LOCK_UN)
+                runtime.os.close(lock_fd)
 
     def test_dirty_rerun_invalidates_functional_success_before_binding_failure(self) -> None:
         commit = "a" * 40
@@ -2266,6 +2309,21 @@ spec:
                     runtime,
                     "_functional_serving_runtime_binding",
                     return_value={"stable": True},
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_guard_functional_service_endpoints",
+                    return_value=mock.MagicMock(),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_nats_runtime_binding",
+                    return_value={
+                        "container_id": "containerd://" + "3" * 64,
+                        "contract_sha256": "4" * 64,
+                        "pod_contract_sha256": "5" * 64,
+                        "runtime_image_ids_sha256": "6" * 64,
+                    },
                 ),
                 mock.patch.object(
                     runtime,
@@ -2894,6 +2952,37 @@ spec:
                 runtime.portability_report(root)
             fresh_functional.assert_called_once_with(root, commit)
 
+            functional_receipt = json.loads(
+                (receipts / "functional-readback.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            fresh_t048 = {
+                "schema_version": 1,
+                "status": "pass",
+                "source_commit": commit,
+                "scenario": {"virtual_users": 10},
+            }
+            with (
+                mock.patch.object(
+                    runtime,
+                    "functional_readback",
+                    return_value=functional_receipt,
+                ) as fresh_functional,
+                mock.patch.object(
+                    runtime,
+                    "t048_load_proof",
+                    return_value=fresh_t048,
+                ) as fresh_load,
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "T048 load receipt changed after fresh live validation",
+                ),
+            ):
+                runtime.portability_report(root)
+            fresh_functional.assert_called_once_with(root, commit)
+            fresh_load.assert_called_once_with(root, commit)
+
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
         commit = "a" * 40
         config = runtime.load_config()
@@ -3099,14 +3188,22 @@ spec:
         }
         with (
             tempfile.TemporaryDirectory() as tmp,
-            mock.patch.object(
+            mock.patch.multiple(
                 runtime,
-                "functional_readback",
-                return_value={
-                    "schema_version": 1,
-                    "status": "pass",
-                    "source_commit": commit,
-                },
+                functional_readback=mock.Mock(
+                    return_value={
+                        "schema_version": 1,
+                        "status": "pass",
+                        "source_commit": commit,
+                    }
+                ),
+                t048_load_proof=mock.Mock(
+                    return_value={
+                        "schema_version": 1,
+                        "status": "pass",
+                        "source_commit": commit,
+                    }
+                ),
             ),
             mock.patch.object(
                 runtime,
@@ -11832,14 +11929,20 @@ def install(*args, **kwargs):
     def test_functional_readback_lives_inside_bound_kube_context(self) -> None:
         source = inspect.getsource(runtime.functional_readback)
         bound = source.index("with _bound_kube_env(")
-        gateway = source.index(
-            "_gateway_data_plane_readback(root, source_commit)"
+        endpoint_guard = source.index(
+            "with _guard_functional_service_endpoints("
         )
-        jetstream = source.index("_jetstream_signature(root)")
+        gateway = source.index("_gateway_data_plane_readback(")
+        nats_binding = source.index(
+            "nats_binding_before = _require_nats_runtime_binding("
+        )
+        jetstream = source.index("_jetstream_signature(")
         final_target = source.rindex("_require_kubernetes_target_binding")
         receipt = source.index("receipt = {")
-        self.assertLess(bound, gateway)
-        self.assertLess(gateway, jetstream)
+        self.assertLess(bound, endpoint_guard)
+        self.assertLess(endpoint_guard, gateway)
+        self.assertLess(gateway, nats_binding)
+        self.assertLess(nats_binding, jetstream)
         self.assertLess(jetstream, final_target)
         self.assertLess(final_target, receipt)
 
@@ -13092,7 +13195,10 @@ def install(*args, **kwargs):
         with mock.patch.object(
             runtime,
             "_kubectl_json",
-            return_value={"items": [endpoint_slice]},
+            return_value={
+                "metadata": {"resourceVersion": "12345"},
+                "items": [endpoint_slice],
+            },
         ) as readback:
             observed = runtime._application_service_endpoint_binding(
                 Path("/tmp"),
@@ -13112,6 +13218,7 @@ def install(*args, **kwargs):
             observed["sha256"],
             runtime._stable_json_sha256(observed["pods"]),
         )
+        self.assertEqual(observed["resource_version"], "12345")
         readback.assert_called_once_with(
             Path("/tmp"),
             [
@@ -13124,7 +13231,10 @@ def install(*args, **kwargs):
             ],
         )
 
-        drifted = {"items": [json.loads(json.dumps(endpoint_slice))]}
+        drifted = {
+            "metadata": {"resourceVersion": "12346"},
+            "items": [json.loads(json.dumps(endpoint_slice))],
+        }
         drifted["items"][0]["endpoints"].append(
             {
                 "addresses": ["10.42.0.99"],
@@ -13152,6 +13262,178 @@ def install(*args, **kwargs):
                 Path("/tmp"),
                 "weltgewebe-api",
                 pod_identities,
+            )
+
+
+    def test_functional_serving_semantic_binding_ignores_watch_cursor(
+        self,
+    ) -> None:
+        before = {
+            "services": {
+                "weltgewebe-api": {
+                    "endpoints": {
+                        "pods": {
+                            "api-1": {
+                                "pod_uid": "api-uid",
+                                "address": "10.42.0.12",
+                            }
+                        },
+                        "sha256": "a" * 64,
+                        "resource_version": "100",
+                    }
+                }
+            },
+            "gateway": {"ready": True},
+        }
+        after = json.loads(json.dumps(before))
+        after["services"]["weltgewebe-api"]["endpoints"][
+            "resource_version"
+        ] = "101"
+
+        semantic_before = (
+            runtime._functional_serving_runtime_semantic_binding(before)
+        )
+        semantic_after = (
+            runtime._functional_serving_runtime_semantic_binding(after)
+        )
+        self.assertEqual(semantic_before, semantic_after)
+        self.assertNotIn(
+            "resource_version",
+            semantic_before["services"]["weltgewebe-api"]["endpoints"],
+        )
+
+        after["services"]["weltgewebe-api"]["endpoints"]["sha256"] = "b" * 64
+        self.assertNotEqual(
+            semantic_before,
+            runtime._functional_serving_runtime_semantic_binding(after),
+        )
+
+    def test_functional_endpoint_watch_rejects_transient_service_changes(
+        self,
+    ) -> None:
+        serving_runtime = {
+            "services": {
+                name: {
+                    "endpoints": {
+                        "resource_version": str(index + 100),
+                    }
+                }
+                for index, name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                )
+            }
+        }
+        processes = []
+        watch_outputs = []
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        def popen(_argv, **kwargs):
+            process = FakeProcess()
+            kwargs["stdout"].write(
+                json.dumps(
+                    {
+                        "type": "ADDED",
+                        "object": {
+                            "metadata": {
+                                "name": "initial-endpoint-slice",
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+            kwargs["stdout"].write(
+                json.dumps(
+                    {
+                        "type": "BOOKMARK",
+                        "object": {
+                            "metadata": {
+                                "annotations": {
+                                    "k8s.io/initial-events-end": "true",
+                                }
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+            kwargs["stdout"].flush()
+            watch_outputs.append(kwargs["stdout"])
+            processes.append(process)
+            return process
+
+        with (
+            mock.patch.object(
+                runtime,
+                "toolchain",
+                return_value={"tools": {"kubectl": "/usr/bin/kubectl"}},
+            ),
+            mock.patch.object(runtime, "kube_env", return_value={}),
+            mock.patch.object(runtime.time, "sleep"),
+            mock.patch.object(
+                runtime.subprocess,
+                "Popen",
+                side_effect=popen,
+            ) as spawn,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "endpoints changed during Gateway probes",
+            ),
+        ):
+            with runtime._guard_functional_service_endpoints(
+                Path("/tmp"),
+                serving_runtime,
+            ):
+                watch_outputs[0].write(
+                    json.dumps({"type": "ADDED", "object": {}})
+                    + "\n"
+                )
+                watch_outputs[0].flush()
+        self.assertEqual(spawn.call_count, 2)
+        for index, service_name in enumerate(
+            ("weltgewebe-api", "weltgewebe-web")
+        ):
+            argv = spawn.call_args_list[index].args[0]
+            self.assertEqual(
+                argv[:3],
+                ["/usr/bin/kubectl", "get", "--raw"],
+            )
+            self.assertEqual(len(argv), 4)
+            watch_url = runtime.urllib.parse.urlsplit(argv[3])
+            self.assertEqual(
+                watch_url.path,
+                (
+                    f"/apis/discovery.k8s.io/v1/namespaces/"
+                    f"{runtime.APP_NAMESPACE}/endpointslices"
+                ),
+            )
+            self.assertEqual(
+                runtime.urllib.parse.parse_qs(watch_url.query),
+                {
+                    "watch": ["1"],
+                    "resourceVersion": [str(index + 100)],
+                    "resourceVersionMatch": ["NotOlderThan"],
+                    "sendInitialEvents": ["true"],
+                    "labelSelector": [
+                        f"kubernetes.io/service-name={service_name}"
+                    ],
+                    "allowWatchBookmarks": ["true"],
+                },
             )
 
     def test_functional_readback_rejects_serving_runtime_drift(
@@ -13188,6 +13470,9 @@ def install(*args, **kwargs):
             bound_context = mock.MagicMock()
             bound_context.__enter__.return_value = None
             bound_context.__exit__.return_value = False
+            endpoint_context = mock.MagicMock()
+            endpoint_context.__enter__.return_value = None
+            endpoint_context.__exit__.return_value = False
             with (
                 mock.patch.object(
                     runtime,
@@ -13216,8 +13501,13 @@ def install(*args, **kwargs):
                 mock.patch.object(
                     runtime,
                     "_functional_serving_runtime_binding",
-                    side_effect=[before, after],
+                    side_effect=[before, before, after],
                 ) as serving_binding,
+                mock.patch.object(
+                    runtime,
+                    "_guard_functional_service_endpoints",
+                    return_value=endpoint_context,
+                ),
                 mock.patch.object(
                     runtime,
                     "_gateway_data_plane_readback",
@@ -13237,9 +13527,104 @@ def install(*args, **kwargs):
             ):
                 runtime.functional_readback(root, source_commit)
 
-            self.assertEqual(serving_binding.call_count, 2)
+            self.assertEqual(serving_binding.call_count, 3)
             gateway_readback.assert_called_once_with(root, source_commit)
             jetstream.assert_not_called()
+
+
+    def test_functional_readback_binds_jetstream_to_exact_nats_runtime(
+        self,
+    ) -> None:
+        source_commit = "a" * 40
+        target = (
+            {"kubeconfig_sha256": "b" * 64},
+            "192.0.2.23",
+            "https://192.0.2.23:6443",
+        )
+        serving = {"stable": True}
+        nats_before = {
+            "container_id": "containerd://" + "c" * 64,
+            "contract_sha256": "d" * 64,
+            "pod_contract_sha256": "e" * 64,
+            "runtime_image_ids_sha256": "f" * 64,
+        }
+        nats_after = dict(nats_before)
+        nats_after["container_id"] = "containerd://" + "1" * 64
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bound_context = mock.MagicMock()
+            bound_context.__enter__.return_value = None
+            bound_context.__exit__.return_value = False
+            endpoint_context = mock.MagicMock()
+            endpoint_context.__enter__.return_value = None
+            endpoint_context.__exit__.return_value = False
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_begin_live_check_attempt",
+                    return_value=(
+                        root / "functional-readback.json",
+                        root / "functional-readback-attempt.json",
+                        1,
+                    ),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_current_protected_main_commit",
+                    return_value=source_commit,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_kubernetes_target_binding",
+                    return_value=target,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_bound_kube_env",
+                    return_value=bound_context,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_functional_serving_runtime_binding",
+                    side_effect=[serving, serving, serving],
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_guard_functional_service_endpoints",
+                    return_value=endpoint_context,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_gateway_data_plane_readback",
+                    return_value={
+                        "gateway": "http://192.0.2.23",
+                        "checks": {},
+                    },
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_nats_runtime_binding",
+                    side_effect=[nats_before, nats_after],
+                ) as nats_binding,
+                mock.patch.object(
+                    runtime,
+                    "_jetstream_signature",
+                    return_value={"messages": 1},
+                ) as jetstream,
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "NATS runtime changed during functional readback",
+                ),
+            ):
+                runtime.functional_readback(root, source_commit)
+
+            self.assertEqual(nats_binding.call_count, 2)
+            jetstream.assert_called_once_with(
+                root,
+                source_commit=source_commit,
+                nats_binding=nats_before,
+            )
 
     def test_t048_database_sampler_uses_bound_postgres_container(self) -> None:
         source = inspect.getsource(runtime._database_connection_count)

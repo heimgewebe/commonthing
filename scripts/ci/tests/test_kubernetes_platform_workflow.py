@@ -52,6 +52,14 @@ class KubernetesPlatformWorkflowDiagnosticsTests(unittest.TestCase):
             "scripts/performance/**",
             proof_workflow["on"]["push"]["paths"],
         )
+        self.assertIn(
+            ".github/workflows/domain-scale.yml",
+            pr_workflow["on"]["pull_request"]["paths"],
+        )
+        self.assertIn(
+            ".github/workflows/domain-scale.yml",
+            proof_workflow["on"]["push"]["paths"],
+        )
 
     def test_failed_live_package_receipt_is_uploaded_for_both_proof_jobs(self) -> None:
         workflow = yaml.safe_load(PROOF_WORKFLOW.read_text(encoding="utf-8"))

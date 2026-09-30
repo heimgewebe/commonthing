@@ -11,6 +11,7 @@ permissions:
     paths:
       - ".github/workflows/kubernetes-platform.yml"
       - ".github/workflows/kubernetes-platform-proof.yml"
+      - ".github/workflows/domain-scale.yml"
       - ".dockerignore"
       - "Cargo.toml"
       - "Cargo.lock"

@@ -14,6 +14,7 @@ import binascii
 import csv
 import ctypes
 import fcntl
+import functools
 import hashlib
 import ipaddress
 import json
@@ -305,6 +306,51 @@ def atomic_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
         os.fsync(handle.fileno())
     os.chmod(tmp, mode)
     os.replace(tmp, path)
+
+
+def _serialize_recovery_proof(function: Any) -> Any:
+    @functools.wraps(function)
+    def wrapped(root: Path, *args: Any, **kwargs: Any) -> Any:
+        lock_path = root / ".recovery-proof.lock"
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | int(getattr(os, "O_CLOEXEC", 0))
+            | int(getattr(os, "O_NOFOLLOW", 0))
+        )
+        try:
+            lock_fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise RuntimeErrorEB("recovery proof lock cannot be opened") from exc
+        acquired = False
+        try:
+            metadata = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+            ):
+                raise RuntimeErrorEB("recovery proof lock identity is invalid")
+            os.fchmod(lock_fd, 0o600)
+            try:
+                fcntl.flock(
+                    lock_fd,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError as exc:
+                raise RuntimeErrorEB(
+                    "recovery proof is already running for this state root"
+                ) from exc
+            acquired = True
+            return function(root, *args, **kwargs)
+        finally:
+            if acquired:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(lock_fd)
+
+    return wrapped
 
 
 PORTABILITY_DERIVED_RECEIPTS = ("portability.json",)
@@ -12287,8 +12333,20 @@ def _application_service_endpoint_binding(
         ],
     )
     items = readback.get("items") if isinstance(readback, dict) else None
+    list_metadata = (
+        readback.get("metadata")
+        if isinstance(readback, dict)
+        else None
+    )
+    resource_version = (
+        list_metadata.get("resourceVersion")
+        if isinstance(list_metadata, dict)
+        else None
+    )
     if (
-        not isinstance(items, list)
+        not isinstance(resource_version, str)
+        or not resource_version
+        or not isinstance(items, list)
         or not items
         or any(not isinstance(item, dict) for item in items)
     ):
@@ -12386,7 +12444,276 @@ def _application_service_endpoint_binding(
     return {
         "pods": normalized,
         "sha256": _stable_json_sha256(normalized),
+        "resource_version": resource_version,
     }
+
+
+def _functional_serving_runtime_semantic_binding(
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(binding, dict):
+        raise RuntimeErrorEB(
+            "functional serving runtime semantic binding is invalid"
+        )
+    normalized = json.loads(json.dumps(binding))
+    services = normalized.get("services")
+    if isinstance(services, dict):
+        for service in services.values():
+            endpoints = (
+                service.get("endpoints")
+                if isinstance(service, dict)
+                else None
+            )
+            if isinstance(endpoints, dict):
+                endpoints.pop("resource_version", None)
+    return normalized
+
+
+def _functional_endpoint_watch_events(
+    stream: Any,
+    service_name: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    try:
+        size = os.fstat(stream.fileno()).st_size
+        payload = os.pread(stream.fileno(), size, 0)
+        text = payload.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeErrorEB(
+            f"functional serving endpoint watch output cannot be read: {service_name}"
+        ) from exc
+
+    events: list[dict[str, Any]] = []
+    cursor = 0
+    decoder = json.JSONDecoder()
+    complete = True
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text):
+            break
+        try:
+            event, cursor = decoder.raw_decode(text, cursor)
+        except json.JSONDecodeError:
+            complete = False
+            break
+        if (
+            not isinstance(event, dict)
+            or not isinstance(event.get("type"), str)
+            or not isinstance(event.get("object"), dict)
+        ):
+            raise RuntimeErrorEB(
+                f"functional serving endpoint watch event is invalid: {service_name}"
+            )
+        events.append(event)
+    return events, complete
+
+
+def _functional_endpoint_watch_is_synced(
+    events: list[dict[str, Any]],
+    service_name: str,
+) -> bool:
+    initial_sync_complete = False
+    for event in events:
+        event_type = event["type"]
+        if not initial_sync_complete:
+            if event_type == "ADDED":
+                continue
+            if event_type == "BOOKMARK":
+                metadata = event["object"].get("metadata")
+                annotations = (
+                    metadata.get("annotations")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if (
+                    isinstance(annotations, dict)
+                    and annotations.get("k8s.io/initial-events-end")
+                    == "true"
+                ):
+                    initial_sync_complete = True
+                    continue
+            raise RuntimeErrorEB(
+                f"functional serving endpoint watch initial sync is invalid: {service_name}"
+            )
+        if event_type != "BOOKMARK":
+            raise RuntimeErrorEB(
+                f"functional serving Service endpoints changed during Gateway probes: "
+                f"{service_name}"
+            )
+    return initial_sync_complete
+
+
+@contextmanager
+def _guard_functional_service_endpoints(
+    root: Path,
+    serving_runtime: dict[str, Any],
+) -> Iterator[None]:
+    services = (
+        serving_runtime.get("services")
+        if isinstance(serving_runtime, dict)
+        else None
+    )
+    if not isinstance(services, dict):
+        raise RuntimeErrorEB(
+            "functional serving endpoint watch has no Service bindings"
+        )
+
+    watches: list[
+        tuple[str, subprocess.Popen[Any], Any, Any]
+    ] = []
+    try:
+        kubectl = toolchain(root)["tools"]["kubectl"]
+        for service_name in ("weltgewebe-api", "weltgewebe-web"):
+            service = services.get(service_name)
+            endpoints = (
+                service.get("endpoints")
+                if isinstance(service, dict)
+                else None
+            )
+            resource_version = (
+                endpoints.get("resource_version")
+                if isinstance(endpoints, dict)
+                else None
+            )
+            if (
+                not isinstance(resource_version, str)
+                or not resource_version
+            ):
+                raise RuntimeErrorEB(
+                    f"functional serving endpoint watch has no resourceVersion: "
+                    f"{service_name}"
+                )
+            stdout = tempfile.TemporaryFile(
+                mode="w+",
+                encoding="utf-8",
+            )
+            stderr = tempfile.TemporaryFile(
+                mode="w+",
+                encoding="utf-8",
+            )
+            watch_query = urllib.parse.urlencode(
+                {
+                    "watch": "1",
+                    "resourceVersion": resource_version,
+                    "resourceVersionMatch": "NotOlderThan",
+                    "sendInitialEvents": "true",
+                    "allowWatchBookmarks": "true",
+                    "labelSelector": (
+                        f"kubernetes.io/service-name={service_name}"
+                    ),
+                }
+            )
+            watch_path = (
+                f"/apis/discovery.k8s.io/v1/namespaces/"
+                f"{urllib.parse.quote(APP_NAMESPACE, safe='')}/endpointslices"
+                f"?{watch_query}"
+            )
+            try:
+                process = subprocess.Popen(
+                    [
+                        kubectl,
+                        "get",
+                        "--raw",
+                        watch_path,
+                    ],
+                    cwd=ROOT,
+                    stdout=stdout,
+                    stderr=stderr,
+                    env=kube_env(root),
+                    text=True,
+                    pass_fds=_bound_subprocess_pass_fds(),
+                )
+            except BaseException:
+                stdout.close()
+                stderr.close()
+                raise
+            watches.append((service_name, process, stdout, stderr))
+
+        pending = {service_name for service_name, *_rest in watches}
+        deadline = time.monotonic() + 10.0
+        while pending:
+            for service_name, process, stdout, stderr in watches:
+                if service_name not in pending:
+                    continue
+                if process.poll() is not None:
+                    stderr.flush()
+                    stderr.seek(0)
+                    detail = stderr.read()[-2000:]
+                    raise RuntimeErrorEB(
+                        f"functional serving endpoint watch exited before initial sync: "
+                        f"{service_name}: {detail}"
+                    )
+                events, complete = _functional_endpoint_watch_events(
+                    stdout,
+                    service_name,
+                )
+                if (
+                    complete
+                    and _functional_endpoint_watch_is_synced(
+                        events,
+                        service_name,
+                    )
+                ):
+                    pending.remove(service_name)
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeErrorEB(
+                    "functional serving endpoint watch initial sync timed out"
+                )
+            time.sleep(0.05)
+
+        try:
+            yield
+        except BaseException:
+            raise
+        else:
+            for service_name, process, _stdout, stderr in watches:
+                if process.poll() is not None:
+                    stderr.flush()
+                    stderr.seek(0)
+                    detail = stderr.read()[-2000:]
+                    raise RuntimeErrorEB(
+                        f"functional serving endpoint watch exited during "
+                        f"Gateway probes: {service_name}: {detail}"
+                    )
+
+            for service_name, process, stdout, stderr in watches:
+                process.terminate()
+                try:
+                    returncode = process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    returncode = process.wait(timeout=5)
+                if returncode not in {-15, -9}:
+                    stderr.flush()
+                    stderr.seek(0)
+                    detail = stderr.read()[-2000:]
+                    raise RuntimeErrorEB(
+                        f"functional serving endpoint watch did not remain "
+                        f"active until controlled shutdown: "
+                        f"{service_name}: {detail}"
+                    )
+                events, complete = _functional_endpoint_watch_events(
+                    stdout,
+                    service_name,
+                )
+                if (
+                    not complete
+                    or not _functional_endpoint_watch_is_synced(
+                        events,
+                        service_name,
+                    )
+                ):
+                    raise RuntimeErrorEB(
+                        f"functional serving endpoint watch has no complete initial sync: "
+                        f"{service_name}"
+                    )
+    finally:
+        for _service_name, process, stdout, stderr in watches:
+            _stop_process(process)
+            stdout.close()
+            stderr.close()
 
 
 def _functional_serving_runtime_binding(
@@ -12730,18 +13057,75 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
             root,
             source_commit,
         )
-        data_plane = _gateway_data_plane_readback(root, source_commit)
-        serving_runtime_after = _functional_serving_runtime_binding(
+        serving_runtime_semantic_before = (
+            _functional_serving_runtime_semantic_binding(
+                serving_runtime_before
+            )
+        )
+        with _guard_functional_service_endpoints(
+            root,
+            serving_runtime_before,
+        ):
+            serving_runtime_probe_start = (
+                _functional_serving_runtime_binding(
+                    root,
+                    source_commit,
+                )
+            )
+            serving_runtime_semantic_probe_start = (
+                _functional_serving_runtime_semantic_binding(
+                    serving_runtime_probe_start
+                )
+            )
+            if (
+                serving_runtime_semantic_probe_start
+                != serving_runtime_semantic_before
+            ):
+                raise RuntimeErrorEB(
+                    "application serving runtime changed before Gateway probes"
+                )
+            data_plane = _gateway_data_plane_readback(
+                root,
+                source_commit,
+            )
+            serving_runtime_after = _functional_serving_runtime_binding(
+                root,
+                source_commit,
+            )
+            serving_runtime_semantic_after = (
+                _functional_serving_runtime_semantic_binding(
+                    serving_runtime_after
+                )
+            )
+            if (
+                serving_runtime_semantic_after
+                != serving_runtime_semantic_probe_start
+            ):
+                raise RuntimeErrorEB(
+                    "application serving runtime changed during functional readback"
+                )
+        base = str(data_plane["gateway"])
+        checks = data_plane["checks"]
+        nats_binding_before = _require_nats_runtime_binding(
             root,
             source_commit,
         )
-        if serving_runtime_after != serving_runtime_before:
+        jetstream = _jetstream_signature(
+            root,
+            source_commit=source_commit,
+            nats_binding=nats_binding_before,
+        )
+        nats_binding_after = _require_nats_runtime_binding(
+            root,
+            source_commit,
+        )
+        if (
+            _nats_runtime_binding_identity(nats_binding_after)
+            != _nats_runtime_binding_identity(nats_binding_before)
+        ):
             raise RuntimeErrorEB(
-                "application serving runtime changed during functional readback"
+                "NATS runtime changed during functional readback"
             )
-        base = str(data_plane["gateway"])
-        checks = data_plane["checks"]
-        jetstream = _jetstream_signature(root)
         if jetstream["messages"] < 1:
             raise RuntimeErrorEB(
                 "Experiment-B JetStream contains no persisted test messages"
@@ -12771,7 +13155,10 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
             target_binding_before
         ),
         "serving_runtime_sha256": _stable_json_sha256(
-            serving_runtime_before
+            serving_runtime_semantic_probe_start
+        ),
+        "nats_runtime_sha256": _stable_json_sha256(
+            _nats_runtime_binding_identity(nats_binding_before)
         ),
         "production_endpoint_used": False,
     }
@@ -14006,6 +14393,7 @@ def _delete_pod(root: Path, namespace: str, name: str) -> None:
         )
 
 
+@_serialize_recovery_proof
 def recovery_proof(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
@@ -14757,6 +15145,51 @@ def portability_report(root: Path) -> dict[str, Any]:
     ):
         raise RuntimeErrorEB(
             "fresh functional readback attempt is not bound to its current success receipt"
+        )
+
+    fresh_t048 = t048_load_proof(root, source_commit)
+    if (
+        not isinstance(fresh_t048, dict)
+        or fresh_t048.get("status") != "pass"
+        or fresh_t048.get("source_commit") != source_commit
+    ):
+        raise RuntimeErrorEB(
+            "fresh T048 load proof did not return source-bound success evidence"
+        )
+    for name, required_status in (
+        ("t048-load.json", "pass"),
+        ("t048-load-attempt.json", "pass"),
+    ):
+        path = root / "receipts" / name
+        try:
+            raw = path.read_bytes()
+            payload = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeErrorEB(
+                f"fresh T048 portability receipt is invalid: {name}"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("status") != required_status
+            or payload.get("source_commit") != source_commit
+        ):
+            raise RuntimeErrorEB(
+                f"fresh T048 portability receipt is invalid: {name}"
+            )
+        if name == "t048-load.json" and payload != fresh_t048:
+            raise RuntimeErrorEB(
+                "T048 load receipt changed after fresh live validation"
+            )
+        payloads[name] = payload
+        receipts[name] = hashlib.sha256(raw).hexdigest()
+    t048_attempt = payloads["t048-load-attempt.json"]
+    if (
+        t048_attempt.get("receipt") != "t048-load.json"
+        or t048_attempt.get("receipt_sha256")
+        != receipts["t048-load.json"]
+    ):
+        raise RuntimeErrorEB(
+            "fresh T048 load attempt is not bound to its current success receipt"
         )
 
     config = _source_commit_config(source_commit)
