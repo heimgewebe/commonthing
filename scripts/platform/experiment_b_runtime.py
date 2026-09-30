@@ -10410,6 +10410,26 @@ def _validated_t048_fixture_receipt(
     if receipt.get("manifest_sha256") != sha256_file(manifest):
         raise RuntimeErrorEB("T048 fixture receipt manifest digest is stale")
 
+    evidence, domain_scale = _performance_modules(source_commit)
+    policy, _policy_sha256 = _source_bound_performance_policy(
+        source_commit
+    )
+    contract_section = evidence.api_runtime_section(policy)
+    canonical_binding = _source_bound_dataset_binding(
+        source_commit,
+        manifest,
+        contract_section,
+        domain_scale,
+    )
+    if (
+        canonical_binding.get("manifest_sha256")
+        != receipt.get("manifest_sha256")
+        or canonical_binding.get("profile") != receipt.get("profile")
+    ):
+        raise RuntimeErrorEB(
+            "T048 fixture receipt does not match source-commit generator output"
+        )
+
     generation_id = receipt.get("generation_id")
     expected_generation = str(
         _source_commit_config(source_commit)["semantic_search"]["generation_id"]
@@ -11898,7 +11918,15 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         if k6_summary_snapshot_fd is None:
             raise RuntimeErrorEB("canonical T048 k6 summary snapshot is unavailable")
 
+        if process.poll() is not None:
+            raise RuntimeErrorEB(
+                "API port-forward exited before T048 metrics post-snapshot"
+            )
         after_status, after_body, _elapsed = _http_read(f"{base_url}/metrics")
+        if process.poll() is not None:
+            raise RuntimeErrorEB(
+                "API port-forward exited during T048 metrics post-snapshot"
+            )
         if after_status != 200:
             raise RuntimeErrorEB("API /metrics post-snapshot failed")
         metrics_after = after_body.decode("utf-8")

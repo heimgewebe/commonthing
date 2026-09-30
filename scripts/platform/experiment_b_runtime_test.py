@@ -10591,6 +10591,14 @@ spec:
         post_metrics = source.index(
             'after_status, after_body, _elapsed = _http_read(f"{base_url}/metrics")'
         )
+        metrics_process_before = source.index(
+            "if process.poll() is not None:",
+            second_api,
+        )
+        metrics_process_after = source.index(
+            "if process.poll() is not None:",
+            metrics_process_before + 1,
+        )
         final_api = source.index(
             "_require_t048_api_runtime_binding",
             second_api + 1,
@@ -10610,8 +10618,10 @@ spec:
         self.assertLess(load, second_fixture)
         self.assertLess(load, second_target)
         self.assertLess(load, second_postgres)
-        self.assertLess(second_api, post_metrics)
-        self.assertLess(post_metrics, final_api)
+        self.assertLess(second_api, metrics_process_before)
+        self.assertLess(metrics_process_before, post_metrics)
+        self.assertLess(post_metrics, metrics_process_after)
+        self.assertLess(metrics_process_after, final_api)
         self.assertLess(final_api, report)
         self.assertIn(
             "final_api_runtime_binding != api_runtime_binding_before",
@@ -11605,6 +11615,79 @@ def install(*args, **kwargs):
                     FakeDomainScale,
                 )
 
+    def test_t048_fixture_receipt_rebinds_source_generator_before_live_state(
+        self,
+    ) -> None:
+        commit = "a" * 40
+        generation_id = "experiment-b-t048"
+        contract_section = {
+            "dataset_proof": {
+                "generator": "scripts/performance/domain_scale.py",
+                "config": "configs/performance/domain-scale.v1.json",
+                "profile": "ci",
+            }
+        }
+        evidence = mock.Mock()
+        evidence.api_runtime_section.return_value = contract_section
+        domain_scale = object()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "performance/fixture/manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("{}\n", encoding="utf-8")
+            (root / "receipts").mkdir()
+            runtime.atomic_json(
+                root / "receipts/t048-fixture.json",
+                {
+                    "schema_version": 1,
+                    "status": "loaded",
+                    "source_commit": commit,
+                    "profile": "ci",
+                    "manifest": str(manifest),
+                    "manifest_sha256": runtime.sha256_file(manifest),
+                    "generation_id": generation_id,
+                    "live_binding": {"self_consistent": True},
+                },
+            )
+
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_performance_modules",
+                    return_value=(evidence, domain_scale),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_source_bound_performance_policy",
+                    return_value=({"policy": "source-bound"}, "f" * 64),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_source_bound_dataset_binding",
+                    side_effect=runtime.RuntimeErrorEB(
+                        "canonical generator drift"
+                    ),
+                ) as source_binding,
+                mock.patch.object(
+                    runtime,
+                    "_t048_live_fixture_binding",
+                ) as live_binding,
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "canonical generator drift",
+                ),
+            ):
+                runtime._validated_t048_fixture_receipt(root, commit)
+
+            source_binding.assert_called_once_with(
+                commit,
+                manifest,
+                contract_section,
+                domain_scale,
+            )
+            live_binding.assert_not_called()
+
     def test_t048_runtime_config_authority_is_source_commit_bound(self) -> None:
         seed_source = inspect.getsource(runtime.seed_t048_fixture)
         receipt_source = inspect.getsource(runtime._validated_t048_fixture_receipt)
@@ -11614,6 +11697,8 @@ def install(*args, **kwargs):
         self.assertIn("_source_commit_config(source_commit)", seed_source)
         self.assertNotIn("config = load_config()", seed_source)
         self.assertIn("_source_commit_config(source_commit)", receipt_source)
+        self.assertIn("_performance_modules(source_commit)", receipt_source)
+        self.assertIn("_source_bound_dataset_binding(", receipt_source)
         self.assertNotIn("load_config()", receipt_source)
         self.assertIn("_source_commit_config(source_commit)", live_source)
         self.assertNotIn("load_config()", live_source)
