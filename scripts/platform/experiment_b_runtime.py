@@ -12171,6 +12171,15 @@ def _application_pod_runtime_identity(
     status = pod.get("status")
     pod_name = metadata.get("name") if isinstance(metadata, dict) else None
     pod_uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    pod_ip = status.get("podIP") if isinstance(status, dict) else None
+    try:
+        normalized_pod_ip = (
+            str(ipaddress.ip_address(pod_ip))
+            if isinstance(pod_ip, str)
+            else None
+        )
+    except ValueError:
+        normalized_pod_ip = None
     statuses = (
         status.get("containerStatuses")
         if isinstance(status, dict)
@@ -12181,6 +12190,7 @@ def _application_pod_runtime_identity(
         or not pod_name
         or not isinstance(pod_uid, str)
         or not pod_uid
+        or normalized_pod_ip is None
         or not isinstance(statuses, list)
     ):
         raise RuntimeErrorEB(f"{context} Pod runtime identity is incomplete")
@@ -12220,7 +12230,162 @@ def _application_pod_runtime_identity(
     return {
         "pod_name": pod_name,
         "pod_uid": pod_uid,
+        "pod_ip": normalized_pod_ip,
         "container_ids": container_ids,
+    }
+
+
+def _application_service_endpoint_binding(
+    root: Path,
+    service_name: str,
+    pod_identities: dict[str, Any],
+) -> dict[str, Any]:
+    if service_name not in {"weltgewebe-api", "weltgewebe-web"}:
+        raise RuntimeErrorEB(
+            f"functional serving Service endpoint binding is invalid: {service_name}"
+        )
+    if not isinstance(pod_identities, dict) or not pod_identities:
+        raise RuntimeErrorEB(
+            f"functional serving Service endpoint Pod set is invalid: {service_name}"
+        )
+
+    expected: dict[str, dict[str, str]] = {}
+    for pod_name, identity in pod_identities.items():
+        if (
+            not isinstance(pod_name, str)
+            or not pod_name
+            or not isinstance(identity, dict)
+            or identity.get("pod_name") != pod_name
+            or not isinstance(identity.get("pod_uid"), str)
+            or not identity["pod_uid"]
+            or not isinstance(identity.get("pod_ip"), str)
+            or not identity["pod_ip"]
+        ):
+            raise RuntimeErrorEB(
+                f"functional serving Service endpoint Pod identity is invalid: {service_name}"
+            )
+        try:
+            address = str(ipaddress.ip_address(identity["pod_ip"]))
+        except ValueError as exc:
+            raise RuntimeErrorEB(
+                f"functional serving Service endpoint Pod address is invalid: {service_name}"
+            ) from exc
+        expected[pod_name] = {
+            "pod_uid": identity["pod_uid"],
+            "address": address,
+        }
+
+    readback = _kubectl_json(
+        root,
+        [
+            "-n",
+            APP_NAMESPACE,
+            "get",
+            "endpointslices.discovery.k8s.io",
+            "-l",
+            f"kubernetes.io/service-name={service_name}",
+        ],
+    )
+    items = readback.get("items") if isinstance(readback, dict) else None
+    if (
+        not isinstance(items, list)
+        or not items
+        or any(not isinstance(item, dict) for item in items)
+    ):
+        raise RuntimeErrorEB(
+            f"functional serving Service EndpointSlice inventory is invalid: {service_name}"
+        )
+
+    observed: dict[str, dict[str, str]] = {}
+    for item in items:
+        metadata = item.get("metadata")
+        labels = metadata.get("labels") if isinstance(metadata, dict) else None
+        endpoints = item.get("endpoints")
+        address_type = item.get("addressType")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("namespace") != APP_NAMESPACE
+            or metadata.get("deletionTimestamp") is not None
+            or not isinstance(labels, dict)
+            or labels.get("kubernetes.io/service-name") != service_name
+            or address_type not in {"IPv4", "IPv6"}
+            or not isinstance(endpoints, list)
+        ):
+            raise RuntimeErrorEB(
+                f"functional serving Service EndpointSlice contract is invalid: {service_name}"
+            )
+        for endpoint in endpoints:
+            conditions = (
+                endpoint.get("conditions")
+                if isinstance(endpoint, dict)
+                else None
+            )
+            target_ref = (
+                endpoint.get("targetRef")
+                if isinstance(endpoint, dict)
+                else None
+            )
+            addresses = (
+                endpoint.get("addresses")
+                if isinstance(endpoint, dict)
+                else None
+            )
+            pod_name = (
+                target_ref.get("name")
+                if isinstance(target_ref, dict)
+                else None
+            )
+            expected_endpoint = expected.get(pod_name)
+            if (
+                not isinstance(conditions, dict)
+                or conditions.get("ready") is not True
+                or conditions.get("terminating") is True
+                or conditions.get("serving") is False
+                or not isinstance(target_ref, dict)
+                or target_ref.get("kind") != "Pod"
+                or target_ref.get("namespace") != APP_NAMESPACE
+                or not isinstance(pod_name, str)
+                or expected_endpoint is None
+                or target_ref.get("uid") != expected_endpoint["pod_uid"]
+                or pod_name in observed
+                or not isinstance(addresses, list)
+                or len(addresses) != 1
+                or not isinstance(addresses[0], str)
+            ):
+                raise RuntimeErrorEB(
+                    f"functional serving Service endpoint target is invalid: {service_name}"
+                )
+            try:
+                address = str(ipaddress.ip_address(addresses[0]))
+            except ValueError as exc:
+                raise RuntimeErrorEB(
+                    f"functional serving Service endpoint address is invalid: {service_name}"
+                ) from exc
+            expected_address_type = (
+                "IPv4"
+                if ipaddress.ip_address(address).version == 4
+                else "IPv6"
+            )
+            if (
+                address_type != expected_address_type
+                or address != expected_endpoint["address"]
+            ):
+                raise RuntimeErrorEB(
+                    f"functional serving Service endpoint address drifted: {service_name}"
+                )
+            observed[pod_name] = {
+                "pod_uid": expected_endpoint["pod_uid"],
+                "address": address,
+            }
+
+    if observed != expected:
+        raise RuntimeErrorEB(
+            f"functional serving Service endpoint set drifted: {service_name}"
+        )
+    normalized = dict(sorted(observed.items()))
+    return {
+        "pods": normalized,
+        "sha256": _stable_json_sha256(normalized),
     }
 
 
@@ -12412,7 +12577,7 @@ def _functional_serving_runtime_binding(
         }
 
     services = _require_live_application_services(root, release)
-    service_binding: dict[str, str] = {}
+    service_binding: dict[str, Any] = {}
     for name in ("weltgewebe-api", "weltgewebe-web"):
         value = services.get(name)
         spec_sha256 = (
@@ -12429,7 +12594,15 @@ def _functional_serving_runtime_binding(
             raise RuntimeErrorEB(
                 f"functional serving Service binding is invalid: {name}"
             )
-        service_binding[name] = spec_sha256
+        endpoint_binding = _application_service_endpoint_binding(
+            root,
+            name,
+            workload_binding[name]["pods"],
+        )
+        service_binding[name] = {
+            "spec_sha256": spec_sha256,
+            "endpoints": endpoint_binding,
+        }
 
     gateway_readback = _require_gateway_ready(
         _kubectl_json(
@@ -14537,6 +14710,54 @@ def portability_report(root: Path) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 f"latest {receipt_stem} attempt is not bound to its current success receipt"
             )
+
+    fresh_functional = functional_readback(root, source_commit)
+    if (
+        not isinstance(fresh_functional, dict)
+        or fresh_functional.get("status") != "pass"
+        or fresh_functional.get("source_commit") != source_commit
+    ):
+        raise RuntimeErrorEB(
+            "fresh functional readback did not return source-bound success evidence"
+        )
+    for name, required_status in (
+        ("functional-readback.json", "pass"),
+        ("functional-readback-attempt.json", "pass"),
+    ):
+        path = root / "receipts" / name
+        try:
+            raw = path.read_bytes()
+            payload = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeErrorEB(
+                f"fresh functional portability receipt is invalid: {name}"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("status") != required_status
+            or payload.get("source_commit") != source_commit
+        ):
+            raise RuntimeErrorEB(
+                f"fresh functional portability receipt is invalid: {name}"
+            )
+        if (
+            name == "functional-readback.json"
+            and payload != fresh_functional
+        ):
+            raise RuntimeErrorEB(
+                "functional readback receipt changed after fresh live validation"
+            )
+        payloads[name] = payload
+        receipts[name] = hashlib.sha256(raw).hexdigest()
+    functional_attempt = payloads["functional-readback-attempt.json"]
+    if (
+        functional_attempt.get("receipt") != "functional-readback.json"
+        or functional_attempt.get("receipt_sha256")
+        != receipts["functional-readback.json"]
+    ):
+        raise RuntimeErrorEB(
+            "fresh functional readback attempt is not bound to its current success receipt"
+        )
 
     config = _source_commit_config(source_commit)
     _require_vm_create_receipt(

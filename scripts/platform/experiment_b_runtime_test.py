@@ -2818,6 +2818,82 @@ spec:
                     inspect.getsource(function),
                 )
 
+
+    def test_portability_revalidates_functional_evidence_before_certifying(
+        self,
+    ) -> None:
+        commit = "a" * 40
+        statuses = {
+            "vm-create.json": "created",
+            "k3s.json": "ready",
+            "platform.json": "ready",
+            "secrets.json": "ready",
+            "release.json": "applied",
+            "release-attempt.json": "pass",
+            "t048-fixture.json": "loaded",
+            "semantic-search.json": "pass",
+            "semantic-search-attempt.json": "pass",
+            "functional-readback.json": "pass",
+            "functional-readback-attempt.json": "pass",
+            "t048-load.json": "pass",
+            "t048-load-attempt.json": "pass",
+            "recovery.json": "pass",
+            "recovery-attempt.json": "pass",
+            "status.json": "observed",
+            "status-attempt.json": "pass",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            for name, status in statuses.items():
+                if name.endswith("-attempt.json"):
+                    continue
+                runtime.atomic_json(
+                    receipts / name,
+                    {
+                        "schema_version": 1,
+                        "status": status,
+                        "source_commit": commit,
+                    },
+                )
+            for name, status in statuses.items():
+                if not name.endswith("-attempt.json"):
+                    continue
+                receipt_name = name.removesuffix("-attempt.json") + ".json"
+                runtime.atomic_json(
+                    receipts / name,
+                    {
+                        "schema_version": 1,
+                        "status": status,
+                        "source_commit": commit,
+                        "receipt": receipt_name,
+                        "receipt_sha256": runtime.sha256_file(
+                            receipts / receipt_name
+                        ),
+                    },
+                )
+
+            fresh_receipt = {
+                "schema_version": 1,
+                "status": "pass",
+                "source_commit": commit,
+                "gateway": "http://192.0.2.23",
+            }
+            with (
+                mock.patch.object(
+                    runtime,
+                    "functional_readback",
+                    return_value=fresh_receipt,
+                ) as fresh_functional,
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "receipt changed after fresh live validation",
+                ),
+            ):
+                runtime.portability_report(root)
+            fresh_functional.assert_called_once_with(root, commit)
+
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
         commit = "a" * 40
         config = runtime.load_config()
@@ -3023,6 +3099,15 @@ spec:
         }
         with (
             tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(
+                runtime,
+                "functional_readback",
+                return_value={
+                    "schema_version": 1,
+                    "status": "pass",
+                    "source_commit": commit,
+                },
+            ),
             mock.patch.object(
                 runtime,
                 "_current_protected_main_commit",
@@ -12904,6 +12989,7 @@ def install(*args, **kwargs):
                 "uid": "pod-uid-serving",
             },
             "status": {
+                "podIP": "10.42.0.12",
                 "containerStatuses": [
                     {
                         "name": "api",
@@ -12927,6 +13013,7 @@ def install(*args, **kwargs):
         )
         self.assertEqual(observed["pod_name"], "weltgewebe-api-serving")
         self.assertEqual(observed["pod_uid"], "pod-uid-serving")
+        self.assertEqual(observed["pod_ip"], "10.42.0.12")
         self.assertEqual(
             observed["container_ids"],
             {
@@ -12957,11 +13044,115 @@ def install(*args, **kwargs):
             "_require_live_application_workloads(",
             "_require_running_pod_images(",
             "_require_live_application_services(",
+            "_application_service_endpoint_binding(",
             "_require_gateway_ready(",
             "_require_httproute_ready(",
             "_application_pod_runtime_identity(",
         ):
             self.assertIn(required, binding_source)
+
+
+    def test_application_service_endpoints_bind_to_validated_pods(self) -> None:
+        pod_identities = {
+            "weltgewebe-api-serving": {
+                "pod_name": "weltgewebe-api-serving",
+                "pod_uid": "pod-uid-serving",
+                "pod_ip": "10.42.0.12",
+                "container_ids": {
+                    "api": "containerd://" + "a" * 64,
+                },
+            }
+        }
+        endpoint_slice = {
+            "metadata": {
+                "name": "weltgewebe-api-slice",
+                "namespace": runtime.APP_NAMESPACE,
+                "labels": {
+                    "kubernetes.io/service-name": "weltgewebe-api",
+                },
+            },
+            "addressType": "IPv4",
+            "endpoints": [
+                {
+                    "addresses": ["10.42.0.12"],
+                    "conditions": {
+                        "ready": True,
+                        "serving": True,
+                        "terminating": False,
+                    },
+                    "targetRef": {
+                        "kind": "Pod",
+                        "namespace": runtime.APP_NAMESPACE,
+                        "name": "weltgewebe-api-serving",
+                        "uid": "pod-uid-serving",
+                    },
+                }
+            ],
+        }
+        with mock.patch.object(
+            runtime,
+            "_kubectl_json",
+            return_value={"items": [endpoint_slice]},
+        ) as readback:
+            observed = runtime._application_service_endpoint_binding(
+                Path("/tmp"),
+                "weltgewebe-api",
+                pod_identities,
+            )
+        self.assertEqual(
+            observed["pods"],
+            {
+                "weltgewebe-api-serving": {
+                    "pod_uid": "pod-uid-serving",
+                    "address": "10.42.0.12",
+                }
+            },
+        )
+        self.assertEqual(
+            observed["sha256"],
+            runtime._stable_json_sha256(observed["pods"]),
+        )
+        readback.assert_called_once_with(
+            Path("/tmp"),
+            [
+                "-n",
+                runtime.APP_NAMESPACE,
+                "get",
+                "endpointslices.discovery.k8s.io",
+                "-l",
+                "kubernetes.io/service-name=weltgewebe-api",
+            ],
+        )
+
+        drifted = {"items": [json.loads(json.dumps(endpoint_slice))]}
+        drifted["items"][0]["endpoints"].append(
+            {
+                "addresses": ["10.42.0.99"],
+                "conditions": {"ready": True},
+                "targetRef": {
+                    "kind": "Pod",
+                    "namespace": runtime.APP_NAMESPACE,
+                    "name": "unvalidated-api-pod",
+                    "uid": "unvalidated-pod-uid",
+                },
+            }
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "_kubectl_json",
+                return_value=drifted,
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "endpoint target is invalid",
+            ),
+        ):
+            runtime._application_service_endpoint_binding(
+                Path("/tmp"),
+                "weltgewebe-api",
+                pod_identities,
+            )
 
     def test_functional_readback_rejects_serving_runtime_drift(
         self,
