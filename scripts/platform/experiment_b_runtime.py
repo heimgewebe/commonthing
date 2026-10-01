@@ -278,9 +278,12 @@ def state_root(value: str | None) -> Path:
             raise RuntimeErrorEB(
                 f"state root must be {allowed_root} or one of its descendants"
             ) from exc
+    return root
+
+
+def _ensure_state_root(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
-    return root
 
 
 def atomic_json(path: Path, payload: dict[str, Any], mode: int = 0o600) -> None:
@@ -315,6 +318,12 @@ def atomic_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
         os.fsync(handle.fileno())
     os.chmod(tmp, mode)
     os.replace(tmp, path)
+
+
+def _write_kubeconfig(root: Path, kubeconfig: str) -> Path:
+    path = root / "kubeconfig.yaml"
+    atomic_bytes(path, kubeconfig.encode("utf-8"), mode=0o600)
+    return path
 
 
 def _serialize_experiment_b_lifecycle(function: Any) -> Any:
@@ -366,6 +375,7 @@ def _serialize_experiment_b_lifecycle(function: Any) -> Any:
                 ) from exc
             acquired = True
             token = _EXPERIMENT_B_LIFECYCLE_LOCK_HELD.set(True)
+            _ensure_state_root(root)
             return function(root, *args, **kwargs)
         finally:
             if token is not None:
@@ -2171,9 +2181,7 @@ def install_k3s(root: Path) -> dict[str, Any]:
     kubeconfig = kubeconfig_raw.replace(
         "https://127.0.0.1:6443", f"https://{ip}:6443"
     )
-    kubeconfig_path = root / "kubeconfig.yaml"
-    kubeconfig_path.write_text(kubeconfig, encoding="utf-8")
-    os.chmod(kubeconfig_path, 0o600)
+    kubeconfig_path = _write_kubeconfig(root, kubeconfig)
 
     version = run(
         [*ssh_argv(root, ip), "/usr/local/bin/k3s --version"]
@@ -13994,14 +14002,27 @@ def _scale_deployment(root: Path, namespace: str, name: str, replicas: int) -> N
     )
 
 
-def _wait_deployment(root: Path, namespace: str, name: str, timeout: str = "5m") -> None:
+def _wait_deployment(
+    root: Path,
+    namespace: str,
+    name: str,
+    timeout_seconds: int = 300,
+) -> None:
+    if type(timeout_seconds) is not int or timeout_seconds <= 0:
+        raise RuntimeErrorEB(
+            "deployment rollout timeout must be positive integer seconds"
+        )
     _kubectl(
         root,
         [
-            "-n", namespace, "rollout", "status", f"deployment/{name}",
-            f"--timeout={timeout}",
+            "-n",
+            namespace,
+            "rollout",
+            "status",
+            f"deployment/{name}",
+            f"--timeout={timeout_seconds}s",
         ],
-        timeout=360,
+        timeout=timeout_seconds + 60,
     )
 
 
@@ -14831,7 +14852,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 root, source_commit, recovery_target, "recovery pre-PostgreSQL restore"
             )
             _scale_deployment(root, DATA_NAMESPACE, "postgres", 1)
-            _wait_deployment(root, DATA_NAMESPACE, "postgres", "5m")
+            _wait_deployment(root, DATA_NAMESPACE, "postgres", 300)
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery PostgreSQL restore"
             )
@@ -14879,7 +14900,7 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 root, source_commit, recovery_target, "recovery post-PostgreSQL restore"
             )
             _scale_deployment(root, DATA_NAMESPACE, "nats", 1)
-            _wait_deployment(root, DATA_NAMESPACE, "nats", "5m")
+            _wait_deployment(root, DATA_NAMESPACE, "nats", 300)
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery data restoration"
             )
@@ -14895,8 +14916,8 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             )
             _flux_resume(root, "commonthing-experiment-b-data")
             _flux_resume(root, "commonthing-experiment-b-app")
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", 300)
             _wait_event_pipeline_quiescent(
                 root,
                 source_commit=source_commit,

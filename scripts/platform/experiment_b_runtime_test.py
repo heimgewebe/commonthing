@@ -900,6 +900,24 @@ spec:
             for name in runtime.K3S_ATTEMPT_INVALIDATES:
                 self.assertFalse((receipts / name).exists(), name)
 
+    def test_install_k3s_kubeconfig_write_replaces_symlink_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            sentinel = parent / "sentinel"
+            sentinel.write_bytes(b"sentinel-bytes")
+            kubeconfig = root / "kubeconfig.yaml"
+            kubeconfig.symlink_to(sentinel)
+            expected = b"apiVersion: v1\nclusters: []\n"
+
+            runtime._write_kubeconfig(root, expected.decode("utf-8"))
+
+            self.assertEqual(sentinel.read_bytes(), b"sentinel-bytes")
+            self.assertFalse(kubeconfig.is_symlink())
+            self.assertEqual(kubeconfig.read_bytes(), expected)
+            self.assertEqual(kubeconfig.stat().st_mode & 0o777, 0o600)
+
     def test_install_k3s_rechecks_pinned_binary_before_copy(self) -> None:
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as tmp:
@@ -2265,6 +2283,51 @@ spec:
                     )
                     runtime.os.close(lock_fd)
 
+    def test_state_root_creation_waits_for_global_lifecycle_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            allowed_root = parent / "experiment-b"
+            target = allowed_root / "blocked"
+            lock_path = parent / "experiment-b.lifecycle.lock"
+            flags = (
+                runtime.os.O_RDWR
+                | runtime.os.O_CREAT
+                | int(getattr(runtime.os, "O_CLOEXEC", 0))
+                | int(getattr(runtime.os, "O_NOFOLLOW", 0))
+            )
+            with (
+                mock.patch.object(runtime, "DEFAULT_STATE_ROOT", allowed_root),
+                mock.patch.object(runtime, "EXPERIMENT_B_LIFECYCLE_LOCK", lock_path),
+            ):
+                root = runtime.state_root(str(target))
+                self.assertEqual(root, target.resolve())
+                self.assertFalse(target.exists())
+
+                lock_fd = runtime.os.open(lock_path, flags, 0o600)
+                runtime.fcntl.flock(
+                    lock_fd,
+                    runtime.fcntl.LOCK_EX | runtime.fcntl.LOCK_NB,
+                )
+
+                @runtime._serialize_experiment_b_lifecycle
+                def operation(operation_root: Path) -> None:
+                    self.assertTrue(operation_root.is_dir())
+
+                try:
+                    with self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB,
+                        "Experiment-B lifecycle is already running",
+                    ):
+                        operation(root)
+                    self.assertFalse(target.exists())
+                finally:
+                    runtime.fcntl.flock(lock_fd, runtime.fcntl.LOCK_UN)
+                    runtime.os.close(lock_fd)
+
+                operation(root)
+                self.assertTrue(target.is_dir())
+                self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
     def test_dirty_rerun_invalidates_functional_success_before_binding_failure(self) -> None:
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as tmp:
@@ -2842,13 +2905,28 @@ spec:
         self.assertLess(app_resume, post_drain)
         self.assertLess(post_drain, after_db)
 
+    def test_wait_deployment_process_timeout_exceeds_rollout_timeout(self) -> None:
+        root = Path("/tmp/unused-experiment-b-root")
+        with mock.patch.object(runtime, "_kubectl") as kubectl:
+            runtime._wait_deployment(
+                root,
+                runtime.APP_NAMESPACE,
+                "weltgewebe-api",
+                480,
+            )
+
+        call_args = kubectl.call_args
+        self.assertIsNotNone(call_args)
+        self.assertIn("--timeout=480s", call_args.args[1])
+        self.assertGreater(call_args.kwargs["timeout"], 480)
+
     def test_recovery_rto_includes_application_rollout(self) -> None:
         source = inspect.getsource(runtime.recovery_proof)
         api_wait = source.index(
-            '_wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", "8m")'
+            '_wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)'
         )
         web_wait = source.index(
-            '_wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", "5m")'
+            '_wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", 300)'
         )
         rto = source.index("rto_seconds = time.monotonic() - destructive_started")
         self.assertLess(api_wait, rto)
