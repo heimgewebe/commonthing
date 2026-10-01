@@ -55,6 +55,7 @@ NAMESPACES = CLUSTER / "namespaces"
 MIGRATION = CLUSTER / "migration"
 APP_OVERLAY = ROOT / "platform/apps/weltgewebe/overlays/experiment-b"
 DEFAULT_STATE_ROOT = Path.home() / ".local/state/commonthing/experiment-b"
+EXPERIMENT_B_LIFECYCLE_LOCK = DEFAULT_STATE_ROOT.parent / "experiment-b.lifecycle.lock"
 VM_NAME = "commonthing-experiment-b"
 LIBVIRT_URI = "qemu:///system"
 POOL_NAME = "commonthing-experiment-b-pool"
@@ -97,6 +98,10 @@ class ContractError(RuntimeError):
     pass
 
 
+def _reject_nonstandard_json_constant(value: str) -> Any:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 _BOUND_KUBECONFIG: ContextVar[str | None] = ContextVar(
     "experiment_b_bound_kubeconfig",
     default=None,
@@ -108,6 +113,10 @@ _BOUND_KUBECONFIG_FD: ContextVar[int | None] = ContextVar(
 _BOUND_SOURCE_COMMIT: ContextVar[str | None] = ContextVar(
     "experiment_b_bound_source_commit",
     default=None,
+)
+_EXPERIMENT_B_LIFECYCLE_LOCK_HELD: ContextVar[bool] = ContextVar(
+    "experiment_b_lifecycle_lock_held",
+    default=False,
 )
 _TOOLCHAIN_SNAPSHOT_FDS: set[int] = set()
 _TOOLCHAIN_SNAPSHOT_RECEIPTS: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -308,10 +317,19 @@ def atomic_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
-def _serialize_recovery_proof(function: Any) -> Any:
+def _serialize_experiment_b_lifecycle(function: Any) -> Any:
     @functools.wraps(function)
     def wrapped(root: Path, *args: Any, **kwargs: Any) -> Any:
-        lock_path = root / ".recovery-proof.lock"
+        if _EXPERIMENT_B_LIFECYCLE_LOCK_HELD.get():
+            return function(root, *args, **kwargs)
+
+        lock_path = EXPERIMENT_B_LIFECYCLE_LOCK
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as exc:
+            raise RuntimeErrorEB(
+                "Experiment-B lifecycle lock directory cannot be created"
+            ) from exc
         flags = (
             os.O_RDWR
             | os.O_CREAT
@@ -321,15 +339,21 @@ def _serialize_recovery_proof(function: Any) -> Any:
         try:
             lock_fd = os.open(lock_path, flags, 0o600)
         except OSError as exc:
-            raise RuntimeErrorEB("recovery proof lock cannot be opened") from exc
+            raise RuntimeErrorEB(
+                "Experiment-B lifecycle lock cannot be opened"
+            ) from exc
         acquired = False
+        token = None
         try:
             metadata = os.fstat(lock_fd)
             if (
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
             ):
-                raise RuntimeErrorEB("recovery proof lock identity is invalid")
+                raise RuntimeErrorEB(
+                    "Experiment-B lifecycle lock identity is invalid"
+                )
             os.fchmod(lock_fd, 0o600)
             try:
                 fcntl.flock(
@@ -338,11 +362,14 @@ def _serialize_recovery_proof(function: Any) -> Any:
                 )
             except BlockingIOError as exc:
                 raise RuntimeErrorEB(
-                    "recovery proof is already running for this state root"
+                    "Experiment-B lifecycle is already running"
                 ) from exc
             acquired = True
+            token = _EXPERIMENT_B_LIFECYCLE_LOCK_HELD.set(True)
             return function(root, *args, **kwargs)
         finally:
+            if token is not None:
+                _EXPERIMENT_B_LIFECYCLE_LOCK_HELD.reset(token)
             if acquired:
                 try:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -659,6 +686,7 @@ def ensure_ssh_key(root: Path) -> tuple[Path, Path]:
     return private, public
 
 
+@_serialize_experiment_b_lifecycle
 def prepare(
     root: Path,
     source_commit: str | None = None,
@@ -1067,6 +1095,7 @@ def _cleanup_pool_after_domain_retirement(
         POOL_TARGET.rmdir()
 
 
+@_serialize_experiment_b_lifecycle
 def create_vm(root: Path) -> dict[str, Any]:
     if run(
         ["virsh", "-c", LIBVIRT_URI, "dominfo", VM_NAME],
@@ -2015,6 +2044,7 @@ def _require_live_k3s_runtime(
     }
 
 
+@_serialize_experiment_b_lifecycle
 def install_k3s(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, K3S_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
@@ -2383,6 +2413,7 @@ def _flux_install_argv(flux: str, *, export: bool = False) -> list[str]:
     return argv
 
 
+@_serialize_experiment_b_lifecycle
 def install_platform(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
@@ -2694,6 +2725,7 @@ def _registry_credential_is_usable(credential: Any) -> bool:
     )
 
 
+@_serialize_experiment_b_lifecycle
 def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     _invalidate_receipts(root, SECRETS_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
@@ -2762,6 +2794,7 @@ def inject_secrets(root: Path, registry_config: Path) -> dict[str, Any]:
     return receipt
 
 
+@_serialize_experiment_b_lifecycle
 def apply_release(
     root: Path,
     source_commit: str,
@@ -3120,6 +3153,7 @@ def _semantic_provider_live_readback(
         "literal_loopback": True,
     }
 
+@_serialize_experiment_b_lifecycle
 def semantic_activate(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
@@ -8604,6 +8638,7 @@ def _require_live_runtime_contract(
     }
 
 
+@_serialize_experiment_b_lifecycle
 def status(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
@@ -9333,6 +9368,7 @@ def _require_teardown_live_identity(
     }
 
 
+@_serialize_experiment_b_lifecycle
 def teardown(root: Path) -> dict[str, Any]:
     ownership = _require_teardown_state_root(root)
     live_identity = _require_teardown_live_identity(root, ownership)
@@ -10551,6 +10587,7 @@ def _validated_t048_fixture_receipt(
     return receipt
 
 
+@_serialize_experiment_b_lifecycle
 def seed_t048_fixture(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, FIXTURE_ATTEMPT_INVALIDATES)
     release_path = root / "receipts/release.json"
@@ -11789,6 +11826,7 @@ def _sample_t048_load(
         _stop_process(load)
 
 
+@_serialize_experiment_b_lifecycle
 def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     report_path, attempt_path, attempt_started_at_unix_ms = (
         _begin_live_check_attempt(root, "t048-load", source_commit)
@@ -12334,6 +12372,32 @@ def _application_pod_runtime_identity(
     }
 
 
+def _kubernetes_object_revision(
+    payload: Any,
+    resource_name: str,
+) -> dict[str, str]:
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    resource_version = (
+        metadata.get("resourceVersion")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if (
+        not isinstance(uid, str)
+        or not uid
+        or not isinstance(resource_version, str)
+        or not resource_version
+    ):
+        raise RuntimeErrorEB(
+            f"functional serving {resource_name} revision is invalid"
+        )
+    return {
+        "uid": uid,
+        "resource_version": resource_version,
+    }
+
+
 def _application_service_endpoint_binding(
     root: Path,
     service_name: str,
@@ -12408,13 +12472,18 @@ def _application_service_endpoint_binding(
         )
 
     observed: dict[str, dict[str, str]] = {}
+    object_revisions: dict[str, dict[str, str]] = {}
     for item in items:
         metadata = item.get("metadata")
+        item_name = metadata.get("name") if isinstance(metadata, dict) else None
         labels = metadata.get("labels") if isinstance(metadata, dict) else None
         endpoints = item.get("endpoints")
         address_type = item.get("addressType")
         if (
             not isinstance(metadata, dict)
+            or not isinstance(item_name, str)
+            or not item_name
+            or item_name in object_revisions
             or metadata.get("namespace") != APP_NAMESPACE
             or metadata.get("deletionTimestamp") is not None
             or not isinstance(labels, dict)
@@ -12425,6 +12494,10 @@ def _application_service_endpoint_binding(
             raise RuntimeErrorEB(
                 f"functional serving Service EndpointSlice contract is invalid: {service_name}"
             )
+        object_revisions[item_name] = _kubernetes_object_revision(
+            item,
+            f"EndpointSlice {service_name}/{item_name}",
+        )
         for endpoint in endpoints:
             conditions = (
                 endpoint.get("conditions")
@@ -12498,6 +12571,7 @@ def _application_service_endpoint_binding(
         "pods": normalized,
         "sha256": _stable_json_sha256(normalized),
         "resource_version": resource_version,
+        "object_revisions": dict(sorted(object_revisions.items())),
     }
 
 
@@ -12519,81 +12593,16 @@ def _functional_serving_runtime_semantic_binding(
             )
             if isinstance(endpoints, dict):
                 endpoints.pop("resource_version", None)
+                revisions = endpoints.get("object_revisions")
+                if isinstance(revisions, dict):
+                    for revision in revisions.values():
+                        if isinstance(revision, dict):
+                            revision.pop("resource_version", None)
+    for resource_name in ("gateway", "httproute"):
+        resource = normalized.get(resource_name)
+        if isinstance(resource, dict):
+            resource.pop("resource_version", None)
     return normalized
-
-
-def _functional_endpoint_watch_events(
-    stream: Any,
-    service_name: str,
-) -> tuple[list[dict[str, Any]], bool]:
-    try:
-        size = os.fstat(stream.fileno()).st_size
-        payload = os.pread(stream.fileno(), size, 0)
-        text = payload.decode("utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RuntimeErrorEB(
-            f"functional serving endpoint watch output cannot be read: {service_name}"
-        ) from exc
-
-    events: list[dict[str, Any]] = []
-    cursor = 0
-    decoder = json.JSONDecoder()
-    complete = True
-    while cursor < len(text):
-        while cursor < len(text) and text[cursor].isspace():
-            cursor += 1
-        if cursor >= len(text):
-            break
-        try:
-            event, cursor = decoder.raw_decode(text, cursor)
-        except json.JSONDecodeError:
-            complete = False
-            break
-        if (
-            not isinstance(event, dict)
-            or not isinstance(event.get("type"), str)
-            or not isinstance(event.get("object"), dict)
-        ):
-            raise RuntimeErrorEB(
-                f"functional serving endpoint watch event is invalid: {service_name}"
-            )
-        events.append(event)
-    return events, complete
-
-
-def _functional_endpoint_watch_is_synced(
-    events: list[dict[str, Any]],
-    service_name: str,
-) -> bool:
-    initial_sync_complete = False
-    for event in events:
-        event_type = event["type"]
-        if not initial_sync_complete:
-            if event_type == "ADDED":
-                continue
-            if event_type == "BOOKMARK":
-                metadata = event["object"].get("metadata")
-                annotations = (
-                    metadata.get("annotations")
-                    if isinstance(metadata, dict)
-                    else None
-                )
-                if (
-                    isinstance(annotations, dict)
-                    and annotations.get("k8s.io/initial-events-end")
-                    == "true"
-                ):
-                    initial_sync_complete = True
-                    continue
-            raise RuntimeErrorEB(
-                f"functional serving endpoint watch initial sync is invalid: {service_name}"
-            )
-        if event_type != "BOOKMARK":
-            raise RuntimeErrorEB(
-                f"functional serving dependency changed during Gateway probes: "
-                f"{service_name}"
-            )
-    return initial_sync_complete
 
 
 @contextmanager
@@ -12608,239 +12617,122 @@ def _guard_functional_service_endpoints(
     )
     if not isinstance(services, dict):
         raise RuntimeErrorEB(
-            "functional serving endpoint watch has no Service bindings"
+            "functional serving dependency replay has no Service bindings"
         )
 
-    watches: list[
-        tuple[str, subprocess.Popen[Any], Any, Any]
-    ] = []
-    try:
-        kubectl = toolchain(root)["tools"]["kubectl"]
-        for service_name in ("weltgewebe-api", "weltgewebe-web"):
-            service = services.get(service_name)
-            endpoints = (
-                service.get("endpoints")
-                if isinstance(service, dict)
-                else None
+    dependencies: list[tuple[str, str, str, str, str]] = []
+    endpoint_path = (
+        f"/apis/discovery.k8s.io/v1/namespaces/"
+        f"{urllib.parse.quote(APP_NAMESPACE, safe='')}/endpointslices"
+    )
+    for service_name in ("weltgewebe-api", "weltgewebe-web"):
+        service = services.get(service_name)
+        endpoints = (
+            service.get("endpoints")
+            if isinstance(service, dict)
+            else None
+        )
+        resource_version = (
+            endpoints.get("resource_version")
+            if isinstance(endpoints, dict)
+            else None
+        )
+        if not isinstance(resource_version, str) or not resource_version:
+            raise RuntimeErrorEB(
+                f"functional serving dependency replay has no resourceVersion: "
+                f"{service_name}"
             )
-            resource_version = (
-                endpoints.get("resource_version")
-                if isinstance(endpoints, dict)
-                else None
+        dependencies.append(
+            (
+                service_name,
+                resource_version,
+                "labelSelector",
+                f"kubernetes.io/service-name={service_name}",
+                endpoint_path,
             )
+        )
+
+    namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
+    for resource_name, key, collection_name in (
+        ("Gateway", "gateway", "gateways"),
+        ("HTTPRoute", "httproute", "httproutes"),
+    ):
+        resource = serving_runtime.get(key)
+        resource_version = (
+            resource.get("resource_version")
+            if isinstance(resource, dict)
+            else None
+        )
+        if not isinstance(resource_version, str) or not resource_version:
+            raise RuntimeErrorEB(
+                f"functional serving dependency replay has no resourceVersion: "
+                f"{resource_name}"
+            )
+        dependencies.append(
+            (
+                resource_name,
+                resource_version,
+                "fieldSelector",
+                "metadata.name=commonthing-experiment-b",
+                (
+                    f"/apis/gateway.networking.k8s.io/v1/namespaces/"
+                    f"{namespace_path}/{collection_name}"
+                ),
+            )
+        )
+
+    yield
+
+    kubectl = toolchain(root)["tools"]["kubectl"]
+    for (
+        subject,
+        resource_version,
+        selector_name,
+        selector_value,
+        collection_path,
+    ) in dependencies:
+        watch_query = urllib.parse.urlencode(
+            {
+                "watch": "1",
+                "resourceVersion": resource_version,
+                "allowWatchBookmarks": "true",
+                "timeoutSeconds": "2",
+                selector_name: selector_value,
+            }
+        )
+        result = run(
+            [
+                kubectl,
+                "get",
+                "--raw",
+                f"{collection_path}?{watch_query}",
+            ],
+            env=kube_env(root),
+            timeout=10,
+        )
+        for raw_event in (result.stdout or "").splitlines():
+            if not raw_event.strip():
+                continue
+            try:
+                event = json.loads(raw_event)
+            except json.JSONDecodeError as exc:
+                raise RuntimeErrorEB(
+                    f"functional serving dependency replay is invalid: {subject}"
+                ) from exc
             if (
-                not isinstance(resource_version, str)
-                or not resource_version
+                not isinstance(event, dict)
+                or not isinstance(event.get("type"), str)
+                or not isinstance(event.get("object"), dict)
             ):
                 raise RuntimeErrorEB(
-                    f"functional serving endpoint watch has no resourceVersion: "
-                    f"{service_name}"
+                    f"functional serving dependency replay event is invalid: "
+                    f"{subject}"
                 )
-            stdout = tempfile.TemporaryFile(
-                mode="w+",
-                encoding="utf-8",
-            )
-            stderr = tempfile.TemporaryFile(
-                mode="w+",
-                encoding="utf-8",
-            )
-            watch_query = urllib.parse.urlencode(
-                {
-                    "watch": "1",
-                    "resourceVersion": resource_version,
-                    "resourceVersionMatch": "NotOlderThan",
-                    "sendInitialEvents": "true",
-                    "allowWatchBookmarks": "true",
-                    "labelSelector": (
-                        f"kubernetes.io/service-name={service_name}"
-                    ),
-                }
-            )
-            watch_path = (
-                f"/apis/discovery.k8s.io/v1/namespaces/"
-                f"{urllib.parse.quote(APP_NAMESPACE, safe='')}/endpointslices"
-                f"?{watch_query}"
-            )
-            try:
-                process = subprocess.Popen(
-                    [
-                        kubectl,
-                        "get",
-                        "--raw",
-                        watch_path,
-                    ],
-                    cwd=ROOT,
-                    stdout=stdout,
-                    stderr=stderr,
-                    env=kube_env(root),
-                    text=True,
-                    pass_fds=_bound_subprocess_pass_fds(),
-                )
-            except BaseException:
-                stdout.close()
-                stderr.close()
-                raise
-            watches.append((service_name, process, stdout, stderr))
-
-        routing_resources = (
-            ("Gateway", "gateway", "gateways"),
-            ("HTTPRoute", "httproute", "httproutes"),
-        )
-        namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
-        for resource_name, kubectl_resource, collection_name in routing_resources:
-            resource = _kubectl_json(
-                root,
-                [
-                    "-n",
-                    APP_NAMESPACE,
-                    "get",
-                    kubectl_resource,
-                    "commonthing-experiment-b",
-                ],
-            )
-            metadata = (
-                resource.get("metadata")
-                if isinstance(resource, dict)
-                else None
-            )
-            resource_version = (
-                metadata.get("resourceVersion")
-                if isinstance(metadata, dict)
-                else None
-            )
-            if not isinstance(resource_version, str) or not resource_version:
+            if event["type"] != "BOOKMARK":
                 raise RuntimeErrorEB(
-                    f"functional serving routing watch has no resourceVersion: "
-                    f"{resource_name}"
+                    f"functional serving dependency changed during Gateway probes: "
+                    f"{subject}"
                 )
-            stdout = tempfile.TemporaryFile(
-                mode="w+",
-                encoding="utf-8",
-            )
-            stderr = tempfile.TemporaryFile(
-                mode="w+",
-                encoding="utf-8",
-            )
-            watch_query = urllib.parse.urlencode(
-                {
-                    "watch": "1",
-                    "resourceVersion": resource_version,
-                    "resourceVersionMatch": "NotOlderThan",
-                    "sendInitialEvents": "true",
-                    "allowWatchBookmarks": "true",
-                    "fieldSelector": "metadata.name=commonthing-experiment-b",
-                }
-            )
-            watch_path = (
-                f"/apis/gateway.networking.k8s.io/v1/namespaces/"
-                f"{namespace_path}/{collection_name}?{watch_query}"
-            )
-            try:
-                process = subprocess.Popen(
-                    [
-                        kubectl,
-                        "get",
-                        "--raw",
-                        watch_path,
-                    ],
-                    cwd=ROOT,
-                    stdout=stdout,
-                    stderr=stderr,
-                    env=kube_env(root),
-                    text=True,
-                    pass_fds=_bound_subprocess_pass_fds(),
-                )
-            except BaseException:
-                stdout.close()
-                stderr.close()
-                raise
-            watches.append((resource_name, process, stdout, stderr))
-
-        pending = {service_name for service_name, *_rest in watches}
-        deadline = time.monotonic() + 10.0
-        while pending:
-            for service_name, process, stdout, stderr in watches:
-                if service_name not in pending:
-                    continue
-                if process.poll() is not None:
-                    stderr.flush()
-                    stderr.seek(0)
-                    detail = stderr.read()[-2000:]
-                    raise RuntimeErrorEB(
-                        f"functional serving endpoint watch exited before initial sync: "
-                        f"{service_name}: {detail}"
-                    )
-                events, complete = _functional_endpoint_watch_events(
-                    stdout,
-                    service_name,
-                )
-                if (
-                    complete
-                    and _functional_endpoint_watch_is_synced(
-                        events,
-                        service_name,
-                    )
-                ):
-                    pending.remove(service_name)
-            if not pending:
-                break
-            if time.monotonic() >= deadline:
-                raise RuntimeErrorEB(
-                    "functional serving endpoint watch initial sync timed out"
-                )
-            time.sleep(0.05)
-
-        try:
-            yield
-        except BaseException:
-            raise
-        else:
-            for service_name, process, _stdout, stderr in watches:
-                if process.poll() is not None:
-                    stderr.flush()
-                    stderr.seek(0)
-                    detail = stderr.read()[-2000:]
-                    raise RuntimeErrorEB(
-                        f"functional serving endpoint watch exited during "
-                        f"Gateway probes: {service_name}: {detail}"
-                    )
-
-            for service_name, process, stdout, stderr in watches:
-                process.terminate()
-                try:
-                    returncode = process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    returncode = process.wait(timeout=5)
-                if returncode not in {-15, -9}:
-                    stderr.flush()
-                    stderr.seek(0)
-                    detail = stderr.read()[-2000:]
-                    raise RuntimeErrorEB(
-                        f"functional serving endpoint watch did not remain "
-                        f"active until controlled shutdown: "
-                        f"{service_name}: {detail}"
-                    )
-                events, complete = _functional_endpoint_watch_events(
-                    stdout,
-                    service_name,
-                )
-                if (
-                    not complete
-                    or not _functional_endpoint_watch_is_synced(
-                        events,
-                        service_name,
-                    )
-                ):
-                    raise RuntimeErrorEB(
-                        f"functional serving endpoint watch has no complete initial sync: "
-                        f"{service_name}"
-                    )
-    finally:
-        for _service_name, process, stdout, stderr in watches:
-            _stop_process(process)
-            stdout.close()
-            stderr.close()
 
 
 def _functional_serving_runtime_binding(
@@ -13058,30 +12950,44 @@ def _functional_serving_runtime_binding(
             "endpoints": endpoint_binding,
         }
 
-    gateway_readback = _require_gateway_ready(
-        _kubectl_json(
-            root,
-            [
-                "-n",
-                APP_NAMESPACE,
-                "get",
-                "gateway",
-                "commonthing-experiment-b",
-            ],
-        )
+    gateway_object = _kubectl_json(
+        root,
+        [
+            "-n",
+            APP_NAMESPACE,
+            "get",
+            "gateway",
+            "commonthing-experiment-b",
+        ],
     )
-    httproute_readback = _require_httproute_ready(
-        _kubectl_json(
-            root,
-            [
-                "-n",
-                APP_NAMESPACE,
-                "get",
-                "httproute",
-                "commonthing-experiment-b",
-            ],
-        )
+    gateway_revision = _kubernetes_object_revision(
+        gateway_object,
+        "Gateway",
     )
+    gateway_readback = {
+        **_require_gateway_ready(gateway_object),
+        "uid": gateway_revision["uid"],
+        "resource_version": gateway_revision["resource_version"],
+    }
+    httproute_object = _kubectl_json(
+        root,
+        [
+            "-n",
+            APP_NAMESPACE,
+            "get",
+            "httproute",
+            "commonthing-experiment-b",
+        ],
+    )
+    httproute_revision = _kubernetes_object_revision(
+        httproute_object,
+        "HTTPRoute",
+    )
+    httproute_readback = {
+        **_require_httproute_ready(httproute_object),
+        "uid": httproute_revision["uid"],
+        "resource_version": httproute_revision["resource_version"],
+    }
     return {
         "workloads": workload_binding,
         "services": service_binding,
@@ -13123,8 +13029,15 @@ def _gateway_data_plane_readback(
         base + "/api/nodes?pagination=cursor&limit=1"
     )
     try:
-        nodes = json.loads(body) if status_code == 200 else {}
-    except (TypeError, json.JSONDecodeError):
+        nodes = (
+            json.loads(
+                body,
+                parse_constant=_reject_nonstandard_json_constant,
+            )
+            if status_code == 200
+            else {}
+        )
+    except (TypeError, ValueError):
         nodes = {}
     items = nodes.get("items") if isinstance(nodes, dict) else None
     page = nodes.get("page") if isinstance(nodes, dict) else None
@@ -13144,6 +13057,19 @@ def _gateway_data_plane_readback(
         if isinstance(page, dict)
         else None
     )
+    longitude = location.get("lon") if isinstance(location, dict) else None
+    latitude = location.get("lat") if isinstance(location, dict) else None
+    page_limit = page.get("limit") if isinstance(page, dict) else None
+    coordinates_valid = (
+        isinstance(longitude, (int, float))
+        and not isinstance(longitude, bool)
+        and math.isfinite(float(longitude))
+        and -180.0 <= float(longitude) <= 180.0
+        and isinstance(latitude, (int, float))
+        and not isinstance(latitude, bool)
+        and math.isfinite(float(latitude))
+        and -90.0 <= float(latitude) <= 90.0
+    )
     node_contract_valid = (
         isinstance(first_node, dict)
         and all(
@@ -13158,14 +13084,12 @@ def _gateway_data_plane_readback(
             )
         )
         and isinstance(location, dict)
-        and isinstance(location.get("lon"), (int, float))
-        and not isinstance(location.get("lon"), bool)
-        and isinstance(location.get("lat"), (int, float))
-        and not isinstance(location.get("lat"), bool)
+        and coordinates_valid
     )
     page_contract_valid = (
         isinstance(page, dict)
-        and page.get("limit") == 1
+        and type(page_limit) is int
+        and page_limit == 1
         and isinstance(has_more, bool)
         and (
             (has_more and isinstance(next_cursor, str) and bool(next_cursor))
@@ -13223,6 +13147,7 @@ def _gateway_data_plane_readback(
     return {"gateway": base, "checks": checks}
 
 
+@_serialize_experiment_b_lifecycle
 def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
     if not COMMIT_RE.fullmatch(source_commit):
         raise RuntimeErrorEB("functional readback source commit is not exact")
@@ -14586,7 +14511,7 @@ def _delete_pod(root: Path, namespace: str, name: str) -> None:
         )
 
 
-@_serialize_recovery_proof
+@_serialize_experiment_b_lifecycle
 def recovery_proof(root: Path) -> dict[str, Any]:
     release_path = root / "receipts/release.json"
     if not release_path.is_file():
@@ -15204,7 +15129,7 @@ def _require_stored_pod_image_contract(
                         )
 
 
-@_serialize_recovery_proof
+@_serialize_experiment_b_lifecycle
 def portability_report(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)
     recovery_failed_receipt = root / "receipts/recovery-failed.json"

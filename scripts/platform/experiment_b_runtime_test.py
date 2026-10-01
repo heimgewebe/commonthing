@@ -4,6 +4,8 @@ import base64
 import hashlib
 import inspect
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -2197,61 +2199,71 @@ spec:
             recovery.index("_current_protected_main_commit()"),
         )
 
-    def test_recovery_proof_is_serialized_per_state_root(self) -> None:
-        self.assertTrue(hasattr(runtime.recovery_proof, "__wrapped__"))
+    def test_experiment_b_lifecycle_lock_is_global_and_teardown_safe(self) -> None:
+        for function in (
+            runtime.prepare,
+            runtime.create_vm,
+            runtime.install_k3s,
+            runtime.install_platform,
+            runtime.inject_secrets,
+            runtime.apply_release,
+            runtime.semantic_activate,
+            runtime.status,
+            runtime.teardown,
+            runtime.seed_t048_fixture,
+            runtime.t048_load_proof,
+            runtime.functional_readback,
+            runtime.recovery_proof,
+            runtime.portability_report,
+        ):
+            with self.subTest(function=function.__name__):
+                self.assertTrue(hasattr(function, "__wrapped__"))
+
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            lock_path = root / ".recovery-proof.lock"
+            parent = Path(tmp)
+            lock_path = parent / "experiment-b.lifecycle.lock"
+            first_root = parent / "experiment-b" / "first"
+            second_root = parent / "experiment-b" / "second"
+            first_root.mkdir(parents=True)
+            second_root.mkdir(parents=True)
             flags = (
                 runtime.os.O_RDWR
                 | runtime.os.O_CREAT
                 | int(getattr(runtime.os, "O_CLOEXEC", 0))
                 | int(getattr(runtime.os, "O_NOFOLLOW", 0))
             )
-            lock_fd = runtime.os.open(lock_path, flags, 0o600)
-            runtime.fcntl.flock(
-                lock_fd,
-                runtime.fcntl.LOCK_EX | runtime.fcntl.LOCK_NB,
-            )
-            try:
-                @runtime._serialize_recovery_proof
-                def second_recovery(_root: Path) -> None:
-                    raise AssertionError("second recovery must not start")
+            with mock.patch.object(
+                runtime,
+                "EXPERIMENT_B_LIFECYCLE_LOCK",
+                lock_path,
+            ):
+                lock_fd = runtime.os.open(lock_path, flags, 0o600)
+                runtime.fcntl.flock(
+                    lock_fd,
+                    runtime.fcntl.LOCK_EX | runtime.fcntl.LOCK_NB,
+                )
+                try:
+                    shutil.rmtree(first_root)
 
-                with self.assertRaisesRegex(
-                    runtime.RuntimeErrorEB,
-                    "already running for this state root",
-                ):
-                    second_recovery(root)
-            finally:
-                runtime.fcntl.flock(lock_fd, runtime.fcntl.LOCK_UN)
-                runtime.os.close(lock_fd)
+                    @runtime._serialize_experiment_b_lifecycle
+                    def second_operation(_root: Path) -> None:
+                        raise AssertionError(
+                            "second Experiment-B lifecycle operation must not start"
+                        )
 
-    def test_portability_report_shares_recovery_lifecycle_lock(self) -> None:
-        self.assertTrue(hasattr(runtime.portability_report, "__wrapped__"))
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            lock_path = root / ".recovery-proof.lock"
-            flags = (
-                runtime.os.O_RDWR
-                | runtime.os.O_CREAT
-                | int(getattr(runtime.os, "O_CLOEXEC", 0))
-                | int(getattr(runtime.os, "O_NOFOLLOW", 0))
-            )
-            lock_fd = runtime.os.open(lock_path, flags, 0o600)
-            runtime.fcntl.flock(
-                lock_fd,
-                runtime.fcntl.LOCK_EX | runtime.fcntl.LOCK_NB,
-            )
-            try:
-                with self.assertRaisesRegex(
-                    runtime.RuntimeErrorEB,
-                    "already running for this state root",
-                ):
-                    runtime.portability_report(root)
-            finally:
-                runtime.fcntl.flock(lock_fd, runtime.fcntl.LOCK_UN)
-                runtime.os.close(lock_fd)
+                    with self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB,
+                        "Experiment-B lifecycle is already running",
+                    ):
+                        second_operation(second_root)
+                    self.assertTrue(lock_path.exists())
+                    self.assertFalse(first_root.exists())
+                finally:
+                    runtime.fcntl.flock(
+                        lock_fd,
+                        runtime.fcntl.LOCK_UN,
+                    )
+                    runtime.os.close(lock_fd)
 
     def test_dirty_rerun_invalidates_functional_success_before_binding_failure(self) -> None:
         commit = "a" * 40
@@ -13402,6 +13414,8 @@ def install(*args, **kwargs):
             "metadata": {
                 "name": "weltgewebe-api-slice",
                 "namespace": runtime.APP_NAMESPACE,
+                "uid": "slice-uid-serving",
+                "resourceVersion": "12344",
                 "labels": {
                     "kubernetes.io/service-name": "weltgewebe-api",
                 },
@@ -13451,6 +13465,15 @@ def install(*args, **kwargs):
             runtime._stable_json_sha256(observed["pods"]),
         )
         self.assertEqual(observed["resource_version"], "12345")
+        self.assertEqual(
+            observed["object_revisions"],
+            {
+                "weltgewebe-api-slice": {
+                    "uid": "slice-uid-serving",
+                    "resource_version": "12344",
+                }
+            },
+        )
         readback.assert_called_once_with(
             Path("/tmp"),
             [
@@ -13540,7 +13563,7 @@ def install(*args, **kwargs):
             runtime._functional_serving_runtime_semantic_binding(after),
         )
 
-    def test_functional_endpoint_watch_rejects_transient_dependency_changes(
+    def test_functional_dependency_replay_rejects_transient_changes(
         self,
     ) -> None:
         serving_runtime = {
@@ -13553,24 +13576,10 @@ def install(*args, **kwargs):
                 for index, name in enumerate(
                     ("weltgewebe-api", "weltgewebe-web")
                 )
-            }
+            },
+            "gateway": {"resource_version": "300"},
+            "httproute": {"resource_version": "400"},
         }
-
-        class FakeProcess:
-            def __init__(self) -> None:
-                self.returncode = None
-
-            def poll(self):
-                return self.returncode
-
-            def terminate(self) -> None:
-                self.returncode = -15
-
-            def wait(self, timeout=None):
-                return self.returncode
-
-            def kill(self) -> None:
-                self.returncode = -9
 
         for mutation_index, subject in (
             (0, "weltgewebe-api"),
@@ -13578,54 +13587,31 @@ def install(*args, **kwargs):
             (3, "HTTPRoute"),
         ):
             with self.subTest(subject=subject):
-                watch_outputs = []
-
-                def popen(_argv, **kwargs):
-                    process = FakeProcess()
-                    kwargs["stdout"].write(
+                results = []
+                for index in range(4):
+                    event = (
                         json.dumps(
                             {
-                                "type": "ADDED",
+                                "type": "MODIFIED",
                                 "object": {
                                     "metadata": {
-                                        "name": "initial-resource",
+                                        "resourceVersion": str(500 + index),
                                     }
                                 },
                             }
                         )
                         + "\n"
+                        if index == mutation_index
+                        else ""
                     )
-                    kwargs["stdout"].write(
-                        json.dumps(
-                            {
-                                "type": "BOOKMARK",
-                                "object": {
-                                    "metadata": {
-                                        "annotations": {
-                                            "k8s.io/initial-events-end": "true",
-                                        }
-                                    }
-                                },
-                            }
+                    results.append(
+                        subprocess.CompletedProcess(
+                            ["kubectl"],
+                            0,
+                            stdout=event,
+                            stderr="",
                         )
-                        + "\n"
                     )
-                    kwargs["stdout"].flush()
-                    watch_outputs.append(kwargs["stdout"])
-                    return process
-
-                def kubectl_json(_root, argv):
-                    resource_name = argv[-2]
-                    resource_versions = {
-                        "gateway": "300",
-                        "httproute": "400",
-                    }
-                    return {
-                        "metadata": {
-                            "resourceVersion": resource_versions[resource_name],
-                        }
-                    }
-
                 with (
                     mock.patch.object(
                         runtime,
@@ -13637,15 +13623,16 @@ def install(*args, **kwargs):
                     mock.patch.object(runtime, "kube_env", return_value={}),
                     mock.patch.object(
                         runtime,
-                        "_kubectl_json",
-                        side_effect=kubectl_json,
-                    ),
-                    mock.patch.object(runtime.time, "sleep"),
+                        "run",
+                        side_effect=results,
+                    ) as replay,
                     mock.patch.object(
                         runtime.subprocess,
                         "Popen",
-                        side_effect=popen,
-                    ) as spawn,
+                        side_effect=AssertionError(
+                            "live watch processes are not part of the replay proof"
+                        ),
+                    ),
                     self.assertRaisesRegex(
                         runtime.RuntimeErrorEB,
                         "dependency changed during Gateway probes",
@@ -13655,84 +13642,118 @@ def install(*args, **kwargs):
                         Path("/tmp"),
                         serving_runtime,
                     ):
-                        watch_outputs[mutation_index].write(
-                            json.dumps(
-                                {"type": "MODIFIED", "object": {}}
-                            )
-                            + "\n"
-                        )
-                        watch_outputs[mutation_index].flush()
+                        pass
 
-                self.assertEqual(spawn.call_count, 4)
-                for index, service_name in enumerate(
-                    ("weltgewebe-api", "weltgewebe-web")
-                ):
-                    argv = spawn.call_args_list[index].args[0]
-                    self.assertEqual(
-                        argv[:3],
-                        ["/usr/bin/kubectl", "get", "--raw"],
-                    )
-                    watch_url = runtime.urllib.parse.urlsplit(argv[3])
-                    self.assertEqual(
-                        watch_url.path,
-                        (
-                            f"/apis/discovery.k8s.io/v1/namespaces/"
-                            f"{runtime.APP_NAMESPACE}/endpointslices"
-                        ),
-                    )
-                    self.assertEqual(
-                        runtime.urllib.parse.parse_qs(watch_url.query),
-                        {
-                            "watch": ["1"],
-                            "resourceVersion": [str(index + 100)],
-                            "resourceVersionMatch": ["NotOlderThan"],
-                            "sendInitialEvents": ["true"],
-                            "labelSelector": [
-                                f"kubernetes.io/service-name={service_name}"
-                            ],
-                            "allowWatchBookmarks": ["true"],
-                        },
-                    )
-
-                for index, (
-                    resource_name,
-                    collection_name,
-                    resource_version,
-                ) in enumerate(
+                self.assertEqual(
+                    replay.call_count,
+                    mutation_index + 1,
+                )
+                expected = (
                     (
-                        ("Gateway", "gateways", "300"),
-                        ("HTTPRoute", "httproutes", "400"),
+                        "weltgewebe-api",
+                        "100",
+                        "labelSelector",
+                        "kubernetes.io/service-name=weltgewebe-api",
+                        "/apis/discovery.k8s.io/v1/namespaces/"
+                        f"{runtime.APP_NAMESPACE}/endpointslices",
                     ),
-                    start=2,
-                ):
-                    argv = spawn.call_args_list[index].args[0]
+                    (
+                        "weltgewebe-web",
+                        "101",
+                        "labelSelector",
+                        "kubernetes.io/service-name=weltgewebe-web",
+                        "/apis/discovery.k8s.io/v1/namespaces/"
+                        f"{runtime.APP_NAMESPACE}/endpointslices",
+                    ),
+                    (
+                        "Gateway",
+                        "300",
+                        "fieldSelector",
+                        "metadata.name=commonthing-experiment-b",
+                        "/apis/gateway.networking.k8s.io/v1/namespaces/"
+                        f"{runtime.APP_NAMESPACE}/gateways",
+                    ),
+                    (
+                        "HTTPRoute",
+                        "400",
+                        "fieldSelector",
+                        "metadata.name=commonthing-experiment-b",
+                        "/apis/gateway.networking.k8s.io/v1/namespaces/"
+                        f"{runtime.APP_NAMESPACE}/httproutes",
+                    ),
+                )
+                for index, (
+                    expected_subject,
+                    resource_version,
+                    selector_name,
+                    selector_value,
+                    expected_path,
+                ) in enumerate(expected[: mutation_index + 1]):
+                    argv = replay.call_args_list[index].args[0]
                     self.assertEqual(
                         argv[:3],
                         ["/usr/bin/kubectl", "get", "--raw"],
+                        expected_subject,
                     )
                     watch_url = runtime.urllib.parse.urlsplit(argv[3])
                     self.assertEqual(
                         watch_url.path,
-                        (
-                            f"/apis/gateway.networking.k8s.io/v1/namespaces/"
-                            f"{runtime.APP_NAMESPACE}/{collection_name}"
-                        ),
-                        resource_name,
+                        expected_path,
+                        expected_subject,
                     )
                     self.assertEqual(
                         runtime.urllib.parse.parse_qs(watch_url.query),
                         {
                             "watch": ["1"],
                             "resourceVersion": [resource_version],
-                            "resourceVersionMatch": ["NotOlderThan"],
-                            "sendInitialEvents": ["true"],
-                            "fieldSelector": [
-                                "metadata.name=commonthing-experiment-b"
-                            ],
                             "allowWatchBookmarks": ["true"],
+                            "timeoutSeconds": ["2"],
+                            selector_name: [selector_value],
                         },
-                        resource_name,
+                        expected_subject,
                     )
+
+    def test_functional_routing_binding_carries_exact_resource_versions(
+        self,
+    ) -> None:
+        self.assertEqual(
+            runtime._kubernetes_object_revision(
+                {
+                    "metadata": {
+                        "uid": "gateway-uid",
+                        "resourceVersion": "300",
+                    }
+                },
+                "Gateway",
+            ),
+            {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+            },
+        )
+        for payload in (
+            {},
+            {"metadata": {"uid": "", "resourceVersion": "300"}},
+            {"metadata": {"uid": "gateway-uid", "resourceVersion": ""}},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    runtime._kubernetes_object_revision(
+                        payload,
+                        "Gateway",
+                    )
+
+        source = inspect.getsource(
+            runtime._functional_serving_runtime_binding
+        )
+        self.assertIn(
+            '"resource_version": gateway_revision["resource_version"]',
+            source,
+        )
+        self.assertIn(
+            '"resource_version": httproute_revision["resource_version"]',
+            source,
+        )
 
     def test_gateway_data_plane_validates_domain_nodes_cursor_body(
         self,
@@ -13789,6 +13810,98 @@ def install(*args, **kwargs):
             (
                 "wrong-envelope",
                 json.dumps([valid_node]),
+            ),
+            (
+                "nan-longitude",
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                **valid_node,
+                                "location": {
+                                    "lon": float("nan"),
+                                    "lat": 53.5,
+                                },
+                            }
+                        ],
+                        "page": valid_page,
+                    }
+                ),
+            ),
+            (
+                "infinite-latitude",
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                **valid_node,
+                                "location": {
+                                    "lon": 10.0,
+                                    "lat": float("inf"),
+                                },
+                            }
+                        ],
+                        "page": valid_page,
+                    }
+                ),
+            ),
+            (
+                "longitude-out-of-range",
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                **valid_node,
+                                "location": {
+                                    "lon": 180.1,
+                                    "lat": 53.5,
+                                },
+                            }
+                        ],
+                        "page": valid_page,
+                    }
+                ),
+            ),
+            (
+                "latitude-out-of-range",
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                **valid_node,
+                                "location": {
+                                    "lon": 10.0,
+                                    "lat": -90.1,
+                                },
+                            }
+                        ],
+                        "page": valid_page,
+                    }
+                ),
+            ),
+            (
+                "boolean-limit",
+                json.dumps(
+                    {
+                        "items": [valid_node],
+                        "page": {
+                            **valid_page,
+                            "limit": True,
+                        },
+                    }
+                ),
+            ),
+            (
+                "floating-limit",
+                json.dumps(
+                    {
+                        "items": [valid_node],
+                        "page": {
+                            **valid_page,
+                            "limit": 1.0,
+                        },
+                    }
+                ),
             ),
         )
         for case, nodes_body in invalid_cases:
