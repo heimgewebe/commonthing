@@ -145,21 +145,22 @@ def run(
     timeout: int = 900,
     pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        argv,
-        cwd=ROOT,
-        input=input_text,
-        env=env,
-        text=True,
-        capture_output=capture,
-        timeout=timeout,
-        check=False,
-        pass_fds=_bound_subprocess_pass_fds(pass_fds),
-    )
+    with _bound_ssh_command(argv) as (command, ssh_pass_fds):
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            input=input_text,
+            env=env,
+            text=True,
+            capture_output=capture,
+            timeout=timeout,
+            check=False,
+            pass_fds=_bound_subprocess_pass_fds((*pass_fds, *ssh_pass_fds)),
+        )
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
         raise RuntimeErrorEB(
-            f"command failed ({result.returncode}): {argv[0]}: {stderr[-2000:]}"
+            f"command failed ({result.returncode}): {command[0]}: {stderr[-2000:]}"
         )
     return result
 
@@ -269,8 +270,9 @@ def _git_tree_regular_blob_paths(
 
 
 def state_root(value: str | None) -> Path:
-    root = (Path(value).expanduser() if value else DEFAULT_STATE_ROOT).resolve()
-    allowed_root = DEFAULT_STATE_ROOT.resolve()
+    configured = Path(value).expanduser() if value else DEFAULT_STATE_ROOT
+    root = Path(os.path.abspath(configured))
+    allowed_root = Path(os.path.abspath(DEFAULT_STATE_ROOT.expanduser()))
     if root != allowed_root:
         try:
             root.relative_to(allowed_root)
@@ -282,42 +284,162 @@ def state_root(value: str | None) -> Path:
 
 
 def _ensure_state_root(root: Path) -> None:
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(root, 0o700)
+    root_fd = _open_directory_nofollow(
+        root,
+        create=True,
+        context="state root",
+        require_owner=True,
+    )
+    try:
+        os.fchmod(root_fd, 0o700)
+    finally:
+        os.close(root_fd)
+
+
+def _open_directory_nofollow(
+    path: Path,
+    *,
+    create: bool,
+    context: str,
+    require_owner: bool = False,
+) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if not all(isinstance(flag, int) for flag in (nofollow, cloexec, directory)):
+        raise RuntimeErrorEB(f"{context} is unsafe")
+    flags = os.O_RDONLY | nofollow | cloexec | directory
+    absolute = Path(os.path.abspath(path))
+    try:
+        directory_fd = os.open("/", flags)
+    except OSError as exc:
+        raise RuntimeErrorEB(f"{context} is unsafe") from exc
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise RuntimeErrorEB(f"{context} is unsafe")
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise RuntimeErrorEB(f"{context} is unsafe") from exc
+                try:
+                    next_fd = os.open(component, flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise RuntimeErrorEB(f"{context} is unsafe") from exc
+            except OSError as exc:
+                raise RuntimeErrorEB(f"{context} is unsafe") from exc
+            os.close(directory_fd)
+            directory_fd = next_fd
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeErrorEB(f"{context} is unsafe")
+        if require_owner and metadata.st_uid != os.getuid():
+            raise RuntimeErrorEB(f"{context} is unsafe")
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def _unlink_state_path(path: Path, context: str) -> None:
+    if not path.name or path.name in {".", ".."}:
+        raise RuntimeErrorEB(f"{context} name is unsafe")
+    parent_fd = _open_directory_nofollow(
+        path.parent,
+        create=True,
+        context=f"{context} parent",
+        require_owner=True,
+    )
+    try:
+        try:
+            os.unlink(path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RuntimeErrorEB(f"{context} is unsafe") from exc
+    finally:
+        os.close(parent_fd)
+
+
+def _atomic_write_bytes(path: Path, payload: bytes, mode: int) -> None:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+        raise RuntimeErrorEB("state output cannot be written safely")
+    if not isinstance(mode, int) or mode < 0 or mode > 0o777:
+        raise RuntimeErrorEB("state output mode is invalid")
+    if not path.name or path.name in {".", ".."}:
+        raise RuntimeErrorEB("state output name is invalid")
+    parent_fd = _open_directory_nofollow(
+        path.parent,
+        create=True,
+        context="state output parent",
+    )
+    temporary_name = f".{path.name}.{secrets.token_hex(12)}.tmp"
+    temporary_fd: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec
+        try:
+            temporary_fd = os.open(
+                temporary_name,
+                flags,
+                mode,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise RuntimeErrorEB("state output cannot be created safely") from exc
+        metadata = os.fstat(temporary_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise RuntimeErrorEB("state output identity is unsafe")
+        os.fchmod(temporary_fd, mode)
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            written = os.write(temporary_fd, view[offset:])
+            if written <= 0:
+                raise RuntimeErrorEB("state output write failed")
+            offset += written
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        try:
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise RuntimeErrorEB("state output replacement failed") from exc
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(parent_fd)
 
 
 def atomic_json(path: Path, payload: dict[str, Any], mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        delete=False,
-        mode="w",
-        encoding="utf-8",
-    ) as handle:
-        tmp = Path(handle.name)
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    encoded = (
+        json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    _atomic_write_bytes(path, encoded, mode)
 
 
 def atomic_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        delete=False,
-        mode="wb",
-    ) as handle:
-        tmp = Path(handle.name)
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    _atomic_write_bytes(path, payload, mode)
 
 
 def _write_kubeconfig(root: Path, kubeconfig: str) -> Path:
@@ -433,24 +555,33 @@ def _serialize_experiment_b_lifecycle(function: Any) -> Any:
             return function(root, *args, **kwargs)
 
         lock_path = EXPERIMENT_B_LIFECYCLE_LOCK
-        try:
-            lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        except OSError as exc:
-            raise RuntimeErrorEB(
-                "Experiment-B lifecycle lock directory cannot be created"
-            ) from exc
-        flags = (
-            os.O_RDWR
-            | os.O_CREAT
-            | int(getattr(os, "O_CLOEXEC", 0))
-            | int(getattr(os, "O_NOFOLLOW", 0))
+        lock_parent_fd = _open_directory_nofollow(
+            lock_path.parent,
+            create=True,
+            context="Experiment-B lifecycle lock directory",
+            require_owner=True,
         )
         try:
-            lock_fd = os.open(lock_path, flags, 0o600)
-        except OSError as exc:
-            raise RuntimeErrorEB(
-                "Experiment-B lifecycle lock cannot be opened"
-            ) from exc
+            nofollow = getattr(os, "O_NOFOLLOW", None)
+            cloexec = getattr(os, "O_CLOEXEC", None)
+            if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+                raise RuntimeErrorEB(
+                    "Experiment-B lifecycle lock cannot be opened safely"
+                )
+            flags = os.O_RDWR | os.O_CREAT | nofollow | cloexec
+            try:
+                lock_fd = os.open(
+                    lock_path.name,
+                    flags,
+                    0o600,
+                    dir_fd=lock_parent_fd,
+                )
+            except OSError as exc:
+                raise RuntimeErrorEB(
+                    "Experiment-B lifecycle lock cannot be opened"
+                ) from exc
+        finally:
+            os.close(lock_parent_fd)
         acquired = False
         token = None
         try:
@@ -516,7 +647,10 @@ FIXTURE_ATTEMPT_INVALIDATES = (
 
 def _invalidate_receipts(root: Path, names: tuple[str, ...]) -> None:
     for name in names:
-        (root / "receipts" / name).unlink(missing_ok=True)
+        _unlink_state_path(
+            root / "receipts" / name,
+            "receipt invalidation",
+        )
 
 
 def _begin_live_check_attempt(
@@ -540,7 +674,7 @@ def _begin_live_check_attempt(
             "started_at_unix_ms": started_at_unix_ms,
         },
     )
-    receipt_path.unlink(missing_ok=True)
+    _unlink_state_path(receipt_path, f"{receipt_stem} receipt")
     return receipt_path, attempt_path, started_at_unix_ms
 
 
@@ -779,20 +913,219 @@ def preflight(expected_source_commit: str | None = None) -> dict[str, Any]:
     }
 
 
+def _state_entry_exists_at(directory_fd: int, name: str, context: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeErrorEB(f"{context} is unsafe") from exc
+    return True
+
+
+def _open_regular_state_file_at(
+    directory_fd: int,
+    name: str,
+    context: str,
+) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+        raise RuntimeErrorEB(f"{context} is unsafe")
+    try:
+        file_fd = os.open(
+            name,
+            os.O_RDONLY | nofollow | cloexec,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise RuntimeErrorEB(f"{context} is unsafe") from exc
+    try:
+        metadata = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise RuntimeErrorEB(f"{context} is unsafe")
+    except Exception:
+        os.close(file_fd)
+        raise
+    return file_fd
+
+
+def _open_or_create_regular_state_file_at(
+    directory_fd: int,
+    name: str,
+    context: str,
+    *,
+    mode: int = 0o600,
+) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+        raise RuntimeErrorEB(f"{context} is unsafe")
+    try:
+        file_fd = os.open(
+            name,
+            os.O_RDWR | os.O_CREAT | nofollow | cloexec,
+            mode,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise RuntimeErrorEB(f"{context} is unsafe") from exc
+    try:
+        metadata = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise RuntimeErrorEB(f"{context} is unsafe")
+        os.fchmod(file_fd, mode)
+    except Exception:
+        os.close(file_fd)
+        raise
+    return file_fd
+
+
+@contextmanager
+def _bound_ssh_command(
+    argv: list[str],
+) -> Iterator[tuple[list[str], tuple[int, ...]]]:
+    if not argv or Path(argv[0]).name not in {"ssh", "scp"}:
+        yield list(argv), ()
+        return
+
+    try:
+        key_flag = argv.index("-i")
+        private_path = Path(argv[key_flag + 1])
+    except (ValueError, IndexError) as exc:
+        raise RuntimeErrorEB("SSH private key binding is missing") from exc
+
+    known_prefix = "UserKnownHostsFile="
+    known_indices = [
+        index
+        for index, value in enumerate(argv)
+        if isinstance(value, str) and value.startswith(known_prefix)
+    ]
+    if len(known_indices) != 1:
+        raise RuntimeErrorEB("SSH known-hosts binding is missing")
+    known_index = known_indices[0]
+    known_hosts_path = Path(argv[known_index][len(known_prefix):])
+    if (
+        private_path.name != "id_ed25519"
+        or known_hosts_path.name != "known_hosts"
+        or private_path.parent != known_hosts_path.parent
+    ):
+        raise RuntimeErrorEB("SSH credential paths are unsafe")
+
+    ssh_fd = _open_directory_nofollow(
+        private_path.parent,
+        create=False,
+        context="SSH state directory",
+        require_owner=True,
+    )
+    private_fd: int | None = None
+    known_hosts_fd: int | None = None
+    try:
+        try:
+            private_fd = _open_regular_state_file_at(
+                ssh_fd,
+                "id_ed25519",
+                "SSH private key",
+            )
+            private_metadata = os.fstat(private_fd)
+            if stat.S_IMODE(private_metadata.st_mode) != 0o600:
+                raise RuntimeErrorEB("SSH private key mode is unsafe")
+            known_hosts_fd = _open_or_create_regular_state_file_at(
+                ssh_fd,
+                "known_hosts",
+                "SSH known-hosts file",
+                mode=0o600,
+            )
+        except Exception:
+            if known_hosts_fd is not None:
+                os.close(known_hosts_fd)
+                known_hosts_fd = None
+            if private_fd is not None:
+                os.close(private_fd)
+                private_fd = None
+            raise
+    finally:
+        os.close(ssh_fd)
+
+    try:
+        bound = list(argv)
+        bound[key_flag + 1] = f"/proc/self/fd/{private_fd}"
+        bound[known_index] = (
+            f"{known_prefix}/proc/self/fd/{known_hosts_fd}"
+        )
+        yield bound, (private_fd, known_hosts_fd)
+    finally:
+        if known_hosts_fd is not None:
+            os.close(known_hosts_fd)
+        if private_fd is not None:
+            os.close(private_fd)
+
+
 def ensure_ssh_key(root: Path) -> tuple[Path, Path]:
     private = root / "ssh/id_ed25519"
     public = root / "ssh/id_ed25519.pub"
-    if private.is_file() and public.is_file():
-        os.chmod(private, 0o600)
-        return private, public
-    private.parent.mkdir(parents=True, exist_ok=True)
-    run(
-        [
-            "ssh-keygen", "-q", "-t", "ed25519", "-N", "",
-            "-C", "commonthing-experiment-b", "-f", str(private),
-        ]
+    ssh_fd = _open_directory_nofollow(
+        root / "ssh",
+        create=True,
+        context="SSH state directory",
+        require_owner=True,
     )
-    os.chmod(private, 0o600)
+    try:
+        private_exists = _state_entry_exists_at(
+            ssh_fd,
+            "id_ed25519",
+            "SSH private key",
+        )
+        public_exists = _state_entry_exists_at(
+            ssh_fd,
+            "id_ed25519.pub",
+            "SSH public key",
+        )
+        if private_exists != public_exists:
+            raise RuntimeErrorEB("SSH key pair is incomplete or unsafe")
+        if not private_exists:
+            run(
+                [
+                    "ssh-keygen",
+                    "-q",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-C",
+                    "commonthing-experiment-b",
+                    "-f",
+                    f"/proc/self/fd/{ssh_fd}/id_ed25519",
+                ],
+                pass_fds=(ssh_fd,),
+            )
+        private_fd = _open_regular_state_file_at(
+            ssh_fd,
+            "id_ed25519",
+            "SSH private key",
+        )
+        try:
+            public_fd = _open_regular_state_file_at(
+                ssh_fd,
+                "id_ed25519.pub",
+                "SSH public key",
+            )
+            try:
+                os.fchmod(private_fd, 0o600)
+            finally:
+                os.close(public_fd)
+        finally:
+            os.close(private_fd)
+    finally:
+        os.close(ssh_fd)
     return private, public
 
 
@@ -1506,31 +1839,19 @@ def scp_fd_to(
     destination: str,
 ) -> None:
     known_hosts = root / "ssh/known_hosts"
-    try:
-        result = subprocess.run(
-            [
-                "scp",
-                "-i", str(root / "ssh/id_ed25519"),
-                "-o", f"UserKnownHostsFile={known_hosts}",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-o", "BatchMode=yes",
-                f"/proc/self/fd/{source_fd}",
-                f"commonthing@{ip}:{destination}",
-            ],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            timeout=900,
-            check=False,
-            pass_fds=(source_fd,),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeErrorEB("command timed out: scp") from exc
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        raise RuntimeErrorEB(
-            f"command failed ({result.returncode}): scp: {stderr[-2000:]}"
-        )
+    run(
+        [
+            "scp",
+            "-i", str(root / "ssh/id_ed25519"),
+            "-o", f"UserKnownHostsFile={known_hosts}",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "BatchMode=yes",
+            f"/proc/self/fd/{source_fd}",
+            f"commonthing@{ip}:{destination}",
+        ],
+        timeout=900,
+        pass_fds=(source_fd,),
+    )
 
 
 def _open_verified_file(
@@ -9952,19 +10273,24 @@ def _run_bound_container_command(
     remote_command = shlex.join(
         ["sudo", "/bin/sh", "-c", script]
     )
-    result = subprocess.run(
-        [
-            *ssh_argv(root, target["vm_ip"]),
-            remote_command,
-        ],
-        cwd=ROOT,
-        input=input_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-        pass_fds=_bound_subprocess_pass_fds(),
-    )
+    ssh_command = [
+        *ssh_argv(root, target["vm_ip"]),
+        remote_command,
+    ]
+    with _bound_ssh_command(ssh_command) as (
+        bound_ssh_command,
+        ssh_pass_fds,
+    ):
+        result = subprocess.run(
+            bound_ssh_command,
+            cwd=ROOT,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            pass_fds=_bound_subprocess_pass_fds(ssh_pass_fds),
+        )
     if result.returncode != 0:
         detail = result.stderr.decode(
             "utf-8", "replace"

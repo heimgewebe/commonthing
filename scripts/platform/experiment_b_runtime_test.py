@@ -157,6 +157,71 @@ class ExperimentBRuntimeContractTests(unittest.TestCase):
                 with self.assertRaises(runtime.RuntimeErrorEB):
                     runtime.state_root(str(sibling))
 
+    def test_lifecycle_rejects_symlinked_default_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            allowed_root = parent / "experiment-b"
+            outside = parent / "outside"
+            outside.mkdir()
+            allowed_root.symlink_to(outside, target_is_directory=True)
+            lock_path = parent / "experiment-b.lifecycle.lock"
+
+            with (
+                mock.patch.object(runtime, "DEFAULT_STATE_ROOT", allowed_root),
+                mock.patch.object(
+                    runtime,
+                    "EXPERIMENT_B_LIFECYCLE_LOCK",
+                    lock_path,
+                ),
+            ):
+                root = runtime.state_root(None)
+
+                @runtime._serialize_experiment_b_lifecycle
+                def operation(operation_root: Path) -> None:
+                    (operation_root / "escaped").write_text(
+                        "escaped",
+                        encoding="utf-8",
+                    )
+
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "state root is unsafe",
+                ):
+                    operation(root)
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_lifecycle_rejects_symlinked_lock_parent_without_external_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            outside = parent / "outside"
+            outside.mkdir()
+            state_parent = parent / "commonthing"
+            state_parent.symlink_to(outside, target_is_directory=True)
+            allowed_root = state_parent / "experiment-b"
+            lock_path = state_parent / "experiment-b.lifecycle.lock"
+
+            with (
+                mock.patch.object(runtime, "DEFAULT_STATE_ROOT", allowed_root),
+                mock.patch.object(
+                    runtime,
+                    "EXPERIMENT_B_LIFECYCLE_LOCK",
+                    lock_path,
+                ),
+            ):
+                root = runtime.state_root(None)
+
+                @runtime._serialize_experiment_b_lifecycle
+                def operation(_operation_root: Path) -> None:
+                    self.fail("lifecycle unexpectedly entered")
+
+                with self.assertRaises(runtime.RuntimeErrorEB):
+                    operation(root)
+
+            self.assertEqual(list(outside.iterdir()), [])
+
     def test_wait_http_200_retries_transient_connection_refusal(self) -> None:
         responses = [
             runtime.urllib.error.URLError("listener not ready"),
@@ -917,6 +982,235 @@ spec:
             self.assertFalse(kubeconfig.is_symlink())
             self.assertEqual(kubeconfig.read_bytes(), expected)
             self.assertEqual(kubeconfig.stat().st_mode & 0o777, 0o600)
+
+    def test_atomic_outputs_reject_symlinked_parent_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.mkdir()
+            sentinel = outside / "status.json"
+            sentinel.write_text("sentinel\\n", encoding="utf-8")
+            (root / "receipts").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "state output parent is unsafe",
+            ):
+                runtime.atomic_json(
+                    root / "receipts/status.json",
+                    {"status": "changed"},
+                )
+
+            self.assertEqual(
+                sentinel.read_text(encoding="utf-8"),
+                "sentinel\\n",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.mkdir()
+            sentinel = outside / "registry-auth.json"
+            sentinel.write_bytes(b"sentinel-bytes")
+            (root / "secrets").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "state output parent is unsafe",
+            ):
+                runtime.atomic_bytes(
+                    root / "secrets/registry-auth.json",
+                    b"changed",
+                )
+
+            self.assertEqual(sentinel.read_bytes(), b"sentinel-bytes")
+
+    def test_ensure_ssh_key_rejects_symlinked_private_key_without_touching_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir()
+            sentinel = parent / "sentinel-key"
+            sentinel.write_text("sentinel-key\\n", encoding="utf-8")
+            sentinel.chmod(0o644)
+            private = ssh_dir / "id_ed25519"
+            private.symlink_to(sentinel)
+            public = ssh_dir / "id_ed25519.pub"
+            public.write_text("ssh-ed25519 test\\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "SSH private key is unsafe",
+            ):
+                runtime.ensure_ssh_key(root)
+
+            self.assertTrue(private.is_symlink())
+            self.assertEqual(
+                sentinel.read_text(encoding="utf-8"),
+                "sentinel-key\\n",
+            )
+            self.assertEqual(sentinel.stat().st_mode & 0o777, 0o644)
+
+    def test_ensure_ssh_key_rejects_symlinked_ssh_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            outside = parent / "outside-ssh"
+            outside.mkdir()
+            private = outside / "id_ed25519"
+            private.write_text("outside-private\\n", encoding="utf-8")
+            private.chmod(0o644)
+            (outside / "id_ed25519.pub").write_text(
+                "ssh-ed25519 outside\\n",
+                encoding="utf-8",
+            )
+            (root / "ssh").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "SSH state directory is unsafe",
+            ):
+                runtime.ensure_ssh_key(root)
+
+            self.assertEqual(
+                private.read_text(encoding="utf-8"),
+                "outside-private\\n",
+            )
+            self.assertEqual(private.stat().st_mode & 0o777, 0o644)
+
+    def test_ssh_command_binding_survives_private_key_path_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir(parents=True)
+            private = ssh_dir / "id_ed25519"
+            private.write_bytes(b"original-private")
+            private.chmod(0o600)
+            (ssh_dir / "id_ed25519.pub").write_text(
+                "ssh-ed25519 public\\n",
+                encoding="utf-8",
+            )
+            sentinel = parent / "sentinel"
+            sentinel.write_bytes(b"external-private")
+
+            command = runtime.ssh_argv(root, "192.0.2.10") + ["true"]
+            with runtime._bound_ssh_command(command) as (bound, pass_fds):
+                retained = ssh_dir / "id_ed25519.retained"
+                private.rename(retained)
+                private.symlink_to(sentinel)
+                key_path = Path(bound[bound.index("-i") + 1])
+                self.assertEqual(key_path.parent, Path("/proc/self/fd"))
+                key_fd = runtime.os.open(key_path, runtime.os.O_RDONLY)
+                try:
+                    self.assertEqual(
+                        runtime.os.read(key_fd, 1024),
+                        b"original-private",
+                    )
+                finally:
+                    runtime.os.close(key_fd)
+                self.assertIn(int(key_path.name), pass_fds)
+
+            self.assertEqual(sentinel.read_bytes(), b"external-private")
+
+    def test_run_binds_ssh_credentials_at_process_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir(parents=True)
+            private = ssh_dir / "id_ed25519"
+            private.write_bytes(b"private")
+            private.chmod(0o600)
+            (ssh_dir / "id_ed25519.pub").write_text(
+                "ssh-ed25519 public\\n",
+                encoding="utf-8",
+            )
+            completed = runtime.subprocess.CompletedProcess(
+                ["ssh"],
+                0,
+                stdout="",
+                stderr="",
+            )
+            with mock.patch.object(
+                runtime.subprocess,
+                "run",
+                return_value=completed,
+            ) as process:
+                runtime.run(
+                    [*runtime.ssh_argv(root, "192.0.2.10"), "true"],
+                )
+
+            argv = process.call_args.args[0]
+            key_path = argv[argv.index("-i") + 1]
+            self.assertTrue(key_path.startswith("/proc/self/fd/"))
+            known_hosts = next(
+                value
+                for value in argv
+                if value.startswith("UserKnownHostsFile=")
+            )
+            self.assertIn("/proc/self/fd/", known_hosts)
+            self.assertGreaterEqual(len(process.call_args.kwargs["pass_fds"]), 2)
+
+    def test_ssh_binding_closes_private_fd_when_known_hosts_open_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir(parents=True)
+            private = ssh_dir / "id_ed25519"
+            private.write_bytes(b"private")
+            private.chmod(0o600)
+            (ssh_dir / "id_ed25519.pub").write_text(
+                "ssh-ed25519 public\\n",
+                encoding="utf-8",
+            )
+            command = runtime.ssh_argv(root, "192.0.2.10") + ["true"]
+            opened: list[int] = []
+            original_open = runtime._open_regular_state_file_at
+
+            def capture_private_fd(*args, **kwargs):
+                file_fd = original_open(*args, **kwargs)
+                opened.append(file_fd)
+                return file_fd
+
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_open_regular_state_file_at",
+                    side_effect=capture_private_fd,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_open_or_create_regular_state_file_at",
+                    side_effect=runtime.RuntimeErrorEB(
+                        "SSH known-hosts file is unsafe"
+                    ),
+                ),
+                mock.patch.object(
+                    runtime.os,
+                    "close",
+                    wraps=runtime.os.close,
+                ) as close_fd,
+            ):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "SSH known-hosts file is unsafe",
+                ):
+                    with runtime._bound_ssh_command(command):
+                        self.fail("SSH binding unexpectedly succeeded")
+
+            self.assertEqual(len(opened), 1)
+            self.assertIn(mock.call(opened[0]), close_fd.call_args_list)
 
     def test_install_k3s_rechecks_pinned_binary_before_copy(self) -> None:
         commit = "a" * 40
