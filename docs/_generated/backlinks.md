@@ -497,6 +497,7 @@ Generated automatically. Do not edit.
 - [relates_to] docs/deploy/CHANGELOG.md
 - [relates_to] docs/deploy/DRIFT_POLICY.md
 - [relates_to] docs/deploy/commonthing.naming.md
+- [relates_to] docs/deploy/dev-entrypoints.md
 - [relates_to] docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md
 - [relates_to] docs/deploy/heim-first-phase0.md
 - [relates_to] docs/deploy/heimserver.deployment.md
@@ -602,6 +603,7 @@ Generated automatically. Do not edit.
 - [relates_to] docs/blueprints/weltgewebe.deploy.plan.md
 - [relates_to] docs/deploy/DRIFT_POLICY.md
 - [relates_to] docs/deploy/README.md
+- [relates_to] docs/deploy/dev-entrypoints.md
 - [relates_to] docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md
 - [relates_to] docs/deploy/heimserver.deployment.md
 - [relates_to] docs/deploy/heimserver.integration.md

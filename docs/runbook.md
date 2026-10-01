@@ -45,9 +45,14 @@ curl -fsS http://127.0.0.1:8081/api/health/live
 curl -fsS http://127.0.0.1:8081/api/health/ready
 ```
 
-Die Web-/Caddy-Frontdoor liegt im Standard-Core-Profil auf Port `8081`. Der
-SvelteKit-Devserver kann für direkte Webentwicklung separat gestartet werden;
-er ist nicht mit dem Compose-Frontdoor gleichzusetzen.
+Der Caddy-Einstieg auf Port `8081` ist im Standard-Core-Profil der
+Entwicklungsproxy für `/api/*` und `/basemap/*`, aber kein unterstützter
+Browser-/UI-Einstieg. Für Frontend- und Hydrationsprüfungen ist der im
+Compose-Webcontainer exponierte Vite-Devserver auf Port `5173` zu verwenden.
+Sein `/api`-Proxy zeigt im Compose-Stack jedoch auf `127.0.0.1:8080` im
+Webcontainer; `:5173` ist dort deshalb kein Nachweis für API-gestützte
+UI-/E2E-Flows. Die kanonische Abgrenzung steht in
+`docs/deploy/dev-entrypoints.md`.
 
 ### Qualitätsprüfung
 
