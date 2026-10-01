@@ -326,6 +326,106 @@ def _write_kubeconfig(root: Path, kubeconfig: str) -> Path:
     return path
 
 
+def _open_performance_directory(root: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if not all(isinstance(flag, int) for flag in (nofollow, cloexec, directory)):
+        raise RuntimeErrorEB("performance state directory is unsafe")
+    flags = os.O_RDONLY | nofollow | cloexec | directory
+    try:
+        root_fd = os.open(root, flags)
+    except OSError as exc:
+        raise RuntimeErrorEB("performance state directory is unsafe") from exc
+    try:
+        root_metadata = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid()
+        ):
+            raise RuntimeErrorEB("performance state directory is unsafe")
+        try:
+            os.mkdir("performance", mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise RuntimeErrorEB("performance state directory is unsafe") from exc
+        try:
+            performance_fd = os.open("performance", flags, dir_fd=root_fd)
+        except OSError as exc:
+            raise RuntimeErrorEB("performance state directory is unsafe") from exc
+    finally:
+        os.close(root_fd)
+    try:
+        metadata = os.fstat(performance_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            raise RuntimeErrorEB("performance state directory is unsafe")
+        os.fchmod(performance_fd, 0o700)
+    except Exception:
+        os.close(performance_fd)
+        raise
+    return performance_fd
+
+
+def _open_performance_text_output(root: Path, name: str) -> Any:
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+    ):
+        raise RuntimeErrorEB("performance output path is unsafe")
+    directory_fd = _open_performance_directory(root)
+    output_fd: int | None = None
+    try:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RuntimeErrorEB("performance output path is unsafe") from exc
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        cloexec = getattr(os, "O_CLOEXEC", None)
+        if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+            raise RuntimeErrorEB("performance output path is unsafe")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec
+        try:
+            output_fd = os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            raise RuntimeErrorEB("performance output path is unsafe") from exc
+        metadata = os.fstat(output_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise RuntimeErrorEB("performance output path is unsafe")
+        os.fchmod(output_fd, 0o600)
+        handle = os.fdopen(output_fd, "w", encoding="utf-8")
+        output_fd = None
+        return handle
+    finally:
+        if output_fd is not None:
+            os.close(output_fd)
+        os.close(directory_fd)
+
+
+def _write_performance_text(root: Path, name: str, payload: str) -> None:
+    with _open_performance_text_output(root, name) as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _serialize_experiment_b_lifecycle(function: Any) -> Any:
     @functools.wraps(function)
     def wrapped(root: Path, *args: Any, **kwargs: Any) -> Any:
@@ -10612,7 +10712,12 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
     config = _source_commit_config(source_commit)
     _require_kubernetes_target_binding(root, source_commit)
     fixture_target = _kubernetes_target_identity(root, source_commit)
-    with _bound_kube_env(root, fixture_target, source_commit):
+    with (
+        _bound_kube_env(root, fixture_target, source_commit),
+        ExitStack() as performance_stack,
+    ):
+        performance_fd = _open_performance_directory(root)
+        performance_stack.callback(os.close, performance_fd)
         postgres_binding = _require_postgres_runtime_binding(
             root,
             source_commit,
@@ -10642,7 +10747,8 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
         contract_section = evidence.api_runtime_section(policy)
         proof = contract_section["dataset_proof"]
         profile = str(proof["profile"])
-        evidence_dir = root / "performance"
+        canonical_manifest = root / "performance/fixture/manifest.json"
+        evidence_dir = Path(f"/proc/self/fd/{performance_fd}")
         fixture = evidence_dir / "fixture"
         manifest = fixture / "manifest.json"
         if not manifest.is_file():
@@ -10750,7 +10856,7 @@ def seed_t048_fixture(root: Path) -> dict[str, Any]:
                 "source_commit": source_commit,
                 "kubernetes_target_sha256": _stable_json_sha256(fixture_target),
                 "profile": profile,
-                "manifest": str(manifest),
+                "manifest": str(canonical_manifest),
                 "manifest_sha256": binding["manifest_sha256"],
                 "nodes": observed_nodes,
                 "edges": observed_edges,
@@ -11132,28 +11238,35 @@ def _start_api_port_forward(
             "API port-forward requires an exact source and verified Pod"
         )
     port = _reserve_loopback_port()
-    evidence_dir = root / "performance"
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    stdout = (evidence_dir / "port-forward.stdout").open("w", encoding="utf-8")
-    stderr = (evidence_dir / "port-forward.stderr").open("w", encoding="utf-8")
+    stdout = _open_performance_text_output(root, "port-forward.stdout")
+    try:
+        stderr = _open_performance_text_output(root, "port-forward.stderr")
+    except BaseException:
+        stdout.close()
+        raise
     kubectl = toolchain(root)["tools"]["kubectl"]
-    process = subprocess.Popen(
-        [
-            kubectl,
-            "-n",
-            APP_NAMESPACE,
-            "port-forward",
-            f"pod/{pod_name}",
-            f"{port}:8080",
-            "--address=127.0.0.1",
-        ],
-        cwd=ROOT,
-        stdout=stdout,
-        stderr=stderr,
-        env=kube_env(root),
-        text=True,
-        pass_fds=_bound_subprocess_pass_fds(),
-    )
+    try:
+        process = subprocess.Popen(
+            [
+                kubectl,
+                "-n",
+                APP_NAMESPACE,
+                "port-forward",
+                f"pod/{pod_name}",
+                f"{port}:8080",
+                "--address=127.0.0.1",
+            ],
+            cwd=ROOT,
+            stdout=stdout,
+            stderr=stderr,
+            env=kube_env(root),
+            text=True,
+            pass_fds=_bound_subprocess_pass_fds(),
+        )
+    except BaseException:
+        stdout.close()
+        stderr.close()
+        raise
     try:
         _wait_http_200(
             f"http://127.0.0.1:{port}/health/live",
@@ -11885,8 +11998,6 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         k6_workload_text, k6_workload_sha256 = _source_bound_k6_workload(
             source_commit
         )
-        metrics_before_path = root / "performance/metrics-before.prom"
-        metrics_after_path = root / "performance/metrics-after.prom"
         resource_path = root / "performance/resource-receipt.json"
         db_path = root / "performance/database-connections.json"
         k6_summary_output_fd = bound_stack.enter_context(
@@ -11920,7 +12031,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         if before_status != 200:
             raise RuntimeErrorEB("API /metrics pre-snapshot failed")
         metrics_before = before_body.decode("utf-8")
-        metrics_before_path.write_text(metrics_before, encoding="utf-8")
+        _write_performance_text(root, "metrics-before.prom", metrics_before)
         families = evidence.parse_prometheus_text(metrics_before)
         if evidence.measured_api_commit(families) != source_commit:
             raise RuntimeErrorEB("API build_info commit does not match T048 source commit")
@@ -11955,7 +12066,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         )]
         sampler_started = time.time_ns() // 1_000_000
         k6_summary_snapshot_fd: int | None = None
-        with stderr_path.open("w", encoding="utf-8") as err:
+        with _open_performance_text_output(root, "k6.stderr") as err:
             load = subprocess.Popen(
                 docker_args,
                 cwd=ROOT,
@@ -12075,7 +12186,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         if after_status != 200:
             raise RuntimeErrorEB("API /metrics post-snapshot failed")
         metrics_after = after_body.decode("utf-8")
-        metrics_after_path.write_text(metrics_after, encoding="utf-8")
+        _write_performance_text(root, "metrics-after.prom", metrics_after)
 
         (
             final_pod_name,

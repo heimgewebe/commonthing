@@ -6477,6 +6477,136 @@ spec:
         self.assertNotIn("get.k3s.io", source)
 
 
+    def test_t048_performance_outputs_do_not_follow_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            performance = root / "performance"
+            performance.mkdir()
+            sentinel = parent / "sentinel"
+            sentinel.write_text("sentinel", encoding="utf-8")
+            output = performance / "metrics-before.prom"
+            output.symlink_to(sentinel)
+
+            runtime._write_performance_text(
+                root,
+                "metrics-before.prom",
+                "metric 1\n",
+            )
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "sentinel")
+            self.assertFalse(output.is_symlink())
+            self.assertEqual(output.read_text(encoding="utf-8"), "metric 1\n")
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
+            stderr_target = parent / "stderr-sentinel"
+            stderr_target.write_text("stderr-sentinel", encoding="utf-8")
+            stderr_path = performance / "k6.stderr"
+            stderr_path.symlink_to(stderr_target)
+            with runtime._open_performance_text_output(
+                root,
+                "k6.stderr",
+            ) as handle:
+                handle.write("k6 failed\n")
+
+            self.assertEqual(
+                stderr_target.read_text(encoding="utf-8"),
+                "stderr-sentinel",
+            )
+            self.assertFalse(stderr_path.is_symlink())
+            self.assertEqual(
+                stderr_path.read_text(encoding="utf-8"),
+                "k6 failed\n",
+            )
+            self.assertEqual(stderr_path.stat().st_mode & 0o777, 0o600)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.mkdir()
+            (root / "performance").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "performance state directory is unsafe",
+            ):
+                runtime._write_performance_text(
+                    root,
+                    "metrics-before.prom",
+                    "metric 1\n",
+                )
+            self.assertEqual(list(outside.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            performance = root / "performance"
+            performance.mkdir()
+            retained = root / "performance-retained"
+            outside = parent / "outside"
+            outside.mkdir()
+            performance_fd = runtime._open_performance_directory(root)
+            try:
+                performance.rename(retained)
+                performance.symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+                bound_output = (
+                    Path(f"/proc/self/fd/{performance_fd}") / "fixture-proof"
+                )
+                bound_output.write_text("bound\n", encoding="utf-8")
+            finally:
+                runtime.os.close(performance_fd)
+
+            self.assertEqual(
+                (retained / "fixture-proof").read_text(encoding="utf-8"),
+                "bound\n",
+            )
+            self.assertEqual(list(outside.iterdir()), [])
+
+        seed_source = inspect.getsource(runtime.seed_t048_fixture)
+        self.assertIn(
+            'Path(f"/proc/self/fd/{performance_fd}")',
+            seed_source,
+        )
+        self.assertIn(
+            '"manifest": str(canonical_manifest)',
+            seed_source,
+        )
+
+        load_source = inspect.getsource(runtime.t048_load_proof)
+        self.assertNotIn("metrics_before_path.write_text", load_source)
+        self.assertNotIn("metrics_after_path.write_text", load_source)
+        self.assertNotIn('stderr_path.open("w"', load_source)
+        self.assertIn(
+            '_write_performance_text(root, "metrics-before.prom"',
+            load_source,
+        )
+        self.assertIn(
+            '_write_performance_text(root, "metrics-after.prom"',
+            load_source,
+        )
+        self.assertIn(
+            '_open_performance_text_output(root, "k6.stderr")',
+            load_source,
+        )
+
+        port_forward_source = inspect.getsource(runtime._start_api_port_forward)
+        self.assertNotIn('.open("w"', port_forward_source)
+        self.assertEqual(
+            port_forward_source.count("_open_performance_text_output"),
+            2,
+        )
+
+
 class ExperimentBVMSubstrateTests(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -12402,7 +12532,7 @@ def install(*args, **kwargs):
                     f"{target_name} = _kubernetes_target_identity"
                 )
                 snapshot = source.index(
-                    f"with _bound_kube_env(root, {target_name}, source_commit)"
+                    f"_bound_kube_env(root, {target_name}, source_commit)"
                 )
                 final = source.rindex(
                     "_require_same_kubernetes_target"
