@@ -3020,6 +3020,68 @@ spec:
             fresh_load.assert_called_once_with(root, commit)
             fresh_status_readback.assert_called_once_with(root)
 
+            status_receipt = json.loads(
+                (receipts / "status.json").read_text(encoding="utf-8")
+            )
+            expected_recovery_state = {
+                "recovery_receipt_sha256": runtime.sha256_file(
+                    receipts / "recovery.json"
+                ),
+                "fixture_receipt_sha256": runtime.sha256_file(
+                    receipts / "t048-fixture.json"
+                ),
+            }
+            for drift_field in (
+                "recovery_receipt_sha256",
+                "fixture_receipt_sha256",
+            ):
+                with self.subTest(drifted_status_dependency=drift_field):
+                    recovery_state = dict(expected_recovery_state)
+                    recovery_state[drift_field] = "f" * 64
+                    fresh_status = {
+                        **status_receipt,
+                        "recovery_state": recovery_state,
+                    }
+                    runtime.atomic_json(receipts / "status.json", fresh_status)
+                    runtime.atomic_json(
+                        receipts / "status-attempt.json",
+                        {
+                            "schema_version": 1,
+                            "status": "pass",
+                            "source_commit": commit,
+                            "receipt": "status.json",
+                            "receipt_sha256": runtime.sha256_file(
+                                receipts / "status.json"
+                            ),
+                        },
+                    )
+                    with (
+                        mock.patch.object(
+                            runtime,
+                            "functional_readback",
+                            return_value=functional_receipt,
+                        ) as fresh_functional,
+                        mock.patch.object(
+                            runtime,
+                            "t048_load_proof",
+                            return_value=t048_receipt,
+                        ) as fresh_load,
+                        mock.patch.object(
+                            runtime,
+                            "status",
+                            return_value=fresh_status,
+                        ) as fresh_status_readback,
+                        self.assertRaisesRegex(
+                            runtime.RuntimeErrorEB,
+                            "fresh status recovery evidence is not bound to retained "
+                            "portability receipts",
+                        ),
+                    ):
+                        runtime.portability_report(root)
+                    fresh_functional.assert_called_once_with(root, commit)
+                    fresh_load.assert_called_once_with(root, commit)
+                    fresh_status_readback.assert_called_once_with(root)
+
     def test_portability_rejects_failed_or_cross_revision_receipts(self) -> None:
         commit = "a" * 40
         config = runtime.load_config()
@@ -3384,6 +3446,14 @@ spec:
                     payload["vm_create_sha256"] = runtime.sha256_file(receipts / "vm-create.json")
                     payload["vm_substrate"] = vm_substrate_fixture()
                     payload["vm_ip"] = "192.168.122.10"
+                    payload["recovery_state"] = {
+                        "recovery_receipt_sha256": runtime.sha256_file(
+                            receipts / "recovery.json"
+                        ),
+                        "fixture_receipt_sha256": runtime.sha256_file(
+                            receipts / "t048-fixture.json"
+                        ),
+                    }
                     payload["k3s_runtime"] = {
                         "vm_ip": "192.168.122.10",
                         "kubeconfig_sha256": kubeconfig_sha256,

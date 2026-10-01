@@ -15236,6 +15236,19 @@ def portability_report(root: Path) -> dict[str, Any]:
         raise RuntimeErrorEB(
             "fresh status attempt is not bound to its current live receipt"
         )
+    recovery_state = fresh_status.get("recovery_state")
+    if (
+        not isinstance(recovery_state, dict)
+        or recovery_state.get("recovery_receipt_sha256")
+        != receipts["recovery.json"]
+        or recovery_state.get("fixture_receipt_sha256")
+        != receipts["t048-fixture.json"]
+    ):
+        raise RuntimeErrorEB(
+            "fresh status recovery evidence is not bound to retained "
+            "portability receipts"
+        )
+
 
     config = _source_commit_config(source_commit)
     _require_vm_create_receipt(
