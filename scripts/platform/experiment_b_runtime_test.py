@@ -759,7 +759,7 @@ spec:
         )
         self.assertLess(
             create_vm.index("_invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)"),
-            create_vm.index("POOL_TARGET.mkdir"),
+            create_vm.index("_open_libvirt_pool_target(create=True)"),
         )
         self.assertLess(
             create_vm.index("_libvirt_volume_sha256(root, BASE_VOLUME)"),
@@ -8603,6 +8603,80 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             return self.httproute
         self.assertIn("gateway", arguments)
         return self.gateway
+
+    def test_create_vm_rejects_symlinked_pool_target_before_libvirt_mutation(
+        self,
+    ) -> None:
+        self.prepare_create()
+        outside = self.root / "outside-pool"
+        outside.mkdir()
+        self.pool.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "libvirt pool target is unsafe",
+        ):
+            runtime.create_vm(self.root)
+
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse(self.pool_present)
+        pool_define_calls = [
+            call
+            for call in self.runner.call_args_list
+            if call.args
+            and call.args[0][:4]
+            == ["virsh", "-c", runtime.LIBVIRT_URI, "pool-define-as"]
+        ]
+        self.assertEqual(pool_define_calls, [])
+
+    def test_teardown_rejects_symlinked_pool_target_before_storage_mutation(
+        self,
+    ) -> None:
+        self.disk.unlink()
+        self.base.unlink()
+        self.pool.rmdir()
+        outside = self.root / "outside-pool"
+        outside.mkdir()
+        outside_disk = outside / runtime.VOLUME_NAME
+        outside_base = outside / runtime.BASE_VOLUME
+        outside_disk.write_bytes(b"outside-volume")
+        outside_base.write_bytes(b"outside-base")
+        self.pool.symlink_to(outside, target_is_directory=True)
+
+        pool_stat = outside.stat()
+        volume_stat = outside_disk.stat()
+        runtime.atomic_json(
+            self.root / "receipts/vm-create-attempt.json",
+            {
+                "schema_version": 1,
+                "status": "running",
+                "source_commit": self.commit,
+                "config_sha256": runtime.sha256_file(
+                    runtime.CLUSTER / "config.json"
+                ),
+                "state_root": str(self.root.resolve()),
+                "vm": runtime.VM_NAME,
+                "pool": runtime.POOL_NAME,
+                "domain_target": self.domain_uuid,
+                "pool_target": self.pool_uuid,
+                "pool_target_device": pool_stat.st_dev,
+                "pool_target_inode": pool_stat.st_ino,
+                "volume_device": volume_stat.st_dev,
+                "volume_inode": volume_stat.st_ino,
+                "base_image_sha256": self.config["vm"]["image"]["sha256"],
+            },
+        )
+
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "libvirt pool target is unsafe",
+        ):
+            runtime.teardown(self.root)
+
+        self.assertTrue(self.domain_present)
+        self.assertTrue(self.pool_present)
+        self.assertEqual(outside_disk.read_bytes(), b"outside-volume")
+        self.assertEqual(outside_base.read_bytes(), b"outside-base")
 
     def test_teardown_proves_domain_pool_volume_and_state_absence(self) -> None:
         retirement = self.root.with_name(self.root.name + "-retirement.json")

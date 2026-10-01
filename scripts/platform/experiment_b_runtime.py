@@ -346,6 +346,51 @@ def _open_directory_nofollow(
         raise
 
 
+def _open_libvirt_pool_target(*, create: bool) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if not all(isinstance(flag, int) for flag in (nofollow, cloexec, directory)):
+        raise RuntimeErrorEB("libvirt pool target is unsafe")
+    parent_fd = _open_directory_nofollow(
+        POOL_TARGET.parent,
+        create=False,
+        context="libvirt pool target parent",
+    )
+    pool_fd: int | None = None
+    try:
+        if create:
+            try:
+                os.mkdir(POOL_TARGET.name, mode=0o755, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise RuntimeErrorEB("libvirt pool target is unsafe") from exc
+        try:
+            pool_fd = os.open(
+                POOL_TARGET.name,
+                os.O_RDONLY | nofollow | cloexec | directory,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise RuntimeErrorEB("libvirt pool target is unsafe") from exc
+    finally:
+        os.close(parent_fd)
+    try:
+        metadata = os.fstat(pool_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            raise RuntimeErrorEB("libvirt pool target is unsafe")
+        result = pool_fd
+        pool_fd = None
+        return result
+    finally:
+        if pool_fd is not None:
+            os.close(pool_fd)
+
+
 def _unlink_state_path(path: Path, context: str) -> None:
     if not path.name or path.name in {".", ".."}:
         raise RuntimeErrorEB(f"{context} name is unsafe")
@@ -1582,15 +1627,20 @@ def create_vm(root: Path) -> dict[str, Any]:
     prepared = prepare(root, source_commit)
     cloud_image = Path(prepared["cloud_image"])
     source_virtual_size = int(prepared["cloud_image_virtual_size"])
-    if POOL_TARGET.exists() and any(POOL_TARGET.iterdir()):
-        raise RuntimeErrorEB("Experiment-B libvirt pool target already contains files")
-    POOL_TARGET.mkdir(parents=True, exist_ok=True)
-    pool_target_stat = POOL_TARGET.stat()
-    attempt.update(
-        pool_target_device=pool_target_stat.st_dev,
-        pool_target_inode=pool_target_stat.st_ino,
-    )
-    atomic_json(attempt_path, attempt)
+    pool_fd = _open_libvirt_pool_target(create=True)
+    try:
+        if os.listdir(pool_fd):
+            raise RuntimeErrorEB(
+                "Experiment-B libvirt pool target already contains files"
+            )
+        pool_target_stat = os.fstat(pool_fd)
+        attempt.update(
+            pool_target_device=pool_target_stat.st_dev,
+            pool_target_inode=pool_target_stat.st_ino,
+        )
+        atomic_json(attempt_path, attempt)
+    finally:
+        os.close(pool_fd)
 
     pool_defined = False
     try:
@@ -9623,6 +9673,13 @@ def _require_teardown_live_identity(
 ) -> dict[str, Any]:
     domain_present = _libvirt_resource_present("domain", VM_NAME)
     pool_present = _libvirt_resource_present("pool", POOL_NAME)
+    pool_target_stat: os.stat_result | None = None
+    if pool_present:
+        pool_fd = _open_libvirt_pool_target(create=False)
+        try:
+            pool_target_stat = os.fstat(pool_fd)
+        finally:
+            os.close(pool_fd)
     if ownership.get("operation") == "teardown":
         domain_target = ownership.get("domain_target")
         pool_target = ownership.get("pool_target")
@@ -9670,15 +9727,18 @@ def _require_teardown_live_identity(
                     "interrupted creation has no verified pool directory identity"
                 )
             try:
-                pool_stat = POOL_TARGET.stat()
+                if pool_target_stat is None:
+                    raise RuntimeErrorEB(
+                        "interrupted creation pool identity cannot be read"
+                    )
                 pool_xml = _libvirt_xml("pool-dumpxml", POOL_NAME)
             except (OSError, ET.ParseError, AttributeError) as exc:
                 raise RuntimeErrorEB(
                     "interrupted creation pool identity cannot be read"
                 ) from exc
             if (
-                pool_stat.st_dev != pool_device
-                or pool_stat.st_ino != pool_inode
+                pool_target_stat.st_dev != pool_device
+                or pool_target_stat.st_ino != pool_inode
                 or pool_xml.findtext("target/path") != str(POOL_TARGET)
             ):
                 raise RuntimeErrorEB(
