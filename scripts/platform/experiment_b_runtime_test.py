@@ -13540,7 +13540,7 @@ def install(*args, **kwargs):
             runtime._functional_serving_runtime_semantic_binding(after),
         )
 
-    def test_functional_endpoint_watch_rejects_transient_service_changes(
+    def test_functional_endpoint_watch_rejects_transient_dependency_changes(
         self,
     ) -> None:
         serving_runtime = {
@@ -13555,8 +13555,6 @@ def install(*args, **kwargs):
                 )
             }
         }
-        processes = []
-        watch_outputs = []
 
         class FakeProcess:
             def __init__(self) -> None:
@@ -13574,99 +13572,280 @@ def install(*args, **kwargs):
             def kill(self) -> None:
                 self.returncode = -9
 
-        def popen(_argv, **kwargs):
-            process = FakeProcess()
-            kwargs["stdout"].write(
-                json.dumps(
-                    {
-                        "type": "ADDED",
-                        "object": {
-                            "metadata": {
-                                "name": "initial-endpoint-slice",
-                            }
-                        },
-                    }
-                )
-                + "\n"
-            )
-            kwargs["stdout"].write(
-                json.dumps(
-                    {
-                        "type": "BOOKMARK",
-                        "object": {
-                            "metadata": {
-                                "annotations": {
-                                    "k8s.io/initial-events-end": "true",
-                                }
-                            }
-                        },
-                    }
-                )
-                + "\n"
-            )
-            kwargs["stdout"].flush()
-            watch_outputs.append(kwargs["stdout"])
-            processes.append(process)
-            return process
+        for mutation_index, subject in (
+            (0, "weltgewebe-api"),
+            (2, "Gateway"),
+            (3, "HTTPRoute"),
+        ):
+            with self.subTest(subject=subject):
+                watch_outputs = []
 
+                def popen(_argv, **kwargs):
+                    process = FakeProcess()
+                    kwargs["stdout"].write(
+                        json.dumps(
+                            {
+                                "type": "ADDED",
+                                "object": {
+                                    "metadata": {
+                                        "name": "initial-resource",
+                                    }
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                    kwargs["stdout"].write(
+                        json.dumps(
+                            {
+                                "type": "BOOKMARK",
+                                "object": {
+                                    "metadata": {
+                                        "annotations": {
+                                            "k8s.io/initial-events-end": "true",
+                                        }
+                                    }
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                    kwargs["stdout"].flush()
+                    watch_outputs.append(kwargs["stdout"])
+                    return process
+
+                def kubectl_json(_root, argv):
+                    resource_name = argv[-2]
+                    resource_versions = {
+                        "gateway": "300",
+                        "httproute": "400",
+                    }
+                    return {
+                        "metadata": {
+                            "resourceVersion": resource_versions[resource_name],
+                        }
+                    }
+
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "toolchain",
+                        return_value={
+                            "tools": {"kubectl": "/usr/bin/kubectl"}
+                        },
+                    ),
+                    mock.patch.object(runtime, "kube_env", return_value={}),
+                    mock.patch.object(
+                        runtime,
+                        "_kubectl_json",
+                        side_effect=kubectl_json,
+                    ),
+                    mock.patch.object(runtime.time, "sleep"),
+                    mock.patch.object(
+                        runtime.subprocess,
+                        "Popen",
+                        side_effect=popen,
+                    ) as spawn,
+                    self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB,
+                        "dependency changed during Gateway probes",
+                    ),
+                ):
+                    with runtime._guard_functional_service_endpoints(
+                        Path("/tmp"),
+                        serving_runtime,
+                    ):
+                        watch_outputs[mutation_index].write(
+                            json.dumps(
+                                {"type": "MODIFIED", "object": {}}
+                            )
+                            + "\n"
+                        )
+                        watch_outputs[mutation_index].flush()
+
+                self.assertEqual(spawn.call_count, 4)
+                for index, service_name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                ):
+                    argv = spawn.call_args_list[index].args[0]
+                    self.assertEqual(
+                        argv[:3],
+                        ["/usr/bin/kubectl", "get", "--raw"],
+                    )
+                    watch_url = runtime.urllib.parse.urlsplit(argv[3])
+                    self.assertEqual(
+                        watch_url.path,
+                        (
+                            f"/apis/discovery.k8s.io/v1/namespaces/"
+                            f"{runtime.APP_NAMESPACE}/endpointslices"
+                        ),
+                    )
+                    self.assertEqual(
+                        runtime.urllib.parse.parse_qs(watch_url.query),
+                        {
+                            "watch": ["1"],
+                            "resourceVersion": [str(index + 100)],
+                            "resourceVersionMatch": ["NotOlderThan"],
+                            "sendInitialEvents": ["true"],
+                            "labelSelector": [
+                                f"kubernetes.io/service-name={service_name}"
+                            ],
+                            "allowWatchBookmarks": ["true"],
+                        },
+                    )
+
+                for index, (
+                    resource_name,
+                    collection_name,
+                    resource_version,
+                ) in enumerate(
+                    (
+                        ("Gateway", "gateways", "300"),
+                        ("HTTPRoute", "httproutes", "400"),
+                    ),
+                    start=2,
+                ):
+                    argv = spawn.call_args_list[index].args[0]
+                    self.assertEqual(
+                        argv[:3],
+                        ["/usr/bin/kubectl", "get", "--raw"],
+                    )
+                    watch_url = runtime.urllib.parse.urlsplit(argv[3])
+                    self.assertEqual(
+                        watch_url.path,
+                        (
+                            f"/apis/gateway.networking.k8s.io/v1/namespaces/"
+                            f"{runtime.APP_NAMESPACE}/{collection_name}"
+                        ),
+                        resource_name,
+                    )
+                    self.assertEqual(
+                        runtime.urllib.parse.parse_qs(watch_url.query),
+                        {
+                            "watch": ["1"],
+                            "resourceVersion": [resource_version],
+                            "resourceVersionMatch": ["NotOlderThan"],
+                            "sendInitialEvents": ["true"],
+                            "fieldSelector": [
+                                "metadata.name=commonthing-experiment-b"
+                            ],
+                            "allowWatchBookmarks": ["true"],
+                        },
+                        resource_name,
+                    )
+
+    def test_gateway_data_plane_validates_domain_nodes_cursor_body(
+        self,
+    ) -> None:
+        source_commit = "a" * 40
+        valid_node = {
+            "id": "node-1",
+            "kind": "knoten",
+            "title": "Node 1",
+            "created_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-01T00:00:00Z",
+            "location": {"lon": 10.0, "lat": 53.5},
+        }
+        valid_page = {
+            "limit": 1,
+            "has_more": False,
+            "next_cursor": None,
+        }
+
+        def responses(nodes_body: str):
+            return [
+                (200, "<html>ok</html>", 1),
+                (200, json.dumps({"commit": source_commit}), 1),
+                (200, json.dumps({"status": "ok"}), 1),
+                (200, nodes_body, 1),
+                (
+                    200,
+                    json.dumps(
+                        {
+                            "items": [{"id": "search-hit"}],
+                            "generation_id": "generation-1",
+                        }
+                    ),
+                    1,
+                ),
+                (
+                    200,
+                    json.dumps(
+                        {
+                            "authenticated": False,
+                            "role": "gast",
+                        }
+                    ),
+                    1,
+                ),
+            ]
+
+        invalid_cases = (
+            ("malformed", "{not-json"),
+            (
+                "empty-items",
+                json.dumps({"items": [], "page": valid_page}),
+            ),
+            (
+                "wrong-envelope",
+                json.dumps([valid_node]),
+            ),
+        )
+        for case, nodes_body in invalid_cases:
+            with (
+                self.subTest(case=case),
+                mock.patch.object(
+                    runtime,
+                    "_gateway_base_url",
+                    return_value="http://192.0.2.23",
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_http_read",
+                    side_effect=responses(nodes_body),
+                ),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "domain read failed through Gateway",
+                ),
+            ):
+                runtime._gateway_data_plane_readback(
+                    Path("/tmp"),
+                    source_commit,
+                )
+
+        valid_body = json.dumps(
+            {
+                "items": [valid_node],
+                "page": valid_page,
+            }
+        )
         with (
             mock.patch.object(
                 runtime,
-                "toolchain",
-                return_value={"tools": {"kubectl": "/usr/bin/kubectl"}},
+                "_gateway_base_url",
+                return_value="http://192.0.2.23",
             ),
-            mock.patch.object(runtime, "kube_env", return_value={}),
-            mock.patch.object(runtime.time, "sleep"),
             mock.patch.object(
-                runtime.subprocess,
-                "Popen",
-                side_effect=popen,
-            ) as spawn,
-            self.assertRaisesRegex(
-                runtime.RuntimeErrorEB,
-                "endpoints changed during Gateway probes",
+                runtime,
+                "_http_read",
+                side_effect=responses(valid_body),
             ),
         ):
-            with runtime._guard_functional_service_endpoints(
+            observed = runtime._gateway_data_plane_readback(
                 Path("/tmp"),
-                serving_runtime,
-            ):
-                watch_outputs[0].write(
-                    json.dumps({"type": "ADDED", "object": {}})
-                    + "\n"
-                )
-                watch_outputs[0].flush()
-        self.assertEqual(spawn.call_count, 2)
-        for index, service_name in enumerate(
-            ("weltgewebe-api", "weltgewebe-web")
-        ):
-            argv = spawn.call_args_list[index].args[0]
-            self.assertEqual(
-                argv[:3],
-                ["/usr/bin/kubectl", "get", "--raw"],
+                source_commit,
             )
-            self.assertEqual(len(argv), 4)
-            watch_url = runtime.urllib.parse.urlsplit(argv[3])
-            self.assertEqual(
-                watch_url.path,
-                (
-                    f"/apis/discovery.k8s.io/v1/namespaces/"
-                    f"{runtime.APP_NAMESPACE}/endpointslices"
-                ),
-            )
-            self.assertEqual(
-                runtime.urllib.parse.parse_qs(watch_url.query),
-                {
-                    "watch": ["1"],
-                    "resourceVersion": [str(index + 100)],
-                    "resourceVersionMatch": ["NotOlderThan"],
-                    "sendInitialEvents": ["true"],
-                    "labelSelector": [
-                        f"kubernetes.io/service-name={service_name}"
-                    ],
-                    "allowWatchBookmarks": ["true"],
-                },
-            )
+
+        self.assertEqual(observed["checks"]["domain_nodes"]["items"], 1)
+        self.assertEqual(
+            observed["checks"]["domain_nodes"]["first_node_id"],
+            "node-1",
+        )
+        self.assertIs(
+            observed["checks"]["domain_nodes"]["has_more"],
+            False,
+        )
 
     def test_functional_readback_rejects_serving_runtime_drift(
         self,

@@ -12590,7 +12590,7 @@ def _functional_endpoint_watch_is_synced(
             )
         if event_type != "BOOKMARK":
             raise RuntimeErrorEB(
-                f"functional serving Service endpoints changed during Gateway probes: "
+                f"functional serving dependency changed during Gateway probes: "
                 f"{service_name}"
             )
     return initial_sync_complete
@@ -12681,6 +12681,80 @@ def _guard_functional_service_endpoints(
                 stderr.close()
                 raise
             watches.append((service_name, process, stdout, stderr))
+
+        routing_resources = (
+            ("Gateway", "gateway", "gateways"),
+            ("HTTPRoute", "httproute", "httproutes"),
+        )
+        namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
+        for resource_name, kubectl_resource, collection_name in routing_resources:
+            resource = _kubectl_json(
+                root,
+                [
+                    "-n",
+                    APP_NAMESPACE,
+                    "get",
+                    kubectl_resource,
+                    "commonthing-experiment-b",
+                ],
+            )
+            metadata = (
+                resource.get("metadata")
+                if isinstance(resource, dict)
+                else None
+            )
+            resource_version = (
+                metadata.get("resourceVersion")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(resource_version, str) or not resource_version:
+                raise RuntimeErrorEB(
+                    f"functional serving routing watch has no resourceVersion: "
+                    f"{resource_name}"
+                )
+            stdout = tempfile.TemporaryFile(
+                mode="w+",
+                encoding="utf-8",
+            )
+            stderr = tempfile.TemporaryFile(
+                mode="w+",
+                encoding="utf-8",
+            )
+            watch_query = urllib.parse.urlencode(
+                {
+                    "watch": "1",
+                    "resourceVersion": resource_version,
+                    "resourceVersionMatch": "NotOlderThan",
+                    "sendInitialEvents": "true",
+                    "allowWatchBookmarks": "true",
+                    "fieldSelector": "metadata.name=commonthing-experiment-b",
+                }
+            )
+            watch_path = (
+                f"/apis/gateway.networking.k8s.io/v1/namespaces/"
+                f"{namespace_path}/{collection_name}?{watch_query}"
+            )
+            try:
+                process = subprocess.Popen(
+                    [
+                        kubectl,
+                        "get",
+                        "--raw",
+                        watch_path,
+                    ],
+                    cwd=ROOT,
+                    stdout=stdout,
+                    stderr=stderr,
+                    env=kube_env(root),
+                    text=True,
+                    pass_fds=_bound_subprocess_pass_fds(),
+                )
+            except BaseException:
+                stdout.close()
+                stderr.close()
+                raise
+            watches.append((resource_name, process, stdout, stderr))
 
         pending = {service_name for service_name, *_rest in watches}
         deadline = time.monotonic() + 10.0
@@ -13048,8 +13122,74 @@ def _gateway_data_plane_readback(
     status_code, body, elapsed = _http_read(
         base + "/api/nodes?pagination=cursor&limit=1"
     )
-    checks["domain_nodes"] = {"status": status_code, "elapsed_ms": elapsed}
-    if status_code != 200:
+    try:
+        nodes = json.loads(body) if status_code == 200 else {}
+    except (TypeError, json.JSONDecodeError):
+        nodes = {}
+    items = nodes.get("items") if isinstance(nodes, dict) else None
+    page = nodes.get("page") if isinstance(nodes, dict) else None
+    first_node = (
+        items[0]
+        if isinstance(items, list) and len(items) == 1
+        else None
+    )
+    location = (
+        first_node.get("location")
+        if isinstance(first_node, dict)
+        else None
+    )
+    has_more = page.get("has_more") if isinstance(page, dict) else None
+    next_cursor = (
+        page.get("next_cursor")
+        if isinstance(page, dict)
+        else None
+    )
+    node_contract_valid = (
+        isinstance(first_node, dict)
+        and all(
+            isinstance(first_node.get(field), str)
+            and bool(first_node[field])
+            for field in (
+                "id",
+                "kind",
+                "title",
+                "created_at",
+                "updated_at",
+            )
+        )
+        and isinstance(location, dict)
+        and isinstance(location.get("lon"), (int, float))
+        and not isinstance(location.get("lon"), bool)
+        and isinstance(location.get("lat"), (int, float))
+        and not isinstance(location.get("lat"), bool)
+    )
+    page_contract_valid = (
+        isinstance(page, dict)
+        and page.get("limit") == 1
+        and isinstance(has_more, bool)
+        and (
+            (has_more and isinstance(next_cursor, str) and bool(next_cursor))
+            or (not has_more and next_cursor is None)
+        )
+    )
+    checks["domain_nodes"] = {
+        "status": status_code,
+        "elapsed_ms": elapsed,
+        "items": len(items) if isinstance(items, list) else None,
+        "first_node_id": (
+            first_node.get("id")
+            if isinstance(first_node, dict)
+            else None
+        ),
+        "has_more": has_more,
+    }
+    if (
+        status_code != 200
+        or not isinstance(items, list)
+        or len(items) != 1
+        or not node_contract_valid
+        or not page_contract_valid
+    ):
         raise RuntimeErrorEB("Experiment-B domain read failed through Gateway")
 
     query = urllib.parse.urlencode({"q": "scale", "limit": 5})
