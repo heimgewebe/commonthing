@@ -2227,6 +2227,32 @@ spec:
                 runtime.fcntl.flock(lock_fd, runtime.fcntl.LOCK_UN)
                 runtime.os.close(lock_fd)
 
+    def test_portability_report_shares_recovery_lifecycle_lock(self) -> None:
+        self.assertTrue(hasattr(runtime.portability_report, "__wrapped__"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = root / ".recovery-proof.lock"
+            flags = (
+                runtime.os.O_RDWR
+                | runtime.os.O_CREAT
+                | int(getattr(runtime.os, "O_CLOEXEC", 0))
+                | int(getattr(runtime.os, "O_NOFOLLOW", 0))
+            )
+            lock_fd = runtime.os.open(lock_path, flags, 0o600)
+            runtime.fcntl.flock(
+                lock_fd,
+                runtime.fcntl.LOCK_EX | runtime.fcntl.LOCK_NB,
+            )
+            try:
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "already running for this state root",
+                ):
+                    runtime.portability_report(root)
+            finally:
+                runtime.fcntl.flock(lock_fd, runtime.fcntl.LOCK_UN)
+                runtime.os.close(lock_fd)
+
     def test_dirty_rerun_invalidates_functional_success_before_binding_failure(self) -> None:
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as tmp:
@@ -7710,6 +7736,33 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 },
             },
         )
+        self.status_serving_runtime = {
+            "services": {
+                "weltgewebe-api": {
+                    "endpoints": {
+                        "resource_version": "101",
+                        "sha256": "1" * 64,
+                    },
+                },
+                "weltgewebe-web": {
+                    "endpoints": {
+                        "resource_version": "202",
+                        "sha256": "2" * 64,
+                    },
+                },
+            },
+            "gateway_base_url": "http://192.168.122.20",
+        }
+        self.functional_serving_runtime = self.patch(
+            "_functional_serving_runtime_binding",
+            side_effect=lambda *_args, **_kwargs: json.loads(
+                json.dumps(self.status_serving_runtime)
+            ),
+        )
+        self.functional_endpoint_guard = self.patch(
+            "_guard_functional_service_endpoints",
+            side_effect=lambda *_args, **_kwargs: mock.MagicMock(),
+        )
         self.semantic_provider = self.patch(
             "_semantic_provider_live_readback",
             return_value={
@@ -9719,6 +9772,71 @@ spec:
         self.assertFalse((self.root / "receipts/portability.json").exists())
 
 
+
+    def test_status_guards_gateway_probe_with_serving_endpoint_watch(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        events: list[str] = []
+        gateway_result = self.gateway_data_plane.return_value
+
+        class TrackingGuard:
+            def __enter__(self) -> None:
+                events.append("enter")
+
+            def __exit__(self, *_args: object) -> bool:
+                events.append("exit")
+                return False
+
+        self.functional_endpoint_guard.side_effect = (
+            lambda *_args, **_kwargs: TrackingGuard()
+        )
+
+        def gateway_probe(*_args: object, **_kwargs: object) -> dict:
+            events.append("probe")
+            return gateway_result
+
+        self.gateway_data_plane.side_effect = gateway_probe
+        result = runtime.status(self.root)
+
+        self.assertEqual(events, ["enter", "probe", "exit"])
+        self.assertEqual(self.functional_serving_runtime.call_count, 3)
+        self.functional_endpoint_guard.assert_called_once_with(
+            self.root,
+            self.status_serving_runtime,
+        )
+        self.assertEqual(
+            result["gateway_serving_runtime"],
+            runtime._functional_serving_runtime_semantic_binding(
+                self.status_serving_runtime
+            ),
+        )
+
+    def test_status_rejects_serving_runtime_change_during_gateway_probe(
+        self,
+    ) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        before = json.loads(json.dumps(self.status_serving_runtime))
+        changed = json.loads(json.dumps(before))
+        changed["gateway_base_url"] = "http://192.168.122.99"
+        self.functional_serving_runtime.side_effect = [
+            before,
+            json.loads(json.dumps(before)),
+            changed,
+        ]
+
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "application serving runtime changed during status readback",
+        ):
+            runtime.status(self.root)
+
+        self.gateway_data_plane.assert_called_once_with(
+            self.root,
+            self.commit,
+        )
+        self.assertFalse((self.root / "receipts/status.json").exists())
+        self.assertFalse((self.root / "receipts/portability.json").exists())
 
     def test_final_recovery_state_readback_binds_current_signatures_and_fixture(
         self,

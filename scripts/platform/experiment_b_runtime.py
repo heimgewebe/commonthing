@@ -8882,7 +8882,59 @@ def status(root: Path) -> dict[str, Any]:
             root, ["-n", APP_NAMESPACE, "get", "httproute", "commonthing-experiment-b"]
         )
         httproute_readback = _require_httproute_ready(httproute)
-        gateway_data_plane = _gateway_data_plane_readback(root, source_commit)
+        status_serving_runtime_before = _functional_serving_runtime_binding(
+            root,
+            source_commit,
+        )
+        status_serving_runtime_semantic_before = (
+            _functional_serving_runtime_semantic_binding(
+                status_serving_runtime_before
+            )
+        )
+        with _guard_functional_service_endpoints(
+            root,
+            status_serving_runtime_before,
+        ):
+            status_serving_runtime_probe_start = (
+                _functional_serving_runtime_binding(
+                    root,
+                    source_commit,
+                )
+            )
+            status_serving_runtime_semantic_probe_start = (
+                _functional_serving_runtime_semantic_binding(
+                    status_serving_runtime_probe_start
+                )
+            )
+            if (
+                status_serving_runtime_semantic_probe_start
+                != status_serving_runtime_semantic_before
+            ):
+                raise RuntimeErrorEB(
+                    "application serving runtime changed before status Gateway probes"
+                )
+            gateway_data_plane = _gateway_data_plane_readback(
+                root,
+                source_commit,
+            )
+            status_serving_runtime_after = (
+                _functional_serving_runtime_binding(
+                    root,
+                    source_commit,
+                )
+            )
+            status_serving_runtime_semantic_after = (
+                _functional_serving_runtime_semantic_binding(
+                    status_serving_runtime_after
+                )
+            )
+            if (
+                status_serving_runtime_semantic_after
+                != status_serving_runtime_semantic_probe_start
+            ):
+                raise RuntimeErrorEB(
+                    "application serving runtime changed during status readback"
+                )
         recovery_state = _final_recovery_state_readback(root, source_commit)
         runtime_contract_readback = _require_live_runtime_contract(
             root,
@@ -8940,6 +8992,7 @@ def status(root: Path) -> dict[str, Any]:
         "gateway_programmed": True,
         "httproute": httproute_readback,
         "gateway_data_plane": gateway_data_plane,
+        "gateway_serving_runtime": status_serving_runtime_semantic_after,
         "recovery_state": recovery_state,
         "kind_runtime": False,
         "staging_cell_runtime_controller": False,
@@ -15011,6 +15064,7 @@ def _require_stored_pod_image_contract(
                         )
 
 
+@_serialize_recovery_proof
 def portability_report(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, PORTABILITY_DERIVED_RECEIPTS)
     recovery_failed_receipt = root / "receipts/recovery-failed.json"
