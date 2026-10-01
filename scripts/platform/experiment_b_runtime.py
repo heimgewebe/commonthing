@@ -822,26 +822,126 @@ def _begin_release_attempt(
     return receipt_path, attempt_path, started_at_unix_ms
 
 
-def download(url: str, expected_sha256: str, destination: Path) -> None:
-    if destination.is_file() and sha256_file(destination) == expected_sha256:
-        return
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as handle:
-        tmp = Path(handle.name)
+def _sha256_fd(file_fd: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(file_fd, 1024 * 1024, offset)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
+def download(
+    url: str,
+    expected_sha256: str,
+    destination: Path,
+    *,
+    mode: int | None = None,
+) -> None:
+    if mode is not None and (
+        not isinstance(mode, int)
+        or isinstance(mode, bool)
+        or mode < 0
+        or mode > 0o777
+    ):
+        raise RuntimeErrorEB("download mode is invalid")
+    if not destination.name or destination.name in {".", ".."}:
+        raise RuntimeErrorEB("download destination is unsafe")
+
+    directory_fd = _open_directory_nofollow(
+        destination.parent,
+        create=True,
+        context="download directory",
+        require_owner=True,
+    )
+    temporary_name = f".{destination.name}.{secrets.token_hex(12)}.tmp"
+    temporary_fd: int | None = None
     try:
+        if _state_entry_exists_at(
+            directory_fd,
+            destination.name,
+            "download destination",
+        ):
+            existing_fd = _open_regular_state_file_at(
+                directory_fd,
+                destination.name,
+                "download destination",
+            )
+            try:
+                if _sha256_fd(existing_fd) == expected_sha256:
+                    if mode is not None:
+                        os.fchmod(existing_fd, mode)
+                    return
+            finally:
+                os.close(existing_fd)
+
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        cloexec = getattr(os, "O_CLOEXEC", None)
+        if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+            raise RuntimeErrorEB("download destination is unsafe")
+        try:
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            raise RuntimeErrorEB("download destination is unsafe") from exc
+        metadata = os.fstat(temporary_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise RuntimeErrorEB("download destination is unsafe")
+
         request = urllib.request.Request(
             url, headers={"User-Agent": "commonthing-experiment-b/1"}
         )
-        with urllib.request.urlopen(request, timeout=90) as response, tmp.open("wb") as out:
-            shutil.copyfileobj(response, out)
-        observed = sha256_file(tmp)
+        digest = hashlib.sha256()
+        with urllib.request.urlopen(request, timeout=90) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                view = memoryview(chunk)
+                offset = 0
+                while offset < len(view):
+                    written = os.write(temporary_fd, view[offset:])
+                    if written <= 0:
+                        raise RuntimeErrorEB("download write failed")
+                    offset += written
+        os.fsync(temporary_fd)
+        observed = digest.hexdigest()
         if observed != expected_sha256:
             raise RuntimeErrorEB(
                 f"download digest mismatch: expected {expected_sha256}, got {observed}"
             )
-        os.replace(tmp, destination)
+        os.fchmod(temporary_fd, mode if mode is not None else 0o600)
+        os.close(temporary_fd)
+        temporary_fd = None
+        try:
+            os.replace(
+                temporary_name,
+                destination.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            raise RuntimeErrorEB("download destination replacement failed") from exc
     finally:
-        tmp.unlink(missing_ok=True)
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(directory_fd)
 
 
 
@@ -1193,8 +1293,12 @@ def prepare(
 
     k3s = config["kubernetes"]
     k3s_binary = root / "downloads/k3s"
-    download(k3s["binary_url"], k3s["binary_sha256"], k3s_binary)
-    os.chmod(k3s_binary, 0o755)
+    download(
+        k3s["binary_url"],
+        k3s["binary_sha256"],
+        k3s_binary,
+        mode=0o755,
+    )
 
     cloud_dir = root / "cloud-init"
     cloud = contract.render_cloud_init(public_key, cloud_dir, VM_NAME)

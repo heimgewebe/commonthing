@@ -1029,6 +1029,86 @@ spec:
 
             self.assertEqual(sentinel.read_bytes(), b"sentinel-bytes")
 
+    def test_download_rejects_symlinked_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.mkdir()
+            (root / "downloads").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+            payload = b"download-payload"
+            source = parent / "source.bin"
+            source.write_bytes(payload)
+            destination = root / "downloads/payload.bin"
+
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "download directory is unsafe",
+            ):
+                runtime.download(
+                    source.as_uri(),
+                    hashlib.sha256(payload).hexdigest(),
+                    destination,
+                )
+
+            self.assertFalse((outside / destination.name).exists())
+
+    def test_prepare_rejects_symlinked_k3s_download_before_chmod(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            downloads = root / "downloads"
+            downloads.mkdir(parents=True)
+            cloud_payload = b"cloud-image"
+            (downloads / "cloud.qcow2").write_bytes(cloud_payload)
+            k3s_payload = b"k3s-binary"
+            sentinel = parent / "sentinel-k3s"
+            sentinel.write_bytes(k3s_payload)
+            sentinel.chmod(0o640)
+            (downloads / "k3s").symlink_to(sentinel)
+            config = {
+                "vm": {
+                    "image": {
+                        "url": "https://example.invalid/cloud.qcow2",
+                        "sha256": hashlib.sha256(cloud_payload).hexdigest(),
+                    }
+                },
+                "kubernetes": {
+                    "binary_url": "https://example.invalid/k3s",
+                    "binary_sha256": hashlib.sha256(k3s_payload).hexdigest(),
+                },
+            }
+            bound_contract = mock.Mock()
+            bound_contract.render_cloud_init.side_effect = runtime.RuntimeErrorEB(
+                "unexpected post-download execution"
+            )
+            public_key = root / "ssh/id_ed25519.pub"
+
+            with (
+                mock.patch.object(runtime, "load_config", return_value=config),
+                mock.patch.object(
+                    runtime,
+                    "_source_bound_contract",
+                    return_value=bound_contract,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "ensure_ssh_key",
+                    return_value=(root / "ssh/id_ed25519", public_key),
+                ),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "download destination is unsafe",
+                ),
+            ):
+                runtime.prepare.__wrapped__(root, "a" * 40)
+
+            self.assertEqual(sentinel.stat().st_mode & 0o777, 0o640)
+
     def test_ensure_ssh_key_rejects_symlinked_private_key_without_touching_target(
         self,
     ) -> None:
