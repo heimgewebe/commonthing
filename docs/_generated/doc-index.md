@@ -45,6 +45,7 @@ Generated automatically. Do not edit.
 | deploy.DRIFT_POLICY | Drift Policy | reference | active | docs/deploy/DRIFT_POLICY.md |
 | deploy.README | Deployment-Übersicht | reference | active | docs/deploy/README.md |
 | deploy.commonthing.naming | commonThing Naming Policy | reference | active | docs/deploy/commonthing.naming.md |
+| deploy.dev-entrypoints | Lokale Entwicklungs-Einstiegspunkte | reference | active | docs/deploy/dev-entrypoints.md |
 | deploy.domain-mail-migration-ionos-inwx-mailbox-brevo | Architektur & Historie: Domain-/Mail-Migration IONOS zu INWX | reference | active | docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md |
 | deploy.germany-basemap-rollout | Deutschlandweite PMTiles-Basemap ausrollen | runbook | active | docs/deploy/germany-basemap-rollout.md |
 | deploy.heim-first-phase0 | Heim-First Phase 0 | reference | deprecated | docs/deploy/heim-first-phase0.md |

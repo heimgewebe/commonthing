@@ -20,7 +20,9 @@ cp .env.example .env
 make up
 
 # 3. URLs prüfen (nur lokale Entwicklung)
-#    - Frontend: http://localhost:8081
+#    - Frontend/Hydration: http://localhost:5173
+#      (im Compose-Stack nicht für API-gestützte UI-/E2E-Nachweise)
+#    - Devproxy, kein UI-Einstieg: http://localhost:8081
 #    - API Live: http://localhost:8081/api/health/live
 #    - API Version: http://localhost:8081/api/version
 
@@ -33,10 +35,11 @@ make down
 
 ## Hinweise
 
-- In der lokalen Entwicklungsumgebung ist der primäre Einstiegspunkt der Proxy auf Port `8081`.
+- Port `8081` ist im Dev-Stack der Proxy-Einstieg für `/api/*` und `/basemap/*`, aber kein unterstützter Browser-/UI-Einstieg.
   (Im Heimserver-Produktionsbetrieb ist der Port 8081 reserviert und commonThing publiziert keinen eigenen Host-Port.)
-- Das Frontend (Port `5173`) wird automatisch vom Proxy bedient.
+- Das Frontend ist direkt auf Port `5173` exponiert. Im Compose-Stack zeigt Vites `/api`-Proxy jedoch auf `127.0.0.1:8080` im Webcontainer; deshalb ist `:5173` dort nur für Frontend-/Hydrationsnachweise geeignet, nicht für API-gestützte UI-/E2E-Flows.
 - Frontend nutzt `PUBLIC_API_BASE=/api` (siehe `apps/web/.env.development`).
+- Die kanonische Abgrenzung steht in `docs/deploy/dev-entrypoints.md`.
 - Compose-Profil `dev` schützt vor Verwechslungen mit späteren prod-Stacks.
 - `make smoke` triggert den GitHub-Workflow `compose-smoke` für einen E2E-Boot-Test.
 - CSP ist im Dev gelockert; für externe Tiles Domains ergänzen.
