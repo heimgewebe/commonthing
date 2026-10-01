@@ -14341,6 +14341,7 @@ def install(*args, **kwargs):
             "title": "Node 1",
             "created_at": "2026-10-01T00:00:00Z",
             "updated_at": "2026-10-01T00:00:00Z",
+            "search_visibility": "public",
             "location": {"lon": 10.0, "lat": 53.5},
         }
         valid_page = {
@@ -14359,8 +14360,10 @@ def install(*args, **kwargs):
                     200,
                     json.dumps(
                         {
-                            "items": [{"id": "search-hit"}],
-                            "generation_id": "generation-1",
+                            "items": [valid_node],
+                            "mode": "hybrid",
+                            "generation_id": "experiment-b-t048",
+                            "offset": 0,
                         }
                     ),
                     1,
@@ -14493,6 +14496,15 @@ def install(*args, **kwargs):
                     "_http_read",
                     side_effect=responses(nodes_body),
                 ),
+                mock.patch.object(
+                    runtime,
+                    "_source_commit_config",
+                    return_value={
+                        "semantic_search": {
+                            "generation_id": "experiment-b-t048"
+                        }
+                    },
+                ),
                 self.assertRaisesRegex(
                     runtime.RuntimeErrorEB,
                     "domain read failed through Gateway",
@@ -14520,6 +14532,15 @@ def install(*args, **kwargs):
                 "_http_read",
                 side_effect=responses(valid_body),
             ),
+            mock.patch.object(
+                runtime,
+                "_source_commit_config",
+                return_value={
+                    "semantic_search": {
+                        "generation_id": "experiment-b-t048"
+                    }
+                },
+            ),
         ):
             observed = runtime._gateway_data_plane_readback(
                 Path("/tmp"),
@@ -14535,6 +14556,156 @@ def install(*args, **kwargs):
             observed["checks"]["domain_nodes"]["has_more"],
             False,
         )
+
+    def test_gateway_data_plane_validates_search_response_contract(
+        self,
+    ) -> None:
+        source_commit = "a" * 40
+        expected_generation = "experiment-b-t048"
+        valid_node = {
+            "id": "node-1",
+            "kind": "knoten",
+            "title": "Node 1",
+            "created_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-01T00:00:00Z",
+            "search_visibility": "public",
+            "location": {"lon": 10.0, "lat": 53.5},
+        }
+        valid_domain_body = json.dumps(
+            {
+                "items": [valid_node],
+                "page": {
+                    "limit": 1,
+                    "has_more": False,
+                    "next_cursor": None,
+                },
+            }
+        )
+
+        def responses(search_body: str):
+            return [
+                (200, "<html>ok</html>", 1),
+                (200, json.dumps({"commit": source_commit}), 1),
+                (200, json.dumps({"status": "ok"}), 1),
+                (200, valid_domain_body, 1),
+                (200, search_body, 1),
+                (
+                    200,
+                    json.dumps(
+                        {
+                            "authenticated": False,
+                            "role": "gast",
+                        }
+                    ),
+                    1,
+                ),
+            ]
+
+        valid_search = {
+            "items": [valid_node],
+            "mode": "hybrid",
+            "generation_id": expected_generation,
+            "offset": 0,
+        }
+        invalid_cases = (
+            (
+                "wrong-generation",
+                {
+                    **valid_search,
+                    "generation_id": "unexpected-generation",
+                },
+            ),
+            (
+                "missing-mode",
+                {
+                    key: value
+                    for key, value in valid_search.items()
+                    if key != "mode"
+                },
+            ),
+            (
+                "malformed-item",
+                {
+                    **valid_search,
+                    "items": [{"id": "search-hit"}],
+                },
+            ),
+            (
+                "missing-search-visibility",
+                {
+                    **valid_search,
+                    "items": [
+                        {
+                            key: value
+                            for key, value in valid_node.items()
+                            if key != "search_visibility"
+                        }
+                    ],
+                },
+            ),
+        )
+        for case, search_payload in invalid_cases:
+            with (
+                self.subTest(case=case),
+                mock.patch.object(
+                    runtime,
+                    "_gateway_base_url",
+                    return_value="http://192.0.2.23",
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_http_read",
+                    side_effect=responses(json.dumps(search_payload)),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_source_commit_config",
+                    return_value={
+                        "semantic_search": {
+                            "generation_id": expected_generation
+                        }
+                    },
+                ),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "search failed through Gateway",
+                ),
+            ):
+                runtime._gateway_data_plane_readback(
+                    Path("/tmp"),
+                    source_commit,
+                )
+
+        with (
+            mock.patch.object(
+                runtime,
+                "_gateway_base_url",
+                return_value="http://192.0.2.23",
+            ),
+            mock.patch.object(
+                runtime,
+                "_http_read",
+                side_effect=responses(json.dumps(valid_search)),
+            ),
+            mock.patch.object(
+                runtime,
+                "_source_commit_config",
+                return_value={
+                    "semantic_search": {
+                        "generation_id": expected_generation
+                    }
+                },
+            ),
+        ):
+            observed = runtime._gateway_data_plane_readback(
+                Path("/tmp"),
+                source_commit,
+            )
+        self.assertEqual(
+            observed["checks"]["search"]["generation_id"],
+            expected_generation,
+        )
+        self.assertEqual(observed["checks"]["search"]["items"], 1)
 
     def test_functional_readback_rejects_serving_runtime_drift(
         self,

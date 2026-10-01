@@ -13621,17 +13621,134 @@ def _gateway_data_plane_readback(
     ):
         raise RuntimeErrorEB("Experiment-B domain read failed through Gateway")
 
+    source_config = _source_commit_config(source_commit)
+    semantic_search = (
+        source_config.get("semantic_search")
+        if isinstance(source_config, dict)
+        else None
+    )
+    expected_generation_id = (
+        semantic_search.get("generation_id")
+        if isinstance(semantic_search, dict)
+        else None
+    )
+    if (
+        not isinstance(expected_generation_id, str)
+        or not expected_generation_id
+    ):
+        raise RuntimeErrorEB(
+            "Experiment-B search generation source binding is invalid"
+        )
+
     query = urllib.parse.urlencode({"q": "scale", "limit": 5})
     status_code, body, elapsed = _http_read(base + "/api/search?" + query)
-    search = json.loads(body) if status_code == 200 else {}
+    try:
+        search = (
+            json.loads(
+                body,
+                parse_constant=_reject_nonstandard_json_constant,
+            )
+            if status_code == 200
+            else {}
+        )
+    except (TypeError, ValueError):
+        search = {}
     items = search.get("items") if isinstance(search, dict) else None
+    search_mode = search.get("mode") if isinstance(search, dict) else None
+    generation_id = (
+        search.get("generation_id")
+        if isinstance(search, dict)
+        else None
+    )
+    search_offset = (
+        search.get("offset")
+        if isinstance(search, dict)
+        else None
+    )
+
+    def search_item_contract_valid(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        location = item.get("location")
+        if not isinstance(location, dict):
+            return False
+        longitude = location.get("lon")
+        latitude = location.get("lat")
+        if (
+            not isinstance(longitude, (int, float))
+            or isinstance(longitude, bool)
+            or not math.isfinite(float(longitude))
+            or not -180.0 <= float(longitude) <= 180.0
+            or not isinstance(latitude, (int, float))
+            or isinstance(latitude, bool)
+            or not math.isfinite(float(latitude))
+            or not -90.0 <= float(latitude) <= 90.0
+        ):
+            return False
+        if item.get("search_visibility") != "public":
+            return False
+        tags = item.get("tags")
+        if tags is not None and (
+            not isinstance(tags, list)
+            or not all(isinstance(tag, str) for tag in tags)
+        ):
+            return False
+        for optional_field in (
+            "created_by_account_id",
+            "summary",
+            "info",
+            "address",
+        ):
+            optional_value = item.get(optional_field)
+            if optional_value is not None and not isinstance(
+                optional_value,
+                str,
+            ):
+                return False
+        return all(
+            isinstance(item.get(field), str) and bool(item[field])
+            for field in (
+                "id",
+                "kind",
+                "title",
+                "created_at",
+                "updated_at",
+            )
+        )
+
+    fallback_reason = (
+        search.get("fallback_reason")
+        if isinstance(search, dict)
+        else None
+    )
+    fallback_contract_valid = (
+        (search_mode == "hybrid" and fallback_reason is None)
+        or (
+            search_mode == "lexical_fallback"
+            and isinstance(fallback_reason, str)
+            and bool(fallback_reason)
+        )
+    )
+    search_contract_valid = (
+        isinstance(search, dict)
+        and isinstance(items, list)
+        and 0 < len(items) <= 5
+        and search_mode in {"hybrid", "lexical_fallback"}
+        and fallback_contract_valid
+        and generation_id == expected_generation_id
+        and type(search_offset) is int
+        and search_offset == 0
+        and all(search_item_contract_valid(item) for item in items)
+    )
     checks["search"] = {
         "status": status_code,
         "elapsed_ms": elapsed,
-        "generation_id": search.get("generation_id") if isinstance(search, dict) else None,
+        "generation_id": generation_id,
+        "mode": search_mode,
+        "offset": search_offset,
         "items": len(items) if isinstance(items, list) else None,
     }
-    if status_code != 200 or not isinstance(items, list) or not items:
+    if status_code != 200 or not search_contract_valid:
         raise RuntimeErrorEB("Experiment-B search failed through Gateway")
 
     status_code, body, elapsed = _http_read(base + "/api/auth/me")
