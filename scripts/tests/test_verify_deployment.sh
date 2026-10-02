@@ -61,6 +61,12 @@ if [[ "$1" == "ps" ]]; then
   else
     echo ""
   fi
+elif [[ "$1" == "image" && "${2:-}" == "inspect" ]]; then
+    if [[ "$ARGS" == *"{{json .Config.Labels}}"* ]]; then
+        source_commit="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["source_commit"])' "$REPO_DIR/infra/schauwerk-editor/release-lock.json")"
+        printf '{"org.opencontainers.image.revision":"%s","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\n' "$source_commit"
+    fi
+    exit 0
 elif [[ "$1" == "rm" ]]; then
     if [[ "$ARGS" == *"-f"* ]]; then
         echo "Mocked remove: $ARGS"
@@ -71,6 +77,11 @@ elif [[ "$1" == "inspect" ]]; then
     # Schaubild postflight: the live container runs exactly the image weltgewebe-up bound.
     if [[ "$ARGS" == *"{{.Config.Image}}"* && "$ARGS" == *"schaubild_container_id"* ]]; then
         echo "${SCHAUWERK_SCHAUBILD_IMAGE:-}"
+        exit 0
+    fi
+    if [[ "$ARGS" == *"{{json .Config.Labels}}"* && "$ARGS" == *"schaubild_container_id"* ]]; then
+        source_commit="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["source_commit"])' "$REPO_DIR/infra/schauwerk-editor/release-lock.json")"
+        printf '{"org.opencontainers.image.revision":"%s","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\n' "$source_commit"
         exit 0
     fi
     # Deferred zombie purge binds the immutable Docker container ID before any later effect.
