@@ -9001,6 +9001,46 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.assertIn("gateway", arguments)
         return self.gateway
 
+    def test_pool_target_create_establishes_intended_mode_under_restrictive_umask(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pool_target = Path(tmp) / "experiment-b-pool"
+            previous_umask = runtime.os.umask(0o077)
+            try:
+                with mock.patch.object(runtime, "POOL_TARGET", pool_target):
+                    pool_fd = runtime._open_libvirt_pool_target(create=True)
+                    try:
+                        self.assertEqual(pool_target.stat().st_mode & 0o777, 0o755)
+                    finally:
+                        runtime.os.close(pool_fd)
+            finally:
+                runtime.os.umask(previous_umask)
+
+
+    def test_pool_target_create_rejects_nonempty_existing_target_without_widening_mode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pool_target = Path(tmp) / "experiment-b-pool"
+            pool_target.mkdir(mode=0o700)
+            (pool_target / "unexpected").write_text("sentinel", encoding="utf-8")
+            pool_target.chmod(0o700)
+
+            with mock.patch.object(runtime, "POOL_TARGET", pool_target):
+                with self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "libvirt pool target already contains files",
+                ):
+                    runtime._open_libvirt_pool_target(create=True)
+
+            self.assertEqual(pool_target.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(
+                (pool_target / "unexpected").read_text(encoding="utf-8"),
+                "sentinel",
+            )
+
+
     def test_create_vm_rejects_symlinked_pool_target_before_libvirt_mutation(
         self,
     ) -> None:
