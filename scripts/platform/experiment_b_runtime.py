@@ -391,6 +391,22 @@ def _open_libvirt_pool_target(*, create: bool) -> int:
             or metadata.st_uid != os.getuid()
         ):
             raise RuntimeErrorEB("libvirt pool target is unsafe")
+        if create:
+            if os.listdir(pool_fd):
+                raise RuntimeErrorEB(
+                    "Experiment-B libvirt pool target already contains files"
+                )
+            try:
+                os.fchmod(pool_fd, 0o755)
+            except OSError as exc:
+                raise RuntimeErrorEB("libvirt pool target is unsafe") from exc
+            metadata = os.fstat(pool_fd)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o755
+            ):
+                raise RuntimeErrorEB("libvirt pool target is unsafe")
         result = pool_fd
         pool_fd = None
         return result
