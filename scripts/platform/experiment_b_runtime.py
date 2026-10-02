@@ -12058,8 +12058,92 @@ def _require_postgres_runtime_binding(
             "PostgreSQL runtime binding has no exact containerID"
         )
 
+    live_pod_items = _kubectl_json(
+        root,
+        ["-n", DATA_NAMESPACE, "get", "pods"],
+    ).get("items")
+    if not isinstance(live_pod_items, list) or any(
+        not isinstance(item, dict) for item in live_pod_items
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL runtime Pod identity inventory is invalid"
+        )
+    matching_live_pods = [
+        item
+        for item in live_pod_items
+        if item.get("metadata", {}).get("name") == pod_name
+    ]
+    if len(matching_live_pods) != 1:
+        raise RuntimeErrorEB(
+            "PostgreSQL runtime Pod identity is not unique"
+        )
+    live_pod = matching_live_pods[0]
+    live_metadata = live_pod.get("metadata")
+    live_status = live_pod.get("status")
+    pod_uid = (
+        live_metadata.get("uid")
+        if isinstance(live_metadata, dict)
+        else None
+    )
+    pod_ip = (
+        live_status.get("podIP")
+        if isinstance(live_status, dict)
+        else None
+    )
+    try:
+        normalized_pod_ip = (
+            str(ipaddress.ip_address(pod_ip))
+            if isinstance(pod_ip, str)
+            else None
+        )
+    except ValueError:
+        normalized_pod_ip = None
+    ready = (
+        any(
+            isinstance(condition, dict)
+            and condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in live_status.get("conditions", [])
+        )
+        if isinstance(live_status, dict)
+        else False
+    )
+    live_statuses = (
+        live_status.get("containerStatuses")
+        if isinstance(live_status, dict)
+        else None
+    )
+    postgres_statuses = (
+        [
+            item
+            for item in live_statuses
+            if isinstance(item, dict)
+            and item.get("name") == "postgres"
+        ]
+        if isinstance(live_statuses, list)
+        else []
+    )
+    if (
+        not isinstance(live_metadata, dict)
+        or live_metadata.get("namespace") != DATA_NAMESPACE
+        or live_metadata.get("deletionTimestamp") is not None
+        or not isinstance(pod_uid, str)
+        or not pod_uid
+        or normalized_pod_ip is None
+        or not isinstance(live_status, dict)
+        or live_status.get("phase") != "Running"
+        or not ready
+        or len(postgres_statuses) != 1
+        or postgres_statuses[0].get("containerID") != container_id
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL runtime Pod identity changed during binding"
+        )
+
     return {
         "pod_name": pod_name,
+        "pod_uid": pod_uid,
+        "pod_ip": normalized_pod_ip,
         "container_id": container_id,
         "images_sha256": postgres["images_sha256"],
         "resources_sha256": _stable_json_sha256(
@@ -12188,6 +12272,337 @@ def _require_t048_postgres_runtime_binding(
         root,
         source_commit,
     )
+
+
+def _require_t048_postgres_service_binding(
+    root: Path,
+    source_commit: str,
+    postgres_binding: dict[str, Any],
+) -> dict[str, Any]:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB(
+            "PostgreSQL Service binding requires exact source commit"
+        )
+    if not isinstance(postgres_binding, dict):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service binding requires runtime Pod identity"
+        )
+    pod_name = postgres_binding.get("pod_name")
+    pod_uid = postgres_binding.get("pod_uid")
+    pod_ip = postgres_binding.get("pod_ip")
+    if (
+        not isinstance(pod_name, str)
+        or not pod_name
+        or not isinstance(pod_uid, str)
+        or not pod_uid
+        or not isinstance(pod_ip, str)
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service binding requires complete Pod identity"
+        )
+    try:
+        normalized_pod_ip = str(ipaddress.ip_address(pod_ip))
+    except ValueError as exc:
+        raise RuntimeErrorEB(
+            "PostgreSQL Service binding Pod address is invalid"
+        ) from exc
+
+    expected = _source_commit_data_service_contract(
+        source_commit,
+        CLUSTER / "data/postgres.yaml",
+        "postgres",
+    )
+    service = _kubectl_json(
+        root,
+        ["-n", DATA_NAMESPACE, "get", "service", "postgres"],
+    )
+    metadata = (
+        service.get("metadata", {})
+        if isinstance(service, dict)
+        else {}
+    )
+    service_uid = (
+        metadata.get("uid")
+        if isinstance(metadata, dict)
+        else None
+    )
+    service_resource_version = (
+        metadata.get("resourceVersion")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != "postgres"
+        or metadata.get("namespace") != DATA_NAMESPACE
+        or metadata.get("deletionTimestamp") is not None
+        or not isinstance(service_uid, str)
+        or not service_uid
+        or not isinstance(service_resource_version, str)
+        or not service_resource_version
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service identity drifted"
+        )
+    observed_spec = _service_spec_projection(
+        service,
+        "T048 PostgreSQL Service",
+    )
+    if observed_spec != expected["spec"]:
+        raise RuntimeErrorEB(
+            "PostgreSQL Service spec drifted from source commit"
+        )
+    service_ports = expected["spec"].get("ports")
+    if (
+        not isinstance(service_ports, list)
+        or len(service_ports) != 1
+        or not isinstance(service_ports[0], dict)
+        or service_ports[0].get("name") != "postgres"
+        or service_ports[0].get("protocol") != "TCP"
+        or not isinstance(service_ports[0].get("port"), int)
+        or isinstance(service_ports[0].get("port"), bool)
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service port contract is invalid"
+        )
+    expected_port = int(service_ports[0]["port"])
+
+    slices = _kubectl_json(
+        root,
+        [
+            "-n",
+            DATA_NAMESPACE,
+            "get",
+            "endpointslices.discovery.k8s.io",
+            "-l",
+            "kubernetes.io/service-name=postgres",
+        ],
+    )
+    items = slices.get("items") if isinstance(slices, dict) else None
+    list_metadata = (
+        slices.get("metadata")
+        if isinstance(slices, dict)
+        else None
+    )
+    endpoint_list_resource_version = (
+        list_metadata.get("resourceVersion")
+        if isinstance(list_metadata, dict)
+        else None
+    )
+    if (
+        not isinstance(endpoint_list_resource_version, str)
+        or not endpoint_list_resource_version
+        or not isinstance(items, list)
+        or len(items) != 1
+        or not isinstance(items[0], dict)
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service EndpointSlice inventory is invalid"
+        )
+    item = items[0]
+    slice_metadata = item.get("metadata")
+    slice_uid = (
+        slice_metadata.get("uid")
+        if isinstance(slice_metadata, dict)
+        else None
+    )
+    labels = (
+        slice_metadata.get("labels")
+        if isinstance(slice_metadata, dict)
+        else None
+    )
+    ports = item.get("ports")
+    endpoints = item.get("endpoints")
+    if (
+        not isinstance(slice_metadata, dict)
+        or slice_metadata.get("namespace") != DATA_NAMESPACE
+        or slice_metadata.get("deletionTimestamp") is not None
+        or not isinstance(slice_uid, str)
+        or not slice_uid
+        or not isinstance(labels, dict)
+        or labels.get("kubernetes.io/service-name") != "postgres"
+        or item.get("addressType") not in {"IPv4", "IPv6"}
+        or not isinstance(ports, list)
+        or len(ports) != 1
+        or not isinstance(ports[0], dict)
+        or ports[0].get("name") != "postgres"
+        or ports[0].get("protocol") != "TCP"
+        or ports[0].get("port") != expected_port
+        or not isinstance(endpoints, list)
+        or len(endpoints) != 1
+        or not isinstance(endpoints[0], dict)
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service EndpointSlice contract is invalid"
+        )
+    endpoint = endpoints[0]
+    conditions = endpoint.get("conditions")
+    target_ref = endpoint.get("targetRef")
+    addresses = endpoint.get("addresses")
+    if (
+        not isinstance(conditions, dict)
+        or conditions.get("ready") is not True
+        or conditions.get("terminating") is True
+        or conditions.get("serving") is False
+        or not isinstance(target_ref, dict)
+        or target_ref.get("kind") != "Pod"
+        or target_ref.get("namespace") != DATA_NAMESPACE
+        or target_ref.get("name") != pod_name
+        or target_ref.get("uid") != pod_uid
+        or not isinstance(addresses, list)
+        or len(addresses) != 1
+        or not isinstance(addresses[0], str)
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service endpoint target drifted"
+        )
+    try:
+        observed_address = str(ipaddress.ip_address(addresses[0]))
+    except ValueError as exc:
+        raise RuntimeErrorEB(
+            "PostgreSQL Service endpoint address is invalid"
+        ) from exc
+    expected_address_type = (
+        "IPv4"
+        if ipaddress.ip_address(normalized_pod_ip).version == 4
+        else "IPv6"
+    )
+    if (
+        item.get("addressType") != expected_address_type
+        or observed_address != normalized_pod_ip
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service endpoint address drifted"
+        )
+    endpoint_projection = {
+        "pod_name": pod_name,
+        "pod_uid": pod_uid,
+        "address": observed_address,
+        "port": expected_port,
+        "protocol": "TCP",
+    }
+    return {
+        "service_uid": service_uid,
+        "service_resource_version": service_resource_version,
+        "endpoint_list_resource_version": endpoint_list_resource_version,
+        "endpoint_slice_uid": slice_uid,
+        "pod_name": pod_name,
+        "pod_uid": pod_uid,
+        "pod_ip": normalized_pod_ip,
+        "service_spec_sha256": expected["spec_sha256"],
+        "endpoint_sha256": _stable_json_sha256(
+            endpoint_projection
+        ),
+    }
+
+
+def _t048_postgres_service_semantic_binding(
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(binding, dict):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service semantic binding is invalid"
+        )
+    normalized = json.loads(json.dumps(binding))
+    normalized.pop("service_resource_version", None)
+    normalized.pop("endpoint_list_resource_version", None)
+    return normalized
+
+
+@contextmanager
+def _guard_t048_postgres_service_endpoints(
+    root: Path,
+    binding: dict[str, Any],
+) -> Iterator[None]:
+    if not isinstance(binding, dict):
+        raise RuntimeErrorEB(
+            "PostgreSQL serving dependency binding is invalid"
+        )
+    service_resource_version = binding.get(
+        "service_resource_version"
+    )
+    endpoint_list_resource_version = binding.get(
+        "endpoint_list_resource_version"
+    )
+    if (
+        not isinstance(service_resource_version, str)
+        or not service_resource_version
+        or not isinstance(endpoint_list_resource_version, str)
+        or not endpoint_list_resource_version
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL serving dependency binding has no resourceVersion"
+        )
+
+    namespace_path = urllib.parse.quote(DATA_NAMESPACE, safe="")
+    dependencies = (
+        (
+            service_resource_version,
+            "fieldSelector",
+            "metadata.name=postgres",
+            f"/api/v1/namespaces/{namespace_path}/services",
+        ),
+        (
+            endpoint_list_resource_version,
+            "labelSelector",
+            "kubernetes.io/service-name=postgres",
+            (
+                f"/apis/discovery.k8s.io/v1/namespaces/"
+                f"{namespace_path}/endpointslices"
+            ),
+        ),
+    )
+
+    yield
+
+    kubectl = toolchain(root)["tools"]["kubectl"]
+    for (
+        resource_version,
+        selector_name,
+        selector_value,
+        collection_path,
+    ) in dependencies:
+        watch_query = urllib.parse.urlencode(
+            {
+                "watch": "1",
+                "resourceVersion": resource_version,
+                "allowWatchBookmarks": "true",
+                "timeoutSeconds": "2",
+                selector_name: selector_value,
+            }
+        )
+        result = run(
+            [
+                kubectl,
+                "get",
+                "--raw",
+                f"{collection_path}?{watch_query}",
+            ],
+            env=kube_env(root),
+            timeout=10,
+        )
+        for raw_event in (result.stdout or "").splitlines():
+            if not raw_event.strip():
+                continue
+            try:
+                event = json.loads(raw_event)
+            except json.JSONDecodeError as exc:
+                raise RuntimeErrorEB(
+                    "PostgreSQL serving dependency replay is invalid"
+                ) from exc
+            if (
+                not isinstance(event, dict)
+                or not isinstance(event.get("type"), str)
+                or not isinstance(event.get("object"), dict)
+            ):
+                raise RuntimeErrorEB(
+                    "PostgreSQL serving dependency replay event is invalid"
+                )
+            if event["type"] != "BOOKMARK":
+                raise RuntimeErrorEB(
+                    "PostgreSQL serving dependency changed during T048 load"
+                )
+
 
 def _parse_cpu_quantity(value: str) -> float:
     if value.endswith("m"):
@@ -12401,6 +12816,7 @@ def _sample_t048_load(
     source_commit: str,
     pod_name: str,
     postgres_binding: dict[str, Any],
+    postgres_service_binding: dict[str, Any],
     database_identity: tuple[str, str],
     load: subprocess.Popen[Any],
     resource_samples: list[dict[str, Any]],
@@ -12413,6 +12829,27 @@ def _sample_t048_load(
         or timeout_seconds <= 0
     ):
         raise RuntimeErrorEB("canonical T048 k6 workload timeout is invalid")
+    if (
+        not isinstance(postgres_service_binding, dict)
+        or not postgres_service_binding
+    ):
+        raise RuntimeErrorEB(
+            "canonical T048 PostgreSQL Service binding is invalid"
+        )
+    current_service_binding = _require_t048_postgres_service_binding(
+        root,
+        source_commit,
+        postgres_binding,
+    )
+    if (
+        _t048_postgres_service_semantic_binding(current_service_binding)
+        != _t048_postgres_service_semantic_binding(
+            postgres_service_binding
+        )
+    ):
+        raise RuntimeErrorEB(
+            "PostgreSQL Service endpoint binding changed during T048 load"
+        )
     deadline = time.monotonic() + timeout_seconds
     try:
         while load.poll() is None:
@@ -12421,6 +12858,20 @@ def _sample_t048_load(
                     "canonical T048 k6 workload exceeded bounded runtime"
                 )
             time.sleep(1)
+            current_service_binding = _require_t048_postgres_service_binding(
+                root,
+                source_commit,
+                postgres_binding,
+            )
+            if (
+                _t048_postgres_service_semantic_binding(current_service_binding)
+                != _t048_postgres_service_semantic_binding(
+                    postgres_service_binding
+                )
+            ):
+                raise RuntimeErrorEB(
+                    "PostgreSQL Service endpoint binding changed during T048 load"
+                )
             resource_samples.append(_sample_api_cgroup(root, pod_name))
             db_samples.append(
                 _database_connection_count(
@@ -12429,6 +12880,20 @@ def _sample_t048_load(
                     postgres_binding,
                     database_identity,
                 )
+            )
+        current_service_binding = _require_t048_postgres_service_binding(
+            root,
+            source_commit,
+            postgres_binding,
+        )
+        if (
+            _t048_postgres_service_semantic_binding(current_service_binding)
+            != _t048_postgres_service_semantic_binding(
+                postgres_service_binding
+            )
+        ):
+            raise RuntimeErrorEB(
+                "PostgreSQL Service endpoint binding changed during T048 load"
             )
         if load.returncode is None:
             raise RuntimeErrorEB("canonical T048 k6 workload has no terminal return code")
@@ -12460,6 +12925,13 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         postgres_binding_before = _require_t048_postgres_runtime_binding(
             root,
             source_commit,
+        )
+        postgres_service_binding_before = (
+            _require_t048_postgres_service_binding(
+                root,
+                source_commit,
+                postgres_binding_before,
+            )
         )
         database_identity = _database_client_identity(root)
         fixture_receipt = _validated_t048_fixture_receipt(root, source_commit)
@@ -12554,6 +13026,12 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             postgres_binding_before,
             database_identity,
         )]
+        bound_stack.enter_context(
+            _guard_t048_postgres_service_endpoints(
+                root,
+                postgres_service_binding_before,
+            )
+        )
         sampler_started = time.time_ns() // 1_000_000
         k6_summary_snapshot_fd: int | None = None
         with _open_performance_text_output(root, "k6.stderr") as err:
@@ -12578,6 +13056,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
                 source_commit,
                 pod_name,
                 postgres_binding_before,
+                postgres_service_binding_before,
                 database_identity,
                 load,
                 resource_samples,
@@ -12611,6 +13090,13 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             root,
             source_commit,
         )
+        postgres_service_binding_after = (
+            _require_t048_postgres_service_binding(
+                root,
+                source_commit,
+                postgres_binding_after,
+            )
+        )
         (
             target_receipt_after,
             target_ip_after,
@@ -12640,6 +13126,17 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         ):
             raise RuntimeErrorEB(
                 "PostgreSQL runtime contract changed during the T048 measurement"
+            )
+        if (
+            _t048_postgres_service_semantic_binding(
+                postgres_service_binding_after
+            )
+            != _t048_postgres_service_semantic_binding(
+                postgres_service_binding_before
+            )
+        ):
+            raise RuntimeErrorEB(
+                "PostgreSQL Service endpoint binding changed during the T048 measurement"
             )
         if target_binding_after != target_binding_before:
             raise RuntimeErrorEB(
@@ -12825,6 +13322,9 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "postgres_pod_contract_sha256": postgres_binding_before[
                 "pod_contract_sha256"
             ],
+            "postgres_service_binding_sha256": _stable_json_sha256(
+                postgres_service_binding_before
+            ),
             "kubernetes_target_sha256": _stable_json_sha256(
                 target_binding_before
             ),

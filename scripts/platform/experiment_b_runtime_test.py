@@ -2954,6 +2954,15 @@ spec:
                 ),
                 mock.patch.object(
                     runtime,
+                    "_require_t048_postgres_service_binding",
+                    return_value={
+                        "canonical": True,
+                        "service_resource_version": "101",
+                        "endpoint_list_resource_version": "202",
+                    },
+                ),
+                mock.patch.object(
+                    runtime,
                     "seed_t048_fixture",
                     side_effect=runtime.RuntimeErrorEB("fixture failed"),
                 ),
@@ -2998,8 +3007,14 @@ spec:
         load.wait.return_value = -15
         resource_samples = [{"sample": "initial"}]
         db_samples = [1]
+        service_binding = {"canonical": True}
         with (
             mock.patch.object(runtime.time, "sleep"),
+            mock.patch.object(
+                runtime,
+                "_require_t048_postgres_service_binding",
+                return_value=service_binding,
+            ),
             mock.patch.object(
                 runtime,
                 "_sample_api_cgroup",
@@ -3017,6 +3032,7 @@ spec:
                         "pod_contract_sha256": "d" * 64,
                         "runtime_image_ids_sha256": "e" * 64,
                     },
+                    service_binding,
                     ("proof_user", "proof_database"),
                     load,
                     resource_samples,
@@ -3033,8 +3049,14 @@ spec:
         load.wait.return_value = -15
         resource_samples = [{"sample": "initial"}]
         db_samples = [1]
+        service_binding = {"canonical": True}
         with (
             mock.patch.object(runtime.time, "sleep"),
+            mock.patch.object(
+                runtime,
+                "_require_t048_postgres_service_binding",
+                return_value=service_binding,
+            ),
             mock.patch.object(
                 runtime.time,
                 "monotonic",
@@ -3055,6 +3077,7 @@ spec:
                         "pod_contract_sha256": "d" * 64,
                         "runtime_image_ids_sha256": "e" * 64,
                     },
+                    service_binding,
                     ("proof_user", "proof_database"),
                     load,
                     resource_samples,
@@ -3064,6 +3087,123 @@ spec:
         load.terminate.assert_called_once_with()
         load.wait.assert_called_once_with(timeout=10)
         load.kill.assert_not_called()
+
+    def test_t048_sampler_rejects_postgres_service_endpoint_drift_during_load(self) -> None:
+        load = mock.Mock()
+        load.poll.side_effect = [None, None]
+        load.wait.return_value = -15
+        resource_samples = [{"sample": "initial"}]
+        db_samples = [1]
+        postgres_binding = {
+            "pod_name": "postgres-0",
+            "pod_uid": "postgres-pod-uid",
+            "pod_ip": "10.42.1.10",
+            "container_id": "containerd://" + "b" * 64,
+            "contract_sha256": "c" * 64,
+            "pod_contract_sha256": "d" * 64,
+            "runtime_image_ids_sha256": "e" * 64,
+        }
+        canonical = {
+            "service_uid": "postgres-service-uid",
+            "pod_name": "postgres-0",
+            "pod_uid": "postgres-pod-uid",
+            "pod_ip": "10.42.1.10",
+            "service_spec_sha256": "f" * 64,
+            "endpoint_sha256": "1" * 64,
+        }
+        with (
+            mock.patch.object(runtime.time, "sleep"),
+            mock.patch.object(
+                runtime,
+                "_sample_api_cgroup",
+                return_value={"sample": "next"},
+            ),
+            mock.patch.object(
+                runtime,
+                "_database_connection_count",
+                return_value=1,
+            ),
+            mock.patch.object(
+                runtime,
+                "_require_t048_postgres_service_binding",
+                create=True,
+                side_effect=[
+                    canonical,
+                    runtime.RuntimeErrorEB(
+                        "PostgreSQL Service endpoint target drifted"
+                    ),
+                ],
+            ) as service_binding,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "PostgreSQL Service endpoint target drifted",
+            ),
+        ):
+            runtime._sample_t048_load(
+                Path("/tmp"),
+                "a" * 40,
+                "api-pod",
+                postgres_binding,
+                canonical,
+                ("proof_user", "proof_database"),
+                load,
+                resource_samples,
+                db_samples,
+                30,
+            )
+
+        self.assertGreaterEqual(service_binding.call_count, 2)
+        load.terminate.assert_called_once_with()
+        load.wait.assert_called_once_with(timeout=10)
+        load.kill.assert_not_called()
+
+    def test_t048_postgres_service_guard_rejects_transient_dependency_changes(
+        self,
+    ) -> None:
+        binding = {
+            "service_resource_version": "101",
+            "endpoint_list_resource_version": "202",
+        }
+        changed = json.dumps(
+            {
+                "type": "MODIFIED",
+                "object": {"metadata": {"resourceVersion": "303"}},
+            }
+        )
+        calls: list[list[str]] = []
+
+        def watched(
+            argv: list[str],
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(argv)
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=changed + "\n",
+                stderr="",
+            )
+
+        with (
+            mock.patch.object(
+                runtime,
+                "toolchain",
+                return_value={"tools": {"kubectl": "/kubectl"}},
+            ),
+            mock.patch.object(runtime, "kube_env", return_value={}),
+            mock.patch.object(runtime, "run", side_effect=watched),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "PostgreSQL serving dependency changed during T048 load",
+            ),
+        ):
+            with runtime._guard_t048_postgres_service_endpoints(
+                Path("/tmp"),
+                binding,
+            ):
+                pass
+
+        self.assertEqual(len(calls), 1)
 
     def test_k6_summary_output_channel_is_pathless_and_sealed(self) -> None:
         canonical = {"canonical": True}
@@ -4936,6 +5076,15 @@ spec:
                     return_value={
                         "images_sha256": "2" * 64,
                         "runtime_image_ids_sha256": "3" * 64,
+                    },
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_require_t048_postgres_service_binding",
+                    return_value={
+                        "canonical": True,
+                        "service_resource_version": "101",
+                        "endpoint_list_resource_version": "202",
                     },
                 ),
                 mock.patch.object(
@@ -7287,6 +7436,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "metadata": {
                     "name": f"{workload}-{ordinal}",
                     "namespace": namespace,
+                    "uid": f"{namespace}-{workload}-{ordinal}-uid",
                     "labels": json.loads(json.dumps(labels)),
                 },
                 "spec": {
@@ -7301,6 +7451,10 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 },
                 "status": {
                     "phase": "Running",
+                    "podIP": (
+                        f"10.42.{(sum(workload.encode('utf-8')) % 200) + 1}."
+                        f"{ordinal + 10}"
+                    ),
                     "conditions": [{"type": "Ready", "status": "True"}],
                     "containerStatuses": [
                         {
@@ -7464,12 +7618,60 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "metadata": {
                     "name": name,
                     "namespace": runtime.DATA_NAMESPACE,
+                    "uid": f"{name}-service-uid",
+                    "resourceVersion": (
+                        "101" if name == "postgres" else "102"
+                    ),
                 },
                 "spec": json.loads(
                     json.dumps(expected_service["spec"])
                 ),
             }
 
+        postgres_pod = self.data_pods["postgres"][0]
+        self.data_endpoint_slices = {
+            "postgres": {
+                "metadata": {"resourceVersion": "202"},
+                "items": [
+                    {
+                        "metadata": {
+                            "name": "postgres-slice",
+                            "namespace": runtime.DATA_NAMESPACE,
+                            "uid": "postgres-slice-uid",
+                            "labels": {
+                                "kubernetes.io/service-name": "postgres"
+                            },
+                        },
+                        "addressType": "IPv4",
+                        "ports": [
+                            {
+                                "name": "postgres",
+                                "protocol": "TCP",
+                                "port": 5432,
+                            }
+                        ],
+                        "endpoints": [
+                            {
+                                "conditions": {
+                                    "ready": True,
+                                    "serving": True,
+                                    "terminating": False,
+                                },
+                                "targetRef": {
+                                    "kind": "Pod",
+                                    "namespace": runtime.DATA_NAMESPACE,
+                                    "name": postgres_pod["metadata"]["name"],
+                                    "uid": postgres_pod["metadata"]["uid"],
+                                },
+                                "addresses": [
+                                    postgres_pod["status"]["podIP"]
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
 
         self.application_service_expected = {}
         self.application_services = {}
@@ -8646,6 +8848,15 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             and arguments[-1] in self.data_services
         ):
             return self.data_services[str(arguments[-1])]
+        if arguments == [
+            "-n",
+            runtime.DATA_NAMESPACE,
+            "get",
+            "endpointslices.discovery.k8s.io",
+            "-l",
+            "kubernetes.io/service-name=postgres",
+        ]:
+            return self.data_endpoint_slices["postgres"]
         if "deployment" in arguments:
             deployment_name = str(arguments[-1])
             replicas = (
@@ -11667,6 +11878,13 @@ spec:
             "_require_t048_postgres_runtime_binding",
             first_postgres + 1,
         )
+        first_postgres_service = source.index(
+            "_require_t048_postgres_service_binding"
+        )
+        second_postgres_service = source.index(
+            "_require_t048_postgres_service_binding",
+            first_postgres_service + 1,
+        )
         bound_snapshot = source.index(
             "bound_stack.enter_context(_bound_kube_env(root, target_binding_before, source_commit))"
         )
@@ -11700,11 +11918,13 @@ spec:
         self.assertLess(port_forward, load)
         self.assertGreater(final_bound_close, load)
         self.assertLess(first_target, first_fixture)
-        self.assertLess(first_postgres, first_fixture)
+        self.assertLess(first_postgres, first_postgres_service)
+        self.assertLess(first_postgres_service, first_fixture)
         self.assertLess(first_fixture, load)
         self.assertLess(load, second_fixture)
         self.assertLess(load, second_target)
         self.assertLess(load, second_postgres)
+        self.assertLess(second_postgres, second_postgres_service)
         self.assertLess(second_api, metrics_process_before)
         self.assertLess(metrics_process_before, post_metrics)
         self.assertLess(post_metrics, metrics_process_after)
@@ -11728,6 +11948,17 @@ spec:
         self.assertIn("postgres_resources_sha256", source)
         self.assertIn("postgres_contract_sha256", source)
         self.assertIn("postgres_pod_contract_sha256", source)
+        self.assertIn("postgres_service_binding_sha256", source)
+        self.assertIn(
+            "_guard_t048_postgres_service_endpoints",
+            source,
+        )
+        sampler = inspect.getsource(runtime._sample_t048_load)
+        self.assertIn("postgres_service_binding", sampler)
+        self.assertGreaterEqual(
+            sampler.count("_require_t048_postgres_service_binding"),
+            3,
+        )
         self.assertIn(
             "_postgres_runtime_binding_identity(postgres_binding_after)",
             source,
@@ -11736,6 +11967,61 @@ spec:
             "database_identity = _database_client_identity(root)",
             source,
         )
+
+    def test_t048_postgres_service_binding_rejects_rogue_endpoint(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        postgres_binding = runtime._require_t048_postgres_runtime_binding(
+            self.root
+        )
+        self.assertEqual(
+            postgres_binding["pod_uid"],
+            self.data_pods["postgres"][0]["metadata"]["uid"],
+        )
+        self.assertEqual(
+            postgres_binding["pod_ip"],
+            self.data_pods["postgres"][0]["status"]["podIP"],
+        )
+
+        with mock.patch.object(
+            runtime,
+            "_git_blob_bytes",
+            side_effect=lambda _commit, path: path.read_bytes(),
+        ):
+            proof = runtime._require_t048_postgres_service_binding(
+                self.root,
+                self.commit,
+                postgres_binding,
+            )
+            self.assertEqual(
+                proof["pod_uid"],
+                postgres_binding["pod_uid"],
+            )
+            self.assertEqual(
+                proof["pod_ip"],
+                postgres_binding["pod_ip"],
+            )
+            self.assertRegex(
+                proof["service_spec_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertRegex(
+                proof["endpoint_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+
+            self.data_endpoint_slices["postgres"]["items"][0][
+                "endpoints"
+            ][0]["targetRef"]["uid"] = "rogue-postgres-pod-uid"
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "PostgreSQL Service endpoint target drifted",
+            ):
+                runtime._require_t048_postgres_service_binding(
+                    self.root,
+                    self.commit,
+                    postgres_binding,
+                )
 
     def test_t048_postgres_binding_rejects_full_runtime_drift(
         self,
