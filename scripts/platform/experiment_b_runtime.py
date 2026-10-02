@@ -20,6 +20,7 @@ import ipaddress
 import json
 import math
 import os
+import pwd
 import re
 import secrets
 import shlex
@@ -389,6 +390,96 @@ def _open_libvirt_pool_target(*, create: bool) -> int:
     finally:
         if pool_fd is not None:
             os.close(pool_fd)
+
+
+def _libvirt_qemu_identity() -> tuple[int, int]:
+    try:
+        account = pwd.getpwnam("libvirt-qemu")
+    except KeyError as exc:
+        raise RuntimeErrorEB("libvirt-qemu account is unavailable") from exc
+    uid = int(account.pw_uid)
+    gid = int(account.pw_gid)
+    if uid <= 0 or gid < 0:
+        raise RuntimeErrorEB("libvirt-qemu identity is invalid")
+    return uid, gid
+
+
+def _libvirt_volume_xml(
+    name: str,
+    capacity_bytes: int,
+    *,
+    qemu_uid: int,
+    qemu_gid: int,
+    backing_path: Path | None = None,
+) -> bytes:
+    if name not in {BASE_VOLUME, VOLUME_NAME}:
+        raise RuntimeErrorEB("libvirt volume name is outside Experiment-B scope")
+    if type(capacity_bytes) is not int or capacity_bytes <= 0:
+        raise RuntimeErrorEB("libvirt volume capacity is invalid")
+    if type(qemu_uid) is not int or qemu_uid <= 0 or type(qemu_gid) is not int or qemu_gid < 0:
+        raise RuntimeErrorEB("libvirt-qemu identity is invalid")
+    volume = ET.Element("volume", {"type": "file"})
+    ET.SubElement(volume, "name").text = name
+    ET.SubElement(volume, "capacity", {"unit": "bytes"}).text = str(capacity_bytes)
+    target = ET.SubElement(volume, "target")
+    ET.SubElement(target, "format", {"type": "qcow2"})
+    permissions = ET.SubElement(target, "permissions")
+    ET.SubElement(permissions, "mode").text = "0600"
+    ET.SubElement(permissions, "owner").text = str(qemu_uid)
+    ET.SubElement(permissions, "group").text = str(qemu_gid)
+    if backing_path is not None:
+        if backing_path != POOL_TARGET / BASE_VOLUME:
+            raise RuntimeErrorEB("libvirt backing path is outside Experiment-B scope")
+        backing = ET.SubElement(volume, "backingStore")
+        ET.SubElement(backing, "path").text = str(backing_path)
+        ET.SubElement(backing, "format", {"type": "qcow2"})
+    return ET.tostring(volume, encoding="utf-8", xml_declaration=True)
+
+
+def _create_libvirt_volume(
+    name: str,
+    capacity_bytes: int,
+    *,
+    qemu_uid: int,
+    qemu_gid: int,
+    backing_path: Path | None = None,
+) -> os.stat_result:
+    payload = _libvirt_volume_xml(
+        name,
+        capacity_bytes,
+        qemu_uid=qemu_uid,
+        qemu_gid=qemu_gid,
+        backing_path=backing_path,
+    )
+    with _sealed_snapshot_fd(
+        payload,
+        f"Experiment-B libvirt volume XML {name}",
+    ) as volume_xml_fd:
+        run(
+            [
+                "virsh",
+                "-c",
+                LIBVIRT_URI,
+                "vol-create",
+                POOL_NAME,
+                f"/proc/self/fd/{volume_xml_fd}",
+            ],
+            pass_fds=(volume_xml_fd,),
+        )
+    path = POOL_TARGET / name
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeErrorEB("libvirt volume permissions are unreadable") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != qemu_uid
+        or metadata.st_gid != qemu_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise RuntimeErrorEB("libvirt volume permissions drifted")
+    return metadata
 
 
 def _unlink_state_path(path: Path, context: str) -> None:
@@ -1704,6 +1795,8 @@ def create_vm(root: Path) -> dict[str, Any]:
             "Experiment-B libvirt pool already exists; run bounded teardown first"
         )
 
+    qemu_uid, qemu_gid = _libvirt_qemu_identity()
+
     RETIREMENT_RECEIPT.unlink(missing_ok=True)
     _retirement_attempt_path().unlink(missing_ok=True)
     _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
@@ -1759,12 +1852,11 @@ def create_vm(root: Path) -> dict[str, Any]:
         run(["virsh", "-c", LIBVIRT_URI, "pool-start", POOL_NAME])
         attempt["pool_target"] = _libvirt_resource_uuid("pool", POOL_NAME)
         atomic_json(attempt_path, attempt)
-        run(
-            [
-                "virsh", "-c", LIBVIRT_URI, "vol-create-as",
-                POOL_NAME, BASE_VOLUME, f"{source_virtual_size}B",
-                "--format", "qcow2",
-            ]
+        _create_libvirt_volume(
+            BASE_VOLUME,
+            source_virtual_size,
+            qemu_uid=qemu_uid,
+            qemu_gid=qemu_gid,
         )
         run(
             [
@@ -1783,16 +1875,13 @@ def create_vm(root: Path) -> dict[str, Any]:
         attempt["base_image_sha256"] = str(config["vm"]["image"]["sha256"])
         atomic_json(attempt_path, attempt)
         run(["virsh", "-c", LIBVIRT_URI, "pool-refresh", POOL_NAME])
-        run(
-            [
-                "virsh", "-c", LIBVIRT_URI, "vol-create-as",
-                POOL_NAME, VOLUME_NAME, f"{config['vm']['disk_gib']}G",
-                "--format", "qcow2",
-                "--backing-vol", BASE_VOLUME,
-                "--backing-vol-format", "qcow2",
-            ]
+        volume_stat = _create_libvirt_volume(
+            VOLUME_NAME,
+            int(config["vm"]["disk_gib"]) * 1024**3,
+            qemu_uid=qemu_uid,
+            qemu_gid=qemu_gid,
+            backing_path=POOL_TARGET / BASE_VOLUME,
         )
-        volume_stat = (POOL_TARGET / VOLUME_NAME).stat()
         attempt.update(
             volume_device=volume_stat.st_dev,
             volume_inode=volume_stat.st_ino,

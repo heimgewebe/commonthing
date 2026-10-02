@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
@@ -8017,6 +8018,13 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         self.extra_httproutes: list[dict] = []
         self.httproute_list_resource_version = "450"
         self.runner = self.patch("run", side_effect=self.run_fixture)
+        self.qemu_uid = self.pool.stat().st_uid
+        self.qemu_gid = self.pool.stat().st_gid
+        self.patch(
+            "_libvirt_qemu_identity",
+            return_value=(self.qemu_uid, self.qemu_gid),
+        )
+        self.created_volume_xml: list[ET.Element] = []
 
     def patch(self, name: str, *args, **kwargs):
         patcher = mock.patch.object(runtime, name, *args, **kwargs)
@@ -8107,6 +8115,14 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 Path(argv[5]).write_bytes(self.base_bytes)
             elif command == "pool-define-as":
                 self.pool_present = True
+            elif command == "vol-create":
+                volume_xml = ET.parse(argv[5]).getroot()
+                self.created_volume_xml.append(volume_xml)
+                volume_name = volume_xml.findtext("name")
+                self.assertIn(volume_name, {runtime.BASE_VOLUME, runtime.VOLUME_NAME})
+                volume_path = self.pool / str(volume_name)
+                volume_path.write_bytes(b"created volume")
+                volume_path.chmod(0o600)
             elif command == "vol-create-as":
                 (self.pool / argv[5]).write_bytes(b"created volume")
             elif command == "vol-delete":
@@ -8168,6 +8184,30 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_create_vm_declares_private_qemu_volume_permissions_before_boot(self) -> None:
+        self.prepare_create()
+        result = runtime.create_vm(self.root)
+
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(len(self.created_volume_xml), 2)
+        by_name = {item.findtext("name"): item for item in self.created_volume_xml}
+        self.assertEqual(set(by_name), {runtime.BASE_VOLUME, runtime.VOLUME_NAME})
+        for volume in by_name.values():
+            permissions = volume.find("./target/permissions")
+            self.assertIsNotNone(permissions)
+            self.assertEqual(permissions.findtext("mode"), "0600")
+            self.assertEqual(permissions.findtext("owner"), str(self.qemu_uid))
+            self.assertEqual(permissions.findtext("group"), str(self.qemu_gid))
+        backing = by_name[runtime.VOLUME_NAME].find("./backingStore")
+        self.assertIsNotNone(backing)
+        self.assertEqual(backing.findtext("path"), str(self.base))
+        self.assertEqual(backing.find("./format").get("type"), "qcow2")
+        self.assertFalse(any(
+            call.args[0][3] == "vol-create-as"
+            for call in self.runner.call_args_list
+            if call.args and call.args[0][:3] == ["virsh", "-c", runtime.LIBVIRT_URI]
+        ))
 
     def test_verified_snapshot_fd_freezes_exact_source_bytes(self) -> None:
         self.prepare_create()
@@ -9096,7 +9136,7 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
         def interrupt_before_first_volume(argv, **kwargs):
             if (
                 argv[:3] == ["virsh", "-c", runtime.LIBVIRT_URI]
-                and argv[3] == "vol-create-as"
+                and argv[3] in {"vol-create-as", "vol-create"}
             ):
                 raise KeyboardInterrupt("simulated pool-only interruption")
             return original(argv, **kwargs)
