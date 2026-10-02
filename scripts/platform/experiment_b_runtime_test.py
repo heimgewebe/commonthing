@@ -13437,6 +13437,10 @@ def install(*args, **kwargs):
         self.assertLess(gateway_apply, cilium_install)
         self.assertLess(cilium_install, node_ready)
         self.assertLess(node_ready, flux_install)
+        ready_gate = source[cilium_install:flux_install]
+        self.assertIn("time.monotonic() + 180", ready_gate)
+        self.assertIn("timeout=", ready_gate)
+        self.assertIn("subprocess.TimeoutExpired", ready_gate)
         self.assertLess(flux_install, cilium_readback)
         self.assertLess(cilium_readback, flux_readback)
         self.assertLess(flux_readback, final_target_check)

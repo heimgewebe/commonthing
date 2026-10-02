@@ -3170,24 +3170,37 @@ def install_platform(root: Path) -> dict[str, Any]:
         )
 
         ready_node: dict[str, Any] | None = None
-        last_node_error: RuntimeErrorEB | json.JSONDecodeError | None = None
-        for _ in range(90):
+        last_node_error: Exception | None = None
+        ready_deadline = time.monotonic() + 180
+        while time.monotonic() < ready_deadline:
+            remaining = ready_deadline - time.monotonic()
+            probe_timeout = max(1, min(5, math.ceil(remaining)))
             try:
                 nodes = json.loads(
                     run(
                         [kubectl, "get", "nodes", "-o", "json"],
                         env=env,
+                        timeout=probe_timeout,
                     ).stdout
                 )
                 ready_node = _require_exact_k3s_node_inventory(
                     nodes,
                     str(config["kubernetes"]["version"]),
                 )
-            except (RuntimeErrorEB, json.JSONDecodeError) as exc:
+            except (
+                RuntimeErrorEB,
+                json.JSONDecodeError,
+                subprocess.TimeoutExpired,
+            ) as exc:
                 last_node_error = exc
-                time.sleep(2)
             else:
                 break
+            sleep_seconds = min(
+                2.0,
+                max(0.0, ready_deadline - time.monotonic()),
+            )
+            if sleep_seconds:
+                time.sleep(sleep_seconds)
         if ready_node is None:
             raise RuntimeErrorEB(
                 "k3s node did not become Ready after Cilium convergence"
