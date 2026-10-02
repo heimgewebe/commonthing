@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 742 |
+| Relationen gesamt | 744 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 685 |
+| — relates_to | 687 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |
@@ -32,7 +32,7 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (293 Dokumente):
+**Cluster 1** (295 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
@@ -125,6 +125,7 @@ _Keine Lücken erkannt._
 - `docs/deploy/commonthing.naming.md`
 - `docs/deploy/dev-entrypoints.md`
 - `docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md`
+- `docs/deploy/experiment-b.md`
 - `docs/deploy/heim-first-phase0.md`
 - `docs/deploy/heimserver.deployment.md`
 - `docs/deploy/heimserver.integration.md`
@@ -325,6 +326,7 @@ _Keine Lücken erkannt._
 - `scripts/ops/resolve_vps_public_bind.py`
 - `scripts/performance/domain_projection_k6.js`
 - `scripts/performance/domain_projection_load.py`
+- `scripts/platform/experiment_b_runtime.py`
 - `scripts/tests/test_domain_multi_instance_guard.sh`
 - `tests/fixtures/agent/handoff-valid.json`
 

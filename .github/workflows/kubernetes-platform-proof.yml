@@ -18,6 +18,7 @@ permissions:
     paths:
       - ".github/workflows/kubernetes-platform.yml"
       - ".github/workflows/kubernetes-platform-proof.yml"
+      - ".github/workflows/domain-scale.yml"
       - ".dockerignore"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -33,6 +34,7 @@ permissions:
       - "infra/compose/compose.prod.yml"
       - "platform/**"
       - "scripts/platform/**"
+      - "scripts/performance/**"
       - "scripts/security/**"
       - "scripts/ci/tests/test_kubernetes_platform_contract.py"
       - "scripts/ci/tests/test_kubernetes_platform_workflow.py"
@@ -99,6 +101,8 @@ jobs:
           scripts/platform/proof_identity.py
           scripts/platform/oci_proof_mirror.py
           scripts/platform/validate_platform.py
+          scripts/platform/experiment_b.py
+          scripts/platform/experiment_b_runtime.py
           scripts/platform/kind_reference.py
           scripts/platform/ha_reference.py
           scripts/security/trivy_rendered_manifests.py
@@ -110,6 +114,10 @@ jobs:
           scripts.ci.tests.test_kubernetes_ha_contract
           scripts.ci.tests.test_trivy_rendered_manifests
           scripts.ci.tests.test_kubernetes_python_bootstrap
+      - name: Run Experiment-B contract tests
+        run: |
+          uv run --project tools/py --locked python scripts/platform/experiment_b_test.py -v
+          uv run --project tools/py --locked python scripts/platform/experiment_b_runtime_test.py -v
       - name: Render and validate all platform targets
         run: uv run --project tools/py --locked python scripts/platform/validate_platform.py --render
 

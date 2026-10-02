@@ -16,10 +16,10 @@ ROOT = Path(__file__).resolve().parents[2]
 PLATFORM = ROOT / "platform"
 PROMOTION_SENTINEL = "promotion-required"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-OVERLAYS = ("local", "ha", "ci", "staging", "production")
+OVERLAYS = ("local", "ha", "ci", "staging", "experiment-b", "production")
 NONLOCAL_OVERLAY_TARGETS = frozenset(
     f"platform/apps/weltgewebe/overlays/{name}"
-    for name in ("ci", "staging", "production")
+    for name in ("ci", "staging", "experiment-b", "production")
 )
 LOCAL_FIXTURE_SENTINELS = (
     "weltgewebe-local-fixture",
@@ -29,6 +29,12 @@ HA_TARGETS = (
     "platform/apps/weltgewebe/overlays/ha",
     "platform/apps/weltgewebe/migration/ha",
     "platform/infrastructure/ha-data",
+)
+EXPERIMENT_B_TARGETS = (
+    "platform/clusters/experiment-b/namespaces",
+    "platform/clusters/experiment-b/data",
+    "platform/clusters/experiment-b/gateway",
+    "platform/clusters/experiment-b/migration",
 )
 LOCAL_FIXTURE_ROOTS = (
     PLATFORM / "apps/weltgewebe/migration/local",
@@ -256,6 +262,79 @@ def _assert_nonlocal_overlay_fixture_boundary(target: str, rendered: str) -> Non
     if observed:
         raise ContractError(
             f"{target} renders local-only fixture marker(s): {observed}"
+        )
+
+
+def _assert_experiment_b_application_render(
+    target: str, documents: list[dict[str, Any]]
+) -> None:
+    if target != "platform/apps/weltgewebe/overlays/experiment-b":
+        return
+
+    config = json.loads(
+        (PLATFORM / "clusters/experiment-b/config.json").read_text(encoding="utf-8")
+    )
+    expected_replicas = {
+        "weltgewebe-api": int(config["semantic_search"]["api_replicas"]),
+        "weltgewebe-web": int(config["runtime_binding"]["web_replicas"]),
+    }
+    deployments = {
+        document.get("metadata", {}).get("name"): document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and isinstance(document.get("metadata"), dict)
+    }
+    for name, replicas in expected_replicas.items():
+        deployment = deployments.get(name)
+        if not isinstance(deployment, dict):
+            raise ContractError(
+                f"Experiment-B rendered application Deployment is missing: {name}"
+            )
+        if deployment.get("spec", {}).get("replicas") != replicas:
+            raise ContractError(
+                f"Experiment-B rendered {name} replicas drifted from config.json"
+            )
+
+    api_pod = (
+        deployments["weltgewebe-api"]
+        .get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+    )
+    containers = api_pod.get("containers", []) if isinstance(api_pod, dict) else []
+    worker = next(
+        (
+            container
+            for container in containers
+            if isinstance(container, dict)
+            and container.get("name") == "search-worker"
+        ),
+        None,
+    )
+    if not isinstance(worker, dict):
+        raise ContractError("Experiment-B rendered search-worker is missing")
+    if worker.get("securityContext", {}).get("readOnlyRootFilesystem") is not True:
+        raise ContractError(
+            "Experiment-B search-worker must keep a read-only root filesystem"
+        )
+    mounts = {
+        mount.get("name"): mount.get("mountPath")
+        for mount in worker.get("volumeMounts", [])
+        if isinstance(mount, dict)
+    }
+    if mounts.get("tmp") != "/tmp":
+        raise ContractError(
+            "Experiment-B search-worker must mount writable tmp at /tmp"
+        )
+    volumes = {
+        volume.get("name"): volume
+        for volume in api_pod.get("volumes", [])
+        if isinstance(volume, dict)
+    }
+    tmp_volume = volumes.get("tmp")
+    if not isinstance(tmp_volume, dict) or "emptyDir" not in tmp_volume:
+        raise ContractError(
+            "Experiment-B search-worker tmp mount must use the pod tmp emptyDir"
         )
 
 
@@ -590,6 +669,7 @@ def _render_and_validate() -> dict[str, int]:
         "platform/clusters/local",
         "platform/clusters/staging/data",
         "platform/clusters/staging/gateway",
+        *EXPERIMENT_B_TARGETS,
     ]
     counts: dict[str, int] = {}
     with tempfile.TemporaryDirectory() as tmp:
@@ -600,6 +680,7 @@ def _render_and_validate() -> dict[str, int]:
             docs = [item for item in yaml.safe_load_all(rendered) if isinstance(item, dict)]
             if not docs:
                 raise ContractError(f"empty Kustomize output for {target}")
+            _assert_experiment_b_application_render(target, docs)
             counts[target] = len(docs)
             output = temp / (target.replace("/", "_") + ".yaml")
             output.write_text(rendered, encoding="utf-8")

@@ -352,8 +352,16 @@ def install(
     *,
     tool_names: list[str] | None = None,
     include_artifacts: bool = True,
+    lock_bytes: bytes | None = None,
 ) -> dict[str, Any]:
-    lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+    if lock_bytes is None:
+        lock_bytes = LOCK_PATH.read_bytes()
+    if not isinstance(lock_bytes, bytes):
+        raise RuntimeError("toolchain lock payload must be bytes")
+    try:
+        lock = json.loads(lock_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("toolchain lock payload is invalid") from exc
     if lock.get("schema_version") != 1:
         raise RuntimeError("unsupported toolchain lock schema")
     _check_host(lock)
@@ -410,7 +418,7 @@ def install(
 
     receipt = {
         "schema_version": 1,
-        "lock_sha256": hashlib.sha256(LOCK_PATH.read_bytes()).hexdigest(),
+        "lock_sha256": hashlib.sha256(lock_bytes).hexdigest(),
         "cache": str(cache),
         "download_policy": {
             "attempts_per_source": DOWNLOAD_ATTEMPTS,
