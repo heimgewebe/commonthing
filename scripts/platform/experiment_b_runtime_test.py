@@ -1557,6 +1557,20 @@ spec:
         }
         readback = runtime._require_exact_k3s_node_inventory(inventory, expected)
         self.assertEqual(readback["kubelet_version"], expected)
+        self.assertTrue(readback["ready"])
+        self.assertIn("require_ready=False", source)
+
+        not_ready = json.loads(json.dumps(inventory))
+        not_ready["items"][0]["status"]["conditions"][0]["status"] = "False"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not Ready"):
+            runtime._require_exact_k3s_node_inventory(not_ready, expected)
+        pre_cni = runtime._require_exact_k3s_node_inventory(
+            not_ready,
+            expected,
+            require_ready=False,
+        )
+        self.assertEqual(pre_cni["kubelet_version"], expected)
+        self.assertFalse(pre_cni["ready"])
 
         stale = json.loads(json.dumps(inventory))
         stale["items"][0]["status"]["nodeInfo"]["kubeletVersion"] = "v1.35.0+k3s1"
@@ -13379,6 +13393,7 @@ def install(*args, **kwargs):
         cilium_install = source.index(
             'helm, "upgrade", "--install", "cilium"'
         )
+        node_ready = source.index("_require_exact_k3s_node_inventory(")
         flux_install = source.index("_flux_install_argv(flux)")
         cilium_readback = source.index("_require_live_cilium_contract(")
         flux_readback = source.index("_require_live_flux_controller_contract(")
@@ -13387,7 +13402,8 @@ def install(*args, **kwargs):
         self.assertLess(target_capture, snapshot)
         self.assertLess(snapshot, gateway_apply)
         self.assertLess(gateway_apply, cilium_install)
-        self.assertLess(cilium_install, flux_install)
+        self.assertLess(cilium_install, node_ready)
+        self.assertLess(node_ready, flux_install)
         self.assertLess(flux_install, cilium_readback)
         self.assertLess(cilium_readback, flux_readback)
         self.assertLess(flux_readback, final_target_check)

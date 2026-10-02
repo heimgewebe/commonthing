@@ -2849,7 +2849,9 @@ def install_k3s(root: Path) -> dict[str, Any]:
             try:
                 inventory = json.loads(result.stdout)
                 live_node = _require_exact_k3s_node_inventory(
-                    inventory, str(config["kubernetes"]["version"])
+                    inventory,
+                    str(config["kubernetes"]["version"]),
+                    require_ready=False,
                 )
             except (json.JSONDecodeError, RuntimeErrorEB):
                 live_node = None
@@ -3111,6 +3113,7 @@ def _flux_install_argv(flux: str, *, export: bool = False) -> list[str]:
 def install_platform(root: Path) -> dict[str, Any]:
     _invalidate_receipts(root, PLATFORM_ATTEMPT_INVALIDATES)
     source_commit = _current_protected_main_commit()
+    config = _source_commit_config(source_commit)
     _require_kubernetes_target_binding(root, source_commit)
     platform_target = _kubernetes_target_identity(root, source_commit)
     receipt = toolchain(root, source_commit)
@@ -3166,6 +3169,30 @@ def install_platform(root: Path) -> dict[str, Any]:
             "platform installation after Cilium",
         )
 
+        ready_node: dict[str, Any] | None = None
+        last_node_error: RuntimeErrorEB | json.JSONDecodeError | None = None
+        for _ in range(90):
+            try:
+                nodes = json.loads(
+                    run(
+                        [kubectl, "get", "nodes", "-o", "json"],
+                        env=env,
+                    ).stdout
+                )
+                ready_node = _require_exact_k3s_node_inventory(
+                    nodes,
+                    str(config["kubernetes"]["version"]),
+                )
+            except (RuntimeErrorEB, json.JSONDecodeError) as exc:
+                last_node_error = exc
+                time.sleep(2)
+            else:
+                break
+        if ready_node is None:
+            raise RuntimeErrorEB(
+                "k3s node did not become Ready after Cilium convergence"
+            ) from last_node_error
+
         _require_same_kubernetes_target(
             root,
             source_commit,
@@ -3186,7 +3213,7 @@ def install_platform(root: Path) -> dict[str, Any]:
 
         cilium_readback = _require_live_cilium_contract(
             root,
-            _source_commit_config(source_commit),
+            config,
         )
         flux_readback: dict[str, Any] | None = None
         last_flux_error: RuntimeErrorEB | None = None
@@ -4335,7 +4362,10 @@ def _require_exact_flux_revision_ready(
 
 
 def _require_exact_k3s_node_inventory(
-    nodes: Any, expected_version: str
+    nodes: Any,
+    expected_version: str,
+    *,
+    require_ready: bool = True,
 ) -> dict[str, Any]:
     if not isinstance(nodes, dict) or nodes.get("kind") not in {"NodeList", "List"}:
         raise RuntimeErrorEB("Experiment B node inventory is not a Kubernetes node list")
@@ -4364,7 +4394,15 @@ def _require_exact_k3s_node_inventory(
         if isinstance(conditions, list)
         else []
     )
-    if len(ready_conditions) != 1 or ready_conditions[0].get("status") != "True":
+    if len(ready_conditions) != 1:
+        if require_ready:
+            raise RuntimeErrorEB("Experiment B k3s node is not Ready")
+        raise RuntimeErrorEB("Experiment B k3s node Ready condition is invalid")
+    ready_status = ready_conditions[0].get("status")
+    if ready_status not in {"True", "False"}:
+        raise RuntimeErrorEB("Experiment B k3s node Ready condition is invalid")
+    ready = ready_status == "True"
+    if require_ready and not ready:
         raise RuntimeErrorEB("Experiment B k3s node is not Ready")
     info = status_obj.get("nodeInfo", {})
     kubelet = str(info.get("kubeletVersion", ""))
@@ -4377,7 +4415,7 @@ def _require_exact_k3s_node_inventory(
         "node": str(metadata["name"]),
         "kubelet_version": kubelet,
         "os_image": os_image,
-        "ready": True,
+        "ready": ready,
     }
 
 
