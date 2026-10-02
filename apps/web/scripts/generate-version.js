@@ -167,7 +167,26 @@ if (writeServer) {
     JSON.stringify(serverPayload, null, 2) + "\n",
     "utf8",
   );
-  filesWritten.push(targetFile);
+
+  const prodVerityFile = path.join(
+    serverBuildDir,
+    ".well-known/prodverity.json",
+  );
+  const prodVerityManifest = {
+    revision: commit,
+    checks: [
+      { id: "homepage", path: "/" },
+      { id: "frontend-version", path: "/_app/version.json" },
+      { id: "api-version", path: "/api/version" },
+    ],
+  };
+  fs.mkdirSync(path.dirname(prodVerityFile), { recursive: true });
+  fs.writeFileSync(
+    prodVerityFile,
+    JSON.stringify(prodVerityManifest, null, 2) + "\n",
+    "utf8",
+  );
+  filesWritten.push(targetFile, prodVerityFile);
 }
 if (writeClient) {
   if (!commit) {

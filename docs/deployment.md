@@ -53,6 +53,26 @@ Server-side correctness does not intrinsically prevent browsers from rendering s
    - **Client-visible diagnostics**: The technical build identifier is also shown directly in the Settings UI.
    - **Primary use**: Enables immediate comparison of delivered versions across clients (for example, Browser A vs. Browser B).
 
+### ProdVerity public release evidence
+
+The finalized frontend build also emits `/.well-known/prodverity.json`. This is a
+small, public, same-origin verification manifest for external production
+readback. Its `revision` is the same full 40-character commit that is accepted
+by the existing build-identity generator; it is not inferred later from a
+branch, tag, container name, or deployment timestamp.
+
+The manifest currently declares three status checks:
+
+- `/` — the public application edge;
+- `/_app/version.json` — the frontend build-identity surface;
+- `/api/version` — the API release-identity surface.
+
+ProdVerity is supplemental evidence only. A successful manifest check does not
+replace the existing exact-commit deploy/reconcile receipts, API identity
+verification, runtime health/readiness checks, or browser-level acceptance
+proofs. Conversely, a missing or invalid ProdVerity manifest must not be treated
+as evidence that another deployment gate passed.
+
 _Note (Phase C Preparation): Future Evaluation: The current bind-mount model could theoretically be replaced by a dedicated Web-Container architecture to eliminate host-mount drift entirely._
 
 ### Basemap Artifact Deployment (Best Effort)

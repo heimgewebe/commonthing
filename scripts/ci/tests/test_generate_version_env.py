@@ -92,6 +92,24 @@ class GenerateVersionEnvironmentTests(unittest.TestCase):
         self.assertEqual(payload["built_at"], "2026-07-15T18:21:48.000Z")
         self.assertNotIn("artifact_tree", payload)
 
+    def test_server_generation_writes_prodverity_manifest_bound_to_full_commit(self) -> None:
+        result, version_file = self.run_generator(self.commit, bind_artifact_tree=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest_file = version_file.parents[1] / ".well-known" / "prodverity.json"
+        self.assertTrue(manifest_file.is_file())
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest,
+            {
+                "revision": self.commit,
+                "checks": [
+                    {"id": "homepage", "path": "/"},
+                    {"id": "frontend-version", "path": "/_app/version.json"},
+                    {"id": "api-version", "path": "/api/version"},
+                ],
+            },
+        )
+
     def test_client_generation_writes_compile_revision_marker(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
