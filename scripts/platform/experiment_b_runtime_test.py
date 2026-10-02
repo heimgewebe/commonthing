@@ -1572,10 +1572,43 @@ spec:
         self.assertEqual(pre_cni["kubelet_version"], expected)
         self.assertFalse(pre_cni["ready"])
 
+        missing_ready = json.loads(json.dumps(inventory))
+        missing_ready["items"][0]["status"]["conditions"] = []
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "Ready condition is invalid"):
+            runtime._require_exact_k3s_node_inventory(
+                missing_ready,
+                expected,
+                require_ready=False,
+            )
+
+        ambiguous_ready = json.loads(json.dumps(inventory))
+        ambiguous_ready["items"][0]["status"]["conditions"].append(
+            {"type": "Ready", "status": "False"}
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "Ready condition is invalid"):
+            runtime._require_exact_k3s_node_inventory(
+                ambiguous_ready,
+                expected,
+                require_ready=False,
+            )
+
+        invalid_ready = json.loads(json.dumps(inventory))
+        invalid_ready["items"][0]["status"]["conditions"][0]["status"] = "Unknown"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "Ready condition is invalid"):
+            runtime._require_exact_k3s_node_inventory(
+                invalid_ready,
+                expected,
+                require_ready=False,
+            )
+
         stale = json.loads(json.dumps(inventory))
         stale["items"][0]["status"]["nodeInfo"]["kubeletVersion"] = "v1.35.0+k3s1"
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "pinned k3s version"):
-            runtime._require_exact_k3s_node_inventory(stale, expected)
+            runtime._require_exact_k3s_node_inventory(
+                stale,
+                expected,
+                require_ready=False,
+            )
 
     def test_live_k3s_runtime_binds_vm_kubeconfig_guest_files_and_process(self) -> None:
         commit = runtime.git_head()
