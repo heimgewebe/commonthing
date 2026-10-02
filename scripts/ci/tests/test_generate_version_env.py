@@ -101,6 +101,7 @@ class GenerateVersionEnvironmentTests(unittest.TestCase):
         self.assertEqual(
             manifest,
             {
+                "version": 1,
                 "revision": self.commit,
                 "checks": [
                     {"id": "homepage", "path": "/", "expected_status": 200},
