@@ -1190,7 +1190,7 @@ spec:
                 private.rename(retained)
                 private.symlink_to(sentinel)
                 key_path = Path(bound[bound.index("-i") + 1])
-                self.assertEqual(key_path.parent, Path("/proc/self/fd"))
+                self.assertEqual(key_path.parent, Path(f"/proc/{runtime.os.getpid()}/fd"))
                 key_fd = runtime.os.open(key_path, runtime.os.O_RDONLY)
                 try:
                     self.assertEqual(
@@ -1202,6 +1202,51 @@ spec:
                 self.assertIn(int(key_path.name), pass_fds)
 
             self.assertEqual(sentinel.read_bytes(), b"external-private")
+
+    def test_ssh_command_binding_survives_child_closefrom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir(parents=True)
+            private = ssh_dir / "id_ed25519"
+            private.write_bytes(b"original-private")
+            private.chmod(0o600)
+            (ssh_dir / "id_ed25519.pub").write_text(
+                "ssh-ed25519 public\n",
+                encoding="utf-8",
+            )
+            known_hosts = ssh_dir / "known_hosts"
+            known_hosts.write_bytes(b"known-hosts")
+
+            command = runtime.ssh_argv(root, "192.0.2.10") + ["true"]
+            with runtime._bound_ssh_command(command) as (bound, pass_fds):
+                key_path = bound[bound.index("-i") + 1]
+                known_path = next(
+                    value.split("=", 1)[1]
+                    for value in bound
+                    if value.startswith("UserKnownHostsFile=")
+                )
+                child = (
+                    "import os,sys,pathlib;"
+                    "[os.close(int(fd)) for fd in sys.argv[3].split(',') if fd];"
+                    "sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes()+b'|'+pathlib.Path(sys.argv[2]).read_bytes())"
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        child,
+                        key_path,
+                        known_path,
+                        ",".join(str(fd) for fd in pass_fds),
+                    ],
+                    pass_fds=pass_fds,
+                    capture_output=True,
+                    check=False,
+                )
+
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stdout, b"original-private|known-hosts")
 
     def test_run_binds_ssh_credentials_at_process_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1232,13 +1277,13 @@ spec:
 
             argv = process.call_args.args[0]
             key_path = argv[argv.index("-i") + 1]
-            self.assertTrue(key_path.startswith("/proc/self/fd/"))
+            self.assertTrue(key_path.startswith(f"/proc/{runtime.os.getpid()}/fd/"))
             known_hosts = next(
                 value
                 for value in argv
                 if value.startswith("UserKnownHostsFile=")
             )
-            self.assertIn("/proc/self/fd/", known_hosts)
+            self.assertIn(f"/proc/{runtime.os.getpid()}/fd/", known_hosts)
             self.assertGreaterEqual(len(process.call_args.kwargs["pass_fds"]), 2)
 
     def test_ssh_binding_closes_private_fd_when_known_hosts_open_fails(
@@ -1338,7 +1383,7 @@ spec:
 
         helper_source = inspect.getsource(runtime.scp_fd_to)
         self.assertIn("pass_fds=(source_fd,)", helper_source)
-        self.assertIn('f"/proc/self/fd/{source_fd}"', helper_source)
+        self.assertIn("_reopenable_proc_fd_path(source_fd)", helper_source)
 
         self.assertNotIn(
             'scp_to(root, ip, CLUSTER / "k3s-config.yaml"', source

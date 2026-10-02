@@ -123,6 +123,13 @@ _TOOLCHAIN_SNAPSHOT_FDS: set[int] = set()
 _TOOLCHAIN_SNAPSHOT_RECEIPTS: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
+def _reopenable_proc_fd_path(fd: int) -> str:
+    """Return a procfs path that survives child-side closefrom()."""
+    if type(fd) is not int or fd < 0:
+        raise RuntimeErrorEB("file descriptor path requires a non-negative integer")
+    return f"/proc/{os.getpid()}/fd/{fd}"
+
+
 def _bound_subprocess_pass_fds(
     pass_fds: tuple[int, ...] = (),
 ) -> tuple[int, ...]:
@@ -1293,9 +1300,9 @@ def _bound_ssh_command(
 
     try:
         bound = list(argv)
-        bound[key_flag + 1] = f"/proc/self/fd/{private_fd}"
+        bound[key_flag + 1] = _reopenable_proc_fd_path(private_fd)
         bound[known_index] = (
-            f"{known_prefix}/proc/self/fd/{known_hosts_fd}"
+            f"{known_prefix}{_reopenable_proc_fd_path(known_hosts_fd)}"
         )
         yield bound, (private_fd, known_hosts_fd)
     finally:
@@ -2088,7 +2095,7 @@ def scp_fd_to(
             "-o", f"UserKnownHostsFile={known_hosts}",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "BatchMode=yes",
-            f"/proc/self/fd/{source_fd}",
+            _reopenable_proc_fd_path(source_fd),
             f"commonthing@{ip}:{destination}",
         ],
         timeout=900,
