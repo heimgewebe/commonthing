@@ -176,9 +176,13 @@ if (writeServer) {
     schema_version: 1,
     revision: commit,
     checks: [
-      { id: "homepage", path: "/" },
-      { id: "frontend-version", path: "/_app/version.json" },
-      { id: "api-version", path: "/api/version" },
+      { id: "homepage", path: "/", expected_status: 200 },
+      {
+        id: "frontend-version",
+        path: "/_app/version.json",
+        expected_status: 200,
+      },
+      { id: "api-version", path: "/api/version", expected_status: 200 },
     ],
   };
   fs.mkdirSync(path.dirname(prodVerityFile), { recursive: true });
