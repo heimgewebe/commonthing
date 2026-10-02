@@ -282,14 +282,17 @@ fetch_main() {
 
 verify_public_schauwerk_runtime() {
   local expected_image_ref="$1"
+  local expected_source_commit="$2"
   local container_ids
   local container_id
   local live_image
+  local live_labels
   local live_health
   local health_attempt
   local manifest_json
 
   [[ "$expected_image_ref" =~ ^ghcr\.io/heimgewebe/schauwerk-schaubild@sha256:[0-9a-f]{64}$ ]] || return 1
+  [[ "$expected_source_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
 
   container_ids="$(
     docker ps \
@@ -307,6 +310,24 @@ verify_public_schauwerk_runtime() {
     echo "public Schaubild runtime image differs from reviewed digest" >&2
     return 1
   }
+  live_labels="$(docker inspect --format '{{json .Config.Labels}}' "$container_id")" || return 1
+  SCHAUWERK_RUNTIME_LABELS_JSON="$live_labels" run_ops_python "$expected_source_commit" << 'PY_SCHAUWERK_IMAGE_LABELS' || return 1
+import json
+import os
+import sys
+
+expected_commit = sys.argv[1]
+try:
+    labels = json.loads(os.environ["SCHAUWERK_RUNTIME_LABELS_JSON"])
+except (KeyError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid Schaubild OCI labels: {exc}")
+if not isinstance(labels, dict):
+    raise SystemExit("Schaubild OCI labels are missing")
+if labels.get("org.opencontainers.image.revision") != expected_commit:
+    raise SystemExit("Schaubild OCI revision does not match reviewed source commit")
+if labels.get("org.opencontainers.image.source") != "https://github.com/heimgewebe/schauwerk":
+    raise SystemExit("Schaubild OCI source does not match Schauwerk repository")
+PY_SCHAUWERK_IMAGE_LABELS
 
   # A freshly recreated container can legitimately remain in Docker's
   # "starting" health state through the configured 10s start period and first
@@ -1652,7 +1673,7 @@ if "$LIVE_VERIFIER" \
     basemap_identity_matches=1
   fi
   schauwerk_identity_matches=0
-  if verify_public_schauwerk_runtime "$expected_schauwerk_image_ref"; then
+  if verify_public_schauwerk_runtime "$expected_schauwerk_image_ref" "$expected_schauwerk_source_commit"; then
     schauwerk_identity_matches=1
   fi
   observed_main="$(fetch_main)"
@@ -1879,7 +1900,7 @@ verify_public_germany_basemap_delivery \
   "$target_commit" "$expected_germany_style_sha" "$expected_germany_dark_style_sha" \
   "$expected_germany_artifact_size" "$expected_germany_range_sha" ||
   fail "public nationwide Germany basemap delivery mismatch after deploy"
-verify_public_schauwerk_runtime "$expected_schauwerk_image_ref" ||
+verify_public_schauwerk_runtime "$expected_schauwerk_image_ref" "$expected_schauwerk_source_commit" ||
   fail "public Schaubild runtime does not match the reviewed OCI digest after deploy"
 
 current_main="$(fetch_main)"

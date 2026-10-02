@@ -141,6 +141,9 @@ class ProductionReconcilerContractTests(unittest.TestCase):
         self.assertIn("ghcr.io/heimgewebe/schauwerk-schaubild", script)
         self.assertIn("verify_public_schauwerk_runtime", script)
         self.assertEqual(script.count("verify_public_schauwerk_runtime"), 3)
+        self.assertIn("org.opencontainers.image.revision", script)
+        self.assertIn("org.opencontainers.image.source", script)
+        self.assertIn('"$expected_schauwerk_source_commit"', script)
         self.assertIn("reason=schaubild_runtime_image_identity_drift", script)
         self.assertIn(
             "public Schaubild runtime does not match the reviewed OCI digest after deploy",
@@ -168,6 +171,7 @@ class ProductionReconcilerContractTests(unittest.TestCase):
             health_counter = Path(temporary) / "health-counter"
             environment = os.environ.copy()
             environment["EXPECTED_IMAGE_REF"] = expected_image_ref
+            environment["EXPECTED_SOURCE_COMMIT"] = "c" * 40
             environment["HEALTH_COUNTER"] = str(health_counter)
             harness = f"""\
 set -euo pipefail
@@ -180,6 +184,10 @@ docker() {{
   fi
   if [[ "$1" == "inspect" && "${3:-}" == '{{{{.Config.Image}}}}' ]]; then
     printf '%s\\n' "$EXPECTED_IMAGE_REF"
+    return 0
+  fi
+  if [[ "$1" == "inspect" && "${3:-}" == '{{{{json .Config.Labels}}}}' ]]; then
+    printf '%s\\n' '{{"org.opencontainers.image.revision":"cccccccccccccccccccccccccccccccccccccccc","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}}'
     return 0
   fi
   if [[ "$1" == "inspect" && "${3:-}" == '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{end}}}}' ]]; then
@@ -205,7 +213,7 @@ run_ops_python() {{
   python3 -I - "$@"
 }}
 SCHAUWERK_MANIFEST_URL='https://example.invalid/schaubild/manifest.json'
-verify_public_schauwerk_runtime "$EXPECTED_IMAGE_REF"
+verify_public_schauwerk_runtime "$EXPECTED_IMAGE_REF" "$EXPECTED_SOURCE_COMMIT"
 """
             result = subprocess.run(
                 ["bash", "-c", harness],
@@ -1348,6 +1356,25 @@ prune_releases
             workflow,
         )
         self.assertIn("bash -n scripts/weltgewebe-up", workflow)
+        convergence = workflow.index(
+            "- name: Resolve latest accepted Schauwerk Schaubild release"
+        )
+        live_readback = workflow.index(
+            "- name: Verify public frontend and API identity", convergence
+        )
+        enforcement = workflow.index(
+            "- name: Enforce Schaubild release convergence", live_readback
+        )
+        self.assertLess(convergence, live_readback)
+        self.assertLess(live_readback, enforcement)
+        convergence_slice = workflow[
+            convergence : workflow.index(
+                "- name: Upload Schaubild release convergence receipt", convergence
+            )
+        ]
+        self.assertIn("continue-on-error: true", convergence_slice)
+        self.assertIn('"state": "invalid"', convergence_slice)
+        self.assertIn('payload.get("state") != "current"', workflow[enforcement:])
 
 
 if __name__ == "__main__":

@@ -2016,6 +2016,34 @@ else
   echo "WARNING: Preflight script scripts/preflight/csp_contract_static.sh not found or not executable. Skipping." >&2
 fi
 
+# Verify the exact digest's producer identity before any full VPS Compose
+# mutation. Pulling an uncached immutable digest may populate only the local
+# image cache; it does not authorize or recreate a running service.
+if [[ "$DEPLOY_TARGET" == "vps" && "$DEPLOY_SCOPE" == "full" ]]; then
+  if ! docker image inspect "$SCHAUWERK_RUNTIME_IMAGE_REF" > /dev/null 2>&1; then
+    echo "   Pulling uncached exact Schaubild digest for source verification..."
+    if ! docker pull "$SCHAUWERK_RUNTIME_IMAGE_REF" > /dev/null; then
+      msg="Schaubild exact runtime digest is unavailable."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      exit 1
+    fi
+  fi
+  SCHAUWERK_RUNTIME_IMAGE_LABELS="$(
+    docker image inspect --format '{{json .Config.Labels}}' "$SCHAUWERK_RUNTIME_IMAGE_REF" 2> /dev/null || true
+  )"
+  if [[ -z "$SCHAUWERK_RUNTIME_IMAGE_LABELS" ]] || ! python3 scripts/preflight/schauwerk_editor_release.py \
+    --lock "$SCHAUWERK_RUNTIME_LOCK_PATH" \
+    --image-labels-json "$SCHAUWERK_RUNTIME_IMAGE_LABELS" \
+    --json > /dev/null; then
+    msg="Schaubild exact runtime image source/revision does not match the reviewed release lock."
+    echo "ERROR: $msg" >&2
+    generate_failure_bundle "$msg"
+    exit 1
+  fi
+  echo "   Schaubild OCI source/revision binding verified for $SCHAUWERK_RUNTIME_SOURCE_COMMIT."
+fi
+
 # Explicit compose-leak cleanup is destructive and therefore stays behind the
 # complete deployment-admission chain. Zombie identities were bound read-only
 # above; delete only those exact immutable IDs after every fail-closed preflight
@@ -3065,6 +3093,16 @@ else
     SCHAUWERK_RUNTIME_LIVE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$SCHAUWERK_RUNTIME_CONTAINER_ID" 2> /dev/null || true)"
     if [[ "$SCHAUWERK_RUNTIME_LIVE_IMAGE" != "$SCHAUWERK_RUNTIME_IMAGE_REF" ]]; then
       msg="Schaubild runtime image mismatch: live $SCHAUWERK_RUNTIME_LIVE_IMAGE, expected $SCHAUWERK_RUNTIME_IMAGE_REF."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      exit 1
+    fi
+    SCHAUWERK_RUNTIME_LIVE_LABELS="$(docker inspect --format '{{json .Config.Labels}}' "$SCHAUWERK_RUNTIME_CONTAINER_ID" 2> /dev/null || true)"
+    if [[ -z "$SCHAUWERK_RUNTIME_LIVE_LABELS" ]] || ! python3 scripts/preflight/schauwerk_editor_release.py \
+      --lock "$SCHAUWERK_RUNTIME_LOCK_PATH" \
+      --image-labels-json "$SCHAUWERK_RUNTIME_LIVE_LABELS" \
+      --json > /dev/null; then
+      msg="Schaubild running runtime OCI source/revision does not match the reviewed release lock."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       exit 1

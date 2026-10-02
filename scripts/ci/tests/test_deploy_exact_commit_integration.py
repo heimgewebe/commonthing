@@ -419,6 +419,13 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                     '{{.Config.Image}}')
                       printf 'ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n'
                       ;;
+                    '{{json .Config.Labels}}')
+                      if [[ "\${TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN:-0}" == "1" && ( -z "\${TEST_DEPLOY_MARKER:-}" || ! -e "$TEST_DEPLOY_MARKER" ) ]]; then
+                        printf '{"org.opencontainers.image.revision":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\\n'
+                      else
+                        printf '{"org.opencontainers.image.revision":"cccccccccccccccccccccccccccccccccccccccc","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\\n'
+                      fi
+                      ;;
                     '{{if .State.Health}}{{.State.Health.Status}}{{end}}')
                       if [[ "${TEST_SCHAUWERK_HEALTH_STARTING_ONCE:-0}" == "1" ]]; then
                         health_state_file="$WELTGEWEBE_DEPLOY_STATE_ROOT/schaubild-health-probe-count"
@@ -1075,6 +1082,23 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                 "WELTGEWEBE_DEPLOY_HELPER": str(DEPLOY_SCRIPT),
                 "PUBLIC_COMMIT": self.commit,
                 "TEST_PUBLIC_SCHAUWERK_MANIFEST_BROKEN": "1",
+                "TEST_DEPLOY_MARKER": str(marker),
+            }
+        )
+        self.restore_test_ownership()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
+        self.assertIn("reason=schaubild_runtime_image_identity_drift", result.stdout)
+        self.assertIn("production_reconcile=verified", result.stdout)
+        self.assertNotIn("production_reconcile=noop", result.stdout)
+
+    def test_reconciler_repairs_same_commit_with_schauwerk_source_label_drift(self) -> None:
+        marker = self.root / "deploy-complete"
+        result = self.reconcile_existing_public_commit(
+            extra_env={
+                "WELTGEWEBE_DEPLOY_HELPER": str(DEPLOY_SCRIPT),
+                "PUBLIC_COMMIT": self.commit,
+                "TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN": "1",
                 "TEST_DEPLOY_MARKER": str(marker),
             }
         )

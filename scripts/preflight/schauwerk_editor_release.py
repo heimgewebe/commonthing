@@ -7,10 +7,12 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 LOCK_SCHEMA = "weltgewebe-schauwerk-runtime-lock.v1"
 SOURCE_REPOSITORY = "heimgewebe/schauwerk"
 IMAGE_REPOSITORY = "ghcr.io/heimgewebe/schauwerk-schaubild"
+IMAGE_SOURCE_URL = "https://github.com/heimgewebe/schauwerk"
 PUBLIC_BASE_PATH = "/schaubild"
 LOCK_KEYS = {
     "schema_version",
@@ -66,13 +68,48 @@ def verify_runtime_lock(lock_path: Path) -> dict[str, str]:
     }
 
 
+def verify_image_labels(labels: Any, *, expected_commit: str) -> dict[str, str]:
+    """Verify the immutable image's source/revision identity.
+
+    The caller is responsible for obtaining these labels from the exact
+    digest-qualified image reference in the verified runtime lock.
+    """
+
+    if not isinstance(expected_commit, str) or COMMIT_RE.fullmatch(expected_commit) is None:
+        raise ReleaseContractError("expected image source commit is invalid")
+    if not isinstance(labels, dict):
+        raise ReleaseContractError("OCI image labels are missing or invalid")
+    revision = labels.get("org.opencontainers.image.revision")
+    source = labels.get("org.opencontainers.image.source")
+    if revision != expected_commit:
+        raise ReleaseContractError("OCI image revision does not match runtime lock source commit")
+    if source != IMAGE_SOURCE_URL:
+        raise ReleaseContractError("OCI image source does not match Schauwerk repository")
+    return {"source_commit": expected_commit, "source_url": IMAGE_SOURCE_URL}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lock", required=True, type=Path)
+    parser.add_argument(
+        "--image-labels-json",
+        help="JSON object read from the exact digest-qualified OCI image Config.Labels",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
         result = verify_runtime_lock(args.lock)
+        if args.image_labels_json is not None:
+            try:
+                labels = json.loads(args.image_labels_json)
+            except json.JSONDecodeError as exc:
+                raise ReleaseContractError("OCI image labels are invalid JSON") from exc
+            result = {
+                **result,
+                "image_identity": verify_image_labels(
+                    labels, expected_commit=result["source_commit"]
+                ),
+            }
     except ReleaseContractError as exc:
         print(
             f"ERROR: Schaubild runtime lock preflight failed: {exc}",
@@ -82,10 +119,15 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     else:
+        suffix = (
+            " image_source_binding=verified"
+            if "image_identity" in result
+            else ""
+        )
         print(
             "schauwerk_runtime_preflight=pass "
             f"source_commit={result['source_commit']} "
-            f"image_ref={result['image_ref']}"
+            f"image_ref={result['image_ref']}{suffix}"
         )
     return 0
 
