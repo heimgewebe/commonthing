@@ -13511,6 +13511,126 @@ def _kubernetes_object_revision(
     }
 
 
+def _httproute_attaches_to_experiment_gateway(
+    route: Any,
+    *,
+    context: str,
+) -> bool:
+    if not isinstance(route, dict):
+        raise RuntimeErrorEB(f"{context} payload is not an object")
+    metadata = route.get("metadata")
+    spec = route.get("spec")
+    if not isinstance(metadata, dict) or not isinstance(spec, dict):
+        raise RuntimeErrorEB(f"{context} metadata/spec is invalid")
+    route_name = metadata.get("name")
+    if (
+        not isinstance(route_name, str)
+        or not route_name
+        or metadata.get("namespace") != APP_NAMESPACE
+    ):
+        raise RuntimeErrorEB(f"{context} identity is invalid")
+    parent_refs = spec.get("parentRefs")
+    if not isinstance(parent_refs, list):
+        raise RuntimeErrorEB(f"{context} parentRef inventory is invalid")
+    for parent_ref in parent_refs:
+        if not isinstance(parent_ref, dict):
+            raise RuntimeErrorEB(f"{context} parentRef inventory is invalid")
+        if (
+            str(parent_ref.get("group") or "gateway.networking.k8s.io")
+            == "gateway.networking.k8s.io"
+            and str(parent_ref.get("kind") or "Gateway") == "Gateway"
+            and str(parent_ref.get("namespace") or APP_NAMESPACE)
+            == APP_NAMESPACE
+            and parent_ref.get("name") == "commonthing-experiment-b"
+        ):
+            return True
+    return False
+
+
+def _gateway_httproute_attachment_binding(
+    root: Path,
+    canonical_route_uid: str,
+) -> dict[str, Any]:
+    if not isinstance(canonical_route_uid, str) or not canonical_route_uid:
+        raise RuntimeErrorEB(
+            "functional serving canonical HTTPRoute UID is invalid"
+        )
+    readback = _kubectl_json(
+        root,
+        ["-n", APP_NAMESPACE, "get", "httproutes"],
+    )
+    list_metadata = (
+        readback.get("metadata")
+        if isinstance(readback, dict)
+        else None
+    )
+    resource_version = (
+        list_metadata.get("resourceVersion")
+        if isinstance(list_metadata, dict)
+        else None
+    )
+    items = readback.get("items") if isinstance(readback, dict) else None
+    if (
+        not isinstance(resource_version, str)
+        or not resource_version
+        or not isinstance(items, list)
+        or any(not isinstance(item, dict) for item in items)
+    ):
+        raise RuntimeErrorEB(
+            "functional serving HTTPRoute attachment inventory is invalid"
+        )
+
+    attached: dict[str, dict[str, str]] = {}
+    for item in items:
+        metadata = item.get("metadata")
+        route_name = (
+            metadata.get("name")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(route_name, str)
+            or not route_name
+            or metadata.get("namespace") != APP_NAMESPACE
+        ):
+            raise RuntimeErrorEB(
+                "functional serving HTTPRoute attachment inventory is invalid"
+            )
+        if not _httproute_attaches_to_experiment_gateway(
+            item,
+            context=f"HTTPRoute inventory {route_name}",
+        ):
+            continue
+        if metadata.get("deletionTimestamp") is not None:
+            raise RuntimeErrorEB(
+                "functional serving HTTPRoute attachment inventory drifted"
+            )
+        if route_name in attached:
+            raise RuntimeErrorEB(
+                "functional serving HTTPRoute attachment inventory is invalid"
+            )
+        revision = _kubernetes_object_revision(
+            item,
+            f"HTTPRoute attachment {route_name}",
+        )
+        attached[route_name] = revision
+
+    canonical = attached.get("commonthing-experiment-b")
+    if (
+        set(attached) != {"commonthing-experiment-b"}
+        or not isinstance(canonical, dict)
+        or canonical.get("uid") != canonical_route_uid
+    ):
+        raise RuntimeErrorEB(
+            "functional serving HTTPRoute attachment inventory drifted"
+        )
+    return {
+        "resource_version": resource_version,
+        "routes": dict(sorted(attached.items())),
+    }
+
+
 def _application_service_endpoint_binding(
     root: Path,
     service_name: str,
@@ -13715,6 +13835,14 @@ def _functional_serving_runtime_semantic_binding(
         resource = normalized.get(resource_name)
         if isinstance(resource, dict):
             resource.pop("resource_version", None)
+    httproute_inventory = normalized.get("httproute_inventory")
+    if isinstance(httproute_inventory, dict):
+        httproute_inventory.pop("resource_version", None)
+        routes = httproute_inventory.get("routes")
+        if isinstance(routes, dict):
+            for route in routes.values():
+                if isinstance(route, dict):
+                    route.pop("resource_version", None)
     return normalized
 
 
@@ -13733,7 +13861,9 @@ def _guard_functional_service_endpoints(
             "functional serving dependency replay has no Service bindings"
         )
 
-    dependencies: list[tuple[str, str, str, str, str]] = []
+    dependencies: list[
+        tuple[str, str, str | None, str | None, str]
+    ] = []
     endpoint_path = (
         f"/apis/discovery.k8s.io/v1/namespaces/"
         f"{urllib.parse.quote(APP_NAMESPACE, safe='')}/endpointslices"
@@ -13766,33 +13896,58 @@ def _guard_functional_service_endpoints(
         )
 
     namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
-    for resource_name, key, collection_name in (
-        ("Gateway", "gateway", "gateways"),
-        ("HTTPRoute", "httproute", "httproutes"),
+    gateway = serving_runtime.get("gateway")
+    gateway_resource_version = (
+        gateway.get("resource_version")
+        if isinstance(gateway, dict)
+        else None
+    )
+    if (
+        not isinstance(gateway_resource_version, str)
+        or not gateway_resource_version
     ):
-        resource = serving_runtime.get(key)
-        resource_version = (
-            resource.get("resource_version")
-            if isinstance(resource, dict)
-            else None
+        raise RuntimeErrorEB(
+            "functional serving dependency replay has no resourceVersion: Gateway"
         )
-        if not isinstance(resource_version, str) or not resource_version:
-            raise RuntimeErrorEB(
-                f"functional serving dependency replay has no resourceVersion: "
-                f"{resource_name}"
-            )
-        dependencies.append(
+    dependencies.append(
+        (
+            "Gateway",
+            gateway_resource_version,
+            "fieldSelector",
+            "metadata.name=commonthing-experiment-b",
             (
-                resource_name,
-                resource_version,
-                "fieldSelector",
-                "metadata.name=commonthing-experiment-b",
-                (
-                    f"/apis/gateway.networking.k8s.io/v1/namespaces/"
-                    f"{namespace_path}/{collection_name}"
-                ),
-            )
+                f"/apis/gateway.networking.k8s.io/v1/namespaces/"
+                f"{namespace_path}/gateways"
+            ),
         )
+    )
+
+    httproute_inventory = serving_runtime.get("httproute_inventory")
+    httproute_resource_version = (
+        httproute_inventory.get("resource_version")
+        if isinstance(httproute_inventory, dict)
+        else None
+    )
+    if (
+        not isinstance(httproute_resource_version, str)
+        or not httproute_resource_version
+    ):
+        raise RuntimeErrorEB(
+            "functional serving dependency replay has no resourceVersion: "
+            "HTTPRoute inventory"
+        )
+    dependencies.append(
+        (
+            "HTTPRoute",
+            httproute_resource_version,
+            None,
+            None,
+            (
+                f"/apis/gateway.networking.k8s.io/v1/namespaces/"
+                f"{namespace_path}/httproutes"
+            ),
+        )
+    )
 
     yield
 
@@ -13804,15 +13959,20 @@ def _guard_functional_service_endpoints(
         selector_value,
         collection_path,
     ) in dependencies:
-        watch_query = urllib.parse.urlencode(
-            {
-                "watch": "1",
-                "resourceVersion": resource_version,
-                "allowWatchBookmarks": "true",
-                "timeoutSeconds": "2",
-                selector_name: selector_value,
-            }
-        )
+        watch_parameters = {
+            "watch": "1",
+            "resourceVersion": resource_version,
+            "allowWatchBookmarks": "true",
+            "timeoutSeconds": "2",
+        }
+        if selector_name is not None:
+            if selector_value is None:
+                raise RuntimeErrorEB(
+                    f"functional serving dependency replay selector is invalid: "
+                    f"{subject}"
+                )
+            watch_parameters[selector_name] = selector_value
+        watch_query = urllib.parse.urlencode(watch_parameters)
         result = run(
             [
                 kubectl,
@@ -13841,11 +14001,32 @@ def _guard_functional_service_endpoints(
                     f"functional serving dependency replay event is invalid: "
                     f"{subject}"
                 )
-            if event["type"] != "BOOKMARK":
-                raise RuntimeErrorEB(
-                    f"functional serving dependency changed during Gateway probes: "
-                    f"{subject}"
+            if event["type"] == "BOOKMARK":
+                continue
+            if subject == "HTTPRoute":
+                route = event["object"]
+                metadata = route.get("metadata")
+                route_name = (
+                    metadata.get("name")
+                    if isinstance(metadata, dict)
+                    else None
                 )
+                if (
+                    route_name == "commonthing-experiment-b"
+                    or _httproute_attaches_to_experiment_gateway(
+                        route,
+                        context="HTTPRoute watch event",
+                    )
+                ):
+                    raise RuntimeErrorEB(
+                        "functional serving dependency changed during Gateway "
+                        "probes: HTTPRoute"
+                    )
+                continue
+            raise RuntimeErrorEB(
+                f"functional serving dependency changed during Gateway probes: "
+                f"{subject}"
+            )
 
 
 def _functional_serving_runtime_binding(
@@ -14101,11 +14282,16 @@ def _functional_serving_runtime_binding(
         "uid": httproute_revision["uid"],
         "resource_version": httproute_revision["resource_version"],
     }
+    httproute_inventory = _gateway_httproute_attachment_binding(
+        root,
+        httproute_revision["uid"],
+    )
     return {
         "workloads": workload_binding,
         "services": service_binding,
         "gateway": gateway_readback,
         "httproute": httproute_readback,
+        "httproute_inventory": httproute_inventory,
         "gateway_base_url": _gateway_base_url(root, source_commit),
     }
 

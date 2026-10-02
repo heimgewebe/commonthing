@@ -7945,6 +7945,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "name": "commonthing-experiment-b",
                 "namespace": runtime.APP_NAMESPACE,
                 "generation": 1,
+                "uid": "gateway-uid",
+                "resourceVersion": "300",
             },
             "spec": {
                 "gatewayClassName": "cilium",
@@ -7972,6 +7974,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "name": "commonthing-experiment-b",
                 "namespace": runtime.APP_NAMESPACE,
                 "generation": 1,
+                "uid": "httproute-uid",
+                "resourceVersion": "400",
             },
             "spec": {
                 "parentRefs": [route_parent],
@@ -8010,6 +8014,8 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 }]
             },
         }
+        self.extra_httproutes: list[dict] = []
+        self.httproute_list_resource_version = "450"
         self.runner = self.patch("run", side_effect=self.run_fixture)
 
     def patch(self, name: str, *args, **kwargs):
@@ -8890,6 +8896,21 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             return self.live_secrets[key]
         if "pvc" in arguments:
             return {"items": self.pvcs}
+        if arguments == [
+            "-n",
+            runtime.APP_NAMESPACE,
+            "get",
+            "httproutes",
+        ]:
+            return {
+                "metadata": {
+                    "resourceVersion": self.httproute_list_resource_version,
+                },
+                "items": [
+                    self.httproute,
+                    *self.extra_httproutes,
+                ],
+            }
         if "httproute" in arguments:
             return self.httproute
         self.assertIn("gateway", arguments)
@@ -14485,11 +14506,24 @@ def install(*args, **kwargs):
                 }
             },
             "gateway": {"ready": True},
+            "httproute_inventory": {
+                "resource_version": "200",
+                "routes": {
+                    "commonthing-experiment-b": {
+                        "uid": "route-uid",
+                        "resource_version": "201",
+                    }
+                },
+            },
         }
         after = json.loads(json.dumps(before))
         after["services"]["weltgewebe-api"]["endpoints"][
             "resource_version"
         ] = "101"
+        after["httproute_inventory"]["resource_version"] = "202"
+        after["httproute_inventory"]["routes"][
+            "commonthing-experiment-b"
+        ]["resource_version"] = "203"
 
         semantic_before = (
             runtime._functional_serving_runtime_semantic_binding(before)
@@ -14501,6 +14535,16 @@ def install(*args, **kwargs):
         self.assertNotIn(
             "resource_version",
             semantic_before["services"]["weltgewebe-api"]["endpoints"],
+        )
+        self.assertNotIn(
+            "resource_version",
+            semantic_before["httproute_inventory"],
+        )
+        self.assertNotIn(
+            "resource_version",
+            semantic_before["httproute_inventory"]["routes"][
+                "commonthing-experiment-b"
+            ],
         )
 
         after["services"]["weltgewebe-api"]["endpoints"]["sha256"] = "b" * 64
@@ -14525,6 +14569,15 @@ def install(*args, **kwargs):
             },
             "gateway": {"resource_version": "300"},
             "httproute": {"resource_version": "400"},
+            "httproute_inventory": {
+                "resource_version": "450",
+                "routes": {
+                    "commonthing-experiment-b": {
+                        "uid": "canonical-route-uid",
+                        "resource_version": "400",
+                    }
+                },
+            },
         }
 
         for mutation_index, subject in (
@@ -14535,15 +14588,33 @@ def install(*args, **kwargs):
             with self.subTest(subject=subject):
                 results = []
                 for index in range(4):
+                    event_object = {
+                        "metadata": {
+                            "resourceVersion": str(500 + index),
+                        }
+                    }
+                    if index == 3:
+                        event_object = {
+                            "metadata": {
+                                "name": "rogue-route",
+                                "namespace": runtime.APP_NAMESPACE,
+                                "resourceVersion": str(500 + index),
+                            },
+                            "spec": {
+                                "parentRefs": [
+                                    {
+                                        "name": "commonthing-experiment-b",
+                                        "namespace": runtime.APP_NAMESPACE,
+                                        "sectionName": "http",
+                                    }
+                                ]
+                            },
+                        }
                     event = (
                         json.dumps(
                             {
                                 "type": "MODIFIED",
-                                "object": {
-                                    "metadata": {
-                                        "resourceVersion": str(500 + index),
-                                    }
-                                },
+                                "object": event_object,
                             }
                         )
                         + "\n"
@@ -14621,9 +14692,9 @@ def install(*args, **kwargs):
                     ),
                     (
                         "HTTPRoute",
-                        "400",
-                        "fieldSelector",
-                        "metadata.name=commonthing-experiment-b",
+                        "450",
+                        None,
+                        None,
                         "/apis/gateway.networking.k8s.io/v1/namespaces/"
                         f"{runtime.APP_NAMESPACE}/httproutes",
                     ),
@@ -14647,17 +14718,142 @@ def install(*args, **kwargs):
                         expected_path,
                         expected_subject,
                     )
+                    expected_query = {
+                        "watch": ["1"],
+                        "resourceVersion": [resource_version],
+                        "allowWatchBookmarks": ["true"],
+                        "timeoutSeconds": ["2"],
+                    }
+                    if selector_name is not None:
+                        self.assertIsNotNone(selector_value)
+                        expected_query[selector_name] = [selector_value]
                     self.assertEqual(
                         runtime.urllib.parse.parse_qs(watch_url.query),
-                        {
-                            "watch": ["1"],
-                            "resourceVersion": [resource_version],
-                            "allowWatchBookmarks": ["true"],
-                            "timeoutSeconds": ["2"],
-                            selector_name: [selector_value],
-                        },
+                        expected_query,
                         expected_subject,
                     )
+
+    def test_functional_httproute_inventory_rejects_additional_gateway_attachment(
+        self,
+    ) -> None:
+        parent_ref = {
+            "name": "commonthing-experiment-b",
+            "namespace": runtime.APP_NAMESPACE,
+            "sectionName": "http",
+        }
+        canonical = {
+            "metadata": {
+                "name": "commonthing-experiment-b",
+                "namespace": runtime.APP_NAMESPACE,
+                "uid": "canonical-route-uid",
+                "resourceVersion": "400",
+            },
+            "spec": {"parentRefs": [parent_ref]},
+        }
+        rogue = json.loads(json.dumps(canonical))
+        rogue["metadata"]["name"] = "rogue-route"
+        rogue["metadata"]["uid"] = "rogue-route-uid"
+        rogue["metadata"]["resourceVersion"] = "401"
+
+        with mock.patch.object(
+            runtime,
+            "_kubectl_json",
+            return_value={
+                "metadata": {"resourceVersion": "450"},
+                "items": [canonical],
+            },
+        ):
+            observed = runtime._gateway_httproute_attachment_binding(
+                Path("/tmp"),
+                "canonical-route-uid",
+            )
+        self.assertEqual(observed["resource_version"], "450")
+        self.assertEqual(
+            set(observed["routes"]),
+            {"commonthing-experiment-b"},
+        )
+
+        with (
+            mock.patch.object(
+                runtime,
+                "_kubectl_json",
+                return_value={
+                    "metadata": {"resourceVersion": "451"},
+                    "items": [canonical, rogue],
+                },
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "HTTPRoute attachment inventory drifted",
+            ),
+        ):
+            runtime._gateway_httproute_attachment_binding(
+                Path("/tmp"),
+                "canonical-route-uid",
+            )
+
+    def test_functional_dependency_replay_watches_complete_httproute_inventory(
+        self,
+    ) -> None:
+        serving_runtime = {
+            "services": {
+                name: {
+                    "endpoints": {
+                        "resource_version": str(index + 100),
+                    }
+                }
+                for index, name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                )
+            },
+            "gateway": {"resource_version": "300"},
+            "httproute": {"resource_version": "400"},
+            "httproute_inventory": {
+                "resource_version": "450",
+                "routes": {
+                    "commonthing-experiment-b": {
+                        "uid": "canonical-route-uid",
+                    }
+                },
+            },
+        }
+        result = subprocess.CompletedProcess(
+            ["kubectl"],
+            0,
+            stdout="",
+            stderr="",
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "toolchain",
+                return_value={"tools": {"kubectl": "/usr/bin/kubectl"}},
+            ),
+            mock.patch.object(runtime, "kube_env", return_value={}),
+            mock.patch.object(
+                runtime,
+                "run",
+                return_value=result,
+            ) as replay,
+        ):
+            with runtime._guard_functional_service_endpoints(
+                Path("/tmp"),
+                serving_runtime,
+            ):
+                pass
+
+        self.assertEqual(replay.call_count, 4)
+        route_argv = replay.call_args_list[3].args[0]
+        route_url = runtime.urllib.parse.urlsplit(route_argv[3])
+        self.assertEqual(
+            route_url.path,
+            "/apis/gateway.networking.k8s.io/v1/namespaces/"
+            f"{runtime.APP_NAMESPACE}/httproutes",
+        )
+        route_query = runtime.urllib.parse.parse_qs(route_url.query)
+        self.assertEqual(route_query["resourceVersion"], ["450"])
+        self.assertNotIn("fieldSelector", route_query)
+        self.assertNotIn("labelSelector", route_query)
 
     def test_functional_routing_binding_carries_exact_resource_versions(
         self,
@@ -14698,6 +14894,14 @@ def install(*args, **kwargs):
         )
         self.assertIn(
             '"resource_version": httproute_revision["resource_version"]',
+            source,
+        )
+        self.assertIn(
+            "_gateway_httproute_attachment_binding(",
+            source,
+        )
+        self.assertIn(
+            '"httproute_inventory": httproute_inventory',
             source,
         )
 
