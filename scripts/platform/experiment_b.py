@@ -13,7 +13,8 @@ import hashlib
 import json
 import os
 import re
-import tempfile
+import secrets
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -249,15 +250,114 @@ def require_state_path(root: Path, path: Path) -> Path:
     return resolved
 
 
+def _open_output_directory_nofollow(path: Path, context: str) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if not all(isinstance(flag, int) for flag in (nofollow, cloexec, directory)):
+        raise ContractError(f"{context} is unsafe")
+    flags = os.O_RDONLY | nofollow | cloexec | directory
+    absolute = Path(os.path.abspath(path))
+    try:
+        directory_fd = os.open("/", flags)
+    except OSError as exc:
+        raise ContractError(f"{context} is unsafe") from exc
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise ContractError(f"{context} is unsafe") from exc
+                try:
+                    next_fd = os.open(component, flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise ContractError(f"{context} is unsafe") from exc
+            except OSError as exc:
+                raise ContractError(f"{context} is unsafe") from exc
+            os.close(directory_fd)
+            directory_fd = next_fd
+        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+            raise ContractError(f"{context} is unsafe")
+        result = directory_fd
+        directory_fd = -1
+        return result
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
-        tmp = Path(handle.name)
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    if (
+        not isinstance(mode, int)
+        or isinstance(mode, bool)
+        or mode < 0
+        or mode > 0o777
+    ):
+        raise ContractError("state output mode is invalid")
+    if not path.name or path.name in {".", ".."}:
+        raise ContractError("state output name is invalid")
+
+    directory_fd = _open_output_directory_nofollow(
+        path.parent,
+        "state output parent",
+    )
+    temporary_name = f".{path.name}.{secrets.token_hex(12)}.tmp"
+    temporary_fd: int | None = None
+    try:
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        cloexec = getattr(os, "O_CLOEXEC", None)
+        if not isinstance(nofollow, int) or not isinstance(cloexec, int):
+            raise ContractError("state output cannot be written safely")
+        try:
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec,
+                mode,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            raise ContractError("state output cannot be created safely") from exc
+        metadata = os.fstat(temporary_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise ContractError("state output identity is unsafe")
+        os.fchmod(temporary_fd, mode)
+        view = memoryview(data)
+        offset = 0
+        while offset < len(view):
+            written = os.write(temporary_fd, view[offset:])
+            if written <= 0:
+                raise ContractError("state output write failed")
+            offset += written
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        try:
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            raise ContractError("state output replacement failed") from exc
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(directory_fd)
 
 
 def render_bootstrap_from_template(

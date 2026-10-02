@@ -61,6 +61,33 @@ class ExperimentBContractTests(unittest.TestCase):
                 with self.assertRaises(eb.ContractError):
                     eb.state_root(str(sibling))
 
+    def test_cloud_init_rejects_symlinked_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "state"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.mkdir()
+            output_dir = root / "cloud-init"
+            output_dir.symlink_to(outside, target_is_directory=True)
+            public_key = parent / "id_ed25519.pub"
+            public_key.write_text(
+                "ssh-ed25519 test-key\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                eb.ContractError,
+                "state output parent is unsafe",
+            ):
+                eb.render_cloud_init(
+                    public_key,
+                    output_dir,
+                    "commonthing-experiment-b",
+                )
+
+            self.assertEqual(list(outside.iterdir()), [])
+
     def test_bootstrap_binds_exact_commit_and_image_digests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "bootstrap.yaml"
