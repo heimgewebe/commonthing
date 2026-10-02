@@ -1795,8 +1795,6 @@ def create_vm(root: Path) -> dict[str, Any]:
             "Experiment-B libvirt pool already exists; run bounded teardown first"
         )
 
-    qemu_uid, qemu_gid = _libvirt_qemu_identity()
-
     RETIREMENT_RECEIPT.unlink(missing_ok=True)
     _retirement_attempt_path().unlink(missing_ok=True)
     _invalidate_receipts(root, VM_ATTEMPT_INVALIDATES)
@@ -1822,6 +1820,7 @@ def create_vm(root: Path) -> dict[str, Any]:
     )
 
     prepared = prepare(root, source_commit)
+    qemu_uid, qemu_gid = _libvirt_qemu_identity()
     cloud_image = Path(prepared["cloud_image"])
     source_virtual_size = int(prepared["cloud_image_virtual_size"])
     pool_fd = _open_libvirt_pool_target(create=True)
