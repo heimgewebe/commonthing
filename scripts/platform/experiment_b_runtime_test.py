@@ -11909,6 +11909,9 @@ spec:
             second_api + 1,
         )
         report = source.index("report = {", post_metrics)
+        postgres_service_guard_close = source.index(
+            "postgres_service_guard.close()"
+        )
         port_forward = source.index("_start_api_port_forward")
         final_bound_close = source.rindex("bound_stack.close()")
         self.assertLess(first_target, bound_snapshot)
@@ -11929,7 +11932,8 @@ spec:
         self.assertLess(metrics_process_before, post_metrics)
         self.assertLess(post_metrics, metrics_process_after)
         self.assertLess(metrics_process_after, final_api)
-        self.assertLess(final_api, report)
+        self.assertLess(final_api, postgres_service_guard_close)
+        self.assertLess(postgres_service_guard_close, report)
         self.assertIn(
             "final_api_runtime_binding != api_runtime_binding_before",
             source,

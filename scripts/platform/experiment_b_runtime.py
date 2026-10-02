@@ -12920,6 +12920,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         "server": target_server_before,
     }
     bound_stack = ExitStack()
+    postgres_service_guard = ExitStack()
     bound_stack.enter_context(_bound_kube_env(root, target_binding_before, source_commit))
     try:
         postgres_binding_before = _require_t048_postgres_runtime_binding(
@@ -13026,7 +13027,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             postgres_binding_before,
             database_identity,
         )]
-        bound_stack.enter_context(
+        postgres_service_guard.enter_context(
             _guard_t048_postgres_service_endpoints(
                 root,
                 postgres_service_binding_before,
@@ -13189,6 +13190,8 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             raise RuntimeErrorEB(
                 "API runtime contract changed after T048 metrics snapshot"
             )
+
+        postgres_service_guard.close()
 
         cpu_percentages: list[float] = []
         for first, second in zip(resource_samples, resource_samples[1:]):
@@ -13367,6 +13370,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             process.wait(timeout=5)
         pf_stdout.close()
         pf_stderr.close()
+        postgres_service_guard.close()
         bound_stack.close()
 
 
