@@ -173,7 +173,6 @@ if (writeServer) {
     ".well-known/prodverity.json",
   );
   const prodVerityManifest = {
-    schema_version: 1,
     revision: commit,
     checks: [
       { id: "homepage", path: "/", expected_status: 200 },
