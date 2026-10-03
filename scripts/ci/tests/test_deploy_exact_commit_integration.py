@@ -116,6 +116,19 @@ class GitFixtureIsolationTests(unittest.TestCase):
             check=False,
         )
 
+    def test_docker_shim_expands_schauwerk_drift_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            case = object.__new__(DeployExactCommitIntegrationTests)
+            case.bin = Path(raw_root) / "bin"
+            case.bin.mkdir()
+            case.make_command_shims()
+            rendered = (case.bin / "docker").read_text(encoding="utf-8")
+
+        self.assertIn('${TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN:-0}', rendered)
+        self.assertIn('${TEST_DEPLOY_MARKER:-}', rendered)
+        self.assertNotIn(r'\${TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN:-0}', rendered)
+        self.assertNotIn(r'\${TEST_DEPLOY_MARKER:-}', rendered)
+
 
 class DeployExactCommitIntegrationTests(unittest.TestCase):
     maxDiff = None
@@ -429,7 +442,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                       printf 'ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n'
                       ;;
                     '{{json .Config.Labels}}')
-                      if [[ "\${TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN:-0}" == "1" && ( -z "\${TEST_DEPLOY_MARKER:-}" || ! -e "$TEST_DEPLOY_MARKER" ) ]]; then
+                      if [[ "${TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN:-0}" == "1" && ( -z "${TEST_DEPLOY_MARKER:-}" || ! -e "$TEST_DEPLOY_MARKER" ) ]]; then
                         printf '{"org.opencontainers.image.revision":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\\n'
                       else
                         printf '{"org.opencontainers.image.revision":"cccccccccccccccccccccccccccccccccccccccc","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\\n'
