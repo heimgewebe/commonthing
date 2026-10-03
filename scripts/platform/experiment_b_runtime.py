@@ -4939,9 +4939,15 @@ def _flux_strategy_projection(
 def _flux_pod_spec_projection(
     pod_spec: Any,
     context: str,
+    *,
+    synthesize_system_priority: bool = False,
 ) -> dict[str, Any]:
     normalized = _normalize_flux_pod_spec(pod_spec, context)
-    projection = _application_pod_spec_projection(normalized, context)
+    projection = _application_pod_spec_projection(
+        normalized,
+        context,
+        synthesize_system_priority=synthesize_system_priority,
+    )
     pod_spec = normalized
     projection.update(
         {
@@ -5091,7 +5097,11 @@ def _flux_deployment_contract(
     annotations = template_metadata.get("annotations", {})
     if not isinstance(labels, dict) or not isinstance(annotations, dict):
         raise RuntimeErrorEB(f"{context} template metadata contract is invalid")
-    pod_contract = _flux_pod_spec_projection(pod_spec, context)
+    pod_contract = _flux_pod_spec_projection(
+        pod_spec,
+        context,
+        synthesize_system_priority=True,
+    )
     deployment_contract = {
         "replicas": replicas,
         "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
@@ -7344,6 +7354,8 @@ def _pod_active_deadline_seconds(
 def _pod_priority_projection(
     pod_spec: dict[str, Any],
     context: str,
+    *,
+    synthesize_system_priority: bool = False,
 ) -> tuple[str, int]:
     priority_class_name = pod_spec.get("priorityClassName")
     if priority_class_name is None:
@@ -7354,10 +7366,14 @@ def _pod_priority_projection(
         )
     priority = pod_spec.get("priority")
     if priority is None:
-        priority = {
-            "system-cluster-critical": 2_000_000_000,
-            "system-node-critical": 2_000_001_000,
-        }.get(priority_class_name, 0)
+        priority = (
+            {
+                "system-cluster-critical": 2_000_000_000,
+                "system-node-critical": 2_000_001_000,
+            }.get(priority_class_name, 0)
+            if synthesize_system_priority
+            else 0
+        )
     if isinstance(priority, bool) or not isinstance(priority, int):
         raise RuntimeErrorEB(f"{context} Pod priority contract is invalid")
     return priority_class_name, priority
@@ -7366,6 +7382,8 @@ def _pod_priority_projection(
 def _application_pod_spec_projection(
     pod_spec: Any,
     context: str,
+    *,
+    synthesize_system_priority: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(pod_spec, dict):
         raise RuntimeErrorEB(f"{context} Pod spec is invalid")
@@ -7417,7 +7435,9 @@ def _application_pod_spec_projection(
         )
 
     priority_class_name, priority = _pod_priority_projection(
-        pod_spec, context
+        pod_spec,
+        context,
+        synthesize_system_priority=synthesize_system_priority,
     )
     result: dict[str, Any] = {
         "serviceAccountName": pod_spec.get(

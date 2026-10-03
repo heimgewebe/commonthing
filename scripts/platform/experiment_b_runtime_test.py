@@ -2217,12 +2217,23 @@ spec:
         ]
         live_pod["priority"] = 2_000_000_000
         expected_projection = runtime._flux_pod_spec_projection(
-            expected_pod, "expected Flux Pod"
+            expected_pod,
+            "expected Flux Pod",
+            synthesize_system_priority=True,
         )
         live_projection = runtime._flux_pod_spec_projection(
             live_pod, "live Flux Pod"
         )
         self.assertEqual(expected_projection, live_projection)
+
+        missing_priority = json.loads(json.dumps(live_pod))
+        missing_priority.pop("priority")
+        self.assertNotEqual(
+            expected_projection,
+            runtime._flux_pod_spec_projection(
+                missing_priority, "live Flux Pod without admitted priority"
+            ),
+        )
 
         priority_drift = json.loads(json.dumps(live_pod))
         priority_drift["priority"] = 1_999_999_999
