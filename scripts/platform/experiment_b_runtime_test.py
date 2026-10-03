@@ -8920,6 +8920,17 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             },
         )
         self.patch("_kubectl_json", side_effect=self.kubernetes_fixture)
+        self.patch(
+            "_endpoint_slice_collection_json",
+            side_effect=self.endpoint_slice_fixture,
+        )
+
+    def endpoint_slice_fixture(self, _root, namespace, service_name):
+        if namespace == runtime.DATA_NAMESPACE and service_name == "postgres":
+            return self.data_endpoint_slices["postgres"]
+        raise runtime.RuntimeErrorEB(
+            f"unexpected EndpointSlice fixture lookup: {namespace}/{service_name}"
+        )
 
     def kubernetes_fixture(self, _root, arguments):
         if (
@@ -14673,6 +14684,47 @@ def install(*args, **kwargs):
             self.assertIn(required, binding_source)
 
 
+    def test_endpoint_slice_collection_uses_raw_server_list_metadata(self) -> None:
+        raw = {
+            "metadata": {"resourceVersion": "5073"},
+            "items": [],
+        }
+        completed = subprocess.CompletedProcess(
+            ["kubectl"],
+            0,
+            stdout=json.dumps(raw),
+            stderr="",
+        )
+        with mock.patch.object(
+            runtime,
+            "_kubectl",
+            return_value=completed,
+        ) as kubectl:
+            observed = runtime._endpoint_slice_collection_json(
+                Path("/tmp"),
+                runtime.APP_NAMESPACE,
+                "weltgewebe-api",
+            )
+        self.assertEqual(observed, raw)
+        argv = kubectl.call_args.args[1]
+        self.assertEqual(argv[:2], ["get", "--raw"])
+        url = runtime.urllib.parse.urlsplit(argv[2])
+        self.assertEqual(
+            url.path,
+            (
+                "/apis/discovery.k8s.io/v1/namespaces/"
+                f"{runtime.APP_NAMESPACE}/endpointslices"
+            ),
+        )
+        self.assertEqual(
+            runtime.urllib.parse.parse_qs(url.query),
+            {
+                "labelSelector": [
+                    "kubernetes.io/service-name=weltgewebe-api"
+                ]
+            },
+        )
+
     def test_application_service_endpoints_bind_to_validated_pods(self) -> None:
         pod_identities = {
             "weltgewebe-api-serving": {
@@ -14714,7 +14766,7 @@ def install(*args, **kwargs):
         }
         with mock.patch.object(
             runtime,
-            "_kubectl_json",
+            "_endpoint_slice_collection_json",
             return_value={
                 "metadata": {"resourceVersion": "12345"},
                 "items": [endpoint_slice],
@@ -14750,14 +14802,8 @@ def install(*args, **kwargs):
         )
         readback.assert_called_once_with(
             Path("/tmp"),
-            [
-                "-n",
-                runtime.APP_NAMESPACE,
-                "get",
-                "endpointslices.discovery.k8s.io",
-                "-l",
-                "kubernetes.io/service-name=weltgewebe-api",
-            ],
+            runtime.APP_NAMESPACE,
+            "weltgewebe-api",
         )
 
         drifted = {
@@ -14779,7 +14825,7 @@ def install(*args, **kwargs):
         with (
             mock.patch.object(
                 runtime,
-                "_kubectl_json",
+                "_endpoint_slice_collection_json",
                 return_value=drifted,
             ),
             self.assertRaisesRegex(
