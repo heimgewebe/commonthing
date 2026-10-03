@@ -1399,6 +1399,13 @@ prune_releases
         convergence_slice = workflow[convergence:live_readback]
         self.assertIn("continue-on-error: true", convergence_slice)
         self.assertIn('"state": "invalid"', convergence_slice)
+        self.assertIn(
+            "https://api.github.com/repos/heimgewebe/schauwerk/actions/workflows",
+            convergence_slice,
+        )
+        self.assertNotIn("GH_TOKEN: ${{ github.token }}", convergence_slice)
+        self.assertNotIn("Authorization: Bearer", convergence_slice)
+        self.assertIn("--header 'Accept: application/vnd.github+json'", convergence_slice)
         self.assertIn('payload.get("state") != "current"', workflow[enforcement:])
 
 

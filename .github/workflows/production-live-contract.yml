@@ -243,10 +243,9 @@ jobs:
         id: schaubild-convergence
         continue-on-error: true
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Public cross-repository read: Commonthing's GITHUB_TOKEN is repository-scoped.
           workflow_runs_url='https://api.github.com/repos/heimgewebe/schauwerk/actions/workflows'
           workflow_runs_url+='/native-schaubild-image.yml/runs?event=workflow_dispatch'
           workflow_runs_url+='&status=success&per_page=20'
@@ -254,7 +253,6 @@ jobs:
             --proto '=https' \
             --connect-timeout 5 \
             --max-time 20 \
-            --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             "$workflow_runs_url" \
             > schaubild-publish-runs.json; then
