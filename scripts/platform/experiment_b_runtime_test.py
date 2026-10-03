@@ -1557,11 +1557,58 @@ spec:
         }
         readback = runtime._require_exact_k3s_node_inventory(inventory, expected)
         self.assertEqual(readback["kubelet_version"], expected)
+        self.assertTrue(readback["ready"])
+        self.assertIn("require_ready=False", source)
+
+        not_ready = json.loads(json.dumps(inventory))
+        not_ready["items"][0]["status"]["conditions"][0]["status"] = "False"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "not Ready"):
+            runtime._require_exact_k3s_node_inventory(not_ready, expected)
+        pre_cni = runtime._require_exact_k3s_node_inventory(
+            not_ready,
+            expected,
+            require_ready=False,
+        )
+        self.assertEqual(pre_cni["kubelet_version"], expected)
+        self.assertFalse(pre_cni["ready"])
+
+        missing_ready = json.loads(json.dumps(inventory))
+        missing_ready["items"][0]["status"]["conditions"] = []
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "Ready condition is invalid"):
+            runtime._require_exact_k3s_node_inventory(
+                missing_ready,
+                expected,
+                require_ready=False,
+            )
+
+        ambiguous_ready = json.loads(json.dumps(inventory))
+        ambiguous_ready["items"][0]["status"]["conditions"].append(
+            {"type": "Ready", "status": "False"}
+        )
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "Ready condition is invalid"):
+            runtime._require_exact_k3s_node_inventory(
+                ambiguous_ready,
+                expected,
+                require_ready=False,
+            )
+
+        invalid_ready = json.loads(json.dumps(inventory))
+        invalid_ready["items"][0]["status"]["conditions"][0]["status"] = "Unknown"
+        with self.assertRaisesRegex(runtime.RuntimeErrorEB, "Ready condition is invalid"):
+            runtime._require_exact_k3s_node_inventory(
+                invalid_ready,
+                expected,
+                require_ready=False,
+            )
 
         stale = json.loads(json.dumps(inventory))
         stale["items"][0]["status"]["nodeInfo"]["kubeletVersion"] = "v1.35.0+k3s1"
         with self.assertRaisesRegex(runtime.RuntimeErrorEB, "pinned k3s version"):
-            runtime._require_exact_k3s_node_inventory(stale, expected)
+            runtime._require_exact_k3s_node_inventory(
+                stale,
+                expected,
+                require_ready=False,
+            )
 
     def test_live_k3s_runtime_binds_vm_kubeconfig_guest_files_and_process(self) -> None:
         commit = runtime.git_head()
@@ -13379,6 +13426,7 @@ def install(*args, **kwargs):
         cilium_install = source.index(
             'helm, "upgrade", "--install", "cilium"'
         )
+        node_ready = source.index("_require_exact_k3s_node_inventory(")
         flux_install = source.index("_flux_install_argv(flux)")
         cilium_readback = source.index("_require_live_cilium_contract(")
         flux_readback = source.index("_require_live_flux_controller_contract(")
@@ -13387,7 +13435,12 @@ def install(*args, **kwargs):
         self.assertLess(target_capture, snapshot)
         self.assertLess(snapshot, gateway_apply)
         self.assertLess(gateway_apply, cilium_install)
-        self.assertLess(cilium_install, flux_install)
+        self.assertLess(cilium_install, node_ready)
+        self.assertLess(node_ready, flux_install)
+        ready_gate = source[cilium_install:flux_install]
+        self.assertIn("time.monotonic() + 180", ready_gate)
+        self.assertIn("timeout=", ready_gate)
+        self.assertIn("subprocess.TimeoutExpired", ready_gate)
         self.assertLess(flux_install, cilium_readback)
         self.assertLess(cilium_readback, flux_readback)
         self.assertLess(flux_readback, final_target_check)
