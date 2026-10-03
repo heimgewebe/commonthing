@@ -122,10 +122,18 @@ tag resolves to one image digest and that image reports both
 `org.opencontainers.image.source=https://github.com/heimgewebe/schauwerk`.
 
 The promotion plan binds the lock preimage SHA-256 and has its own plan digest.
-Apply is compare-and-swap: any lock change between plan and apply fails instead
-of overwriting concurrent work. A current source/digest pair is a byte-preserving
-no-op. Missing images, ambiguous package digests, mismatched commit/source
-labels, stale plans, and changed lock preimages all fail closed.
+Apply requires a fresh workflow-runs evidence snapshot and revalidates that the
+latest accepted producer release still has exactly the plan's source commit and
+workflow run id before any consumer-lock mutation. A newer accepted producer
+release therefore invalidates the older plan instead of being silently skipped.
+The lock mutation itself remains compare-and-swap: any lock change between plan
+and apply fails instead of overwriting concurrent work. A current source/digest
+pair is a byte-preserving no-op. Missing images, ambiguous package digests,
+mismatched commit/source labels, stale producer evidence, stale plans, and
+changed lock preimages all fail closed. A producer release accepted after that
+fresh observation is detected by the recurring convergence observer and returns
+the consumer to `promotion_pending`; this contract does not claim a distributed
+transaction across GitHub and the consumer lock.
 
 The convergence receipt alone does not prove image-digest correctness. Digest
 admission is established by the promotion evidence and then rechecked on the

@@ -58,6 +58,22 @@ def _workflow() -> dict[str, object]:
     }
 
 
+def _newer_workflow() -> dict[str, object]:
+    payload = _workflow()
+    payload["workflow_runs"] = [
+        *payload["workflow_runs"],
+        {
+            "id": 37096765551,
+            "event": "workflow_dispatch",
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": "e" * 40,
+            "created_at": "2026-10-03T04:30:26Z",
+        },
+    ]
+    return payload
+
+
 def _packages(digest: str = NEW_DIGEST) -> list[dict[str, object]]:
     return [
         {
@@ -89,7 +105,9 @@ def test_new_release_plan_and_apply_updates_exact_lock(tmp_path: Path) -> None:
     assert plan["action"] == "update"
     assert plan["source_commit"] == NEW
     assert plan["image_digest"] == NEW_DIGEST
-    result = MODULE.apply_plan(lock, plan, expected_plan_sha256=plan["plan_sha256"])
+    result = MODULE.apply_plan(
+        lock, plan, _workflow(), expected_plan_sha256=plan["plan_sha256"]
+    )
     assert result == "updated"
     payload = json.loads(lock.read_text(encoding="utf-8"))
     assert payload["source_commit"] == NEW
@@ -101,7 +119,12 @@ def test_already_current_plan_is_noop_and_preserves_bytes(tmp_path: Path) -> Non
     before = lock.read_bytes()
     plan = MODULE.build_plan(lock, _workflow(), _packages(), _image_identity())
     assert plan["action"] == "noop"
-    assert MODULE.apply_plan(lock, plan, expected_plan_sha256=plan["plan_sha256"]) == "noop"
+    assert (
+        MODULE.apply_plan(
+            lock, plan, _workflow(), expected_plan_sha256=plan["plan_sha256"]
+        )
+        == "noop"
+    )
     assert lock.read_bytes() == before
 
 
@@ -128,12 +151,31 @@ def test_missing_image_fails_without_lock_update(tmp_path: Path) -> None:
     assert lock.read_bytes() == before
 
 
+def test_apply_rejects_newer_accepted_release_after_plan(tmp_path: Path) -> None:
+    lock = _lock(tmp_path)
+    before = lock.read_bytes()
+    plan = MODULE.build_plan(lock, _workflow(), _packages(), _image_identity())
+    with pytest.raises(
+        MODULE.PromotionError,
+        match="accepted Schauwerk release changed after promotion plan",
+    ):
+        MODULE.apply_plan(
+            lock,
+            plan,
+            _newer_workflow(),
+            expected_plan_sha256=plan["plan_sha256"],
+        )
+    assert lock.read_bytes() == before
+
+
 def test_concurrent_lock_update_rejects_stale_plan(tmp_path: Path) -> None:
     lock = _lock(tmp_path)
     plan = MODULE.build_plan(lock, _workflow(), _packages(), _image_identity())
     lock.write_text(lock.read_text(encoding="utf-8") + " ", encoding="utf-8")
     with pytest.raises(MODULE.PromotionError, match="preimage changed"):
-        MODULE.apply_plan(lock, plan, expected_plan_sha256=plan["plan_sha256"])
+        MODULE.apply_plan(
+            lock, plan, _workflow(), expected_plan_sha256=plan["plan_sha256"]
+        )
 
 
 def test_build_plan_binds_semantics_and_preimage_to_same_snapshot(
@@ -158,7 +200,9 @@ def test_build_plan_binds_semantics_and_preimage_to_same_snapshot(
     assert plan["current_image_digest"] == OLD_DIGEST
     assert plan["lock_preimage_sha256"] == MODULE._sha256_bytes(before)
     with pytest.raises(MODULE.PromotionError, match="preimage changed"):
-        MODULE.apply_plan(lock, plan, expected_plan_sha256=plan["plan_sha256"])
+        MODULE.apply_plan(
+            lock, plan, _workflow(), expected_plan_sha256=plan["plan_sha256"]
+        )
 
 
 def test_concurrent_apply_serializes_preimage_check_with_replace(
@@ -192,6 +236,7 @@ def test_concurrent_apply_serializes_preimage_check_with_replace(
                 MODULE.apply_plan(
                     lock,
                     plan,
+                    _workflow(),
                     expected_plan_sha256=plan["plan_sha256"],
                 )
             )
@@ -224,4 +269,4 @@ def test_plan_hash_is_required_for_apply(tmp_path: Path) -> None:
     lock = _lock(tmp_path)
     plan = MODULE.build_plan(lock, _workflow(), _packages(), _image_identity())
     with pytest.raises(MODULE.PromotionError, match="plan hash mismatch"):
-        MODULE.apply_plan(lock, plan, expected_plan_sha256="0" * 64)
+        MODULE.apply_plan(lock, plan, _workflow(), expected_plan_sha256="0" * 64)

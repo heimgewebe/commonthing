@@ -158,7 +158,13 @@ def _expected_lock(plan: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def apply_plan(lock_path: Path, plan: Any, *, expected_plan_sha256: str) -> str:
+def apply_plan(
+    lock_path: Path,
+    plan: Any,
+    workflow_payload: Any,
+    *,
+    expected_plan_sha256: str,
+) -> str:
     if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_SCHEMA:
         raise PromotionError("promotion plan shape or schema is invalid")
     recorded = plan.get("plan_sha256")
@@ -169,6 +175,14 @@ def apply_plan(lock_path: Path, plan: Any, *, expected_plan_sha256: str) -> str:
     resolved = str(lock_path.expanduser().absolute())
     if plan.get("lock_path") != resolved:
         raise PromotionError("promotion plan targets another runtime lock")
+    try:
+        accepted = latest_accepted_release(workflow_payload)
+    except ConvergenceError as exc:
+        raise PromotionError(str(exc)) from exc
+    if accepted["source_commit"] != plan.get("source_commit") or accepted[
+        "workflow_run_id"
+    ] != plan.get("workflow_run_id"):
+        raise PromotionError("accepted Schauwerk release changed after promotion plan")
 
     with _exclusive_parent_lock(lock_path) as directory_fd:
         try:
@@ -223,6 +237,7 @@ def main() -> int:
     apply = sub.add_parser("apply")
     apply.add_argument("--lock", required=True, type=Path)
     apply.add_argument("--plan", required=True, type=Path)
+    apply.add_argument("--workflow-runs", required=True, type=Path)
     apply.add_argument("--expected-plan-sha256", required=True)
 
     args = parser.parse_args()
@@ -240,6 +255,7 @@ def main() -> int:
             result = apply_plan(
                 args.lock,
                 _load_json(args.plan, label="promotion plan"),
+                _load_json(args.workflow_runs, label="Schauwerk workflow"),
                 expected_plan_sha256=args.expected_plan_sha256,
             )
             print(f"schauwerk_promotion={result}")
