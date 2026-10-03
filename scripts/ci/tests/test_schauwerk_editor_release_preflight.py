@@ -165,16 +165,27 @@ def test_image_labels_fail_closed_on_source_digest_binding_drift(
     with pytest.raises(MODULE.ReleaseContractError):
         MODULE.verify_image_labels(labels, expected_commit=SOURCE_COMMIT)
 
-def test_full_vps_deploy_verifies_oci_source_before_container_mutation() -> None:
+def test_full_vps_deploy_verifies_oci_source_before_edge_mutation() -> None:
     repo = Path(__file__).resolve().parents[3]
     deploy = (repo / "scripts" / "weltgewebe-up").read_text(encoding="utf-8")
     lock_preflight = deploy.index("scripts/preflight/schauwerk_editor_release.py")
-    image_probe = deploy.index('docker image inspect "$SCHAUWERK_RUNTIME_IMAGE_REF"', lock_preflight)
+    image_probe = deploy.index(
+        'docker image inspect "$SCHAUWERK_RUNTIME_IMAGE_REF"', lock_preflight
+    )
     exact_pull = deploy.index('docker pull "$SCHAUWERK_RUNTIME_IMAGE_REF"', image_probe)
     label_probe = deploy.index("SCHAUWERK_RUNTIME_IMAGE_LABELS", exact_pull)
     source_verify = deploy.index("--image-labels-json", label_probe)
-    first_container_mutation = deploy.index('echo ">> Deploying..."', source_verify)
-    assert lock_preflight < image_probe < exact_pull < label_probe < source_verify < first_container_mutation
+    edge_guard = deploy.index("# 6d. Static UI Runtime Guard & Edge Caddy Recreate")
+    edge_recreate = deploy.index('docker rm -f "$EDGE_GATEWAY_CONTAINER"', edge_guard)
+    assert (
+        lock_preflight
+        < image_probe
+        < exact_pull
+        < label_probe
+        < source_verify
+        < edge_guard
+        < edge_recreate
+    )
 
 
 def test_full_vps_postflight_reverifies_running_oci_source() -> None:

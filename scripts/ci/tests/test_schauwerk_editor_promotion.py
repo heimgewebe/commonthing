@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import threading
 
 import pytest
 
@@ -133,6 +134,65 @@ def test_concurrent_lock_update_rejects_stale_plan(tmp_path: Path) -> None:
     lock.write_text(lock.read_text(encoding="utf-8") + " ", encoding="utf-8")
     with pytest.raises(MODULE.PromotionError, match="preimage changed"):
         MODULE.apply_plan(lock, plan, expected_plan_sha256=plan["plan_sha256"])
+
+
+def test_concurrent_apply_serializes_preimage_check_with_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = _lock(tmp_path)
+    plan = MODULE.build_plan(lock, _workflow(), _packages(), _image_identity())
+    real_replace = MODULE.os.replace
+    first_at_replace = threading.Event()
+    release_first = threading.Event()
+    second_done = threading.Event()
+    counter_lock = threading.Lock()
+    replace_calls = 0
+    outcomes: list[object] = []
+
+    def controlled_replace(source: str, target: str) -> None:
+        nonlocal replace_calls
+        with counter_lock:
+            replace_calls += 1
+            call = replace_calls
+        if call == 1:
+            first_at_replace.set()
+            assert release_first.wait(2)
+        real_replace(source, target)
+
+    monkeypatch.setattr(MODULE.os, "replace", controlled_replace)
+
+    def apply(*, done: threading.Event | None = None) -> None:
+        try:
+            outcomes.append(
+                MODULE.apply_plan(
+                    lock,
+                    plan,
+                    expected_plan_sha256=plan["plan_sha256"],
+                )
+            )
+        except Exception as exc:  # captured for deterministic cross-thread assertion
+            outcomes.append(exc)
+        finally:
+            if done is not None:
+                done.set()
+
+    first = threading.Thread(target=apply)
+    first.start()
+    assert first_at_replace.wait(2)
+
+    second = threading.Thread(target=apply, kwargs={"done": second_done})
+    second.start()
+    assert not second_done.wait(0.1)
+
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert outcomes.count("updated") == 1
+    failures = [item for item in outcomes if isinstance(item, MODULE.PromotionError)]
+    assert len(failures) == 1
+    assert "preimage changed" in str(failures[0])
 
 
 def test_plan_hash_is_required_for_apply(tmp_path: Path) -> None:

@@ -111,6 +111,30 @@ implementations:
       - scripts/ci/tests/test_schauwerk_editor_release_preflight.py
       - scripts/ci/tests/test_schaubild_frontdoor.py
 
+  - id: impl.guard.schauwerk-release-convergence
+    path: scripts/preflight/schauwerk_release_convergence.py
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/deploy/schauwerk-editor-frontdoor.md
+    verified_by:
+      - scripts/ci/tests/test_schauwerk_release_convergence.py
+      - .github/workflows/production-live-contract.yml
+
+  - id: impl.guard.schauwerk-editor-promotion
+    path: scripts/preflight/schauwerk_editor_promotion.py
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/deploy/schauwerk-editor-frontdoor.md
+    verified_by:
+      - scripts/ci/tests/test_schauwerk_editor_promotion.py
+      - scripts/ci/tests/test_schauwerk_editor_release_preflight.py
+
   - id: impl.contracts
     path: contracts/domain/
     impl_type: schema

@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from schauwerk_editor_release import (
     IMAGE_REPOSITORY,
@@ -46,6 +48,21 @@ def _load_json(path: Path, *, label: str) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PromotionError(f"{label} evidence is unreadable or invalid JSON") from exc
+
+
+@contextmanager
+def _exclusive_parent_lock(lock_path: Path) -> Iterator[int]:
+    """Serialize promotion applies on a stable inode that survives lock replacement."""
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    directory_fd = os.open(lock_path.parent, flags)
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        yield directory_fd
+    finally:
+        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
 
 
 def package_digest_for_commit(payload: Any, source_commit: str) -> tuple[str, int]:
@@ -156,44 +173,47 @@ def apply_plan(lock_path: Path, plan: Any, *, expected_plan_sha256: str) -> str:
     resolved = str(lock_path.expanduser().absolute())
     if plan.get("lock_path") != resolved:
         raise PromotionError("promotion plan targets another runtime lock")
-    if lock_path.is_symlink() or not lock_path.is_file():
-        raise PromotionError("runtime lock is missing or unsafe")
-    current_bytes = lock_path.read_bytes()
-    if _sha256_bytes(current_bytes) != plan.get("lock_preimage_sha256"):
-        raise PromotionError("runtime lock preimage changed after promotion plan")
-    try:
-        current = verify_runtime_lock(lock_path)
-    except ReleaseContractError as exc:
-        raise PromotionError(str(exc)) from exc
-    expected = _expected_lock(plan)
-    action = plan.get("action")
-    if action == "noop":
-        if (
-            current["source_commit"] != expected["source_commit"]
-            or current["image_digest"] != expected["image_digest"]
-        ):
-            raise PromotionError("no-op promotion plan no longer matches runtime lock")
-        return "noop"
-    if action != "update":
-        raise PromotionError("promotion plan action is invalid")
 
-    encoded = json.dumps(expected, indent=2).encode("utf-8") + b"\n"
-    fd, temporary = tempfile.mkstemp(prefix=".release-lock.", dir=str(lock_path.parent))
-    try:
-        os.fchmod(fd, 0o644)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if _sha256_bytes(lock_path.read_bytes()) != plan["lock_preimage_sha256"]:
-            raise PromotionError("runtime lock changed during promotion apply")
-        os.replace(temporary, lock_path)
-    finally:
+    with _exclusive_parent_lock(lock_path) as directory_fd:
+        if lock_path.is_symlink() or not lock_path.is_file():
+            raise PromotionError("runtime lock is missing or unsafe")
+        current_bytes = lock_path.read_bytes()
+        if _sha256_bytes(current_bytes) != plan.get("lock_preimage_sha256"):
+            raise PromotionError("runtime lock preimage changed after promotion plan")
         try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-    return "updated"
+            current = verify_runtime_lock(lock_path)
+        except ReleaseContractError as exc:
+            raise PromotionError(str(exc)) from exc
+        expected = _expected_lock(plan)
+        action = plan.get("action")
+        if action == "noop":
+            if (
+                current["source_commit"] != expected["source_commit"]
+                or current["image_digest"] != expected["image_digest"]
+            ):
+                raise PromotionError("no-op promotion plan no longer matches runtime lock")
+            return "noop"
+        if action != "update":
+            raise PromotionError("promotion plan action is invalid")
+
+        encoded = json.dumps(expected, indent=2).encode("utf-8") + b"\n"
+        fd, temporary = tempfile.mkstemp(prefix=".release-lock.", dir=str(lock_path.parent))
+        try:
+            os.fchmod(fd, 0o644)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if _sha256_bytes(lock_path.read_bytes()) != plan["lock_preimage_sha256"]:
+                raise PromotionError("runtime lock changed during promotion apply")
+            os.replace(temporary, lock_path)
+            os.fsync(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        return "updated"
 
 
 def main() -> int:

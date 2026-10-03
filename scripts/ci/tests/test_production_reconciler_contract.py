@@ -871,6 +871,31 @@ prune_releases
         ):
             self.assertIn(expected, entry)
 
+    def test_schauwerk_release_guards_are_in_critical_impl_registry(self) -> None:
+        registry = self.read("audit/impl-registry.yaml")
+        expectations = {
+            "impl.guard.schauwerk-release-convergence": (
+                "path: scripts/preflight/schauwerk_release_convergence.py",
+                "docs/deploy/schauwerk-editor-frontdoor.md",
+                "scripts/ci/tests/test_schauwerk_release_convergence.py",
+                ".github/workflows/production-live-contract.yml",
+            ),
+            "impl.guard.schauwerk-editor-promotion": (
+                "path: scripts/preflight/schauwerk_editor_promotion.py",
+                "docs/deploy/schauwerk-editor-frontdoor.md",
+                "scripts/ci/tests/test_schauwerk_editor_promotion.py",
+                "scripts/ci/tests/test_schauwerk_editor_release_preflight.py",
+            ),
+        }
+        for implementation_id, expected_fields in expectations.items():
+            start = registry.index(f"  - id: {implementation_id}\n")
+            next_entry = registry.find("\n  - id:", start + 1)
+            entry = registry[start : next_entry if next_entry != -1 else len(registry)]
+            self.assertIn("criticality: high", entry)
+            self.assertIn("evidence_level: ci", entry)
+            for expected in expected_fields:
+                self.assertIn(expected, entry)
+
     def test_secure_receipt_helper_is_in_critical_impl_registry(self) -> None:
         registry = self.read("audit/impl-registry.yaml")
         self.assertIn("id: impl.guard.secure-receipt-io", registry)

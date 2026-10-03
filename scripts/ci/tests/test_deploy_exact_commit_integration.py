@@ -414,6 +414,15 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                   printf 'schaubild-runtime\n'
                   exit 0
                 fi
+                if [[ "$1" == "image" && "${2:-}" == "inspect" ]]; then
+                  if [[ "${3:-}" == "--format" && "${4:-}" == '{{json .Config.Labels}}' ]]; then
+                    printf '{"org.opencontainers.image.revision":"cccccccccccccccccccccccccccccccccccccccc","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\n'
+                  fi
+                  exit 0
+                fi
+                if [[ "$1" == "pull" ]]; then
+                  exit 0
+                fi
                 if [[ "$1" == "inspect" && "${2:-}" == "--format" ]]; then
                   case "${3:-}" in
                     '{{.Config.Image}}')
