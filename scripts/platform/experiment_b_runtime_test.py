@@ -14725,6 +14725,36 @@ def install(*args, **kwargs):
             },
         )
 
+    def test_httproute_collection_uses_raw_server_list_metadata(self) -> None:
+        raw = {
+            "metadata": {"resourceVersion": "5074"},
+            "items": [],
+        }
+        completed = subprocess.CompletedProcess(
+            ["kubectl"],
+            0,
+            stdout=json.dumps(raw),
+            stderr="",
+        )
+        with mock.patch.object(
+            runtime,
+            "_kubectl",
+            return_value=completed,
+        ) as kubectl:
+            observed = runtime._httproute_collection_json(Path("/tmp"))
+        self.assertEqual(observed, raw)
+        argv = kubectl.call_args.args[1]
+        self.assertEqual(argv[:2], ["get", "--raw"])
+        url = runtime.urllib.parse.urlsplit(argv[2])
+        self.assertEqual(
+            url.path,
+            (
+                "/apis/gateway.networking.k8s.io/v1/namespaces/"
+                f"{runtime.APP_NAMESPACE}/httproutes"
+            ),
+        )
+        self.assertEqual(url.query, "")
+
     def test_application_service_endpoints_bind_to_validated_pods(self) -> None:
         pod_identities = {
             "weltgewebe-api-serving": {
@@ -15110,7 +15140,7 @@ def install(*args, **kwargs):
 
         with mock.patch.object(
             runtime,
-            "_kubectl_json",
+            "_httproute_collection_json",
             return_value={
                 "metadata": {"resourceVersion": "450"},
                 "items": [canonical],
@@ -15129,7 +15159,7 @@ def install(*args, **kwargs):
         with (
             mock.patch.object(
                 runtime,
-                "_kubectl_json",
+                "_httproute_collection_json",
                 return_value={
                     "metadata": {"resourceVersion": "451"},
                     "items": [canonical, rogue],
