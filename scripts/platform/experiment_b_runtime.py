@@ -10616,6 +10616,28 @@ def _endpoint_slice_collection_json(
     return value
 
 
+def _httproute_collection_json(root: Path) -> dict[str, Any]:
+    namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
+    result = _kubectl(
+        root,
+        [
+            "get",
+            "--raw",
+            (
+                f"/apis/gateway.networking.k8s.io/v1/namespaces/"
+                f"{namespace_path}/httproutes"
+            ),
+        ],
+    )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeErrorEB("HTTPRoute raw JSON readback failed") from exc
+    if not isinstance(value, dict):
+        raise RuntimeErrorEB("HTTPRoute raw JSON readback is not an object")
+    return value
+
+
 def _database_client_identity(root: Path) -> tuple[str, str]:
     database_path = root / "secrets/database.json"
     if not database_path.is_file() or database_path.is_symlink():
@@ -13877,10 +13899,7 @@ def _gateway_httproute_attachment_binding(
         raise RuntimeErrorEB(
             "functional serving canonical HTTPRoute UID is invalid"
         )
-    readback = _kubectl_json(
-        root,
-        ["-n", APP_NAMESPACE, "get", "httproutes"],
-    )
+    readback = _httproute_collection_json(root)
     list_metadata = (
         readback.get("metadata")
         if isinstance(readback, dict)
