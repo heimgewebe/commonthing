@@ -4939,9 +4939,15 @@ def _flux_strategy_projection(
 def _flux_pod_spec_projection(
     pod_spec: Any,
     context: str,
+    *,
+    synthesize_system_priority: bool = False,
 ) -> dict[str, Any]:
     normalized = _normalize_flux_pod_spec(pod_spec, context)
-    projection = _application_pod_spec_projection(normalized, context)
+    projection = _application_pod_spec_projection(
+        normalized,
+        context,
+        synthesize_system_priority=synthesize_system_priority,
+    )
     pod_spec = normalized
     projection.update(
         {
@@ -5091,7 +5097,11 @@ def _flux_deployment_contract(
     annotations = template_metadata.get("annotations", {})
     if not isinstance(labels, dict) or not isinstance(annotations, dict):
         raise RuntimeErrorEB(f"{context} template metadata contract is invalid")
-    pod_contract = _flux_pod_spec_projection(pod_spec, context)
+    pod_contract = _flux_pod_spec_projection(
+        pod_spec,
+        context,
+        synthesize_system_priority=True,
+    )
     deployment_contract = {
         "replicas": replicas,
         "revisionHistoryLimit": spec.get("revisionHistoryLimit", 10),
@@ -7256,6 +7266,9 @@ def _probe_runtime_contract(value: Any, context: str) -> Any:
     http_get = normalized.get("httpGet")
     if isinstance(http_get, dict) and http_get.get("scheme") == "HTTP":
         http_get.pop("scheme", None)
+    grpc = normalized.get("grpc")
+    if isinstance(grpc, dict) and grpc.get("service") == "":
+        grpc.pop("service", None)
     return normalized
 
 
@@ -7338,9 +7351,39 @@ def _pod_active_deadline_seconds(
     return active_deadline_seconds
 
 
+def _pod_priority_projection(
+    pod_spec: dict[str, Any],
+    context: str,
+    *,
+    synthesize_system_priority: bool = False,
+) -> tuple[str, int]:
+    priority_class_name = pod_spec.get("priorityClassName")
+    if priority_class_name is None:
+        priority_class_name = ""
+    if not isinstance(priority_class_name, str):
+        raise RuntimeErrorEB(
+            f"{context} Pod priorityClassName contract is invalid"
+        )
+    priority = pod_spec.get("priority")
+    if priority is None:
+        priority = (
+            {
+                "system-cluster-critical": 2_000_000_000,
+                "system-node-critical": 2_000_001_000,
+            }.get(priority_class_name, 0)
+            if synthesize_system_priority
+            else 0
+        )
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise RuntimeErrorEB(f"{context} Pod priority contract is invalid")
+    return priority_class_name, priority
+
+
 def _application_pod_spec_projection(
     pod_spec: Any,
     context: str,
+    *,
+    synthesize_system_priority: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(pod_spec, dict):
         raise RuntimeErrorEB(f"{context} Pod spec is invalid")
@@ -7391,6 +7434,11 @@ def _application_pod_spec_projection(
             f"{context} Pod ephemeral containers are forbidden"
         )
 
+    priority_class_name, priority = _pod_priority_projection(
+        pod_spec,
+        context,
+        synthesize_system_priority=synthesize_system_priority,
+    )
     result: dict[str, Any] = {
         "serviceAccountName": pod_spec.get(
             "serviceAccountName", "default"
@@ -7415,7 +7463,7 @@ def _application_pod_spec_projection(
         "hostIPC": pod_spec.get("hostIPC", False),
         "dnsPolicy": pod_spec.get("dnsPolicy", "ClusterFirst"),
         "dnsConfig": pod_spec.get("dnsConfig"),
-        "priorityClassName": pod_spec.get("priorityClassName", ""),
+        "priorityClassName": priority_class_name,
         "tolerations": normalized_tolerations,
         "restartPolicy": pod_spec.get("restartPolicy", "Always"),
         "schedulerName": pod_spec.get(
@@ -7434,7 +7482,7 @@ def _application_pod_spec_projection(
         "preemptionPolicy": pod_spec.get(
             "preemptionPolicy", "PreemptLowerPriority"
         ),
-        "priority": pod_spec.get("priority", 0),
+        "priority": priority,
     }
     for field, output_key in (
         ("containers", "containers"),
@@ -8479,12 +8527,93 @@ def _require_live_data_deployments(
     return result
 
 
+def _normalize_cilium_pod_spec(
+    pod_spec: Any,
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(pod_spec, dict):
+        raise RuntimeErrorEB(f"{context} Pod spec is invalid")
+    normalized = json.loads(json.dumps(pod_spec))
+
+    volumes = normalized.get("volumes") or []
+    if not isinstance(volumes, list) or any(
+        not isinstance(volume, dict) for volume in volumes
+    ):
+        raise RuntimeErrorEB(f"{context} volume contract is invalid")
+    for volume in volumes:
+        host_path = volume.get("hostPath")
+        if isinstance(host_path, dict) and host_path.get("type") == "":
+            host_path.pop("type", None)
+        config_map = volume.get("configMap")
+        if isinstance(config_map, dict) and config_map.get("defaultMode") == 420:
+            config_map.pop("defaultMode", None)
+
+    for field in ("containers", "initContainers"):
+        items = normalized.get(field, [])
+        if not isinstance(items, list) or any(
+            not isinstance(item, dict) for item in items
+        ):
+            raise RuntimeErrorEB(f"{context} {field} inventory is invalid")
+        for container in items:
+            resources = container.get("resources")
+            if resources is None:
+                resources = {}
+            if not isinstance(resources, dict):
+                raise RuntimeErrorEB(
+                    f"{context} container resources contract is invalid"
+                )
+            resources = json.loads(json.dumps(resources))
+            for bucket_name in ("limits", "requests"):
+                bucket = resources.get(bucket_name)
+                if bucket is None:
+                    continue
+                if not isinstance(bucket, dict):
+                    raise RuntimeErrorEB(
+                        f"{context} {bucket_name} resources contract is invalid"
+                    )
+                for resource_name, value in list(bucket.items()):
+                    if isinstance(value, bool) or not isinstance(
+                        value, (str, int, float)
+                    ):
+                        raise RuntimeErrorEB(
+                            f"{context} resource quantity is invalid"
+                        )
+                    try:
+                        if resource_name == "cpu":
+                            bucket[resource_name] = _parse_cpu_quantity(str(value))
+                        elif resource_name == "memory":
+                            bucket[resource_name] = _parse_memory_quantity(str(value))
+                        elif isinstance(value, (int, float)):
+                            bucket[resource_name] = str(value)
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeErrorEB(
+                            f"{context} resource quantity is invalid"
+                        ) from exc
+            container["resources"] = resources
+
+            mounts = container.get("volumeMounts")
+            if mounts is None:
+                continue
+            if not isinstance(mounts, list) or any(
+                not isinstance(mount, dict) for mount in mounts
+            ):
+                raise RuntimeErrorEB(
+                    f"{context} container volumeMounts contract is invalid"
+                )
+            for mount in mounts:
+                if mount.get("readOnly") is False:
+                    mount.pop("readOnly", None)
+
+    return normalized
+
+
 def _cilium_pod_spec_projection(
     pod_spec: Any,
     context: str,
 ) -> dict[str, Any]:
-    projection = _application_pod_spec_projection(pod_spec, context)
-    assert isinstance(pod_spec, dict)
+    normalized = _normalize_cilium_pod_spec(pod_spec, context)
+    projection = _application_pod_spec_projection(normalized, context)
+    pod_spec = normalized
     projection.update(
         {
             "hostNetwork": pod_spec.get("hostNetwork", False),
@@ -8492,7 +8621,6 @@ def _cilium_pod_spec_projection(
             "hostIPC": pod_spec.get("hostIPC", False),
             "dnsPolicy": pod_spec.get("dnsPolicy", "ClusterFirst"),
             "dnsConfig": pod_spec.get("dnsConfig"),
-            "priorityClassName": pod_spec.get("priorityClassName", ""),
             "tolerations": pod_spec.get("tolerations") or [],
             "restartPolicy": pod_spec.get("restartPolicy", "Always"),
             "schedulerName": pod_spec.get(
