@@ -129,3 +129,70 @@ def test_full_vps_deploy_reads_back_native_runtime_before_state_commit() -> None
         < native_api
         < state_commit
     )
+
+def test_image_labels_bind_exact_source_commit() -> None:
+    result = MODULE.verify_image_labels(
+        {
+            "org.opencontainers.image.revision": SOURCE_COMMIT,
+            "org.opencontainers.image.source": MODULE.IMAGE_SOURCE_URL,
+            "other": "allowed",
+        },
+        expected_commit=SOURCE_COMMIT,
+    )
+    assert result == {
+        "source_commit": SOURCE_COMMIT,
+        "source_url": MODULE.IMAGE_SOURCE_URL,
+    }
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {},
+        {
+            "org.opencontainers.image.revision": "c" * 40,
+            "org.opencontainers.image.source": MODULE.IMAGE_SOURCE_URL,
+        },
+        {
+            "org.opencontainers.image.revision": SOURCE_COMMIT,
+            "org.opencontainers.image.source": "https://github.com/other/repo",
+        },
+    ],
+)
+def test_image_labels_fail_closed_on_source_digest_binding_drift(
+    labels: dict[str, str],
+) -> None:
+    with pytest.raises(MODULE.ReleaseContractError):
+        MODULE.verify_image_labels(labels, expected_commit=SOURCE_COMMIT)
+
+def test_full_vps_deploy_verifies_oci_source_before_edge_mutation() -> None:
+    repo = Path(__file__).resolve().parents[3]
+    deploy = (repo / "scripts" / "weltgewebe-up").read_text(encoding="utf-8")
+    lock_preflight = deploy.index("scripts/preflight/schauwerk_editor_release.py")
+    image_probe = deploy.index(
+        'docker image inspect "$SCHAUWERK_RUNTIME_IMAGE_REF"', lock_preflight
+    )
+    exact_pull = deploy.index('docker pull "$SCHAUWERK_RUNTIME_IMAGE_REF"', image_probe)
+    label_probe = deploy.index("SCHAUWERK_RUNTIME_IMAGE_LABELS", exact_pull)
+    source_verify = deploy.index("--image-labels-json", label_probe)
+    edge_guard = deploy.index("# 6d. Static UI Runtime Guard & Edge Caddy Recreate")
+    edge_recreate = deploy.index('docker rm -f "$EDGE_GATEWAY_CONTAINER"', edge_guard)
+    assert (
+        lock_preflight
+        < image_probe
+        < exact_pull
+        < label_probe
+        < source_verify
+        < edge_guard
+        < edge_recreate
+    )
+
+
+def test_full_vps_postflight_reverifies_running_oci_source() -> None:
+    repo = Path(__file__).resolve().parents[3]
+    deploy = (repo / "scripts" / "weltgewebe-up").read_text(encoding="utf-8")
+    postflight = deploy.index("SCHAUWERK_RUNTIME_LIVE_IMAGE")
+    live_labels = deploy.index("SCHAUWERK_RUNTIME_LIVE_LABELS", postflight)
+    source_verify = deploy.index("--image-labels-json", live_labels)
+    health = deploy.index("wait_for_schaubild_runtime_health", source_verify)
+    assert postflight < live_labels < source_verify < health

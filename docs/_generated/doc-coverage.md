@@ -15,7 +15,7 @@ Generated automatically. Do not edit.
 | Component Type | Coverage | Total | Documented |
 | --- | --- | --- | --- |
 | Config | 100% | 4 | 4 |
-| Guard | 100% | 10 | 10 |
+| Guard | 100% | 12 | 12 |
 | Platform | 100% | 5 | 5 |
 | Schema | 100% | 1 | 1 |
 | Service | 100% | 9 | 9 |

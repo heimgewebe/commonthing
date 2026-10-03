@@ -116,6 +116,19 @@ class GitFixtureIsolationTests(unittest.TestCase):
             check=False,
         )
 
+    def test_docker_shim_expands_schauwerk_drift_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            case = object.__new__(DeployExactCommitIntegrationTests)
+            case.bin = Path(raw_root) / "bin"
+            case.bin.mkdir()
+            case.make_command_shims()
+            rendered = (case.bin / "docker").read_text(encoding="utf-8")
+
+        self.assertIn('${TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN:-0}', rendered)
+        self.assertIn('${TEST_DEPLOY_MARKER:-}', rendered)
+        self.assertNotIn(r'\${TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN:-0}', rendered)
+        self.assertNotIn(r'\${TEST_DEPLOY_MARKER:-}', rendered)
+
 
 class DeployExactCommitIntegrationTests(unittest.TestCase):
     maxDiff = None
@@ -414,10 +427,26 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                   printf 'schaubild-runtime\n'
                   exit 0
                 fi
+                if [[ "$1" == "image" && "${2:-}" == "inspect" ]]; then
+                  if [[ "${3:-}" == "--format" && "${4:-}" == '{{json .Config.Labels}}' ]]; then
+                    printf '{"org.opencontainers.image.revision":"cccccccccccccccccccccccccccccccccccccccc","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\n'
+                  fi
+                  exit 0
+                fi
+                if [[ "$1" == "pull" ]]; then
+                  exit 0
+                fi
                 if [[ "$1" == "inspect" && "${2:-}" == "--format" ]]; then
                   case "${3:-}" in
                     '{{.Config.Image}}')
                       printf 'ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n'
+                      ;;
+                    '{{json .Config.Labels}}')
+                      if [[ "${TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN:-0}" == "1" && ( -z "${TEST_DEPLOY_MARKER:-}" || ! -e "$TEST_DEPLOY_MARKER" ) ]]; then
+                        printf '{"org.opencontainers.image.revision":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\\n'
+                      else
+                        printf '{"org.opencontainers.image.revision":"cccccccccccccccccccccccccccccccccccccccc","org.opencontainers.image.source":"https://github.com/heimgewebe/schauwerk"}\\n'
+                      fi
                       ;;
                     '{{if .State.Health}}{{.State.Health.Status}}{{end}}')
                       if [[ "${TEST_SCHAUWERK_HEALTH_STARTING_ONCE:-0}" == "1" ]]; then
@@ -1075,6 +1104,23 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                 "WELTGEWEBE_DEPLOY_HELPER": str(DEPLOY_SCRIPT),
                 "PUBLIC_COMMIT": self.commit,
                 "TEST_PUBLIC_SCHAUWERK_MANIFEST_BROKEN": "1",
+                "TEST_DEPLOY_MARKER": str(marker),
+            }
+        )
+        self.restore_test_ownership()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
+        self.assertIn("reason=schaubild_runtime_image_identity_drift", result.stdout)
+        self.assertIn("production_reconcile=verified", result.stdout)
+        self.assertNotIn("production_reconcile=noop", result.stdout)
+
+    def test_reconciler_repairs_same_commit_with_schauwerk_source_label_drift(self) -> None:
+        marker = self.root / "deploy-complete"
+        result = self.reconcile_existing_public_commit(
+            extra_env={
+                "WELTGEWEBE_DEPLOY_HELPER": str(DEPLOY_SCRIPT),
+                "PUBLIC_COMMIT": self.commit,
+                "TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN": "1",
                 "TEST_DEPLOY_MARKER": str(marker),
             }
         )

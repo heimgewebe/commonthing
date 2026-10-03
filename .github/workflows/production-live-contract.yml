@@ -13,6 +13,14 @@ name: Production live contract
       - "scripts/ops/ensure_web_push_vapid_env.py"
       - "scripts/ops/deploy-exact-commit-vps.sh"
       - "scripts/ops/reconcile-production-main-vps.sh"
+      - "scripts/preflight/schauwerk_editor_release.py"
+      - "scripts/preflight/schauwerk_release_convergence.py"
+      - "scripts/preflight/schauwerk_editor_promotion.py"
+      - "infra/schauwerk-editor/release-lock.json"
+      - "scripts/ci/tests/test_schauwerk_editor_release_preflight.py"
+      - "scripts/ci/tests/test_schauwerk_release_convergence.py"
+      - "scripts/ci/tests/test_schauwerk_editor_promotion.py"
+      - "docs/deploy/schauwerk-editor-frontdoor.md"
       - "scripts/ops/install-production-reconciler.sh"
       - "scripts/ops/activate-production-reconciler-from-release.sh"
       - "scripts/weltgewebe-up"
@@ -59,6 +67,20 @@ jobs:
       - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: ".python-version"
+      - name: Read uv version
+        id: contract-uv-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          UV_VERSION=$(grep '^uv:' toolchain.versions.yml | cut -d '"' -f2)
+          [[ -n "$UV_VERSION" ]]
+          printf 'uv_version=%s\n' "$UV_VERSION" >> "$GITHUB_OUTPUT"
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # tag: v8.3.2
+        with:
+          version: ${{ steps.contract-uv-version.outputs.uv_version }}
+      - name: Sync hash-locked contract dependencies
+        run: uv sync --project tools/py --locked
       - name: Compile Python tools
         run: |
           python -m py_compile scripts/ops/verify_public_release_commit.py
@@ -66,6 +88,9 @@ jobs:
           python -m py_compile scripts/ops/weltgewebe_secure_receipt_io.py
           python -m py_compile scripts/ops/validate_web_deploy_archive.py
           python -m py_compile scripts/ops/ensure_web_push_vapid_env.py
+          python -m py_compile scripts/preflight/schauwerk_editor_release.py
+          python -m py_compile scripts/preflight/schauwerk_release_convergence.py
+          python -m py_compile scripts/preflight/schauwerk_editor_promotion.py
       - name: Check shell syntax and semantics
         run: |
           bash -n scripts/ops/deploy-exact-commit-vps.sh
@@ -111,6 +136,12 @@ jobs:
         run: >-
           python -m unittest -v
           scripts/ci/tests/test_ensure_web_push_vapid_env.py
+      - name: Verify Schaubild release identity and convergence contracts
+        run: >-
+          uv run --project tools/py --locked python -m pytest -q
+          scripts/ci/tests/test_schauwerk_editor_release_preflight.py
+          scripts/ci/tests/test_schauwerk_release_convergence.py
+          scripts/ci/tests/test_schauwerk_editor_promotion.py
       - name: Verify production reconciler source contract
         run: >-
           python -m unittest -v
@@ -208,6 +239,48 @@ jobs:
           commit="$(git rev-parse HEAD)"
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Resolve latest accepted Schauwerk Schaubild release
+        id: schaubild-convergence
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Public cross-repository read: Commonthing's GITHUB_TOKEN is repository-scoped.
+          workflow_runs_url='https://api.github.com/repos/heimgewebe/schauwerk/actions/workflows'
+          workflow_runs_url+='/native-schaubild-image.yml/runs?event=workflow_dispatch'
+          workflow_runs_url+='&status=success&per_page=20'
+          if ! curl --fail --silent --show-error --location \
+            --proto '=https' \
+            --connect-timeout 5 \
+            --max-time 20 \
+            --header 'Accept: application/vnd.github+json' \
+            "$workflow_runs_url" \
+            > schaubild-publish-runs.json; then
+            python - <<'PY'
+          import json
+          from pathlib import Path
+
+          Path("schaubild-release-convergence.json").write_text(
+              json.dumps(
+                  {
+                      "schema_version": "weltgewebe-schauwerk-release-convergence.v1",
+                      "state": "invalid",
+                      "action_required": True,
+                      "error": "accepted Schauwerk publish lookup failed",
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+            exit 1
+          fi
+          python scripts/preflight/schauwerk_release_convergence.py \
+            --lock infra/schauwerk-editor/release-lock.json \
+            --workflow-runs schaubild-publish-runs.json \
+            --output schaubild-release-convergence.json
       - name: Verify public frontend and API identity
         run: |
           wait_seconds=0
@@ -219,6 +292,14 @@ jobs:
             --wait-seconds "$wait_seconds" \
             --poll-seconds 15 \
             --output production-live-receipt.json
+      - name: Upload Schaubild release convergence receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
+        with:
+          name: schaubild-release-convergence-${{ steps.target.outputs.commit }}
+          path: schaubild-release-convergence.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Upload production receipt
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
@@ -227,3 +308,22 @@ jobs:
           path: production-live-receipt.json
           if-no-files-found: error
           retention-days: 30
+      - name: Enforce Schaubild release convergence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("schaubild-release-convergence.json")
+          if not path.is_file():
+              raise SystemExit("Schaubild release convergence receipt is missing")
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          if payload.get("state") != "current" or payload.get("action_required") is not False:
+              raise SystemExit(
+                  "Schaubild release convergence is not current: "
+                  + json.dumps(payload, sort_keys=True)
+              )
+          PY
