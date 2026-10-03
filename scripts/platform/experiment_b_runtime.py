@@ -10578,6 +10578,44 @@ def _kubectl_json(root: Path, arguments: list[str]) -> dict[str, Any]:
     return value
 
 
+def _endpoint_slice_collection_json(
+    root: Path,
+    namespace: str,
+    service_name: str,
+) -> dict[str, Any]:
+    if not isinstance(namespace, str) or not namespace:
+        raise RuntimeErrorEB("EndpointSlice namespace is invalid")
+    if not isinstance(service_name, str) or not service_name:
+        raise RuntimeErrorEB("EndpointSlice Service name is invalid")
+    namespace_path = urllib.parse.quote(namespace, safe="")
+    query = urllib.parse.urlencode(
+        {"labelSelector": f"kubernetes.io/service-name={service_name}"}
+    )
+    result = _kubectl(
+        root,
+        [
+            "get",
+            "--raw",
+            (
+                f"/apis/discovery.k8s.io/v1/namespaces/"
+                f"{namespace_path}/endpointslices?{query}"
+            ),
+        ],
+    )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeErrorEB(
+            f"EndpointSlice raw JSON readback failed: {namespace}/{service_name}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise RuntimeErrorEB(
+            f"EndpointSlice raw JSON readback is not an object: "
+            f"{namespace}/{service_name}"
+        )
+    return value
+
+
 def _database_client_identity(root: Path) -> tuple[str, str]:
     database_path = root / "secrets/database.json"
     if not database_path.is_file() or database_path.is_symlink():
@@ -12657,16 +12695,10 @@ def _require_t048_postgres_service_binding(
         )
     expected_port = int(service_ports[0]["port"])
 
-    slices = _kubectl_json(
+    slices = _endpoint_slice_collection_json(
         root,
-        [
-            "-n",
-            DATA_NAMESPACE,
-            "get",
-            "endpointslices.discovery.k8s.io",
-            "-l",
-            "kubernetes.io/service-name=postgres",
-        ],
+        DATA_NAMESPACE,
+        "postgres",
     )
     items = slices.get("items") if isinstance(slices, dict) else None
     list_metadata = (
@@ -13961,16 +13993,10 @@ def _application_service_endpoint_binding(
             "address": address,
         }
 
-    readback = _kubectl_json(
+    readback = _endpoint_slice_collection_json(
         root,
-        [
-            "-n",
-            APP_NAMESPACE,
-            "get",
-            "endpointslices.discovery.k8s.io",
-            "-l",
-            f"kubernetes.io/service-name={service_name}",
-        ],
+        APP_NAMESPACE,
+        service_name,
     )
     items = readback.get("items") if isinstance(readback, dict) else None
     list_metadata = (
