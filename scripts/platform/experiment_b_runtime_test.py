@@ -443,6 +443,113 @@ spec:
         self.assertIn("gatewayAPI.enabled=true", argv)
         self.assertIn("kubeProxyReplacement=true", argv)
 
+    def test_cilium_pod_projection_normalizes_only_kubernetes_api_defaults(
+        self,
+    ) -> None:
+        expected = {
+            "serviceAccountName": "cilium",
+            "priorityClassName": None,
+            "volumes": [
+                {
+                    "name": "bpf-maps",
+                    "hostPath": {"path": "/sys/fs/bpf"},
+                },
+                {
+                    "name": "config",
+                    "configMap": {"name": "cilium-config"},
+                },
+            ],
+            "initContainers": [
+                {
+                    "name": "config",
+                    "image": "quay.io/cilium/cilium:vfixture",
+                    "resources": None,
+                },
+                {
+                    "name": "install-cni-binaries",
+                    "image": "quay.io/cilium/cilium:vfixture",
+                    "resources": {"limits": {"cpu": 1}},
+                },
+            ],
+            "containers": [
+                {
+                    "name": "cilium-agent",
+                    "image": "quay.io/cilium/cilium:vfixture",
+                    "resources": None,
+                    "volumeMounts": [
+                        {
+                            "name": "bpf-maps",
+                            "mountPath": "/sys/fs/bpf",
+                        }
+                    ],
+                    "livenessProbe": {"grpc": {"port": 4244}},
+                }
+            ],
+        }
+        live = json.loads(json.dumps(expected))
+        live["priorityClassName"] = ""
+        live["volumes"][0]["hostPath"]["type"] = ""
+        live["volumes"][1]["configMap"]["defaultMode"] = 420
+        live["containers"][0]["livenessProbe"]["grpc"]["service"] = ""
+        live["initContainers"][0]["resources"] = {}
+        live["initContainers"][1]["resources"]["limits"]["cpu"] = "1"
+        live["containers"][0]["resources"] = {}
+        live["containers"][0]["volumeMounts"][0]["readOnly"] = False
+
+        expected_projection = runtime._cilium_pod_spec_projection(
+            expected, "expected Cilium Pod"
+        )
+        live_projection = runtime._cilium_pod_spec_projection(
+            live, "live Cilium Pod"
+        )
+        self.assertEqual(expected_projection, live_projection)
+
+        read_only_drift = json.loads(json.dumps(live))
+        read_only_drift["containers"][0]["volumeMounts"][0]["readOnly"] = True
+        self.assertNotEqual(
+            expected_projection,
+            runtime._cilium_pod_spec_projection(
+                read_only_drift, "drifted Cilium Pod"
+            ),
+        )
+
+        host_path_drift = json.loads(json.dumps(live))
+        host_path_drift["volumes"][0]["hostPath"]["type"] = "Directory"
+        self.assertNotEqual(
+            expected_projection,
+            runtime._cilium_pod_spec_projection(
+                host_path_drift, "drifted Cilium Pod"
+            ),
+        )
+
+        cpu_drift = json.loads(json.dumps(live))
+        cpu_drift["initContainers"][1]["resources"]["limits"]["cpu"] = "2"
+        self.assertNotEqual(
+            expected_projection,
+            runtime._cilium_pod_spec_projection(
+                cpu_drift, "drifted Cilium Pod"
+            ),
+        )
+
+        mode_drift = json.loads(json.dumps(live))
+        mode_drift["volumes"][1]["configMap"]["defaultMode"] = 511
+        self.assertNotEqual(
+            expected_projection,
+            runtime._cilium_pod_spec_projection(
+                mode_drift, "drifted Cilium Pod"
+            ),
+        )
+
+        grpc_service_drift = json.loads(json.dumps(live))
+        grpc_service_drift["containers"][0]["livenessProbe"]["grpc"][
+            "service"
+        ] = "shadow"
+        self.assertNotEqual(
+            expected_projection,
+            runtime._cilium_pod_spec_projection(
+                grpc_service_drift, "drifted Cilium Pod"
+            ),
+        )
 
     def test_t048_fixture_activates_canonical_synthetic_projections_atomically(self) -> None:
         source = inspect.getsource(runtime.seed_t048_fixture)
@@ -1979,6 +2086,7 @@ spec:
                     "spec": {
                         "serviceAccountName": "helm-controller",
                         "securityContext": {"fsGroup": 1337},
+                        "priorityClassName": "system-cluster-critical",
                         "volumes": [{"name": "temp", "emptyDir": {}}],
                         "containers": [
                             {
@@ -2107,13 +2215,34 @@ spec:
                 "tolerationSeconds": 300,
             },
         ]
+        live_pod["priority"] = 2_000_000_000
         expected_projection = runtime._flux_pod_spec_projection(
-            expected_pod, "expected Flux Pod"
+            expected_pod,
+            "expected Flux Pod",
+            synthesize_system_priority=True,
         )
         live_projection = runtime._flux_pod_spec_projection(
             live_pod, "live Flux Pod"
         )
         self.assertEqual(expected_projection, live_projection)
+
+        missing_priority = json.loads(json.dumps(live_pod))
+        missing_priority.pop("priority")
+        self.assertNotEqual(
+            expected_projection,
+            runtime._flux_pod_spec_projection(
+                missing_priority, "live Flux Pod without admitted priority"
+            ),
+        )
+
+        priority_drift = json.loads(json.dumps(live_pod))
+        priority_drift["priority"] = 1_999_999_999
+        self.assertNotEqual(
+            expected_projection,
+            runtime._flux_pod_spec_projection(
+                priority_drift, "drifted Flux Pod"
+            ),
+        )
 
         for field, value in (
             ("args", ["--shadow-mode"]),
