@@ -30,13 +30,10 @@ class ReleaseContractError(RuntimeError):
     pass
 
 
-def verify_runtime_lock(lock_path: Path) -> dict[str, str]:
-    lock_path = lock_path.expanduser().absolute()
-    if lock_path.is_symlink() or not lock_path.is_file():
-        raise ReleaseContractError(f"runtime lock is missing or unsafe: {lock_path}")
+def verify_runtime_lock_bytes(lock_bytes: bytes) -> dict[str, str]:
     try:
-        lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        lock = json.loads(lock_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ReleaseContractError("runtime lock is unreadable or invalid JSON") from exc
     if not isinstance(lock, dict) or set(lock) != LOCK_KEYS:
         raise ReleaseContractError("runtime lock shape mismatch")
@@ -66,6 +63,22 @@ def verify_runtime_lock(lock_path: Path) -> dict[str, str]:
         "image_ref": f"{IMAGE_REPOSITORY}@{image_digest}",
         "public_base_path": PUBLIC_BASE_PATH,
     }
+
+
+def read_runtime_lock_snapshot(lock_path: Path) -> tuple[bytes, dict[str, str]]:
+    """Read and validate one exact runtime-lock byte snapshot."""
+    lock_path = lock_path.expanduser().absolute()
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise ReleaseContractError(f"runtime lock is missing or unsafe: {lock_path}")
+    try:
+        lock_bytes = lock_path.read_bytes()
+    except OSError as exc:
+        raise ReleaseContractError("runtime lock is unreadable or invalid JSON") from exc
+    return lock_bytes, verify_runtime_lock_bytes(lock_bytes)
+
+
+def verify_runtime_lock(lock_path: Path) -> dict[str, str]:
+    return read_runtime_lock_snapshot(lock_path)[1]
 
 
 def verify_image_labels(labels: Any, *, expected_commit: str) -> dict[str, str]:

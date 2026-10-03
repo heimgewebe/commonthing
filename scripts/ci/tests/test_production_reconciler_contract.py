@@ -1387,16 +1387,16 @@ prune_releases
         live_readback = workflow.index(
             "- name: Verify public frontend and API identity", convergence
         )
+        convergence_upload = workflow.index(
+            "- name: Upload Schaubild release convergence receipt", live_readback
+        )
         enforcement = workflow.index(
-            "- name: Enforce Schaubild release convergence", live_readback
+            "- name: Enforce Schaubild release convergence", convergence_upload
         )
         self.assertLess(convergence, live_readback)
-        self.assertLess(live_readback, enforcement)
-        convergence_slice = workflow[
-            convergence : workflow.index(
-                "- name: Upload Schaubild release convergence receipt", convergence
-            )
-        ]
+        self.assertLess(live_readback, convergence_upload)
+        self.assertLess(convergence_upload, enforcement)
+        convergence_slice = workflow[convergence:live_readback]
         self.assertIn("continue-on-error: true", convergence_slice)
         self.assertIn('"state": "invalid"', convergence_slice)
         self.assertIn('payload.get("state") != "current"', workflow[enforcement:])

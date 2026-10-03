@@ -247,13 +247,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          workflow_runs_url='https://api.github.com/repos/heimgewebe/schauwerk/actions/workflows'
+          workflow_runs_url+='/native-schaubild-image.yml/runs?event=workflow_dispatch'
+          workflow_runs_url+='&status=success&per_page=20'
           if ! curl --fail --silent --show-error --location \
             --proto '=https' \
             --connect-timeout 5 \
             --max-time 20 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
-            'https://api.github.com/repos/heimgewebe/schauwerk/actions/workflows/native-schaubild-image.yml/runs?event=workflow_dispatch&status=success&per_page=20' \
+            "$workflow_runs_url" \
             > schaubild-publish-runs.json; then
             python - <<'PY'
           import json
@@ -280,14 +283,6 @@ jobs:
             --lock infra/schauwerk-editor/release-lock.json \
             --workflow-runs schaubild-publish-runs.json \
             --output schaubild-release-convergence.json
-      - name: Upload Schaubild release convergence receipt
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
-        with:
-          name: schaubild-release-convergence-${{ steps.target.outputs.commit }}
-          path: schaubild-release-convergence.json
-          if-no-files-found: error
-          retention-days: 30
       - name: Verify public frontend and API identity
         run: |
           wait_seconds=0
@@ -299,6 +294,14 @@ jobs:
             --wait-seconds "$wait_seconds" \
             --poll-seconds 15 \
             --output production-live-receipt.json
+      - name: Upload Schaubild release convergence receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
+        with:
+          name: schaubild-release-convergence-${{ steps.target.outputs.commit }}
+          path: schaubild-release-convergence.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Upload production receipt
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1

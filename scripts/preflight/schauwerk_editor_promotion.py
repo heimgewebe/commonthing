@@ -20,8 +20,8 @@ from schauwerk_editor_release import (
     PUBLIC_BASE_PATH,
     SOURCE_REPOSITORY,
     ReleaseContractError,
+    read_runtime_lock_snapshot,
     verify_image_labels,
-    verify_runtime_lock,
 )
 from schauwerk_release_convergence import ConvergenceError, latest_accepted_release
 
@@ -112,7 +112,7 @@ def build_plan(
     image_identity_payload: Any,
 ) -> dict[str, Any]:
     try:
-        current = verify_runtime_lock(lock_path)
+        lock_bytes, current = read_runtime_lock_snapshot(lock_path)
         accepted = latest_accepted_release(workflow_payload)
     except (ReleaseContractError, ConvergenceError) as exc:
         raise PromotionError(str(exc)) from exc
@@ -125,10 +125,6 @@ def build_plan(
         image_ref=image_ref,
         source_commit=accepted["source_commit"],
     )
-    try:
-        lock_bytes = lock_path.read_bytes()
-    except OSError as exc:
-        raise PromotionError("runtime lock preimage is unreadable") from exc
     action = (
         "noop"
         if current["source_commit"] == accepted["source_commit"]
@@ -175,15 +171,12 @@ def apply_plan(lock_path: Path, plan: Any, *, expected_plan_sha256: str) -> str:
         raise PromotionError("promotion plan targets another runtime lock")
 
     with _exclusive_parent_lock(lock_path) as directory_fd:
-        if lock_path.is_symlink() or not lock_path.is_file():
-            raise PromotionError("runtime lock is missing or unsafe")
-        current_bytes = lock_path.read_bytes()
-        if _sha256_bytes(current_bytes) != plan.get("lock_preimage_sha256"):
-            raise PromotionError("runtime lock preimage changed after promotion plan")
         try:
-            current = verify_runtime_lock(lock_path)
+            current_bytes, current = read_runtime_lock_snapshot(lock_path)
         except ReleaseContractError as exc:
             raise PromotionError(str(exc)) from exc
+        if _sha256_bytes(current_bytes) != plan.get("lock_preimage_sha256"):
+            raise PromotionError("runtime lock preimage changed after promotion plan")
         expected = _expected_lock(plan)
         action = plan.get("action")
         if action == "noop":

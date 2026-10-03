@@ -136,6 +136,31 @@ def test_concurrent_lock_update_rejects_stale_plan(tmp_path: Path) -> None:
         MODULE.apply_plan(lock, plan, expected_plan_sha256=plan["plan_sha256"])
 
 
+def test_build_plan_binds_semantics_and_preimage_to_same_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = _lock(tmp_path)
+    before = lock.read_bytes()
+    real_snapshot = MODULE.read_runtime_lock_snapshot
+    snapshot_calls = 0
+
+    def change_after_snapshot(path: Path) -> tuple[bytes, dict[str, str]]:
+        nonlocal snapshot_calls
+        snapshot = real_snapshot(path)
+        snapshot_calls += 1
+        if snapshot_calls == 1:
+            _lock(tmp_path, NEW, NEW_DIGEST)
+        return snapshot
+
+    monkeypatch.setattr(MODULE, "read_runtime_lock_snapshot", change_after_snapshot)
+    plan = MODULE.build_plan(lock, _workflow(), _packages(), _image_identity())
+    assert plan["current_source_commit"] == OLD
+    assert plan["current_image_digest"] == OLD_DIGEST
+    assert plan["lock_preimage_sha256"] == MODULE._sha256_bytes(before)
+    with pytest.raises(MODULE.PromotionError, match="preimage changed"):
+        MODULE.apply_plan(lock, plan, expected_plan_sha256=plan["plan_sha256"])
+
+
 def test_concurrent_apply_serializes_preimage_check_with_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
