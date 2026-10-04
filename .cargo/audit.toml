@@ -1,0 +1,14 @@
+# cargo-audit reads Cargo.lock without feature resolution, so it reports crates
+# that are locked but never compiled. Every exception here must name the proof
+# that it is not in the build graph; security.yml re-checks it before each audit.
+#
+# review-after: 2027-01-04
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 (rsa, Marvin timing side channel; no patched release).
+  # rsa is locked only as a dependency of sqlx-mysql. The API enables sqlx's
+  # postgres feature alone, so `cargo tree --locked --target all -e all -i rsa`
+  # prints nothing and cargo-deny's feature-aware advisory check passes.
+  "RUSTSEC-2023-0071",
+]

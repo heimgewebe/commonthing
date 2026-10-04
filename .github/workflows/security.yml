@@ -18,6 +18,7 @@ name: security
       - "scripts/dev/bootstrap-first-account.sh"
       - "scripts/ops/search-worker-loop.sh"
       - "deny.toml"
+      - ".cargo/audit.toml"
       - ".github/workflows/security.yml"
     types: [opened, synchronize, labeled]
   schedule:
@@ -41,10 +42,11 @@ jobs:
     name: cargo audit (nightly + on-demand)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The workflow's pull_request trigger is already path-filtered to
+    # Rust- and security-relevant files, so every matched PR is audited.
     if: |
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       contains(github.event.pull_request.labels.*.name, 'security')) ||
+      github.event_name == 'pull_request' ||
       (github.event_name == 'schedule')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
@@ -72,8 +74,39 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # tag: v2
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --force
+      - name: Verify cargo audit exceptions still hold
+        shell: bash
+        run: |
+          set -euo pipefail
+          # .cargo/audit.toml ignores RUSTSEC-2023-0071 only because rsa sits in
+          # Cargo.lock without being compiled. Fail once that stops being true
+          # or the exception passes its review date.
+          review_after="$(sed -nE 's/^# review-after: ([0-9]{4}-[0-9]{2}-[0-9]{2})$/\1/p' .cargo/audit.toml)"
+          if [ -z "${review_after}" ]; then
+            echo "::error file=.cargo/audit.toml::missing '# review-after: YYYY-MM-DD' line"
+            exit 1
+          fi
+          if [[ "$(date -u +%F)" > "${review_after}" ]]; then
+            echo "::error file=.cargo/audit.toml::audit exceptions expired on ${review_after}; re-verify or remove them"
+            exit 1
+          fi
+          rsa_graph="$(cargo tree --locked --target all -e all -i rsa 2>/dev/null)"
+          if [ -n "${rsa_graph}" ]; then
+            echo "::error file=.cargo/audit.toml::rsa is now compiled; the RUSTSEC-2023-0071 exception no longer holds"
+            printf '%s\n' "${rsa_graph}"
+            exit 1
+          fi
+          echo "rsa is absent from the build graph; exception valid until ${review_after}"
       - name: Run cargo audit (JSON report)
-        run: cargo audit --json | tee cargo-audit-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo audit --json | tee cargo-audit-report.json
+          if ! jq -e '.settings.ignore == ["RUSTSEC-2023-0071"]' cargo-audit-report.json > /dev/null; then
+            echo "::error file=.cargo/audit.toml::unexpected cargo audit exceptions"
+            echo "Only RUSTSEC-2023-0071 is covered by a workflow proof."
+            exit 1
+          fi
       - name: Upload audit report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
@@ -88,8 +121,7 @@ jobs:
     timeout-minutes: 12
     if: |
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       contains(github.event.pull_request.labels.*.name, 'security')) ||
+      github.event_name == 'pull_request' ||
       (github.event_name == 'schedule' && github.event.schedule == '10 3 * * 0')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
@@ -118,7 +150,11 @@ jobs:
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked --force
       - name: Run cargo deny (JSON report)
-        run: cargo deny --format json check | tee cargo-deny-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo-deny writes its JSON diagnostics to stderr.
+          cargo deny --format json check 2>&1 | tee cargo-deny-report.json
       - name: Upload cargo-deny report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1

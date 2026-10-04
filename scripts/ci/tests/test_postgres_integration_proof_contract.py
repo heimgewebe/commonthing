@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
+import unittest
 
 import yaml
 
@@ -273,3 +275,35 @@ def test_rust_support_rejects_unsafe_database_identifier_characters() -> None:
     assert "character.is_ascii_alphanumeric()" in rust
     assert "matches!(character, '_' | '-' | '.')" in rust
     assert "unsafe disposable database identifier" in rust
+
+
+class FederationDeliveryDbProofTest(unittest.TestCase):
+    """The runner must name every ignored PostgreSQL unit test in federation_delivery.rs.
+
+    `--test <target>` never reaches ignored unit tests in src/, so this list is
+    the only path by which CI executes them.
+    """
+
+    def test_runner_runs_every_ignored_federation_delivery_db_test_by_name(self) -> None:
+        source = (REPO / "apps/api/src/federation_delivery.rs").read_text(encoding="utf-8")
+        ignored = set(
+            re.findall(
+                r'#\[ignore = "requires an isolated FEDERATION_TEST_DATABASE_URL"\]'
+                r"(?:\s*#\[[^\]]+\])*\s*async fn (\w+)",
+                source,
+            )
+        )
+        self.assertEqual(len(ignored), 9)
+        runner = RUNNER.read_text(encoding="utf-8")
+        listed = re.search(r"federation_delivery_db_tests=\(\n(.*?)\n  \)", runner, re.S)
+        self.assertIsNotNone(listed)
+        self.assertEqual(set(listed.group(1).split()), ignored)
+
+    def test_runner_fails_when_a_listed_test_did_not_run(self) -> None:
+        runner = RUNNER.read_text(encoding="utf-8")
+        block = runner[runner.index("federation_delivery_db_tests=(") :]
+        self.assertIn("--lib federation_delivery::tests::postgres_", block)
+        self.assertIn("-- --ignored --test-threads=1", block)
+        self.assertIn('grep -Fxq "test federation_delivery::tests::${test_name} ... ok"', block)
+        self.assertIn('"$federation_ran" -ne "${#federation_delivery_db_tests[@]}"', block)
+        self.assertLess(block.index("reset_database"), block.index("cargo test"))
