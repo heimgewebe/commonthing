@@ -16152,6 +16152,7 @@ def _nats_transfer_pod(
                     "image": image,
                     "imagePullPolicy": "IfNotPresent",
                     "command": ["/bin/sh", "-c", "sleep 3600"],
+                    "resources": {},
                     "securityContext": {
                         "allowPrivilegeEscalation": False,
                         "capabilities": {"drop": ["ALL"]},
