@@ -172,14 +172,24 @@ def test_full_vps_deploy_verifies_oci_source_before_edge_mutation() -> None:
     image_probe = deploy.index(
         'docker image inspect "$SCHAUWERK_RUNTIME_IMAGE_REF"', lock_preflight
     )
-    exact_pull = deploy.index('docker pull "$SCHAUWERK_RUNTIME_IMAGE_REF"', image_probe)
+    pull_config = deploy.index(
+        'SCHAUWERK_PULL_DOCKER_CONFIG="$(mktemp -d)"', image_probe
+    )
+    exact_pull = deploy.index(
+        'DOCKER_CONFIG="$SCHAUWERK_PULL_DOCKER_CONFIG" docker pull '
+        '"$SCHAUWERK_RUNTIME_IMAGE_REF"',
+        pull_config,
+    )
     label_probe = deploy.index("SCHAUWERK_RUNTIME_IMAGE_LABELS", exact_pull)
+    pull_block = deploy[pull_config:label_probe]
+    assert pull_block.count('rm -rf -- "$SCHAUWERK_PULL_DOCKER_CONFIG"') == 2
     source_verify = deploy.index("--image-labels-json", label_probe)
     edge_guard = deploy.index("# 6d. Static UI Runtime Guard & Edge Caddy Recreate")
     edge_recreate = deploy.index('docker rm -f "$EDGE_GATEWAY_CONTAINER"', edge_guard)
     assert (
         lock_preflight
         < image_probe
+        < pull_config
         < exact_pull
         < label_probe
         < source_verify

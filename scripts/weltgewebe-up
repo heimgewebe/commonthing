@@ -1857,12 +1857,18 @@ fi
 if [[ "$DEPLOY_TARGET" == "vps" && "$DEPLOY_SCOPE" == "full" ]]; then
   if ! docker image inspect "$SCHAUWERK_RUNTIME_IMAGE_REF" > /dev/null 2>&1; then
     echo "   Pulling uncached exact Schaubild digest for source verification..."
-    if ! docker pull "$SCHAUWERK_RUNTIME_IMAGE_REF" > /dev/null; then
+    # Keep this public-registry pull independent of any ambient root/operator
+    # Docker login so a private replacement fails closed instead of reusing
+    # credentials from the host's default Docker configuration.
+    SCHAUWERK_PULL_DOCKER_CONFIG="$(mktemp -d)"
+    if ! DOCKER_CONFIG="$SCHAUWERK_PULL_DOCKER_CONFIG" docker pull "$SCHAUWERK_RUNTIME_IMAGE_REF" > /dev/null; then
+      rm -rf -- "$SCHAUWERK_PULL_DOCKER_CONFIG"
       msg="Schaubild exact runtime digest is unavailable."
       echo "ERROR: $msg" >&2
       generate_failure_bundle "$msg"
       exit 1
     fi
+    rm -rf -- "$SCHAUWERK_PULL_DOCKER_CONFIG"
   fi
   SCHAUWERK_RUNTIME_IMAGE_LABELS="$(
     docker image inspect --format '{{json .Config.Labels}}' "$SCHAUWERK_RUNTIME_IMAGE_REF" 2> /dev/null || true
