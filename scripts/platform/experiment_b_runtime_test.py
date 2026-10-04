@@ -6970,14 +6970,14 @@ spec:
                 ],
             )
             manifest = captured["manifest"]
+            live_spec = json.loads(json.dumps(manifest["spec"]))
+            live_spec["containers"][0]["resources"] = {}
             return {
                 "metadata": {
                     "name": "transfer",
                     "namespace": runtime.DATA_NAMESPACE,
                 },
-                "spec": json.loads(
-                    json.dumps(manifest["spec"])
-                ),
+                "spec": live_spec,
                 "status": {
                     "phase": "Running",
                     "conditions": [
@@ -7034,6 +7034,10 @@ spec:
         self.assertEqual(
             manifest["spec"]["containers"][0]["imagePullPolicy"],
             "IfNotPresent",
+        )
+        self.assertEqual(
+            manifest["spec"]["containers"][0]["resources"],
+            {},
         )
         self.assertEqual(
             binding["container_id"],
