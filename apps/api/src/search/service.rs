@@ -1,5 +1,12 @@
 //! T006 server-side hybrid search service.
-use std::{env, sync::Arc, time::Instant};
+use std::{
+    env,
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
+};
+
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 
 use axum::{
     http::StatusCode,
@@ -32,7 +39,78 @@ use crate::{
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 10;
 const MAX_OFFSET: usize = 0;
+
 const MAX_QUERY_CHARS: usize = 512;
+
+// Runtime search keeps exactly one successful query embedding. The key stores
+// only a digest of user-controlled query text and is generation-bound, so model
+// changes cannot reuse stale vectors and query cardinality cannot grow memory.
+#[derive(Clone)]
+struct QueryEmbeddingCacheEntry {
+    generation_id: String,
+    query_sha256: [u8; 32],
+    dimension: usize,
+    embedding: Vec<f64>,
+}
+
+fn runtime_query_embedding_cache() -> &'static Mutex<Option<QueryEmbeddingCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<QueryEmbeddingCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn lock_runtime_query_embedding_cache(
+) -> std::sync::MutexGuard<'static, Option<QueryEmbeddingCacheEntry>> {
+    runtime_query_embedding_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+struct CachedQueryEmbeddingProvider {
+    inner: Arc<dyn EmbeddingProvider>,
+    generation_id: String,
+}
+
+impl CachedQueryEmbeddingProvider {
+    fn new(inner: Arc<dyn EmbeddingProvider>, generation_id: String) -> Self {
+        Self {
+            inner,
+            generation_id,
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for CachedQueryEmbeddingProvider {
+    async fn embed(
+        &self,
+        document: &str,
+        dimension: usize,
+    ) -> Result<Vec<f64>, EmbeddingProviderError> {
+        let query_sha256: [u8; 32] = Sha256::digest(document.as_bytes()).into();
+        if let Some(entry) = lock_runtime_query_embedding_cache().as_ref() {
+            if entry.generation_id == self.generation_id
+                && entry.query_sha256 == query_sha256
+                && entry.dimension == dimension
+            {
+                return Ok(entry.embedding.clone());
+            }
+        }
+
+        let embedding = self.inner.embed(document, dimension).await?;
+        *lock_runtime_query_embedding_cache() = Some(QueryEmbeddingCacheEntry {
+            generation_id: self.generation_id.clone(),
+            query_sha256,
+            dimension,
+            embedding: embedding.clone(),
+        });
+        Ok(embedding)
+    }
+}
+
+#[cfg(test)]
+fn clear_runtime_query_embedding_cache_for_test() {
+    *lock_runtime_query_embedding_cache() = None;
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct SearchQueryParams {
@@ -179,13 +257,16 @@ fn runtime_provider(
     }
     let base_url =
         env::var("WELTGEWEBE_SEARCH_OLLAMA_URL").map_err(|_| SearchError::Unavailable)?;
-    let provider = OllamaEmbeddingProvider::new(
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(OllamaEmbeddingProvider::new(
         &base_url,
         generation.model_id.clone(),
         generation.model_revision.clone(),
         generation.runtime_identity.clone(),
-    )?;
-    Ok(Arc::new(provider))
+    )?);
+    Ok(Arc::new(CachedQueryEmbeddingProvider::new(
+        provider,
+        generation.generation_id.clone(),
+    )))
 }
 
 pub async fn execute_search(
@@ -355,6 +436,113 @@ async fn execute_search_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    struct CountingProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for CountingProvider {
+        async fn embed(
+            &self,
+            document: &str,
+            dimension: usize,
+        ) -> Result<Vec<f64>, EmbeddingProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let marker = document.len() as f64;
+            Ok(vec![marker; dimension])
+        }
+    }
+
+    struct UnavailableThenAvailableProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for UnavailableThenAvailableProvider {
+        async fn embed(
+            &self,
+            _document: &str,
+            dimension: usize,
+        ) -> Result<Vec<f64>, EmbeddingProviderError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Err(EmbeddingProviderError::Unavailable)
+            } else {
+                Ok(vec![0.5; dimension])
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn runtime_query_embedding_cache_does_not_cache_provider_failures() {
+        clear_runtime_query_embedding_cache_for_test();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cached = CachedQueryEmbeddingProvider::new(
+            Arc::new(UnavailableThenAvailableProvider {
+                calls: Arc::clone(&calls),
+            }),
+            "generation-a".to_string(),
+        );
+
+        assert!(matches!(
+            cached.embed("retry query", 4).await,
+            Err(EmbeddingProviderError::Unavailable)
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        assert_eq!(
+            cached
+                .embed("retry query", 4)
+                .await
+                .expect("retry succeeds"),
+            vec![0.5; 4]
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn runtime_query_embedding_cache_is_single_entry_generation_bound_and_query_hashed() {
+        clear_runtime_query_embedding_cache_for_test();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        });
+        let cached_a = CachedQueryEmbeddingProvider::new(
+            Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
+            "generation-a".to_string(),
+        );
+
+        let first = cached_a
+            .embed("same query", 4)
+            .await
+            .expect("first embedding");
+        let second = cached_a
+            .embed("same query", 4)
+            .await
+            .expect("cached embedding");
+        assert_eq!(first, second);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        cached_a
+            .embed("different query", 4)
+            .await
+            .expect("query miss");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let cached_b = CachedQueryEmbeddingProvider::new(
+            provider as Arc<dyn EmbeddingProvider>,
+            "generation-b".to_string(),
+        );
+        cached_b
+            .embed("different query", 4)
+            .await
+            .expect("generation miss");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn pagination_is_a_bounded_top_ten_contract_without_offset_pages() {
