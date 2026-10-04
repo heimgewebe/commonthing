@@ -13531,7 +13531,7 @@ def install(*args, **kwargs):
         self.assertIn("_k6_image_binding(source_commit)", load_source)
         self.assertIn("_source_bound_k6_workload", load_source)
         self.assertIn('"--interactive"', load_source)
-        self.assertIn('k6_image, "run", "-"', load_source)
+        self.assertIn('k6_image, "run", "--quiet", "-"', load_source)
         self.assertIn("stdin=subprocess.PIPE", load_source)
         self.assertIn("_k6_summary_output_channel()", load_source)
         self.assertIn("_seal_k6_summary_output(", load_source)

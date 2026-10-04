@@ -13360,7 +13360,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "--env", f"API_RUNTIME_RUN_ID={run_id}",
             "--env", f"API_RUNTIME_K6_IMAGE={k6_image}",
             "--env", "API_RUNTIME_SUMMARY_PATH=stdout",
-            k6_image, "run", "-",
+            k6_image, "run", "--quiet", "-",
         ]
 
         initial_cgroup = _sample_api_cgroup(root, pod_name)
