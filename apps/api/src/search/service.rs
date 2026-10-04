@@ -436,6 +436,7 @@ async fn execute_search_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     struct CountingProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -475,6 +476,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn runtime_query_embedding_cache_does_not_cache_provider_failures() {
         clear_runtime_query_embedding_cache_for_test();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -502,6 +504,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn runtime_query_embedding_cache_is_single_entry_generation_bound_and_query_hashed() {
         clear_runtime_query_embedding_cache_for_test();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
