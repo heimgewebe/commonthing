@@ -368,6 +368,7 @@ async fn execute_search_inner(
         &filters,
         auth,
         provider_result.is_ok(),
+        Some(limit),
     )
     .await;
     state
