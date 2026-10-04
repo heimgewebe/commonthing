@@ -397,4 +397,36 @@ if [[ -z "${POSTGRES_PROOF_TARGETS:-}" ]]; then
   cargo test --locked -p weltgewebe-api --test db_node_conversations \
     private_message_push_preference_cancels_queued_delivery \
     -- --include-ignored --test-threads=1
+
+  # Federation delivery keeps its PostgreSQL proofs as ignored unit tests in
+  # src/, which `--test <target>` never reaches. Run them by exact name and
+  # fail unless every one of them actually ran and passed.
+  federation_delivery_db_tests=(
+    postgres_reconcile_noop_preserves_timestamps_and_delivery_state
+    postgres_reconcile_empty_bindings_clear_all_delivery_endpoints
+    postgres_reconcile_clear_only_batch_handles_nullable_arrays
+    postgres_reconcile_updates_and_backfills_multiple_changed_peers
+    postgres_reconcile_validates_before_mutation_and_rolls_back_unknown_peer
+    postgres_reconcile_backfills_trusted_but_not_blocked_peer
+    postgres_batch_backfill_preserves_existing_delivery_state_semantics
+    postgres_reconcile_preserves_sequential_duplicate_binding_semantics
+    postgres_delivery_retries_and_is_multi_instance_safe
+  )
+  printf '=== PostgreSQL proof: federation_delivery (lib) ===\n'
+  reset_database
+  federation_log="$(mktemp)"
+  cargo test --locked -p weltgewebe-api --lib federation_delivery::tests::postgres_ \
+    -- --ignored --test-threads=1 2>&1 | tee "$federation_log"
+  for test_name in "${federation_delivery_db_tests[@]}"; do
+    if ! grep -Fxq "test federation_delivery::tests::${test_name} ... ok" "$federation_log"; then
+      echo "federation delivery PostgreSQL proof did not pass: ${test_name}" >&2
+      exit 1
+    fi
+  done
+  federation_ran="$(grep -c '^test federation_delivery::tests::postgres_.* \.\.\. ' "$federation_log" || true)"
+  if [[ "$federation_ran" -ne "${#federation_delivery_db_tests[@]}" ]]; then
+    echo "federation delivery PostgreSQL proof ran ${federation_ran} tests, expected ${#federation_delivery_db_tests[@]}" >&2
+    exit 1
+  fi
+  rm -f "$federation_log"
 fi
