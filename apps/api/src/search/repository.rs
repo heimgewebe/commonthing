@@ -100,16 +100,26 @@ pub async fn fetch_postgres_candidates(
         return Ok(None);
     };
     Ok(Some(
-        fetch_postgres_candidates_for_generation(pool, &generation, query, filters, auth, true)
-            .await?,
+        fetch_postgres_candidates_for_generation(
+            pool,
+            &generation,
+            query,
+            filters,
+            auth,
+            true,
+            None,
+        )
+        .await?,
     ))
 }
 
 /// Fetches candidates authorized by the current canonical domain state for the
 /// exact active generation already selected by the caller. Unknown or legacy
 /// visibility values fail closed. Stale projections are excluded by exact source
-/// version/revision equality. When semantic ranking is unavailable, embeddings
-/// stay server-side instead of transferring up to 1,000 unused 2,560-d vectors.
+/// version/revision equality. Embeddings stay server-side when semantic ranking
+/// is unavailable or when the authoritative lexical prefix already fills the
+/// caller's visible result window. A missing semantic result limit preserves the
+/// complete-vector compatibility path used by integration/reference callers.
 pub async fn fetch_postgres_candidates_for_generation(
     pool: &PgPool,
     generation: &ActiveSearchGeneration,
@@ -117,6 +127,7 @@ pub async fn fetch_postgres_candidates_for_generation(
     filters: &SearchFilters,
     auth: &AuthContext,
     include_embeddings: bool,
+    semantic_result_limit: Option<usize>,
 ) -> Result<SearchCandidateSet, SearchRepositoryError> {
     let account_id = auth
         .account_id
@@ -235,8 +246,14 @@ pub async fn fetch_postgres_candidates_for_generation(
              LIMIT 10
         )
         SELECT scored.node_id, scored.title, scored.tags, scored.searchable_text,
-               scored.language, scored.kind, scored.embedding, scored.created_at,
-               scored.updated_at, scored.lat, scored.lon, scored.payload,
+               scored.language, scored.kind,
+               CASE
+                 WHEN $10::boolean
+                  AND ($11::bigint IS NULL OR (SELECT count(*) FROM lexical_top) < $11::bigint)
+                 THEN scored.embedding
+                 ELSE NULL::DOUBLE PRECISION[]
+               END AS embedding,
+               scored.created_at, scored.updated_at, scored.lat, scored.lon, scored.payload,
                scored.search_visibility, lexical_top.rank_class, lexical_top.rank_score
           FROM scored
           LEFT JOIN lexical_top ON lexical_top.node_id = scored.node_id
@@ -256,6 +273,7 @@ pub async fn fetch_postgres_candidates_for_generation(
     .bind(generation.dimension)
     .bind((MAX_AUTHORIZED_CANDIDATES + 1) as i64)
     .bind(include_embeddings)
+    .bind(semantic_result_limit.map(|limit| limit as i64))
     .fetch_all(pool)
     .await?;
 
