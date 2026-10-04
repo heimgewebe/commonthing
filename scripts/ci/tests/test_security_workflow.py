@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -346,3 +347,116 @@ class TrivyReportRenderingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+FAKE_SCANNER = """#!/usr/bin/env bash
+# Stands in for cargo: `cargo tree` prints FAKE_TREE. Scanner calls emit
+# reports on the same streams as the real tools and fail unless overridden.
+if [ "$1" = "tree" ]; then
+  printf '%s' "${FAKE_TREE:-}"
+  exit 0
+fi
+if [ "$1" = "audit" ]; then
+  printf '{"settings":{"ignore":%s},"vulnerabilities":{"found":true,"count":1}}\\n' \
+    "${FAKE_AUDIT_IGNORES:-[\"RUSTSEC-2023-0071\"]}"
+  exit "${FAKE_SCAN_EXIT:-1}"
+fi
+if [ "$1" = "deny" ]; then
+  printf '{"type":"diagnostic"}\\n' >&2
+fi
+exit "${FAKE_SCAN_EXIT:-1}"
+"""
+
+
+def job_step(job: str, name: str) -> dict:
+    payload, _ = load_workflow()
+    return next(step for step in payload["jobs"][job]["steps"] if step.get("name") == name)
+
+
+def run_with_fake_cargo(
+    script: str, workdir: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    bin_dir = workdir / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    cargo = bin_dir / "cargo"
+    cargo.write_text(FAKE_SCANNER, encoding="utf-8")
+    cargo.chmod(0o755)
+    run_env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", **(env or {})}
+    # `bash -e` without pipefail is GitHub's default shell, the weakest case.
+    return subprocess.run(
+        ["bash", "-e", "-c", script], cwd=workdir, env=run_env, capture_output=True, text=True, check=False
+    )
+
+
+class RustScannerSignalTest(unittest.TestCase):
+    """A failing Rust scanner must fail its job while the report survives."""
+
+    def test_scanner_steps_fail_on_findings_and_keep_the_report(self) -> None:
+        cases = [
+            ("audit", "Run cargo audit (JSON report)", "cargo-audit-report.json"),
+            ("deny", "Run cargo deny (JSON report)", "cargo-deny-report.json"),
+        ]
+        for job, name, report in cases:
+            with self.subTest(job=job), tempfile.TemporaryDirectory() as tmp:
+                step = job_step(job, name)
+                self.assertEqual(step.get("shell"), "bash")
+                result = run_with_fake_cargo(step["run"], Path(tmp))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue((Path(tmp) / report).read_text(encoding="utf-8").strip())
+
+    def test_the_former_tee_pipeline_would_have_passed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_with_fake_cargo("cargo audit --json | tee cargo-audit-report.json", Path(tmp))
+            self.assertEqual(result.returncode, 0)
+
+    def test_audit_and_deny_run_on_every_filtered_pull_request(self) -> None:
+        payload, triggers = load_workflow()
+        self.assertIn(".cargo/audit.toml", triggers["pull_request"]["paths"])
+        for job in ("audit", "deny"):
+            condition = payload["jobs"][job]["if"]
+            self.assertIn("github.event_name == 'pull_request' ||", condition)
+            self.assertNotIn("labels", condition)
+
+    def test_audit_rejects_an_unproved_configured_exception(self) -> None:
+        step = job_step("audit", "Run cargo audit (JSON report)")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_with_fake_cargo(
+                step["run"],
+                Path(tmp),
+                {
+                    "FAKE_SCAN_EXIT": "0",
+                    "FAKE_AUDIT_IGNORES": '["RUSTSEC-2023-0071","RUSTSEC-2099-9999"]',
+                },
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected cargo audit exceptions", result.stdout)
+
+
+class CargoAuditExceptionTest(unittest.TestCase):
+    STEP = "Verify cargo audit exceptions still hold"
+
+    def run_guard(self, audit_toml: str, tree: str = "") -> subprocess.CompletedProcess:
+        script = job_step("audit", self.STEP)["run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            (workdir / ".cargo").mkdir()
+            (workdir / ".cargo" / "audit.toml").write_text(audit_toml, encoding="utf-8")
+            return run_with_fake_cargo(script, workdir, {"FAKE_TREE": tree})
+
+    def test_repository_exceptions_are_explicit_and_dated(self) -> None:
+        text = (ROOT / ".cargo" / "audit.toml").read_text(encoding="utf-8")
+        self.assertEqual(tomllib.loads(text)["advisories"]["ignore"], ["RUSTSEC-2023-0071"])
+        self.assertRegex(text, r"(?m)^# review-after: \d{4}-\d{2}-\d{2}$")
+
+    def test_guard_passes_while_rsa_is_not_compiled(self) -> None:
+        result = self.run_guard("# review-after: 2999-01-01\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_guard_fails_once_rsa_enters_the_build_graph(self) -> None:
+        result = self.run_guard("# review-after: 2999-01-01\n", tree="rsa v0.9.10\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no longer holds", result.stdout)
+
+    def test_guard_fails_after_the_review_date_or_without_one(self) -> None:
+        self.assertNotEqual(self.run_guard("# review-after: 2000-01-01\n").returncode, 0)
+        self.assertNotEqual(self.run_guard("[advisories]\n").returncode, 0)

@@ -26,9 +26,10 @@ use weltgewebe_api::{
     },
     middleware::auth::AuthContext,
     search::{
-        execute_search, fetch_postgres_candidates, EmbeddingProvider, EmbeddingProviderError,
-        GenerationSpec, ProcessOutcome, ProjectionWorker, SearchError, SearchFilters, SearchMode,
-        SearchQueryParams, SearchRepositoryError, DOCUMENT_REVISION, MAX_AUTHORIZED_CANDIDATES,
+        execute_search, fetch_postgres_candidates, fetch_postgres_candidates_for_generation,
+        EmbeddingProvider, EmbeddingProviderError, GenerationSpec, ProcessOutcome,
+        ProjectionWorker, SearchError, SearchFilters, SearchMode, SearchQueryParams,
+        SearchRepositoryError, DOCUMENT_REVISION, MAX_AUTHORIZED_CANDIDATES,
         NORMALIZATION_REVISION, RANKING_REVISION,
     },
     state::ApiState,
@@ -2073,6 +2074,124 @@ async fn t006_search_api_against_postgres_projections() {
             .count(),
         10,
         "T006 must expose exactly the T003 top-10 lexical prefix even when more lexical matches exist"
+    );
+
+    assert!(
+        bounded_candidates
+            .candidates
+            .iter()
+            .any(|candidate| candidate.embedding.is_some()),
+        "the compatibility repository path must still expose semantic vectors"
+    );
+
+    let saturated_window = fetch_postgres_candidates_for_generation(
+        &pool,
+        &bounded_candidates.generation,
+        "Fahrrad",
+        &SearchFilters::default(),
+        &anonymous,
+        true,
+        Some(5),
+    )
+    .await
+    .expect("fetch saturated visible-window candidates");
+    assert_eq!(
+        saturated_window
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.rank_class != u8::MAX)
+            .count(),
+        10,
+        "saturated-window optimization must preserve the authoritative lexical prefix"
+    );
+    assert!(
+        saturated_window
+            .candidates
+            .iter()
+            .all(|candidate| candidate.embedding.is_none()),
+        "semantic vectors must stay in PostgreSQL when lexical results already fill limit=5"
+    );
+
+    let boundary_window = fetch_postgres_candidates_for_generation(
+        &pool,
+        &bounded_candidates.generation,
+        "Fahrrad",
+        &SearchFilters::default(),
+        &anonymous,
+        true,
+        Some(10),
+    )
+    .await
+    .expect("fetch exact-boundary visible-window candidates");
+    assert_eq!(
+        boundary_window
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.rank_class != u8::MAX)
+            .count(),
+        10,
+        "boundary proof must use exactly ten lexical candidates"
+    );
+    assert!(
+        boundary_window
+            .candidates
+            .iter()
+            .all(|candidate| candidate.embedding.is_none()),
+        "semantic vectors must stay in PostgreSQL when lexical_count equals the visible limit"
+    );
+    let reference_order = bounded_candidates
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.node.id.as_str(),
+                candidate.rank_class,
+                candidate.rank_score.to_bits(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let optimized_order = saturated_window
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.node.id.as_str(),
+                candidate.rank_class,
+                candidate.rank_score.to_bits(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        optimized_order, reference_order,
+        "suppressing invisible embeddings must not change candidate identity or lexical ordering"
+    );
+
+    let unsaturated_window = fetch_postgres_candidates_for_generation(
+        &pool,
+        &bounded_candidates.generation,
+        "voellig fremder begriff",
+        &SearchFilters::default(),
+        &anonymous,
+        true,
+        Some(5),
+    )
+    .await
+    .expect("fetch unsaturated visible-window candidates");
+    assert!(
+        unsaturated_window
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.rank_class != u8::MAX)
+            .count()
+            < 5,
+        "unsaturated proof query must leave room for the semantic append"
+    );
+    assert!(
+        unsaturated_window
+            .candidates
+            .iter()
+            .any(|candidate| candidate.embedding.is_some()),
+        "semantic vectors must remain available while an append can still enter the visible window"
     );
 
     let parity_candidates = fetch_postgres_candidates(
