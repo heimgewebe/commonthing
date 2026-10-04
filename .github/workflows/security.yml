@@ -42,8 +42,8 @@ jobs:
     name: cargo audit (nightly + on-demand)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # The workflow's pull_request trigger is already path-filtered to Rust
-    # manifests, lockfiles and deny.toml, so every such PR is audited.
+    # The workflow's pull_request trigger is already path-filtered to
+    # Rust- and security-relevant files, so every matched PR is audited.
     if: |
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'pull_request' ||
@@ -102,6 +102,11 @@ jobs:
         run: |
           set -euo pipefail
           cargo audit --json | tee cargo-audit-report.json
+          if ! jq -e '.settings.ignore == ["RUSTSEC-2023-0071"]' cargo-audit-report.json > /dev/null; then
+            echo "::error file=.cargo/audit.toml::unexpected cargo audit exceptions"
+            echo "Only RUSTSEC-2023-0071 is covered by a workflow proof."
+            exit 1
+          fi
       - name: Upload audit report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1

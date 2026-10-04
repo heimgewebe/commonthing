@@ -350,18 +350,21 @@ if __name__ == "__main__":
 
 
 FAKE_SCANNER = """#!/usr/bin/env bash
-# Stands in for cargo: `cargo tree` prints FAKE_TREE, every other call emits a
-# finding the way the real scanner does and then fails like it.
+# Stands in for cargo: `cargo tree` prints FAKE_TREE. Scanner calls emit
+# reports on the same streams as the real tools and fail unless overridden.
 if [ "$1" = "tree" ]; then
   printf '%s' "${FAKE_TREE:-}"
   exit 0
 fi
+if [ "$1" = "audit" ]; then
+  printf '{"settings":{"ignore":%s},"vulnerabilities":{"found":true,"count":1}}\\n' \
+    "${FAKE_AUDIT_IGNORES:-[\"RUSTSEC-2023-0071\"]}"
+  exit "${FAKE_SCAN_EXIT:-1}"
+fi
 if [ "$1" = "deny" ]; then
   printf '{"type":"diagnostic"}\\n' >&2
-else
-  printf '{"vulnerabilities":{"found":true,"count":1}}\\n'
 fi
-exit 1
+exit "${FAKE_SCAN_EXIT:-1}"
 """
 
 
@@ -413,6 +416,20 @@ class RustScannerSignalTest(unittest.TestCase):
             condition = payload["jobs"][job]["if"]
             self.assertIn("github.event_name == 'pull_request' ||", condition)
             self.assertNotIn("labels", condition)
+
+    def test_audit_rejects_an_unproved_configured_exception(self) -> None:
+        step = job_step("audit", "Run cargo audit (JSON report)")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_with_fake_cargo(
+                step["run"],
+                Path(tmp),
+                {
+                    "FAKE_SCAN_EXIT": "0",
+                    "FAKE_AUDIT_IGNORES": '["RUSTSEC-2023-0071","RUSTSEC-2099-9999"]',
+                },
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected cargo audit exceptions", result.stdout)
 
 
 class CargoAuditExceptionTest(unittest.TestCase):
