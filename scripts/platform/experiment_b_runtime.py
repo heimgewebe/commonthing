@@ -12048,6 +12048,17 @@ def _http_read(url: str, *, timeout: int = 10) -> tuple[int, bytes, float]:
     return status_code, body, elapsed_ms
 
 
+def _prime_t048_search_metric(base_url: str, search_query: str) -> None:
+    if not isinstance(search_query, str) or not search_query.strip():
+        raise RuntimeErrorEB("canonical T048 search query is invalid")
+    query = urllib.parse.urlencode({"q": search_query, "limit": 5})
+    status, _body, _elapsed = _http_read(
+        f"{base_url.rstrip('/')}/search?{query}"
+    )
+    if status != 200:
+        raise RuntimeErrorEB("T048 /search warm-up failed")
+
+
 def _wait_http_200(url: str, process: subprocess.Popen[Any] | None = None) -> None:
     for _ in range(60):
         if process is not None and process.poll() is not None:
@@ -13334,6 +13345,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         raise
     base_url = f"http://127.0.0.1:{port}"
     try:
+        _prime_t048_search_metric(base_url, scenario["search_query"])
         before_status, before_body, _elapsed = _http_read(f"{base_url}/metrics")
         if before_status != 200:
             raise RuntimeErrorEB("API /metrics pre-snapshot failed")

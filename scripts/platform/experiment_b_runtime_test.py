@@ -3199,6 +3199,42 @@ spec:
             self.assertEqual(attempt["status"], "running")
             self.assertEqual(attempt["source_commit"], commit)
 
+    def test_t048_primes_search_metric_before_baseline_scrape(self) -> None:
+        load_source = inspect.getsource(runtime.t048_load_proof)
+        self.assertIn("_prime_t048_search_metric(", load_source)
+        self.assertLess(
+            load_source.index("_prime_t048_search_metric("),
+            load_source.index('_http_read(f"{base_url}/metrics")'),
+        )
+
+    def test_t048_search_metric_prime_binds_query_and_requires_success(self) -> None:
+        with mock.patch.object(
+            runtime,
+            "_http_read",
+            return_value=(200, b"{}", 1.0),
+        ) as http_read:
+            runtime._prime_t048_search_metric(
+                "http://127.0.0.1:1234",
+                "welt gewebe",
+            )
+        http_read.assert_called_once_with(
+            "http://127.0.0.1:1234/search?q=welt+gewebe&limit=5"
+        )
+
+        with mock.patch.object(
+            runtime,
+            "_http_read",
+            return_value=(503, b"unavailable", 1.0),
+        ):
+            with self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "T048 /search warm-up failed",
+            ):
+                runtime._prime_t048_search_metric(
+                    "http://127.0.0.1:1234",
+                    "welt gewebe",
+                )
+
     def test_http_read_disables_ambient_proxy(self) -> None:
         response = mock.MagicMock()
         response.__enter__.return_value = response
