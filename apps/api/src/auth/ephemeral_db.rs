@@ -404,11 +404,16 @@ pub async fn cleanup_expired_shared_auth(pool: &PgPool) -> Result<(u64, u64), sq
     Ok((auth, limits))
 }
 
-pub fn spawn_cleanup_loop(pool: PgPool) {
+pub fn spawn_cleanup_loop(pool: PgPool, stop: crate::shutdown::ShutdownSignal) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        let stop = stop.wait();
+        tokio::pin!(stop);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = &mut stop => break,
+            }
             match cleanup_expired_shared_auth(&pool).await {
                 Ok((auth, limits)) if auth > 0 || limits > 0 => tracing::debug!(
                     auth_rows = auth,

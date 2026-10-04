@@ -12,6 +12,7 @@ pub mod notifications;
 pub mod outbox;
 pub mod routes;
 pub mod search;
+pub mod shutdown;
 pub mod state;
 pub mod telemetry;
 pub mod utils;
@@ -22,6 +23,7 @@ pub mod test_helpers;
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     env,
+    future::IntoFuture,
     io::ErrorKind,
     net::SocketAddr,
     sync::Arc,
@@ -381,9 +383,25 @@ pub async fn run() -> anyhow::Result<()> {
         passkeys,
         web_push,
     };
+    let db_pool_for_shutdown = state.db_pool.clone();
+
+    // SIGTERM/SIGINT become one shutdown signal for the HTTP server and the
+    // background loops; see `shutdown` for the drain budget.
+    let shutdown_grace = shutdown::grace_period_from_env()?;
+    let shutdown = shutdown::Shutdown::new();
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            match shutdown::termination_signal().await {
+                Ok(signal) => tracing::info!(signal, "shutdown requested"),
+                Err(error) => tracing::error!(%error, "signal handling failed; shutting down"),
+            }
+            shutdown.trigger();
+        });
+    }
 
     if let Some(pool) = state.db_pool.clone() {
-        crate::auth::ephemeral_db::spawn_cleanup_loop(pool);
+        crate::auth::ephemeral_db::spawn_cleanup_loop(pool, shutdown.signal());
     }
 
     if let (Some(pool), Some(client), Some(service)) = (
@@ -438,11 +456,17 @@ pub async fn run() -> anyhow::Result<()> {
             ));
         };
         let accounts = state.accounts.clone();
+        let stop = shutdown.signal();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let stop = stop.wait();
+            tokio::pin!(stop);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    () = &mut stop => break,
+                }
                 match governance::finalize_due_proposals(&pool, chrono::Utc::now()).await {
                     Ok(outcomes) => {
                         governance::apply_promotions_to_store(&accounts, &outcomes).await;
@@ -499,11 +523,29 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!(%bind_addr, "starting API server");
 
     let listener = TcpListener::bind(bind_addr).await?;
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(shutdown.signal().wait())
+    .into_future();
+    match shutdown::drain_within(server, shutdown.signal(), shutdown_grace).await? {
+        shutdown::DrainOutcome::Drained => tracing::info!("HTTP server drained"),
+        shutdown::DrainOutcome::GraceExpired => tracing::warn!(
+            grace_seconds = shutdown_grace.as_secs(),
+            "shutdown grace period expired with requests still open; dropping them"
+        ),
+    }
+
+    if let Some(pool) = db_pool_for_shutdown {
+        if tokio::time::timeout(shutdown::POOL_CLOSE_TIMEOUT, pool.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("PostgreSQL pool did not close in time; connections are dropped");
+        }
+    }
+    tracing::info!("API stopped");
 
     Ok(())
 }
