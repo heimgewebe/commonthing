@@ -39,6 +39,21 @@ The lock is `weltgewebe-schauwerk-runtime-lock.v1` and binds exactly:
 
 Mutable tags such as `latest` are not deployment authority.
 
+The production registry contract is intentionally credential-free: the
+`heimgewebe/schauwerk-schaubild` GHCR package is public so a fresh production
+host can pull the exact reviewed digest without a PAT or another long-lived
+registry secret. The repository release lock and OCI source/revision checks
+remain the authority; public package visibility does not weaken digest pinning.
+
+The current package's public visibility is deliberate and irreversible under
+GitHub's package visibility model. Production must not silently introduce a GHCR
+credential by replacing it with a private package. Such a replacement would be a
+new architecture decision with an explicit secret-management contract. Until
+such a decision is reviewed, an uncached private or otherwise unauthenticated
+image must fail closed at the exact-digest pull. Organization policy may still
+forbid creating additional public packages; that policy is separate from the
+deliberate public visibility of this existing runtime package.
+
 The sidecar has no published host port. It runs read-only, drops all Linux
 capabilities, enables `no-new-privileges`, and receives only a bounded 64 MiB
 `/tmp` tmpfs. Its server binds the Compose network only in explicit
