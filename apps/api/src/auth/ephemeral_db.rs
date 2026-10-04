@@ -404,7 +404,10 @@ pub async fn cleanup_expired_shared_auth(pool: &PgPool) -> Result<(u64, u64), sq
     Ok((auth, limits))
 }
 
-pub fn spawn_cleanup_loop(pool: PgPool, stop: crate::shutdown::ShutdownSignal) {
+pub fn spawn_cleanup_loop(
+    pool: PgPool,
+    stop: crate::shutdown::ShutdownSignal,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         let stop = stop.wait();
@@ -427,5 +430,33 @@ pub fn spawn_cleanup_loop(pool: PgPool, stop: crate::shutdown::ShutdownSignal) {
                 ),
             }
         }
-    });
+    })
+}
+
+#[cfg(test)]
+mod cleanup_loop_tests {
+    use super::spawn_cleanup_loop;
+    use crate::shutdown::Shutdown;
+    use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cleanup_loop_stops_on_shutdown_signal() {
+        // Nothing listens on port 1, so every cleanup round fails fast; the loop
+        // must still keep running until the signal and then end.
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://cleanup@127.0.0.1:1/cleanup")
+            .unwrap();
+        let shutdown = Shutdown::new();
+        let handle = spawn_cleanup_loop(pool, shutdown.signal());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handle.is_finished(), "loop must run until shutdown");
+
+        shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("cleanup loop must stop after the shutdown signal")
+            .unwrap();
+    }
 }
