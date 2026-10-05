@@ -3661,21 +3661,27 @@ spec:
             api_scale,
         )
         before_db = source.index("before_db = _database_signature(", frozen)
+        after_db = source.index("after_db = _database_signature(", before_db)
+        restored_continuity = source.index(
+            '"recovery restored continuity"',
+            after_db,
+        )
         app_resume = source.index(
-            '_flux_resume(root, "commonthing-experiment-b-app")'
+            '_flux_resume(root, "commonthing-experiment-b-app")',
+            restored_continuity,
         )
         post_drain = source.index(
             "_wait_event_pipeline_quiescent(",
             app_resume,
         )
-        after_db = source.index("after_db = _database_signature(", post_drain)
         self.assertLess(flux_suspend, pre_drain)
         self.assertLess(pre_drain, api_scale)
         self.assertLess(api_scale, frozen)
         self.assertLess(frozen, before_db)
-        self.assertLess(before_db, app_resume)
+        self.assertLess(before_db, after_db)
+        self.assertLess(after_db, restored_continuity)
+        self.assertLess(restored_continuity, app_resume)
         self.assertLess(app_resume, post_drain)
-        self.assertLess(post_drain, after_db)
 
     def test_wait_deployment_process_timeout_exceeds_rollout_timeout(self) -> None:
         root = Path("/tmp/unused-experiment-b-root")
@@ -6824,6 +6830,66 @@ spec:
                 database_identity=("user", "db"),
             )
 
+    def test_database_runtime_continuity_allows_only_forward_sequence_progress(
+        self,
+    ) -> None:
+        restored = {
+            "tables": [
+                {
+                    "schema": "public",
+                    "name": "domain_nodes",
+                    "rows": 2,
+                    "md5": "a" * 32,
+                }
+            ],
+            "sequences": [
+                {
+                    "schema": "public",
+                    "name": "domain_nodes_id_seq",
+                    "last_value": "10",
+                    "is_called": True,
+                    "start_value": "1",
+                    "increment_by": "1",
+                    "min_value": "1",
+                    "max_value": "9223372036854775807",
+                    "cache_size": "1",
+                    "cycle": False,
+                }
+            ],
+            "schema_sha256": "b" * 64,
+        }
+        progressed = json.loads(json.dumps(restored))
+        progressed["sequences"][0]["last_value"] = "12"
+        runtime._require_database_runtime_continuity(
+            restored,
+            progressed,
+            "test runtime continuity",
+        )
+
+        row_drift = json.loads(json.dumps(progressed))
+        row_drift["tables"][0]["md5"] = "c" * 32
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "persisted rows or schema drifted",
+        ):
+            runtime._require_database_runtime_continuity(
+                restored,
+                row_drift,
+                "test runtime continuity",
+            )
+
+        regression = json.loads(json.dumps(progressed))
+        regression["sequences"][0]["last_value"] = "9"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "sequence position regressed",
+        ):
+            runtime._require_database_runtime_continuity(
+                restored,
+                regression,
+                "test runtime continuity",
+            )
+
     def test_application_contract_render_uses_sealed_source_commit_tree(
         self,
     ) -> None:
@@ -6884,6 +6950,73 @@ spec:
         self.assertLess(db_signature, nats_signature)
         self.assertLess(nats_signature, dump)
 
+    def test_recovery_proves_restored_signatures_before_flux_resume(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        restore = source.index('"pg_restore"')
+        nats_restart = source.index(
+            '_scale_deployment(root, DATA_NAMESPACE, "nats", 1)',
+            restore,
+        )
+        after_db = source.index(
+            "after_db = _database_signature(",
+            nats_restart,
+        )
+        after_nats = source.index(
+            "after_nats = _jetstream_signature(",
+            after_db,
+        )
+        db_compare = source.index(
+            "if after_db != before_db:",
+            after_nats,
+        )
+        nats_compare = source.index(
+            "if after_nats != before_nats:",
+            db_compare,
+        )
+        data_resume = source.index(
+            '_flux_resume(root, "commonthing-experiment-b-data")',
+            nats_compare,
+        )
+        app_resume = source.index(
+            '_flux_resume(root, "commonthing-experiment-b-app")',
+            data_resume,
+        )
+        api_wait = source.index(
+            '_wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)',
+            app_resume,
+        )
+        event_quiescence = source.index(
+            "_wait_event_pipeline_quiescent(",
+            api_wait,
+        )
+        database_post_resume = source.index(
+            "database_post_resume = _database_signature(",
+            event_quiescence,
+        )
+        runtime_continuity = source.index(
+            "_require_database_runtime_continuity(",
+            database_post_resume,
+        )
+        completion = source.index(
+            '"recovery completion"',
+            runtime_continuity,
+        )
+        self.assertLess(restore, nats_restart)
+        self.assertLess(nats_restart, after_db)
+        self.assertLess(after_db, after_nats)
+        self.assertLess(after_nats, db_compare)
+        self.assertLess(db_compare, nats_compare)
+        self.assertLess(nats_compare, data_resume)
+        self.assertLess(data_resume, app_resume)
+        self.assertLess(app_resume, api_wait)
+        self.assertLess(api_wait, event_quiescence)
+        self.assertLess(event_quiescence, database_post_resume)
+        self.assertLess(database_post_resume, runtime_continuity)
+        self.assertLess(runtime_continuity, completion)
+        self.assertNotIn(
+            "_flux_resume(",
+            source[after_db:data_resume],
+        )
 
     def test_recovery_binds_postgres_clients_to_validated_source_pod(
         self,
@@ -11093,15 +11226,46 @@ spec:
     def test_final_recovery_state_readback_binds_current_signatures_and_fixture(
         self,
     ) -> None:
+        restored_database = {
+            "tables": [
+                {
+                    "schema": "public",
+                    "name": "domain_nodes",
+                    "rows": 2,
+                    "md5": "a" * 32,
+                }
+            ],
+            "sequences": [
+                {
+                    "schema": "public",
+                    "name": "domain_nodes_id_seq",
+                    "last_value": "10",
+                    "is_called": True,
+                    "start_value": "1",
+                    "increment_by": "1",
+                    "min_value": "1",
+                    "max_value": "9223372036854775807",
+                    "cache_size": "1",
+                    "cycle": False,
+                }
+            ],
+            "schema_sha256": "b" * 64,
+        }
+        post_resume_database = json.loads(json.dumps(restored_database))
+        post_resume_database["sequences"][0]["last_value"] = "12"
+        current_database = json.loads(json.dumps(post_resume_database))
+        current_database["sequences"][0]["last_value"] = "14"
         recovery = {
             "schema_version": 1,
             "status": "pass",
             "source_commit": self.commit,
             "rpo_seconds": 0,
-            "database_before": {"db": "stable"},
-            "database_after": {"db": "stable"},
+            "database_before": restored_database,
+            "database_after": restored_database,
+            "database_post_resume": post_resume_database,
             "jetstream_before": {"nats": "stable"},
             "jetstream_after": {"nats": "stable"},
+            "jetstream_post_resume": {"nats": "stable"},
         }
         runtime.atomic_json(
             self.root / "receipts/recovery.json",
@@ -11137,7 +11301,7 @@ spec:
             mock.patch.object(
                 runtime,
                 "_database_signature",
-                return_value={"db": "stable"},
+                return_value=current_database,
             ) as database_signature,
             mock.patch.object(
                 runtime,
@@ -11160,7 +11324,7 @@ spec:
             )
         self.assertEqual(
             result["database_signature"],
-            {"db": "stable"},
+            current_database,
         )
         self.assertEqual(
             result["jetstream_signature"],
@@ -11216,7 +11380,15 @@ spec:
             mock.patch.object(
                 runtime,
                 "_database_signature",
-                return_value={"db": "drift"},
+                return_value={
+                    **current_database,
+                    "tables": [
+                        {
+                            **current_database["tables"][0],
+                            "md5": "d" * 32,
+                        }
+                    ],
+                },
             ),
             mock.patch.object(
                 runtime,

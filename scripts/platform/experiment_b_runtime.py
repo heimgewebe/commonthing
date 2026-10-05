@@ -6613,8 +6613,18 @@ def _final_recovery_state_readback(
         or recovery.get("rpo_seconds") != 0
         or recovery.get("database_before") != recovery.get("database_after")
         or recovery.get("jetstream_before") != recovery.get("jetstream_after")
+        or not isinstance(recovery.get("database_post_resume"), dict)
+        or recovery.get("jetstream_post_resume") != recovery.get("jetstream_after")
     ):
         raise RuntimeErrorEB("Experiment-B recovery receipt binding is invalid")
+    try:
+        _require_database_runtime_continuity(
+            recovery["database_after"],
+            recovery["database_post_resume"],
+            "recovery receipt post-resume database",
+        )
+    except RuntimeErrorEB as exc:
+        raise RuntimeErrorEB("Experiment-B recovery receipt binding is invalid") from exc
 
     database_identity = _verified_database_client_identity(
         root,
@@ -6639,9 +6649,17 @@ def _final_recovery_state_readback(
         source_commit=source_commit,
         nats_binding=nats_binding,
     )
-    if current_database != recovery.get("database_after"):
-        raise RuntimeErrorEB("Experiment-B database/search state drifted after recovery")
-    if current_jetstream != recovery.get("jetstream_after"):
+    try:
+        _require_database_runtime_continuity(
+            recovery["database_post_resume"],
+            current_database,
+            "final recovery-state database",
+        )
+    except RuntimeErrorEB as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B database/search state drifted after recovery"
+        ) from exc
+    if current_jetstream != recovery.get("jetstream_post_resume"):
         raise RuntimeErrorEB("Experiment-B JetStream state drifted after recovery")
 
     fixture_path = root / "receipts/t048-fixture.json"
@@ -15319,6 +15337,90 @@ SELECT json_build_object(
         value["schema_sha256"] = schema_sha256
     return value
 
+
+def _require_database_runtime_continuity(
+    restored: Any,
+    observed: Any,
+    context: str,
+) -> None:
+    if not isinstance(restored, dict) or not isinstance(observed, dict):
+        raise RuntimeErrorEB(f"{context} database signature is invalid")
+    restored_tables = restored.get("tables")
+    observed_tables = observed.get("tables")
+    restored_sequences = restored.get("sequences")
+    observed_sequences = observed.get("sequences")
+    if (
+        not isinstance(restored_tables, list)
+        or not isinstance(observed_tables, list)
+        or not isinstance(restored_sequences, list)
+        or not isinstance(observed_sequences, list)
+    ):
+        raise RuntimeErrorEB(f"{context} database signature is incomplete")
+    if (
+        restored_tables != observed_tables
+        or restored.get("schema_sha256") != observed.get("schema_sha256")
+    ):
+        raise RuntimeErrorEB(f"{context} persisted rows or schema drifted")
+
+    def sequence_map(
+        items: list[Any],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        result: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                raise RuntimeErrorEB(f"{context} sequence signature is invalid")
+            schema = item.get("schema")
+            name = item.get("name")
+            if not isinstance(schema, str) or not schema or not isinstance(name, str) or not name:
+                raise RuntimeErrorEB(f"{context} sequence identity is invalid")
+            key = (schema, name)
+            if key in result:
+                raise RuntimeErrorEB(f"{context} sequence identity is duplicated")
+            result[key] = item
+        return result
+
+    restored_by_key = sequence_map(restored_sequences)
+    observed_by_key = sequence_map(observed_sequences)
+    if set(restored_by_key) != set(observed_by_key):
+        raise RuntimeErrorEB(f"{context} sequence inventory drifted")
+
+    definition_fields = (
+        "start_value",
+        "increment_by",
+        "min_value",
+        "max_value",
+        "cache_size",
+        "cycle",
+    )
+    for key in sorted(restored_by_key):
+        before = restored_by_key[key]
+        after = observed_by_key[key]
+        if any(before.get(field) != after.get(field) for field in definition_fields):
+            raise RuntimeErrorEB(f"{context} sequence definition drifted")
+        try:
+            increment = int(str(before["increment_by"]))
+            before_last = int(str(before["last_value"]))
+            after_last = int(str(after["last_value"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeErrorEB(f"{context} sequence progress is invalid") from exc
+        before_called = before.get("is_called")
+        after_called = after.get("is_called")
+        if type(before_called) is not bool or type(after_called) is not bool:
+            raise RuntimeErrorEB(f"{context} sequence call state is invalid")
+        if increment == 0:
+            raise RuntimeErrorEB(f"{context} sequence increment is invalid")
+        if before_called and not after_called:
+            raise RuntimeErrorEB(f"{context} sequence call state regressed")
+        if not before_called and not after_called and after_last != before_last:
+            raise RuntimeErrorEB(f"{context} unused sequence position drifted")
+        if before.get("cycle") is True and after_last != before_last:
+            raise RuntimeErrorEB(f"{context} cycling sequence progress is ambiguous")
+        if increment > 0 and after_last < before_last:
+            raise RuntimeErrorEB(f"{context} sequence position regressed")
+        if increment < 0 and after_last > before_last:
+            raise RuntimeErrorEB(f"{context} sequence position regressed")
+
+
 def _jetstream_sequence_progress(value: Any, context: str) -> dict[str, int]:
     if not isinstance(value, dict):
         raise RuntimeErrorEB(f"{context} is missing from JetStream monitoring output")
@@ -16671,22 +16773,10 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery pre-Flux resume"
             )
-            _flux_resume(root, "commonthing-experiment-b-data")
-            _flux_resume(root, "commonthing-experiment-b-app")
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", 300)
-            _wait_event_pipeline_quiescent(
-                root,
-                source_commit=source_commit,
-                database_identity=database_identity,
-            )
-            _require_same_kubernetes_target(
-                root,
-                source_commit,
-                recovery_target,
-                "recovery post-resume event quiescence",
-            )
-
+            # Compare the exact persisted state before application workers
+            # resume. Search reconciliation intentionally retries idempotent
+            # INSERT ... ON CONFLICT DO NOTHING operations; PostgreSQL can
+            # advance their identity sequence even when no row is inserted.
             postgres_signature_after = _require_postgres_runtime_binding(
                 root,
                 source_commit,
@@ -16723,6 +16813,56 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 raise RuntimeErrorEB(
                     "JetStream stream/message-store/durable-consumer continuity signature changed across restore"
                 )
+            _require_same_kubernetes_target(
+                root,
+                source_commit,
+                recovery_target,
+                "recovery restored continuity",
+            )
+            _flux_resume(root, "commonthing-experiment-b-data")
+            _flux_resume(root, "commonthing-experiment-b-app")
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", 300)
+            _wait_event_pipeline_quiescent(
+                root,
+                source_commit=source_commit,
+                database_identity=database_identity,
+            )
+            _require_same_kubernetes_target(
+                root,
+                source_commit,
+                recovery_target,
+                "recovery post-resume event quiescence",
+            )
+            postgres_post_resume_binding = _require_postgres_runtime_binding(
+                root,
+                source_commit,
+            )
+            database_post_resume = _database_signature(
+                root,
+                database_identity=database_identity,
+                source_commit=source_commit,
+                postgres_binding=postgres_post_resume_binding,
+            )
+            _require_database_runtime_continuity(
+                after_db,
+                database_post_resume,
+                "recovery post-resume database",
+            )
+            nats_post_resume_binding = _require_nats_runtime_binding(
+                root,
+                source_commit,
+            )
+            jetstream_post_resume = _jetstream_signature(
+                root,
+                source_commit=source_commit,
+                nats_binding=nats_post_resume_binding,
+            )
+            if jetstream_post_resume != after_nats:
+                raise RuntimeErrorEB(
+                    "JetStream state changed after restore while the event pipeline was quiescent"
+                )
+
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery completion"
             )
@@ -16821,8 +16961,10 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         "nats_backup_sha256": nats_backup_sha256,
         "database_before": before_db,
         "database_after": after_db,
+        "database_post_resume": database_post_resume,
         "jetstream_before": before_nats,
         "jetstream_after": after_nats,
+        "jetstream_post_resume": jetstream_post_resume,
         "pvc_replacements": pvc_replacements,
         "pvc_delete_to_prove": True,
         "replacement_pvcs_empty_before_restore": True,
