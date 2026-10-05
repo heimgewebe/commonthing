@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, BufReader},
     sync::Mutex,
 };
 use uuid::Uuid;
@@ -367,7 +367,7 @@ async fn open_existing_audit() -> std::io::Result<Option<File>> {
 
 async fn append_jsonl_event(event: &JsonlAuditEvent) -> std::io::Result<()> {
     event.validate()?;
-    let _append_guard = JSONL_AUDIT_APPEND_LOCK
+    let append_guard = JSONL_AUDIT_APPEND_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .await;
@@ -389,7 +389,7 @@ async fn append_jsonl_event(event: &JsonlAuditEvent) -> std::io::Result<()> {
         .append(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(&path).await?;
+    let file = options.open(&path).await?;
     let metadata = file.metadata().await?;
     if !metadata.file_type().is_file() {
         return Err(invalid_input(
@@ -401,14 +401,31 @@ async fn append_jsonl_event(event: &JsonlAuditEvent) -> std::io::Result<()> {
             "node mutation audit file permissions are too broad",
         ));
     }
-    let bytes = serde_json::to_vec(event)
+    let mut line = serde_json::to_vec(event)
         .map_err(|error| invalid_data(format!("failed to encode mutation audit: {error}")))?;
-    file.write_all(&bytes).await?;
-    file.write_all(b"\n").await?;
-    file.flush().await?;
-    file.sync_all().await?;
-    sync_directory(directory)?;
-    Ok(())
+    line.push(b'\n');
+    let file = file.into_std().await;
+    let directory = directory.to_path_buf();
+    // The record is written as one append on a blocking task that owns the
+    // append lock. Dropping the awaiting future (e.g. a startup aborted by
+    // SIGTERM) can then no longer leave a torn line that a later recovery
+    // rejects as invalid JSON.
+    tokio::task::spawn_blocking(move || write_jsonl_line(append_guard, file, &line, &directory))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn write_jsonl_line(
+    _append_guard: tokio::sync::MutexGuard<'static, ()>,
+    mut file: std::fs::File,
+    line: &[u8],
+    directory: &Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    file.write_all(line)?;
+    file.sync_all()?;
+    sync_directory(directory)
 }
 
 async fn load_current_node_hashes() -> std::io::Result<HashMap<String, String>> {
@@ -620,6 +637,52 @@ mod tests {
         let error = recover_jsonl_audit().await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("cannot be reconciled"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cancelled_audit_append_never_leaves_a_torn_line() {
+        let directory = tempdir().unwrap();
+        let _env = EnvGuard::set("GEWEBE_IN_DIR", directory.path().to_str().unwrap());
+        let before = node("node-a", "Before");
+        write_nodes(directory.path(), std::slice::from_ref(&before));
+        let audit = NodeMutationAudit::new(
+            NodeMutationOperation::Delete,
+            "node-a",
+            "actor-a",
+            &before,
+            None,
+        )
+        .unwrap();
+
+        // Drop the append after a varying number of polls, the way an
+        // aborted startup drops `recover_jsonl_audit`.
+        for polls in 0..64 {
+            let mut append = Box::pin(prepare_jsonl_audit(&audit));
+            for _ in 0..polls {
+                if futures_util::poll!(append.as_mut()).is_ready() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(append);
+            // A write that already started finishes while holding the lock.
+            drop(
+                JSONL_AUDIT_APPEND_LOCK
+                    .get_or_init(|| Mutex::new(()))
+                    .lock()
+                    .await,
+            );
+        }
+
+        let content = std::fs::read_to_string(audit_path().unwrap()).unwrap();
+        assert!(!content.is_empty());
+        assert!(content.ends_with('\n'));
+        for line in content.lines() {
+            serde_json::from_str::<JsonlAuditEvent>(line).unwrap();
+        }
+        let summary = recover_jsonl_audit().await.unwrap();
+        assert_eq!(summary.aborted, 1);
     }
 
     #[tokio::test]
