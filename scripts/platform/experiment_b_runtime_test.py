@@ -6774,10 +6774,212 @@ spec:
         self.assertIn("commonthing_signature_sequences", source)
         self.assertIn("pg_catalog.pg_sequence", source)
         self.assertIn("last_value::text, is_called", source)
-        self.assertIn('"--schema-only"', source)
-        self.assertIn('"--quote-all-identifiers"', source)
         self.assertIn("schema_sha256", source)
-        self.assertIn("_run_bound_postgres_client", source)
+        self.assertIn("_restore_stable_database_schema_sha256", source)
+        schema_source = inspect.getsource(
+            runtime._restore_stable_database_schema_sha256
+        )
+        self.assertIn('"-Fc"', schema_source)
+        self.assertIn('"pg_restore"', schema_source)
+        self.assertIn('"--quote-all-identifiers"', schema_source)
+        self.assertIn("CREATE DATABASE", schema_source)
+        self.assertIn("DROP DATABASE IF EXISTS", schema_source)
+        self.assertIn("_run_bound_postgres_client", schema_source)
+
+
+    def test_restore_stable_database_schema_signature_uses_scratch_roundtrip(
+        self,
+    ) -> None:
+        scratch_hex = "a" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        canonical = (
+            b"\\restrict one\n"
+            b'CREATE TABLE "public"."example" ("id" integer);\n'
+            b"\\unrestrict two\n"
+        )
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    b"",
+                    b"",
+                    canonical,
+                    b"",
+                ],
+            ) as run_bound,
+        ):
+            observed = runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        expected = hashlib.sha256(
+            b'CREATE TABLE "public"."example" ("id" integer);\n'
+        ).hexdigest()
+        self.assertEqual(observed, expected)
+        self.assertEqual(run_bound.call_count, 5)
+        commands = [call.args[3] for call in run_bound.call_args_list]
+        self.assertIn("-Fc", commands[0])
+        self.assertIn("--schema-only", commands[0])
+        self.assertEqual(commands[2][0], "pg_restore")
+        self.assertIn(scratch_name, commands[2])
+        self.assertIn("--schema-only", commands[2])
+        self.assertEqual(commands[3][0], "pg_dump")
+        self.assertIn(scratch_name, commands[3])
+        self.assertIn("--schema-only", commands[3])
+        self.assertIn(
+            f'CREATE DATABASE "{scratch_name}" TEMPLATE template0;',
+            run_bound.call_args_list[1].kwargs["input_bytes"].decode("utf-8"),
+        )
+        self.assertIn(
+            f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE);',
+            run_bound.call_args_list[4].kwargs["input_bytes"].decode("utf-8"),
+        )
+
+    def test_restore_stable_database_schema_signature_cleans_up_after_failure(
+        self,
+    ) -> None:
+        scratch_hex = "b" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    b"",
+                    runtime.RuntimeErrorEB("restore failed"),
+                    b"",
+                ],
+            ) as run_bound,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "restore failed",
+            ),
+        ):
+            runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        self.assertEqual(run_bound.call_count, 4)
+        self.assertIn(
+            f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE);',
+            run_bound.call_args_list[-1].kwargs["input_bytes"].decode("utf-8"),
+        )
+
+
+    def test_restore_stable_database_schema_signature_does_not_drop_uncreated_scratch(
+        self,
+    ) -> None:
+        scratch_hex = "c" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    runtime.RuntimeErrorEB("create failed"),
+                ],
+            ) as run_bound,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "create failed",
+            ),
+        ):
+            runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        self.assertEqual(run_bound.call_count, 2)
+        self.assertIn(
+            f'CREATE DATABASE "{scratch_name}" TEMPLATE template0;',
+            run_bound.call_args_list[1].kwargs["input_bytes"].decode("utf-8"),
+        )
+        observed_input = b"\n".join(
+            call.kwargs.get("input_bytes", b"")
+            for call in run_bound.call_args_list
+        )
+        self.assertNotIn(b"DROP DATABASE IF EXISTS", observed_input)
+
+    def test_restore_stable_database_schema_signature_tracks_canonical_schema(
+        self,
+    ) -> None:
+        scratch_hex = "d" * 32
+
+        def signature(schema_archive: bytes, canonical_schema: bytes) -> str:
+            with (
+                mock.patch.object(
+                    runtime.uuid,
+                    "uuid4",
+                    return_value=mock.Mock(hex=scratch_hex),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_run_bound_postgres_client",
+                    side_effect=[
+                        schema_archive,
+                        b"",
+                        b"",
+                        canonical_schema,
+                        b"",
+                    ],
+                ),
+            ):
+                return runtime._restore_stable_database_schema_sha256(
+                    Path("/unused"),
+                    "a" * 40,
+                    {"container_id": "bound"},
+                    ("user", "database"),
+                )
+
+        canonical = (
+            b'CREATE TABLE "public"."example" ('
+            b'"id" integer CHECK (("id" > 0)));\n'
+        )
+        formatting_variant = signature(
+            b"source-schema-serialization-a",
+            canonical,
+        )
+        restored_variant = signature(
+            b"source-schema-serialization-b",
+            canonical,
+        )
+        semantic_drift = signature(
+            b"source-schema-serialization-b",
+            (
+                b'CREATE TABLE "public"."example" ('
+                b'"id" integer CHECK (("id" >= 0)));\n'
+            ),
+        )
+        self.assertEqual(formatting_variant, restored_variant)
+        self.assertNotEqual(formatting_variant, semantic_drift)
+
 
     def test_database_signature_uses_public_domain_nodes_as_canonical_state(
         self,

@@ -15074,6 +15074,132 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
 
 
 
+
+def _normalized_database_schema_dump(schema_bytes: bytes) -> bytes:
+    try:
+        schema_text = schema_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeErrorEB(
+            "database schema signature is not UTF-8"
+        ) from exc
+    normalized_schema = "\n".join(
+        line
+        for line in schema_text.splitlines()
+        if not line.startswith("\\restrict ")
+        and not line.startswith("\\unrestrict ")
+    ) + "\n"
+    return normalized_schema.encode("utf-8")
+
+
+def _restore_stable_database_schema_sha256(
+    root: Path,
+    source_commit: str,
+    postgres_binding: dict[str, Any],
+    database_identity: tuple[str, str],
+) -> str:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature requires exact source commit"
+        )
+    username, database = database_identity
+    if not username or not database:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature requires database identity"
+        )
+    scratch_database = f"commonthing_schema_signature_{uuid.uuid4().hex}"
+    if len(scratch_database) > 63 or re.fullmatch(
+        r"[a-z0-9_]+",
+        scratch_database,
+    ) is None:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature scratch database name is invalid"
+        )
+
+    schema_archive = _run_bound_postgres_client(
+        root,
+        source_commit,
+        postgres_binding,
+        [
+            *_database_client_argv("pg_dump", database_identity),
+            "-Fc",
+            "--schema-only",
+            "--no-owner",
+            "--no-privileges",
+        ],
+        timeout=900,
+    )
+    if not schema_archive:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature archive is empty"
+        )
+
+    scratch_identity = (username, scratch_database)
+    create_sql = (
+        f'CREATE DATABASE "{scratch_database}" TEMPLATE template0;\n'
+    ).encode("utf-8")
+    drop_sql = (
+        f'DROP DATABASE IF EXISTS "{scratch_database}" WITH (FORCE);\n'
+    ).encode("utf-8")
+    control_command = [
+        *_database_client_argv("psql", database_identity),
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-qAt",
+    ]
+
+    scratch_created = False
+    try:
+        _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            control_command,
+            input_bytes=create_sql,
+            timeout=120,
+        )
+        scratch_created = True
+        _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            [
+                *_database_client_argv("pg_restore", scratch_identity),
+                "--schema-only",
+                "--no-owner",
+                "--no-privileges",
+                "--exit-on-error",
+            ],
+            input_bytes=schema_archive,
+            timeout=900,
+        )
+        canonical_schema = _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            [
+                *_database_client_argv("pg_dump", scratch_identity),
+                "--schema-only",
+                "--no-owner",
+                "--no-privileges",
+                "--quote-all-identifiers",
+            ],
+            timeout=900,
+        )
+        return hashlib.sha256(
+            _normalized_database_schema_dump(canonical_schema)
+        ).hexdigest()
+    finally:
+        if scratch_created:
+            _run_bound_postgres_client(
+                root,
+                source_commit,
+                postgres_binding,
+                control_command,
+                input_bytes=drop_sql,
+                timeout=120,
+            )
+
+
 def _database_signature(
     root: Path,
     *,
@@ -15272,34 +15398,12 @@ SELECT json_build_object(
             raise RuntimeErrorEB(
                 "database continuity signature is not UTF-8"
             ) from exc
-        schema_bytes = _run_bound_postgres_client(
+        schema_sha256 = _restore_stable_database_schema_sha256(
             root,
             source_commit,
             postgres_binding,
-            [
-                *_database_client_argv("pg_dump", identity),
-                "--schema-only",
-                "--no-owner",
-                "--no-privileges",
-                "--quote-all-identifiers",
-            ],
-            timeout=900,
+            identity,
         )
-        try:
-            schema_text = schema_bytes.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise RuntimeErrorEB(
-                "database schema signature is not UTF-8"
-            ) from exc
-        normalized_schema = "\n".join(
-            line
-            for line in schema_text.splitlines()
-            if not line.startswith("\\restrict ")
-            and not line.startswith("\\unrestrict ")
-        ) + "\n"
-        schema_sha256 = hashlib.sha256(
-            normalized_schema.encode("utf-8")
-        ).hexdigest()
 
     try:
         value = json.loads(raw)
