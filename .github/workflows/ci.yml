@@ -211,6 +211,9 @@ jobs:
       - name: Validate Garnrolle ontology contract
         run: python3 -m unittest scripts.ci.tests.test_garnrolle_ontology_contract -v
 
+      - name: Validate dev compose port binding
+        run: uv run --project tools/py --locked python -m unittest scripts.ci.tests.test_compose_dev_port_binding -v
+
       - name: Check out pinned convergence protocol
         env:
           PROTOCOL_ROOT: ${{ runner.temp }}/konvergenzregelkreis
