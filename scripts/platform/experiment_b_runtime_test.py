@@ -11707,6 +11707,11 @@ spec:
         self.assertEqual(result["new"], new_identity)
         self.assertTrue(result["empty_before_restore"])
         apply.assert_called_once()
+        applied_manifest = json.loads(apply.call_args.args[1])
+        self.assertEqual(
+            applied_manifest["spec"]["containers"][0]["resources"],
+            {},
+        )
         bind_probe.assert_called_once()
         bound_exec.assert_called_once()
         self.assertEqual(bound_exec.call_args.args[2], probe_container_id)
