@@ -1,8 +1,9 @@
 //! Process shutdown coordination.
 //!
-//! The API runs as PID 1 in its container. Without a handler the kernel ignores
-//! SIGTERM for PID 1, so `docker stop` and Kubernetes always fell through to
-//! SIGKILL. This module turns SIGTERM/SIGINT into one shutdown signal that the
+//! In the container, `entrypoint.sh` stays PID 1 and forwards SIGTERM/SIGINT to
+//! the API; started without it, the API itself is PID 1. Without a handler the
+//! kernel ignores SIGTERM for PID 1, so `docker stop` and Kubernetes used to
+//! fall through to SIGKILL. This module turns SIGTERM/SIGINT into one shutdown signal that the
 //! HTTP server and the background loops share, and bounds every drain step so a
 //! hanging request or worker cannot hold the process past its grace period.
 //!
