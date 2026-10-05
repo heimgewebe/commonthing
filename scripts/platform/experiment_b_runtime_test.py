@@ -6793,9 +6793,9 @@ spec:
         scratch_hex = "a" * 32
         scratch_name = f"commonthing_schema_signature_{scratch_hex}"
         canonical = (
-            b"\\restrict one\n"
+            b"\\restrict stable_key\n"
             b'CREATE TABLE "public"."example" ("id" integer);\n'
-            b"\\unrestrict two\n"
+            b"\\unrestrict stable_key\n"
         )
         with (
             mock.patch.object(
@@ -6823,7 +6823,9 @@ spec:
             )
 
         expected = hashlib.sha256(
+            b"\\restrict <pg-dump-key>\n"
             b'CREATE TABLE "public"."example" ("id" integer);\n'
+            b"\\unrestrict <pg-dump-key>\n"
         ).hexdigest()
         self.assertEqual(observed, expected)
         self.assertEqual(run_bound.call_count, 5)
@@ -6844,6 +6846,55 @@ spec:
             f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE);',
             run_bound.call_args_list[4].kwargs["input_bytes"].decode("utf-8"),
         )
+
+    def test_normalized_database_schema_dump_preserves_function_body_meta_commands(
+        self,
+    ) -> None:
+        source = (
+            b"-- PostgreSQL database dump\n"
+            b"\n"
+            b"\\restrict generated_key\n"
+            b'CREATE FUNCTION "public"."example"() RETURNS "text"\n'
+            b'    LANGUAGE "plpgsql"\n'
+            b"    AS $$\n"
+            b"\\restrict function_semantics\n"
+            b"\\unrestrict function_semantics\n"
+            b"RETURN 'ok';\n"
+            b"$$;\n"
+            b"\n"
+            b"-- PostgreSQL database dump complete\n"
+            b"\n"
+            b"\\unrestrict generated_key\n"
+        )
+        normalized = runtime._normalized_database_schema_dump(source)
+        self.assertIn(b"\\restrict <pg-dump-key>\n", normalized)
+        self.assertIn(b"\\unrestrict <pg-dump-key>\n", normalized)
+        self.assertIn(b"\\restrict function_semantics\n", normalized)
+        self.assertIn(b"\\unrestrict function_semantics\n", normalized)
+        self.assertEqual(
+            normalized.count(b"\\restrict function_semantics"),
+            1,
+        )
+        self.assertEqual(
+            normalized.count(b"\\unrestrict function_semantics"),
+            1,
+        )
+
+    def test_normalized_database_schema_dump_rejects_mismatched_boundary_keys(
+        self,
+    ) -> None:
+        source = (
+            b"-- PostgreSQL database dump\n"
+            b"\\restrict first_key\n"
+            b"SELECT 1;\n"
+            b"\\unrestrict second_key\n"
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "invalid pg_dump restrict markers",
+        ):
+            runtime._normalized_database_schema_dump(source)
+
 
     def test_restore_stable_database_schema_signature_cleans_up_after_failure(
         self,
@@ -6946,7 +6997,11 @@ spec:
                         schema_archive,
                         b"",
                         b"",
-                        canonical_schema,
+                        (
+                            b"\\restrict stable_key\n"
+                            + canonical_schema
+                            + b"\\unrestrict stable_key\n"
+                        ),
                         b"",
                     ],
                 ),

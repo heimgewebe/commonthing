@@ -15082,12 +15082,52 @@ def _normalized_database_schema_dump(schema_bytes: bytes) -> bytes:
         raise RuntimeErrorEB(
             "database schema signature is not UTF-8"
         ) from exc
-    normalized_schema = "\n".join(
-        line
-        for line in schema_text.splitlines()
-        if not line.startswith("\\restrict ")
-        and not line.startswith("\\unrestrict ")
-    ) + "\n"
+
+    lines = schema_text.splitlines()
+    leading_restrict_index: int | None = None
+    for index, line in enumerate(lines):
+        if line.startswith("\\restrict "):
+            leading_restrict_index = index
+            break
+        if line and not line.startswith("--"):
+            raise RuntimeErrorEB(
+                "database schema signature is missing leading pg_dump restrict marker"
+            )
+    if leading_restrict_index is None:
+        raise RuntimeErrorEB(
+            "database schema signature is missing leading pg_dump restrict marker"
+        )
+
+    trailing_unrestrict_index = len(lines) - 1
+    while (
+        trailing_unrestrict_index >= 0
+        and not lines[trailing_unrestrict_index]
+    ):
+        trailing_unrestrict_index -= 1
+    if (
+        trailing_unrestrict_index <= leading_restrict_index
+        or not lines[trailing_unrestrict_index].startswith("\\unrestrict ")
+    ):
+        raise RuntimeErrorEB(
+            "database schema signature is missing trailing pg_dump unrestrict marker"
+        )
+
+    restrict_token = lines[leading_restrict_index][len("\\restrict "):]
+    unrestrict_token = lines[trailing_unrestrict_index][len("\\unrestrict "):]
+    if (
+        not restrict_token
+        or not unrestrict_token
+        or any(char.isspace() for char in restrict_token)
+        or any(char.isspace() for char in unrestrict_token)
+        or restrict_token != unrestrict_token
+    ):
+        raise RuntimeErrorEB(
+            "database schema signature has invalid pg_dump restrict markers"
+        )
+
+    lines[leading_restrict_index] = "\\restrict <pg-dump-key>"
+    lines[trailing_unrestrict_index] = "\\unrestrict <pg-dump-key>"
+    normalized_schema = "\n".join(lines) + "\n"
     return normalized_schema.encode("utf-8")
 
 
