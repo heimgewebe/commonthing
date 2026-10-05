@@ -282,6 +282,40 @@ Bei einem Push wartet der Workflow begrenzt auf das Rollout. Danach schlägt er
 fehlgeschlossen fehl und lädt den maschinenlesbaren Receipt auch im Fehlerfall
 hoch. Ein stiller Zustand `main != live` ist damit nicht grün.
 
+### Zustände und Alarmzustellung
+
+`scripts/ops/classify_production_live_state.py` ordnet jeden Receipt gegen die
+aktuelle `main`-Linie ein und schreibt `production-live-state.json`:
+
+| Zustand | Bedeutung | Alarm |
+|---|---|---|
+| `current` | erwarteter Commit live und konsistent | nein, löst offenen Alarm auf |
+| `superseded` | ein neuerer `main`-Commit, der den erwarteten enthält, ist live | nein, löst nichts auf |
+| `pending` | älterer `main`-Commit live, Ziel jünger als 1200 s | nein |
+| `stale` | älterer `main`-Commit nach 1200 s noch live (Rollout oder Reconciler hängt) | ja |
+| `divergent` | Frontend und API uneinig oder Live-Commit nicht auf `main` | ja |
+| `invalid` | Commit stimmt, Receipt scheitert aus anderem Grund | ja |
+| `outage` | Endpunkt nicht lesbar oder nicht HTTP 200 | ja |
+| `monitor_failure` | Receipt oder Klassifikation fehlt | ja |
+
+`superseded` ist kein Produktionsnachweis: Den liefert nur der Lauf des neueren
+Commits selbst. Deshalb schließt ausschließlich `current` einen offenen Alarm.
+
+Der Job `Deliver production alert` (`scripts/ops/production_alert_issue.py`)
+führt genau ein offenes Issue mit Label `production-alert`. Ein Alarm öffnet es;
+solange er anhält, kommt nur bei geändertem Zustand oder Live-Commit ein
+Kommentar dazu. Erholung kommentiert und schließt es. Die Meldung erreicht
+Menschen über die normalen GitHub-Benachrichtigungen der Repository-Beobachter.
+
+Ein manueller Lauf mit `alert_drill: true` öffnet und schließt ein separates
+Issue mit Label `production-alert-drill`, ohne Produktion zu stören. Ob die
+Meldung tatsächlich ankommt, hängt an den Benachrichtigungseinstellungen und muss
+nach einer Probe von einem Menschen bestätigt werden.
+
+Grenzen: Fällt der Zeitplan von GitHub aus, meldet niemand das Ausbleiben der
+Läufe. Backup, Off-host-Kopie und Restore-Proof auf dem Host sind von hier aus
+nicht sichtbar und brauchen einen eigenen Alarmweg.
+
 ## Belege und Vertragsgrenze
 
 Root-eigene Deploymentbelege einschließlich des letzten direkten
