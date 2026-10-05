@@ -86,6 +86,9 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let app_config = AppConfig::load().context("failed to load API configuration")?;
+    // Validate the drain budget before the first side effect (pool, migrations,
+    // NATS), so an invalid value rejects the start without having migrated.
+    let shutdown_grace = shutdown::grace_period_from_env()?;
 
     // Install the proxy allowlist before the first request can be served, so the
     // request path resolves client IPs from the validated config rather than
@@ -387,7 +390,6 @@ pub async fn run() -> anyhow::Result<()> {
 
     // SIGTERM/SIGINT become one shutdown signal for the HTTP server and the
     // background loops; see `shutdown` for the drain budget.
-    let shutdown_grace = shutdown::grace_period_from_env()?;
     let shutdown = shutdown::Shutdown::new();
     {
         let shutdown = shutdown.clone();
