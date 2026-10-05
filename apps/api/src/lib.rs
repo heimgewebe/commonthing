@@ -12,6 +12,7 @@ pub mod notifications;
 pub mod outbox;
 pub mod routes;
 pub mod search;
+pub mod shutdown;
 pub mod state;
 pub mod telemetry;
 pub mod utils;
@@ -22,6 +23,7 @@ pub mod test_helpers;
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     env,
+    future::IntoFuture,
     io::ErrorKind,
     net::SocketAddr,
     sync::Arc,
@@ -64,6 +66,24 @@ fn configured_session_lifetime() -> anyhow::Result<crate::auth::session::Session
 }
 
 pub async fn run() -> anyhow::Result<()> {
+    // SIGTERM/SIGINT become one shutdown signal for startup, the HTTP server
+    // and the background loops; see `shutdown` for the drain budget. The
+    // handlers are installed first, before configuration and before the first
+    // await that can block (pool, migrations, NATS), so a stop during startup
+    // is not lost.
+    let shutdown = shutdown::Shutdown::new();
+    {
+        let termination = shutdown::install_termination_handler()?;
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            match termination.await {
+                Ok(signal) => tracing::info!(signal, "shutdown requested"),
+                Err(error) => tracing::error!(%error, "signal handling failed; shutting down"),
+            }
+            shutdown.trigger();
+        });
+    }
+
     // Load `.env` *before* initialising tracing so a `RUST_LOG` defined there is
     // visible to `EnvFilter::try_from_default_env()` inside `init_tracing`. The
     // load *result* must only be logged *after* the subscriber is installed —
@@ -84,21 +104,78 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let app_config = AppConfig::load().context("failed to load API configuration")?;
+    // Validate the drain budget before the first side effect (pool, migrations,
+    // NATS), so an invalid value rejects the start without having migrated.
+    let shutdown_grace = shutdown::grace_period_from_env()?;
+    let migration_only = migration_only_requested()?;
 
+    let result = run_until_stopped(app_config, migration_only, shutdown, shutdown_grace).await;
+    // A request or recovery dropped by shutdown may have left an audit append
+    // running on a blocking task. Let it finish before the process exits.
+    if tokio::time::timeout(
+        shutdown::AUDIT_APPEND_DRAIN_TIMEOUT,
+        node_mutation::wait_for_audit_appends(),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("node mutation audit append still running at exit");
+    }
+    result
+}
+
+async fn run_until_stopped(
+    app_config: AppConfig,
+    migration_only: bool,
+    shutdown: shutdown::Shutdown,
+    shutdown_grace: std::time::Duration,
+) -> anyhow::Result<()> {
+    let startup = start(app_config, migration_only, shutdown.clone());
+    let Some(started) = shutdown::abort_on_shutdown(startup, shutdown.signal()).await else {
+        // Dropping the startup future closes its connections; PostgreSQL rolls
+        // back an unfinished migration transaction and releases its lock.
+        if migration_only {
+            // A migration job must not report success for work it did not finish.
+            return Err(anyhow!(
+                "shutdown requested before migration-only startup completed"
+            ));
+        }
+        tracing::info!("shutdown requested during startup; API stopped before serving");
+        return Ok(());
+    };
+    let Some((app, listener, db_pool_for_shutdown)) = started? else {
+        return Ok(());
+    };
+    serve(
+        app,
+        listener,
+        db_pool_for_shutdown,
+        shutdown,
+        shutdown_grace,
+    )
+    .await
+}
+
+/// Everything between configuration and a bound listener. Returns `None` in
+/// migration-only mode.
+async fn start(
+    app_config: AppConfig,
+    migration_only: bool,
+    shutdown: shutdown::Shutdown,
+) -> anyhow::Result<Option<(Router, TcpListener, Option<PgPool>)>> {
     // Install the proxy allowlist before the first request can be served, so the
     // request path resolves client IPs from the validated config rather than
     // re-reading the environment behind the config's back.
     routes::auth::init_trusted_proxies(&app_config);
 
     let migration_mode = StartupMigrationMode::load()?;
-    let migration_only = migration_only_requested()?;
     let (db_pool, db_pool_configured) = initialise_database_pool().await?;
     validate_migration_only_request(migration_only, migration_mode, db_pool_configured)?;
     handle_startup_migrations(db_pool_configured, db_pool.as_ref(), migration_mode).await?;
 
     if migration_only {
         tracing::info!("startup migrations completed in migration-only mode; exiting before runtime initialization");
-        return Ok(());
+        return Ok(None);
     }
 
     let session_lifetime = configured_session_lifetime()?;
@@ -381,9 +458,10 @@ pub async fn run() -> anyhow::Result<()> {
         passkeys,
         web_push,
     };
+    let db_pool_for_shutdown = state.db_pool.clone();
 
     if let Some(pool) = state.db_pool.clone() {
-        crate::auth::ephemeral_db::spawn_cleanup_loop(pool);
+        crate::auth::ephemeral_db::spawn_cleanup_loop(pool, shutdown.signal());
     }
 
     if let (Some(pool), Some(client), Some(service)) = (
@@ -438,11 +516,17 @@ pub async fn run() -> anyhow::Result<()> {
             ));
         };
         let accounts = state.accounts.clone();
+        let stop = shutdown.signal();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let stop = stop.wait();
+            tokio::pin!(stop);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    () = &mut stop => break,
+                }
                 match governance::finalize_due_proposals(&pool, chrono::Utc::now()).await {
                     Ok(outcomes) => {
                         governance::apply_promotions_to_store(&accounts, &outcomes).await;
@@ -499,11 +583,39 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!(%bind_addr, "starting API server");
 
     let listener = TcpListener::bind(bind_addr).await?;
-    axum::serve(
+    Ok(Some((app, listener, db_pool_for_shutdown)))
+}
+
+async fn serve(
+    app: Router,
+    listener: TcpListener,
+    db_pool_for_shutdown: Option<PgPool>,
+    shutdown: shutdown::Shutdown,
+    shutdown_grace: std::time::Duration,
+) -> anyhow::Result<()> {
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(shutdown.signal().wait())
+    .into_future();
+    match shutdown::drain_within(server, shutdown.signal(), shutdown_grace).await? {
+        shutdown::DrainOutcome::Drained => tracing::info!("HTTP server drained"),
+        shutdown::DrainOutcome::GraceExpired => tracing::warn!(
+            grace_seconds = shutdown_grace.as_secs(),
+            "shutdown grace period expired with requests still open; dropping them"
+        ),
+    }
+
+    if let Some(pool) = db_pool_for_shutdown {
+        if tokio::time::timeout(shutdown::POOL_CLOSE_TIMEOUT, pool.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("PostgreSQL pool did not close in time; connections are dropped");
+        }
+    }
+    tracing::info!("API stopped");
 
     Ok(())
 }
