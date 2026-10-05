@@ -6880,6 +6880,43 @@ spec:
             1,
         )
 
+    def test_normalized_database_schema_dump_keeps_unicode_nel_distinct_from_lf(
+        self,
+    ) -> None:
+        prefix = (
+            b"-- PostgreSQL database dump\n"
+            b"\n"
+            b"\\restrict stable_key\n"
+            b'CREATE FUNCTION "public"."example"() RETURNS "text"\n'
+            b'    LANGUAGE "sql"\n'
+            b"    AS $$SELECT 'a"
+        )
+        suffix = (
+            b"b';$$;\n"
+            b"\n"
+            b"-- PostgreSQL database dump complete\n"
+            b"\n"
+            b"\\unrestrict stable_key\n"
+        )
+        with_lf = prefix + b"\n" + suffix
+        with_nel = prefix + "\u0085".encode("utf-8") + suffix
+
+        normalized_lf = runtime._normalized_database_schema_dump(with_lf)
+        normalized_nel = runtime._normalized_database_schema_dump(with_nel)
+
+        self.assertNotEqual(normalized_lf, normalized_nel)
+        self.assertIn("\u0085".encode("utf-8"), normalized_nel)
+        self.assertEqual(
+            normalized_nel.replace(
+                b"\\restrict <pg-dump-key>",
+                b"\\restrict stable_key",
+            ).replace(
+                b"\\unrestrict <pg-dump-key>",
+                b"\\unrestrict stable_key",
+            ),
+            with_nel,
+        )
+
     def test_normalized_database_schema_dump_rejects_mismatched_boundary_keys(
         self,
     ) -> None:

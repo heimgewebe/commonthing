@@ -15077,19 +15077,22 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
 
 def _normalized_database_schema_dump(schema_bytes: bytes) -> bytes:
     try:
-        schema_text = schema_bytes.decode("utf-8")
+        schema_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RuntimeErrorEB(
             "database schema signature is not UTF-8"
         ) from exc
 
-    lines = schema_text.splitlines()
+    lines = schema_bytes.split(b"\n")
+    restrict_prefix = b"\\restrict "
+    unrestrict_prefix = b"\\unrestrict "
+
     leading_restrict_index: int | None = None
     for index, line in enumerate(lines):
-        if line.startswith("\\restrict "):
+        if line.startswith(restrict_prefix):
             leading_restrict_index = index
             break
-        if line and not line.startswith("--"):
+        if line and not line.startswith(b"--"):
             raise RuntimeErrorEB(
                 "database schema signature is missing leading pg_dump restrict marker"
             )
@@ -15106,29 +15109,31 @@ def _normalized_database_schema_dump(schema_bytes: bytes) -> bytes:
         trailing_unrestrict_index -= 1
     if (
         trailing_unrestrict_index <= leading_restrict_index
-        or not lines[trailing_unrestrict_index].startswith("\\unrestrict ")
+        or not lines[trailing_unrestrict_index].startswith(unrestrict_prefix)
     ):
         raise RuntimeErrorEB(
             "database schema signature is missing trailing pg_dump unrestrict marker"
         )
 
-    restrict_token = lines[leading_restrict_index][len("\\restrict "):]
-    unrestrict_token = lines[trailing_unrestrict_index][len("\\unrestrict "):]
+    restrict_token = lines[leading_restrict_index][len(restrict_prefix):]
+    unrestrict_token = lines[trailing_unrestrict_index][len(unrestrict_prefix):]
+    ascii_whitespace = b" \t\r\n\v\f"
     if (
         not restrict_token
         or not unrestrict_token
-        or any(char.isspace() for char in restrict_token)
-        or any(char.isspace() for char in unrestrict_token)
+        or not restrict_token.isascii()
+        or not unrestrict_token.isascii()
+        or any(byte in ascii_whitespace for byte in restrict_token)
+        or any(byte in ascii_whitespace for byte in unrestrict_token)
         or restrict_token != unrestrict_token
     ):
         raise RuntimeErrorEB(
             "database schema signature has invalid pg_dump restrict markers"
         )
 
-    lines[leading_restrict_index] = "\\restrict <pg-dump-key>"
-    lines[trailing_unrestrict_index] = "\\unrestrict <pg-dump-key>"
-    normalized_schema = "\n".join(lines) + "\n"
-    return normalized_schema.encode("utf-8")
+    lines[leading_restrict_index] = b"\\restrict <pg-dump-key>"
+    lines[trailing_unrestrict_index] = b"\\unrestrict <pg-dump-key>"
+    return b"\n".join(lines)
 
 
 def _restore_stable_database_schema_sha256(
