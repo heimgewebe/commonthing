@@ -16671,22 +16671,10 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery pre-Flux resume"
             )
-            _flux_resume(root, "commonthing-experiment-b-data")
-            _flux_resume(root, "commonthing-experiment-b-app")
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", 300)
-            _wait_event_pipeline_quiescent(
-                root,
-                source_commit=source_commit,
-                database_identity=database_identity,
-            )
-            _require_same_kubernetes_target(
-                root,
-                source_commit,
-                recovery_target,
-                "recovery post-resume event quiescence",
-            )
-
+            # Compare the exact persisted state before application workers
+            # resume. Search reconciliation intentionally retries idempotent
+            # INSERT ... ON CONFLICT DO NOTHING operations; PostgreSQL can
+            # advance their identity sequence even when no row is inserted.
             postgres_signature_after = _require_postgres_runtime_binding(
                 root,
                 source_commit,
@@ -16723,6 +16711,28 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 raise RuntimeErrorEB(
                     "JetStream stream/message-store/durable-consumer continuity signature changed across restore"
                 )
+            _require_same_kubernetes_target(
+                root,
+                source_commit,
+                recovery_target,
+                "recovery restored continuity",
+            )
+            _flux_resume(root, "commonthing-experiment-b-data")
+            _flux_resume(root, "commonthing-experiment-b-app")
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", 300)
+            _wait_event_pipeline_quiescent(
+                root,
+                source_commit=source_commit,
+                database_identity=database_identity,
+            )
+            _require_same_kubernetes_target(
+                root,
+                source_commit,
+                recovery_target,
+                "recovery post-resume event quiescence",
+            )
+
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery completion"
             )

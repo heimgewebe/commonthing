@@ -3661,21 +3661,27 @@ spec:
             api_scale,
         )
         before_db = source.index("before_db = _database_signature(", frozen)
+        after_db = source.index("after_db = _database_signature(", before_db)
+        restored_continuity = source.index(
+            '"recovery restored continuity"',
+            after_db,
+        )
         app_resume = source.index(
-            '_flux_resume(root, "commonthing-experiment-b-app")'
+            '_flux_resume(root, "commonthing-experiment-b-app")',
+            restored_continuity,
         )
         post_drain = source.index(
             "_wait_event_pipeline_quiescent(",
             app_resume,
         )
-        after_db = source.index("after_db = _database_signature(", post_drain)
         self.assertLess(flux_suspend, pre_drain)
         self.assertLess(pre_drain, api_scale)
         self.assertLess(api_scale, frozen)
         self.assertLess(frozen, before_db)
-        self.assertLess(before_db, app_resume)
+        self.assertLess(before_db, after_db)
+        self.assertLess(after_db, restored_continuity)
+        self.assertLess(restored_continuity, app_resume)
         self.assertLess(app_resume, post_drain)
-        self.assertLess(post_drain, after_db)
 
     def test_wait_deployment_process_timeout_exceeds_rollout_timeout(self) -> None:
         root = Path("/tmp/unused-experiment-b-root")
@@ -6884,6 +6890,58 @@ spec:
         self.assertLess(db_signature, nats_signature)
         self.assertLess(nats_signature, dump)
 
+    def test_recovery_proves_restored_signatures_before_flux_resume(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        restore = source.index('"pg_restore"')
+        nats_restart = source.index(
+            '_scale_deployment(root, DATA_NAMESPACE, "nats", 1)',
+            restore,
+        )
+        after_db = source.index(
+            "after_db = _database_signature(",
+            nats_restart,
+        )
+        after_nats = source.index(
+            "after_nats = _jetstream_signature(",
+            after_db,
+        )
+        db_compare = source.index(
+            "if after_db != before_db:",
+            after_nats,
+        )
+        nats_compare = source.index(
+            "if after_nats != before_nats:",
+            db_compare,
+        )
+        data_resume = source.index(
+            '_flux_resume(root, "commonthing-experiment-b-data")',
+            nats_compare,
+        )
+        app_resume = source.index(
+            '_flux_resume(root, "commonthing-experiment-b-app")',
+            data_resume,
+        )
+        api_wait = source.index(
+            '_wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)',
+            app_resume,
+        )
+        event_quiescence = source.index(
+            "_wait_event_pipeline_quiescent(",
+            api_wait,
+        )
+        self.assertLess(restore, nats_restart)
+        self.assertLess(nats_restart, after_db)
+        self.assertLess(after_db, after_nats)
+        self.assertLess(after_nats, db_compare)
+        self.assertLess(db_compare, nats_compare)
+        self.assertLess(nats_compare, data_resume)
+        self.assertLess(data_resume, app_resume)
+        self.assertLess(app_resume, api_wait)
+        self.assertLess(api_wait, event_quiescence)
+        self.assertNotIn(
+            "_flux_resume(",
+            source[after_db:data_resume],
+        )
 
     def test_recovery_binds_postgres_clients_to_validated_source_pod(
         self,
