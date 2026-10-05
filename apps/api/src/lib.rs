@@ -89,21 +89,71 @@ pub async fn run() -> anyhow::Result<()> {
     // Validate the drain budget before the first side effect (pool, migrations,
     // NATS), so an invalid value rejects the start without having migrated.
     let shutdown_grace = shutdown::grace_period_from_env()?;
+    let migration_only = migration_only_requested()?;
 
+    // SIGTERM/SIGINT become one shutdown signal for startup, the HTTP server
+    // and the background loops; see `shutdown` for the drain budget. The
+    // handlers are installed before the first await that can block (pool,
+    // migrations, NATS), so a stop during startup is not lost.
+    let shutdown = shutdown::Shutdown::new();
+    {
+        let termination = shutdown::install_termination_handler()?;
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            match termination.await {
+                Ok(signal) => tracing::info!(signal, "shutdown requested"),
+                Err(error) => tracing::error!(%error, "signal handling failed; shutting down"),
+            }
+            shutdown.trigger();
+        });
+    }
+
+    let startup = start(app_config, migration_only, shutdown.clone());
+    let Some(started) = shutdown::abort_on_shutdown(startup, shutdown.signal()).await else {
+        // Dropping the startup future closes its connections; PostgreSQL rolls
+        // back an unfinished migration transaction and releases its lock.
+        if migration_only {
+            // A migration job must not report success for work it did not finish.
+            return Err(anyhow!(
+                "shutdown requested before migration-only startup completed"
+            ));
+        }
+        tracing::info!("shutdown requested during startup; API stopped before serving");
+        return Ok(());
+    };
+    let Some((app, listener, db_pool_for_shutdown)) = started? else {
+        return Ok(());
+    };
+    serve(
+        app,
+        listener,
+        db_pool_for_shutdown,
+        shutdown,
+        shutdown_grace,
+    )
+    .await
+}
+
+/// Everything between configuration and a bound listener. Returns `None` in
+/// migration-only mode.
+async fn start(
+    app_config: AppConfig,
+    migration_only: bool,
+    shutdown: shutdown::Shutdown,
+) -> anyhow::Result<Option<(Router, TcpListener, Option<PgPool>)>> {
     // Install the proxy allowlist before the first request can be served, so the
     // request path resolves client IPs from the validated config rather than
     // re-reading the environment behind the config's back.
     routes::auth::init_trusted_proxies(&app_config);
 
     let migration_mode = StartupMigrationMode::load()?;
-    let migration_only = migration_only_requested()?;
     let (db_pool, db_pool_configured) = initialise_database_pool().await?;
     validate_migration_only_request(migration_only, migration_mode, db_pool_configured)?;
     handle_startup_migrations(db_pool_configured, db_pool.as_ref(), migration_mode).await?;
 
     if migration_only {
         tracing::info!("startup migrations completed in migration-only mode; exiting before runtime initialization");
-        return Ok(());
+        return Ok(None);
     }
 
     let session_lifetime = configured_session_lifetime()?;
@@ -388,20 +438,6 @@ pub async fn run() -> anyhow::Result<()> {
     };
     let db_pool_for_shutdown = state.db_pool.clone();
 
-    // SIGTERM/SIGINT become one shutdown signal for the HTTP server and the
-    // background loops; see `shutdown` for the drain budget.
-    let shutdown = shutdown::Shutdown::new();
-    {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            match shutdown::termination_signal().await {
-                Ok(signal) => tracing::info!(signal, "shutdown requested"),
-                Err(error) => tracing::error!(%error, "signal handling failed; shutting down"),
-            }
-            shutdown.trigger();
-        });
-    }
-
     if let Some(pool) = state.db_pool.clone() {
         crate::auth::ephemeral_db::spawn_cleanup_loop(pool, shutdown.signal());
     }
@@ -525,6 +561,16 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!(%bind_addr, "starting API server");
 
     let listener = TcpListener::bind(bind_addr).await?;
+    Ok(Some((app, listener, db_pool_for_shutdown)))
+}
+
+async fn serve(
+    app: Router,
+    listener: TcpListener,
+    db_pool_for_shutdown: Option<PgPool>,
+    shutdown: shutdown::Shutdown,
+    shutdown_grace: std::time::Duration,
+) -> anyhow::Result<()> {
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

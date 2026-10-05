@@ -81,8 +81,12 @@ impl ShutdownSignal {
     }
 }
 
-/// Resolves on the first SIGTERM or SIGINT.
-pub async fn termination_signal() -> anyhow::Result<&'static str> {
+/// Installs the SIGTERM/SIGINT handlers now and returns a future that resolves
+/// on the first of them. Installing eagerly matters for PID 1: a signal that
+/// arrives before a handler exists is discarded by the kernel, so the handlers
+/// must be in place before the first startup step that can block.
+pub fn install_termination_handler(
+) -> anyhow::Result<impl Future<Output = anyhow::Result<&'static str>> + Send + 'static> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -90,17 +94,33 @@ pub async fn termination_signal() -> anyhow::Result<&'static str> {
             signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
         let mut interrupt =
             signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
-        tokio::select! {
-            _ = terminate.recv() => Ok("SIGTERM"),
-            _ = interrupt.recv() => Ok("SIGINT"),
-        }
+        Ok(async move {
+            tokio::select! {
+                _ = terminate.recv() => Ok("SIGTERM"),
+                _ = interrupt.recv() => Ok("SIGINT"),
+            }
+        })
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .context("failed to install Ctrl-C handler")?;
-        Ok("Ctrl-C")
+        Ok(async {
+            tokio::signal::ctrl_c()
+                .await
+                .context("failed to install Ctrl-C handler")?;
+            Ok("Ctrl-C")
+        })
+    }
+}
+
+/// Runs a startup phase unless shutdown is requested first. Returns `None`
+/// when the signal won; the phase future is then dropped at its current await
+/// point. Startup steps that write are transactional (migrations) or
+/// idempotent on the next start, so dropping them is safe to resume.
+pub async fn abort_on_shutdown<F: Future>(phase: F, signal: ShutdownSignal) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        () = signal.wait() => None,
+        output = phase => Some(output),
     }
 }
 
@@ -215,6 +235,31 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), signal.wait())
             .await
             .expect("dropping the owner must release waiters");
+    }
+
+    #[tokio::test]
+    async fn startup_phase_is_abandoned_once_shutdown_is_triggered() {
+        let shutdown = Shutdown::new();
+        let phase = tokio::spawn(abort_on_shutdown(
+            std::future::pending::<()>(),
+            shutdown.signal(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!phase.is_finished());
+
+        shutdown.trigger();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), phase)
+            .await
+            .expect("a hanging startup phase must not outlive the signal")
+            .unwrap();
+        assert_eq!(outcome, None);
+
+        // Without a signal the phase result passes through.
+        let shutdown = Shutdown::new();
+        assert_eq!(
+            abort_on_shutdown(async { 7 }, shutdown.signal()).await,
+            Some(7)
+        );
     }
 
     async fn spawn_server(
