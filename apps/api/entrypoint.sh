@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 set -e
 
-# This script runs as PID 1 until the final exec. PID 1 ignores SIGTERM
-# without a handler, so seeding steps run as background children that a stop
-# signal can reach: the trap forwards it, waits for the child and exits.
-# Both seeders upsert idempotently, so an interrupted run is redone on the
-# next start.
+# This script stays PID 1 for the container's whole life. PID 1 ignores
+# SIGTERM without a handler, and an exec'd server would be PID 1 without one
+# until it installs its own, so a stop in that window would be lost. Every
+# step therefore runs as a background child that the trap can reach: it
+# forwards the signal, waits for the child and exits. Both seeders upsert
+# idempotently, so an interrupted run is redone on the next start.
 child_pid=""
+serving=0
+# shellcheck disable=SC2329 # invoked by the trap below
 forward_stop() {
+  local status=143
   if [ -n "$child_pid" ]; then
     kill -TERM "$child_pid" 2> /dev/null || true
-    wait "$child_pid" 2> /dev/null || true
+    status=0
+    wait "$child_pid" 2> /dev/null || status=$?
   fi
-  exit 143
+  # A stopped seeding step is not a success; the server reports its own exit.
+  if [ "$serving" -ne 1 ]; then
+    status=143
+  fi
+  exit "$status"
 }
 trap forward_stop TERM INT
 
@@ -79,7 +88,9 @@ else
   echo "Skipping data seeding (GEWEBE_SEED_DEMO=$ENABLE_SEEDING)"
 fi
 
-# Exec the passed command (e.g. the API server). It installs its own
-# handlers; drop the trap so nothing of this shell's handling carries over.
-trap - TERM INT
-exec "$@"
+# Run the passed command (e.g. the API server) under the same forwarding and
+# exit with its status.
+serving=1
+status=0
+run_stoppable "$@" || status=$?
+exit "$status"

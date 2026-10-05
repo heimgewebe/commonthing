@@ -415,6 +415,18 @@ async fn append_jsonl_event(event: &JsonlAuditEvent) -> std::io::Result<()> {
         .map_err(std::io::Error::other)?
 }
 
+/// Resolves once no audit append is in flight. A cancelled caller leaves its
+/// append running on a blocking task that holds the append lock; shutdown
+/// waits on this so the process does not exit in the middle of that write.
+pub async fn wait_for_audit_appends() {
+    drop(
+        JSONL_AUDIT_APPEND_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .await,
+    );
+}
+
 fn write_jsonl_line(
     _append_guard: tokio::sync::MutexGuard<'static, ()>,
     mut file: std::fs::File,
@@ -667,12 +679,7 @@ mod tests {
             }
             drop(append);
             // A write that already started finishes while holding the lock.
-            drop(
-                JSONL_AUDIT_APPEND_LOCK
-                    .get_or_init(|| Mutex::new(()))
-                    .lock()
-                    .await,
-            );
+            wait_for_audit_appends().await;
         }
 
         let content = std::fs::read_to_string(audit_path().unwrap()).unwrap();

@@ -18,13 +18,18 @@ use tokio::sync::watch;
 pub const SHUTDOWN_GRACE_ENV: &str = "WELTGEWEBE_API_SHUTDOWN_GRACE_SECONDS";
 
 /// Budget for draining in-flight HTTP requests after the signal. Together with
-/// [`POOL_CLOSE_TIMEOUT`] and [`RUNTIME_SHUTDOWN_TIMEOUT`] it stays below
-/// Docker's default 10 s stop timeout.
+/// [`POOL_CLOSE_TIMEOUT`], [`AUDIT_APPEND_DRAIN_TIMEOUT`] and
+/// [`RUNTIME_SHUTDOWN_TIMEOUT`] it stays below Docker's default 10 s stop
+/// timeout.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
 const MAX_SHUTDOWN_GRACE_SECONDS: u64 = 300;
 
 /// Upper bound for returning pooled PostgreSQL connections after the drain.
 pub const POOL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Upper bound for waiting on a node-mutation audit append that is still
+/// being written when `run` returns (see `node_mutation::wait_for_audit_appends`).
+pub const AUDIT_APPEND_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Upper bound for tearing down the Tokio runtime once `run` has returned. It
 /// covers tasks that never yield and blocking work that would otherwise make
@@ -203,7 +208,10 @@ mod tests {
 
     #[test]
     fn default_budget_fits_docker_stop_timeout() {
-        let total = DEFAULT_SHUTDOWN_GRACE + POOL_CLOSE_TIMEOUT + RUNTIME_SHUTDOWN_TIMEOUT;
+        let total = DEFAULT_SHUTDOWN_GRACE
+            + POOL_CLOSE_TIMEOUT
+            + AUDIT_APPEND_DRAIN_TIMEOUT
+            + RUNTIME_SHUTDOWN_TIMEOUT;
         assert!(total < Duration::from_secs(10), "{total:?}");
     }
 

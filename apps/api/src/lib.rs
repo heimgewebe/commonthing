@@ -66,6 +66,24 @@ fn configured_session_lifetime() -> anyhow::Result<crate::auth::session::Session
 }
 
 pub async fn run() -> anyhow::Result<()> {
+    // SIGTERM/SIGINT become one shutdown signal for startup, the HTTP server
+    // and the background loops; see `shutdown` for the drain budget. The
+    // handlers are installed first, before configuration and before the first
+    // await that can block (pool, migrations, NATS), so a stop during startup
+    // is not lost.
+    let shutdown = shutdown::Shutdown::new();
+    {
+        let termination = shutdown::install_termination_handler()?;
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            match termination.await {
+                Ok(signal) => tracing::info!(signal, "shutdown requested"),
+                Err(error) => tracing::error!(%error, "signal handling failed; shutting down"),
+            }
+            shutdown.trigger();
+        });
+    }
+
     // Load `.env` *before* initialising tracing so a `RUST_LOG` defined there is
     // visible to `EnvFilter::try_from_default_env()` inside `init_tracing`. The
     // load *result* must only be logged *after* the subscriber is installed —
@@ -91,23 +109,27 @@ pub async fn run() -> anyhow::Result<()> {
     let shutdown_grace = shutdown::grace_period_from_env()?;
     let migration_only = migration_only_requested()?;
 
-    // SIGTERM/SIGINT become one shutdown signal for startup, the HTTP server
-    // and the background loops; see `shutdown` for the drain budget. The
-    // handlers are installed before the first await that can block (pool,
-    // migrations, NATS), so a stop during startup is not lost.
-    let shutdown = shutdown::Shutdown::new();
+    let result = run_until_stopped(app_config, migration_only, shutdown, shutdown_grace).await;
+    // A request or recovery dropped by shutdown may have left an audit append
+    // running on a blocking task. Let it finish before the process exits.
+    if tokio::time::timeout(
+        shutdown::AUDIT_APPEND_DRAIN_TIMEOUT,
+        node_mutation::wait_for_audit_appends(),
+    )
+    .await
+    .is_err()
     {
-        let termination = shutdown::install_termination_handler()?;
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            match termination.await {
-                Ok(signal) => tracing::info!(signal, "shutdown requested"),
-                Err(error) => tracing::error!(%error, "signal handling failed; shutting down"),
-            }
-            shutdown.trigger();
-        });
+        tracing::warn!("node mutation audit append still running at exit");
     }
+    result
+}
 
+async fn run_until_stopped(
+    app_config: AppConfig,
+    migration_only: bool,
+    shutdown: shutdown::Shutdown,
+    shutdown_grace: std::time::Duration,
+) -> anyhow::Result<()> {
     let startup = start(app_config, migration_only, shutdown.clone());
     let Some(started) = shutdown::abort_on_shutdown(startup, shutdown.signal()).await else {
         // Dropping the startup future closes its connections; PostgreSQL rolls
