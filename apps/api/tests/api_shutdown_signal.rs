@@ -36,9 +36,32 @@ fn sigterm_during_blocked_startup(extra_env: &[(&str, &str)]) -> ExitStatus {
     let mut api = command.spawn().expect("spawn API binary");
 
     // Startup has reached the database step once the stand-in sees a client.
-    let (_connection, _) = silent_db
-        .accept()
-        .expect("API must try to connect to the database");
+    // The accept is polled so an API that exits or never connects fails the
+    // test instead of hanging it.
+    silent_db
+        .set_nonblocking(true)
+        .expect("make silent database stand-in nonblocking");
+    let accept_deadline = Instant::now() + Duration::from_secs(10);
+    let _connection = loop {
+        match silent_db.accept() {
+            Ok((connection, _)) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                let _ = api.kill();
+                let _ = api.wait();
+                panic!("silent database stand-in failed: {error}");
+            }
+        }
+        if let Some(exit) = api.try_wait().unwrap() {
+            panic!("API exited before connecting to the database: {exit:?}");
+        }
+        if Instant::now() > accept_deadline {
+            let _ = api.kill();
+            let _ = api.wait();
+            panic!("API did not connect to the database within 10 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     std::thread::sleep(Duration::from_millis(200));
     assert!(
         api.try_wait().unwrap().is_none(),
@@ -58,6 +81,7 @@ fn sigterm_during_blocked_startup(extra_env: &[(&str, &str)]) -> ExitStatus {
         }
         if Instant::now() > deadline {
             let _ = api.kill();
+            let _ = api.wait();
             panic!("API did not exit within 5 s of SIGTERM during startup");
         }
         std::thread::sleep(Duration::from_millis(20));

@@ -9,7 +9,7 @@ set -e
 # idempotently, so an interrupted run is redone on the next start.
 child_pid=""
 serving=0
-# shellcheck disable=SC2329 # invoked by the trap below
+# shellcheck disable=SC2317,SC2329 # invoked by the trap below
 forward_stop() {
   local status=143
   if [ -n "$child_pid" ]; then
