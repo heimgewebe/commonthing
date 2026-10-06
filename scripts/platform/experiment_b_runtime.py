@@ -15381,6 +15381,40 @@ FROM (
   UNION ALL
 
   SELECT
+    'sequence-ownership',
+    json_build_array(seq_n.nspname, seq.relname)::text,
+    json_build_object(
+      'kind', 'sequence-ownership',
+      'schema', seq_n.nspname,
+      'sequence', seq.relname,
+      'owned_by_schema', owner_n.nspname,
+      'owned_by_relation', owner_rel.relname,
+      'owned_by_column', owner_att.attname,
+      'dependency_type', dep.deptype
+    )
+  FROM pg_catalog.pg_class seq
+  JOIN pg_catalog.pg_namespace seq_n ON seq_n.oid = seq.relnamespace
+  JOIN pg_catalog.pg_depend dep
+    ON dep.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+   AND dep.objid = seq.oid
+   AND dep.objsubid = 0
+   AND dep.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+   AND dep.refobjsubid > 0
+   AND dep.deptype IN ('a', 'i')
+  JOIN pg_catalog.pg_class owner_rel ON owner_rel.oid = dep.refobjid
+  JOIN pg_catalog.pg_namespace owner_n ON owner_n.oid = owner_rel.relnamespace
+  JOIN pg_catalog.pg_attribute owner_att
+    ON owner_att.attrelid = dep.refobjid
+   AND owner_att.attnum = dep.refobjsubid
+   AND NOT owner_att.attisdropped
+  WHERE seq.relkind = 'S'
+    AND seq_n.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND seq_n.nspname !~ '^pg_toast'
+    AND seq_n.nspname !~ '^pg_temp_'
+
+  UNION ALL
+
+  SELECT
     'type',
     json_build_array(n.nspname, typ.typname)::text,
     json_build_object(

@@ -6791,6 +6791,7 @@ spec:
             "pg_catalog.pg_get_functiondef",
             "pg_catalog.pg_trigger",
             "pg_catalog.pg_policy",
+            "pg_catalog.pg_depend",
             "pg_catalog.pg_type",
         ):
             self.assertIn(expected_fragment, catalog_sql)
@@ -6893,6 +6894,42 @@ spec:
                 catalog,
                 [advanced_sequence],
             ),
+        )
+
+
+    def test_database_schema_sha256_detects_sequence_ownership_drift(
+        self,
+    ) -> None:
+        sequences = [
+            {
+                "schema": "public",
+                "name": "example_id_seq",
+                "last_value": "9",
+                "is_called": True,
+                "start_value": "1",
+                "increment_by": "1",
+                "min_value": "1",
+                "max_value": "9223372036854775807",
+                "cache_size": "1",
+                "cycle": False,
+            }
+        ]
+        owned = [
+            {"kind": "schema", "schema": "public"},
+            {
+                "kind": "sequence-ownership",
+                "schema": "public",
+                "sequence": "example_id_seq",
+                "owned_by_schema": "public",
+                "owned_by_relation": "example",
+                "owned_by_column": "id",
+                "dependency_type": "a",
+            },
+        ]
+        detached = [owned[0]]
+        self.assertNotEqual(
+            runtime._database_schema_sha256(owned, sequences),
+            runtime._database_schema_sha256(detached, sequences),
         )
 
 
@@ -7222,6 +7259,69 @@ WHERE c.relkind = 'S'
             second = fingerprint("restore_b")
             self.assertEqual(first, second)
 
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "restore_ownership",
+                ]
+            )
+            run_container(
+                [
+                    "exec",
+                    "-i",
+                    container,
+                    "pg_restore",
+                    "-U",
+                    "postgres",
+                    "--schema-only",
+                    "--no-owner",
+                    "--no-privileges",
+                    "--exit-on-error",
+                    "-d",
+                    "restore_ownership",
+                ],
+                input_bytes=schema_archive,
+            )
+            ownership_baseline = fingerprint("restore_ownership")
+            self.assertEqual(second, ownership_baseline)
+            owned_sequence = psql(
+                "restore_ownership",
+                r"""
+SELECT pg_catalog.format('%I.%I', seq_n.nspname, seq.relname)
+FROM pg_catalog.pg_class seq
+JOIN pg_catalog.pg_namespace seq_n ON seq_n.oid = seq.relnamespace
+JOIN pg_catalog.pg_depend dep
+  ON dep.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+ AND dep.objid = seq.oid
+ AND dep.objsubid = 0
+ AND dep.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+ AND dep.refobjsubid > 0
+ AND dep.deptype IN ('a', 'i')
+WHERE seq.relkind = 'S'
+  AND seq_n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY seq_n.nspname, seq.relname
+LIMIT 1;
+""",
+            )
+            self.assertTrue(owned_sequence)
+            psql(
+                "restore_ownership",
+                f"ALTER SEQUENCE {owned_sequence} OWNED BY NONE;",
+            )
+            ownership_drift = fingerprint("restore_ownership")
+            self.assertNotEqual(
+                ownership_baseline["sha256"],
+                ownership_drift["sha256"],
+            )
+            self.assertEqual(
+                int(ownership_baseline["catalog_items"]) - 1,
+                ownership_drift["catalog_items"],
+            )
+
             psql(
                 "restore_b",
                 "ALTER TABLE public.domain_nodes "
@@ -7250,8 +7350,10 @@ WHERE c.relkind = 'S'
                 "first_restore": first,
                 "second_restore": second,
                 "deliberate_constraint_drift": drifted,
+                "deliberate_sequence_ownership_drift": ownership_drift,
                 "restore_stable": True,
                 "semantic_drift_detected": True,
+                "sequence_ownership_drift_detected": True,
             }
             print(
                 "HISTORICAL_SCHEMA_CATALOG_PROOF="
