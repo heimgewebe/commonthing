@@ -15351,6 +15351,27 @@ FROM (
   UNION ALL
 
   SELECT
+    'rule',
+    json_build_array(n.nspname, rel.relname, rw.rulename)::text,
+    json_build_object(
+      'kind', 'rule',
+      'schema', n.nspname,
+      'relation', rel.relname,
+      'name', rw.rulename,
+      'definition', pg_catalog.pg_get_ruledef(rw.oid, false),
+      'enabled', rw.ev_enabled
+    )
+  FROM pg_catalog.pg_rewrite rw
+  JOIN pg_catalog.pg_class rel ON rel.oid = rw.ev_class
+  JOIN pg_catalog.pg_namespace n ON n.oid = rel.relnamespace
+  WHERE rw.rulename <> '_RETURN'
+    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND n.nspname !~ '^pg_toast'
+    AND n.nspname !~ '^pg_temp_'
+
+  UNION ALL
+
+  SELECT
     'policy',
     json_build_array(n.nspname, rel.relname, pol.polname)::text,
     json_build_object(

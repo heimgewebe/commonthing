@@ -6790,6 +6790,8 @@ spec:
             "pg_catalog.pg_get_viewdef",
             "pg_catalog.pg_get_functiondef",
             "pg_catalog.pg_trigger",
+            "pg_catalog.pg_rewrite",
+            "pg_catalog.pg_get_ruledef",
             "pg_catalog.pg_policy",
             "pg_catalog.pg_depend",
             "pg_catalog.pg_sequence",
@@ -7027,6 +7029,48 @@ spec:
         )
 
 
+    def test_database_schema_sha256_detects_rewrite_rule_drift(
+        self,
+    ) -> None:
+        baseline = [
+            {"kind": "schema", "schema": "public"},
+            {
+                "kind": "rule",
+                "schema": "public",
+                "relation": "example",
+                "name": "example_rewrite",
+                "definition": (
+                    "CREATE RULE example_rewrite AS "
+                    "ON UPDATE TO public.example DO INSTEAD NOTHING;"
+                ),
+                "enabled": "O",
+            },
+        ]
+        definition_drift = [
+            baseline[0],
+            {
+                **baseline[1],
+                "definition": (
+                    "CREATE RULE example_rewrite AS "
+                    "ON DELETE TO public.example DO INSTEAD NOTHING;"
+                ),
+            },
+        ]
+        enabled_drift = [
+            baseline[0],
+            {**baseline[1], "enabled": "D"},
+        ]
+        baseline_hash = runtime._database_schema_sha256(baseline, [])
+        self.assertNotEqual(
+            baseline_hash,
+            runtime._database_schema_sha256(definition_drift, []),
+        )
+        self.assertNotEqual(
+            baseline_hash,
+            runtime._database_schema_sha256(enabled_drift, []),
+        )
+
+
     def test_database_schema_catalog_uses_bound_read_only_psql(
         self,
     ) -> None:
@@ -7187,6 +7231,9 @@ CREATE TYPE public.commonthing_gap_composite AS (
   last_attr text
 );
 ALTER TYPE public.commonthing_gap_composite DROP ATTRIBUTE dropped_attr;
+CREATE RULE commonthing_gap_rule AS
+ON UPDATE TO public.commonthing_gap_probe
+DO INSTEAD NOTHING;
 """,
             )
             before = fingerprint("migration_gap_source")
@@ -7234,6 +7281,35 @@ ALTER TYPE public.commonthing_gap_composite DROP ATTRIBUTE dropped_attr;
             )
             after = fingerprint("migration_gap_restored")
             self.assertEqual(before, after)
+
+            psql(
+                "migration_gap_restored",
+                "ALTER TABLE public.commonthing_gap_probe "
+                "DISABLE RULE commonthing_gap_rule;",
+            )
+            disabled_rule = fingerprint("migration_gap_restored")
+            self.assertNotEqual(after, disabled_rule)
+
+            psql(
+                "migration_gap_restored",
+                "ALTER TABLE public.commonthing_gap_probe "
+                "ENABLE RULE commonthing_gap_rule;",
+            )
+            self.assertEqual(
+                after,
+                fingerprint("migration_gap_restored"),
+            )
+
+            psql(
+                "migration_gap_restored",
+                "DROP RULE commonthing_gap_rule "
+                "ON public.commonthing_gap_probe; "
+                "CREATE RULE commonthing_gap_rule AS "
+                "ON DELETE TO public.commonthing_gap_probe "
+                "DO INSTEAD NOTHING;",
+            )
+            definition_drift = fingerprint("migration_gap_restored")
+            self.assertNotEqual(after, definition_drift)
         finally:
             subprocess.run(
                 [docker, "rm", "-f", container],
