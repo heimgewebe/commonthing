@@ -7064,6 +7064,185 @@ spec:
 
 
 
+    def test_database_schema_catalog_real_dropped_attribute_restore_stability(
+        self,
+    ) -> None:
+        docker = shutil.which("docker")
+        if docker is None:
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                self.fail(
+                    "required dropped-attribute PostgreSQL regression "
+                    "requires docker in GitHub Actions"
+                )
+            self.skipTest(
+                "docker unavailable for dropped-attribute PostgreSQL regression"
+            )
+        assert docker is not None
+        postgres_image = (
+            "postgres:16@sha256:"
+            "be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c"
+        )
+        container = (
+            "commonthing-schema-drop-gap-regression-"
+            + uuid.uuid4().hex[:12]
+        )
+
+        def run_container(
+            arguments: list[str],
+            *,
+            input_bytes: bytes | None = None,
+        ) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                [docker, *arguments],
+                input=input_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+
+        def psql(database: str, sql: str) -> str:
+            completed = run_container(
+                [
+                    "exec",
+                    "-i",
+                    container,
+                    "psql",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    database,
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-qAt",
+                ],
+                input_bytes=sql.encode("utf-8"),
+            )
+            return completed.stdout.decode("utf-8").strip()
+
+        def fingerprint(database: str) -> str:
+            catalog = json.loads(
+                psql(database, runtime._DATABASE_SCHEMA_CATALOG_SQL)
+            )
+            return runtime._database_schema_sha256(catalog, [])
+
+        try:
+            run_container(
+                [
+                    "run",
+                    "-d",
+                    "--name",
+                    container,
+                    "-e",
+                    "POSTGRES_PASSWORD=proof",
+                    "-e",
+                    "POSTGRES_USER=postgres",
+                    postgres_image,
+                ]
+            )
+            for _ in range(90):
+                ready = subprocess.run(
+                    [
+                        docker,
+                        "exec",
+                        container,
+                        "pg_isready",
+                        "-U",
+                        "postgres",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if ready.returncode == 0:
+                    break
+                time.sleep(1)
+            else:
+                self.fail(
+                    "dropped-attribute PostgreSQL regression container "
+                    "was not ready"
+                )
+
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "migration_gap_source",
+                ]
+            )
+            psql(
+                "migration_gap_source",
+                r"""
+CREATE TABLE public.commonthing_gap_probe (
+  first_col bigint,
+  dropped_col text,
+  last_col text
+);
+ALTER TABLE public.commonthing_gap_probe DROP COLUMN dropped_col;
+CREATE TYPE public.commonthing_gap_composite AS (
+  first_attr bigint,
+  dropped_attr text,
+  last_attr text
+);
+ALTER TYPE public.commonthing_gap_composite DROP ATTRIBUTE dropped_attr;
+""",
+            )
+            before = fingerprint("migration_gap_source")
+            schema_archive = run_container(
+                [
+                    "exec",
+                    container,
+                    "pg_dump",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "migration_gap_source",
+                    "-Fc",
+                    "--schema-only",
+                    "--no-owner",
+                    "--no-privileges",
+                ]
+            ).stdout
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "migration_gap_restored",
+                ]
+            )
+            run_container(
+                [
+                    "exec",
+                    "-i",
+                    container,
+                    "pg_restore",
+                    "-U",
+                    "postgres",
+                    "--schema-only",
+                    "--no-owner",
+                    "--no-privileges",
+                    "--exit-on-error",
+                    "-d",
+                    "migration_gap_restored",
+                ],
+                input_bytes=schema_archive,
+            )
+            after = fingerprint("migration_gap_restored")
+            self.assertEqual(before, after)
+        finally:
+            subprocess.run(
+                [docker, "rm", "-f", container],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
+
     @unittest.skipUnless(
         os.environ.get("COMMONTHING_HISTORICAL_POSTGRES_DUMP")
         and os.environ.get("COMMONTHING_HISTORICAL_POSTGRES_DIAGNOSTIC"),
@@ -7234,82 +7413,6 @@ WHERE c.relkind = 'S'
                 time.sleep(1)
             else:
                 self.fail("historical PostgreSQL regression container was not ready")
-
-            run_container(
-                [
-                    "exec",
-                    container,
-                    "createdb",
-                    "-U",
-                    "postgres",
-                    "migration_gap_source",
-                ]
-            )
-            psql(
-                "migration_gap_source",
-                r"""
-CREATE TABLE public.commonthing_gap_probe (
-  first_col bigint,
-  dropped_col text,
-  last_col text
-);
-ALTER TABLE public.commonthing_gap_probe DROP COLUMN dropped_col;
-CREATE TYPE public.commonthing_gap_composite AS (
-  first_attr bigint,
-  dropped_attr text,
-  last_attr text
-);
-ALTER TYPE public.commonthing_gap_composite DROP ATTRIBUTE dropped_attr;
-""",
-            )
-            migration_gap_before = fingerprint("migration_gap_source")
-            migration_gap_archive = run_container(
-                [
-                    "exec",
-                    container,
-                    "pg_dump",
-                    "-U",
-                    "postgres",
-                    "-d",
-                    "migration_gap_source",
-                    "-Fc",
-                    "--schema-only",
-                    "--no-owner",
-                    "--no-privileges",
-                ]
-            ).stdout
-            run_container(
-                [
-                    "exec",
-                    container,
-                    "createdb",
-                    "-U",
-                    "postgres",
-                    "migration_gap_restored",
-                ]
-            )
-            run_container(
-                [
-                    "exec",
-                    "-i",
-                    container,
-                    "pg_restore",
-                    "-U",
-                    "postgres",
-                    "--schema-only",
-                    "--no-owner",
-                    "--no-privileges",
-                    "--exit-on-error",
-                    "-d",
-                    "migration_gap_restored",
-                ],
-                input_bytes=migration_gap_archive,
-            )
-            migration_gap_after = fingerprint("migration_gap_restored")
-            self.assertEqual(
-                migration_gap_before,
-                migration_gap_after,
-            )
 
             run_container(
                 [
@@ -7573,13 +7676,10 @@ LIMIT 1;
                 "second_restore": second,
                 "deliberate_constraint_drift": drifted,
                 "deliberate_sequence_ownership_drift": ownership_drift,
-                "migration_gap_before": migration_gap_before,
-                "migration_gap_after": migration_gap_after,
                 "deliberate_sequence_persistence_drift":
                     sequence_persistence_drift,
                 "deliberate_sequence_type_drift": sequence_type_drift,
                 "restore_stable": True,
-                "migration_gap_restore_stable": True,
                 "semantic_drift_detected": True,
                 "sequence_ownership_drift_detected": True,
                 "sequence_persistence_drift_detected": True,
