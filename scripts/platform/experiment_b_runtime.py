@@ -15156,12 +15156,20 @@ FROM (
 
   SELECT
     'column',
-    json_build_array(n.nspname, c.relname, a.attnum)::text,
+    json_build_array(n.nspname, c.relname, a.attname)::text,
     json_build_object(
       'kind', 'column',
       'schema', n.nspname,
       'relation', c.relname,
-      'position', a.attnum,
+      'position',
+        (
+          SELECT count(*)
+          FROM pg_catalog.pg_attribute logical_a
+          WHERE logical_a.attrelid = a.attrelid
+            AND logical_a.attnum > 0
+            AND NOT logical_a.attisdropped
+            AND logical_a.attnum <= a.attnum
+        ),
       'name', a.attname,
       'type', pg_catalog.format_type(a.atttypid, a.atttypmod),
       'not_null', a.attnotnull,
@@ -15381,6 +15389,26 @@ FROM (
   UNION ALL
 
   SELECT
+    'sequence-definition',
+    json_build_array(seq_n.nspname, seq.relname)::text,
+    json_build_object(
+      'kind', 'sequence-definition',
+      'schema', seq_n.nspname,
+      'sequence', seq.relname,
+      'data_type', pg_catalog.format_type(seq_def.seqtypid, -1),
+      'persistence', seq.relpersistence
+    )
+  FROM pg_catalog.pg_class seq
+  JOIN pg_catalog.pg_namespace seq_n ON seq_n.oid = seq.relnamespace
+  JOIN pg_catalog.pg_sequence seq_def ON seq_def.seqrelid = seq.oid
+  WHERE seq.relkind = 'S'
+    AND seq_n.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND seq_n.nspname !~ '^pg_toast'
+    AND seq_n.nspname !~ '^pg_temp_'
+
+  UNION ALL
+
+  SELECT
     'sequence-ownership',
     json_build_array(seq_n.nspname, seq.relname)::text,
     json_build_object(
@@ -15477,7 +15505,15 @@ FROM (
             (
               SELECT json_agg(
                 json_build_object(
-                  'position', a.attnum,
+                  'position',
+                    (
+                      SELECT count(*)
+                      FROM pg_catalog.pg_attribute logical_a
+                      WHERE logical_a.attrelid = a.attrelid
+                        AND logical_a.attnum > 0
+                        AND NOT logical_a.attisdropped
+                        AND logical_a.attnum <= a.attnum
+                    ),
                   'name', a.attname,
                   'type', pg_catalog.format_type(a.atttypid, a.atttypmod),
                   'collation',

@@ -6792,6 +6792,10 @@ spec:
             "pg_catalog.pg_trigger",
             "pg_catalog.pg_policy",
             "pg_catalog.pg_depend",
+            "pg_catalog.pg_sequence",
+            "pg_catalog.format_type(seq_def.seqtypid, -1)",
+            "'persistence', seq.relpersistence",
+            "logical_a.attnum <= a.attnum",
             "pg_catalog.pg_type",
         ):
             self.assertIn(expected_fragment, catalog_sql)
@@ -6893,6 +6897,58 @@ spec:
             runtime._database_schema_sha256(
                 catalog,
                 [advanced_sequence],
+            ),
+        )
+
+
+    def test_database_schema_sha256_detects_sequence_definition_drift(
+        self,
+    ) -> None:
+        sequences = [
+            {
+                "schema": "public",
+                "name": "example_id_seq",
+                "last_value": "9",
+                "is_called": True,
+                "start_value": "1",
+                "increment_by": "1",
+                "min_value": "1",
+                "max_value": "9223372036854775807",
+                "cache_size": "1",
+                "cycle": False,
+            }
+        ]
+        base = [
+            {"kind": "schema", "schema": "public"},
+            {
+                "kind": "sequence-definition",
+                "schema": "public",
+                "sequence": "example_id_seq",
+                "data_type": "bigint",
+                "persistence": "p",
+            },
+        ]
+        persistence_drift = [
+            base[0],
+            {**base[1], "persistence": "u"},
+        ]
+        type_drift = [
+            base[0],
+            {**base[1], "data_type": "integer"},
+        ]
+        baseline = runtime._database_schema_sha256(base, sequences)
+        self.assertNotEqual(
+            baseline,
+            runtime._database_schema_sha256(
+                persistence_drift,
+                sequences,
+            ),
+        )
+        self.assertNotEqual(
+            baseline,
+            runtime._database_schema_sha256(
+                type_drift,
+                sequences,
             ),
         )
 
@@ -7181,6 +7237,82 @@ WHERE c.relkind = 'S'
 
             run_container(
                 [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "migration_gap_source",
+                ]
+            )
+            psql(
+                "migration_gap_source",
+                r"""
+CREATE TABLE public.commonthing_gap_probe (
+  first_col bigint,
+  dropped_col text,
+  last_col text
+);
+ALTER TABLE public.commonthing_gap_probe DROP COLUMN dropped_col;
+CREATE TYPE public.commonthing_gap_composite AS (
+  first_attr bigint,
+  dropped_attr text,
+  last_attr text
+);
+ALTER TYPE public.commonthing_gap_composite DROP ATTRIBUTE dropped_attr;
+""",
+            )
+            migration_gap_before = fingerprint("migration_gap_source")
+            migration_gap_archive = run_container(
+                [
+                    "exec",
+                    container,
+                    "pg_dump",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "migration_gap_source",
+                    "-Fc",
+                    "--schema-only",
+                    "--no-owner",
+                    "--no-privileges",
+                ]
+            ).stdout
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "migration_gap_restored",
+                ]
+            )
+            run_container(
+                [
+                    "exec",
+                    "-i",
+                    container,
+                    "pg_restore",
+                    "-U",
+                    "postgres",
+                    "--schema-only",
+                    "--no-owner",
+                    "--no-privileges",
+                    "--exit-on-error",
+                    "-d",
+                    "migration_gap_restored",
+                ],
+                input_bytes=migration_gap_archive,
+            )
+            migration_gap_after = fingerprint("migration_gap_restored")
+            self.assertEqual(
+                migration_gap_before,
+                migration_gap_after,
+            )
+
+            run_container(
+                [
                     "cp",
                     str(dump_path),
                     f"{container}:/tmp/source.dump",
@@ -7322,6 +7454,96 @@ LIMIT 1;
                 ownership_drift["catalog_items"],
             )
 
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "restore_sequence_definition",
+                ]
+            )
+            run_container(
+                [
+                    "exec",
+                    "-i",
+                    container,
+                    "pg_restore",
+                    "-U",
+                    "postgres",
+                    "--schema-only",
+                    "--no-owner",
+                    "--no-privileges",
+                    "--exit-on-error",
+                    "-d",
+                    "restore_sequence_definition",
+                ],
+                input_bytes=schema_archive,
+            )
+            definition_restore_baseline = fingerprint(
+                "restore_sequence_definition"
+            )
+            self.assertEqual(second, definition_restore_baseline)
+            psql(
+                "restore_sequence_definition",
+                "CREATE SEQUENCE public.commonthing_sequence_definition_probe "
+                "AS integer MINVALUE 1 MAXVALUE 1000000 START WITH 1 "
+                "INCREMENT BY 1 CACHE 1;",
+            )
+            sequence_definition_baseline = fingerprint(
+                "restore_sequence_definition"
+            )
+            psql(
+                "restore_sequence_definition",
+                "ALTER SEQUENCE public.commonthing_sequence_definition_probe "
+                "SET UNLOGGED;",
+            )
+            sequence_persistence_drift = fingerprint(
+                "restore_sequence_definition"
+            )
+            self.assertNotEqual(
+                sequence_definition_baseline["sha256"],
+                sequence_persistence_drift["sha256"],
+            )
+            self.assertEqual(
+                sequence_definition_baseline["catalog_items"],
+                sequence_persistence_drift["catalog_items"],
+            )
+            self.assertEqual(
+                sequence_definition_baseline["sequence_count"],
+                sequence_persistence_drift["sequence_count"],
+            )
+            psql(
+                "restore_sequence_definition",
+                "ALTER SEQUENCE public.commonthing_sequence_definition_probe "
+                "SET LOGGED;",
+            )
+            self.assertEqual(
+                sequence_definition_baseline,
+                fingerprint("restore_sequence_definition"),
+            )
+            psql(
+                "restore_sequence_definition",
+                "ALTER SEQUENCE public.commonthing_sequence_definition_probe "
+                "AS bigint;",
+            )
+            sequence_type_drift = fingerprint(
+                "restore_sequence_definition"
+            )
+            self.assertNotEqual(
+                sequence_definition_baseline["sha256"],
+                sequence_type_drift["sha256"],
+            )
+            self.assertEqual(
+                sequence_definition_baseline["catalog_items"],
+                sequence_type_drift["catalog_items"],
+            )
+            self.assertEqual(
+                sequence_definition_baseline["sequence_count"],
+                sequence_type_drift["sequence_count"],
+            )
+
             psql(
                 "restore_b",
                 "ALTER TABLE public.domain_nodes "
@@ -7351,9 +7573,17 @@ LIMIT 1;
                 "second_restore": second,
                 "deliberate_constraint_drift": drifted,
                 "deliberate_sequence_ownership_drift": ownership_drift,
+                "migration_gap_before": migration_gap_before,
+                "migration_gap_after": migration_gap_after,
+                "deliberate_sequence_persistence_drift":
+                    sequence_persistence_drift,
+                "deliberate_sequence_type_drift": sequence_type_drift,
                 "restore_stable": True,
+                "migration_gap_restore_stable": True,
                 "semantic_drift_detected": True,
                 "sequence_ownership_drift_detected": True,
+                "sequence_persistence_drift_detected": True,
+                "sequence_type_drift_detected": True,
             }
             print(
                 "HISTORICAL_SCHEMA_CATALOG_PROOF="
