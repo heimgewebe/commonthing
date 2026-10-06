@@ -5,8 +5,8 @@ doc_type: runbook
 status: active
 summary: >
   Wiederherstellungsablauf für die produktive PostgreSQL-Wahrheit von
-  commonThing: logische Backups, isolierter Restore-Proof, Off-Host-Kopie,
-  Integritätsprüfung und kontrollierte Promotion.
+  commonThing: logische Backups, isolierter Restore-Proof, age-verschlüsselte
+  Off-Host-Kopie, Integritätsprüfung und kontrollierte Promotion.
 relations:
   - type: relates_to
     target: docs/runbooks/README.md
@@ -68,13 +68,82 @@ Der Vertrag prüft vor dem Dump:
 
 Danach entstehen unter `/var/backups/weltgewebe/postgres`:
 
-- `weltgewebe-postgres-<UTC>.sql.gz`;
-- `weltgewebe-postgres-<UTC>.sha256.manifest`.
+- `weltgewebe-postgres-<UTC>.sql.gz` – Klartext-Dump, bleibt ausschließlich
+  auf dem Host;
+- `weltgewebe-postgres-<UTC>.sha256.manifest` – Metadaten zum Klartext-Dump;
+- `weltgewebe-postgres-<UTC>.sql.gz.age` – age-Chiffrat desselben Dumps, die
+  einzige Dump-Form, die den Host verlässt;
+- `weltgewebe-postgres-<UTC>.age.sha256.manifest` – Manifest über das
+  Chiffrat (`contract=weltgewebe-postgres-backup-age-v1`).
 
-Beide Dateien werden mit Modus `0600` geschrieben. Gzip-Integrität, SHA256,
+Alle Dateien werden mit Modus `0600` geschrieben. Gzip-Integrität, SHA256,
 Größe, Erstellungszeit, Tabellenumfang und – soweit verfügbar – Git-Commit
-stehen im Manifest. Unvollständige temporäre Dateien werden nicht sichtbar.
-Die Standard-Retention beträgt 14 Tage.
+stehen im Klartext-Manifest. Das Off-Host-Manifest enthält SHA256 und Größe
+des Chiffrats, das Format `age-encryption.org/v1`, die öffentlichen
+Empfänger sowie Dateiname und SHA256 des zugehörigen Klartext-Dumps.
+Unvollständige temporäre Dateien werden nicht sichtbar; das
+Off-Host-Manifest wird als letzte Datei eines vollständigen Satzes
+veröffentlicht. Die Standard-Retention beträgt 14 Tage und gilt für alle
+vier Dateiarten.
+
+Der Dump enthält E-Mail-Adressen und private Kartenanker. Der
+Klartext-Dump liegt auf demselben Host wie das Datenbankvolume und erzeugt
+dort keine neue Exposition; der wöchentliche Restore-Proof (Abschnitt 3)
+arbeitet unverändert auf ihm. Für die Off-Host-Kette wird dagegen nur das
+Chiffrat erzeugt und übertragen.
+
+### Verschlüsselung der Off-Host-Kopie (age)
+
+Das Skript verschlüsselt mit `age` ausschließlich an **öffentliche**
+X25519-Empfänger (`age1…`). Der private Schlüssel (Identity) wird weder auf
+`commonserver` noch auf `heim-pc` benötigt und bleibt offline.
+
+Konfiguration: `BACKUP_AGE_RECIPIENTS_FILE`, in der Systemd-Unit auf
+`/etc/weltgewebe/postgres-backup-age-recipients.txt` gesetzt (gleicher
+Default im Skript). Pro Zeile steht ein `age1…`-Empfänger; Leerzeilen und
+`#`-Kommentare sind erlaubt. Mehrere Empfänger (z. B. ein zweiter
+Notfallschlüssel) sind möglich.
+
+Verhalten: **fail-closed.** Fehlt `age`, fehlt die Empfängerdatei, ist sie
+leer, enthält sie einen anderen Eintrag als einen `age1…`-Empfänger oder
+versehentlich einen privaten Schlüssel (`AGE-SECRET-KEY-…`), bricht das
+Skript vor dem Dump ab und schreibt keine Datei. Begründung: Das Skript prüft
+alle Pflichtvoraussetzungen (Werkzeuge, Verbindung, Schreibrecht, Health,
+Pflichttabellen) vor dem ersten Artefakt und veröffentlicht nur vollständige
+Sätze; ein unverschlüsselter Teilstand ohne Chiffrat würde diesen Vertrag
+aufweichen. Ein Abschalten der Verschlüsselung ist nicht vorgesehen. Der
+Ausfall ist über den fehlgeschlagenen Systemd-Dienst sichtbar.
+
+Deployment-Voraussetzungen auf `commonserver` (vor dem ersten Lauf dieses
+Skriptstands, sonst schlägt der tägliche Backupdienst fehl):
+
+1. `age` installieren, z. B. `apt-get install age` (stellt `/usr/bin/age`
+   bereit).
+2. Den öffentlichen Empfänger ablegen:
+
+   ```bash
+   install -d -o root -g root -m 0755 /etc/weltgewebe
+   printf '%s\n' 'age1…' > /etc/weltgewebe/postgres-backup-age-recipients.txt
+   chmod 0644 /etc/weltgewebe/postgres-backup-age-recipients.txt
+   ```
+
+3. Die aktualisierte `weltgewebe-postgres-backup.service` (mit
+   `Environment=BACKUP_AGE_RECIPIENTS_FILE=…`) installieren und
+   `systemctl daemon-reload` ausführen.
+
+Schlüsselerzeugung – ausschließlich auf einem Offline-Gerät, niemals auf
+`commonserver` oder `heim-pc`:
+
+```bash
+umask 077
+age-keygen -o weltgewebe-backup-identity.txt
+age-keygen -y weltgewebe-backup-identity.txt   # öffentlicher Empfänger age1…
+```
+
+Nur die mit `age-keygen -y` ausgegebene `age1…`-Zeile gehört in die
+Empfängerdatei. Die Identity-Datei wird offline (z. B. auf zwei getrennten
+verschlüsselten Datenträgern) aufbewahrt; ihr Verlust macht alle Off-Host-
+Kopien unlesbar.
 
 Systemd:
 
@@ -126,7 +195,10 @@ zeigen und darf niemals der produktiven `DATABASE_URL` entsprechen.
 ## 4. Off-Host-Kette
 
 Ein lokaler Dump auf dem VPS schützt nicht vor Hostverlust. Deshalb holt
-`heim-pc` den neuesten Dump und das Manifest täglich über SSH ab:
+`heim-pc` täglich über SSH das neueste **Chiffrat** (`*.sql.gz.age`), sein
+Off-Host-Manifest und das Klartext-Metadatenmanifest (`*.sha256.manifest`,
+enthält nur Dateiname, SHA256, Größe, Zeit, Tabellenliste und Commit – keine
+Dumpinhalte) ab:
 
 ```text
 scripts/ops/pull-production-postgres-backup.sh
@@ -138,8 +210,15 @@ Ziel:
 ~/merges/weltgewebe-production-backups
 ```
 
-Der Pull läuft fail-closed, validiert den Dateinamen und den SHA256-Wert und
-schreibt eine `latest-pull.receipt`. Ein vorhandener Wochen-Restore-Proof wird
+Der Pull läuft fail-closed. Er wählt ausschließlich `*.sql.gz.age`-Dateien
+aus und fordert den Klartext-Dump nie über SSH an; findet er kein Chiffrat
+(z. B. weil auf dem Host kein Empfänger konfiguriert ist), bricht er ab. Er
+prüft Dateinamen, Vertrag, SHA256 und Größe des Chiffrats gegen das
+Off-Host-Manifest, verlangt den age-Header `age-encryption.org/v1` und prüft,
+dass beide Manifeste denselben Klartext-SHA256 nennen. `age` und der private
+Schlüssel werden auf `heim-pc` dafür nicht benötigt. Erst danach schreibt er
+eine `latest-pull.receipt` (`contract=weltgewebe-offhost-backup-pull-v2`,
+`encryption=age`). Ein vorhandener Wochen-Restore-Proof wird
 mitgenommen. Der bestehende Restic-Lauf auf `heim-pc` sichert `~/merges`
 anschließend in das entfernte Restic-Repository und liest einen Sentinel aus
 dem exakten Snapshot zurück.
@@ -155,26 +234,31 @@ backup_dir=/var/backups/weltgewebe/postgres
 getent hosts commonserver > /dev/null
 latest="$(
   ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-    "sudo -n find '$backup_dir' -maxdepth 1 -type f -name 'weltgewebe-postgres-*.sql.gz' -printf '%f\\n'" |
+    "sudo -n find '$backup_dir' -maxdepth 1 -type f -name 'weltgewebe-postgres-*.sql.gz.age' -printf '%f\\n'" |
     sort |
     tail -n1
 )"
-if [[ "$latest" != weltgewebe-postgres-*.sql.gz ]]; then
-  printf 'Kein PostgreSQL-Backup auf commonserver gefunden.\n' >&2
+if [[ "$latest" != weltgewebe-postgres-*.sql.gz.age ]]; then
+  printf 'Kein verschlüsseltes PostgreSQL-Backup auf commonserver gefunden.\n' >&2
   exit 1
 fi
-manifest="${latest%.sql.gz}.sha256.manifest"
+age_manifest="${latest%.sql.gz.age}.age.sha256.manifest"
 ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-  "sudo -n cat -- '$backup_dir/$manifest'" > /dev/null
+  "sudo -n cat -- '$backup_dir/$age_manifest'" > /dev/null
 ```
 
-Damit werden genau die beiden verpflichtenden privilegierten Leseoperationen
-(`find` und `cat`) geprüft, die auch der Pull verwendet. `set -euo pipefail`
-sorgt zusätzlich dafür, dass ein fehlgeschlagenes SSH/`sudo find` nicht durch
+Damit werden genau die verpflichtenden privilegierten Leseoperationen
+(`find` und `cat`) geprüft, die auch der Pull verwendet. Befehlsbezogene
+Sudoers-Regeln auf `commonserver` müssen dafür das neue `find`-Muster
+`weltgewebe-postgres-*.sql.gz.age` und `cat` auf `*.sql.gz.age`,
+`*.age.sha256.manifest` und `*.sha256.manifest` erlauben; `cat` auf den
+Klartext-Dump `*.sql.gz` wird vom Pull nicht mehr benötigt und sollte aus
+den Regeln entfernt werden. `set -euo pipefail` sorgt zusätzlich dafür, dass ein fehlgeschlagenes SSH/`sudo find` nicht durch
 das nachgeschaltete `sort`/`tail` verdeckt wird; ein leerer oder unerwarteter
 Dateiname bricht explizit ab. Ein allgemeines `sudo -n true` reicht bei
 befehlsbezogenen Sudoers-Regeln nicht aus. Der Readback vom 2026-09-10 hat
-DNS/SSH sowie diese `find`-/`cat`-Prüfung erfolgreich bestanden.
+DNS/SSH sowie die damalige `find`-/`cat`-Prüfung auf `*.sql.gz` erfolgreich
+bestanden; für das age-Muster liegt noch kein Runtime-Readback vor.
 `REMOTE_HOST` bleibt als expliziter Kompatibilitäts-Override erhalten; der
 Default und neue Installationen verwenden `commonserver`.
 
@@ -200,12 +284,55 @@ weil diese Kernel-Capability im User-Manager nicht portabel verfügbar ist. Alle
 Diese Kette ist ein täglicher Off-Host-Vertrag. Sie ist kein RPO-von-fünf-Minuten
 und kein Ersatz für WAL/PITR.
 
+### Altbestand unverschlüsselter Off-Host-Kopien
+
+Vor dem age-Vertrag hat der Pull Klartext-Dumps (`weltgewebe-postgres-*.sql.gz`)
+nach `~/merges/weltgewebe-production-backups` kopiert. Die lokale Retention
+löscht sie zwar nach `LOCAL_RETENTION_DAYS` (Default 30 Tage), sie müssen aber
+nach der Umstellung **manuell sofort gelöscht** werden:
+
+```bash
+find ~/merges/weltgewebe-production-backups -maxdepth 1 -type f \
+  -name 'weltgewebe-postgres-*.sql.gz' -print -delete
+```
+
+Diese Klartext-Kopien sind zusätzlich in älteren Restic-Snapshots von
+`~/merges` enthalten. Sie verschwinden dort erst, wenn die betroffenen
+Snapshots bewusst per `restic forget`/`restic prune` entfernt werden; diese
+Entscheidung (Verlust älterer Wiederherstellungspunkte gegen Entfernung der
+Klartextdaten) ist manuell zu treffen und zu dokumentieren.
+
+### Wiederherstellung aus der Off-Host-Kopie
+
+Nur auf einem vertrauenswürdigen Gerät mit Zugriff auf die Offline-Identity,
+in einem Verzeichnis mit Modus `0700`:
+
+```bash
+set -euo pipefail
+umask 077
+src=~/merges/weltgewebe-production-backups
+base=weltgewebe-postgres-<UTC>
+work="$(mktemp -d)"
+age -d -i /pfad/zur/weltgewebe-backup-identity.txt \
+  -o "$work/$base.sql.gz" "$src/$base.sql.gz.age"
+cp "$src/$base.sha256.manifest" "$work/"
+expected="$(awk -F= '$1=="sha256" {print $2}' "$work/$base.sha256.manifest")"
+[[ "$(sha256sum "$work/$base.sql.gz" | awk '{print $1}')" == "$expected" ]]
+gzip -t "$work/$base.sql.gz"
+```
+
+Danach kann `scripts/ops/postgres-restore-proof.sh` mit
+`BACKUP_FILE="$work/$base.sql.gz"` gegen eine Wegwerfdatenbank laufen
+(Abschnitt 3); anschließend gilt Abschnitt 5. Der entschlüsselte Dump ist
+Klartext mit personenbezogenen Daten und wird nach Gebrauch gelöscht.
+
 ## 5. Vorfall und Wiederherstellung
 
 1. Vorfall und betroffenen Commit/Image-Stand sichern.
 2. Schreibzugriffe stoppen; keine Volumes löschen und kein `just down` als
    Routine verwenden.
-3. Backup, Manifest und möglichst zugehörigen Restore-Proof auswählen.
+3. Backup, Manifest und möglichst zugehörigen Restore-Proof auswählen; eine
+   Off-Host-Kopie zuvor nach Abschnitt 4 offline entschlüsseln.
 4. Den Dump zuerst in einer neuen, isolierten PostgreSQL-Instanz prüfen.
 5. SHA, Tabellen, Migrationen und repräsentative Datensätze kontrollieren.
 6. Erst dann eine neue produktive Datenbank aus dem geprüften Dump aufbauen.
@@ -243,7 +370,7 @@ Nicht implementiert:
 Eine aktuelle Backupaussage braucht mindestens:
 
 - Timer- und Servicezustand;
-- neuesten Dump und Manifest;
+- neuesten Dump, Chiffrat und beide Manifeste;
 - erfolgreichen Restore-Proof;
 - Off-Host-Pull-Receipt;
 - Snapshotbeleg des bestehenden Restic-Laufs;
