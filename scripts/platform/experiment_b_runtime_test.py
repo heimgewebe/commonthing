@@ -4,7 +4,10 @@ import base64
 import hashlib
 import inspect
 import json
+import os
 import shutil
+import time
+import uuid
 import subprocess
 import sys
 import tempfile
@@ -6774,10 +6777,588 @@ spec:
         self.assertIn("commonthing_signature_sequences", source)
         self.assertIn("pg_catalog.pg_sequence", source)
         self.assertIn("last_value::text, is_called", source)
-        self.assertIn('"--schema-only"', source)
-        self.assertIn('"--quote-all-identifiers"', source)
         self.assertIn("schema_sha256", source)
-        self.assertIn("_run_bound_postgres_client", source)
+        self.assertIn("_restore_stable_database_schema_sha256", source)
+        schema_source = inspect.getsource(
+            runtime._restore_stable_database_schema_sha256
+        )
+        self.assertIn('"-Fc"', schema_source)
+        self.assertIn('"pg_restore"', schema_source)
+        self.assertIn('"--quote-all-identifiers"', schema_source)
+        self.assertIn("CREATE DATABASE", schema_source)
+        self.assertIn("DROP DATABASE IF EXISTS", schema_source)
+        self.assertIn("_run_bound_postgres_client", schema_source)
+
+
+    def test_restore_stable_database_schema_signature_uses_scratch_roundtrip(
+        self,
+    ) -> None:
+        scratch_hex = "a" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        canonical = (
+            b"\\restrict stable_key\n"
+            b'CREATE TABLE "public"."example" ("id" integer);\n'
+            b"\\unrestrict stable_key\n"
+        )
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    b"",
+                    b"",
+                    canonical,
+                    b"",
+                ],
+            ) as run_bound,
+        ):
+            observed = runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        expected = hashlib.sha256(
+            b"\\restrict <pg-dump-key>\n"
+            b'CREATE TABLE "public"."example" ("id" integer);\n'
+            b"\\unrestrict <pg-dump-key>\n"
+        ).hexdigest()
+        self.assertEqual(observed, expected)
+        self.assertEqual(run_bound.call_count, 5)
+        commands = [call.args[3] for call in run_bound.call_args_list]
+        self.assertIn("-Fc", commands[0])
+        self.assertIn("--schema-only", commands[0])
+        self.assertEqual(commands[2][0], "pg_restore")
+        self.assertIn(scratch_name, commands[2])
+        self.assertIn("--schema-only", commands[2])
+        self.assertEqual(commands[3][0], "pg_dump")
+        self.assertIn(scratch_name, commands[3])
+        self.assertIn("--schema-only", commands[3])
+        self.assertIn(
+            f'CREATE DATABASE "{scratch_name}" TEMPLATE template0;',
+            run_bound.call_args_list[1].kwargs["input_bytes"].decode("utf-8"),
+        )
+        self.assertIn(
+            f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE);',
+            run_bound.call_args_list[4].kwargs["input_bytes"].decode("utf-8"),
+        )
+
+    def test_normalized_database_schema_dump_preserves_function_body_meta_commands(
+        self,
+    ) -> None:
+        source = (
+            b"-- PostgreSQL database dump\n"
+            b"\n"
+            b"\\restrict generated_key\n"
+            b'CREATE FUNCTION "public"."example"() RETURNS "text"\n'
+            b'    LANGUAGE "plpgsql"\n'
+            b"    AS $$\n"
+            b"\\restrict function_semantics\n"
+            b"\\unrestrict function_semantics\n"
+            b"RETURN 'ok';\n"
+            b"$$;\n"
+            b"\n"
+            b"-- PostgreSQL database dump complete\n"
+            b"\n"
+            b"\\unrestrict generated_key\n"
+        )
+        normalized = runtime._normalized_database_schema_dump(source)
+        self.assertIn(b"\\restrict <pg-dump-key>\n", normalized)
+        self.assertIn(b"\\unrestrict <pg-dump-key>\n", normalized)
+        self.assertIn(b"\\restrict function_semantics\n", normalized)
+        self.assertIn(b"\\unrestrict function_semantics\n", normalized)
+        self.assertEqual(
+            normalized.count(b"\\restrict function_semantics"),
+            1,
+        )
+        self.assertEqual(
+            normalized.count(b"\\unrestrict function_semantics"),
+            1,
+        )
+
+    def test_normalized_database_schema_dump_keeps_unicode_nel_distinct_from_lf(
+        self,
+    ) -> None:
+        prefix = (
+            b"-- PostgreSQL database dump\n"
+            b"\n"
+            b"\\restrict stable_key\n"
+            b'CREATE FUNCTION "public"."example"() RETURNS "text"\n'
+            b'    LANGUAGE "sql"\n'
+            b"    AS $$SELECT 'a"
+        )
+        suffix = (
+            b"b';$$;\n"
+            b"\n"
+            b"-- PostgreSQL database dump complete\n"
+            b"\n"
+            b"\\unrestrict stable_key\n"
+        )
+        with_lf = prefix + b"\n" + suffix
+        with_nel = prefix + "\u0085".encode("utf-8") + suffix
+
+        normalized_lf = runtime._normalized_database_schema_dump(with_lf)
+        normalized_nel = runtime._normalized_database_schema_dump(with_nel)
+
+        self.assertNotEqual(normalized_lf, normalized_nel)
+        self.assertIn("\u0085".encode("utf-8"), normalized_nel)
+        self.assertEqual(
+            normalized_nel.replace(
+                b"\\restrict <pg-dump-key>",
+                b"\\restrict stable_key",
+            ).replace(
+                b"\\unrestrict <pg-dump-key>",
+                b"\\unrestrict stable_key",
+            ),
+            with_nel,
+        )
+
+    def test_normalized_database_schema_dump_rejects_mismatched_boundary_keys(
+        self,
+    ) -> None:
+        source = (
+            b"-- PostgreSQL database dump\n"
+            b"\\restrict first_key\n"
+            b"SELECT 1;\n"
+            b"\\unrestrict second_key\n"
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "invalid pg_dump restrict markers",
+        ):
+            runtime._normalized_database_schema_dump(source)
+
+
+    def test_restore_stable_database_schema_signature_cleans_up_after_failure(
+        self,
+    ) -> None:
+        scratch_hex = "b" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    b"",
+                    runtime.RuntimeErrorEB("restore failed"),
+                    b"",
+                ],
+            ) as run_bound,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "restore failed",
+            ),
+        ):
+            runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        self.assertEqual(run_bound.call_count, 4)
+        self.assertIn(
+            f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE);',
+            run_bound.call_args_list[-1].kwargs["input_bytes"].decode("utf-8"),
+        )
+
+
+    def test_restore_stable_database_schema_signature_does_not_drop_uncreated_scratch(
+        self,
+    ) -> None:
+        scratch_hex = "c" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    runtime.RuntimeErrorEB("create failed"),
+                ],
+            ) as run_bound,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "create failed",
+            ),
+        ):
+            runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        self.assertEqual(run_bound.call_count, 2)
+        self.assertIn(
+            f'CREATE DATABASE "{scratch_name}" TEMPLATE template0;',
+            run_bound.call_args_list[1].kwargs["input_bytes"].decode("utf-8"),
+        )
+        observed_input = b"\n".join(
+            call.kwargs.get("input_bytes", b"")
+            for call in run_bound.call_args_list
+        )
+        self.assertNotIn(b"DROP DATABASE IF EXISTS", observed_input)
+
+    def test_restore_stable_database_schema_signature_tracks_canonical_schema(
+        self,
+    ) -> None:
+        scratch_hex = "d" * 32
+
+        def signature(schema_archive: bytes, canonical_schema: bytes) -> str:
+            with (
+                mock.patch.object(
+                    runtime.uuid,
+                    "uuid4",
+                    return_value=mock.Mock(hex=scratch_hex),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_run_bound_postgres_client",
+                    side_effect=[
+                        schema_archive,
+                        b"",
+                        b"",
+                        (
+                            b"\\restrict stable_key\n"
+                            + canonical_schema
+                            + b"\\unrestrict stable_key\n"
+                        ),
+                        b"",
+                    ],
+                ),
+            ):
+                return runtime._restore_stable_database_schema_sha256(
+                    Path("/unused"),
+                    "a" * 40,
+                    {"container_id": "bound"},
+                    ("user", "database"),
+                )
+
+        canonical = (
+            b'CREATE TABLE "public"."example" ('
+            b'"id" integer CHECK (("id" > 0)));\n'
+        )
+        formatting_variant = signature(
+            b"source-schema-serialization-a",
+            canonical,
+        )
+        restored_variant = signature(
+            b"source-schema-serialization-b",
+            canonical,
+        )
+        semantic_drift = signature(
+            b"source-schema-serialization-b",
+            (
+                b'CREATE TABLE "public"."example" ('
+                b'"id" integer CHECK (("id" >= 0)));\n'
+            ),
+        )
+        self.assertEqual(formatting_variant, restored_variant)
+        self.assertNotEqual(formatting_variant, semantic_drift)
+
+
+    def test_restore_stable_signature_real_migrations_production_restore(
+        self,
+    ) -> None:
+        docker = shutil.which("docker")
+        if docker is None:
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                self.fail(
+                    "required migration-built PostgreSQL restore regression "
+                    "requires docker in GitHub Actions"
+                )
+            self.skipTest(
+                "docker unavailable for migration-built PostgreSQL restore regression"
+            )
+        assert docker is not None
+
+        postgres_image = (
+            "postgres:16@sha256:"
+            "be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c"
+        )
+        container = (
+            "commonthing-schema-production-restore-"
+            + uuid.uuid4().hex[:12]
+        )
+
+        def run_container(
+            arguments: list[str],
+            *,
+            input_bytes: bytes | None = None,
+            check: bool = True,
+            timeout: int = 300,
+        ) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                [docker, *arguments],
+                input=input_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=check,
+                timeout=timeout,
+            )
+
+        def exec_postgres(
+            command: list[str],
+            *,
+            input_bytes: bytes = b"",
+            timeout: int = 300,
+        ) -> bytes:
+            completed = run_container(
+                ["exec", "-i", container, *command],
+                input_bytes=input_bytes,
+                check=False,
+                timeout=timeout,
+            )
+            if completed.returncode != 0:
+                raise runtime.RuntimeErrorEB(
+                    "migration-built PostgreSQL proof command failed "
+                    f"({completed.returncode}): "
+                    + completed.stderr.decode("utf-8", "replace")[-3000:]
+                )
+            return completed.stdout
+
+        def psql(database: str, sql: str) -> str:
+            return exec_postgres(
+                [
+                    "psql",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    database,
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-qAt",
+                ],
+                input_bytes=sql.encode("utf-8"),
+            ).decode("utf-8").strip()
+
+        def bound_postgres_client(
+            _root: Path,
+            _source_commit: str,
+            _binding: dict[str, object],
+            command: list[str],
+            *,
+            input_bytes: bytes = b"",
+            timeout: int = 900,
+        ) -> bytes:
+            return exec_postgres(
+                command,
+                input_bytes=input_bytes,
+                timeout=timeout,
+            )
+
+        def signature(database: str) -> dict[str, object]:
+            with mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=bound_postgres_client,
+            ):
+                return runtime._database_signature(
+                    Path("/unused"),
+                    database_identity=("postgres", database),
+                    source_commit="a" * 40,
+                    postgres_binding={"proof": "docker"},
+                )
+
+        try:
+            run_container(
+                [
+                    "run",
+                    "-d",
+                    "--name",
+                    container,
+                    "-e",
+                    "POSTGRES_PASSWORD=proof",
+                    "-e",
+                    "POSTGRES_USER=postgres",
+                    postgres_image,
+                ],
+                timeout=120,
+            )
+            for _ in range(90):
+                ready = subprocess.run(
+                    [
+                        docker,
+                        "exec",
+                        container,
+                        "pg_isready",
+                        "-h",
+                        "127.0.0.1",
+                        "-U",
+                        "postgres",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if ready.returncode == 0:
+                    break
+                time.sleep(1)
+            else:
+                self.fail(
+                    "migration-built PostgreSQL regression container was not ready"
+                )
+
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "source",
+                ]
+            )
+            psql(
+                "source",
+                """
+CREATE TABLE public._sqlx_migrations (
+  version BIGINT PRIMARY KEY,
+  description TEXT NOT NULL,
+  installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+  success BOOLEAN NOT NULL,
+  checksum BYTEA NOT NULL,
+  execution_time BIGINT NOT NULL
+);
+""",
+            )
+            migrations = sorted(
+                (runtime.ROOT / "apps/api/migrations").glob("*.up.sql")
+            )
+            self.assertGreater(len(migrations), 0)
+            for migration in migrations:
+                version_text, separator, description_part = migration.name.partition("_")
+                self.assertEqual(separator, "_")
+                self.assertTrue(version_text.isdigit())
+                self.assertTrue(description_part.endswith(".up.sql"))
+                migration_bytes = migration.read_bytes()
+                exec_postgres(
+                    [
+                        "psql",
+                        "-U",
+                        "postgres",
+                        "-d",
+                        "source",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "--single-transaction",
+                        "-q",
+                    ],
+                    input_bytes=migration_bytes,
+                )
+                description = (
+                    description_part.removesuffix(".up.sql")
+                    .replace("_", " ")
+                    .replace("'", "''")
+                )
+                checksum = hashlib.sha384(migration_bytes).hexdigest()
+                psql(
+                    "source",
+                    "INSERT INTO public._sqlx_migrations "
+                    "(version, description, success, checksum, execution_time) "
+                    f"VALUES ({int(version_text)}, '{description}', true, "
+                    f"decode('{checksum}', 'hex'), 0);",
+                )
+
+            psql(
+                "source",
+                """
+INSERT INTO public.domain_nodes
+  (id, kind, title, lat, lon, payload)
+VALUES
+  ('schema-restore-proof-node', 'TestKind', 'Restore Proof', 53.55, 10.0,
+   '{"info":"source-to-restore"}'::jsonb);
+""",
+            )
+            source_signature = signature("source")
+
+            dump_payload = exec_postgres(
+                [
+                    "pg_dump",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "source",
+                    "-Fc",
+                ],
+                timeout=900,
+            )
+            self.assertTrue(dump_payload)
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "restored",
+                ]
+            )
+            exec_postgres(
+                [
+                    "pg_restore",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "restored",
+                    "--clean",
+                    "--if-exists",
+                    "--no-owner",
+                ],
+                input_bytes=dump_payload,
+                timeout=1200,
+            )
+            restored_signature = signature("restored")
+            self.assertEqual(source_signature, restored_signature)
+
+            psql(
+                "restored",
+                """
+CREATE RULE commonthing_restore_proof_rule AS
+ON UPDATE TO public.domain_nodes
+DO INSTEAD NOTHING;
+""",
+            )
+            drifted_signature = signature("restored")
+            self.assertEqual(
+                restored_signature["tables"],
+                drifted_signature["tables"],
+            )
+            self.assertEqual(
+                restored_signature["sequences"],
+                drifted_signature["sequences"],
+            )
+            self.assertNotEqual(
+                restored_signature["schema_sha256"],
+                drifted_signature["schema_sha256"],
+            )
+        finally:
+            subprocess.run(
+                [docker, "rm", "-f", container],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
 
     def test_database_signature_uses_public_domain_nodes_as_canonical_state(
         self,
