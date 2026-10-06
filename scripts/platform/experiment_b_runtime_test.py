@@ -3,15 +3,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import inspect
-import os
 import json
+import os
 import shutil
+import time
+import uuid
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
-import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
@@ -6778,356 +6778,325 @@ spec:
         self.assertIn("pg_catalog.pg_sequence", source)
         self.assertIn("last_value::text, is_called", source)
         self.assertIn("schema_sha256", source)
-        self.assertIn("_database_schema_catalog", source)
-        self.assertIn("_database_schema_sha256", source)
+        self.assertIn("_restore_stable_database_schema_sha256", source)
+        schema_source = inspect.getsource(
+            runtime._restore_stable_database_schema_sha256
+        )
+        self.assertIn('"-Fc"', schema_source)
+        self.assertIn('"pg_restore"', schema_source)
+        self.assertIn('"--quote-all-identifiers"', schema_source)
+        self.assertIn("CREATE DATABASE", schema_source)
+        self.assertIn("DROP DATABASE IF EXISTS", schema_source)
+        self.assertIn("_run_bound_postgres_client", schema_source)
 
-        catalog_sql = runtime._DATABASE_SCHEMA_CATALOG_SQL
-        for expected_fragment in (
-            "pg_catalog.pg_extension",
-            "pg_catalog.pg_attribute",
-            "pg_catalog.pg_constraint",
-            "pg_catalog.pg_index",
-            "pg_catalog.pg_get_viewdef",
-            "pg_catalog.pg_get_functiondef",
-            "pg_catalog.pg_trigger",
-            "pg_catalog.pg_rewrite",
-            "pg_catalog.pg_get_ruledef",
-            "pg_catalog.pg_policy",
-            "pg_catalog.pg_depend",
-            "pg_catalog.pg_sequence",
-            "pg_catalog.format_type(seq_def.seqtypid, -1)",
-            "'persistence', seq.relpersistence",
-            "logical_a.attnum <= a.attnum",
-            "pg_catalog.pg_type",
+
+    def test_restore_stable_database_schema_signature_uses_scratch_roundtrip(
+        self,
+    ) -> None:
+        scratch_hex = "a" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        canonical = (
+            b"\\restrict stable_key\n"
+            b'CREATE TABLE "public"."example" ("id" integer);\n'
+            b"\\unrestrict stable_key\n"
+        )
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    b"",
+                    b"",
+                    canonical,
+                    b"",
+                ],
+            ) as run_bound,
         ):
-            self.assertIn(expected_fragment, catalog_sql)
-        self.assertNotIn("CREATE DATABASE", catalog_sql)
-        self.assertNotIn("DROP DATABASE", catalog_sql)
-        self.assertNotIn("pg_restore", catalog_sql)
-        self.assertNotIn("pg_dump", catalog_sql)
-
-
-    def test_database_schema_sha256_is_order_and_key_order_stable(
-        self,
-    ) -> None:
-        catalog_a = [
-            {
-                "kind": "schema",
-                "schema": "public",
-            },
-            {
-                "kind": "constraint",
-                "schema": "public",
-                "relation": "example",
-                "name": "example_positive",
-                "definition": "CHECK ((id > 0))",
-            },
-        ]
-        catalog_b = [
-            {
-                "definition": "CHECK ((id > 0))",
-                "name": "example_positive",
-                "relation": "example",
-                "schema": "public",
-                "kind": "constraint",
-            },
-            {
-                "schema": "public",
-                "kind": "schema",
-            },
-        ]
-        sequences_a = [
-            {
-                "schema": "public",
-                "name": "example_id_seq",
-                "last_value": "9",
-                "is_called": True,
-                "start_value": "1",
-                "increment_by": "1",
-                "min_value": "1",
-                "max_value": "9223372036854775807",
-                "cache_size": "1",
-                "cycle": False,
-            }
-        ]
-        sequences_b = [
-            {
-                "cycle": False,
-                "cache_size": "1",
-                "max_value": "9223372036854775807",
-                "min_value": "1",
-                "increment_by": "1",
-                "start_value": "1",
-                "is_called": True,
-                "last_value": "9",
-                "name": "example_id_seq",
-                "schema": "public",
-            }
-        ]
-        self.assertEqual(
-            runtime._database_schema_sha256(catalog_a, sequences_a),
-            runtime._database_schema_sha256(catalog_b, sequences_b),
-        )
-
-
-    def test_database_schema_sha256_ignores_dynamic_sequence_position(
-        self,
-    ) -> None:
-        catalog = [{"kind": "schema", "schema": "public"}]
-        base_sequence = {
-            "schema": "public",
-            "name": "example_id_seq",
-            "last_value": "9",
-            "is_called": True,
-            "start_value": "1",
-            "increment_by": "1",
-            "min_value": "1",
-            "max_value": "9223372036854775807",
-            "cache_size": "1",
-            "cycle": False,
-        }
-        advanced_sequence = {
-            **base_sequence,
-            "last_value": "999",
-            "is_called": False,
-        }
-        self.assertEqual(
-            runtime._database_schema_sha256(
-                catalog,
-                [base_sequence],
-            ),
-            runtime._database_schema_sha256(
-                catalog,
-                [advanced_sequence],
-            ),
-        )
-
-
-    def test_database_schema_sha256_detects_sequence_definition_drift(
-        self,
-    ) -> None:
-        sequences = [
-            {
-                "schema": "public",
-                "name": "example_id_seq",
-                "last_value": "9",
-                "is_called": True,
-                "start_value": "1",
-                "increment_by": "1",
-                "min_value": "1",
-                "max_value": "9223372036854775807",
-                "cache_size": "1",
-                "cycle": False,
-            }
-        ]
-        base = [
-            {"kind": "schema", "schema": "public"},
-            {
-                "kind": "sequence-definition",
-                "schema": "public",
-                "sequence": "example_id_seq",
-                "data_type": "bigint",
-                "persistence": "p",
-            },
-        ]
-        persistence_drift = [
-            base[0],
-            {**base[1], "persistence": "u"},
-        ]
-        type_drift = [
-            base[0],
-            {**base[1], "data_type": "integer"},
-        ]
-        baseline = runtime._database_schema_sha256(base, sequences)
-        self.assertNotEqual(
-            baseline,
-            runtime._database_schema_sha256(
-                persistence_drift,
-                sequences,
-            ),
-        )
-        self.assertNotEqual(
-            baseline,
-            runtime._database_schema_sha256(
-                type_drift,
-                sequences,
-            ),
-        )
-
-
-    def test_database_schema_sha256_detects_sequence_ownership_drift(
-        self,
-    ) -> None:
-        sequences = [
-            {
-                "schema": "public",
-                "name": "example_id_seq",
-                "last_value": "9",
-                "is_called": True,
-                "start_value": "1",
-                "increment_by": "1",
-                "min_value": "1",
-                "max_value": "9223372036854775807",
-                "cache_size": "1",
-                "cycle": False,
-            }
-        ]
-        owned = [
-            {"kind": "schema", "schema": "public"},
-            {
-                "kind": "sequence-ownership",
-                "schema": "public",
-                "sequence": "example_id_seq",
-                "owned_by_schema": "public",
-                "owned_by_relation": "example",
-                "owned_by_column": "id",
-                "dependency_type": "a",
-            },
-        ]
-        detached = [owned[0]]
-        self.assertNotEqual(
-            runtime._database_schema_sha256(owned, sequences),
-            runtime._database_schema_sha256(detached, sequences),
-        )
-
-
-    def test_database_schema_sha256_detects_constraint_definition_drift(
-        self,
-    ) -> None:
-        sequences = [
-            {
-                "schema": "public",
-                "name": "example_id_seq",
-                "last_value": "9",
-                "is_called": True,
-                "start_value": "1",
-                "increment_by": "1",
-                "min_value": "1",
-                "max_value": "9223372036854775807",
-                "cache_size": "1",
-                "cycle": False,
-            }
-        ]
-        before = [
-            {
-                "kind": "constraint",
-                "schema": "public",
-                "relation": "example",
-                "name": "example_positive",
-                "definition": "CHECK ((id > 0))",
-            }
-        ]
-        drifted = [
-            {
-                **before[0],
-                "definition": "CHECK ((id >= 0))",
-            }
-        ]
-        self.assertNotEqual(
-            runtime._database_schema_sha256(before, sequences),
-            runtime._database_schema_sha256(drifted, sequences),
-        )
-
-
-    def test_database_schema_sha256_detects_rewrite_rule_drift(
-        self,
-    ) -> None:
-        baseline = [
-            {"kind": "schema", "schema": "public"},
-            {
-                "kind": "rule",
-                "schema": "public",
-                "relation": "example",
-                "name": "example_rewrite",
-                "definition": (
-                    "CREATE RULE example_rewrite AS "
-                    "ON UPDATE TO public.example DO INSTEAD NOTHING;"
-                ),
-                "enabled": "O",
-            },
-        ]
-        definition_drift = [
-            baseline[0],
-            {
-                **baseline[1],
-                "definition": (
-                    "CREATE RULE example_rewrite AS "
-                    "ON DELETE TO public.example DO INSTEAD NOTHING;"
-                ),
-            },
-        ]
-        enabled_drift = [
-            baseline[0],
-            {**baseline[1], "enabled": "D"},
-        ]
-        baseline_hash = runtime._database_schema_sha256(baseline, [])
-        self.assertNotEqual(
-            baseline_hash,
-            runtime._database_schema_sha256(definition_drift, []),
-        )
-        self.assertNotEqual(
-            baseline_hash,
-            runtime._database_schema_sha256(enabled_drift, []),
-        )
-
-
-    def test_database_schema_catalog_uses_bound_read_only_psql(
-        self,
-    ) -> None:
-        payload = [
-            {"kind": "schema", "schema": "public"},
-            {
-                "kind": "constraint",
-                "schema": "public",
-                "relation": "example",
-                "name": "example_positive",
-                "definition": "CHECK ((id > 0))",
-            },
-        ]
-        with mock.patch.object(
-            runtime,
-            "_run_bound_postgres_client",
-            return_value=json.dumps(payload).encode("utf-8"),
-        ) as run_bound:
-            observed = runtime._database_schema_catalog(
+            observed = runtime._restore_stable_database_schema_sha256(
                 Path("/unused"),
                 "a" * 40,
                 {"container_id": "bound"},
                 ("user", "database"),
             )
 
-        self.assertEqual(observed, payload)
-        self.assertEqual(run_bound.call_count, 1)
-        command = run_bound.call_args.args[3]
-        self.assertEqual(command[0], "psql")
-        self.assertIn("ON_ERROR_STOP=1", command)
-        sql = run_bound.call_args.kwargs["input_bytes"].decode("utf-8")
-        self.assertIn("SET search_path = pg_catalog;", sql)
-        self.assertNotIn("CREATE DATABASE", sql)
-        self.assertNotIn("DROP DATABASE", sql)
+        expected = hashlib.sha256(
+            b"\\restrict <pg-dump-key>\n"
+            b'CREATE TABLE "public"."example" ("id" integer);\n'
+            b"\\unrestrict <pg-dump-key>\n"
+        ).hexdigest()
+        self.assertEqual(observed, expected)
+        self.assertEqual(run_bound.call_count, 5)
+        commands = [call.args[3] for call in run_bound.call_args_list]
+        self.assertIn("-Fc", commands[0])
+        self.assertIn("--schema-only", commands[0])
+        self.assertEqual(commands[2][0], "pg_restore")
+        self.assertIn(scratch_name, commands[2])
+        self.assertIn("--schema-only", commands[2])
+        self.assertEqual(commands[3][0], "pg_dump")
+        self.assertIn(scratch_name, commands[3])
+        self.assertIn("--schema-only", commands[3])
+        self.assertIn(
+            f'CREATE DATABASE "{scratch_name}" TEMPLATE template0;',
+            run_bound.call_args_list[1].kwargs["input_bytes"].decode("utf-8"),
+        )
+        self.assertIn(
+            f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE);',
+            run_bound.call_args_list[4].kwargs["input_bytes"].decode("utf-8"),
+        )
+
+    def test_normalized_database_schema_dump_preserves_function_body_meta_commands(
+        self,
+    ) -> None:
+        source = (
+            b"-- PostgreSQL database dump\n"
+            b"\n"
+            b"\\restrict generated_key\n"
+            b'CREATE FUNCTION "public"."example"() RETURNS "text"\n'
+            b'    LANGUAGE "plpgsql"\n'
+            b"    AS $$\n"
+            b"\\restrict function_semantics\n"
+            b"\\unrestrict function_semantics\n"
+            b"RETURN 'ok';\n"
+            b"$$;\n"
+            b"\n"
+            b"-- PostgreSQL database dump complete\n"
+            b"\n"
+            b"\\unrestrict generated_key\n"
+        )
+        normalized = runtime._normalized_database_schema_dump(source)
+        self.assertIn(b"\\restrict <pg-dump-key>\n", normalized)
+        self.assertIn(b"\\unrestrict <pg-dump-key>\n", normalized)
+        self.assertIn(b"\\restrict function_semantics\n", normalized)
+        self.assertIn(b"\\unrestrict function_semantics\n", normalized)
+        self.assertEqual(
+            normalized.count(b"\\restrict function_semantics"),
+            1,
+        )
+        self.assertEqual(
+            normalized.count(b"\\unrestrict function_semantics"),
+            1,
+        )
+
+    def test_normalized_database_schema_dump_keeps_unicode_nel_distinct_from_lf(
+        self,
+    ) -> None:
+        prefix = (
+            b"-- PostgreSQL database dump\n"
+            b"\n"
+            b"\\restrict stable_key\n"
+            b'CREATE FUNCTION "public"."example"() RETURNS "text"\n'
+            b'    LANGUAGE "sql"\n'
+            b"    AS $$SELECT 'a"
+        )
+        suffix = (
+            b"b';$$;\n"
+            b"\n"
+            b"-- PostgreSQL database dump complete\n"
+            b"\n"
+            b"\\unrestrict stable_key\n"
+        )
+        with_lf = prefix + b"\n" + suffix
+        with_nel = prefix + "\u0085".encode("utf-8") + suffix
+
+        normalized_lf = runtime._normalized_database_schema_dump(with_lf)
+        normalized_nel = runtime._normalized_database_schema_dump(with_nel)
+
+        self.assertNotEqual(normalized_lf, normalized_nel)
+        self.assertIn("\u0085".encode("utf-8"), normalized_nel)
+        self.assertEqual(
+            normalized_nel.replace(
+                b"\\restrict <pg-dump-key>",
+                b"\\restrict stable_key",
+            ).replace(
+                b"\\unrestrict <pg-dump-key>",
+                b"\\unrestrict stable_key",
+            ),
+            with_nel,
+        )
+
+    def test_normalized_database_schema_dump_rejects_mismatched_boundary_keys(
+        self,
+    ) -> None:
+        source = (
+            b"-- PostgreSQL database dump\n"
+            b"\\restrict first_key\n"
+            b"SELECT 1;\n"
+            b"\\unrestrict second_key\n"
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "invalid pg_dump restrict markers",
+        ):
+            runtime._normalized_database_schema_dump(source)
 
 
+    def test_restore_stable_database_schema_signature_cleans_up_after_failure(
+        self,
+    ) -> None:
+        scratch_hex = "b" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    b"",
+                    runtime.RuntimeErrorEB("restore failed"),
+                    b"",
+                ],
+            ) as run_bound,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "restore failed",
+            ),
+        ):
+            runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
 
-    def test_database_schema_catalog_real_dropped_attribute_restore_stability(
+        self.assertEqual(run_bound.call_count, 4)
+        self.assertIn(
+            f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE);',
+            run_bound.call_args_list[-1].kwargs["input_bytes"].decode("utf-8"),
+        )
+
+
+    def test_restore_stable_database_schema_signature_does_not_drop_uncreated_scratch(
+        self,
+    ) -> None:
+        scratch_hex = "c" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    runtime.RuntimeErrorEB("create failed"),
+                ],
+            ) as run_bound,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "create failed",
+            ),
+        ):
+            runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        self.assertEqual(run_bound.call_count, 2)
+        self.assertIn(
+            f'CREATE DATABASE "{scratch_name}" TEMPLATE template0;',
+            run_bound.call_args_list[1].kwargs["input_bytes"].decode("utf-8"),
+        )
+        observed_input = b"\n".join(
+            call.kwargs.get("input_bytes", b"")
+            for call in run_bound.call_args_list
+        )
+        self.assertNotIn(b"DROP DATABASE IF EXISTS", observed_input)
+
+    def test_restore_stable_database_schema_signature_tracks_canonical_schema(
+        self,
+    ) -> None:
+        scratch_hex = "d" * 32
+
+        def signature(schema_archive: bytes, canonical_schema: bytes) -> str:
+            with (
+                mock.patch.object(
+                    runtime.uuid,
+                    "uuid4",
+                    return_value=mock.Mock(hex=scratch_hex),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_run_bound_postgres_client",
+                    side_effect=[
+                        schema_archive,
+                        b"",
+                        b"",
+                        (
+                            b"\\restrict stable_key\n"
+                            + canonical_schema
+                            + b"\\unrestrict stable_key\n"
+                        ),
+                        b"",
+                    ],
+                ),
+            ):
+                return runtime._restore_stable_database_schema_sha256(
+                    Path("/unused"),
+                    "a" * 40,
+                    {"container_id": "bound"},
+                    ("user", "database"),
+                )
+
+        canonical = (
+            b'CREATE TABLE "public"."example" ('
+            b'"id" integer CHECK (("id" > 0)));\n'
+        )
+        formatting_variant = signature(
+            b"source-schema-serialization-a",
+            canonical,
+        )
+        restored_variant = signature(
+            b"source-schema-serialization-b",
+            canonical,
+        )
+        semantic_drift = signature(
+            b"source-schema-serialization-b",
+            (
+                b'CREATE TABLE "public"."example" ('
+                b'"id" integer CHECK (("id" >= 0)));\n'
+            ),
+        )
+        self.assertEqual(formatting_variant, restored_variant)
+        self.assertNotEqual(formatting_variant, semantic_drift)
+
+
+    def test_restore_stable_signature_real_migrations_production_restore(
         self,
     ) -> None:
         docker = shutil.which("docker")
         if docker is None:
             if os.environ.get("GITHUB_ACTIONS") == "true":
                 self.fail(
-                    "required dropped-attribute PostgreSQL regression "
+                    "required migration-built PostgreSQL restore regression "
                     "requires docker in GitHub Actions"
                 )
             self.skipTest(
-                "docker unavailable for dropped-attribute PostgreSQL regression"
+                "docker unavailable for migration-built PostgreSQL restore regression"
             )
         assert docker is not None
+
         postgres_image = (
             "postgres:16@sha256:"
             "be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c"
         )
         container = (
-            "commonthing-schema-drop-gap-regression-"
+            "commonthing-schema-production-restore-"
             + uuid.uuid4().hex[:12]
         )
 
@@ -7135,21 +7104,41 @@ spec:
             arguments: list[str],
             *,
             input_bytes: bytes | None = None,
+            check: bool = True,
+            timeout: int = 300,
         ) -> subprocess.CompletedProcess[bytes]:
             return subprocess.run(
                 [docker, *arguments],
                 input=input_bytes,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                check=True,
+                check=check,
+                timeout=timeout,
             )
 
-        def psql(database: str, sql: str) -> str:
+        def exec_postgres(
+            command: list[str],
+            *,
+            input_bytes: bytes = b"",
+            timeout: int = 300,
+        ) -> bytes:
             completed = run_container(
+                ["exec", "-i", container, *command],
+                input_bytes=input_bytes,
+                check=False,
+                timeout=timeout,
+            )
+            if completed.returncode != 0:
+                raise runtime.RuntimeErrorEB(
+                    "migration-built PostgreSQL proof command failed "
+                    f"({completed.returncode}): "
+                    + completed.stderr.decode("utf-8", "replace")[-3000:]
+                )
+            return completed.stdout
+
+        def psql(database: str, sql: str) -> str:
+            return exec_postgres(
                 [
-                    "exec",
-                    "-i",
-                    container,
                     "psql",
                     "-U",
                     "postgres",
@@ -7160,14 +7149,35 @@ spec:
                     "-qAt",
                 ],
                 input_bytes=sql.encode("utf-8"),
-            )
-            return completed.stdout.decode("utf-8").strip()
+            ).decode("utf-8").strip()
 
-        def fingerprint(database: str) -> str:
-            catalog = json.loads(
-                psql(database, runtime._DATABASE_SCHEMA_CATALOG_SQL)
+        def bound_postgres_client(
+            _root: Path,
+            _source_commit: str,
+            _binding: dict[str, object],
+            command: list[str],
+            *,
+            input_bytes: bytes = b"",
+            timeout: int = 900,
+        ) -> bytes:
+            return exec_postgres(
+                command,
+                input_bytes=input_bytes,
+                timeout=timeout,
             )
-            return runtime._database_schema_sha256(catalog, [])
+
+        def signature(database: str) -> dict[str, object]:
+            with mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=bound_postgres_client,
+            ):
+                return runtime._database_signature(
+                    Path("/unused"),
+                    database_identity=("postgres", database),
+                    source_commit="a" * 40,
+                    postgres_binding={"proof": "docker"},
+                )
 
         try:
             run_container(
@@ -7181,7 +7191,8 @@ spec:
                     "-e",
                     "POSTGRES_USER=postgres",
                     postgres_image,
-                ]
+                ],
+                timeout=120,
             )
             for _ in range(90):
                 ready = subprocess.run(
@@ -7190,6 +7201,8 @@ spec:
                         "exec",
                         container,
                         "pg_isready",
+                        "-h",
+                        "127.0.0.1",
                         "-U",
                         "postgres",
                     ],
@@ -7202,8 +7215,7 @@ spec:
                 time.sleep(1)
             else:
                 self.fail(
-                    "dropped-attribute PostgreSQL regression container "
-                    "was not ready"
+                    "migration-built PostgreSQL regression container was not ready"
                 )
 
             run_container(
@@ -7213,561 +7225,131 @@ spec:
                     "createdb",
                     "-U",
                     "postgres",
-                    "migration_gap_source",
+                    "source",
                 ]
             )
             psql(
-                "migration_gap_source",
-                r"""
-CREATE TABLE public.commonthing_gap_probe (
-  first_col bigint,
-  dropped_col text,
-  last_col text
+                "source",
+                """
+CREATE TABLE public._sqlx_migrations (
+  version BIGINT PRIMARY KEY,
+  description TEXT NOT NULL,
+  installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+  success BOOLEAN NOT NULL,
+  checksum BYTEA NOT NULL,
+  execution_time BIGINT NOT NULL
 );
-ALTER TABLE public.commonthing_gap_probe DROP COLUMN dropped_col;
-CREATE TYPE public.commonthing_gap_composite AS (
-  first_attr bigint,
-  dropped_attr text,
-  last_attr text
-);
-ALTER TYPE public.commonthing_gap_composite DROP ATTRIBUTE dropped_attr;
-CREATE RULE commonthing_gap_rule AS
-ON UPDATE TO public.commonthing_gap_probe
+""",
+            )
+            migrations = sorted(
+                (runtime.ROOT / "apps/api/migrations").glob("*.up.sql")
+            )
+            self.assertGreater(len(migrations), 0)
+            for migration in migrations:
+                version_text, separator, description_part = migration.name.partition("_")
+                self.assertEqual(separator, "_")
+                self.assertTrue(version_text.isdigit())
+                self.assertTrue(description_part.endswith(".up.sql"))
+                migration_bytes = migration.read_bytes()
+                exec_postgres(
+                    [
+                        "psql",
+                        "-U",
+                        "postgres",
+                        "-d",
+                        "source",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "--single-transaction",
+                        "-q",
+                    ],
+                    input_bytes=migration_bytes,
+                )
+                description = (
+                    description_part.removesuffix(".up.sql")
+                    .replace("_", " ")
+                    .replace("'", "''")
+                )
+                checksum = hashlib.sha384(migration_bytes).hexdigest()
+                psql(
+                    "source",
+                    "INSERT INTO public._sqlx_migrations "
+                    "(version, description, success, checksum, execution_time) "
+                    f"VALUES ({int(version_text)}, '{description}', true, "
+                    f"decode('{checksum}', 'hex'), 0);",
+                )
+
+            psql(
+                "source",
+                """
+INSERT INTO public.domain_nodes
+  (id, kind, title, lat, lon, payload)
+VALUES
+  ('schema-restore-proof-node', 'TestKind', 'Restore Proof', 53.55, 10.0,
+   '{"info":"source-to-restore"}'::jsonb);
+""",
+            )
+            source_signature = signature("source")
+
+            dump_payload = exec_postgres(
+                [
+                    "pg_dump",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "source",
+                    "-Fc",
+                ],
+                timeout=900,
+            )
+            self.assertTrue(dump_payload)
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "restored",
+                ]
+            )
+            exec_postgres(
+                [
+                    "pg_restore",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "restored",
+                    "--clean",
+                    "--if-exists",
+                    "--no-owner",
+                ],
+                input_bytes=dump_payload,
+                timeout=1200,
+            )
+            restored_signature = signature("restored")
+            self.assertEqual(source_signature, restored_signature)
+
+            psql(
+                "restored",
+                """
+CREATE RULE commonthing_restore_proof_rule AS
+ON UPDATE TO public.domain_nodes
 DO INSTEAD NOTHING;
 """,
             )
-            before = fingerprint("migration_gap_source")
-            schema_archive = run_container(
-                [
-                    "exec",
-                    container,
-                    "pg_dump",
-                    "-U",
-                    "postgres",
-                    "-d",
-                    "migration_gap_source",
-                    "-Fc",
-                    "--schema-only",
-                    "--no-owner",
-                    "--no-privileges",
-                ]
-            ).stdout
-            run_container(
-                [
-                    "exec",
-                    container,
-                    "createdb",
-                    "-U",
-                    "postgres",
-                    "migration_gap_restored",
-                ]
-            )
-            run_container(
-                [
-                    "exec",
-                    "-i",
-                    container,
-                    "pg_restore",
-                    "-U",
-                    "postgres",
-                    "--schema-only",
-                    "--no-owner",
-                    "--no-privileges",
-                    "--exit-on-error",
-                    "-d",
-                    "migration_gap_restored",
-                ],
-                input_bytes=schema_archive,
-            )
-            after = fingerprint("migration_gap_restored")
-            self.assertEqual(before, after)
-
-            psql(
-                "migration_gap_restored",
-                "ALTER TABLE public.commonthing_gap_probe "
-                "DISABLE RULE commonthing_gap_rule;",
-            )
-            disabled_rule = fingerprint("migration_gap_restored")
-            self.assertNotEqual(after, disabled_rule)
-
-            psql(
-                "migration_gap_restored",
-                "ALTER TABLE public.commonthing_gap_probe "
-                "ENABLE RULE commonthing_gap_rule;",
+            drifted_signature = signature("restored")
+            self.assertEqual(
+                restored_signature["tables"],
+                drifted_signature["tables"],
             )
             self.assertEqual(
-                after,
-                fingerprint("migration_gap_restored"),
-            )
-
-            psql(
-                "migration_gap_restored",
-                "DROP RULE commonthing_gap_rule "
-                "ON public.commonthing_gap_probe; "
-                "CREATE RULE commonthing_gap_rule AS "
-                "ON DELETE TO public.commonthing_gap_probe "
-                "DO INSTEAD NOTHING;",
-            )
-            definition_drift = fingerprint("migration_gap_restored")
-            self.assertNotEqual(after, definition_drift)
-        finally:
-            subprocess.run(
-                [docker, "rm", "-f", container],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-
-
-    @unittest.skipUnless(
-        os.environ.get("COMMONTHING_HISTORICAL_POSTGRES_DUMP")
-        and os.environ.get("COMMONTHING_HISTORICAL_POSTGRES_DIAGNOSTIC"),
-        "historical PostgreSQL schema-catalog regression is opt-in",
-    )
-    def test_database_schema_catalog_real_historical_restore_stability(
-        self,
-    ) -> None:
-        dump_path = Path(
-            os.environ["COMMONTHING_HISTORICAL_POSTGRES_DUMP"]
-        ).resolve()
-        diagnostic_path = Path(
-            os.environ["COMMONTHING_HISTORICAL_POSTGRES_DIAGNOSTIC"]
-        ).resolve()
-        expected_dump_sha256 = (
-            "37a11cdbf6810c0fcd8d16ec59b8ca09746da11466c63dee54a1e8f62bee9bef"
-        )
-        postgres_image = (
-            "postgres:16@sha256:"
-            "be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c"
-        )
-        self.assertEqual(
-            runtime.sha256_file(dump_path),
-            expected_dump_sha256,
-        )
-        diagnostic = json.loads(
-            diagnostic_path.read_text(encoding="utf-8")
-        )
-        self.assertEqual(
-            diagnostic["dump_sha256"],
-            expected_dump_sha256,
-        )
-        self.assertEqual(
-            diagnostic["postgres_image"],
-            postgres_image,
-        )
-        self.assertEqual(
-            diagnostic["tables"]["expected_count"],
-            43,
-        )
-        self.assertEqual(
-            diagnostic["tables"]["restored_count"],
-            43,
-        )
-        self.assertTrue(diagnostic["tables"]["equal"])
-        self.assertTrue(diagnostic["sequences"]["equal"])
-        self.assertNotEqual(
-            diagnostic["schema"]["expected_sha256"],
-            diagnostic["schema"]["restored_sha256"],
-        )
-
-        docker = shutil.which("docker")
-        self.assertIsNotNone(docker)
-        assert docker is not None
-        container = (
-            "commonthing-schema-catalog-regression-"
-            + uuid.uuid4().hex[:12]
-        )
-
-        def run_container(
-            arguments: list[str],
-            *,
-            input_bytes: bytes | None = None,
-        ) -> subprocess.CompletedProcess[bytes]:
-            return subprocess.run(
-                [docker, *arguments],
-                input=input_bytes,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-
-        def psql(database: str, sql: str) -> str:
-            completed = run_container(
-                [
-                    "exec",
-                    "-i",
-                    container,
-                    "psql",
-                    "-U",
-                    "postgres",
-                    "-d",
-                    database,
-                    "-v",
-                    "ON_ERROR_STOP=1",
-                    "-qAt",
-                ],
-                input_bytes=sql.encode("utf-8"),
-            )
-            return completed.stdout.decode("utf-8").strip()
-
-        static_sequence_sql = r"""
-SET search_path = pg_catalog;
-SELECT COALESCE(
-  json_agg(
-    json_build_object(
-      'schema', n.nspname,
-      'name', c.relname,
-      'start_value', s.seqstart::text,
-      'increment_by', s.seqincrement::text,
-      'min_value', s.seqmin::text,
-      'max_value', s.seqmax::text,
-      'cache_size', s.seqcache::text,
-      'cycle', s.seqcycle
-    )
-    ORDER BY n.nspname, c.relname
-  ),
-  '[]'::json
-)::text
-FROM pg_catalog.pg_class c
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid
-WHERE c.relkind = 'S'
-  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-  AND n.nspname !~ '^pg_toast'
-  AND n.nspname !~ '^pg_temp_';
-"""
-
-        def fingerprint(database: str) -> dict[str, object]:
-            catalog = json.loads(
-                psql(
-                    database,
-                    runtime._DATABASE_SCHEMA_CATALOG_SQL,
-                )
-            )
-            sequences = json.loads(
-                psql(database, static_sequence_sql)
-            )
-            return {
-                "sha256": runtime._database_schema_sha256(
-                    catalog,
-                    sequences,
-                ),
-                "catalog_items": len(catalog),
-                "sequence_count": len(sequences),
-            }
-
-        try:
-            run_container(
-                [
-                    "run",
-                    "-d",
-                    "--name",
-                    container,
-                    "-e",
-                    "POSTGRES_PASSWORD=proof",
-                    "-e",
-                    "POSTGRES_USER=postgres",
-                    postgres_image,
-                ]
-            )
-            for _ in range(90):
-                ready = subprocess.run(
-                    [
-                        docker,
-                        "exec",
-                        container,
-                        "pg_isready",
-                        "-U",
-                        "postgres",
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                if ready.returncode == 0:
-                    break
-                time.sleep(1)
-            else:
-                self.fail("historical PostgreSQL regression container was not ready")
-
-            run_container(
-                [
-                    "cp",
-                    str(dump_path),
-                    f"{container}:/tmp/source.dump",
-                ]
-            )
-            run_container(
-                [
-                    "exec",
-                    container,
-                    "createdb",
-                    "-U",
-                    "postgres",
-                    "restore_a",
-                ]
-            )
-            run_container(
-                [
-                    "exec",
-                    container,
-                    "pg_restore",
-                    "-U",
-                    "postgres",
-                    "--schema-only",
-                    "--no-owner",
-                    "--no-privileges",
-                    "--exit-on-error",
-                    "-d",
-                    "restore_a",
-                    "/tmp/source.dump",
-                ]
-            )
-            first = fingerprint("restore_a")
-
-            schema_archive = run_container(
-                [
-                    "exec",
-                    container,
-                    "pg_dump",
-                    "-U",
-                    "postgres",
-                    "-d",
-                    "restore_a",
-                    "-Fc",
-                    "--schema-only",
-                    "--no-owner",
-                    "--no-privileges",
-                ]
-            ).stdout
-            run_container(
-                [
-                    "exec",
-                    container,
-                    "createdb",
-                    "-U",
-                    "postgres",
-                    "restore_b",
-                ]
-            )
-            run_container(
-                [
-                    "exec",
-                    "-i",
-                    container,
-                    "pg_restore",
-                    "-U",
-                    "postgres",
-                    "--schema-only",
-                    "--no-owner",
-                    "--no-privileges",
-                    "--exit-on-error",
-                    "-d",
-                    "restore_b",
-                ],
-                input_bytes=schema_archive,
-            )
-            second = fingerprint("restore_b")
-            self.assertEqual(first, second)
-
-            run_container(
-                [
-                    "exec",
-                    container,
-                    "createdb",
-                    "-U",
-                    "postgres",
-                    "restore_ownership",
-                ]
-            )
-            run_container(
-                [
-                    "exec",
-                    "-i",
-                    container,
-                    "pg_restore",
-                    "-U",
-                    "postgres",
-                    "--schema-only",
-                    "--no-owner",
-                    "--no-privileges",
-                    "--exit-on-error",
-                    "-d",
-                    "restore_ownership",
-                ],
-                input_bytes=schema_archive,
-            )
-            ownership_baseline = fingerprint("restore_ownership")
-            self.assertEqual(second, ownership_baseline)
-            owned_sequence = psql(
-                "restore_ownership",
-                r"""
-SELECT pg_catalog.format('%I.%I', seq_n.nspname, seq.relname)
-FROM pg_catalog.pg_class seq
-JOIN pg_catalog.pg_namespace seq_n ON seq_n.oid = seq.relnamespace
-JOIN pg_catalog.pg_depend dep
-  ON dep.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
- AND dep.objid = seq.oid
- AND dep.objsubid = 0
- AND dep.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
- AND dep.refobjsubid > 0
- AND dep.deptype IN ('a', 'i')
-WHERE seq.relkind = 'S'
-  AND seq_n.nspname NOT IN ('pg_catalog', 'information_schema')
-ORDER BY seq_n.nspname, seq.relname
-LIMIT 1;
-""",
-            )
-            self.assertTrue(owned_sequence)
-            psql(
-                "restore_ownership",
-                f"ALTER SEQUENCE {owned_sequence} OWNED BY NONE;",
-            )
-            ownership_drift = fingerprint("restore_ownership")
-            self.assertNotEqual(
-                ownership_baseline["sha256"],
-                ownership_drift["sha256"],
-            )
-            self.assertEqual(
-                int(ownership_baseline["catalog_items"]) - 1,
-                ownership_drift["catalog_items"],
-            )
-
-            run_container(
-                [
-                    "exec",
-                    container,
-                    "createdb",
-                    "-U",
-                    "postgres",
-                    "restore_sequence_definition",
-                ]
-            )
-            run_container(
-                [
-                    "exec",
-                    "-i",
-                    container,
-                    "pg_restore",
-                    "-U",
-                    "postgres",
-                    "--schema-only",
-                    "--no-owner",
-                    "--no-privileges",
-                    "--exit-on-error",
-                    "-d",
-                    "restore_sequence_definition",
-                ],
-                input_bytes=schema_archive,
-            )
-            definition_restore_baseline = fingerprint(
-                "restore_sequence_definition"
-            )
-            self.assertEqual(second, definition_restore_baseline)
-            psql(
-                "restore_sequence_definition",
-                "CREATE SEQUENCE public.commonthing_sequence_definition_probe "
-                "AS integer MINVALUE 1 MAXVALUE 1000000 START WITH 1 "
-                "INCREMENT BY 1 CACHE 1;",
-            )
-            sequence_definition_baseline = fingerprint(
-                "restore_sequence_definition"
-            )
-            psql(
-                "restore_sequence_definition",
-                "ALTER SEQUENCE public.commonthing_sequence_definition_probe "
-                "SET UNLOGGED;",
-            )
-            sequence_persistence_drift = fingerprint(
-                "restore_sequence_definition"
+                restored_signature["sequences"],
+                drifted_signature["sequences"],
             )
             self.assertNotEqual(
-                sequence_definition_baseline["sha256"],
-                sequence_persistence_drift["sha256"],
-            )
-            self.assertEqual(
-                sequence_definition_baseline["catalog_items"],
-                sequence_persistence_drift["catalog_items"],
-            )
-            self.assertEqual(
-                sequence_definition_baseline["sequence_count"],
-                sequence_persistence_drift["sequence_count"],
-            )
-            psql(
-                "restore_sequence_definition",
-                "ALTER SEQUENCE public.commonthing_sequence_definition_probe "
-                "SET LOGGED;",
-            )
-            self.assertEqual(
-                sequence_definition_baseline,
-                fingerprint("restore_sequence_definition"),
-            )
-            psql(
-                "restore_sequence_definition",
-                "ALTER SEQUENCE public.commonthing_sequence_definition_probe "
-                "AS bigint;",
-            )
-            sequence_type_drift = fingerprint(
-                "restore_sequence_definition"
-            )
-            self.assertNotEqual(
-                sequence_definition_baseline["sha256"],
-                sequence_type_drift["sha256"],
-            )
-            self.assertEqual(
-                sequence_definition_baseline["catalog_items"],
-                sequence_type_drift["catalog_items"],
-            )
-            self.assertEqual(
-                sequence_definition_baseline["sequence_count"],
-                sequence_type_drift["sequence_count"],
-            )
-
-            psql(
-                "restore_b",
-                "ALTER TABLE public.domain_nodes "
-                "ADD CONSTRAINT commonthing_schema_regression_probe "
-                "CHECK (true) NOT VALID;",
-            )
-            drifted = fingerprint("restore_b")
-            self.assertNotEqual(
-                second["sha256"],
-                drifted["sha256"],
-            )
-            self.assertEqual(
-                int(second["catalog_items"]) + 1,
-                drifted["catalog_items"],
-            )
-            proof = {
-                "schema_version": 1,
-                "status": "pass",
-                "historical_dump_sha256": expected_dump_sha256,
-                "postgres_image": postgres_image,
-                "historical_old_schema_expected_sha256":
-                    diagnostic["schema"]["expected_sha256"],
-                "historical_old_schema_restored_sha256":
-                    diagnostic["schema"]["restored_sha256"],
-                "historical_old_text_hash_mismatch": True,
-                "first_restore": first,
-                "second_restore": second,
-                "deliberate_constraint_drift": drifted,
-                "deliberate_sequence_ownership_drift": ownership_drift,
-                "deliberate_sequence_persistence_drift":
-                    sequence_persistence_drift,
-                "deliberate_sequence_type_drift": sequence_type_drift,
-                "restore_stable": True,
-                "semantic_drift_detected": True,
-                "sequence_ownership_drift_detected": True,
-                "sequence_persistence_drift_detected": True,
-                "sequence_type_drift_detected": True,
-            }
-            print(
-                "HISTORICAL_SCHEMA_CATALOG_PROOF="
-                + json.dumps(
-                    proof,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+                restored_signature["schema_sha256"],
+                drifted_signature["schema_sha256"],
             )
         finally:
             subprocess.run(

@@ -15075,620 +15075,174 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
 
 
 
-_DATABASE_SCHEMA_CATALOG_SQL = r"""
-SET search_path = pg_catalog;
+def _normalized_database_schema_dump(schema_bytes: bytes) -> bytes:
+    try:
+        schema_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeErrorEB(
+            "database schema signature is not UTF-8"
+        ) from exc
 
-SELECT COALESCE(
-  json_agg(entry ORDER BY kind, identity),
-  '[]'::json
-)::text
-FROM (
-  SELECT
-    'schema'::text AS kind,
-    json_build_array(n.nspname)::text AS identity,
-    json_build_object(
-      'kind', 'schema',
-      'schema', n.nspname
-    ) AS entry
-  FROM pg_catalog.pg_namespace n
-  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
+    lines = schema_bytes.split(b"\n")
+    restrict_prefix = b"\\restrict "
+    unrestrict_prefix = b"\\unrestrict "
 
-  UNION ALL
-
-  SELECT
-    'extension',
-    json_build_array(e.extname)::text,
-    json_build_object(
-      'kind', 'extension',
-      'name', e.extname,
-      'schema', n.nspname,
-      'version', e.extversion,
-      'relocatable', e.extrelocatable
-    )
-  FROM pg_catalog.pg_extension e
-  JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
-
-  UNION ALL
-
-  SELECT
-    'relation',
-    json_build_array(n.nspname, c.relname)::text,
-    json_build_object(
-      'kind', 'relation',
-      'schema', n.nspname,
-      'name', c.relname,
-      'relation_kind', c.relkind,
-      'persistence', c.relpersistence,
-      'access_method', am.amname,
-      'replica_identity', c.relreplident,
-      'row_security', c.relrowsecurity,
-      'force_row_security', c.relforcerowsecurity,
-      'partition_key',
-        CASE WHEN c.relkind = 'p'
-          THEN pg_catalog.pg_get_partkeydef(c.oid)
-          ELSE NULL
-        END,
-      'partition_bound',
-        CASE WHEN c.relispartition
-          THEN pg_catalog.pg_get_expr(c.relpartbound, c.oid, false)
-          ELSE NULL
-        END,
-      'options',
-        COALESCE(
-          (
-            SELECT json_agg(option_value ORDER BY option_value)
-            FROM unnest(COALESCE(c.reloptions, ARRAY[]::text[])) AS option_value
-          ),
-          '[]'::json
+    leading_restrict_index: int | None = None
+    for index, line in enumerate(lines):
+        if line.startswith(restrict_prefix):
+            leading_restrict_index = index
+            break
+        if line and not line.startswith(b"--"):
+            raise RuntimeErrorEB(
+                "database schema signature is missing leading pg_dump restrict marker"
+            )
+    if leading_restrict_index is None:
+        raise RuntimeErrorEB(
+            "database schema signature is missing leading pg_dump restrict marker"
         )
-    )
-  FROM pg_catalog.pg_class c
-  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-  LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
-  WHERE c.relkind IN ('r', 'p', 'v', 'm')
-    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
 
-  UNION ALL
-
-  SELECT
-    'column',
-    json_build_array(n.nspname, c.relname, a.attname)::text,
-    json_build_object(
-      'kind', 'column',
-      'schema', n.nspname,
-      'relation', c.relname,
-      'position',
-        (
-          SELECT count(*)
-          FROM pg_catalog.pg_attribute logical_a
-          WHERE logical_a.attrelid = a.attrelid
-            AND logical_a.attnum > 0
-            AND NOT logical_a.attisdropped
-            AND logical_a.attnum <= a.attnum
-        ),
-      'name', a.attname,
-      'type', pg_catalog.format_type(a.atttypid, a.atttypmod),
-      'not_null', a.attnotnull,
-      'default',
-        CASE WHEN d.oid IS NULL
-          THEN NULL
-          ELSE pg_catalog.pg_get_expr(d.adbin, d.adrelid, false)
-        END,
-      'identity', a.attidentity,
-      'generated', a.attgenerated,
-      'collation',
-        CASE WHEN a.attcollation = 0
-          THEN NULL
-          ELSE json_build_object(
-            'schema', coll_n.nspname,
-            'name', coll.collname
-          )
-        END
-    )
-  FROM pg_catalog.pg_attribute a
-  JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-  LEFT JOIN pg_catalog.pg_attrdef d
-    ON d.adrelid = a.attrelid
-   AND d.adnum = a.attnum
-  LEFT JOIN pg_catalog.pg_collation coll ON coll.oid = a.attcollation
-  LEFT JOIN pg_catalog.pg_namespace coll_n ON coll_n.oid = coll.collnamespace
-  WHERE c.relkind IN ('r', 'p', 'v', 'm')
-    AND a.attnum > 0
-    AND NOT a.attisdropped
-    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
-
-  UNION ALL
-
-  SELECT
-    'constraint',
-    json_build_array(
-      n.nspname,
-      COALESCE(rel_n.nspname, type_n.nspname, ''),
-      COALESCE(rel.relname, typ.typname, ''),
-      con.conname
-    )::text,
-    json_build_object(
-      'kind', 'constraint',
-      'schema', n.nspname,
-      'name', con.conname,
-      'constraint_type', con.contype,
-      'relation_schema', rel_n.nspname,
-      'relation', rel.relname,
-      'type_schema', type_n.nspname,
-      'type', typ.typname,
-      'definition', pg_catalog.pg_get_constraintdef(con.oid, false),
-      'validated', con.convalidated,
-      'deferrable', con.condeferrable,
-      'deferred', con.condeferred,
-      'no_inherit', con.connoinherit
-    )
-  FROM pg_catalog.pg_constraint con
-  JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
-  LEFT JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
-  LEFT JOIN pg_catalog.pg_namespace rel_n ON rel_n.oid = rel.relnamespace
-  LEFT JOIN pg_catalog.pg_type typ ON typ.oid = con.contypid
-  LEFT JOIN pg_catalog.pg_namespace type_n ON type_n.oid = typ.typnamespace
-  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
-
-  UNION ALL
-
-  SELECT
-    'index',
-    json_build_array(n.nspname, rel.relname, idx.relname)::text,
-    json_build_object(
-      'kind', 'index',
-      'schema', n.nspname,
-      'relation', rel.relname,
-      'name', idx.relname,
-      'definition', pg_catalog.pg_get_indexdef(i.indexrelid, 0, false),
-      'unique', i.indisunique,
-      'primary', i.indisprimary,
-      'exclusion', i.indisexclusion,
-      'immediate', i.indimmediate,
-      'valid', i.indisvalid,
-      'ready', i.indisready,
-      'clustered', i.indisclustered,
-      'replica_identity', i.indisreplident
-    )
-  FROM pg_catalog.pg_index i
-  JOIN pg_catalog.pg_class idx ON idx.oid = i.indexrelid
-  JOIN pg_catalog.pg_class rel ON rel.oid = i.indrelid
-  JOIN pg_catalog.pg_namespace n ON n.oid = rel.relnamespace
-  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
-
-  UNION ALL
-
-  SELECT
-    'view',
-    json_build_array(n.nspname, c.relname)::text,
-    json_build_object(
-      'kind', 'view',
-      'schema', n.nspname,
-      'name', c.relname,
-      'materialized', c.relkind = 'm',
-      'definition', pg_catalog.pg_get_viewdef(c.oid, false)
-    )
-  FROM pg_catalog.pg_class c
-  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-  WHERE c.relkind IN ('v', 'm')
-    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
-
-  UNION ALL
-
-  SELECT
-    'routine',
-    json_build_array(
-      n.nspname,
-      p.proname,
-      pg_catalog.pg_get_function_identity_arguments(p.oid)
-    )::text,
-    json_build_object(
-      'kind', 'routine',
-      'schema', n.nspname,
-      'name', p.proname,
-      'routine_kind', p.prokind,
-      'identity_arguments',
-        pg_catalog.pg_get_function_identity_arguments(p.oid),
-      'result', pg_catalog.pg_get_function_result(p.oid),
-      'language', l.lanname,
-      'definition', pg_catalog.pg_get_functiondef(p.oid),
-      'volatility', p.provolatile,
-      'strict', p.proisstrict,
-      'security_definer', p.prosecdef,
-      'leakproof', p.proleakproof,
-      'parallel', p.proparallel,
-      'config',
-        COALESCE(
-          (
-            SELECT json_agg(config_value ORDER BY config_value)
-            FROM unnest(COALESCE(p.proconfig, ARRAY[]::text[])) AS config_value
-          ),
-          '[]'::json
+    trailing_unrestrict_index = len(lines) - 1
+    while (
+        trailing_unrestrict_index >= 0
+        and not lines[trailing_unrestrict_index]
+    ):
+        trailing_unrestrict_index -= 1
+    if (
+        trailing_unrestrict_index <= leading_restrict_index
+        or not lines[trailing_unrestrict_index].startswith(unrestrict_prefix)
+    ):
+        raise RuntimeErrorEB(
+            "database schema signature is missing trailing pg_dump unrestrict marker"
         )
-    )
-  FROM pg_catalog.pg_proc p
-  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-  JOIN pg_catalog.pg_language l ON l.oid = p.prolang
-  WHERE p.prokind IN ('f', 'p')
-    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
 
-  UNION ALL
+    restrict_token = lines[leading_restrict_index][len(restrict_prefix):]
+    unrestrict_token = lines[trailing_unrestrict_index][len(unrestrict_prefix):]
+    ascii_whitespace = b" \t\r\n\v\f"
+    if (
+        not restrict_token
+        or not unrestrict_token
+        or not restrict_token.isascii()
+        or not unrestrict_token.isascii()
+        or any(byte in ascii_whitespace for byte in restrict_token)
+        or any(byte in ascii_whitespace for byte in unrestrict_token)
+        or restrict_token != unrestrict_token
+    ):
+        raise RuntimeErrorEB(
+            "database schema signature has invalid pg_dump restrict markers"
+        )
 
-  SELECT
-    'trigger',
-    json_build_array(n.nspname, rel.relname, t.tgname)::text,
-    json_build_object(
-      'kind', 'trigger',
-      'schema', n.nspname,
-      'relation', rel.relname,
-      'name', t.tgname,
-      'definition', pg_catalog.pg_get_triggerdef(t.oid, false),
-      'enabled', t.tgenabled
-    )
-  FROM pg_catalog.pg_trigger t
-  JOIN pg_catalog.pg_class rel ON rel.oid = t.tgrelid
-  JOIN pg_catalog.pg_namespace n ON n.oid = rel.relnamespace
-  WHERE NOT t.tgisinternal
-    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
-
-  UNION ALL
-
-  SELECT
-    'rule',
-    json_build_array(n.nspname, rel.relname, rw.rulename)::text,
-    json_build_object(
-      'kind', 'rule',
-      'schema', n.nspname,
-      'relation', rel.relname,
-      'name', rw.rulename,
-      'definition', pg_catalog.pg_get_ruledef(rw.oid, false),
-      'enabled', rw.ev_enabled
-    )
-  FROM pg_catalog.pg_rewrite rw
-  JOIN pg_catalog.pg_class rel ON rel.oid = rw.ev_class
-  JOIN pg_catalog.pg_namespace n ON n.oid = rel.relnamespace
-  WHERE rw.rulename <> '_RETURN'
-    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
-
-  UNION ALL
-
-  SELECT
-    'policy',
-    json_build_array(n.nspname, rel.relname, pol.polname)::text,
-    json_build_object(
-      'kind', 'policy',
-      'schema', n.nspname,
-      'relation', rel.relname,
-      'name', pol.polname,
-      'command', pol.polcmd,
-      'permissive', pol.polpermissive,
-      'roles',
-        COALESCE(
-          (
-            SELECT json_agg(role_name ORDER BY role_name)
-            FROM (
-              SELECT
-                CASE WHEN role_oid = 0
-                  THEN 'PUBLIC'
-                  ELSE pg_catalog.pg_get_userbyid(role_oid)
-                END AS role_name
-              FROM unnest(pol.polroles) AS role_oid
-            ) policy_roles
-          ),
-          '[]'::json
-        ),
-      'using', pg_catalog.pg_get_expr(pol.polqual, pol.polrelid, false),
-      'with_check',
-        pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid, false)
-    )
-  FROM pg_catalog.pg_policy pol
-  JOIN pg_catalog.pg_class rel ON rel.oid = pol.polrelid
-  JOIN pg_catalog.pg_namespace n ON n.oid = rel.relnamespace
-  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
-
-  UNION ALL
-
-  SELECT
-    'sequence-definition',
-    json_build_array(seq_n.nspname, seq.relname)::text,
-    json_build_object(
-      'kind', 'sequence-definition',
-      'schema', seq_n.nspname,
-      'sequence', seq.relname,
-      'data_type', pg_catalog.format_type(seq_def.seqtypid, -1),
-      'persistence', seq.relpersistence
-    )
-  FROM pg_catalog.pg_class seq
-  JOIN pg_catalog.pg_namespace seq_n ON seq_n.oid = seq.relnamespace
-  JOIN pg_catalog.pg_sequence seq_def ON seq_def.seqrelid = seq.oid
-  WHERE seq.relkind = 'S'
-    AND seq_n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND seq_n.nspname !~ '^pg_toast'
-    AND seq_n.nspname !~ '^pg_temp_'
-
-  UNION ALL
-
-  SELECT
-    'sequence-ownership',
-    json_build_array(seq_n.nspname, seq.relname)::text,
-    json_build_object(
-      'kind', 'sequence-ownership',
-      'schema', seq_n.nspname,
-      'sequence', seq.relname,
-      'owned_by_schema', owner_n.nspname,
-      'owned_by_relation', owner_rel.relname,
-      'owned_by_column', owner_att.attname,
-      'dependency_type', dep.deptype
-    )
-  FROM pg_catalog.pg_class seq
-  JOIN pg_catalog.pg_namespace seq_n ON seq_n.oid = seq.relnamespace
-  JOIN pg_catalog.pg_depend dep
-    ON dep.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-   AND dep.objid = seq.oid
-   AND dep.objsubid = 0
-   AND dep.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
-   AND dep.refobjsubid > 0
-   AND dep.deptype IN ('a', 'i')
-  JOIN pg_catalog.pg_class owner_rel ON owner_rel.oid = dep.refobjid
-  JOIN pg_catalog.pg_namespace owner_n ON owner_n.oid = owner_rel.relnamespace
-  JOIN pg_catalog.pg_attribute owner_att
-    ON owner_att.attrelid = dep.refobjid
-   AND owner_att.attnum = dep.refobjsubid
-   AND NOT owner_att.attisdropped
-  WHERE seq.relkind = 'S'
-    AND seq_n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND seq_n.nspname !~ '^pg_toast'
-    AND seq_n.nspname !~ '^pg_temp_'
-
-  UNION ALL
-
-  SELECT
-    'type',
-    json_build_array(n.nspname, typ.typname)::text,
-    json_build_object(
-      'kind', 'type',
-      'schema', n.nspname,
-      'name', typ.typname,
-      'type_kind', typ.typtype,
-      'enum_values',
-        CASE WHEN typ.typtype = 'e'
-          THEN (
-            SELECT json_agg(e.enumlabel ORDER BY e.enumsortorder)
-            FROM pg_catalog.pg_enum e
-            WHERE e.enumtypid = typ.oid
-          )
-          ELSE NULL
-        END,
-      'domain_base',
-        CASE WHEN typ.typtype = 'd'
-          THEN pg_catalog.format_type(typ.typbasetype, typ.typtypmod)
-          ELSE NULL
-        END,
-      'domain_not_null',
-        CASE WHEN typ.typtype = 'd' THEN typ.typnotnull ELSE NULL END,
-      'domain_default',
-        CASE WHEN typ.typtype = 'd' AND typ.typdefaultbin IS NOT NULL
-          THEN pg_catalog.pg_get_expr(typ.typdefaultbin, 0, false)
-          ELSE NULL
-        END,
-      'range_subtype',
-        CASE WHEN typ.typtype = 'r'
-          THEN pg_catalog.format_type(range_def.rngsubtype, -1)
-          ELSE NULL
-        END,
-      'range_collation',
-        CASE WHEN typ.typtype = 'r' AND range_def.rngcollation <> 0
-          THEN json_build_object(
-            'schema', range_coll_n.nspname,
-            'name', range_coll.collname
-          )
-          ELSE NULL
-        END,
-      'range_canonical',
-        CASE WHEN typ.typtype = 'r' AND range_def.rngcanonical <> 0
-          THEN range_def.rngcanonical::regprocedure::text
-          ELSE NULL
-        END,
-      'range_subdiff',
-        CASE WHEN typ.typtype = 'r' AND range_def.rngsubdiff <> 0
-          THEN range_def.rngsubdiff::regprocedure::text
-          ELSE NULL
-        END,
-      'multirange_range',
-        CASE WHEN typ.typtype = 'm'
-          THEN pg_catalog.format_type(multirange_def.rngtypid, -1)
-          ELSE NULL
-        END,
-      'composite_attributes',
-        CASE WHEN typ.typtype = 'c'
-          THEN COALESCE(
-            (
-              SELECT json_agg(
-                json_build_object(
-                  'position',
-                    (
-                      SELECT count(*)
-                      FROM pg_catalog.pg_attribute logical_a
-                      WHERE logical_a.attrelid = a.attrelid
-                        AND logical_a.attnum > 0
-                        AND NOT logical_a.attisdropped
-                        AND logical_a.attnum <= a.attnum
-                    ),
-                  'name', a.attname,
-                  'type', pg_catalog.format_type(a.atttypid, a.atttypmod),
-                  'collation',
-                    CASE WHEN a.attcollation = 0
-                      THEN NULL
-                      ELSE json_build_object(
-                        'schema', attr_coll_n.nspname,
-                        'name', attr_coll.collname
-                      )
-                    END
-                )
-                ORDER BY a.attnum
-              )
-              FROM pg_catalog.pg_attribute a
-              LEFT JOIN pg_catalog.pg_collation attr_coll
-                ON attr_coll.oid = a.attcollation
-              LEFT JOIN pg_catalog.pg_namespace attr_coll_n
-                ON attr_coll_n.oid = attr_coll.collnamespace
-              WHERE a.attrelid = typ.typrelid
-                AND a.attnum > 0
-                AND NOT a.attisdropped
-            ),
-            '[]'::json
-          )
-          ELSE NULL
-        END
-    )
-  FROM pg_catalog.pg_type typ
-  JOIN pg_catalog.pg_namespace n ON n.oid = typ.typnamespace
-  LEFT JOIN pg_catalog.pg_class type_rel ON type_rel.oid = typ.typrelid
-  LEFT JOIN pg_catalog.pg_range range_def ON range_def.rngtypid = typ.oid
-  LEFT JOIN pg_catalog.pg_range multirange_def
-    ON multirange_def.rngmultitypid = typ.oid
-  LEFT JOIN pg_catalog.pg_collation range_coll
-    ON range_coll.oid = range_def.rngcollation
-  LEFT JOIN pg_catalog.pg_namespace range_coll_n
-    ON range_coll_n.oid = range_coll.collnamespace
-  WHERE typ.typtype IN ('e', 'd', 'r', 'm', 'c')
-    AND (typ.typtype <> 'c' OR type_rel.relkind = 'c')
-    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-    AND n.nspname !~ '^pg_toast'
-    AND n.nspname !~ '^pg_temp_'
-) catalog_items;
-"""
+    lines[leading_restrict_index] = b"\\restrict <pg-dump-key>"
+    lines[trailing_unrestrict_index] = b"\\unrestrict <pg-dump-key>"
+    return b"\n".join(lines)
 
 
-def _database_schema_catalog(
+def _restore_stable_database_schema_sha256(
     root: Path,
     source_commit: str,
     postgres_binding: dict[str, Any],
     database_identity: tuple[str, str],
-) -> list[dict[str, Any]]:
-    raw_bytes = _run_bound_postgres_client(
+) -> str:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature requires exact source commit"
+        )
+    username, database = database_identity
+    if not username or not database:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature requires database identity"
+        )
+    scratch_database = f"commonthing_schema_signature_{uuid.uuid4().hex}"
+    if len(scratch_database) > 63 or re.fullmatch(
+        r"[a-z0-9_]+",
+        scratch_database,
+    ) is None:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature scratch database name is invalid"
+        )
+
+    schema_archive = _run_bound_postgres_client(
         root,
         source_commit,
         postgres_binding,
         [
-            *_database_client_argv("psql", database_identity),
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-qAt",
+            *_database_client_argv("pg_dump", database_identity),
+            "-Fc",
+            "--schema-only",
+            "--no-owner",
+            "--no-privileges",
         ],
-        input_bytes=_DATABASE_SCHEMA_CATALOG_SQL.encode("utf-8"),
         timeout=900,
     )
-    try:
-        raw = raw_bytes.decode("utf-8").strip()
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    if not schema_archive:
         raise RuntimeErrorEB(
-            "database schema catalog is not valid UTF-8 JSON"
-        ) from exc
-    if (
-        not isinstance(value, list)
-        or not value
-        or any(
-            not isinstance(item, dict)
-            or not isinstance(item.get("kind"), str)
-            or not item["kind"]
-            for item in value
+            "restore-stable schema signature archive is empty"
         )
-    ):
-        raise RuntimeErrorEB("database schema catalog is incomplete")
-    return value
 
+    scratch_identity = (username, scratch_database)
+    create_sql = (
+        f'CREATE DATABASE "{scratch_database}" TEMPLATE template0;\n'
+    ).encode("utf-8")
+    drop_sql = (
+        f'DROP DATABASE IF EXISTS "{scratch_database}" WITH (FORCE);\n'
+    ).encode("utf-8")
+    control_command = [
+        *_database_client_argv("psql", database_identity),
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-qAt",
+    ]
 
-def _database_schema_sort_key(value: dict[str, Any]) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _database_schema_manifest(
-    catalog: list[dict[str, Any]],
-    sequences: list[Any],
-) -> dict[str, Any]:
-    static_sequence_fields = (
-        "schema",
-        "name",
-        "start_value",
-        "increment_by",
-        "min_value",
-        "max_value",
-        "cache_size",
-        "cycle",
-    )
-    static_sequences: list[dict[str, Any]] = []
-    for item in sequences:
-        if not isinstance(item, dict):
-            raise RuntimeErrorEB(
-                "database schema manifest sequence is invalid"
+    scratch_created = False
+    try:
+        _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            control_command,
+            input_bytes=create_sql,
+            timeout=120,
+        )
+        scratch_created = True
+        _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            [
+                *_database_client_argv("pg_restore", scratch_identity),
+                "--schema-only",
+                "--no-owner",
+                "--no-privileges",
+                "--exit-on-error",
+            ],
+            input_bytes=schema_archive,
+            timeout=900,
+        )
+        canonical_schema = _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            [
+                *_database_client_argv("pg_dump", scratch_identity),
+                "--schema-only",
+                "--no-owner",
+                "--no-privileges",
+                "--quote-all-identifiers",
+            ],
+            timeout=900,
+        )
+        return hashlib.sha256(
+            _normalized_database_schema_dump(canonical_schema)
+        ).hexdigest()
+    finally:
+        if scratch_created:
+            _run_bound_postgres_client(
+                root,
+                source_commit,
+                postgres_binding,
+                control_command,
+                input_bytes=drop_sql,
+                timeout=120,
             )
-        if any(field not in item for field in static_sequence_fields):
-            raise RuntimeErrorEB(
-                "database schema manifest sequence is incomplete"
-            )
-        static_sequences.append(
-            {field: item[field] for field in static_sequence_fields}
-        )
-
-    if (
-        not isinstance(catalog, list)
-        or not catalog
-        or any(
-            not isinstance(item, dict)
-            or not isinstance(item.get("kind"), str)
-            or not item["kind"]
-            for item in catalog
-        )
-    ):
-        raise RuntimeErrorEB("database schema manifest catalog is invalid")
-
-    return {
-        "catalog": sorted(
-            (dict(item) for item in catalog),
-            key=_database_schema_sort_key,
-        ),
-        "sequences": sorted(
-            static_sequences,
-            key=_database_schema_sort_key,
-        ),
-    }
-
-
-def _database_schema_sha256(
-    catalog: list[dict[str, Any]],
-    sequences: list[Any],
-) -> str:
-    return _stable_json_sha256(
-        _database_schema_manifest(catalog, sequences)
-    )
 
 
 def _database_signature(
@@ -15858,13 +15412,13 @@ SELECT json_build_object(
         if database_identity is None
         else database_identity
     )
-    schema_catalog: list[dict[str, Any]] | None = None
     if postgres_binding is None:
         raw = _psql(
             root,
             sql,
             database_identity=identity,
         )
+        schema_sha256: str | None = None
     else:
         if source_commit is None:
             raise RuntimeErrorEB(
@@ -15889,7 +15443,7 @@ SELECT json_build_object(
             raise RuntimeErrorEB(
                 "database continuity signature is not UTF-8"
             ) from exc
-        schema_catalog = _database_schema_catalog(
+        schema_sha256 = _restore_stable_database_schema_sha256(
             root,
             source_commit,
             postgres_binding,
@@ -15928,11 +15482,8 @@ SELECT json_build_object(
         raise RuntimeErrorEB(
             "database continuity signature has no canonical domain state"
         )
-    if schema_catalog is not None:
-        value["schema_sha256"] = _database_schema_sha256(
-            schema_catalog,
-            sequences,
-        )
+    if schema_sha256 is not None:
+        value["schema_sha256"] = schema_sha256
     return value
 
 
