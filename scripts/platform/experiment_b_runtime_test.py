@@ -15734,6 +15734,38 @@ def install(*args, **kwargs):
             runtime._functional_serving_runtime_semantic_binding(after),
         )
 
+    def test_gateway_collection_json_uses_filtered_raw_collection(self) -> None:
+        payload = {
+            "metadata": {"resourceVersion": "950"},
+            "items": [],
+        }
+        result = subprocess.CompletedProcess(
+            ["kubectl"],
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with mock.patch.object(
+            runtime,
+            "_kubectl",
+            return_value=result,
+        ) as kubectl:
+            observed = runtime._gateway_collection_json(Path("/tmp"))
+
+        self.assertEqual(observed, payload)
+        argv = kubectl.call_args.args[1]
+        self.assertEqual(argv[:2], ["get", "--raw"])
+        raw_url = runtime.urllib.parse.urlsplit(argv[2])
+        self.assertEqual(
+            raw_url.path,
+            "/apis/gateway.networking.k8s.io/v1/namespaces/"
+            f"{runtime.APP_NAMESPACE}/gateways",
+        )
+        self.assertEqual(
+            runtime.urllib.parse.parse_qs(raw_url.query),
+            {"fieldSelector": ["metadata.name=commonthing-experiment-b"]},
+        )
+
     def test_functional_dependency_replay_rejects_transient_changes(
         self,
     ) -> None:
@@ -15748,7 +15780,10 @@ def install(*args, **kwargs):
                     ("weltgewebe-api", "weltgewebe-web")
                 )
             },
-            "gateway": {"resource_version": "300"},
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+            },
             "httproute": {"resource_version": "400"},
             "httproute_inventory": {
                 "resource_version": "450",
@@ -15821,6 +15856,21 @@ def install(*args, **kwargs):
                     mock.patch.object(runtime, "kube_env", return_value={}),
                     mock.patch.object(
                         runtime,
+                        "_gateway_collection_json",
+                        return_value={
+                            "metadata": {"resourceVersion": "350"},
+                            "items": [
+                                {
+                                    "metadata": {
+                                        "uid": "gateway-uid",
+                                        "resourceVersion": "300",
+                                    }
+                                }
+                            ],
+                        },
+                    ),
+                    mock.patch.object(
+                        runtime,
                         "run",
                         side_effect=results,
                     ) as replay,
@@ -15865,7 +15915,7 @@ def install(*args, **kwargs):
                     ),
                     (
                         "Gateway",
-                        "300",
+                        "350",
                         "fieldSelector",
                         "metadata.name=commonthing-experiment-b",
                         "/apis/gateway.networking.k8s.io/v1/namespaces/"
@@ -15913,6 +15963,52 @@ def install(*args, **kwargs):
                         expected_query,
                         expected_subject,
                     )
+
+    def test_functional_dependency_replay_rejects_gateway_snapshot_drift(
+        self,
+    ) -> None:
+        serving_runtime = {
+            "services": {
+                name: {"endpoints": {"resource_version": str(index + 100)}}
+                for index, name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                )
+            },
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+            },
+            "httproute_inventory": {
+                "resource_version": "450",
+                "routes": {},
+            },
+        }
+        with (
+            mock.patch.object(
+                runtime,
+                "_gateway_collection_json",
+                return_value={
+                    "metadata": {"resourceVersion": "350"},
+                    "items": [
+                        {
+                            "metadata": {
+                                "uid": "gateway-uid",
+                                "resourceVersion": "301",
+                            }
+                        }
+                    ],
+                },
+            ),
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "Gateway snapshot drifted",
+            ),
+        ):
+            with runtime._guard_functional_service_endpoints(
+                Path("/tmp"),
+                serving_runtime,
+            ):
+                pass
 
     def test_functional_httproute_inventory_rejects_additional_gateway_attachment(
         self,
@@ -15987,7 +16083,10 @@ def install(*args, **kwargs):
                     ("weltgewebe-api", "weltgewebe-web")
                 )
             },
-            "gateway": {"resource_version": "300"},
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+            },
             "httproute": {"resource_version": "400"},
             "httproute_inventory": {
                 "resource_version": "450",
@@ -16013,6 +16112,21 @@ def install(*args, **kwargs):
             mock.patch.object(runtime, "kube_env", return_value={}),
             mock.patch.object(
                 runtime,
+                "_gateway_collection_json",
+                return_value={
+                    "metadata": {"resourceVersion": "350"},
+                    "items": [
+                        {
+                            "metadata": {
+                                "uid": "gateway-uid",
+                                "resourceVersion": "300",
+                            }
+                        }
+                    ],
+                },
+            ),
+            mock.patch.object(
+                runtime,
                 "run",
                 return_value=result,
             ) as replay,
@@ -16024,6 +16138,12 @@ def install(*args, **kwargs):
                 pass
 
         self.assertEqual(replay.call_count, 4)
+        gateway_argv = replay.call_args_list[2].args[0]
+        gateway_url = runtime.urllib.parse.urlsplit(gateway_argv[3])
+        gateway_query = runtime.urllib.parse.parse_qs(gateway_url.query)
+        self.assertEqual(gateway_query["resourceVersion"], ["350"])
+        self.assertNotEqual(gateway_query["resourceVersion"], ["300"])
+
         route_argv = replay.call_args_list[3].args[0]
         route_url = runtime.urllib.parse.urlsplit(route_argv[3])
         self.assertEqual(

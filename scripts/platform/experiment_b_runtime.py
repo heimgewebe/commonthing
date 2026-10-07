@@ -10634,6 +10634,31 @@ def _endpoint_slice_collection_json(
     return value
 
 
+def _gateway_collection_json(root: Path) -> dict[str, Any]:
+    namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
+    query = urllib.parse.urlencode(
+        {"fieldSelector": "metadata.name=commonthing-experiment-b"}
+    )
+    result = _kubectl(
+        root,
+        [
+            "get",
+            "--raw",
+            (
+                f"/apis/gateway.networking.k8s.io/v1/namespaces/"
+                f"{namespace_path}/gateways?{query}"
+            ),
+        ],
+    )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeErrorEB("Gateway raw JSON readback failed") from exc
+    if not isinstance(value, dict):
+        raise RuntimeErrorEB("Gateway raw JSON readback is not an object")
+    return value
+
+
 def _httproute_collection_json(root: Path) -> dict[str, Any]:
     namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
     result = _kubectl(
@@ -14262,22 +14287,54 @@ def _guard_functional_service_endpoints(
 
     namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
     gateway = serving_runtime.get("gateway")
-    gateway_resource_version = (
+    gateway_uid = gateway.get("uid") if isinstance(gateway, dict) else None
+    gateway_object_resource_version = (
         gateway.get("resource_version")
         if isinstance(gateway, dict)
         else None
     )
     if (
-        not isinstance(gateway_resource_version, str)
-        or not gateway_resource_version
+        not isinstance(gateway_uid, str)
+        or not gateway_uid
+        or not isinstance(gateway_object_resource_version, str)
+        or not gateway_object_resource_version
     ):
         raise RuntimeErrorEB(
-            "functional serving dependency replay has no resourceVersion: Gateway"
+            "functional serving dependency replay has no exact Gateway revision"
+        )
+    gateway_collection = _gateway_collection_json(root)
+    gateway_collection_metadata = gateway_collection.get("metadata")
+    gateway_items = gateway_collection.get("items")
+    gateway_watch_resource_version = (
+        gateway_collection_metadata.get("resourceVersion")
+        if isinstance(gateway_collection_metadata, dict)
+        else None
+    )
+    if (
+        not isinstance(gateway_watch_resource_version, str)
+        or not gateway_watch_resource_version
+        or not isinstance(gateway_items, list)
+        or len(gateway_items) != 1
+        or not isinstance(gateway_items[0], dict)
+    ):
+        raise RuntimeErrorEB(
+            "functional serving dependency replay Gateway snapshot is invalid"
+        )
+    gateway_snapshot_revision = _kubernetes_object_revision(
+        gateway_items[0],
+        "Gateway collection snapshot",
+    )
+    if gateway_snapshot_revision != {
+        "uid": gateway_uid,
+        "resource_version": gateway_object_resource_version,
+    }:
+        raise RuntimeErrorEB(
+            "functional serving dependency replay Gateway snapshot drifted"
         )
     dependencies.append(
         (
             "Gateway",
-            gateway_resource_version,
+            gateway_watch_resource_version,
             "fieldSelector",
             "metadata.name=commonthing-experiment-b",
             (
