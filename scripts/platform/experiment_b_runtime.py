@@ -14326,6 +14326,8 @@ def _guard_functional_service_endpoints(
     }
     if (
         gateway_snapshot_revision["uid"] != gateway.get("uid")
+        or gateway_snapshot_revision["resource_version"]
+        != gateway.get("resource_version")
         or gateway_snapshot_semantic != expected_gateway_semantic
     ):
         raise RuntimeErrorEB(

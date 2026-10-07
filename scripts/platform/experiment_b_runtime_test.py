@@ -15766,6 +15766,232 @@ def install(*args, **kwargs):
             {"fieldSelector": ["metadata.name=commonthing-experiment-b"]},
         )
 
+    def test_functional_dependency_replay_accepts_real_gateway_snapshot(
+        self,
+    ) -> None:
+        serving_runtime = {
+            "services": {
+                name: {"endpoints": {"resource_version": str(index + 100)}}
+                for index, name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                )
+            },
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+                "generation": 1,
+                "gateway_class": "cilium",
+                "listener": "http",
+                "programmed": True,
+            },
+            "httproute_inventory": {
+                "resource_version": "450",
+                "routes": {},
+            },
+        }
+        gateway = {
+            "metadata": {
+                "name": "commonthing-experiment-b",
+                "namespace": runtime.APP_NAMESPACE,
+                "uid": "gateway-uid",
+                "resourceVersion": "300",
+                "generation": 1,
+            },
+            "spec": {
+                "gatewayClassName": "cilium",
+                "listeners": [
+                    {
+                        "name": "http",
+                        "protocol": "HTTP",
+                        "port": 80,
+                        "allowedRoutes": {
+                            "namespaces": {"from": "Same"},
+                            "kinds": [
+                                {
+                                    "group": "gateway.networking.k8s.io",
+                                    "kind": "HTTPRoute",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Programmed",
+                        "status": "True",
+                        "observedGeneration": 1,
+                    }
+                ]
+            },
+        }
+        result = subprocess.CompletedProcess(
+            ["kubectl"],
+            0,
+            stdout="",
+            stderr="",
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "_gateway_collection_json",
+                return_value={
+                    "metadata": {"resourceVersion": "350"},
+                    "items": [gateway],
+                },
+            ),
+            mock.patch.object(
+                runtime,
+                "toolchain",
+                return_value={"tools": {"kubectl": "/usr/bin/kubectl"}},
+            ),
+            mock.patch.object(runtime, "kube_env", return_value={}),
+            mock.patch.object(runtime, "run", return_value=result) as replay,
+        ):
+            with runtime._guard_functional_service_endpoints(
+                Path("/tmp"),
+                serving_runtime,
+            ):
+                pass
+
+        self.assertEqual(replay.call_count, 4)
+
+    def test_functional_dependency_replay_rejects_gateway_snapshot_drift(
+        self,
+    ) -> None:
+        serving_runtime = {
+            "services": {
+                name: {"endpoints": {"resource_version": str(index + 100)}}
+                for index, name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                )
+            },
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+                "generation": 1,
+                "gateway_class": "cilium",
+                "listener": "http",
+                "programmed": True,
+            },
+            "httproute_inventory": {
+                "resource_version": "450",
+                "routes": {},
+            },
+        }
+        expected_semantic = {
+            "generation": 1,
+            "gateway_class": "cilium",
+            "listener": "http",
+            "programmed": True,
+        }
+        cases = (
+            (
+                "resource-version",
+                {"uid": "gateway-uid", "resourceVersion": "301"},
+                expected_semantic,
+            ),
+            (
+                "uid",
+                {"uid": "other-gateway-uid", "resourceVersion": "300"},
+                expected_semantic,
+            ),
+            (
+                "semantic",
+                {"uid": "gateway-uid", "resourceVersion": "300"},
+                {**expected_semantic, "programmed": False},
+            ),
+        )
+        for label, metadata, semantic in cases:
+            with self.subTest(label=label):
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "_gateway_collection_json",
+                        return_value={
+                            "metadata": {"resourceVersion": "350"},
+                            "items": [{"metadata": metadata}],
+                        },
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "_require_gateway_ready",
+                        return_value=semantic,
+                    ),
+                    self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB,
+                        "Gateway snapshot drifted",
+                    ),
+                ):
+                    with runtime._guard_functional_service_endpoints(
+                        Path("/tmp"),
+                        serving_runtime,
+                    ):
+                        pass
+
+    def test_functional_dependency_replay_rejects_invalid_gateway_snapshot(
+        self,
+    ) -> None:
+        serving_runtime = {
+            "services": {
+                name: {"endpoints": {"resource_version": str(index + 100)}}
+                for index, name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                )
+            },
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+                "generation": 1,
+                "gateway_class": "cilium",
+                "listener": "http",
+                "programmed": True,
+            },
+            "httproute_inventory": {
+                "resource_version": "450",
+                "routes": {},
+            },
+        }
+        item = {
+            "metadata": {
+                "uid": "gateway-uid",
+                "resourceVersion": "300",
+            }
+        }
+        cases = (
+            ("missing-list-rv", {"metadata": {}, "items": [item]}),
+            (
+                "no-items",
+                {"metadata": {"resourceVersion": "350"}, "items": []},
+            ),
+            (
+                "multiple-items",
+                {
+                    "metadata": {"resourceVersion": "350"},
+                    "items": [item, item],
+                },
+            ),
+        )
+        for label, payload in cases:
+            with self.subTest(label=label):
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "_gateway_collection_json",
+                        return_value=payload,
+                    ),
+                    self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB,
+                        "Gateway snapshot is invalid",
+                    ),
+                ):
+                    with runtime._guard_functional_service_endpoints(
+                        Path("/tmp"),
+                        serving_runtime,
+                    ):
+                        pass
+
     def test_functional_dependency_replay_rejects_transient_changes(
         self,
     ) -> None:
