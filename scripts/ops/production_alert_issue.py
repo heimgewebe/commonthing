@@ -3,9 +3,9 @@
 
 A red workflow run is easy to ignore and repeats every few minutes. Instead,
 an alerting classification opens one issue labelled ``production-alert``;
-repository watchers get a notification for it. While the alert lasts, a new
-comment is added only when the alert's fingerprint (state and live commit)
-changes. Only a ``current`` classification resolves the issue: ``pending``
+the operator is explicitly assigned; actual notification delivery is not
+proven until acknowledged. While the alert lasts, a new comment is added only
+when its fingerprint (state and live commit) changes. Only a ``current`` classification resolves the issue: ``pending``
 and ``superseded`` runs are no production proof and leave it open.
 
 ``--drill`` opens and immediately closes a separately labelled test issue, so
@@ -40,6 +40,7 @@ NON_ALERTING_STATES = frozenset({"current", "superseded", "pending"})
 
 class IssueClient(Protocol):
     def open_issues(self, label: str) -> list[dict[str, Any]]: ...
+    def ensure_assignee(self, issue: dict[str, Any]) -> None: ...
     def comments(self, number: int) -> list[dict[str, Any]]: ...
     def create_issue(self, title: str, body: str, label: str) -> dict[str, Any]: ...
     def comment(self, number: int, body: str) -> None: ...
@@ -47,12 +48,18 @@ class IssueClient(Protocol):
 
 
 class GitHubIssueClient:
-    def __init__(self, repository: str, token: str, timeout: float = 15.0) -> None:
+    def __init__(
+        self, repository: str, token: str, timeout: float = 15.0,
+        assignee: str | None = None,
+    ) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             raise ValueError(f"invalid repository {repository!r}")
         self._base = f"{API_ROOT}/repos/{repository}"
+        if assignee is not None and not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", assignee):
+            raise ValueError("invalid alert assignee")
         self._token = token
         self._timeout = timeout
+        self._assignee = assignee
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -75,7 +82,38 @@ class GitHubIssueClient:
         issues = self._request(
             "GET", f"/issues?state=open&labels={label}&sort=created&direction=asc&per_page=100"
         )
-        return [issue for issue in issues if "pull_request" not in issue]
+        result = [issue for issue in issues if "pull_request" not in issue]
+        if label == ALERT_LABEL:
+            # A public issue labelled by a third party cannot impersonate our alert.
+            result = [issue for issue in result if _trusted_alert_author(issue)]
+        return result
+
+    def _has_assignee(self, issue: dict[str, Any]) -> bool:
+        # GitHub logins are case-insensitive; reject missing or non-string logins.
+        return self._assignee is not None and any(
+            isinstance(account, dict)
+            and isinstance(account.get("login"), str)
+            and account["login"].casefold() == self._assignee.casefold()
+            for account in issue.get("assignees") or []
+        )
+
+    def ensure_assignee(self, issue: dict[str, Any]) -> None:
+        """Repair only the handled issue; fail if GitHub does not confirm ownership."""
+        if not self._assignee:
+            raise ValueError("production alert assignee is not configured")
+        if self._has_assignee(issue):
+            return
+        number = issue.get("number")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise ValueError("alert issue has invalid number")
+        updated = self._request(
+            "POST", f"/issues/{number}/assignees", {"assignees": [self._assignee]}
+        )
+        self._require_assignee(updated)
+
+    def _require_assignee(self, issue: dict[str, Any]) -> None:
+        if self._assignee and not self._has_assignee(issue):
+            raise ValueError(f"issue #{issue.get('number')} has no verified alert assignee")
 
     def comments(self, number: int) -> list[dict[str, Any]]:
         # Follow every page: the newest fingerprint may sit past comment 100.
@@ -99,10 +137,33 @@ class GitHubIssueClient:
 
     def create_issue(self, title: str, body: str, label: str) -> dict[str, Any]:
         self.ensure_label(label)
-        issue = self._request("POST", "/issues", {"title": title, "body": body, "labels": [label]})
-        names = {item.get("name") for item in issue.get("labels") or [] if isinstance(item, dict)}
-        if label not in names:
-            raise ValueError(f"issue #{issue.get('number')} was created without label {label!r}")
+        # Publish the incident before assigning it. GitHub rejects a create
+        # with an unassignable login (HTTP 422), which must never hide an alarm.
+        payload: dict[str, Any] = {"title": title, "body": body, "labels": [label]}
+        issue = self._request("POST", "/issues", payload)
+        try:
+            names = {item.get("name") for item in issue.get("labels") or [] if isinstance(item, dict)}
+            if label not in names:
+                raise ValueError(f"issue #{issue.get('number')} was created without label {label!r}")
+            if self._assignee:
+                # Verify ownership separately; on failure the real issue stays open.
+                self.ensure_assignee(issue)
+        except (OSError, ValueError):
+            # Unlike a real alert, a failed controlled drill must not be stranded.
+            number = issue.get("number")
+            if (
+                label == DRILL_LABEL
+                and isinstance(number, int)
+                and not isinstance(number, bool)
+                and number > 0
+            ):
+                try:
+                    self.close(number)
+                except (OSError, ValueError) as cleanup_exc:
+                    raise ValueError(
+                        f"drill issue #{number} is unverified and could not be closed"
+                    ) from cleanup_exc
+            raise
         return issue
 
     def comment(self, number: int, body: str) -> None:
@@ -167,9 +228,12 @@ def monitor_failure(reason: str) -> dict[str, Any]:
 
 
 def reconcile(client: IssueClient, classification: dict[str, Any], run_url: str) -> str:
+    # Inspect first and publish any new alarm detail before checking ownership.
+    # GitHub rejecting an assignee must still fail the run, never suppress an
+    # escalation comment or block the primary issue because of duplicates.
+    state = classification.get("state")
     open_alerts = client.open_issues(ALERT_LABEL)
     issue = open_alerts[0] if open_alerts else None
-    state = classification.get("state")
 
     if classification.get("alert") is True:
         fingerprint = str(classification.get("fingerprint") or f"{state}:none")
@@ -184,14 +248,15 @@ def reconcile(client: IssueClient, classification: dict[str, Any], run_url: str)
                 ALERT_LABEL,
             )
             return "opened"
-        if latest_fingerprint(issue, client.comments(issue["number"])) == fingerprint:
-            return "unchanged"
-        client.comment(
-            issue["number"],
-            "Der Alarm hat sich geändert.\n\n" + _details(classification, run_url) + "\n\n"
-            + _marker(fingerprint),
-        )
-        return "updated"
+        changed = latest_fingerprint(issue, client.comments(issue["number"])) != fingerprint
+        if changed:
+            client.comment(
+                issue["number"],
+                "Der Alarm hat sich geändert.\n\n"
+                + _details(classification, run_url) + "\n\n" + _marker(fingerprint),
+            )
+        client.ensure_assignee(issue)
+        return "updated" if changed else "unchanged"
 
     if state == "current" and issue is not None:
         client.comment(
@@ -201,6 +266,9 @@ def reconcile(client: IssueClient, classification: dict[str, Any], run_url: str)
         )
         client.close(issue["number"])
         return "resolved"
+    # pending/superseded are not recovery: the still-open incident needs an owner.
+    if issue is not None:
+        client.ensure_assignee(issue)
     return "unchanged"
 
 
@@ -274,11 +342,15 @@ def main(argv: list[str] | None = None) -> int:
 
     token = os.environ.get("GITHUB_TOKEN", "")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
-    if not token or not repository:
-        print("ERROR: GITHUB_TOKEN and GITHUB_REPOSITORY are required", file=sys.stderr)
+    assignee = os.environ.get("PRODUCTION_ALERT_ASSIGNEE", "")
+    if not token or not repository or not assignee:
+        print(
+            "ERROR: GITHUB_TOKEN, GITHUB_REPOSITORY and PRODUCTION_ALERT_ASSIGNEE are required",
+            file=sys.stderr,
+        )
         return 2
-    client = GitHubIssueClient(repository, token)
     try:
+        client = GitHubIssueClient(repository, token, assignee=assignee)
         if args.drill:
             action = drill(client, args.run_url)
         else:

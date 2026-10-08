@@ -376,6 +376,8 @@ jobs:
     needs: verify-live-commit
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      PRODUCTION_ALERT_ASSIGNEE: alexdermohr
     permissions:
       contents: read
       issues: write
@@ -402,6 +404,7 @@ jobs:
           python scripts/ops/production_alert_issue.py --drill
           --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
       - name: Open, update or resolve the production alert
+        if: ${{ !cancelled() }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
