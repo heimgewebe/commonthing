@@ -90,14 +90,22 @@ class GitHubIssueClient:
                     self._ensure_assignee(issue)
         return result
 
+    def _has_assignee(self, issue: dict[str, Any]) -> bool:
+        # GitHub logins are case-insensitive; reject missing or non-string logins.
+        return self._assignee is not None and any(
+            isinstance(account, dict)
+            and isinstance(account.get("login"), str)
+            and account["login"].casefold() == self._assignee.casefold()
+            for account in issue.get("assignees") or []
+        )
+
     def _ensure_assignee(self, issue: dict[str, Any]) -> None:
-        """Repair preexisting unassigned alerts; never accept a silent API omission."""
+        """Repair missing assignees and verify GitHub's actual returned state."""
         assert self._assignee is not None
-        assigned = {a.get("login") for a in issue.get("assignees") or [] if isinstance(a, dict)}
-        if self._assignee in assigned:
+        if self._has_assignee(issue):
             return
         number = issue.get("number")
-        if not isinstance(number, int) or number < 1:
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
             raise ValueError("alert issue has invalid number")
         updated = self._request(
             "POST", f"/issues/{number}/assignees", {"assignees": [self._assignee]}
@@ -105,9 +113,7 @@ class GitHubIssueClient:
         self._require_assignee(updated)
 
     def _require_assignee(self, issue: dict[str, Any]) -> None:
-        if self._assignee and self._assignee not in {
-            a.get("login") for a in issue.get("assignees") or [] if isinstance(a, dict)
-        }:
+        if self._assignee and not self._has_assignee(issue):
             raise ValueError(f"issue #{issue.get('number')} has no verified alert assignee")
 
     def comments(self, number: int) -> list[dict[str, Any]]:
@@ -136,10 +142,29 @@ class GitHubIssueClient:
         if self._assignee:
             payload["assignees"] = [self._assignee]
         issue = self._request("POST", "/issues", payload)
-        names = {item.get("name") for item in issue.get("labels") or [] if isinstance(item, dict)}
-        if label not in names:
-            raise ValueError(f"issue #{issue.get('number')} was created without label {label!r}")
-        self._require_assignee(issue)
+        try:
+            names = {item.get("name") for item in issue.get("labels") or [] if isinstance(item, dict)}
+            if label not in names:
+                raise ValueError(f"issue #{issue.get('number')} was created without label {label!r}")
+            if self._assignee:
+                # GitHub may ignore assignees in the create request. Repair once.
+                self._ensure_assignee(issue)
+        except (OSError, ValueError):
+            # Unlike a real alert, a failed controlled drill must not be stranded.
+            number = issue.get("number")
+            if (
+                label == DRILL_LABEL
+                and isinstance(number, int)
+                and not isinstance(number, bool)
+                and number > 0
+            ):
+                try:
+                    self.close(number)
+                except (OSError, ValueError) as cleanup_exc:
+                    raise ValueError(
+                        f"drill issue #{number} is unverified and could not be closed"
+                    ) from cleanup_exc
+            raise
         return issue
 
     def comment(self, number: int, body: str) -> None:

@@ -655,6 +655,7 @@ class RecordingClient(ALERT.GitHubIssueClient):
         returned_labels: list[str],
         assignee: str | None = None,
         api_assignees: list[str] | None = None,
+        repair_assignees: list[str] | None = None,
     ) -> None:
         super().__init__("owner/repo", "token", assignee=assignee)
         self.calls: list[tuple[str, str]] = []
@@ -662,6 +663,9 @@ class RecordingClient(ALERT.GitHubIssueClient):
         self._label_status = label_status
         self._returned_labels = returned_labels
         self._api_assignees = api_assignees or []
+        self._repair_assignees = (
+            self._api_assignees if repair_assignees is None else repair_assignees
+        )
         self._existing: list[dict[str, Any]] = []
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
@@ -677,7 +681,7 @@ class RecordingClient(ALERT.GitHubIssueClient):
                 "assignees": [{"login": n} for n in self._api_assignees],
             }
         if path == "/issues/7/assignees":
-            return {"number": 7, "assignees": [{"login": n} for n in self._api_assignees]}
+            return {"number": 7, "assignees": [{"login": n} for n in self._repair_assignees]}
         return None
 
 
@@ -687,6 +691,32 @@ class GitHubIssueClientTest(unittest.TestCase):
         issue = client.create_issue("t", "b", ALERT.ALERT_LABEL)
         self.assertEqual(issue["number"], 7)
         self.assertEqual(client.payloads[1]["assignees"], ["alexdermohr"])
+
+    def test_create_repairs_assignee_ignored_by_github(self) -> None:
+        client = RecordingClient(
+            None, [ALERT.ALERT_LABEL], "alexdermohr", [],
+            repair_assignees=["AlexDerMohr"],
+        )
+        self.assertEqual(client.create_issue("t", "b", ALERT.ALERT_LABEL)["number"], 7)
+        self.assertEqual(client.calls[-1], ("POST", "/issues/7/assignees"))
+        self.assertEqual(client.payloads[-1], {"assignees": ["alexdermohr"]})
+
+    def test_existing_assignment_accepts_case_insensitive_login(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", ["AlexDerMohr"])
+        self.assertEqual(client.create_issue("t", "b", ALERT.ALERT_LABEL)["number"], 7)
+        self.assertEqual(client.calls, [("POST", "/labels"), ("POST", "/issues")])
+
+    def test_failed_drill_assignment_closes_created_issue(self) -> None:
+        client = RecordingClient(None, [ALERT.DRILL_LABEL], "alexdermohr", [])
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            client.create_issue("t", "b", ALERT.DRILL_LABEL)
+        self.assertEqual(client.calls[-1], ("PATCH", "/issues/7"))
+
+    def test_failed_drill_label_check_closes_created_issue(self) -> None:
+        client = RecordingClient(None, [], "alexdermohr", ["alexdermohr"])
+        with self.assertRaisesRegex(ValueError, "created without label"):
+            client.create_issue("t", "b", ALERT.DRILL_LABEL)
+        self.assertEqual(client.calls[-1], ("PATCH", "/issues/7"))
 
     def test_api_silently_omitting_assignee_is_a_delivery_failure(self) -> None:
         client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
