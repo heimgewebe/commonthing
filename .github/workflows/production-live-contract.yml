@@ -376,6 +376,8 @@ jobs:
     needs: verify-live-commit
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      PRODUCTION_ALERT_ASSIGNEE: alexdermohr
     permissions:
       contents: read
       issues: write

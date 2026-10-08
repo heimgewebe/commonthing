@@ -3,9 +3,9 @@
 
 A red workflow run is easy to ignore and repeats every few minutes. Instead,
 an alerting classification opens one issue labelled ``production-alert``;
-repository watchers get a notification for it. While the alert lasts, a new
-comment is added only when the alert's fingerprint (state and live commit)
-changes. Only a ``current`` classification resolves the issue: ``pending``
+the operator is explicitly assigned; actual notification delivery is not
+proven until acknowledged. While the alert lasts, a new comment is added only
+when its fingerprint (state and live commit) changes. Only a ``current`` classification resolves the issue: ``pending``
 and ``superseded`` runs are no production proof and leave it open.
 
 ``--drill`` opens and immediately closes a separately labelled test issue, so
@@ -47,12 +47,18 @@ class IssueClient(Protocol):
 
 
 class GitHubIssueClient:
-    def __init__(self, repository: str, token: str, timeout: float = 15.0) -> None:
+    def __init__(
+        self, repository: str, token: str, timeout: float = 15.0,
+        assignee: str | None = None,
+    ) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             raise ValueError(f"invalid repository {repository!r}")
         self._base = f"{API_ROOT}/repos/{repository}"
+        if assignee is not None and not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", assignee):
+            raise ValueError("invalid alert assignee")
         self._token = token
         self._timeout = timeout
+        self._assignee = assignee
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -75,7 +81,34 @@ class GitHubIssueClient:
         issues = self._request(
             "GET", f"/issues?state=open&labels={label}&sort=created&direction=asc&per_page=100"
         )
-        return [issue for issue in issues if "pull_request" not in issue]
+        result = [issue for issue in issues if "pull_request" not in issue]
+        if label == ALERT_LABEL:
+            # A public issue labelled by a third party cannot impersonate our alert.
+            result = [issue for issue in result if _trusted_alert_author(issue)]
+            if self._assignee:
+                for issue in result:
+                    self._ensure_assignee(issue)
+        return result
+
+    def _ensure_assignee(self, issue: dict[str, Any]) -> None:
+        """Repair preexisting unassigned alerts; never accept a silent API omission."""
+        assert self._assignee is not None
+        assigned = {a.get("login") for a in issue.get("assignees") or [] if isinstance(a, dict)}
+        if self._assignee in assigned:
+            return
+        number = issue.get("number")
+        if not isinstance(number, int) or number < 1:
+            raise ValueError("alert issue has invalid number")
+        updated = self._request(
+            "POST", f"/issues/{number}/assignees", {"assignees": [self._assignee]}
+        )
+        self._require_assignee(updated)
+
+    def _require_assignee(self, issue: dict[str, Any]) -> None:
+        if self._assignee and self._assignee not in {
+            a.get("login") for a in issue.get("assignees") or [] if isinstance(a, dict)
+        }:
+            raise ValueError(f"issue #{issue.get('number')} has no verified alert assignee")
 
     def comments(self, number: int) -> list[dict[str, Any]]:
         # Follow every page: the newest fingerprint may sit past comment 100.
@@ -99,10 +132,14 @@ class GitHubIssueClient:
 
     def create_issue(self, title: str, body: str, label: str) -> dict[str, Any]:
         self.ensure_label(label)
-        issue = self._request("POST", "/issues", {"title": title, "body": body, "labels": [label]})
+        payload: dict[str, Any] = {"title": title, "body": body, "labels": [label]}
+        if self._assignee:
+            payload["assignees"] = [self._assignee]
+        issue = self._request("POST", "/issues", payload)
         names = {item.get("name") for item in issue.get("labels") or [] if isinstance(item, dict)}
         if label not in names:
             raise ValueError(f"issue #{issue.get('number')} was created without label {label!r}")
+        self._require_assignee(issue)
         return issue
 
     def comment(self, number: int, body: str) -> None:
@@ -274,11 +311,15 @@ def main(argv: list[str] | None = None) -> int:
 
     token = os.environ.get("GITHUB_TOKEN", "")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
-    if not token or not repository:
-        print("ERROR: GITHUB_TOKEN and GITHUB_REPOSITORY are required", file=sys.stderr)
+    assignee = os.environ.get("PRODUCTION_ALERT_ASSIGNEE", "")
+    if not token or not repository or not assignee:
+        print(
+            "ERROR: GITHUB_TOKEN, GITHUB_REPOSITORY and PRODUCTION_ALERT_ASSIGNEE are required",
+            file=sys.stderr,
+        )
         return 2
-    client = GitHubIssueClient(repository, token)
     try:
+        client = GitHubIssueClient(repository, token, assignee=assignee)
         if args.drill:
             action = drill(client, args.run_url)
         else:

@@ -309,8 +309,10 @@ gescheiterter Prüfungen (bei `invalid`), Fehlerbild (bei `outage` und geteiltem
 gesperrtes und gewünschtes Release, Fehlertext) ein Kommentar
 dazu. Scheitert Schaubild neben einem anderen Alarm, bleibt der spezifischere
 Zustand, und der Schaubild-Befund steht im Grund. Erholung kommentiert und
-schließt es. Die Meldung erreicht
-Menschen über die normalen GitHub-Benachrichtigungen der Repository-Beobachter.
+schließt es. Das GitHub-Issue wird explizit `alexdermohr` zugewiesen; die API-Antwort
+muss die Zuweisung bestätigen. Offene Alt-Issues ohne diese Zuweisung werden
+nachträglich korrigiert. Eine tatsächliche Push- oder E-Mail-Benachrichtigung
+ist damit **nicht** bewiesen; deren Empfang muss separat bestätigt werden.
 
 Ein manueller Lauf mit `alert_drill: true` öffnet und schließt ein separates
 Issue mit Label `production-alert-drill`, ohne Produktion zu stören. Ob die
