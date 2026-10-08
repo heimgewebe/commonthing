@@ -70,7 +70,15 @@ class GitHubIssueClient:
         return [issue for issue in issues if "pull_request" not in issue]
 
     def comments(self, number: int) -> list[dict[str, Any]]:
-        return self._request("GET", f"/issues/{number}/comments?per_page=100")
+        # Follow every page: the newest fingerprint may sit past comment 100.
+        result: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            batch = self._request("GET", f"/issues/{number}/comments?per_page=100&page={page}")
+            result.extend(batch or [])
+            if not batch or len(batch) < 100:
+                return result
+            page += 1
 
     def ensure_label(self, label: str) -> None:
         # Issue creation does not reliably provision a missing label, and an

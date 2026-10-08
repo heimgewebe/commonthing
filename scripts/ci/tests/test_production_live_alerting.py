@@ -262,6 +262,19 @@ class GitHubIssueClientTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             RecordingClient(403, [ALERT.ALERT_LABEL]).create_issue("t", "b", ALERT.ALERT_LABEL)
 
+    def test_comments_follow_every_page(self) -> None:
+        class Paged(ALERT.GitHubIssueClient):
+            def __init__(self) -> None:
+                super().__init__("owner/repo", "token")
+
+            def _request(self, method: str, path: str, payload: Any = None) -> Any:
+                page = int(path.rsplit("page=", 1)[1])
+                return [{"body": f"c{page}-{i}"} for i in range(100 if page < 3 else 5)]
+
+        comments = Paged().comments(1)
+        self.assertEqual(len(comments), 205)
+        self.assertEqual(comments[-1]["body"], "c3-4")
+
     def test_unlabelled_issue_fails_delivery(self) -> None:
         with self.assertRaises(ValueError):
             RecordingClient(None, []).create_issue("t", "b", ALERT.ALERT_LABEL)
