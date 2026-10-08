@@ -7971,7 +7971,23 @@ def _require_live_application_service_accounts(
         observed = _service_account_contract_projection(
             service_account, f"live application ServiceAccount {name}"
         )
-        if observed != expected_value["contract"]:
+        # Flux adds exactly these reconciliation ownership labels to the
+        # rendered application ServiceAccounts. All other fields stay pinned.
+        flux_owner_labels = {
+            "kustomize.toolkit.fluxcd.io/name": "commonthing-experiment-b-app",
+            "kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+        }
+        expected_contract = expected_value["contract"]
+        expected_labels = expected_contract["labels"]
+        if not expected_labels.keys().isdisjoint(flux_owner_labels):
+            raise RuntimeErrorEB(
+                f"rendered application ServiceAccount labels overlap Flux ownership: {name}"
+            )
+        expected_live = {
+            **expected_contract,
+            "labels": {**expected_labels, **flux_owner_labels},
+        }
+        if observed != expected_live:
             raise RuntimeErrorEB(
                 f"live application ServiceAccount contract drifted: {name}"
             )
@@ -9840,7 +9856,7 @@ def status(root: Path) -> dict[str, Any]:
             ),
         }
 
-        pvc_items = _kubectl_json(root, ["-A", "get", "pvc"]).get("items", [])
+        pvc_items = _kubectl_json(root, ["get", "pvc", "--all-namespaces"]).get("items", [])
         pvc_readback = _require_exact_healthy_pvcs(
             root,
             pvc_items,
