@@ -135,6 +135,26 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
                 self.assertEqual(result.state, "invalid", result.reason)
                 self.assertTrue(result.alert)
 
+    def test_current_reparses_artifact_declarations_in_receipts(self) -> None:
+        valid = receipt(C, passed=True)
+        self.assertEqual(classify(valid, C).state, "current")
+        for changed in (
+            {"schema_version": 2},
+            {"sha256": "not-a-digest"},
+            {"file_count": 0},
+            {"error": "precomputed false failure"},
+        ):
+            broken_tree = {**valid["frontend"]["artifact_tree"], **changed}
+            broken = {**valid, "frontend": {**valid["frontend"], "artifact_tree": broken_tree}}
+            with self.subTest(changed=changed):
+                result = classify(broken, C)
+                self.assertEqual(result.state, "invalid", result.reason)
+                self.assertTrue(result.alert)
+        missing_error = {**valid["frontend"]["artifact_tree"]}
+        del missing_error["error"]
+        broken = {**valid, "frontend": {**valid["frontend"], "artifact_tree": missing_error}}
+        self.assertEqual(classify(broken, C).state, "invalid")
+
     def test_passing_receipt_for_an_older_target_is_not_current(self) -> None:
         # main moved from B to C after the run resolved B as its target.
         pending = classify(receipt(B, passed=True), B, main=C, age=300)

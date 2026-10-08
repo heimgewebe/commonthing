@@ -151,6 +151,18 @@ def revalidate_against(receipt: dict[str, Any], commit: str) -> list[str]:
 
     def endpoint(raw: Any) -> Any:
         tree = raw.get("artifact_tree")
+        checked_tree = None
+        if isinstance(tree, dict):
+            # The receipt contains the parser's derived "error" alongside the
+            # declaration. Reparse the declaration instead of trusting that
+            # an inconsistent stored error:null means the tree is valid.
+            if "error" not in tree:
+                raise ValueError("artifact_tree has no parser result")
+            checked_tree = verify._parse_artifact_tree(
+                {"artifact_tree": {key: value for key, value in tree.items() if key != "error"}}
+            )
+            if checked_tree.error != tree["error"]:
+                raise ValueError("artifact_tree parser result contradicts declaration")
         return verify.EndpointResult(
             url=str(raw.get("url") or ""),
             status=raw.get("status"),
@@ -158,12 +170,12 @@ def revalidate_against(receipt: dict[str, Any], commit: str) -> list[str]:
             version=raw.get("version"),
             headers={str(k).lower(): str(v) for k, v in (raw.get("headers") or {}).items()},
             error=raw.get("error"),
-            artifact_tree=verify.ArtifactTreeResult(**tree) if isinstance(tree, dict) else None,
+            artifact_tree=checked_tree,
         )
 
     try:
         result = verify.evaluate(commit, endpoint(receipt["frontend"]), endpoint(receipt["api"]))
-    except (KeyError, TypeError, AttributeError) as exc:
+    except (KeyError, TypeError, AttributeError, ValueError) as exc:
         return [f"receipt cannot be revalidated against {commit}: {exc}"]
     return list(result.reasons)
 
