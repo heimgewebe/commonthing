@@ -3608,6 +3608,13 @@ spec:
                 "t048_ready_http_503": metric(5),
                 "t048_ready_unclassified": metric(6),
             },
+            {
+                # Unclassified 503s cannot also have a named failed check.
+                "t048_ready_samples": metric(10),
+                "t048_ready_http_503": metric(5),
+                "t048_ready_unclassified": metric(3),
+                "t048_ready_check_false_database": metric(4),
+            },
         ]
         for metrics in cases:
             with self.subTest(metrics=metrics), self.assertRaises(runtime.RuntimeErrorEB):

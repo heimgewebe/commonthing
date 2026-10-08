@@ -12203,7 +12203,7 @@ def _t048_readiness_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
         samples <= 0
         or status_503 > samples
         or unclassified > status_503
-        or any(value > status_503 for value in failed.values())
+        or any(value + unclassified > status_503 for value in failed.values())
         or sum(failed.values()) + unclassified < status_503
     ):
         raise RuntimeErrorEB("T048 readiness diagnostic counters are inconsistent")
