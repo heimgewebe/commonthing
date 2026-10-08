@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -82,6 +83,18 @@ def classify(data: dict | None, expected: str, main: str = C, age: int = 5000):
         is_ancestor=ancestor,
         commit_time=lambda _commit: 10_000 - age,
     )
+
+
+class AlertWorkflowTest(unittest.TestCase):
+    def test_alert_job_runs_after_failures_but_not_after_cancellation(self) -> None:
+        workflow = (OPS.parents[1] / ".github/workflows/production-live-contract.yml").read_text(
+            encoding="utf-8"
+        )
+        job = re.split(r"\n  \S", workflow.split("\n  alert:\n", 1)[1], maxsplit=1)[0]
+        condition = next(line for line in job.splitlines() if line.strip().startswith("if:"))
+        self.assertIn("!cancelled()", condition)
+        self.assertNotIn("always()", condition)
+        self.assertIn("github.event_name != 'pull_request'", condition)
 
 
 class ClassifyProductionLiveStateTest(unittest.TestCase):

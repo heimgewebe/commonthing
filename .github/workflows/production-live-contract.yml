@@ -371,7 +371,8 @@ jobs:
 
   alert:
     name: Deliver production alert
-    if: always() && github.event_name != 'pull_request'
+    # always() would also run on a cancelled (superseded) run and report stale state.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     needs: verify-live-commit
     runs-on: ubuntu-latest
     timeout-minutes: 5
