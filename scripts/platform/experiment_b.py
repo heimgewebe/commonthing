@@ -93,6 +93,8 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ContractError("k3s binary must use HTTPS")
     if not SHA256_RE.fullmatch(str(kubernetes.get("binary_sha256", ""))):
         raise ContractError("k3s binary SHA-256 is invalid")
+    if not SHA256_RE.fullmatch(str(kubernetes.get("reexec_binary_sha256", ""))):
+        raise ContractError("k3s reexec binary SHA-256 is invalid")
     flags = set(kubernetes.get("server_flags", []))
     if not REQUIRED_K3S_FLAGS.issubset(flags):
         raise ContractError("required k3s/Cilium isolation flags are missing")

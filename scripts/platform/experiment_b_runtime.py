@@ -2595,6 +2595,19 @@ def _parse_systemctl_properties(stdout: str) -> dict[str, str]:
     return properties
 
 
+def _k3s_process_identity_is_supported(process_exe: Any, process_argv: Any) -> bool:
+    if process_exe == "/usr/local/bin/k3s":
+        return process_argv == ["/usr/local/bin/k3s", "server"]
+    return (
+        isinstance(process_exe, str)
+        and re.fullmatch(
+            r"/var/lib/rancher/k3s/data/[0-9a-f]{64}/bin/k3s",
+            process_exe,
+        ) is not None
+        and process_argv == ["/usr/local/bin/k3s server"]
+    )
+
+
 def _require_live_k3s_runtime(
     root: Path,
     config: dict[str, Any],
@@ -2697,11 +2710,34 @@ def _require_live_k3s_runtime(
         timeout=30,
     ).stdout
     argv = [value for value in process_cmdline.split("\0") if value]
-    if (
-        process_exe != "/usr/local/bin/k3s"
-        or argv != ["/usr/local/bin/k3s", "server"]
-    ):
+    if not _k3s_process_identity_is_supported(process_exe, argv):
         raise RuntimeErrorEB("active k3s process identity drifted")
+    reexec_binary_sha256: str | None = None
+    if process_exe != "/usr/local/bin/k3s":
+        # The pinned k3s launcher reexecs its packaged server from data/current.
+        current_exe = run(
+            [
+                *ssh_argv(root, live_ip),
+                "sudo",
+                "readlink",
+                "-f",
+                "/var/lib/rancher/k3s/data/current/bin/k3s",
+            ],
+            timeout=30,
+        ).stdout.strip()
+        if current_exe != process_exe:
+            raise RuntimeErrorEB("active k3s reexec target drifted")
+        process_path = f"/proc/{main_pid}/exe"
+        reexec_digests = _parse_sha256sum_output(
+            run(
+                [*ssh_argv(root, live_ip), "sudo", "sha256sum", "--", process_path],
+                timeout=30,
+            ).stdout,
+            (process_path,),
+        )
+        reexec_binary_sha256 = reexec_digests[process_path]
+        if reexec_binary_sha256 != config["kubernetes"]["reexec_binary_sha256"]:
+            raise RuntimeErrorEB("active k3s reexec binary digest drifted")
     process_environment = run(
         [
             *ssh_argv(root, live_ip),
@@ -2736,6 +2772,8 @@ def _require_live_k3s_runtime(
         "main_pid": main_pid,
         "process_exe": process_exe,
         "process_argv": argv,
+        "reexec_binary_sha256": reexec_binary_sha256,
+        "reexec_current_target_verified": reexec_binary_sha256 is not None,
         "environment_overrides_absent": True,
     }
 
@@ -6856,18 +6894,28 @@ def _require_live_namespace_security_contract(
             else {}
         )
         labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+        # Flux adds exactly these ownership labels to the reconciled Namespace.
+        # All versioned security labels must still match without any extra keys.
+        flux_owner_labels = {
+            "kustomize.toolkit.fluxcd.io/name": "commonthing-experiment-b-namespaces",
+            "kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+        }
+        if not contract_value["labels"].keys().isdisjoint(flux_owner_labels):
+            raise RuntimeErrorEB(f"versioned Namespace labels overlap Flux ownership: {name}")
+        expected_live_labels = {**contract_value["labels"], **flux_owner_labels}
         if (
             not isinstance(metadata, dict)
             or metadata.get("name") != name
             or metadata.get("deletionTimestamp") is not None
             or not isinstance(labels, dict)
-            or labels != contract_value["labels"]
+            or labels != expected_live_labels
         ):
             raise RuntimeErrorEB(
                 f"live Namespace security labels drifted: {name}"
             )
         result[name] = {
-            "labels": {str(key): str(value) for key, value in labels.items()},
+            # The portable security projection excludes verified Flux ownership metadata.
+            "labels": dict(contract_value["labels"]),
             "labels_sha256": contract_value["labels_sha256"],
             "canonical": True,
         }
@@ -17606,9 +17654,18 @@ def portability_report(root: Path) -> dict[str, Any]:
         or not isinstance(k3s_status.get("main_pid"), int)
         or isinstance(k3s_status.get("main_pid"), bool)
         or k3s_status["main_pid"] <= 0
-        or k3s_status.get("process_exe") != "/usr/local/bin/k3s"
-        or k3s_status.get("process_argv")
-        != ["/usr/local/bin/k3s", "server"]
+        or not _k3s_process_identity_is_supported(
+            k3s_status.get("process_exe"),
+            k3s_status.get("process_argv"),
+        )
+        or (
+            k3s_status.get("process_exe") != "/usr/local/bin/k3s"
+            and (
+                k3s_status.get("reexec_binary_sha256")
+                != config["kubernetes"]["reexec_binary_sha256"]
+                or k3s_status.get("reexec_current_target_verified") is not True
+            )
+        )
         or k3s_status.get("environment_overrides_absent") is not True
     ):
         raise RuntimeErrorEB("status does not prove the live pinned k3s runtime")
