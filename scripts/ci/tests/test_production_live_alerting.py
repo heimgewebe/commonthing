@@ -753,6 +753,38 @@ class GitHubIssueClientTest(unittest.TestCase):
         self.assertNotIn(("POST", "/issues/7/assignees"), client.calls)
         self.assertIn(("PATCH", "/issues/7"), client.calls)
 
+    def test_unresolved_non_alerting_run_repairs_unassigned_alert(self) -> None:
+        for state_name in ("pending", "superseded"):
+            with self.subTest(state=state_name):
+                client = RecordingClient(
+                    None, [ALERT.ALERT_LABEL], "alexdermohr", [],
+                    repair_assignees=["alexdermohr"],
+                )
+                client._existing = [{
+                    "number": 7, "assignees": [],
+                    "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+                }]
+                self.assertEqual(
+                    ALERT.reconcile(client, state(state_name, C), "r"), "unchanged"
+                )
+                self.assertIn(("POST", "/issues/7/assignees"), client.calls)
+                self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_unresolved_non_alerting_run_rejects_missing_owner(self) -> None:
+        for state_name in ("pending", "superseded"):
+            with self.subTest(state=state_name):
+                client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+                client._existing = [{
+                    "number": 7, "assignees": [],
+                    "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+                }]
+                with self.assertRaisesRegex(
+                    ValueError, "no verified alert assignee"
+                ):
+                    ALERT.reconcile(client, state(state_name, C), "r")
+                self.assertIn(("POST", "/issues/7/assignees"), client.calls)
+                self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
     def test_active_alarm_still_refuses_unassigned_existing_issue(self) -> None:
         client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
         client._existing = [{

@@ -229,13 +229,15 @@ def monitor_failure(reason: str) -> dict[str, Any]:
 
 
 def reconcile(client: IssueClient, classification: dict[str, Any], run_url: str) -> str:
-    # A proven recovery must close an incident even if the previously assigned
-    # account is no longer assignable; active alarms still require assignment.
+    # Only a proven recovery resolves existing incidents. Pending and superseded
+    # runs leave them open, so those runs must also repair missing ownership.
+    state = classification.get("state")
     open_alerts = client.open_issues(
-        ALERT_LABEL, repair_assignee=classification.get("alert") is True
+        ALERT_LABEL, repair_assignee=not (
+            state == "current" and classification.get("alert") is False
+        )
     )
     issue = open_alerts[0] if open_alerts else None
-    state = classification.get("state")
 
     if classification.get("alert") is True:
         fingerprint = str(classification.get("fingerprint") or f"{state}:none")
