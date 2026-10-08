@@ -273,6 +273,18 @@ def classify(
 
     if live == expected_commit:
         if receipt.get("pass") is True:
+            # A boolean from a partially written or forged receipt is not
+            # proof. Re-run every endpoint invariant before reporting recovery.
+            proof_failures = []
+            if receipt.get("schema_version") != 3:
+                proof_failures.append("production verifier receipt schema_version is not 3")
+            if receipt.get("expected_commit") != expected_commit:
+                proof_failures.append("production verifier receipt expected_commit mismatch")
+            if receipt.get("reasons") != []:
+                proof_failures.append("production verifier receipt pass contradicts reasons")
+            proof_failures.extend(revalidate_against(receipt, live))
+            if proof_failures:
+                return result("invalid", live, "; ".join(proof_failures), tuple(proof_failures))
             if main_commit == expected_commit:
                 return result("current", live, "expected commit is live and consistent")
             # main moved after the run resolved its target: this receipt proves

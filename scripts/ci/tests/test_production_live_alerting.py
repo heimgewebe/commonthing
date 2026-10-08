@@ -66,6 +66,8 @@ def endpoint(commit: str | None, status: int = 200, error: str | None = None) ->
 
 def receipt(frontend: str | None, api: str | None = None, *, passed: bool = False) -> dict:
     return {
+        "schema_version": 3,
+        "expected_commit": frontend,
         "pass": passed,
         "reasons": [] if passed else ["mismatch"],
         "frontend": endpoint(frontend),
@@ -114,6 +116,24 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         self.assertFalse(cases["pending"].alert)
         self.assertTrue(cases["stale"].alert)
         self.assertTrue(cases["invalid"].alert)
+
+    def test_current_requires_a_complete_consistent_verifier_receipt(self) -> None:
+        valid = receipt(C, passed=True)
+        self.assertEqual(classify(valid, C).state, "current")
+        wrong_schema = {**valid, "schema_version": 2}
+        wrong_expected = {**valid, "expected_commit": B}
+        missing_expected = {key: value for key, value in valid.items() if key != "expected_commit"}
+        contradictory = {**valid, "reasons": ["not verified"]}
+        missing_header = {**valid, "frontend": {**valid["frontend"], "headers": {}}}
+        missing_artifact = {**valid, "frontend": {**valid["frontend"], "artifact_tree": None}}
+        for broken in (
+            wrong_schema, wrong_expected, missing_expected, contradictory,
+            missing_header, missing_artifact,
+        ):
+            with self.subTest(broken=broken):
+                result = classify(broken, C)
+                self.assertEqual(result.state, "invalid", result.reason)
+                self.assertTrue(result.alert)
 
     def test_passing_receipt_for_an_older_target_is_not_current(self) -> None:
         # main moved from B to C after the run resolved B as its target.
