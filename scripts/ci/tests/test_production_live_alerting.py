@@ -38,7 +38,29 @@ def ancestor(a: str, d: str) -> bool | None:
 
 
 def endpoint(commit: str | None, status: int = 200, error: str | None = None) -> dict:
-    return {"status": status, "commit": commit, "error": error}
+    # A well-formed readback for ``commit``: the headers and artifact
+    # declaration a newer live commit must still satisfy to count as superseded.
+    short = commit[:8] if commit else None
+    return {
+        "url": "https://example.invalid/",
+        "status": status,
+        "commit": commit,
+        "version": short,
+        "error": error,
+        "headers": {
+            "cache-control": "no-store",
+            "x-weltgewebe-api-build": commit,
+            "x-weltgewebe-build": short,
+        },
+        "artifact_tree": {
+            "schema_version": 1,
+            "sha256": "0" * 64,
+            "file_count": 1,
+            "compile_revision": commit,
+            "provenance": "unattested",
+            "error": None,
+        },
+    }
 
 
 def receipt(frontend: str | None, api: str | None = None, *, passed: bool = False) -> dict:
@@ -79,6 +101,29 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         self.assertFalse(cases["pending"].alert)
         self.assertTrue(cases["stale"].alert)
         self.assertTrue(cases["invalid"].alert)
+
+    def test_superseded_requires_a_valid_receipt_for_the_newer_commit(self) -> None:
+        broken = receipt(C)
+        broken["frontend"]["headers"]["cache-control"] = "max-age=60"
+        result = classify(broken, B)
+        self.assertEqual(result.state, "invalid")
+        self.assertTrue(result.alert)
+        self.assertIn("no-store", result.reason)
+
+        undeclared = receipt(C)
+        undeclared["frontend"]["artifact_tree"] = None
+        self.assertEqual(classify(undeclared, B).state, "invalid")
+
+        stale_header = receipt(C)
+        stale_header["api"]["headers"]["x-weltgewebe-api-build"] = B
+        self.assertEqual(classify(stale_header, B).state, "invalid")
+
+    def test_split_deployment_fingerprint_tracks_both_commits(self) -> None:
+        first = classify(receipt(A, api=B), C)
+        second = classify(receipt(B, api=C), C)
+        self.assertEqual(first.state, "divergent")
+        self.assertEqual(first.fingerprint(), f"divergent:{A}/{B}")
+        self.assertNotEqual(first.fingerprint(), second.fingerprint())
 
     def test_split_and_off_main_live_commits_are_divergent(self) -> None:
         self.assertEqual(classify(receipt(C, api=B), C).state, "divergent")

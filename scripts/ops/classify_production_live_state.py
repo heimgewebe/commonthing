@@ -6,7 +6,8 @@ live? A "no" can mean very different things, and only some of them need a
 human. This classifier separates them:
 
 * ``current``     the expected commit is live and consistent.
-* ``superseded``  a newer main commit that contains the expected one is live.
+* ``superseded``  a newer main commit that contains the expected one is live
+                  and passes every receipt check against that newer commit.
                   This run is not a production proof; the newer commit's own
                   run is. It never resolves an open alert.
 * ``pending``     production still serves an older main commit, but the target
@@ -15,8 +16,9 @@ human. This classifier separates them:
                   period: the deploy or the reconciler is stuck.
 * ``divergent``   frontend and API disagree, or the live commit is not on the
                   main lineage at all.
-* ``invalid``     the live commit matches, but the receipt fails for another
-                  reason (cache headers, artifact declaration).
+* ``invalid``     the expected (or a newer main) commit is live, but the
+                  receipt fails for another reason (cache headers, build
+                  headers, artifact declaration).
 * ``outage``      an endpoint could not be read or did not answer 200.
 * ``monitor_failure`` the receipt is missing or unreadable.
 
@@ -50,9 +52,15 @@ class Classification:
     main_commit: str
     live_commit: str | None
     reason: str
+    frontend_commit: str | None = None
+    api_commit: str | None = None
 
     def fingerprint(self) -> str:
         """Stable identity of an alert, used to deduplicate notifications."""
+        if self.live_commit is None and (self.frontend_commit or self.api_commit):
+            # A split deployment has no single live commit; keep both sides so
+            # a change from A/B to B/C is reported as a change.
+            return f"{self.state}:{self.frontend_commit or 'none'}/{self.api_commit or 'none'}"
         return f"{self.state}:{self.live_commit or 'none'}"
 
 
@@ -88,6 +96,38 @@ def git_commit_time(repo: Path, commit: str) -> int | None:
     return int(raw)
 
 
+def revalidate_against(receipt: dict[str, Any], commit: str) -> list[str]:
+    """Re-run the receipt checks as if ``commit`` had been the expected one.
+
+    A newer live commit fails the original receipt for its commit fields
+    alone. Every other invariant (cache headers, build headers, artifact
+    declaration) must still hold before the run may count as ``superseded``.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import verify_public_release_commit as verify
+    finally:
+        sys.path.pop(0)
+
+    def endpoint(raw: Any) -> Any:
+        tree = raw.get("artifact_tree")
+        return verify.EndpointResult(
+            url=str(raw.get("url") or ""),
+            status=raw.get("status"),
+            commit=raw.get("commit"),
+            version=raw.get("version"),
+            headers={str(k).lower(): str(v) for k, v in (raw.get("headers") or {}).items()},
+            error=raw.get("error"),
+            artifact_tree=verify.ArtifactTreeResult(**tree) if isinstance(tree, dict) else None,
+        )
+
+    try:
+        result = verify.evaluate(commit, endpoint(receipt["frontend"]), endpoint(receipt["api"]))
+    except (KeyError, TypeError, AttributeError) as exc:
+        return [f"receipt cannot be revalidated against {commit}: {exc}"]
+    return list(result.reasons)
+
+
 def classify(
     receipt: dict[str, Any] | None,
     *,
@@ -98,6 +138,8 @@ def classify(
     is_ancestor: Callable[[str, str], bool | None],
     commit_time: Callable[[str], int | None],
 ) -> Classification:
+    observed: dict[str, str | None] = {"frontend": None, "api": None}
+
     def result(state: str, live: str | None, reason: str) -> Classification:
         return Classification(
             schema_version=1,
@@ -107,6 +149,8 @@ def classify(
             main_commit=main_commit,
             live_commit=live,
             reason=reason,
+            frontend_commit=observed["frontend"],
+            api_commit=observed["api"],
         )
 
     if not isinstance(receipt, dict):
@@ -125,6 +169,8 @@ def classify(
 
     frontend_commit = frontend.get("commit")
     api_commit = api.get("commit")
+    observed["frontend"] = frontend_commit if _is_commit(frontend_commit) else None
+    observed["api"] = api_commit if _is_commit(api_commit) else None
     if not (_is_commit(frontend_commit) and _is_commit(api_commit)):
         return result("divergent", None, "live commit is not a full SHA on both endpoints")
     if frontend_commit != api_commit:
@@ -146,6 +192,9 @@ def classify(
     if expected_is_older:
         on_main = is_ancestor(live, main_commit)
         if on_main:
+            failures = revalidate_against(receipt, live)
+            if failures:
+                return result("invalid", live, "; ".join(failures))
             return result(
                 "superseded",
                 live,
