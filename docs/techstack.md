@@ -47,8 +47,8 @@ API-Pakets. Die repositoryweit gepinnte Entwicklungs-/CI-Toolchain kann neuer
 sein. Beide Angaben sind verschiedene Verträge und dürfen nicht gleichgesetzt
 werden. Die Untergrenze ist gemessen, nicht angenommen: Mit Rust 1.87 scheitert
 `cargo check --locked` an `async-nats`, `base64urlsafedata` und `time`. Der
-CI-Job `MSRV check (rust-version)` in `api.yml` baut mit genau der in
-`Cargo.toml` angegebenen Version und hält die Angabe damit wahr.
+CI-Job `MSRV check (rust-version)` in `api.yml` baut alle Targets und Features
+mit genau der in `Cargo.toml` angegebenen Version und hält die Angabe damit wahr.
 
 ### Datenhaltung
 

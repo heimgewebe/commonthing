@@ -125,8 +125,8 @@ jobs:
         with:
           key: msrv-${{ steps.msrv.outputs.msrv }}
 
-      - name: Build every target with the declared minimum
-        run: cargo +${{ steps.msrv.outputs.msrv }} check --locked -p weltgewebe-api --all-targets
+      - name: Build every target and feature with the declared minimum
+        run: cargo +${{ steps.msrv.outputs.msrv }} check --locked -p weltgewebe-api --all-targets --all-features
 
   cookie-session-proof:
     name: cookie session proof (phase 6)
