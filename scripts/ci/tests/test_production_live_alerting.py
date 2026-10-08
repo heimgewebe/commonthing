@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -229,6 +230,41 @@ class ProductionAlertIssueTest(unittest.TestCase):
         self.assertEqual(issues.issues[0]["labels"], [ALERT.DRILL_LABEL])
         self.assertEqual(issues.issues[0]["state"], "closed")
         self.assertEqual(issues.open_issues(ALERT.ALERT_LABEL), [])
+
+
+class RecordingClient(ALERT.GitHubIssueClient):
+    def __init__(self, label_status: int | None, returned_labels: list[str]) -> None:
+        super().__init__("owner/repo", "token")
+        self.calls: list[tuple[str, str]] = []
+        self._label_status = label_status
+        self._returned_labels = returned_labels
+
+    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+        self.calls.append((method, path))
+        if path == "/labels" and self._label_status is not None:
+            raise urllib.error.HTTPError(path, self._label_status, "error", None, None)
+        if path == "/issues":
+            return {"number": 7, "labels": [{"name": n} for n in self._returned_labels]}
+        return None
+
+
+class GitHubIssueClientTest(unittest.TestCase):
+    def test_label_is_provisioned_before_the_issue(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL])
+        client.create_issue("t", "b", ALERT.ALERT_LABEL)
+        self.assertEqual(client.calls, [("POST", "/labels"), ("POST", "/issues")])
+
+    def test_existing_label_is_accepted(self) -> None:
+        client = RecordingClient(422, [ALERT.ALERT_LABEL])
+        self.assertEqual(client.create_issue("t", "b", ALERT.ALERT_LABEL)["number"], 7)
+
+    def test_other_label_errors_are_not_swallowed(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError):
+            RecordingClient(403, [ALERT.ALERT_LABEL]).create_issue("t", "b", ALERT.ALERT_LABEL)
+
+    def test_unlabelled_issue_fails_delivery(self) -> None:
+        with self.assertRaises(ValueError):
+            RecordingClient(None, []).create_issue("t", "b", ALERT.ALERT_LABEL)
 
 
 if __name__ == "__main__":

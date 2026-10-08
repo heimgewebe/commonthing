@@ -72,8 +72,22 @@ class GitHubIssueClient:
     def comments(self, number: int) -> list[dict[str, Any]]:
         return self._request("GET", f"/issues/{number}/comments?per_page=100")
 
+    def ensure_label(self, label: str) -> None:
+        # Issue creation does not reliably provision a missing label, and an
+        # unlabelled alert would never be found again by open_issues().
+        try:
+            self._request("POST", "/labels", {"name": label, "color": "b60205"})
+        except urllib.error.HTTPError as exc:
+            if exc.code != 422:  # 422: the label already exists
+                raise
+
     def create_issue(self, title: str, body: str, label: str) -> dict[str, Any]:
-        return self._request("POST", "/issues", {"title": title, "body": body, "labels": [label]})
+        self.ensure_label(label)
+        issue = self._request("POST", "/issues", {"title": title, "body": body, "labels": [label]})
+        names = {item.get("name") for item in issue.get("labels") or [] if isinstance(item, dict)}
+        if label not in names:
+            raise ValueError(f"issue #{issue.get('number')} was created without label {label!r}")
+        return issue
 
     def comment(self, number: int, body: str) -> None:
         self._request("POST", f"/issues/{number}/comments", {"body": body})
