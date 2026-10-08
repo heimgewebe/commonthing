@@ -140,6 +140,11 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         self.assertEqual(first.fingerprint(), f"outage:{A}/none")
         self.assertEqual(len({first.fingerprint(), moved.fingerprint(), flipped.fingerprint()}), 3)
 
+    def test_future_commit_time_does_not_extend_the_grace_period(self) -> None:
+        result = classify(receipt(B), C, age=-3600)
+        self.assertEqual(result.state, "stale")
+        self.assertIn("future", result.reason)
+
     def test_split_and_off_main_live_commits_are_divergent(self) -> None:
         self.assertEqual(classify(receipt(C, api=B), C).state, "divergent")
         self.assertEqual(classify(receipt(X), C).state, "divergent")

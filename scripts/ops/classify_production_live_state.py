@@ -216,6 +216,12 @@ def classify(
         if merged_at is None:
             return result("stale", live, f"age of {expected_commit} is unknown; treating lag as stale")
         age = int(now) - merged_at
+        if age < 0:
+            # A future timestamp (clock skew, imported commit) must not extend
+            # the grace period indefinitely.
+            return result(
+                "stale", live, f"{expected_commit} has a committer time {-age}s in the future"
+            )
         if age < pending_grace_seconds:
             return result(
                 "pending",
