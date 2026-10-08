@@ -29,6 +29,9 @@ ALERT_LABEL = "production-alert"
 DRILL_LABEL = "production-alert-drill"
 FINGERPRINT_RE = re.compile(r"<!-- production-alert-fingerprint: (\S+) -->")
 API_ROOT = "https://api.github.com"
+# The repository GITHUB_TOKEN writes as this verified GitHub service identity.
+ALERT_BOT_LOGIN = "github-actions[bot]"
+ALERT_BOT_ID = 41898282
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # Mirrors classify_production_live_state.py; the alert job checks out only scripts/ops.
 ALERTING_STATES = frozenset({"stale", "divergent", "invalid", "outage", "monitor_failure"})
@@ -129,10 +132,22 @@ def _details(classification: dict[str, Any], run_url: str) -> str:
     )
 
 
+def _trusted_alert_author(entry: dict[str, Any]) -> bool:
+    # Comments in public issues are untrusted, including hidden HTML markers.
+    user = entry.get("user")
+    return (
+        isinstance(user, dict)
+        and user.get("id") == ALERT_BOT_ID
+        and user.get("login") == ALERT_BOT_LOGIN
+    )
+
+
 def latest_fingerprint(issue: dict[str, Any], comments: list[dict[str, Any]]) -> str | None:
     fingerprint = None
-    for text in [issue.get("body") or ""] + [c.get("body") or "" for c in comments]:
-        for match in FINGERPRINT_RE.finditer(text):
+    for entry in [issue, *comments]:
+        if not isinstance(entry, dict) or not _trusted_alert_author(entry):
+            continue
+        for match in FINGERPRINT_RE.finditer(entry.get("body") or ""):
             fingerprint = match.group(1)
     return fingerprint
 

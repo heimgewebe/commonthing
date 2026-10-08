@@ -445,11 +445,18 @@ class FakeIssues:
         return [i for i in self.issues if i["state"] == "open" and label in i["labels"]]
 
     def comments(self, number: int) -> list[dict[str, Any]]:
-        return [{"body": body} for body in self.issues[number - 1]["comments"]]
+        return [
+            body if isinstance(body, dict) else {
+                "body": body,
+                "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+            }
+            for body in self.issues[number - 1]["comments"]
+        ]
 
     def create_issue(self, title: str, body: str, label: str) -> dict[str, Any]:
         issue = {"number": len(self.issues) + 1, "title": title, "body": body,
-                 "labels": [label], "state": "open", "comments": []}
+                 "labels": [label], "state": "open", "comments": [],
+                 "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID}}
         self.issues.append(issue)
         self.notifications.append(f"open {issue['number']}")
         return issue
@@ -493,6 +500,24 @@ class ProductionAlertIssueTest(unittest.TestCase):
         # A new incident after recovery notifies again.
         self.assertEqual(ALERT.reconcile(issues, state("stale"), run), "opened")
         self.assertEqual(len(issues.issues), 2)
+
+    def test_spoofed_issue_comment_does_not_suppress_alarm_update(self) -> None:
+        issues = FakeIssues()
+        run = "https://example.invalid/run"
+        self.assertEqual(ALERT.reconcile(issues, state("stale"), run), "opened")
+        changed = state("outage", None)
+        issues.issues[0]["comments"].append({
+            "body": ALERT._marker(changed["fingerprint"]),
+            "user": {"login": "untrusted-user", "id": 12345},
+        })
+        self.assertEqual(ALERT.reconcile(issues, changed, run), "updated")
+        self.assertEqual(ALERT.reconcile(issues, changed, run), "unchanged")
+        self.assertEqual(issues.notifications, ["open 1", "comment 1"])
+
+    def test_untrusted_issue_body_is_not_a_delivery_receipt(self) -> None:
+        forged = {"body": ALERT._marker("stale:spoof"),
+                  "user": {"login": "untrusted-user", "id": 12345}}
+        self.assertIsNone(ALERT.latest_fingerprint(forged, []))
 
     def test_current_without_open_alert_is_silent(self) -> None:
         issues = FakeIssues()
