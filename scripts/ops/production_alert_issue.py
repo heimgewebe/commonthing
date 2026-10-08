@@ -15,6 +15,7 @@ the delivery path can be proven without breaking production.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -141,7 +142,9 @@ def monitor_failure(reason: str) -> dict[str, Any]:
         "expected_commit": None,
         "main_commit": None,
         "live_commit": None,
-        "fingerprint": "monitor_failure:none",
+        # The reason distinguishes a missing, unreadable or malformed classification.
+        "fingerprint": "monitor_failure:none#"
+        + hashlib.sha256(reason.encode()).hexdigest()[:12],
     }
 
 

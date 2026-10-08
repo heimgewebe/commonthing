@@ -306,6 +306,17 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         broken["frontend"]["headers"]["cache-control"] = "max-age=60"
         self.assertTrue(classify(broken, B).causes)
 
+    def test_changed_schaubild_failure_changes_the_fingerprint(self) -> None:
+        green = classify(receipt(C, passed=True), C)
+        pending = CLASSIFY.with_schaubild(green, "Schaubild state 'promotion_pending'")
+        unreadable = CLASSIFY.with_schaubild(green, "Schaubild receipt is unreadable")
+        self.assertNotEqual(pending.fingerprint(), unreadable.fingerprint())
+        specific = classify(receipt(None), C)
+        self.assertNotEqual(
+            CLASSIFY.with_schaubild(specific, "a").fingerprint(),
+            CLASSIFY.with_schaubild(specific, "b").fingerprint(),
+        )
+
     def test_recovery_of_one_cause_changes_the_fingerprint(self) -> None:
         # Receipt and Schaubild fail on the same commit, then only Schaubild.
         both = CLASSIFY.with_schaubild(classify(receipt(C, passed=False), C), "Schaubild broken")
@@ -422,6 +433,15 @@ class ProductionAlertIssueTest(unittest.TestCase):
                 issues.create_issue("Produktionsalarm: stale", "", ALERT.ALERT_LABEL)
                 self.assertNotEqual(ALERT.reconcile(issues, loaded, "r"), "resolved", payload)
                 self.assertEqual(issues.issues[0]["state"], "open")
+
+    def test_monitor_failure_fingerprint_follows_its_reason(self) -> None:
+        missing = ALERT.load_classification(None)
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "state.json"
+            broken.write_text("{not json")
+            unreadable = ALERT.load_classification(broken)
+        self.assertNotEqual(missing["fingerprint"], unreadable["fingerprint"])
+        self.assertEqual(missing["fingerprint"], ALERT.load_classification(None)["fingerprint"])
 
     def test_real_classifications_load_unchanged(self) -> None:
         self.assertEqual(ALERT.NON_ALERTING_STATES, CLASSIFY.NON_ALERTING_STATES)

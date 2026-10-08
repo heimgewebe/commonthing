@@ -289,9 +289,19 @@ def with_schaubild(classification: Classification, failure: str | None) -> Class
     if classification.alert:
         # Keep the more specific alert, but record Schaubild so it stays visible.
         return replace(
-            classification, reason=f"{classification.reason}; {failure}", schaubild="also"
+            classification,
+            reason=f"{classification.reason}; {failure}",
+            schaubild="also",
+            causes=(*classification.causes, failure),
         )
-    return replace(classification, state="invalid", alert=True, reason=failure, schaubild="only")
+    return replace(
+        classification,
+        state="invalid",
+        alert=True,
+        reason=failure,
+        schaubild="only",
+        causes=(failure,),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
