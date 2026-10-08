@@ -39,7 +39,8 @@ NON_ALERTING_STATES = frozenset({"current", "superseded", "pending"})
 
 
 class IssueClient(Protocol):
-    def open_issues(self, label: str, *, repair_assignee: bool = True) -> list[dict[str, Any]]: ...
+    def open_issues(self, label: str) -> list[dict[str, Any]]: ...
+    def ensure_assignee(self, issue: dict[str, Any]) -> None: ...
     def comments(self, number: int) -> list[dict[str, Any]]: ...
     def create_issue(self, title: str, body: str, label: str) -> dict[str, Any]: ...
     def comment(self, number: int, body: str) -> None: ...
@@ -77,7 +78,7 @@ class GitHubIssueClient:
             body = response.read()
         return json.loads(body) if body else None
 
-    def open_issues(self, label: str, *, repair_assignee: bool = True) -> list[dict[str, Any]]:
+    def open_issues(self, label: str) -> list[dict[str, Any]]:
         issues = self._request(
             "GET", f"/issues?state=open&labels={label}&sort=created&direction=asc&per_page=100"
         )
@@ -85,9 +86,6 @@ class GitHubIssueClient:
         if label == ALERT_LABEL:
             # A public issue labelled by a third party cannot impersonate our alert.
             result = [issue for issue in result if _trusted_alert_author(issue)]
-            if self._assignee and repair_assignee:
-                for issue in result:
-                    self._ensure_assignee(issue)
         return result
 
     def _has_assignee(self, issue: dict[str, Any]) -> bool:
@@ -99,9 +97,10 @@ class GitHubIssueClient:
             for account in issue.get("assignees") or []
         )
 
-    def _ensure_assignee(self, issue: dict[str, Any]) -> None:
-        """Repair missing assignees and verify GitHub's actual returned state."""
-        assert self._assignee is not None
+    def ensure_assignee(self, issue: dict[str, Any]) -> None:
+        """Repair only the handled issue; fail if GitHub does not confirm ownership."""
+        if not self._assignee:
+            raise ValueError("production alert assignee is not configured")
         if self._has_assignee(issue):
             return
         number = issue.get("number")
@@ -148,7 +147,7 @@ class GitHubIssueClient:
                 raise ValueError(f"issue #{issue.get('number')} was created without label {label!r}")
             if self._assignee:
                 # GitHub may ignore assignees in the create request. Repair once.
-                self._ensure_assignee(issue)
+                self.ensure_assignee(issue)
         except (OSError, ValueError):
             # Unlike a real alert, a failed controlled drill must not be stranded.
             number = issue.get("number")
@@ -229,14 +228,11 @@ def monitor_failure(reason: str) -> dict[str, Any]:
 
 
 def reconcile(client: IssueClient, classification: dict[str, Any], run_url: str) -> str:
-    # Only a proven recovery resolves existing incidents. Pending and superseded
-    # runs leave them open, so those runs must also repair missing ownership.
+    # Inspect first and publish any new alarm detail before checking ownership.
+    # GitHub rejecting an assignee must still fail the run, never suppress an
+    # escalation comment or block the primary issue because of duplicates.
     state = classification.get("state")
-    open_alerts = client.open_issues(
-        ALERT_LABEL, repair_assignee=not (
-            state == "current" and classification.get("alert") is False
-        )
-    )
+    open_alerts = client.open_issues(ALERT_LABEL)
     issue = open_alerts[0] if open_alerts else None
 
     if classification.get("alert") is True:
@@ -252,14 +248,15 @@ def reconcile(client: IssueClient, classification: dict[str, Any], run_url: str)
                 ALERT_LABEL,
             )
             return "opened"
-        if latest_fingerprint(issue, client.comments(issue["number"])) == fingerprint:
-            return "unchanged"
-        client.comment(
-            issue["number"],
-            "Der Alarm hat sich geändert.\n\n" + _details(classification, run_url) + "\n\n"
-            + _marker(fingerprint),
-        )
-        return "updated"
+        changed = latest_fingerprint(issue, client.comments(issue["number"])) != fingerprint
+        if changed:
+            client.comment(
+                issue["number"],
+                "Der Alarm hat sich geändert.\n\n"
+                + _details(classification, run_url) + "\n\n" + _marker(fingerprint),
+            )
+        client.ensure_assignee(issue)
+        return "updated" if changed else "unchanged"
 
     if state == "current" and issue is not None:
         client.comment(
@@ -269,6 +266,9 @@ def reconcile(client: IssueClient, classification: dict[str, Any], run_url: str)
         )
         client.close(issue["number"])
         return "resolved"
+    # pending/superseded are not recovery: the still-open incident needs an owner.
+    if issue is not None:
+        client.ensure_assignee(issue)
     return "unchanged"
 
 
