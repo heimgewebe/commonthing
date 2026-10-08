@@ -1798,18 +1798,24 @@ spec:
             process_exe = "/usr/local/bin/k3s"
             process_cmdline = "/usr/local/bin/k3s\0server\0"
             process_environment = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin\0"
+            staged_exe = "/var/lib/rancher/k3s/data/" + "1" * 64 + "/bin/k3s"
+            staged_link = staged_exe
+            staged_digest = config["kubernetes"]["reexec_binary_sha256"]
 
             def runner(argv: list[str], **_kwargs):
                 nonlocal process_exe, process_cmdline, process_environment
                 if "sha256sum" in argv:
-                    stdout = "".join(
-                        f"{guest_digests[path]}  {path}\n"
-                        for path in (
-                            "/usr/local/bin/k3s",
-                            "/etc/rancher/k3s/config.yaml",
-                            "/etc/systemd/system/k3s.service",
+                    if argv[-1] == "/proc/4321/exe":
+                        stdout = f"{staged_digest}  {argv[-1]}\n"
+                    else:
+                        stdout = "".join(
+                            f"{guest_digests[path]}  {path}\n"
+                            for path in (
+                                "/usr/local/bin/k3s",
+                                "/etc/rancher/k3s/config.yaml",
+                                "/etc/systemd/system/k3s.service",
+                            )
                         )
-                    )
                 elif "systemctl" in argv:
                     stdout = "".join(
                         f"{key}={systemctl[key]}\n"
@@ -1824,7 +1830,11 @@ spec:
                         )
                     )
                 elif "readlink" in argv:
-                    stdout = process_exe + "\n"
+                    stdout = (
+                        staged_link
+                        if argv[-1] == "/var/lib/rancher/k3s/data/current/bin/k3s"
+                        else process_exe
+                    ) + "\n"
                 elif "cat" in argv and any("/cmdline" in item for item in argv):
                     stdout = process_cmdline
                 elif "cat" in argv and any("/environ" in item for item in argv):
@@ -1924,6 +1934,51 @@ spec:
                 with self.assertRaisesRegex(
                     runtime.RuntimeErrorEB, "process identity"
                 ):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+
+            process_exe = staged_exe
+            process_cmdline = "/usr/local/bin/k3s server\0"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                observed = runtime._require_live_k3s_runtime(root, config, commit)
+            self.assertEqual(observed["process_exe"], staged_exe)
+            self.assertEqual(observed["process_argv"], ["/usr/local/bin/k3s server"])
+
+            staged_link = "/var/lib/rancher/k3s/data/" + "2" * 64 + "/bin/k3s"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "reexec target"):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            staged_link = staged_exe
+
+            staged_digest = "0" * 64
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "reexec binary digest"):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            staged_digest = config["kubernetes"]["reexec_binary_sha256"]
+
+            process_cmdline = "/usr/local/bin/k3s server\0--disable=metrics-server\0"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "process identity"):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            process_cmdline = "/usr/local/bin/k3s server\0"
+
+            process_exe = "/var/lib/rancher/k3s/data/unpinned/bin/k3s"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "process identity"):
                     runtime._require_live_k3s_runtime(root, config, commit)
 
         source = inspect.getsource(runtime.status)

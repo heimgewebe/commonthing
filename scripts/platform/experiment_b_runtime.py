@@ -2697,11 +2697,42 @@ def _require_live_k3s_runtime(
         timeout=30,
     ).stdout
     argv = [value for value in process_cmdline.split("\0") if value]
-    if (
-        process_exe != "/usr/local/bin/k3s"
-        or argv != ["/usr/local/bin/k3s", "server"]
-    ):
-        raise RuntimeErrorEB("active k3s process identity drifted")
+    launcher_identity = (
+        process_exe == "/usr/local/bin/k3s"
+        and argv == ["/usr/local/bin/k3s", "server"]
+    )
+    if not launcher_identity:
+        # The pinned k3s launcher reexecs its packaged server from data/current.
+        if (
+            argv != ["/usr/local/bin/k3s server"]
+            or re.fullmatch(
+                r"/var/lib/rancher/k3s/data/[0-9a-f]{64}/bin/k3s",
+                process_exe,
+            ) is None
+        ):
+            raise RuntimeErrorEB("active k3s process identity drifted")
+        current_exe = run(
+            [
+                *ssh_argv(root, live_ip),
+                "sudo",
+                "readlink",
+                "-f",
+                "/var/lib/rancher/k3s/data/current/bin/k3s",
+            ],
+            timeout=30,
+        ).stdout.strip()
+        if current_exe != process_exe:
+            raise RuntimeErrorEB("active k3s reexec target drifted")
+        process_path = f"/proc/{main_pid}/exe"
+        reexec_digests = _parse_sha256sum_output(
+            run(
+                [*ssh_argv(root, live_ip), "sudo", "sha256sum", "--", process_path],
+                timeout=30,
+            ).stdout,
+            (process_path,),
+        )
+        if reexec_digests[process_path] != config["kubernetes"]["reexec_binary_sha256"]:
+            raise RuntimeErrorEB("active k3s reexec binary digest drifted")
     process_environment = run(
         [
             *ssh_argv(root, live_ip),
