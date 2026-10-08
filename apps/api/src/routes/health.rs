@@ -8,7 +8,7 @@ use std::{
 use tokio::{
     fs,
     io::AsyncReadExt,
-    sync::Mutex,
+    sync::{watch, Mutex},
     time::{timeout, Instant},
 };
 
@@ -111,7 +111,10 @@ const EVENT_CHAIN_READINESS_CACHE_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Default)]
 struct EventChainReadinessCache {
+    // Reuse healthy results only; never mask recovery after a failed check.
     completed: Option<(Instant, CheckResult)>,
+    // All waiters subscribe without holding the lock during I/O.
+    in_flight: Option<watch::Receiver<Option<CheckResult>>>,
 }
 const STALE_UNPUBLISHED_AFTER_SECONDS: i64 = 60;
 const DELAYED_RECEIPT_AFTER_SECONDS: i64 = 60;
@@ -470,25 +473,67 @@ where
     }
 }
 
-// Serialize only the expensive event-chain verification. A completed result is
-// shared for 250 ms across cloned ApiState handles. Cancellation before the
-// check finishes never publishes a partial or successful cache entry.
+// Only cache bookkeeping holds the mutex. A shared worker executes the
+// event-chain check once and has its OWN 750ms deadline, independent of HTTP
+// request cancellation. Followers await the same result without a mutex queue.
 async fn cached_event_chain_check<F>(
-    cache: &Mutex<EventChainReadinessCache>,
+    cache: Arc<Mutex<EventChainReadinessCache>>,
     check: F,
 ) -> CheckResult
 where
-    F: Future<Output = CheckResult>,
+    F: Future<Output = CheckResult> + Send + 'static,
 {
-    let mut cache = cache.lock().await;
-    if let Some((completed_at, result)) = cache.completed.as_ref() {
-        if completed_at.elapsed() < EVENT_CHAIN_READINESS_CACHE_TTL {
+    let mut updates = {
+        let mut slot = cache.lock().await;
+        if let Some((completed_at, result)) = &slot.completed {
+            if completed_at.elapsed() < EVENT_CHAIN_READINESS_CACHE_TTL {
+                return result.clone();
+            }
+        }
+        slot.completed = None;
+        if let Some(existing) = &slot.in_flight {
+            existing.clone()
+        } else {
+            let (sender, receiver) = watch::channel(None);
+            slot.in_flight = Some(receiver.clone());
+            let shared = cache.clone();
+            tokio::spawn(async move {
+                let result = bounded_check(
+                    "event_chain",
+                    Duration::from_millis(READINESS_CHECK_TIMEOUT_MS),
+                    check,
+                )
+                .await;
+                let mut slot = shared.lock().await;
+                if matches!(result.status, CheckStatus::Ready) {
+                    slot.completed = Some((Instant::now(), result.clone()));
+                }
+                sender.send_replace(Some(result));
+                slot.in_flight = None;
+            });
+            receiver
+        }
+    };
+    loop {
+        if let Some(result) = updates.borrow_and_update().as_ref() {
             return result.clone();
         }
+        if updates.changed().await.is_err() {
+            // Worker aborted without publishing (for example after a panic).
+            // Never leave subsequent requests subscribed to a dead channel.
+            let mut slot = cache.lock().await;
+            if slot
+                .in_flight
+                .as_ref()
+                .is_some_and(|current| current.same_channel(&updates))
+            {
+                slot.in_flight = None;
+            }
+            let message = "shared event-chain readiness check ended without a result";
+            readiness_check_failed("event_chain", message);
+            return CheckResult::failure_with_message(message.to_owned());
+        }
     }
-    let result = check.await;
-    cache.completed = Some((Instant::now(), result.clone()));
-    result
 }
 
 async fn run_readiness_checks_with_budgets<N, D, E, P>(
@@ -542,12 +587,16 @@ where
 
 async fn run_readiness_checks(
     state: &ApiState,
-    cache: &Mutex<EventChainReadinessCache>,
+    cache: Arc<Mutex<EventChainReadinessCache>>,
 ) -> ReadinessResults {
+    let event_chain_state = state.clone();
     run_readiness_checks_with_budgets(
         check_nats(state),
         check_database(state),
-        cached_event_chain_check(cache, check_event_chain(state)),
+        cached_event_chain_check(
+            cache,
+            async move { check_event_chain(&event_chain_state).await },
+        ),
         check_policy(),
         Duration::from_millis(READINESS_CHECK_TIMEOUT_MS),
         Duration::from_millis(READINESS_TOTAL_TIMEOUT_MS),
@@ -559,7 +608,7 @@ async fn ready(
     State(state): State<ApiState>,
     Extension(cache): Extension<Arc<Mutex<EventChainReadinessCache>>>,
 ) -> Response {
-    readiness_response(run_readiness_checks(&state, &cache).await)
+    readiness_response(run_readiness_checks(&state, cache).await)
 }
 
 fn readiness_check_json(status: CheckStatus) -> Value {
@@ -763,13 +812,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn health_router_installs_event_chain_cache_extension() -> Result<()> {
-        let mut router = health_routes().with_state(test_state()?);
-        let request = axum::http::Request::builder()
-            .uri("/health/ready")
-            .body(body::Body::empty())?;
-        let response = tower::Service::call(&mut router, request).await?;
-        assert_eq!(response.status(), StatusCode::OK);
+        let router = health_routes().with_state(test_state()?);
+        for mut clone in [router.clone(), router] {
+            let request = axum::http::Request::builder()
+                .uri("/health/ready")
+                .body(body::Body::empty())?;
+            let response = tower::Service::call(&mut clone, request).await?;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
         Ok(())
     }
 
@@ -837,7 +889,7 @@ mod tests {
             let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                let result = cached_event_chain_check(&cache, async {
+                let result = cached_event_chain_check(cache.clone(), async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(40)).await;
                     CheckResult::ready()
@@ -851,15 +903,16 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let cached = cached_event_chain_check(&cache, async {
+        let cached = cached_event_chain_check(cache.clone(), async {
             panic!("a fresh cached result must not run another check")
         })
         .await;
         assert!(matches!(cached.status, CheckStatus::Ready));
 
         tokio::time::sleep(EVENT_CHAIN_READINESS_CACHE_TTL + Duration::from_millis(20)).await;
-        let refreshed = cached_event_chain_check(&cache, async {
-            calls.fetch_add(1, Ordering::SeqCst);
+        let refresh_calls = calls.clone();
+        let refreshed = cached_event_chain_check(cache.clone(), async move {
+            refresh_calls.fetch_add(1, Ordering::SeqCst);
             CheckResult::failure_with_message("dependency unavailable".to_owned())
         })
         .await;
@@ -869,16 +922,154 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancelled_event_chain_check_does_not_cache_success() {
-        let cache = tokio::sync::Mutex::new(EventChainReadinessCache::default());
+        let cache = Arc::new(Mutex::new(EventChainReadinessCache::default()));
         let timed_out = tokio::time::timeout(
             Duration::from_millis(10),
-            cached_event_chain_check(&cache, pending::<CheckResult>()),
+            cached_event_chain_check(cache.clone(), pending::<CheckResult>()),
         )
         .await;
         assert!(timed_out.is_err());
+        {
+            let slot = cache.lock().await;
+            assert!(slot.completed.is_none());
+            assert!(slot.in_flight.is_some());
+        }
+        // The detached worker remains bounded even after its first caller
+        // disappears. An already subscribed follower must not start a scan.
+        let failed = tokio::time::timeout(
+            Duration::from_millis(1_200),
+            cached_event_chain_check(cache.clone(), async { CheckResult::ready() }),
+        )
+        .await
+        .expect("shared worker must finish within its 750ms budget");
+        assert!(matches!(failed.status, CheckStatus::Failed));
+        assert!(cache.lock().await.completed.is_none());
 
-        let result = cached_event_chain_check(&cache, async { CheckResult::ready() }).await;
-        assert!(matches!(result.status, CheckStatus::Ready));
+        let recovered =
+            cached_event_chain_check(cache.clone(), async { CheckResult::ready() }).await;
+        assert!(matches!(recovered.status, CheckStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn failed_event_chain_check_is_not_cached() {
+        let cache = Arc::new(Mutex::new(EventChainReadinessCache::default()));
+        let failed = cached_event_chain_check(cache.clone(), async {
+            CheckResult::failure_with_message("transient event-chain error".to_owned())
+        })
+        .await;
+        assert!(matches!(failed.status, CheckStatus::Failed));
+        assert!(cache.lock().await.completed.is_none());
+        let recovered =
+            cached_event_chain_check(cache.clone(), async { CheckResult::ready() }).await;
+        assert!(matches!(recovered.status, CheckStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn ten_concurrent_readiness_checks_near_timeout_share_one_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Arc::new(Mutex::new(EventChainReadinessCache::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(10));
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let result = run_readiness_checks_with_budgets(
+                    async { CheckResult::ready() },
+                    async { CheckResult::ready() },
+                    cached_event_chain_check(cache, async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(650)).await;
+                        CheckResult::ready()
+                    }),
+                    async { CheckResult::ready() },
+                    Duration::from_millis(READINESS_CHECK_TIMEOUT_MS),
+                    Duration::from_millis(READINESS_TOTAL_TIMEOUT_MS),
+                )
+                .await;
+                matches!(result.event_chain.status, CheckStatus::Ready)
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.expect("readiness task must not panic"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ten_concurrent_slow_checks_do_not_start_a_timeout_convoy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Arc::new(Mutex::new(EventChainReadinessCache::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(10));
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let result = run_readiness_checks_with_budgets(
+                    async { CheckResult::ready() },
+                    async { CheckResult::ready() },
+                    cached_event_chain_check(cache, async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                        CheckResult::ready()
+                    }),
+                    async { CheckResult::ready() },
+                    Duration::from_millis(READINESS_CHECK_TIMEOUT_MS),
+                    Duration::from_millis(READINESS_TOTAL_TIMEOUT_MS),
+                )
+                .await;
+                matches!(result.event_chain.status, CheckStatus::Failed)
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.expect("timed-out readiness task must complete"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let slot = cache.lock().await;
+        assert!(slot.completed.is_none());
+        assert!(slot.in_flight.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_shared_check_releases_every_waiter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Arc::new(Mutex::new(EventChainReadinessCache::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(10));
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let result = cached_event_chain_check(cache, async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    CheckResult::failure_with_message(
+                        "dependency temporarily unavailable".to_owned(),
+                    )
+                })
+                .await;
+                matches!(result.status, CheckStatus::Failed)
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.expect("readiness waiter must finish"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(cache.lock().await.completed.is_none());
     }
 
     #[tokio::test(start_paused = true)]
