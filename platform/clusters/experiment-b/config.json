@@ -27,6 +27,7 @@
     "kubernetes_version": "1.36.1",
     "binary_url": "https://github.com/k3s-io/k3s/releases/download/v1.36.1%2Bk3s1/k3s",
     "binary_sha256": "a443db3fe9820cd93617ae67e4386d87c1514c1e96ceb30f4c2791c39065653c",
+    "reexec_binary_sha256": "07a079618fd12985baf8885b11706a4a723b5c2e396a18859b584ccd89288667",
     "server_flags": [
       "--flannel-backend=none",
       "--disable-network-policy",

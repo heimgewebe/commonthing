@@ -1798,18 +1798,24 @@ spec:
             process_exe = "/usr/local/bin/k3s"
             process_cmdline = "/usr/local/bin/k3s\0server\0"
             process_environment = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin\0"
+            staged_exe = "/var/lib/rancher/k3s/data/" + "1" * 64 + "/bin/k3s"
+            staged_link = staged_exe
+            staged_digest = config["kubernetes"]["reexec_binary_sha256"]
 
             def runner(argv: list[str], **_kwargs):
                 nonlocal process_exe, process_cmdline, process_environment
                 if "sha256sum" in argv:
-                    stdout = "".join(
-                        f"{guest_digests[path]}  {path}\n"
-                        for path in (
-                            "/usr/local/bin/k3s",
-                            "/etc/rancher/k3s/config.yaml",
-                            "/etc/systemd/system/k3s.service",
+                    if argv[-1] == "/proc/4321/exe":
+                        stdout = f"{staged_digest}  {argv[-1]}\n"
+                    else:
+                        stdout = "".join(
+                            f"{guest_digests[path]}  {path}\n"
+                            for path in (
+                                "/usr/local/bin/k3s",
+                                "/etc/rancher/k3s/config.yaml",
+                                "/etc/systemd/system/k3s.service",
+                            )
                         )
-                    )
                 elif "systemctl" in argv:
                     stdout = "".join(
                         f"{key}={systemctl[key]}\n"
@@ -1824,7 +1830,11 @@ spec:
                         )
                     )
                 elif "readlink" in argv:
-                    stdout = process_exe + "\n"
+                    stdout = (
+                        staged_link
+                        if argv[-1] == "/var/lib/rancher/k3s/data/current/bin/k3s"
+                        else process_exe
+                    ) + "\n"
                 elif "cat" in argv and any("/cmdline" in item for item in argv):
                     stdout = process_cmdline
                 elif "cat" in argv and any("/environ" in item for item in argv):
@@ -1844,6 +1854,8 @@ spec:
                 )
             self.assertEqual(observed["vm_ip"], ip)
             self.assertEqual(observed["process_exe"], "/usr/local/bin/k3s")
+            self.assertIsNone(observed["reexec_binary_sha256"])
+            self.assertFalse(observed["reexec_current_target_verified"])
             self.assertEqual(
                 observed["binary_sha256"],
                 config["kubernetes"]["binary_sha256"],
@@ -1924,6 +1936,56 @@ spec:
                 with self.assertRaisesRegex(
                     runtime.RuntimeErrorEB, "process identity"
                 ):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+
+            process_exe = staged_exe
+            process_cmdline = "/usr/local/bin/k3s server\0"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                observed = runtime._require_live_k3s_runtime(root, config, commit)
+            self.assertEqual(observed["process_exe"], staged_exe)
+            self.assertEqual(observed["process_argv"], ["/usr/local/bin/k3s server"])
+            self.assertEqual(
+                observed["reexec_binary_sha256"],
+                config["kubernetes"]["reexec_binary_sha256"],
+            )
+            self.assertTrue(observed["reexec_current_target_verified"])
+
+            staged_link = "/var/lib/rancher/k3s/data/" + "2" * 64 + "/bin/k3s"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "reexec target"):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            staged_link = staged_exe
+
+            staged_digest = "0" * 64
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "reexec binary digest"):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            staged_digest = config["kubernetes"]["reexec_binary_sha256"]
+
+            process_cmdline = "/usr/local/bin/k3s server\0--disable=metrics-server\0"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "process identity"):
+                    runtime._require_live_k3s_runtime(root, config, commit)
+            process_cmdline = "/usr/local/bin/k3s server\0"
+
+            process_exe = "/var/lib/rancher/k3s/data/unpinned/bin/k3s"
+            with (
+                mock.patch.object(runtime, "vm_ip", return_value=ip),
+                mock.patch.object(runtime, "run", side_effect=runner),
+            ):
+                with self.assertRaisesRegex(runtime.RuntimeErrorEB, "process identity"):
                     runtime._require_live_k3s_runtime(root, config, commit)
 
         source = inspect.getsource(runtime.status)
@@ -4803,6 +4865,45 @@ spec:
                     changed_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
                     runtime.atomic_json(attempt_path, changed_attempt)
                     with self.assertRaisesRegex(runtime.RuntimeErrorEB, "status is not bound"):
+                        runtime.portability_report(root)
+            status_path.write_text(original_status, encoding="utf-8")
+            attempt_path.write_text(original_attempt, encoding="utf-8")
+            self.assertEqual(runtime.portability_report(root)["status"], "pass")
+
+            # Status' freshly attested staged K3s reexec is also portable.
+            reexec_status = json.loads(original_status)
+            reexec_k3s = reexec_status["k3s_runtime"]
+            reexec_k3s["process_exe"] = (
+                "/var/lib/rancher/k3s/data/" + "1" * 64 + "/bin/k3s"
+            )
+            reexec_k3s["process_argv"] = ["/usr/local/bin/k3s server"]
+            reexec_k3s["reexec_binary_sha256"] = (
+                config["kubernetes"]["reexec_binary_sha256"]
+            )
+            reexec_k3s["reexec_current_target_verified"] = True
+            runtime.atomic_json(status_path, reexec_status)
+            reexec_attempt = json.loads(original_attempt)
+            reexec_attempt["receipt_sha256"] = runtime.sha256_file(status_path)
+            runtime.atomic_json(attempt_path, reexec_attempt)
+            self.assertEqual(runtime.portability_report(root)["status"], "pass")
+
+            for field, invalid_value in (
+                ("process_exe", "/var/lib/rancher/k3s/data/unpinned/bin/k3s"),
+                ("process_argv", ["/usr/local/bin/k3s", "server"]),
+                ("reexec_binary_sha256", "0" * 64),
+                ("reexec_current_target_verified", False),
+            ):
+                with self.subTest(reexec_field=field):
+                    invalid_status = json.loads(json.dumps(reexec_status))
+                    invalid_status["k3s_runtime"][field] = invalid_value
+                    runtime.atomic_json(status_path, invalid_status)
+                    reexec_attempt["receipt_sha256"] = runtime.sha256_file(
+                        status_path
+                    )
+                    runtime.atomic_json(attempt_path, reexec_attempt)
+                    with self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB, "live pinned k3s runtime"
+                    ):
                         runtime.portability_report(root)
             status_path.write_text(original_status, encoding="utf-8")
             attempt_path.write_text(original_attempt, encoding="utf-8")
