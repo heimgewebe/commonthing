@@ -101,6 +101,14 @@ class AlertWorkflowTest(unittest.TestCase):
         self.assertIn("PRODUCTION_ALERT_ASSIGNEE: alexdermohr", job)
 
 
+    def test_failed_drill_cannot_skip_real_production_alarm(self) -> None:
+        workflow = (OPS.parents[1] / ".github/workflows/production-live-contract.yml").read_text(
+            encoding="utf-8"
+        )
+        step = workflow.split("      - name: Open, update or resolve the production alert\n", 1)[1]
+        self.assertTrue(step.startswith("        if: " + chr(36) + "{{ !cancelled() }}\n"))
+
+
 class ClassifyProductionLiveStateTest(unittest.TestCase):
     def test_states(self) -> None:
         cases = {
@@ -692,10 +700,15 @@ class RecordingClient(ALERT.GitHubIssueClient):
 
 class GitHubIssueClientTest(unittest.TestCase):
     def test_new_issue_has_explicit_verified_assignee(self) -> None:
-        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", ["alexdermohr"])
+        client = RecordingClient(
+            None, [ALERT.ALERT_LABEL], "alexdermohr", [],
+            repair_assignees=["alexdermohr"],
+        )
         issue = client.create_issue("t", "b", ALERT.ALERT_LABEL)
         self.assertEqual(issue["number"], 7)
-        self.assertEqual(client.payloads[1]["assignees"], ["alexdermohr"])
+        self.assertNotIn("assignees", client.payloads[1])
+        self.assertEqual(client.calls[-1], ("POST", "/issues/7/assignees"))
+        self.assertEqual(client.payloads[-1], {"assignees": ["alexdermohr"]})
 
     def test_create_repairs_assignee_ignored_by_github(self) -> None:
         client = RecordingClient(
@@ -703,8 +716,47 @@ class GitHubIssueClientTest(unittest.TestCase):
             repair_assignees=["AlexDerMohr"],
         )
         self.assertEqual(client.create_issue("t", "b", ALERT.ALERT_LABEL)["number"], 7)
+        self.assertNotIn("assignees", client.payloads[1])
         self.assertEqual(client.calls[-1], ("POST", "/issues/7/assignees"))
         self.assertEqual(client.payloads[-1], {"assignees": ["alexdermohr"]})
+
+    def test_rejected_owner_does_not_prevent_first_alert_creation(self) -> None:
+        class RejectOwnerAtCreate(RecordingClient):
+            def __init__(self) -> None:
+                super().__init__(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+                self.created = False
+
+            def _request(self, method: str, path: str, payload: Any = None) -> Any:
+                if method == "POST" and path == "/issues" and "assignees" in payload:
+                    raise urllib.error.HTTPError(path, 422, "Invalid assignee", None, None)
+                result = super()._request(method, path, payload)
+                if method == "POST" and path == "/issues":
+                    self.created = True
+                return result
+
+        client = RejectOwnerAtCreate()
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            ALERT.reconcile(client, state("outage", None), "r")
+        self.assertTrue(client.created)
+        index = client.calls.index(("POST", "/issues"))
+        self.assertNotIn("assignees", client.payloads[index])
+        self.assertIn(ALERT._marker(state("outage", None)["fingerprint"]),
+                      client.payloads[index]["body"])
+        self.assertIn(("POST", "/issues/7/assignees"), client.calls)
+        self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_post_create_assignment_http_422_keeps_real_alert_open(self) -> None:
+        class RejectOwnerPatch(RecordingClient):
+            def _request(self, method: str, path: str, payload: Any = None) -> Any:
+                if method == "POST" and path == "/issues/7/assignees":
+                    raise urllib.error.HTTPError(path, 422, "Unassignable", None, None)
+                return super()._request(method, path, payload)
+
+        client = RejectOwnerPatch(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        with self.assertRaises(urllib.error.HTTPError):
+            ALERT.reconcile(client, state("outage", None), "r")
+        self.assertIn(("POST", "/issues"), client.calls)
+        self.assertNotIn(("PATCH", "/issues/7"), client.calls)
 
     def test_existing_assignment_accepts_case_insensitive_login(self) -> None:
         client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", ["AlexDerMohr"])

@@ -404,6 +404,7 @@ jobs:
           python scripts/ops/production_alert_issue.py --drill
           --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
       - name: Open, update or resolve the production alert
+        if: ${{ !cancelled() }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-

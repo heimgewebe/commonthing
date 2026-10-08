@@ -137,16 +137,16 @@ class GitHubIssueClient:
 
     def create_issue(self, title: str, body: str, label: str) -> dict[str, Any]:
         self.ensure_label(label)
+        # Publish the incident before assigning it. GitHub rejects a create
+        # with an unassignable login (HTTP 422), which must never hide an alarm.
         payload: dict[str, Any] = {"title": title, "body": body, "labels": [label]}
-        if self._assignee:
-            payload["assignees"] = [self._assignee]
         issue = self._request("POST", "/issues", payload)
         try:
             names = {item.get("name") for item in issue.get("labels") or [] if isinstance(item, dict)}
             if label not in names:
                 raise ValueError(f"issue #{issue.get('number')} was created without label {label!r}")
             if self._assignee:
-                # GitHub may ignore assignees in the create request. Repair once.
+                # Verify ownership separately; on failure the real issue stays open.
                 self.ensure_assignee(issue)
         except (OSError, ValueError):
             # Unlike a real alert, a failed controlled drill must not be stranded.
