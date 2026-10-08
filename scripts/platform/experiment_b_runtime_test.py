@@ -13476,6 +13476,26 @@ spec:
                 runtime._require_live_namespace_security_contract(self.root)
 
         self.namespaces = json.loads(json.dumps(healthy))
+        for key in (
+            "kustomize.toolkit.fluxcd.io/name",
+            "kustomize.toolkit.fluxcd.io/namespace",
+        ):
+            colliding_contract = json.loads(json.dumps(expected))
+            colliding_contract[runtime.APP_NAMESPACE]["labels"][key] = "foreign-owner"
+            with (
+                self.subTest(contract_collision_key=key),
+                mock.patch.object(
+                    runtime,
+                    "_versioned_namespace_security_contract",
+                    return_value=colliding_contract,
+                ),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB, "versioned Namespace labels overlap Flux ownership"
+                ),
+            ):
+                runtime._require_live_namespace_security_contract(self.root)
+
+        self.namespaces = json.loads(json.dumps(healthy))
         self.namespaces[runtime.DATA_NAMESPACE]["metadata"]["labels"][
             "unexpected.example/label"
         ] = "drift"

@@ -6896,11 +6896,13 @@ def _require_live_namespace_security_contract(
         labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
         # Flux adds exactly these ownership labels to the reconciled Namespace.
         # All versioned security labels must still match without any extra keys.
-        expected_live_labels = {
-            **contract_value["labels"],
+        flux_owner_labels = {
             "kustomize.toolkit.fluxcd.io/name": "commonthing-experiment-b-namespaces",
             "kustomize.toolkit.fluxcd.io/namespace": "flux-system",
         }
+        if not contract_value["labels"].keys().isdisjoint(flux_owner_labels):
+            raise RuntimeErrorEB(f"versioned Namespace labels overlap Flux ownership: {name}")
+        expected_live_labels = {**contract_value["labels"], **flux_owner_labels}
         if (
             not isinstance(metadata, dict)
             or metadata.get("name") != name
