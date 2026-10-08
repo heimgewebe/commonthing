@@ -482,7 +482,7 @@ class FakeIssues:
         self.issues: list[dict[str, Any]] = []
         self.notifications: list[str] = []
 
-    def open_issues(self, label: str) -> list[dict[str, Any]]:
+    def open_issues(self, label: str, *, repair_assignee: bool = True) -> list[dict[str, Any]]:
         return [i for i in self.issues if i["state"] == "open" and label in i["labels"]]
 
     def comments(self, number: int) -> list[dict[str, Any]]:
@@ -742,6 +742,26 @@ class GitHubIssueClientTest(unittest.TestCase):
         }]
         with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
             client.open_issues(ALERT.ALERT_LABEL)
+
+    def test_recovery_resolves_open_bot_issue_without_repairing_unassignable_owner(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        client._existing = [{
+            "number": 7, "assignees": [],
+            "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+        }]
+        self.assertEqual(ALERT.reconcile(client, state("current", C), "r"), "resolved")
+        self.assertNotIn(("POST", "/issues/7/assignees"), client.calls)
+        self.assertIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_active_alarm_still_refuses_unassigned_existing_issue(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        client._existing = [{
+            "number": 7, "assignees": [],
+            "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+        }]
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            ALERT.reconcile(client, state("stale"), "r")
+        self.assertNotIn(("PATCH", "/issues/7"), client.calls)
 
     def test_third_party_labelled_issue_is_never_assigned_or_treated_as_owned(self) -> None:
         client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", ["alexdermohr"])

@@ -39,7 +39,7 @@ NON_ALERTING_STATES = frozenset({"current", "superseded", "pending"})
 
 
 class IssueClient(Protocol):
-    def open_issues(self, label: str) -> list[dict[str, Any]]: ...
+    def open_issues(self, label: str, *, repair_assignee: bool = True) -> list[dict[str, Any]]: ...
     def comments(self, number: int) -> list[dict[str, Any]]: ...
     def create_issue(self, title: str, body: str, label: str) -> dict[str, Any]: ...
     def comment(self, number: int, body: str) -> None: ...
@@ -77,7 +77,7 @@ class GitHubIssueClient:
             body = response.read()
         return json.loads(body) if body else None
 
-    def open_issues(self, label: str) -> list[dict[str, Any]]:
+    def open_issues(self, label: str, *, repair_assignee: bool = True) -> list[dict[str, Any]]:
         issues = self._request(
             "GET", f"/issues?state=open&labels={label}&sort=created&direction=asc&per_page=100"
         )
@@ -85,7 +85,7 @@ class GitHubIssueClient:
         if label == ALERT_LABEL:
             # A public issue labelled by a third party cannot impersonate our alert.
             result = [issue for issue in result if _trusted_alert_author(issue)]
-            if self._assignee:
+            if self._assignee and repair_assignee:
                 for issue in result:
                     self._ensure_assignee(issue)
         return result
@@ -229,7 +229,11 @@ def monitor_failure(reason: str) -> dict[str, Any]:
 
 
 def reconcile(client: IssueClient, classification: dict[str, Any], run_url: str) -> str:
-    open_alerts = client.open_issues(ALERT_LABEL)
+    # A proven recovery must close an incident even if the previously assigned
+    # account is no longer assignable; active alarms still require assignment.
+    open_alerts = client.open_issues(
+        ALERT_LABEL, repair_assignee=classification.get("alert") is True
+    )
     issue = open_alerts[0] if open_alerts else None
     state = classification.get("state")
 
