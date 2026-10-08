@@ -59,14 +59,19 @@ class Classification:
     reason: str
     frontend_commit: str | None = None
     api_commit: str | None = None
+    # "only" when Schaubild is the sole alert cause, "also" when it fails next
+    # to another alert, so recovery of either cause changes the fingerprint.
+    schaubild: str | None = None
 
     def fingerprint(self) -> str:
         """Stable identity of an alert, used to deduplicate notifications."""
         if self.live_commit is None and (self.frontend_commit or self.api_commit):
             # A split or partly unreadable deployment has no single live
             # commit; keep both sides so A/B -> B/C or a moving outage is a change.
-            return f"{self.state}:{self.frontend_commit or 'none'}/{self.api_commit or 'none'}"
-        return f"{self.state}:{self.live_commit or 'none'}"
+            identity = f"{self.state}:{self.frontend_commit or 'none'}/{self.api_commit or 'none'}"
+        else:
+            identity = f"{self.state}:{self.live_commit or 'none'}"
+        return f"{identity}+schaubild-{self.schaubild}" if self.schaubild else identity
 
 
 def _is_commit(value: Any) -> bool:
@@ -267,9 +272,14 @@ def schaubild_failure(path: Path) -> str | None:
 
 
 def with_schaubild(classification: Classification, failure: str | None) -> Classification:
-    if failure is None or classification.alert:
+    if failure is None:
         return classification
-    return replace(classification, state="invalid", alert=True, reason=failure)
+    if classification.alert:
+        # Keep the more specific alert, but record Schaubild so it stays visible.
+        return replace(
+            classification, reason=f"{classification.reason}; {failure}", schaubild="also"
+        )
+    return replace(classification, state="invalid", alert=True, reason=failure, schaubild="only")
 
 
 def build_parser() -> argparse.ArgumentParser:

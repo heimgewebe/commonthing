@@ -279,8 +279,21 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             self.assertIn("unreadable", json.loads(output.read_text())["reason"])
 
     def test_schaubild_failure_keeps_a_more_specific_alert(self) -> None:
-        outage = classify(receipt(None), C)
-        self.assertIs(CLASSIFY.with_schaubild(outage, "Schaubild broken"), outage)
+        specific = classify(receipt(None), C)
+        self.assertTrue(specific.alert)
+        combined = CLASSIFY.with_schaubild(specific, "Schaubild broken")
+        self.assertEqual(combined.state, specific.state)
+        self.assertIn(specific.reason, combined.reason)
+        self.assertIn("Schaubild broken", combined.reason)
+        self.assertIs(CLASSIFY.with_schaubild(specific, None), specific)
+
+    def test_recovery_of_one_cause_changes_the_fingerprint(self) -> None:
+        # Receipt and Schaubild fail on the same commit, then only Schaubild.
+        both = CLASSIFY.with_schaubild(classify(receipt(C, passed=False), C), "Schaubild broken")
+        only = CLASSIFY.with_schaubild(classify(receipt(C, passed=True), C), "Schaubild broken")
+        self.assertEqual((both.state, only.state), ("invalid", "invalid"))
+        self.assertNotEqual(both.fingerprint(), only.fingerprint())
+        self.assertNotEqual(only.fingerprint(), classify(receipt(C, passed=False), C).fingerprint())
 
 
 class FakeIssues:

@@ -303,8 +303,9 @@ Commits selbst. Deshalb schließt ausschließlich `current` einen offenen Alarm.
 
 Der Job `Deliver production alert` (`scripts/ops/production_alert_issue.py`)
 führt genau ein offenes Issue mit Label `production-alert`. Ein Alarm öffnet es;
-solange er anhält, kommt nur bei geändertem Zustand oder Live-Commit ein
-Kommentar dazu. Erholung kommentiert und schließt es. Die Meldung erreicht
+solange er anhält, kommt nur bei geändertem Zustand, Live-Commit oder
+Schaubild-Befund ein Kommentar dazu. Scheitert Schaubild neben einem anderen
+Alarm, bleibt der spezifischere Zustand, und der Schaubild-Befund steht im Grund. Erholung kommentiert und schließt es. Die Meldung erreicht
 Menschen über die normalen GitHub-Benachrichtigungen der Repository-Beobachter.
 
 Ein manueller Lauf mit `alert_drill: true` öffnet und schließt ein separates
