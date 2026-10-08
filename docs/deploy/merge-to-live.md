@@ -291,8 +291,8 @@ aktuelle `main`-Linie ein und schreibt `production-live-state.json`:
 |---|---|---|
 | `current` | erwarteter Commit live und konsistent, und er ist noch der Kopf von `main` | nein, löst offenen Alarm auf |
 | `superseded` | der aktuelle Kopf von `main`, der den erwarteten Commit enthält, ist live und besteht alle übrigen Receipt-Prüfungen | nein, löst nichts auf |
-| `pending` | älterer `main`-Commit live und sonst gültig, Kopf von `main` jünger als 1200 s | nein |
-| `stale` | älterer `main`-Commit nach 1200 s noch live (Rollout oder Reconciler hängt) | ja |
+| `pending` | älterer `main`-Commit live und sonst gültig, der erste `main`-Commit danach ist jünger als 1200 s (spätere Merges starten die Frist nicht neu) | nein |
+| `stale` | älterer `main`-Commit 1200 s nach dem ersten `main`-Commit danach noch live (Rollout oder Reconciler hängt) | ja |
 | `divergent` | Frontend und API uneinig oder Live-Commit nicht auf `main` | ja |
 | `invalid` | der erwartete, ein neuerer oder ein älterer `main`-Commit ist live, aber der Receipt scheitert aus anderem Grund, oder die Schaubild-Release-Konvergenz ist nicht `current` | ja |
 | `outage` | Endpunkt nicht lesbar oder nicht HTTP 200 | ja |
@@ -304,7 +304,8 @@ Commits selbst. Deshalb schließt ausschließlich `current` einen offenen Alarm.
 Der Job `Deliver production alert` (`scripts/ops/production_alert_issue.py`)
 führt genau ein offenes Issue mit Label `production-alert`. Ein Alarm öffnet es;
 solange er anhält, kommt nur bei geändertem Zustand, Live-Commit, Satz
-gescheiterter Prüfungen (bei `invalid`) oder Schaubild-Befund ein Kommentar
+gescheiterter Prüfungen (bei `invalid`) oder Schaubild-Befund (Zustand,
+gesperrtes und gewünschtes Release, Fehlertext) ein Kommentar
 dazu. Scheitert Schaubild neben einem anderen Alarm, bleibt der spezifischere
 Zustand, und der Schaubild-Befund steht im Grund. Erholung kommentiert und
 schließt es. Die Meldung erreicht

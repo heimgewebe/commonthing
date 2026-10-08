@@ -81,7 +81,7 @@ def classify(data: dict | None, expected: str, main: str = C, age: int = 5000):
         now=10_000,
         pending_grace_seconds=1200,
         is_ancestor=ancestor,
-        commit_time=lambda _commit: 10_000 - age,
+        rollout_start=lambda _live, _target: 10_000 - age,
     )
 
 
@@ -179,6 +179,26 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         self.assertEqual(first.fingerprint(), f"outage:{A}/none")
         self.assertEqual(len({first.fingerprint(), moved.fingerprint(), flipped.fingerprint()}), 3)
 
+    def test_later_merges_do_not_restart_the_grace_period(self) -> None:
+        # A is live; B landed long ago, but a fresh merge C is main's head now.
+        landed = {B: 10_000 - 5000, C: 10_000 - 60}
+
+        def first_after(live: str, target: str) -> int | None:
+            self.assertEqual((live, target), (A, C))
+            return landed[B]
+
+        result = CLASSIFY.classify(
+            receipt(A),
+            expected_commit=C,
+            main_commit=C,
+            now=10_000,
+            pending_grace_seconds=1200,
+            is_ancestor=ancestor,
+            rollout_start=first_after,
+        )
+        self.assertEqual(result.state, "stale")
+        self.assertTrue(result.alert)
+
     def test_future_commit_time_does_not_extend_the_grace_period(self) -> None:
         result = classify(receipt(B), C, age=-3600)
         self.assertEqual(result.state, "stale")
@@ -212,7 +232,7 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             now=10_000,
             pending_grace_seconds=1200,
             is_ancestor=ancestor,
-            commit_time=lambda _commit: None,
+            rollout_start=lambda _live, _target: None,
         )
         self.assertEqual(result.state, "stale")
 
@@ -223,7 +243,7 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             commits = []
-            for index, stamp in enumerate(("1700000000", "1700000100")):
+            for index, stamp in enumerate(("1700000000", "1700000050", "1700000100")):
                 subprocess.run(
                     ["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", str(index)],
                     check=True,
@@ -235,11 +255,16 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
                         check=True, capture_output=True, text=True,
                     ).stdout.strip()
                 )
-            old, new = commits
+            old, middle, new = commits
             self.assertTrue(CLASSIFY.git_is_ancestor(repo, old, new))
             self.assertFalse(CLASSIFY.git_is_ancestor(repo, new, old))
             self.assertIsNone(CLASSIFY.git_is_ancestor(repo, X, new))
             self.assertEqual(CLASSIFY.git_commit_time(repo, new), 1700000100)
+            # The rollout is owed since the first commit after the live one.
+            self.assertEqual(CLASSIFY.git_rollout_start(repo, old, new), 1700000050)
+            self.assertEqual(CLASSIFY.git_rollout_start(repo, middle, new), 1700000100)
+            self.assertIsNone(CLASSIFY.git_rollout_start(repo, new, new))
+            self.assertIsNone(CLASSIFY.git_rollout_start(repo, X, new))
 
     def test_cli_exit_code_follows_alert(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -305,6 +330,31 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         broken = receipt(C)
         broken["frontend"]["headers"]["cache-control"] = "max-age=60"
         self.assertTrue(classify(broken, B).causes)
+
+    def test_schaubild_failure_names_the_release_pair_and_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "schaubild.json"
+
+            def failure(payload: dict) -> str | None:
+                path.write_text(json.dumps(payload))
+                return CLASSIFY.schaubild_failure(path)
+
+            pending = {"state": "promotion_pending", "action_required": True,
+                       "locked_source_commit": A}
+            first = failure({**pending, "desired_source_commit": B})
+            newer = failure({**pending, "desired_source_commit": C})
+            self.assertIn(B, first)
+            self.assertNotEqual(first, newer)
+            invalid = {"state": "invalid", "action_required": True}
+            self.assertNotEqual(
+                failure({**invalid, "error": "lock missing"}),
+                failure({**invalid, "error": "no accepted release"}),
+            )
+            green = classify(receipt(C, passed=True), C)
+            self.assertNotEqual(
+                CLASSIFY.with_schaubild(green, first).fingerprint(),
+                CLASSIFY.with_schaubild(green, newer).fingerprint(),
+            )
 
     def test_changed_schaubild_failure_changes_the_fingerprint(self) -> None:
         green = classify(receipt(C, passed=True), C)

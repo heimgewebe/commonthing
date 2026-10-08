@@ -10,8 +10,9 @@ human. This classifier separates them:
                   and passes every receipt check against that newer commit.
                   This run is not a production proof; the newer commit's own
                   run is. It never resolves an open alert.
-* ``pending``     production still serves an older main commit, but the target
-                  merged less than the grace period ago.
+* ``pending``     production still serves an older main commit, but the first
+                  main commit after it landed less than the grace period ago.
+                  Later merges do not restart that clock.
 * ``stale``       production still serves an older main commit after the grace
                   period: the deploy or the reconciler is stuck.
 * ``divergent``   frontend and API disagree, or the live commit is not on the
@@ -113,6 +114,25 @@ def git_commit_time(repo: Path, commit: str) -> int | None:
     return int(raw)
 
 
+def git_rollout_start(repo: Path, live: str, target: str) -> int | None:
+    """Committer time of the first main commit after ``live`` on the way to ``target``.
+
+    The rollout has been owed since that commit landed. Measuring from
+    ``target`` instead would let every further merge restart the grace period
+    while production stays stuck on ``live``.
+    """
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--first-parent", "--reverse", f"{live}..{target}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    lines = completed.stdout.split()
+    if completed.returncode != 0 or not lines:
+        return None
+    return git_commit_time(repo, lines[0])
+
+
 def revalidate_against(receipt: dict[str, Any], commit: str) -> list[str]:
     """Re-run the receipt checks as if ``commit`` had been the expected one.
 
@@ -153,7 +173,7 @@ def classify(
     now: float,
     pending_grace_seconds: int,
     is_ancestor: Callable[[str, str], bool | None],
-    commit_time: Callable[[str], int | None],
+    rollout_start: Callable[[str, str], int | None],
 ) -> Classification:
     observed: dict[str, str | None] = {"frontend": None, "api": None}
 
@@ -209,22 +229,32 @@ def classify(
         failures = revalidate_against(receipt, live)
         if failures:
             return result("invalid", live, "; ".join(failures), tuple(failures))
-        merged_at = commit_time(target)
-        if merged_at is None:
-            return result("stale", live, f"age of {target} is unknown; treating lag as stale")
-        age = int(now) - merged_at
+        # The clock starts at the first commit after ``live``, so a stream of
+        # merges cannot keep a stuck deployment pending forever.
+        owed_since = rollout_start(live, target)
+        if owed_since is None:
+            return result(
+                "stale", live, f"rollout start after {live} is unknown; treating lag as stale"
+            )
+        age = int(now) - owed_since
         if age < 0:
             # A future timestamp (clock skew, imported commit) must not extend
             # the grace period indefinitely.
-            return result("stale", live, f"{target} has a committer time {-age}s in the future")
+            return result(
+                "stale", live, f"the first commit after {live} is dated {-age}s in the future"
+            )
         if age < pending_grace_seconds:
             return result(
                 "pending",
                 live,
-                f"older main commit {live} is live; {target} is {age}s old "
-                f"(grace {pending_grace_seconds}s)",
+                f"older main commit {live} is live; rollout towards {target} is owed for "
+                f"{age}s (grace {pending_grace_seconds}s)",
             )
-        return result("stale", live, f"older main commit {live} is still live {age}s after {target}")
+        return result(
+            "stale",
+            live,
+            f"older main commit {live} is still live {age}s after the next main commit landed",
+        )
 
     if live == expected_commit:
         if receipt.get("pass") is True:
@@ -276,9 +306,16 @@ def schaubild_failure(path: Path) -> str | None:
     if not isinstance(payload, dict):
         return "Schaubild release convergence receipt is not an object"
     if payload.get("state") != "current" or payload.get("action_required") is not False:
+        # The release pair and the error are part of the failure, so a new
+        # desired release or a new diagnosis is reported, not deduplicated away.
+        details = "".join(
+            f", {key} {payload[key]!r}"
+            for key in ("locked_source_commit", "desired_source_commit", "error")
+            if key in payload
+        )
         return (
             f"Schaubild release convergence is not current: state {payload.get('state')!r}, "
-            f"action_required {payload.get('action_required')!r}"
+            f"action_required {payload.get('action_required')!r}{details}"
         )
     return None
 
@@ -343,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         now=time.time(),
         pending_grace_seconds=args.pending_grace_seconds,
         is_ancestor=lambda a, d: git_is_ancestor(args.repo, a, d),
-        commit_time=lambda c: git_commit_time(args.repo, c),
+        rollout_start=lambda live, target: git_rollout_start(args.repo, live, target),
     )
     if args.schaubild_receipt is not None:
         classification = with_schaubild(classification, schaubild_failure(args.schaubild_receipt))
