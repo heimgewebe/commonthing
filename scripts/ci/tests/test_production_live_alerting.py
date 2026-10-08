@@ -315,6 +315,35 @@ class ProductionAlertIssueTest(unittest.TestCase):
             broken.write_text("{not json")
             self.assertEqual(ALERT.load_classification(broken)["state"], "monitor_failure")
 
+    def test_incomplete_or_contradictory_classification_alerts_as_monitor_failure(self) -> None:
+        payloads = [
+            {"state": "stale"},
+            {"state": "stale", "alert": "true", "fingerprint": "stale:x"},
+            {"state": "stale", "alert": False, "fingerprint": "stale:x"},
+            {"state": "current", "alert": True, "fingerprint": "current:x"},
+            {"state": "stale", "alert": True},
+            {"state": "stale", "alert": True, "fingerprint": "a b"},
+            {"state": "unknown", "alert": True, "fingerprint": "unknown:x"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            for payload in payloads:
+                path.write_text(json.dumps(payload))
+                loaded = ALERT.load_classification(path)
+                self.assertEqual(loaded["state"], "monitor_failure", payload)
+                self.assertIs(loaded["alert"], True)
+                issues = FakeIssues()
+                self.assertEqual(ALERT.reconcile(issues, loaded, "r"), "opened", payload)
+
+    def test_real_classifications_load_unchanged(self) -> None:
+        self.assertEqual(ALERT.NON_ALERTING_STATES, CLASSIFY.NON_ALERTING_STATES)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            for name in sorted(ALERT.ALERTING_STATES | ALERT.NON_ALERTING_STATES):
+                payload = state(name, C)
+                path.write_text(json.dumps(payload))
+                self.assertEqual(ALERT.load_classification(path), payload, name)
+
     def test_drill_issue_is_closed_even_if_the_comment_fails(self) -> None:
         issues = FlakyCommentIssues()
         with self.assertRaises(OSError):

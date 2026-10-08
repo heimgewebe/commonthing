@@ -28,6 +28,9 @@ ALERT_LABEL = "production-alert"
 DRILL_LABEL = "production-alert-drill"
 FINGERPRINT_RE = re.compile(r"<!-- production-alert-fingerprint: (\S+) -->")
 API_ROOT = "https://api.github.com"
+# Mirrors classify_production_live_state.py; the alert job checks out only scripts/ops.
+ALERTING_STATES = frozenset({"stale", "divergent", "invalid", "outage", "monitor_failure"})
+NON_ALERTING_STATES = frozenset({"current", "superseded", "pending"})
 
 
 class IssueClient(Protocol):
@@ -203,6 +206,14 @@ def load_classification(path: Path | None) -> dict[str, Any]:
         return monitor_failure(f"classification is unreadable: {exc}")
     if not isinstance(payload, dict) or not isinstance(payload.get("state"), str):
         return monitor_failure("classification has no state")
+    state, alert = payload["state"], payload.get("alert")
+    if state not in ALERTING_STATES | NON_ALERTING_STATES:
+        return monitor_failure(f"classification has unknown state {state!r}")
+    if not isinstance(alert, bool) or alert != (state in ALERTING_STATES):
+        return monitor_failure(f"classification alert flag {alert!r} contradicts state {state!r}")
+    fingerprint = payload.get("fingerprint")
+    if alert and not (isinstance(fingerprint, str) and re.fullmatch(r"\S+", fingerprint)):
+        return monitor_failure("alerting classification has no usable fingerprint")
     return payload
 
 
