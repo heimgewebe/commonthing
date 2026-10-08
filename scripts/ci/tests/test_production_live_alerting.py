@@ -299,8 +299,13 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
                 "state": "current",
                 "action_required": False,
                 "locked_source_commit": A,
+                "locked_image_digest": "sha256:" + "e" * 64,
                 "desired_source_commit": A,
+                "desired_workflow_run_id": 4242,
+                "desired_published_at": "2026-10-08T12:00:00Z",
             }
+            trimmed = {k: v for k, v in converged.items() if not k.startswith(
+                ("locked_image", "desired_workflow", "desired_published"))}
             schaubild.write_text(json.dumps(converged))
             self.assertEqual(CLASSIFY.main(args), 0)
             self.assertEqual(json.loads(output.read_text())["state"], "current")
@@ -311,6 +316,14 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
                 {**converged, "schema_version": 2},
                 {**converged, "desired_source_commit": B},
                 {**converged, "locked_source_commit": None},
+                trimmed,
+                {**converged, "locked_image_digest": "latest"},
+                {**converged, "desired_workflow_run_id": 0},
+                {**converged, "desired_workflow_run_id": True},
+                {**converged, "desired_workflow_run_id": "4242"},
+                {**converged, "desired_published_at": "2026-10-08T12:00:00"},
+                {**converged, "desired_published_at": "yesterday"},
+                {**converged, "desired_published_at": None},
             ):
                 schaubild.write_text(json.dumps(unproven))
                 self.assertEqual(CLASSIFY.main(args), 1, unproven)
@@ -331,6 +344,9 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(f'SCHEMA = "{CLASSIFY.SCHAUBILD_SCHEMA}"', producer)
+        # The proof fields checked on the green path are the ones it emits.
+        for field in ("locked_image_digest", "desired_workflow_run_id", "desired_published_at"):
+            self.assertIn(f'"{field}"', producer)
 
     def test_schaubild_failure_keeps_a_more_specific_alert(self) -> None:
         specific = classify(receipt(None), C)

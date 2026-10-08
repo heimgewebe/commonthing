@@ -41,10 +41,12 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 # Matches the push run's 1200 s wait: once that wait is over, a lag is stale.
 DEFAULT_PENDING_GRACE_SECONDS = 1200
 NON_ALERTING_STATES = frozenset({"current", "superseded", "pending"})
@@ -328,20 +330,34 @@ def schaubild_failure(path: Path) -> str | None:
             f"Schaubild release convergence is not current: state {payload.get('state')!r}, "
             f"action_required {payload.get('action_required')!r}{details}"
         )
-    # A bare {"state": "current"} is no proof: the producer's shape and an
-    # agreeing release pair must be present before Schaubild counts as converged.
+    # A bare {"state": "current"} is no proof: the whole producer shape
+    # (schauwerk_release_convergence.evaluate_convergence) must be present.
+    problem = _schaubild_proof_problem(payload)
+    if problem:
+        return f"Schaubild release convergence receipt reports current without proof: {problem}"
+    return None
+
+
+def _schaubild_proof_problem(payload: dict[str, Any]) -> str | None:
+    if payload.get("schema_version") != SCHAUBILD_SCHEMA:
+        return f"schema {payload.get('schema_version')!r}, expected {SCHAUBILD_SCHEMA!r}"
     locked = payload.get("locked_source_commit")
     desired = payload.get("desired_source_commit")
-    if payload.get("schema_version") != SCHAUBILD_SCHEMA:
-        return (
-            "Schaubild release convergence receipt has schema "
-            f"{payload.get('schema_version')!r}, expected {SCHAUBILD_SCHEMA!r}"
-        )
     if not (_is_commit(locked) and _is_commit(desired)) or locked != desired:
-        return (
-            "Schaubild release convergence receipt reports current without an agreeing "
-            f"release pair: locked {locked!r}, desired {desired!r}"
-        )
+        return f"no agreeing release pair: locked {locked!r}, desired {desired!r}"
+    digest = payload.get("locked_image_digest")
+    if not isinstance(digest, str) or not IMAGE_DIGEST_RE.fullmatch(digest):
+        return f"locked_image_digest {digest!r} is not a sha256 image digest"
+    run_id = payload.get("desired_workflow_run_id")
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+        return f"desired_workflow_run_id {run_id!r} is not a positive integer"
+    published = payload.get("desired_published_at")
+    try:
+        parsed = datetime.fromisoformat(str(published).replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if not isinstance(published, str) or parsed is None or parsed.tzinfo is None:
+        return f"desired_published_at {published!r} is not a timestamp with timezone"
     return None
 
 

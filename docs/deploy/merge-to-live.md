@@ -294,7 +294,7 @@ aktuelle `main`-Linie ein und schreibt `production-live-state.json`:
 | `pending` | älterer `main`-Commit live und sonst gültig, der erste `main`-Commit danach ist jünger als 1200 s (spätere Merges starten die Frist nicht neu) | nein |
 | `stale` | älterer `main`-Commit 1200 s nach dem ersten `main`-Commit danach noch live (Rollout oder Reconciler hängt) | ja |
 | `divergent` | Frontend und API uneinig oder Live-Commit nicht auf `main` | ja |
-| `invalid` | der erwartete, ein neuerer oder ein älterer `main`-Commit ist live, aber der Receipt scheitert aus anderem Grund, oder die Schaubild-Release-Konvergenz ist nicht `current` oder ohne vollständigen Nachweis (Schema, übereinstimmendes Release-Paar) | ja |
+| `invalid` | der erwartete, ein neuerer oder ein älterer `main`-Commit ist live, aber der Receipt scheitert aus anderem Grund, oder die Schaubild-Release-Konvergenz ist nicht `current` oder ohne vollständigen Nachweis (Schema, übereinstimmendes Release-Paar, Image-Digest, Workflow-Run-ID, Veröffentlichungszeit mit Zeitzone) | ja |
 | `outage` | Endpunkt nicht lesbar oder nicht HTTP 200 | ja |
 | `monitor_failure` | Receipt oder Klassifikation fehlt oder ist unvollständig | ja |
 
