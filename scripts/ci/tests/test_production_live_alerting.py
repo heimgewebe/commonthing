@@ -125,6 +125,21 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         self.assertEqual(first.fingerprint(), f"divergent:{A}/{B}")
         self.assertNotEqual(first.fingerprint(), second.fingerprint())
 
+    def test_outage_fingerprint_tracks_the_readable_side(self) -> None:
+        def half_down(frontend: str | None, api: str | None) -> dict:
+            data = receipt(frontend or A, api or A)
+            for name, commit in (("frontend", frontend), ("api", api)):
+                if commit is None:
+                    data[name] = endpoint(None, 0, "down")
+            return data
+
+        first = classify(half_down(A, None), C)
+        moved = classify(half_down(B, None), C)
+        flipped = classify(half_down(None, B), C)
+        self.assertEqual(first.state, "outage")
+        self.assertEqual(first.fingerprint(), f"outage:{A}/none")
+        self.assertEqual(len({first.fingerprint(), moved.fingerprint(), flipped.fingerprint()}), 3)
+
     def test_split_and_off_main_live_commits_are_divergent(self) -> None:
         self.assertEqual(classify(receipt(C, api=B), C).state, "divergent")
         self.assertEqual(classify(receipt(X), C).state, "divergent")

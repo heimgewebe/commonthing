@@ -63,8 +63,8 @@ class Classification:
     def fingerprint(self) -> str:
         """Stable identity of an alert, used to deduplicate notifications."""
         if self.live_commit is None and (self.frontend_commit or self.api_commit):
-            # A split deployment has no single live commit; keep both sides so
-            # a change from A/B to B/C is reported as a change.
+            # A split or partly unreadable deployment has no single live
+            # commit; keep both sides so A/B -> B/C or a moving outage is a change.
             return f"{self.state}:{self.frontend_commit or 'none'}/{self.api_commit or 'none'}"
         return f"{self.state}:{self.live_commit or 'none'}"
 
@@ -163,6 +163,13 @@ def classify(
 
     frontend = receipt.get("frontend") if isinstance(receipt.get("frontend"), dict) else {}
     api = receipt.get("api") if isinstance(receipt.get("api"), dict) else {}
+    frontend_commit = frontend.get("commit")
+    api_commit = api.get("commit")
+    # Recorded before any return so outage and split fingerprints carry
+    # whichever side is still readable.
+    observed["frontend"] = frontend_commit if _is_commit(frontend_commit) else None
+    observed["api"] = api_commit if _is_commit(api_commit) else None
+
     for name, endpoint in (("frontend", frontend), ("api", api)):
         if endpoint.get("error") or endpoint.get("status") != 200:
             return result(
@@ -172,10 +179,6 @@ def classify(
                 f"error {endpoint.get('error')!r}",
             )
 
-    frontend_commit = frontend.get("commit")
-    api_commit = api.get("commit")
-    observed["frontend"] = frontend_commit if _is_commit(frontend_commit) else None
-    observed["api"] = api_commit if _is_commit(api_commit) else None
     if not (_is_commit(frontend_commit) and _is_commit(api_commit)):
         return result("divergent", None, "live commit is not a full SHA on both endpoints")
     if frontend_commit != api_commit:
