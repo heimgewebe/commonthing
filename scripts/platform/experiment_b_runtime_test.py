@@ -8785,7 +8785,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
             name: {
                 "metadata": {
                     "name": name,
-                    "labels": json.loads(json.dumps(value["labels"])),
+                    "labels": {
+                        **json.loads(json.dumps(value["labels"])),
+                        "kustomize.toolkit.fluxcd.io/name": "commonthing-experiment-b-namespaces",
+                        "kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+                    },
                 }
             }
             for name, value in (
@@ -13450,6 +13454,26 @@ spec:
             runtime._require_live_namespace_security_contract(
                 self.root
             )
+
+        for key, changed in (
+            ("kustomize.toolkit.fluxcd.io/name", "foreign-namespace-owner"),
+            ("kustomize.toolkit.fluxcd.io/namespace", "foreign-namespace"),
+        ):
+            self.namespaces = json.loads(json.dumps(healthy))
+            self.namespaces[runtime.APP_NAMESPACE]["metadata"]["labels"][key] = changed
+            with self.subTest(flux_key=key), self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "Namespace security labels drifted",
+            ):
+                runtime._require_live_namespace_security_contract(self.root)
+
+            self.namespaces = json.loads(json.dumps(healthy))
+            del self.namespaces[runtime.APP_NAMESPACE]["metadata"]["labels"][key]
+            with self.subTest(missing_flux_key=key), self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "Namespace security labels drifted",
+            ):
+                runtime._require_live_namespace_security_contract(self.root)
 
         self.namespaces = json.loads(json.dumps(healthy))
         self.namespaces[runtime.DATA_NAMESPACE]["metadata"]["labels"][

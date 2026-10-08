@@ -6894,18 +6894,26 @@ def _require_live_namespace_security_contract(
             else {}
         )
         labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
+        # Flux adds exactly these ownership labels to the reconciled Namespace.
+        # All versioned security labels must still match without any extra keys.
+        expected_live_labels = {
+            **contract_value["labels"],
+            "kustomize.toolkit.fluxcd.io/name": "commonthing-experiment-b-namespaces",
+            "kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+        }
         if (
             not isinstance(metadata, dict)
             or metadata.get("name") != name
             or metadata.get("deletionTimestamp") is not None
             or not isinstance(labels, dict)
-            or labels != contract_value["labels"]
+            or labels != expected_live_labels
         ):
             raise RuntimeErrorEB(
                 f"live Namespace security labels drifted: {name}"
             )
         result[name] = {
-            "labels": {str(key): str(value) for key, value in labels.items()},
+            # The portable security projection excludes verified Flux ownership metadata.
+            "labels": dict(contract_value["labels"]),
             "labels_sha256": contract_value["labels_sha256"],
             "canonical": True,
         }
