@@ -33,6 +33,7 @@ Only ``current``, ``superseded`` and ``pending`` exit 0.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -62,6 +63,9 @@ class Classification:
     # "only" when Schaubild is the sole alert cause, "also" when it fails next
     # to another alert, so recovery of either cause changes the fingerprint.
     schaubild: str | None = None
+    # The failed contract checks behind an ``invalid`` state, so a change of
+    # cause on the same commit (one check repaired, another broken) is visible.
+    causes: tuple[str, ...] = ()
 
     def fingerprint(self) -> str:
         """Stable identity of an alert, used to deduplicate notifications."""
@@ -71,6 +75,9 @@ class Classification:
             identity = f"{self.state}:{self.frontend_commit or 'none'}/{self.api_commit or 'none'}"
         else:
             identity = f"{self.state}:{self.live_commit or 'none'}"
+        if self.causes:
+            digest = hashlib.sha256("\n".join(sorted(self.causes)).encode()).hexdigest()
+            identity = f"{identity}#{digest[:12]}"
         return f"{identity}+schaubild-{self.schaubild}" if self.schaubild else identity
 
 
@@ -150,7 +157,9 @@ def classify(
 ) -> Classification:
     observed: dict[str, str | None] = {"frontend": None, "api": None}
 
-    def result(state: str, live: str | None, reason: str) -> Classification:
+    def result(
+        state: str, live: str | None, reason: str, causes: tuple[str, ...] = ()
+    ) -> Classification:
         return Classification(
             schema_version=1,
             state=state,
@@ -161,6 +170,7 @@ def classify(
             reason=reason,
             frontend_commit=observed["frontend"],
             api_commit=observed["api"],
+            causes=causes,
         )
 
     if not isinstance(receipt, dict):
@@ -198,7 +208,7 @@ def classify(
         # The grace period excuses only commit lag, never another contract failure.
         failures = revalidate_against(receipt, live)
         if failures:
-            return result("invalid", live, "; ".join(failures))
+            return result("invalid", live, "; ".join(failures), tuple(failures))
         merged_at = commit_time(target)
         if merged_at is None:
             return result("stale", live, f"age of {target} is unknown; treating lag as stale")
@@ -226,8 +236,10 @@ def classify(
                 return lag(live, main_commit)
             return result("divergent", live, f"live commit {live} is not on main {main_commit}")
         reasons = receipt.get("reasons")
-        detail = "; ".join(reasons) if isinstance(reasons, list) else "receipt did not pass"
-        return result("invalid", live, detail)
+        causes = tuple(str(r) for r in reasons) if isinstance(reasons, list) and reasons else (
+            "receipt did not pass",
+        )
+        return result("invalid", live, "; ".join(causes), causes)
 
     expected_is_older = is_ancestor(expected_commit, live)
     if expected_is_older:
@@ -238,7 +250,7 @@ def classify(
                 return lag(live, main_commit)
             failures = revalidate_against(receipt, live)
             if failures:
-                return result("invalid", live, "; ".join(failures))
+                return result("invalid", live, "; ".join(failures), tuple(failures))
             return result(
                 "superseded",
                 live,

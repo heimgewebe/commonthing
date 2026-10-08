@@ -287,6 +287,25 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         self.assertIn("Schaubild broken", combined.reason)
         self.assertIs(CLASSIFY.with_schaubild(specific, None), specific)
 
+    def test_changed_failure_cause_on_the_same_commit_changes_the_fingerprint(self) -> None:
+        cache = receipt(C)
+        cache["reasons"] = ["frontend version readback is not served with Cache-Control: no-store"]
+        tree = receipt(C)
+        tree["reasons"] = ["frontend artifact_tree declaration is missing"]
+        both = receipt(C)
+        both["reasons"] = list(reversed(cache["reasons"] + tree["reasons"]))
+        both_again = receipt(C)
+        both_again["reasons"] = cache["reasons"] + tree["reasons"]
+        prints = [classify(r, C).fingerprint() for r in (cache, tree, both)]
+        self.assertTrue(all(p.startswith(f"invalid:{C}#") for p in prints), prints)
+        self.assertEqual(len(set(prints)), 3)
+        # Order of the same causes does not matter.
+        self.assertEqual(prints[2], classify(both_again, C).fingerprint())
+        # A newer-commit revalidation failure carries its causes too.
+        broken = receipt(C)
+        broken["frontend"]["headers"]["cache-control"] = "max-age=60"
+        self.assertTrue(classify(broken, B).causes)
+
     def test_recovery_of_one_cause_changes_the_fingerprint(self) -> None:
         # Receipt and Schaubild fail on the same commit, then only Schaubild.
         both = CLASSIFY.with_schaubild(classify(receipt(C, passed=False), C), "Schaubild broken")
@@ -327,7 +346,8 @@ def state(name: str, live: str | None = B) -> dict[str, Any]:
                                      C, C, live, f"{name} reason")
     payload = result.__dict__.copy()
     payload["fingerprint"] = result.fingerprint()
-    return payload
+    # Same shape as the JSON the classifier writes (tuples become lists).
+    return json.loads(json.dumps(payload))
 
 
 class ProductionAlertIssueTest(unittest.TestCase):
