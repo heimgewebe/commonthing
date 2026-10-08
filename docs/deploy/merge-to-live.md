@@ -309,8 +309,15 @@ gescheiterter Prüfungen (bei `invalid`), Fehlerbild (bei `outage` und geteiltem
 gesperrtes und gewünschtes Release, Fehlertext) ein Kommentar
 dazu. Scheitert Schaubild neben einem anderen Alarm, bleibt der spezifischere
 Zustand, und der Schaubild-Befund steht im Grund. Erholung kommentiert und
-schließt es. Die Meldung erreicht
-Menschen über die normalen GitHub-Benachrichtigungen der Repository-Beobachter.
+schließt es. Ein neues Alarm-Issue wird zuerst unabhängig von einer Zuweisung
+erstellt; bei bestehenden Alarmen wird eine neue Ursache zuerst kommentiert.
+Danach wird für das tatsächlich bearbeitete (älteste offene, vom GitHub-Bot
+erzeugte) Alarm-Issue der Empfänger alexdermohr zugewiesen und die GitHub-Antwort
+geprüft. Ist die Zuweisung nicht bestätigbar, schlägt der Lauf fehl, aber Issue
+und Alarmkommentare bleiben erhalten. Nicht bearbeitete Duplikate werden nicht
+nachträglich zugewiesen. Die verifizierte Erholung current schließt den Vorfall
+auch ohne erneute Zuweisung. Eine tatsächliche Push- oder E-Mail-Benachrichtigung
+ist damit **nicht** bewiesen und muss separat bestätigt werden.
 
 Ein manueller Lauf mit `alert_drill: true` öffnet und schließt ein separates
 Issue mit Label `production-alert-drill`, ohne Produktion zu stören. Ob die

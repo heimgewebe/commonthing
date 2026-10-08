@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import urllib.error
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,15 @@ class AlertWorkflowTest(unittest.TestCase):
         self.assertIn("!cancelled()", condition)
         self.assertNotIn("always()", condition)
         self.assertIn("github.event_name != 'pull_request'", condition)
+        self.assertIn("PRODUCTION_ALERT_ASSIGNEE: alexdermohr", job)
+
+
+    def test_failed_drill_cannot_skip_real_production_alarm(self) -> None:
+        workflow = (OPS.parents[1] / ".github/workflows/production-live-contract.yml").read_text(
+            encoding="utf-8"
+        )
+        step = workflow.split("      - name: Open, update or resolve the production alert\n", 1)[1]
+        self.assertTrue(step.startswith("        if: " + chr(36) + "{{ !cancelled() }}\n"))
 
 
 class ClassifyProductionLiveStateTest(unittest.TestCase):
@@ -484,6 +494,10 @@ class FakeIssues:
     def open_issues(self, label: str) -> list[dict[str, Any]]:
         return [i for i in self.issues if i["state"] == "open" and label in i["labels"]]
 
+    def ensure_assignee(self, issue: dict[str, Any]) -> None:
+        # In-memory fake has no GitHub assignment API.
+        pass
+
     def comments(self, number: int) -> list[dict[str, Any]]:
         return [
             body if isinstance(body, dict) else {
@@ -648,22 +662,296 @@ class FlakyCommentIssues(FakeIssues):
 
 
 class RecordingClient(ALERT.GitHubIssueClient):
-    def __init__(self, label_status: int | None, returned_labels: list[str]) -> None:
-        super().__init__("owner/repo", "token")
+    def __init__(
+        self,
+        label_status: int | None,
+        returned_labels: list[str],
+        assignee: str | None = None,
+        api_assignees: list[str] | None = None,
+        repair_assignees: list[str] | None = None,
+    ) -> None:
+        super().__init__("owner/repo", "token", assignee=assignee)
         self.calls: list[tuple[str, str]] = []
+        self.payloads: list[dict[str, Any] | None] = []
         self._label_status = label_status
         self._returned_labels = returned_labels
+        self._api_assignees = api_assignees or []
+        self._repair_assignees = (
+            self._api_assignees if repair_assignees is None else repair_assignees
+        )
+        self._existing: list[dict[str, Any]] = []
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         self.calls.append((method, path))
+        self.payloads.append(payload)
         if path == "/labels" and self._label_status is not None:
             raise urllib.error.HTTPError(path, self._label_status, "error", None, None)
+        if path.startswith("/issues?") and method == "GET":
+            return self._existing
         if path == "/issues":
-            return {"number": 7, "labels": [{"name": n} for n in self._returned_labels]}
+            return {
+                "number": 7, "labels": [{"name": n} for n in self._returned_labels],
+                "assignees": [{"login": n} for n in self._api_assignees],
+            }
+        if path == "/issues/7/assignees":
+            return {"number": 7, "assignees": [{"login": n} for n in self._repair_assignees]}
         return None
 
 
 class GitHubIssueClientTest(unittest.TestCase):
+    def test_new_issue_has_explicit_verified_assignee(self) -> None:
+        client = RecordingClient(
+            None, [ALERT.ALERT_LABEL], "alexdermohr", [],
+            repair_assignees=["alexdermohr"],
+        )
+        issue = client.create_issue("t", "b", ALERT.ALERT_LABEL)
+        self.assertEqual(issue["number"], 7)
+        self.assertNotIn("assignees", client.payloads[1])
+        self.assertEqual(client.calls[-1], ("POST", "/issues/7/assignees"))
+        self.assertEqual(client.payloads[-1], {"assignees": ["alexdermohr"]})
+
+    def test_create_repairs_assignee_ignored_by_github(self) -> None:
+        client = RecordingClient(
+            None, [ALERT.ALERT_LABEL], "alexdermohr", [],
+            repair_assignees=["AlexDerMohr"],
+        )
+        self.assertEqual(client.create_issue("t", "b", ALERT.ALERT_LABEL)["number"], 7)
+        self.assertNotIn("assignees", client.payloads[1])
+        self.assertEqual(client.calls[-1], ("POST", "/issues/7/assignees"))
+        self.assertEqual(client.payloads[-1], {"assignees": ["alexdermohr"]})
+
+    def test_rejected_owner_does_not_prevent_first_alert_creation(self) -> None:
+        class RejectOwnerAtCreate(RecordingClient):
+            def __init__(self) -> None:
+                super().__init__(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+                self.created = False
+
+            def _request(self, method: str, path: str, payload: Any = None) -> Any:
+                if method == "POST" and path == "/issues" and "assignees" in payload:
+                    raise urllib.error.HTTPError(path, 422, "Invalid assignee", None, None)
+                result = super()._request(method, path, payload)
+                if method == "POST" and path == "/issues":
+                    self.created = True
+                return result
+
+        client = RejectOwnerAtCreate()
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            ALERT.reconcile(client, state("outage", None), "r")
+        self.assertTrue(client.created)
+        index = client.calls.index(("POST", "/issues"))
+        self.assertNotIn("assignees", client.payloads[index])
+        self.assertIn(ALERT._marker(state("outage", None)["fingerprint"]),
+                      client.payloads[index]["body"])
+        self.assertIn(("POST", "/issues/7/assignees"), client.calls)
+        self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_post_create_assignment_http_422_keeps_real_alert_open(self) -> None:
+        class RejectOwnerPatch(RecordingClient):
+            def _request(self, method: str, path: str, payload: Any = None) -> Any:
+                if method == "POST" and path == "/issues/7/assignees":
+                    raise urllib.error.HTTPError(path, 422, "Unassignable", None, None)
+                return super()._request(method, path, payload)
+
+        client = RejectOwnerPatch(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        with self.assertRaises(urllib.error.HTTPError):
+            ALERT.reconcile(client, state("outage", None), "r")
+        self.assertIn(("POST", "/issues"), client.calls)
+        self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_existing_assignment_accepts_case_insensitive_login(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", ["AlexDerMohr"])
+        self.assertEqual(client.create_issue("t", "b", ALERT.ALERT_LABEL)["number"], 7)
+        self.assertEqual(client.calls, [("POST", "/labels"), ("POST", "/issues")])
+
+    def test_failed_drill_assignment_closes_created_issue(self) -> None:
+        client = RecordingClient(None, [ALERT.DRILL_LABEL], "alexdermohr", [])
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            client.create_issue("t", "b", ALERT.DRILL_LABEL)
+        self.assertEqual(client.calls[-1], ("PATCH", "/issues/7"))
+
+    def test_failed_drill_label_check_closes_created_issue(self) -> None:
+        client = RecordingClient(None, [], "alexdermohr", ["alexdermohr"])
+        with self.assertRaisesRegex(ValueError, "created without label"):
+            client.create_issue("t", "b", ALERT.DRILL_LABEL)
+        self.assertEqual(client.calls[-1], ("PATCH", "/issues/7"))
+
+    def test_api_silently_omitting_assignee_is_a_delivery_failure(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            client.create_issue("t", "b", ALERT.ALERT_LABEL)
+
+    def test_existing_unassigned_alert_is_repaired_before_deduplication(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", ["alexdermohr"])
+        client._existing = [{
+            "number": 7, "assignees": [], "labels": [{"name": ALERT.ALERT_LABEL}],
+            "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+        }]
+        self.assertEqual(ALERT.reconcile(client, state("stale"), "r"), "updated")
+        self.assertTrue(client.calls[0][1].startswith("/issues?state=open"))
+        self.assertIn(("POST", "/issues/7/comments"), client.calls)
+        self.assertEqual(client.calls[-1], ("POST", "/issues/7/assignees"))
+        self.assertEqual(client.payloads[-1], {"assignees": ["alexdermohr"]})
+
+    def test_existing_unassigned_alert_cannot_silently_skip_failed_repair(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        client._existing = [{
+            "number": 7, "assignees": [],
+            "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+        }]
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            ALERT.reconcile(client, state("stale"), "r")
+        self.assertIn(("POST", "/issues/7/comments"), client.calls)
+
+    def test_recovery_resolves_open_bot_issue_without_repairing_unassignable_owner(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        client._existing = [{
+            "number": 7, "assignees": [],
+            "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+        }]
+        self.assertEqual(ALERT.reconcile(client, state("current", C), "r"), "resolved")
+        self.assertNotIn(("POST", "/issues/7/assignees"), client.calls)
+        self.assertIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_unresolved_non_alerting_run_repairs_unassigned_alert(self) -> None:
+        for state_name in ("pending", "superseded"):
+            with self.subTest(state=state_name):
+                client = RecordingClient(
+                    None, [ALERT.ALERT_LABEL], "alexdermohr", [],
+                    repair_assignees=["alexdermohr"],
+                )
+                client._existing = [{
+                    "number": 7, "assignees": [],
+                    "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+                }]
+                self.assertEqual(
+                    ALERT.reconcile(client, state(state_name, C), "r"), "unchanged"
+                )
+                self.assertIn(("POST", "/issues/7/assignees"), client.calls)
+                self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_unresolved_non_alerting_run_rejects_missing_owner(self) -> None:
+        for state_name in ("pending", "superseded"):
+            with self.subTest(state=state_name):
+                client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+                client._existing = [{
+                    "number": 7, "assignees": [],
+                    "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+                }]
+                with self.assertRaisesRegex(
+                    ValueError, "no verified alert assignee"
+                ):
+                    ALERT.reconcile(client, state(state_name, C), "r")
+                self.assertIn(("POST", "/issues/7/assignees"), client.calls)
+                self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_active_alarm_still_refuses_unassigned_existing_issue(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        client._existing = [{
+            "number": 7, "assignees": [],
+            "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+        }]
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            ALERT.reconcile(client, state("stale"), "r")
+        self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_escalation_is_commented_before_failed_assignee_repair(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        client._existing = [{
+            "number": 7, "assignees": [],
+            "body": ALERT._marker(state("stale")["fingerprint"]),
+            "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+        }]
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            ALERT.reconcile(client, state("outage", None), "r")
+        comment = client.calls.index(("POST", "/issues/7/comments"))
+        assignment = client.calls.index(("POST", "/issues/7/assignees"))
+        self.assertLess(comment, assignment)
+        self.assertIn("outage", client.payloads[comment]["body"])
+        self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_failed_assignment_retry_does_not_duplicate_escalation_comment(self) -> None:
+        class StatefulClient(RecordingClient):
+            def __init__(self) -> None:
+                super().__init__(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+                self.recorded_comments: list[str] = []
+
+            def _request(self, method: str, path: str, payload: Any = None) -> Any:
+                result = super()._request(method, path, payload)
+                if method == "POST" and path == "/issues/7/comments":
+                    self.recorded_comments.append(payload["body"])
+                if method == "GET" and path.startswith("/issues/7/comments?"):
+                    return [
+                        {"body": body, "user": {
+                            "login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID,
+                        }}
+                        for body in self.recorded_comments
+                    ]
+                return result
+
+        client = StatefulClient()
+        client._existing = [{
+            "number": 7, "assignees": [],
+            "body": ALERT._marker(state("stale")["fingerprint"]),
+            "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID},
+        }]
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+                ALERT.reconcile(client, state("outage", None), "r")
+        self.assertEqual(len(client.recorded_comments), 1)
+        self.assertEqual(client.calls.count(("POST", "/issues/7/comments")), 1)
+        self.assertEqual(client.calls.count(("POST", "/issues/7/assignees")), 2)
+
+    def test_duplicate_unassignable_alert_does_not_block_main_issue(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        client._existing = [
+            {"number": 7, "assignees": [{"login": "alexdermohr"}],
+             "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID}},
+            {"number": 8, "assignees": [],
+             "user": {"login": ALERT.ALERT_BOT_LOGIN, "id": ALERT.ALERT_BOT_ID}},
+        ]
+        self.assertEqual(ALERT.reconcile(client, state("stale"), "r"), "updated")
+        self.assertIn(("POST", "/issues/7/comments"), client.calls)
+        self.assertNotIn(("POST", "/issues/8/assignees"), client.calls)
+
+    def test_real_alert_creation_failure_never_closes_incident(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", [])
+        with self.assertRaisesRegex(ValueError, "no verified alert assignee"):
+            client.create_issue("t", "b", ALERT.ALERT_LABEL)
+        self.assertNotIn(("PATCH", "/issues/7"), client.calls)
+
+    def test_failed_drill_cleanup_is_reported(self) -> None:
+        class CannotClose(RecordingClient):
+            def _request(self, method: str, path: str, payload: Any = None) -> Any:
+                if method == "PATCH" and path == "/issues/7":
+                    raise OSError("simulated cleanup failure")
+                return super()._request(method, path, payload)
+
+        client = CannotClose(None, [ALERT.DRILL_LABEL], "alexdermohr", [])
+        with self.assertRaisesRegex(ValueError, "unverified and could not be closed"):
+            client.create_issue("t", "b", ALERT.DRILL_LABEL)
+
+    def test_cli_requires_valid_assignee_before_network_writes(self) -> None:
+        with patch.dict(os.environ, {
+            "GITHUB_TOKEN": "fake", "GITHUB_REPOSITORY": "owner/repo",
+            "PRODUCTION_ALERT_ASSIGNEE": "",
+        }):
+            self.assertEqual(ALERT.main(["--run-url", "r", "--drill"]), 2)
+        with patch.dict(os.environ, {
+            "GITHUB_TOKEN": "fake", "GITHUB_REPOSITORY": "owner/repo",
+            "PRODUCTION_ALERT_ASSIGNEE": "bad user",
+        }):
+            self.assertEqual(ALERT.main(["--run-url", "r", "--drill"]), 1)
+
+    def test_third_party_labelled_issue_is_never_assigned_or_treated_as_owned(self) -> None:
+        client = RecordingClient(None, [ALERT.ALERT_LABEL], "alexdermohr", ["alexdermohr"])
+        client._existing = [{
+            "number": 7, "assignees": [],
+            "user": {"login": "attacker", "id": 123},
+        }]
+        self.assertEqual(client.open_issues(ALERT.ALERT_LABEL), [])
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0][0], "GET")
+
     def test_label_is_provisioned_before_the_issue(self) -> None:
         client = RecordingClient(None, [ALERT.ALERT_LABEL])
         client.create_issue("t", "b", ALERT.ALERT_LABEL)
