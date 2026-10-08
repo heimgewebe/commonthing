@@ -331,6 +331,7 @@ jobs:
             --expected-commit "${{ steps.target.outputs.commit }}" \
             --main-commit "$main_commit" \
             --pending-grace-seconds 1200 \
+            --schaubild-receipt schaubild-release-convergence.json \
             --output production-live-state.json
       - name: Upload production live state
         if: always()

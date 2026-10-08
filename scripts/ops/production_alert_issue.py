@@ -186,8 +186,11 @@ def drill(client: IssueClient, run_url: str) -> str:
         f"Meldung angekommen ist, funktioniert die Zustellung.\n\n- Lauf: {run_url}",
         DRILL_LABEL,
     )
-    client.comment(issue["number"], "Probe beendet; das Issue wird geschlossen.")
-    client.close(issue["number"])
+    try:
+        client.comment(issue["number"], "Probe beendet; das Issue wird geschlossen.")
+    finally:
+        # A stranded drill issue would read as a real open alarm.
+        client.close(issue["number"])
     return "drill"
 
 

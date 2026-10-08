@@ -290,11 +290,11 @@ aktuelle `main`-Linie ein und schreibt `production-live-state.json`:
 | Zustand | Bedeutung | Alarm |
 |---|---|---|
 | `current` | erwarteter Commit live und konsistent | nein, löst offenen Alarm auf |
-| `superseded` | ein neuerer `main`-Commit, der den erwarteten enthält, ist live | nein, löst nichts auf |
+| `superseded` | ein neuerer `main`-Commit, der den erwarteten enthält, ist live und besteht alle übrigen Receipt-Prüfungen | nein, löst nichts auf |
 | `pending` | älterer `main`-Commit live, Ziel jünger als 1200 s | nein |
 | `stale` | älterer `main`-Commit nach 1200 s noch live (Rollout oder Reconciler hängt) | ja |
 | `divergent` | Frontend und API uneinig oder Live-Commit nicht auf `main` | ja |
-| `invalid` | Commit stimmt, Receipt scheitert aus anderem Grund | ja |
+| `invalid` | Commit stimmt (oder ein neuerer `main`-Commit ist live), aber der Receipt scheitert aus anderem Grund, oder die Schaubild-Release-Konvergenz ist nicht `current` | ja |
 | `outage` | Endpunkt nicht lesbar oder nicht HTTP 200 | ja |
 | `monitor_failure` | Receipt oder Klassifikation fehlt | ja |
 

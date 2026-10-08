@@ -22,6 +22,11 @@ human. This classifier separates them:
 * ``outage``      an endpoint could not be read or did not answer 200.
 * ``monitor_failure`` the receipt is missing or unreadable.
 
+The Schaubild release convergence is a mandatory part of the same contract.
+When ``--schaubild-receipt`` is given and that receipt is missing or not
+``current``, an otherwise non-alerting state becomes ``invalid``; no run can
+resolve an alert while Schaubild has not converged.
+
 Only ``current``, ``superseded`` and ``pending`` exit 0.
 """
 
@@ -33,7 +38,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -226,6 +231,28 @@ def classify(
     return result("divergent", live, f"live commit {live} diverges from {expected_commit}")
 
 
+def schaubild_failure(path: Path) -> str | None:
+    """Reason the Schaubild convergence receipt fails, or None if it is current."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"Schaubild release convergence receipt is unreadable: {exc}"
+    if not isinstance(payload, dict):
+        return "Schaubild release convergence receipt is not an object"
+    if payload.get("state") != "current" or payload.get("action_required") is not False:
+        return (
+            f"Schaubild release convergence is not current: state {payload.get('state')!r}, "
+            f"action_required {payload.get('action_required')!r}"
+        )
+    return None
+
+
+def with_schaubild(classification: Classification, failure: str | None) -> Classification:
+    if failure is None or classification.alert:
+        return classification
+    return replace(classification, state="invalid", alert=True, reason=failure)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--receipt", type=Path, required=True)
@@ -235,6 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pending-grace-seconds", type=int, default=DEFAULT_PENDING_GRACE_SECONDS
     )
+    parser.add_argument("--schaubild-receipt", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -266,6 +294,8 @@ def main(argv: list[str] | None = None) -> int:
         is_ancestor=lambda a, d: git_is_ancestor(args.repo, a, d),
         commit_time=lambda c: git_commit_time(args.repo, c),
     )
+    if args.schaubild_receipt is not None:
+        classification = with_schaubild(classification, schaubild_failure(args.schaubild_receipt))
     payload = asdict(classification)
     payload["fingerprint"] = classification.fingerprint()
     args.output.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")

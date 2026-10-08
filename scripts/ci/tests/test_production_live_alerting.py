@@ -196,6 +196,33 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             self.assertEqual(payload["state"], "outage")
             self.assertEqual(payload["fingerprint"], "outage:none")
 
+    def test_schaubild_failure_turns_a_green_state_into_an_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt_path = Path(tmp) / "receipt.json"
+            schaubild = Path(tmp) / "schaubild.json"
+            output = Path(tmp) / "state.json"
+            receipt_path.write_text(json.dumps(receipt(C, passed=True)))
+            args = ["--receipt", str(receipt_path), "--expected-commit", C, "--main-commit", C,
+                    "--repo", tmp, "--schaubild-receipt", str(schaubild), "--output", str(output)]
+
+            schaubild.write_text(json.dumps({"state": "current", "action_required": False}))
+            self.assertEqual(CLASSIFY.main(args), 0)
+            self.assertEqual(json.loads(output.read_text())["state"], "current")
+
+            schaubild.write_text(json.dumps({"state": "stale", "action_required": True}))
+            self.assertEqual(CLASSIFY.main(args), 1)
+            payload = json.loads(output.read_text())
+            self.assertEqual(payload["state"], "invalid")
+            self.assertIn("Schaubild", payload["reason"])
+
+            schaubild.unlink()
+            self.assertEqual(CLASSIFY.main(args), 1)
+            self.assertIn("unreadable", json.loads(output.read_text())["reason"])
+
+    def test_schaubild_failure_keeps_a_more_specific_alert(self) -> None:
+        outage = classify(receipt(None), C)
+        self.assertIs(CLASSIFY.with_schaubild(outage, "Schaubild broken"), outage)
+
 
 class FakeIssues:
     def __init__(self) -> None:
@@ -268,6 +295,12 @@ class ProductionAlertIssueTest(unittest.TestCase):
             broken.write_text("{not json")
             self.assertEqual(ALERT.load_classification(broken)["state"], "monitor_failure")
 
+    def test_drill_issue_is_closed_even_if_the_comment_fails(self) -> None:
+        issues = FlakyCommentIssues()
+        with self.assertRaises(OSError):
+            ALERT.drill(issues, "r")
+        self.assertEqual(issues.issues[0]["state"], "closed")
+
     def test_drill_notifies_and_cleans_up_without_touching_real_alerts(self) -> None:
         issues = FakeIssues()
         self.assertEqual(ALERT.drill(issues, "r"), "drill")
@@ -275,6 +308,11 @@ class ProductionAlertIssueTest(unittest.TestCase):
         self.assertEqual(issues.issues[0]["labels"], [ALERT.DRILL_LABEL])
         self.assertEqual(issues.issues[0]["state"], "closed")
         self.assertEqual(issues.open_issues(ALERT.ALERT_LABEL), [])
+
+
+class FlakyCommentIssues(FakeIssues):
+    def comment(self, number: int, body: str) -> None:
+        raise OSError("transient")
 
 
 class RecordingClient(ALERT.GitHubIssueClient):
