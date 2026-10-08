@@ -113,6 +113,21 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         off_main = classify(receipt(X, passed=True), X, main=C)
         self.assertEqual(off_main.state, "divergent", off_main.reason)
 
+    def test_intermediate_live_commit_is_lag_not_superseded(self) -> None:
+        # Target A, B is live, main already at C: C is not proven live.
+        pending = classify(receipt(B), A, main=C, age=300)
+        self.assertEqual(pending.state, "pending", pending.reason)
+        stale = classify(receipt(B), A, main=C, age=1200)
+        self.assertEqual(stale.state, "stale", stale.reason)
+        self.assertTrue(stale.alert)
+
+    def test_grace_period_does_not_excuse_other_contract_failures(self) -> None:
+        broken = receipt(B)
+        broken["frontend"]["headers"]["cache-control"] = "max-age=60"
+        result = classify(broken, C, age=300)
+        self.assertEqual(result.state, "invalid", result.reason)
+        self.assertTrue(result.alert)
+
     def test_superseded_requires_a_valid_receipt_for_the_newer_commit(self) -> None:
         broken = receipt(C)
         broken["frontend"]["headers"]["cache-control"] = "max-age=60"
@@ -345,6 +360,22 @@ class ProductionAlertIssueTest(unittest.TestCase):
                 self.assertIs(loaded["alert"], True)
                 issues = FakeIssues()
                 self.assertEqual(ALERT.reconcile(issues, loaded, "r"), "opened", payload)
+
+    def test_malformed_non_alerting_classification_cannot_resolve(self) -> None:
+        bare_current = {"state": "current", "alert": False}
+        wrong_head = state("current", C) | {"main_commit": B}
+        no_reason = state("superseded", C)
+        del no_reason["reason"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            for payload in (bare_current, wrong_head, no_reason):
+                path.write_text(json.dumps(payload))
+                loaded = ALERT.load_classification(path)
+                self.assertEqual(loaded["state"], "monitor_failure", payload)
+                issues = FakeIssues()
+                issues.create_issue("Produktionsalarm: stale", "", ALERT.ALERT_LABEL)
+                self.assertNotEqual(ALERT.reconcile(issues, loaded, "r"), "resolved", payload)
+                self.assertEqual(issues.issues[0]["state"], "open")
 
     def test_real_classifications_load_unchanged(self) -> None:
         self.assertEqual(ALERT.NON_ALERTING_STATES, CLASSIFY.NON_ALERTING_STATES)

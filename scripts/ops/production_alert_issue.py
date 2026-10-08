@@ -28,6 +28,7 @@ ALERT_LABEL = "production-alert"
 DRILL_LABEL = "production-alert-drill"
 FINGERPRINT_RE = re.compile(r"<!-- production-alert-fingerprint: (\S+) -->")
 API_ROOT = "https://api.github.com"
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # Mirrors classify_production_live_state.py; the alert job checks out only scripts/ops.
 ALERTING_STATES = frozenset({"stale", "divergent", "invalid", "outage", "monitor_failure"})
 NON_ALERTING_STATES = frozenset({"current", "superseded", "pending"})
@@ -211,10 +212,36 @@ def load_classification(path: Path | None) -> dict[str, Any]:
         return monitor_failure(f"classification has unknown state {state!r}")
     if not isinstance(alert, bool) or alert != (state in ALERTING_STATES):
         return monitor_failure(f"classification alert flag {alert!r} contradicts state {state!r}")
-    fingerprint = payload.get("fingerprint")
-    if alert and not (isinstance(fingerprint, str) and re.fullmatch(r"\S+", fingerprint)):
-        return monitor_failure("alerting classification has no usable fingerprint")
+    problem = _schema_problem(payload)
+    if problem:
+        return monitor_failure(f"classification is malformed: {problem}")
     return payload
+
+
+def _schema_problem(payload: dict[str, Any]) -> str | None:
+    # Checked for every state: a malformed "current" must never close an alarm.
+    if payload.get("schema_version") != 1:
+        return f"schema_version {payload.get('schema_version')!r}"
+    for name in ("expected_commit", "main_commit"):
+        if not _is_commit(payload.get(name)):
+            return f"{name} is not a full SHA"
+    live = payload.get("live_commit")
+    if live is not None and not _is_commit(live):
+        return "live_commit is neither null nor a full SHA"
+    if not isinstance(payload.get("reason"), str):
+        return "reason is not a string"
+    fingerprint = payload.get("fingerprint")
+    if not (isinstance(fingerprint, str) and re.fullmatch(r"\S+", fingerprint)):
+        return "no usable fingerprint"
+    if payload["state"] == "current" and not (
+        live == payload["expected_commit"] == payload["main_commit"]
+    ):
+        return "current without the expected main head live"
+    return None
+
+
+def _is_commit(value: Any) -> bool:
+    return isinstance(value, str) and COMMIT_RE.fullmatch(value) is not None
 
 
 def main(argv: list[str] | None = None) -> int:

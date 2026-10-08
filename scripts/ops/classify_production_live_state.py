@@ -6,7 +6,7 @@ live? A "no" can mean very different things, and only some of them need a
 human. This classifier separates them:
 
 * ``current``     the expected commit is live and consistent and still main's head.
-* ``superseded``  a newer main commit that contains the expected one is live
+* ``superseded``  main's head, a newer commit that contains the expected one, is live
                   and passes every receipt check against that newer commit.
                   This run is not a production proof; the newer commit's own
                   run is. It never resolves an open alert.
@@ -190,6 +190,10 @@ def classify(
     live = frontend_commit
 
     def lag(live: str, target: str) -> Classification:
+        # The grace period excuses only commit lag, never another contract failure.
+        failures = revalidate_against(receipt, live)
+        if failures:
+            return result("invalid", live, "; ".join(failures))
         merged_at = commit_time(target)
         if merged_at is None:
             return result("stale", live, f"age of {target} is unknown; treating lag as stale")
@@ -224,6 +228,9 @@ def classify(
     if expected_is_older:
         on_main = is_ancestor(live, main_commit)
         if on_main:
+            if live != main_commit:
+                # An intermediate commit is live while main has moved further.
+                return lag(live, main_commit)
             failures = revalidate_against(receipt, live)
             if failures:
                 return result("invalid", live, "; ".join(failures))
