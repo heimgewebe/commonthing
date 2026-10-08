@@ -282,6 +282,45 @@ Bei einem Push wartet der Workflow begrenzt auf das Rollout. Danach schlägt er
 fehlgeschlossen fehl und lädt den maschinenlesbaren Receipt auch im Fehlerfall
 hoch. Ein stiller Zustand `main != live` ist damit nicht grün.
 
+### Zustände und Alarmzustellung
+
+`scripts/ops/classify_production_live_state.py` ordnet jeden Receipt gegen die
+aktuelle `main`-Linie ein und schreibt `production-live-state.json`:
+
+| Zustand | Bedeutung | Alarm |
+|---|---|---|
+| `current` | erwarteter Commit live und konsistent, und er ist noch der Kopf von `main` | nein, löst offenen Alarm auf |
+| `superseded` | der aktuelle Kopf von `main`, der den erwarteten Commit enthält, ist live und besteht alle übrigen Receipt-Prüfungen | nein, löst nichts auf |
+| `pending` | älterer `main`-Commit live und sonst gültig, der erste `main`-Commit danach ist jünger als 1200 s (spätere Merges starten die Frist nicht neu) | nein |
+| `stale` | älterer `main`-Commit 1200 s nach dem ersten `main`-Commit danach noch live (Rollout oder Reconciler hängt) | ja |
+| `divergent` | Frontend und API uneinig oder Live-Commit nicht auf `main` | ja |
+| `invalid` | der erwartete, ein neuerer oder ein älterer `main`-Commit ist live, aber der Receipt scheitert aus anderem Grund, oder die Schaubild-Release-Konvergenz ist nicht `current` oder ohne vollständigen Nachweis (Schema, übereinstimmendes Release-Paar, Image-Digest, Workflow-Run-ID, Veröffentlichungszeit mit Zeitzone) | ja |
+| `outage` | Endpunkt nicht lesbar oder nicht HTTP 200 | ja |
+| `monitor_failure` | Receipt oder Klassifikation fehlt oder ist unvollständig | ja |
+
+`superseded` ist kein Produktionsnachweis: Den liefert nur der Lauf des neueren
+Commits selbst. Deshalb schließt ausschließlich `current` einen offenen Alarm.
+
+Der Job `Deliver production alert` (`scripts/ops/production_alert_issue.py`)
+führt genau ein offenes Issue mit Label `production-alert`. Ein Alarm öffnet es;
+solange er anhält, kommt nur bei geändertem Zustand, Live-Commit, Satz
+gescheiterter Prüfungen (bei `invalid`), Fehlerbild (bei `outage` und geteiltem
+`divergent`) oder Schaubild-Befund (Zustand,
+gesperrtes und gewünschtes Release, Fehlertext) ein Kommentar
+dazu. Scheitert Schaubild neben einem anderen Alarm, bleibt der spezifischere
+Zustand, und der Schaubild-Befund steht im Grund. Erholung kommentiert und
+schließt es. Die Meldung erreicht
+Menschen über die normalen GitHub-Benachrichtigungen der Repository-Beobachter.
+
+Ein manueller Lauf mit `alert_drill: true` öffnet und schließt ein separates
+Issue mit Label `production-alert-drill`, ohne Produktion zu stören. Ob die
+Meldung tatsächlich ankommt, hängt an den Benachrichtigungseinstellungen und muss
+nach einer Probe von einem Menschen bestätigt werden.
+
+Grenzen: Fällt der Zeitplan von GitHub aus, meldet niemand das Ausbleiben der
+Läufe. Backup, Off-host-Kopie und Restore-Proof auf dem Host sind von hier aus
+nicht sichtbar und brauchen einen eigenen Alarmweg.
+
 ## Belege und Vertragsgrenze
 
 Root-eigene Deploymentbelege einschließlich des letzten direkten

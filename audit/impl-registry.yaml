@@ -542,6 +542,30 @@ implementations:
       - scripts/ci/tests/test_deploy_exact_commit_integration.py
       - .github/workflows/production-live-contract.yml
 
+  - id: impl.guard.production-live-state
+    path: scripts/ops/classify_production_live_state.py
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/deploy/merge-to-live.md
+    verified_by:
+      - scripts/ci/tests/test_production_live_alerting.py
+      - .github/workflows/production-live-contract.yml
+
+  - id: impl.guard.production-alert-issue
+    path: scripts/ops/production_alert_issue.py
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/deploy/merge-to-live.md
+    verified_by:
+      - scripts/ci/tests/test_production_live_alerting.py
+      - .github/workflows/production-live-contract.yml
+
   - id: impl.guard.kubernetes-platform
     path: scripts/platform/validate_platform.py
     impl_type: guard

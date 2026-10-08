@@ -7,6 +7,9 @@ name: Production live contract
     paths:
       - "apps/web/scripts/generate-version.js"
       - "scripts/ops/verify_public_release_commit.py"
+      - "scripts/ops/classify_production_live_state.py"
+      - "scripts/ops/production_alert_issue.py"
+      - "scripts/ci/tests/test_production_live_alerting.py"
       - "scripts/ops/resolve_vps_public_bind.py"
       - "scripts/ops/weltgewebe_secure_receipt_io.py"
       - "scripts/ops/validate_web_deploy_archive.py"
@@ -41,7 +44,12 @@ name: Production live contract
     branches: [main]
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      alert_drill:
+        description: "Open and close a test alert issue to prove delivery"
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -84,6 +92,8 @@ jobs:
       - name: Compile Python tools
         run: |
           python -m py_compile scripts/ops/verify_public_release_commit.py
+          python -m py_compile scripts/ops/classify_production_live_state.py
+          python -m py_compile scripts/ops/production_alert_issue.py
           python -m py_compile scripts/ops/resolve_vps_public_bind.py
           python -m py_compile scripts/ops/weltgewebe_secure_receipt_io.py
           python -m py_compile scripts/ops/validate_web_deploy_archive.py
@@ -120,6 +130,10 @@ jobs:
         run: >-
           python -m unittest -v
           scripts/ci/tests/test_verify_public_release_commit.py
+      - name: Verify live-state classification and alert delivery
+        run: >-
+          python -m unittest -v
+          scripts/ci/tests/test_production_live_alerting.py
       - name: Verify VPS public Caddy bind resolver
         run: >-
           python -m unittest -v
@@ -227,7 +241,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
         with:
           ref: main
-          fetch-depth: 1
+          # Full history: the classifier needs ancestry between the expected,
+          # the live and the current main commit.
+          fetch-depth: 0
       - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: ".python-version"
@@ -282,6 +298,9 @@ jobs:
             --workflow-runs schaubild-publish-runs.json \
             --output schaubild-release-convergence.json
       - name: Verify public frontend and API identity
+        id: verify
+        # The classification below decides whether a mismatch is a failure.
+        continue-on-error: true
         run: |
           wait_seconds=0
           if [[ "${{ github.event_name }}" == "push" ]]; then
@@ -299,6 +318,28 @@ jobs:
           name: schaubild-release-convergence-${{ steps.target.outputs.commit }}
           path: schaubild-release-convergence.json
           if-no-files-found: error
+          retention-days: 30
+      - name: Classify production live state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          main_commit="$(git rev-parse refs/remotes/origin/main)"
+          python scripts/ops/classify_production_live_state.py \
+            --receipt production-live-receipt.json \
+            --expected-commit "${{ steps.target.outputs.commit }}" \
+            --main-commit "$main_commit" \
+            --pending-grace-seconds 1200 \
+            --schaubild-receipt schaubild-release-convergence.json \
+            --output production-live-state.json
+      - name: Upload production live state
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
+        with:
+          name: production-live-state
+          path: production-live-state.json
+          if-no-files-found: warn
           retention-days: 30
       - name: Upload production receipt
         if: always()
@@ -327,3 +368,43 @@ jobs:
                   + json.dumps(payload, sort_keys=True)
               )
           PY
+
+  alert:
+    name: Deliver production alert
+    # always() would also run on a cancelled (superseded) run and report stale state.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    needs: verify-live-commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
+        with:
+          ref: main
+          fetch-depth: 1
+          sparse-checkout: scripts/ops
+      - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
+        with:
+          python-version-file: ".python-version"
+      - name: Download production live state
+        # A missing state is itself alerted as a monitor failure.
+        continue-on-error: true
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317 # provenance: untagged (after v8.0.1)
+        with:
+          name: production-live-state
+      - name: Send controlled test alert
+        if: github.event_name == 'workflow_dispatch' && inputs.alert_drill
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/ops/production_alert_issue.py --drill
+          --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      - name: Open, update or resolve the production alert
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/ops/production_alert_issue.py
+          --classification production-live-state.json
+          --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

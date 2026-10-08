@@ -118,7 +118,10 @@ belegt werden; `latest` ist dafür nicht zulässig.
 Der Container lauscht intern auf Port `5432`; deshalb verbindet sich die API im
 Compose-Netz über `pgbouncer:5432`. Nur die optionale Veröffentlichung auf dem
 Entwicklungsrechner bleibt `6432:5432`, damit PgBouncer nicht mit dem direkten
-PostgreSQL-Port verwechselt wird. PostgreSQL 16 verwendet SCRAM-Passwörter;
+PostgreSQL-Port verwechselt wird. Alle Dev-Ports (5173, 8080, 5432, 6432) werden
+nur an `DEV_BIND` veröffentlicht, Standard `127.0.0.1`. Die Dev-Datenbank nutzt
+das bekannte Passwort `welt:gewebe`; LAN-Zugriff braucht daher eine bewusste
+Freigabe mit `DEV_BIND=0.0.0.0` oder einer LAN-IP. PostgreSQL 16 verwendet SCRAM-Passwörter;
 der Dev-Pooler muss daher `AUTH_TYPE=scram-sha-256` verwenden. `trust` oder ein
 MD5-generiertes Userlist-Passwort sind mit diesem Pfad nicht zulässig.
 

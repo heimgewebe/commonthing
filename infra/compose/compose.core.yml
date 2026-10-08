@@ -20,7 +20,7 @@ services:
       - ../../map-style:/map-style:ro
       - /workspace/node_modules
     ports:
-      - "5173:5173"
+      - "${DEV_BIND:-127.0.0.1}:5173:5173"
     depends_on:
       api:
         condition: service_healthy
@@ -52,7 +52,7 @@ services:
       pgbouncer:
         condition: service_started
     ports:
-      - "8080:8080"
+      - "${DEV_BIND:-127.0.0.1}:8080:8080"
     volumes:
       - ../..:/workspace
       - cargo_registry:/usr/local/cargo/registry
@@ -77,7 +77,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gewebe}
       POSTGRES_DB: ${POSTGRES_DB:-weltgewebe}
     ports:
-      - "5432:5432"
+      - "${DEV_BIND:-127.0.0.1}:5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./sql/init:/docker-entrypoint-initdb.d:ro
@@ -110,7 +110,7 @@ services:
     # Containers use PgBouncer's actual listener 5432. The host keeps the
     # conventional development port 6432 to distinguish it from PostgreSQL.
     ports:
-      - "6432:5432"
+      - "${DEV_BIND:-127.0.0.1}:6432:5432"
 
   caddy:
     profiles: ["dev"]
