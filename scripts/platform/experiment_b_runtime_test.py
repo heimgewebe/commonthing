@@ -8823,7 +8823,11 @@ class ExperimentBVMSubstrateTests(unittest.TestCase):
                 "metadata": {
                     "name": name,
                     "namespace": runtime.APP_NAMESPACE,
-                    "labels": {"app.kubernetes.io/name": name},
+                    "labels": {
+                        "app.kubernetes.io/name": name,
+                        "kustomize.toolkit.fluxcd.io/name": "commonthing-experiment-b-app",
+                        "kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+                    },
                 },
                 "automountServiceAccountToken": False,
             }
@@ -11305,6 +11309,87 @@ spec:
                 "ServiceAccount identity drifted: weltgewebe-web",
             ):
                 runtime.status(self.root)
+
+    def test_status_rejects_invalid_flux_service_account_ownership(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        healthy = json.loads(json.dumps(self.application_service_accounts))
+        flux_keys = (
+            "kustomize.toolkit.fluxcd.io/name",
+            "kustomize.toolkit.fluxcd.io/namespace",
+        )
+        for account in ("weltgewebe-api", "weltgewebe-web"):
+            for key in flux_keys:
+                for mutation in ("missing", "wrong"):
+                    self.application_service_accounts = json.loads(json.dumps(healthy))
+                    labels = self.application_service_accounts[account]["metadata"]["labels"]
+                    if mutation == "missing":
+                        labels.pop(key)
+                    else:
+                        labels[key] = "foreign-controller"
+                    with (
+                        self.subTest(account=account, key=key, mutation=mutation),
+                        self.assertRaisesRegex(
+                            runtime.RuntimeErrorEB,
+                            f"ServiceAccount contract drifted: {account}",
+                        ),
+                    ):
+                        runtime.status(self.root)
+            self.application_service_accounts = json.loads(json.dumps(healthy))
+            self.application_service_accounts[account]["metadata"]["labels"][
+                "unrecognized.example/owner"
+            ] = "untrusted"
+            with (
+                self.subTest(account=account, mutation="extra"),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    f"ServiceAccount contract drifted: {account}",
+                ),
+            ):
+                runtime.status(self.root)
+        self.application_service_accounts = healthy
+
+    def test_status_rejects_flux_service_account_contract_key_collision(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        for key, value in (
+            ("kustomize.toolkit.fluxcd.io/name", "commonthing-experiment-b-app"),
+            ("kustomize.toolkit.fluxcd.io/namespace", "foreign-namespace"),
+        ):
+            contract = json.loads(
+                json.dumps(self.application_service_account_expected)
+            )
+            contract["weltgewebe-api"]["contract"]["labels"][key] = value
+            with (
+                self.subTest(flux_key=key),
+                mock.patch.object(
+                    runtime,
+                    "_rendered_application_service_account_contract",
+                    return_value=contract,
+                ),
+                self.assertRaisesRegex(
+                    runtime.RuntimeErrorEB,
+                    "rendered application ServiceAccount labels overlap Flux ownership",
+                ),
+            ):
+                runtime.status(self.root)
+
+    def test_status_lists_pvcs_using_verb_first(self) -> None:
+        self.write_vm_receipt()
+        self.prepare_status()
+        pvc_calls = []
+
+        def track_pvc_call(root, arguments):
+            if "pvc" in arguments:
+                pvc_calls.append(list(arguments))
+            return self.kubernetes_fixture(root, arguments)
+
+        with mock.patch.object(
+            runtime, "_kubectl_json", side_effect=track_pvc_call
+        ):
+            result = runtime.status(self.root)
+        self.assertEqual(result["status"], "observed")
+        self.assertEqual(pvc_calls, [["get", "pvc", "--all-namespaces"]])
 
     def test_rendered_service_account_contract_tracks_deployment_references(self) -> None:
         api_digest = "sha256:" + "b" * 64
