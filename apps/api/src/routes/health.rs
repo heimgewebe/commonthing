@@ -2,16 +2,22 @@ use std::{
     env,
     future::Future,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
-use tokio::{fs, io::AsyncReadExt, time::timeout};
+use tokio::{
+    fs,
+    io::AsyncReadExt,
+    sync::Mutex,
+    time::{timeout, Instant},
+};
 
 use axum::{
     extract::State,
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -32,6 +38,9 @@ pub fn health_routes() -> Router<ApiState> {
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
+        .layer(Extension(Arc::new(Mutex::new(
+            EventChainReadinessCache::default(),
+        ))))
 }
 
 async fn live() -> Response {
@@ -51,7 +60,7 @@ enum CheckStatus {
     Failed,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct CheckResult {
     status: CheckStatus,
     errors: Vec<String>,
@@ -96,6 +105,14 @@ fn readiness_verbose() -> bool {
 const MAX_POLICY_FILE_BYTES: u64 = 64 * 1024;
 const READINESS_CHECK_TIMEOUT_MS: u64 = 750;
 const READINESS_TOTAL_TIMEOUT_MS: u64 = 1_000;
+// A 250 ms reuse window is small compared with the 60 s receipt grace period.
+// It prevents one expensive event-chain table scan per concurrent health request.
+const EVENT_CHAIN_READINESS_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Default)]
+struct EventChainReadinessCache {
+    completed: Option<(Instant, CheckResult)>,
+}
 const STALE_UNPUBLISHED_AFTER_SECONDS: i64 = 60;
 const DELAYED_RECEIPT_AFTER_SECONDS: i64 = 60;
 const RECEIPT_HEALTH_WINDOW_SECONDS: i64 = 10 * 60;
@@ -453,6 +470,27 @@ where
     }
 }
 
+// Serialize only the expensive event-chain verification. A completed result is
+// shared for 250 ms across cloned ApiState handles. Cancellation before the
+// check finishes never publishes a partial or successful cache entry.
+async fn cached_event_chain_check<F>(
+    cache: &Mutex<EventChainReadinessCache>,
+    check: F,
+) -> CheckResult
+where
+    F: Future<Output = CheckResult>,
+{
+    let mut cache = cache.lock().await;
+    if let Some((completed_at, result)) = cache.completed.as_ref() {
+        if completed_at.elapsed() < EVENT_CHAIN_READINESS_CACHE_TTL {
+            return result.clone();
+        }
+    }
+    let result = check.await;
+    cache.completed = Some((Instant::now(), result.clone()));
+    result
+}
+
 async fn run_readiness_checks_with_budgets<N, D, E, P>(
     nats: N,
     database: D,
@@ -502,11 +540,14 @@ where
     }
 }
 
-async fn run_readiness_checks(state: &ApiState) -> ReadinessResults {
+async fn run_readiness_checks(
+    state: &ApiState,
+    cache: &Mutex<EventChainReadinessCache>,
+) -> ReadinessResults {
     run_readiness_checks_with_budgets(
         check_nats(state),
         check_database(state),
-        check_event_chain(state),
+        cached_event_chain_check(cache, check_event_chain(state)),
         check_policy(),
         Duration::from_millis(READINESS_CHECK_TIMEOUT_MS),
         Duration::from_millis(READINESS_TOTAL_TIMEOUT_MS),
@@ -514,8 +555,11 @@ async fn run_readiness_checks(state: &ApiState) -> ReadinessResults {
     .await
 }
 
-async fn ready(State(state): State<ApiState>) -> Response {
-    readiness_response(run_readiness_checks(&state).await)
+async fn ready(
+    State(state): State<ApiState>,
+    Extension(cache): Extension<Arc<Mutex<EventChainReadinessCache>>>,
+) -> Response {
+    readiness_response(run_readiness_checks(&state, &cache).await)
 }
 
 fn readiness_check_json(status: CheckStatus) -> Value {
@@ -689,6 +733,16 @@ mod tests {
         })
     }
 
+    // Direct handler tests supply their own cache, while production shares one
+    // through health_routes()' Axum extension across requests.
+    async fn ready_test(state: ApiState) -> Response {
+        ready(
+            State(state),
+            Extension(Arc::new(Mutex::new(EventChainReadinessCache::default()))),
+        )
+        .await
+    }
+
     #[tokio::test]
     #[serial]
     async fn live_returns_ok_status_and_no_store_header() -> Result<()> {
@@ -709,11 +763,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_router_installs_event_chain_cache_extension() -> Result<()> {
+        let mut router = health_routes().with_state(test_state()?);
+        let request = axum::http::Request::builder()
+            .uri("/health/ready")
+            .body(body::Body::empty())?;
+        let response = tower::Service::call(&mut router, request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
     #[serial]
     async fn readiness_succeeds_when_optional_dependencies_are_disabled() -> Result<()> {
         let state = test_state()?;
 
-        let response = ready(State(state)).await;
+        let response = ready_test(state).await;
         let status = response.status();
         let cache_control = response.headers().get(header::CACHE_CONTROL).cloned();
         let body_bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
@@ -739,7 +804,7 @@ mod tests {
         let _policy = EnvGuard::set("POLICY_LIMITS_PATH", "/does/not/exist");
         let state = test_state()?;
 
-        let response = ready(State(state)).await;
+        let response = ready_test(state).await;
         let status = response.status();
         let cache_control = response.headers().get(header::CACHE_CONTROL).cloned();
         let body_bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
@@ -756,6 +821,64 @@ mod tests {
         assert_eq!(body["checks"]["policy"], false);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_chain_check_is_singleflight_and_cache_expires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Arc::new(tokio::sync::Mutex::new(EventChainReadinessCache::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(10));
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let result = cached_event_chain_check(&cache, async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    CheckResult::ready()
+                })
+                .await;
+                matches!(result.status, CheckStatus::Ready)
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.expect("event-chain check task must complete"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let cached = cached_event_chain_check(&cache, async {
+            panic!("a fresh cached result must not run another check")
+        })
+        .await;
+        assert!(matches!(cached.status, CheckStatus::Ready));
+
+        tokio::time::sleep(EVENT_CHAIN_READINESS_CACHE_TTL + Duration::from_millis(20)).await;
+        let refreshed = cached_event_chain_check(&cache, async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            CheckResult::failure_with_message("dependency unavailable".to_owned())
+        })
+        .await;
+        assert!(matches!(refreshed.status, CheckStatus::Failed));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_event_chain_check_does_not_cache_success() {
+        let cache = tokio::sync::Mutex::new(EventChainReadinessCache::default());
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(10),
+            cached_event_chain_check(&cache, pending::<CheckResult>()),
+        )
+        .await;
+        assert!(timed_out.is_err());
+
+        let result = cached_event_chain_check(&cache, async { CheckResult::ready() }).await;
+        assert!(matches!(result.status, CheckStatus::Ready));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1014,7 +1137,7 @@ mod tests {
         );
         let state = test_state()?;
 
-        let response = ready(State(state)).await;
+        let response = ready_test(state).await;
         let status = response.status();
         let body_bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
         let body: Value = serde_json::from_slice(&body_bytes)?;
@@ -1031,7 +1154,7 @@ mod tests {
         let mut state = test_state()?;
         state.db_pool_configured = true;
 
-        let response = ready(State(state)).await;
+        let response = ready_test(state).await;
         let status = response.status();
         let body_bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
         let body: Value = serde_json::from_slice(&body_bytes)?;
@@ -1050,7 +1173,7 @@ mod tests {
         let mut state = test_state()?;
         state.nats_configured = true;
 
-        let response = ready(State(state)).await;
+        let response = ready_test(state).await;
         let status = response.status();
         let body_bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
         let body: Value = serde_json::from_slice(&body_bytes)?;
@@ -1070,7 +1193,7 @@ mod tests {
         let _verbose = EnvGuard::set("READINESS_VERBOSE", "1");
         let state = test_state()?;
 
-        let response = ready(State(state)).await;
+        let response = ready_test(state).await;
         let status = response.status();
         let body_bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
         let body: Value = serde_json::from_slice(&body_bytes)?;
