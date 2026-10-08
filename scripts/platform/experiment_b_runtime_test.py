@@ -3528,6 +3528,91 @@ spec:
 
         self.assertEqual(len(calls), 1)
 
+    def test_t048_readiness_diagnostics_classifies_fixed_checks(self) -> None:
+        summary = {
+            "metrics": {
+                "t048_ready_samples": {"values": {"count": 300}},
+                "t048_ready_http_503": {"values": {"count": 267}},
+                "t048_ready_check_false_database": {"values": {"count": 180}},
+                "t048_ready_check_false_nats": {"values": {"count": 100}},
+                "t048_ready_check_false_event_chain": {"values": {"count": 10}},
+                "t048_ready_unclassified": {"values": {"count": 3}},
+            }
+        }
+        observed = runtime._t048_readiness_diagnostics(summary)
+        self.assertEqual(
+            observed,
+            {
+                "sample_count": 300,
+                "http_503_count": 267,
+                "checks_false": {
+                    "database": 180,
+                    "nats": 100,
+                    "event_chain": 10,
+                    "policy": 0,
+                },
+                "unclassified_503_count": 3,
+            },
+        )
+        source = inspect.getsource(runtime.t048_load_proof)
+        self.assertIn("readiness_diagnostics = _t048_readiness_diagnostics(summary)", source)
+        self.assertIn('"readiness": readiness_diagnostics', source)
+
+    def test_t048_readiness_diagnostics_handles_zero_and_unclassified(self) -> None:
+        clean = {"metrics": {"t048_ready_samples": {"values": {"count": 3511}}}}
+        self.assertEqual(
+            runtime._t048_readiness_diagnostics(clean)["http_503_count"], 0
+        )
+        malformed = {
+            "metrics": {
+                "t048_ready_samples": {"values": {"count": 10}},
+                "t048_ready_http_503": {"values": {"count": 5}},
+                "t048_ready_unclassified": {"values": {"count": 5}},
+            }
+        }
+        self.assertEqual(
+            runtime._t048_readiness_diagnostics(malformed)["unclassified_503_count"],
+            5,
+        )
+        workload = (runtime.ROOT / "scripts/performance/api_runtime_k6.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("import { Counter } from 'k6/metrics';", workload)
+        for name in [
+            "samples", "http_503", "unclassified", "check_false_database",
+            "check_false_nats", "check_false_event_chain", "check_false_policy",
+        ]:
+            self.assertIn(f"'t048_ready_{name}'", workload)
+        self.assertIn("ready.json()", workload)
+        self.assertIn("checks[component] === false", workload)
+
+    def test_t048_readiness_diagnostics_rejects_inconsistent_counts(self) -> None:
+        def metric(value: object) -> dict[str, object]:
+            return {"values": {"count": value}}
+
+        cases = [
+            {},
+            {"t048_ready_samples": metric(0)},
+            {"t048_ready_samples": metric(True)},
+            {"t048_ready_samples": metric(2.5)},
+            {"t048_ready_samples": metric(float("nan"))},
+            {"t048_ready_samples": metric(2), "t048_ready_http_503": metric(3)},
+            {"t048_ready_samples": metric(10), "t048_ready_http_503": metric(5)},
+            {
+                "t048_ready_samples": metric(10),
+                "t048_ready_http_503": metric(5),
+                "t048_ready_check_false_database": metric(6),
+            },
+            {
+                "t048_ready_samples": metric(10),
+                "t048_ready_http_503": metric(5),
+                "t048_ready_unclassified": metric(6),
+            },
+        ]
+        for metrics in cases:
+            with self.subTest(metrics=metrics), self.assertRaises(runtime.RuntimeErrorEB):
+                runtime._t048_readiness_diagnostics({"metrics": metrics})
+
     def test_k6_summary_output_channel_is_pathless_and_sealed(self) -> None:
         canonical = {"canonical": True}
         encoded = json.dumps(canonical, separators=(",", ":")).encode("utf-8")

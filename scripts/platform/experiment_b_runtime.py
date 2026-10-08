@@ -12166,6 +12166,55 @@ def _prime_t048_search_metric(base_url: str, search_query: str) -> None:
         raise RuntimeErrorEB("T048 /search warm-up failed")
 
 
+
+_T048_READY_COMPONENTS = ("database", "nats", "event_chain", "policy")
+
+
+def _t048_readiness_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
+    """Classify fixed-label readiness 503s without changing load PASS/FAIL."""
+    metrics = summary.get("metrics")
+    if not isinstance(metrics, dict):
+        raise RuntimeErrorEB("T048 readiness diagnostics have no k6 metrics")
+
+    def counter(name: str, *, required: bool = False) -> int:
+        metric = metrics.get(name)
+        if metric is None and not required:
+            return 0  # k6 omits Counter series that never received a sample
+        values = metric.get("values") if isinstance(metric, dict) else None
+        raw = values.get("count") if isinstance(values, dict) else None
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, (int, float))
+            or not math.isfinite(raw)
+            or raw < 0
+            or not float(raw).is_integer()
+        ):
+            raise RuntimeErrorEB(f"T048 readiness counter {name} is invalid or missing")
+        return int(raw)
+
+    samples = counter("t048_ready_samples", required=True)
+    status_503 = counter("t048_ready_http_503")
+    unclassified = counter("t048_ready_unclassified")
+    failed = {
+        name: counter(f"t048_ready_check_false_{name}")
+        for name in _T048_READY_COMPONENTS
+    }
+    if (
+        samples <= 0
+        or status_503 > samples
+        or unclassified > status_503
+        or any(value > status_503 for value in failed.values())
+        or sum(failed.values()) + unclassified < status_503
+    ):
+        raise RuntimeErrorEB("T048 readiness diagnostic counters are inconsistent")
+    return {
+        "sample_count": samples,
+        "http_503_count": status_503,
+        "checks_false": failed,
+        "unclassified_503_count": unclassified,
+    }
+
+
 def _wait_http_200(url: str, process: subprocess.Popen[Any] | None = None) -> None:
     for _ in range(60):
         if process is not None and process.poll() is not None:
@@ -13710,6 +13759,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
         if evidence.extract_declared_scenario(summary) != scenario:
             raise RuntimeErrorEB("k6 scenario drifted from the canonical T048 policy")
         http_metrics = evidence.extract_http_metrics(summary)
+        readiness_diagnostics = _t048_readiness_diagnostics(summary)
         failures = list(
             evidence.threshold_failures(http_metrics, contract_section["thresholds"])
         )
@@ -13797,6 +13847,7 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
             "scenario": scenario,
             "thresholds": contract_section["thresholds"],
             "http": http_metrics,
+            "readiness": readiness_diagnostics,
             "database": database_metrics,
             "resources": {
                 "api_peak_cpu_percent": peak_cpu,
