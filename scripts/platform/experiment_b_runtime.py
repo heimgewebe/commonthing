@@ -2595,6 +2595,19 @@ def _parse_systemctl_properties(stdout: str) -> dict[str, str]:
     return properties
 
 
+def _k3s_process_identity_is_supported(process_exe: Any, process_argv: Any) -> bool:
+    if process_exe == "/usr/local/bin/k3s":
+        return process_argv == ["/usr/local/bin/k3s", "server"]
+    return (
+        isinstance(process_exe, str)
+        and re.fullmatch(
+            r"/var/lib/rancher/k3s/data/[0-9a-f]{64}/bin/k3s",
+            process_exe,
+        ) is not None
+        and process_argv == ["/usr/local/bin/k3s server"]
+    )
+
+
 def _require_live_k3s_runtime(
     root: Path,
     config: dict[str, Any],
@@ -2697,20 +2710,11 @@ def _require_live_k3s_runtime(
         timeout=30,
     ).stdout
     argv = [value for value in process_cmdline.split("\0") if value]
-    launcher_identity = (
-        process_exe == "/usr/local/bin/k3s"
-        and argv == ["/usr/local/bin/k3s", "server"]
-    )
-    if not launcher_identity:
+    if not _k3s_process_identity_is_supported(process_exe, argv):
+        raise RuntimeErrorEB("active k3s process identity drifted")
+    reexec_binary_sha256: str | None = None
+    if process_exe != "/usr/local/bin/k3s":
         # The pinned k3s launcher reexecs its packaged server from data/current.
-        if (
-            argv != ["/usr/local/bin/k3s server"]
-            or re.fullmatch(
-                r"/var/lib/rancher/k3s/data/[0-9a-f]{64}/bin/k3s",
-                process_exe,
-            ) is None
-        ):
-            raise RuntimeErrorEB("active k3s process identity drifted")
         current_exe = run(
             [
                 *ssh_argv(root, live_ip),
@@ -2731,7 +2735,8 @@ def _require_live_k3s_runtime(
             ).stdout,
             (process_path,),
         )
-        if reexec_digests[process_path] != config["kubernetes"]["reexec_binary_sha256"]:
+        reexec_binary_sha256 = reexec_digests[process_path]
+        if reexec_binary_sha256 != config["kubernetes"]["reexec_binary_sha256"]:
             raise RuntimeErrorEB("active k3s reexec binary digest drifted")
     process_environment = run(
         [
@@ -2767,6 +2772,8 @@ def _require_live_k3s_runtime(
         "main_pid": main_pid,
         "process_exe": process_exe,
         "process_argv": argv,
+        "reexec_binary_sha256": reexec_binary_sha256,
+        "reexec_current_target_verified": reexec_binary_sha256 is not None,
         "environment_overrides_absent": True,
     }
 
@@ -17637,9 +17644,18 @@ def portability_report(root: Path) -> dict[str, Any]:
         or not isinstance(k3s_status.get("main_pid"), int)
         or isinstance(k3s_status.get("main_pid"), bool)
         or k3s_status["main_pid"] <= 0
-        or k3s_status.get("process_exe") != "/usr/local/bin/k3s"
-        or k3s_status.get("process_argv")
-        != ["/usr/local/bin/k3s", "server"]
+        or not _k3s_process_identity_is_supported(
+            k3s_status.get("process_exe"),
+            k3s_status.get("process_argv"),
+        )
+        or (
+            k3s_status.get("process_exe") != "/usr/local/bin/k3s"
+            and (
+                k3s_status.get("reexec_binary_sha256")
+                != config["kubernetes"]["reexec_binary_sha256"]
+                or k3s_status.get("reexec_current_target_verified") is not True
+            )
+        )
         or k3s_status.get("environment_overrides_absent") is not True
     ):
         raise RuntimeErrorEB("status does not prove the live pinned k3s runtime")
