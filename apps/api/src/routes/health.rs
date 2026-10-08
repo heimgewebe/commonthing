@@ -590,7 +590,7 @@ async fn run_readiness_checks(
     cache: Arc<Mutex<EventChainReadinessCache>>,
 ) -> ReadinessResults {
     let event_chain_state = state.clone();
-    run_readiness_checks_with_budgets(
+    let mut result = run_readiness_checks_with_budgets(
         check_nats(state),
         check_database(state),
         cached_event_chain_check(
@@ -601,7 +601,25 @@ async fn run_readiness_checks(
         Duration::from_millis(READINESS_CHECK_TIMEOUT_MS),
         Duration::from_millis(READINESS_TOTAL_TIMEOUT_MS),
     )
-    .await
+    .await;
+
+    // The expensive event-chain probe may be shared for 250 ms, but essential
+    // worker liveness is local and cheap. Re-evaluate it for EVERY response:
+    // an exited relay or receipt consumer must never be masked by a cached 200.
+    if outbox::event_chain_required(&state.config) {
+        for worker in [DomainEventWorker::Relay, DomainEventWorker::ReceiptConsumer] {
+            if !state.metrics.domain_event_worker_is_up(worker) {
+                let message = format!("essential domain event worker {worker:?} is not running");
+                if !result.event_chain.errors.contains(&message) {
+                    readiness_check_failed("event_chain", &message);
+                    result.event_chain.errors.push(message);
+                }
+                result.event_chain.status = CheckStatus::Failed;
+            }
+        }
+    }
+
+    result
 }
 
 async fn ready(
@@ -821,6 +839,39 @@ mod tests {
                 .body(body::Body::empty())?;
             let response = tower::Service::call(&mut clone, request).await?;
             assert_eq!(response.status(), StatusCode::OK);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cached_success_never_masks_stopped_event_worker() -> Result<()> {
+        let mut state = test_state()?;
+        state.config.domain_read_source = crate::config::DomainReadSource::Postgres;
+        for worker in [DomainEventWorker::Relay, DomainEventWorker::ReceiptConsumer] {
+            state.metrics.set_domain_event_worker_up(worker, true);
+        }
+        let cache = Arc::new(Mutex::new(EventChainReadinessCache {
+            completed: Some((Instant::now(), CheckResult::ready())),
+            in_flight: None,
+        }));
+        let healthy = ready(State(state.clone()), Extension(cache.clone())).await;
+        assert_eq!(healthy.status(), StatusCode::OK);
+
+        for worker in [DomainEventWorker::Relay, DomainEventWorker::ReceiptConsumer] {
+            state.metrics.set_domain_event_worker_up(worker, false);
+            let stopped = ready(State(state.clone()), Extension(cache.clone())).await;
+            assert_eq!(stopped.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body_bytes = body::to_bytes(stopped.into_body(), usize::MAX).await?;
+            let body: Value = serde_json::from_slice(&body_bytes)?;
+            assert_eq!(body["checks"]["event_chain"], false);
+            // The expensive probe remains cached as healthy; the fresh worker
+            // check alone forces 503 without waiting for cache expiry.
+            assert!(cache.lock().await.completed.is_some());
+
+            state.metrics.set_domain_event_worker_up(worker, true);
+            let recovered = ready(State(state.clone()), Extension(cache.clone())).await;
+            assert_eq!(recovered.status(), StatusCode::OK);
         }
         Ok(())
     }
