@@ -48,6 +48,7 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # Matches the push run's 1200 s wait: once that wait is over, a lag is stale.
 DEFAULT_PENDING_GRACE_SECONDS = 1200
 NON_ALERTING_STATES = frozenset({"current", "superseded", "pending"})
+SCHAUBILD_SCHEMA = "weltgewebe-schauwerk-release-convergence.v1"
 
 
 @dataclass(frozen=True)
@@ -326,6 +327,20 @@ def schaubild_failure(path: Path) -> str | None:
         return (
             f"Schaubild release convergence is not current: state {payload.get('state')!r}, "
             f"action_required {payload.get('action_required')!r}{details}"
+        )
+    # A bare {"state": "current"} is no proof: the producer's shape and an
+    # agreeing release pair must be present before Schaubild counts as converged.
+    locked = payload.get("locked_source_commit")
+    desired = payload.get("desired_source_commit")
+    if payload.get("schema_version") != SCHAUBILD_SCHEMA:
+        return (
+            "Schaubild release convergence receipt has schema "
+            f"{payload.get('schema_version')!r}, expected {SCHAUBILD_SCHEMA!r}"
+        )
+    if not (_is_commit(locked) and _is_commit(desired)) or locked != desired:
+        return (
+            "Schaubild release convergence receipt reports current without an agreeing "
+            f"release pair: locked {locked!r}, desired {desired!r}"
         )
     return None
 

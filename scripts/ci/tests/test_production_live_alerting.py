@@ -294,9 +294,27 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             args = ["--receipt", str(receipt_path), "--expected-commit", C, "--main-commit", C,
                     "--repo", tmp, "--schaubild-receipt", str(schaubild), "--output", str(output)]
 
-            schaubild.write_text(json.dumps({"state": "current", "action_required": False}))
+            converged = {
+                "schema_version": CLASSIFY.SCHAUBILD_SCHEMA,
+                "state": "current",
+                "action_required": False,
+                "locked_source_commit": A,
+                "desired_source_commit": A,
+            }
+            schaubild.write_text(json.dumps(converged))
             self.assertEqual(CLASSIFY.main(args), 0)
             self.assertEqual(json.loads(output.read_text())["state"], "current")
+
+            # "current" without the producer's proof fields is not convergence.
+            for unproven in (
+                {"state": "current", "action_required": False},
+                {**converged, "schema_version": 2},
+                {**converged, "desired_source_commit": B},
+                {**converged, "locked_source_commit": None},
+            ):
+                schaubild.write_text(json.dumps(unproven))
+                self.assertEqual(CLASSIFY.main(args), 1, unproven)
+                self.assertEqual(json.loads(output.read_text())["state"], "invalid")
 
             schaubild.write_text(json.dumps({"state": "stale", "action_required": True}))
             self.assertEqual(CLASSIFY.main(args), 1)
@@ -307,6 +325,12 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             schaubild.unlink()
             self.assertEqual(CLASSIFY.main(args), 1)
             self.assertIn("unreadable", json.loads(output.read_text())["reason"])
+
+    def test_schaubild_schema_matches_the_producer(self) -> None:
+        producer = (OPS.parent / "preflight/schauwerk_release_convergence.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f'SCHEMA = "{CLASSIFY.SCHAUBILD_SCHEMA}"', producer)
 
     def test_schaubild_failure_keeps_a_more_specific_alert(self) -> None:
         specific = classify(receipt(None), C)
