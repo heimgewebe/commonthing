@@ -213,14 +213,16 @@ def classify(
     observed["frontend"] = frontend_commit if _is_commit(frontend_commit) else None
     observed["api"] = api_commit if _is_commit(api_commit) else None
 
-    for name, endpoint in (("frontend", frontend), ("api", api)):
-        if endpoint.get("error") or endpoint.get("status") != 200:
-            return failed(
-                "outage",
-                None,
-                f"{name} readback failed: HTTP {endpoint.get('status')!r}, "
-                f"error {endpoint.get('error')!r}",
-            )
+    # Both sides are collected, so a changed API failure behind an unchanged
+    # frontend failure is still a new diagnosis.
+    readback_failures = [
+        f"{name} readback failed: HTTP {endpoint.get('status')!r}, "
+        f"error {endpoint.get('error')!r}"
+        for name, endpoint in (("frontend", frontend), ("api", api))
+        if endpoint.get("error") or endpoint.get("status") != 200
+    ]
+    if readback_failures:
+        return result("outage", None, "; ".join(readback_failures), tuple(readback_failures))
 
     if not (_is_commit(frontend_commit) and _is_commit(api_commit)):
         return failed(

@@ -223,6 +223,21 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         self.assertNotEqual(result.fingerprint(), bad_gateway.fingerprint())
         data["api"] = endpoint(C, status=500)
         self.assertNotEqual(bad_gateway.fingerprint(), classify(data, C).fingerprint())
+        # Both sides down: a change behind an unchanged frontend failure counts.
+        data["frontend"] = endpoint(None, status=0, error="timed out")
+        both = classify(data, C)
+        self.assertIn("frontend", both.reason)
+        self.assertIn("api", both.reason)
+        data["api"] = endpoint(None, status=0, error="timed out")
+        self.assertNotEqual(both.fingerprint(), classify(data, C).fingerprint())
+
+    def test_alert_details_show_both_endpoint_commits(self) -> None:
+        half_down = receipt(A)
+        half_down["api"] = endpoint(None, status=502)
+        payload = CLASSIFY.asdict(classify(half_down, C))
+        details = ALERT._details(payload, "https://run")
+        self.assertIn(f"Frontend-Commit: `{A}`", details)
+        self.assertIn("API-Commit: `None`", details)
 
     def test_missing_receipt_is_a_monitor_failure(self) -> None:
         result = classify(None, C)

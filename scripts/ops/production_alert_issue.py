@@ -120,6 +120,9 @@ def _details(classification: dict[str, Any], run_url: str) -> str:
             f"- Grund: {classification.get('reason')}",
             f"- Erwarteter Commit: `{classification.get('expected_commit')}`",
             f"- Live-Commit: `{classification.get('live_commit')}`",
+            # Split and partly unreadable deployments have no single live commit.
+            f"- Frontend-Commit: `{classification.get('frontend_commit')}`",
+            f"- API-Commit: `{classification.get('api_commit')}`",
             f"- main: `{classification.get('main_commit')}`",
             f"- Lauf: {run_url}",
         ]
