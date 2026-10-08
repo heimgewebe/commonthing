@@ -6613,8 +6613,18 @@ def _final_recovery_state_readback(
         or recovery.get("rpo_seconds") != 0
         or recovery.get("database_before") != recovery.get("database_after")
         or recovery.get("jetstream_before") != recovery.get("jetstream_after")
+        or not isinstance(recovery.get("database_post_resume"), dict)
+        or recovery.get("jetstream_post_resume") != recovery.get("jetstream_after")
     ):
         raise RuntimeErrorEB("Experiment-B recovery receipt binding is invalid")
+    try:
+        _require_database_runtime_continuity(
+            recovery["database_after"],
+            recovery["database_post_resume"],
+            "recovery receipt post-resume database",
+        )
+    except RuntimeErrorEB as exc:
+        raise RuntimeErrorEB("Experiment-B recovery receipt binding is invalid") from exc
 
     database_identity = _verified_database_client_identity(
         root,
@@ -6639,9 +6649,17 @@ def _final_recovery_state_readback(
         source_commit=source_commit,
         nats_binding=nats_binding,
     )
-    if current_database != recovery.get("database_after"):
-        raise RuntimeErrorEB("Experiment-B database/search state drifted after recovery")
-    if current_jetstream != recovery.get("jetstream_after"):
+    try:
+        _require_database_runtime_continuity(
+            recovery["database_post_resume"],
+            current_database,
+            "final recovery-state database",
+        )
+    except RuntimeErrorEB as exc:
+        raise RuntimeErrorEB(
+            "Experiment-B database/search state drifted after recovery"
+        ) from exc
+    if current_jetstream != recovery.get("jetstream_post_resume"):
         raise RuntimeErrorEB("Experiment-B JetStream state drifted after recovery")
 
     fixture_path = root / "receipts/t048-fixture.json"
@@ -10616,6 +10634,31 @@ def _endpoint_slice_collection_json(
     return value
 
 
+def _gateway_collection_json(root: Path) -> dict[str, Any]:
+    namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
+    query = urllib.parse.urlencode(
+        {"fieldSelector": "metadata.name=commonthing-experiment-b"}
+    )
+    result = _kubectl(
+        root,
+        [
+            "get",
+            "--raw",
+            (
+                f"/apis/gateway.networking.k8s.io/v1/namespaces/"
+                f"{namespace_path}/gateways?{query}"
+            ),
+        ],
+    )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeErrorEB("Gateway raw JSON readback failed") from exc
+    if not isinstance(value, dict):
+        raise RuntimeErrorEB("Gateway raw JSON readback is not an object")
+    return value
+
+
 def _httproute_collection_json(root: Path) -> dict[str, Any]:
     namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
     result = _kubectl(
@@ -14244,17 +14287,51 @@ def _guard_functional_service_endpoints(
 
     namespace_path = urllib.parse.quote(APP_NAMESPACE, safe="")
     gateway = serving_runtime.get("gateway")
+    if not isinstance(gateway, dict):
+        raise RuntimeErrorEB(
+            "functional serving dependency replay has no Gateway binding"
+        )
+    gateway_collection = _gateway_collection_json(root)
+    gateway_collection_metadata = gateway_collection.get("metadata")
+    gateway_items = gateway_collection.get("items")
     gateway_resource_version = (
-        gateway.get("resource_version")
-        if isinstance(gateway, dict)
+        gateway_collection_metadata.get("resourceVersion")
+        if isinstance(gateway_collection_metadata, dict)
         else None
     )
     if (
         not isinstance(gateway_resource_version, str)
         or not gateway_resource_version
+        or not isinstance(gateway_items, list)
+        or len(gateway_items) != 1
+        or not isinstance(gateway_items[0], dict)
     ):
         raise RuntimeErrorEB(
-            "functional serving dependency replay has no resourceVersion: Gateway"
+            "functional serving dependency replay Gateway snapshot is invalid"
+        )
+    gateway_snapshot = gateway_items[0]
+    gateway_snapshot_revision = _kubernetes_object_revision(
+        gateway_snapshot,
+        "Gateway collection snapshot",
+    )
+    gateway_snapshot_semantic = _require_gateway_ready(gateway_snapshot)
+    expected_gateway_semantic = {
+        field: gateway.get(field)
+        for field in (
+            "generation",
+            "gateway_class",
+            "listener",
+            "programmed",
+        )
+    }
+    if (
+        gateway_snapshot_revision["uid"] != gateway.get("uid")
+        or gateway_snapshot_revision["resource_version"]
+        != gateway.get("resource_version")
+        or gateway_snapshot_semantic != expected_gateway_semantic
+    ):
+        raise RuntimeErrorEB(
+            "functional serving dependency replay Gateway snapshot drifted"
         )
     dependencies.append(
         (
@@ -15056,6 +15133,177 @@ def functional_readback(root: Path, source_commit: str) -> dict[str, Any]:
 
 
 
+
+def _normalized_database_schema_dump(schema_bytes: bytes) -> bytes:
+    try:
+        schema_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeErrorEB(
+            "database schema signature is not UTF-8"
+        ) from exc
+
+    lines = schema_bytes.split(b"\n")
+    restrict_prefix = b"\\restrict "
+    unrestrict_prefix = b"\\unrestrict "
+
+    leading_restrict_index: int | None = None
+    for index, line in enumerate(lines):
+        if line.startswith(restrict_prefix):
+            leading_restrict_index = index
+            break
+        if line and not line.startswith(b"--"):
+            raise RuntimeErrorEB(
+                "database schema signature is missing leading pg_dump restrict marker"
+            )
+    if leading_restrict_index is None:
+        raise RuntimeErrorEB(
+            "database schema signature is missing leading pg_dump restrict marker"
+        )
+
+    trailing_unrestrict_index = len(lines) - 1
+    while (
+        trailing_unrestrict_index >= 0
+        and not lines[trailing_unrestrict_index]
+    ):
+        trailing_unrestrict_index -= 1
+    if (
+        trailing_unrestrict_index <= leading_restrict_index
+        or not lines[trailing_unrestrict_index].startswith(unrestrict_prefix)
+    ):
+        raise RuntimeErrorEB(
+            "database schema signature is missing trailing pg_dump unrestrict marker"
+        )
+
+    restrict_token = lines[leading_restrict_index][len(restrict_prefix):]
+    unrestrict_token = lines[trailing_unrestrict_index][len(unrestrict_prefix):]
+    ascii_whitespace = b" \t\r\n\v\f"
+    if (
+        not restrict_token
+        or not unrestrict_token
+        or not restrict_token.isascii()
+        or not unrestrict_token.isascii()
+        or any(byte in ascii_whitespace for byte in restrict_token)
+        or any(byte in ascii_whitespace for byte in unrestrict_token)
+        or restrict_token != unrestrict_token
+    ):
+        raise RuntimeErrorEB(
+            "database schema signature has invalid pg_dump restrict markers"
+        )
+
+    lines[leading_restrict_index] = b"\\restrict <pg-dump-key>"
+    lines[trailing_unrestrict_index] = b"\\unrestrict <pg-dump-key>"
+    return b"\n".join(lines)
+
+
+def _restore_stable_database_schema_sha256(
+    root: Path,
+    source_commit: str,
+    postgres_binding: dict[str, Any],
+    database_identity: tuple[str, str],
+) -> str:
+    if COMMIT_RE.fullmatch(source_commit) is None:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature requires exact source commit"
+        )
+    username, database = database_identity
+    if not username or not database:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature requires database identity"
+        )
+    scratch_database = f"commonthing_schema_signature_{uuid.uuid4().hex}"
+    if len(scratch_database) > 63 or re.fullmatch(
+        r"[a-z0-9_]+",
+        scratch_database,
+    ) is None:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature scratch database name is invalid"
+        )
+
+    schema_archive = _run_bound_postgres_client(
+        root,
+        source_commit,
+        postgres_binding,
+        [
+            *_database_client_argv("pg_dump", database_identity),
+            "-Fc",
+            "--schema-only",
+            "--no-owner",
+            "--no-privileges",
+        ],
+        timeout=900,
+    )
+    if not schema_archive:
+        raise RuntimeErrorEB(
+            "restore-stable schema signature archive is empty"
+        )
+
+    scratch_identity = (username, scratch_database)
+    create_sql = (
+        f'CREATE DATABASE "{scratch_database}" TEMPLATE template0;\n'
+    ).encode("utf-8")
+    drop_sql = (
+        f'DROP DATABASE IF EXISTS "{scratch_database}" WITH (FORCE);\n'
+    ).encode("utf-8")
+    control_command = [
+        *_database_client_argv("psql", database_identity),
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-qAt",
+    ]
+
+    scratch_created = False
+    try:
+        _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            control_command,
+            input_bytes=create_sql,
+            timeout=120,
+        )
+        scratch_created = True
+        _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            [
+                *_database_client_argv("pg_restore", scratch_identity),
+                "--schema-only",
+                "--no-owner",
+                "--no-privileges",
+                "--exit-on-error",
+            ],
+            input_bytes=schema_archive,
+            timeout=900,
+        )
+        canonical_schema = _run_bound_postgres_client(
+            root,
+            source_commit,
+            postgres_binding,
+            [
+                *_database_client_argv("pg_dump", scratch_identity),
+                "--schema-only",
+                "--no-owner",
+                "--no-privileges",
+                "--quote-all-identifiers",
+            ],
+            timeout=900,
+        )
+        return hashlib.sha256(
+            _normalized_database_schema_dump(canonical_schema)
+        ).hexdigest()
+    finally:
+        if scratch_created:
+            _run_bound_postgres_client(
+                root,
+                source_commit,
+                postgres_binding,
+                control_command,
+                input_bytes=drop_sql,
+                timeout=120,
+            )
+
+
 def _database_signature(
     root: Path,
     *,
@@ -15254,34 +15502,12 @@ SELECT json_build_object(
             raise RuntimeErrorEB(
                 "database continuity signature is not UTF-8"
             ) from exc
-        schema_bytes = _run_bound_postgres_client(
+        schema_sha256 = _restore_stable_database_schema_sha256(
             root,
             source_commit,
             postgres_binding,
-            [
-                *_database_client_argv("pg_dump", identity),
-                "--schema-only",
-                "--no-owner",
-                "--no-privileges",
-                "--quote-all-identifiers",
-            ],
-            timeout=900,
+            identity,
         )
-        try:
-            schema_text = schema_bytes.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise RuntimeErrorEB(
-                "database schema signature is not UTF-8"
-            ) from exc
-        normalized_schema = "\n".join(
-            line
-            for line in schema_text.splitlines()
-            if not line.startswith("\\restrict ")
-            and not line.startswith("\\unrestrict ")
-        ) + "\n"
-        schema_sha256 = hashlib.sha256(
-            normalized_schema.encode("utf-8")
-        ).hexdigest()
 
     try:
         value = json.loads(raw)
@@ -15318,6 +15544,90 @@ SELECT json_build_object(
     if schema_sha256 is not None:
         value["schema_sha256"] = schema_sha256
     return value
+
+
+def _require_database_runtime_continuity(
+    restored: Any,
+    observed: Any,
+    context: str,
+) -> None:
+    if not isinstance(restored, dict) or not isinstance(observed, dict):
+        raise RuntimeErrorEB(f"{context} database signature is invalid")
+    restored_tables = restored.get("tables")
+    observed_tables = observed.get("tables")
+    restored_sequences = restored.get("sequences")
+    observed_sequences = observed.get("sequences")
+    if (
+        not isinstance(restored_tables, list)
+        or not isinstance(observed_tables, list)
+        or not isinstance(restored_sequences, list)
+        or not isinstance(observed_sequences, list)
+    ):
+        raise RuntimeErrorEB(f"{context} database signature is incomplete")
+    if (
+        restored_tables != observed_tables
+        or restored.get("schema_sha256") != observed.get("schema_sha256")
+    ):
+        raise RuntimeErrorEB(f"{context} persisted rows or schema drifted")
+
+    def sequence_map(
+        items: list[Any],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        result: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                raise RuntimeErrorEB(f"{context} sequence signature is invalid")
+            schema = item.get("schema")
+            name = item.get("name")
+            if not isinstance(schema, str) or not schema or not isinstance(name, str) or not name:
+                raise RuntimeErrorEB(f"{context} sequence identity is invalid")
+            key = (schema, name)
+            if key in result:
+                raise RuntimeErrorEB(f"{context} sequence identity is duplicated")
+            result[key] = item
+        return result
+
+    restored_by_key = sequence_map(restored_sequences)
+    observed_by_key = sequence_map(observed_sequences)
+    if set(restored_by_key) != set(observed_by_key):
+        raise RuntimeErrorEB(f"{context} sequence inventory drifted")
+
+    definition_fields = (
+        "start_value",
+        "increment_by",
+        "min_value",
+        "max_value",
+        "cache_size",
+        "cycle",
+    )
+    for key in sorted(restored_by_key):
+        before = restored_by_key[key]
+        after = observed_by_key[key]
+        if any(before.get(field) != after.get(field) for field in definition_fields):
+            raise RuntimeErrorEB(f"{context} sequence definition drifted")
+        try:
+            increment = int(str(before["increment_by"]))
+            before_last = int(str(before["last_value"]))
+            after_last = int(str(after["last_value"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeErrorEB(f"{context} sequence progress is invalid") from exc
+        before_called = before.get("is_called")
+        after_called = after.get("is_called")
+        if type(before_called) is not bool or type(after_called) is not bool:
+            raise RuntimeErrorEB(f"{context} sequence call state is invalid")
+        if increment == 0:
+            raise RuntimeErrorEB(f"{context} sequence increment is invalid")
+        if before_called and not after_called:
+            raise RuntimeErrorEB(f"{context} sequence call state regressed")
+        if not before_called and not after_called and after_last != before_last:
+            raise RuntimeErrorEB(f"{context} unused sequence position drifted")
+        if before.get("cycle") is True and after_last != before_last:
+            raise RuntimeErrorEB(f"{context} cycling sequence progress is ambiguous")
+        if increment > 0 and after_last < before_last:
+            raise RuntimeErrorEB(f"{context} sequence position regressed")
+        if increment < 0 and after_last > before_last:
+            raise RuntimeErrorEB(f"{context} sequence position regressed")
+
 
 def _jetstream_sequence_progress(value: Any, context: str) -> dict[str, int]:
     if not isinstance(value, dict):
@@ -16671,22 +16981,10 @@ def recovery_proof(root: Path) -> dict[str, Any]:
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery pre-Flux resume"
             )
-            _flux_resume(root, "commonthing-experiment-b-data")
-            _flux_resume(root, "commonthing-experiment-b-app")
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)
-            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", 300)
-            _wait_event_pipeline_quiescent(
-                root,
-                source_commit=source_commit,
-                database_identity=database_identity,
-            )
-            _require_same_kubernetes_target(
-                root,
-                source_commit,
-                recovery_target,
-                "recovery post-resume event quiescence",
-            )
-
+            # Compare the exact persisted state before application workers
+            # resume. Search reconciliation intentionally retries idempotent
+            # INSERT ... ON CONFLICT DO NOTHING operations; PostgreSQL can
+            # advance their identity sequence even when no row is inserted.
             postgres_signature_after = _require_postgres_runtime_binding(
                 root,
                 source_commit,
@@ -16723,6 +17021,56 @@ def recovery_proof(root: Path) -> dict[str, Any]:
                 raise RuntimeErrorEB(
                     "JetStream stream/message-store/durable-consumer continuity signature changed across restore"
                 )
+            _require_same_kubernetes_target(
+                root,
+                source_commit,
+                recovery_target,
+                "recovery restored continuity",
+            )
+            _flux_resume(root, "commonthing-experiment-b-data")
+            _flux_resume(root, "commonthing-experiment-b-app")
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)
+            _wait_deployment(root, APP_NAMESPACE, "weltgewebe-web", 300)
+            _wait_event_pipeline_quiescent(
+                root,
+                source_commit=source_commit,
+                database_identity=database_identity,
+            )
+            _require_same_kubernetes_target(
+                root,
+                source_commit,
+                recovery_target,
+                "recovery post-resume event quiescence",
+            )
+            postgres_post_resume_binding = _require_postgres_runtime_binding(
+                root,
+                source_commit,
+            )
+            database_post_resume = _database_signature(
+                root,
+                database_identity=database_identity,
+                source_commit=source_commit,
+                postgres_binding=postgres_post_resume_binding,
+            )
+            _require_database_runtime_continuity(
+                after_db,
+                database_post_resume,
+                "recovery post-resume database",
+            )
+            nats_post_resume_binding = _require_nats_runtime_binding(
+                root,
+                source_commit,
+            )
+            jetstream_post_resume = _jetstream_signature(
+                root,
+                source_commit=source_commit,
+                nats_binding=nats_post_resume_binding,
+            )
+            if jetstream_post_resume != after_nats:
+                raise RuntimeErrorEB(
+                    "JetStream state changed after restore while the event pipeline was quiescent"
+                )
+
             _require_same_kubernetes_target(
                 root, source_commit, recovery_target, "recovery completion"
             )
@@ -16821,8 +17169,10 @@ def recovery_proof(root: Path) -> dict[str, Any]:
         "nats_backup_sha256": nats_backup_sha256,
         "database_before": before_db,
         "database_after": after_db,
+        "database_post_resume": database_post_resume,
         "jetstream_before": before_nats,
         "jetstream_after": after_nats,
+        "jetstream_post_resume": jetstream_post_resume,
         "pvc_replacements": pvc_replacements,
         "pvc_delete_to_prove": True,
         "replacement_pvcs_empty_before_restore": True,

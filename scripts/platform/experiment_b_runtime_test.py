@@ -4,7 +4,10 @@ import base64
 import hashlib
 import inspect
 import json
+import os
 import shutil
+import time
+import uuid
 import subprocess
 import sys
 import tempfile
@@ -3661,21 +3664,27 @@ spec:
             api_scale,
         )
         before_db = source.index("before_db = _database_signature(", frozen)
+        after_db = source.index("after_db = _database_signature(", before_db)
+        restored_continuity = source.index(
+            '"recovery restored continuity"',
+            after_db,
+        )
         app_resume = source.index(
-            '_flux_resume(root, "commonthing-experiment-b-app")'
+            '_flux_resume(root, "commonthing-experiment-b-app")',
+            restored_continuity,
         )
         post_drain = source.index(
             "_wait_event_pipeline_quiescent(",
             app_resume,
         )
-        after_db = source.index("after_db = _database_signature(", post_drain)
         self.assertLess(flux_suspend, pre_drain)
         self.assertLess(pre_drain, api_scale)
         self.assertLess(api_scale, frozen)
         self.assertLess(frozen, before_db)
-        self.assertLess(before_db, app_resume)
+        self.assertLess(before_db, after_db)
+        self.assertLess(after_db, restored_continuity)
+        self.assertLess(restored_continuity, app_resume)
         self.assertLess(app_resume, post_drain)
-        self.assertLess(post_drain, after_db)
 
     def test_wait_deployment_process_timeout_exceeds_rollout_timeout(self) -> None:
         root = Path("/tmp/unused-experiment-b-root")
@@ -6768,10 +6777,588 @@ spec:
         self.assertIn("commonthing_signature_sequences", source)
         self.assertIn("pg_catalog.pg_sequence", source)
         self.assertIn("last_value::text, is_called", source)
-        self.assertIn('"--schema-only"', source)
-        self.assertIn('"--quote-all-identifiers"', source)
         self.assertIn("schema_sha256", source)
-        self.assertIn("_run_bound_postgres_client", source)
+        self.assertIn("_restore_stable_database_schema_sha256", source)
+        schema_source = inspect.getsource(
+            runtime._restore_stable_database_schema_sha256
+        )
+        self.assertIn('"-Fc"', schema_source)
+        self.assertIn('"pg_restore"', schema_source)
+        self.assertIn('"--quote-all-identifiers"', schema_source)
+        self.assertIn("CREATE DATABASE", schema_source)
+        self.assertIn("DROP DATABASE IF EXISTS", schema_source)
+        self.assertIn("_run_bound_postgres_client", schema_source)
+
+
+    def test_restore_stable_database_schema_signature_uses_scratch_roundtrip(
+        self,
+    ) -> None:
+        scratch_hex = "a" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        canonical = (
+            b"\\restrict stable_key\n"
+            b'CREATE TABLE "public"."example" ("id" integer);\n'
+            b"\\unrestrict stable_key\n"
+        )
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    b"",
+                    b"",
+                    canonical,
+                    b"",
+                ],
+            ) as run_bound,
+        ):
+            observed = runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        expected = hashlib.sha256(
+            b"\\restrict <pg-dump-key>\n"
+            b'CREATE TABLE "public"."example" ("id" integer);\n'
+            b"\\unrestrict <pg-dump-key>\n"
+        ).hexdigest()
+        self.assertEqual(observed, expected)
+        self.assertEqual(run_bound.call_count, 5)
+        commands = [call.args[3] for call in run_bound.call_args_list]
+        self.assertIn("-Fc", commands[0])
+        self.assertIn("--schema-only", commands[0])
+        self.assertEqual(commands[2][0], "pg_restore")
+        self.assertIn(scratch_name, commands[2])
+        self.assertIn("--schema-only", commands[2])
+        self.assertEqual(commands[3][0], "pg_dump")
+        self.assertIn(scratch_name, commands[3])
+        self.assertIn("--schema-only", commands[3])
+        self.assertIn(
+            f'CREATE DATABASE "{scratch_name}" TEMPLATE template0;',
+            run_bound.call_args_list[1].kwargs["input_bytes"].decode("utf-8"),
+        )
+        self.assertIn(
+            f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE);',
+            run_bound.call_args_list[4].kwargs["input_bytes"].decode("utf-8"),
+        )
+
+    def test_normalized_database_schema_dump_preserves_function_body_meta_commands(
+        self,
+    ) -> None:
+        source = (
+            b"-- PostgreSQL database dump\n"
+            b"\n"
+            b"\\restrict generated_key\n"
+            b'CREATE FUNCTION "public"."example"() RETURNS "text"\n'
+            b'    LANGUAGE "plpgsql"\n'
+            b"    AS $$\n"
+            b"\\restrict function_semantics\n"
+            b"\\unrestrict function_semantics\n"
+            b"RETURN 'ok';\n"
+            b"$$;\n"
+            b"\n"
+            b"-- PostgreSQL database dump complete\n"
+            b"\n"
+            b"\\unrestrict generated_key\n"
+        )
+        normalized = runtime._normalized_database_schema_dump(source)
+        self.assertIn(b"\\restrict <pg-dump-key>\n", normalized)
+        self.assertIn(b"\\unrestrict <pg-dump-key>\n", normalized)
+        self.assertIn(b"\\restrict function_semantics\n", normalized)
+        self.assertIn(b"\\unrestrict function_semantics\n", normalized)
+        self.assertEqual(
+            normalized.count(b"\\restrict function_semantics"),
+            1,
+        )
+        self.assertEqual(
+            normalized.count(b"\\unrestrict function_semantics"),
+            1,
+        )
+
+    def test_normalized_database_schema_dump_keeps_unicode_nel_distinct_from_lf(
+        self,
+    ) -> None:
+        prefix = (
+            b"-- PostgreSQL database dump\n"
+            b"\n"
+            b"\\restrict stable_key\n"
+            b'CREATE FUNCTION "public"."example"() RETURNS "text"\n'
+            b'    LANGUAGE "sql"\n'
+            b"    AS $$SELECT 'a"
+        )
+        suffix = (
+            b"b';$$;\n"
+            b"\n"
+            b"-- PostgreSQL database dump complete\n"
+            b"\n"
+            b"\\unrestrict stable_key\n"
+        )
+        with_lf = prefix + b"\n" + suffix
+        with_nel = prefix + "\u0085".encode("utf-8") + suffix
+
+        normalized_lf = runtime._normalized_database_schema_dump(with_lf)
+        normalized_nel = runtime._normalized_database_schema_dump(with_nel)
+
+        self.assertNotEqual(normalized_lf, normalized_nel)
+        self.assertIn("\u0085".encode("utf-8"), normalized_nel)
+        self.assertEqual(
+            normalized_nel.replace(
+                b"\\restrict <pg-dump-key>",
+                b"\\restrict stable_key",
+            ).replace(
+                b"\\unrestrict <pg-dump-key>",
+                b"\\unrestrict stable_key",
+            ),
+            with_nel,
+        )
+
+    def test_normalized_database_schema_dump_rejects_mismatched_boundary_keys(
+        self,
+    ) -> None:
+        source = (
+            b"-- PostgreSQL database dump\n"
+            b"\\restrict first_key\n"
+            b"SELECT 1;\n"
+            b"\\unrestrict second_key\n"
+        )
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "invalid pg_dump restrict markers",
+        ):
+            runtime._normalized_database_schema_dump(source)
+
+
+    def test_restore_stable_database_schema_signature_cleans_up_after_failure(
+        self,
+    ) -> None:
+        scratch_hex = "b" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    b"",
+                    runtime.RuntimeErrorEB("restore failed"),
+                    b"",
+                ],
+            ) as run_bound,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "restore failed",
+            ),
+        ):
+            runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        self.assertEqual(run_bound.call_count, 4)
+        self.assertIn(
+            f'DROP DATABASE IF EXISTS "{scratch_name}" WITH (FORCE);',
+            run_bound.call_args_list[-1].kwargs["input_bytes"].decode("utf-8"),
+        )
+
+
+    def test_restore_stable_database_schema_signature_does_not_drop_uncreated_scratch(
+        self,
+    ) -> None:
+        scratch_hex = "c" * 32
+        scratch_name = f"commonthing_schema_signature_{scratch_hex}"
+        with (
+            mock.patch.object(
+                runtime.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex=scratch_hex),
+            ),
+            mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=[
+                    b"schema-archive",
+                    runtime.RuntimeErrorEB("create failed"),
+                ],
+            ) as run_bound,
+            self.assertRaisesRegex(
+                runtime.RuntimeErrorEB,
+                "create failed",
+            ),
+        ):
+            runtime._restore_stable_database_schema_sha256(
+                Path("/unused"),
+                "a" * 40,
+                {"container_id": "bound"},
+                ("user", "database"),
+            )
+
+        self.assertEqual(run_bound.call_count, 2)
+        self.assertIn(
+            f'CREATE DATABASE "{scratch_name}" TEMPLATE template0;',
+            run_bound.call_args_list[1].kwargs["input_bytes"].decode("utf-8"),
+        )
+        observed_input = b"\n".join(
+            call.kwargs.get("input_bytes", b"")
+            for call in run_bound.call_args_list
+        )
+        self.assertNotIn(b"DROP DATABASE IF EXISTS", observed_input)
+
+    def test_restore_stable_database_schema_signature_tracks_canonical_schema(
+        self,
+    ) -> None:
+        scratch_hex = "d" * 32
+
+        def signature(schema_archive: bytes, canonical_schema: bytes) -> str:
+            with (
+                mock.patch.object(
+                    runtime.uuid,
+                    "uuid4",
+                    return_value=mock.Mock(hex=scratch_hex),
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_run_bound_postgres_client",
+                    side_effect=[
+                        schema_archive,
+                        b"",
+                        b"",
+                        (
+                            b"\\restrict stable_key\n"
+                            + canonical_schema
+                            + b"\\unrestrict stable_key\n"
+                        ),
+                        b"",
+                    ],
+                ),
+            ):
+                return runtime._restore_stable_database_schema_sha256(
+                    Path("/unused"),
+                    "a" * 40,
+                    {"container_id": "bound"},
+                    ("user", "database"),
+                )
+
+        canonical = (
+            b'CREATE TABLE "public"."example" ('
+            b'"id" integer CHECK (("id" > 0)));\n'
+        )
+        formatting_variant = signature(
+            b"source-schema-serialization-a",
+            canonical,
+        )
+        restored_variant = signature(
+            b"source-schema-serialization-b",
+            canonical,
+        )
+        semantic_drift = signature(
+            b"source-schema-serialization-b",
+            (
+                b'CREATE TABLE "public"."example" ('
+                b'"id" integer CHECK (("id" >= 0)));\n'
+            ),
+        )
+        self.assertEqual(formatting_variant, restored_variant)
+        self.assertNotEqual(formatting_variant, semantic_drift)
+
+
+    def test_restore_stable_signature_real_migrations_production_restore(
+        self,
+    ) -> None:
+        docker = shutil.which("docker")
+        if docker is None:
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                self.fail(
+                    "required migration-built PostgreSQL restore regression "
+                    "requires docker in GitHub Actions"
+                )
+            self.skipTest(
+                "docker unavailable for migration-built PostgreSQL restore regression"
+            )
+        assert docker is not None
+
+        postgres_image = (
+            "postgres:16@sha256:"
+            "be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c"
+        )
+        container = (
+            "commonthing-schema-production-restore-"
+            + uuid.uuid4().hex[:12]
+        )
+
+        def run_container(
+            arguments: list[str],
+            *,
+            input_bytes: bytes | None = None,
+            check: bool = True,
+            timeout: int = 300,
+        ) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                [docker, *arguments],
+                input=input_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=check,
+                timeout=timeout,
+            )
+
+        def exec_postgres(
+            command: list[str],
+            *,
+            input_bytes: bytes = b"",
+            timeout: int = 300,
+        ) -> bytes:
+            completed = run_container(
+                ["exec", "-i", container, *command],
+                input_bytes=input_bytes,
+                check=False,
+                timeout=timeout,
+            )
+            if completed.returncode != 0:
+                raise runtime.RuntimeErrorEB(
+                    "migration-built PostgreSQL proof command failed "
+                    f"({completed.returncode}): "
+                    + completed.stderr.decode("utf-8", "replace")[-3000:]
+                )
+            return completed.stdout
+
+        def psql(database: str, sql: str) -> str:
+            return exec_postgres(
+                [
+                    "psql",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    database,
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-qAt",
+                ],
+                input_bytes=sql.encode("utf-8"),
+            ).decode("utf-8").strip()
+
+        def bound_postgres_client(
+            _root: Path,
+            _source_commit: str,
+            _binding: dict[str, object],
+            command: list[str],
+            *,
+            input_bytes: bytes = b"",
+            timeout: int = 900,
+        ) -> bytes:
+            return exec_postgres(
+                command,
+                input_bytes=input_bytes,
+                timeout=timeout,
+            )
+
+        def signature(database: str) -> dict[str, object]:
+            with mock.patch.object(
+                runtime,
+                "_run_bound_postgres_client",
+                side_effect=bound_postgres_client,
+            ):
+                return runtime._database_signature(
+                    Path("/unused"),
+                    database_identity=("postgres", database),
+                    source_commit="a" * 40,
+                    postgres_binding={"proof": "docker"},
+                )
+
+        try:
+            run_container(
+                [
+                    "run",
+                    "-d",
+                    "--name",
+                    container,
+                    "-e",
+                    "POSTGRES_PASSWORD=proof",
+                    "-e",
+                    "POSTGRES_USER=postgres",
+                    postgres_image,
+                ],
+                timeout=120,
+            )
+            for _ in range(90):
+                ready = subprocess.run(
+                    [
+                        docker,
+                        "exec",
+                        container,
+                        "pg_isready",
+                        "-h",
+                        "127.0.0.1",
+                        "-U",
+                        "postgres",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if ready.returncode == 0:
+                    break
+                time.sleep(1)
+            else:
+                self.fail(
+                    "migration-built PostgreSQL regression container was not ready"
+                )
+
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "source",
+                ]
+            )
+            psql(
+                "source",
+                """
+CREATE TABLE public._sqlx_migrations (
+  version BIGINT PRIMARY KEY,
+  description TEXT NOT NULL,
+  installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+  success BOOLEAN NOT NULL,
+  checksum BYTEA NOT NULL,
+  execution_time BIGINT NOT NULL
+);
+""",
+            )
+            migrations = sorted(
+                (runtime.ROOT / "apps/api/migrations").glob("*.up.sql")
+            )
+            self.assertGreater(len(migrations), 0)
+            for migration in migrations:
+                version_text, separator, description_part = migration.name.partition("_")
+                self.assertEqual(separator, "_")
+                self.assertTrue(version_text.isdigit())
+                self.assertTrue(description_part.endswith(".up.sql"))
+                migration_bytes = migration.read_bytes()
+                exec_postgres(
+                    [
+                        "psql",
+                        "-U",
+                        "postgres",
+                        "-d",
+                        "source",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "--single-transaction",
+                        "-q",
+                    ],
+                    input_bytes=migration_bytes,
+                )
+                description = (
+                    description_part.removesuffix(".up.sql")
+                    .replace("_", " ")
+                    .replace("'", "''")
+                )
+                checksum = hashlib.sha384(migration_bytes).hexdigest()
+                psql(
+                    "source",
+                    "INSERT INTO public._sqlx_migrations "
+                    "(version, description, success, checksum, execution_time) "
+                    f"VALUES ({int(version_text)}, '{description}', true, "
+                    f"decode('{checksum}', 'hex'), 0);",
+                )
+
+            psql(
+                "source",
+                """
+INSERT INTO public.domain_nodes
+  (id, kind, title, lat, lon, payload)
+VALUES
+  ('schema-restore-proof-node', 'TestKind', 'Restore Proof', 53.55, 10.0,
+   '{"info":"source-to-restore"}'::jsonb);
+""",
+            )
+            source_signature = signature("source")
+
+            dump_payload = exec_postgres(
+                [
+                    "pg_dump",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "source",
+                    "-Fc",
+                ],
+                timeout=900,
+            )
+            self.assertTrue(dump_payload)
+            run_container(
+                [
+                    "exec",
+                    container,
+                    "createdb",
+                    "-U",
+                    "postgres",
+                    "restored",
+                ]
+            )
+            exec_postgres(
+                [
+                    "pg_restore",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "restored",
+                    "--clean",
+                    "--if-exists",
+                    "--no-owner",
+                ],
+                input_bytes=dump_payload,
+                timeout=1200,
+            )
+            restored_signature = signature("restored")
+            self.assertEqual(source_signature, restored_signature)
+
+            psql(
+                "restored",
+                """
+CREATE RULE commonthing_restore_proof_rule AS
+ON UPDATE TO public.domain_nodes
+DO INSTEAD NOTHING;
+""",
+            )
+            drifted_signature = signature("restored")
+            self.assertEqual(
+                restored_signature["tables"],
+                drifted_signature["tables"],
+            )
+            self.assertEqual(
+                restored_signature["sequences"],
+                drifted_signature["sequences"],
+            )
+            self.assertNotEqual(
+                restored_signature["schema_sha256"],
+                drifted_signature["schema_sha256"],
+            )
+        finally:
+            subprocess.run(
+                [docker, "rm", "-f", container],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
 
     def test_database_signature_uses_public_domain_nodes_as_canonical_state(
         self,
@@ -6822,6 +7409,66 @@ spec:
             runtime._database_signature(
                 Path("/unused"),
                 database_identity=("user", "db"),
+            )
+
+    def test_database_runtime_continuity_allows_only_forward_sequence_progress(
+        self,
+    ) -> None:
+        restored = {
+            "tables": [
+                {
+                    "schema": "public",
+                    "name": "domain_nodes",
+                    "rows": 2,
+                    "md5": "a" * 32,
+                }
+            ],
+            "sequences": [
+                {
+                    "schema": "public",
+                    "name": "domain_nodes_id_seq",
+                    "last_value": "10",
+                    "is_called": True,
+                    "start_value": "1",
+                    "increment_by": "1",
+                    "min_value": "1",
+                    "max_value": "9223372036854775807",
+                    "cache_size": "1",
+                    "cycle": False,
+                }
+            ],
+            "schema_sha256": "b" * 64,
+        }
+        progressed = json.loads(json.dumps(restored))
+        progressed["sequences"][0]["last_value"] = "12"
+        runtime._require_database_runtime_continuity(
+            restored,
+            progressed,
+            "test runtime continuity",
+        )
+
+        row_drift = json.loads(json.dumps(progressed))
+        row_drift["tables"][0]["md5"] = "c" * 32
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "persisted rows or schema drifted",
+        ):
+            runtime._require_database_runtime_continuity(
+                restored,
+                row_drift,
+                "test runtime continuity",
+            )
+
+        regression = json.loads(json.dumps(progressed))
+        regression["sequences"][0]["last_value"] = "9"
+        with self.assertRaisesRegex(
+            runtime.RuntimeErrorEB,
+            "sequence position regressed",
+        ):
+            runtime._require_database_runtime_continuity(
+                restored,
+                regression,
+                "test runtime continuity",
             )
 
     def test_application_contract_render_uses_sealed_source_commit_tree(
@@ -6884,6 +7531,73 @@ spec:
         self.assertLess(db_signature, nats_signature)
         self.assertLess(nats_signature, dump)
 
+    def test_recovery_proves_restored_signatures_before_flux_resume(self) -> None:
+        source = inspect.getsource(runtime.recovery_proof)
+        restore = source.index('"pg_restore"')
+        nats_restart = source.index(
+            '_scale_deployment(root, DATA_NAMESPACE, "nats", 1)',
+            restore,
+        )
+        after_db = source.index(
+            "after_db = _database_signature(",
+            nats_restart,
+        )
+        after_nats = source.index(
+            "after_nats = _jetstream_signature(",
+            after_db,
+        )
+        db_compare = source.index(
+            "if after_db != before_db:",
+            after_nats,
+        )
+        nats_compare = source.index(
+            "if after_nats != before_nats:",
+            db_compare,
+        )
+        data_resume = source.index(
+            '_flux_resume(root, "commonthing-experiment-b-data")',
+            nats_compare,
+        )
+        app_resume = source.index(
+            '_flux_resume(root, "commonthing-experiment-b-app")',
+            data_resume,
+        )
+        api_wait = source.index(
+            '_wait_deployment(root, APP_NAMESPACE, "weltgewebe-api", 480)',
+            app_resume,
+        )
+        event_quiescence = source.index(
+            "_wait_event_pipeline_quiescent(",
+            api_wait,
+        )
+        database_post_resume = source.index(
+            "database_post_resume = _database_signature(",
+            event_quiescence,
+        )
+        runtime_continuity = source.index(
+            "_require_database_runtime_continuity(",
+            database_post_resume,
+        )
+        completion = source.index(
+            '"recovery completion"',
+            runtime_continuity,
+        )
+        self.assertLess(restore, nats_restart)
+        self.assertLess(nats_restart, after_db)
+        self.assertLess(after_db, after_nats)
+        self.assertLess(after_nats, db_compare)
+        self.assertLess(db_compare, nats_compare)
+        self.assertLess(nats_compare, data_resume)
+        self.assertLess(data_resume, app_resume)
+        self.assertLess(app_resume, api_wait)
+        self.assertLess(api_wait, event_quiescence)
+        self.assertLess(event_quiescence, database_post_resume)
+        self.assertLess(database_post_resume, runtime_continuity)
+        self.assertLess(runtime_continuity, completion)
+        self.assertNotIn(
+            "_flux_resume(",
+            source[after_db:data_resume],
+        )
 
     def test_recovery_binds_postgres_clients_to_validated_source_pod(
         self,
@@ -11093,15 +11807,46 @@ spec:
     def test_final_recovery_state_readback_binds_current_signatures_and_fixture(
         self,
     ) -> None:
+        restored_database = {
+            "tables": [
+                {
+                    "schema": "public",
+                    "name": "domain_nodes",
+                    "rows": 2,
+                    "md5": "a" * 32,
+                }
+            ],
+            "sequences": [
+                {
+                    "schema": "public",
+                    "name": "domain_nodes_id_seq",
+                    "last_value": "10",
+                    "is_called": True,
+                    "start_value": "1",
+                    "increment_by": "1",
+                    "min_value": "1",
+                    "max_value": "9223372036854775807",
+                    "cache_size": "1",
+                    "cycle": False,
+                }
+            ],
+            "schema_sha256": "b" * 64,
+        }
+        post_resume_database = json.loads(json.dumps(restored_database))
+        post_resume_database["sequences"][0]["last_value"] = "12"
+        current_database = json.loads(json.dumps(post_resume_database))
+        current_database["sequences"][0]["last_value"] = "14"
         recovery = {
             "schema_version": 1,
             "status": "pass",
             "source_commit": self.commit,
             "rpo_seconds": 0,
-            "database_before": {"db": "stable"},
-            "database_after": {"db": "stable"},
+            "database_before": restored_database,
+            "database_after": restored_database,
+            "database_post_resume": post_resume_database,
             "jetstream_before": {"nats": "stable"},
             "jetstream_after": {"nats": "stable"},
+            "jetstream_post_resume": {"nats": "stable"},
         }
         runtime.atomic_json(
             self.root / "receipts/recovery.json",
@@ -11137,7 +11882,7 @@ spec:
             mock.patch.object(
                 runtime,
                 "_database_signature",
-                return_value={"db": "stable"},
+                return_value=current_database,
             ) as database_signature,
             mock.patch.object(
                 runtime,
@@ -11160,7 +11905,7 @@ spec:
             )
         self.assertEqual(
             result["database_signature"],
-            {"db": "stable"},
+            current_database,
         )
         self.assertEqual(
             result["jetstream_signature"],
@@ -11216,7 +11961,15 @@ spec:
             mock.patch.object(
                 runtime,
                 "_database_signature",
-                return_value={"db": "drift"},
+                return_value={
+                    **current_database,
+                    "tables": [
+                        {
+                            **current_database["tables"][0],
+                            "md5": "d" * 32,
+                        }
+                    ],
+                },
             ),
             mock.patch.object(
                 runtime,
@@ -14981,6 +15734,264 @@ def install(*args, **kwargs):
             runtime._functional_serving_runtime_semantic_binding(after),
         )
 
+    def test_gateway_collection_json_uses_filtered_raw_collection(self) -> None:
+        payload = {
+            "metadata": {"resourceVersion": "950"},
+            "items": [],
+        }
+        result = subprocess.CompletedProcess(
+            ["kubectl"],
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with mock.patch.object(
+            runtime,
+            "_kubectl",
+            return_value=result,
+        ) as kubectl:
+            observed = runtime._gateway_collection_json(Path("/tmp"))
+
+        self.assertEqual(observed, payload)
+        argv = kubectl.call_args.args[1]
+        self.assertEqual(argv[:2], ["get", "--raw"])
+        raw_url = runtime.urllib.parse.urlsplit(argv[2])
+        self.assertEqual(
+            raw_url.path,
+            "/apis/gateway.networking.k8s.io/v1/namespaces/"
+            f"{runtime.APP_NAMESPACE}/gateways",
+        )
+        self.assertEqual(
+            runtime.urllib.parse.parse_qs(raw_url.query),
+            {"fieldSelector": ["metadata.name=commonthing-experiment-b"]},
+        )
+
+    def test_functional_dependency_replay_accepts_real_gateway_snapshot(
+        self,
+    ) -> None:
+        serving_runtime = {
+            "services": {
+                name: {"endpoints": {"resource_version": str(index + 100)}}
+                for index, name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                )
+            },
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+                "generation": 1,
+                "gateway_class": "cilium",
+                "listener": "http",
+                "programmed": True,
+            },
+            "httproute_inventory": {
+                "resource_version": "450",
+                "routes": {},
+            },
+        }
+        gateway = {
+            "metadata": {
+                "name": "commonthing-experiment-b",
+                "namespace": runtime.APP_NAMESPACE,
+                "uid": "gateway-uid",
+                "resourceVersion": "300",
+                "generation": 1,
+            },
+            "spec": {
+                "gatewayClassName": "cilium",
+                "listeners": [
+                    {
+                        "name": "http",
+                        "protocol": "HTTP",
+                        "port": 80,
+                        "allowedRoutes": {
+                            "namespaces": {"from": "Same"},
+                            "kinds": [
+                                {
+                                    "group": "gateway.networking.k8s.io",
+                                    "kind": "HTTPRoute",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Programmed",
+                        "status": "True",
+                        "observedGeneration": 1,
+                    }
+                ]
+            },
+        }
+        result = subprocess.CompletedProcess(
+            ["kubectl"],
+            0,
+            stdout="",
+            stderr="",
+        )
+        with (
+            mock.patch.object(
+                runtime,
+                "_gateway_collection_json",
+                return_value={
+                    "metadata": {"resourceVersion": "350"},
+                    "items": [gateway],
+                },
+            ),
+            mock.patch.object(
+                runtime,
+                "toolchain",
+                return_value={"tools": {"kubectl": "/usr/bin/kubectl"}},
+            ),
+            mock.patch.object(runtime, "kube_env", return_value={}),
+            mock.patch.object(runtime, "run", return_value=result) as replay,
+        ):
+            with runtime._guard_functional_service_endpoints(
+                Path("/tmp"),
+                serving_runtime,
+            ):
+                pass
+
+        self.assertEqual(replay.call_count, 4)
+
+    def test_functional_dependency_replay_rejects_gateway_snapshot_drift(
+        self,
+    ) -> None:
+        serving_runtime = {
+            "services": {
+                name: {"endpoints": {"resource_version": str(index + 100)}}
+                for index, name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                )
+            },
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+                "generation": 1,
+                "gateway_class": "cilium",
+                "listener": "http",
+                "programmed": True,
+            },
+            "httproute_inventory": {
+                "resource_version": "450",
+                "routes": {},
+            },
+        }
+        expected_semantic = {
+            "generation": 1,
+            "gateway_class": "cilium",
+            "listener": "http",
+            "programmed": True,
+        }
+        cases = (
+            (
+                "resource-version",
+                {"uid": "gateway-uid", "resourceVersion": "301"},
+                expected_semantic,
+            ),
+            (
+                "uid",
+                {"uid": "other-gateway-uid", "resourceVersion": "300"},
+                expected_semantic,
+            ),
+            (
+                "semantic",
+                {"uid": "gateway-uid", "resourceVersion": "300"},
+                {**expected_semantic, "programmed": False},
+            ),
+        )
+        for label, metadata, semantic in cases:
+            with self.subTest(label=label):
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "_gateway_collection_json",
+                        return_value={
+                            "metadata": {"resourceVersion": "350"},
+                            "items": [{"metadata": metadata}],
+                        },
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "_require_gateway_ready",
+                        return_value=semantic,
+                    ),
+                    self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB,
+                        "Gateway snapshot drifted",
+                    ),
+                ):
+                    with runtime._guard_functional_service_endpoints(
+                        Path("/tmp"),
+                        serving_runtime,
+                    ):
+                        pass
+
+    def test_functional_dependency_replay_rejects_invalid_gateway_snapshot(
+        self,
+    ) -> None:
+        serving_runtime = {
+            "services": {
+                name: {"endpoints": {"resource_version": str(index + 100)}}
+                for index, name in enumerate(
+                    ("weltgewebe-api", "weltgewebe-web")
+                )
+            },
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+                "generation": 1,
+                "gateway_class": "cilium",
+                "listener": "http",
+                "programmed": True,
+            },
+            "httproute_inventory": {
+                "resource_version": "450",
+                "routes": {},
+            },
+        }
+        item = {
+            "metadata": {
+                "uid": "gateway-uid",
+                "resourceVersion": "300",
+            }
+        }
+        cases = (
+            ("missing-list-rv", {"metadata": {}, "items": [item]}),
+            (
+                "no-items",
+                {"metadata": {"resourceVersion": "350"}, "items": []},
+            ),
+            (
+                "multiple-items",
+                {
+                    "metadata": {"resourceVersion": "350"},
+                    "items": [item, item],
+                },
+            ),
+        )
+        for label, payload in cases:
+            with self.subTest(label=label):
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "_gateway_collection_json",
+                        return_value=payload,
+                    ),
+                    self.assertRaisesRegex(
+                        runtime.RuntimeErrorEB,
+                        "Gateway snapshot is invalid",
+                    ),
+                ):
+                    with runtime._guard_functional_service_endpoints(
+                        Path("/tmp"),
+                        serving_runtime,
+                    ):
+                        pass
+
     def test_functional_dependency_replay_rejects_transient_changes(
         self,
     ) -> None:
@@ -14995,7 +16006,14 @@ def install(*args, **kwargs):
                     ("weltgewebe-api", "weltgewebe-web")
                 )
             },
-            "gateway": {"resource_version": "300"},
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+                "generation": 1,
+                "gateway_class": "cilium",
+                "listener": "http",
+                "programmed": True,
+            },
             "httproute": {"resource_version": "400"},
             "httproute_inventory": {
                 "resource_version": "450",
@@ -15068,6 +16086,31 @@ def install(*args, **kwargs):
                     mock.patch.object(runtime, "kube_env", return_value={}),
                     mock.patch.object(
                         runtime,
+                        "_gateway_collection_json",
+                        return_value={
+                            "metadata": {"resourceVersion": "350"},
+                            "items": [
+                                {
+                                    "metadata": {
+                                        "uid": "gateway-uid",
+                                        "resourceVersion": "300",
+                                    }
+                                }
+                            ],
+                        },
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "_require_gateway_ready",
+                        return_value={
+                            "generation": 1,
+                            "gateway_class": "cilium",
+                            "listener": "http",
+                            "programmed": True,
+                        },
+                    ),
+                    mock.patch.object(
+                        runtime,
                         "run",
                         side_effect=results,
                     ) as replay,
@@ -15112,7 +16155,7 @@ def install(*args, **kwargs):
                     ),
                     (
                         "Gateway",
-                        "300",
+                        "350",
                         "fieldSelector",
                         "metadata.name=commonthing-experiment-b",
                         "/apis/gateway.networking.k8s.io/v1/namespaces/"
@@ -15234,7 +16277,14 @@ def install(*args, **kwargs):
                     ("weltgewebe-api", "weltgewebe-web")
                 )
             },
-            "gateway": {"resource_version": "300"},
+            "gateway": {
+                "uid": "gateway-uid",
+                "resource_version": "300",
+                "generation": 1,
+                "gateway_class": "cilium",
+                "listener": "http",
+                "programmed": True,
+            },
             "httproute": {"resource_version": "400"},
             "httproute_inventory": {
                 "resource_version": "450",
@@ -15260,6 +16310,31 @@ def install(*args, **kwargs):
             mock.patch.object(runtime, "kube_env", return_value={}),
             mock.patch.object(
                 runtime,
+                "_gateway_collection_json",
+                return_value={
+                    "metadata": {"resourceVersion": "350"},
+                    "items": [
+                        {
+                            "metadata": {
+                                "uid": "gateway-uid",
+                                "resourceVersion": "300",
+                            }
+                        }
+                    ],
+                },
+            ),
+            mock.patch.object(
+                runtime,
+                "_require_gateway_ready",
+                return_value={
+                    "generation": 1,
+                    "gateway_class": "cilium",
+                    "listener": "http",
+                    "programmed": True,
+                },
+            ),
+            mock.patch.object(
+                runtime,
                 "run",
                 return_value=result,
             ) as replay,
@@ -15271,6 +16346,12 @@ def install(*args, **kwargs):
                 pass
 
         self.assertEqual(replay.call_count, 4)
+        gateway_argv = replay.call_args_list[2].args[0]
+        gateway_url = runtime.urllib.parse.urlsplit(gateway_argv[3])
+        gateway_query = runtime.urllib.parse.parse_qs(gateway_url.query)
+        self.assertEqual(gateway_query["resourceVersion"], ["350"])
+        self.assertNotEqual(gateway_query["resourceVersion"], ["300"])
+
         route_argv = replay.call_args_list[3].args[0]
         route_url = runtime.urllib.parse.urlsplit(route_argv[3])
         self.assertEqual(
