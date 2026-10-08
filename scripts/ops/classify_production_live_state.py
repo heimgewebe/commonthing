@@ -193,6 +193,11 @@ def classify(
             causes=causes,
         )
 
+    def failed(state: str, live: str | None, reason: str) -> Classification:
+        # Without a single live commit, the reason is the failure identity:
+        # HTTP 500 turning into a timeout on the same commits is a change.
+        return result(state, live, reason, (reason,))
+
     if not isinstance(receipt, dict):
         return result("monitor_failure", None, "production live receipt is missing or unreadable")
 
@@ -207,7 +212,7 @@ def classify(
 
     for name, endpoint in (("frontend", frontend), ("api", api)):
         if endpoint.get("error") or endpoint.get("status") != 200:
-            return result(
+            return failed(
                 "outage",
                 None,
                 f"{name} readback failed: HTTP {endpoint.get('status')!r}, "
@@ -215,9 +220,14 @@ def classify(
             )
 
     if not (_is_commit(frontend_commit) and _is_commit(api_commit)):
-        return result("divergent", None, "live commit is not a full SHA on both endpoints")
+        return failed(
+            "divergent",
+            None,
+            f"live commit is not a full SHA on both endpoints: frontend {frontend_commit!r}, "
+            f"API {api_commit!r}",
+        )
     if frontend_commit != api_commit:
-        return result(
+        return failed(
             "divergent",
             None,
             f"frontend serves {frontend_commit}, API serves {api_commit}",

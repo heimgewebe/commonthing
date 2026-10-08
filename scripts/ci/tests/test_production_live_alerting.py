@@ -161,7 +161,7 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         first = classify(receipt(A, api=B), C)
         second = classify(receipt(B, api=C), C)
         self.assertEqual(first.state, "divergent")
-        self.assertEqual(first.fingerprint(), f"divergent:{A}/{B}")
+        self.assertTrue(first.fingerprint().startswith(f"divergent:{A}/{B}#"))
         self.assertNotEqual(first.fingerprint(), second.fingerprint())
 
     def test_outage_fingerprint_tracks_the_readable_side(self) -> None:
@@ -176,7 +176,7 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         moved = classify(half_down(B, None), C)
         flipped = classify(half_down(None, B), C)
         self.assertEqual(first.state, "outage")
-        self.assertEqual(first.fingerprint(), f"outage:{A}/none")
+        self.assertTrue(first.fingerprint().startswith(f"outage:{A}/none#"))
         self.assertEqual(len({first.fingerprint(), moved.fingerprint(), flipped.fingerprint()}), 3)
 
     def test_later_merges_do_not_restart_the_grace_period(self) -> None:
@@ -217,7 +217,12 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         self.assertEqual(result.state, "outage")
         self.assertTrue(result.alert)
         data["api"] = endpoint(C, status=502)
-        self.assertEqual(classify(data, C).state, "outage")
+        bad_gateway = classify(data, C)
+        self.assertEqual(bad_gateway.state, "outage")
+        # Same commits, new diagnosis: the alert must be updated, not deduplicated.
+        self.assertNotEqual(result.fingerprint(), bad_gateway.fingerprint())
+        data["api"] = endpoint(C, status=500)
+        self.assertNotEqual(bad_gateway.fingerprint(), classify(data, C).fingerprint())
 
     def test_missing_receipt_is_a_monitor_failure(self) -> None:
         result = classify(None, C)
@@ -278,7 +283,7 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             self.assertEqual(code, 1)
             payload = json.loads(output.read_text())
             self.assertEqual(payload["state"], "outage")
-            self.assertEqual(payload["fingerprint"], "outage:none")
+            self.assertTrue(payload["fingerprint"].startswith("outage:none#"))
 
     def test_schaubild_failure_turns_a_green_state_into_an_alert(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

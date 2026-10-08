@@ -304,7 +304,8 @@ Commits selbst. Deshalb schließt ausschließlich `current` einen offenen Alarm.
 Der Job `Deliver production alert` (`scripts/ops/production_alert_issue.py`)
 führt genau ein offenes Issue mit Label `production-alert`. Ein Alarm öffnet es;
 solange er anhält, kommt nur bei geändertem Zustand, Live-Commit, Satz
-gescheiterter Prüfungen (bei `invalid`) oder Schaubild-Befund (Zustand,
+gescheiterter Prüfungen (bei `invalid`), Fehlerbild (bei `outage` und geteiltem
+`divergent`) oder Schaubild-Befund (Zustand,
 gesperrtes und gewünschtes Release, Fehlertext) ein Kommentar
 dazu. Scheitert Schaubild neben einem anderen Alarm, bleibt der spezifischere
 Zustand, und der Schaubild-Befund steht im Grund. Erholung kommentiert und
