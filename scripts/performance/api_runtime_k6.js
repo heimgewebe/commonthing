@@ -8,6 +8,7 @@
 // copy of the budget would defeat that single-source-of-truth guarantee.
 import http from 'k6/http';
 import { check } from 'k6';
+import { Counter } from 'k6/metrics';
 
 const BASE_URL = __ENV.BASE_URL;
 if (!BASE_URL) {
@@ -53,6 +54,18 @@ const CONCURRENCY_PROFILE =
 http.setResponseCallback(http.expectedStatuses(200));
 const READY_RESPONSE_CALLBACK = http.expectedStatuses(200, 503);
 
+// Fixed-cardinality diagnostic counters. A 503 still retains the historical
+// response classification: these counters do not change T048 pass/fail gates.
+const READY_SAMPLES = new Counter('t048_ready_samples');
+const READY_HTTP_503 = new Counter('t048_ready_http_503');
+const READY_UNCLASSIFIED = new Counter('t048_ready_unclassified');
+const READY_CHECKS_FALSE = {
+  database: new Counter('t048_ready_check_false_database'),
+  nats: new Counter('t048_ready_check_false_nats'),
+  event_chain: new Counter('t048_ready_check_false_event_chain'),
+  policy: new Counter('t048_ready_check_false_policy'),
+};
+
 export const options = {
   vus: Number(__ENV.API_RUNTIME_VUS || 10),
   duration: `${Number(__ENV.API_RUNTIME_DURATION_SECONDS || 30)}s`,
@@ -70,6 +83,27 @@ export default function () {
     responseCallback: READY_RESPONSE_CALLBACK,
   });
   check(ready, { 'ready 2xx/5xx': (r) => r.status === 200 || r.status === 503 });
+  READY_SAMPLES.add(1);
+  if (ready.status === 503) {
+    READY_HTTP_503.add(1);
+    let checks = null;
+    try {
+      const payload = ready.json();
+      checks = payload && typeof payload === 'object' ? payload.checks : null;
+    } catch (_error) {
+      // Invalid/unavailable JSON is counted, never written to a receipt.
+    }
+    let classified = false;
+    for (const component of Object.keys(READY_CHECKS_FALSE)) {
+      if (checks && checks[component] === false) {
+        READY_CHECKS_FALSE[component].add(1);
+        classified = true;
+      }
+    }
+    if (!classified) {
+      READY_UNCLASSIFIED.add(1);
+    }
+  }
 
   // The only read endpoint in the mix that is wired to PostgreSQL repository
   // telemetry (search_repository_duration_seconds); scripts/performance/
