@@ -5,7 +5,7 @@
 live? A "no" can mean very different things, and only some of them need a
 human. This classifier separates them:
 
-* ``current``     the expected commit is live and consistent.
+* ``current``     the expected commit is live and consistent and still main's head.
 * ``superseded``  a newer main commit that contains the expected one is live
                   and passes every receipt check against that newer commit.
                   This run is not a production proof; the newer commit's own
@@ -189,9 +189,33 @@ def classify(
         )
     live = frontend_commit
 
+    def lag(live: str, target: str) -> Classification:
+        merged_at = commit_time(target)
+        if merged_at is None:
+            return result("stale", live, f"age of {target} is unknown; treating lag as stale")
+        age = int(now) - merged_at
+        if age < 0:
+            # A future timestamp (clock skew, imported commit) must not extend
+            # the grace period indefinitely.
+            return result("stale", live, f"{target} has a committer time {-age}s in the future")
+        if age < pending_grace_seconds:
+            return result(
+                "pending",
+                live,
+                f"older main commit {live} is live; {target} is {age}s old "
+                f"(grace {pending_grace_seconds}s)",
+            )
+        return result("stale", live, f"older main commit {live} is still live {age}s after {target}")
+
     if live == expected_commit:
         if receipt.get("pass") is True:
-            return result("current", live, "expected commit is live and consistent")
+            if main_commit == expected_commit:
+                return result("current", live, "expected commit is live and consistent")
+            # main moved after the run resolved its target: this receipt proves
+            # an older commit and must not resolve an alarm for the newer one.
+            if is_ancestor(live, main_commit):
+                return lag(live, main_commit)
+            return result("divergent", live, f"live commit {live} is not on main {main_commit}")
         reasons = receipt.get("reasons")
         detail = "; ".join(reasons) if isinstance(reasons, list) else "receipt did not pass"
         return result("invalid", live, detail)
@@ -212,28 +236,7 @@ def classify(
 
     live_is_older = is_ancestor(live, expected_commit)
     if live_is_older:
-        merged_at = commit_time(expected_commit)
-        if merged_at is None:
-            return result("stale", live, f"age of {expected_commit} is unknown; treating lag as stale")
-        age = int(now) - merged_at
-        if age < 0:
-            # A future timestamp (clock skew, imported commit) must not extend
-            # the grace period indefinitely.
-            return result(
-                "stale", live, f"{expected_commit} has a committer time {-age}s in the future"
-            )
-        if age < pending_grace_seconds:
-            return result(
-                "pending",
-                live,
-                f"older main commit {live} is live; {expected_commit} is {age}s old "
-                f"(grace {pending_grace_seconds}s)",
-            )
-        return result(
-            "stale",
-            live,
-            f"older main commit {live} is still live {age}s after {expected_commit}",
-        )
+        return lag(live, expected_commit)
 
     if expected_is_older is None or live_is_older is None:
         return result("divergent", live, f"live commit {live} is unknown to the main history")

@@ -289,7 +289,7 @@ aktuelle `main`-Linie ein und schreibt `production-live-state.json`:
 
 | Zustand | Bedeutung | Alarm |
 |---|---|---|
-| `current` | erwarteter Commit live und konsistent | nein, löst offenen Alarm auf |
+| `current` | erwarteter Commit live und konsistent, und er ist noch der Kopf von `main` | nein, löst offenen Alarm auf |
 | `superseded` | ein neuerer `main`-Commit, der den erwarteten enthält, ist live und besteht alle übrigen Receipt-Prüfungen | nein, löst nichts auf |
 | `pending` | älterer `main`-Commit live, Ziel jünger als 1200 s | nein |
 | `stale` | älterer `main`-Commit nach 1200 s noch live (Rollout oder Reconciler hängt) | ja |

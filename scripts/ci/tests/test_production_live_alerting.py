@@ -102,6 +102,17 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
         self.assertTrue(cases["stale"].alert)
         self.assertTrue(cases["invalid"].alert)
 
+    def test_passing_receipt_for_an_older_target_is_not_current(self) -> None:
+        # main moved from B to C after the run resolved B as its target.
+        pending = classify(receipt(B, passed=True), B, main=C, age=300)
+        self.assertEqual(pending.state, "pending", pending.reason)
+        self.assertFalse(pending.alert)
+        stale = classify(receipt(B, passed=True), B, main=C, age=1200)
+        self.assertEqual(stale.state, "stale", stale.reason)
+        self.assertTrue(stale.alert)
+        off_main = classify(receipt(X, passed=True), X, main=C)
+        self.assertEqual(off_main.state, "divergent", off_main.reason)
+
     def test_superseded_requires_a_valid_receipt_for_the_newer_commit(self) -> None:
         broken = receipt(C)
         broken["frontend"]["headers"]["cache-control"] = "max-age=60"
