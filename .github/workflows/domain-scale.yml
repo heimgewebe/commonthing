@@ -472,7 +472,8 @@ jobs:
         run: |
           set -euo pipefail
           # Read the same pinned JetStream digest as the existing Event-Chain proof.
-          NATS_IMAGE="$(python3 -B -c 'import json;print(json.load(open("scripts/ci/postgres-proof-contract.json"))["jetstream_image"])')"
+          NATS_IMAGE="$(python3 -B -c \
+            'import json;print(json.load(open("scripts/ci/postgres-proof-contract.json"))["jetstream_image"])')"
           [[ "${NATS_IMAGE}" =~ ^nats@sha256:[0-9a-f]{64}$ ]]
           docker pull "${NATS_IMAGE}"
           docker run --detach --rm --name "${NATS_CONTAINER}" --network host "${NATS_IMAGE}" -js >/dev/null
