@@ -39,8 +39,11 @@ def manifest():
     }
 
 
-def summary(variant="baseline", phase="recent", p95=500.0, p99=690.0, statuses=(100, 0, 0)):
+def summary(variant="baseline", phase="recent", p95=500.0, p99=690.0,
+            statuses=(100, 0, 0), event_chain_timeout_count=None):
     ok, unavailable, other = statuses
+    if event_chain_timeout_count is None:
+        event_chain_timeout_count = unavailable
     count = ok + unavailable + other
     sha = OLD_SHA if variant == "baseline" else FIX_SHA
     image = BASE_IMAGE if variant == "baseline" else FIX_IMAGE
@@ -58,12 +61,18 @@ def summary(variant="baseline", phase="recent", p95=500.0, p99=690.0, statuses=(
             "virtual_users": 10,
             "duration_seconds": 30,
         },
+        "state": {"testRunDurationMs": 30_100},
         "metrics": {
+            "vus_max": {"values": {"max": 10}},
             "http_reqs": {"values": {"count": count}},
             "http_req_duration": {"values": {"p(95)": p95, "p(99)": p99}},
             "http_req_failed": {"values": {"rate": rate}},
             "proof_ready_200": {"values": {"count": ok}},
             **({"proof_ready_503": {"values": {"count": unavailable}}} if unavailable else {}),
+            **({"proof_ready_503_event_chain_timeout": {"values": {"count": event_chain_timeout_count}}}
+               if event_chain_timeout_count else {}),
+            **({"proof_ready_503_other_cause": {"values": {"count": unavailable - event_chain_timeout_count}}}
+               if unavailable > event_chain_timeout_count else {}),
             **({"proof_ready_other": {"values": {"count": other}}} if other else {}),
         },
     }
@@ -91,6 +100,46 @@ class EventChainReadinessProofTests(unittest.TestCase):
         self.assertEqual(result["status"], "pass")
         self.assertTrue(all(result["checks"].values()))
         self.assertEqual(result["runs"]["fix_recent"]["ready_503"], 0)
+
+    def test_control_all_transport_errors_cannot_fake_an_effectiveness_pass(self):
+        cases = runs()
+        cases[("baseline", "recent")] = summary(p95=2_000, p99=2_000, statuses=(0, 0, 100))
+        result = evaluate(manifest(), cases, policy())
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertFalse(result["checks"]["baseline_recent_cause_attributed"])
+
+    def test_baseline_other_component_503_cannot_claim_event_chain_benefit(self):
+        cases = runs()
+        cases[("baseline", "recent")] = summary(
+            p95=752, p99=754, statuses=(10, 90, 0), event_chain_timeout_count=0
+        )
+        result = evaluate(manifest(), cases, policy())
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertFalse(result["checks"]["baseline_recent_cause_attributed"])
+
+    def test_one_stray_event_chain_503_is_not_material_improvement(self):
+        cases = runs()
+        cases[("baseline", "recent")] = summary(p95=70, p99=130, statuses=(9999, 1, 0))
+        result = evaluate(manifest(), cases, policy())
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertFalse(result["checks"]["relative_improvement_observed"])
+
+    def test_event_chain_cause_counter_mismatch_invalidates_evidence(self):
+        cases = runs()
+        cases[("baseline", "recent")] = summary(p95=752, p99=754, statuses=(10, 90, 0))
+        cases[("baseline", "recent")]["metrics"]["proof_ready_503_event_chain_timeout"]["values"]["count"] = 89
+        with self.assertRaisesRegex(InvalidEvidence, "readiness_503_cause_accounting_invalid"):
+            evaluate(manifest(), cases, policy())
+
+    def test_observed_vus_and_duration_are_required(self):
+        cases = runs()
+        cases[("fix", "recent")]["metrics"]["vus_max"]["values"]["max"] = 11
+        with self.assertRaisesRegex(InvalidEvidence, "observed_vus_mismatch"):
+            evaluate(manifest(), cases, policy())
+        cases = runs()
+        cases[("fix", "aged")]["state"]["testRunDurationMs"] = 5_000
+        with self.assertRaisesRegex(InvalidEvidence, "observed_duration_mismatch"):
+            evaluate(manifest(), cases, policy())
 
     def test_candidate_503_is_real_failure_even_if_it_is_fast(self):
         cases = runs()

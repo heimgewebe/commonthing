@@ -15,6 +15,8 @@ if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(__ENV.PROOF_RUN_ID)) throw new Er
 
 const READY_200 = new Counter('proof_ready_200');
 const READY_503 = new Counter('proof_ready_503');
+const READY_503_EVENT_CHAIN_TIMEOUT = new Counter('proof_ready_503_event_chain_timeout');
+const READY_503_OTHER_CAUSE = new Counter('proof_ready_503_other_cause');
 const READY_OTHER = new Counter('proof_ready_other');
 
 http.setResponseCallback(http.expectedStatuses(200));
@@ -28,8 +30,26 @@ export const options = {
 export default function () {
   const response = http.get('http://127.0.0.1:8787/health/ready', { timeout: '2s' });
   if (response.status === 200) READY_200.add(1);
-  else if (response.status === 503) READY_503.add(1);
-  else READY_OTHER.add(1);
+  else if (response.status === 503) {
+    READY_503.add(1);
+    let body;
+    try {
+      body = response.json();
+    } catch (_) {
+      // A malformed 503 is never credited to the event-chain timeout.
+    }
+    const checks = body && body.checks;
+    const errors = body && body.errors;
+    const eventErrors = errors && errors.event_chain;
+    const eventChainTimeoutOnly =
+      checks && checks.event_chain === false &&
+      checks.database === true && checks.nats === true && checks.policy === true &&
+      Array.isArray(eventErrors) &&
+      eventErrors.includes('readiness check timed out after 750 ms') &&
+      !errors.database && !errors.nats && !errors.policy;
+    if (eventChainTimeoutOnly) READY_503_EVENT_CHAIN_TIMEOUT.add(1);
+    else READY_503_OTHER_CAUSE.add(1);
+  } else READY_OTHER.add(1);
 }
 
 export function handleSummary(data) {

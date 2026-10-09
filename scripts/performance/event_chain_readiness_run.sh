@@ -122,7 +122,10 @@ start_api() {
     --env WELTGEWEBE_DOMAIN_READ_SOURCE=postgres \
     --env WELTGEWEBE_DOMAIN_JETSTREAM_REPLICAS=1 \
     --env WELTGEWEBE_API_STARTUP_MIGRATIONS=verify-applied \
+    --env READINESS_VERBOSE=true \
     "${image}" > /dev/null
+  # Bind the running container, not only the local image tag, to the measured SHA.
+  [[ "$(docker inspect "${API_CONTAINER}" --format '{{.Image}}')" == "$(cat "${ROOT}/${variant}.image")" ]]
   local consecutive=0
   for _ in $(seq 1 90); do
     if curl --fail --silent --output /dev/null --max-time 2 http://127.0.0.1:8787/health/ready; then
@@ -200,6 +203,11 @@ measure() {
     --env "PROOF_SUMMARY_PATH=${filename}" \
     "${K6_IMAGE}" run scripts/performance/event_chain_readiness_k6.js
   curl --fail --silent --show-error http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-${phase}-after.prom"
+  # A fast response is not healthy when relay or receipt consumer has exited.
+  grep -F "commit=\"${sha}\"" "${ROOT}/${variant}-${phase}-after.prom" > /dev/null
+  for worker in relay receipt_consumer; do
+    grep -Eq "^domain_event_worker_up\\{worker=\"${worker}\"\\} 1([.]0)?$" "${ROOT}/${variant}-${phase}-after.prom"
+  done
   [[ -s "${ROOT}/${variant}-${phase}.json" ]]
 }
 

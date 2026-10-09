@@ -107,13 +107,26 @@ def parse_run(data: dict, manifest: dict, variant: str, phase: str) -> dict:
     ok = _count(data, "proof_ready_200", missing_zero=True)
     unavailable = _count(data, "proof_ready_503", missing_zero=True)
     other = _count(data, "proof_ready_other", missing_zero=True)
+    chain_timeout = _count(data, "proof_ready_503_event_chain_timeout", missing_zero=True)
+    other_cause = _count(data, "proof_ready_503_other_cause", missing_zero=True)
     if total < 10 or ok + unavailable + other != total:
         raise InvalidEvidence(f"request_accounting_invalid:{variant}_{phase}")
+    if chain_timeout + other_cause != unavailable:
+        raise InvalidEvidence(f"readiness_503_cause_accounting_invalid:{variant}_{phase}")
     p95 = _metric(data, "http_req_duration", "p(95)")
     p99 = _metric(data, "http_req_duration", "p(99)")
     failure = _metric(data, "http_req_failed", "rate")
-    if failure > 1:
+    if failure > 1 or abs(failure - (unavailable + other) / total) > 0.00001:
         raise InvalidEvidence(f"invalid_failure_rate:{variant}_{phase}")
+    # Enforce k6's observed concurrency and elapsed duration, not only its own
+    # declarative metadata (which could stay stale after a load-profile change).
+    if _metric(data, "vus_max", "max") != 10:
+        raise InvalidEvidence(f"observed_vus_mismatch:{variant}_{phase}")
+    state = data.get("state")
+    if not isinstance(state, dict) or not 29_000 <= _finite(
+        state.get("testRunDurationMs"), f"observed_duration:{variant}_{phase}"
+    ) <= 35_000:
+        raise InvalidEvidence(f"observed_duration_mismatch:{variant}_{phase}")
     return {
         "variant": variant,
         "phase": phase,
@@ -122,6 +135,8 @@ def parse_run(data: dict, manifest: dict, variant: str, phase: str) -> dict:
         "http_requests": total,
         "ready_200": ok,
         "ready_503": unavailable,
+        "ready_503_event_chain_timeout": chain_timeout,
+        "ready_503_other_cause": other_cause,
         "ready_other": other,
         "p95_ms": round(p95, 3),
         "p99_ms": round(p99, 3),
@@ -152,6 +167,7 @@ def evaluate(manifest: dict, runs: dict, policy: dict) -> dict:
 
     checks = {
         "baseline_aged_all_ready": results["baseline_aged"]["ready_200"] == results["baseline_aged"]["http_requests"],
+        "baseline_recent_cause_attributed": baseline["ready_other"] == 0 and baseline["ready_503_other_cause"] == 0,
         "candidate_recent_all_ready": candidate["ready_200"] == candidate["http_requests"],
         "candidate_aged_all_ready": candidate_aged["ready_200"] == candidate_aged["http_requests"],
         "candidate_recent_p95": candidate["p95_ms"] <= p95_limit,
@@ -162,19 +178,32 @@ def evaluate(manifest: dict, runs: dict, policy: dict) -> dict:
             candidate["http_failed_rate"] == 0 and candidate_aged["http_failed_rate"] == 0
         ),
     }
-    # An old-vs-new difference on one runner is suggestive, never a historical
-    # attribution or proof of a production speedup. Do not award efficacy PASS
-    # just because the candidate was fast if the control was equally fast.
+    # The control is only interpretable when every 503 is independently
+    # identified from the JSON response as the 750 ms Event-Chain timeout.
+    # A different failing component or an HTTP transport error cannot be
+    # attributed to the #1944 singleflight change.
+    valid_control = checks["baseline_recent_cause_attributed"]
+    # A single stray 503, or a 20% latency gap on a shared CI runner, is not
+    # material evidence. Require >=5% exact Event-Chain timeouts OR a control
+    # that breaches the canonical p95 budget by >=3x the healthy candidate.
     observed_improvement = (
-        baseline["ready_503"] > candidate["ready_503"]
-        or baseline["p95_ms"] >= 1.2 * max(candidate["p95_ms"], 0.001)
+        baseline["ready_503_event_chain_timeout"] / baseline["http_requests"] >= 0.05
+        or (
+            baseline["ready_503"] == 0
+            and baseline["p95_ms"] > p95_limit
+            and baseline["p95_ms"] >= 3 * max(candidate["p95_ms"], 0.001)
+        )
     )
     checks["relative_improvement_observed"] = observed_improvement
-    # An inconclusive comparison may satisfy absolute readiness limits without
-    # establishing a measurable benefit over the unchanged baseline.
-    absolute_pass = all(v for key, v in checks.items() if key != "relative_improvement_observed")
-    verdict = "pass" if absolute_pass and observed_improvement else (
-        "inconclusive" if absolute_pass else "fail"
+    # Treat a healthy candidate plus an unrelated baseline failure as
+    # INCONCLUSIVE, never as a successful effectiveness experiment.
+    candidate_pass = all(
+        value for key, value in checks.items()
+        if key not in {"relative_improvement_observed", "baseline_recent_cause_attributed"}
+    )
+    verdict = (
+        "fail" if not candidate_pass else
+        "pass" if valid_control and observed_improvement else "inconclusive"
     )
     return {
         "schema_version": 1,
