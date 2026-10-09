@@ -1,4 +1,4 @@
 # Commonthing: independent public read-only check every five minutes (Heimberry user alex)
-# No cron mail; events and heartbeat are written locally under ~/.local/state/commonthing-watch/
+# No cron mail; events and heartbeat are written locally under ~/.local/commonthing-watch-state/
 MAILTO=""
 */5 * * * * /usr/bin/python3 -B /home/alex/.local/commonthing-production-watch.py >/dev/null 2>&1

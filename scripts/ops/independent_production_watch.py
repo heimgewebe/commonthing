@@ -188,7 +188,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--state-dir", type=Path,
-                        default=Path.home() / ".local/state/commonthing-watch")
+                        default=Path.home() / ".local/commonthing-watch-state")
     args = parser.parse_args()
     result = evaluate(datetime.now(UTC))
     if args.dry_run:
