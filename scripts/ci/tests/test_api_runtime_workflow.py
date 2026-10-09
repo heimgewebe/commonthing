@@ -34,6 +34,31 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("weltgewebe_search_generation_activation_ready", self.job)
         self.assertIn("weltgewebe_activate_search_generation", self.job)
 
+    def test_ready_200_requires_pinned_live_jetstream_workers(self) -> None:
+        import json
+
+        pinned = json.loads(
+            (ROOT / "scripts/ci/postgres-proof-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )["jetstream_image"]
+        self.assertRegex(pinned, r"^nats@sha256:[0-9a-f]{64}$")
+        nats = self.job.index("name: Start isolated JetStream for measured API")
+        api = self.job.index("name: Start and warm the measured API container")
+        self.assertLess(nats, api)
+        start = self.job[nats:api]
+        self.assertIn("scripts/ci/postgres-proof-contract.json", start)
+        self.assertIn("jetstream_image", start)
+        self.assertIn("--network host", start)
+        self.assertIn('"${NATS_IMAGE}" -js', start)
+        self.assertIn('socket.create_connection(("127.0.0.1", 4222)', start)
+        end = self.job[self.job.index("name: Stop isolated JetStream"): ]
+        self.assertIn("if: ${{ always() }}", end)
+        self.assertIn('docker rm --force "${NATS_CONTAINER}"', end)
+        warmup = self.job[api:self.job.index("name: Bind live API runtime")]
+        self.assertIn('--env "NATS_URL=nats://127.0.0.1:4222"', warmup)
+        self.assertIn("--env WELTGEWEBE_DOMAIN_JETSTREAM_REPLICAS=1", warmup)
+
     def test_readiness_is_stable_before_starting_measured_load(self) -> None:
         start = self.job.index("name: Start and warm the measured API container")
         bound = self.job.index("name: Bind live API runtime to the exact fixture")

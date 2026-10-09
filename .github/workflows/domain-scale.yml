@@ -123,6 +123,7 @@ jobs:
       API_IMAGE_REPOSITORY: 127.0.0.1:5000/weltgewebe-api
       API_CONTAINER: weltgewebe-api-runtime-evidence
       K6_IMAGE: grafana/k6@sha256:65c920dc067d5e2e00befbf982af6ad6ad0117034e8b1c65817c7975c52d4669
+      NATS_CONTAINER: weltgewebe-nats-runtime-evidence
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
         with:
@@ -466,6 +467,29 @@ jobs:
             "SELECT count(*) FROM search_index_generations WHERE state = 'active'" \
             "1"
 
+      - name: Start isolated JetStream for measured API
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read the same pinned JetStream digest as the existing Event-Chain proof.
+          NATS_IMAGE="$(python3 -B -c 'import json;print(json.load(open("scripts/ci/postgres-proof-contract.json"))["jetstream_image"])')"
+          [[ "${NATS_IMAGE}" =~ ^nats@sha256:[0-9a-f]{64}$ ]]
+          docker pull "${NATS_IMAGE}"
+          docker run --detach --rm --name "${NATS_CONTAINER}" --network host "${NATS_IMAGE}" -js >/dev/null
+          python3 -B - <<'PY'
+          import socket
+          import time
+          deadline = time.monotonic() + 35
+          while time.monotonic() < deadline:
+              try:
+                  with socket.create_connection(("127.0.0.1", 4222), timeout=1):
+                      break
+              except OSError:
+                  time.sleep(0.3)
+          else:
+              raise SystemExit("isolated JetStream never became reachable")
+          PY
+
       - name: Start and warm the measured API container
         env:
           API_RUNTIME_SEARCH_QUERY: ${{ steps.contract.outputs.search_query }}
@@ -477,6 +501,8 @@ jobs:
             --network host \
             --env API_BIND=127.0.0.1:8787 \
             --env "DATABASE_URL=${DATABASE_URL}" \
+            --env "NATS_URL=nats://127.0.0.1:4222" \
+            --env WELTGEWEBE_DOMAIN_JETSTREAM_REPLICAS=1 \
             --env WELTGEWEBE_DOMAIN_READ_SOURCE=postgres \
             --env WELTGEWEBE_API_STARTUP_MIGRATIONS=verify-applied \
             --env WELTGEWEBE_SEARCH_OLLAMA_URL=http://127.0.0.1:9/ \
@@ -657,4 +683,13 @@ jobs:
           set -euo pipefail
           if docker container inspect "${API_CONTAINER}" >/dev/null 2>&1; then
             docker rm --force "${API_CONTAINER}"
+          fi
+
+      - name: Stop isolated JetStream
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker container inspect "${NATS_CONTAINER}" >/dev/null 2>&1; then
+            docker rm --force "${NATS_CONTAINER}"
           fi
