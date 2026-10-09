@@ -14,6 +14,7 @@ if (!['recent', 'aged'].includes(__ENV.PROOF_PHASE)) throw new Error('invalid ev
 if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(__ENV.PROOF_RUN_ID)) throw new Error('invalid run id');
 
 const READY_200 = new Counter('proof_ready_200');
+const READY_200_INCOMPLETE = new Counter('proof_ready_200_incomplete');
 const READY_503 = new Counter('proof_ready_503');
 const READY_503_EVENT_CHAIN_TIMEOUT = new Counter('proof_ready_503_event_chain_timeout');
 const READY_503_OTHER_CAUSE = new Counter('proof_ready_503_other_cause');
@@ -37,8 +38,23 @@ export const options = {
 
 export default function () {
   const response = http.get('http://127.0.0.1:8787/health/ready', { timeout: '2s' });
-  if (response.status === 200) READY_200.add(1);
-  else if (response.status === 503) {
+  if (response.status === 200) {
+    READY_200.add(1);
+    let checks;
+    let status;
+    try {
+      const body = response.json();
+      checks = body && body.checks;
+      status = body && body.status;
+    } catch (_) {
+      // A 200 with missing or malformed readiness details is not evidence of health.
+    }
+    if (
+      status !== 'ok' || !checks ||
+      checks.database !== true || checks.nats !== true ||
+      checks.event_chain !== true || checks.policy !== true
+    ) READY_200_INCOMPLETE.add(1);
+  } else if (response.status === 503) {
     READY_503.add(1);
     let body;
     try {

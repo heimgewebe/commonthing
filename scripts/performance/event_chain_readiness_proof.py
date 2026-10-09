@@ -85,6 +85,46 @@ def validate_manifest(manifest: dict) -> None:
         for name in ("baseline", "fix")
     ):
         raise InvalidEvidence("manifest_image_identity_missing")
+    observed = manifest.get("observed_runtime_images")
+    if not isinstance(observed, dict) or any(
+        observed.get(variant) != images[variant] for variant in ("baseline", "fix")
+    ):
+        raise InvalidEvidence("observed_container_image_identity_mismatch")
+
+
+def parse_negative_control(data: dict, manifest: dict, variant: str) -> dict:
+    if not isinstance(data, dict):
+        raise InvalidEvidence(f"negative_control_missing:{variant}")
+    expected_sha = OLD_SHA if variant == "baseline" else FIX_SHA
+    if (
+        data.get("schema_version") != 1
+        or data.get("run_id") != manifest["run_id"]
+        or data.get("variant") != variant
+        or data.get("source_sha") != expected_sha
+        or data.get("image_id") != manifest["images"][variant]
+    ):
+        raise InvalidEvidence(f"negative_control_binding_invalid:{variant}")
+    status = data.get("http_status")
+    if isinstance(status, bool) or not isinstance(status, int) or status < 0 or status > 599:
+        raise InvalidEvidence(f"negative_control_status_invalid:{variant}")
+    flags = ("event_chain_failed", "other_checks_ready", "missing_durable_receipt",
+             "recovered_http_200", "worker_up_after_recovery")
+    if any(type(data.get(key)) is not bool for key in flags):
+        raise InvalidEvidence(f"negative_control_flags_invalid:{variant}")
+    if not data["recovered_http_200"] or not data["worker_up_after_recovery"]:
+        raise InvalidEvidence(f"negative_control_recovery_missing:{variant}")
+    return {
+        "http_status": status,
+        "event_chain_failed": data["event_chain_failed"],
+        "other_checks_ready": data["other_checks_ready"],
+        "missing_durable_receipt": data["missing_durable_receipt"],
+        "recovered_http_200": data["recovered_http_200"],
+        "worker_up_after_recovery": data["worker_up_after_recovery"],
+        "detected": (
+            status == 503 and data["event_chain_failed"] and data["other_checks_ready"]
+            and data["missing_durable_receipt"]
+        ),
+    }
 
 
 def parse_run(data: dict, manifest: dict, variant: str, phase: str) -> dict:
@@ -105,14 +145,29 @@ def parse_run(data: dict, manifest: dict, variant: str, phase: str) -> dict:
         raise InvalidEvidence(f"run_binding_invalid:{variant}_{phase}")
     total = _count(data, "http_reqs")
     ok = _count(data, "proof_ready_200", missing_zero=True)
+    incomplete_200 = _count(data, "proof_ready_200_incomplete", missing_zero=True)
     unavailable = _count(data, "proof_ready_503", missing_zero=True)
     other = _count(data, "proof_ready_other", missing_zero=True)
     chain_timeout = _count(data, "proof_ready_503_event_chain_timeout", missing_zero=True)
     other_cause = _count(data, "proof_ready_503_other_cause", missing_zero=True)
+    mixed_timeout = _count(data, "proof_ready_503_event_chain_timeout_mixed", missing_zero=True)
+    parse_error = _count(data, "proof_ready_503_parse_error", missing_zero=True)
+    component_false = {
+        name: _count(data, f"proof_ready_503_check_false_{name}", missing_zero=True)
+        for name in ("database", "nats", "event_chain", "policy")
+    }
     if total < 10 or ok + unavailable + other != total:
         raise InvalidEvidence(f"request_accounting_invalid:{variant}_{phase}")
+    if incomplete_200:
+        raise InvalidEvidence(f"readiness_200_incomplete_checks:{variant}_{phase}")
     if chain_timeout + other_cause != unavailable:
         raise InvalidEvidence(f"readiness_503_cause_accounting_invalid:{variant}_{phase}")
+    if (
+        mixed_timeout > other_cause or parse_error > other_cause
+        or any(value > unavailable for value in component_false.values())
+        or chain_timeout + mixed_timeout > component_false["event_chain"]
+    ):
+        raise InvalidEvidence(f"readiness_503_diagnostics_inconsistent:{variant}_{phase}")
     p95 = _metric(data, "http_req_duration", "p(95)")
     p99 = _metric(data, "http_req_duration", "p(99)")
     failure = _metric(data, "http_req_failed", "rate")
@@ -137,6 +192,9 @@ def parse_run(data: dict, manifest: dict, variant: str, phase: str) -> dict:
         "ready_503": unavailable,
         "ready_503_event_chain_timeout": chain_timeout,
         "ready_503_other_cause": other_cause,
+        "ready_503_event_chain_timeout_mixed": mixed_timeout,
+        "ready_503_parse_error": parse_error,
+        "ready_503_component_false": component_false,
         "ready_other": other,
         "p95_ms": round(p95, 3),
         "p99_ms": round(p99, 3),
@@ -144,8 +202,14 @@ def parse_run(data: dict, manifest: dict, variant: str, phase: str) -> dict:
     }
 
 
-def evaluate(manifest: dict, runs: dict, policy: dict) -> dict:
+def evaluate(manifest: dict, runs: dict, policy: dict, negative_controls: dict) -> dict:
     validate_manifest(manifest)
+    if not isinstance(negative_controls, dict):
+        raise InvalidEvidence("negative_controls_missing")
+    negative_results = {
+        variant: parse_negative_control(negative_controls.get(variant), manifest, variant)
+        for variant in ("baseline", "fix")
+    }
     section = policy.get("measurements", {}).get("api_runtime", {})
     metrics = section.get("metrics", {})
     try:
@@ -167,7 +231,24 @@ def evaluate(manifest: dict, runs: dict, policy: dict) -> dict:
 
     checks = {
         "baseline_aged_all_ready": results["baseline_aged"]["ready_200"] == results["baseline_aged"]["http_requests"],
-        "baseline_recent_cause_attributed": baseline["ready_other"] == 0 and baseline["ready_503_other_cause"] == 0,
+        # Every baseline 503 must carry a 750 ms Event-Chain timeout.
+        # Pure timeouts and mixed Event-Chain+database failures are distinct.
+        # Mixed database failures remain causally unassigned and never
+        # contribute to the demonstrated Event-Chain-only improvement.
+        "baseline_recent_cause_attributed": (
+            baseline["ready_other"] == 0
+            and baseline["ready_503_parse_error"] == 0
+            and baseline["ready_503_other_cause"]
+            == baseline["ready_503_event_chain_timeout_mixed"]
+            and baseline["ready_503_component_false"]["event_chain"]
+            == baseline["ready_503"]
+            and baseline["ready_503_component_false"]["database"]
+            == baseline["ready_503_event_chain_timeout_mixed"]
+            and baseline["ready_503_component_false"]["nats"] == 0
+            and baseline["ready_503_component_false"]["policy"] == 0
+        ),
+        "baseline_negative_control_detected": negative_results["baseline"]["detected"],
+        "candidate_negative_control_detected": negative_results["fix"]["detected"],
         "candidate_recent_all_ready": candidate["ready_200"] == candidate["http_requests"],
         "candidate_aged_all_ready": candidate_aged["ready_200"] == candidate_aged["http_requests"],
         "candidate_recent_p95": candidate["p95_ms"] <= p95_limit,
@@ -178,32 +259,28 @@ def evaluate(manifest: dict, runs: dict, policy: dict) -> dict:
             candidate["http_failed_rate"] == 0 and candidate_aged["http_failed_rate"] == 0
         ),
     }
-    # The control is only interpretable when every 503 is independently
-    # identified from the JSON response as the 750 ms Event-Chain timeout.
-    # A different failing component or an HTTP transport error cannot be
-    # attributed to the #1944 singleflight change.
+    # Distinguish the independently identified exclusive Event-Chain timeout
+    # subset from mixed database/Event-Chain timeouts. Co-occurrence in mixed
+    # responses does not prove the database check was blocked by Event-Chain I/O.
     valid_control = checks["baseline_recent_cause_attributed"]
-    # A single stray 503, or a 20% latency gap on a shared CI runner, is not
-    # material evidence. Require >=5% exact Event-Chain timeouts OR a control
-    # that breaches the canonical p95 budget by >=3x the healthy candidate.
+    # Never infer efficacy from one latency-only paired run: no repeat/counter-
+    # balance exists to distinguish a timing difference from runner drift.
+    # Require many separately attributed 750 ms Event-Chain timeouts.
     observed_improvement = (
-        baseline["ready_503_event_chain_timeout"] / baseline["http_requests"] >= 0.05
-        or (
-            baseline["ready_503"] == 0
-            and baseline["p95_ms"] > p95_limit
-            and baseline["p95_ms"] >= 3 * max(candidate["p95_ms"], 0.001)
-        )
+        baseline["ready_503_event_chain_timeout"] >= 20
+        and baseline["ready_503_event_chain_timeout"] / baseline["http_requests"] >= 0.10
     )
     checks["relative_improvement_observed"] = observed_improvement
-    # Treat a healthy candidate plus an unrelated baseline failure as
-    # INCONCLUSIVE, never as a successful effectiveness experiment.
-    candidate_pass = all(
-        value for key, value in checks.items()
-        if key not in {"relative_improvement_observed", "baseline_recent_cause_attributed"}
+    # A broken baseline control cannot be called a failure of the fix.
+    # Failed fix readiness or a missed negative control is a genuine FAIL.
+    candidate_pass = all(value for key, value in checks.items() if key.startswith("candidate_"))
+    baseline_pass = (
+        checks["baseline_aged_all_ready"] and valid_control
+        and checks["baseline_negative_control_detected"]
     )
     verdict = (
         "fail" if not candidate_pass else
-        "pass" if valid_control and observed_improvement else "inconclusive"
+        "pass" if baseline_pass and observed_improvement else "inconclusive"
     )
     return {
         "schema_version": 1,
@@ -218,7 +295,18 @@ def evaluate(manifest: dict, runs: dict, policy: dict) -> dict:
         "canonical_limits_ms": {"p95": p95_limit, "p99": p99_limit},
         "checks": checks,
         "runs": results,
+        "negative_controls": negative_results,
+        "baseline_timeout_partition": {
+            "exclusive_event_chain_timeout_503": baseline["ready_503_event_chain_timeout"],
+            "mixed_event_chain_and_database_timeout_503":
+                baseline["ready_503_event_chain_timeout_mixed"],
+            "other_or_unclassified_503": (
+                baseline["ready_503_other_cause"]
+                - baseline["ready_503_event_chain_timeout_mixed"]
+            ),
+        },
         "limitations": [
+            "mixed database/Event-Chain timeouts are correlated failures, not uniquely attributed to the Event-Chain scan; only exclusive timeout 503s count toward efficacy",
             "isolated GitHub runner, not production or a complete Experiment-B cell",
             "recent versus aged published events, not a historical deployment cold start",
             "one paired run does not prove the cause of the archived 267 readiness 503s",
@@ -236,6 +324,8 @@ def main() -> int:
     parser.add_argument("--baseline-aged", type=Path, required=True)
     parser.add_argument("--fix-recent", type=Path, required=True)
     parser.add_argument("--fix-aged", type=Path, required=True)
+    parser.add_argument("--baseline-negative", type=Path, required=True)
+    parser.add_argument("--fix-negative", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     try:
@@ -248,6 +338,10 @@ def main() -> int:
                 ("fix", "aged"): load_json(args.fix_aged),
             },
             load_json(args.policy),
+            {
+                "baseline": load_json(args.baseline_negative),
+                "fix": load_json(args.fix_negative),
+            },
         )
     except InvalidEvidence as exc:
         report = {

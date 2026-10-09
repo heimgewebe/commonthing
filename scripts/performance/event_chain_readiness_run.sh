@@ -124,8 +124,11 @@ start_api() {
     --env WELTGEWEBE_API_STARTUP_MIGRATIONS=verify-applied \
     --env READINESS_VERBOSE=true \
     "${image}" > /dev/null
-  # Bind the running container, not only the local image tag, to the measured SHA.
-  [[ "$(docker inspect "${API_CONTAINER}" --format '{{.Image}}')" == "$(cat "${ROOT}/${variant}.image")" ]]
+  # Observe the physical running image, not only the local image tag.
+  local observed_image
+  observed_image="$(docker inspect "${API_CONTAINER}" --format '{{.Image}}')"
+  [[ "${observed_image}" == "$(cat "${ROOT}/${variant}.image")" ]]
+  printf '%s' "${observed_image}" > "${ROOT}/${variant}.running-image"
   local consecutive=0
   for _ in $(seq 1 90); do
     if curl --fail --silent --output /dev/null --max-time 2 http://127.0.0.1:8787/health/ready; then
@@ -211,6 +214,101 @@ measure() {
   [[ -s "${ROOT}/${variant}-${phase}.json" ]]
 }
 
+negative_control() {
+  local variant="$1" sha="$2" event_id http_code receipt
+  # The negative fixture is inserted only AFTER the aged load phase: preserve
+  # the 140001-event A/B measurements and make exactly one durable receipt absent.
+  event_id="$(psql "${DATABASE_URL}" -At -c "SELECT MIN(id) FROM domain_outbox WHERE aggregate_type='readiness-proof'")"
+  [[ "${event_id}" =~ ^[0-9]+$ ]]
+  [[ "$(psql "${DATABASE_URL}" -At -c "SELECT count(*) FROM domain_event_consumptions WHERE consumer_name='weltgewebe-api-domain-receipts-v1' AND event_id=${event_id}")" == "1" ]]
+  psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -c "
+    DELETE FROM domain_event_consumptions
+     WHERE consumer_name='weltgewebe-api-domain-receipts-v1' AND event_id=${event_id};
+    UPDATE domain_outbox
+       SET published_at = NOW() - INTERVAL '2 minutes'
+     WHERE id=${event_id};" > /dev/null
+  [[ "$(psql "${DATABASE_URL}" -At -c "SELECT count(*) FROM domain_event_consumptions WHERE consumer_name='weltgewebe-api-domain-receipts-v1' AND event_id=${event_id}")" == "0" ]]
+  sleep 1
+  receipt="${ROOT}/${variant}-negative-control.json"
+  http_code="$(curl --silent --show-error --max-time 3 \
+    --output "${ROOT}/${variant}-negative-response.json" \
+    --write-out '%{http_code}' http://127.0.0.1:8787/health/ready)"
+  python3 - "${variant}" "${sha}" "${http_code}" "${ROOT}/${variant}-negative-response.json" "${receipt}" "$(cat "${ROOT}/${variant}.image")" "${RUN_ID}" << 'PY'
+import json
+import pathlib
+import sys
+
+variant, revision, raw_status, raw_path, receipt_path, image_id, run_id = sys.argv[1:]
+try:
+    body = json.loads(pathlib.Path(raw_path).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    body = {}
+checks = body.get("checks") if isinstance(body, dict) else None
+errors = body.get("errors") if isinstance(body, dict) else None
+checks = checks if isinstance(checks, dict) else {}
+errors = errors if isinstance(errors, dict) else {}
+chain_errors = errors.get("event_chain")
+chain_errors = chain_errors if isinstance(chain_errors, list) else []
+result = {
+    "schema_version": 1,
+    "run_id": run_id,
+    "variant": variant,
+    "source_sha": revision,
+    "image_id": image_id,
+    "http_status": int(raw_status),
+    "event_chain_failed": checks.get("event_chain") is False,
+    "other_checks_ready": all(checks.get(name) is True for name in ("database", "nats", "policy")),
+    "missing_durable_receipt": any(
+        isinstance(item, str) and "without a durable receipt" in item
+        for item in chain_errors
+    ),
+    "recovered_http_200": False,
+    "worker_up_after_recovery": False,
+}
+pathlib.Path(receipt_path).write_text(
+    json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+)
+# An actual HTTP 200 is a measured sensitivity failure, not malformed data.
+# Repair the fixture and let the evaluator classify it as a candidate FAIL.
+if not (
+    result["http_status"] == 503
+    and result["event_chain_failed"]
+    and result["other_checks_ready"]
+    and result["missing_durable_receipt"]
+):
+    print(f"{variant}: negative-control sensitivity failed", file=sys.stderr)
+PY
+  # Recreate the exact original receipt and aged state; then require three
+  # fresh 200s to prove recovery, not just failure detection.
+  psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -c "
+    INSERT INTO domain_event_consumptions (consumer_name, event_id)
+      VALUES ('weltgewebe-api-domain-receipts-v1', ${event_id});
+    UPDATE domain_outbox
+       SET published_at = NOW() - INTERVAL '12 minutes'
+     WHERE id=${event_id};" > /dev/null
+  [[ "$(psql "${DATABASE_URL}" -At -c "SELECT count(*) FROM domain_event_consumptions WHERE consumer_name='weltgewebe-api-domain-receipts-v1' AND event_id=${event_id}")" == "1" ]]
+  sleep 1
+  for _ in 1 2 3; do
+    curl --fail --silent --show-error --max-time 3 \
+      --output /dev/null http://127.0.0.1:8787/health/ready
+  done
+  curl --fail --silent --show-error http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-negative-after.prom"
+  grep -F "commit=\"${sha}\"" "${ROOT}/${variant}-negative-after.prom" > /dev/null
+  for worker in relay receipt_consumer; do
+    grep -Eq "^domain_event_worker_up\\{worker=\"${worker}\"\\} 1([.]0)?$" "${ROOT}/${variant}-negative-after.prom"
+  done
+  python3 - "${receipt}" << 'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+data["recovered_http_200"] = True
+data["worker_up_after_recovery"] = True
+path.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
 # Run the FIX first. Host and PostgreSQL cache warming would otherwise
 # spuriously favor the new revision run second after a cold baseline. Both
 # revisions receive the same 140001 receipted recent and aged-event fixtures.
@@ -219,17 +317,19 @@ seed_recent
 measure fix recent "${FIX}"
 age_events
 measure fix aged "${FIX}"
+negative_control fix "${FIX}"
 start_api baseline "${BASELINE}" "${BASE_IMAGE}"
 seed_recent
 measure baseline recent "${BASELINE}"
 age_events
 measure baseline aged "${BASELINE}"
+negative_control baseline "${BASELINE}"
 
-python3 - "${ROOT}/manifest.json" "${RUN_ID}" "${ROOT}/baseline.image" "${ROOT}/fix.image" << 'PY'
+python3 - "${ROOT}/manifest.json" "${RUN_ID}" "${ROOT}/baseline.image" "${ROOT}/fix.image" "${ROOT}/baseline.running-image" "${ROOT}/fix.running-image" << 'PY'
 import json
 import pathlib
 import sys
-path, run_id, baseline, fix = sys.argv[1:]
+path, run_id, baseline, fix, runtime_baseline, runtime_fix = sys.argv[1:]
 manifest = {
     "schema_version": 1,
     "run_id": run_id,
@@ -244,6 +344,10 @@ manifest = {
         "baseline": pathlib.Path(baseline).read_text(encoding="utf-8"),
         "fix": pathlib.Path(fix).read_text(encoding="utf-8"),
     },
+    "observed_runtime_images": {
+        "baseline": pathlib.Path(runtime_baseline).read_text(encoding="utf-8"),
+        "fix": pathlib.Path(runtime_fix).read_text(encoding="utf-8"),
+    },
 }
 pathlib.Path(path).write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
@@ -253,4 +357,6 @@ python3 -B scripts/performance/event_chain_readiness_proof.py \
   --baseline-aged "${ROOT}/baseline-aged.json" \
   --fix-recent "${ROOT}/fix-recent.json" \
   --fix-aged "${ROOT}/fix-aged.json" \
+  --baseline-negative "${ROOT}/baseline-negative-control.json" \
+  --fix-negative "${ROOT}/fix-negative-control.json" \
   --report "${ROOT}/report.json"

@@ -16,7 +16,7 @@ from scripts.performance.event_chain_readiness_proof import (
     FIX_SHA,
     OLD_SHA,
     InvalidEvidence,
-    evaluate,
+    evaluate as evaluate_proof,
     validate_manifest,
 )
 
@@ -36,11 +36,12 @@ def manifest():
         "startup_ready": {"baseline": True, "fix": True},
         "run_order": ["fix", "baseline"],
         "images": {"baseline": BASE_IMAGE, "fix": FIX_IMAGE},
+        "observed_runtime_images": {"baseline": BASE_IMAGE, "fix": FIX_IMAGE},
     }
 
 
 def summary(variant="baseline", phase="recent", p95=500.0, p99=690.0,
-            statuses=(100, 0, 0), event_chain_timeout_count=None):
+            statuses=(100, 0, 0), event_chain_timeout_count=None, mixed_timeout_count=0):
     ok, unavailable, other = statuses
     if event_chain_timeout_count is None:
         event_chain_timeout_count = unavailable
@@ -71,6 +72,12 @@ def summary(variant="baseline", phase="recent", p95=500.0, p99=690.0,
             **({"proof_ready_503": {"values": {"count": unavailable}}} if unavailable else {}),
             **({"proof_ready_503_event_chain_timeout": {"values": {"count": event_chain_timeout_count}}}
                if event_chain_timeout_count else {}),
+            **({"proof_ready_503_check_false_event_chain": {"values": {"count": event_chain_timeout_count + mixed_timeout_count}}}
+               if event_chain_timeout_count + mixed_timeout_count else {}),
+            **({"proof_ready_503_check_false_database": {"values": {"count": mixed_timeout_count}}}
+               if mixed_timeout_count else {}),
+            **({"proof_ready_503_event_chain_timeout_mixed": {"values": {"count": mixed_timeout_count}}}
+               if mixed_timeout_count else {}),
             **({"proof_ready_503_other_cause": {"values": {"count": unavailable - event_chain_timeout_count}}}
                if unavailable > event_chain_timeout_count else {}),
             **({"proof_ready_other": {"values": {"count": other}}} if other else {}),
@@ -87,11 +94,37 @@ def policy():
 
 def runs():
     return {
-        ("baseline", "recent"): summary(p95=500, p99=690),
+        ("baseline", "recent"): summary(p95=752, p99=754, statuses=(30, 70, 0)),
         ("baseline", "aged"): summary(phase="aged", p95=60, p99=90),
         ("fix", "recent"): summary("fix", "recent", p95=70, p99=130),
         ("fix", "aged"): summary("fix", "aged", p95=55, p99=90),
     }
+
+
+def negative_controls():
+    result = {}
+    for variant in ("baseline", "fix"):
+        result[variant] = {
+            "schema_version": 1,
+            "run_id": "ct1940-test",
+            "variant": variant,
+            "source_sha": OLD_SHA if variant == "baseline" else FIX_SHA,
+            "image_id": BASE_IMAGE if variant == "baseline" else FIX_IMAGE,
+            "http_status": 503,
+            "event_chain_failed": True,
+            "other_checks_ready": True,
+            "missing_durable_receipt": True,
+            "recovered_http_200": True,
+            "worker_up_after_recovery": True,
+        }
+    return result
+
+
+def evaluate(manifest_data, run_data, policy_data, negatives=None):
+    return evaluate_proof(
+        manifest_data, run_data, policy_data,
+        negative_controls() if negatives is None else negatives,
+    )
 
 
 class EventChainReadinessProofTests(unittest.TestCase):
@@ -100,6 +133,41 @@ class EventChainReadinessProofTests(unittest.TestCase):
         self.assertEqual(result["status"], "pass")
         self.assertTrue(all(result["checks"].values()))
         self.assertEqual(result["runs"]["fix_recent"]["ready_503"], 0)
+
+    def test_mixed_db_event_chain_timeout_is_reported_without_claiming_joint_causality(self):
+        cases = runs()
+        cases[("baseline", "recent")] = summary(
+            p95=752.253, p99=752.632, statuses=(30, 388, 0),
+            event_chain_timeout_count=271, mixed_timeout_count=117,
+        )
+        result = evaluate(manifest(), cases, policy())
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["baseline_timeout_partition"], {
+            "exclusive_event_chain_timeout_503": 271,
+            "mixed_event_chain_and_database_timeout_503": 117,
+            "other_or_unclassified_503": 0,
+        })
+        self.assertTrue(result["checks"]["baseline_recent_cause_attributed"])
+        self.assertTrue(any("not uniquely attributed" in item for item in result["limitations"]))
+
+    def test_non_event_chain_or_nats_timeout_never_counts_as_pure_event_chain_improvement(self):
+        cases = runs()
+        cases[("baseline", "recent")] = summary(
+            p95=752, p99=754, statuses=(30, 388, 0),
+            event_chain_timeout_count=271, mixed_timeout_count=100,
+        )
+        result = evaluate(manifest(), cases, policy())
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertEqual(result["baseline_timeout_partition"]["other_or_unclassified_503"], 17)
+        cases = runs()
+        cases[("baseline", "recent")] = summary(
+            p95=752, p99=754, statuses=(30, 388, 0),
+            event_chain_timeout_count=271, mixed_timeout_count=117,
+        )
+        cases[("baseline", "recent")]["metrics"]["proof_ready_503_check_false_nats"] = {
+            "values": {"count": 1}
+        }
+        self.assertEqual(evaluate(manifest(), cases, policy())["status"], "inconclusive")
 
     def test_control_all_transport_errors_cannot_fake_an_effectiveness_pass(self):
         cases = runs()
@@ -131,6 +199,14 @@ class EventChainReadinessProofTests(unittest.TestCase):
         with self.assertRaisesRegex(InvalidEvidence, "readiness_503_cause_accounting_invalid"):
             evaluate(manifest(), cases, policy())
 
+    def test_http_200_with_skipped_event_chain_is_invalid_evidence(self):
+        cases = runs()
+        cases[("fix", "recent")]["metrics"]["proof_ready_200_incomplete"] = {
+            "values": {"count": 1}
+        }
+        with self.assertRaisesRegex(InvalidEvidence, "readiness_200_incomplete_checks"):
+            evaluate(manifest(), cases, policy())
+
     def test_observed_vus_and_duration_are_required(self):
         cases = runs()
         cases[("fix", "recent")]["metrics"]["vus_max"]["values"]["max"] = 11
@@ -140,6 +216,45 @@ class EventChainReadinessProofTests(unittest.TestCase):
         cases[("fix", "aged")]["state"]["testRunDurationMs"] = 5_000
         with self.assertRaisesRegex(InvalidEvidence, "observed_duration_mismatch"):
             evaluate(manifest(), cases, policy())
+
+    def test_fix_skipping_unreceipted_event_is_a_real_failure(self):
+        negatives = negative_controls()
+        negatives["fix"]["http_status"] = 200
+        negatives["fix"]["event_chain_failed"] = False
+        result = evaluate(manifest(), runs(), policy(), negatives)
+        self.assertEqual(result["status"], "fail")
+        self.assertFalse(result["checks"]["candidate_negative_control_detected"])
+
+    def test_baseline_missing_negative_detection_is_inconclusive(self):
+        negatives = negative_controls()
+        negatives["baseline"]["http_status"] = 200
+        self.assertEqual(
+            evaluate(manifest(), runs(), policy(), negatives)["status"], "inconclusive"
+        )
+
+    def test_missing_or_wrong_revision_negative_receipt_is_invalid(self):
+        cases = negative_controls()
+        cases.pop("fix")
+        with self.assertRaisesRegex(InvalidEvidence, "negative_control_missing"):
+            evaluate(manifest(), runs(), policy(), cases)
+        cases = negative_controls()
+        cases["fix"]["source_sha"] = OLD_SHA
+        with self.assertRaisesRegex(InvalidEvidence, "negative_control_binding"):
+            evaluate(manifest(), runs(), policy(), cases)
+
+    def test_corrupt_mixed_503_diagnostic_counts_are_invalid(self):
+        cases = runs()
+        cases[("baseline", "recent")]["metrics"]["proof_ready_503_event_chain_timeout_mixed"] = {
+            "values": {"count": 999}
+        }
+        with self.assertRaisesRegex(InvalidEvidence, "readiness_503_diagnostics_inconsistent"):
+            evaluate(manifest(), cases, policy())
+
+    def test_observed_container_image_identity_is_not_self_attested(self):
+        m = manifest()
+        m["observed_runtime_images"]["fix"] = BASE_IMAGE
+        with self.assertRaisesRegex(InvalidEvidence, "observed_container_image_identity"):
+            evaluate(m, runs(), policy())
 
     def test_candidate_503_is_real_failure_even_if_it_is_fast(self):
         cases = runs()
@@ -157,7 +272,7 @@ class EventChainReadinessProofTests(unittest.TestCase):
     def test_unhealthy_control_aged_is_not_valid_control(self):
         cases = runs()
         cases[("baseline", "aged")] = summary(phase="aged", p95=50, p99=90, statuses=(0, 100, 0))
-        self.assertEqual(evaluate(manifest(), cases, policy())["status"], "fail")
+        self.assertEqual(evaluate(manifest(), cases, policy())["status"], "inconclusive")
 
     def test_invalid_source_or_image_is_rejected(self):
         cases = runs()

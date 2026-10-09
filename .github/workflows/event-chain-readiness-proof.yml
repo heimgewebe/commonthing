@@ -80,6 +80,7 @@ jobs:
             ${{ runner.temp }}/ct1940-event-chain-proof/teardown.json
             ${{ runner.temp }}/ct1940-event-chain-proof/*-recent.json
             ${{ runner.temp }}/ct1940-event-chain-proof/*-aged.json
+            ${{ runner.temp }}/ct1940-event-chain-proof/*-negative-control.json
             ${{ runner.temp }}/ct1940-event-chain-proof/*-startup.prom
             ${{ runner.temp }}/ct1940-event-chain-proof/*-before.prom
             ${{ runner.temp }}/ct1940-event-chain-proof/*-after.prom
