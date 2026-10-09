@@ -285,6 +285,15 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(f"- '{path}'", docs_changes, path)
 
+        runtime_start = docs_changes.index("            api_runtime:")
+        runtime_end = docs_changes.index("            heavy:", runtime_start)
+        runtime_filter = docs_changes[runtime_start:runtime_end]
+        self.assertIn(
+            "- 'scripts/ci/postgres-proof-contract.json'",
+            runtime_filter,
+            "Changing the pinned JetStream image must run T048",
+        )
+
         caller = self.ci_source[
             self.ci_source.index("  api-runtime-proof:\n") : self.ci_source.index(
                 "  guard-tests:\n"

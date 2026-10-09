@@ -70,6 +70,7 @@ jobs:
               - 'scripts/tests/test_domain_scale.py'
               - 'scripts/ci/tests/test_api_runtime_evidence.py'
               - 'scripts/ci/tests/test_api_runtime_workflow.py'
+              - 'scripts/ci/postgres-proof-contract.json'
               - 'apps/api/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
