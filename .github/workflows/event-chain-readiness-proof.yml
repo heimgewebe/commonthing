@@ -9,6 +9,7 @@ name: Event-Chain Readiness A/B Proof
       - "scripts/performance/event_chain_readiness_*.js"
       - "scripts/performance/event_chain_readiness_*.sh"
       - "scripts/ci/tests/test_event_chain_readiness_proof.py"
+      - "scripts/ci/tests/event_chain_readiness_k6_classification.test.mjs"
       - "scripts/ci/postgres-proof-contract.json"
       - "policies/performance.v1.json"
   workflow_dispatch: {}

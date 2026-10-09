@@ -298,7 +298,7 @@ def evaluate(manifest: dict, runs: dict, policy: dict, negative_controls: dict) 
         "negative_controls": negative_results,
         "baseline_timeout_partition": {
             "exclusive_event_chain_timeout_503": baseline["ready_503_event_chain_timeout"],
-            "mixed_event_chain_and_database_timeout_503":
+            "mixed_event_chain_timeout_and_database_failure_503":
                 baseline["ready_503_event_chain_timeout_mixed"],
             "other_or_unclassified_503": (
                 baseline["ready_503_other_cause"]
@@ -313,6 +313,7 @@ def evaluate(manifest: dict, runs: dict, policy: dict, negative_controls: dict) 
             "one paired run does not prove the cause of the archived 267 readiness 503s",
             "mixed-health-and-search T048 is not rerun; the probe measures readiness only",
             "performance changes on a shared runner require repetition before a capacity claim",
+            "PASS is per one paired attempt only; rerun selection and variable control timeout rates do not prove reproducibility",
         ],
     }
 

@@ -144,7 +144,7 @@ class EventChainReadinessProofTests(unittest.TestCase):
         self.assertEqual(result["status"], "pass")
         self.assertEqual(result["baseline_timeout_partition"], {
             "exclusive_event_chain_timeout_503": 271,
-            "mixed_event_chain_and_database_timeout_503": 117,
+            "mixed_event_chain_timeout_and_database_failure_503": 117,
             "other_or_unclassified_503": 0,
         })
         self.assertTrue(result["checks"]["baseline_recent_cause_attributed"])
@@ -189,6 +189,10 @@ class EventChainReadinessProofTests(unittest.TestCase):
         # Mutation guards: counting mixed 503s, counting all 503s, using OR
         # instead of AND, or dropping either materiality threshold must fail.
         cases_to_check = (
+            # These two fixtures independently kill either mutation that
+            # counts mixed/all 503s instead of exclusive timeout 503s.
+            (19, 1, 100, "inconclusive"),  # count: 19 pure, 20 total 503
+            (20, 20, 300, "inconclusive"),  # ratio: 6.7% pure, 13.3% total
             (19, 300, 400, "inconclusive"),
             (19, 0, 100, "inconclusive"),
             (25, 0, 1000, "inconclusive"),
@@ -204,6 +208,17 @@ class EventChainReadinessProofTests(unittest.TestCase):
                     mixed_timeout_count=mixed,
                 )
                 self.assertEqual(evaluate(manifest(), samples, policy())["status"], verdict)
+
+    def test_actual_k6_javascript_classifies_synthetic_http_bodies(self):
+        # Exercise the checked-in ESM module itself: do not mock the classifier
+        # or guess the published k6 metric names via static text matching.
+        root = Path(__file__).resolve().parents[3]
+        script = root / "scripts/ci/tests/event_chain_readiness_k6_classification.test.mjs"
+        proc = subprocess.run(
+            ["node", "--no-warnings", "--experimental-vm-modules", str(script)],
+            cwd=root, capture_output=True, text=True, check=False, timeout=20,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_each_missing_receipt_detection_flag_is_required_for_both_variants(self):
         for flag in ("event_chain_failed", "other_checks_ready", "missing_durable_receipt"):
