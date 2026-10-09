@@ -45,6 +45,21 @@ class ExperimentBT048ReadyStreakTests(unittest.TestCase):
             )
         self.assertEqual(read.call_count, 120)
 
+    def test_experiment_b_drains_full_pipeline_before_t048_measurement(self) -> None:
+        source = inspect.getsource(runtime.t048_load_proof)
+        fixture = source.index("_validated_t048_fixture_receipt(")
+        drain = source.index("_wait_event_pipeline_quiescent(")
+        ready = source.index('_wait_http_200(f"{base_url}/health/ready"')
+        metrics = source.index('_http_read(f"{base_url}/metrics")')
+        load = source.index("load = subprocess.Popen(")
+        self.assertLess(fixture, drain)
+        self.assertLess(drain, ready)
+        self.assertLess(ready, metrics)
+        self.assertLess(metrics, load)
+        binding = source[drain:ready]
+        self.assertIn("source_commit=source_commit", binding)
+        self.assertIn("database_identity=database_identity", binding)
+
     def test_experiment_b_gates_measurement_on_stable_readiness(self) -> None:
         source = inspect.getsource(runtime.t048_load_proof)
         search = source.index("_prime_t048_search_metric(")

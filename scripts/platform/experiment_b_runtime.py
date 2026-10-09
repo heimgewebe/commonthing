@@ -13511,8 +13511,14 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     base_url = f"http://127.0.0.1:{port}"
     try:
         _prime_t048_search_metric(base_url, scenario["search_query"])
-        # The shared T048 k6 workload counts every readiness 503 as a
-        # measured failure. Exclude initial startup by proving stable ready 200.
+        # Loading the fixture enqueues domain events via production triggers.
+        # Verify a stable full relay/receipt/JetStream drain before measuring.
+        _wait_event_pipeline_quiescent(
+            root,
+            source_commit=source_commit,
+            database_identity=database_identity,
+        )
+        # After the full event drain, count each readiness 503 during T048.
         _wait_http_200(f"{base_url}/health/ready", process, consecutive=3)
         before_status, before_body, _elapsed = _http_read(f"{base_url}/metrics")
         if before_status != 200:
