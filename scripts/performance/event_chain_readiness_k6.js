@@ -17,6 +17,14 @@ const READY_200 = new Counter('proof_ready_200');
 const READY_503 = new Counter('proof_ready_503');
 const READY_503_EVENT_CHAIN_TIMEOUT = new Counter('proof_ready_503_event_chain_timeout');
 const READY_503_OTHER_CAUSE = new Counter('proof_ready_503_other_cause');
+const READY_503_CHAIN_TIMEOUT_MIXED = new Counter('proof_ready_503_event_chain_timeout_mixed');
+const READY_503_PARSE_ERROR = new Counter('proof_ready_503_parse_error');
+const READY_503_COMPONENT_FALSE = {
+  database: new Counter('proof_ready_503_check_false_database'),
+  nats: new Counter('proof_ready_503_check_false_nats'),
+  event_chain: new Counter('proof_ready_503_check_false_event_chain'),
+  policy: new Counter('proof_ready_503_check_false_policy'),
+};
 const READY_OTHER = new Counter('proof_ready_other');
 
 http.setResponseCallback(http.expectedStatuses(200));
@@ -36,19 +44,27 @@ export default function () {
     try {
       body = response.json();
     } catch (_) {
-      // A malformed 503 is never credited to the event-chain timeout.
+      // No response body is ever copied to logs or evidence.
     }
     const checks = body && body.checks;
     const errors = body && body.errors;
+    if (!checks || typeof checks !== 'object') READY_503_PARSE_ERROR.add(1);
+    for (const component of Object.keys(READY_503_COMPONENT_FALSE)) {
+      if (checks && checks[component] === false) READY_503_COMPONENT_FALSE[component].add(1);
+    }
     const eventErrors = errors && errors.event_chain;
+    const hasEventChainTimeout = Array.isArray(eventErrors) &&
+      eventErrors.includes('readiness check timed out after 750 ms');
     const eventChainTimeoutOnly =
       checks && checks.event_chain === false &&
       checks.database === true && checks.nats === true && checks.policy === true &&
-      Array.isArray(eventErrors) &&
-      eventErrors.includes('readiness check timed out after 750 ms') &&
+      hasEventChainTimeout &&
       !errors.database && !errors.nats && !errors.policy;
     if (eventChainTimeoutOnly) READY_503_EVENT_CHAIN_TIMEOUT.add(1);
-    else READY_503_OTHER_CAUSE.add(1);
+    else {
+      READY_503_OTHER_CAUSE.add(1);
+      if (hasEventChainTimeout) READY_503_CHAIN_TIMEOUT_MIXED.add(1);
+    }
   } else READY_OTHER.add(1);
 }
 
