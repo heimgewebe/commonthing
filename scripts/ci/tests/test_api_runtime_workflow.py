@@ -34,6 +34,19 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("weltgewebe_search_generation_activation_ready", self.job)
         self.assertIn("weltgewebe_activate_search_generation", self.job)
 
+    def test_readiness_is_stable_before_starting_measured_load(self) -> None:
+        start = self.job.index("name: Start and warm the measured API container")
+        bound = self.job.index("name: Bind live API runtime to the exact fixture")
+        measure = self.job.index(
+            "name: Measure the canonical mixed-health-and-read scenario"
+        )
+        self.assertLess(start, bound)
+        self.assertLess(bound, measure)
+        warmup = self.job[start:bound]
+        self.assertIn("http://127.0.0.1:8787/health/ready", warmup)
+        self.assertIn("READINESS_STREAK=$((READINESS_STREAK + 1))", warmup)
+        self.assertIn('if [[ "${READINESS_STREAK}" -lt 3 ]]', warmup)
+
     def test_scenario_values_come_from_the_canonical_policy(self) -> None:
         self.assertIn(
             "from scripts.performance.api_runtime_evidence import api_runtime_section, load_policy",

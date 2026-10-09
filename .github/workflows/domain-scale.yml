@@ -502,6 +502,25 @@ jobs:
             --data-urlencode "q=${API_RUNTIME_SEARCH_QUERY}" \
             --data-urlencode "limit=5" \
             http://127.0.0.1:8787/search >/dev/null
+          # This is a post-deploy throughput test, not a cold-start test.
+          # Require sustained readiness before counting in-load 503s as failures.
+          READINESS_STREAK=0
+          for _ in {1..120}; do
+            if curl -fsS --max-time 2 http://127.0.0.1:8787/health/ready >/dev/null 2>&1; then
+              READINESS_STREAK=$((READINESS_STREAK + 1))
+              if [[ "${READINESS_STREAK}" -ge 3 ]]; then
+                break
+              fi
+            else
+              READINESS_STREAK=0
+            fi
+            sleep 1
+          done
+          if [[ "${READINESS_STREAK}" -lt 3 ]]; then
+            echo "T048 API did not sustain 3 readiness 200s before load" >&2
+            docker logs "${API_CONTAINER}" >&2
+            exit 1
+          fi
           curl -fsS http://127.0.0.1:8787/metrics \
             | grep -F "commit=\"${{ steps.image.outputs.commit }}\"" >/dev/null
 

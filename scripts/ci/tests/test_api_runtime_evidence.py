@@ -283,6 +283,24 @@ class PolicyBindingTests(unittest.TestCase):
             ["peak_cpu_percent", "peak_memory_bytes", "database_connections"],
         )
 
+    def test_post_deploy_readiness_503_policy_is_explicit(self) -> None:
+        policy = _load_policy()["measurements"]["api_runtime"]
+        self.assertEqual(policy["metrics"]["http_request_failed_rate"]["max"], 0.01)
+        limitations = policy["limitations"]
+        self.assertTrue(
+            any(
+                "a /health/ready HTTP 503 during the measured load counts" in value
+                for value in limitations
+            )
+        )
+        self.assertTrue(
+            any(
+                "earlier 503-tolerant run artifacts are not retrospectively reclassified"
+                in value
+                for value in limitations
+            )
+        )
+
     def test_policy_defines_repository_duration_span(self) -> None:
         policy = _load_policy()
         limitations = policy["measurements"]["api_runtime"]["limitations"]
@@ -443,13 +461,15 @@ class K6SummaryParsingTests(unittest.TestCase):
 
 
 class K6ScriptContractTests(unittest.TestCase):
-    def test_503_tolerance_is_scoped_to_readiness_only(self) -> None:
+    def test_post_deploy_ready_503_is_an_http_failure(self) -> None:
         source = (ROOT / "scripts/performance/api_runtime_k6.js").read_text(encoding="utf-8")
         self.assertIn("http.setResponseCallback(http.expectedStatuses(200));", source)
-        self.assertIn("READY_RESPONSE_CALLBACK = http.expectedStatuses(200, 503)", source)
+        self.assertIn("READY_RESPONSE_CALLBACK = http.expectedStatuses(200)", source)
+        self.assertNotIn("expectedStatuses(200, 503)", source)
         self.assertIn("responseCallback: READY_RESPONSE_CALLBACK", source)
-        self.assertRegex(source, r"[\'\"]search 200[\'\"]: \(r\) => r\.status === 200")
-        self.assertNotIn("http.setResponseCallback(http.expectedStatuses(200, 503));", source)
+        self.assertIn("'ready 200': (r) => r.status === 200", source)
+        self.assertIn("'search 200': (r) => r.status === 200", source)
+
         self.assertIn("API_RUNTIME_DATASET_PROFILE is required", source)
         self.assertIn("API_RUNTIME_SEARCH_QUERY is required", source)
         self.assertIn("API_RUNTIME_DATASET_MANIFEST_SHA256", source)
@@ -465,6 +485,21 @@ class K6ScriptContractTests(unittest.TestCase):
         self.assertIn("weltgewebe_k6_image", source)
         self.assertNotIn("API_RUNTIME_DATASET_PROFILE || 'domain-scale-ci'", source)
         self.assertNotRegex(source, r"API_RUNTIME_SEARCH_QUERY\s*\|\|")
+
+    def test_real_k6_module_classifies_503_as_an_http_failure(self) -> None:
+        completed = subprocess.run(
+            [
+                "node",
+                "--experimental-vm-modules",
+                str(ROOT / "scripts/ci/tests/api_runtime_k6_classification.test.mjs"),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
 
 class AssembleReportTests(unittest.TestCase):
