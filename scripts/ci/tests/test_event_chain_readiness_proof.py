@@ -185,6 +185,84 @@ class EventChainReadinessProofTests(unittest.TestCase):
         self.assertEqual(result["status"], "inconclusive")
         self.assertFalse(result["checks"]["baseline_recent_cause_attributed"])
 
+    def test_event_chain_efficacy_requires_both_count_and_ratio_boundaries(self):
+        # Mutation guards: counting mixed 503s, counting all 503s, using OR
+        # instead of AND, or dropping either materiality threshold must fail.
+        cases_to_check = (
+            (19, 300, 400, "inconclusive"),
+            (19, 0, 100, "inconclusive"),
+            (25, 0, 1000, "inconclusive"),
+            (20, 0, 200, "pass"),
+        )
+        for pure, mixed, total, verdict in cases_to_check:
+            with self.subTest(pure=pure, mixed=mixed, total=total):
+                samples = runs()
+                samples[("baseline", "recent")] = summary(
+                    p95=752, p99=754,
+                    statuses=(total - pure - mixed, pure + mixed, 0),
+                    event_chain_timeout_count=pure,
+                    mixed_timeout_count=mixed,
+                )
+                self.assertEqual(evaluate(manifest(), samples, policy())["status"], verdict)
+
+    def test_each_missing_receipt_detection_flag_is_required_for_both_variants(self):
+        for flag in ("event_chain_failed", "other_checks_ready", "missing_durable_receipt"):
+            for variant in ("baseline", "fix"):
+                with self.subTest(flag=flag, variant=variant):
+                    negatives = negative_controls()
+                    negatives[variant][flag] = False
+                    result = evaluate(manifest(), runs(), policy(), negatives)
+                    self.assertEqual(
+                        result["status"],
+                        "fail" if variant == "fix" else "inconclusive",
+                    )
+                    self.assertFalse(result["negative_controls"][variant]["detected"])
+
+    def test_both_negative_control_recovery_signals_are_required(self):
+        for variant in ("baseline", "fix"):
+            for flag in ("recovered_http_200", "worker_up_after_recovery"):
+                with self.subTest(variant=variant, flag=flag):
+                    negatives = negative_controls()
+                    negatives[variant][flag] = False
+                    with self.assertRaisesRegex(
+                        InvalidEvidence, "negative_control_recovery_missing"
+                    ):
+                        evaluate(manifest(), runs(), policy(), negatives)
+
+    def test_mixed_baseline_errors_require_consistent_database_policy_and_parse_counts(self):
+        mutations = (
+            ("proof_ready_503_parse_error", 1),
+            ("proof_ready_503_check_false_database", 116),
+            ("proof_ready_503_check_false_policy", 1),
+        )
+        for metric, count in mutations:
+            with self.subTest(metric=metric):
+                cases = runs()
+                cases[("baseline", "recent")] = summary(
+                    p95=752, p99=754, statuses=(30, 388, 0),
+                    event_chain_timeout_count=271, mixed_timeout_count=117,
+                )
+                cases[("baseline", "recent")]["metrics"][metric] = {
+                    "values": {"count": count}
+                }
+                result = evaluate(manifest(), cases, policy())
+                self.assertEqual(result["status"], "inconclusive")
+                self.assertFalse(result["checks"]["baseline_recent_cause_attributed"])
+
+    def test_mixed_timeout_counter_cannot_exceed_event_chain_component_failures(self):
+        cases = runs()
+        cases[("baseline", "recent")] = summary(
+            p95=752, p99=754, statuses=(30, 388, 0),
+            event_chain_timeout_count=271, mixed_timeout_count=117,
+        )
+        cases[("baseline", "recent")]["metrics"][
+            "proof_ready_503_check_false_event_chain"
+        ]["values"]["count"] = 387
+        with self.assertRaisesRegex(
+            InvalidEvidence, "readiness_503_diagnostics_inconsistent"
+        ):
+            evaluate(manifest(), cases, policy())
+
     def test_one_stray_event_chain_503_is_not_material_improvement(self):
         cases = runs()
         cases[("baseline", "recent")] = summary(p95=70, p99=130, statuses=(9999, 1, 0))

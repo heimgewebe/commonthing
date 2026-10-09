@@ -307,6 +307,7 @@ def evaluate(manifest: dict, runs: dict, policy: dict, negative_controls: dict) 
         },
         "limitations": [
             "mixed database/Event-Chain timeouts are correlated failures, not uniquely attributed to the Event-Chain scan; only exclusive timeout 503s count toward efficacy",
+            "the missing-receipt negative control runs after the aged phase; it does not prove negative-control sensitivity under concurrent recent-event load",
             "isolated GitHub runner, not production or a complete Experiment-B cell",
             "recent versus aged published events, not a historical deployment cold start",
             "one paired run does not prove the cause of the archived 267 readiness 503s",

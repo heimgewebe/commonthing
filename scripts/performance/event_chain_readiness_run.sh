@@ -7,6 +7,8 @@ set -Eeuo pipefail
 [[ "${GITHUB_ACTIONS:-}" == "true" && -n "${RUNNER_TEMP:-}" && -n "${GITHUB_RUN_ID:-}" ]]
 [[ "${DATABASE_URL:-}" == "postgres://postgres:postgres@127.0.0.1:5432/postgres" ]]
 [[ "${NATS_URL:-}" == "nats://127.0.0.1:4222" ]]
+# Keep isolated fixture mutations finite; a timeout is a proof failure, never a PASS.
+export PGOPTIONS='-c statement_timeout=120000 -c lock_timeout=30000'
 
 BASELINE="4164c5b337c7d09dc4e3229b0705b9a2076fd9e9"
 FIX="66c77f39de4a67783e8ab42daa305193d8e4450d"
@@ -143,7 +145,7 @@ start_api() {
     echo "${variant}: startup never had 3 successful readiness probes" >&2
     exit 1
   }
-  curl --fail --silent --show-error http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-startup.prom"
+  curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-startup.prom"
   grep -F "commit=\"${sha}\"" "${ROOT}/${variant}-startup.prom" > /dev/null
   grep -Eq '^domain_event_worker_up\{worker="relay"\} 1([.]0)?$' "${ROOT}/${variant}-startup.prom"
   grep -Eq '^domain_event_worker_up\{worker="receipt_consumer"\} 1([.]0)?$' "${ROOT}/${variant}-startup.prom"
@@ -192,7 +194,7 @@ measure() {
   local image_id filename
   image_id="$(cat "${ROOT}/${variant}.image")"
   filename="/evidence/${variant}-${phase}.json"
-  curl --fail --silent --show-error http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-${phase}-before.prom"
+  curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-${phase}-before.prom"
   docker run --rm --network host \
     --user "$(id -u):$(id -g)" \
     --volume "${PWD}:/workspace:ro" \
@@ -205,7 +207,7 @@ measure() {
     --env "PROOF_IMAGE_ID=${image_id}" \
     --env "PROOF_SUMMARY_PATH=${filename}" \
     "${K6_IMAGE}" run scripts/performance/event_chain_readiness_k6.js
-  curl --fail --silent --show-error http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-${phase}-after.prom"
+  curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-${phase}-after.prom"
   # A fast response is not healthy when relay or receipt consumer has exited.
   grep -F "commit=\"${sha}\"" "${ROOT}/${variant}-${phase}-after.prom" > /dev/null
   for worker in relay receipt_consumer; do
@@ -292,7 +294,7 @@ PY
     curl --fail --silent --show-error --max-time 3 \
       --output /dev/null http://127.0.0.1:8787/health/ready
   done
-  curl --fail --silent --show-error http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-negative-after.prom"
+  curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8787/metrics > "${ROOT}/${variant}-negative-after.prom"
   grep -F "commit=\"${sha}\"" "${ROOT}/${variant}-negative-after.prom" > /dev/null
   for worker in relay receipt_consumer; do
     grep -Eq "^domain_event_worker_up\\{worker=\"${worker}\"\\} 1([.]0)?$" "${ROOT}/${variant}-negative-after.prom"
