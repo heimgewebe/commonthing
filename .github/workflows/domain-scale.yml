@@ -467,6 +467,38 @@ jobs:
             "SELECT count(*) FROM search_index_generations WHERE state = 'active'" \
             "1"
 
+      - name: Reset synthetic fixture outbox before readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The disposable SQL fixture inserts map records via production
+          # triggers. Their setup-only backlog is not T048 read traffic.
+          # Refuse to erase published, quarantined or foreign event state.
+          psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 <<'SQL'
+          BEGIN;
+          DO $t048_fixture$
+          BEGIN
+            IF EXISTS (
+              SELECT 1 FROM domain_outbox
+              WHERE aggregate_type NOT IN ('node', 'edge', 'conversation')
+                 OR published_at IS NOT NULL
+                 OR quarantined_at IS NOT NULL
+                 OR attempt_count > 0
+            ) OR EXISTS (SELECT 1 FROM domain_event_consumptions) THEN
+              RAISE EXCEPTION 'T048 fixture outbox contains non-fixture event state';
+            END IF;
+          END;
+          $t048_fixture$;
+          TRUNCATE TABLE domain_event_consumptions, domain_outbox RESTART IDENTITY CASCADE;
+          COMMIT;
+          SQL
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_outbox')" = "0"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_event_consumptions')" = "0"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_nodes')" = \
+            "${{ steps.contract.outputs.node_count }}"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_edges')" = \
+            "${{ steps.contract.outputs.edge_count }}"
+
       - name: Start isolated JetStream for measured API
         shell: bash
         run: |

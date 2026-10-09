@@ -59,6 +59,24 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn('--env "NATS_URL=nats://127.0.0.1:4222"', warmup)
         self.assertIn("--env WELTGEWEBE_DOMAIN_JETSTREAM_REPLICAS=1", warmup)
 
+    def test_isolated_fixture_backlog_is_reset_before_readiness(self) -> None:
+        fixture = self.job.index("name: Load the canonical fixture into the migrated API database")
+        reset = self.job.index("name: Reset synthetic fixture outbox before readiness")
+        broker = self.job.index("name: Start isolated JetStream for measured API")
+        self.assertLess(fixture, reset)
+        self.assertLess(reset, broker)
+        source = self.job[reset:broker]
+        self.assertIn('psql "${DATABASE_URL}" -v ON_ERROR_STOP=1', source)
+        self.assertIn("aggregate_type NOT IN ('node', 'edge', 'conversation')", source)
+        self.assertIn("published_at IS NOT NULL", source)
+        self.assertEqual(source.count("$t048_fixture$"), 2)
+        self.assertIn("quarantined_at IS NOT NULL", source)
+        self.assertIn("attempt_count > 0", source)
+        self.assertIn("domain_event_consumptions", source)
+        self.assertIn("TRUNCATE TABLE domain_event_consumptions, domain_outbox RESTART IDENTITY CASCADE", source)
+        self.assertIn("SELECT count(*) FROM domain_outbox", source)
+        self.assertIn("SELECT count(*) FROM domain_nodes", source)
+
     def test_readiness_is_stable_before_starting_measured_load(self) -> None:
         start = self.job.index("name: Start and warm the measured API container")
         bound = self.job.index("name: Bind live API runtime to the exact fixture")

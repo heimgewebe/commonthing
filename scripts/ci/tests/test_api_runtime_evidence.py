@@ -300,6 +300,9 @@ class PolicyBindingTests(unittest.TestCase):
                 for value in limitations
             )
         )
+        self.assertTrue(
+            any("does not establish bulk event ingestion throughput" in item for item in limitations)
+        )
 
     def test_policy_defines_repository_duration_span(self) -> None:
         policy = _load_policy()
