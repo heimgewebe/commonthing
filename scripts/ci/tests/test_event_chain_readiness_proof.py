@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Tests for the isolated Event-Chain readiness A/B receipt gate."""
+import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -175,6 +179,47 @@ class EventChainReadinessProofTests(unittest.TestCase):
         report = evaluate(manifest(), runs(), policy())
         self.assertTrue(any("historical" in item for item in report["limitations"]))
         self.assertTrue(any("not production" in item for item in report["limitations"]))
+
+    def _exercise_real_cleanup_trap(self, experiment_exit: int, leak: bool) -> tuple[int, dict]:
+        shell = (Path(__file__).resolve().parents[2] / "performance" / "event_chain_readiness_run.sh").read_text(
+            encoding="utf-8"
+        )
+        start = shell.index("cleanup() {")
+        end = shell.index("\ntrap cleanup EXIT", start)
+        function = shell[start:end]
+        # Stub the two potentially mutating external commands. This executes
+        # the actual checked-in EXIT trap without Docker, Git or network access.
+        script = """
+set -Eeuo pipefail
+docker() {
+  if [[ "$1" == "ps" ]]; then
+    if [[ "$STUB_LEAK" == "yes" ]]; then echo "$API_CONTAINER"; fi
+    return 0
+  fi
+  if [[ "$1" == "image" && "$2" == "inspect" ]]; then return 1; fi
+  return 0
+}
+git() { return 0; }
+""" + function + "\ntrap cleanup EXIT\nexit " + str(experiment_exit) + "\n"
+        with tempfile.TemporaryDirectory(prefix="ct1940-teardown-test-") as root:
+            env = dict(os.environ, ROOT=root, API_CONTAINER="ct1940-test-api",
+                       NATS_CONTAINER="ct1940-test-nats", BASE_IMAGE="ct1940-base:test",
+                       FIX_IMAGE="ct1940-fix:test", STUB_LEAK="yes" if leak else "no")
+            proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
+                                  text=True, check=False, timeout=10)
+            receipt = json.loads((Path(root) / "teardown.json").read_text(encoding="utf-8"))
+        return proc.returncode, receipt
+
+    def test_cleanup_pass_can_coexist_with_expected_inconclusive_exit(self):
+        exit_code, receipt = self._exercise_real_cleanup_trap(experiment_exit=2, leak=False)
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(receipt["status"], "pass")
+        self.assertTrue(receipt["api_removed"])
+
+    def test_cleanup_failure_blocks_successful_experiment(self):
+        exit_code, receipt = self._exercise_real_cleanup_trap(experiment_exit=0, leak=True)
+        self.assertNotEqual(exit_code, 0)
+        self.assertEqual(receipt["status"], "fail")
 
 
 if __name__ == "__main__":
