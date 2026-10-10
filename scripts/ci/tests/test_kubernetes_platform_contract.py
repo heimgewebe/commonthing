@@ -1220,6 +1220,139 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             handle.close()
         return Path(handle.name)
 
+    def _validate_pending_oci_seed(
+        self, *, mutate_seed=None, mutate_lock=None, unchanged_seed=False
+    ) -> dict[str, object]:
+        """Simulate a reviewed next digest without registry writes or source Git changes."""
+        original = (ROOT / "platform/oci-proof-mirror.seed.json").read_bytes()
+        seed = json.loads(original)
+        seed["images"]["build_debian"]["canonical"] = (
+            "docker.io/library/debian:bookworm-slim@sha256:" + "0" * 64
+        )
+        if mutate_seed is not None:
+            mutate_seed(seed)
+        seed_bytes = (
+            original
+            if unchanged_seed
+            else (json.dumps(seed, sort_keys=True) + "\n").encode("utf-8")
+        )
+        lock = json.loads(
+            (ROOT / "platform/oci-proof-mirror.lock.json").read_text(encoding="utf-8")
+        )
+        lock["generation"]["pending_seed_sha256"] = hashlib.sha256(
+            seed_bytes
+        ).hexdigest()
+        if mutate_lock is not None:
+            mutate_lock(lock)
+
+        def verified_git_read(argv, **_kwargs):
+            if argv[:2] == ["git", "show"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=original)
+            return subprocess.CompletedProcess(argv, 0, stdout=b"")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "platform").mkdir()
+            (root / "platform/oci-proof-mirror.seed.json").write_bytes(seed_bytes)
+            lock_path = root / "platform/oci-proof-mirror.lock.json"
+            lock_path.write_text(json.dumps(lock), encoding="utf-8")
+            with (
+                mock.patch.object(self.oci_mirror, "ROOT", root),
+                mock.patch.object(self.oci_mirror, "LOCK_PATH", lock_path),
+                mock.patch.object(
+                    self.oci_mirror.subprocess,
+                    "run",
+                    side_effect=verified_git_read,
+                ),
+            ):
+                return self.oci_mirror._load_lock()
+
+    def test_oci_mirror_pending_seed_preserves_published_lock_authority(self) -> None:
+        locked = self._validate_pending_oci_seed()
+        current_lock = json.loads(
+            (ROOT / "platform/oci-proof-mirror.lock.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(locked["images"], current_lock["images"])
+        self.assertNotEqual(
+            locked["generation"]["pending_seed_sha256"],
+            locked["generation"]["seed_sha256"],
+        )
+
+    def test_oci_mirror_pending_seed_rejects_unbound_and_unsafe_changes(self) -> None:
+        scenarios = [
+            (
+                "missing exact pending digest",
+                None,
+                lambda lock: lock["generation"].pop("pending_seed_sha256"),
+                self.oci_mirror.AncestryError,
+            ),
+            (
+                "wrong pending digest",
+                None,
+                lambda lock: lock["generation"].__setitem__(
+                    "pending_seed_sha256", "a" * 64
+                ),
+                self.oci_mirror.AncestryError,
+            ),
+            (
+                "stale pending marker",
+                None,
+                None,
+                self.oci_mirror.AncestryError,
+            ),
+            (
+                "publisher permission downgrade",
+                lambda seed: seed["publisher"].__setitem__(
+                    "require_protected_main", False
+                ),
+                None,
+                self.oci_mirror.IntegrityError,
+            ),
+            (
+                "different registry",
+                lambda seed: seed["images"]["build_debian"].__setitem__(
+                    "canonical", "docker.io/library/ubuntu@sha256:" + "0" * 64
+                ),
+                None,
+                self.oci_mirror.IntegrityError,
+            ),
+            (
+                "lost digest pin",
+                lambda seed: seed["images"]["build_debian"].__setitem__(
+                    "canonical", "docker.io/library/debian:bookworm-slim"
+                ),
+                None,
+                self.oci_mirror.IntegrityError,
+            ),
+            (
+                "changed proof suite",
+                lambda seed: seed["images"]["build_debian"].__setitem__(
+                    "suites", ["kind-gitops"]
+                ),
+                None,
+                self.oci_mirror.IntegrityError,
+            ),
+            (
+                "lock rewritten without publisher",
+                None,
+                lambda lock: lock["images"]["build_debian"].__setitem__(
+                    "canonical",
+                    "docker.io/library/debian:bookworm-slim@sha256:" + "0" * 64,
+                ),
+                self.oci_mirror.IntegrityError,
+            ),
+        ]
+        for name, seed_change, lock_change, failure in scenarios:
+            with self.subTest(name=name):
+                with self.assertRaises(failure):
+                    self._validate_pending_oci_seed(
+                        mutate_seed=seed_change,
+                        mutate_lock=lock_change,
+                        unchanged_seed=name == "stale pending marker",
+                    )
+
     def test_oci_mirror_lock_rejects_unreachable_source_head(self) -> None:
         """Network-independent: synthetic commit id is not a local object."""
         path = self._write_mutated_oci_lock(
