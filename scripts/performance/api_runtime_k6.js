@@ -43,19 +43,15 @@ if (!K6_IMAGE || !/^.+@sha256:[0-9a-f]{64}$/.test(K6_IMAGE)) {
 const CONCURRENCY_PROFILE =
   __ENV.API_RUNTIME_CONCURRENCY_PROFILE || 'mixed-health-and-read';
 
-// k6's http_req_failed metric only reflects network-level errors by default
-// (DNS/TCP/timeout), never HTTP status codes, which would make the
-// http_request_failed_rate gate blind to real 5xx responses. Only
-// /health/ready legitimately reports 503 for expected unavailability (its
-// dependencies are still starting up); every other endpoint, including
-// /search, must return 200 to count as a success, so a 503 there is a real
-// failure and must count against http_req_failed. The 503 tolerance below is
-// therefore scoped to the /health/ready request only, not set globally.
+// This post-deploy load starts only after the API has passed the readiness
+// warm-up. Every route, including /health/ready, must therefore return 200;
+// otherwise k6's http_req_failed metric must count the failed response.
+// Keep the canonical failure-rate budget in policies/performance.v1.json.
 http.setResponseCallback(http.expectedStatuses(200));
-const READY_RESPONSE_CALLBACK = http.expectedStatuses(200, 503);
+const READY_RESPONSE_CALLBACK = http.expectedStatuses(200);
 
-// Fixed-cardinality diagnostic counters. A 503 still retains the historical
-// response classification: these counters do not change T048 pass/fail gates.
+// Fixed-cardinality component diagnostics supplement the HTTP failure metric.
+// A 503 counts toward the canonical T048 failure-rate gate regardless of cause.
 const READY_SAMPLES = new Counter('t048_ready_samples');
 const READY_HTTP_503 = new Counter('t048_ready_http_503');
 const READY_UNCLASSIFIED = new Counter('t048_ready_unclassified');
@@ -82,7 +78,7 @@ export default function () {
   const ready = http.get(`${BASE_URL}/health/ready`, {
     responseCallback: READY_RESPONSE_CALLBACK,
   });
-  check(ready, { 'ready 2xx/5xx': (r) => r.status === 200 || r.status === 503 });
+  check(ready, { 'ready 200': (r) => r.status === 200 });
   READY_SAMPLES.add(1);
   if (ready.status === 503) {
     READY_HTTP_503.add(1);
@@ -109,10 +105,8 @@ export default function () {
   // telemetry (search_repository_duration_seconds); scripts/performance/
   // api_runtime_evidence.py cross-checks its request count against that
   // histogram's observation count as its deterministic query-count evidence.
-  // Unlike /health/ready, /search has no legitimate 503 case in this
-  // scenario, so it uses the default (200-only) response callback: a 503
-  // here is real evidence of /search unavailability and must surface in
-  // http_req_failed rather than being silently tolerated.
+  // As for /health/ready, /search uses the default 200-only response
+  // callback: failures in either route count toward http_req_failed.
   const search = http.get(
     `${BASE_URL}/search?q=${encodeURIComponent(SEARCH_QUERY)}&limit=5`,
   );
