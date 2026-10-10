@@ -1,0 +1,91 @@
+---
+name: Event-Chain Readiness A/B Proof
+
+"on":
+  pull_request:
+    paths:
+      - ".github/workflows/event-chain-readiness-proof.yml"
+      - "scripts/performance/event_chain_readiness_*.py"
+      - "scripts/performance/event_chain_readiness_*.js"
+      - "scripts/performance/event_chain_readiness_*.sh"
+      - "scripts/ci/tests/test_event_chain_readiness_proof.py"
+      - "scripts/ci/tests/event_chain_readiness_k6_classification.test.mjs"
+      - "scripts/ci/postgres-proof-contract.json"
+      - "policies/performance.v1.json"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: event-chain-readiness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+  NATS_URL: nats://127.0.0.1:4222
+
+jobs:
+  compare:
+    name: Postgres + JetStream recent/aged Event-Chain A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    services:
+      postgres:
+        image: postgres:16@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout proof and immutable comparison history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup pinned Python
+        uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
+        with:
+          python-version-file: ".python-version"
+
+      - name: Validate the strict evidence evaluator
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 -B -m scripts.ci.tests.test_event_chain_readiness_proof
+          bash -n scripts/performance/event_chain_readiness_run.sh
+
+      - name: Install PostgreSQL client for disposable fixture
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Compare exact pre/post-1944 revisions with real healthy event workers
+        shell: bash
+        run: bash scripts/performance/event_chain_readiness_run.sh
+
+      - name: Upload bounded proof and teardown receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # tag: v7.0.1
+        with:
+          name: event-chain-readiness-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ct1940-event-chain-proof/manifest.json
+            ${{ runner.temp }}/ct1940-event-chain-proof/report.json
+            ${{ runner.temp }}/ct1940-event-chain-proof/teardown.json
+            ${{ runner.temp }}/ct1940-event-chain-proof/*-recent.json
+            ${{ runner.temp }}/ct1940-event-chain-proof/*-aged.json
+            ${{ runner.temp }}/ct1940-event-chain-proof/*-negative-control.json
+            ${{ runner.temp }}/ct1940-event-chain-proof/*-startup.prom
+            ${{ runner.temp }}/ct1940-event-chain-proof/*-before.prom
+            ${{ runner.temp }}/ct1940-event-chain-proof/*-after.prom
+          if-no-files-found: warn
+          retention-days: 30

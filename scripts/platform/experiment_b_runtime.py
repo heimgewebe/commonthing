@@ -12215,17 +12215,26 @@ def _t048_readiness_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _wait_http_200(url: str, process: subprocess.Popen[Any] | None = None) -> None:
-    for _ in range(60):
+def _wait_http_200(
+    url: str,
+    process: subprocess.Popen[Any] | None = None,
+    *,
+    consecutive: int = 1,
+) -> None:
+    if not isinstance(consecutive, int) or not 1 <= consecutive <= 3:
+        raise RuntimeErrorEB("HTTP readiness streak must be between 1 and 3")
+    streak = 0
+    for _ in range(120 if consecutive > 1 else 60):
         if process is not None and process.poll() is not None:
             raise RuntimeErrorEB("port-forward exited before the target became ready")
         try:
             status_code, _body, _elapsed = _http_read(url, timeout=2)
-        except urllib.error.URLError:
-            time.sleep(1)
-            continue
-        if status_code == 200:
-            return
+        except (urllib.error.URLError, TimeoutError):
+            streak = 0
+        else:
+            streak = streak + 1 if status_code == 200 else 0
+            if streak >= consecutive:
+                return
         time.sleep(1)
     raise RuntimeErrorEB(f"HTTP target did not become ready: {url}")
 
@@ -13502,6 +13511,15 @@ def t048_load_proof(root: Path, source_commit: str) -> dict[str, Any]:
     base_url = f"http://127.0.0.1:{port}"
     try:
         _prime_t048_search_metric(base_url, scenario["search_query"])
+        # Loading the fixture enqueues domain events via production triggers.
+        # Verify a stable full relay/receipt/JetStream drain before measuring.
+        _wait_event_pipeline_quiescent(
+            root,
+            source_commit=source_commit,
+            database_identity=database_identity,
+        )
+        # After the full event drain, count each readiness 503 during T048.
+        _wait_http_200(f"{base_url}/health/ready", process, consecutive=3)
         before_status, before_body, _elapsed = _http_read(f"{base_url}/metrics")
         if before_status != 200:
             raise RuntimeErrorEB("API /metrics pre-snapshot failed")

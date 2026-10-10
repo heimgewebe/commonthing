@@ -123,6 +123,7 @@ jobs:
       API_IMAGE_REPOSITORY: 127.0.0.1:5000/weltgewebe-api
       API_CONTAINER: weltgewebe-api-runtime-evidence
       K6_IMAGE: grafana/k6@sha256:65c920dc067d5e2e00befbf982af6ad6ad0117034e8b1c65817c7975c52d4669
+      NATS_CONTAINER: weltgewebe-nats-runtime-evidence
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
         with:
@@ -466,6 +467,165 @@ jobs:
             "SELECT count(*) FROM search_index_generations WHERE state = 'active'" \
             "1"
 
+      - name: Reset synthetic fixture outbox before readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The disposable SQL fixture inserts map records via production
+          # triggers. Their setup-only backlog is not T048 read traffic.
+          # Refuse to erase published, quarantined or foreign event state.
+          # Confirm PostgreSQL refuses TRUNCATE when an unknown FK depends on outbox.
+          psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 <<'SQL'
+          BEGIN;
+          CREATE TABLE t048_outbox_fk_guard AS
+            SELECT id FROM domain_outbox WITH NO DATA;
+          ALTER TABLE t048_outbox_fk_guard
+            ADD CONSTRAINT t048_outbox_fk_guard_ref
+            FOREIGN KEY (id) REFERENCES domain_outbox(id);
+          DO $t048_fk$
+          BEGIN
+            BEGIN
+              TRUNCATE TABLE domain_event_consumptions, domain_outbox, web_push_deliveries RESTART IDENTITY RESTRICT;
+              RAISE EXCEPTION 'T048 RESTRICT unexpectedly ignored dependent table';
+            EXCEPTION WHEN SQLSTATE '0A000' THEN
+              NULL;
+            END;
+          END;
+          $t048_fk$;
+          ROLLBACK;
+          SQL
+          psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 <<'SQL'
+          BEGIN;
+          DO $t048_fixture$
+          BEGIN
+            -- Each inserted node also creates one conversation and its outbox
+            -- event via domain_nodes_create_conversation (20260719 migration).
+            -- Prove there are no extra, missing, duplicate, or foreign events
+            -- before destroying any setup-only backlog.
+            IF EXISTS (
+              SELECT 1 FROM domain_outbox AS event
+              WHERE event.aggregate_type NOT IN ('node', 'edge', 'conversation')
+                 OR event.published_at IS NOT NULL
+                 OR event.quarantined_at IS NOT NULL
+                 OR event.attempt_count > 0
+                 OR NOT (
+                   (event.aggregate_type = 'node'
+                    AND event.event_type = 'domain.node.created'
+                    AND EXISTS (
+                      SELECT 1 FROM domain_nodes n WHERE n.id = event.aggregate_id
+                    ))
+                   OR (event.aggregate_type = 'edge'
+                    AND event.event_type = 'domain.edge.created'
+                    AND EXISTS (
+                      SELECT 1 FROM domain_edges e WHERE e.id = event.aggregate_id
+                    ))
+                   OR (event.aggregate_type = 'conversation'
+                    AND event.event_type = 'domain.conversation.created'
+                    AND EXISTS (
+                      SELECT 1 FROM domain_conversations c
+                      JOIN domain_nodes n ON n.id = c.node_id
+                      WHERE c.id::text = event.aggregate_id
+                        AND c.id = weltgewebe_node_conversation_id(n.id)
+                        AND c.deleted_at IS NULL
+                    ))
+                   -- The migration seeds exactly one Hammer Park center conversation
+                   -- before the bulk fixture; it is also disposable setup-only state.
+                   OR (event.aggregate_type = 'conversation'
+                    AND event.event_type = 'domain.conversation.created'
+                    AND EXISTS (
+                      SELECT 1 FROM domain_conversations c
+                      JOIN webgemeindezentren w ON w.id = c.webgemeindezentrum_id
+                      WHERE c.id::text = event.aggregate_id
+                        AND c.conversation_type = 'webgemeindezentrum'
+                        AND w.id = 'webgemeindezentrum-hammer-park'
+                        AND c.id = weltgewebe_webgemeindezentrum_conversation_id(w.id)
+                        AND c.deleted_at IS NULL
+                    ))
+                 )
+            ) OR (SELECT count(*) FROM webgemeindezentren) <> 1
+              OR NOT EXISTS (
+                SELECT 1 FROM webgemeindezentren
+                WHERE id = 'webgemeindezentrum-hammer-park'
+              )
+              OR (SELECT count(*) FROM domain_outbox) <> (
+              2 * (SELECT count(*) FROM domain_nodes) +
+              (SELECT count(*) FROM domain_edges) +
+              (SELECT count(*) FROM webgemeindezentren)
+            ) OR EXISTS (
+              SELECT 1 FROM domain_outbox
+              GROUP BY aggregate_type, aggregate_id
+              HAVING count(*) > 1
+            ) OR EXISTS (SELECT 1 FROM domain_event_consumptions)
+              OR EXISTS (SELECT 1 FROM web_push_deliveries) THEN
+              RAISE EXCEPTION 'T048 fixture outbox contains non-fixture event state';
+            END IF;
+          END;
+          $t048_fixture$;
+          TRUNCATE TABLE domain_event_consumptions, domain_outbox, web_push_deliveries RESTART IDENTITY RESTRICT;
+          COMMIT;
+          SQL
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_outbox')" = "0"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_event_consumptions')" = "0"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM web_push_deliveries')" = "0"
+          test "$(psql "${DATABASE_URL}" -Atc \
+            "SELECT count(*) FROM domain_conversations WHERE conversation_type = 'node'")" = \
+            "${{ steps.contract.outputs.node_count }}"
+          test "$(psql "${DATABASE_URL}" -Atc \
+            "SELECT count(*) FROM domain_conversations WHERE conversation_type = 'webgemeindezentrum'")" = "1"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_nodes')" = \
+            "${{ steps.contract.outputs.node_count }}"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_edges')" = \
+            "${{ steps.contract.outputs.edge_count }}"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM search_node_projections')" = \
+            "${{ steps.contract.outputs.node_count }}"
+          test "$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM search_index_generations WHERE state='active'")" = \
+            "1"
+
+      - name: Start isolated JetStream for measured API
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the same pinned NATS digest used by the Event-Chain proof.
+          NATS_IMAGE="$(python3 -B -c \
+            'import json;print(json.load(open("scripts/ci/postgres-proof-contract.json"))["jetstream_image"])')"
+          [[ "${NATS_IMAGE}" =~ ^nats@sha256:[0-9a-f]{64}$ ]]
+          docker pull "${NATS_IMAGE}"
+          # Docker <28 can expose localhost-published ports to same-L2 peers.
+          DOCKER_SERVER_MAJOR="$(docker version --format '{{.Server.Version}}' | cut -d. -f1)"
+          [[ "${DOCKER_SERVER_MAJOR}" =~ ^[0-9]+$ ]]
+          (( DOCKER_SERVER_MAJOR >= 28 ))
+          # Bridge networking is isolated; only loopback on the host is published.
+          # Monitoring remains read-only and is not reachable on public host interfaces.
+          NATS_SERVER_NAME="t048-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
+          NATS_CONTAINER_ID="$(docker run --detach --rm --name "${NATS_CONTAINER}" \
+            --network bridge \
+            --publish 127.0.0.1:4222:4222 \
+            --publish 127.0.0.1:8222:8222 \
+            "${NATS_IMAGE}" -js -n "${NATS_SERVER_NAME}" -m 8222)"
+          [[ "${NATS_CONTAINER_ID}" =~ ^[0-9a-f]{64}$ ]]
+          printf 'NATS_IMAGE=%s\nNATS_SERVER_NAME=%s\nNATS_CONTAINER_ID=%s\n' \
+            "${NATS_IMAGE}" "${NATS_SERVER_NAME}" "${NATS_CONTAINER_ID}" >> "${GITHUB_ENV}"
+          # TCP-only reachability can be falsely satisfied by a foreign process.
+          NATS_READY=0
+          for _ in {1..35}; do
+            if python3 -B scripts/ci/check_t048_jetstream.py \
+                --container "${NATS_CONTAINER}" --container-id "${NATS_CONTAINER_ID}" \
+                --image "${NATS_IMAGE}" --server-name "${NATS_SERVER_NAME}"; then
+              NATS_READY=1
+              break
+            fi
+            if ! docker container inspect "${NATS_CONTAINER}" --format '{{.State.Running}}' \
+                | grep -qx true; then
+              docker logs "${NATS_CONTAINER}" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "${NATS_READY}" -ne 1 ]]; then
+            echo "T048 isolated JetStream failed identity/quiescence proof" >&2
+            exit 1
+          fi
+
       - name: Start and warm the measured API container
         env:
           API_RUNTIME_SEARCH_QUERY: ${{ steps.contract.outputs.search_query }}
@@ -477,6 +637,8 @@ jobs:
             --network host \
             --env API_BIND=127.0.0.1:8787 \
             --env "DATABASE_URL=${DATABASE_URL}" \
+            --env "NATS_URL=nats://127.0.0.1:4222" \
+            --env WELTGEWEBE_DOMAIN_JETSTREAM_REPLICAS=1 \
             --env WELTGEWEBE_DOMAIN_READ_SOURCE=postgres \
             --env WELTGEWEBE_API_STARTUP_MIGRATIONS=verify-applied \
             --env WELTGEWEBE_SEARCH_OLLAMA_URL=http://127.0.0.1:9/ \
@@ -502,6 +664,25 @@ jobs:
             --data-urlencode "q=${API_RUNTIME_SEARCH_QUERY}" \
             --data-urlencode "limit=5" \
             http://127.0.0.1:8787/search >/dev/null
+          # This is a post-deploy throughput test, not a cold-start test.
+          # Require sustained readiness before counting in-load 503s as failures.
+          READINESS_STREAK=0
+          for _ in {1..120}; do
+            if curl -fsS --max-time 2 http://127.0.0.1:8787/health/ready >/dev/null 2>&1; then
+              READINESS_STREAK=$((READINESS_STREAK + 1))
+              if [[ "${READINESS_STREAK}" -ge 3 ]]; then
+                break
+              fi
+            else
+              READINESS_STREAK=0
+            fi
+            sleep 1
+          done
+          if [[ "${READINESS_STREAK}" -lt 3 ]]; then
+            echo "T048 API did not sustain 3 readiness 200s before load" >&2
+            docker logs "${API_CONTAINER}" >&2
+            exit 1
+          fi
           curl -fsS http://127.0.0.1:8787/metrics \
             | grep -F "commit=\"${{ steps.image.outputs.commit }}\"" >/dev/null
 
@@ -526,6 +707,15 @@ jobs:
             --k6-image "${K6_IMAGE}" --run-id "${RUN_ID}" \
             --output "${EVIDENCE_DIR}/runtime-binding.json"
           printf 'run_id=%s\n' "${RUN_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify JetStream is empty before measured load
+        shell: bash
+        run: |
+          set -euo pipefail
+          # After API warm-up, reject foreign messages and unacknowledged deliveries.
+          python3 -B scripts/ci/check_t048_jetstream.py \
+            --container "${NATS_CONTAINER}" --container-id "${NATS_CONTAINER_ID}" \
+            --image "${NATS_IMAGE}" --server-name "${NATS_SERVER_NAME}"
 
       - name: Measure the canonical mixed-health-and-read scenario
         env:
@@ -638,4 +828,13 @@ jobs:
           set -euo pipefail
           if docker container inspect "${API_CONTAINER}" >/dev/null 2>&1; then
             docker rm --force "${API_CONTAINER}"
+          fi
+
+      - name: Stop isolated JetStream
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker container inspect "${NATS_CONTAINER}" >/dev/null 2>&1; then
+            docker rm --force "${NATS_CONTAINER}"
           fi
