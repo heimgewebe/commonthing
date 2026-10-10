@@ -25,6 +25,8 @@ relations:
     target: docs/runbooks/gewebezelle-two-operator-pilot-v1.md
   - type: relates_to
     target: docs/runbooks/commonthing-mail-identity-cutover.md
+  - type: relates_to
+    target: docs/runbooks/independent-production-watch.md
 ---
 # Runbooks
 
@@ -38,6 +40,7 @@ Anleitungen für wiederkehrende Aufgaben.
 - [Zwei-Betreiber-GewebeZelle-Pilotvertrag v1](gewebezelle-two-operator-pilot-v1.md)
 - [Codespaces Recovery](codespaces-recovery.md)
 - [commonThing-Mailidentität umstellen](commonthing-mail-identity-cutover.md)
+- [Unabhängige Produktionswache (Heimberry)](independent-production-watch.md)
 - [Zurück zum Doku-Index](../index.md)
 
 ## Historische Runbooks

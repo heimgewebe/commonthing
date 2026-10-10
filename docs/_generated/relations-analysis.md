@@ -14,13 +14,13 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Dokumente gesamt | 206 |
-| Dokumente mit ausgehenden Relationen | 205 |
-| Dokumente als Ziel referenziert | 153 |
-| Relationen gesamt | 744 |
+| Dokumente gesamt | 207 |
+| Dokumente mit ausgehenden Relationen | 206 |
+| Dokumente als Ziel referenziert | 154 |
+| Relationen gesamt | 747 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 687 |
+| — relates_to | 690 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | Isolierte Dokumente | 0 |
@@ -33,7 +33,7 @@ Generated automatically. Do not edit.
 - ⚠️ High outbound count (15): `docs/roadmap.md` — possible over-linking
 - ⚠️ High outbound count (13): `docs/blueprints/domain-data-postgres-cutover.md` — possible over-linking
 - ⚠️ High outbound count (13): `docs/reports/domain-postgres-instance-coherence-decision.md` — possible over-linking
-- ⚠️ High outbound count (10): `docs/runbooks/README.md` — possible over-linking
+- ⚠️ High outbound count (11): `docs/runbooks/README.md` — possible over-linking
 - ⚠️ High outbound count (9): `docs/blueprints/blueprint-agent-safety-control-layer.md` — possible over-linking
 - ⚠️ High outbound count (9): `docs/reports/cq-02-domain-projection-load.md` — possible over-linking
 - ⚠️ High outbound count (9): `docs/runbooks/db-recovery.md` — possible over-linking
@@ -63,7 +63,7 @@ _Keine Zyklen gefunden._
 - `docs/roadmap.md` — 15 ausgehende Relationen
 - `docs/blueprints/domain-data-postgres-cutover.md` — 13 ausgehende Relationen
 - `docs/reports/domain-postgres-instance-coherence-decision.md` — 13 ausgehende Relationen
-- `docs/runbooks/README.md` — 10 ausgehende Relationen
+- `docs/runbooks/README.md` — 11 ausgehende Relationen
 - `docs/blueprints/blueprint-agent-safety-control-layer.md` — 9 ausgehende Relationen
 - `docs/reports/cq-02-domain-projection-load.md` — 9 ausgehende Relationen
 - `docs/runbooks/db-recovery.md` — 9 ausgehende Relationen

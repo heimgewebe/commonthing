@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Off-GitHub read-only Commonthing production checker.
+
+Only reads public URLs. Writes evidence to the local per-user state directory.
+No GitHub mutation, email, webhook or claimed notification delivery.
+"""
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import sys
+from urllib.request import Request, urlopen
+
+URLS = {
+    "frontend": "https://commonthing.net/_app/version.json",
+    "api": "https://commonthing.net/api/version",
+    "main": "https://api.github.com/repos/heimgewebe/commonthing/commits/main",
+    "schedule": "https://api.github.com/repos/heimgewebe/commonthing/actions/workflows/production-live-contract.yml/runs?event=schedule&per_page=2",
+}
+SHA = re.compile(r"^[0-9a-f]{40}$")
+UTC = timezone.utc
+LIMIT = 512 * 1024
+THRESHOLD = 45 * 60
+# Each P1 is cleared only after the observations needed to verify it succeed.
+# Another still-visible P1 cannot hide an unverified incident.
+P1_UNVERIFIABLE_ON = {
+    "frontend_cache": {"unavailable_frontend"},
+    "invalid_commit_frontend": {"unavailable_frontend"},
+    "invalid_commit_api": {"unavailable_api"},
+    "frontend_api_diverge": {
+        "unavailable_frontend", "unavailable_api",
+        "invalid_commit_frontend", "invalid_commit_api",
+    },
+    "stale_frontend": {
+        "unavailable_frontend", "unavailable_main",
+        "invalid_commit_frontend", "invalid_commit_main",
+    },
+    "stale_api": {
+        "unavailable_api", "unavailable_main",
+        "invalid_commit_api", "invalid_commit_main",
+    },
+}
+
+
+def timestamp(value):
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def fetch(name):
+    error = None
+    for _ in range(2):
+        try:
+            req = Request(URLS[name], headers={
+                "User-Agent": "commonthing-independent-watch/1",
+                "Accept": "application/vnd.github+json",
+            })
+            with urlopen(req, timeout=8) as response:
+                if response.status != 200:
+                    raise ValueError(f"HTTP {response.status}")
+                content = response.read(LIMIT + 1)
+                if len(content) > LIMIT:
+                    raise ValueError("response exceeds limit")
+                data = json.loads(content)
+                if not isinstance(data, dict):
+                    raise ValueError("JSON root not an object")
+                return data, response.headers.get("Cache-Control", "")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:150]}"
+    raise ValueError(f"two reads failed: {error}")
+
+
+def evaluate(now, reader=fetch, *, previous_main_observation=None):
+    data, headers, issues = {}, {}, []
+    def flag(code, component, actual, expected, source, severity="P1", duration=None):
+        item = {"code": code, "component": component, "actual": actual,
+                "expected": expected, "source": URLS[source], "severity": severity}
+        if duration is not None:
+            item["duration_seconds"] = round(duration)
+        issues.append(item)
+
+    for name in URLS:
+        try:
+            data[name], headers[name] = reader(name)
+        except Exception as exc:
+            flag("unavailable_" + name, "observation channel", str(exc)[:200],
+                 "HTTP 200 and valid JSON", name,
+                 "INFO" if name == "schedule" else "P2")
+
+    commits = {}
+    for name in ("frontend", "api", "main"):
+        if name in data:
+            field = "sha" if name == "main" else "commit"
+            value = data[name].get(field)
+            if not isinstance(value, str) or not SHA.fullmatch(value):
+                flag("invalid_commit_" + name, name, str(value)[:100],
+                     "40-character hexadecimal commit", name,
+                     "P2" if name == "main" else "P1")
+            else:
+                commits[name] = value
+
+    if "frontend" in data:
+        cache_directives = [p.strip().lower() for p in headers["frontend"].split(",")]
+        if "no-store" not in cache_directives:
+            flag("frontend_cache", "frontend", headers["frontend"][:120],
+                 "Cache-Control: no-store", "frontend")
+    if "frontend" in commits and "api" in commits and commits["frontend"] != commits["api"]:
+        flag("frontend_api_diverge", "production commits",
+             {"frontend": commits["frontend"], "api": commits["api"]},
+             "frontend == API", "frontend")
+
+    # Git commit timestamps are not GitHub branch-ref update timestamps.
+    # Persist the first observed main ref instead of falsely ageing a fresh
+    # fast-forward/push by an existing commit's old committer date.
+    main_observation = None
+    if "main" in commits:
+        previous = previous_main_observation
+        first_seen = now
+        if isinstance(previous, dict) and previous.get("sha") == commits["main"]:
+            recorded = timestamp(previous.get("first_seen"))
+            if recorded is not None and 0 <= (now - recorded).total_seconds():
+                first_seen = recorded
+        main_observation = {
+            "sha": commits["main"],
+            "first_seen": first_seen.isoformat().replace("+00:00", "Z"),
+        }
+        commit_time = timestamp(data["main"].get("commit", {}).get("committer", {}).get("date"))
+        commit_age = (now - commit_time).total_seconds() if commit_time else None
+        if commit_age is None or commit_age < -120:
+            flag("main_time_unreliable", "GitHub main", str(commit_age),
+                 "valid commit timestamp", "main", "P2")
+        observed_age = (now - first_seen).total_seconds()
+        if observed_age >= THRESHOLD:
+            for name in ("frontend", "api"):
+                if name in commits and commits[name] != commits["main"]:
+                    flag("stale_" + name, name, commits[name],
+                         commits["main"], name, duration=observed_age)
+
+    newest_schedule = None
+    if "schedule" in data:
+        rows = data["schedule"].get("workflow_runs")
+        if not isinstance(rows, list):
+            flag("invalid_schedule_json", "GitHub schedule", str(type(rows)),
+                 "workflow_runs array", "schedule", "INFO")
+        else:
+            scheduled = [r for r in rows if isinstance(r, dict)
+                         and r.get("event") == "schedule" and timestamp(r.get("created_at"))]
+            if not scheduled:
+                flag("no_schedule", "GitHub schedule", "no event=schedule",
+                     "scheduled run within 45 minutes", "schedule", "INFO")
+            else:
+                run = max(scheduled, key=lambda r: timestamp(r["created_at"]))
+                newest_schedule = {"created_at": run["created_at"], "id": run.get("id"),
+                                   "status": run.get("status"), "conclusion": run.get("conclusion")}
+                age = (now - timestamp(run["created_at"])).total_seconds()
+                if age > THRESHOLD:
+                    flag("schedule_stale", "GitHub schedule", run["created_at"],
+                         "event=schedule within 45 minutes", "schedule",
+                         severity="INFO", duration=age)
+                elif age < -120:
+                    flag("schedule_time_future", "GitHub schedule", str(round(age)),
+                         "valid timestamp", "schedule", "INFO")
+                # A newer queued/in-progress run is not proof that the most
+                # recent completed scheduled check has recovered.
+                completed = [item for item in scheduled if item.get("status") == "completed"]
+                last_done = max(
+                    completed, key=lambda item: timestamp(item["created_at"]),
+                    default=None,
+                )
+                if last_done is not None and last_done.get("conclusion") != "success":
+                    flag("schedule_failed", "GitHub scheduled check",
+                         str(last_done.get("conclusion")),
+                         "successful scheduled run", "schedule", "INFO")
+
+    return {
+        "checked_at_utc": now.isoformat().replace("+00:00", "Z"),
+        "status": "ALARM" if any(i["severity"] == "P1" for i in issues)
+                  else "MONITOR_DATA_FAILURE" if any(i["severity"] == "P2" for i in issues)
+                  else "HEALTHY",
+        "commits": commits, "main_observation": main_observation,
+        "latest_schedule": newest_schedule, "issues": issues,
+    }
+
+
+def write_json(path, value):
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as out:
+        json.dump(value, out, sort_keys=True, separators=(",", ":"))
+        out.write("\n")
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(temporary, path)
+
+
+def record(result, directory):
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (directory / "lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        path = directory / "state.json"
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        raw_severe = previous.get("severe")
+        raw_severe = raw_severe if isinstance(raw_severe, list) else []
+        # Malformed state is not evidence for either an incident or a recovery.
+        old_severe = sorted(
+            item for item in raw_severe
+            if isinstance(item, list) and len(item) == 2
+            and all(isinstance(value, str) for value in item)
+            and item[0] not in {"schedule_stale", "schedule_failed", "no_schedule"}
+        )
+        old_uncertain = previous.get("uncertain")
+        old_uncertain = old_uncertain if isinstance(old_uncertain, list) else []
+        severe = sorted([x["code"], str(x["actual"])[:160]]
+                        for x in result["issues"] if x["severity"] == "P1")
+        uncertain = sorted(x["code"] for x in result["issues"] if x["severity"] == "P2")
+        observed_codes = {item["code"] for item in result["issues"]}
+        # Preserve only incidents whose required observation is unavailable or invalid.
+        for item in old_severe:
+            if item not in severe and P1_UNVERIFIABLE_ON.get(item[0], set()) & observed_codes:
+                severe.append(item)
+        severe.sort()
+        new_event = None
+        if severe and severe != old_severe:
+            new_event = "ALARM"
+        elif old_severe and not severe and not uncertain:
+            new_event = "RECOVERY"
+        elif uncertain and uncertain != old_uncertain:
+            new_event = "MONITOR_DATA_FAILURE"
+        if new_event:
+            event = {"event": new_event, **result,
+                     "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939"}
+            with (directory / "events.jsonl").open("a", encoding="utf-8") as out:
+                out.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+        current_main = result.get("main_observation")
+        previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
+        if not isinstance(current_main, dict):
+            current_main = previous_main
+        elif isinstance(previous_main, dict) and previous_main.get("sha") == current_main.get("sha"):
+            old_time = timestamp(previous_main.get("first_seen"))
+            new_time = timestamp(current_main.get("first_seen"))
+            if old_time is not None and new_time is not None and old_time <= new_time:
+                current_main = previous_main
+        write_json(path, {"severe": severe, "uncertain": uncertain,
+                          "main_observation": current_main})
+        write_json(directory / "heartbeat.json", result)
+    return new_event
+
+
+def read_previous_main_observation(directory):
+    try:
+        state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    recorded = state.get("main_observation")
+    if not isinstance(recorded, dict):
+        return None
+    sha = recorded.get("sha")
+    seen = timestamp(recorded.get("first_seen"))
+    if not isinstance(sha, str) or not SHA.fullmatch(sha) or seen is None:
+        return None
+    return {"sha": sha, "first_seen": seen.isoformat().replace("+00:00", "Z")}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--state-dir", type=Path,
+                        default=Path.home() / ".local/commonthing-watch-state")
+    args = parser.parse_args()
+    # The local state snapshot anchors grace; record() serializes state updates.
+    previous_main = read_previous_main_observation(args.state_dir)
+    result = evaluate(datetime.now(UTC), previous_main_observation=previous_main)
+    if args.dry_run:
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["status"] == "HEALTHY" else 2
+    event = record(result, args.state_dir)
+    if event:
+        print(event, result["checked_at_utc"],
+              ",".join(x["code"] for x in result["issues"]))
+    return 0 if result["status"] == "HEALTHY" else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
