@@ -474,6 +474,26 @@ jobs:
           # The disposable SQL fixture inserts map records via production
           # triggers. Their setup-only backlog is not T048 read traffic.
           # Refuse to erase published, quarantined or foreign event state.
+          # Confirm PostgreSQL refuses TRUNCATE when an unknown FK depends on outbox.
+          psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 <<'SQL'
+          BEGIN;
+          CREATE TABLE t048_outbox_fk_guard AS
+            SELECT id FROM domain_outbox WITH NO DATA;
+          ALTER TABLE t048_outbox_fk_guard
+            ADD CONSTRAINT t048_outbox_fk_guard_ref
+            FOREIGN KEY (id) REFERENCES domain_outbox(id);
+          DO $t048_fk$
+          BEGIN
+            BEGIN
+              TRUNCATE TABLE domain_event_consumptions, domain_outbox, web_push_deliveries RESTART IDENTITY RESTRICT;
+              RAISE EXCEPTION 'T048 RESTRICT unexpectedly ignored dependent table';
+            EXCEPTION WHEN SQLSTATE '0A000' THEN
+              NULL;
+            END;
+          END;
+          $t048_fk$;
+          ROLLBACK;
+          SQL
           psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 <<'SQL'
           BEGIN;
           DO $t048_fixture$
@@ -484,44 +504,71 @@ jobs:
                  OR published_at IS NOT NULL
                  OR quarantined_at IS NOT NULL
                  OR attempt_count > 0
-            ) OR EXISTS (SELECT 1 FROM domain_event_consumptions) THEN
+            ) OR EXISTS (SELECT 1 FROM domain_event_consumptions)
+              OR EXISTS (SELECT 1 FROM web_push_deliveries) THEN
               RAISE EXCEPTION 'T048 fixture outbox contains non-fixture event state';
             END IF;
           END;
           $t048_fixture$;
-          TRUNCATE TABLE domain_event_consumptions, domain_outbox RESTART IDENTITY CASCADE;
+          TRUNCATE TABLE domain_event_consumptions, domain_outbox, web_push_deliveries RESTART IDENTITY RESTRICT;
           COMMIT;
           SQL
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_outbox')" = "0"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_event_consumptions')" = "0"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM web_push_deliveries')" = "0"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_nodes')" = \
             "${{ steps.contract.outputs.node_count }}"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_edges')" = \
             "${{ steps.contract.outputs.edge_count }}"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM search_node_projections')" = \
+            "${{ steps.contract.outputs.node_count }}"
+          test "$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM search_index_generations WHERE state='active'")" = \
+            "1"
 
       - name: Start isolated JetStream for measured API
         shell: bash
         run: |
           set -euo pipefail
-          # Read the same pinned JetStream digest as the existing Event-Chain proof.
+          # Keep the same pinned NATS digest used by the Event-Chain proof.
           NATS_IMAGE="$(python3 -B -c \
             'import json;print(json.load(open("scripts/ci/postgres-proof-contract.json"))["jetstream_image"])')"
           [[ "${NATS_IMAGE}" =~ ^nats@sha256:[0-9a-f]{64}$ ]]
           docker pull "${NATS_IMAGE}"
-          docker run --detach --rm --name "${NATS_CONTAINER}" --network host "${NATS_IMAGE}" -js >/dev/null
-          python3 -B - <<'PY'
-          import socket
-          import time
-          deadline = time.monotonic() + 35
-          while time.monotonic() < deadline:
-              try:
-                  with socket.create_connection(("127.0.0.1", 4222), timeout=1):
-                      break
-              except OSError:
-                  time.sleep(0.3)
-          else:
-              raise SystemExit("isolated JetStream never became reachable")
-          PY
+          # Docker <28 can expose localhost-published ports to same-L2 peers.
+          DOCKER_SERVER_MAJOR="$(docker version --format '{{.Server.Version}}' | cut -d. -f1)"
+          [[ "${DOCKER_SERVER_MAJOR}" =~ ^[0-9]+$ ]]
+          (( DOCKER_SERVER_MAJOR >= 28 ))
+          # Bridge networking is isolated; only loopback on the host is published.
+          # Monitoring remains read-only and is not reachable on public host interfaces.
+          NATS_SERVER_NAME="t048-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
+          NATS_CONTAINER_ID="$(docker run --detach --rm --name "${NATS_CONTAINER}" \
+            --network bridge \
+            --publish 127.0.0.1:4222:4222 \
+            --publish 127.0.0.1:8222:8222 \
+            "${NATS_IMAGE}" -js -n "${NATS_SERVER_NAME}" -m 8222)"
+          [[ "${NATS_CONTAINER_ID}" =~ ^[0-9a-f]{64}$ ]]
+          printf 'NATS_IMAGE=%s\nNATS_SERVER_NAME=%s\nNATS_CONTAINER_ID=%s\n' \
+            "${NATS_IMAGE}" "${NATS_SERVER_NAME}" "${NATS_CONTAINER_ID}" >> "${GITHUB_ENV}"
+          # TCP-only reachability can be falsely satisfied by a foreign process.
+          NATS_READY=0
+          for _ in {1..35}; do
+            if python3 -B scripts/ci/check_t048_jetstream.py \
+                --container "${NATS_CONTAINER}" --container-id "${NATS_CONTAINER_ID}" \
+                --image "${NATS_IMAGE}" --server-name "${NATS_SERVER_NAME}"; then
+              NATS_READY=1
+              break
+            fi
+            if ! docker container inspect "${NATS_CONTAINER}" --format '{{.State.Running}}' \
+                | grep -qx true; then
+              docker logs "${NATS_CONTAINER}" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "${NATS_READY}" -ne 1 ]]; then
+            echo "T048 isolated JetStream failed identity/quiescence proof" >&2
+            exit 1
+          fi
 
       - name: Start and warm the measured API container
         env:
@@ -604,6 +651,15 @@ jobs:
             --k6-image "${K6_IMAGE}" --run-id "${RUN_ID}" \
             --output "${EVIDENCE_DIR}/runtime-binding.json"
           printf 'run_id=%s\n' "${RUN_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify JetStream is empty before measured load
+        shell: bash
+        run: |
+          set -euo pipefail
+          # After API warm-up, reject foreign messages and unacknowledged deliveries.
+          python3 -B scripts/ci/check_t048_jetstream.py \
+            --container "${NATS_CONTAINER}" --container-id "${NATS_CONTAINER_ID}" \
+            --image "${NATS_IMAGE}" --server-name "${NATS_SERVER_NAME}"
 
       - name: Measure the canonical mixed-health-and-read scenario
         env:

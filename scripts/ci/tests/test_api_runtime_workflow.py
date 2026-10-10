@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -49,9 +50,17 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         start = self.job[nats:api]
         self.assertIn("scripts/ci/postgres-proof-contract.json", start)
         self.assertIn("jetstream_image", start)
-        self.assertIn("--network host", start)
-        self.assertIn('"${NATS_IMAGE}" -js', start)
-        self.assertIn('socket.create_connection(("127.0.0.1", 4222)', start)
+        self.assertIn("--network bridge", start)
+        self.assertIn("(( DOCKER_SERVER_MAJOR >= 28 ))", start)
+        self.assertNotIn("--network host", start)
+        self.assertIn("--publish 127.0.0.1:4222:4222", start)
+        self.assertIn("--publish 127.0.0.1:8222:8222", start)
+        self.assertIn('"${NATS_IMAGE}" -js -n "${NATS_SERVER_NAME}" -m 8222', start)
+        self.assertIn('NATS_CONTAINER_ID="$(docker run', start)
+        self.assertIn("check_t048_jetstream.py", start)
+        self.assertIn('--server-name "${NATS_SERVER_NAME}"', start)
+        self.assertIn('--container-id "${NATS_CONTAINER_ID}"', start)
+        self.assertIn("name: Verify JetStream is empty before measured load", self.job)
         end = self.job[self.job.index("name: Stop isolated JetStream"): ]
         self.assertIn("if: ${{ always() }}", end)
         self.assertIn('docker rm --force "${NATS_CONTAINER}"', end)
@@ -73,7 +82,13 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("quarantined_at IS NOT NULL", source)
         self.assertIn("attempt_count > 0", source)
         self.assertIn("domain_event_consumptions", source)
-        self.assertIn("TRUNCATE TABLE domain_event_consumptions, domain_outbox RESTART IDENTITY CASCADE", source)
+        self.assertIn("OR EXISTS (SELECT 1 FROM web_push_deliveries)", source)
+        self.assertIn("SELECT count(*) FROM web_push_deliveries", source)
+        self.assertIn("TRUNCATE TABLE domain_event_consumptions, domain_outbox, web_push_deliveries RESTART IDENTITY RESTRICT", source)
+        self.assertNotIn("RESTART IDENTITY CASCADE", source)
+        self.assertIn("CREATE TABLE t048_outbox_fk_guard", source)
+        self.assertIn("FOREIGN KEY (id) REFERENCES domain_outbox(id)", source)
+        self.assertIn("WHEN SQLSTATE '0A000'", source)
         self.assertIn("SELECT count(*) FROM domain_outbox", source)
         self.assertIn("SELECT count(*) FROM domain_nodes", source)
 
@@ -89,6 +104,31 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:8787/health/ready", warmup)
         self.assertIn("READINESS_STREAK=$((READINESS_STREAK + 1))", warmup)
         self.assertIn('if [[ "${READINESS_STREAK}" -lt 3 ]]', warmup)
+        self.assertRegex(warmup, r"else\s*\n\s*READINESS_STREAK=0")
+
+    def test_readiness_200_200_503_requires_three_new_200s(self) -> None:
+        start = self.job.index("name: Start and warm the measured API container")
+        bound = self.job.index("name: Bind live API runtime to the exact fixture")
+        warmup = self.job[start:bound]
+        loop = warmup[
+            warmup.index("READINESS_STREAK=0") :
+            warmup.index('if [[ "${READINESS_STREAK}" -lt 3 ]]')
+        ]
+        fake_curl = '''
+responses=(200 200 503 200 200 200)
+cursor=0
+curl() {
+  local status="${responses[cursor]:-503}"
+  cursor=$((cursor + 1))
+  [[ "${status}" == 200 ]]
+}
+sleep() { :; }
+'''
+        script = fake_curl + loop + 'echo "${READINESS_STREAK}:${cursor}"\n'
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, check=True
+        )
+        self.assertEqual(result.stdout.strip(), "3:6")
 
     def test_scenario_values_come_from_the_canonical_policy(self) -> None:
         self.assertIn(
