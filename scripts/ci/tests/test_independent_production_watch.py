@@ -40,11 +40,19 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(result["issues"])
 
     def test_schedule_stale_when_more_than_45m(self):
+        delayed = watch.evaluate(NOW, self.fixtures(schedule_age=46))
+        self.assertEqual(delayed["status"], "HEALTHY")
+        self.assertEqual(
+            [item["severity"] for item in delayed["issues"]
+             if item["code"] == "schedule_stale"], ["INFO"])
         self.assertIn("schedule_stale", self.codes(schedule_age=46))
         self.assertNotIn("schedule_stale", self.codes(schedule_age=44))
 
     def test_only_actual_schedule_counts(self):
-        self.assertIn("no_schedule", self.codes(schedule_event="workflow_dispatch"))
+        result = watch.evaluate(NOW, self.fixtures(schedule_event="workflow_dispatch"))
+        self.assertEqual(result["status"], "HEALTHY")
+        self.assertEqual([(i["code"], i["severity"]) for i in result["issues"]],
+                         [("no_schedule", "INFO")])
 
     def test_main_convergence_grace(self):
         self.assertNotIn("stale_frontend", self.codes(frontend=OLD, api=OLD, commit_age=44))
@@ -56,7 +64,10 @@ class WatchTests(unittest.TestCase):
         self.assertIn("invalid_commit_api", self.codes(api="short"))
 
     def test_schedule_failure_and_transport_failure_are_distinct(self):
-        self.assertIn("schedule_failed", self.codes(conclusion="failure"))
+        schedule_failure = watch.evaluate(NOW, self.fixtures(conclusion="failure"))
+        self.assertEqual(schedule_failure["status"], "HEALTHY")
+        self.assertEqual([(i["code"], i["severity"]) for i in schedule_failure["issues"]],
+                         [("schedule_failed", "INFO")])
         def reader(name):
             if name == "api":
                 raise ValueError("two reads failed: timeout")
@@ -65,14 +76,43 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(result["status"], "MONITOR_DATA_FAILURE")
         self.assertEqual([i["code"] for i in result["issues"]], ["unavailable_api"])
 
+    def test_schedule_transport_failure_does_not_claim_production_failure(self):
+        def unreadable_schedule(name):
+            if name == "schedule":
+                raise ValueError("GitHub schedule API unavailable")
+            return self.fixtures()(name)
+        result = watch.evaluate(NOW, unreadable_schedule)
+        self.assertEqual(result["status"], "HEALTHY")
+        self.assertEqual([(i["code"], i["severity"]) for i in result["issues"]],
+                         [("unavailable_schedule", "INFO")])
+
+    def test_schedule_legacy_alarm_state_is_silently_migrated(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "state.json").write_text(
+                json.dumps({"severe": [["schedule_stale", "2026-10-09T13:00:00Z"]],
+                            "uncertain": []}), encoding="utf-8")
+            info_only = watch.evaluate(NOW, self.fixtures(schedule_age=90))
+            self.assertEqual(info_only["status"], "HEALTHY")
+            self.assertIsNone(watch.record(info_only, directory))
+            self.assertEqual(json.loads((directory / "state.json").read_text())["severe"], [])
+            self.assertFalse((directory / "events.jsonl").exists())
+
+    def test_production_alarm_remains_actionable_even_with_schedule_gap(self):
+        result = watch.evaluate(NOW, self.fixtures(frontend=OLD, schedule_age=90))
+        self.assertEqual(result["status"], "ALARM")
+        self.assertEqual({i["code"]: i["severity"] for i in result["issues"]},
+                         {"frontend_api_diverge": "P1", "schedule_stale": "INFO"})
+
     def test_dedupe_recovery_and_unknown_not_false_recovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
-            alarm = watch.evaluate(NOW, self.fixtures(schedule_age=50))
+            alarm = watch.evaluate(NOW, self.fixtures(frontend=OLD))
             self.assertEqual(watch.record(alarm, directory), "ALARM")
             self.assertIsNone(watch.record(alarm, directory))
             def unreadable(name):
-                if name == "schedule":
+                if name == "api":
                     raise ValueError("unreachable after retry")
                 return self.fixtures()(name)
             unknown = watch.evaluate(NOW, unreadable)

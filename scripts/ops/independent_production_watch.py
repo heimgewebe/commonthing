@@ -70,7 +70,8 @@ def evaluate(now, reader=fetch):
             data[name], headers[name] = reader(name)
         except Exception as exc:
             flag("unavailable_" + name, "observation channel", str(exc)[:200],
-                 "HTTP 200 and valid JSON", name, "P2")
+                 "HTTP 200 and valid JSON", name,
+                 "INFO" if name == "schedule" else "P2")
 
     commits = {}
     for name in ("frontend", "api", "main"):
@@ -109,13 +110,13 @@ def evaluate(now, reader=fetch):
         rows = data["schedule"].get("workflow_runs")
         if not isinstance(rows, list):
             flag("invalid_schedule_json", "GitHub schedule", str(type(rows)),
-                 "workflow_runs array", "schedule")
+                 "workflow_runs array", "schedule", "INFO")
         else:
             scheduled = [r for r in rows if isinstance(r, dict)
                          and r.get("event") == "schedule" and timestamp(r.get("created_at"))]
             if not scheduled:
                 flag("no_schedule", "GitHub schedule", "no event=schedule",
-                     "scheduled run within 45 minutes", "schedule")
+                     "scheduled run within 45 minutes", "schedule", "INFO")
             else:
                 run = max(scheduled, key=lambda r: timestamp(r["created_at"]))
                 newest_schedule = {"created_at": run["created_at"], "id": run.get("id"),
@@ -123,18 +124,20 @@ def evaluate(now, reader=fetch):
                 age = (now - timestamp(run["created_at"])).total_seconds()
                 if age > THRESHOLD:
                     flag("schedule_stale", "GitHub schedule", run["created_at"],
-                         "event=schedule within 45 minutes", "schedule", duration=age)
+                         "event=schedule within 45 minutes", "schedule",
+                         severity="INFO", duration=age)
                 elif age < -120:
                     flag("schedule_time_future", "GitHub schedule", str(round(age)),
-                         "valid timestamp", "schedule", "P2")
+                         "valid timestamp", "schedule", "INFO")
                 if run.get("status") == "completed" and run.get("conclusion") != "success":
                     flag("schedule_failed", "GitHub scheduled check", str(run.get("conclusion")),
-                         "successful scheduled run", "schedule")
+                         "successful scheduled run", "schedule", "INFO")
 
     return {
         "checked_at_utc": now.isoformat().replace("+00:00", "Z"),
         "status": "ALARM" if any(i["severity"] == "P1" for i in issues)
-                  else "MONITOR_DATA_FAILURE" if issues else "HEALTHY",
+                  else "MONITOR_DATA_FAILURE" if any(i["severity"] == "P2" for i in issues)
+                  else "HEALTHY",
         "commits": commits, "latest_schedule": newest_schedule, "issues": issues,
     }
 
@@ -162,7 +165,10 @@ def record(result, directory):
                         for x in result["issues"] if x["severity"] == "P1")
         uncertain = sorted(x["code"] for x in result["issues"] if x["severity"] == "P2")
         new_event = None
-        old_severe = previous.get("severe", [])
+        # Retire old GitHub-schedule-only incidents without a fictitious RECOVERY.
+        old_severe = [item for item in previous.get("severe", [])
+                      if isinstance(item, list) and item
+                      and item[0] not in {"schedule_stale", "schedule_failed", "no_schedule"}]
         if severe and severe != old_severe:
             new_event = "ALARM"
         elif old_severe and not severe and not uncertain:
@@ -193,12 +199,12 @@ def main():
     result = evaluate(datetime.now(UTC))
     if args.dry_run:
         print(json.dumps(result, sort_keys=True))
-        return 0 if not result["issues"] else 2
+        return 0 if result["status"] == "HEALTHY" else 2
     event = record(result, args.state_dir)
     if event:
         print(event, result["checked_at_utc"],
               ",".join(x["code"] for x in result["issues"]))
-    return 0 if not result["issues"] else 2
+    return 0 if result["status"] == "HEALTHY" else 2
 
 
 if __name__ == "__main__":
