@@ -542,6 +542,17 @@ implementations:
       - scripts/ci/tests/test_deploy_exact_commit_integration.py
       - .github/workflows/production-live-contract.yml
 
+  - id: impl.guard.independent-production-watch
+    path: scripts/ops/independent_production_watch.py
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: test
+    documented_by:
+      - docs/runbooks/independent-production-watch.md
+    verified_by:
+      - scripts/ci/tests/test_independent_production_watch.py
+
   - id: impl.guard.production-live-state
     path: scripts/ops/classify_production_live_state.py
     impl_type: guard

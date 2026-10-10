@@ -56,7 +56,7 @@ def fetch(name):
     raise ValueError(f"two reads failed: {error}")
 
 
-def evaluate(now, reader=fetch):
+def evaluate(now, reader=fetch, *, previous_main_observation=None):
     data, headers, issues = {}, {}, []
     def flag(code, component, actual, expected, source, severity="P1", duration=None):
         item = {"code": code, "component": component, "actual": actual,
@@ -80,7 +80,8 @@ def evaluate(now, reader=fetch):
             value = data[name].get(field)
             if not isinstance(value, str) or not SHA.fullmatch(value):
                 flag("invalid_commit_" + name, name, str(value)[:100],
-                     "40-character hexadecimal commit", name)
+                     "40-character hexadecimal commit", name,
+                     "P2" if name == "main" else "P1")
             else:
                 commits[name] = value
 
@@ -90,20 +91,36 @@ def evaluate(now, reader=fetch):
             flag("frontend_cache", "frontend", headers["frontend"][:120],
                  "Cache-Control: no-store", "frontend")
     if "frontend" in commits and "api" in commits and commits["frontend"] != commits["api"]:
-        flag("frontend_api_diverge", "production commits", commits,
+        flag("frontend_api_diverge", "production commits",
+             {"frontend": commits["frontend"], "api": commits["api"]},
              "frontend == API", "frontend")
 
+    # Git commit timestamps are not GitHub branch-ref update timestamps.
+    # Persist the first observed main ref instead of falsely ageing a fresh
+    # fast-forward/push by an existing commit's old committer date.
+    main_observation = None
     if "main" in commits:
+        previous = previous_main_observation
+        first_seen = now
+        if isinstance(previous, dict) and previous.get("sha") == commits["main"]:
+            recorded = timestamp(previous.get("first_seen"))
+            if recorded is not None and 0 <= (now - recorded).total_seconds():
+                first_seen = recorded
+        main_observation = {
+            "sha": commits["main"],
+            "first_seen": first_seen.isoformat().replace("+00:00", "Z"),
+        }
         commit_time = timestamp(data["main"].get("commit", {}).get("committer", {}).get("date"))
-        age = (now - commit_time).total_seconds() if commit_time else None
-        if age is None or age < -120:
-            flag("main_time_unreliable", "GitHub main", str(age),
+        commit_age = (now - commit_time).total_seconds() if commit_time else None
+        if commit_age is None or commit_age < -120:
+            flag("main_time_unreliable", "GitHub main", str(commit_age),
                  "valid commit timestamp", "main", "P2")
-        if age is not None and age >= THRESHOLD:
+        observed_age = (now - first_seen).total_seconds()
+        if observed_age >= THRESHOLD:
             for name in ("frontend", "api"):
                 if name in commits and commits[name] != commits["main"]:
                     flag("stale_" + name, name, commits[name],
-                         commits["main"], name, duration=age)
+                         commits["main"], name, duration=observed_age)
 
     newest_schedule = None
     if "schedule" in data:
@@ -129,8 +146,16 @@ def evaluate(now, reader=fetch):
                 elif age < -120:
                     flag("schedule_time_future", "GitHub schedule", str(round(age)),
                          "valid timestamp", "schedule", "INFO")
-                if run.get("status") == "completed" and run.get("conclusion") != "success":
-                    flag("schedule_failed", "GitHub scheduled check", str(run.get("conclusion")),
+                # A newer queued/in-progress run is not proof that the most
+                # recent completed scheduled check has recovered.
+                completed = [item for item in scheduled if item.get("status") == "completed"]
+                last_done = max(
+                    completed, key=lambda item: timestamp(item["created_at"]),
+                    default=None,
+                )
+                if last_done is not None and last_done.get("conclusion") != "success":
+                    flag("schedule_failed", "GitHub scheduled check",
+                         str(last_done.get("conclusion")),
                          "successful scheduled run", "schedule", "INFO")
 
     return {
@@ -138,7 +163,8 @@ def evaluate(now, reader=fetch):
         "status": "ALARM" if any(i["severity"] == "P1" for i in issues)
                   else "MONITOR_DATA_FAILURE" if any(i["severity"] == "P2" for i in issues)
                   else "HEALTHY",
-        "commits": commits, "latest_schedule": newest_schedule, "issues": issues,
+        "commits": commits, "main_observation": main_observation,
+        "latest_schedule": newest_schedule, "issues": issues,
     }
 
 
@@ -185,9 +211,36 @@ def record(result, directory):
         # Never erase a prior confirmed incident due to a failed HTTP observation.
         if not severe and uncertain:
             severe = old_severe
-        write_json(path, {"severe": severe, "uncertain": uncertain})
+        current_main = result.get("main_observation")
+        previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
+        if not isinstance(current_main, dict):
+            current_main = previous_main
+        elif isinstance(previous_main, dict) and previous_main.get("sha") == current_main.get("sha"):
+            old_time = timestamp(previous_main.get("first_seen"))
+            new_time = timestamp(current_main.get("first_seen"))
+            if old_time is not None and new_time is not None and old_time <= new_time:
+                current_main = previous_main
+        write_json(path, {"severe": severe, "uncertain": uncertain,
+                          "main_observation": current_main})
         write_json(directory / "heartbeat.json", result)
     return new_event
+
+
+def read_previous_main_observation(directory):
+    try:
+        state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    recorded = state.get("main_observation")
+    if not isinstance(recorded, dict):
+        return None
+    sha = recorded.get("sha")
+    seen = timestamp(recorded.get("first_seen"))
+    if not isinstance(sha, str) or not SHA.fullmatch(sha) or seen is None:
+        return None
+    return {"sha": sha, "first_seen": seen.isoformat().replace("+00:00", "Z")}
 
 
 def main():
@@ -196,7 +249,9 @@ def main():
     parser.add_argument("--state-dir", type=Path,
                         default=Path.home() / ".local/commonthing-watch-state")
     args = parser.parse_args()
-    result = evaluate(datetime.now(UTC))
+    # The local state snapshot anchors grace; record() serializes state updates.
+    previous_main = read_previous_main_observation(args.state_dir)
+    result = evaluate(datetime.now(UTC), previous_main_observation=previous_main)
     if args.dry_run:
         print(json.dumps(result, sort_keys=True))
         return 0 if result["status"] == "HEALTHY" else 2

@@ -55,8 +55,21 @@ class WatchTests(unittest.TestCase):
                          [("no_schedule", "INFO")])
 
     def test_main_convergence_grace(self):
-        self.assertNotIn("stale_frontend", self.codes(frontend=OLD, api=OLD, commit_age=44))
-        self.assertIn("stale_frontend", self.codes(frontend=OLD, api=OLD, commit_age=46))
+        observed = {
+            "sha": MAIN,
+            "first_seen": (NOW - timedelta(minutes=44)).isoformat(),
+        }
+        recent = watch.evaluate(
+            NOW, self.fixtures(frontend=OLD, api=OLD, commit_age=900),
+            previous_main_observation=observed,
+        )
+        self.assertNotIn("stale_frontend", {i["code"] for i in recent["issues"]})
+        observed["first_seen"] = (NOW - timedelta(minutes=46)).isoformat()
+        stale = watch.evaluate(
+            NOW, self.fixtures(frontend=OLD, api=OLD, commit_age=1),
+            previous_main_observation=observed,
+        )
+        self.assertIn("stale_frontend", {i["code"] for i in stale["issues"]})
 
     def test_frontend_api_and_cache(self):
         self.assertIn("frontend_api_diverge", self.codes(frontend=OLD, api=MAIN))
@@ -75,6 +88,28 @@ class WatchTests(unittest.TestCase):
         result = watch.evaluate(NOW, reader)
         self.assertEqual(result["status"], "MONITOR_DATA_FAILURE")
         self.assertEqual([i["code"] for i in result["issues"]], ["unavailable_api"])
+
+    def test_new_schedule_in_progress_cannot_hide_last_completed_failure(self):
+        base_reader = self.fixtures()
+        def reader(name):
+            if name != "schedule":
+                return base_reader(name)
+            return ({
+                "workflow_runs": [
+                    {"id": 2, "event": "schedule", "created_at": NOW.isoformat(),
+                     "status": "in_progress", "conclusion": None},
+                    {"id": 1, "event": "schedule",
+                     "created_at": (NOW - timedelta(minutes=5)).isoformat(),
+                     "status": "completed", "conclusion": "failure"},
+                ]
+            }, "")
+        report = watch.evaluate(NOW, reader)
+        self.assertEqual(report["status"], "HEALTHY")
+        self.assertEqual(report["latest_schedule"]["status"], "in_progress")
+        self.assertEqual(
+            [(i["code"], i["severity"]) for i in report["issues"]],
+            [("schedule_failed", "INFO")],
+        )
 
     def test_schedule_transport_failure_does_not_claim_production_failure(self):
         def unreadable_schedule(name):
@@ -104,6 +139,85 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(result["status"], "ALARM")
         self.assertEqual({i["code"]: i["severity"] for i in result["issues"]},
                          {"frontend_api_diverge": "P1", "schedule_stale": "INFO"})
+
+    def test_invalid_main_sha_is_monitor_uncertainty_not_production_alarm(self):
+        result = watch.evaluate(NOW, self.fixtures(main="not-a-sha"))
+        self.assertEqual(result["status"], "MONITOR_DATA_FAILURE")
+        self.assertEqual(
+            [(issue["code"], issue["severity"]) for issue in result["issues"]],
+            [("invalid_commit_main", "P2")],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(watch.record(result, Path(tmp)), "MONITOR_DATA_FAILURE")
+            import json
+            self.assertEqual(json.loads((Path(tmp) / "state.json").read_text())["severe"], [])
+
+    def test_main_advance_does_not_duplicate_same_frontend_api_divergence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = watch.evaluate(NOW, self.fixtures(frontend=OLD))
+            self.assertEqual(watch.record(first, directory), "ALARM")
+            after_main = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(frontend=OLD, main="c" * 40),
+            )
+            self.assertEqual(watch.record(after_main, directory), None)
+            self.assertEqual(len((directory / "events.jsonl").read_text().splitlines()), 1)
+
+    def test_convergence_grace_starts_with_observed_main_ref_not_commit_date(self):
+        # A newly pushed old commit is not necessarily a 46-minute-old branch update.
+        first = watch.evaluate(NOW, self.fixtures(frontend=OLD, api=OLD, commit_age=900))
+        self.assertFalse(
+            any(issue["code"].startswith("stale_") for issue in first["issues"])
+        )
+        observed = {
+            "sha": MAIN,
+            "first_seen": (NOW - timedelta(minutes=46)).isoformat(),
+        }
+        overdue = watch.evaluate(
+            NOW, self.fixtures(frontend=OLD, api=OLD, commit_age=2),
+            previous_main_observation=observed,
+        )
+        self.assertIn("stale_frontend", {i["code"] for i in overdue["issues"]})
+        self.assertIn("stale_api", {i["code"] for i in overdue["issues"]})
+        fresh_main = watch.evaluate(
+            NOW, self.fixtures(frontend=OLD, api=OLD, main="c" * 40,
+                               commit_age=900),
+            previous_main_observation=observed,
+        )
+        self.assertNotIn("stale_frontend", {i["code"] for i in fresh_main["issues"]})
+
+    def test_main_observation_persists_across_transient_reference_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = watch.evaluate(NOW, self.fixtures())
+            watch.record(first, directory)
+            seen = watch.read_previous_main_observation(directory)
+            self.assertEqual(seen["sha"], MAIN)
+            self.assertEqual(seen["first_seen"], NOW.isoformat().replace("+00:00", "Z"))
+            def missing_main(name):
+                if name == "main":
+                    raise ValueError("upstream unavailable")
+                return self.fixtures()(name)
+            lost = watch.evaluate(
+                NOW + timedelta(minutes=4), missing_main,
+                previous_main_observation=seen,
+            )
+            watch.record(lost, directory)
+            self.assertEqual(watch.read_previous_main_observation(directory), seen)
+            overdue = watch.evaluate(
+                NOW + timedelta(minutes=46),
+                self.fixtures(frontend=OLD, api=OLD, commit_age=1),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertIn("stale_frontend", {i["code"] for i in overdue["issues"]})
+
+    def test_critical_watcher_is_in_evidence_registry(self):
+        registry = SCRIPT.parents[2] / "audit/impl-registry.yaml"
+        text = registry.read_text(encoding="utf-8")
+        self.assertIn("impl.guard.independent-production-watch", text)
+        self.assertIn("scripts/ci/tests/test_independent_production_watch.py", text)
+        self.assertIn("docs/runbooks/independent-production-watch.md", text)
 
     def test_dedupe_recovery_and_unknown_not_false_recovery(self):
         with tempfile.TemporaryDirectory() as tmp:
