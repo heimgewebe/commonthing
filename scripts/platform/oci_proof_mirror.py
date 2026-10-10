@@ -158,12 +158,12 @@ def _same_json_value(left: Any, right: Any) -> bool:
         return False
 
 
-def _load_seed() -> dict[str, Any]:
-    path = ROOT / "platform/oci-proof-mirror.seed.json"
+def _load_seed(seed_bytes: bytes) -> dict[str, Any]:
+    """Parse exactly the seed bytes already hashed and bound to Git HEAD."""
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise IntegrityError(f"OCI mirror seed is unreadable: {error}") from error
+        payload = json.loads(seed_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrityError(f"OCI mirror seed is invalid JSON: {error}") from error
     if (
         not isinstance(payload, dict)
         or type(payload.get("schema_version")) is not int
@@ -198,7 +198,7 @@ def _git_bytes(argv: list[str]) -> bytes:
 
 def _validate_generation_ancestry(
     generation: dict[str, Any],
-) -> tuple[dict[str, Any], bool]:
+) -> tuple[dict[str, Any], bool, bytes]:
     """Fail closed on source commit, allowed ancestry, and seed binding.
 
     Machine-checked generation contract (before inventory / full validation):
@@ -265,7 +265,8 @@ def _validate_generation_ancestry(
         )
     current_seed = ROOT / "platform/oci-proof-mirror.seed.json"
     try:
-        current_digest = hashlib.sha256(current_seed.read_bytes()).hexdigest()
+        seed_bytes = current_seed.read_bytes()
+        current_digest = hashlib.sha256(seed_bytes).hexdigest()
     except OSError as error:
         raise AncestryError(f"current OCI mirror seed is unreadable: {error}") from error
     pending_digest = generation.get("pending_seed_sha256")
@@ -305,7 +306,7 @@ def _validate_generation_ancestry(
         raise AncestryError("published OCI mirror seed is invalid JSON") from error
     if not isinstance(published_seed, dict):
         raise AncestryError("published OCI mirror seed must be an object")
-    return published_seed, pending
+    return published_seed, pending, seed_bytes
 
 
 def _load_lock() -> dict[str, Any]:
@@ -327,7 +328,7 @@ def _load_lock() -> dict[str, Any]:
     if not all(isinstance(item, dict) for item in (generation, mirror, budgets, images)):
         raise IntegrityError("OCI mirror lock sections are incomplete")
     # Ancestry / seed binding fails closed before inventory and mirror section checks.
-    published_seed, pending_seed = _validate_generation_ancestry(generation)
+    published_seed, pending_seed, verified_seed_bytes = _validate_generation_ancestry(generation)
     if not str(generation.get("workflow_run_id", "")).isdigit():
         raise IntegrityError("OCI mirror workflow run ID is invalid")
     if not str(generation.get("workflow_run_attempt", "")).isdigit():
@@ -381,7 +382,7 @@ def _load_lock() -> dict[str, Any]:
         raise IntegrityError("OCI mirror inventory mismatch")
     if budgets.get("observed_inventory_images") != len(images):
         raise IntegrityError("OCI mirror observed inventory count mismatch")
-    seed = _load_seed()
+    seed = _load_seed(verified_seed_bytes)
     seed_images = seed.get("images")
     if not isinstance(seed_images, dict) or set(seed_images) != EXPECTED_IMAGES:
         raise IntegrityError("OCI mirror seed inventory mismatch")

@@ -1223,6 +1223,7 @@ class KubernetesPlatformContractTests(unittest.TestCase):
     def _validate_pending_oci_seed(
         self, *, mutate_seed=None, mutate_lock=None, unchanged_seed=False,
         committed_seed_bytes=None, published_seed_bytes=None,
+        replace_seed_after_head=None,
     ) -> dict[str, object]:
         """Simulate reviewed HEAD seed bytes without Registry or repository writes.
 
@@ -1264,6 +1265,12 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                     stdout=original if published_seed_bytes is None else published_seed_bytes,
                 )
             if argv == ["git", "show", "HEAD:platform/oci-proof-mirror.seed.json"]:
+                if replace_seed_after_head is not None:
+                    # Replace the temporary seed after the SHA/HEAD snapshot,
+                    # just before policy parsing would re-open the file.
+                    (root / "platform/oci-proof-mirror.seed.json").write_bytes(
+                        replace_seed_after_head
+                    )
                 return subprocess.CompletedProcess(
                     argv, 0,
                     stdout=seed_bytes if committed_seed_bytes is None else committed_seed_bytes,
@@ -1301,6 +1308,30 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         self.assertNotEqual(
             locked["generation"]["pending_seed_sha256"],
             locked["generation"]["seed_sha256"],
+        )
+
+    def test_oci_mirror_pending_seed_parses_the_same_verified_bytes(self) -> None:
+        """An on-disk swap after the HEAD check cannot replace policy input."""
+        untrusted = json.loads(
+            (ROOT / "platform/oci-proof-mirror.seed.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        untrusted["publisher"]["require_protected_main"] = False
+        untrusted["extra_unpublished_policy"] = {"trusted": False}
+        replacement = (json.dumps(untrusted, sort_keys=True) + "\n").encode("utf-8")
+        locked = self._validate_pending_oci_seed(
+            replace_seed_after_head=replacement
+        )
+        baseline = json.loads(
+            (ROOT / "platform/oci-proof-mirror.lock.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(locked["images"], baseline["images"])
+        self.assertNotEqual(
+            locked["generation"]["pending_seed_sha256"],
+            hashlib.sha256(replacement).hexdigest(),
         )
 
     def test_oci_mirror_pending_seed_rejects_unbound_and_unsafe_changes(self) -> None:
