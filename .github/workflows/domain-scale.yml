@@ -528,10 +528,29 @@ jobs:
                         AND c.id = weltgewebe_node_conversation_id(n.id)
                         AND c.deleted_at IS NULL
                     ))
+                   -- The migration seeds exactly one Hammer Park center conversation
+                   -- before the bulk fixture; it is also disposable setup-only state.
+                   OR (event.aggregate_type = 'conversation'
+                    AND event.event_type = 'domain.conversation.created'
+                    AND EXISTS (
+                      SELECT 1 FROM domain_conversations c
+                      JOIN webgemeindezentren w ON w.id = c.webgemeindezentrum_id
+                      WHERE c.id::text = event.aggregate_id
+                        AND c.conversation_type = 'webgemeindezentrum'
+                        AND w.id = 'webgemeindezentrum-hammer-park'
+                        AND c.id = weltgewebe_webgemeindezentrum_conversation_id(w.id)
+                        AND c.deleted_at IS NULL
+                    ))
                  )
-            ) OR (SELECT count(*) FROM domain_outbox) <> (
+            ) OR (SELECT count(*) FROM webgemeindezentren) <> 1
+              OR NOT EXISTS (
+                SELECT 1 FROM webgemeindezentren
+                WHERE id = 'webgemeindezentrum-hammer-park'
+              )
+              OR (SELECT count(*) FROM domain_outbox) <> (
               2 * (SELECT count(*) FROM domain_nodes) +
-              (SELECT count(*) FROM domain_edges)
+              (SELECT count(*) FROM domain_edges) +
+              (SELECT count(*) FROM webgemeindezentren)
             ) OR EXISTS (
               SELECT 1 FROM domain_outbox
               GROUP BY aggregate_type, aggregate_id
@@ -548,8 +567,11 @@ jobs:
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_outbox')" = "0"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_event_consumptions')" = "0"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM web_push_deliveries')" = "0"
-          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_conversations')" = \
+          test "$(psql "${DATABASE_URL}" -Atc \
+            "SELECT count(*) FROM domain_conversations WHERE conversation_type = 'node'")" = \
             "${{ steps.contract.outputs.node_count }}"
+          test "$(psql "${DATABASE_URL}" -Atc \
+            "SELECT count(*) FROM domain_conversations WHERE conversation_type = 'webgemeindezentrum'")" = "1"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_nodes')" = \
             "${{ steps.contract.outputs.node_count }}"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_edges')" = \

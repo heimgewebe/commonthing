@@ -90,6 +90,14 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("event_type = 'domain.conversation.created'", source)
         self.assertIn("weltgewebe_node_conversation_id(n.id)", source)
         self.assertIn("FROM domain_conversations c", source)
+        # A fresh fully migrated database also seeds a Webgemeindezentrum conversation.
+        self.assertIn("c.conversation_type = 'webgemeindezentrum'", source)
+        self.assertIn("JOIN webgemeindezentren w", source)
+        self.assertIn("w.id = c.webgemeindezentrum_id", source)
+        self.assertIn("weltgewebe_webgemeindezentrum_conversation_id(w.id)", source)
+        self.assertIn("(SELECT count(*) FROM webgemeindezentren)", source)
+        self.assertIn("WHERE conversation_type = 'node'", source)
+        self.assertIn("WHERE conversation_type = 'webgemeindezentrum'", source)
         self.assertIn("2 * (SELECT count(*) FROM domain_nodes)", source)
         self.assertIn("SELECT count(*) FROM domain_conversations", source)
         self.assertIn("FROM domain_nodes n WHERE n.id = event.aggregate_id", source)
@@ -105,6 +113,22 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("WHEN SQLSTATE '0A000'", source)
         self.assertIn("SELECT count(*) FROM domain_outbox", source)
         self.assertIn("SELECT count(*) FROM domain_nodes", source)
+
+    def test_center_event_guard_matches_the_real_seed_migration(self) -> None:
+        migration = (
+            ROOT / "apps/api/migrations/20260802000002_webgemeindezentrum_governance_hub.up.sql"
+        ).read_text(encoding="utf-8")
+        seed = (
+            ROOT / "apps/api/migrations/20260802000001_ortsweberei_webgemeindezentrum.up.sql"
+        ).read_text(encoding="utf-8")
+        self.assertIn("webgemeindezentrum-hammer-park", seed)
+        self.assertIn("CREATE OR REPLACE FUNCTION weltgewebe_webgemeindezentrum_conversation_id", migration)
+        self.assertIn("INSERT INTO domain_conversations(", migration)
+        self.assertIn("FROM webgemeindezentren", migration)
+        reset = self.job.split("name: Reset synthetic fixture outbox before readiness", 1)[1].split(
+            "name: Start isolated JetStream for measured API", 1
+        )[0]
+        self.assertIn("weltgewebe_webgemeindezentrum_conversation_id(w.id)", reset)
 
     def test_readiness_is_stable_before_starting_measured_load(self) -> None:
         start = self.job.index("name: Start and warm the measured API container")
@@ -352,6 +376,17 @@ sleep() { :; }
             runtime_filter,
             "Changing broker identity/quiescence checks must run live T048",
         )
+        self.assertIn("name: Run T048 and JetStream regression suites", self.ci_source)
+        for module in (
+            "scripts.ci.tests.test_api_runtime_evidence",
+            "scripts.ci.tests.test_api_runtime_workflow",
+            "scripts.ci.tests.test_t048_jetstream",
+            "scripts.ci.tests.test_experiment_b_t048_readiness",
+            "scripts.ci.tests.test_event_chain_readiness_proof",
+        ):
+            self.assertIn(module, self.ci_source)
+        self.assertIn("node --experimental-vm-modules --test", self.ci_source)
+        self.assertIn("scripts/ci/tests/api_runtime_k6_classification.test.mjs", self.ci_source)
 
         caller = self.ci_source[
             self.ci_source.index("  api-runtime-proof:\n") : self.ci_source.index(
