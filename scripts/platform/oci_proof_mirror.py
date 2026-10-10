@@ -149,6 +149,15 @@ def _output(argv: list[str], *, timeout: int = 120) -> str:
     return _run(argv, capture=True, timeout=timeout).stdout.strip()
 
 
+def _same_json_value(left: Any, right: Any) -> bool:
+    """Compare JSON without Python's bool/int/float equality coercions."""
+    try:
+        options = {"sort_keys": True, "separators": (",", ":"), "allow_nan": False}
+        return json.dumps(left, **options) == json.dumps(right, **options)
+    except (TypeError, ValueError):
+        return False
+
+
 def _load_seed() -> dict[str, Any]:
     path = ROOT / "platform/oci-proof-mirror.seed.json"
     try:
@@ -157,7 +166,8 @@ def _load_seed() -> dict[str, Any]:
         raise IntegrityError(f"OCI mirror seed is unreadable: {error}") from error
     if (
         not isinstance(payload, dict)
-        or payload.get("schema_version") != 1
+        or type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
         or payload.get("owner") != "heimgewebe/weltgewebe"
     ):
         raise IntegrityError("OCI mirror seed identity mismatch")
@@ -303,7 +313,7 @@ def _load_lock() -> dict[str, Any]:
         lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise IntegrityError(f"OCI mirror lock is unreadable: {error}") from error
-    if lock.get("schema_version") != 1:
+    if type(lock.get("schema_version")) is not int or lock["schema_version"] != 1:
         raise IntegrityError("unsupported OCI mirror lock schema")
     if lock.get("kind") != "weltgewebe.oci-proof-mirror-lock":
         raise IntegrityError("OCI mirror lock kind mismatch")
@@ -385,7 +395,7 @@ def _load_lock() -> dict[str, Any]:
         if set(seed) != expected_seed_fields or set(published_seed) != expected_seed_fields:
             raise IntegrityError("pending OCI seed adds or removes top-level authority fields")
         if any(
-            seed.get(field) != published_seed.get(field)
+            not _same_json_value(seed[field], published_seed[field])
             for field in ("schema_version", "owner", "target", "publisher")
         ):
             raise IntegrityError("pending OCI seed changes immutable publisher policy")
@@ -404,8 +414,8 @@ def _load_lock() -> dict[str, Any]:
                 or not isinstance(staged_spec, dict)
                 or set(old_spec) != expected_fields
                 or set(staged_spec) != expected_fields
-                or old_spec["suites"] != staged_spec["suites"]
-                or old_spec["load_into_kind"] != staged_spec["load_into_kind"]
+                or not _same_json_value(old_spec["suites"], staged_spec["suites"])
+                or not _same_json_value(old_spec["load_into_kind"], staged_spec["load_into_kind"])
             ):
                 raise IntegrityError("pending OCI seed changes non-digest image policy")
             old_ref, staged_ref = old_spec["canonical"], staged_spec["canonical"]

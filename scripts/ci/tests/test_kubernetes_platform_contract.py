@@ -1421,6 +1421,42 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                 with self.assertRaises(self.oci_mirror.IntegrityError):
                     self._validate_pending_oci_seed(mutate_seed=mutation)
 
+    def test_oci_mirror_pending_seed_rejects_python_equal_json_type_changes(self) -> None:
+        """Old Python == comparison wrongly accepted true→1 and false→0."""
+        scenarios = [
+            ("schema integer becomes boolean",
+             lambda seed: seed.__setitem__("schema_version", True), None),
+            ("schema integer becomes float",
+             lambda seed: seed.__setitem__("schema_version", 1.0), None),
+            ("publisher boolean becomes integer",
+             lambda seed: seed["publisher"].__setitem__("require_protected_main", 1), None),
+            ("publisher boolean becomes float",
+             lambda seed: seed["publisher"].__setitem__("require_protected_main", 1.0), None),
+            ("publisher integer becomes float",
+             lambda seed: seed["publisher"].__setitem__("max_parallelism", 3.0), None),
+            ("target retention integer becomes float",
+             lambda seed: seed["target"]["retention"].__setitem__("orphan_grace_days", 14.0), None),
+            ("kind import boolean becomes integer",
+             lambda seed: seed["images"]["build_debian"].__setitem__("load_into_kind", 0), None),
+            ("kind import boolean becomes float",
+             lambda seed: seed["images"]["build_debian"].__setitem__("load_into_kind", 0.0), None),
+            ("lock schema integer becomes boolean",
+             None, lambda lock: lock.__setitem__("schema_version", True)),
+        ]
+        for name, seed_mutation, lock_mutation in scenarios:
+            with self.subTest(name=name):
+                with self.assertRaises(self.oci_mirror.IntegrityError):
+                    self._validate_pending_oci_seed(
+                        mutate_seed=seed_mutation,
+                        mutate_lock=lock_mutation,
+                    )
+        self.assertTrue(self.oci_mirror._same_json_value(
+            {"a": [False, 1], "z": {"v": "same"}}, {"z": {"v": "same"}, "a": [False, 1]}
+        ))
+        self.assertFalse(self.oci_mirror._same_json_value([False], [0]))
+        self.assertFalse(self.oci_mirror._same_json_value({"schema": 1}, {"schema": True}))
+        self.assertFalse(self.oci_mirror._same_json_value(float("nan"), float("nan")))
+
     def test_oci_mirror_pending_seed_requires_committed_head_blob(self) -> None:
         with self.assertRaisesRegex(
             self.oci_mirror.AncestryError, "differs from committed HEAD"
