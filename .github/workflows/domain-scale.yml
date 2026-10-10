@@ -498,12 +498,34 @@ jobs:
           BEGIN;
           DO $t048_fixture$
           BEGIN
+            -- The generated CI fixture inserts nodes and edges once each.
+            -- Prove there are no extra, missing, duplicate, or foreign events
+            -- before destroying any setup-only backlog.
             IF EXISTS (
+              SELECT 1 FROM domain_outbox AS event
+              WHERE event.aggregate_type NOT IN ('node', 'edge')
+                 OR event.published_at IS NOT NULL
+                 OR event.quarantined_at IS NOT NULL
+                 OR event.attempt_count > 0
+                 OR NOT (
+                   (event.aggregate_type = 'node'
+                    AND event.event_type = 'domain.node.created'
+                    AND EXISTS (
+                      SELECT 1 FROM domain_nodes n WHERE n.id = event.aggregate_id
+                    ))
+                   OR (event.aggregate_type = 'edge'
+                    AND event.event_type = 'domain.edge.created'
+                    AND EXISTS (
+                      SELECT 1 FROM domain_edges e WHERE e.id = event.aggregate_id
+                    ))
+                 )
+            ) OR (SELECT count(*) FROM domain_outbox) <> (
+              (SELECT count(*) FROM domain_nodes) +
+              (SELECT count(*) FROM domain_edges)
+            ) OR EXISTS (
               SELECT 1 FROM domain_outbox
-              WHERE aggregate_type NOT IN ('node', 'edge', 'conversation')
-                 OR published_at IS NOT NULL
-                 OR quarantined_at IS NOT NULL
-                 OR attempt_count > 0
+              GROUP BY aggregate_type, aggregate_id
+              HAVING count(*) > 1
             ) OR EXISTS (SELECT 1 FROM domain_event_consumptions)
               OR EXISTS (SELECT 1 FROM web_push_deliveries) THEN
               RAISE EXCEPTION 'T048 fixture outbox contains non-fixture event state';
