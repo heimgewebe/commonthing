@@ -155,7 +155,11 @@ def _load_seed() -> dict[str, Any]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise IntegrityError(f"OCI mirror seed is unreadable: {error}") from error
-    if payload.get("schema_version") != 1 or payload.get("owner") != "heimgewebe/weltgewebe":
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("owner") != "heimgewebe/weltgewebe"
+    ):
         raise IntegrityError("OCI mirror seed identity mismatch")
     return payload
 
@@ -270,10 +274,27 @@ def _validate_generation_ancestry(
                 "or exact pending_seed_sha256"
             )
         pending = True
+        # A pending digest is a publication request, not publisher evidence.
+        # Its exact bytes must nevertheless be committed in the reviewed HEAD:
+        # otherwise a changed working-tree seed could escape PR review.
+        try:
+            committed_seed = subprocess.run(
+                ["git", "show", "HEAD:platform/oci-proof-mirror.seed.json"],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                timeout=30,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            raise AncestryError("pending OCI seed is not bound to HEAD") from error
+        if hashlib.sha256(committed_seed).hexdigest() != current_digest:
+            raise AncestryError("pending OCI seed differs from committed HEAD")
     try:
         published_seed = json.loads(seed_at_head)
     except json.JSONDecodeError as error:
         raise AncestryError("published OCI mirror seed is invalid JSON") from error
+    if not isinstance(published_seed, dict):
+        raise AncestryError("published OCI mirror seed must be an object")
     return published_seed, pending
 
 
@@ -358,7 +379,11 @@ def _load_lock() -> dict[str, Any]:
     if pending_seed:
         # A pending seed is only a reviewed publication request. The old lock
         # remains the sole build/offline proof authority until main publishes
-        # and verifies the replacement mirror generation.
+        # and verifies the replacement mirror generation. No extra seed keys
+        # may hitch a ride alongside an otherwise valid digest update.
+        expected_seed_fields = {"schema_version", "owner", "target", "publisher", "images"}
+        if set(seed) != expected_seed_fields or set(published_seed) != expected_seed_fields:
+            raise IntegrityError("pending OCI seed adds or removes top-level authority fields")
         if any(
             seed.get(field) != published_seed.get(field)
             for field in ("schema_version", "owner", "target", "publisher")
@@ -387,10 +412,11 @@ def _load_lock() -> dict[str, Any]:
             if (
                 not isinstance(old_ref, str)
                 or not isinstance(staged_ref, str)
-                or "@" not in old_ref
-                or "@" not in staged_ref
-                or old_ref.rsplit("@", 1)[0] != staged_ref.rsplit("@", 1)[0]
-                or not FULL_SHA256.fullmatch(staged_ref.rsplit("@", 1)[1])
+                or old_ref.count("@") != 1
+                or staged_ref.count("@") != 1
+                or old_ref.split("@", 1)[0] != staged_ref.split("@", 1)[0]
+                or not FULL_SHA256.fullmatch(old_ref.split("@", 1)[1])
+                or not FULL_SHA256.fullmatch(staged_ref.split("@", 1)[1])
             ):
                 raise IntegrityError(
                     "pending OCI seed changes image identity or pinning"

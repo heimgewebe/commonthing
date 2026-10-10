@@ -1221,9 +1221,14 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         return Path(handle.name)
 
     def _validate_pending_oci_seed(
-        self, *, mutate_seed=None, mutate_lock=None, unchanged_seed=False
+        self, *, mutate_seed=None, mutate_lock=None, unchanged_seed=False,
+        committed_seed_bytes=None, published_seed_bytes=None,
     ) -> dict[str, object]:
-        """Simulate a reviewed next digest without registry writes or source Git changes."""
+        """Simulate reviewed HEAD seed bytes without Registry or repository writes.
+
+        Source-commit existence and ancestry still execute against the real local
+        Git objects. Only exact seed-blob reads are supplied by this fixture.
+        """
         original = (ROOT / "platform/oci-proof-mirror.seed.json").read_bytes()
         seed = json.loads(original)
         seed["images"]["build_debian"]["canonical"] = (
@@ -1239,16 +1244,34 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         lock = json.loads(
             (ROOT / "platform/oci-proof-mirror.lock.json").read_text(encoding="utf-8")
         )
+        trusted_source_head = lock["generation"]["source_head"]
+        if published_seed_bytes is not None:
+            lock["generation"]["seed_sha256"] = hashlib.sha256(
+                published_seed_bytes
+            ).hexdigest()
         lock["generation"]["pending_seed_sha256"] = hashlib.sha256(
             seed_bytes
         ).hexdigest()
         if mutate_lock is not None:
             mutate_lock(lock)
 
-        def verified_git_read(argv, **_kwargs):
-            if argv[:2] == ["git", "show"]:
-                return subprocess.CompletedProcess(argv, 0, stdout=original)
-            return subprocess.CompletedProcess(argv, 0, stdout=b"")
+        real_run = subprocess.run
+
+        def verified_git_read(argv, **kwargs):
+            if argv == ["git", "show", f"{trusted_source_head}:platform/oci-proof-mirror.seed.json"]:
+                return subprocess.CompletedProcess(
+                    argv, 0,
+                    stdout=original if published_seed_bytes is None else published_seed_bytes,
+                )
+            if argv == ["git", "show", "HEAD:platform/oci-proof-mirror.seed.json"]:
+                return subprocess.CompletedProcess(
+                    argv, 0,
+                    stdout=seed_bytes if committed_seed_bytes is None else committed_seed_bytes,
+                )
+            if argv[:2] in (["git", "cat-file"], ["git", "merge-base"]):
+                # No blanket rc=0 mock: real reachable-commit and ancestry guards.
+                return real_run(argv, **{**kwargs, "cwd": ROOT})
+            raise AssertionError(f"unexpected Git command in pending seed proof: {argv!r}")
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1351,6 +1374,87 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                         mutate_seed=seed_change,
                         mutate_lock=lock_change,
                         unchanged_seed=name == "stale pending marker",
+                    )
+
+    def test_oci_mirror_pending_seed_rejects_unpublished_authority_and_malformed_pins(self) -> None:
+        original_seed = json.loads(
+            (ROOT / "platform/oci-proof-mirror.seed.json").read_text(encoding="utf-8")
+        )
+        original_debian = original_seed["images"]["build_debian"]["canonical"]
+        scenarios = [
+            ("extra top-level key with a digest bump",
+             lambda seed: seed.__setitem__("unpublished_authority", {"trusted": False})),
+            ("extra key without a digest bump",
+             lambda seed: (seed.__setitem__("unpublished_authority", 1),
+                           seed["images"]["build_debian"].__setitem__("canonical", original_debian))),
+            ("unexpected version",
+             lambda seed: seed.__setitem__("schema_version", 2)),
+            ("wrong owner",
+             lambda seed: seed.__setitem__("owner", "other/owner")),
+            ("altered target",
+             lambda seed: seed["target"].__setitem__("visibility", "public")),
+            ("altered publisher",
+             lambda seed: seed["publisher"].__setitem__("require_protected_main", False)),
+            ("changed kind load semantics",
+             lambda seed: seed["images"]["build_debian"].__setitem__("load_into_kind", True)),
+            ("missing canonical",
+             lambda seed: seed["images"]["build_debian"].pop("canonical")),
+            ("unsigned extra image field",
+             lambda seed: seed["images"]["build_debian"].__setitem__("untrusted", "payload")),
+            ("extra separator in pin",
+             lambda seed: seed["images"]["build_debian"].__setitem__(
+                 "canonical", "docker.io/library/debian:bookworm-slim@tag@sha256:" + "0" * 64)),
+            ("uppercase sha256 hex",
+             lambda seed: seed["images"]["build_debian"].__setitem__(
+                 "canonical", "docker.io/library/debian:bookworm-slim@sha256:" + "A" * 64)),
+            ("missing sha256 prefix",
+             lambda seed: seed["images"]["build_debian"].__setitem__(
+                 "canonical", "docker.io/library/debian:bookworm-slim@" + "0" * 64)),
+            ("registry retarget",
+             lambda seed: seed["images"]["build_debian"].__setitem__(
+                 "canonical", "docker.io/alternate/debian:bookworm-slim@sha256:" + "0" * 64)),
+            ("digest update absent",
+             lambda seed: seed["images"]["build_debian"].__setitem__("canonical", original_debian)),
+        ]
+        for name, mutation in scenarios:
+            with self.subTest(name=name):
+                with self.assertRaises(self.oci_mirror.IntegrityError):
+                    self._validate_pending_oci_seed(mutate_seed=mutation)
+
+    def test_oci_mirror_pending_seed_requires_committed_head_blob(self) -> None:
+        with self.assertRaisesRegex(
+            self.oci_mirror.AncestryError, "differs from committed HEAD"
+        ):
+            self._validate_pending_oci_seed(
+                committed_seed_bytes=(
+                    ROOT / "platform/oci-proof-mirror.seed.json"
+                ).read_bytes()
+            )
+
+    def test_oci_mirror_pending_seed_checks_real_source_ancestry(self) -> None:
+        with self.assertRaisesRegex(
+            self.oci_mirror.AncestryError, "unreachable"
+        ):
+            self._validate_pending_oci_seed(
+                mutate_lock=lambda lock: lock["generation"].__setitem__(
+                    "source_head", "deadbeef" + "0" * 32
+                )
+            )
+
+    def test_oci_mirror_pending_seed_rejects_nonobject_published_seed(self) -> None:
+        with self.assertRaisesRegex(
+            self.oci_mirror.AncestryError, "must be an object"
+        ):
+            self._validate_pending_oci_seed(published_seed_bytes=b"[]")
+
+    def test_oci_mirror_pending_seed_rejects_invalid_marker_types(self) -> None:
+        for value in (False, 123, [], {}, "A" * 64, "0" * 63):
+            with self.subTest(marker=value):
+                with self.assertRaises(self.oci_mirror.AncestryError):
+                    self._validate_pending_oci_seed(
+                        mutate_lock=lambda lock: lock["generation"].__setitem__(
+                            "pending_seed_sha256", value
+                        )
                     )
 
     def test_oci_mirror_lock_rejects_unreachable_source_head(self) -> None:
