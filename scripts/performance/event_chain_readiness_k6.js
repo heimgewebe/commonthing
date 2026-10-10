@@ -1,0 +1,106 @@
+// Isolated event-chain probe, NOT the canonical mixed search/health T048 workload.
+// A 503 is an error here: the API must already have healthy PostgreSQL,
+// JetStream, Relay and ReceiptConsumer before sampling begins.
+import http from 'k6/http';
+import { Counter } from 'k6/metrics';
+
+for (const name of ['PROOF_RUN_ID', 'PROOF_VARIANT', 'PROOF_PHASE', 'PROOF_GIT_HEAD', 'PROOF_IMAGE_ID']) {
+  if (!__ENV[name]) throw new Error(`${name} is required`);
+}
+if (!/^[0-9a-f]{40}$/.test(__ENV.PROOF_GIT_HEAD)) throw new Error('invalid head');
+if (!/^sha256:[0-9a-f]{64}$/.test(__ENV.PROOF_IMAGE_ID)) throw new Error('invalid image identity');
+if (!['baseline', 'fix'].includes(__ENV.PROOF_VARIANT)) throw new Error('invalid variant');
+if (!['recent', 'aged'].includes(__ENV.PROOF_PHASE)) throw new Error('invalid event age phase');
+if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(__ENV.PROOF_RUN_ID)) throw new Error('invalid run id');
+
+const READY_200 = new Counter('proof_ready_200');
+const READY_200_INCOMPLETE = new Counter('proof_ready_200_incomplete');
+const READY_503 = new Counter('proof_ready_503');
+const READY_503_EVENT_CHAIN_TIMEOUT = new Counter('proof_ready_503_event_chain_timeout');
+const READY_503_OTHER_CAUSE = new Counter('proof_ready_503_other_cause');
+const READY_503_CHAIN_TIMEOUT_MIXED = new Counter('proof_ready_503_event_chain_timeout_mixed');
+const READY_503_PARSE_ERROR = new Counter('proof_ready_503_parse_error');
+const READY_503_COMPONENT_FALSE = {
+  database: new Counter('proof_ready_503_check_false_database'),
+  nats: new Counter('proof_ready_503_check_false_nats'),
+  event_chain: new Counter('proof_ready_503_check_false_event_chain'),
+  policy: new Counter('proof_ready_503_check_false_policy'),
+};
+const READY_OTHER = new Counter('proof_ready_other');
+
+http.setResponseCallback(http.expectedStatuses(200));
+
+export const options = {
+  vus: 10,
+  duration: '30s',
+  summaryTrendStats: ['avg', 'min', 'med', 'p(50)', 'p(95)', 'p(99)', 'max'],
+};
+
+export default function () {
+  const response = http.get('http://127.0.0.1:8787/health/ready', { timeout: '2s' });
+  if (response.status === 200) {
+    READY_200.add(1);
+    let checks;
+    let status;
+    try {
+      const body = response.json();
+      checks = body && body.checks;
+      status = body && body.status;
+    } catch (_) {
+      // A 200 with missing or malformed readiness details is not evidence of health.
+    }
+    if (
+      status !== 'ok' || !checks ||
+      checks.database !== true || checks.nats !== true ||
+      checks.event_chain !== true || checks.policy !== true
+    ) READY_200_INCOMPLETE.add(1);
+  } else if (response.status === 503) {
+    READY_503.add(1);
+    let body;
+    try {
+      body = response.json();
+    } catch (_) {
+      // No response body is ever copied to logs or evidence.
+    }
+    const checks = body && body.checks;
+    const errors = body && body.errors;
+    if (!checks || typeof checks !== 'object') READY_503_PARSE_ERROR.add(1);
+    for (const component of Object.keys(READY_503_COMPONENT_FALSE)) {
+      if (checks && checks[component] === false) READY_503_COMPONENT_FALSE[component].add(1);
+    }
+    const eventErrors = errors && errors.event_chain;
+    const hasEventChainTimeout = Array.isArray(eventErrors) &&
+      eventErrors.includes('readiness check timed out after 750 ms');
+    const eventChainTimeoutOnly =
+      checks && checks.event_chain === false &&
+      checks.database === true && checks.nats === true && checks.policy === true &&
+      hasEventChainTimeout &&
+      !errors.database && !errors.nats && !errors.policy;
+    if (eventChainTimeoutOnly) READY_503_EVENT_CHAIN_TIMEOUT.add(1);
+    else {
+      READY_503_OTHER_CAUSE.add(1);
+      if (hasEventChainTimeout) READY_503_CHAIN_TIMEOUT_MIXED.add(1);
+    }
+  } else READY_OTHER.add(1);
+}
+
+export function handleSummary(data) {
+  const meta = {
+    schema_version: 1,
+    run_id: __ENV.PROOF_RUN_ID,
+    variant: __ENV.PROOF_VARIANT,
+    phase: __ENV.PROOF_PHASE,
+    git_head: __ENV.PROOF_GIT_HEAD,
+    image_id: __ENV.PROOF_IMAGE_ID,
+    event_count: 140001,
+    event_age_seconds: __ENV.PROOF_PHASE === 'recent' ? 120 : 720,
+    virtual_users: 10,
+    duration_seconds: 30,
+  };
+  const output = Object.assign({}, data, { event_chain_proof: meta });
+  const path = __ENV.PROOF_SUMMARY_PATH;
+  if (!path || !path.startsWith('/evidence/') || !path.endsWith('.json')) {
+    throw new Error('PROOF_SUMMARY_PATH must be an absolute /evidence JSON path');
+  }
+  return { [path]: JSON.stringify(output) };
+}
