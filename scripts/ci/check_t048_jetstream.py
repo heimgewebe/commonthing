@@ -20,6 +20,16 @@ def _count(obj: Mapping, key: str) -> int:
     return value
 
 
+def _aggregate_count(obj: Mapping, current: str, legacy: str) -> int:
+    """Support both documented /jsz generations, rejecting missing or conflicting counts."""
+    if current not in obj and legacy not in obj:
+        raise ValueError(f"JetStream {current} is missing")
+    values = [_count(obj, key) for key in (current, legacy) if key in obj]
+    if len(values) == 2 and values[0] != values[1]:
+        raise ValueError(f"JetStream {current} counters disagree")
+    return values[0]
+
+
 def validate(
     container: Mapping,
     server: Mapping,
@@ -60,9 +70,9 @@ def validate(
     ):
         raise ValueError("T048 NATS monitoring endpoint belongs to the wrong broker")
 
-    streams = _count(jetstream, "total_streams")
-    consumers = _count(jetstream, "total_consumers")
-    messages = _count(jetstream, "total_messages")
+    streams = _aggregate_count(jetstream, "streams", "total_streams")
+    consumers = _aggregate_count(jetstream, "consumers", "total_consumers")
+    messages = _aggregate_count(jetstream, "messages", "total_messages")
     if messages != 0:
         raise ValueError(f"T048 JetStream contains {messages} prior messages")
 

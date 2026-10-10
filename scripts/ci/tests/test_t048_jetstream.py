@@ -125,6 +125,22 @@ class T048JetstreamTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing"):
             self.prove()
 
+    def test_current_nats_jsz_counters_pass(self) -> None:
+        self.jetstream["streams"] = self.jetstream.pop("total_streams")
+        self.jetstream["consumers"] = self.jetstream.pop("total_consumers")
+        self.jetstream["messages"] = self.jetstream.pop("total_messages")
+        self.assertEqual(self.prove()["consumers"], 1)
+
+    def test_conflicting_jsz_counter_aliases_fail_closed(self) -> None:
+        self.jetstream["streams"] = 0
+        with self.assertRaisesRegex(ValueError, "counters disagree"):
+            self.prove()
+
+    def test_missing_both_jsz_counter_aliases_fail_closed(self) -> None:
+        del self.jetstream["total_consumers"]
+        with self.assertRaisesRegex(ValueError, "missing"):
+            self.prove()
+
     def test_zero_streams_and_consumers_are_valid(self) -> None:
         empty = copy.deepcopy(self.jetstream)
         empty.update({"total_streams": 0, "total_consumers": 0, "account_details": []})
