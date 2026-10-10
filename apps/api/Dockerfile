@@ -46,11 +46,11 @@ WORKDIR /app
 # wget is needed for healthchecks. ca-certificates for HTTPS.
 # jq is kept for demo/dev tooling and smoke-style JSON inspection; bootstrap-first-account.sh does not require jq.
 # libssl3 is required by OpenSSL-linked Rust dependencies such as webauthn-rs.
-# libpcre2-8-0 and perl-base are refreshed from bookworm-security so the pinned
-# base does not retain the vulnerable package versions reported by the image
-# scanner.
+# libpcre2-8-0 and perl-base are explicitly refreshed from the Debian security
+# repositories so the pinned base cannot retain their known vulnerable versions.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates wget jq libssl3 libpcre2-8-0 perl-base passwd \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates wget jq libssl3 libpcre2-8-0 passwd perl-base \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
