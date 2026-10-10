@@ -68,4 +68,4 @@ Lokale source-only Checks:
 Lokale ALARM-Events sind ausdrücklich keine nachgewiesen zugestellten
 Benachrichtigungen. Die Wache beweist ihre eigene Cron-Liveness nicht
 unabhängig; ein externer Empfänger samt echtem Benachrichtigungstest bleibt
-in Issue #1939 offen: https://github.com/heimgewebe/commonthing/issues/1939 .
+in [Issue #1939](https://github.com/heimgewebe/commonthing/issues/1939).
