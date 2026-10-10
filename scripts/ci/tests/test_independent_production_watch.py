@@ -212,6 +212,78 @@ class WatchTests(unittest.TestCase):
             )
             self.assertIn("stale_frontend", {i["code"] for i in overdue["issues"]})
 
+    def test_unconfirmed_peer_p1_survives_other_visible_p1(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            observed = {
+                "sha": MAIN,
+                "first_seen": (NOW - timedelta(minutes=46)).isoformat(),
+            }
+            first = watch.evaluate(
+                NOW,
+                self.fixtures(api=OLD, cache="public, max-age=30"),
+                previous_main_observation=observed,
+            )
+            self.assertEqual(watch.record(first, directory), "ALARM")
+            original = json.loads((directory / "state.json").read_text())["severe"]
+            self.assertIn("stale_api", [item[0] for item in original])
+
+            def missing_api(name):
+                if name == "api":
+                    raise ValueError("temporary API observer outage")
+                return self.fixtures(api=OLD, cache="public, max-age=30")(name)
+
+            unknown = watch.evaluate(
+                NOW + timedelta(minutes=1), missing_api,
+                previous_main_observation=observed,
+            )
+            self.assertEqual(watch.record(unknown, directory), "MONITOR_DATA_FAILURE")
+            retained = json.loads((directory / "state.json").read_text())["severe"]
+            self.assertEqual(retained, original)
+            restored = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(api=OLD, cache="public, max-age=30"),
+                previous_main_observation=observed,
+            )
+            self.assertIsNone(watch.record(restored, directory))
+            self.assertEqual(len((directory / "events.jsonl").read_text().splitlines()), 2)
+
+    def test_malformed_state_shapes_do_not_disable_heartbeat(self):
+        import json
+        malformed = [None, [], {"severe": None, "uncertain": None},
+                     {"severe": [None, {}, ["frontend_cache", None]],
+                      "uncertain": None}]
+        for state in malformed:
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+                healthy = watch.evaluate(NOW, self.fixtures())
+                self.assertIsNone(watch.record(healthy, directory))
+                self.assertTrue((directory / "heartbeat.json").is_file())
+                persisted = json.loads((directory / "state.json").read_text())
+                self.assertEqual(persisted["severe"], [])
+                self.assertEqual(persisted["uncertain"], [])
+                self.assertFalse((directory / "events.jsonl").exists())
+
+    def test_cron_activation_has_independent_critical_registry_entry(self):
+        import re
+        registry = (SCRIPT.parents[2] / "audit/impl-registry.yaml").read_text(encoding="utf-8")
+        self.assertRegex(
+            registry,
+            re.compile(
+                r"(?m)^  - id: impl.workflow.independent-production-watch-cron\n"
+                r"    path: scripts/ops/independent_production_watch\.crontab\n"
+                r"    impl_type: workflow\n"
+                r"    status: active\n"
+                r"    criticality: high\n",
+            ),
+        )
+        crontab = (SCRIPT.parents[2] / "scripts/ops/independent_production_watch.crontab").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("*/5 * * * * /usr/bin/python3 -B /home/alex/.local/commonthing-production-watch.py", crontab)
+
     def test_critical_watcher_is_in_evidence_registry(self):
         registry = SCRIPT.parents[2] / "audit/impl-registry.yaml"
         text = registry.read_text(encoding="utf-8")

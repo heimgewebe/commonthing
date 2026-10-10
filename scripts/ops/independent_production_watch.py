@@ -24,6 +24,25 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 UTC = timezone.utc
 LIMIT = 512 * 1024
 THRESHOLD = 45 * 60
+# Each P1 is cleared only after the observations needed to verify it succeed.
+# Another still-visible P1 cannot hide an unverified incident.
+P1_UNVERIFIABLE_ON = {
+    "frontend_cache": {"unavailable_frontend"},
+    "invalid_commit_frontend": {"unavailable_frontend"},
+    "invalid_commit_api": {"unavailable_api"},
+    "frontend_api_diverge": {
+        "unavailable_frontend", "unavailable_api",
+        "invalid_commit_frontend", "invalid_commit_api",
+    },
+    "stale_frontend": {
+        "unavailable_frontend", "unavailable_main",
+        "invalid_commit_frontend", "invalid_commit_main",
+    },
+    "stale_api": {
+        "unavailable_api", "unavailable_main",
+        "invalid_commit_api", "invalid_commit_main",
+    },
+}
 
 
 def timestamp(value):
@@ -187,19 +206,34 @@ def record(result, directory):
             previous = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, ValueError):
             previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        raw_severe = previous.get("severe")
+        raw_severe = raw_severe if isinstance(raw_severe, list) else []
+        # Malformed state is not evidence for either an incident or a recovery.
+        old_severe = sorted(
+            item for item in raw_severe
+            if isinstance(item, list) and len(item) == 2
+            and all(isinstance(value, str) for value in item)
+            and item[0] not in {"schedule_stale", "schedule_failed", "no_schedule"}
+        )
+        old_uncertain = previous.get("uncertain")
+        old_uncertain = old_uncertain if isinstance(old_uncertain, list) else []
         severe = sorted([x["code"], str(x["actual"])[:160]]
                         for x in result["issues"] if x["severity"] == "P1")
         uncertain = sorted(x["code"] for x in result["issues"] if x["severity"] == "P2")
+        observed_codes = {item["code"] for item in result["issues"]}
+        # Preserve only incidents whose required observation is unavailable or invalid.
+        for item in old_severe:
+            if item not in severe and P1_UNVERIFIABLE_ON.get(item[0], set()) & observed_codes:
+                severe.append(item)
+        severe.sort()
         new_event = None
-        # Retire old GitHub-schedule-only incidents without a fictitious RECOVERY.
-        old_severe = [item for item in previous.get("severe", [])
-                      if isinstance(item, list) and item
-                      and item[0] not in {"schedule_stale", "schedule_failed", "no_schedule"}]
         if severe and severe != old_severe:
             new_event = "ALARM"
         elif old_severe and not severe and not uncertain:
             new_event = "RECOVERY"
-        elif uncertain and uncertain != previous.get("uncertain", []):
+        elif uncertain and uncertain != old_uncertain:
             new_event = "MONITOR_DATA_FAILURE"
         if new_event:
             event = {"event": new_event, **result,
@@ -208,9 +242,6 @@ def record(result, directory):
                 out.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
                 out.flush()
                 os.fsync(out.fileno())
-        # Never erase a prior confirmed incident due to a failed HTTP observation.
-        if not severe and uncertain:
-            severe = old_severe
         current_main = result.get("main_observation")
         previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
         if not isinstance(current_main, dict):

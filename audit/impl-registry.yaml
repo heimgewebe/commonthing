@@ -553,6 +553,17 @@ implementations:
     verified_by:
       - scripts/ci/tests/test_independent_production_watch.py
 
+  - id: impl.workflow.independent-production-watch-cron
+    path: scripts/ops/independent_production_watch.crontab
+    impl_type: workflow
+    status: active
+    criticality: high
+    evidence_level: test
+    documented_by:
+      - docs/runbooks/independent-production-watch.md
+    verified_by:
+      - scripts/ci/tests/test_independent_production_watch.py
+
   - id: impl.guard.production-live-state
     path: scripts/ops/classify_production_live_state.py
     impl_type: guard
