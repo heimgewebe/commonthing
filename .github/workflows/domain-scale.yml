@@ -498,12 +498,13 @@ jobs:
           BEGIN;
           DO $t048_fixture$
           BEGIN
-            -- The generated CI fixture inserts nodes and edges once each.
+            -- Each inserted node also creates one conversation and its outbox
+            -- event via domain_nodes_create_conversation (20260719 migration).
             -- Prove there are no extra, missing, duplicate, or foreign events
             -- before destroying any setup-only backlog.
             IF EXISTS (
               SELECT 1 FROM domain_outbox AS event
-              WHERE event.aggregate_type NOT IN ('node', 'edge')
+              WHERE event.aggregate_type NOT IN ('node', 'edge', 'conversation')
                  OR event.published_at IS NOT NULL
                  OR event.quarantined_at IS NOT NULL
                  OR event.attempt_count > 0
@@ -518,9 +519,18 @@ jobs:
                     AND EXISTS (
                       SELECT 1 FROM domain_edges e WHERE e.id = event.aggregate_id
                     ))
+                   OR (event.aggregate_type = 'conversation'
+                    AND event.event_type = 'domain.conversation.created'
+                    AND EXISTS (
+                      SELECT 1 FROM domain_conversations c
+                      JOIN domain_nodes n ON n.id = c.node_id
+                      WHERE c.id::text = event.aggregate_id
+                        AND c.id = weltgewebe_node_conversation_id(n.id)
+                        AND c.deleted_at IS NULL
+                    ))
                  )
             ) OR (SELECT count(*) FROM domain_outbox) <> (
-              (SELECT count(*) FROM domain_nodes) +
+              2 * (SELECT count(*) FROM domain_nodes) +
               (SELECT count(*) FROM domain_edges)
             ) OR EXISTS (
               SELECT 1 FROM domain_outbox
@@ -538,6 +548,8 @@ jobs:
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_outbox')" = "0"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_event_consumptions')" = "0"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM web_push_deliveries')" = "0"
+          test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_conversations')" = \
+            "${{ steps.contract.outputs.node_count }}"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_nodes')" = \
             "${{ steps.contract.outputs.node_count }}"
           test "$(psql "${DATABASE_URL}" -Atc 'SELECT count(*) FROM domain_edges')" = \

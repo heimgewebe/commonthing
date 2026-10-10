@@ -76,7 +76,7 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertLess(reset, broker)
         source = self.job[reset:broker]
         self.assertIn('psql "${DATABASE_URL}" -v ON_ERROR_STOP=1', source)
-        self.assertIn("event.aggregate_type NOT IN ('node', 'edge')", source)
+        self.assertIn("event.aggregate_type NOT IN ('node', 'edge', 'conversation')", source)
         self.assertIn("published_at IS NOT NULL", source)
         self.assertEqual(source.count("$t048_fixture$"), 2)
         self.assertIn("quarantined_at IS NOT NULL", source)
@@ -84,9 +84,14 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("domain_event_consumptions", source)
         self.assertIn("OR EXISTS (SELECT 1 FROM web_push_deliveries)", source)
         self.assertIn("SELECT count(*) FROM web_push_deliveries", source)
-        # Only one fresh created event per fixture node/edge is disposable.
+        # Each fixture node creates node + conversation; each edge creates one event.
         self.assertIn("event_type = 'domain.node.created'", source)
         self.assertIn("event_type = 'domain.edge.created'", source)
+        self.assertIn("event_type = 'domain.conversation.created'", source)
+        self.assertIn("weltgewebe_node_conversation_id(n.id)", source)
+        self.assertIn("FROM domain_conversations c", source)
+        self.assertIn("2 * (SELECT count(*) FROM domain_nodes)", source)
+        self.assertIn("SELECT count(*) FROM domain_conversations", source)
         self.assertIn("FROM domain_nodes n WHERE n.id = event.aggregate_id", source)
         self.assertIn("FROM domain_edges e WHERE e.id = event.aggregate_id", source)
         self.assertIn("HAVING count(*) > 1", source)
