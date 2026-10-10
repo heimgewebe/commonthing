@@ -182,7 +182,9 @@ def _git_bytes(argv: list[str]) -> bytes:
         raise IntegrityError(f"Git binding check failed for {argv}: {error}") from error
 
 
-def _validate_generation_ancestry(generation: dict[str, Any]) -> None:
+def _validate_generation_ancestry(
+    generation: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
     """Fail closed on source commit, allowed ancestry, and seed binding.
 
     Machine-checked generation contract (before inventory / full validation):
@@ -191,7 +193,8 @@ def _validate_generation_ancestry(generation: dict[str, Any]) -> None:
     - that commit is reachable in this clone (``git cat-file -e``)
     - that commit is an ancestor of ``HEAD`` (allowed ancestry for this checkout)
     - ``seed_sha256`` is a 64-hex digest matching the seed blob at ``source_head``
-    - the working-tree seed matches the same digest (lock update required on seed change)
+    - a changed working-tree seed must match an explicitly staged pending digest
+    - while staged, the published generation and its mirror images remain authoritative
 
     Lock updates must re-bind ``source_head`` and ``seed_sha256`` together with the
     publisher evidence fields. Ancestry is never skipped or weakened.
@@ -251,10 +254,27 @@ def _validate_generation_ancestry(generation: dict[str, Any]) -> None:
         current_digest = hashlib.sha256(current_seed.read_bytes()).hexdigest()
     except OSError as error:
         raise AncestryError(f"current OCI mirror seed is unreadable: {error}") from error
-    if current_digest != seed_sha256:
-        raise AncestryError(
-            "current OCI mirror seed changed without a new lock generation"
-        )
+    pending_digest = generation.get("pending_seed_sha256")
+    if current_digest == seed_sha256:
+        if pending_digest is not None:
+            raise AncestryError("OCI mirror pending seed marker is stale")
+        pending = False
+    else:
+        if (
+            not isinstance(pending_digest, str)
+            or not HEX64.fullmatch(pending_digest)
+            or pending_digest != current_digest
+        ):
+            raise AncestryError(
+                "current OCI mirror seed changed without a new lock generation "
+                "or exact pending_seed_sha256"
+            )
+        pending = True
+    try:
+        published_seed = json.loads(seed_at_head)
+    except json.JSONDecodeError as error:
+        raise AncestryError("published OCI mirror seed is invalid JSON") from error
+    return published_seed, pending
 
 
 def _load_lock() -> dict[str, Any]:
@@ -276,7 +296,7 @@ def _load_lock() -> dict[str, Any]:
     if not all(isinstance(item, dict) for item in (generation, mirror, budgets, images)):
         raise IntegrityError("OCI mirror lock sections are incomplete")
     # Ancestry / seed binding fails closed before inventory and mirror section checks.
-    _validate_generation_ancestry(generation)
+    published_seed, pending_seed = _validate_generation_ancestry(generation)
     if not str(generation.get("workflow_run_id", "")).isdigit():
         raise IntegrityError("OCI mirror workflow run ID is invalid")
     if not str(generation.get("workflow_run_attempt", "")).isdigit():
@@ -334,6 +354,51 @@ def _load_lock() -> dict[str, Any]:
     seed_images = seed.get("images")
     if not isinstance(seed_images, dict) or set(seed_images) != EXPECTED_IMAGES:
         raise IntegrityError("OCI mirror seed inventory mismatch")
+    locked_seed_images = seed_images
+    if pending_seed:
+        # A pending seed is only a reviewed publication request. The old lock
+        # remains the sole build/offline proof authority until main publishes
+        # and verifies the replacement mirror generation.
+        if any(
+            seed.get(field) != published_seed.get(field)
+            for field in ("schema_version", "owner", "target", "publisher")
+        ):
+            raise IntegrityError("pending OCI seed changes immutable publisher policy")
+        previous_images = published_seed.get("images")
+        if (
+            not isinstance(previous_images, dict)
+            or set(previous_images) != EXPECTED_IMAGES
+        ):
+            raise IntegrityError("published OCI seed inventory mismatch")
+        digest_updates = 0
+        expected_fields = {"canonical", "suites", "load_into_kind"}
+        for name in sorted(EXPECTED_IMAGES):
+            old_spec, staged_spec = previous_images[name], seed_images[name]
+            if (
+                not isinstance(old_spec, dict)
+                or not isinstance(staged_spec, dict)
+                or set(old_spec) != expected_fields
+                or set(staged_spec) != expected_fields
+                or old_spec["suites"] != staged_spec["suites"]
+                or old_spec["load_into_kind"] != staged_spec["load_into_kind"]
+            ):
+                raise IntegrityError("pending OCI seed changes non-digest image policy")
+            old_ref, staged_ref = old_spec["canonical"], staged_spec["canonical"]
+            if (
+                not isinstance(old_ref, str)
+                or not isinstance(staged_ref, str)
+                or "@" not in old_ref
+                or "@" not in staged_ref
+                or old_ref.rsplit("@", 1)[0] != staged_ref.rsplit("@", 1)[0]
+                or not FULL_SHA256.fullmatch(staged_ref.rsplit("@", 1)[1])
+            ):
+                raise IntegrityError(
+                    "pending OCI seed changes image identity or pinning"
+                )
+            digest_updates += old_ref != staged_ref
+        if not digest_updates:
+            raise IntegrityError("pending OCI seed has no image digest changes")
+        locked_seed_images = previous_images
     suite_counts = {
         suite: sum(1 for spec in images.values() if suite in spec.get("suites", []))
         for suite in sorted(ALLOWED_SUITES)
@@ -390,7 +455,7 @@ def _load_lock() -> dict[str, Any]:
             raise IntegrityError(f"OCI mirror image {name} suite drift")
         if not isinstance(spec["load_into_kind"], bool):
             raise IntegrityError(f"OCI mirror image {name} kind-load drift")
-        seed_spec = seed_images[name]
+        seed_spec = locked_seed_images[name]
         if (
             spec["canonical"] != seed_spec.get("canonical")
             or spec["suites"] != seed_spec.get("suites")
