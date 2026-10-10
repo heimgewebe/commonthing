@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -33,6 +34,139 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("SELECT count(*) FROM weltgewebe_perf.domain_edges", self.job)
         self.assertIn("weltgewebe_search_generation_activation_ready", self.job)
         self.assertIn("weltgewebe_activate_search_generation", self.job)
+
+    def test_ready_200_requires_pinned_live_jetstream_workers(self) -> None:
+        import json
+
+        pinned = json.loads(
+            (ROOT / "scripts/ci/postgres-proof-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )["jetstream_image"]
+        self.assertRegex(pinned, r"^nats@sha256:[0-9a-f]{64}$")
+        nats = self.job.index("name: Start isolated JetStream for measured API")
+        api = self.job.index("name: Start and warm the measured API container")
+        self.assertLess(nats, api)
+        start = self.job[nats:api]
+        self.assertIn("scripts/ci/postgres-proof-contract.json", start)
+        self.assertIn("jetstream_image", start)
+        self.assertIn("--network bridge", start)
+        self.assertIn("(( DOCKER_SERVER_MAJOR >= 28 ))", start)
+        self.assertNotIn("--network host", start)
+        self.assertIn("--publish 127.0.0.1:4222:4222", start)
+        self.assertIn("--publish 127.0.0.1:8222:8222", start)
+        self.assertIn('"${NATS_IMAGE}" -js -n "${NATS_SERVER_NAME}" -m 8222', start)
+        self.assertIn('NATS_CONTAINER_ID="$(docker run', start)
+        self.assertIn("check_t048_jetstream.py", start)
+        self.assertIn('--server-name "${NATS_SERVER_NAME}"', start)
+        self.assertIn('--container-id "${NATS_CONTAINER_ID}"', start)
+        self.assertIn("name: Verify JetStream is empty before measured load", self.job)
+        end = self.job[self.job.index("name: Stop isolated JetStream"): ]
+        self.assertIn("if: ${{ always() }}", end)
+        self.assertIn('docker rm --force "${NATS_CONTAINER}"', end)
+        warmup = self.job[api:self.job.index("name: Bind live API runtime")]
+        self.assertIn('--env "NATS_URL=nats://127.0.0.1:4222"', warmup)
+        self.assertIn("--env WELTGEWEBE_DOMAIN_JETSTREAM_REPLICAS=1", warmup)
+
+    def test_isolated_fixture_backlog_is_reset_before_readiness(self) -> None:
+        fixture = self.job.index("name: Load the canonical fixture into the migrated API database")
+        reset = self.job.index("name: Reset synthetic fixture outbox before readiness")
+        broker = self.job.index("name: Start isolated JetStream for measured API")
+        self.assertLess(fixture, reset)
+        self.assertLess(reset, broker)
+        source = self.job[reset:broker]
+        self.assertIn('psql "${DATABASE_URL}" -v ON_ERROR_STOP=1', source)
+        self.assertIn("event.aggregate_type NOT IN ('node', 'edge', 'conversation')", source)
+        self.assertIn("published_at IS NOT NULL", source)
+        self.assertEqual(source.count("$t048_fixture$"), 2)
+        self.assertIn("quarantined_at IS NOT NULL", source)
+        self.assertIn("attempt_count > 0", source)
+        self.assertIn("domain_event_consumptions", source)
+        self.assertIn("OR EXISTS (SELECT 1 FROM web_push_deliveries)", source)
+        self.assertIn("SELECT count(*) FROM web_push_deliveries", source)
+        # Each fixture node creates node + conversation; each edge creates one event.
+        self.assertIn("event_type = 'domain.node.created'", source)
+        self.assertIn("event_type = 'domain.edge.created'", source)
+        self.assertIn("event_type = 'domain.conversation.created'", source)
+        self.assertIn("weltgewebe_node_conversation_id(n.id)", source)
+        self.assertIn("FROM domain_conversations c", source)
+        # A fresh fully migrated database also seeds a Webgemeindezentrum conversation.
+        self.assertIn("c.conversation_type = 'webgemeindezentrum'", source)
+        self.assertIn("JOIN webgemeindezentren w", source)
+        self.assertIn("w.id = c.webgemeindezentrum_id", source)
+        self.assertIn("weltgewebe_webgemeindezentrum_conversation_id(w.id)", source)
+        self.assertIn("(SELECT count(*) FROM webgemeindezentren)", source)
+        self.assertIn("WHERE conversation_type = 'node'", source)
+        self.assertIn("WHERE conversation_type = 'webgemeindezentrum'", source)
+        self.assertIn("2 * (SELECT count(*) FROM domain_nodes)", source)
+        self.assertIn("SELECT count(*) FROM domain_conversations", source)
+        self.assertIn("FROM domain_nodes n WHERE n.id = event.aggregate_id", source)
+        self.assertIn("FROM domain_edges e WHERE e.id = event.aggregate_id", source)
+        self.assertIn("HAVING count(*) > 1", source)
+        self.assertIn("SELECT count(*) FROM domain_outbox", source)
+        self.assertIn("SELECT count(*) FROM domain_nodes", source)
+        self.assertIn("SELECT count(*) FROM domain_edges", source)
+        self.assertIn("TRUNCATE TABLE domain_event_consumptions, domain_outbox, web_push_deliveries RESTART IDENTITY RESTRICT", source)
+        self.assertNotIn("RESTART IDENTITY CASCADE", source)
+        self.assertIn("CREATE TABLE t048_outbox_fk_guard", source)
+        self.assertIn("FOREIGN KEY (id) REFERENCES domain_outbox(id)", source)
+        self.assertIn("WHEN SQLSTATE '0A000'", source)
+        self.assertIn("SELECT count(*) FROM domain_outbox", source)
+        self.assertIn("SELECT count(*) FROM domain_nodes", source)
+
+    def test_center_event_guard_matches_the_real_seed_migration(self) -> None:
+        migration = (
+            ROOT / "apps/api/migrations/20260802000002_webgemeindezentrum_governance_hub.up.sql"
+        ).read_text(encoding="utf-8")
+        seed = (
+            ROOT / "apps/api/migrations/20260802000001_ortsweberei_webgemeindezentrum.up.sql"
+        ).read_text(encoding="utf-8")
+        self.assertIn("webgemeindezentrum-hammer-park", seed)
+        self.assertIn("CREATE OR REPLACE FUNCTION weltgewebe_webgemeindezentrum_conversation_id", migration)
+        self.assertIn("INSERT INTO domain_conversations(", migration)
+        self.assertIn("FROM webgemeindezentren", migration)
+        reset = self.job.split("name: Reset synthetic fixture outbox before readiness", 1)[1].split(
+            "name: Start isolated JetStream for measured API", 1
+        )[0]
+        self.assertIn("weltgewebe_webgemeindezentrum_conversation_id(w.id)", reset)
+
+    def test_readiness_is_stable_before_starting_measured_load(self) -> None:
+        start = self.job.index("name: Start and warm the measured API container")
+        bound = self.job.index("name: Bind live API runtime to the exact fixture")
+        measure = self.job.index(
+            "name: Measure the canonical mixed-health-and-read scenario"
+        )
+        self.assertLess(start, bound)
+        self.assertLess(bound, measure)
+        warmup = self.job[start:bound]
+        self.assertIn("http://127.0.0.1:8787/health/ready", warmup)
+        self.assertIn("READINESS_STREAK=$((READINESS_STREAK + 1))", warmup)
+        self.assertIn('if [[ "${READINESS_STREAK}" -lt 3 ]]', warmup)
+        self.assertRegex(warmup, r"else\s*\n\s*READINESS_STREAK=0")
+
+    def test_readiness_200_200_503_requires_three_new_200s(self) -> None:
+        start = self.job.index("name: Start and warm the measured API container")
+        bound = self.job.index("name: Bind live API runtime to the exact fixture")
+        warmup = self.job[start:bound]
+        loop = warmup[
+            warmup.index("READINESS_STREAK=0") :
+            warmup.index('if [[ "${READINESS_STREAK}" -lt 3 ]]')
+        ]
+        fake_curl = '''
+responses=(200 200 503 200 200 200)
+cursor=0
+curl() {
+  local status="${responses[cursor]:-503}"
+  cursor=$((cursor + 1))
+  [[ "${status}" == 200 ]]
+}
+sleep() { :; }
+'''
+        script = fake_curl + loop + 'echo "${READINESS_STREAK}:${cursor}"\n'
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, check=True
+        )
+        self.assertEqual(result.stdout.strip(), "3:6")
 
     def test_scenario_values_come_from_the_canonical_policy(self) -> None:
         self.assertIn(
@@ -228,6 +362,31 @@ class ApiRuntimeWorkflowContractTests(unittest.TestCase):
             "Cargo.lock",
         ):
             self.assertIn(f"- '{path}'", docs_changes, path)
+
+        runtime_start = docs_changes.index("            api_runtime:")
+        runtime_end = docs_changes.index("            heavy:", runtime_start)
+        runtime_filter = docs_changes[runtime_start:runtime_end]
+        self.assertIn(
+            "- 'scripts/ci/postgres-proof-contract.json'",
+            runtime_filter,
+            "Changing the pinned JetStream image must run T048",
+        )
+        self.assertIn(
+            "- 'scripts/ci/check_t048_jetstream.py'",
+            runtime_filter,
+            "Changing broker identity/quiescence checks must run live T048",
+        )
+        self.assertIn("name: Run T048 and JetStream regression suites", self.ci_source)
+        for module in (
+            "scripts.ci.tests.test_api_runtime_evidence",
+            "scripts.ci.tests.test_api_runtime_workflow",
+            "scripts.ci.tests.test_t048_jetstream",
+            "scripts.ci.tests.test_experiment_b_t048_readiness",
+            "scripts.ci.tests.test_event_chain_readiness_proof",
+        ):
+            self.assertIn(module, self.ci_source)
+        self.assertIn("node --experimental-vm-modules --test", self.ci_source)
+        self.assertIn("scripts/ci/tests/api_runtime_k6_classification.test.mjs", self.ci_source)
 
         caller = self.ci_source[
             self.ci_source.index("  api-runtime-proof:\n") : self.ci_source.index(

@@ -70,6 +70,8 @@ jobs:
               - 'scripts/tests/test_domain_scale.py'
               - 'scripts/ci/tests/test_api_runtime_evidence.py'
               - 'scripts/ci/tests/test_api_runtime_workflow.py'
+              - 'scripts/ci/postgres-proof-contract.json'
+              - 'scripts/ci/check_t048_jetstream.py'
               - 'apps/api/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -137,6 +139,19 @@ jobs:
 
       - name: Sync hash-locked guard dependencies
         run: uv sync --project tools/py --locked
+
+      - name: Run T048 and JetStream regression suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --project tools/py --locked python -B -m unittest \
+            scripts.ci.tests.test_api_runtime_evidence \
+            scripts.ci.tests.test_api_runtime_workflow \
+            scripts.ci.tests.test_t048_jetstream \
+            scripts.ci.tests.test_experiment_b_t048_readiness \
+            scripts.ci.tests.test_event_chain_readiness_proof
+          node --experimental-vm-modules --test \
+            scripts/ci/tests/api_runtime_k6_classification.test.mjs
 
       - name: Check guard syntax
         shell: bash
