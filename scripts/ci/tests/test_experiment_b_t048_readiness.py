@@ -33,6 +33,47 @@ class ExperimentBT048ReadyStreakTests(unittest.TestCase):
         self.assertTrue(all(timeout == 2 for _, timeout in calls))
         self.assertEqual(sleep.call_count, 6)
 
+    def test_http_body_timeout_resets_streak_then_retries(self) -> None:
+        results = [200, 200, TimeoutError('body read timed out'), 200, 200, 200]
+        calls = []
+
+        def read(url: str, *, timeout: int) -> tuple[int, bytes, float]:
+            calls.append((url, timeout))
+            result = results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result, b'', 1.0
+
+        process = mock.Mock()
+        process.poll.return_value = None
+        with (
+            mock.patch.object(runtime, '_http_read', side_effect=read),
+            mock.patch.object(runtime.time, 'sleep') as sleep,
+        ):
+            runtime._wait_http_200(
+                'http://127.0.0.1:8787/health/ready', process, consecutive=3
+            )
+        self.assertEqual(results, [])
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(sleep.call_count, 5)
+
+    def test_permanent_http_body_timeouts_fail_within_existing_bound(self) -> None:
+        with (
+            mock.patch.object(runtime, '_http_read', side_effect=TimeoutError('read timeout')) as read,
+            mock.patch.object(runtime.time, 'sleep'),
+            self.assertRaisesRegex(runtime.RuntimeErrorEB, 'did not become ready'),
+        ):
+            runtime._wait_http_200('http://127.0.0.1:8787/health/ready', consecutive=3)
+        self.assertEqual(read.call_count, 120)
+
+    def test_unexpected_readiness_error_is_not_suppressed(self) -> None:
+        with (
+            mock.patch.object(runtime, '_http_read', side_effect=ValueError('invalid response')),
+            self.assertRaisesRegex(ValueError, 'invalid response'),
+        ):
+            runtime._wait_http_200('http://127.0.0.1:8787/health/ready', consecutive=3)
+
+
     def test_permanently_unready_api_fails_closed(self) -> None:
         with (
             mock.patch.object(runtime, "_http_read", return_value=(503, b"", 1.0)) as read,

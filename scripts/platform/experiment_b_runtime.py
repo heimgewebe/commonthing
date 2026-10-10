@@ -12229,7 +12229,7 @@ def _wait_http_200(
             raise RuntimeErrorEB("port-forward exited before the target became ready")
         try:
             status_code, _body, _elapsed = _http_read(url, timeout=2)
-        except urllib.error.URLError:
+        except (urllib.error.URLError, TimeoutError):
             streak = 0
         else:
             streak = streak + 1 if status_code == 200 else 0
