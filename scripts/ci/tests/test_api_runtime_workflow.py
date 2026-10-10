@@ -333,6 +333,11 @@ sleep() { :; }
             runtime_filter,
             "Changing the pinned JetStream image must run T048",
         )
+        self.assertIn(
+            "- 'scripts/ci/check_t048_jetstream.py'",
+            runtime_filter,
+            "Changing broker identity/quiescence checks must run live T048",
+        )
 
         caller = self.ci_source[
             self.ci_source.index("  api-runtime-proof:\n") : self.ci_source.index(
