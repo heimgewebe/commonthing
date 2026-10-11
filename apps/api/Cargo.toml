@@ -3,7 +3,7 @@ name = "weltgewebe-api"
 default-run = "weltgewebe-api"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85.0"
+rust-version = "1.88.0"
 authors = ["commonThing Team"]
 license = "AGPL-3.0-or-later"
 
@@ -43,9 +43,10 @@ url = "2"
 serde_jcs = "0.1"
 unicode-normalization = "0.1"
 p256 = { version = "0.13.2", features = ["ecdsa"] }
-# 0.5 requires Rust 1.87; the repository contract is Rust 1.85. Keep only the
-# RFC 8291 payload encryption here; VAPID is signed locally to avoid a broad
-# general-purpose JWT and post-quantum dependency stack.
+# Pinned to 0.4. 0.5 needs Rust 1.87, which the 1.88 MSRV now allows; moving
+# to it is a separate change. Keep only the RFC 8291 payload encryption here;
+# VAPID is signed locally to avoid a broad general-purpose JWT and
+# post-quantum dependency stack.
 web-push-native = { version = "=0.4.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
