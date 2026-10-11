@@ -1230,7 +1230,16 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         Source-commit existence and ancestry still execute against the real local
         Git objects. Only exact seed-blob reads are supplied by this fixture.
         """
-        original = (ROOT / "platform/oci-proof-mirror.seed.json").read_bytes()
+        lock = json.loads(
+            (ROOT / "platform/oci-proof-mirror.lock.json").read_text(encoding="utf-8")
+        )
+        trusted_source_head = lock["generation"]["source_head"]
+        original = subprocess.run(
+            ["git", "show", f"{trusted_source_head}:platform/oci-proof-mirror.seed.json"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
         seed = json.loads(original)
         seed["images"]["build_debian"]["canonical"] = (
             "docker.io/library/debian:bookworm-slim@sha256:" + "0" * 64
@@ -1242,10 +1251,6 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             if unchanged_seed
             else (json.dumps(seed, sort_keys=True) + "\n").encode("utf-8")
         )
-        lock = json.loads(
-            (ROOT / "platform/oci-proof-mirror.lock.json").read_text(encoding="utf-8")
-        )
-        trusted_source_head = lock["generation"]["source_head"]
         if published_seed_bytes is not None:
             lock["generation"]["seed_sha256"] = hashlib.sha256(
                 published_seed_bytes
@@ -1408,10 +1413,10 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                     )
 
     def test_oci_mirror_pending_seed_rejects_unpublished_authority_and_malformed_pins(self) -> None:
-        original_seed = json.loads(
-            (ROOT / "platform/oci-proof-mirror.seed.json").read_text(encoding="utf-8")
+        original_lock = json.loads(
+            (ROOT / "platform/oci-proof-mirror.lock.json").read_text(encoding="utf-8")
         )
-        original_debian = original_seed["images"]["build_debian"]["canonical"]
+        original_debian = original_lock["images"]["build_debian"]["canonical"]
         scenarios = [
             ("extra top-level key with a digest bump",
              lambda seed: seed.__setitem__("unpublished_authority", {"trusted": False})),
