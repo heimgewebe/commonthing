@@ -38,7 +38,7 @@ RUN printf '%s' "${GIT_COMMIT_SHA}" | grep -Eq '^[0-9a-f]{40}$' \
        cargo build --release --locked --bin weltgewebe-api --bin search-backfill
 
 # Runner stage
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 WORKDIR /app
 
