@@ -42,10 +42,16 @@ automatisch „produktiv betrieben“.
 - SMTP über `lettre`
 - Prometheus-Metriken
 
-`rust-version = 1.85.0` beschreibt die minimale Cargo-Kompatibilität des
+`rust-version = 1.88.0` beschreibt die minimale Cargo-Kompatibilität des
 API-Pakets. Die repositoryweit gepinnte Entwicklungs-/CI-Toolchain kann neuer
 sein. Beide Angaben sind verschiedene Verträge und dürfen nicht gleichgesetzt
-werden.
+werden. Die Untergrenze wurde einmalig lokal gemessen (Oktober 2026): Mit
+`cargo +1.87.0 check --locked` in `apps/api` scheitern `async-nats`,
+`base64urlsafedata`, `time` und `time-core`, weil sie Rust 1.88 verlangen. Der
+CI-Job `MSRV check (rust-version)` in `api.yml` führt `cargo check` für alle
+Targets und Features mit genau der in `Cargo.toml` angegebenen Version aus. Er
+belegt bei jedem Lauf, dass diese Version ausreicht; ob sie noch die kleinste
+mögliche ist, prüft er nicht.
 
 ### Datenhaltung
 
