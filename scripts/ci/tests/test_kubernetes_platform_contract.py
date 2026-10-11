@@ -829,7 +829,7 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         self.assertEqual(result["repository_binding"], "heimgewebe/commonthing")
         self.assertEqual(result["image_count"], 25)
         self.assertTrue(result["retention"]["unbounded_growth_prevented"])
-        self.assertEqual(result["retention"]["observed_package_versions"], 193)
+        self.assertEqual(result["retention"]["observed_package_versions"], 204)
         self.assertEqual(result["retention"]["package_version_hard_limit"], 512)
         self.assertEqual(result["retention"]["orphan_grace_days"], 14)
 
