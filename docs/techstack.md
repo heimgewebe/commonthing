@@ -45,10 +45,13 @@ automatisch „produktiv betrieben“.
 `rust-version = 1.88.0` beschreibt die minimale Cargo-Kompatibilität des
 API-Pakets. Die repositoryweit gepinnte Entwicklungs-/CI-Toolchain kann neuer
 sein. Beide Angaben sind verschiedene Verträge und dürfen nicht gleichgesetzt
-werden. Die Untergrenze ist gemessen, nicht angenommen: Mit Rust 1.87 scheitert
-`cargo check --locked` an `async-nats`, `base64urlsafedata` und `time`. Der
-CI-Job `MSRV check (rust-version)` in `api.yml` baut alle Targets und Features
-mit genau der in `Cargo.toml` angegebenen Version und hält die Angabe damit wahr.
+werden. Die Untergrenze wurde einmalig lokal gemessen (Oktober 2026): Mit
+`cargo +1.87.0 check --locked` in `apps/api` scheitern `async-nats`,
+`base64urlsafedata`, `time` und `time-core`, weil sie Rust 1.88 verlangen. Der
+CI-Job `MSRV check (rust-version)` in `api.yml` führt `cargo check` für alle
+Targets und Features mit genau der in `Cargo.toml` angegebenen Version aus. Er
+belegt bei jedem Lauf, dass diese Version ausreicht; ob sie noch die kleinste
+mögliche ist, prüft er nicht.
 
 ### Datenhaltung
 
@@ -87,7 +90,11 @@ mit genau der in `Cargo.toml` angegebenen Version und hält die Angabe damit wah
 ## Im Repository vorhanden, aber nicht allgemein produktiv belegt
 
 - NATS im Produktions-Compose und API-Verbindungsfläche
-- PgBouncer im Core-Profil
+- PgBouncer im Dev-Profil von `compose.core.yml` (v1.25.2). Produktion hat
+  keinen Pooler: `compose.prod.yml` enthält keinen PgBouncer-Dienst, und
+  `.env.prod.example` setzt `DATABASE_URL` direkt auf `db:5432`.
+  Der Sessiontest über PgBouncer (`sqlx_pgbouncer_session_crud`) ist
+  `#[ignore]` und läuft in CI nicht.
 - Prometheus-Konfiguration und optionale Observability-Profile
 - PWA-/Offline-nahe Webbestandteile
 - Rollencontract sowie private und föderierte Gesprächstypen

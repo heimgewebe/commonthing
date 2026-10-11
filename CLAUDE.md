@@ -80,7 +80,7 @@ change.
 |---|---|
 | Frontend | SvelteKit 2 / Svelte 5 (TypeScript, static adapter) |
 | Backend | Rust / Axum 0.8 (async, tokio) |
-| Database | PostgreSQL 16 + PgBouncer 1.20 |
+| Database | PostgreSQL 16 (production: API connects directly; PgBouncer 1.25 only in the dev compose profile) |
 | Messaging | NATS JetStream (optional, Gate C) |
 | Proxy | Caddy |
 | Orchestration | Docker Compose (multi-profile) |
