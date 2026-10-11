@@ -636,5 +636,72 @@ class WatchTests(unittest.TestCase):
             self.assertTrue((directory / "heartbeat.json").is_file())
 
 
+    def test_recovered_divergence_anchor_not_resurrected_on_later_main_push(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            prior = {
+                "sha": MAIN,
+                "first_seen": (NOW - timedelta(minutes=46)).isoformat(),
+            }
+            lagging = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=OLD),
+                previous_main_observation=prior,
+            )
+            self.assertEqual(watch.record(lagging, directory), "ALARM")
+            recovered = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(watch.record(recovered, directory), "RECOVERY")
+            saved = watch.read_previous_main_observation(directory)
+            self.assertEqual(saved["sha"], MAIN)
+            self.assertNotIn("diverged_since", saved)
+            next_main = "c" * 40
+            fresh_push = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(frontend=MAIN, api=MAIN, main=next_main),
+                previous_main_observation=saved,
+            )
+            self.assertFalse(
+                [item["code"] for item in fresh_push["issues"]
+                 if item["code"] in {"stale_frontend", "stale_api"}]
+            )
+            self.assertEqual(json.loads((directory / "state.json").read_text())["severe"], [])
+
+    def test_unobserved_frontend_keeps_prior_divergence_anchor_across_main_push(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            beginning = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=OLD),
+            )
+            self.assertIsNone(watch.record(beginning, directory))
+            later_main = "c" * 40
+            baseline_reader = self.fixtures(frontend=OLD, api=OLD, main=later_main)
+            def missing_frontend(name):
+                if name == "frontend":
+                    raise OSError("temporary watcher transport outage")
+                return baseline_reader(name)
+            blind = watch.evaluate(
+                NOW + timedelta(minutes=20), missing_frontend,
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(blind["status"], "MONITOR_DATA_FAILURE")
+            self.assertEqual(watch.record(blind, directory), "MONITOR_DATA_FAILURE")
+            anchor = NOW.isoformat().replace("+00:00", "Z")
+            saved = watch.read_previous_main_observation(directory)
+            self.assertEqual(saved["diverged_since"]["frontend"], anchor)
+            self.assertEqual(saved["diverged_since"]["api"], anchor)
+            overdue = watch.evaluate(
+                NOW + timedelta(minutes=46),
+                self.fixtures(frontend=OLD, api=OLD, main=later_main),
+                previous_main_observation=saved,
+            )
+            self.assertEqual(
+                {i["code"] for i in overdue["issues"] if i["severity"] == "P1"},
+                {"stale_frontend", "stale_api"},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

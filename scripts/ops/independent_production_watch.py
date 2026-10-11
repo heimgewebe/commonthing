@@ -157,9 +157,15 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
         prior_divergence = prior_divergence if isinstance(prior_divergence, dict) else {}
         diverged_since = {}
         for name in ("frontend", "api"):
-            if name not in commits or commits[name] == commits["main"]:
-                continue
             recorded = timestamp(prior_divergence.get(name))
+            if name not in commits:
+                # An unreadable endpoint has not converged; preserve the
+                # previously observed mismatch across a new main SHA.
+                if recorded is not None and recorded <= now:
+                    diverged_since[name] = recorded.isoformat().replace("+00:00", "Z")
+                continue
+            if commits[name] == commits["main"]:
+                continue
             anchor = recorded if recorded is not None and recorded <= now else first_seen
             diverged_since[name] = anchor.isoformat().replace("+00:00", "Z")
             age = (now - anchor).total_seconds()
@@ -327,11 +333,6 @@ def record(result, directory):
         previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
         if not isinstance(current_main, dict):
             current_main = previous_main
-        elif isinstance(previous_main, dict) and previous_main.get("sha") == current_main.get("sha"):
-            old_time = timestamp(previous_main.get("first_seen"))
-            new_time = timestamp(current_main.get("first_seen"))
-            if old_time is not None and new_time is not None and old_time <= new_time:
-                current_main = previous_main
         write_json(path, {"severe": severe, "uncertain": uncertain,
                           "main_observation": current_main})
         write_json(directory / "heartbeat.json", result)
