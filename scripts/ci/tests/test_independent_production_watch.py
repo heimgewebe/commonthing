@@ -212,6 +212,88 @@ class WatchTests(unittest.TestCase):
             )
             self.assertIn("stale_frontend", {i["code"] for i in overdue["issues"]})
 
+    def test_new_main_grace_does_not_recover_existing_stale_incident(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            prior_observation = {
+                "sha": MAIN,
+                "first_seen": (NOW - timedelta(minutes=46)).isoformat(),
+            }
+            overdue = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=OLD),
+                previous_main_observation=prior_observation,
+            )
+            self.assertEqual(watch.record(overdue, directory), "ALARM")
+            former = json.loads((directory / "state.json").read_text())["severe"]
+            self.assertEqual({entry[0] for entry in former}, {"stale_frontend", "stale_api"})
+
+            new_main = "c" * 40
+            new_grace = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(frontend=OLD, api=OLD, main=new_main),
+                previous_main_observation=prior_observation,
+            )
+            self.assertNotIn("stale_frontend", [i["code"] for i in new_grace["issues"]])
+            self.assertIsNone(watch.record(new_grace, directory))
+            self.assertEqual(json.loads((directory / "state.json").read_text())["severe"], former)
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertEqual(heartbeat["observation_status"], "HEALTHY")
+            self.assertEqual(heartbeat["retained_prior_p1"], former)
+            self.assertEqual(len((directory / "events.jsonl").read_text().splitlines()), 1)
+
+            converged = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(frontend=new_main, api=new_main, main=new_main),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(watch.record(converged, directory), "RECOVERY")
+            self.assertEqual(json.loads((directory / "state.json").read_text())["severe"], [])
+
+    def test_malformed_nested_main_metadata_is_monitor_uncertainty(self):
+        import json
+        for nested in (None, [], {"committer": None}, {"committer": []},
+                       {"committer": {"date": []}}):
+            with self.subTest(nested=nested), tempfile.TemporaryDirectory() as tmp:
+                def broken_main(name):
+                    if name == "main":
+                        return ({"sha": MAIN, "commit": nested}, "")
+                    return self.fixtures()(name)
+                result = watch.evaluate(NOW, broken_main)
+                self.assertEqual(result["status"], "MONITOR_DATA_FAILURE")
+                self.assertIn("main_time_unreliable", {x["code"] for x in result["issues"]})
+                self.assertEqual(watch.record(result, Path(tmp)), "MONITOR_DATA_FAILURE")
+                self.assertTrue((Path(tmp) / "heartbeat.json").is_file())
+                self.assertEqual(json.loads((Path(tmp) / "state.json").read_text())["severe"], [])
+
+    def test_two_unfinished_schedule_runs_use_last_completed_fallback(self):
+        original = self.fixtures()
+        def reader(name):
+            if name == "schedule":
+                return ({"workflow_runs": [
+                    {"id": 3, "event": "schedule", "created_at": NOW.isoformat(),
+                     "status": "queued", "conclusion": None},
+                    {"id": 2, "event": "schedule",
+                     "created_at": (NOW - timedelta(minutes=5)).isoformat(),
+                     "status": "in_progress", "conclusion": None},
+                ]}, "")
+            if name == "schedule_completed":
+                return ({"workflow_runs": [
+                    {"id": 1, "event": "schedule",
+                     "created_at": (NOW - timedelta(minutes=10)).isoformat(),
+                     "status": "completed", "conclusion": "failure"},
+                ]}, "")
+            return original(name)
+        report = watch.evaluate(NOW, reader)
+        self.assertEqual(report["latest_schedule"]["id"], 3)
+        self.assertEqual(report["status"], "HEALTHY")
+        self.assertIn("schedule_failed", {i["code"] for i in report["issues"]})
+        self.assertEqual(
+            [i["severity"] for i in report["issues"] if i["code"] == "schedule_failed"],
+            ["INFO"],
+        )
+
     def test_unconfirmed_peer_p1_survives_other_visible_p1(self):
         import json
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,6 +347,248 @@ class WatchTests(unittest.TestCase):
                 self.assertEqual(persisted["severe"], [])
                 self.assertEqual(persisted["uncertain"], [])
                 self.assertFalse((directory / "events.jsonl").exists())
+
+
+    def test_stale_production_survives_another_main_commit(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            initial = watch.evaluate(NOW, self.fixtures(frontend=OLD, api=OLD))
+            self.assertIsNone(watch.record(initial, directory))
+            overdue = watch.evaluate(
+                NOW + timedelta(minutes=46),
+                self.fixtures(frontend=OLD, api=OLD),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertIn("stale_frontend", {i["code"] for i in overdue["issues"]})
+            self.assertEqual(watch.record(overdue, directory), "ALARM")
+            main2 = "c" * 40
+            still_stale = watch.evaluate(
+                NOW + timedelta(minutes=47),
+                self.fixtures(frontend=OLD, api=OLD, main=main2),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertIn("stale_frontend", {i["code"] for i in still_stale["issues"]})
+            self.assertIn("stale_api", {i["code"] for i in still_stale["issues"]})
+            self.assertIsNone(watch.record(still_stale, directory))
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
+            deployed = watch.evaluate(
+                NOW + timedelta(minutes=48),
+                self.fixtures(frontend=main2, api=main2, main=main2),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(watch.record(deployed, directory), "RECOVERY")
+
+    def test_repeated_main_advances_cannot_restart_unreported_divergence_grace(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            initial = watch.evaluate(NOW, self.fixtures(frontend=OLD, api=OLD))
+            self.assertIsNone(watch.record(initial, directory))
+            for minutes, new_main in ((25, "c" * 40), (43, "d" * 40)):
+                seen = watch.read_previous_main_observation(directory)
+                report = watch.evaluate(
+                    NOW + timedelta(minutes=minutes),
+                    self.fixtures(frontend=OLD, api=OLD, main=new_main),
+                    previous_main_observation=seen,
+                )
+                self.assertNotIn("stale_frontend", {i["code"] for i in report["issues"]})
+                self.assertIsNone(watch.record(report, directory))
+                persisted = json.loads((directory / "state.json").read_text())
+                self.assertEqual(
+                    persisted["main_observation"]["diverged_since"]["frontend"],
+                    NOW.isoformat().replace("+00:00", "Z"),
+                )
+            overdue = watch.evaluate(
+                NOW + timedelta(minutes=46),
+                self.fixtures(frontend=OLD, api=OLD, main="e" * 40),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(
+                {i["code"] for i in overdue["issues"] if i["severity"] == "P1"},
+                {"stale_frontend", "stale_api"},
+            )
+            self.assertEqual(watch.record(overdue, directory), "ALARM")
+
+    def test_mixed_http_503_and_timeout_does_not_claim_confirmed_product_failure(self):
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+
+        server_error = HTTPError(watch.URLS["frontend"], 503, "unavailable", {}, None)
+        with patch.object(watch, "urlopen",
+                          side_effect=[server_error, TimeoutError("transport timeout")]):
+            with self.assertRaises(ValueError) as failure:
+                watch.fetch("frontend")
+        self.assertNotIsInstance(failure.exception, watch.ConfirmedProductHTTPError)
+
+    def test_verified_recovery_is_logged_despite_unrelated_p2(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = watch.evaluate(NOW, self.fixtures(cache="public, max-age=30"))
+            self.assertEqual(watch.record(first, directory), "ALARM")
+            normal = self.fixtures()
+            def missing_main(name):
+                if name == "main":
+                    raise TimeoutError("GitHub reference channel failure")
+                return normal(name)
+            uncertain = watch.evaluate(NOW + timedelta(minutes=1), missing_main)
+            self.assertEqual(uncertain["status"], "MONITOR_DATA_FAILURE")
+            self.assertEqual(watch.record(uncertain, directory), "RECOVERY")
+            events = [
+                json.loads(line)["event"] for line in
+                (directory / "events.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(events, ["ALARM", "RECOVERY", "MONITOR_DATA_FAILURE"])
+
+    def test_two_http_503_reads_are_production_failure_not_transport_noise(self):
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+        error = HTTPError(watch.URLS["frontend"], 503, "unavailable", {}, None)
+        with patch.object(watch, "urlopen", side_effect=error) as request:
+            with self.assertRaises(watch.ConfirmedProductHTTPError):
+                watch.fetch("frontend")
+            self.assertEqual(request.call_count, 2)
+        normal = self.fixtures()
+        def failed_http(name):
+            if name == "frontend":
+                raise watch.ConfirmedProductHTTPError("two confirmed HTTP 503")
+            return normal(name)
+        observed = watch.evaluate(NOW, failed_http)
+        self.assertEqual(observed["status"], "ALARM")
+        self.assertEqual(
+            [(i["code"], i["severity"]) for i in observed["issues"]],
+            [("unavailable_frontend", "P1")],
+        )
+        def failed_transport(name):
+            if name == "frontend":
+                raise TimeoutError("unknown observation transport")
+            return normal(name)
+        self.assertEqual(watch.evaluate(NOW, failed_transport)["status"],
+                         "MONITOR_DATA_FAILURE")
+
+    def test_null_github_commit_shape_preserves_heartbeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            normal = self.fixtures()
+            def malformed(name):
+                if name == "main":
+                    return {"sha": MAIN, "commit": None}, ""
+                return normal(name)
+            result = watch.evaluate(NOW, malformed)
+            self.assertEqual(result["status"], "MONITOR_DATA_FAILURE")
+            self.assertIn("main_time_unreliable", {i["code"] for i in result["issues"]})
+            self.assertEqual(watch.record(result, directory), "MONITOR_DATA_FAILURE")
+            self.assertTrue((directory / "heartbeat.json").exists())
+
+    def test_stale_incidents_survive_main_advance_until_production_converges(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            observed = {
+                "sha": MAIN,
+                "first_seen": (NOW - timedelta(minutes=46)).isoformat(),
+            }
+            first = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=OLD),
+                previous_main_observation=observed,
+            )
+            self.assertEqual(watch.record(first, directory), "ALARM")
+            new_main = "c" * 40
+            grace = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(frontend=OLD, api=OLD, main=new_main),
+                previous_main_observation=observed,
+            )
+            self.assertEqual(grace["status"], "HEALTHY")
+            self.assertIsNone(watch.record(grace, directory))
+            open_incidents = json.loads((directory / "state.json").read_text())["severe"]
+            self.assertEqual({item[0] for item in open_incidents},
+                             {"stale_api", "stale_frontend"})
+            self.assertEqual(len((directory / "events.jsonl").read_text().splitlines()), 1)
+            converged = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(frontend=new_main, api=new_main, main=new_main),
+                previous_main_observation=grace["main_observation"],
+            )
+            self.assertEqual(watch.record(converged, directory), "RECOVERY")
+
+    def test_malformed_nested_github_main_metadata_stays_p2_and_writes_heartbeat(self):
+        for nested in (
+            None, [], "invalid", {"committer": None},
+            {"committer": []}, {"committer": {"date": {}}},
+        ):
+            with self.subTest(nested=nested), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                base_reader = self.fixtures()
+
+                def malformed_main(name):
+                    if name == "main":
+                        return ({"sha": MAIN, "commit": nested}, "")
+                    return base_reader(name)
+
+                observed = watch.evaluate(NOW, malformed_main)
+                self.assertEqual(observed["status"], "MONITOR_DATA_FAILURE")
+                self.assertIn("main_time_unreliable",
+                              {item["code"] for item in observed["issues"]})
+                self.assertEqual(watch.record(observed, directory),
+                                 "MONITOR_DATA_FAILURE")
+                self.assertTrue((directory / "heartbeat.json").is_file())
+
+    def test_schedule_two_unfinished_runs_do_not_hide_last_completed_failure(self):
+        import json
+        from unittest.mock import patch
+
+        def schedule_run(run_id, minutes, status, conclusion):
+            return {"id": run_id, "event": "schedule",
+                    "created_at": (NOW - timedelta(minutes=minutes)).isoformat(),
+                    "status": status, "conclusion": conclusion}
+
+        newest = [schedule_run(3, 1, "queued", None),
+                  schedule_run(2, 3, "in_progress", None)]
+        last_completed = schedule_run(1, 6, "completed", "failure")
+        calls = []
+
+        class Response:
+            status = 200
+            headers = {"Cache-Control": ""}
+
+            def __init__(self, data):
+                self.payload = json.dumps(data).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, _limit):
+                return self.payload
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            if "status=completed" in request.full_url:
+                return Response({"workflow_runs": [last_completed]})
+            return Response({"workflow_runs": newest})
+
+        base_reader = self.fixtures()
+        def reader(name):
+            if name in {"schedule", "schedule_completed"}:
+                return watch.fetch(name)
+            return base_reader(name)
+
+        # evaluate() owns the bounded fallback read, not fetch("schedule").
+        with patch.object(watch, "urlopen", side_effect=fake_urlopen):
+            observed = watch.evaluate(NOW, reader)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(any("status=completed" in url for url in calls))
+        self.assertEqual(observed["status"], "HEALTHY")
+        self.assertEqual(observed["latest_schedule"]["status"], "queued")
+        self.assertIn("schedule_failed", {item["code"] for item in observed["issues"]})
 
     def test_cron_activation_has_independent_critical_registry_entry(self):
         import re

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 URLS = {
@@ -20,10 +21,18 @@ URLS = {
     "main": "https://api.github.com/repos/heimgewebe/commonthing/commits/main",
     "schedule": "https://api.github.com/repos/heimgewebe/commonthing/actions/workflows/production-live-contract.yml/runs?event=schedule&per_page=2",
 }
+SCHEDULE_COMPLETED_URL = (
+    "https://api.github.com/repos/heimgewebe/commonthing/actions/workflows/"
+    "production-live-contract.yml/runs?event=schedule&status=completed&per_page=1"
+)
 SHA = re.compile(r"^[0-9a-f]{40}$")
 UTC = timezone.utc
 LIMIT = 512 * 1024
 THRESHOLD = 45 * 60
+
+
+class ConfirmedProductHTTPError(ValueError):
+    """Both observations confirmed a server-side product HTTP failure."""
 # Each P1 is cleared only after the observations needed to verify it succeed.
 # Another still-visible P1 cannot hide an unverified incident.
 P1_UNVERIFIABLE_ON = {
@@ -54,14 +63,18 @@ def timestamp(value):
 
 def fetch(name):
     error = None
+    server_failures = 0
     for _ in range(2):
         try:
-            req = Request(URLS[name], headers={
+            url = SCHEDULE_COMPLETED_URL if name == "schedule_completed" else URLS[name]
+            req = Request(url, headers={
                 "User-Agent": "commonthing-independent-watch/1",
                 "Accept": "application/vnd.github+json",
             })
             with urlopen(req, timeout=8) as response:
                 if response.status != 200:
+                    if 500 <= response.status <= 599:
+                        server_failures += 1
                     raise ValueError(f"HTTP {response.status}")
                 content = response.read(LIMIT + 1)
                 if len(content) > LIMIT:
@@ -70,8 +83,14 @@ def fetch(name):
                 if not isinstance(data, dict):
                     raise ValueError("JSON root not an object")
                 return data, response.headers.get("Cache-Control", "")
+        except HTTPError as exc:
+            if 500 <= exc.code <= 599:
+                server_failures += 1
+            error = f"HTTPError: HTTP {exc.code}"
         except Exception as exc:
             error = f"{type(exc).__name__}: {str(exc)[:150]}"
+    if name in {"frontend", "api"} and server_failures == 2:
+        raise ConfirmedProductHTTPError(f"two confirmed server HTTP 5xx failures: {error}")
     raise ValueError(f"two reads failed: {error}")
 
 
@@ -87,6 +106,9 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
     for name in URLS:
         try:
             data[name], headers[name] = reader(name)
+        except ConfirmedProductHTTPError as exc:
+            flag("unavailable_" + name, "product HTTP response", str(exc)[:200],
+                 "HTTP 200 from production", name, "P1")
         except Exception as exc:
             flag("unavailable_" + name, "observation channel", str(exc)[:200],
                  "HTTP 200 and valid JSON", name,
@@ -129,18 +151,30 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
             "sha": commits["main"],
             "first_seen": first_seen.isoformat().replace("+00:00", "Z"),
         }
-        commit_time = timestamp(data["main"].get("commit", {}).get("committer", {}).get("date"))
+        # Carry the first observed mismatch across repeated main advances;
+        # a later main SHA cannot erase an unresolved production divergence.
+        prior_divergence = previous.get("diverged_since") if isinstance(previous, dict) else None
+        prior_divergence = prior_divergence if isinstance(prior_divergence, dict) else {}
+        diverged_since = {}
+        for name in ("frontend", "api"):
+            if name not in commits or commits[name] == commits["main"]:
+                continue
+            recorded = timestamp(prior_divergence.get(name))
+            anchor = recorded if recorded is not None and recorded <= now else first_seen
+            diverged_since[name] = anchor.isoformat().replace("+00:00", "Z")
+            age = (now - anchor).total_seconds()
+            if age >= THRESHOLD:
+                flag("stale_" + name, name, commits[name],
+                     commits["main"], name, duration=age)
+        if diverged_since:
+            main_observation["diverged_since"] = diverged_since
+        metadata = data["main"].get("commit")
+        committer = metadata.get("committer") if isinstance(metadata, dict) else None
+        commit_time = timestamp(committer.get("date") if isinstance(committer, dict) else None)
         commit_age = (now - commit_time).total_seconds() if commit_time else None
         if commit_age is None or commit_age < -120:
             flag("main_time_unreliable", "GitHub main", str(commit_age),
                  "valid commit timestamp", "main", "P2")
-        observed_age = (now - first_seen).total_seconds()
-        if observed_age >= THRESHOLD:
-            for name in ("frontend", "api"):
-                if name in commits and commits[name] != commits["main"]:
-                    flag("stale_" + name, name, commits[name],
-                         commits["main"], name, duration=observed_age)
-
     newest_schedule = None
     if "schedule" in data:
         rows = data["schedule"].get("workflow_runs")
@@ -168,6 +202,30 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
                 # A newer queued/in-progress run is not proof that the most
                 # recent completed scheduled check has recovered.
                 completed = [item for item in scheduled if item.get("status") == "completed"]
+                if not completed:
+                    # Queued/in-progress runs can obscure older completed runs
+                    # beyond the short latest-runs page; read completed runs directly.
+                    try:
+                        prior, _ = reader("schedule_completed")
+                        history = prior.get("workflow_runs") if isinstance(prior, dict) else None
+                        if not isinstance(history, list):
+                            flag("invalid_completed_schedule_json", "GitHub completed schedule",
+                                 str(type(history)), "workflow_runs array",
+                                 "schedule", "INFO")
+                        else:
+                            completed = [item for item in history
+                                         if isinstance(item, dict)
+                                         and item.get("event") == "schedule"
+                                         and item.get("status") == "completed"
+                                         and timestamp(item.get("created_at"))]
+                            if not completed:
+                                flag("no_completed_schedule", "GitHub completed schedule",
+                                     "no completed schedule in history",
+                                     "completed event=schedule run", "schedule", "INFO")
+                    except Exception as exc:
+                        flag("unavailable_completed_schedule", "GitHub completed schedule",
+                             str(exc)[:200], "valid completed schedule history",
+                             "schedule", "INFO")
                 last_done = max(
                     completed, key=lambda item: timestamp(item["created_at"]),
                     default=None,
@@ -223,23 +281,46 @@ def record(result, directory):
                         for x in result["issues"] if x["severity"] == "P1")
         uncertain = sorted(x["code"] for x in result["issues"] if x["severity"] == "P2")
         observed_codes = {item["code"] for item in result["issues"]}
-        # Preserve only incidents whose required observation is unavailable or invalid.
+        # Never infer a recovery during a new-main grace while the affected
+        # production commit still mismatches the currently observed main.
+        commits = result.get("commits")
+        commits = commits if isinstance(commits, dict) else {}
         for item in old_severe:
-            if item not in severe and P1_UNVERIFIABLE_ON.get(item[0], set()) & observed_codes:
+            code = item[0]
+            name = code.removeprefix("stale_")
+            still_stale = (
+                code in {"stale_frontend", "stale_api"}
+                and name in commits and "main" in commits
+                and commits[name] != commits["main"]
+            )
+            if item not in severe and (
+                P1_UNVERIFIABLE_ON.get(code, set()) & observed_codes or still_stale
+            ):
                 severe.append(item)
         severe.sort()
-        new_event = None
-        if severe and severe != old_severe:
-            new_event = "ALARM"
-        elif old_severe and not severe and not uncertain:
-            new_event = "RECOVERY"
-        elif uncertain and uncertain != old_uncertain:
-            new_event = "MONITOR_DATA_FAILURE"
-        if new_event:
-            event = {"event": new_event, **result,
-                     "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939"}
+        # Retained P1s are real active incidents, even when this single poll
+        # fell inside a fresh-main grace period or a reference channel failed.
+        detected = sorted([x["code"], str(x["actual"])[:160]]
+                          for x in result["issues"] if x["severity"] == "P1")
+        retained = [item for item in severe if item not in detected]
+        if retained:
+            result["observation_status"] = result["status"]
+            result["retained_prior_p1"] = retained
+        if severe:
+            result["status"] = "ALARM"
+
+        transition = ("ALARM" if severe and severe != old_severe
+                      else "RECOVERY" if old_severe and not severe else None)
+        uncertainty_event = ("MONITOR_DATA_FAILURE"
+                             if uncertain and uncertain != old_uncertain else None)
+        new_event = transition or uncertainty_event
+        events = [event for event in (transition, uncertainty_event) if event]
+        if events:
             with (directory / "events.jsonl").open("a", encoding="utf-8") as out:
-                out.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+                for event_name in events:
+                    event = {"event": event_name, **result,
+                             "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939"}
+                    out.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
                 out.flush()
                 os.fsync(out.fileno())
         current_main = result.get("main_observation")
@@ -271,7 +352,17 @@ def read_previous_main_observation(directory):
     seen = timestamp(recorded.get("first_seen"))
     if not isinstance(sha, str) or not SHA.fullmatch(sha) or seen is None:
         return None
-    return {"sha": sha, "first_seen": seen.isoformat().replace("+00:00", "Z")}
+    observation = {"sha": sha, "first_seen": seen.isoformat().replace("+00:00", "Z")}
+    raw_divergence = recorded.get("diverged_since")
+    if isinstance(raw_divergence, dict):
+        divergence = {}
+        for name in ("frontend", "api"):
+            value = timestamp(raw_divergence.get(name))
+            if value is not None:
+                divergence[name] = value.isoformat().replace("+00:00", "Z")
+        if divergence:
+            observation["diverged_since"] = divergence
+    return observation
 
 
 def main():
