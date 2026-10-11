@@ -90,7 +90,11 @@ mögliche ist, prüft er nicht.
 ## Im Repository vorhanden, aber nicht allgemein produktiv belegt
 
 - NATS im Produktions-Compose und API-Verbindungsfläche
-- PgBouncer im Core-Profil
+- PgBouncer im Dev-Profil von `compose.core.yml` (v1.25.2). Produktion hat
+  keinen Pooler: `compose.prod.yml` enthält keinen PgBouncer-Dienst, und
+  `.env.prod.example` setzt `DATABASE_URL` direkt auf `db:5432`.
+  Der Sessiontest über PgBouncer (`sqlx_pgbouncer_session_crud`) ist
+  `#[ignore]` und läuft in CI nicht.
 - Prometheus-Konfiguration und optionale Observability-Profile
 - PWA-/Offline-nahe Webbestandteile
 - Rollencontract sowie private und föderierte Gesprächstypen
