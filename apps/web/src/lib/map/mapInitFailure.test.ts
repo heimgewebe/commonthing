@@ -123,7 +123,9 @@ describe("map page early init-timeout wiring", () => {
     expect(firstGuardIdx).toBeGreaterThan(initIdx);
 
     const importBatch = pageSource.slice(initIdx, firstGuardIdx);
-    expect(importBatch).toContain('import("maplibre-gl")');
+    // The runtime loader sets the bundled worker URL before any map exists.
+    expect(importBatch).toContain("loadMapLibre()");
+    expect(importBatch).not.toContain('import("maplibre-gl")');
     expect(importBatch).toContain('import("$lib/map/overlay/nodes")');
     expect(importBatch).toContain('import("$lib/map/overlay/edgeMotion")');
     expect(importBatch).toContain('currentBasemap.mode === "local-sovereign"');
