@@ -4,6 +4,7 @@
   import "$lib/styles/tokens.css";
   import "maplibre-gl/dist/maplibre-gl.css";
   import type { Map as MapLibreMap } from "maplibre-gl";
+  import { loadMapLibre } from "$lib/maplibre/runtime";
 
   import TopBar from "$lib/components/TopBar.svelte";
   import MapRouteOverlays from "$lib/components/map/MapRouteOverlays.svelte";
@@ -670,6 +671,7 @@
         map.off("moveend", handleNodeViewportMoveEnd);
         map.off("resize", handleSearchMapResize);
         map.off("styledata", handleMapStyleData);
+        map.off("idle", handleMapStyleData);
         map.off("idle", rehydrateMapOverlays);
         if (typeof map.remove === "function") map.remove();
         map = null;
@@ -912,7 +914,7 @@
       // after map creation and may perform one guarded convergence later.
       const [maplibregl, nodesModule, edgeMotionModule, pmtilesModule] =
         await Promise.all([
-          import("maplibre-gl"),
+          loadMapLibre(),
           import("$lib/map/overlay/nodes"),
           import("$lib/map/overlay/edgeMotion"),
           currentBasemap.mode === "local-sovereign"
@@ -982,6 +984,11 @@
       map.on("move", handleSearchMapMove);
       map.on("moveend", handleNodeViewportMoveEnd);
       map.on("styledata", handleMapStyleData);
+      // MapLibre 6 can emit every styledata of a style replacement while
+      // isStyleLoaded() is still false (an overlay adding its source resets
+      // it). idle follows once the style has settled and is the terminal
+      // retry; the rehydrate is a no-op while the canonical layers exist.
+      map.on("idle", handleMapStyleData);
       stopColorSchemeObserver = observeDocumentColorScheme((scheme) => {
         switchBasemapScheme(scheme);
       });

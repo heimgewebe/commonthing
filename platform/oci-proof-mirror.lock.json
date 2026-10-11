@@ -4,7 +4,7 @@
     "max_inventory_images": 30,
     "max_parallel_pulls": 3,
     "observed_inventory_images": 25,
-    "observed_package_versions": 193,
+    "observed_package_versions": 204,
     "orphan_grace_days": 14,
     "package_version_hard_limit": 512,
     "proof_pull_images": {
@@ -23,33 +23,32 @@
     }
   },
   "generation": {
-    "buildx_version": "github.com/docker/buildx v0.36.1 1d8dde89b8aba914e05e45366770736fea1fd690",
-    "completed_at": "2026-09-01T22:37:01.986961Z",
+    "buildx_version": "github.com/docker/buildx v0.37.2 2d379c0c3f22da0d2759d132a0ec81ca949098f0",
+    "completed_at": "2026-10-11T15:57:48.657752Z",
     "docker_version": "28.0.4",
     "package_metadata": {
       "bytes": 6608,
-      "sha256": "365b90c96c2d6c0e65ecf2cb68d458f54a23bb129af86aca12fde431977238cf"
+      "sha256": "b82b1f4e63af0f4aebf32a76902a56f141a4e5515af6ac1d1714fa9b152f1930"
     },
     "package_preflight": {
       "bytes": 6687,
       "sha256": "19795e7c2a423e47d5f1fc733f3357463f82c9e69104083ec1f519a8fbafaae5"
     },
-    "pending_seed_sha256": "c6e73ef4328a3b4ae4b7ed4196a4c8033b3d2dc761802efc93b9d5989e187aba",
     "provenance": {
-      "bytes": 19851,
-      "sha256": "8da9a26e725796fddc05d973a6db2d4b49596fe3e2987c56e01f07b70f7cc64f"
+      "bytes": 19854,
+      "sha256": "654c1b870df990ac443a0083f1c8ec21e33bd00a37cc76a1b434d1041759ad7e"
     },
     "publisher_actor": "alexdermohr",
     "read_access": {
       "bytes": 6620,
       "checked_images": 25,
-      "sha256": "569008a704422106a51c7e4f15cdd2b0f203dd7be28046503ccc2407e07e74d0"
+      "sha256": "3ca4bdc7b3649e59f45aac3f01f93da3dde477293da3f7479f4e27435dd4b72a"
     },
-    "seed_sha256": "7185ec4a3972a13465e1951fb22ceecbc96157af0c3128261c8bff6d47196b48",
-    "source_head": "299992eb099b28882a98b94a163064dc4cde3feb",
-    "started_at": "2026-09-01T22:36:08.388224Z",
+    "seed_sha256": "c6e73ef4328a3b4ae4b7ed4196a4c8033b3d2dc761802efc93b9d5989e187aba",
+    "source_head": "520a1670cfa87f768804afabe14c30b4597f5ff7",
+    "started_at": "2026-10-11T15:57:13.194377Z",
     "workflow_run_attempt": "1",
-    "workflow_run_id": "33567018989"
+    "workflow_run_id": "38153374540"
   },
   "images": {
     "barman_cloud_plugin": {
@@ -86,12 +85,12 @@
       ]
     },
     "build_debian": {
-      "canonical": "docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
-      "digest": "sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
+      "canonical": "docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+      "digest": "sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
       "load_into_kind": false,
       "local_ref": "debian:bookworm-slim",
-      "mirror": "ghcr.io/heimgewebe/weltgewebe-proof-oci@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
-      "mirror_tag": "ghcr.io/heimgewebe/weltgewebe-proof-oci:build_debian-7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
+      "mirror": "ghcr.io/heimgewebe/weltgewebe-proof-oci@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+      "mirror_tag": "ghcr.io/heimgewebe/weltgewebe-proof-oci:build_debian-7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
       "suites": [
         "app-build"
       ]
@@ -344,7 +343,7 @@
     "package_type": "container",
     "repository": "ghcr.io/heimgewebe/weltgewebe-proof-oci",
     "repository_binding": "heimgewebe/commonthing",
-    "updated_at": "2026-07-25T08:03:47Z",
+    "updated_at": "2026-10-11T15:57:43Z",
     "visibility": "private"
   },
   "owner": "heimgewebe/weltgewebe",

@@ -8,6 +8,7 @@
     MapOptions,
   } from "maplibre-gl";
   import { initMapContext } from "./context";
+  import { loadMapLibre } from "./runtime";
 
   const dispatch = createEventDispatcher();
   const context = initMapContext();
@@ -50,7 +51,7 @@
     let destroyed = false;
 
     const initialise = async () => {
-      const maplibreModule = await import("maplibre-gl");
+      const maplibreModule = await loadMapLibre();
 
       if (destroyed) {
         return;
