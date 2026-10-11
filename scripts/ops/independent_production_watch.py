@@ -287,6 +287,10 @@ def record(result, directory):
                         for x in result["issues"] if x["severity"] == "P1")
         uncertain = sorted(x["code"] for x in result["issues"] if x["severity"] == "P2")
         observed_codes = {item["code"] for item in result["issues"]}
+        # A confirmed product HTTP-5xx incident cannot recover merely because
+        # the next poll times out. Both outcomes use unavailable_<component>,
+        # but only the latter is P2 observation uncertainty.
+        uncertain_product_http = {"unavailable_frontend", "unavailable_api"} & set(uncertain)
         # Never infer a recovery during a new-main grace while the affected
         # production commit still mismatches the currently observed main.
         commits = result.get("commits")
@@ -300,7 +304,8 @@ def record(result, directory):
                 and commits[name] != commits["main"]
             )
             if item not in severe and (
-                P1_UNVERIFIABLE_ON.get(code, set()) & observed_codes or still_stale
+                P1_UNVERIFIABLE_ON.get(code, set()) & observed_codes
+                or still_stale or code in uncertain_product_http
             ):
                 severe.append(item)
         severe.sort()
