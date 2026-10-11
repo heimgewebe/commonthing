@@ -34,6 +34,7 @@
       "bytes": 6687,
       "sha256": "19795e7c2a423e47d5f1fc733f3357463f82c9e69104083ec1f519a8fbafaae5"
     },
+    "pending_seed_sha256": "c6e73ef4328a3b4ae4b7ed4196a4c8033b3d2dc761802efc93b9d5989e187aba",
     "provenance": {
       "bytes": 19851,
       "sha256": "8da9a26e725796fddc05d973a6db2d4b49596fe3e2987c56e01f07b70f7cc64f"
