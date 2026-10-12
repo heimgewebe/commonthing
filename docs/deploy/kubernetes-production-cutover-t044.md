@@ -55,6 +55,7 @@ vollständige, gegen die konkrete Zielrevision gebundene Abnahme erforderlich.
   die revisionsgebundene öffentliche Prüfung. Dazu gehören kanonische und
   Legacy-Redirects, API-Erreichbarkeit, geschützte Metrikrouten, die Kartenroute,
   lokale Style-/Glyph-Auslieferung sowie vier PMTiles-Full-/Range-Verträge.
+  <!-- commonthing-naming: legacy -->
   `https://weltgewebe.net/` leitet mit HTTP 308 auf
   `https://commonthing.net/` weiter.
 - `https://commonthing.net/schaubild/manifest.json` antwortet HTTP 200 mit
