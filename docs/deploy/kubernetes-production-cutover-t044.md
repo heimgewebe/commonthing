@@ -9,10 +9,9 @@ owner_task: WELTGEWEBE-OS-V1-T044
 last_reviewed: 2026-10-12
 review_after: 2026-10-19
 summary: >
-  Revisionsgebundener R5-Preflight für den Wechsel von Compose/Caddy-Blue auf
-  Kubernetes-Green. Bindet die am 25.09.2026 frisch rückgelesene Produktions- und
-  Referenzplattformwahrheit und blockiert jede Produktionswirkung bis Zielplattform,
-  Capability-Parität, Datenübergang, Backup und Rollback konkret belegt sind.
+  Historischer R5-Preflight vom 25.09.2026 mit separater unvollständiger
+  read-only-Nachbeobachtung vom 12.10.2026. Beide Beobachtungen sind
+  ausdrücklich keine Produktions- oder R6-Aktivierungsfreigabe.
 relations:
   - type: depends_on
     target: docs/reports/kubernetes-platform-foundation-status.md
@@ -28,10 +27,15 @@ relations:
 
 ## R5-Nachbeobachtung — 12. Oktober 2026 (read-only; weiterhin BLOCKED)
 
-Dieser **inkrementelle Live-Readback** aktualisiert die Beobachtungen aus
-§3–§6 vom 25.09.2026. Er ersetzt die historische Inventur **nicht** durch
-eine vollständige R5-Abnahme. Kein produktiver Writer, Datenstand, DNS,
-Traffic, Cluster oder Secret wurde hierbei verändert. Vor R6 ist eine neue,
+Dieser **inkrementelle Live-Readback** ergänzt die historischen Beobachtungen
+in §3–§6 vom 25.09.2026. Deren Werte bleiben ausdrücklich **historische
+Momentaufnahmen** und dürfen nicht unter dem neueren `last_reviewed`-Datum
+als aktueller Produktionszustand gelesen werden. Dieses Addendum ist nur für
+die ausdrücklich erneut geprüften Punkte der jüngere Beobachtungsstand,
+**keine** vollständige R5-Abnahme und **keine** neue Aktivierungsfreigabe.
+Bei widersprechenden oder fehlenden Angaben bleibt das R5-Gate BLOCKED.
+Kein produktiver Writer, Datenstand, DNS, Traffic, Cluster oder Secret wurde
+hierbei verändert. Vor R6 ist eine neue,
 vollständige, gegen die konkrete Zielrevision gebundene Abnahme erforderlich.
 
 ### Bindung und Blue-Produktionsbefund
@@ -118,7 +122,7 @@ vollständige, gegen die konkrete Zielrevision gebundene Abnahme erforderlich.
 | B2 Semantic Search | **BLOCKED** | Produktionszielgebundener Ollama-/Embedding-/Search-Worker-Pfad samt Modell- und Indexparität |
 | B3 Public Frontdoor | **BLOCKED** | Schauwerk, PMTiles/Styles/Glyphs, Auth und Legacy-Hosts am echten Green samt TLS und Routing |
 | B4 Datenübergang | **BLOCKED** | Frischer, vollständiger und versionsgebundener PostgreSQL-/Auth-/JetStream-/Outbox-/Projektionsabgleich sowie Writer-Fencing |
-| B5 Zieltestbed | **TEILWEISE** | T085 terminal auf älterem Commit; für die gewählte **Cutover-Revision** ist die geforderte frische Zieltestbed-Abnahme noch zu binden |
+| B5 Zieltestbed | **BLOCKED** | T085 terminal auf älterem Commit bleibt historischer Beleg; die für die tatsächliche **Cutover-Revision** verlangte neue Zieltestbed-Abnahme fehlt |
 | B6 Zwei-Betreiber-Freigabe | **BLOCKED** | Konkrete doppelte Zustimmung, externe Receipt-/Replay-Verifikation und Aktivierungsbeleg derselben Cutover-Revision |
 
 **Zusätzlicher Registry-Readback:** Die GitHub-Registry von
@@ -126,13 +130,20 @@ vollständige, gegen die konkrete Zielrevision gebundene Abnahme erforderlich.
 `1b96351fa0933e29a4f355f94217c99e65a46beb` führt T044 als
 `state=planned` in der Queue-Lane `later` und zählt **neun**
 Acceptance-Einträge. Die historische Restplanung nennt teils
-`ready`/Revision 5 und elf Einträge. Das ist **keine** aktuelle
-Verifikations- oder Dispositionsevidenz. Vor R9 sind die verbindlichen
-Kriterien mit der zuständigen Bureau-Control-Plane zu reconciliieren;
-insbesondere dürfen die Suchkontinuität und deklarative
-Staging-Runtime-Wahrheit nicht wegen der kürzeren Zählliste entfallen.
+`ready`/Revision 5 und elf Einträge. Die neueren Registry-Einträge
+sind keine Autorität, den strengeren bestehenden **elfteiligen**
+Cutover-Abschlussvertrag (§11) durch bloße Dokumentänderung zu verkürzen.
+Das ist ein **ungeklärter Vertragswiderspruch und R5-Stopgrund**, nicht
+nur eine vor R9 zu erledigende Formalität. Vor Eintritt in **R6** müssen
+die tatsächlichen Kriterien zwischen verantwortlicher Bureau-Control-Plane,
+Cutover-Vertrag und Produktfähigkeiten formell revisionsgebunden
+reconciliiert sein; weder Suchkontinuität noch deklarative
+Staging-Runtime-Wahrheit dürfen still wegfallen. Bis dahin gelten die
+bisherigen strengeren R9-Schranken unverändert und R6 bleibt BLOCKED.
 
 **Disposition:** R5 ist **nicht bestanden**. R6–R9 bleiben gesperrt.
+Die B1–B6-Tabelle wertet nur die konkrete Zielrevision, nicht historische
+Teilbeweise.
 Blue bleibt bis zu einem gesondert beweisgebundenen Fencing-/Cutover-Gate der
 bestehende produktive Pfad. Aus der lokalen kind-Referenz, einem historischen
 Proof-Receipt oder dem öffentlichen Commitgleichstand folgt **keine**
@@ -1049,10 +1060,9 @@ erneutem Writer-Fencing.
 
 ## 11. R9 — Abschluss
 
-T044 darf erst terminalisiert werden, wenn alle in der jeweils aktuellen
-Bureau-Registry definierten Acceptance-Kriterien revisionsgebunden gegen die
-tatsächlich laufende Produktion authentifiziert wurden und
-`verification-stamp WELTGEWEBE-OS-V1-T044` erfolgreich ist.
+T044 darf erst terminalisiert werden, wenn seine elf Acceptance-Kriterien
+revisionsgebunden gegen die tatsächlich laufende Produktion authentifiziert
+wurden und `verification-stamp WELTGEWEBE-OS-V1-T044` erfolgreich ist.
 
 Der alte Compose-Pfad bleibt während der Beobachtungs- und Recoveryfrist
 erhalten und wird nicht sofort gelöscht. Nach der Write-Cutover-Grenze ist er
