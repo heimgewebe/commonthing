@@ -32,7 +32,7 @@ THRESHOLD = 45 * 60
 
 
 class ConfirmedProductHTTPError(ValueError):
-    """Both observations confirmed a server-side product HTTP failure."""
+    """Both observations confirmed a critical product HTTP endpoint failure."""
 # Each P1 is cleared only after the observations needed to verify it succeed.
 # Another still-visible P1 cannot hide an unverified incident.
 P1_UNVERIFIABLE_ON = {
@@ -63,7 +63,7 @@ def timestamp(value):
 
 def fetch(name):
     error = None
-    server_failures = 0
+    product_failures = 0
     for _ in range(2):
         try:
             url = SCHEDULE_COMPLETED_URL if name == "schedule_completed" else URLS[name]
@@ -73,8 +73,8 @@ def fetch(name):
             })
             with urlopen(req, timeout=8) as response:
                 if response.status != 200:
-                    if 500 <= response.status <= 599:
-                        server_failures += 1
+                    if response.status in {404, 410} or 500 <= response.status <= 599:
+                        product_failures += 1
                     raise ValueError(f"HTTP {response.status}")
                 content = response.read(LIMIT + 1)
                 if len(content) > LIMIT:
@@ -84,13 +84,13 @@ def fetch(name):
                     raise ValueError("JSON root not an object")
                 return data, response.headers.get("Cache-Control", "")
         except HTTPError as exc:
-            if 500 <= exc.code <= 599:
-                server_failures += 1
+            if exc.code in {404, 410} or 500 <= exc.code <= 599:
+                product_failures += 1
             error = f"HTTPError: HTTP {exc.code}"
         except Exception as exc:
             error = f"{type(exc).__name__}: {str(exc)[:150]}"
-    if name in {"frontend", "api"} and server_failures == 2:
-        raise ConfirmedProductHTTPError(f"two confirmed server HTTP 5xx failures: {error}")
+    if name in {"frontend", "api"} and product_failures == 2:
+        raise ConfirmedProductHTTPError(f"two confirmed product HTTP failures: {error}")
     raise ValueError(f"two reads failed: {error}")
 
 
@@ -265,6 +265,20 @@ def record(result, directory):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        # Polls may evaluate concurrently, but only the newest observation
+        # may replace persistent state. Check under the same record lock so
+        # an older delayed poll cannot erase a newer alarm or main anchor.
+        try:
+            previous_heartbeat = json.loads(
+                (directory / "heartbeat.json").read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, OSError, ValueError):
+            previous_heartbeat = None
+        if isinstance(previous_heartbeat, dict):
+            last_checked = timestamp(previous_heartbeat.get("checked_at_utc"))
+            checked = timestamp(result.get("checked_at_utc"))
+            if last_checked is not None and (checked is None or checked < last_checked):
+                return None
         path = directory / "state.json"
         try:
             previous = json.loads(path.read_text(encoding="utf-8"))
@@ -320,7 +334,11 @@ def record(result, directory):
         if severe:
             result["status"] = "ALARM"
 
-        transition = ("ALARM" if severe and severe != old_severe
+        # A surviving incident with changed details, or partial recovery,
+        # is not a new escalation. Only an actually new P1 code is an ALARM.
+        old_codes = {item[0] for item in old_severe}
+        new_codes = {item[0] for item in severe}
+        transition = ("ALARM" if new_codes - old_codes
                       else "RECOVERY" if old_severe and not severe else None)
         uncertainty_event = ("MONITOR_DATA_FAILURE"
                              if uncertain and uncertain != old_uncertain else None)

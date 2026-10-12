@@ -502,6 +502,138 @@ class WatchTests(unittest.TestCase):
                     ["ALARM", "MONITOR_DATA_FAILURE", "RECOVERY"],
                 )
 
+    def test_confirmed_404_and_410_endpoint_failures_are_p1(self):
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+
+        for component in ("frontend", "api"):
+            for code in (404, 410):
+                with self.subTest(component=component, code=code):
+                    error = HTTPError(watch.URLS[component], code, "route absent", {}, None)
+                    with patch.object(watch, "urlopen", side_effect=error) as request:
+                        with self.assertRaises(watch.ConfirmedProductHTTPError):
+                            watch.fetch(component)
+                        self.assertEqual(request.call_count, 2)
+                    normal = self.fixtures()
+
+                    def absent(name):
+                        if name == component:
+                            raise watch.ConfirmedProductHTTPError(
+                                f"two confirmed product HTTP {code}"
+                            )
+                        return normal(name)
+
+                    report = watch.evaluate(NOW, absent)
+                    self.assertEqual(report["status"], "ALARM")
+                    self.assertEqual(
+                        [(item["code"], item["severity"]) for item in report["issues"]],
+                        [("unavailable_" + component, "P1")],
+                    )
+
+    def test_partial_recovery_does_not_raise_duplicate_alarm(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            active = watch.evaluate(
+                NOW,
+                self.fixtures(frontend=OLD, api=MAIN, cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(active, directory), "ALARM")
+            prior = json.loads((directory / "state.json").read_text())["severe"]
+            self.assertEqual({item[0] for item in prior},
+                             {"frontend_api_diverge", "frontend_cache"})
+
+            partial = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(frontend=OLD, api=MAIN),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertIsNone(watch.record(partial, directory))
+            open_incidents = json.loads((directory / "state.json").read_text())["severe"]
+            self.assertEqual([item[0] for item in open_incidents],
+                             ["frontend_api_diverge"])
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
+            healthy = watch.evaluate(
+                NOW + timedelta(minutes=2), self.fixtures(),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(watch.record(healthy, directory), "RECOVERY")
+
+    def test_repeated_same_incident_with_changed_details_is_not_new_alarm(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            normal = self.fixtures()
+
+            def confirmed(detail):
+                def reader(name):
+                    if name == "frontend":
+                        raise watch.ConfirmedProductHTTPError(detail)
+                    return normal(name)
+                return reader
+
+            first = watch.evaluate(NOW, confirmed("two confirmed HTTP 503"))
+            self.assertEqual(watch.record(first, directory), "ALARM")
+            next_observation = watch.evaluate(
+                NOW + timedelta(minutes=1), confirmed("two confirmed HTTP 502"),
+            )
+            self.assertIsNone(watch.record(next_observation, directory))
+            severe = json.loads((directory / "state.json").read_text())["severe"]
+            self.assertEqual([item[0] for item in severe], ["unavailable_frontend"])
+            self.assertIn("502", severe[0][1])
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
+
+    def test_out_of_order_polls_cannot_overwrite_newer_heartbeat_or_alarm(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            old_healthy = watch.evaluate(NOW, self.fixtures())
+            newer_alarm = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(frontend=OLD),
+            )
+            self.assertEqual(watch.record(newer_alarm, directory), "ALARM")
+            self.assertIsNone(watch.record(old_healthy, directory))
+            saved = json.loads((directory / "state.json").read_text())
+            self.assertEqual([row[0] for row in saved["severe"]],
+                             ["frontend_api_diverge"])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["checked_at_utc"],
+                             newer_alarm["checked_at_utc"])
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertEqual(
+                [json.loads(row)["event"] for row in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
+            recovered = watch.evaluate(
+                NOW + timedelta(minutes=2), self.fixtures(),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(watch.record(recovered, directory), "RECOVERY")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            old_alarm = watch.evaluate(NOW, self.fixtures(frontend=OLD))
+            newer_healthy = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(),
+            )
+            self.assertIsNone(watch.record(newer_healthy, directory))
+            self.assertIsNone(watch.record(old_alarm, directory))
+            self.assertEqual(
+                json.loads((directory / "state.json").read_text())["severe"], [],
+            )
+            self.assertFalse((directory / "events.jsonl").exists())
+
     def test_two_http_503_reads_are_production_failure_not_transport_noise(self):
         from unittest.mock import patch
         from urllib.error import HTTPError
