@@ -502,12 +502,12 @@ class WatchTests(unittest.TestCase):
                     ["ALARM", "MONITOR_DATA_FAILURE", "RECOVERY"],
                 )
 
-    def test_confirmed_404_and_410_endpoint_failures_are_p1(self):
+    def test_confirmed_401_403_404_410_endpoint_failures_are_p1(self):
         from unittest.mock import patch
         from urllib.error import HTTPError
 
         for component in ("frontend", "api"):
-            for code in (404, 410):
+            for code in (401, 403, 404, 410):
                 with self.subTest(component=component, code=code):
                     error = HTTPError(watch.URLS[component], code, "route absent", {}, None)
                     with patch.object(watch, "urlopen", side_effect=error) as request:
@@ -529,6 +529,20 @@ class WatchTests(unittest.TestCase):
                         [(item["code"], item["severity"]) for item in report["issues"]],
                         [("unavailable_" + component, "P1")],
                     )
+
+    def test_http_429_rate_limit_stays_monitor_uncertainty(self):
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+
+        for component in ("frontend", "api"):
+            with self.subTest(component=component):
+                error = HTTPError(watch.URLS[component], 429, "throttled", {}, None)
+                with patch.object(watch, "urlopen", side_effect=error) as request:
+                    with self.assertRaises(ValueError) as failure:
+                        watch.fetch(component)
+                    self.assertNotIsInstance(failure.exception,
+                                             watch.ConfirmedProductHTTPError)
+                    self.assertEqual(request.call_count, 2)
 
     def test_partial_recovery_does_not_raise_duplicate_alarm(self):
         import json

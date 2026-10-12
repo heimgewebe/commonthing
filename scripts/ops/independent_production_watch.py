@@ -73,7 +73,7 @@ def fetch(name):
             })
             with urlopen(req, timeout=8) as response:
                 if response.status != 200:
-                    if response.status in {404, 410} or 500 <= response.status <= 599:
+                    if response.status in {401, 403, 404, 410} or 500 <= response.status <= 599:
                         product_failures += 1
                     raise ValueError(f"HTTP {response.status}")
                 content = response.read(LIMIT + 1)
@@ -84,7 +84,7 @@ def fetch(name):
                     raise ValueError("JSON root not an object")
                 return data, response.headers.get("Cache-Control", "")
         except HTTPError as exc:
-            if exc.code in {404, 410} or 500 <= exc.code <= 599:
+            if exc.code in {401, 403, 404, 410} or 500 <= exc.code <= 599:
                 product_failures += 1
             error = f"HTTPError: HTTP {exc.code}"
         except Exception as exc:
