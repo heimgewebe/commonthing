@@ -339,13 +339,20 @@ class WatchTests(unittest.TestCase):
         for state in malformed:
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
-                (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+                state_bytes = json.dumps(state).encode()
+                (directory / "state.json").write_bytes(state_bytes)
                 healthy = watch.evaluate(NOW, self.fixtures())
-                self.assertIsNone(watch.record(healthy, directory))
-                self.assertTrue((directory / "heartbeat.json").is_file())
-                persisted = json.loads((directory / "state.json").read_text())
-                self.assertEqual(persisted["severe"], [])
-                self.assertEqual(persisted["uncertain"], [])
+                self.assertEqual(watch.record(healthy, directory),
+                                 "MONITOR_DATA_FAILURE")
+                self.assertEqual((directory / "state.json").read_bytes(),
+                                 state_bytes)
+                heartbeat = json.loads((directory / "heartbeat.json").read_text())
+                self.assertEqual(heartbeat["status"], "MONITOR_DATA_FAILURE")
+                self.assertIn(
+                    "unverifiable_state",
+                    [item["code"] for item in heartbeat["issues"]],
+                )
+                self.assertEqual(healthy["status"], "MONITOR_DATA_FAILURE")
                 self.assertFalse((directory / "events.jsonl").exists())
 
 
@@ -1551,6 +1558,12 @@ class WatchTests(unittest.TestCase):
                 "watcher_execution_failed",
                 [row["code"] for row in heartbeat["issues"]],
             )
+            # A snapshot retry must not repeat the ALARM already journaled.
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM", "MONITOR_DATA_FAILURE"],
+            )
             # The retry stamps its actual wall-clock time, not fixture NOW.
             later_at = watch.timestamp(heartbeat["checked_at_utc"]) + timedelta(minutes=1)
             later = watch.evaluate(later_at, self.fixtures())
@@ -1628,6 +1641,141 @@ class WatchTests(unittest.TestCase):
                 self.assertEqual(watch.record(result, directory), "ALARM")
                 severe = json.loads((directory / "state.json").read_text())["severe"]
                 self.assertIn(code, [item[0] for item in severe])
+
+
+    def test_corrupt_state_keeps_prior_heartbeat_p1_and_no_false_recovery(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            original = watch.evaluate(NOW, self.fixtures(cache="public, max-age=30"))
+            self.assertEqual(watch.record(original, directory), "ALARM")
+            clean_state = (directory / "state.json").read_bytes()
+            damaged_state = b'{"severe":[["frontend_cache",'
+            (directory / "state.json").write_bytes(damaged_state)
+
+            healthy = watch.evaluate(NOW + timedelta(minutes=1), self.fixtures())
+            self.assertEqual(watch.record(healthy, directory),
+                             "MONITOR_DATA_FAILURE")
+            self.assertEqual((directory / "state.json").read_bytes(), damaged_state)
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("frontend_cache",
+                          [item["code"] for item in heartbeat["issues"]])
+            self.assertIn("unverifiable_state",
+                          [item["code"] for item in heartbeat["issues"]])
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
+            # After an explicitly restored validated state, real recovery works.
+            (directory / "state.json").write_bytes(clean_state)
+            later = watch.evaluate(NOW + timedelta(minutes=2), self.fixtures())
+            self.assertEqual(watch.record(later, directory), "RECOVERY")
+
+
+    def test_event_batch_is_serialized_before_one_append(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            normal = self.fixtures(cache="public, max-age=30")
+
+            def failing_reference(name):
+                if name == "main":
+                    raise TimeoutError("GitHub reference unavailable")
+                return normal(name)
+
+            observed = watch.evaluate(NOW, failing_reference)
+            self.assertEqual(observed["status"], "ALARM")
+            self.assertEqual(
+                {x["severity"] for x in observed["issues"]}, {"P1", "P2"},
+            )
+            actual_open = Path.open
+            writes = []
+
+            class EventWriter:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def __enter__(self):
+                    self.stream.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.stream.__exit__(*args)
+
+                def write(self, content):
+                    writes.append(content)
+                    return self.stream.write(content)
+
+                def flush(self):
+                    return self.stream.flush()
+
+                def fileno(self):
+                    return self.stream.fileno()
+
+            def monitored_open(path, *args, **kwargs):
+                stream = actual_open(path, *args, **kwargs)
+                return (
+                    EventWriter(stream)
+                    if path == directory / "events.jsonl" else stream
+                )
+
+            with patch.object(Path, "open", new=monitored_open):
+                self.assertEqual(watch.record(observed, directory), "ALARM")
+
+            self.assertEqual(len(writes), 1)
+            self.assertTrue(writes[0].endswith(b"\n"))
+            self.assertEqual(
+                [json.loads(line)["event"] for line in writes[0].splitlines()],
+                ["ALARM", "MONITOR_DATA_FAILURE"],
+            )
+
+
+    def test_event_fsync_failure_truncates_uncommitted_append(self):
+        import json
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = watch.evaluate(NOW, self.fixtures(cache="public, max-age=30"))
+            actual_fsync = watch.os.fsync
+            failed = []
+
+            def interrupted_fsync(fd):
+                destination = os.readlink(f"/proc/self/fd/{fd}")
+                if destination == str(directory / "events.jsonl") and not failed:
+                    failed.append(True)
+                    raise OSError("simulated event journal fsync failure")
+                return actual_fsync(fd)
+
+            with patch.object(watch.os, "fsync", side_effect=interrupted_fsync):
+                self.assertEqual(watch.record(first, directory), "ALARM")
+            self.assertEqual(failed, [True])
+            self.assertEqual((directory / "events.jsonl").read_bytes(), b"")
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("event_log_write_failed",
+                          [item["code"] for item in heartbeat["issues"]])
+            self.assertEqual(
+                [item[0] for item in
+                 json.loads((directory / "state.json").read_text())["severe"]],
+                ["frontend_cache"],
+            )
+
+            recovered = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures()
+            )
+            self.assertEqual(watch.record(recovered, directory), "RECOVERY")
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["RECOVERY"],
+            )
 
 
 if __name__ == "__main__":

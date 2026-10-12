@@ -317,7 +317,66 @@ def write_json(path, value):
     os.replace(temporary, path)
 
 
-def record(result, directory, *, serialized_poll=False):
+def _record_unverifiable_prior_state(result, directory, heartbeat, cause):
+    # Never replace incident history if its old P1 entries cannot be parsed.
+    # The local heartbeat is a separate best-effort liveness channel, not a
+    # substitute for the corrupted original state.json.
+    failure = watcher_failure_report(
+        timestamp(result.get("checked_at_utc")) or datetime.now(UTC),
+        ValueError(cause),
+    )
+    failure["issues"][0].update({
+        "code": "unverifiable_state",
+        "component": "watcher incident state",
+        "actual": cause[:150],
+        "expected": "readable well-formed prior state.json",
+        "source": str(directory / "state.json"),
+    })
+    failure["observation_status"] = result.get("status")
+    confirmed = []
+    seen = set()
+    for observed in (
+        result.get("issues", []),
+        heartbeat.get("issues", []) if isinstance(heartbeat, dict) else [],
+    ):
+        if not isinstance(observed, list):
+            continue
+        for item in observed:
+            if not isinstance(item, dict) or item.get("severity") != "P1":
+                continue
+            code = item.get("code")
+            if not isinstance(code, str) or not code or code in seen:
+                continue
+            seen.add(code)
+            confirmed.append(item)
+    prior_retained = (
+        heartbeat.get("retained_prior_p1", [])
+        if isinstance(heartbeat, dict) else []
+    )
+    if isinstance(prior_retained, list):
+        for item in prior_retained:
+            if (not isinstance(item, list) or len(item) != 2
+                    or not all(isinstance(part, str) for part in item)):
+                continue
+            code, actual = item
+            if code in seen:
+                continue
+            seen.add(code)
+            confirmed.append({
+                "code": code, "component": "prior watcher P1",
+                "actual": actual[:160], "expected": "confirmed recovery",
+                "source": "local persisted heartbeat", "severity": "P1",
+            })
+    if confirmed:
+        failure["issues"].extend(confirmed)
+        failure["status"] = "ALARM"
+    result.clear()
+    result.update(failure)
+    write_json(directory / "heartbeat.json", result)
+    return "MONITOR_DATA_FAILURE"
+
+
+def record(result, directory, *, serialized_poll=False, suppress_transition_event=False):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -336,26 +395,40 @@ def record(result, directory, *, serialized_poll=False):
             if not serialized_poll and last_checked is not None and (checked is None or checked < last_checked):
                 return None
         path = directory / "state.json"
+        no_prior_state = False
         try:
             previous = json.loads(path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError):
+        except FileNotFoundError:
+            no_prior_state = True
             previous = {}
-        if not isinstance(previous, dict):
-            previous = {}
+        except (ValueError, UnicodeError) as exc:
+            return _record_unverifiable_prior_state(
+                result, directory, previous_heartbeat,
+                f"malformed state JSON: {type(exc).__name__}",
+            )
+        if not no_prior_state and not isinstance(previous, dict):
+            return _record_unverifiable_prior_state(
+                result, directory, previous_heartbeat, "state root is not object",
+            )
+        raw_severe = [] if no_prior_state else previous.get("severe")
+        if not isinstance(raw_severe, list) or any(
+            not isinstance(item, list) or len(item) != 2
+            or not all(isinstance(value, str) for value in item)
+            for item in raw_severe
+        ):
+            return _record_unverifiable_prior_state(
+                result, directory, previous_heartbeat,
+                "missing or malformed severe incident list",
+            )
         # The incident state is replaced before heartbeat.json. A failed
         # heartbeat write must not let an older overlapping poll erase P1.
         state_checked = timestamp(previous.get("checked_at_utc"))
         checked = timestamp(result.get("checked_at_utc"))
         if not serialized_poll and state_checked is not None and (checked is None or checked < state_checked):
             return None
-        raw_severe = previous.get("severe")
-        raw_severe = raw_severe if isinstance(raw_severe, list) else []
-        # Malformed state is not evidence for either an incident or a recovery.
         old_severe = sorted(
             item for item in raw_severe
-            if isinstance(item, list) and len(item) == 2
-            and all(isinstance(value, str) for value in item)
-            and item[0] not in {"schedule_stale", "schedule_failed", "no_schedule"}
+            if item[0] not in {"schedule_stale", "schedule_failed", "no_schedule"}
         )
         old_uncertain = previous.get("uncertain")
         old_uncertain = old_uncertain if isinstance(old_uncertain, list) else []
@@ -410,16 +483,42 @@ def record(result, directory, *, serialized_poll=False):
         uncertainty_event = ("MONITOR_DATA_FAILURE"
                              if uncertain and uncertain != old_uncertain else None)
         new_event = transition or uncertainty_event
-        events = [event for event in (transition, uncertainty_event) if event]
+        # The fallback retry must not re-emit a transition the first call
+        # may already have committed to the local event journal.
+        events = [event for event in (
+            None if suppress_transition_event else transition, uncertainty_event,
+        ) if event]
         if events:
             try:
-                with (directory / "events.jsonl").open("a", encoding="utf-8") as out:
-                    for event_name in events:
-                        event = {"event": event_name, **result,
-                                 "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939"}
-                        out.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
-                    out.flush()
-                    os.fsync(out.fileno())
+                # Construct the complete batch before touching the journal.
+                # A mid-loop failure must not commit only the first event.
+                batch = []
+                for event_name in events:
+                    event = {"event": event_name, **result,
+                             "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939"}
+                    batch.append(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+                # Unbuffered single append with rollback to the exact old
+                # size on a short write or fsync failure. The surrounding
+                # record flock serializes all watcher-owned journal writers.
+                payload = "".join(batch).encode("utf-8")
+                with (directory / "events.jsonl").open("ab", buffering=0) as out:
+                    fd = out.fileno()
+                    previous_end = os.lseek(fd, 0, os.SEEK_END)
+                    try:
+                        written = out.write(payload)
+                        if written != len(payload):
+                            raise OSError("short event history append")
+                        os.fsync(fd)
+                    except OSError as append_error:
+                        try:
+                            os.ftruncate(fd, previous_end)
+                            os.fsync(fd)
+                        except OSError as rollback_error:
+                            raise OSError(
+                                f"event append failed: {append_error}; "
+                                f"rollback failed: {rollback_error}"
+                            ) from rollback_error
+                        raise
             except OSError as exc:
                 # Auxiliary event history must not block durable incident state.
                 # It is NOT evidence of notification delivery.
@@ -542,7 +641,10 @@ def _persist_cycle(result, directory):
             failure["status"] = "ALARM"
         signal.alarm(10)
         try:
-            record(failure, directory, serialized_poll=True)
+            record(
+                failure, directory, serialized_poll=True,
+                suppress_transition_event=True,
+            )
         except (WatchRuntimeExceeded, Exception) as recovery_exc:
             print(
                 f"watcher heartbeat failed: {type(recovery_exc).__name__}",
