@@ -1202,6 +1202,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_yaml_security_regressions() -> Result<()> {
+        let anchored = policy_file("max_nodes_jsonl_mb: &cap 10\nmax_edges_jsonl_mb: *cap\n")?;
+        let limits = load_policy_file(anchored.path())
+            .await
+            .expect("YAML aliases used by valid policies stay compatible");
+        assert_eq!(limits.max_nodes_jsonl_mb, 10);
+        assert_eq!(limits.max_edges_jsonl_mb, 10);
+
+        let invalid_fixtures = [
+            (
+                "duplicate policy limit",
+                "max_nodes_jsonl_mb: 10\nmax_nodes_jsonl_mb: 99\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "wrong policy type",
+                "max_nodes_jsonl_mb: [10]\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "negative policy limit",
+                "max_nodes_jsonl_mb: -1\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "unknown policy property",
+                "max_nodes_jsonl_mb: 10\nmax_edges_jsonl_mb: 10\ninvalid: true\n",
+            ),
+            (
+                "unsupported custom YAML tag",
+                "max_nodes_jsonl_mb: !custom 10\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "multiple policy documents",
+                "max_nodes_jsonl_mb: 10\nmax_edges_jsonl_mb: 10\n---\nmax_nodes_jsonl_mb: 20\nmax_edges_jsonl_mb: 20\n",
+            ),
+        ];
+        for (case, yaml) in invalid_fixtures {
+            let file = policy_file(yaml)?;
+            assert!(
+                load_policy_file(file.path()).await.is_err(),
+                "policy accepted {case}: {yaml}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn policy_check_accepts_valid_contract() -> Result<()> {
         let file = policy_file("max_nodes_jsonl_mb: 10\nmax_edges_jsonl_mb: 10\n")?;
         assert!(load_policy_file(file.path()).await.is_ok());

@@ -437,10 +437,9 @@ impl AppConfig {
             "delegation_expire_days",
             "anonymize_opt_in",
         ] {
-            let key = serde_yaml::Value::String(removed_key.to_string());
             if value
                 .as_mapping()
-                .is_some_and(|mapping| mapping.contains_key(&key))
+                .is_some_and(|mapping| mapping.contains_key(removed_key))
             {
                 match removed_key {
                     "fade_days" => anyhow::bail!(
@@ -1018,6 +1017,43 @@ mod tests {
     const YAML: &str = r#"
 max_guest_owned_nodes: 1000
 "#;
+
+    #[test]
+    fn yaml_security_parser_accepts_documented_config_forms() {
+        let config = super::AppConfig::parse_yaml(
+            "max_guest_owned_nodes: &limit 21\nauth_cookie_secure: false\nunused_legacy_field: *limit\n",
+        )
+        .expect("existing YAML anchors and tolerated unknown fields remain compatible");
+        assert_eq!(config.max_guest_owned_nodes, 21);
+        assert!(!config.auth_cookie_secure);
+    }
+
+    #[test]
+    fn yaml_security_parser_rejects_ambiguous_or_wrong_typed_config() {
+        let fixtures = [
+            (
+                "duplicate root key",
+                "max_guest_owned_nodes: 1\nmax_guest_owned_nodes: 20\n",
+            ),
+            ("wrong scalar type", "max_guest_owned_nodes: [10, 20]\n"),
+            ("wrong nested type", "node_mutation_rate_limits: [1, 2]\n"),
+            (
+                "multiple YAML documents",
+                "max_guest_owned_nodes: 1\n---\nmax_guest_owned_nodes: 20\n",
+            ),
+            (
+                "unsupported custom tag",
+                "max_guest_owned_nodes: !custom 21\n",
+            ),
+            ("removed dangerous option", "fade_days: 7\n"),
+        ];
+        for (name, yaml) in fixtures {
+            assert!(
+                super::AppConfig::parse_yaml(yaml).is_err(),
+                "config parser accepted {name}: {yaml}"
+            );
+        }
+    }
 
     // Config tests must not inherit a removed operator switch from the developer
     // or CI host. The explicit rejection test below bypasses this facade so it

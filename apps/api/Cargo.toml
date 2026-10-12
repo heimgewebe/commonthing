@@ -26,7 +26,7 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Used by `apps::api::config` to read YAML configuration defaults and files.
-serde_yaml = "0.9"
+serde_yaml = { package = "noyalib-serde-yaml", version = "=0.0.56" }
 chrono = { version = "0.4.42", features = ["serde"] }
 uuid = { version = "1.19.0", features = ["v4", "v5", "fast-rng", "serde"] }
 axum-extra = { version = "0.12", features = ["cookie"] }
