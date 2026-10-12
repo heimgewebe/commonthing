@@ -135,8 +135,9 @@ def fetch(name):
     raise ValueError(f"two reads failed: {error}")
 
 
-def evaluate(now, reader=fetch, *, previous_main_observation=None):
-    data, headers, issues = {}, {}, []
+def evaluate(now, reader=fetch, *, previous_main_observation=None, issue_sink=None):
+    data, headers = {}, {}
+    issues = issue_sink if issue_sink is not None else []
     def flag(code, component, actual, expected, source, severity="P1", duration=None):
         item = {"code": code, "component": component, "actual": actual,
                 "expected": expected, "source": (SCHEDULE_COMPLETED_URL if source == "schedule_completed" else URLS[source]),
@@ -145,7 +146,7 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
             item["duration_seconds"] = round(duration)
         issues.append(item)
 
-    for name in URLS:
+    def observe(name):
         try:
             data[name], headers[name] = reader(name)
         except ConfirmedProductVersionError as exc:
@@ -158,6 +159,18 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
             flag("unavailable_" + name, "observation channel", str(exc)[:200],
                  "HTTP 200 and valid JSON", name,
                  "INFO" if name == "schedule" else "P2")
+        else:
+            # Preserve confirmed frontend cache faults if a later URL hangs.
+            if name == "frontend":
+                cache_directives = [p.strip().lower() for p in headers[name].split(",")]
+                if "no-store" not in cache_directives:
+                    flag("frontend_cache", "frontend", headers[name][:120],
+                         "Cache-Control: no-store", "frontend")
+
+    # Resolve and classify production data before optional schedule reads.
+    # A later global deadline must not discard already-confirmed P1s.
+    for name in ("frontend", "api", "main"):
+        observe(name)
 
     commits = {}
     for name in ("frontend", "api", "main"):
@@ -171,11 +184,6 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
             else:
                 commits[name] = value
 
-    if "frontend" in data:
-        cache_directives = [p.strip().lower() for p in headers["frontend"].split(",")]
-        if "no-store" not in cache_directives:
-            flag("frontend_cache", "frontend", headers["frontend"][:120],
-                 "Cache-Control: no-store", "frontend")
     if "frontend" in commits and "api" in commits and commits["frontend"] != commits["api"]:
         flag("frontend_api_diverge", "production commits",
              {"frontend": commits["frontend"], "api": commits["api"]},
@@ -226,6 +234,7 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
         if commit_age is None or commit_age < -120:
             flag("main_time_unreliable", "GitHub main", str(commit_age),
                  "valid commit timestamp", "main", "P2")
+    observe("schedule")
     newest_schedule = None
     if "schedule" in data:
         rows = data["schedule"].get("workflow_runs")
@@ -490,16 +499,30 @@ def watcher_failure_report(now, exc):
 
 def _evaluate_cycle(directory):
     now = datetime.now(UTC)
+    observed_issues = []
     try:
         previous = read_previous_main_observation(directory)
-        return evaluate(now, previous_main_observation=previous)
-    except WatchRuntimeExceeded as exc:
-        return watcher_failure_report(now, exc)
-    except Exception as exc:
-        return watcher_failure_report(now, exc)
+        return evaluate(
+            now, previous_main_observation=previous, issue_sink=observed_issues,
+        )
+    except (WatchRuntimeExceeded, Exception) as exc:
+        # Only preserve confirmed P1s collected before the failing read.
+        # Unknown later endpoints remain a P2 observer failure.
+        failure = watcher_failure_report(now, exc)
+        confirmed_p1 = [
+            item for item in observed_issues
+            if isinstance(item, dict) and item.get("severity") == "P1"
+        ]
+        if confirmed_p1:
+            failure["issues"].extend(confirmed_p1)
+            failure["status"] = "ALARM"
+        return failure
 
 
 def _persist_cycle(result, directory):
+    # SIGALRM is one-shot. Evaluation may already have consumed the whole
+    # budget; rearm so a blocked state/heartbeat fsync cannot hang cron.
+    signal.alarm(10)
     try:
         event = record(result, directory, serialized_poll=True)
     except (WatchRuntimeExceeded, Exception) as exc:
@@ -507,6 +530,16 @@ def _persist_cycle(result, directory):
         # storage is completely inaccessible; an external liveness watcher
         # remains necessary.
         failure = watcher_failure_report(datetime.now(UTC), exc)
+        # A failed state replace must not turn a confirmed NEW product P1
+        # into generic P2 uncertainty. Preserve the observation from this
+        # poll even when no prior state.json contains the incident yet.
+        observed_p1 = [
+            item for item in result.get("issues", [])
+            if isinstance(item, dict) and item.get("severity") == "P1"
+        ]
+        if observed_p1:
+            failure["issues"].extend(observed_p1)
+            failure["status"] = "ALARM"
         signal.alarm(10)
         try:
             record(failure, directory, serialized_poll=True)

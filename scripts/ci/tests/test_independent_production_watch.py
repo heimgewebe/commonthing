@@ -1512,5 +1512,123 @@ class WatchTests(unittest.TestCase):
             )
 
 
+    def test_first_new_p1_survives_transient_state_replace_failure(self):
+        import json
+        import signal
+        import sys
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            new_alarm = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30")
+            )
+            self.assertEqual(new_alarm["status"], "ALARM")
+            actual_write = watch.write_json
+            failures = []
+
+            def fail_first_state_replace(path, value):
+                if path.name == "state.json" and not failures:
+                    failures.append("state.json")
+                    raise OSError("simulated first state replace failure")
+                return actual_write(path, value)
+
+            with patch.object(sys, "argv", [
+                "independent_production_watch.py", "--state-dir", tmp,
+            ]), patch.object(
+                watch, "evaluate", return_value=new_alarm,
+            ), patch.object(
+                watch, "write_json", side_effect=fail_first_state_replace,
+            ), patch.object(signal, "alarm", return_value=0):
+                self.assertEqual(watch.main(), 2)
+
+            self.assertEqual(failures, ["state.json"])
+            persisted = json.loads((directory / "state.json").read_text())
+            self.assertIn("frontend_cache", [row[0] for row in persisted["severe"]])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn(
+                "watcher_execution_failed",
+                [row["code"] for row in heartbeat["issues"]],
+            )
+            # The retry stamps its actual wall-clock time, not fixture NOW.
+            later_at = watch.timestamp(heartbeat["checked_at_utc"]) + timedelta(minutes=1)
+            later = watch.evaluate(later_at, self.fixtures())
+            self.assertEqual(watch.record(later, directory), "RECOVERY")
+
+    def test_overall_deadline_rearmed_after_evaluation_timeout(self):
+        import json
+        import signal
+        import sys
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            with patch.object(sys, "argv", [
+                "independent_production_watch.py", "--state-dir", tmp,
+            ]), patch.object(
+                watch, "evaluate",
+                side_effect=watch.WatchRuntimeExceeded("simulated 240s deadline"),
+            ), patch.object(signal, "alarm", return_value=0) as alarm:
+                self.assertEqual(watch.main(), 2)
+            self.assertEqual(
+                [call.args for call in alarm.call_args_list],
+                [(watch.WATCH_MAX_SECONDS,), (10,), (0,)],
+            )
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "MONITOR_DATA_FAILURE")
+            self.assertEqual(heartbeat["issues"][0]["code"], "watcher_execution_failed")
+
+
+    def test_late_schedule_deadline_keeps_earlier_confirmed_product_p1(self):
+        import json
+        from unittest.mock import patch
+
+        for mode, code in (
+            ("confirmed_http", "unavailable_frontend"),
+            ("cache_header", "frontend_cache"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                normal = self.fixtures()
+                actual_evaluate = watch.evaluate
+
+                def reader(name):
+                    if name == "frontend" and mode == "confirmed_http":
+                        raise watch.ConfirmedProductHTTPError("two observed HTTP 503")
+                    if name == "frontend" and mode == "cache_header":
+                        data, _ = normal(name)
+                        return data, "public, max-age=3600"
+                    if name == "schedule":
+                        raise watch.WatchRuntimeExceeded(
+                            "global deadline during later scheduled endpoint"
+                        )
+                    return normal(name)
+
+                def interrupted_evaluation(
+                    now, *, previous_main_observation=None, issue_sink=None,
+                ):
+                    options = {"previous_main_observation": previous_main_observation}
+                    if issue_sink is not None:
+                        options["issue_sink"] = issue_sink
+                    return actual_evaluate(now, reader, **options)
+
+                with patch.object(
+                    watch, "evaluate", side_effect=interrupted_evaluation,
+                ):
+                    result = watch._evaluate_cycle(directory)
+                self.assertEqual(result["status"], "ALARM")
+                self.assertIn(
+                    code, [issue["code"] for issue in result["issues"]]
+                )
+                self.assertIn(
+                    "watcher_execution_failed",
+                    [issue["code"] for issue in result["issues"]],
+                )
+                self.assertEqual(watch.record(result, directory), "ALARM")
+                severe = json.loads((directory / "state.json").read_text())["severe"]
+                self.assertIn(code, [item[0] for item in severe])
+
+
 if __name__ == "__main__":
     unittest.main()
