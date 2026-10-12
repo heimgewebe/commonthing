@@ -646,6 +646,102 @@ class WatchTests(unittest.TestCase):
                              "MONITOR_DATA_FAILURE")
             self.assertTrue((directory / "heartbeat.json").is_file())
 
+    def test_invalid_version_schema_retries_before_product_p1(self):
+        import json
+        from unittest.mock import patch
+
+        for component in ("frontend", "api"):
+            normal = self.fixtures()
+
+            class Response:
+                status = 200
+                headers = {"Cache-Control": "public, no-store"}
+
+                def __init__(self, content):
+                    self.content = json.dumps(content).encode("utf-8")
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    return False
+
+                def read(self, _limit):
+                    return self.content
+
+            cases = {
+                "both_invalid": ({"commit": "bad"}, {"commit": 0}, "ALARM", "P1"),
+                "invalid_then_timeout": ({"commit": "bad"}, TimeoutError("timeout"),
+                                         "MONITOR_DATA_FAILURE", "P2"),
+                "timeout_then_invalid": (TimeoutError("timeout"), {"commit": "bad"},
+                                         "MONITOR_DATA_FAILURE", "P2"),
+                "invalid_then_valid": ({"commit": "bad"}, {"commit": MAIN},
+                                       "HEALTHY", None),
+            }
+            for case, (first, second, status, severity) in cases.items():
+                with self.subTest(component=component, case=case):
+                    attempts = [first, second]
+                    calls = []
+
+                    def fake_urlopen(_request, timeout):
+                        calls.append(timeout)
+                        attempt = attempts.pop(0)
+                        if isinstance(attempt, Exception):
+                            raise attempt
+                        return Response(attempt)
+
+                    def reader(name):
+                        return watch.fetch(name) if name == component else normal(name)
+
+                    with patch.object(watch, "urlopen", side_effect=fake_urlopen):
+                        observed = watch.evaluate(NOW, reader)
+                    self.assertEqual(len(calls), 2)
+                    self.assertEqual(observed["status"], status)
+                    if severity:
+                        self.assertIn(
+                            ("unavailable_" + component, severity),
+                            [(issue["code"], issue["severity"])
+                             for issue in observed["issues"]],
+                        )
+                    else:
+                        self.assertFalse(observed["issues"])
+
+    def test_updated_stale_incident_replaces_old_commit_detail(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            old_anchor = {
+                "sha": MAIN,
+                "first_seen": (NOW - timedelta(minutes=46)).isoformat(),
+            }
+            initial = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=MAIN),
+                previous_main_observation=old_anchor,
+            )
+            self.assertIn("stale_frontend", {x["code"] for x in initial["issues"]})
+            self.assertEqual(watch.record(initial, directory), "ALARM")
+
+            next_frontend = "c" * 40
+            newer = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(frontend=next_frontend, api=MAIN),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertIn("stale_frontend", {x["code"] for x in newer["issues"]})
+            self.assertIsNone(watch.record(newer, directory))
+            state = json.loads((directory / "state.json").read_text())
+            stale = [item for item in state["severe"] if item[0] == "stale_frontend"]
+            self.assertEqual(stale, [["stale_frontend", next_frontend]])
+            self.assertFalse(
+                any(row[0] == "stale_frontend" for row in newer.get("retained_prior_p1", []))
+            )
+            self.assertEqual(
+                [json.loads(row)["event"] for row in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
+
     def test_http_429_rate_limit_stays_monitor_uncertainty(self):
         from unittest.mock import patch
         from urllib.error import HTTPError

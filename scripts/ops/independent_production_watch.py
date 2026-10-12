@@ -91,6 +91,11 @@ def fetch(name):
                     if name in {"frontend", "api"}:
                         product_failures += 1
                     raise ValueError("JSON root not an object")
+                if name in {"frontend", "api"}:
+                    commit = data.get("commit")
+                    if not isinstance(commit, str) or not SHA.fullmatch(commit):
+                        product_failures += 1
+                        raise ValueError("invalid production version commit")
                 return data, response.headers.get("Cache-Control", "")
         except HTTPError as exc:
             if exc.code in {401, 403, 404, 410} or 500 <= exc.code <= 599:
@@ -326,7 +331,9 @@ def record(result, directory):
                 and name in commits and "main" in commits
                 and commits[name] != commits["main"]
             )
-            if item not in severe and (
+            # Keep old incident evidence only when this poll did not
+            # observe the same incident code with fresh, current details.
+            if code not in {current[0] for current in severe} and (
                 P1_UNVERIFIABLE_ON.get(code, set()) & observed_codes
                 or still_stale or code in uncertain_product_http
             ):
