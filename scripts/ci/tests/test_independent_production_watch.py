@@ -534,7 +534,7 @@ class WatchTests(unittest.TestCase):
         from unittest.mock import patch
 
         for component in ("frontend", "api", "main", "schedule"):
-            for payload in (b"not-json", b"[]"):
+            for payload in (b"not-json", b"[]", bytes(watch.LIMIT + 1)):
                 with self.subTest(component=component, payload=payload):
                     normal = self.fixtures()
 
@@ -572,6 +572,45 @@ class WatchTests(unittest.TestCase):
                                          else "ALARM" if expected_severity == "P1"
                                          else "MONITOR_DATA_FAILURE")
                         self.assertTrue((Path(tmp) / "heartbeat.json").is_file())
+
+    def test_single_malformed_200_plus_timeout_is_not_confirmed_p1(self):
+        from unittest.mock import patch
+
+        for component in ("frontend", "api"):
+            with self.subTest(component=component):
+                attempts = []
+                normal = self.fixtures()
+
+                class Response:
+                    status = 200
+                    headers = {"Cache-Control": "public, no-store"}
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_):
+                        return False
+
+                    def read(self, _limit):
+                        return b"[]"  # Invalid version payload, but only once.
+
+                def intermittent(_request, timeout):
+                    attempts.append(timeout)
+                    if len(attempts) == 1:
+                        return Response()
+                    raise TimeoutError("read timed out")
+
+                def reader(name):
+                    return watch.fetch(name) if name == component else normal(name)
+
+                with patch.object(watch, "urlopen", side_effect=intermittent):
+                    observed = watch.evaluate(NOW, reader)
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(observed["status"], "MONITOR_DATA_FAILURE")
+                self.assertEqual(
+                    [(item["code"], item["severity"]) for item in observed["issues"]],
+                    [("unavailable_" + component, "P2")],
+                )
 
     def test_timestamp_normalization_overflow_keeps_observer_alive(self):
         import json
