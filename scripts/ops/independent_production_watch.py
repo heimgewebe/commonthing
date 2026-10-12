@@ -51,7 +51,7 @@ def permanent_product_http_failure(name, status):
 # Each P1 is cleared only after the observations needed to verify it succeed.
 # Another still-visible P1 cannot hide an unverified incident.
 P1_UNVERIFIABLE_ON = {
-    "frontend_cache": {"unavailable_frontend"},
+    "frontend_cache": {"unavailable_frontend", "invalid_commit_frontend"},
     "invalid_commit_frontend": {"unavailable_frontend"},
     "invalid_commit_api": {"unavailable_api"},
     "frontend_api_diverge": {
@@ -133,7 +133,8 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
     data, headers, issues = {}, {}, []
     def flag(code, component, actual, expected, source, severity="P1", duration=None):
         item = {"code": code, "component": component, "actual": actual,
-                "expected": expected, "source": URLS[source], "severity": severity}
+                "expected": expected, "source": (SCHEDULE_COMPLETED_URL if source == "schedule_completed" else URLS[source]),
+                "severity": severity}
         if duration is not None:
             item["duration_seconds"] = round(duration)
         issues.append(item)
@@ -236,7 +237,7 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
                 newest_schedule = {"created_at": run["created_at"], "id": run.get("id"),
                                    "status": run.get("status"), "conclusion": run.get("conclusion")}
                 age = (now - timestamp(run["created_at"])).total_seconds()
-                if age > THRESHOLD:
+                if age >= THRESHOLD:
                     flag("schedule_stale", "GitHub schedule", run["created_at"],
                          "event=schedule within 45 minutes", "schedule",
                          severity="INFO", duration=age)
@@ -255,7 +256,7 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
                         if not isinstance(history, list):
                             flag("invalid_completed_schedule_json", "GitHub completed schedule",
                                  str(type(history)), "workflow_runs array",
-                                 "schedule", "INFO")
+                                 "schedule_completed", "INFO")
                         else:
                             completed = [item for item in history
                                          if isinstance(item, dict)
@@ -265,11 +266,11 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
                             if not completed:
                                 flag("no_completed_schedule", "GitHub completed schedule",
                                      "no completed schedule in history",
-                                     "completed event=schedule run", "schedule", "INFO")
+                                     "completed event=schedule run", "schedule_completed", "INFO")
                     except Exception as exc:
                         flag("unavailable_completed_schedule", "GitHub completed schedule",
                              str(exc)[:200], "valid completed schedule history",
-                             "schedule", "INFO")
+                             "schedule_completed", "INFO")
                 last_done = max(
                     completed, key=lambda item: timestamp(item["created_at"]),
                     default=None,
@@ -324,6 +325,12 @@ def record(result, directory):
             previous = {}
         if not isinstance(previous, dict):
             previous = {}
+        # The incident state is replaced before heartbeat.json. A failed
+        # heartbeat write must not let an older overlapping poll erase P1.
+        state_checked = timestamp(previous.get("checked_at_utc"))
+        checked = timestamp(result.get("checked_at_utc"))
+        if state_checked is not None and (checked is None or checked < state_checked):
+            return None
         raw_severe = previous.get("severe")
         raw_severe = raw_severe if isinstance(raw_severe, list) else []
         # Malformed state is not evidence for either an incident or a recovery.
@@ -399,7 +406,8 @@ def record(result, directory):
         if not isinstance(current_main, dict):
             current_main = previous_main
         write_json(path, {"severe": severe, "uncertain": uncertain,
-                          "main_observation": current_main})
+                          "main_observation": current_main,
+                          "checked_at_utc": result["checked_at_utc"]})
         write_json(directory / "heartbeat.json", result)
     return new_event
 

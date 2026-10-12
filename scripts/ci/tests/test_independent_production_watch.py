@@ -1197,5 +1197,113 @@ class WatchTests(unittest.TestCase):
                     self.assertEqual(observed["status"], "ALARM")
 
 
+    def test_cache_p1_survives_two_confirmed_invalid_commit_responses(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            initial = watch.evaluate(NOW, self.fixtures(cache="public, max-age=30"))
+            self.assertEqual(watch.record(initial, directory), "ALARM")
+            normal = self.fixtures()
+            def bad_version(name):
+                if name == "frontend":
+                    raise watch.ConfirmedProductVersionError(
+                        "two confirmed invalid frontend commit fields"
+                    )
+                return normal(name)
+            invalid = watch.evaluate(NOW + timedelta(minutes=1), bad_version)
+            self.assertEqual(invalid["status"], "ALARM")
+            self.assertEqual(watch.record(invalid, directory), "ALARM")
+            severe = json.loads((directory / "state.json").read_text())["severe"]
+            self.assertEqual(
+                {item[0] for item in severe},
+                {"frontend_cache", "invalid_commit_frontend"},
+            )
+            self.assertIn("frontend_cache", [row[0] for row in invalid["retained_prior_p1"]])
+            still_wrong = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertIsNone(watch.record(still_wrong, directory))
+            self.assertEqual(
+                [item[0] for item in json.loads(
+                    (directory / "state.json").read_text())["severe"]],
+                ["frontend_cache"],
+            )
+            events = [json.loads(line)["event"] for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events, ["ALARM", "ALARM"])
+
+    def test_newer_atomic_state_time_survives_failed_heartbeat_write(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            early = watch.evaluate(NOW, self.fixtures())
+            self.assertIsNone(watch.record(early, directory))
+            newer = watch.evaluate(
+                NOW + timedelta(minutes=3),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            original_write_json = watch.write_json
+            def fail_only_heartbeat(path, value):
+                if path.name == "heartbeat.json":
+                    raise OSError("simulated heartbeat replace failed")
+                return original_write_json(path, value)
+            with patch.object(watch, "write_json", side_effect=fail_only_heartbeat):
+                with self.assertRaises(OSError):
+                    watch.record(newer, directory)
+
+            state_before = json.loads((directory / "state.json").read_text())
+            self.assertEqual(
+                [item[0] for item in state_before["severe"]], ["frontend_cache"]
+            )
+            # Previous heartbeat is still old despite the newer committed alarm.
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["checked_at_utc"], early["checked_at_utc"])
+
+            stale = watch.evaluate(NOW + timedelta(minutes=1), self.fixtures())
+            self.assertIsNone(watch.record(stale, directory))
+            state_after = json.loads((directory / "state.json").read_text())
+            self.assertEqual(state_after, state_before)
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
+
+
+    def test_completed_schedule_errors_bind_completed_url_and_45m_boundary(self):
+        base = self.fixtures()
+        now = NOW
+
+        def unreadable_completed(name):
+            if name == "schedule":
+                return (
+                    {"workflow_runs": [
+                        {"id": 2, "event": "schedule", "status": "queued",
+                         "created_at": (now - timedelta(minutes=1)).isoformat()},
+                    ]}, "",
+                )
+            if name == "schedule_completed":
+                raise TimeoutError("completed-runs-only endpoint failed")
+            return base(name)
+
+        observed = watch.evaluate(NOW, unreadable_completed)
+        issues = [item for item in observed["issues"]
+                  if item["code"] == "unavailable_completed_schedule"]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["source"], watch.SCHEDULE_COMPLETED_URL)
+        self.assertEqual(issues[0]["severity"], "INFO")
+        self.assertEqual(observed["status"], "HEALTHY")
+
+        exactly_45 = watch.evaluate(NOW, self.fixtures(schedule_age=45))
+        flagged = [item for item in exactly_45["issues"]
+                   if item["code"] == "schedule_stale"]
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["severity"], "INFO")
+
+
 if __name__ == "__main__":
     unittest.main()
