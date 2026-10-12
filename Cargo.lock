@@ -1656,10 +1656,13 @@ checksum = "17cb8fe21481880d02e866e6678da0ce313735b659edf3dfd4beb7fdaca06e77"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
+ "itoa",
  "libm",
  "memchr",
  "rustc-hash",
+ "ryu",
  "serde_core",
+ "serde_ignored",
  "smallvec",
 ]
 
@@ -2556,6 +2559,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.2",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -3779,6 +3792,7 @@ dependencies = [
  "ipnet",
  "lettre",
  "libc",
+ "noyalib",
  "noyalib-serde-yaml",
  "openssl",
  "p256",

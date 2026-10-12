@@ -428,17 +428,123 @@ pub struct AppConfig {
 impl AppConfig {
     const DEFAULT_CONFIG: &'static str = include_str!("../../../configs/app.defaults.yml");
 
+    // The noyalib compatibility deserializer can round floats into integer
+    // fields. Inspect only declared integer fields: unknown YAML fields were
+    // intentionally tolerated by AppConfig and must not change semantics.
+    // A tagged root is still a mapping for validation purposes.  Without
+    // unwrapping, !custom {fade_days: 7} evades removed-option checks while
+    // the compatibility decoder accepts it into AppConfig.
+    fn inspection_root_mapping(value: &serde_yaml::Value) -> Option<&serde_yaml::Mapping> {
+        let mut root = value;
+        while let serde_yaml::Value::Tagged(tagged) = root {
+            root = tagged.value();
+        }
+        root.as_mapping()
+    }
+
+    // A merge key is not a declared AppConfig field. Reject it anywhere in
+    // the parsed YAML tree, including aliased or tagged mappings, rather than
+    // silently ignoring a configuration that may look as if it was merged.
+    // Walk iteratively to avoid recursive validator stack growth.
+    fn reject_yaml_merge_keys(value: &serde_yaml::Value) -> Result<()> {
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            match value {
+                serde_yaml::Value::Mapping(mapping) => {
+                    for (key, item) in mapping {
+                        anyhow::ensure!(
+                            key.as_str() != "<<",
+                            "YAML merge keys (<<) are not supported in configuration"
+                        );
+                        pending.push(item);
+                    }
+                }
+                serde_yaml::Value::Sequence(items) => pending.extend(items),
+                serde_yaml::Value::Tagged(tagged) => pending.push(tagged.value()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_yaml_float_values(value: &serde_yaml::Value) -> Result<()> {
+        let Some(mapping) = Self::inspection_root_mapping(value) else {
+            return Ok(());
+        };
+        for field in [
+            "max_guest_owned_nodes",
+            "auth_rl_ip_per_min",
+            "auth_rl_ip_per_hour",
+            "auth_rl_email_per_min",
+            "auth_rl_email_per_hour",
+            "smtp_port",
+        ] {
+            if matches!(mapping.get(field), Some(serde_yaml::Value::Number(n)) if matches!(n, serde_yaml::Number::Float(_)))
+            {
+                anyhow::bail!("{field} must be a YAML integer, not a floating-point value");
+            }
+        }
+        if let Some(rate_limits) = mapping
+            .get("node_mutation_rate_limits")
+            .and_then(|v| v.as_mapping())
+        {
+            for field in [
+                "replace_per_minute",
+                "replace_per_hour",
+                "delete_per_minute",
+                "delete_per_hour",
+            ] {
+                if matches!(rate_limits.get(field), Some(serde_yaml::Value::Number(n)) if matches!(n, serde_yaml::Number::Float(_)))
+                {
+                    anyhow::bail!("node_mutation_rate_limits.{field} must be a YAML integer");
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn parse_yaml(raw: &str) -> Result<Self> {
         let value: serde_yaml::Value =
             serde_yaml::from_str(raw).context("failed to parse YAML configuration")?;
+        Self::reject_yaml_merge_keys(&value)?;
+        Self::reject_yaml_float_values(&value)?;
+        // The serde_yaml compatibility Value uses String mapping keys and
+        // would silently convert a numeric YAML key (e.g. 1: ignored) to
+        // "1". Inspect the original key types before accepting this config.
+        let raw_keys: noyalib::MappingAny =
+            noyalib::from_str(raw).context("failed to inspect YAML configuration mapping keys")?;
+        anyhow::ensure!(
+            raw_keys
+                .keys()
+                .all(|key| matches!(key, noyalib::Value::String(_))),
+            "YAML configuration mapping keys must be strings"
+        );
+        // The old deserializer accepted only scalar enum variants. Noyalib's
+        // compatibility deserializer also accepts a YAML mapping for unit enums.
+        if let Some(mapping) = Self::inspection_root_mapping(&value) {
+            for enum_field in [
+                "domain_read_source",
+                "domain_account_write_source",
+                "domain_node_write_source",
+                "domain_edge_write_source",
+                "passkey_credential_source",
+                "auth_auto_provision_role",
+            ] {
+                if let Some(entry) = mapping.get(enum_field) {
+                    anyhow::ensure!(
+                        matches!(entry, serde_yaml::Value::String(_)),
+                        "{enum_field} must be a scalar enum variant"
+                    );
+                }
+            }
+        }
         for removed_key in [
             "fade_days",
             "ron_days",
             "delegation_expire_days",
             "anonymize_opt_in",
         ] {
-            if value
-                .as_mapping()
+            if Self::inspection_root_mapping(&value)
                 .is_some_and(|mapping| mapping.contains_key(removed_key))
             {
                 match removed_key {
@@ -1044,6 +1150,36 @@ max_guest_owned_nodes: 1000
             (
                 "unsupported custom tag",
                 "max_guest_owned_nodes: !custom 21\n",
+            ),
+            (
+                "floating point coercion to maximum integer",
+                "max_guest_owned_nodes: 18446744073709551616.0\n",
+            ),
+            (
+                "enum accepted as mapping",
+                "domain_read_source: {jsonl: null}\n",
+            ),
+            ("non-string mapping key", "1: ignored\n"),
+            (
+                "tagged root with removed option",
+                "!custom {fade_days: 7}\n",
+            ),
+            (
+                "tagged root with removed RON retention",
+                "!custom {ron_days: 30}\n",
+            ),
+            (
+                "tagged root with removed delegation expiry",
+                "!custom {delegation_expire_days: 30}\n",
+            ),
+            (
+                "tagged root with removed anonymization switch",
+                "!custom {anonymize_opt_in: true}\n",
+            ),
+            ("YAML merge injects removed switch", "<<: {fade_days: 7}\n"),
+            (
+                "YAML anchored merge injects removed switch",
+                "defaults: &defaults {ron_days: 30}\n<<: *defaults\n",
             ),
             ("removed dangerous option", "fade_days: 7\n"),
         ];

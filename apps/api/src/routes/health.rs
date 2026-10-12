@@ -238,9 +238,33 @@ async fn load_policy_file(path: &Path) -> Result<PolicyLimits, String> {
             error
         )
     })?;
-    let policy: PolicyLimits = serde_yaml::from_str(raw).map_err(|error| {
+    // Decode to a Value first: the compatibility parser's direct typed path
+    // can discard an invalid first value when a later duplicate key overwrites
+    // it. Value decoding rejects such duplicate keys before type coercion.
+    let value: serde_yaml::Value = serde_yaml::from_str(raw).map_err(|error| {
         format!(
             "failed to parse policy file at {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| format!("policy file at {} must be a YAML mapping", path.display()))?;
+    for required_limit in ["max_nodes_jsonl_mb", "max_edges_jsonl_mb"] {
+        match mapping.get(required_limit) {
+            Some(serde_yaml::Value::Number(number)) if number.as_u64().is_some() => {}
+            _ => {
+                return Err(format!(
+                    "policy file at {}: {required_limit} must be an unsigned YAML integer",
+                    path.display()
+                ))
+            }
+        }
+    }
+    let policy: PolicyLimits = serde_yaml::from_value(value).map_err(|error| {
+        format!(
+            "failed to decode policy file at {}: {}",
             path.display(),
             error
         )
@@ -1214,6 +1238,14 @@ mod tests {
             (
                 "duplicate policy limit",
                 "max_nodes_jsonl_mb: 10\nmax_nodes_jsonl_mb: 99\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "invalid first value shadowed by duplicate",
+                "max_nodes_jsonl_mb: -1\nmax_nodes_jsonl_mb: 99\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "floating point rounding accepted as integer",
+                "max_nodes_jsonl_mb: 10.0000000000000001\nmax_edges_jsonl_mb: 10\n",
             ),
             (
                 "wrong policy type",
