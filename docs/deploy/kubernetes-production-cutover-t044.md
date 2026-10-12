@@ -6,8 +6,8 @@ status: active
 canonicality: operational
 lifecycle_state: active
 owner_task: WELTGEWEBE-OS-V1-T044
-last_reviewed: 2026-09-25
-review_after: 2026-10-07
+last_reviewed: 2026-10-12
+review_after: 2026-10-19
 summary: >
   Revisionsgebundener R5-Preflight für den Wechsel von Compose/Caddy-Blue auf
   Kubernetes-Green. Bindet die am 25.09.2026 frisch rückgelesene Produktions- und
@@ -25,6 +25,119 @@ relations:
 ---
 
 # T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates
+
+## R5-Nachbeobachtung — 12. Oktober 2026 (read-only; weiterhin BLOCKED)
+
+Dieser **inkrementelle Live-Readback** aktualisiert die Beobachtungen aus
+§3–§6 vom 25.09.2026. Er ersetzt die historische Inventur **nicht** durch
+eine vollständige R5-Abnahme. Kein produktiver Writer, Datenstand, DNS,
+Traffic, Cluster oder Secret wurde hierbei verändert. Vor R6 ist eine neue,
+vollständige, gegen die konkrete Zielrevision gebundene Abnahme erforderlich.
+
+### Bindung und Blue-Produktionsbefund
+
+- Öffentlicher und lokaler Commonthing-`main` am 12.10.2026:
+  `59a1bf56c86acdcd355d10604263524c6a551df1`; lokaler Main-Checkout
+  beim Readback sauber.
+- `https://commonthing.net/_app/version.json` (HTTP 200, `no-store`)
+  meldet denselben Commit und den Web-Artefaktbaum
+  `045269e21ef91e126979edbbe7875daf5b42e9c7f885232cb9964919ae18126b`
+  mit 140 Dateien. Der Artefakt-Provenienzstatus ist ausdrücklich
+  `unattested`, also **keine** kryptographisch verifizierte Auslieferung.
+  `/version.json` ist nicht der kanonische Vertragspfad und antwortet 404.
+- `https://commonthing.net/api/version` und
+  `https://api.commonthing.net/version` (HTTP 200) melden den exakt gleichen
+  API-Commit. `/health/ready` meldet HTTP 200 sowie
+  `database=true`, `nats=true`, `event_chain=true` und `policy=true`.
+  Dies ist Readiness, kein Datenparitäts- oder Writer-Fencing-Beweis.
+- Der bestehende read-only-Prüfer
+  `scripts/ops/check_public_live_readiness.py` meldete `status=pass` für
+  die revisionsgebundene öffentliche Prüfung. Dazu gehören kanonische und
+  Legacy-Redirects, API-Erreichbarkeit, geschützte Metrikrouten, die Kartenroute,
+  lokale Style-/Glyph-Auslieferung sowie vier PMTiles-Full-/Range-Verträge.
+  `https://weltgewebe.net/` leitet mit HTTP 308 auf
+  `https://commonthing.net/` weiter.
+- `https://commonthing.net/schaubild/manifest.json` antwortet HTTP 200 mit
+  `schauwerk-standalone-editor-manifest.v2` und
+  `schauwerk-native-diagram-v1`; der Legacy-Editor benötigt laut Manifest
+  weiterhin eine externe Browser-Iframe-Runtime. Der öffentliche Manifest-Readback
+  belegt nicht die gesamte interaktive Fachfunktion.
+- `commonserver`: Docker ist aktiv. Ein ausschließlich lesender, privilegierter
+  `docker ps`-Readback zeigt die Compose-Container Caddy, API,
+  `search-worker`, Ollama 0.12.6, Schauwerk/Schaubild, PostgreSQL 16 und NATS
+  2.10. API-/Worker-Image-Tags: `weltgewebe-api:59a1bf56`.
+- Der laufende PostgreSQL-Container führt `POSTGRES_USER=weltgewebe`;
+  die ältere Annahme `-U welt` scheiterte mit `role does not exist`.
+  Ein danach mit dem tatsächlichen Datenbankbenutzer ausgeführtes, durch
+  `BEGIN READ ONLY` und 3 Sekunden Statement-Timeout begrenztes SQL-
+  Aggregat bestätigte frisch die folgenden reinen Zählwerte:
+  `domain_accounts=13`, `domain_nodes=4`, `domain_edges=16`,
+  `domain_outbox=292`, `domain_event_consumptions=292`,
+  `search_index_generations=1`, `search_node_projections=4`,
+  `search_projection_jobs=23`. Die Counts entsprechen den am 25.09.
+  notierten Zahlen; **Zählwertgleichheit beweist weder Inhaltsgleichheit noch
+  Ereignis-/Auth-/Writer-Konvergenz**. Es wurden keine Writer-Übertragungen
+  oder persistenten Suchtests ausgeführt.
+- Kapazitätsmomentaufnahme auf Blue: 7,8 GiB RAM insgesamt, 5,6 GiB
+  verfügbar, kein Swap; Root-Dateisystem 74 GiB frei bei 70 % Belegung.
+  Ein zweiter vollwertiger Stack auf demselben Host ist dadurch **nicht**
+  kapazitiv bewiesen. Diese Momentwerte sind keine SLO-/RTO-/RPO-Grenzen.
+
+### Green-Referenz und getrennte T085-Evidenz
+
+- Der **lokale**, ausdrücklich nicht produktive kind-Cluster
+  `commonthing-staging` ist am 12.10.2026 erreichbar: drei Nodes
+  `Ready` auf Kubernetes v1.36.1.
+- Flux meldet die App-Revision
+  `bb1e26d47b50d38ec720b123d55255c05436100b` und die Datenrevision
+  `6a10c76666b9769fdfddb62ecb3fbf0c2c5df935` als angewandt; beide
+  unterscheiden sich vom aktuellen produktiven Commit. API/Web je 2/2,
+  PostgreSQL/NATS je 1/1 verfügbar, PostgreSQL-PVC 10 GiB und NATS-PVC 5 GiB
+  `Bound`.
+- Das Cilium-Gateway ist `Programmed=True`, seine Adresse
+  `172.20.0.3` ist jedoch eine lokale kind-/Container-Netzadresse.
+  Öffentliche Green-DNS-/TLS-/Load-Balancer- und Produktionswriter-Autorität
+  sind damit nicht nachgewiesen.
+- In der vollständigen Pod- und Deployment-Inventur dieses Referenzclusters
+  erscheinen **kein** Ollama-, Search-Worker- oder Schauwerk-Workload. Eine
+  aktuell gleichwertige Auth-Konfiguration, produktive Datenbasis, JetStream-/
+  Suchindex-Konvergenz und vollständige Fachparität sind nicht nachgewiesen.
+- Der getrennte, temporäre Experiment-B-Zieltest T085 wurde auf
+  `5d509feda6db24e294698cb42501fd41ec8e0fbe` terminal bestanden.
+  Das vor Ort erneut gelesene Retirement-Receipt bestätigt `retired`,
+  entfernte Volumes und entfernten Lauf-State. Dieses Testergebnis ist
+  **kein** Test des jetzigen Produktionscommits und begründet weder einen
+  bestehenden Produktions-Green-Cluster noch die Freigabe des Cutovers.
+
+### R5-Gate-Entscheidung
+
+| Gate | Status 12.10.2026 | Fehlender wirklicher Beweis |
+| --- | --- | --- |
+| B1 Produktions-Green | **BLOCKED** | Identifizierter, erreichbarer Produktionscluster mit eigener Fehlerdomäne, Public Edge, TLS, Secrets, Kapazität und Eigentümerautorität |
+| B2 Semantic Search | **BLOCKED** | Produktionszielgebundener Ollama-/Embedding-/Search-Worker-Pfad samt Modell- und Indexparität |
+| B3 Public Frontdoor | **BLOCKED** | Schauwerk, PMTiles/Styles/Glyphs, Auth und Legacy-Hosts am echten Green samt TLS und Routing |
+| B4 Datenübergang | **BLOCKED** | Frischer, vollständiger und versionsgebundener PostgreSQL-/Auth-/JetStream-/Outbox-/Projektionsabgleich sowie Writer-Fencing |
+| B5 Zieltestbed | **TEILWEISE** | T085 terminal auf älterem Commit; für die gewählte **Cutover-Revision** ist die geforderte frische Zieltestbed-Abnahme noch zu binden |
+| B6 Zwei-Betreiber-Freigabe | **BLOCKED** | Konkrete doppelte Zustimmung, externe Receipt-/Replay-Verifikation und Aktivierungsbeleg derselben Cutover-Revision |
+
+**Zusätzlicher Registry-Readback:** Die GitHub-Registry von
+`heimgewebe/bureau` auf `main`
+`1b96351fa0933e29a4f355f94217c99e65a46beb` führt T044 als
+`state=planned` in der Queue-Lane `later` und zählt **neun**
+Acceptance-Einträge. Die historische Restplanung nennt teils
+`ready`/Revision 5 und elf Einträge. Das ist **keine** aktuelle
+Verifikations- oder Dispositionsevidenz. Vor R9 sind die verbindlichen
+Kriterien mit der zuständigen Bureau-Control-Plane zu reconciliieren;
+insbesondere dürfen die Suchkontinuität und deklarative
+Staging-Runtime-Wahrheit nicht wegen der kürzeren Zählliste entfallen.
+
+**Disposition:** R5 ist **nicht bestanden**. R6–R9 bleiben gesperrt.
+Blue bleibt bis zu einem gesondert beweisgebundenen Fencing-/Cutover-Gate der
+bestehende produktive Pfad. Aus der lokalen kind-Referenz, einem historischen
+Proof-Receipt oder dem öffentlichen Commitgleichstand folgt **keine**
+Produktionsmutationsfreigabe. Nächster kleinster Schnitt: reales
+Produktions-Green identifizieren und dessen Capability-/Datenvertrag für
+die gewählte aktuelle Release-Revision neu erfassen.
 
 ## 1. Zweck und Autorität
 
@@ -935,9 +1048,10 @@ erneutem Writer-Fencing.
 
 ## 11. R9 — Abschluss
 
-T044 darf erst terminalisiert werden, wenn seine elf Acceptance-Kriterien
-revisionsgebunden gegen die tatsächlich laufende Produktion authentifiziert
-wurden und `verification-stamp WELTGEWEBE-OS-V1-T044` erfolgreich ist.
+T044 darf erst terminalisiert werden, wenn alle in der jeweils aktuellen
+Bureau-Registry definierten Acceptance-Kriterien revisionsgebunden gegen die
+tatsächlich laufende Produktion authentifiziert wurden und
+`verification-stamp WELTGEWEBE-OS-V1-T044` erfolgreich ist.
 
 Der alte Compose-Pfad bleibt während der Beobachtungs- und Recoveryfrist
 erhalten und wird nicht sofort gelöscht. Nach der Write-Cutover-Grenze ist er
