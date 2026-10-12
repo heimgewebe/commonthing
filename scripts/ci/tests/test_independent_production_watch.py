@@ -530,6 +530,83 @@ class WatchTests(unittest.TestCase):
                         [("unavailable_" + component, "P1")],
                     )
 
+    def test_repeated_malformed_200_payload_is_confirmed_product_failure(self):
+        from unittest.mock import patch
+
+        for component in ("frontend", "api", "main", "schedule"):
+            for payload in (b"not-json", b"[]"):
+                with self.subTest(component=component, payload=payload):
+                    normal = self.fixtures()
+
+                    class Response:
+                        status = 200
+                        headers = {"Cache-Control": "public, no-store"}
+
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *_):
+                            return False
+
+                        def read(self, _limit):
+                            return payload
+
+                    def reader(name):
+                        return watch.fetch(name) if name == component else normal(name)
+
+                    with patch.object(watch, "urlopen", return_value=Response()) as request:
+                        observed = watch.evaluate(NOW, reader)
+                    self.assertEqual(request.call_count, 2)
+                    issues = [(issue["code"], issue["severity"])
+                              for issue in observed["issues"]]
+                    expected_severity = ("P1" if component in ("frontend", "api")
+                                         else "P2" if component == "main" else "INFO")
+                    self.assertIn(("unavailable_" + component, expected_severity), issues)
+                    expected_status = ("ALARM" if expected_severity == "P1"
+                                       else "MONITOR_DATA_FAILURE" if expected_severity == "P2"
+                                       else "HEALTHY")
+                    self.assertEqual(observed["status"], expected_status)
+                    with tempfile.TemporaryDirectory() as tmp:
+                        event = watch.record(observed, Path(tmp))
+                        self.assertEqual(event, None if expected_severity == "INFO"
+                                         else "ALARM" if expected_severity == "P1"
+                                         else "MONITOR_DATA_FAILURE")
+                        self.assertTrue((Path(tmp) / "heartbeat.json").is_file())
+
+    def test_timestamp_normalization_overflow_keeps_observer_alive(self):
+        import json
+
+        for value in ("0001-01-01T00:00:00+14:00",
+                      "9999-12-31T23:59:59-14:00"):
+            with self.subTest(value=value):
+                self.assertIsNone(watch.timestamp(value))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "state.json").write_text(
+                json.dumps({"main_observation": {
+                    "sha": MAIN, "first_seen": "0001-01-01T00:00:00+14:00"
+                }}), encoding="utf-8"
+            )
+            self.assertIsNone(watch.read_previous_main_observation(directory))
+            normal = self.fixtures()
+
+            def reader(name):
+                data, headers = normal(name)
+                if name == "main":
+                    data = {"sha": MAIN, "commit": {
+                        "committer": {"date": "0001-01-01T00:00:00+14:00"}
+                    }}
+                return data, headers
+
+            observed = watch.evaluate(NOW, reader)
+            self.assertEqual(observed["status"], "MONITOR_DATA_FAILURE")
+            self.assertIn("main_time_unreliable",
+                          {row["code"] for row in observed["issues"]})
+            self.assertEqual(watch.record(observed, directory),
+                             "MONITOR_DATA_FAILURE")
+            self.assertTrue((directory / "heartbeat.json").is_file())
+
     def test_http_429_rate_limit_stays_monitor_uncertainty(self):
         from unittest.mock import patch
         from urllib.error import HTTPError

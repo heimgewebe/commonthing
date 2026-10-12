@@ -57,7 +57,7 @@ P1_UNVERIFIABLE_ON = {
 def timestamp(value):
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
-    except (ValueError, AttributeError, TypeError):
+    except (ValueError, AttributeError, TypeError, OverflowError):
         return None
 
 
@@ -78,9 +78,18 @@ def fetch(name):
                     raise ValueError(f"HTTP {response.status}")
                 content = response.read(LIMIT + 1)
                 if len(content) > LIMIT:
+                    if name in {"frontend", "api"}:
+                        product_failures += 1
                     raise ValueError("response exceeds limit")
-                data = json.loads(content)
+                try:
+                    data = json.loads(content)
+                except (ValueError, UnicodeError) as exc:
+                    if name in {"frontend", "api"}:
+                        product_failures += 1
+                    raise ValueError("invalid JSON response") from exc
                 if not isinstance(data, dict):
+                    if name in {"frontend", "api"}:
+                        product_failures += 1
                     raise ValueError("JSON root not an object")
                 return data, response.headers.get("Cache-Control", "")
         except HTTPError as exc:
