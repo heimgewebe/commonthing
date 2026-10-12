@@ -91,6 +91,11 @@ def fetch(name):
                     if name in {"frontend", "api"}:
                         product_failures += 1
                     raise ValueError("JSON root not an object")
+                if name in {"frontend", "api"}:
+                    commit = data.get("commit")
+                    if not isinstance(commit, str) or SHA.fullmatch(commit) is None:
+                        product_failures += 1
+                        raise ValueError("invalid public product version commit")
                 return data, response.headers.get("Cache-Control", "")
         except HTTPError as exc:
             if exc.code in {401, 403, 404, 410} or 500 <= exc.code <= 599:
@@ -308,6 +313,7 @@ def record(result, directory):
         old_uncertain = old_uncertain if isinstance(old_uncertain, list) else []
         severe = sorted([x["code"], str(x["actual"])[:160]]
                         for x in result["issues"] if x["severity"] == "P1")
+        observed_p1_codes = {item[0] for item in severe}
         uncertain = sorted(x["code"] for x in result["issues"] if x["severity"] == "P2")
         observed_codes = {item["code"] for item in result["issues"]}
         # A confirmed product HTTP-5xx incident cannot recover merely because
@@ -320,6 +326,9 @@ def record(result, directory):
         commits = commits if isinstance(commits, dict) else {}
         for item in old_severe:
             code = item[0]
+            # Same-code P1 with refreshed details supersedes stale prior detail.
+            if code in observed_p1_codes:
+                continue
             name = code.removeprefix("stale_")
             still_stale = (
                 code in {"stale_frontend", "stale_api"}

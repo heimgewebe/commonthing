@@ -1022,5 +1022,93 @@ class WatchTests(unittest.TestCase):
             )
 
 
+    def test_invalid_version_schema_needs_two_confirmed_responses(self):
+        import json
+        from unittest.mock import patch
+
+        for component in ("frontend", "api"):
+            for payload in ({"commit": "not-a-sha"}, {}):
+                with self.subTest(component=component, payload=payload):
+                    attempts = []
+
+                    class Response:
+                        status = 200
+                        headers = {"Cache-Control": "public, no-store"}
+
+                        def __init__(self, body):
+                            self.body = json.dumps(body).encode("utf-8")
+
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *_):
+                            return False
+
+                        def read(self, _limit):
+                            return self.body
+
+                    def fake_urlopen(_request, timeout):
+                        attempts.append(timeout)
+                        if len(attempts) == 1:
+                            return Response(payload)
+                        raise TimeoutError("transient second read timeout")
+
+                    normal = self.fixtures()
+                    def reader(name):
+                        return watch.fetch(name) if name == component else normal(name)
+
+                    with patch.object(watch, "urlopen", side_effect=fake_urlopen):
+                        observed = watch.evaluate(NOW, reader)
+                    self.assertEqual(len(attempts), 2)
+                    self.assertEqual(observed["status"], "MONITOR_DATA_FAILURE")
+                    self.assertEqual(
+                        [(issue["code"], issue["severity"]) for issue in observed["issues"]],
+                        [("unavailable_" + component, "P2")],
+                    )
+
+                    with patch.object(watch, "urlopen", return_value=Response(payload)) as requests:
+                        with self.assertRaises(watch.ConfirmedProductHTTPError):
+                            watch.fetch(component)
+                        self.assertEqual(requests.call_count, 2)
+
+                    successful = [Response(payload), Response({"commit": MAIN})]
+                    with patch.object(watch, "urlopen", side_effect=successful) as requests:
+                        self.assertEqual(watch.fetch(component)[0]["commit"], MAIN)
+                        self.assertEqual(requests.call_count, 2)
+
+    def test_new_stale_commit_replaces_prior_incident_detail(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            prior = {
+                "sha": MAIN,
+                "first_seen": (NOW - timedelta(minutes=60)).isoformat(),
+                "diverged_since": {
+                    "frontend": (NOW - timedelta(minutes=60)).isoformat(),
+                },
+            }
+            original = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD),
+                previous_main_observation=prior,
+            )
+            self.assertEqual(watch.record(original, directory), "ALARM")
+            successor_sha = "c" * 40
+            advanced = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(frontend=successor_sha),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(advanced["status"], "ALARM")
+            self.assertIsNone(watch.record(advanced, directory))
+            severe = json.loads((directory / "state.json").read_text())["severe"]
+            self.assertEqual(
+                [item for item in severe if item[0] == "stale_frontend"],
+                [["stale_frontend", successor_sha]],
+            )
+            self.assertNotIn("retained_prior_p1", advanced)
+            self.assertEqual(len((directory / "events.jsonl").read_text().splitlines()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
