@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sys
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -29,6 +30,11 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 UTC = timezone.utc
 LIMIT = 512 * 1024
 THRESHOLD = 45 * 60
+WATCH_MAX_SECONDS = 240
+
+
+class WatchRuntimeExceeded(BaseException):
+    """The entire cron invocation exceeded its fixed time budget."""
 
 
 class ConfirmedProductHTTPError(ValueError):
@@ -247,6 +253,7 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
                 # A newer queued/in-progress run is not proof that the most
                 # recent completed scheduled check has recovered.
                 completed = [item for item in scheduled if item.get("status") == "completed"]
+                completed_source = "schedule"
                 if not completed:
                     # Queued/in-progress runs can obscure older completed runs
                     # beyond the short latest-runs page; read completed runs directly.
@@ -258,6 +265,7 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
                                  str(type(history)), "workflow_runs array",
                                  "schedule_completed", "INFO")
                         else:
+                            completed_source = "schedule_completed"
                             completed = [item for item in history
                                          if isinstance(item, dict)
                                          and item.get("event") == "schedule"
@@ -278,7 +286,7 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
                 if last_done is not None and last_done.get("conclusion") != "success":
                     flag("schedule_failed", "GitHub scheduled check",
                          str(last_done.get("conclusion")),
-                         "successful scheduled run", "schedule", "INFO")
+                         "successful scheduled run", completed_source, "INFO")
 
     return {
         "checked_at_utc": now.isoformat().replace("+00:00", "Z"),
@@ -300,7 +308,7 @@ def write_json(path, value):
     os.replace(temporary, path)
 
 
-def record(result, directory):
+def record(result, directory, *, serialized_poll=False):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -311,17 +319,17 @@ def record(result, directory):
             previous_heartbeat = json.loads(
                 (directory / "heartbeat.json").read_text(encoding="utf-8")
             )
-        except (FileNotFoundError, OSError, ValueError):
+        except (FileNotFoundError, ValueError):
             previous_heartbeat = None
         if isinstance(previous_heartbeat, dict):
             last_checked = timestamp(previous_heartbeat.get("checked_at_utc"))
             checked = timestamp(result.get("checked_at_utc"))
-            if last_checked is not None and (checked is None or checked < last_checked):
+            if not serialized_poll and last_checked is not None and (checked is None or checked < last_checked):
                 return None
         path = directory / "state.json"
         try:
             previous = json.loads(path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, ValueError):
+        except (FileNotFoundError, ValueError):
             previous = {}
         if not isinstance(previous, dict):
             previous = {}
@@ -329,7 +337,7 @@ def record(result, directory):
         # heartbeat write must not let an older overlapping poll erase P1.
         state_checked = timestamp(previous.get("checked_at_utc"))
         checked = timestamp(result.get("checked_at_utc"))
-        if state_checked is not None and (checked is None or checked < state_checked):
+        if not serialized_poll and state_checked is not None and (checked is None or checked < state_checked):
             return None
         raw_severe = previous.get("severe")
         raw_severe = raw_severe if isinstance(raw_severe, list) else []
@@ -369,6 +377,7 @@ def record(result, directory):
             if item not in severe and (
                 P1_UNVERIFIABLE_ON.get(code, set()) & observed_codes
                 or still_stale or code in uncertain_product_http
+                or "watcher_execution_failed" in observed_codes
             ):
                 severe.append(item)
         severe.sort()
@@ -394,13 +403,29 @@ def record(result, directory):
         new_event = transition or uncertainty_event
         events = [event for event in (transition, uncertainty_event) if event]
         if events:
-            with (directory / "events.jsonl").open("a", encoding="utf-8") as out:
-                for event_name in events:
-                    event = {"event": event_name, **result,
-                             "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939"}
-                    out.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
-                out.flush()
-                os.fsync(out.fileno())
+            try:
+                with (directory / "events.jsonl").open("a", encoding="utf-8") as out:
+                    for event_name in events:
+                        event = {"event": event_name, **result,
+                                 "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939"}
+                        out.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+                    out.flush()
+                    os.fsync(out.fileno())
+            except OSError as exc:
+                # Auxiliary event history must not block durable incident state.
+                # It is NOT evidence of notification delivery.
+                result["issues"].append({
+                    "code": "event_log_write_failed",
+                    "component": "watcher event history",
+                    "actual": f"{type(exc).__name__}: {str(exc)[:150]}",
+                    "expected": "append and fsync local event history",
+                    "source": str(directory / "events.jsonl"),
+                    "severity": "P2",
+                })
+                uncertain = sorted(set(uncertain) | {"event_log_write_failed"})
+                if not severe:
+                    result["observation_status"] = result["status"]
+                    result["status"] = "MONITOR_DATA_FAILURE"
         current_main = result.get("main_observation")
         previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
         if not isinstance(current_main, dict):
@@ -439,23 +464,91 @@ def read_previous_main_observation(directory):
     return observation
 
 
+def _watch_deadline(_signal, _frame):
+    # Not an Exception: fetch() deliberately retries ordinary transport faults.
+    # The entire invocation must still abort after its overall runtime budget.
+    raise WatchRuntimeExceeded("watcher total runtime deadline exceeded")
+
+
+def watcher_failure_report(now, exc):
+    return {
+        "checked_at_utc": now.isoformat().replace("+00:00", "Z"),
+        "status": "MONITOR_DATA_FAILURE",
+        "commits": {},
+        "main_observation": None,
+        "latest_schedule": None,
+        "issues": [{
+            "code": "watcher_execution_failed",
+            "component": "watcher",
+            "actual": f"{type(exc).__name__}: {str(exc)[:150]}",
+            "expected": "bounded successful watcher observation",
+            "source": "local watcher execution",
+            "severity": "P2",
+        }],
+    }
+
+
+def _evaluate_cycle(directory):
+    now = datetime.now(UTC)
+    try:
+        previous = read_previous_main_observation(directory)
+        return evaluate(now, previous_main_observation=previous)
+    except WatchRuntimeExceeded as exc:
+        return watcher_failure_report(now, exc)
+    except Exception as exc:
+        return watcher_failure_report(now, exc)
+
+
+def _persist_cycle(result, directory):
+    try:
+        event = record(result, directory, serialized_poll=True)
+    except (WatchRuntimeExceeded, Exception) as exc:
+        # Best effort only. No local write can prove its own availability when
+        # storage is completely inaccessible; an external liveness watcher
+        # remains necessary.
+        failure = watcher_failure_report(datetime.now(UTC), exc)
+        signal.alarm(10)
+        try:
+            record(failure, directory, serialized_poll=True)
+        except (WatchRuntimeExceeded, Exception) as recovery_exc:
+            print(
+                f"watcher heartbeat failed: {type(recovery_exc).__name__}",
+                file=sys.stderr,
+            )
+        return 2
+    if event:
+        print(event, result["checked_at_utc"],
+              ",".join(x["code"] for x in result["issues"]))
+    return 0 if result["status"] == "HEALTHY" else 2
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--state-dir", type=Path,
                         default=Path.home() / ".local/commonthing-watch-state")
     args = parser.parse_args()
-    # The local state snapshot anchors grace; record() serializes state updates.
-    previous_main = read_previous_main_observation(args.state_dir)
-    result = evaluate(datetime.now(UTC), previous_main_observation=previous_main)
-    if args.dry_run:
-        print(json.dumps(result, sort_keys=True))
-        return 0 if result["status"] == "HEALTHY" else 2
-    event = record(result, args.state_dir)
-    if event:
-        print(event, result["checked_at_utc"],
-              ",".join(x["code"] for x in result["issues"]))
-    return 0 if result["status"] == "HEALTHY" else 2
+    previous_handler = signal.signal(signal.SIGALRM, _watch_deadline)
+    signal.alarm(WATCH_MAX_SECONDS)
+    try:
+        if args.dry_run:
+            result = _evaluate_cycle(args.state_dir)
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result["status"] == "HEALTHY" else 2
+        args.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Exclude a second cron invocation from the entire read/evaluate/write
+        # cycle. A new pass after an NTP wall-clock step must not be blocked by
+        # the persisted timestamp of an older completed pass.
+        with (args.state_dir / "poll.lock").open("a+") as poll_lock:
+            try:
+                fcntl.flock(poll_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 2
+            result = _evaluate_cycle(args.state_dir)
+            return _persist_cycle(result, args.state_dir)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 if __name__ == "__main__":

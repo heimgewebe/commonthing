@@ -1305,5 +1305,212 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(flagged[0]["severity"], "INFO")
 
 
+    def test_unreadable_state_file_fails_closed_without_false_recovery(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            initial = watch.evaluate(NOW, self.fixtures(cache="public, max-age=30"))
+            self.assertEqual(watch.record(initial, directory), "ALARM")
+            previous_state = (directory / "state.json").read_bytes()
+            previous_heartbeat = (directory / "heartbeat.json").read_bytes()
+            original_read = Path.read_text
+
+            def protected_read(path, *args, **kwargs):
+                if path == directory / "state.json":
+                    raise PermissionError("simulated unreadable incident state")
+                return original_read(path, *args, **kwargs)
+
+            recovery = watch.evaluate(NOW + timedelta(minutes=1), self.fixtures())
+            with patch.object(Path, "read_text", new=protected_read):
+                with self.assertRaises(PermissionError):
+                    watch.record(recovery, directory)
+
+            self.assertEqual((directory / "state.json").read_bytes(), previous_state)
+            self.assertEqual((directory / "heartbeat.json").read_bytes(), previous_heartbeat)
+            events = [json.loads(line)["event"] for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events, ["ALARM"])
+
+    def test_event_journal_failure_preserves_state_and_heartbeat(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            healthy = watch.evaluate(NOW, self.fixtures())
+            self.assertIsNone(watch.record(healthy, directory))
+            alarm = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            original_open = Path.open
+
+            def cannot_append(path, *args, **kwargs):
+                if path == directory / "events.jsonl":
+                    raise OSError("simulated event history unavailable")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", new=cannot_append):
+                self.assertEqual(watch.record(alarm, directory), "ALARM")
+
+            state = json.loads((directory / "state.json").read_text())
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual([x[0] for x in state["severe"]], ["frontend_cache"])
+            self.assertIn("event_log_write_failed", state["uncertain"])
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn(
+                "event_log_write_failed",
+                [issue["code"] for issue in heartbeat["issues"]],
+            )
+            self.assertEqual(
+                heartbeat["checked_at_utc"],
+                alarm["checked_at_utc"],
+            )
+
+    def test_completed_failure_uses_completed_history_source(self):
+        base_reader = self.fixtures()
+        queue = [
+            {"id": 3, "event": "schedule", "status": "queued",
+             "created_at": (NOW - timedelta(minutes=1)).isoformat()},
+            {"id": 2, "event": "schedule", "status": "in_progress",
+             "created_at": (NOW - timedelta(minutes=2)).isoformat()},
+        ]
+        completed = {
+            "id": 1, "event": "schedule", "status": "completed",
+            "created_at": (NOW - timedelta(minutes=3)).isoformat(),
+            "conclusion": "failure",
+        }
+
+        def reader(name):
+            if name == "schedule":
+                return {"workflow_runs": queue}, ""
+            if name == "schedule_completed":
+                return {"workflow_runs": [completed]}, ""
+            return base_reader(name)
+
+        observed = watch.evaluate(NOW, reader)
+        failures = [i for i in observed["issues"]
+                    if i["code"] == "schedule_failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["source"], watch.SCHEDULE_COMPLETED_URL)
+        self.assertEqual(failures[0]["severity"], "INFO")
+
+
+    def test_main_failsafe_observation_and_total_runtime_budget(self):
+        import json
+        import signal
+        import sys
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            argv = ["independent_production_watch.py", "--state-dir", tmp]
+            with patch.object(sys, "argv", argv), patch.object(
+                watch, "evaluate", side_effect=RuntimeError("unexpected evaluation failure")
+            ), patch.object(signal, "alarm", return_value=0) as alarm:
+                code = watch.main()
+            self.assertEqual(code, 2)
+            self.assertIn(((240,), {}), [
+                (call.args, call.kwargs) for call in alarm.call_args_list
+            ])
+            self.assertEqual(alarm.call_args.args, (0,))
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "MONITOR_DATA_FAILURE")
+            self.assertEqual(
+                [(i["code"], i["severity"]) for i in heartbeat["issues"]],
+                [("watcher_execution_failed", "P2")],
+            )
+            self.assertTrue((directory / "state.json").is_file())
+            self.assertEqual(
+                json.loads((directory / "state.json").read_text())["uncertain"],
+                ["watcher_execution_failed"],
+            )
+
+    def test_serialized_main_poll_survives_backward_wall_clock_jump(self):
+        import json
+        import signal
+        import sys
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            future = datetime.now(timezone.utc) + timedelta(hours=3)
+            previous = watch.evaluate(
+                future, self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(previous, directory), "ALARM")
+            earlier_clock = datetime.now(timezone.utc) - timedelta(seconds=1)
+            corrected = watch.evaluate(earlier_clock, self.fixtures())
+            self.assertEqual(corrected["status"], "HEALTHY")
+            with patch.object(sys, "argv", [
+                "independent_production_watch.py", "--state-dir", tmp,
+            ]), patch.object(
+                watch, "evaluate", return_value=corrected,
+            ), patch.object(signal, "alarm", return_value=0):
+                self.assertEqual(watch.main(), 0)
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual(state["severe"], [])
+            self.assertEqual(state["checked_at_utc"], corrected["checked_at_utc"])
+            self.assertTrue((directory / "poll.lock").is_file())
+
+
+    def test_deadline_signal_interrupts_retry_instead_of_becoming_p2_timeout(self):
+        import signal
+        from unittest.mock import patch
+
+        original = signal.signal(signal.SIGALRM, watch._watch_deadline)
+        try:
+            def interrupt(_request, timeout):
+                signal.raise_signal(signal.SIGALRM)
+            with patch.object(watch, "urlopen", side_effect=interrupt) as urlopen:
+                with self.assertRaises(watch.WatchRuntimeExceeded):
+                    watch.fetch("frontend")
+            self.assertEqual(urlopen.call_count, 1)
+        finally:
+            signal.signal(signal.SIGALRM, original)
+
+    def test_main_record_failure_best_effort_heartbeat_retains_p1(self):
+        import json
+        import signal
+        import sys
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            initial = watch.evaluate(NOW, self.fixtures(cache="public, max-age=30"))
+            self.assertEqual(watch.record(initial, directory), "ALARM")
+            real_record = watch.record
+            attempts = []
+
+            def intermittent_record(*args, **kwargs):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise OSError("transient state journal unavailable")
+                return real_record(*args, **kwargs)
+
+            with patch.object(sys, "argv", [
+                "independent_production_watch.py", "--state-dir", tmp,
+            ]), patch.object(
+                watch, "evaluate", return_value=watch.evaluate(
+                    datetime.now(timezone.utc), self.fixtures(),
+                )
+            ), patch.object(
+                watch, "record", side_effect=intermittent_record,
+            ), patch.object(signal, "alarm", return_value=0):
+                self.assertEqual(watch.main(), 2)
+
+            self.assertEqual(len(attempts), 2)
+            state = json.loads((directory / "state.json").read_text())
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual([x[0] for x in state["severe"]], ["frontend_cache"])
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn(
+                "watcher_execution_failed",
+                [i["code"] for i in heartbeat["issues"]],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
