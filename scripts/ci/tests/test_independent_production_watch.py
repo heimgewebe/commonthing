@@ -1110,5 +1110,92 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(len((directory / "events.jsonl").read_text().splitlines()), 1)
 
 
+    def test_permanent_non200_and_legacy_invalid_commit(self):
+        import json
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+
+        class Response:
+            headers = {"Cache-Control": "public, no-store"}
+
+            def __init__(self, payload, status=200):
+                self.status = status
+                self.payload = json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, _limit):
+                return self.payload
+
+        for component in ("frontend", "api"):
+            for code in (204, 400, 405, 418):
+                with self.subTest(component=component, code=code):
+                    if code == 204:
+                        response = Response({"commit": MAIN}, code)
+                        side_effect = None
+                    else:
+                        response = None
+                        side_effect = HTTPError(
+                            watch.URLS[component], code, "non-200 response", {}, None
+                        )
+                    with patch.object(
+                        watch, "urlopen", return_value=response,
+                        side_effect=side_effect,
+                    ) as request:
+                        with self.assertRaises(watch.ConfirmedProductHTTPError):
+                            watch.fetch(component)
+                    self.assertEqual(request.call_count, 2)
+
+            for code in (408, 425, 429):
+                with self.subTest(component=component, transient=code):
+                    failure = HTTPError(
+                        watch.URLS[component], code, "transient response", {}, None
+                    )
+                    with patch.object(watch, "urlopen", side_effect=failure) as request:
+                        with self.assertRaises(ValueError) as caught:
+                            watch.fetch(component)
+                    self.assertNotIsInstance(
+                        caught.exception, watch.ConfirmedProductHTTPError
+                    )
+                    self.assertEqual(request.call_count, 2)
+
+            with self.subTest(component=component, legacy_p1=True):
+                with tempfile.TemporaryDirectory() as tmp:
+                    directory = Path(tmp)
+                    old_code = "invalid_commit_" + component
+                    (directory / "state.json").write_text(
+                        json.dumps({"severe": [[old_code, "legacy bad commit"]],
+                                    "uncertain": []}),
+                        encoding="utf-8",
+                    )
+                    original = self.fixtures()
+
+                    def reader(name):
+                        return watch.fetch(name) if name == component else original(name)
+
+                    with patch.object(
+                        watch, "urlopen",
+                        return_value=Response({"commit": "bad"}),
+                    ) as request:
+                        observed = watch.evaluate(NOW, reader)
+                    self.assertEqual(request.call_count, 2)
+                    self.assertEqual(
+                        [(i["code"], i["severity"]) for i in observed["issues"]],
+                        [(old_code, "P1")],
+                    )
+                    self.assertIsNone(watch.record(observed, directory))
+                    severe = json.loads(
+                        (directory / "state.json").read_text(encoding="utf-8")
+                    )["severe"]
+                    self.assertEqual(len(severe), 1)
+                    self.assertEqual(severe[0][0], old_code)
+                    self.assertFalse((directory / "events.jsonl").exists())
+                    self.assertEqual(observed["status"], "ALARM")
+
+
 if __name__ == "__main__":
     unittest.main()

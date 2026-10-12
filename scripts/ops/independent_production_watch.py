@@ -33,6 +33,21 @@ THRESHOLD = 45 * 60
 
 class ConfirmedProductHTTPError(ValueError):
     """Both observations confirmed a critical product HTTP endpoint failure."""
+
+
+class ConfirmedProductVersionError(ConfirmedProductHTTPError):
+    """Both observations confirmed a malformed production commit field."""
+
+
+def permanent_product_http_failure(name, status):
+    return (
+        name in {"frontend", "api"}
+        and type(status) is int
+        and status != 200
+        and status not in {408, 425, 429}
+    )
+
+
 # Each P1 is cleared only after the observations needed to verify it succeed.
 # Another still-visible P1 cannot hide an unverified incident.
 P1_UNVERIFIABLE_ON = {
@@ -64,6 +79,7 @@ def timestamp(value):
 def fetch(name):
     error = None
     product_failures = 0
+    version_failures = 0
     for _ in range(2):
         try:
             url = SCHEDULE_COMPLETED_URL if name == "schedule_completed" else URLS[name]
@@ -73,7 +89,7 @@ def fetch(name):
             })
             with urlopen(req, timeout=8) as response:
                 if response.status != 200:
-                    if response.status in {401, 403, 404, 410} or 500 <= response.status <= 599:
+                    if permanent_product_http_failure(name, response.status):
                         product_failures += 1
                     raise ValueError(f"HTTP {response.status}")
                 content = response.read(LIMIT + 1)
@@ -95,15 +111,20 @@ def fetch(name):
                     commit = data.get("commit")
                     if not isinstance(commit, str) or SHA.fullmatch(commit) is None:
                         product_failures += 1
+                        version_failures += 1
                         raise ValueError("invalid public product version commit")
                 return data, response.headers.get("Cache-Control", "")
         except HTTPError as exc:
-            if exc.code in {401, 403, 404, 410} or 500 <= exc.code <= 599:
+            if permanent_product_http_failure(name, exc.code):
                 product_failures += 1
             error = f"HTTPError: HTTP {exc.code}"
         except Exception as exc:
             error = f"{type(exc).__name__}: {str(exc)[:150]}"
     if name in {"frontend", "api"} and product_failures == 2:
+        if version_failures == 2:
+            raise ConfirmedProductVersionError(
+                f"two confirmed invalid public product version commits: {error}"
+            )
         raise ConfirmedProductHTTPError(f"two confirmed product HTTP failures: {error}")
     raise ValueError(f"two reads failed: {error}")
 
@@ -120,6 +141,9 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None):
     for name in URLS:
         try:
             data[name], headers[name] = reader(name)
+        except ConfirmedProductVersionError as exc:
+            flag("invalid_commit_" + name, "product version response", str(exc)[:200],
+                 "canonical commit in two production responses", name, "P1")
         except ConfirmedProductHTTPError as exc:
             flag("unavailable_" + name, "product HTTP response", str(exc)[:200],
                  "HTTP 200 from production", name, "P1")
