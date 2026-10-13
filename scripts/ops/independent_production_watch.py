@@ -474,7 +474,26 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 commits_now = commits_now if isinstance(commits_now, dict) else {}
                 for name in ("frontend", "api"):
                     if name not in current_divergence:
-                        continue
+                        # The preliminary state read failed, so evaluate()
+                        # cannot recover the old per-component anchor itself.
+                        # A missing API/frontend commit is NOT evidence of
+                        # convergence. Carry its prior mismatch timestamp
+                        # until the component is successfully observed.
+                        prior_at = timestamp(old_divergence.get(name))
+                        if (
+                            name not in commits_now
+                            and prior_at is not None
+                            and observed_at is not None
+                            and prior_at <= observed_at
+                        ):
+                            current_divergence[name] = (
+                                prior_at.isoformat().replace("+00:00", "Z")
+                            )
+                        else:
+                            # A reported commit equal to main proves that
+                            # component has converged; do not retain the
+                            # old mismatch just because another read failed.
+                            continue
                     prior_at = timestamp(old_divergence.get(name))
                     fresh_at = timestamp(current_divergence[name])
                     if (

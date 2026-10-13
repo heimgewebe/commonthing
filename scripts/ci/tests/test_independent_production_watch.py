@@ -2424,5 +2424,58 @@ class WatchTests(unittest.TestCase):
             )
 
 
+
+    def test_transient_state_read_unavailable_api_retains_prior_mismatch_anchor(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            initial = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=OLD)
+            )
+            self.assertIsNone(watch.record(initial, directory))
+            first = watch.read_previous_main_observation(directory)
+            self.assertEqual(first["diverged_since"], {
+                "frontend": NOW.isoformat().replace("+00:00", "Z"),
+                "api": NOW.isoformat().replace("+00:00", "Z"),
+            })
+
+            later = NOW + timedelta(minutes=4)
+            fixtures = self.fixtures(frontend=MAIN, api=OLD)
+
+            def unavailable_api(name):
+                if name == "api":
+                    raise PermissionError("transient API observation failure")
+                return fixtures(name)
+
+            observed = watch.evaluate(later, unavailable_api)
+            # Simulate the state read failing once during preliminary
+            # evaluation, but succeeding under record()'s exclusive lock.
+            observed["issues"].append({
+                "code": "unverifiable_state", "component": "prior state",
+                "actual": "PermissionError", "expected": "readable prior state",
+                "source": str(directory / "state.json"), "severity": "P2",
+            })
+            self.assertIn("unavailable_api", [i["code"] for i in observed["issues"]])
+            self.assertEqual(observed["main_observation"]["sha"], MAIN)
+            self.assertNotIn("diverged_since", observed["main_observation"])
+            self.assertEqual(watch.record(observed, directory), "MONITOR_DATA_FAILURE")
+            persisted = json.loads((directory / "state.json").read_text())
+            self.assertEqual(persisted["main_observation"]["diverged_since"], {
+                "api": NOW.isoformat().replace("+00:00", "Z"),
+            })
+            self.assertNotIn("frontend", persisted["main_observation"]["diverged_since"])
+
+            # The old API anchor must be authoritative as soon as the API is
+            # readable again; its 45-minute grace must not restart.
+            next_poll = watch.evaluate(
+                NOW + timedelta(minutes=46),
+                self.fixtures(frontend=MAIN, api=OLD),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertIn("stale_api", [i["code"] for i in next_poll["issues"]])
+            self.assertNotIn("stale_frontend", [i["code"] for i in next_poll["issues"]])
+
+
 if __name__ == "__main__":
     unittest.main()
