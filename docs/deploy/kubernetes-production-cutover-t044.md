@@ -268,7 +268,9 @@ Kubernetes-Cutover wurde hierdurch ausgeführt.
   für den 13.10.2026**; der nachgewiesene Merge um 04:24 UTC ist unten
   ausdrücklich maßgeblich. Der damalige PR schlägt **neu** die zwei Kriterien
   `staging-gitops-runtime` und `semantic-search-continuity` vor; es gibt
-  keine historisch nachgewiesene Bureau-TaskSpec mit elf Einträgen.
+  zu dem undatierten früheren Beobachtungszeitpunkt noch keine verifizierte
+  Bureau-TaskSpec mit elf Einträgen. Diese historische Unsicherheit
+  wurde durch den späteren #2350-Merge um 04:24 UTC aufgelöst.
   Für die **zwei neuen** Kriterien sind gültige `manual_observation`-
   Prüfverträge samt unterschiedlichen `observation_scope`-Konfigurationen
   vorhanden. Der damalige PR-Head besaß grüne GitHub-Validierung und
@@ -280,7 +282,7 @@ Kubernetes-Cutover wurde hierdurch ausgeführt.
   Vertrag `validate_acceptance_contract` meldet dadurch je
   `verifier-unknown` und `verifier-config-missing`, insgesamt **18
   Alt-Diagnosen**. [Bureau #2351](https://github.com/heimgewebe/bureau/issues/2351)
-  verfolgt den separaten, sicherheitsbewussten Fix. Strukturell grüne
+  verfolgte damals den separaten, sicherheitsbewussten Fix. Strukturell grüne
   Registry-CI schließt diesen **Claim-/Dispatcher-Blocker nicht**. Selbst
   elf formal gültige Prüfverträge wären noch **keine elf bestandenen
   Produktionsprüfungen**.
@@ -288,8 +290,10 @@ Kubernetes-Cutover wurde hierdurch ausgeführt.
   `59a1bf56c86acdcd355d10604263524c6a551df1`.
   Der Parser-Sicherheitsfix
   [Commonthing PR #1959](https://github.com/heimgewebe/commonthing/pull/1959)
-  blieb auf Head `e92d5c3bea56251a5e9b26ae09f91b2b4b9745d3`
-  **OPEN**. Die YAML-Regressionen und `Cargo.lock`-Sicherheitskorrektur
+  wurde in dieser früheren, noch nicht abschließend datierten Momentaufnahme
+  als **OPEN** auf Head `e92d5c3bea56251a5e9b26ae09f91b2b4b9745d3`
+  beobachtet. Diese historische OPEN-Aussage ist durch den oben
+  nachgewiesenen Merge am 13.10.2026, 17:01 UTC abgelöst. Die YAML-Regressionen und `Cargo.lock`-Sicherheitskorrektur
   bestanden zuletzt 588 API-Library-Tests sowie `cargo audit` und
   `cargo deny check`. Ein unabhängiger Review dieses Heads war
   `PASS` ohne Findings; die vollständige GitHub-/Review-Evidence-
@@ -298,7 +302,7 @@ Kubernetes-Cutover wurde hierdurch ausgeführt.
   Readback-/Abnahmebeschreibung. Bureau-Vertrag, produktives Green und
   B1–B6 sind damit **nicht** freigegeben.
 
-### Historischer Vertrags-Readback — 13. Oktober 2026 (vor #1959-Merge)
+### Historischer Vertrags-Readback — 13. Oktober 2026 (vor #1959-Merge; keine aktuelle Statusautorität)
 
 Dieser **neuere, ausschließlich GitHub-/TaskSpec-bezogene Readback**
 ersetzt die PR-/Registry-Statusbehauptungen des unmittelbar vorangehenden
@@ -321,8 +325,8 @@ Freigabe einer produktiven Green-Zelle.
 - Die neun älteren Kriterien blieben durch diesen Merge unverändert und
   ursprünglich **nicht ausführbar**. Der disjunkte Reparatur-PR
   [Bureau #2352](https://github.com/heimgewebe/bureau/pull/2352)
-  steht im hier beobachteten GitHub-Readback vom 13.10.2026
-  als **OPEN** auf veröffentlichtem Head
+  stand in diesem früheren, vor dem oben datierten neuesten #2352-Readback
+  als **OPEN** auf dem damals veröffentlichten Head
   `6c9d28ffec32319be2be59235eee0e1f23413210`. Dort
   sind neun spezifische `runtime_proof_bundle`-Verträge sowie
   im TaskSpec eingefrorene Sollfelder für die Green-Revision
@@ -337,14 +341,15 @@ Freigabe einer produktiven Green-Zelle.
   **Kein T044-Verifikationsstempel** wurde dadurch erworben.
 - Der Parser-/Dependency-Sicherheitsfix
   [Commonthing #1959](https://github.com/heimgewebe/commonthing/pull/1959)
-  ist im hier überprüften GitHub-Stand weiterhin **OPEN**,
-  mit veröffentlichtem Head
+  war in diesem ausdrücklich historischen GitHub-Snapshot noch **OPEN**,
+  auf dem damals veröffentlichten Head
   `14408677f105476f6e7e907432a32cceafb4c22f`.
   Dieser neue beobachtete Head ersetzt die vorangehend
   notierte `e92d5c3`-Revision; kein älteres Review-PASS
   oder CI-Ergebnis darf auf `14408677` übertragen werden.
-  Vor jeder Mergeentscheidung muss dieser konkrete Head
-  gegen seine dann aktuelle Basis erneut geprüft werden.
+  Diese damalige Revisionsprüfung war vor dem späteren, oben
+  dokumentierten #1959-Merge erforderlich; sie ist ausdrücklich
+  **keine heutige Forderung, den bereits gemergten PR erneut zu mergen**.
 - Der Dokumentations-PR
   [#1957](https://github.com/heimgewebe/commonthing/pull/1957)
   wurde damals erst nach Sicherheitskonvergenz, gültiger eigener CI und
@@ -709,6 +714,11 @@ abgenommen sein. Sie darf **zeitlich begrenzt und ausschließlich für diesen
 Proof** betrieben werden. Damit bleibt T044 mit ADR-0010 vereinbar: Das dort
 definierte Experiment B kann diese Abnahme liefern; ein permanenter
 Staging-Dauerbetrieb wird dadurch ausdrücklich **nicht** beschlossen.
+Das inzwischen auf dem **älteren** Commit `5d509feda6db24e294698cb42501fd41ec8e0fbe`
+terminal nachgewiesene und retirierte Experiment B/T085 ist dafür
+**keine** aktuelle Abnahme. B5 erfordert ein **neues, separates**,
+revisionsgebundenes T044-Testbed mit negativen Blue-/Writer-Isolationstests,
+Last-, Recovery- und Suchbelegen.
 
 Die revisionsgebundene Staging-/Zieltestbed-Abnahme umfasst mindestens:
 
@@ -1325,7 +1335,11 @@ Stand dieses R5-Preflights:
 - **Kein Traffic-/DNS-/Writer-Cutover.**
 - **Keine neue Plattformschicht.**
 - Nächster harter Hebel ist zuerst ein zeitlich begrenztes reales
-  Kubernetes-Zieltestbed als T044-Staging-/Experiment-B-Abnahme samt
-  produktionsnaher Last-/Recovery-Evidenz. Erst danach folgt die konkrete,
+  Kubernetes-Zieltestbed als **neue T044-B5-Staging-Abnahme**, ausdrücklich
+  **nicht** als Wiederholung oder Übertragung von Experiment B/T085,
+  samt negativer Blue-/Writer-Isolation und revisionsgebundenen
+  Last-, Recovery-, Such- und Backup-/Restore-Belegen. Vorher müssen
+  die autoritativen Bureau-Verifier- und Primärreader-Verträge integriert
+  und unabhängig freigegeben sein. Erst danach folgt die konkrete,
   kapazitiv belegte Produktions-Green-Zielidentität und die Schließung der
   Capability-Lücken gegen genau dieses Ziel.
