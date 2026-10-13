@@ -27,7 +27,6 @@ fn implicit_null_mapping_keys_must_not_be_silently_ignored() {
             "anchor nested block",
             "unknown: &mapping\n  : ignored\nother: *mapping\n",
         ),
-        ("tagged empty root key", "! : ignored\n"),
         (
             "rate limits flow",
             "node_mutation_rate_limits: {: ignored}\n",
@@ -227,4 +226,26 @@ fn explicitly_tagged_empty_string_keys_remain_valid() {
         .expect("a verified !!str empty key is a string, not an implicit null key");
     assert_eq!(parsed.max_guest_owned_nodes, 21);
     assert!(AppConfig::load_from_str(": ignored\nmax_guest_owned_nodes: 21\n").is_err());
+}
+#[test]
+fn bare_nonspecific_tag_empty_string_key_is_compatible() {
+    let config = AppConfig::load_from_str("! : ignored\nmax_guest_owned_nodes: 21\n")
+        .expect("an empty key carrying the non-specific ! tag is a string");
+    assert_eq!(config.max_guest_owned_nodes, 21);
+    // YAML 1.2 §10 explicitly resolves ! scalar nodes to strings.
+    assert!(AppConfig::load_from_str("! : ignored\n").is_ok());
+    assert!(AppConfig::load_from_str(": ignored\nmax_guest_owned_nodes: 21\n").is_err());
+}
+
+#[test]
+fn anchored_explicit_empty_string_is_valid_mapping_key() {
+    let config = AppConfig::load_from_str(
+        "field: &key !!str\n? *key\n: ignored\nmax_guest_owned_nodes: 21\n",
+    )
+    .expect("an alias of a verified tagged empty string remains a string key");
+    assert_eq!(config.max_guest_owned_nodes, 21);
+    assert!(AppConfig::load_from_str(
+        "field: &key !!int\n? *key\n: ignored\nmax_guest_owned_nodes: 21\n"
+    )
+    .is_err());
 }

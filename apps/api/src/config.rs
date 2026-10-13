@@ -614,7 +614,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                                         "YAML configuration mapping key has a non-string tag"
                                     );
                                     explicitly_string = true;
-                                    explicit_empty_string_tag = spelling != "!";
+                                    explicit_empty_string_tag = true;
                                 }
                                 SyntaxKind::PlainScalar
                                 | SyntaxKind::SingleQuotedScalar
@@ -669,7 +669,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                                     "YAML configuration mapping key has a non-string tag"
                                 );
                                 explicitly_string = true;
-                                explicit_empty_string_tag = spelling != "!";
+                                explicit_empty_string_tag = true;
                             }
                             SyntaxKind::PlainScalar
                             | SyntaxKind::SingleQuotedScalar
@@ -695,6 +695,12 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                 }
             }
             offset += child.text_len();
+        }
+        // A verified string tag can denote an empty scalar without emitting
+        // a scalar CST token. Close only that still-pending anchor as a string;
+        // collections and untagged/null/numeric targets remain unverified.
+        if let Some(anchor) = pending_anchor.take() {
+            anchors.insert(anchor, anchor_tag_is_string == Some(true));
         }
         if node.kind() == SyntaxKind::MappingEntry {
             anyhow::ensure!(
