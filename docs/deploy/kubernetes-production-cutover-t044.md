@@ -26,6 +26,36 @@ relations:
 
 # T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates
 
+## Sicherheitskonvergenz — 13. Oktober 2026, 17:01 UTC (nur GitHub/Main)
+
+Dieser neueste GitHub-Readback ergänzt die vorherigen datierten
+Momentaufnahmen; er erneuert **nicht** die Blue-/Green-Laufzeitbeobachtungen
+vom 12. Oktober und autorisiert ausdrücklich keinen produktiven Cutover.
+
+- [Commonthing #1959](https://github.com/heimgewebe/commonthing/pull/1959)
+  wurde laut GitHub am **13.10.2026 um 17:01 UTC** als **MERGED**
+  geschlossen. Der integrierte Head ist
+  `2f011e0a6eca160ba3feb9fa8f32960f931c343f`, der neue
+  `main`-Merge-Commit lautet
+  `f2d9707fc0bceeaa4e4f6a2e007b22dbd95b085f`.
+- Das direkt auf diesem Merge-Commit gelesene `Cargo.lock` enthält weder
+  `unsafe-libyaml` noch `serde_yaml`, stattdessen `noyalib` und
+  `noyalib-serde-yaml` jeweils in Version `0.0.56` sowie
+  `quinn-proto` in Version `0.11.18`. Das bestätigt die
+  **Repository-Sicherheitsmigration**, nicht eine laufende API- oder
+  Produktionsbereitstellung.
+- [Bureau #2352](https://github.com/heimgewebe/bureau/pull/2352)
+  war beim getrennten GitHub-Readback weiterhin **OPEN** auf
+  `2dbf0713d722fe71f8b7e7ee4e8c6f8c61448c37`; mehrere materielle
+  High-Critical-Befunde sind nicht abschließend unabhängig freigegeben.
+  Die elf normativen T044-Kriterien und deren authentische Runtime-Beweise
+  bleiben daher weiterhin gesondert verpflichtend.
+
+**Unveränderte Wirkungssperre:** B1–B6 und R6–R9 bleiben BLOCKED.
+Insbesondere ist kein neues produktives Green, keine Writer-Übertragung,
+keine Datenmigration und keine Änderung an DNS oder produktivem Traffic
+in diesem Nachtrag nachgewiesen oder freigegeben.
+
 ## R5-Nachbeobachtung — 12. Oktober 2026 (read-only; weiterhin BLOCKED)
 
 Dieser **inkrementelle Live-Readback** ergänzt die historischen Beobachtungen
