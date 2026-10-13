@@ -482,12 +482,52 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
         directive_offset += child.text_len();
     }
 
+    fn is_standard_string_tag_uri(uri: &str) -> bool {
+        // YAML tag URIs permit percent-escaped bytes. Decode for equality
+        // against exactly the core string URI, not as a generic trusted tag.
+        // In particular, %69nt must never be mistaken for %73tr.
+        const EXPECTED: &[u8] = b"tag:yaml.org,2002:str";
+        fn hex_digit(value: u8) -> Option<u8> {
+            match value {
+                b'0'..=b'9' => Some(value - b'0'),
+                b'a'..=b'f' => Some(value - b'a' + 10),
+                b'A'..=b'F' => Some(value - b'A' + 10),
+                _ => None,
+            }
+        }
+        let source = uri.as_bytes();
+        let mut index = 0;
+        for &expected in EXPECTED {
+            let actual = match source.get(index).copied() {
+                Some(b'%') => {
+                    let Some(high) = source.get(index + 1).copied().and_then(hex_digit) else {
+                        return false;
+                    };
+                    let Some(low) = source.get(index + 2).copied().and_then(hex_digit) else {
+                        return false;
+                    };
+                    index += 3;
+                    high * 16 + low
+                }
+                Some(value) => {
+                    index += 1;
+                    value
+                }
+                None => return false,
+            };
+            if actual != expected {
+                return false;
+            }
+        }
+        index == source.len()
+    }
+
     fn tag_is_string(tag: &str, handles: &HashMap<String, String>) -> bool {
         if tag == "!" {
             return true; // Non-specific scalar tag.
         }
         if let Some(uri) = tag.strip_prefix("!<").and_then(|s| s.strip_suffix('>')) {
-            return uri == "tag:yaml.org,2002:str";
+            return is_standard_string_tag_uri(uri);
         }
         if !tag.starts_with('!') {
             return false;
@@ -495,10 +535,9 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
         let handle_end = tag[1..].find('!').map_or(1, |i| i + 2);
         let handle = &tag[..handle_end];
         let suffix = &tag[handle_end..];
-        handles.get(handle).is_some_and(|prefix| {
-            prefix.len() + suffix.len() == "tag:yaml.org,2002:str".len()
-                && format!("{prefix}{suffix}") == "tag:yaml.org,2002:str"
-        })
+        handles
+            .get(handle)
+            .is_some_and(|prefix| is_standard_string_tag_uri(&format!("{prefix}{suffix}")))
     }
 
     fn inspect_key(

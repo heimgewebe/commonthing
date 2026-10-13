@@ -273,3 +273,48 @@ fn tagged_empty_string_anchor_survives_flow_collection_delimiters() {
         assert!(AppConfig::load_from_str(source).is_err());
     }
 }
+#[test]
+fn percent_escaped_standard_string_tags_preserve_compatibility() {
+    let mut failures = Vec::new();
+    for (case, source) in [
+        (
+            "explicit URI",
+            "!<tag:yaml.org,2002:%73tr> max_guest_owned_nodes: 21\n",
+        ),
+        (
+            "escaped directive prefix",
+            "%TAG !core! tag:yaml.org,2002:%73\n---\n!core!tr max_guest_owned_nodes: 21\n",
+        ),
+        (
+            "escaped declared suffix",
+            "%TAG !core! tag:yaml.org,2002:\n---\n!core!%73tr max_guest_owned_nodes: 21\n",
+        ),
+    ] {
+        match AppConfig::load_from_str(source) {
+            Ok(config) if config.max_guest_owned_nodes == 21 => {}
+            Ok(config) => failures.push(format!(
+                "{case}: wrong value {}",
+                config.max_guest_owned_nodes
+            )),
+            Err(error) => failures.push(format!("{case}: {error:#}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "standard YAML string percent tags rejected: {failures:?}"
+    );
+}
+
+#[test]
+fn percent_escaped_non_string_tags_stay_rejected() {
+    for source in [
+        "!<tag:yaml.org,2002:%69nt> '1': ignored\n",
+        "%TAG !core! tag:yaml.org,2002:\n---\n!core!%69nt '1': ignored\n",
+        "!<tag:yaml.org,2002:%ZZtr> max_guest_owned_nodes: 21\n",
+    ] {
+        assert!(
+            AppConfig::load_from_str(source).is_err(),
+            "non-string tag accepted: {source:?}"
+        );
+    }
+}
