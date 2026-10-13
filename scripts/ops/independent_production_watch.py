@@ -307,6 +307,14 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None, issue_sink=No
     }
 
 
+def _fsync_directory(directory):
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def write_json(path, value):
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("w", encoding="utf-8") as out:
@@ -315,13 +323,9 @@ def write_json(path, value):
         out.flush()
         os.fsync(out.fileno())
     os.replace(temporary, path)
-    # The file fsync alone does not durably commit the renamed directory
-    # entry. Treat parent-sync failures as uncertain snapshot commits.
-    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    # A file fsync alone cannot commit the renamed directory entry.
+    # Treat parent-sync errors as uncertain, not successful, writes.
+    _fsync_directory(path.parent)
 
 
 def _record_unverifiable_prior_state(result, directory, heartbeat, cause):
@@ -516,7 +520,9 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                         if written != len(payload):
                             raise OSError("short event history append")
                         os.fsync(fd)
-                    except OSError as append_error:
+                        # A newly created journal requires a durable directory entry.
+                        _fsync_directory(directory)
+                    except (OSError, WatchRuntimeExceeded) as append_error:
                         try:
                             os.ftruncate(fd, previous_end)
                             os.fsync(fd)
@@ -555,7 +561,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
 def read_previous_main_observation(directory):
     try:
         state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
+    except FileNotFoundError:
         return None
     if not isinstance(state, dict):
         return None

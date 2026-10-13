@@ -1821,10 +1821,15 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(alarm["status"], "ALARM")
             original_fsync = watch.os.fsync
             failures = []
+            last_file = [None]
 
             def fail_first_directory_sync(fd):
                 destination = os.readlink(f"/proc/self/fd/{fd}")
-                if destination == str(directory) and not failures:
+                if destination.endswith(".tmp"):
+                    last_file[0] = destination
+                if (destination == str(directory)
+                        and last_file[0] == str(directory / "state.json.tmp")
+                        and not failures):
                     failures.append(destination)
                     raise OSError("simulated parent directory fsync failure")
                 return original_fsync(fd)
@@ -1846,6 +1851,171 @@ class WatchTests(unittest.TestCase):
             events = [json.loads(line)["event"] for line in
                       (directory / "events.jsonl").read_text().splitlines()]
             self.assertEqual(events.count("ALARM"), 1)
+
+
+    def test_transient_prior_anchor_read_error_preserves_grace(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            initial = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=OLD)
+            )
+            self.assertEqual(initial["status"], "HEALTHY")
+            watch.record(initial, directory)
+            anchor = watch.read_previous_main_observation(directory)
+            self.assertIn("diverged_since", anchor)
+            read_text = Path.read_text
+            failures = []
+
+            def interrupted_read(path, *args, **kwargs):
+                if path == directory / "state.json" and not failures:
+                    failures.append(True)
+                    raise OSError("simulated transient state read failure")
+                return read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", new=interrupted_read), patch.object(
+                watch, "fetch", side_effect=self.fixtures(frontend=OLD, api=OLD),
+            ):
+                result = watch._evaluate_cycle(directory)
+
+            self.assertEqual(failures, [True])
+            self.assertEqual(result["status"], "MONITOR_DATA_FAILURE")
+            self.assertIn(
+                "watcher_execution_failed",
+                [item["code"] for item in result["issues"]],
+            )
+            self.assertEqual(watch.record(result, directory),
+                             "MONITOR_DATA_FAILURE")
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual(state["main_observation"], anchor)
+            overdue = watch.evaluate(
+                NOW + timedelta(minutes=46),
+                self.fixtures(frontend=OLD, api=OLD),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(
+                {item["code"] for item in overdue["issues"]
+                 if item["severity"] == "P1"},
+                {"stale_frontend", "stale_api"},
+            )
+
+    def test_new_event_journal_fsyncs_directory_before_snapshot(self):
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30")
+            )
+            actual = watch.os.fsync
+            calls = []
+
+            def monitored_fsync(fd):
+                calls.append(os.readlink(f"/proc/self/fd/{fd}"))
+                return actual(fd)
+
+            with patch.object(watch.os, "fsync", side_effect=monitored_fsync):
+                self.assertEqual(watch.record(alarm, directory), "ALARM")
+
+            event_index = calls.index(str(directory / "events.jsonl"))
+            self.assertEqual(calls[event_index + 1], str(directory))
+            self.assertEqual(calls[event_index + 2],
+                             str(directory / "state.json.tmp"))
+
+    def test_failed_journal_directory_sync_rolls_back_event_and_keeps_p1(self):
+        import json
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30")
+            )
+            original = watch.os.fsync
+            faults = []
+
+            def fail_first_directory_fsync(fd):
+                destination = os.readlink(f"/proc/self/fd/{fd}")
+                if destination == str(directory) and not faults:
+                    faults.append(True)
+                    raise OSError("simulated journal directory fsync failure")
+                return original(fd)
+
+            with patch.object(
+                watch.os, "fsync", side_effect=fail_first_directory_fsync,
+            ):
+                self.assertEqual(watch.record(alarm, directory), "ALARM")
+
+            self.assertEqual(faults, [True])
+            self.assertEqual((directory / "events.jsonl").read_bytes(), b"")
+            state = json.loads((directory / "state.json").read_text())
+            self.assertIn("frontend_cache", [item[0] for item in state["severe"]])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn(
+                "event_log_write_failed",
+                [item["code"] for item in heartbeat["issues"]],
+            )
+
+
+    def test_deadline_during_partial_event_append_rolls_back_fragment(self):
+        import json
+        import signal
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30")
+            )
+            original_open = Path.open
+            interrupted = []
+
+            class InterruptedWriter:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def __enter__(self):
+                    self.stream.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.stream.__exit__(*args)
+
+                def fileno(self):
+                    return self.stream.fileno()
+
+                def write(self, payload):
+                    if not interrupted:
+                        interrupted.append(True)
+                        self.stream.write(payload[:5])
+                        raise watch.WatchRuntimeExceeded("deadline during append")
+                    return self.stream.write(payload)
+
+            def interrupted_open(path, *args, **kwargs):
+                stream = original_open(path, *args, **kwargs)
+                if path == directory / "events.jsonl":
+                    return InterruptedWriter(stream)
+                return stream
+
+            with patch.object(Path, "open", new=interrupted_open), patch.object(
+                signal, "alarm", return_value=0,
+            ):
+                self.assertEqual(watch._persist_cycle(alarm, directory), 2)
+
+            self.assertEqual(interrupted, [True])
+            lines = (directory / "events.jsonl").read_text().splitlines()
+            self.assertEqual([json.loads(line)["event"] for line in lines],
+                             ["MONITOR_DATA_FAILURE"])
+            state = json.loads((directory / "state.json").read_text())
+            self.assertIn("frontend_cache", [row[0] for row in state["severe"]])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+
 
 
 if __name__ == "__main__":
