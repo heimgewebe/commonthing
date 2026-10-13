@@ -1248,6 +1248,10 @@ mod tests {
                 "max_nodes_jsonl_mb: 10.0000000000000001\nmax_edges_jsonl_mb: 10\n",
             ),
             (
+                "integral-looking YAML float must not become integer",
+                "max_nodes_jsonl_mb: 10.0\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
                 "wrong policy type",
                 "max_nodes_jsonl_mb: [10]\nmax_edges_jsonl_mb: 10\n",
             ),

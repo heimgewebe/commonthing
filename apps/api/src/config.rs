@@ -743,6 +743,15 @@ impl AppConfig {
     }
 
     fn reject_yaml_float_values(value: &serde_yaml::Value) -> Result<()> {
+        // Treat tagged numbers as their actual scalar type before any
+        // compatibility deserializer may coerce security-critical limits.
+        fn untagged(mut value: &serde_yaml::Value) -> &serde_yaml::Value {
+            while let serde_yaml::Value::Tagged(tagged) = value {
+                value = tagged.value();
+            }
+            value
+        }
+
         let Some(mapping) = Self::inspection_root_mapping(value) else {
             return Ok(());
         };
@@ -754,13 +763,14 @@ impl AppConfig {
             "auth_rl_email_per_hour",
             "smtp_port",
         ] {
-            if matches!(mapping.get(field), Some(serde_yaml::Value::Number(n)) if matches!(n, serde_yaml::Number::Float(_)))
+            if matches!(mapping.get(field).map(untagged), Some(serde_yaml::Value::Number(n)) if matches!(n, serde_yaml::Number::Float(_)))
             {
                 anyhow::bail!("{field} must be a YAML integer, not a floating-point value");
             }
         }
         if let Some(rate_limits) = mapping
             .get("node_mutation_rate_limits")
+            .map(untagged)
             .and_then(|v| v.as_mapping())
         {
             for field in [
@@ -769,7 +779,7 @@ impl AppConfig {
                 "delete_per_minute",
                 "delete_per_hour",
             ] {
-                if matches!(rate_limits.get(field), Some(serde_yaml::Value::Number(n)) if matches!(n, serde_yaml::Number::Float(_)))
+                if matches!(rate_limits.get(field).map(untagged), Some(serde_yaml::Value::Number(n)) if matches!(n, serde_yaml::Number::Float(_)))
                 {
                     anyhow::bail!("node_mutation_rate_limits.{field} must be a YAML integer");
                 }

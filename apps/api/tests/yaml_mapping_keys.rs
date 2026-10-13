@@ -54,6 +54,9 @@ fn tagged_mutation_rate_limits_cannot_be_dropped_to_defaults() {
         "node_mutation_rate_limits: !custom {replace_per_minute: 1.5}\n",
         "node_mutation_rate_limits: ! {replace_per_minute: 1.5}\n",
         "node_mutation_rate_limits: !!map {replace_per_minute: 1.5}\n",
+        "node_mutation_rate_limits: !!map {delete_per_hour: 18446744073709551616.0}\n",
+        "node_mutation_rate_limits: !!map {delete_per_hour: !!float 18446744073709551616.0}\n",
+        "node_mutation_rate_limits: {delete_per_hour: !!float 10.0}\n",
     ] {
         assert!(
             AppConfig::load_from_str(source).is_err(),
@@ -194,4 +197,18 @@ fn declared_plain_handle_prefix_is_compatible() {
     )
     .expect("YAML primary handle may resolve to a declared standard string tag");
     assert_eq!(parsed.max_guest_owned_nodes, 21);
+}
+
+#[test]
+fn merge_key_cannot_inject_valid_security_config_options() {
+    for source in [
+        "<<: {auth_cookie_secure: false}\n",
+        "<<: {max_guest_owned_nodes: 1}\n",
+        "base: &settings {auth_cookie_secure: false}\n<<: *settings\n",
+    ] {
+        assert!(
+            AppConfig::load_from_str(source).is_err(),
+            "YAML merge key silently modified security config: {source:?}"
+        );
+    }
 }
