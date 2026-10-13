@@ -315,6 +315,13 @@ def write_json(path, value):
         out.flush()
         os.fsync(out.fileno())
     os.replace(temporary, path)
+    # The file fsync alone does not durably commit the renamed directory
+    # entry. Treat parent-sync failures as uncertain snapshot commits.
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _record_unverifiable_prior_state(result, directory, heartbeat, cause):

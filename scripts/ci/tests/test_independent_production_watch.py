@@ -1778,5 +1778,75 @@ class WatchTests(unittest.TestCase):
             )
 
 
+    def test_snapshot_replace_fsyncs_parent_for_state_and_heartbeat(self):
+        import json
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            actual_fsync = watch.os.fsync
+            calls = []
+
+            def capture_fsync(fd):
+                calls.append(os.readlink(f"/proc/self/fd/{fd}"))
+                return actual_fsync(fd)
+
+            with patch.object(watch.os, "fsync", side_effect=capture_fsync):
+                for name in ("state.json", "heartbeat.json"):
+                    target = directory / name
+                    for revision in (1, 2):
+                        watch.write_json(target, {"revision": revision})
+                        self.assertEqual(json.loads(target.read_text()),
+                                         {"revision": revision})
+
+            self.assertEqual(calls, [
+                str(directory / "state.json.tmp"), str(directory),
+                str(directory / "state.json.tmp"), str(directory),
+                str(directory / "heartbeat.json.tmp"), str(directory),
+                str(directory / "heartbeat.json.tmp"), str(directory),
+            ])
+
+    def test_failed_parent_fsync_is_not_success_and_retains_confirmed_p1(self):
+        import json
+        import os
+        import signal
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30")
+            )
+            self.assertEqual(alarm["status"], "ALARM")
+            original_fsync = watch.os.fsync
+            failures = []
+
+            def fail_first_directory_sync(fd):
+                destination = os.readlink(f"/proc/self/fd/{fd}")
+                if destination == str(directory) and not failures:
+                    failures.append(destination)
+                    raise OSError("simulated parent directory fsync failure")
+                return original_fsync(fd)
+
+            with patch.object(
+                watch.os, "fsync", side_effect=fail_first_directory_sync,
+            ), patch.object(signal, "alarm", return_value=0):
+                self.assertEqual(watch._persist_cycle(alarm, directory), 2)
+
+            self.assertEqual(failures, [str(directory)])
+            state = json.loads((directory / "state.json").read_text())
+            self.assertIn("frontend_cache", [item[0] for item in state["severe"]])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn(
+                "watcher_execution_failed",
+                [item["code"] for item in heartbeat["issues"]],
+            )
+            events = [json.loads(line)["event"] for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events.count("ALARM"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
