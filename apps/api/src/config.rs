@@ -469,6 +469,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
     ) -> Result<()> {
         let mut offset = base;
         let mut block_key = node.kind() == SyntaxKind::MappingEntry;
+        let mut seen_block_key = false;
         let mut flow_key = node.kind() == SyntaxKind::FlowMapping;
         let mut seen_flow_key = false;
         let mut explicitly_string = false;
@@ -477,14 +478,23 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
             match child {
                 GreenChild::Token { kind, len } => {
                     let spelling = &source[offset..offset + *len as usize];
+                    if node.kind() == SyntaxKind::BlockMapping
+                        && *kind == SyntaxKind::ColonIndicator
+                    {
+                        anyhow::bail!("YAML block mapping entry has no string key");
+                    }
                     if node.kind() == SyntaxKind::MappingEntry {
                         if *kind == SyntaxKind::ColonIndicator {
+                            anyhow::ensure!(seen_block_key, "YAML mapping entry has no string key");
                             block_key = false;
                         } else if block_key {
                             match *kind {
                                 SyntaxKind::TagMark => {
                                     anyhow::ensure!(
-                                        matches!(spelling, "!!str" | "!<tag:yaml.org,2002:str>"),
+                                        matches!(
+                                            spelling,
+                                            "!" | "!!str" | "!<tag:yaml.org,2002:str>"
+                                        ),
                                         "YAML configuration mapping key has a non-string tag"
                                     );
                                     explicitly_string = true;
@@ -494,6 +504,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                                 | SyntaxKind::DoubleQuotedScalar
                                 | SyntaxKind::AliasMark => {
                                     inspect_key(*kind, spelling, explicitly_string, config)?;
+                                    seen_block_key = true;
                                 }
                                 _ => {}
                             }
@@ -505,10 +516,16 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                                 seen_flow_key = false;
                                 explicitly_string = false;
                             }
-                            SyntaxKind::ColonIndicator => flow_key = false,
+                            SyntaxKind::ColonIndicator => {
+                                anyhow::ensure!(
+                                    seen_flow_key,
+                                    "YAML flow mapping entry has no string key"
+                                );
+                                flow_key = false;
+                            }
                             SyntaxKind::TagMark if flow_key => {
                                 anyhow::ensure!(
-                                    matches!(spelling, "!!str" | "!<tag:yaml.org,2002:str>"),
+                                    matches!(spelling, "!" | "!!str" | "!<tag:yaml.org,2002:str>"),
                                     "YAML configuration mapping key has a non-string tag"
                                 );
                                 explicitly_string = true;
