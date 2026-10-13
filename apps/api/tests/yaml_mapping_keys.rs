@@ -87,6 +87,10 @@ fn anchored_string_mapping_key_aliases_keep_legacy_compatibility() {
             "quoted",
             "field: &key 'max_guest_owned_nodes'\n? *key\n: 21\n",
         ),
+        (
+            "comment-separated",
+            "field: &key # comment\n  max_guest_owned_nodes\n? *key\n: 21\n",
+        ),
     ] {
         let parsed = AppConfig::load_from_str(source)
             .unwrap_or_else(|error| panic!("{case} anchored scalar key alias rejected: {error:#}"));

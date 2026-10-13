@@ -521,7 +521,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                             }
                             anchor_tag_is_string = None;
                         }
-                        SyntaxKind::Whitespace | SyntaxKind::Newline => {}
+                        SyntaxKind::Whitespace | SyntaxKind::Newline | SyntaxKind::Comment => {}
                         _ => {
                             if let Some(anchor) = pending_anchor.take() {
                                 anchors.insert(anchor, false);
