@@ -28,12 +28,14 @@ relations:
 
 ## Sicherheitskonvergenz — 13. Oktober 2026 (GitHub/Main, bis nach 20:13 UTC)
 
-Dieser neueste GitHub-/Main-Readback **ersetzt alle älteren PR-Status-,
-Head- und Sicherheitskonvergenzaussagen weiter unten**, insbesondere
-`#1959 OPEN` und frühere `#2352`-Heads. Die dort in der Gegenwartsform
-notierten Angaben sind **ausschließlich historische Momentaufnahmen**,
-nicht parallel gültige aktuelle Statusmeldungen. Das gilt auch für die
-früheren Zwischenstände des 13. Oktober ohne präzise Uhrzeit.
+Dieser neueste GitHub-/Main-Readback **ersetzt ältere PR-Status-, Head-,
+CI- und Review-Zuordnungen weiter unten**, insbesondere `#1959 OPEN` und
+frühere `#2352`-Heads. Diese Status- und Freigabeangaben sind **historische
+Momentaufnahmen**, keine parallel gültigen aktuellen Tatsachen. Die
+normativen Sicherheitsgates, Stopbedingungen und die unten erläuterte
+B5-Reihenfolge bleiben dagegen **verbindlich**, soweit sie hier nicht
+ausdrücklich verschärft werden. Das gilt auch für Zwischenstände des
+13. Oktober ohne präzise Uhrzeit.
 Der neueste Abschnitt erneuert **nicht** die Blue-/Green-Laufzeitbeobachtungen
 vom 12. Oktober und autorisiert ausdrücklich keinen produktiven Cutover.
 
@@ -63,11 +65,13 @@ vom 12. Oktober und autorisiert ausdrücklich keinen produktiven Cutover.
   eine laufende API- oder Produktionsbereitstellung.
 - [Bureau #2350](https://github.com/heimgewebe/bureau/pull/2350)
   hat am 13.10.2026 um **04:24 UTC** den **normativen Vertrag mit elf
-  T044-Kriterien** in Main integriert. Die neun historischen
-  `runtime_proof_bundle`-Verifier und ihre produktiven Primärbeweise
-  werden dagegen erst durch den **noch offenen** #2352 abgesichert.
-  Diese Implementierung ist weder unabhängige Freigabe noch produktive
-  Verifier-Aktivierung.
+  T044-Kriterien** in Main integriert. Für die neun bestehenden Kriterien
+  schlägt der **noch offene** #2352 ausführbare
+  `runtime_proof_bundle`-Verifier-Verträge vor; deren sichere
+  Implementierung ist noch nicht unabhängig freigegeben. Ein produktiv
+  autorisierter Primärreader, eine gebundene Green-Zielidentität und
+  authentische produktive Runtime-Proofs fehlen weiterhin. Weder #2350
+  noch #2352 stellen allein einen bestandenen Runtime-Beweis dar.
 - [Bureau #2352](https://github.com/heimgewebe/bureau/pull/2352)
   war beim erneuten GitHub-Readback am 13.10.2026 nach **20:13 UTC**
   weiterhin **OPEN**, nun auf veröffentlichtem Head
@@ -81,6 +85,33 @@ vom 12. Oktober und autorisiert ausdrücklich keinen produktiven Cutover.
   Primärreader und Zielidentitätsbindung). Für diesen neuen Head
   sind aktuelle unabhängige R3-PASS-Reviews, vollständige CI und
   Captain-Freigabe weiterhin gesondert erforderlich.
+
+**Aktuell gültige R5-Abnahmefolge (keine historische Momentaufnahme):**
+Zuerst müssen die neun Runtime-Verifier-Verträge einschließlich
+authentifizierter Primärreader, Claim-/Handoff-/Lease-/Closeout-Autorität
+durch #2352 tatsächlich implementiert, getestet und unabhängig freigegeben
+und über Captain integriert werden. Danach muss ein **isoliertes,
+revisionsgebundenes B5-Staging-/Zieltestbed** mit negativen Blue-Isolations-,
+Search-Kontinuitäts-, Last-, Backup-, Restore- und Recovery-Belegen
+abgenommen werden. Erst danach dürfen Zielidentität und reale
+Produktionsplattform für weitere B1–B6-Gates verbindlich bewertet werden.
+Der noch offene #2352 und die unvollständige isolierte B5-Plattform
+erfüllen diese Vorbedingungen ausdrücklich **nicht**.
+
+**Dokumentationsmerge und Runtime-Freigabe sind unterschiedliche
+Entscheidungen:** Der #1959-RustSec-Merge ist als Repository-Voraussetzung
+für die Korrektheit dieses R5-Dokumentationsnachtrags erfüllt; #2352
+muss für eine dokumentarische Darstellung seines **BLOCKED**-Zustands
+nicht bereits gemergt sein. #1957 selbst darf dennoch **nur** bei
+aktuellen unabhängigen R3-PASS-Reviews, vollständiger Review-Evidence-CI
+und Captain-Freigabe integriert werden. Sein späterer Merge ersetzt
+keine Runtime-/Staging-/Cutover-Abnahme und ändert kein B1–B6-Gate.
+
+**Aktuelle R5-Entscheidung:** R5 **nicht bestanden**. Blue auf
+`commonserver` bleibt alleiniger produktiver Writer; Green ist keine
+freigegebene produktive Zielplattform. Wenn kein isoliertes,
+revisionsgebundenes und durch Recovery-Belege abgesichertes B5-Testbed
+vorliegt, bleiben R6 und alle produktiven Phasen gesperrt.
 
 **Unveränderte Wirkungssperre:** B1–B6 und R6–R9 bleiben BLOCKED.
 Insbesondere ist kein neues produktives Green, keine Writer-Übertragung,
