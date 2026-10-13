@@ -1331,11 +1331,16 @@ class WatchTests(unittest.TestCase):
 
             recovery = watch.evaluate(NOW + timedelta(minutes=1), self.fixtures())
             with patch.object(Path, "read_text", new=protected_read):
-                with self.assertRaises(PermissionError):
-                    watch.record(recovery, directory)
+                self.assertEqual(watch.record(recovery, directory),
+                                 "MONITOR_DATA_FAILURE")
 
             self.assertEqual((directory / "state.json").read_bytes(), previous_state)
-            self.assertEqual((directory / "heartbeat.json").read_bytes(), previous_heartbeat)
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertNotEqual((directory / "heartbeat.json").read_bytes(),
+                                previous_heartbeat)
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("frontend_cache", [i["code"] for i in heartbeat["issues"]])
+            self.assertIn("unverifiable_state", [i["code"] for i in heartbeat["issues"]])
             events = [json.loads(line)["event"] for line in
                       (directory / "events.jsonl").read_text().splitlines()]
             self.assertEqual(events, ["ALARM"])
@@ -1883,7 +1888,7 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(failures, [True])
             self.assertEqual(result["status"], "MONITOR_DATA_FAILURE")
             self.assertIn(
-                "watcher_execution_failed",
+                "unverifiable_state",
                 [item["code"] for item in result["issues"]],
             )
             self.assertEqual(watch.record(result, directory),
@@ -2108,13 +2113,23 @@ class WatchTests(unittest.TestCase):
                 self.assertEqual(watch._persist_cycle(alarm, directory), 2)
 
             self.assertEqual(failures, [True])
-            events = [json.loads(x)["event"] for x in
-                      (directory / "events.jsonl").read_text().splitlines()]
-            self.assertEqual(events, ["ALARM", "MONITOR_DATA_FAILURE"])
-            state = json.loads((directory / "state.json").read_text())
-            self.assertIn("frontend_cache", [i[0] for i in state["severe"]])
+            self.assertFalse((directory / "events.jsonl").exists())
+            self.assertFalse((directory / "state.json").exists())
             heartbeat = json.loads((directory / "heartbeat.json").read_text())
             self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("unverifiable_state", [i["code"] for i in heartbeat["issues"]])
+            self.assertIn("frontend_cache", [i["code"] for i in heartbeat["issues"]])
+            # When the state becomes readable, this same P1 must still journal
+            # its first ALARM, not a RECOVERY or duplicate failed transition.
+            subsequent = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(cache="max-age=3600")
+            )
+            self.assertEqual(watch.record(subsequent, directory), "ALARM")
+            self.assertEqual(
+                [json.loads(x)["event"] for x in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
 
 
     def test_persistent_heartbeat_read_error_preserves_new_confirmed_p1(self):
@@ -2205,6 +2220,59 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(events, [
                 "ALARM", "MONITOR_DATA_FAILURE", "RECOVERY",
             ])
+
+
+
+    def test_unreadable_state_still_observes_and_heartbeats_new_product_p1(self):
+        import json
+        import signal
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            healthy = watch.evaluate(NOW, self.fixtures())
+            self.assertIsNone(watch.record(healthy, directory))
+            state_before = (directory / "state.json").read_bytes()
+            base_reader = self.fixtures(cache="max-age=3600")
+            attempted = []
+            actual_read = Path.read_text
+
+            def denied_state(path, *args, **kwargs):
+                if path == directory / "state.json":
+                    raise PermissionError("simulated persistent state read denial")
+                return actual_read(path, *args, **kwargs)
+
+            def observing(name):
+                attempted.append(name)
+                return base_reader(name)
+
+            actual_evaluate = watch.evaluate
+
+            def using_fixture(now, *, previous_main_observation=None, issue_sink=None):
+                return actual_evaluate(
+                    now, observing,
+                    previous_main_observation=previous_main_observation,
+                    issue_sink=issue_sink,
+                )
+
+            with patch.object(Path, "read_text", new=denied_state), patch.object(
+                watch, "evaluate", side_effect=using_fixture,
+            ), patch.object(signal, "alarm", return_value=0):
+                observed = watch._evaluate_cycle(directory)
+                self.assertIn("frontend", attempted)
+                self.assertIn(
+                    "frontend_cache",
+                    [issue["code"] for issue in observed["issues"]],
+                )
+                self.assertEqual(observed["status"], "ALARM")
+                self.assertEqual(watch._persist_cycle(observed, directory), 2)
+
+            self.assertEqual((directory / "state.json").read_bytes(), state_before)
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("frontend_cache", [i["code"] for i in heartbeat["issues"]])
+            self.assertIn("unverifiable_state", [i["code"] for i in heartbeat["issues"]])
+            self.assertFalse((directory / "events.jsonl").exists())
 
 
 

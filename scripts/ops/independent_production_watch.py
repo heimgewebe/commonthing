@@ -423,6 +423,13 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         except FileNotFoundError:
             no_prior_state = True
             previous = {}
+        except OSError as exc:
+            # A failed read cannot prove an empty incident journal. Preserve
+            # state.json and publish newly observed P1s via the heartbeat.
+            return _record_unverifiable_prior_state(
+                result, directory, previous_heartbeat,
+                f"unreadable state JSON: {type(exc).__name__}",
+            )
         except (ValueError, UnicodeError) as exc:
             return _record_unverifiable_prior_state(
                 result, directory, previous_heartbeat,
@@ -482,6 +489,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 P1_UNVERIFIABLE_ON.get(code, set()) & observed_codes
                 or still_stale or code in uncertain_product_http
                 or "watcher_execution_failed" in observed_codes
+                or "unverifiable_state" in observed_codes
             ):
                 severe.append(item)
         severe.sort()
@@ -513,7 +521,11 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
 
         current_main = result.get("main_observation")
         previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
-        if not isinstance(current_main, dict):
+        if "unverifiable_state" in observed_codes and isinstance(previous_main, dict):
+            # Evaluation could not read the original divergence anchor; if
+            # record() can now read it, never reset its 45-minute clock.
+            current_main = previous_main
+        elif not isinstance(current_main, dict):
             current_main = previous_main
 
         def persist_snapshots():
@@ -650,7 +662,20 @@ def _evaluate_cycle(directory):
     now = datetime.now(UTC)
     observed_issues = []
     try:
-        previous = read_previous_main_observation(directory)
+        try:
+            previous = read_previous_main_observation(directory)
+        except (OSError, ValueError) as exc:
+            # Prior state is uncertain, but the live product endpoints can
+            # still independently confirm critical HTTP/cache failures.
+            previous = None
+            observed_issues.append({
+                "code": "unverifiable_state",
+                "component": "watcher previous incident state",
+                "actual": f"{type(exc).__name__}: {str(exc)[:150]}",
+                "expected": "readable prior state.json",
+                "source": str(directory / "state.json"),
+                "severity": "P2",
+            })
         return evaluate(
             now, previous_main_observation=previous, issue_sink=observed_issues,
         )
