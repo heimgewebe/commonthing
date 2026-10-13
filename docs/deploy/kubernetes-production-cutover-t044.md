@@ -26,10 +26,15 @@ relations:
 
 # T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates
 
-## Sicherheitskonvergenz — 13. Oktober 2026, 17:01 UTC (nur GitHub/Main)
+## Sicherheitskonvergenz — 13. Oktober 2026 (GitHub/Main, bis nach 20:13 UTC)
 
-Dieser neueste GitHub-Readback ergänzt die vorherigen datierten
-Momentaufnahmen; er erneuert **nicht** die Blue-/Green-Laufzeitbeobachtungen
+Dieser neueste GitHub-/Main-Readback **ersetzt alle älteren PR-Status-,
+Head- und Sicherheitskonvergenzaussagen weiter unten**, insbesondere
+`#1959 OPEN` und frühere `#2352`-Heads. Die dort in der Gegenwartsform
+notierten Angaben sind **ausschließlich historische Momentaufnahmen**,
+nicht parallel gültige aktuelle Statusmeldungen. Das gilt auch für die
+früheren Zwischenstände des 13. Oktober ohne präzise Uhrzeit.
+Der neueste Abschnitt erneuert **nicht** die Blue-/Green-Laufzeitbeobachtungen
 vom 12. Oktober und autorisiert ausdrücklich keinen produktiven Cutover.
 
 - [Commonthing #1959](https://github.com/heimgewebe/commonthing/pull/1959)
@@ -38,18 +43,44 @@ vom 12. Oktober und autorisiert ausdrücklich keinen produktiven Cutover.
   `2f011e0a6eca160ba3feb9fa8f32960f931c343f`, der neue
   `main`-Merge-Commit lautet
   `f2d9707fc0bceeaa4e4f6a2e007b22dbd95b085f`.
-- Das direkt auf diesem Merge-Commit gelesene `Cargo.lock` enthält weder
-  `unsafe-libyaml` noch `serde_yaml`, stattdessen `noyalib` und
-  `noyalib-serde-yaml` jeweils in Version `0.0.56` sowie
-  `quinn-proto` in Version `0.11.18`. Das bestätigt die
-  **Repository-Sicherheitsmigration**, nicht eine laufende API- oder
-  Produktionsbereitstellung.
+- Die Freigabe gehört **zum integrierten #1959-Head
+  `2f011e0a6eca160ba3feb9fa8f32960f931c343f`** und nicht zu
+  früheren, inzwischen abgelösten PR-Heads. Vor dem Merge waren 47
+  GitHub-Prüfungen erfolgreich, drei regulär übersprungen; dazu
+  gehörten die YAML-Integrationstests (20 PASS), die Rust-API-Tests,
+  `cargo fmt --check`, `cargo audit` und `cargo deny` sowie der
+  fünfteilige High-Critical-Self-Review. Die unabhängigen PASS-Reviews
+  sind mit Grabowski-Jobs `grabowski-job-5969714b2e24` (Grok 4.6),
+  `grabowski-job-62d62730cb18` (Claude Opus 5.5) und dem weiteren
+  Captain-gebundenen Review `grabowski-job-e0541eb280da` belegt.
+  Dies sind **PR-/Merge-Nachweise**, keine Runtime-Receipts.
+- Das direkt auf dem Main-Merge-Commit
+  `f2d9707fc0bceeaa4e4f6a2e007b22dbd95b085f` gelesene
+  `Cargo.lock` enthält weder `unsafe-libyaml` noch `serde_yaml`,
+  stattdessen `noyalib` und `noyalib-serde-yaml` jeweils in
+  Version `0.0.56` sowie `quinn-proto` in Version `0.11.18`.
+  Das bestätigt die **Repository-Sicherheitsmigration**, nicht
+  eine laufende API- oder Produktionsbereitstellung.
+- [Bureau #2350](https://github.com/heimgewebe/bureau/pull/2350)
+  hat am 13.10.2026 um **04:24 UTC** den **normativen Vertrag mit elf
+  T044-Kriterien** in Main integriert. Die neun historischen
+  `runtime_proof_bundle`-Verifier und ihre produktiven Primärbeweise
+  werden dagegen erst durch den **noch offenen** #2352 abgesichert.
+  Diese Implementierung ist weder unabhängige Freigabe noch produktive
+  Verifier-Aktivierung.
 - [Bureau #2352](https://github.com/heimgewebe/bureau/pull/2352)
-  war beim getrennten GitHub-Readback weiterhin **OPEN** auf
-  `2dbf0713d722fe71f8b7e7ee4e8c6f8c61448c37`; mehrere materielle
-  High-Critical-Befunde sind nicht abschließend unabhängig freigegeben.
-  Die elf normativen T044-Kriterien und deren authentische Runtime-Beweise
-  bleiben daher weiterhin gesondert verpflichtend.
+  war beim erneuten GitHub-Readback am 13.10.2026 nach **20:13 UTC**
+  weiterhin **OPEN**, nun auf veröffentlichtem Head
+  `1f76d0f36847f46c0556728e428e171ee1aeeb09`.
+  Die zuvor hier beobachteten Heads `6c9d28ff`, `2dbf0713` und
+  `a3111fc3` sind **ältere Revisionen desselben offenen PRs**.
+  Auf `1f76d0f3` wurde ein Guard für weiterhin vorhandene exklusive
+  Blue-/Green-Reservierungen beim terminalen Closeout ergänzt; das
+  beseitigt **nicht** automatisch die übrigen offenen P1/P2-Befunde
+  (insbesondere StateStore-TaskSpec, koordinierte Claim-Ressourcen,
+  Primärreader und Zielidentitätsbindung). Für diesen neuen Head
+  sind aktuelle unabhängige R3-PASS-Reviews, vollständige CI und
+  Captain-Freigabe weiterhin gesondert erforderlich.
 
 **Unveränderte Wirkungssperre:** B1–B6 und R6–R9 bleiben BLOCKED.
 Insbesondere ist kein neues produktives Green, keine Writer-Übertragung,
@@ -172,7 +203,7 @@ reconciliiert sein; weder Suchkontinuität noch deklarative
 Staging-Runtime-Wahrheit dürfen still wegfallen. Bis dahin gelten die
 bisherigen strengeren R9-Schranken unverändert und R6 bleibt BLOCKED.
 
-### PR- und Verifier-Nachtrag — 13. Oktober 2026 (kein Produktionsreadback)
+### Historischer PR- und Verifier-Nachtrag — 13. Oktober 2026
 
 Diese erneute Prüfung betrifft **nur GitHub-Revisionen, Review- und
 Abnahmeverträge**. Die Blue-/kind-/T085-Messwerte oberhalb wurden am
@@ -218,7 +249,7 @@ Kubernetes-Cutover wurde hierdurch ausgeführt.
   Readback-/Abnahmebeschreibung. Bureau-Vertrag, produktives Green und
   B1–B6 sind damit **nicht** freigegeben.
 
-### Späterer Vertrags-Readback — 13. Oktober 2026 (GitHub-Stand nach 10:01 UTC; ohne Runtimewirkung)
+### Historischer Vertrags-Readback — 13. Oktober 2026 (vor #1959-Merge)
 
 Dieser **neuere, ausschließlich GitHub-/TaskSpec-bezogene Readback**
 ersetzt die PR-/Registry-Statusbehauptungen des unmittelbar vorangehenden
@@ -278,9 +309,17 @@ strukturell gültige Registry noch ein lokales Referenz-Kubernetes oder
 ein früheres Review-PASS autorisiert R6, R7, R8, R9 oder einen
 Produktionscutover.
 
-Die Priorität bleibt: Sicherheits- und Verifierverträge final
-revisionsgebunden integrieren, danach den realen Zielcluster und B1–B6
-tatsächlich prüfen. Ohne alle Wirkungsevidenzen bleibt **R6 gesperrt**.
+Die verbindliche Abfolge lautet: **zuerst** die autoritativen
+Verifier-/Reader-/Claim-/Closeout-Sicherheitsverträge in Bureau
+revisionsgebunden integrieren und unabhängig freigeben; **danach**
+das isolierte, revisionsgebundene **B5-Staging-/Zieltestbed** mit
+negativen Isolationstests, Last-, Recovery- und Suchkontinuitätsbelegen
+abnehmen; **erst nach dessen Abnahme** die reale Produktions-Green-
+Zielidentität samt Kapazitäts- und Paritätsnachweis festlegen und alle
+weiteren B1–B6-Gates gegen die tatsächlich beabsichtigte Zielruntime
+prüfen. Read-only-Staging-Inventur darf als Vorarbeit stattfinden,
+ersetzt aber keine Verifier-Integration oder B5-Abnahme.
+Ohne alle Wirkungsevidenzen bleibt **R6 gesperrt**.
 
 **Disposition:** R5 ist **nicht bestanden**. R6–R9 bleiben gesperrt.
 Die B1–B6-Tabelle wertet nur die konkrete Zielrevision, nicht historische
@@ -288,8 +327,9 @@ Teilbeweise.
 Blue bleibt bis zu einem gesondert beweisgebundenen Fencing-/Cutover-Gate der
 bestehende produktive Pfad. Aus der lokalen kind-Referenz, einem historischen
 Proof-Receipt oder dem öffentlichen Commitgleichstand folgt **keine**
-Produktionsmutationsfreigabe. Die nächste Abnahmesequenz ist ausschließlich
-die in §12 festgehaltene Reihenfolge: **zuerst B5** mit getrenntem,
+Produktionsmutationsfreigabe. Die nächste **Staging-Abnahmesequenz nach
+integrierten Sicherheits- und Verifierverträgen** folgt ausschließlich
+§12: **zuerst B5** mit getrenntem,
 zeitlich begrenztem und revisionsgebundenem T044-Staging-/Zieltestbed
 einschließlich Last-, Recovery- und Suchbelegen; **erst nach dessen Abnahme**
 folgen die konkrete Produktions-Green-Zielidentität, Kapazitätsprüfung
