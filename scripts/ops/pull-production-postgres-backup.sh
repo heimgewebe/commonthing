@@ -30,17 +30,19 @@ esac
 ssh_args=(-o BatchMode=yes -o ConnectTimeout=15)
 # Only the age-encrypted off-host artefact (*.sql.gz.age) is ever selected or
 # transferred. The host-local plaintext dump never crosses the SSH link.
+# Candidates come from the off-host manifest, which postgres-backup.sh publishes
+# last: an interrupted run leaves ciphertext without it and is never selected.
 # Values below are validated locally; expansion on the client is intentional.
 # shellcheck disable=SC2029
-latest="$(ssh "${ssh_args[@]}" "$REMOTE_HOST" \
-  "sudo -n find '$REMOTE_BACKUP_DIR' -maxdepth 1 -type f -name '${BACKUP_PREFIX}-*.sql.gz.age' -printf '%f\\n' | sort | tail -n1")"
-case "$latest" in
-  "${BACKUP_PREFIX}-"*.sql.gz.age) ;;
-  *) fail "remote host returned no encrypted (*.sql.gz.age) backup filename" ;;
+age_manifest="$(ssh "${ssh_args[@]}" "$REMOTE_HOST" \
+  "sudo -n find '$REMOTE_BACKUP_DIR' -maxdepth 1 -type f -name '${BACKUP_PREFIX}-*.age.sha256.manifest' -printf '%f\\n' | sort | tail -n1")"
+case "$age_manifest" in
+  "${BACKUP_PREFIX}-"*.age.sha256.manifest) ;;
+  *) fail "remote host returned no complete encrypted backup set (*.age.sha256.manifest)" ;;
 esac
-[[ "$latest" =~ ^[A-Za-z0-9._-]+$ && "$latest" != *'..'* ]] || fail "unsafe remote backup filename"
-base="${latest%.sql.gz.age}"
-age_manifest="${base}.age.sha256.manifest"
+[[ "$age_manifest" =~ ^[A-Za-z0-9._-]+$ && "$age_manifest" != *'..'* ]] || fail "unsafe remote backup filename"
+base="${age_manifest%.age.sha256.manifest}"
+latest="${base}.sql.gz.age"
 manifest="${base}.sha256.manifest"
 proof="${base}.restore-proof"
 

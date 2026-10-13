@@ -67,6 +67,9 @@ age_bytes="$(wc -c < "$remote/$file" | tr -d '[:space:]')"
 write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
 # A newer host-local plaintext dump without ciphertext must never be selected.
 printf 'newer plaintext\n' | gzip -c > "$remote/weltgewebe-postgres-20260713T040000Z.sql.gz"
+# A newer ciphertext whose off-host manifest (the completion marker, published
+# last) is missing is an interrupted run and must not be selected either.
+printf 'age-encryption.org/v1\ninterrupted\n' > "$remote/weltgewebe-postgres-20260713T040000Z.sql.gz.age"
 cat > "$remote/proofs/$base.restore-proof" << PROOF
 contract=weltgewebe-postgres-restore-proof-v1
 result=ok
@@ -175,8 +178,8 @@ expect_pull_failure "$root/bad-plain" 'manifests disagree'
 write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
 
 # A host without an encrypted artefact (e.g. no recipient configured) fails closed.
-rm -f "$remote/$file"
-expect_pull_failure "$root/no-age" 'no encrypted (*.sql.gz.age) backup filename'
+rm -f "$remote/$file" "$remote/$age_manifest"
+expect_pull_failure "$root/no-age" 'no complete encrypted backup set'
 # The user service is generated from a clean commit placeholder and must avoid
 # ProtectKernelModules, which is unsupported by the real user manager on heim-pc.
 grep -q '@WELTGEWEBE_COMMIT@' "$SERVICE_TEMPLATE"

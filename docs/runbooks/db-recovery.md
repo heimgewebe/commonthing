@@ -210,9 +210,13 @@ Ziel:
 ~/merges/weltgewebe-production-backups
 ```
 
-Der Pull läuft fail-closed. Er wählt ausschließlich `*.sql.gz.age`-Dateien
-aus und fordert den Klartext-Dump nie über SSH an; findet er kein Chiffrat
-(z. B. weil auf dem Host kein Empfänger konfiguriert ist), bricht er ab. Er
+Der Pull läuft fail-closed. Er wählt den neuesten vollständigen Satz über das
+Off-Host-Manifest (`*.age.sha256.manifest`), das `postgres-backup.sh` als
+letzte Datei veröffentlicht; ein abgebrochener Lauf mit Chiffrat ohne dieses
+Manifest wird übergangen. Übertragen wird nur das zugehörige
+`*.sql.gz.age`, der Klartext-Dump wird nie über SSH angefordert. Findet er
+keinen vollständigen Satz (z. B. weil auf dem Host kein Empfänger
+konfiguriert ist), bricht er ab. Er
 prüft Dateinamen, Vertrag, SHA256 und Größe des Chiffrats gegen das
 Off-Host-Manifest, verlangt den age-Header `age-encryption.org/v1` und prüft,
 dass beide Manifeste denselben Klartext-SHA256 nennen. `age` und der private
