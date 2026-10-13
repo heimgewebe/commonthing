@@ -186,6 +186,57 @@ Kubernetes-Cutover wurde hierdurch ausgeführt.
   Readback-/Abnahmebeschreibung. Bureau-Vertrag, produktives Green und
   B1–B6 sind damit **nicht** freigegeben.
 
+### Späterer Vertrags-Readback — 13. Oktober 2026 (ohne Runtimewirkung)
+
+Dieser **neuere, ausschließlich GitHub-/TaskSpec-bezogene Readback**
+ersetzt die PR-/Registry-Statusbehauptungen des unmittelbar vorangehenden
+Abschnitts, **nicht** jedoch die am 12. Oktober erhobenen Blue-/kind-/T085-
+Messwerte. Insbesondere war `#2350 OPEN` beim früheren Readback korrekt,
+ist aber inzwischen überholt. Es erfolgte **kein neuer produktiver
+Kubernetes-, DNS-, Daten-, Writer- oder Traffic-Readback** und keine
+Freigabe einer produktiven Green-Zelle.
+
+- [Bureau PR #2350](https://github.com/heimgewebe/bureau/pull/2350)
+  wurde am **13.10.2026, 04:24 UTC** über den vorgesehenen Mergepfad
+  integriert (Merge-Commit
+  `0c5a3d4b50e63d970a5ec61c3b4042941fdb0a86`). Damit ist die
+  **normative Erweiterung auf elf T044-Kriterien** in Bureau-`main`
+  vorhanden. Die zwei neuen Kriterien gelten weiterhin als
+  `manual_observation` mit getrennten Scopes; das ist kein bestandener
+  Staging- oder Suchkontinuitätstest.
+- Die neun älteren Kriterien blieben durch diesen Merge unverändert und
+  ursprünglich **nicht ausführbar**. Der disjunkte Reparatur-PR
+  [Bureau #2352](https://github.com/heimgewebe/bureau/pull/2352)
+  steht als **OPEN** auf veröffentlichtem Head
+  `12d9f87f4f8d45a72136c8e51c07ffd7b65c4fbe`. Dort wurden
+  spezifische `runtime_proof_bundle`-Prüfverträge vorgeschlagen.
+  Neue Codex-P1-Einwände verlangen zusätzlich, das vorgesehene Green-Ziel
+  und dessen Software-Revision *außerhalb des Produzentenbelegs* fest
+  zu binden und die tatsächlichen Receipts durch eine unabhängige
+  Laufzeit-Quelle zu authentifizieren. Lokale Folgekorrekturen und
+  lokale Tests sind **keine** veröffentlichte, freigegebene oder
+  produktiv installierte Bureau-Revision. Die Registry bleibt ohne
+  neue echte Laufzeitbelege **ohne T044-Verifikationsstempel**.
+- Der Parser-/Dependency-Sicherheitsfix
+  [Commonthing #1959](https://github.com/heimgewebe/commonthing/pull/1959)
+  ist weiterhin **OPEN**. Neuerliche Test-, Reviewer- und
+  Codex-Ergebnisse müssen jeweils exakt an den **aktuell
+  veröffentlichten** GitHub-Head gebunden werden; ältere PASS-Berichte
+  berechtigen nicht zum Merge. Die vorangehend genannte ältere
+  `e92d5c3`-Revision ist nicht mehr der veröffentlichte PR-Head.
+- Der Dokumentations-PR
+  [#1957](https://github.com/heimgewebe/commonthing/pull/1957)
+  darf erst nach realer Sicherheitskonvergenz sowie für seine eigene
+  finale Revision gültiger CI und unabhängigem R3-Review durch Captain
+  integriert werden. Ein Dokumentationsmerge verändert kein B1–B6-Gate.
+
+**Unveränderte Stopentscheidung:** B1–B6 sind weiterhin **BLOCKED**.
+Ein auf die konkrete spätere Green-Zielidentität und Produktiv-Revision
+gebundener, primär authentifizierter Abnahmebeleg fehlt. Weder eine
+strukturell gültige Registry noch ein lokales Referenz-Kubernetes oder
+ein früheres Review-PASS autorisiert R6, R7, R8, R9 oder einen
+Produktionscutover.
+
 Die Priorität bleibt: Sicherheits- und Verifierverträge final
 revisionsgebunden integrieren, danach den realen Zielcluster und B1–B6
 tatsächlich prüfen. Ohne alle Wirkungsevidenzen bleibt **R6 gesperrt**.
