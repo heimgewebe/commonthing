@@ -425,6 +425,122 @@ pub struct AppConfig {
     pub auth_log_magic_token: bool,
 }
 
+// Noyalib's Value stringifies mapping keys, erasing the type of raw keys.
+// Inspect the original lossless syntax tree before deserializing AppConfig.
+fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
+    use noyalib::cst::{GreenChild, GreenNode, SyntaxKind};
+
+    let config = noyalib::ParserConfig::serde_yaml_compat();
+    let document = noyalib::cst::parse_document_with_config(raw, &config)
+        .context("failed to inspect YAML configuration mapping keys")?;
+
+    fn inspect_key(
+        kind: SyntaxKind,
+        spelling: &str,
+        explicitly_string: bool,
+        config: &noyalib::ParserConfig,
+    ) -> Result<()> {
+        match kind {
+            SyntaxKind::SingleQuotedScalar | SyntaxKind::DoubleQuotedScalar => Ok(()),
+            SyntaxKind::PlainScalar if explicitly_string => Ok(()),
+            SyntaxKind::PlainScalar => {
+                // Keep serde_yaml scalar semantics: 0123 is text,
+                // but 0b11, 1, true and null are typed as non-strings.
+                let scalar: noyalib::Value = noyalib::from_str_with_config(spelling, config)
+                    .context("failed to resolve original YAML mapping key")?;
+                anyhow::ensure!(
+                    matches!(scalar, noyalib::Value::String(_)),
+                    "YAML configuration mapping keys must be strings, got unquoted {spelling:?}"
+                );
+                Ok(())
+            }
+            SyntaxKind::AliasMark => anyhow::bail!(
+                "YAML configuration mapping key aliases cannot be verified as strings"
+            ),
+            _ => anyhow::bail!("unsupported YAML configuration mapping key form"),
+        }
+    }
+
+    fn verify_tree(
+        node: &GreenNode,
+        source: &str,
+        base: usize,
+        config: &noyalib::ParserConfig,
+    ) -> Result<()> {
+        let mut offset = base;
+        let mut block_key = node.kind() == SyntaxKind::MappingEntry;
+        let mut flow_key = node.kind() == SyntaxKind::FlowMapping;
+        let mut seen_flow_key = false;
+        let mut explicitly_string = false;
+
+        for child in node.children() {
+            match child {
+                GreenChild::Token { kind, len } => {
+                    let spelling = &source[offset..offset + *len as usize];
+                    if node.kind() == SyntaxKind::MappingEntry {
+                        if *kind == SyntaxKind::ColonIndicator {
+                            block_key = false;
+                        } else if block_key {
+                            match *kind {
+                                SyntaxKind::TagMark => {
+                                    anyhow::ensure!(
+                                        matches!(spelling, "!!str" | "!<tag:yaml.org,2002:str>"),
+                                        "YAML configuration mapping key has a non-string tag"
+                                    );
+                                    explicitly_string = true;
+                                }
+                                SyntaxKind::PlainScalar
+                                | SyntaxKind::SingleQuotedScalar
+                                | SyntaxKind::DoubleQuotedScalar
+                                | SyntaxKind::AliasMark => {
+                                    inspect_key(*kind, spelling, explicitly_string, config)?;
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else if node.kind() == SyntaxKind::FlowMapping {
+                        match *kind {
+                            SyntaxKind::Comma => {
+                                flow_key = true;
+                                seen_flow_key = false;
+                                explicitly_string = false;
+                            }
+                            SyntaxKind::ColonIndicator => flow_key = false,
+                            SyntaxKind::TagMark if flow_key => {
+                                anyhow::ensure!(
+                                    matches!(spelling, "!!str" | "!<tag:yaml.org,2002:str>"),
+                                    "YAML configuration mapping key has a non-string tag"
+                                );
+                                explicitly_string = true;
+                            }
+                            SyntaxKind::PlainScalar
+                            | SyntaxKind::SingleQuotedScalar
+                            | SyntaxKind::DoubleQuotedScalar
+                            | SyntaxKind::AliasMark
+                                if flow_key && !seen_flow_key =>
+                            {
+                                inspect_key(*kind, spelling, explicitly_string, config)?;
+                                seen_flow_key = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                GreenChild::Node(child_node) => {
+                    if block_key || (flow_key && !seen_flow_key) {
+                        anyhow::bail!("YAML configuration mapping key is not a string scalar");
+                    }
+                    verify_tree(child_node, source, offset, config)?;
+                }
+            }
+            offset += child.text_len();
+        }
+        Ok(())
+    }
+
+    verify_tree(document.syntax(), raw, 0, &config)
+}
+
 impl AppConfig {
     const DEFAULT_CONFIG: &'static str = include_str!("../../../configs/app.defaults.yml");
 
@@ -508,17 +624,9 @@ impl AppConfig {
             serde_yaml::from_str(raw).context("failed to parse YAML configuration")?;
         Self::reject_yaml_merge_keys(&value)?;
         Self::reject_yaml_float_values(&value)?;
-        // The serde_yaml compatibility Value uses String mapping keys and
-        // would silently convert a numeric YAML key (e.g. 1: ignored) to
-        // "1". Inspect the original key types before accepting this config.
-        let raw_keys: noyalib::MappingAny =
-            noyalib::from_str(raw).context("failed to inspect YAML configuration mapping keys")?;
-        anyhow::ensure!(
-            raw_keys
-                .keys()
-                .all(|key| matches!(key, noyalib::Value::String(_))),
-            "YAML configuration mapping keys must be strings"
-        );
+        // Preserve the compatibility resolver while rejecting numeric keys
+        // even inside nested mappings and aliases.
+        check_yaml_mapping_keys(raw)?;
         // The old deserializer accepted only scalar enum variants. Noyalib's
         // compatibility deserializer also accepts a YAML mapping for unit enums.
         if let Some(mapping) = Self::inspection_root_mapping(&value) {
@@ -1132,6 +1240,21 @@ max_guest_owned_nodes: 1000
         .expect("existing YAML anchors and tolerated unknown fields remain compatible");
         assert_eq!(config.max_guest_owned_nodes, 21);
         assert!(!config.auth_cookie_secure);
+        let legacy_numeric_text = super::AppConfig::parse_yaml(
+            "0123: tolerated_legacy_field\nmax_guest_owned_nodes: 21\n",
+        )
+        .expect("leading-zero legacy text key remains a tolerated unknown field");
+        assert_eq!(legacy_numeric_text.max_guest_owned_nodes, 21);
+        let nested_string_key = super::AppConfig::parse_yaml(
+            "node_mutation_rate_limits: {replace_per_minute: 11, '1': ignored}\n",
+        )
+        .expect("quoted numeric unknown nested key remains a string");
+        assert_eq!(
+            nested_string_key
+                .node_mutation_rate_limits
+                .replace_per_minute,
+            11
+        );
     }
 
     #[test]
@@ -1168,6 +1291,22 @@ max_guest_owned_nodes: 1000
                 "domain_read_source: {jsonl: null}\n",
             ),
             ("non-string mapping key", "1: ignored\n"),
+            ("YAML 1.1 binary mapping key", "0b11: ignored\n"),
+            ("non-string null key", "null: ignored\n"),
+            ("non-string boolean key", "true: ignored\n"),
+            (
+                "non-string nested block key",
+                "unknown: {inside: {1: ignored}}\n",
+            ),
+            (
+                "non-string nested unknown block mapping",
+                "unknown:\n  1: ignored\n",
+            ),
+            ("explicit integer tag mapping key", "!!int '1': ignored\n"),
+            (
+                "non-string nested mutation rate mapping key",
+                "node_mutation_rate_limits: {1: 999}\n",
+            ),
             (
                 "tagged root with removed option",
                 "!custom {fade_days: 7}\n",
