@@ -208,6 +208,15 @@ printf 'ssh-ed25519 AAAAC3Nza fixture\n' > "$TEMP_DIR/foreign-recipients.txt"
 expect_backup_failure foreign "$TEMP_DIR/foreign-recipients.txt" 'unsupported entry'
 printf '%s\nAGE-SECRET-KEY-1FIXTURE\n' "$AGE_RECIPIENT" > "$TEMP_DIR/secret-recipients.txt"
 expect_backup_failure secret "$TEMP_DIR/secret-recipients.txt" 'contains a private age identity'
+if ((REAL_AGE)); then
+  # A one-character typo keeps the age1 shape but breaks the Bech32 checksum;
+  # it must fail before pg_dump, not after a full plaintext dump.
+  last="${AGE_RECIPIENT: -1}"
+  typo="q"
+  [[ "$last" != q ]] || typo="p"
+  printf '%s%s\n' "${AGE_RECIPIENT%?}" "$typo" > "$TEMP_DIR/typo-recipients.txt"
+  expect_backup_failure typo "$TEMP_DIR/typo-recipients.txt" 'age rejected a recipient'
+fi
 
 BACKUP_FILE="$backup_file" \
   BACKUP_MANIFEST="$manifest_file" \
