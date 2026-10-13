@@ -1144,6 +1144,14 @@ max_guest_owned_nodes: 1000
             ("wrong scalar type", "max_guest_owned_nodes: [10, 20]\n"),
             ("wrong nested type", "node_mutation_rate_limits: [1, 2]\n"),
             (
+                "tagged nested mutation rate float",
+                "node_mutation_rate_limits: !custom {replace_per_minute: 1.5}\n",
+            ),
+            (
+                "tagged nested mutation rate huge float",
+                "node_mutation_rate_limits: !custom {delete_per_hour: 18446744073709551616.0}\n",
+            ),
+            (
                 "multiple YAML documents",
                 "max_guest_owned_nodes: 1\n---\nmax_guest_owned_nodes: 20\n",
             ),
