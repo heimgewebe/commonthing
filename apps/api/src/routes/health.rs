@@ -238,9 +238,33 @@ async fn load_policy_file(path: &Path) -> Result<PolicyLimits, String> {
             error
         )
     })?;
-    let policy: PolicyLimits = serde_yaml::from_str(raw).map_err(|error| {
+    // Decode to a Value first: the compatibility parser's direct typed path
+    // can discard an invalid first value when a later duplicate key overwrites
+    // it. Value decoding rejects such duplicate keys before type coercion.
+    let value: serde_yaml::Value = serde_yaml::from_str(raw).map_err(|error| {
         format!(
             "failed to parse policy file at {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| format!("policy file at {} must be a YAML mapping", path.display()))?;
+    for required_limit in ["max_nodes_jsonl_mb", "max_edges_jsonl_mb"] {
+        match mapping.get(required_limit) {
+            Some(serde_yaml::Value::Number(number)) if number.as_u64().is_some() => {}
+            _ => {
+                return Err(format!(
+                    "policy file at {}: {required_limit} must be an unsigned YAML integer",
+                    path.display()
+                ))
+            }
+        }
+    }
+    let policy: PolicyLimits = serde_yaml::from_value(value).map_err(|error| {
+        format!(
+            "failed to decode policy file at {}: {}",
             path.display(),
             error
         )
@@ -1199,6 +1223,69 @@ mod tests {
         file.write_all(content.as_bytes())?;
         file.flush()?;
         Ok(file)
+    }
+
+    #[tokio::test]
+    async fn policy_yaml_security_regressions() -> Result<()> {
+        let anchored = policy_file("max_nodes_jsonl_mb: &cap 10\nmax_edges_jsonl_mb: *cap\n")?;
+        let limits = load_policy_file(anchored.path())
+            .await
+            .expect("YAML aliases used by valid policies stay compatible");
+        assert_eq!(limits.max_nodes_jsonl_mb, 10);
+        assert_eq!(limits.max_edges_jsonl_mb, 10);
+
+        let tagged = policy_file("max_nodes_jsonl_mb: !!int 10\nmax_edges_jsonl_mb: 10\n")?;
+        let tagged_limits = load_policy_file(tagged.path())
+            .await
+            .expect("the standard !!int YAML tag is an unsigned integer");
+        assert_eq!(tagged_limits.max_nodes_jsonl_mb, 10);
+
+        let invalid_fixtures = [
+            (
+                "duplicate policy limit",
+                "max_nodes_jsonl_mb: 10\nmax_nodes_jsonl_mb: 99\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "invalid first value shadowed by duplicate",
+                "max_nodes_jsonl_mb: -1\nmax_nodes_jsonl_mb: 99\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "floating point rounding accepted as integer",
+                "max_nodes_jsonl_mb: 10.0000000000000001\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "integral-looking YAML float must not become integer",
+                "max_nodes_jsonl_mb: 10.0\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "wrong policy type",
+                "max_nodes_jsonl_mb: [10]\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "negative policy limit",
+                "max_nodes_jsonl_mb: -1\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "unknown policy property",
+                "max_nodes_jsonl_mb: 10\nmax_edges_jsonl_mb: 10\ninvalid: true\n",
+            ),
+            (
+                "unsupported custom YAML tag",
+                "max_nodes_jsonl_mb: !custom 10\nmax_edges_jsonl_mb: 10\n",
+            ),
+            (
+                "multiple policy documents",
+                "max_nodes_jsonl_mb: 10\nmax_edges_jsonl_mb: 10\n---\nmax_nodes_jsonl_mb: 20\nmax_edges_jsonl_mb: 20\n",
+            ),
+        ];
+        for (case, yaml) in invalid_fixtures {
+            let file = policy_file(yaml)?;
+            assert!(
+                load_policy_file(file.path()).await.is_err(),
+                "policy accepted {case}: {yaml}"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
