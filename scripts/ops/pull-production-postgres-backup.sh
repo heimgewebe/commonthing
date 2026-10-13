@@ -21,6 +21,11 @@ BACKUP_PREFIX="${BACKUP_PREFIX:-weltgewebe-postgres}"
 DEST_DIR="${DEST_DIR:-${HOME:?HOME must be set}/merges/weltgewebe-production-backups}"
 LOCAL_RETENTION_DAYS="${LOCAL_RETENTION_DAYS:-30}"
 case "$LOCAL_RETENTION_DAYS" in '' | *[!0-9]*) fail "LOCAL_RETENTION_DAYS must be a non-negative integer" ;; esac
+# BACKUP_PREFIX enters a remotely evaluated SSH shell command. Treat it as
+# untrusted, like REMOTE_HOST and REMOTE_BACKUP_DIR, before making any SSH call.
+case "$BACKUP_PREFIX" in
+  '' | *..* | *[!A-Za-z0-9._-]*) fail "BACKUP_PREFIX contains unsupported characters" ;;
+esac
 case "$REMOTE_HOST" in '' | *[!A-Za-z0-9._-]*) fail "REMOTE_HOST contains unsupported characters" ;; esac
 [[ "$REMOTE_BACKUP_DIR" == /var/backups/weltgewebe/* || "${ALLOW_TEST_REMOTE_BACKUP_DIR:-0}" == 1 ]] || fail "REMOTE_BACKUP_DIR must remain below /var/backups/weltgewebe"
 case "$REMOTE_BACKUP_DIR" in

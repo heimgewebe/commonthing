@@ -107,6 +107,10 @@ check_connection_config
 
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-weltgewebe-postgres}"
+# A path component used for all create-only backup artefacts must be canonical.
+case "$BACKUP_PREFIX" in
+  '' | *..* | *[!A-Za-z0-9._-]*) fail "BACKUP_PREFIX contains unsupported characters" ;;
+esac
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
 export PGCONNECT_TIMEOUT
