@@ -2477,5 +2477,116 @@ class WatchTests(unittest.TestCase):
             self.assertNotIn("stale_frontend", [i["code"] for i in next_poll["issues"]])
 
 
+
+    def test_main_watch_deadline_keeps_independent_product_p1(self):
+        import json
+        import signal
+        from unittest.mock import patch
+
+        for mode, frontend, api, expected in (
+            ("diverged", OLD, MAIN, "frontend_api_diverge"),
+            ("invalid_api", MAIN, "bad-sha", "invalid_commit_api"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                attempted = []
+                source = self.fixtures(frontend=frontend, api=api)
+                original_evaluate = watch.evaluate
+
+                def deadline_on_main(name):
+                    attempted.append(name)
+                    if name == "main":
+                        raise watch.WatchRuntimeExceeded(
+                            "simulated total deadline on GitHub main"
+                        )
+                    return source(name)
+
+                def evaluate_fixture(
+                    now, *, previous_main_observation=None, issue_sink=None
+                ):
+                    return original_evaluate(
+                        now, deadline_on_main,
+                        previous_main_observation=previous_main_observation,
+                        issue_sink=issue_sink,
+                    )
+
+                with patch.object(
+                    watch, "evaluate", side_effect=evaluate_fixture
+                ):
+                    report = watch._evaluate_cycle(directory)
+                self.assertEqual(attempted, ["frontend", "api", "main"])
+                self.assertEqual(report["status"], "ALARM")
+                codes = [issue["code"] for issue in report["issues"]]
+                self.assertIn(expected, codes)
+                self.assertIn("watcher_execution_failed", codes)
+                with patch.object(signal, "alarm", return_value=0):
+                    self.assertEqual(watch._persist_cycle(report, directory), 2)
+                state = json.loads((directory / "state.json").read_text())
+                self.assertIn(expected, [entry[0] for entry in state["severe"]])
+                heartbeat = json.loads((directory / "heartbeat.json").read_text())
+                self.assertEqual(heartbeat["status"], "ALARM")
+
+    def test_invalid_utf8_heartbeat_cannot_hide_new_confirmed_p1(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.assertIsNone(watch.record(watch.evaluate(
+                NOW, self.fixtures()
+            ), directory))
+            (directory / "heartbeat.json").write_bytes(b"\xff")
+            confirmed = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(cache="max-age=3600"),
+            )
+            self.assertEqual(watch.record(confirmed, directory), "ALARM")
+            state = json.loads((directory / "state.json").read_text())
+            self.assertIn("frontend_cache", [item[0] for item in state["severe"]])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("frontend_cache", [i["code"] for i in heartbeat["issues"]])
+
+    def test_invalid_utf8_state_keeps_live_observation_and_original_bytes(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.assertIsNone(watch.record(watch.evaluate(
+                NOW, self.fixtures()
+            ), directory))
+            (directory / "state.json").write_bytes(b"\xff\xfe")
+            source = self.fixtures(cache="max-age=3600")
+            attempted = []
+            original_evaluate = watch.evaluate
+
+            def observe_product(name):
+                attempted.append(name)
+                return source(name)
+
+            def evaluate_fixture(
+                now, *, previous_main_observation=None, issue_sink=None
+            ):
+                return original_evaluate(
+                    now, observe_product,
+                    previous_main_observation=previous_main_observation,
+                    issue_sink=issue_sink,
+                )
+
+            with patch.object(watch, "evaluate", side_effect=evaluate_fixture):
+                report = watch._evaluate_cycle(directory)
+            self.assertIn("frontend", attempted)
+            self.assertEqual(report["status"], "ALARM")
+            self.assertIn("frontend_cache", [i["code"] for i in report["issues"]])
+            self.assertIn("unverifiable_state", [i["code"] for i in report["issues"]])
+            self.assertEqual(
+                watch.record(report, directory), "MONITOR_DATA_FAILURE"
+            )
+            self.assertEqual((directory / "state.json").read_bytes(), b"\xff\xfe")
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("frontend_cache", [i["code"] for i in heartbeat["issues"]])
+
+
 if __name__ == "__main__":
     unittest.main()

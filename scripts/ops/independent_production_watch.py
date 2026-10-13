@@ -167,27 +167,35 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None, issue_sink=No
                     flag("frontend_cache", "frontend", headers[name][:120],
                          "Cache-Control: no-store", "frontend")
 
-    # Resolve and classify production data before optional schedule reads.
-    # A later global deadline must not discard already-confirmed P1s.
-    for name in ("frontend", "api", "main"):
+    # Frontend/API independently prove product failures: classify them
+    # BEFORE the optional GitHub main read can consume the global SIGALRM.
+    # A deadline on main must not erase an already-confirmed production split
+    # or invalid product SHA. Main-dependent staleness is evaluated below.
+    for name in ("frontend", "api"):
         observe(name)
 
     commits = {}
-    for name in ("frontend", "api", "main"):
+    for name in ("frontend", "api"):
         if name in data:
-            field = "sha" if name == "main" else "commit"
-            value = data[name].get(field)
+            value = data[name].get("commit")
             if not isinstance(value, str) or not SHA.fullmatch(value):
                 flag("invalid_commit_" + name, name, str(value)[:100],
-                     "40-character hexadecimal commit", name,
-                     "P2" if name == "main" else "P1")
+                     "40-character hexadecimal commit", name)
             else:
                 commits[name] = value
-
     if "frontend" in commits and "api" in commits and commits["frontend"] != commits["api"]:
         flag("frontend_api_diverge", "production commits",
              {"frontend": commits["frontend"], "api": commits["api"]},
              "frontend == API", "frontend")
+
+    observe("main")
+    if "main" in data:
+        value = data["main"].get("sha")
+        if not isinstance(value, str) or not SHA.fullmatch(value):
+            flag("invalid_commit_main", "main", str(value)[:100],
+                 "40-character hexadecimal commit", "main", "P2")
+        else:
+            commits["main"] = value
 
     # Git commit timestamps are not GitHub branch-ref update timestamps.
     # Persist the first observed main ref instead of falsely ageing a fresh
