@@ -62,6 +62,25 @@ Neuer umgebungsspezifischer Lifecycle-Code benötigt eine reale Zielumgebung und
 
 Die nächste Architekturentscheidung über reale Kubernetes-Betriebsmechanismen fällt durch **Experiment B**: ein zeitlich begrenztes reales Kubernetes-Zieltestbed, möglichst ohne **staging_cell.py**, das vorhandene Kustomize-/Flux- und portable Proofteile wiederverwendet. Ziel ist festzustellen, welche Invarianten auf einer echten Zielplattform tatsächlich nötig sind; unnötige kind-/Host-spezifische Mechanismen werden danach abgebaut.
 
+**Nachtrag vom 13.10.2026 — historischer Experiment-B-Stand:** Die oben als
+„nächste Architekturentscheidung“ bezeichnete, temporäre Experiment-B-Probe
+wurde unter Bureau T085 auf dem älteren Commit
+`5d509feda6db24e294698cb42501fd41ec8e0fbe` terminal belegt und
+die damalige Testumgebung laut Retirement-Receipt anschließend abgebaut.
+Dies ist **kein** Nachweis, dass die danach vorgesehene Extraktion
+portabler Invarianten oder der Abbau kind-/Host-spezifischer Mechanismen
+erledigt wurde. Vor allem ersetzt T085 **nicht** die eigenständige neue,
+revisionsgebundene T044-B5-Staging-Abnahme gegen ein von Blue, der lokalen
+Referenz und der späteren produktiven Green-Zelle getrenntes Zieltestbed.
+Dafür fehlen weiterhin negative Blue-/Writer-Isolation sowie Last-, Backup-,
+Restore-, Recovery- und Suchkontinuitätsnachweise. Jede spätere produktive
+Green-Zielruntime muss erneut eigenständig gegen B1–B6 geprüft werden.
+Maßgebliche aktuelle Sperren und Beweisgrenzen:
+[T044 R5-Vorabnahme](../deploy/kubernetes-production-cutover-t044.md).
+Dies aktualisiert nur den Status der ehemaligen Experiment-B-Planung;
+die ursprüngliche Architekturentscheidung und die Produktionssperre
+bleiben unverändert.
+
 Eine permanente Staging-Umgebung ist damit ausdrücklich nicht beschlossen. Ihr Nutzen muss aus realen Produktionsrisiken folgen, etwa irreversiblen Datenmigrationen, mehreren Produktionsinstanzen, Multi-Host-HA, Fremdbetreibern oder föderierten Zellen, verbindlichen SLOs oder wiederkehrenden DNS-/TLS-/Load-Balancer-/Provider-Cutovern.
 
 ## Kanonische Plattformstruktur
