@@ -425,22 +425,479 @@ pub struct AppConfig {
     pub auth_log_magic_token: bool,
 }
 
+// Noyalib's Value stringifies mapping keys, erasing the type of raw keys.
+// Inspect the original lossless syntax tree before deserializing AppConfig.
+fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
+    use noyalib::cst::{GreenChild, GreenNode, SyntaxKind};
+    use std::collections::HashMap;
+
+    let config = noyalib::ParserConfig::serde_yaml_compat();
+    let document = noyalib::cst::parse_document_with_config(raw, &config)
+        .context("failed to inspect YAML configuration mapping keys")?;
+
+    // Noyalib's CST retains the spelling of !handle!suffix tags, not their
+    // expanded URI. Resolve only parser-validated %TAG directive tokens and
+    // compare the *expanded* tag, so an overridden !! handle cannot spoof
+    // the YAML string type.
+    let mut tag_handles = HashMap::from([
+        ("!".to_owned(), "!".to_owned()),
+        ("!!".to_owned(), "tag:yaml.org,2002:".to_owned()),
+    ]);
+    let mut declared_handles = std::collections::HashSet::new();
+    let mut directive_offset = 0;
+    for child in document.syntax().children() {
+        if let GreenChild::Token {
+            kind: SyntaxKind::Directive,
+            len,
+        } = child
+        {
+            let directive = &raw[directive_offset..directive_offset + *len as usize];
+            let mut parts = directive.split_ascii_whitespace();
+            if parts.next() == Some("%TAG") {
+                let (Some(handle), Some(prefix)) = (parts.next(), parts.next()) else {
+                    anyhow::bail!("invalid YAML %TAG directive");
+                };
+                // A YAML directive may end with a separated trailing comment.
+                // Never accept a third non-comment directive parameter.
+                anyhow::ensure!(
+                    parts.next().is_none_or(|extra| extra.starts_with('#')),
+                    "invalid YAML %TAG directive"
+                );
+                let valid_handle = handle == "!"
+                    || handle == "!!"
+                    || (handle.len() > 2
+                        && handle.starts_with('!')
+                        && handle.ends_with('!')
+                        && handle[1..handle.len() - 1]
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'-'));
+                anyhow::ensure!(valid_handle, "invalid YAML tag handle");
+                anyhow::ensure!(
+                    declared_handles.insert(handle.to_owned()),
+                    "duplicate YAML %TAG declaration"
+                );
+                tag_handles.insert(handle.to_owned(), prefix.to_owned());
+            }
+        }
+        directive_offset += child.text_len();
+    }
+
+    fn is_standard_string_tag_uri(uri: &str) -> bool {
+        // YAML tag URIs permit percent-escaped bytes. Decode for equality
+        // against exactly the core string URI, not as a generic trusted tag.
+        // In particular, %69nt must never be mistaken for %73tr.
+        const EXPECTED: &[u8] = b"tag:yaml.org,2002:str";
+        fn hex_digit(value: u8) -> Option<u8> {
+            match value {
+                b'0'..=b'9' => Some(value - b'0'),
+                b'a'..=b'f' => Some(value - b'a' + 10),
+                b'A'..=b'F' => Some(value - b'A' + 10),
+                _ => None,
+            }
+        }
+        let source = uri.as_bytes();
+        let mut index = 0;
+        for &expected in EXPECTED {
+            let actual = match source.get(index).copied() {
+                Some(b'%') => {
+                    let Some(high) = source.get(index + 1).copied().and_then(hex_digit) else {
+                        return false;
+                    };
+                    let Some(low) = source.get(index + 2).copied().and_then(hex_digit) else {
+                        return false;
+                    };
+                    index += 3;
+                    high * 16 + low
+                }
+                Some(value) => {
+                    index += 1;
+                    value
+                }
+                None => return false,
+            };
+            if actual != expected {
+                return false;
+            }
+        }
+        index == source.len()
+    }
+
+    fn tag_is_string(tag: &str, handles: &HashMap<String, String>) -> bool {
+        if tag == "!" {
+            return true; // Non-specific scalar tag.
+        }
+        if let Some(uri) = tag.strip_prefix("!<").and_then(|s| s.strip_suffix('>')) {
+            return is_standard_string_tag_uri(uri);
+        }
+        if !tag.starts_with('!') {
+            return false;
+        }
+        let handle_end = tag[1..].find('!').map_or(1, |i| i + 2);
+        let handle = &tag[..handle_end];
+        let suffix = &tag[handle_end..];
+        handles
+            .get(handle)
+            .is_some_and(|prefix| is_standard_string_tag_uri(&format!("{prefix}{suffix}")))
+    }
+
+    fn inspect_key(
+        kind: SyntaxKind,
+        spelling: &str,
+        explicitly_string: bool,
+        config: &noyalib::ParserConfig,
+        anchors: &HashMap<String, bool>,
+    ) -> Result<()> {
+        match kind {
+            SyntaxKind::SingleQuotedScalar
+            | SyntaxKind::DoubleQuotedScalar
+            | SyntaxKind::LiteralScalar
+            | SyntaxKind::FoldedScalar => Ok(()),
+            SyntaxKind::PlainScalar if explicitly_string => Ok(()),
+            SyntaxKind::PlainScalar => {
+                // Keep serde_yaml scalar semantics: 0123 is text,
+                // but 0b11, 1, true and null are typed as non-strings.
+                let scalar: noyalib::Value = noyalib::from_str_with_config(spelling, config)
+                    .context("failed to resolve original YAML mapping key")?;
+                anyhow::ensure!(
+                    matches!(scalar, noyalib::Value::String(_)),
+                    "YAML configuration mapping keys must be strings, got unquoted {spelling:?}"
+                );
+                Ok(())
+            }
+            SyntaxKind::AliasMark => {
+                anyhow::ensure!(
+                    anchors.get(spelling.trim_start_matches('*')) == Some(&true),
+                    "YAML mapping key alias does not reference a verified string scalar"
+                );
+                Ok(())
+            }
+            _ => anyhow::bail!("unsupported YAML configuration mapping key form"),
+        }
+    }
+
+    fn verify_tree(
+        node: &GreenNode,
+        source: &str,
+        base: usize,
+        config: &noyalib::ParserConfig,
+        tag_handles: &HashMap<String, String>,
+        anchors: &mut HashMap<String, bool>,
+    ) -> Result<()> {
+        let mut offset = base;
+        let mut block_key = node.kind() == SyntaxKind::MappingEntry;
+        let mut seen_block_key = false;
+        let mut flow_key = node.kind() == SyntaxKind::FlowMapping;
+        let mut seen_flow_key = false;
+        let mut seen_flow_question = false;
+        let mut explicitly_string = false;
+        let mut explicit_empty_string_tag = false;
+        // Anchors are observed in source order. Only scalar string targets can
+        // later be used as mapping keys; collections and typed values stay closed.
+        let mut pending_anchor: Option<String> = None;
+        let mut anchor_tag_is_string: Option<bool> = None;
+
+        for child in node.children() {
+            match child {
+                GreenChild::Token { kind, len } => {
+                    let spelling = &source[offset..offset + *len as usize];
+                    match *kind {
+                        SyntaxKind::TagMark => {
+                            anchor_tag_is_string = Some(tag_is_string(spelling, tag_handles));
+                        }
+                        SyntaxKind::AnchorMark => {
+                            if let Some(previous) =
+                                pending_anchor.replace(spelling.trim_start_matches('&').to_owned())
+                            {
+                                anchors.insert(previous, false);
+                            }
+                        }
+                        SyntaxKind::PlainScalar
+                        | SyntaxKind::SingleQuotedScalar
+                        | SyntaxKind::DoubleQuotedScalar
+                        | SyntaxKind::LiteralScalar
+                        | SyntaxKind::FoldedScalar => {
+                            if let Some(anchor) = pending_anchor.take() {
+                                let target_is_string = anchor_tag_is_string != Some(false)
+                                    && (anchor_tag_is_string == Some(true)
+                                        || inspect_key(*kind, spelling, false, config, anchors)
+                                            .is_ok());
+                                anchors.insert(anchor, target_is_string);
+                            }
+                            anchor_tag_is_string = None;
+                        }
+                        SyntaxKind::Whitespace | SyntaxKind::Newline | SyntaxKind::Comment => {}
+                        _ => {
+                            if let Some(anchor) = pending_anchor.take() {
+                                // A tagged empty scalar ends at a flow/map
+                                // delimiter, so the verified string anchor
+                                // must survive just as it does at node end.
+                                // Unknown tokens and collection nodes still
+                                // fail closed rather than blessing aliases.
+                                let ends_empty_scalar = matches!(
+                                    *kind,
+                                    SyntaxKind::Comma
+                                        | SyntaxKind::CloseBrace
+                                        | SyntaxKind::CloseBracket
+                                        | SyntaxKind::ColonIndicator
+                                );
+                                anchors.insert(
+                                    anchor,
+                                    ends_empty_scalar && anchor_tag_is_string == Some(true),
+                                );
+                            }
+                            anchor_tag_is_string = None;
+                        }
+                    }
+                    if node.kind() == SyntaxKind::BlockMapping
+                        && *kind == SyntaxKind::ColonIndicator
+                    {
+                        anyhow::bail!("YAML block mapping entry has no string key");
+                    }
+                    if node.kind() == SyntaxKind::MappingEntry {
+                        if *kind == SyntaxKind::ColonIndicator {
+                            anyhow::ensure!(
+                                seen_block_key || explicit_empty_string_tag,
+                                "YAML mapping entry has no string key"
+                            );
+                            block_key = false;
+                        } else if block_key {
+                            match *kind {
+                                SyntaxKind::TagMark => {
+                                    anyhow::ensure!(
+                                        tag_is_string(spelling, tag_handles),
+                                        "YAML configuration mapping key has a non-string tag"
+                                    );
+                                    explicitly_string = true;
+                                    explicit_empty_string_tag = true;
+                                }
+                                SyntaxKind::PlainScalar
+                                | SyntaxKind::SingleQuotedScalar
+                                | SyntaxKind::DoubleQuotedScalar
+                                | SyntaxKind::LiteralScalar
+                                | SyntaxKind::FoldedScalar
+                                | SyntaxKind::AliasMark => {
+                                    inspect_key(
+                                        *kind,
+                                        spelling,
+                                        explicitly_string,
+                                        config,
+                                        anchors,
+                                    )?;
+                                    seen_block_key = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else if node.kind() == SyntaxKind::FlowMapping {
+                        match *kind {
+                            SyntaxKind::Comma => {
+                                anyhow::ensure!(
+                                    !seen_flow_question || seen_flow_key,
+                                    "YAML flow mapping entry has no string key"
+                                );
+                                flow_key = true;
+                                seen_flow_key = false;
+                                seen_flow_question = false;
+                                explicitly_string = false;
+                                explicit_empty_string_tag = false;
+                            }
+                            SyntaxKind::QuestionIndicator if flow_key => {
+                                seen_flow_question = true;
+                            }
+                            SyntaxKind::CloseBrace => {
+                                anyhow::ensure!(
+                                    !seen_flow_question || seen_flow_key,
+                                    "YAML flow mapping entry has no string key"
+                                );
+                            }
+                            SyntaxKind::ColonIndicator => {
+                                anyhow::ensure!(
+                                    seen_flow_key || explicit_empty_string_tag,
+                                    "YAML flow mapping entry has no string key"
+                                );
+                                flow_key = false;
+                            }
+                            SyntaxKind::TagMark if flow_key => {
+                                anyhow::ensure!(
+                                    tag_is_string(spelling, tag_handles),
+                                    "YAML configuration mapping key has a non-string tag"
+                                );
+                                explicitly_string = true;
+                                explicit_empty_string_tag = true;
+                            }
+                            SyntaxKind::PlainScalar
+                            | SyntaxKind::SingleQuotedScalar
+                            | SyntaxKind::DoubleQuotedScalar
+                            | SyntaxKind::AliasMark
+                                if flow_key && !seen_flow_key =>
+                            {
+                                inspect_key(*kind, spelling, explicitly_string, config, anchors)?;
+                                seen_flow_key = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                GreenChild::Node(child_node) => {
+                    if let Some(anchor) = pending_anchor.take() {
+                        anchors.insert(anchor, false);
+                    }
+                    if block_key || (flow_key && !seen_flow_key) {
+                        anyhow::bail!("YAML configuration mapping key is not a string scalar");
+                    }
+                    verify_tree(child_node, source, offset, config, tag_handles, anchors)?;
+                }
+            }
+            offset += child.text_len();
+        }
+        // A verified string tag can denote an empty scalar without emitting
+        // a scalar CST token. Close only that still-pending anchor as a string;
+        // collections and untagged/null/numeric targets remain unverified.
+        if let Some(anchor) = pending_anchor.take() {
+            anchors.insert(anchor, anchor_tag_is_string == Some(true));
+        }
+        if node.kind() == SyntaxKind::MappingEntry {
+            anyhow::ensure!(
+                seen_block_key || explicit_empty_string_tag,
+                "YAML mapping entry has no string key"
+            );
+        }
+        Ok(())
+    }
+
+    verify_tree(
+        document.syntax(),
+        raw,
+        0,
+        &config,
+        &tag_handles,
+        &mut HashMap::new(),
+    )
+}
+
 impl AppConfig {
     const DEFAULT_CONFIG: &'static str = include_str!("../../../configs/app.defaults.yml");
+
+    // The noyalib compatibility deserializer can round floats into integer
+    // fields. Inspect only declared integer fields: unknown YAML fields were
+    // intentionally tolerated by AppConfig and must not change semantics.
+    // A tagged root is still a mapping for validation purposes.  Without
+    // unwrapping, !custom {fade_days: 7} evades removed-option checks while
+    // the compatibility decoder accepts it into AppConfig.
+    fn inspection_root_mapping(value: &serde_yaml::Value) -> Option<&serde_yaml::Mapping> {
+        let mut root = value;
+        while let serde_yaml::Value::Tagged(tagged) = root {
+            root = tagged.value();
+        }
+        root.as_mapping()
+    }
+
+    // A merge key is not a declared AppConfig field. Reject it anywhere in
+    // the parsed YAML tree, including aliased or tagged mappings, rather than
+    // silently ignoring a configuration that may look as if it was merged.
+    // Walk iteratively to avoid recursive validator stack growth.
+    fn reject_yaml_merge_keys(value: &serde_yaml::Value) -> Result<()> {
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            match value {
+                serde_yaml::Value::Mapping(mapping) => {
+                    for (key, item) in mapping {
+                        anyhow::ensure!(
+                            key.as_str() != "<<",
+                            "YAML merge keys (<<) are not supported in configuration"
+                        );
+                        pending.push(item);
+                    }
+                }
+                serde_yaml::Value::Sequence(items) => pending.extend(items),
+                serde_yaml::Value::Tagged(tagged) => pending.push(tagged.value()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_yaml_float_values(value: &serde_yaml::Value) -> Result<()> {
+        // Treat tagged numbers as their actual scalar type before any
+        // compatibility deserializer may coerce security-critical limits.
+        fn untagged(mut value: &serde_yaml::Value) -> &serde_yaml::Value {
+            while let serde_yaml::Value::Tagged(tagged) = value {
+                value = tagged.value();
+            }
+            value
+        }
+
+        let Some(mapping) = Self::inspection_root_mapping(value) else {
+            return Ok(());
+        };
+        for field in [
+            "max_guest_owned_nodes",
+            "auth_rl_ip_per_min",
+            "auth_rl_ip_per_hour",
+            "auth_rl_email_per_min",
+            "auth_rl_email_per_hour",
+            "smtp_port",
+        ] {
+            if matches!(mapping.get(field).map(untagged), Some(serde_yaml::Value::Number(n)) if matches!(n, serde_yaml::Number::Float(_)))
+            {
+                anyhow::bail!("{field} must be a YAML integer, not a floating-point value");
+            }
+        }
+        if let Some(rate_limits) = mapping
+            .get("node_mutation_rate_limits")
+            .map(untagged)
+            .and_then(|v| v.as_mapping())
+        {
+            for field in [
+                "replace_per_minute",
+                "replace_per_hour",
+                "delete_per_minute",
+                "delete_per_hour",
+            ] {
+                if matches!(rate_limits.get(field).map(untagged), Some(serde_yaml::Value::Number(n)) if matches!(n, serde_yaml::Number::Float(_)))
+                {
+                    anyhow::bail!("node_mutation_rate_limits.{field} must be a YAML integer");
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn parse_yaml(raw: &str) -> Result<Self> {
         let value: serde_yaml::Value =
             serde_yaml::from_str(raw).context("failed to parse YAML configuration")?;
+        Self::reject_yaml_merge_keys(&value)?;
+        Self::reject_yaml_float_values(&value)?;
+        // Preserve the compatibility resolver while rejecting numeric keys
+        // even inside nested mappings and aliases.
+        check_yaml_mapping_keys(raw)?;
+        // The old deserializer accepted only scalar enum variants. Noyalib's
+        // compatibility deserializer also accepts a YAML mapping for unit enums.
+        if let Some(mapping) = Self::inspection_root_mapping(&value) {
+            for enum_field in [
+                "domain_read_source",
+                "domain_account_write_source",
+                "domain_node_write_source",
+                "domain_edge_write_source",
+                "passkey_credential_source",
+                "auth_auto_provision_role",
+            ] {
+                if let Some(entry) = mapping.get(enum_field) {
+                    anyhow::ensure!(
+                        matches!(entry, serde_yaml::Value::String(_)),
+                        "{enum_field} must be a scalar enum variant"
+                    );
+                }
+            }
+        }
         for removed_key in [
             "fade_days",
             "ron_days",
             "delegation_expire_days",
             "anonymize_opt_in",
         ] {
-            let key = serde_yaml::Value::String(removed_key.to_string());
-            if value
-                .as_mapping()
-                .is_some_and(|mapping| mapping.contains_key(&key))
+            if Self::inspection_root_mapping(&value)
+                .is_some_and(|mapping| mapping.contains_key(removed_key))
             {
                 match removed_key {
                     "fade_days" => anyhow::bail!(
@@ -1018,6 +1475,112 @@ mod tests {
     const YAML: &str = r#"
 max_guest_owned_nodes: 1000
 "#;
+
+    #[test]
+    fn yaml_security_parser_accepts_documented_config_forms() {
+        let config = super::AppConfig::parse_yaml(
+            "max_guest_owned_nodes: &limit 21\nauth_cookie_secure: false\nunused_legacy_field: *limit\n",
+        )
+        .expect("existing YAML anchors and tolerated unknown fields remain compatible");
+        assert_eq!(config.max_guest_owned_nodes, 21);
+        assert!(!config.auth_cookie_secure);
+        let legacy_numeric_text = super::AppConfig::parse_yaml(
+            "0123: tolerated_legacy_field\nmax_guest_owned_nodes: 21\n",
+        )
+        .expect("leading-zero legacy text key remains a tolerated unknown field");
+        assert_eq!(legacy_numeric_text.max_guest_owned_nodes, 21);
+        let nested_string_key = super::AppConfig::parse_yaml(
+            "node_mutation_rate_limits: {replace_per_minute: 11, '1': ignored}\n",
+        )
+        .expect("quoted numeric unknown nested key remains a string");
+        assert_eq!(
+            nested_string_key
+                .node_mutation_rate_limits
+                .replace_per_minute,
+            11
+        );
+    }
+
+    #[test]
+    fn yaml_security_parser_rejects_ambiguous_or_wrong_typed_config() {
+        let fixtures = [
+            (
+                "duplicate root key",
+                "max_guest_owned_nodes: 1\nmax_guest_owned_nodes: 20\n",
+            ),
+            ("wrong scalar type", "max_guest_owned_nodes: [10, 20]\n"),
+            ("wrong nested type", "node_mutation_rate_limits: [1, 2]\n"),
+            (
+                "tagged nested mutation rate float",
+                "node_mutation_rate_limits: !custom {replace_per_minute: 1.5}\n",
+            ),
+            (
+                "tagged nested mutation rate huge float",
+                "node_mutation_rate_limits: !custom {delete_per_hour: 18446744073709551616.0}\n",
+            ),
+            (
+                "multiple YAML documents",
+                "max_guest_owned_nodes: 1\n---\nmax_guest_owned_nodes: 20\n",
+            ),
+            (
+                "unsupported custom tag",
+                "max_guest_owned_nodes: !custom 21\n",
+            ),
+            (
+                "floating point coercion to maximum integer",
+                "max_guest_owned_nodes: 18446744073709551616.0\n",
+            ),
+            (
+                "enum accepted as mapping",
+                "domain_read_source: {jsonl: null}\n",
+            ),
+            ("non-string mapping key", "1: ignored\n"),
+            ("YAML 1.1 binary mapping key", "0b11: ignored\n"),
+            ("non-string null key", "null: ignored\n"),
+            ("non-string boolean key", "true: ignored\n"),
+            (
+                "non-string nested block key",
+                "unknown: {inside: {1: ignored}}\n",
+            ),
+            (
+                "non-string nested unknown block mapping",
+                "unknown:\n  1: ignored\n",
+            ),
+            ("explicit integer tag mapping key", "!!int '1': ignored\n"),
+            (
+                "non-string nested mutation rate mapping key",
+                "node_mutation_rate_limits: {1: 999}\n",
+            ),
+            (
+                "tagged root with removed option",
+                "!custom {fade_days: 7}\n",
+            ),
+            (
+                "tagged root with removed RON retention",
+                "!custom {ron_days: 30}\n",
+            ),
+            (
+                "tagged root with removed delegation expiry",
+                "!custom {delegation_expire_days: 30}\n",
+            ),
+            (
+                "tagged root with removed anonymization switch",
+                "!custom {anonymize_opt_in: true}\n",
+            ),
+            ("YAML merge injects removed switch", "<<: {fade_days: 7}\n"),
+            (
+                "YAML anchored merge injects removed switch",
+                "defaults: &defaults {ron_days: 30}\n<<: *defaults\n",
+            ),
+            ("removed dangerous option", "fade_days: 7\n"),
+        ];
+        for (name, yaml) in fixtures {
+            assert!(
+                super::AppConfig::parse_yaml(yaml).is_err(),
+                "config parser accepted {name}: {yaml}"
+            );
+        }
+    }
 
     // Config tests must not inherit a removed operator switch from the developer
     // or CI host. The explicit rejection test below bypasses this facade so it
