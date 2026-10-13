@@ -2097,9 +2097,9 @@ class WatchTests(unittest.TestCase):
             failures = []
 
             def transient_read(path, *args, **kwargs):
-                if path == directory / "heartbeat.json" and not failures:
+                if path == directory / "state.json" and not failures:
                     failures.append(True)
-                    raise OSError("synthetic read error before event append")
+                    raise OSError("synthetic incident-state read error before event append")
                 return actual_read(path, *args, **kwargs)
 
             with patch.object(Path, "read_text", new=transient_read), (
@@ -2115,6 +2115,97 @@ class WatchTests(unittest.TestCase):
             self.assertIn("frontend_cache", [i[0] for i in state["severe"]])
             heartbeat = json.loads((directory / "heartbeat.json").read_text())
             self.assertEqual(heartbeat["status"], "ALARM")
+
+
+    def test_persistent_heartbeat_read_error_preserves_new_confirmed_p1(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            confirmed = watch.evaluate(
+                NOW, self.fixtures(cache="max-age=3600")
+            )
+            self.assertEqual(confirmed["status"], "ALARM")
+            real_read = Path.read_text
+            denied = []
+
+            def unreadable_heartbeat(path, *args, **kwargs):
+                if path == directory / "heartbeat.json":
+                    denied.append(True)
+                    raise PermissionError("simulated heartbeat read access denied")
+                return real_read(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", new=unreadable_heartbeat):
+                self.assertEqual(watch.record(confirmed, directory), "ALARM")
+                older = watch.evaluate(
+                    NOW - timedelta(minutes=1), self.fixtures()
+                )
+                self.assertIsNone(watch.record(older, directory))
+
+            self.assertEqual(len(denied), 2)
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual([x[0] for x in state["severe"]],
+                             ["frontend_cache"])
+            self.assertEqual(state["checked_at_utc"],
+                             NOW.isoformat().replace("+00:00", "Z"))
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertEqual(
+                [json.loads(x)["event"] for x in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
+
+    def test_recovery_journal_waits_for_durable_state_and_heartbeat(self):
+        import json
+        import signal
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(
+                NOW, self.fixtures(cache="max-age=3600")
+            )
+            self.assertEqual(watch.record(alarm, directory), "ALARM")
+            recovery = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures()
+            )
+            actual_write = watch.write_json
+            failures = []
+
+            def fail_first_recovered_state(path, value):
+                if path.name == "state.json" and not failures:
+                    failures.append(True)
+                    raise OSError("simulated recovery state replace failure")
+                return actual_write(path, value)
+
+            with patch.object(
+                watch, "write_json", side_effect=fail_first_recovered_state
+            ), patch.object(signal, "alarm", return_value=0):
+                self.assertEqual(watch._persist_cycle(recovery, directory), 2)
+
+            self.assertEqual(failures, [True])
+            events = [json.loads(x)["event"] for x in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events, ["ALARM", "MONITOR_DATA_FAILURE"])
+            persisted = json.loads((directory / "state.json").read_text())
+            self.assertEqual([x[0] for x in persisted["severe"]],
+                             ["frontend_cache"])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+
+            later = watch.evaluate(
+                datetime.now(timezone.utc) + timedelta(minutes=1),
+                self.fixtures(),
+            )
+            self.assertEqual(watch.record(later, directory), "RECOVERY")
+            events = [json.loads(x)["event"] for x in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events, [
+                "ALARM", "MONITOR_DATA_FAILURE", "RECOVERY",
+            ])
+
 
 
 if __name__ == "__main__":

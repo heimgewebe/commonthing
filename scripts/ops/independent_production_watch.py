@@ -407,7 +407,9 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             previous_heartbeat = json.loads(
                 (directory / "heartbeat.json").read_text(encoding="utf-8")
             )
-        except (FileNotFoundError, ValueError):
+        except (OSError, ValueError):
+            # A heartbeat read fault is observer uncertainty, not absence of
+            # authoritative incident state. Continue with state.json checks.
             previous_heartbeat = None
         if isinstance(previous_heartbeat, dict):
             last_checked = timestamp(previous_heartbeat.get("checked_at_utc"))
@@ -508,6 +510,28 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         events = [event for event in (
             None if suppress_transition_event else transition, uncertainty_event,
         ) if event]
+
+        current_main = result.get("main_observation")
+        previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
+        if not isinstance(current_main, dict):
+            current_main = previous_main
+
+        def persist_snapshots():
+            write_json(path, {"severe": severe, "uncertain": uncertain,
+                              "main_observation": current_main,
+                              "checked_at_utc": result["checked_at_utc"]})
+            write_json(directory / "heartbeat.json", result)
+
+        # New ALARM events precede snapshots so failed writes do not hide P1.
+        # A RECOVERY is the opposite: emit it only after *both* snapshots
+        # are durably committed; otherwise a failed state write can fabricate
+        # recovered history while the confirmed incident remains active.
+        recovery_before_event = (
+            transition == "RECOVERY" and not suppress_transition_event
+        )
+        if recovery_before_event:
+            persist_snapshots()
+        event_log_failed = False
         if events:
             try:
                 # Construct the complete batch before touching the journal.
@@ -548,6 +572,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                             ) from rollback_error
                         raise
             except OSError as exc:
+                event_log_failed = True
                 # Auxiliary event history must not block durable incident state.
                 # It is NOT evidence of notification delivery.
                 result["issues"].append({
@@ -562,14 +587,11 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 if not severe:
                     result["observation_status"] = result["status"]
                     result["status"] = "MONITOR_DATA_FAILURE"
-        current_main = result.get("main_observation")
-        previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
-        if not isinstance(current_main, dict):
-            current_main = previous_main
-        write_json(path, {"severe": severe, "uncertain": uncertain,
-                          "main_observation": current_main,
-                          "checked_at_utc": result["checked_at_utc"]})
-        write_json(directory / "heartbeat.json", result)
+        # A failed journal append adds a P2 to the report. For a committed
+        # recovery, refresh both snapshots only in that case; otherwise
+        # ordinary observations keep the established write order.
+        if not recovery_before_event or event_log_failed:
+            persist_snapshots()
     return new_event
 
 
