@@ -112,3 +112,86 @@ fn non_string_key_aliases_must_not_be_silently_ignored() {
         );
     }
 }
+
+#[test]
+fn tagged_root_keeps_configured_values_in_typed_decoder() {
+    let parsed = AppConfig::load_from_str(
+        "!custom {max_guest_owned_nodes: 21, auth_cookie_secure: false}\n",
+    )
+    .expect("tagged YAML root must preserve the validated configuration mapping");
+    assert_eq!(parsed.max_guest_owned_nodes, 21);
+    assert!(!parsed.auth_cookie_secure);
+}
+
+#[test]
+fn declared_yaml_string_tag_handles_are_compatible() {
+    for (case, source) in [
+        (
+            "block",
+            "%TAG !core! tag:yaml.org,2002:\n---\n!core!str max_guest_owned_nodes: 21\n",
+        ),
+        (
+            "flow",
+            "%TAG !core! tag:yaml.org,2002:\n---\n{!core!str max_guest_owned_nodes: 21}\n",
+        ),
+    ] {
+        let parsed = AppConfig::load_from_str(source).unwrap_or_else(|error| {
+            panic!("{case} declared YAML string handle rejected: {error:#}")
+        });
+        assert_eq!(parsed.max_guest_owned_nodes, 21, "{case}");
+    }
+}
+
+#[test]
+fn declared_non_string_tag_handles_stay_rejected() {
+    for source in [
+        "%TAG !core! tag:yaml.org,2002:\n---\n!core!int '1': ignored\n",
+        "%TAG !core! tag:yaml.org,2002:\n---\n{!core!bool 'true': ignored}\n",
+    ] {
+        assert!(
+            AppConfig::load_from_str(source).is_err(),
+            "declared non-string tag handle escaped key type guard: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn tagged_root_block_and_standard_map_preserve_all_declared_values() {
+    for (case, source) in [
+        (
+            "tagged-block",
+            "!custom\nmax_guest_owned_nodes: 21\nauth_cookie_secure: false\n",
+        ),
+        (
+            "standard-map",
+            "!!map {max_guest_owned_nodes: 21, auth_cookie_secure: false}\n",
+        ),
+    ] {
+        let parsed = AppConfig::load_from_str(source)
+            .unwrap_or_else(|error| panic!("{case} tagged root rejected: {error:#}"));
+        assert_eq!(parsed.max_guest_owned_nodes, 21, "{case}");
+        assert!(!parsed.auth_cookie_secure, "{case}");
+    }
+}
+
+#[test]
+fn declared_tag_handle_cannot_spoof_builtin_yaml_string_tag() {
+    for source in [
+        "%TAG !! tag:example.invalid,2026:\n---\n!!str max_guest_owned_nodes: 21\n",
+        "%TAG !core! tag:yaml.org,2002:\n---\n!core!int '1': ignored\n",
+    ] {
+        assert!(
+            AppConfig::load_from_str(source).is_err(),
+            "overridden or non-string YAML tag handle escaped check: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn declared_plain_handle_prefix_is_compatible() {
+    let parsed = AppConfig::load_from_str(
+        "%TAG ! tag:yaml.org,2002:\n---\n!str max_guest_owned_nodes: 21\n",
+    )
+    .expect("YAML primary handle may resolve to a declared standard string tag");
+    assert_eq!(parsed.max_guest_owned_nodes, 21);
+}

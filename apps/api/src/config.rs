@@ -435,6 +435,67 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
     let document = noyalib::cst::parse_document_with_config(raw, &config)
         .context("failed to inspect YAML configuration mapping keys")?;
 
+    // Noyalib's CST retains the spelling of !handle!suffix tags, not their
+    // expanded URI. Resolve only parser-validated %TAG directive tokens and
+    // compare the *expanded* tag, so an overridden !! handle cannot spoof
+    // the YAML string type.
+    let mut tag_handles = HashMap::from([
+        ("!".to_owned(), "!".to_owned()),
+        ("!!".to_owned(), "tag:yaml.org,2002:".to_owned()),
+    ]);
+    let mut declared_handles = std::collections::HashSet::new();
+    let mut directive_offset = 0;
+    for child in document.syntax().children() {
+        if let GreenChild::Token {
+            kind: SyntaxKind::Directive,
+            len,
+        } = child
+        {
+            let directive = &raw[directive_offset..directive_offset + *len as usize];
+            let mut parts = directive.split_ascii_whitespace();
+            if parts.next() == Some("%TAG") {
+                let (Some(handle), Some(prefix), None) = (parts.next(), parts.next(), parts.next())
+                else {
+                    anyhow::bail!("invalid YAML %TAG directive");
+                };
+                let valid_handle = handle == "!"
+                    || handle == "!!"
+                    || (handle.len() > 2
+                        && handle.starts_with('!')
+                        && handle.ends_with('!')
+                        && handle[1..handle.len() - 1]
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'-'));
+                anyhow::ensure!(valid_handle, "invalid YAML tag handle");
+                anyhow::ensure!(
+                    declared_handles.insert(handle.to_owned()),
+                    "duplicate YAML %TAG declaration"
+                );
+                tag_handles.insert(handle.to_owned(), prefix.to_owned());
+            }
+        }
+        directive_offset += child.text_len();
+    }
+
+    fn tag_is_string(tag: &str, handles: &HashMap<String, String>) -> bool {
+        if tag == "!" {
+            return true; // Non-specific scalar tag.
+        }
+        if let Some(uri) = tag.strip_prefix("!<").and_then(|s| s.strip_suffix('>')) {
+            return uri == "tag:yaml.org,2002:str";
+        }
+        if !tag.starts_with('!') {
+            return false;
+        }
+        let handle_end = tag[1..].find('!').map_or(1, |i| i + 2);
+        let handle = &tag[..handle_end];
+        let suffix = &tag[handle_end..];
+        handles.get(handle).is_some_and(|prefix| {
+            prefix.len() + suffix.len() == "tag:yaml.org,2002:str".len()
+                && format!("{prefix}{suffix}") == "tag:yaml.org,2002:str"
+        })
+    }
+
     fn inspect_key(
         kind: SyntaxKind,
         spelling: &str,
@@ -475,6 +536,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
         source: &str,
         base: usize,
         config: &noyalib::ParserConfig,
+        tag_handles: &HashMap<String, String>,
         anchors: &mut HashMap<String, bool>,
     ) -> Result<()> {
         let mut offset = base;
@@ -495,10 +557,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                     let spelling = &source[offset..offset + *len as usize];
                     match *kind {
                         SyntaxKind::TagMark => {
-                            anchor_tag_is_string = Some(matches!(
-                                spelling,
-                                "!" | "!!str" | "!<tag:yaml.org,2002:str>"
-                            ));
+                            anchor_tag_is_string = Some(tag_is_string(spelling, tag_handles));
                         }
                         SyntaxKind::AnchorMark => {
                             if let Some(previous) =
@@ -542,10 +601,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                             match *kind {
                                 SyntaxKind::TagMark => {
                                     anyhow::ensure!(
-                                        matches!(
-                                            spelling,
-                                            "!" | "!!str" | "!<tag:yaml.org,2002:str>"
-                                        ),
+                                        tag_is_string(spelling, tag_handles),
                                         "YAML configuration mapping key has a non-string tag"
                                     );
                                     explicitly_string = true;
@@ -598,7 +654,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                             }
                             SyntaxKind::TagMark if flow_key => {
                                 anyhow::ensure!(
-                                    matches!(spelling, "!" | "!!str" | "!<tag:yaml.org,2002:str>"),
+                                    tag_is_string(spelling, tag_handles),
                                     "YAML configuration mapping key has a non-string tag"
                                 );
                                 explicitly_string = true;
@@ -623,7 +679,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                     if block_key || (flow_key && !seen_flow_key) {
                         anyhow::bail!("YAML configuration mapping key is not a string scalar");
                     }
-                    verify_tree(child_node, source, offset, config, anchors)?;
+                    verify_tree(child_node, source, offset, config, tag_handles, anchors)?;
                 }
             }
             offset += child.text_len();
@@ -634,7 +690,14 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
         Ok(())
     }
 
-    verify_tree(document.syntax(), raw, 0, &config, &mut HashMap::new())
+    verify_tree(
+        document.syntax(),
+        raw,
+        0,
+        &config,
+        &tag_handles,
+        &mut HashMap::new(),
+    )
 }
 
 impl AppConfig {
