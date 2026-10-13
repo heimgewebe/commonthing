@@ -26,7 +26,7 @@ relations:
 
 # T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates
 
-## Sicherheitskonvergenz — 13. Oktober 2026 (GitHub/Main, bis nach 20:13 UTC)
+## Sicherheits-Readback — 13. Oktober 2026 (GitHub/Main, bis nach 20:13 UTC; keine Runtime-Freigabe)
 
 Dieser neueste GitHub-/Main-Readback **ersetzt ältere PR-Status-, Head-,
 CI- und Review-Zuordnungen weiter unten**, insbesondere `#1959 OPEN` und
@@ -72,12 +72,21 @@ vom 12. Oktober und autorisiert ausdrücklich keinen produktiven Cutover.
   autorisierter Primärreader, eine gebundene Green-Zielidentität und
   authentische produktive Runtime-Proofs fehlen weiterhin. Weder #2350
   noch #2352 stellen allein einen bestandenen Runtime-Beweis dar.
+  **Reconciliation der früheren 9/11-Zählung:** Der damalige reine
+  Anzahl-Widerspruch ist seit #2350 für die **normative** TaskSpec-Zahl
+  elf geschlossen. Die neun alten Kriterien sind in Bureau-Main weiterhin
+  nicht als freigegebene Runtime-Verifier ausführbar; die technische
+  §11-Zuordnung, echte Primärreader und unabhängige Prüfungen bleiben
+  eigene **offene R5-Stopgründe**. Eine normativ elfteilige TaskSpec
+  ist kein elfteiliger PASS.
 - [Bureau #2352](https://github.com/heimgewebe/bureau/pull/2352)
   war beim erneuten GitHub-Readback am 13.10.2026 nach **20:13 UTC**
   weiterhin **OPEN**, nun auf veröffentlichtem Head
   `1f76d0f36847f46c0556728e428e171ee1aeeb09`.
-  Die zuvor hier beobachteten Heads `6c9d28ff`, `2dbf0713` und
-  `a3111fc3` sind **ältere Revisionen desselben offenen PRs**.
+  Der weiter unten dokumentierte ältere Head `6c9d28ff` sowie die
+  im PR-Verlauf nachgewiesenen Heads `2dbf0713` und `a3111fc3`
+  (diese beiden wurden im vorliegenden Runbook zuvor nicht aufgeführt)
+  sind **historische Revisionen desselben offenen PRs**.
   Auf `1f76d0f3` wurde ein Guard für weiterhin vorhandene exklusive
   Blue-/Green-Reservierungen beim terminalen Closeout ergänzt; das
   beseitigt **nicht** automatisch die übrigen offenen P1/P2-Befunde
@@ -96,7 +105,11 @@ Search-Kontinuitäts-, Last-, Backup-, Restore- und Recovery-Belegen
 abgenommen werden. Erst danach dürfen Zielidentität und reale
 Produktionsplattform für weitere B1–B6-Gates verbindlich bewertet werden.
 Der noch offene #2352 und die unvollständige isolierte B5-Plattform
-erfüllen diese Vorbedingungen ausdrücklich **nicht**.
+erfüllen diese Vorbedingungen ausdrücklich **nicht**. Ein selbst
+bestandener lokaler B5-Test wäre **kein Ersatz** für negative Blue-Isolation,
+Last-, Recovery-, Such- und Datenprüfungen auf der später tatsächlich
+gewählten produktiven Green-Zielruntime. Jeder Wechsel der Zielidentität
+oder Cutover-Revision erfordert frische zugehörige Abnahmebelege.
 
 **Dokumentationsmerge und Runtime-Freigabe sind unterschiedliche
 Entscheidungen:** Der #1959-RustSec-Merge ist als Repository-Voraussetzung
@@ -215,7 +228,7 @@ vollständige, gegen die konkrete Zielrevision gebundene Abnahme erforderlich.
 | B2 Semantic Search | **BLOCKED** | Produktionszielgebundener Ollama-/Embedding-/Search-Worker-Pfad samt Modell- und Indexparität |
 | B3 Public Frontdoor | **BLOCKED** | Schauwerk, PMTiles/Styles/Glyphs, Auth und Legacy-Hosts am echten Green samt TLS und Routing |
 | B4 Datenübergang | **BLOCKED** | Frischer, vollständiger und versionsgebundener PostgreSQL-/Auth-/JetStream-/Outbox-/Projektionsabgleich sowie Writer-Fencing |
-| B5 Zieltestbed | **BLOCKED** | T085 terminal auf älterem Commit bleibt historischer Beleg; die für die tatsächliche **Cutover-Revision** verlangte neue Zieltestbed-Abnahme fehlt |
+| B5 Zieltestbed | **BLOCKED** | T085 terminal auf älterem Commit bleibt historischer Beleg; eine aktuelle Zieltestbed-Abnahme einschließlich **negativer Blue-/Writer-Isolation**, Last-, Recovery- und Suchbelege auf derselben Zielrevision fehlt |
 | B6 Zwei-Betreiber-Freigabe | **BLOCKED** | Konkrete doppelte Zustimmung, externe Receipt-/Replay-Verifikation und Aktivierungsbeleg derselben Cutover-Revision |
 
 **Zusätzlicher Registry-Readback:** Die GitHub-Registry von
@@ -226,8 +239,13 @@ Acceptance-Einträge. Die historische Restplanung nennt teils
 `ready`/Revision 5 und elf Einträge. Die neueren Registry-Einträge
 sind keine Autorität, den strengeren bestehenden **elfteiligen**
 Cutover-Abschlussvertrag (§11) durch bloße Dokumentänderung zu verkürzen.
-Das ist ein **ungeklärter Vertragswiderspruch und R5-Stopgrund**, nicht
-nur eine vor R9 zu erledigende Formalität. Vor Eintritt in **R6** müssen
+Das war am 12.10.2026 ein **ungeklärter Vertragswiderspruch und R5-Stopgrund**, nicht
+nur eine vor R9 zu erledigende Formalität. **Späterer Revisionsstand:**
+Der normative 9/11-Zählkonflikt wurde durch #2350 am 13.10.2026
+auf elf Kriterien aufgelöst. Die technisch ausführbaren neun
+Runtime-Verifier, der §11-Abnahmeabgleich und alle Primärbelege sind
+aber durch den weiterhin offenen #2352 beziehungsweise separate
+R5-Prüfungen **nicht** erledigt. Vor Eintritt in **R6** müssen
 die tatsächlichen Kriterien zwischen verantwortlicher Bureau-Control-Plane,
 Cutover-Vertrag und Produktfähigkeiten formell revisionsgebunden
 reconciliiert sein; weder Suchkontinuität noch deklarative
@@ -329,9 +347,15 @@ Freigabe einer produktiven Green-Zelle.
   gegen seine dann aktuelle Basis erneut geprüft werden.
 - Der Dokumentations-PR
   [#1957](https://github.com/heimgewebe/commonthing/pull/1957)
-  darf erst nach realer Sicherheitskonvergenz sowie für seine eigene
-  finale Revision gültiger CI und unabhängigem R3-Review durch Captain
-  integriert werden. Ein Dokumentationsmerge verändert kein B1–B6-Gate.
+  wurde damals erst nach Sicherheitskonvergenz, gültiger eigener CI und
+  unabhängigem R3-Review für Captain vorgemerkt. **Präzisierung zum
+  neueren Stand:** Die für einen dokumentarischen Merge relevante
+  RustSec-Repositorymigration #1959 ist inzwischen integriert. Die
+  weiterhin offenen Bureau-#2352- und Green-Runtime-Sicherheitsgates
+  sperren die **operative** Abnahme, nicht die wahrheitsgemäße
+  Dokumentation des BLOCKED-Zustands. Für #1957 selbst bleiben
+  aktuelle unabhängige R3-PASSes, Review-Evidence-CI und Captain
+  zwingend. Ein Dokumentationsmerge verändert kein B1–B6-Gate.
 
 **Unveränderte Stopentscheidung:** B1–B6 sind weiterhin **BLOCKED**.
 Ein auf die konkrete spätere Green-Zielidentität und Produktiv-Revision
@@ -362,9 +386,14 @@ Produktionsmutationsfreigabe. Die nächste **Staging-Abnahmesequenz nach
 integrierten Sicherheits- und Verifierverträgen** folgt ausschließlich
 §12: **zuerst B5** mit getrenntem,
 zeitlich begrenztem und revisionsgebundenem T044-Staging-/Zieltestbed
-einschließlich Last-, Recovery- und Suchbelegen; **erst nach dessen Abnahme**
+einschließlich **negativer Blue-/Writer-Isolation** sowie Last-,
+Recovery- und Suchbelegen; **erst nach dessen Abnahme**
 folgen die konkrete Produktions-Green-Zielidentität, Kapazitätsprüfung
-und Capability-/Datenparität. Diese Reihenfolge selbst erteilt keine
+und Capability-/Datenparität. Sämtliche für die reale
+Produktions-Green-Runtime erforderlichen Isolations-, Last-, Recovery-
+und Suchbelege sowie **B1–B6 einschließlich B5** sind auf deren eigene
+Zielidentität und Cutover-Revision erneut zu prüfen. Diese Reihenfolge
+selbst erteilt keine
 Staging-, Cluster- oder Produktionsmutationsautorität.
 
 ## 1. Zweck und Autorität

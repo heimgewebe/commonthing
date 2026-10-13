@@ -103,8 +103,10 @@ Belegt bleiben insbesondere:
 - Ein permanentes Kubernetes-Staging ist nicht beschlossen.
 - Die Existenz des Legacy-Controllers ist kein Auftrag, daraus einen zukünftigen GewebeZelle-Operator auszubauen.
 
-## Nächster Architekturtest
+## Historischer Architekturtest — Experiment B (T085)
 
-**Experiment B** ist ein separater Folgetask: temporäres reales Kubernetes-Zieltestbed, möglichst ohne **staging_cell.py**, mit Wiederverwendung der vorhandenen Kustomize-/Flux- und portablen Proofteile. Danach werden tatsächlich benötigte portable Invarianten extrahiert und unnötige kind-/Host-spezifische Mechanismen weiter abgebaut.
+**Historische Planung, inzwischen abgeschlossen:** Experiment B war ein separater Folgetask für ein temporäres reales Kubernetes-Zieltestbed, möglichst ohne **staging_cell.py**, mit Wiederverwendung der vorhandenen Kustomize-/Flux- und portablen Proofteile. Danach sollten tatsächlich benötigte portable Invarianten extrahiert und unnötige kind-/Host-spezifische Mechanismen weiter abgebaut werden.
+
+**Revisionsgebundener Nachtrag vom 13.10.2026, kein erneuter Laufzeittest:** Experiment B/T085 wurde für den älteren Testcommit `5d509feda6db24e294698cb42501fd41ec8e0fbe` terminal nachgewiesen; das temporäre Testbed wurde laut Retirement-Receipt anschließend abgebaut. Dies ersetzt die obige **offene Aufgabenplanung**, aber weder die B5-Staging-Abnahme auf einer aktuellen Cutover-Revision noch B1–B6. Quelle und historische Beweisgrenzen: [T044-R5-Vorabnahme](../deploy/kubernetes-production-cutover-t044.md). Die tatsächlich noch fehlenden produktiven Nachweise bleiben dort ausdrücklich **BLOCKED**.
 
 Ein permanentes Staging wird erst dann neu bewertet, wenn reale Produktionsrisiken seinen dauerhaften Betrieb rechtfertigen, etwa irreversible Migrationen, mehrere Produktionsinstanzen, Multi-Host-HA, Fremdbetreiber oder föderierte Zellen, verbindliche SLOs oder regelmäßige Provider-/DNS-/TLS-/Load-Balancer-Cutover.
