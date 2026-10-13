@@ -127,7 +127,7 @@ expect_backup_failure() {
 # The producer must reject unsafe filename prefixes before creating any
 # plaintext or ciphertext artefact, even with otherwise valid DB credentials.
 if BACKUP_PREFIX="unsafe'prefix" run_backup unsafe-prefix "$RECIPIENTS_FILE" \
-    > /dev/null 2> "$TEMP_DIR/unsafe-prefix.stderr"; then
+  > /dev/null 2> "$TEMP_DIR/unsafe-prefix.stderr"; then
   echo 'untrusted BACKUP_PREFIX must fail closed' >&2
   exit 1
 fi

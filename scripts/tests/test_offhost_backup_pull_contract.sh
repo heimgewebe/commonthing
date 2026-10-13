@@ -87,8 +87,8 @@ export SSH_LOG="$root/ssh.log"
 # Prefixes occur inside SSH's remote shell command; reject shell quoting tokens
 # before the first SSH invocation, rather than relying on a later filename check.
 if BACKUP_PREFIX="unsafe'prefix" PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 \
-    REMOTE_HOST=test-host REMOTE_BACKUP_DIR="$remote" DEST_DIR="$root/unsafe-prefix" \
-    scripts/ops/pull-production-postgres-backup.sh > /dev/null 2> "$root/unsafe-prefix.stderr"; then
+  REMOTE_HOST=test-host REMOTE_BACKUP_DIR="$remote" DEST_DIR="$root/unsafe-prefix" \
+  scripts/ops/pull-production-postgres-backup.sh > /dev/null 2> "$root/unsafe-prefix.stderr"; then
   echo 'untrusted BACKUP_PREFIX must fail closed' >&2
   exit 1
 fi
@@ -96,7 +96,10 @@ grep -qF 'BACKUP_PREFIX contains unsupported characters' "$root/unsafe-prefix.st
   echo 'untrusted prefix was not rejected before SSH' >&2
   exit 1
 }
-[[ ! -s "$SSH_LOG" ]] || { echo 'unsafe prefix reached SSH command' >&2; exit 1; }
+[[ ! -s "$SSH_LOG" ]] || {
+  echo 'unsafe prefix reached SSH command' >&2
+  exit 1
+}
 pull() {
   local destination="$1"
   PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST="${2-}" REMOTE_BACKUP_DIR="$remote" DEST_DIR="$destination" \
