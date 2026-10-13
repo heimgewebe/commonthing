@@ -439,6 +439,80 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             return _record_unverifiable_prior_state(
                 result, directory, previous_heartbeat, "state root is not object",
             )
+        # Evaluation may have been unable to read this same file, but the
+        # locked persistence step can now read the original anchor. Keep the
+        # independently observed current main SHA, and merge only mismatches
+        # still present on this poll. A newly converged component must not
+        # inherit a stale mismatch just because a prior read failed.
+        current_main = result.get("main_observation")
+        previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
+        had_anchor_read_fault = any(
+            item.get("code") == "unverifiable_state"
+            for item in result.get("issues", [])
+            if isinstance(item, dict)
+        )
+        if had_anchor_read_fault and isinstance(previous_main, dict):
+            if isinstance(current_main, dict):
+                observed_at = timestamp(result.get("checked_at_utc"))
+                prior_first = timestamp(previous_main.get("first_seen"))
+                current_first = timestamp(current_main.get("first_seen"))
+                if (
+                    current_main.get("sha") == previous_main.get("sha")
+                    and prior_first is not None
+                    and observed_at is not None
+                    and prior_first <= observed_at
+                    and (current_first is None or prior_first <= current_first)
+                ):
+                    current_main["first_seen"] = prior_first.isoformat().replace("+00:00", "Z")
+                old_divergence = previous_main.get("diverged_since")
+                current_divergence = current_main.get("diverged_since")
+                old_divergence = old_divergence if isinstance(old_divergence, dict) else {}
+                current_divergence = (
+                    current_divergence if isinstance(current_divergence, dict) else {}
+                )
+                commits_now = result.get("commits")
+                commits_now = commits_now if isinstance(commits_now, dict) else {}
+                for name in ("frontend", "api"):
+                    if name not in current_divergence:
+                        continue
+                    prior_at = timestamp(old_divergence.get(name))
+                    fresh_at = timestamp(current_divergence[name])
+                    if (
+                        prior_at is not None and observed_at is not None
+                        and prior_at <= observed_at
+                        and (fresh_at is None or prior_at <= fresh_at)
+                    ):
+                        current_divergence[name] = prior_at.isoformat().replace("+00:00", "Z")
+                    anchor_at = timestamp(current_divergence[name])
+                    if (
+                        anchor_at is None or observed_at is None
+                        or name not in commits_now or "main" not in commits_now
+                        or commits_now[name] == commits_now["main"]
+                    ):
+                        continue
+                    age = (observed_at - anchor_at).total_seconds()
+                    stale_code = "stale_" + name
+                    if age >= THRESHOLD and not any(
+                        isinstance(item, dict) and item.get("code") == stale_code
+                        for item in result["issues"]
+                    ):
+                        # Reconstitute a P1 already overdue at this observation
+                        # instead of silently postponing it until the next poll.
+                        result["issues"].append({
+                            "code": stale_code, "component": name,
+                            "actual": commits_now[name], "expected": commits_now["main"],
+                            "source": URLS[name], "severity": "P1",
+                            "duration_seconds": round(age),
+                        })
+                        result["status"] = "ALARM"
+                if current_divergence:
+                    current_main["diverged_since"] = current_divergence
+            else:
+                current_main = previous_main
+        elif not isinstance(current_main, dict):
+            current_main = previous_main
+        result["main_observation"] = current_main
+
         raw_severe = [] if no_prior_state else previous.get("severe")
         if not isinstance(raw_severe, list) or any(
             not isinstance(item, list) or len(item) != 2
@@ -519,20 +593,17 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             None if suppress_transition_event else transition, uncertainty_event,
         ) if event]
 
-        current_main = result.get("main_observation")
-        previous_main = previous.get("main_observation") if isinstance(previous, dict) else None
-        if "unverifiable_state" in observed_codes and isinstance(previous_main, dict):
-            # Evaluation could not read the original divergence anchor; if
-            # record() can now read it, never reset its 45-minute clock.
-            current_main = previous_main
-        elif not isinstance(current_main, dict):
-            current_main = previous_main
-
-        def persist_snapshots():
+        def persist_snapshots(*, heartbeat_first=False):
+            if heartbeat_first:
+                # A recovery cannot destroy the only durable prior-P1 anchor
+                # before the heartbeat update succeeds. This ordering also
+                # keeps the journal from advertising an uncommitted recovery.
+                write_json(directory / "heartbeat.json", result)
             write_json(path, {"severe": severe, "uncertain": uncertain,
                               "main_observation": current_main,
                               "checked_at_utc": result["checked_at_utc"]})
-            write_json(directory / "heartbeat.json", result)
+            if not heartbeat_first:
+                write_json(directory / "heartbeat.json", result)
 
         # New ALARM events precede snapshots so failed writes do not hide P1.
         # A RECOVERY is the opposite: emit it only after *both* snapshots
@@ -542,7 +613,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             transition == "RECOVERY" and not suppress_transition_event
         )
         if recovery_before_event:
-            persist_snapshots()
+            persist_snapshots(heartbeat_first=True)
         event_log_failed = False
         if events:
             try:

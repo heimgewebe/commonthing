@@ -1880,9 +1880,26 @@ class WatchTests(unittest.TestCase):
                     raise OSError("simulated transient state read failure")
                 return read_text(path, *args, **kwargs)
 
+            # evaluate(reader=fetch) has a default-bound function; patch its
+            # entrypoint explicitly so this test is hermetic on every runner.
+            original_evaluate = watch.evaluate
+            fixture_reader = self.fixtures(frontend=OLD, api=OLD)
+
+            def evaluate_fixture(now, *, previous_main_observation=None, issue_sink=None):
+                return original_evaluate(
+                    now, fixture_reader,
+                    previous_main_observation=previous_main_observation,
+                    issue_sink=issue_sink,
+                )
+
+            class StableNow(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return NOW + timedelta(minutes=1)
+
             with patch.object(Path, "read_text", new=interrupted_read), patch.object(
-                watch, "fetch", side_effect=self.fixtures(frontend=OLD, api=OLD),
-            ):
+                watch, "evaluate", side_effect=evaluate_fixture,
+            ), patch.object(watch, "datetime", StableNow):
                 result = watch._evaluate_cycle(directory)
 
             self.assertEqual(failures, [True])
@@ -2274,6 +2291,137 @@ class WatchTests(unittest.TestCase):
             self.assertIn("unverifiable_state", [i["code"] for i in heartbeat["issues"]])
             self.assertFalse((directory / "events.jsonl").exists())
 
+
+
+    def test_recovery_heartbeat_replace_failure_retains_transition_intent(self):
+        import json
+        import signal
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30")
+            )
+            self.assertEqual(watch.record(alarm, directory), "ALARM")
+            recovery = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures()
+            )
+            original_write = watch.write_json
+            failures = []
+
+            def fail_once_on_recovery_heartbeat(path, value):
+                if path.name == "heartbeat.json" and not failures:
+                    failures.append(True)
+                    raise OSError("recovery heartbeat replace unavailable")
+                return original_write(path, value)
+
+            with patch.object(
+                watch, "write_json", side_effect=fail_once_on_recovery_heartbeat
+            ), patch.object(signal, "alarm", return_value=0):
+                self.assertEqual(watch._persist_cycle(recovery, directory), 2)
+
+            self.assertEqual(failures, [True])
+            state = json.loads((directory / "state.json").read_text())
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertIn("frontend_cache", [row[0] for row in state["severe"]])
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM", "MONITOR_DATA_FAILURE"],
+            )
+            # The best-effort retry uses wall-clock now; a later live poll
+            # must carry a newer timestamp than that retry's heartbeat.
+            later = watch.evaluate(
+                datetime.now(timezone.utc) + timedelta(minutes=1),
+                self.fixtures(),
+            )
+            self.assertEqual(watch.record(later, directory), "RECOVERY")
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM", "MONITOR_DATA_FAILURE", "RECOVERY"],
+            )
+            self.assertEqual(
+                json.loads((directory / "state.json").read_text())["severe"], []
+            )
+
+    def test_transient_state_read_preserves_new_main_and_old_mismatch_anchors(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            starting = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=OLD)
+            )
+            self.assertIsNone(watch.record(starting, directory))
+            next_main = "c" * 40
+            next_now = NOW + timedelta(minutes=1)
+            observed = watch.evaluate(
+                next_now,
+                self.fixtures(frontend=OLD, api=OLD, main=next_main),
+            )
+            observed["issues"].append({
+                "code": "unverifiable_state", "component": "prior state",
+                "actual": "PermissionError", "expected": "readable prior state",
+                "source": str(directory / "state.json"), "severity": "P2",
+            })
+            observed["status"] = "MONITOR_DATA_FAILURE"
+            self.assertEqual(
+                watch.record(observed, directory), "MONITOR_DATA_FAILURE"
+            )
+            state = json.loads((directory / "state.json").read_text())
+            anchor = state["main_observation"]
+            self.assertEqual(anchor["sha"], next_main)
+            self.assertEqual(
+                anchor["first_seen"], next_now.isoformat().replace("+00:00", "Z")
+            )
+            self.assertEqual(anchor["diverged_since"], {
+                "frontend": NOW.isoformat().replace("+00:00", "Z"),
+                "api": NOW.isoformat().replace("+00:00", "Z"),
+            })
+
+    def test_transient_state_read_carries_only_unresolved_overdue_mismatch(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            old = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=OLD)
+            )
+            self.assertIsNone(watch.record(old, directory))
+            current = "c" * 40
+            elapsed = NOW + timedelta(minutes=46)
+            observed = watch.evaluate(
+                elapsed,
+                self.fixtures(frontend=current, api=OLD, main=current),
+            )
+            observed["issues"].append({
+                "code": "unverifiable_state", "component": "prior state",
+                "actual": "PermissionError", "expected": "readable prior state",
+                "source": str(directory / "state.json"), "severity": "P2",
+            })
+            observed["status"] = "MONITOR_DATA_FAILURE"
+            self.assertEqual(watch.record(observed, directory), "ALARM")
+            state = json.loads((directory / "state.json").read_text())
+            anchor = state["main_observation"]
+            self.assertEqual(anchor["sha"], current)
+            self.assertEqual(
+                anchor["diverged_since"],
+                {"api": NOW.isoformat().replace("+00:00", "Z")},
+            )
+            # API differs from freshly advanced main and frontend; this is
+            # both a cross-product divergence and an overdue main mismatch.
+            self.assertEqual(
+                [row[0] for row in state["severe"]],
+                ["frontend_api_diverge", "stale_api"],
+            )
+            self.assertEqual(
+                [issue["code"] for issue in observed["issues"]
+                 if issue["severity"] == "P1"],
+                ["frontend_api_diverge", "stale_api"],
+            )
 
 
 if __name__ == "__main__":
