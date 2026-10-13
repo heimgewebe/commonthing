@@ -441,7 +441,10 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
         config: &noyalib::ParserConfig,
     ) -> Result<()> {
         match kind {
-            SyntaxKind::SingleQuotedScalar | SyntaxKind::DoubleQuotedScalar => Ok(()),
+            SyntaxKind::SingleQuotedScalar
+            | SyntaxKind::DoubleQuotedScalar
+            | SyntaxKind::LiteralScalar
+            | SyntaxKind::FoldedScalar => Ok(()),
             SyntaxKind::PlainScalar if explicitly_string => Ok(()),
             SyntaxKind::PlainScalar => {
                 // Keep serde_yaml scalar semantics: 0123 is text,
@@ -502,6 +505,8 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                                 SyntaxKind::PlainScalar
                                 | SyntaxKind::SingleQuotedScalar
                                 | SyntaxKind::DoubleQuotedScalar
+                                | SyntaxKind::LiteralScalar
+                                | SyntaxKind::FoldedScalar
                                 | SyntaxKind::AliasMark => {
                                     inspect_key(*kind, spelling, explicitly_string, config)?;
                                     seen_block_key = true;

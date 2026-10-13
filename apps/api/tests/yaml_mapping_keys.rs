@@ -57,3 +57,15 @@ fn tagged_mutation_rate_limits_cannot_be_dropped_to_defaults() {
     assert_eq!(valid.node_mutation_rate_limits.replace_per_minute, 11);
     assert_eq!(valid.node_mutation_rate_limits.delete_per_hour, 42);
 }
+
+#[test]
+fn block_scalar_mapping_keys_are_valid_strings() {
+    for (case, source) in [
+        ("literal", "? |-\n  max_guest_owned_nodes\n: 21\n"),
+        ("folded", "? >-\n  max_guest_owned_nodes\n: 21\n"),
+    ] {
+        let parsed = AppConfig::load_from_str(source)
+            .unwrap_or_else(|error| panic!("{case} YAML block string key rejected: {error:#}"));
+        assert_eq!(parsed.max_guest_owned_nodes, 21, "{case}");
+    }
+}
