@@ -247,9 +247,13 @@ Teilbeweise.
 Blue bleibt bis zu einem gesondert beweisgebundenen Fencing-/Cutover-Gate der
 bestehende produktive Pfad. Aus der lokalen kind-Referenz, einem historischen
 Proof-Receipt oder dem öffentlichen Commitgleichstand folgt **keine**
-Produktionsmutationsfreigabe. Nächster kleinster Schnitt: reales
-Produktions-Green identifizieren und dessen Capability-/Datenvertrag für
-die gewählte aktuelle Release-Revision neu erfassen.
+Produktionsmutationsfreigabe. Die nächste Abnahmesequenz ist ausschließlich
+die in §12 festgehaltene Reihenfolge: **zuerst B5** mit getrenntem,
+zeitlich begrenztem und revisionsgebundenem T044-Staging-/Zieltestbed
+einschließlich Last-, Recovery- und Suchbelegen; **erst nach dessen Abnahme**
+folgen die konkrete Produktions-Green-Zielidentität, Kapazitätsprüfung
+und Capability-/Datenparität. Diese Reihenfolge selbst erteilt keine
+Staging-, Cluster- oder Produktionsmutationsautorität.
 
 ## 1. Zweck und Autorität
 
