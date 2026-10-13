@@ -212,3 +212,19 @@ fn merge_key_cannot_inject_valid_security_config_options() {
         );
     }
 }
+#[test]
+fn directive_trailing_comments_compatible_with_yaml_string_handles() {
+    let parsed = AppConfig::load_from_str(
+        "%TAG !core! tag:yaml.org,2002: # core types\n---\n!core!str max_guest_owned_nodes: 21\n",
+    )
+    .expect("trailing comments on YAML tag directives must preserve core string handles");
+    assert_eq!(parsed.max_guest_owned_nodes, 21);
+}
+
+#[test]
+fn explicitly_tagged_empty_string_keys_remain_valid() {
+    let parsed = AppConfig::load_from_str("!!str : ignored\nmax_guest_owned_nodes: 21\n")
+        .expect("a verified !!str empty key is a string, not an implicit null key");
+    assert_eq!(parsed.max_guest_owned_nodes, 21);
+    assert!(AppConfig::load_from_str(": ignored\nmax_guest_owned_nodes: 21\n").is_err());
+}

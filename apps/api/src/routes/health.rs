@@ -1234,6 +1234,12 @@ mod tests {
         assert_eq!(limits.max_nodes_jsonl_mb, 10);
         assert_eq!(limits.max_edges_jsonl_mb, 10);
 
+        let tagged = policy_file("max_nodes_jsonl_mb: !!int 10\nmax_edges_jsonl_mb: 10\n")?;
+        let tagged_limits = load_policy_file(tagged.path())
+            .await
+            .expect("the standard !!int YAML tag is an unsigned integer");
+        assert_eq!(tagged_limits.max_nodes_jsonl_mb, 10);
+
         let invalid_fixtures = [
             (
                 "duplicate policy limit",

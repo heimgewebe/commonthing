@@ -454,10 +454,15 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
             let directive = &raw[directive_offset..directive_offset + *len as usize];
             let mut parts = directive.split_ascii_whitespace();
             if parts.next() == Some("%TAG") {
-                let (Some(handle), Some(prefix), None) = (parts.next(), parts.next(), parts.next())
-                else {
+                let (Some(handle), Some(prefix)) = (parts.next(), parts.next()) else {
                     anyhow::bail!("invalid YAML %TAG directive");
                 };
+                // A YAML directive may end with a separated trailing comment.
+                // Never accept a third non-comment directive parameter.
+                anyhow::ensure!(
+                    parts.next().is_none_or(|extra| extra.starts_with('#')),
+                    "invalid YAML %TAG directive"
+                );
                 let valid_handle = handle == "!"
                     || handle == "!!"
                     || (handle.len() > 2
@@ -546,6 +551,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
         let mut seen_flow_key = false;
         let mut seen_flow_question = false;
         let mut explicitly_string = false;
+        let mut explicit_empty_string_tag = false;
         // Anchors are observed in source order. Only scalar string targets can
         // later be used as mapping keys; collections and typed values stay closed.
         let mut pending_anchor: Option<String> = None;
@@ -595,7 +601,10 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                     }
                     if node.kind() == SyntaxKind::MappingEntry {
                         if *kind == SyntaxKind::ColonIndicator {
-                            anyhow::ensure!(seen_block_key, "YAML mapping entry has no string key");
+                            anyhow::ensure!(
+                                seen_block_key || explicit_empty_string_tag,
+                                "YAML mapping entry has no string key"
+                            );
                             block_key = false;
                         } else if block_key {
                             match *kind {
@@ -605,6 +614,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                                         "YAML configuration mapping key has a non-string tag"
                                     );
                                     explicitly_string = true;
+                                    explicit_empty_string_tag = spelling != "!";
                                 }
                                 SyntaxKind::PlainScalar
                                 | SyntaxKind::SingleQuotedScalar
@@ -635,6 +645,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                                 seen_flow_key = false;
                                 seen_flow_question = false;
                                 explicitly_string = false;
+                                explicit_empty_string_tag = false;
                             }
                             SyntaxKind::QuestionIndicator if flow_key => {
                                 seen_flow_question = true;
@@ -647,7 +658,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                             }
                             SyntaxKind::ColonIndicator => {
                                 anyhow::ensure!(
-                                    seen_flow_key,
+                                    seen_flow_key || explicit_empty_string_tag,
                                     "YAML flow mapping entry has no string key"
                                 );
                                 flow_key = false;
@@ -658,6 +669,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                                     "YAML configuration mapping key has a non-string tag"
                                 );
                                 explicitly_string = true;
+                                explicit_empty_string_tag = spelling != "!";
                             }
                             SyntaxKind::PlainScalar
                             | SyntaxKind::SingleQuotedScalar
@@ -685,7 +697,10 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
             offset += child.text_len();
         }
         if node.kind() == SyntaxKind::MappingEntry {
-            anyhow::ensure!(seen_block_key, "YAML mapping entry has no string key");
+            anyhow::ensure!(
+                seen_block_key || explicit_empty_string_tag,
+                "YAML mapping entry has no string key"
+            );
         }
         Ok(())
     }
