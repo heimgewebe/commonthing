@@ -150,16 +150,18 @@ Abnahmeverträge**. Die Blue-/kind-/T085-Messwerte oberhalb wurden am
 ursprünglichen Beobachtungsdaten. Kein DNS-, Daten-, Writer-, Traffic- oder
 Kubernetes-Cutover wurde hierdurch ausgeführt.
 
-- Bureau-`main` blieb auf
-  `1b96351fa0933e29a4f355f94217c99e65a46beb`.
-  [Bureau PR #2350](https://github.com/heimgewebe/bureau/pull/2350)
-  war auf Head `ac42601c2c8f401982ac40241948bafb50ae9e3e` weiterhin
-  **OPEN**. Er schlägt ausdrücklich **neu** die zwei Kriterien
+- Ein früherer, **nicht mit Uhrzeit belegter** PR-Zwischenstand notierte
+  Bureau-`main` als `1b96351fa0933e29a4f355f94217c99e65a46beb`
+  und [Bureau PR #2350](https://github.com/heimgewebe/bureau/pull/2350)
+  auf Head `ac42601c2c8f401982ac40241948bafb50ae9e3e` als
+  **OPEN**. Diese Notiz ist **keine verifizierte Zustandsbehauptung
+  für den 13.10.2026**; der nachgewiesene Merge um 04:24 UTC ist unten
+  ausdrücklich maßgeblich. Der damalige PR schlägt **neu** die zwei Kriterien
   `staging-gitops-runtime` und `semantic-search-continuity` vor; es gibt
   keine historisch nachgewiesene Bureau-TaskSpec mit elf Einträgen.
   Für die **zwei neuen** Kriterien sind gültige `manual_observation`-
   Prüfverträge samt unterschiedlichen `observation_scope`-Konfigurationen
-  vorhanden. Der aktuelle Head besitzt grüne GitHub-Validierung und
+  vorhanden. Der damalige PR-Head besaß grüne GitHub-Validierung und
   revisionsgebundene unabhängige Reviews, doch ein Captain-Preflight
   ersetzt keinen Merge: Der tatsächliche Captain-Run war **BLOCKED**,
   und eine Integration in Bureau-`main` wurde nicht nachgewiesen.
@@ -186,13 +188,15 @@ Kubernetes-Cutover wurde hierdurch ausgeführt.
   Readback-/Abnahmebeschreibung. Bureau-Vertrag, produktives Green und
   B1–B6 sind damit **nicht** freigegeben.
 
-### Späterer Vertrags-Readback — 13. Oktober 2026 (ohne Runtimewirkung)
+### Späterer Vertrags-Readback — 13. Oktober 2026 (GitHub-Stand nach 10:01 UTC; ohne Runtimewirkung)
 
 Dieser **neuere, ausschließlich GitHub-/TaskSpec-bezogene Readback**
 ersetzt die PR-/Registry-Statusbehauptungen des unmittelbar vorangehenden
 Abschnitts, **nicht** jedoch die am 12. Oktober erhobenen Blue-/kind-/T085-
-Messwerte. Insbesondere war `#2350 OPEN` beim früheren Readback korrekt,
-ist aber inzwischen überholt. Es erfolgte **kein neuer produktiver
+Messwerte. Die frühere, **nicht uhrzeitgebundene** Notiz
+`#2350 OPEN` wird ausdrücklich **nicht** als historisch korrekt
+bestätigt, sondern durch den unten belegten Merge-Zustand ersetzt.
+Es erfolgte **kein neuer produktiver
 Kubernetes-, DNS-, Daten-, Writer- oder Traffic-Readback** und keine
 Freigabe einer produktiven Green-Zelle.
 
@@ -207,23 +211,30 @@ Freigabe einer produktiven Green-Zelle.
 - Die neun älteren Kriterien blieben durch diesen Merge unverändert und
   ursprünglich **nicht ausführbar**. Der disjunkte Reparatur-PR
   [Bureau #2352](https://github.com/heimgewebe/bureau/pull/2352)
-  steht als **OPEN** auf veröffentlichtem Head
-  `12d9f87f4f8d45a72136c8e51c07ffd7b65c4fbe`. Dort wurden
-  spezifische `runtime_proof_bundle`-Prüfverträge vorgeschlagen.
-  Neue Codex-P1-Einwände verlangen zusätzlich, das vorgesehene Green-Ziel
-  und dessen Software-Revision *außerhalb des Produzentenbelegs* fest
-  zu binden und die tatsächlichen Receipts durch eine unabhängige
-  Laufzeit-Quelle zu authentifizieren. Lokale Folgekorrekturen und
-  lokale Tests sind **keine** veröffentlichte, freigegebene oder
-  produktiv installierte Bureau-Revision. Die Registry bleibt ohne
-  neue echte Laufzeitbelege **ohne T044-Verifikationsstempel**.
+  steht im hier beobachteten GitHub-Readback vom 13.10.2026
+  als **OPEN** auf veröffentlichtem Head
+  `6c9d28ffec32319be2be59235eee0e1f23413210`. Dort
+  sind neun spezifische `runtime_proof_bundle`-Verträge sowie
+  im TaskSpec eingefrorene Sollfelder für die Green-Revision
+  und Zielidentität ergänzt. Beide Sollfelder bleiben für
+  das noch nicht ausgewählte Produktions-Green ausdrücklich **null**:
+  dies blockiert die Abnahme statt einen hypothetischen Cluster
+  für real auszugeben. Der neue Codex-P1-Befund auf diesem Head
+  beanstandet den weiterhin fehlenden produktiv verdrahteten,
+  primären Laufzeit-Receipt-Adapter. Ohne dessen echte
+  Autorisierung/Readbacks, aktuelle Reviews und Captain-Merge
+  ist die Änderung keine freigegebene Bureau-Revision.
+  **Kein T044-Verifikationsstempel** wurde dadurch erworben.
 - Der Parser-/Dependency-Sicherheitsfix
   [Commonthing #1959](https://github.com/heimgewebe/commonthing/pull/1959)
-  ist weiterhin **OPEN**. Neuerliche Test-, Reviewer- und
-  Codex-Ergebnisse müssen jeweils exakt an den **aktuell
-  veröffentlichten** GitHub-Head gebunden werden; ältere PASS-Berichte
-  berechtigen nicht zum Merge. Die vorangehend genannte ältere
-  `e92d5c3`-Revision ist nicht mehr der veröffentlichte PR-Head.
+  ist im hier überprüften GitHub-Stand weiterhin **OPEN**,
+  mit veröffentlichtem Head
+  `14408677f105476f6e7e907432a32cceafb4c22f`.
+  Dieser neue beobachtete Head ersetzt die vorangehend
+  notierte `e92d5c3`-Revision; kein älteres Review-PASS
+  oder CI-Ergebnis darf auf `14408677` übertragen werden.
+  Vor jeder Mergeentscheidung muss dieser konkrete Head
+  gegen seine dann aktuelle Basis erneut geprüft werden.
 - Der Dokumentations-PR
   [#1957](https://github.com/heimgewebe/commonthing/pull/1957)
   darf erst nach realer Sicherheitskonvergenz sowie für seine eigene
