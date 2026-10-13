@@ -1635,7 +1635,7 @@ class WatchTests(unittest.TestCase):
                     code, [issue["code"] for issue in result["issues"]]
                 )
                 self.assertIn(
-                    "watcher_execution_failed",
+                    "schedule_deadline_exceeded",
                     [issue["code"] for issue in result["issues"]],
                 )
                 self.assertEqual(watch.record(result, directory), "ALARM")
@@ -2010,12 +2010,111 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(interrupted, [True])
             lines = (directory / "events.jsonl").read_text().splitlines()
             self.assertEqual([json.loads(line)["event"] for line in lines],
-                             ["MONITOR_DATA_FAILURE"])
+                             ["ALARM", "MONITOR_DATA_FAILURE"])
             state = json.loads((directory / "state.json").read_text())
             self.assertIn("frontend_cache", [row[0] for row in state["severe"]])
             heartbeat = json.loads((directory / "heartbeat.json").read_text())
             self.assertEqual(heartbeat["status"], "ALARM")
 
+
+
+    def test_deadline_rearmed_before_journal_rollback_io(self):
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(NOW, self.fixtures(cache="max-age=3600"))
+            real_fsync = watch.os.fsync
+            real_truncate = watch.os.ftruncate
+            events = []
+
+            def expired_journal_sync(fd):
+                if (os.readlink(f"/proc/self/fd/{fd}")
+                        == str(directory / "events.jsonl")
+                        and "timeout" not in events):
+                    events.append("timeout")
+                    raise watch.WatchRuntimeExceeded("deadline in journal fsync")
+                return real_fsync(fd)
+
+            def inspect_rollback(fd, offset):
+                events.append("rollback")
+                return real_truncate(fd, offset)
+
+            with patch.object(watch.os, "fsync", side_effect=expired_journal_sync), (
+                patch.object(watch.os, "ftruncate", side_effect=inspect_rollback)
+            ), patch.object(watch.signal, "getsignal",
+                            return_value=watch._watch_deadline), patch.object(
+                watch.signal, "alarm",
+                side_effect=lambda seconds: events.append(("alarm", seconds)),
+            ):
+                with self.assertRaises(watch.WatchRuntimeExceeded):
+                    watch.record(alarm, directory)
+
+            self.assertEqual(events.count("rollback"), 1)
+            self.assertIn(("alarm", 10), events)
+            self.assertLess(events.index(("alarm", 10)), events.index("rollback"))
+            self.assertEqual((directory / "events.jsonl").read_bytes(), b"")
+
+    def test_optional_schedule_deadline_retains_primary_mismatch_anchor(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            normal = self.fixtures(frontend=OLD, api=OLD)
+
+            def schedule_deadline(name):
+                if name in {"schedule", "schedule_completed"}:
+                    raise watch.WatchRuntimeExceeded("optional schedule hung")
+                return normal(name)
+
+            first = watch.evaluate(NOW, schedule_deadline)
+            self.assertEqual(first["status"], "MONITOR_DATA_FAILURE")
+            self.assertIn("frontend", first["main_observation"]["diverged_since"])
+            self.assertEqual(watch.record(first, directory),
+                             "MONITOR_DATA_FAILURE")
+            persisted = json.loads((directory / "state.json").read_text())
+            expected = persisted["main_observation"]["diverged_since"]
+            self.assertEqual(expected["frontend"],
+                             NOW.isoformat().replace("+00:00", "Z"))
+
+            overdue = watch.evaluate(
+                NOW + timedelta(minutes=46), schedule_deadline,
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(overdue["status"], "ALARM")
+            self.assertIn("stale_frontend", [x["code"] for x in overdue["issues"]])
+
+    def test_retry_before_journal_append_emits_original_new_alarm(self):
+        import json
+        import signal
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(NOW, self.fixtures(cache="max-age=3600"))
+            actual_read = Path.read_text
+            failures = []
+
+            def transient_read(path, *args, **kwargs):
+                if path == directory / "heartbeat.json" and not failures:
+                    failures.append(True)
+                    raise OSError("synthetic read error before event append")
+                return actual_read(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", new=transient_read), (
+                patch.object(signal, "alarm", return_value=0)
+            ):
+                self.assertEqual(watch._persist_cycle(alarm, directory), 2)
+
+            self.assertEqual(failures, [True])
+            events = [json.loads(x)["event"] for x in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events, ["ALARM", "MONITOR_DATA_FAILURE"])
+            state = json.loads((directory / "state.json").read_text())
+            self.assertIn("frontend_cache", [i[0] for i in state["severe"]])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
 
 
 if __name__ == "__main__":

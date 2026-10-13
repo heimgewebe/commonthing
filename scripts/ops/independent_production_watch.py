@@ -234,68 +234,76 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None, issue_sink=No
         if commit_age is None or commit_age < -120:
             flag("main_time_unreliable", "GitHub main", str(commit_age),
                  "valid commit timestamp", "main", "P2")
-    observe("schedule")
     newest_schedule = None
-    if "schedule" in data:
-        rows = data["schedule"].get("workflow_runs")
-        if not isinstance(rows, list):
-            flag("invalid_schedule_json", "GitHub schedule", str(type(rows)),
-                 "workflow_runs array", "schedule", "INFO")
-        else:
-            scheduled = [r for r in rows if isinstance(r, dict)
-                         and r.get("event") == "schedule" and timestamp(r.get("created_at"))]
-            if not scheduled:
-                flag("no_schedule", "GitHub schedule", "no event=schedule",
-                     "scheduled run within 45 minutes", "schedule", "INFO")
+    # Schedule telemetry is optional. Its deadline must not discard the
+    # completed frontend/API/main observation or reset the staleness anchor.
+    try:
+        observe("schedule")
+        if "schedule" in data:
+            rows = data["schedule"].get("workflow_runs")
+            if not isinstance(rows, list):
+                flag("invalid_schedule_json", "GitHub schedule", str(type(rows)),
+                     "workflow_runs array", "schedule", "INFO")
             else:
-                run = max(scheduled, key=lambda r: timestamp(r["created_at"]))
-                newest_schedule = {"created_at": run["created_at"], "id": run.get("id"),
-                                   "status": run.get("status"), "conclusion": run.get("conclusion")}
-                age = (now - timestamp(run["created_at"])).total_seconds()
-                if age >= THRESHOLD:
-                    flag("schedule_stale", "GitHub schedule", run["created_at"],
-                         "event=schedule within 45 minutes", "schedule",
-                         severity="INFO", duration=age)
-                elif age < -120:
-                    flag("schedule_time_future", "GitHub schedule", str(round(age)),
-                         "valid timestamp", "schedule", "INFO")
-                # A newer queued/in-progress run is not proof that the most
-                # recent completed scheduled check has recovered.
-                completed = [item for item in scheduled if item.get("status") == "completed"]
-                completed_source = "schedule"
-                if not completed:
-                    # Queued/in-progress runs can obscure older completed runs
-                    # beyond the short latest-runs page; read completed runs directly.
-                    try:
-                        prior, _ = reader("schedule_completed")
-                        history = prior.get("workflow_runs") if isinstance(prior, dict) else None
-                        if not isinstance(history, list):
-                            flag("invalid_completed_schedule_json", "GitHub completed schedule",
-                                 str(type(history)), "workflow_runs array",
+                scheduled = [r for r in rows if isinstance(r, dict)
+                             and r.get("event") == "schedule" and timestamp(r.get("created_at"))]
+                if not scheduled:
+                    flag("no_schedule", "GitHub schedule", "no event=schedule",
+                         "scheduled run within 45 minutes", "schedule", "INFO")
+                else:
+                    run = max(scheduled, key=lambda r: timestamp(r["created_at"]))
+                    newest_schedule = {"created_at": run["created_at"], "id": run.get("id"),
+                                       "status": run.get("status"), "conclusion": run.get("conclusion")}
+                    age = (now - timestamp(run["created_at"])).total_seconds()
+                    if age >= THRESHOLD:
+                        flag("schedule_stale", "GitHub schedule", run["created_at"],
+                             "event=schedule within 45 minutes", "schedule",
+                             severity="INFO", duration=age)
+                    elif age < -120:
+                        flag("schedule_time_future", "GitHub schedule", str(round(age)),
+                             "valid timestamp", "schedule", "INFO")
+                    # A newer queued/in-progress run is not proof that the most
+                    # recent completed scheduled check has recovered.
+                    completed = [item for item in scheduled if item.get("status") == "completed"]
+                    completed_source = "schedule"
+                    if not completed:
+                        # Queued/in-progress runs can obscure older completed runs
+                        # beyond the short latest-runs page; read completed runs directly.
+                        try:
+                            prior, _ = reader("schedule_completed")
+                            history = prior.get("workflow_runs") if isinstance(prior, dict) else None
+                            if not isinstance(history, list):
+                                flag("invalid_completed_schedule_json", "GitHub completed schedule",
+                                     str(type(history)), "workflow_runs array",
+                                     "schedule_completed", "INFO")
+                            else:
+                                completed_source = "schedule_completed"
+                                completed = [item for item in history
+                                             if isinstance(item, dict)
+                                             and item.get("event") == "schedule"
+                                             and item.get("status") == "completed"
+                                             and timestamp(item.get("created_at"))]
+                                if not completed:
+                                    flag("no_completed_schedule", "GitHub completed schedule",
+                                         "no completed schedule in history",
+                                         "completed event=schedule run", "schedule_completed", "INFO")
+                        except Exception as exc:
+                            flag("unavailable_completed_schedule", "GitHub completed schedule",
+                                 str(exc)[:200], "valid completed schedule history",
                                  "schedule_completed", "INFO")
-                        else:
-                            completed_source = "schedule_completed"
-                            completed = [item for item in history
-                                         if isinstance(item, dict)
-                                         and item.get("event") == "schedule"
-                                         and item.get("status") == "completed"
-                                         and timestamp(item.get("created_at"))]
-                            if not completed:
-                                flag("no_completed_schedule", "GitHub completed schedule",
-                                     "no completed schedule in history",
-                                     "completed event=schedule run", "schedule_completed", "INFO")
-                    except Exception as exc:
-                        flag("unavailable_completed_schedule", "GitHub completed schedule",
-                             str(exc)[:200], "valid completed schedule history",
-                             "schedule_completed", "INFO")
-                last_done = max(
-                    completed, key=lambda item: timestamp(item["created_at"]),
-                    default=None,
-                )
-                if last_done is not None and last_done.get("conclusion") != "success":
-                    flag("schedule_failed", "GitHub scheduled check",
-                         str(last_done.get("conclusion")),
-                         "successful scheduled run", completed_source, "INFO")
+                    last_done = max(
+                        completed, key=lambda item: timestamp(item["created_at"]),
+                        default=None,
+                    )
+                    if last_done is not None and last_done.get("conclusion") != "success":
+                        flag("schedule_failed", "GitHub scheduled check",
+                             str(last_done.get("conclusion")),
+                             "successful scheduled run", completed_source, "INFO")
+
+    except WatchRuntimeExceeded as exc:
+        flag("schedule_deadline_exceeded", "GitHub schedule",
+             str(exc)[:160], "bounded optional schedule observation",
+             "schedule", severity="P2")
 
     return {
         "checked_at_utc": now.isoformat().replace("+00:00", "Z"),
@@ -387,7 +395,8 @@ def _record_unverifiable_prior_state(result, directory, heartbeat, cause):
     return "MONITOR_DATA_FAILURE"
 
 
-def record(result, directory, *, serialized_poll=False, suppress_transition_event=False):
+def record(result, directory, *, serialized_poll=False, suppress_transition_event=False,
+           committed_event_names=None):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -522,7 +531,13 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                         os.fsync(fd)
                         # A newly created journal requires a durable directory entry.
                         _fsync_directory(directory)
+                        if committed_event_names is not None:
+                            committed_event_names.update(events)
                     except (OSError, WatchRuntimeExceeded) as append_error:
+                        # SIGALRM is one-shot; rollback itself can block on the
+                        # same faulty filesystem. Bound this last-resort I/O.
+                        if signal.getsignal(signal.SIGALRM) is _watch_deadline:
+                            signal.alarm(10)
                         try:
                             os.ftruncate(fd, previous_end)
                             os.fsync(fd)
@@ -635,8 +650,12 @@ def _persist_cycle(result, directory):
     # SIGALRM is one-shot. Evaluation may already have consumed the whole
     # budget; rearm so a blocked state/heartbeat fsync cannot hang cron.
     signal.alarm(10)
+    committed_events = set()
     try:
-        event = record(result, directory, serialized_poll=True)
+        event = record(
+            result, directory, serialized_poll=True,
+            committed_event_names=committed_events,
+        )
     except (WatchRuntimeExceeded, Exception) as exc:
         # Best effort only. No local write can prove its own availability when
         # storage is completely inaccessible; an external liveness watcher
@@ -656,7 +675,9 @@ def _persist_cycle(result, directory):
         try:
             record(
                 failure, directory, serialized_poll=True,
-                suppress_transition_event=True,
+                suppress_transition_event=bool(
+                    committed_events & {"ALARM", "RECOVERY"}
+                ),
             )
         except (WatchRuntimeExceeded, Exception) as recovery_exc:
             print(
