@@ -249,3 +249,27 @@ fn anchored_explicit_empty_string_is_valid_mapping_key() {
     )
     .is_err());
 }
+#[test]
+fn tagged_empty_string_anchor_survives_flow_collection_delimiters() {
+    for (case, source) in [
+        (
+            "close brace",
+            "holder: {value: &key !!str}\n? *key\n: ignored\nmax_guest_owned_nodes: 21\n",
+        ),
+        (
+            "comma",
+            "holder: {first: &key !!str, second: other}\n? *key\n: ignored\nmax_guest_owned_nodes: 21\n",
+        ),
+    ] {
+        let config = AppConfig::load_from_str(source)
+            .unwrap_or_else(|error| panic!("{case} did not retain string anchor: {error:#}"));
+        assert_eq!(config.max_guest_owned_nodes, 21, "{case}");
+    }
+    // Collection and typed numeric aliases must still remain forbidden as mapping keys.
+    for source in [
+        "holder: {value: &key {item: 1}}\n? *key\n: ignored\n",
+        "holder: {value: &key !!int 1}\n? *key\n: ignored\n",
+    ] {
+        assert!(AppConfig::load_from_str(source).is_err());
+    }
+}

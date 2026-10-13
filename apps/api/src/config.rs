@@ -589,7 +589,22 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                         SyntaxKind::Whitespace | SyntaxKind::Newline | SyntaxKind::Comment => {}
                         _ => {
                             if let Some(anchor) = pending_anchor.take() {
-                                anchors.insert(anchor, false);
+                                // A tagged empty scalar ends at a flow/map
+                                // delimiter, so the verified string anchor
+                                // must survive just as it does at node end.
+                                // Unknown tokens and collection nodes still
+                                // fail closed rather than blessing aliases.
+                                let ends_empty_scalar = matches!(
+                                    *kind,
+                                    SyntaxKind::Comma
+                                        | SyntaxKind::CloseBrace
+                                        | SyntaxKind::CloseBracket
+                                        | SyntaxKind::ColonIndicator
+                                );
+                                anchors.insert(
+                                    anchor,
+                                    ends_empty_scalar && anchor_tag_is_string == Some(true),
+                                );
                             }
                             anchor_tag_is_string = None;
                         }
