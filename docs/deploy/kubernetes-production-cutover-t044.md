@@ -6,12 +6,13 @@ status: active
 canonicality: operational
 lifecycle_state: active
 owner_task: WELTGEWEBE-OS-V1-T044
-last_reviewed: 2026-10-12
+last_reviewed: 2026-10-13
 review_after: 2026-10-19
 summary: >
   Historischer R5-Preflight vom 25.09.2026 mit separater unvollständiger
-  read-only-Nachbeobachtung vom 12.10.2026. Beide Beobachtungen sind
-  ausdrücklich keine Produktions- oder R6-Aktivierungsfreigabe.
+  read-only-Nachbeobachtung vom 12.10.2026 sowie getrenntem
+  PR-/Abnahmevertrags-Readback vom 13.10.2026. Keine dieser Beobachtungen ist
+  eine Produktions- oder R6-Aktivierungsfreigabe.
 relations:
   - type: depends_on
     target: docs/reports/kubernetes-platform-foundation-status.md
@@ -140,6 +141,54 @@ Cutover-Vertrag und Produktfähigkeiten formell revisionsgebunden
 reconciliiert sein; weder Suchkontinuität noch deklarative
 Staging-Runtime-Wahrheit dürfen still wegfallen. Bis dahin gelten die
 bisherigen strengeren R9-Schranken unverändert und R6 bleibt BLOCKED.
+
+### PR- und Verifier-Nachtrag — 13. Oktober 2026 (kein Produktionsreadback)
+
+Diese erneute Prüfung betrifft **nur GitHub-Revisionen, Review- und
+Abnahmeverträge**. Die Blue-/kind-/T085-Messwerte oberhalb wurden am
+13.10.2026 **nicht** neu gemessen; sie behalten ausdrücklich ihre jeweiligen
+ursprünglichen Beobachtungsdaten. Kein DNS-, Daten-, Writer-, Traffic- oder
+Kubernetes-Cutover wurde hierdurch ausgeführt.
+
+- Bureau-`main` blieb auf
+  `1b96351fa0933e29a4f355f94217c99e65a46beb`.
+  [Bureau PR #2350](https://github.com/heimgewebe/bureau/pull/2350)
+  war auf Head `ac42601c2c8f401982ac40241948bafb50ae9e3e` weiterhin
+  **OPEN**. Er schlägt ausdrücklich **neu** die zwei Kriterien
+  `staging-gitops-runtime` und `semantic-search-continuity` vor; es gibt
+  keine historisch nachgewiesene Bureau-TaskSpec mit elf Einträgen.
+  Für die **zwei neuen** Kriterien sind gültige `manual_observation`-
+  Prüfverträge samt unterschiedlichen `observation_scope`-Konfigurationen
+  vorhanden. Der aktuelle Head besitzt grüne GitHub-Validierung und
+  revisionsgebundene unabhängige Reviews, doch ein Captain-Preflight
+  ersetzt keinen Merge: Der tatsächliche Captain-Run war **BLOCKED**,
+  und eine Integration in Bureau-`main` wurde nicht nachgewiesen.
+- Die **neun bestehenden** T044-Acceptance-Kriterien verwenden weiterhin
+  freie `verifier`-Prosa ohne `verifier_config`. Der operative Bureau-
+  Vertrag `validate_acceptance_contract` meldet dadurch je
+  `verifier-unknown` und `verifier-config-missing`, insgesamt **18
+  Alt-Diagnosen**. [Bureau #2351](https://github.com/heimgewebe/bureau/issues/2351)
+  verfolgt den separaten, sicherheitsbewussten Fix. Strukturell grüne
+  Registry-CI schließt diesen **Claim-/Dispatcher-Blocker nicht**. Selbst
+  elf formal gültige Prüfverträge wären noch **keine elf bestandenen
+  Produktionsprüfungen**.
+- Commonthing-`main` blieb auf
+  `59a1bf56c86acdcd355d10604263524c6a551df1`.
+  Der Parser-Sicherheitsfix
+  [Commonthing PR #1959](https://github.com/heimgewebe/commonthing/pull/1959)
+  blieb auf Head `e92d5c3bea56251a5e9b26ae09f91b2b4b9745d3`
+  **OPEN**. Die YAML-Regressionen und `Cargo.lock`-Sicherheitskorrektur
+  bestanden zuletzt 588 API-Library-Tests sowie `cargo audit` und
+  `cargo deny check`. Ein unabhängiger Review dieses Heads war
+  `PASS` ohne Findings; die vollständige GitHub-/Review-Evidence-
+  Freigabe und ein Captain-Merge waren **nicht** abgeschlossen.
+- Dieser R5-Dokumentations-PR #1957 selbst bleibt eine bloße
+  Readback-/Abnahmebeschreibung. Bureau-Vertrag, produktives Green und
+  B1–B6 sind damit **nicht** freigegeben.
+
+Die Priorität bleibt: Sicherheits- und Verifierverträge final
+revisionsgebunden integrieren, danach den realen Zielcluster und B1–B6
+tatsächlich prüfen. Ohne alle Wirkungsevidenzen bleibt **R6 gesperrt**.
 
 **Disposition:** R5 ist **nicht bestanden**. R6–R9 bleiben gesperrt.
 Die B1–B6-Tabelle wertet nur die konkrete Zielrevision, nicht historische
