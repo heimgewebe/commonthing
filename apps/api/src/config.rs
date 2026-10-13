@@ -429,6 +429,7 @@ pub struct AppConfig {
 // Inspect the original lossless syntax tree before deserializing AppConfig.
 fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
     use noyalib::cst::{GreenChild, GreenNode, SyntaxKind};
+    use std::collections::HashMap;
 
     let config = noyalib::ParserConfig::serde_yaml_compat();
     let document = noyalib::cst::parse_document_with_config(raw, &config)
@@ -439,6 +440,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
         spelling: &str,
         explicitly_string: bool,
         config: &noyalib::ParserConfig,
+        anchors: &HashMap<String, bool>,
     ) -> Result<()> {
         match kind {
             SyntaxKind::SingleQuotedScalar
@@ -457,9 +459,13 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                 );
                 Ok(())
             }
-            SyntaxKind::AliasMark => anyhow::bail!(
-                "YAML configuration mapping key aliases cannot be verified as strings"
-            ),
+            SyntaxKind::AliasMark => {
+                anyhow::ensure!(
+                    anchors.get(spelling.trim_start_matches('*')) == Some(&true),
+                    "YAML mapping key alias does not reference a verified string scalar"
+                );
+                Ok(())
+            }
             _ => anyhow::bail!("unsupported YAML configuration mapping key form"),
         }
     }
@@ -469,18 +475,60 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
         source: &str,
         base: usize,
         config: &noyalib::ParserConfig,
+        anchors: &mut HashMap<String, bool>,
     ) -> Result<()> {
         let mut offset = base;
         let mut block_key = node.kind() == SyntaxKind::MappingEntry;
         let mut seen_block_key = false;
         let mut flow_key = node.kind() == SyntaxKind::FlowMapping;
         let mut seen_flow_key = false;
+        let mut seen_flow_question = false;
         let mut explicitly_string = false;
+        // Anchors are observed in source order. Only scalar string targets can
+        // later be used as mapping keys; collections and typed values stay closed.
+        let mut pending_anchor: Option<String> = None;
+        let mut anchor_tag_is_string: Option<bool> = None;
 
         for child in node.children() {
             match child {
                 GreenChild::Token { kind, len } => {
                     let spelling = &source[offset..offset + *len as usize];
+                    match *kind {
+                        SyntaxKind::TagMark => {
+                            anchor_tag_is_string = Some(matches!(
+                                spelling,
+                                "!" | "!!str" | "!<tag:yaml.org,2002:str>"
+                            ));
+                        }
+                        SyntaxKind::AnchorMark => {
+                            if let Some(previous) =
+                                pending_anchor.replace(spelling.trim_start_matches('&').to_owned())
+                            {
+                                anchors.insert(previous, false);
+                            }
+                        }
+                        SyntaxKind::PlainScalar
+                        | SyntaxKind::SingleQuotedScalar
+                        | SyntaxKind::DoubleQuotedScalar
+                        | SyntaxKind::LiteralScalar
+                        | SyntaxKind::FoldedScalar => {
+                            if let Some(anchor) = pending_anchor.take() {
+                                let target_is_string = anchor_tag_is_string != Some(false)
+                                    && (anchor_tag_is_string == Some(true)
+                                        || inspect_key(*kind, spelling, false, config, anchors)
+                                            .is_ok());
+                                anchors.insert(anchor, target_is_string);
+                            }
+                            anchor_tag_is_string = None;
+                        }
+                        SyntaxKind::Whitespace | SyntaxKind::Newline => {}
+                        _ => {
+                            if let Some(anchor) = pending_anchor.take() {
+                                anchors.insert(anchor, false);
+                            }
+                            anchor_tag_is_string = None;
+                        }
+                    }
                     if node.kind() == SyntaxKind::BlockMapping
                         && *kind == SyntaxKind::ColonIndicator
                     {
@@ -508,7 +556,13 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                                 | SyntaxKind::LiteralScalar
                                 | SyntaxKind::FoldedScalar
                                 | SyntaxKind::AliasMark => {
-                                    inspect_key(*kind, spelling, explicitly_string, config)?;
+                                    inspect_key(
+                                        *kind,
+                                        spelling,
+                                        explicitly_string,
+                                        config,
+                                        anchors,
+                                    )?;
                                     seen_block_key = true;
                                 }
                                 _ => {}
@@ -517,9 +571,23 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                     } else if node.kind() == SyntaxKind::FlowMapping {
                         match *kind {
                             SyntaxKind::Comma => {
+                                anyhow::ensure!(
+                                    !seen_flow_question || seen_flow_key,
+                                    "YAML flow mapping entry has no string key"
+                                );
                                 flow_key = true;
                                 seen_flow_key = false;
+                                seen_flow_question = false;
                                 explicitly_string = false;
+                            }
+                            SyntaxKind::QuestionIndicator if flow_key => {
+                                seen_flow_question = true;
+                            }
+                            SyntaxKind::CloseBrace => {
+                                anyhow::ensure!(
+                                    !seen_flow_question || seen_flow_key,
+                                    "YAML flow mapping entry has no string key"
+                                );
                             }
                             SyntaxKind::ColonIndicator => {
                                 anyhow::ensure!(
@@ -541,7 +609,7 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                             | SyntaxKind::AliasMark
                                 if flow_key && !seen_flow_key =>
                             {
-                                inspect_key(*kind, spelling, explicitly_string, config)?;
+                                inspect_key(*kind, spelling, explicitly_string, config, anchors)?;
                                 seen_flow_key = true;
                             }
                             _ => {}
@@ -549,18 +617,24 @@ fn check_yaml_mapping_keys(raw: &str) -> Result<()> {
                     }
                 }
                 GreenChild::Node(child_node) => {
+                    if let Some(anchor) = pending_anchor.take() {
+                        anchors.insert(anchor, false);
+                    }
                     if block_key || (flow_key && !seen_flow_key) {
                         anyhow::bail!("YAML configuration mapping key is not a string scalar");
                     }
-                    verify_tree(child_node, source, offset, config)?;
+                    verify_tree(child_node, source, offset, config, anchors)?;
                 }
             }
             offset += child.text_len();
         }
+        if node.kind() == SyntaxKind::MappingEntry {
+            anyhow::ensure!(seen_block_key, "YAML mapping entry has no string key");
+        }
         Ok(())
     }
 
-    verify_tree(document.syntax(), raw, 0, &config)
+    verify_tree(document.syntax(), raw, 0, &config, &mut HashMap::new())
 }
 
 impl AppConfig {

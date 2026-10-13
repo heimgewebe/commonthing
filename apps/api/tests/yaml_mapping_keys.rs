@@ -5,6 +5,16 @@ use weltgewebe_api::config::AppConfig;
 fn implicit_null_mapping_keys_must_not_be_silently_ignored() {
     let invalid = [
         ("root block", ": ignored\nmax_guest_owned_nodes: 21\n"),
+        ("explicit bare root key", "max_guest_owned_nodes: 21\n?\n"),
+        (
+            "explicit bare nested key",
+            "unknown:\n  ?\nmax_guest_owned_nodes: 21\n",
+        ),
+        ("explicit bare flow key", "{?, max_guest_owned_nodes: 21}\n"),
+        (
+            "explicit bare flow tail",
+            "{max_guest_owned_nodes: 21, ?}\n",
+        ),
         ("nested block", "unknown:\n  : ignored\n"),
         (
             "rate limits block",
@@ -67,5 +77,34 @@ fn block_scalar_mapping_keys_are_valid_strings() {
         let parsed = AppConfig::load_from_str(source)
             .unwrap_or_else(|error| panic!("{case} YAML block string key rejected: {error:#}"));
         assert_eq!(parsed.max_guest_owned_nodes, 21, "{case}");
+    }
+}
+#[test]
+fn anchored_string_mapping_key_aliases_keep_legacy_compatibility() {
+    for (case, source) in [
+        ("plain", "field: &key max_guest_owned_nodes\n? *key\n: 21\n"),
+        (
+            "quoted",
+            "field: &key 'max_guest_owned_nodes'\n? *key\n: 21\n",
+        ),
+    ] {
+        let parsed = AppConfig::load_from_str(source)
+            .unwrap_or_else(|error| panic!("{case} anchored scalar key alias rejected: {error:#}"));
+        assert_eq!(parsed.max_guest_owned_nodes, 21, "{case}");
+    }
+}
+
+#[test]
+fn non_string_key_aliases_must_not_be_silently_ignored() {
+    for source in [
+        "field: &key 1\n? *key\n: ignored\n",
+        "field: &key true\n? *key\n: ignored\n",
+        "field: &key null\n? *key\n: ignored\n",
+        "field: &key {nested: value}\n? *key\n: ignored\n",
+    ] {
+        assert!(
+            AppConfig::load_from_str(source).is_err(),
+            "non-string key alias accepted: {source:?}"
+        );
     }
 }
