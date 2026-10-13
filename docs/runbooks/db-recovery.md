@@ -236,17 +236,16 @@ Off-Host-Pull nicht still unterbrechen:
 set -euo pipefail
 backup_dir=/var/backups/weltgewebe/postgres
 getent hosts commonserver > /dev/null
-latest="$(
+age_manifest="$(
   ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-    "sudo -n find '$backup_dir' -maxdepth 1 -type f -name 'weltgewebe-postgres-*.sql.gz.age' -printf '%f\\n'" |
+    "sudo -n find '$backup_dir' -maxdepth 1 -type f -name 'weltgewebe-postgres-*.age.sha256.manifest' -printf '%f\\n'" |
     sort |
     tail -n1
 )"
-if [[ "$latest" != weltgewebe-postgres-*.sql.gz.age ]]; then
-  printf 'Kein verschlüsseltes PostgreSQL-Backup auf commonserver gefunden.\n' >&2
+if [[ "$age_manifest" != weltgewebe-postgres-*.age.sha256.manifest ]]; then
+  printf 'Kein vollständiges verschlüsseltes PostgreSQL-Backup auf commonserver gefunden.\n' >&2
   exit 1
 fi
-age_manifest="${latest%.sql.gz.age}.age.sha256.manifest"
 ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
   "sudo -n cat -- '$backup_dir/$age_manifest'" > /dev/null
 ```
@@ -254,7 +253,8 @@ ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
 Damit werden genau die verpflichtenden privilegierten Leseoperationen
 (`find` und `cat`) geprüft, die auch der Pull verwendet. Befehlsbezogene
 Sudoers-Regeln auf `commonserver` müssen dafür das neue `find`-Muster
-`weltgewebe-postgres-*.sql.gz.age` und `cat` auf `*.sql.gz.age`,
+`weltgewebe-postgres-*.age.sha256.manifest` (Abschlussmarker eines
+vollständigen Satzes) und `cat` auf `*.sql.gz.age`,
 `*.age.sha256.manifest` und `*.sha256.manifest` erlauben; `cat` auf den
 Klartext-Dump `*.sql.gz` wird vom Pull nicht mehr benötigt und sollte aus
 den Regeln entfernt werden. `set -euo pipefail` sorgt zusätzlich dafür, dass ein fehlgeschlagenes SSH/`sudo find` nicht durch
