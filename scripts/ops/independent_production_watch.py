@@ -403,6 +403,63 @@ def _record_unverifiable_prior_state(result, directory, heartbeat, cause):
     return "MONITOR_DATA_FAILURE"
 
 
+def _pending_transition_entries(snapshot):
+    """Read a bounded, typed transition outbox from durable incident anchors."""
+    if not isinstance(snapshot, dict):
+        return []
+    entries = snapshot.get("pending_transitions", [])
+    if not isinstance(entries, list) or len(entries) > 16:
+        raise ValueError("malformed pending transition outbox")
+    validated = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"event", "payload"}:
+            raise ValueError("malformed pending transition entry")
+        payload = entry["payload"]
+        if (
+            entry["event"] not in {"ALARM", "RECOVERY"}
+            or not isinstance(payload, dict)
+            or payload.get("event") != entry["event"]
+            or payload.get("status") not in {"ALARM", "HEALTHY", "MONITOR_DATA_FAILURE"}
+            or timestamp(payload.get("checked_at_utc")) is None
+            or not isinstance(payload.get("issues"), list)
+            or len(json.dumps(payload, sort_keys=True)) > 65536
+        ):
+            raise ValueError("invalid pending transition payload")
+        if entry not in validated:
+            validated.append(entry)
+    return validated
+
+
+def _transition_already_journaled(directory, entry):
+    """Confirm an outbox entry by exact durable bytes, never by a status flag.
+
+    A crash after journal fsync but before clearing the outbox must not
+    replay the already committed ALARM or RECOVERY. Never assume absence
+    from a truncated journal read (which would create duplicates).
+    """
+    expected = (
+        json.dumps(entry["payload"], sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    try:
+        with (directory / "events.jsonl").open("rb") as reader:
+            # A fixed overall journal limit eventually prevents all replay.
+            # Scan the append-only history with bounded per-line memory, even
+            # if a malformed line is arbitrarily long. Production SIGALRM
+            # bounds wall time; an incomplete scan never asserts absence.
+            at_line_start = True
+            while chunk := reader.readline(len(expected) + 1):
+                if at_line_start and chunk == expected:
+                    # Visible bytes after a previous fsync error are not proof
+                    # of durability: sync the journal and directory first.
+                    os.fsync(reader.fileno())
+                    _fsync_directory(directory)
+                    return True
+                at_line_start = chunk.endswith(b"\n")
+            return False
+    except FileNotFoundError:
+        return False
+
+
 def record(result, directory, *, serialized_poll=False, suppress_transition_event=False,
            committed_event_names=None):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -560,6 +617,29 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             item for item in raw_severe
             if item[0] not in {"schedule_stale", "schedule_failed", "no_schedule"}
         )
+        # State normally owns this outbox. A recovery writes heartbeat first;
+        # if state.json is replaced but its directory fsync then fails, the
+        # earlier heartbeat is the only durable evidence of that RECOVERY.
+        try:
+            pending = []
+            for anchor in (previous, previous_heartbeat):
+                for entry in _pending_transition_entries(anchor):
+                    if entry not in pending:
+                        pending.append(entry)
+            if len(pending) > 16:
+                raise ValueError("pending transition outbox exceeds bound")
+            # Crash-consistent exact-once retry: the first append may be
+            # durable even when its following state-clear fsync failed.
+            # Any read failure remains an error, preserving prior anchors.
+            pending = [
+                entry for entry in pending
+                if not _transition_already_journaled(directory, entry)
+            ]
+        except (ValueError, TypeError) as exc:
+            return _record_unverifiable_prior_state(
+                result, directory, previous_heartbeat,
+                f"invalid pending transition outbox: {type(exc).__name__}",
+            )
         old_uncertain = previous.get("uncertain")
         old_uncertain = old_uncertain if isinstance(old_uncertain, list) else []
         severe = sorted([x["code"], str(x["actual"])[:160]]
@@ -619,16 +699,61 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         events = [event for event in (
             None if suppress_transition_event else transition, uncertainty_event,
         ) if event]
+        # Include the actual first-observation payload, not a synthetic later
+        # poll's status. Both incident anchors persist this bounded outbox.
+        for event_name in events:
+            if event_name in {"ALARM", "RECOVERY"}:
+                # The old state may still contain the incident when the
+                # recovery's first snapshot failed before os.replace. The
+                # heartbeat already carries that exact uncommitted RECOVERY;
+                # do not add a second event with a later checked_at timestamp.
+                if event_name == "RECOVERY" and any(
+                    entry["event"] == "RECOVERY" for entry in pending
+                ):
+                    continue
+                payload = {
+                    "event": event_name,
+                    **{key: value for key, value in result.items()
+                       if key != "pending_transitions"},
+                    "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939",
+                }
+                entry = {"event": event_name, "payload": payload}
+                if entry not in pending:
+                    pending.append(entry)
+        if len(pending) > 16:
+            raise ValueError("pending transition outbox exceeds bound")
+        unverified = {"watcher_execution_failed", "unverifiable_state"} & observed_codes
+        ready_pending = ([] if suppress_transition_event else [
+            entry for entry in pending
+            if entry["event"] == "ALARM" or (not severe and not unverified)
+        ])
+        replayed_event = next(
+            (entry["event"] for entry in ready_pending
+             if entry not in _pending_transition_entries(previous)
+             and entry not in _pending_transition_entries(previous_heartbeat)),
+            None,
+        )
+        if replayed_event is None and ready_pending:
+            replayed_event = ready_pending[0]["event"]
 
         def persist_snapshots(*, heartbeat_first=False):
+            if pending:
+                result["pending_transitions"] = pending
+            else:
+                result.pop("pending_transitions", None)
+            state_snapshot = {
+                "severe": severe, "uncertain": uncertain,
+                "main_observation": current_main,
+                "checked_at_utc": result["checked_at_utc"],
+            }
+            if pending:
+                state_snapshot["pending_transitions"] = pending
             if heartbeat_first:
                 # A recovery cannot destroy the only durable prior-P1 anchor
                 # before the heartbeat update succeeds. This ordering also
                 # keeps the journal from advertising an uncommitted recovery.
                 write_json(directory / "heartbeat.json", result)
-            write_json(path, {"severe": severe, "uncertain": uncertain,
-                              "main_observation": current_main,
-                              "checked_at_utc": result["checked_at_utc"]})
+            write_json(path, state_snapshot)
             if not heartbeat_first:
                 write_json(directory / "heartbeat.json", result)
 
@@ -637,20 +762,27 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         # are durably committed; otherwise a failed state write can fabricate
         # recovered history while the confirmed incident remains active.
         recovery_before_event = (
-            transition == "RECOVERY" and not suppress_transition_event
+            any(entry["event"] == "RECOVERY" for entry in ready_pending)
         )
         if recovery_before_event:
             persist_snapshots(heartbeat_first=True)
         event_log_failed = False
-        if events:
+        journal_events = [entry["payload"] for entry in ready_pending]
+        journal_events.extend(
+            {"event": event_name, **{
+                key: value for key, value in result.items()
+                if key != "pending_transitions"
+            }, "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939"}
+            for event_name in events if event_name == "MONITOR_DATA_FAILURE"
+        )
+        if journal_events:
             try:
-                # Construct the complete batch before touching the journal.
-                # A mid-loop failure must not commit only the first event.
-                batch = []
-                for event_name in events:
-                    event = {"event": event_name, **result,
-                             "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939"}
-                    batch.append(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+                # Prepare one atomic append batch: old pending transitions
+                # always precede subsequent monitor-data evidence.
+                batch = [
+                    json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+                    for event in journal_events
+                ]
                 # Unbuffered single append with rollback to the exact old
                 # size on a short write or fsync failure. The surrounding
                 # record flock serializes all watcher-owned journal writers.
@@ -666,7 +798,9 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                         # A newly created journal requires a durable directory entry.
                         _fsync_directory(directory)
                         if committed_event_names is not None:
-                            committed_event_names.update(events)
+                            committed_event_names.update(
+                                entry["event"] for entry in journal_events
+                            )
                     except (OSError, WatchRuntimeExceeded) as append_error:
                         # SIGALRM is one-shot; rollback itself can block on the
                         # same faulty filesystem. Bound this last-resort I/O.
@@ -681,6 +815,11 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                                 f"rollback failed: {rollback_error}"
                             ) from rollback_error
                         raise
+                # Append and both syncs finished; remove only those entries
+                # actually published. Any deferred recovery stays pending.
+                pending[:] = [
+                    entry for entry in pending if entry not in ready_pending
+                ]
             except OSError as exc:
                 event_log_failed = True
                 # Auxiliary event history must not block durable incident state.
@@ -700,9 +839,9 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         # A failed journal append adds a P2 to the report. For a committed
         # recovery, refresh both snapshots only in that case; otherwise
         # ordinary observations keep the established write order.
-        if not recovery_before_event or event_log_failed:
+        if not recovery_before_event or event_log_failed or ready_pending:
             persist_snapshots()
-    return new_event
+    return new_event or (replayed_event if not event_log_failed else None)
 
 
 def read_previous_main_observation(directory):

@@ -1779,7 +1779,7 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(
                 [json.loads(line)["event"] for line in
                  (directory / "events.jsonl").read_text().splitlines()],
-                ["RECOVERY"],
+                ["ALARM", "RECOVERY"],
             )
 
 
@@ -2587,6 +2587,202 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(heartbeat["status"], "ALARM")
             self.assertIn("frontend_cache", [i["code"] for i in heartbeat["issues"]])
 
+
+    def test_failed_alarm_journal_append_retries_original_transition(self):
+        import json
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.assertIsNone(watch.record(
+                watch.evaluate(NOW, self.fixtures()), directory,
+            ))
+            original = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            normal_open = Path.open
+            failed = []
+            def fail_first_append(path, *args, **kwargs):
+                if path == directory / "events.jsonl" and not failed:
+                    failed.append(True)
+                    raise OSError("temporary journal append failure")
+                return normal_open(path, *args, **kwargs)
+            with patch.object(Path, "open", new=fail_first_append):
+                self.assertEqual(watch.record(original, directory), "ALARM")
+            self.assertEqual(failed, [True])
+            followup = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(followup, directory), "ALARM")
+            events = [json.loads(line) for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual([x["event"] for x in events], ["ALARM"])
+            self.assertEqual(events[0]["checked_at_utc"], original["checked_at_utc"])
+            self.assertIsNone(watch.record(
+                watch.evaluate(
+                    NOW + timedelta(minutes=3),
+                    self.fixtures(cache="public, max-age=30"),
+                ), directory,
+            ))
+            self.assertEqual(
+                [json.loads(line)["event"] for line in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],
+            )
+
+    def test_recovery_after_state_rename_parent_fsync_fault_is_retried(self):
+        import json
+        import os
+        import signal
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(alarm, directory), "ALARM")
+            recovered = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(),
+            )
+            fsync = watch.os.fsync
+            last_file = [None]
+            failures = []
+            def fail_post_replace_directory_fsync(fd):
+                name = os.readlink(f"/proc/self/fd/{fd}")
+                if name.endswith(".tmp"):
+                    last_file[0] = name
+                if (name == str(directory)
+                        and last_file[0] == str(directory / "state.json.tmp")
+                        and not failures):
+                    failures.append(True)
+                    raise OSError("state rename succeeded, parent fsync failed")
+                return fsync(fd)
+            with patch.object(
+                watch.os, "fsync",
+                side_effect=fail_post_replace_directory_fsync,
+            ), patch.object(signal, "alarm", return_value=0):
+                self.assertEqual(watch._persist_cycle(recovered, directory), 2)
+            self.assertEqual(failures, [True])
+            self.assertNotIn("RECOVERY", [json.loads(x)["event"] for x in
+                (directory / "events.jsonl").read_text().splitlines()])
+            self.assertEqual(
+                watch.record(watch.evaluate(
+                    datetime.now(timezone.utc) + timedelta(minutes=1),
+                    self.fixtures(),
+                ), directory),
+                "RECOVERY",
+            )
+            events = [json.loads(x) for x in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual([x["event"] for x in events].count("RECOVERY"), 1)
+            self.assertEqual(
+                [x for x in events if x["event"] == "RECOVERY"][0][
+                    "checked_at_utc"
+                ], recovered["checked_at_utc"],
+            )
+            self.assertEqual(
+                json.loads((directory / "state.json").read_text())["severe"], [],
+            )
+
+
+    def test_replayed_recovery_dedupes_after_postappend_snapshot_failure(self):
+        import json
+        import signal
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(alarm, directory), "ALARM")
+            recovered = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(),
+            )
+            actual_write = watch.write_json
+            failures = []
+            def fail_final_snapshot(path, value):
+                if (path.name == "state.json" and
+                        "pending_transitions" not in value and not failures):
+                    failures.append(True)
+                    raise OSError("outbox-clear failed after durable event append")
+                return actual_write(path, value)
+            with patch.object(
+                watch, "write_json", side_effect=fail_final_snapshot,
+            ), patch.object(signal, "alarm", return_value=0):
+                self.assertEqual(watch._persist_cycle(recovered, directory), 2)
+            self.assertEqual(failures, [True])
+            saved = [json.loads(line)["event"] for line in
+                     (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(saved.count("RECOVERY"), 1)
+            later = watch.evaluate(
+                datetime.now(timezone.utc) + timedelta(minutes=1),
+                self.fixtures(),
+            )
+            self.assertIsNone(watch.record(later, directory))
+            events = [json.loads(line)["event"] for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events.count("RECOVERY"), 1)
+            self.assertFalse(
+                json.loads((directory / "state.json").read_text()).get(
+                    "pending_transitions",
+                ),
+            )
+
+
+
+    def test_replayed_alarm_reconciles_when_journal_exceeds_sixteen_megabytes(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            # Append a valid 17-MiB history BEFORE the incident. Dedupe
+            # must scan to the actual event beyond the old 16-MiB bound.
+            with (directory / "events.jsonl").open("ab") as out:
+                out.write(b'{"event":"MONITOR_DATA_FAILURE"}\n' * 550_000)
+            alarm = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(alarm, directory), "ALARM")
+            with (directory / "events.jsonl").open("rb") as src:
+                src.seek(0, 2)
+                src.seek(-4096, 2)
+                original = json.loads(src.read().splitlines()[-1])
+            pending = [{"event": "ALARM", "payload": original}]
+            for anchor in ("state.json", "heartbeat.json"):
+                item_path = directory / anchor
+                saved = json.loads(item_path.read_text())
+                saved["pending_transitions"] = pending
+                watch.write_json(item_path, saved)
+            journal_size = (directory / "events.jsonl").stat().st_size
+            self.assertGreater(journal_size, 16 * 1024 * 1024)
+            followup = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertIsNone(watch.record(followup, directory))
+            self.assertEqual((directory / "events.jsonl").stat().st_size,
+                             journal_size)
+            self.assertFalse(json.loads(
+                (directory / "state.json").read_text()
+            ).get("pending_transitions"))
+
+    def test_journal_replay_does_not_match_malformed_line_suffix(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            payload = {
+                "event": "ALARM", "status": "ALARM",
+                "checked_at_utc": NOW.isoformat(), "issues": [],
+            }
+            entry = {"event": "ALARM", "payload": payload}
+            expected = (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
+            # The next bounded chunk happens to look like a valid JSONL row
+            # but starts in the middle of a single malformed long row.
+            with (directory / "events.jsonl").open("wb") as out:
+                out.write(b"x" * (len(expected) + 1) + expected)
+            self.assertFalse(watch._transition_already_journaled(directory, entry))
 
 if __name__ == "__main__":
     unittest.main()
