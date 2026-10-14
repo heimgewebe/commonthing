@@ -246,16 +246,29 @@ if [[ "$age_manifest" != weltgewebe-postgres-*.age.sha256.manifest ]]; then
   printf 'Kein vollständiges verschlüsseltes PostgreSQL-Backup auf commonserver gefunden.\n' >&2
   exit 1
 fi
+base="${age_manifest%.age.sha256.manifest}"
+for file in "$age_manifest" "$base.sql.gz.age" "$base.sha256.manifest"; do
+  ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
+    "sudo -n cat -- '$backup_dir/$file'" > /dev/null
+done
+# Der Wochen-Proof ist optional und fehlt oft für das neueste Backup. Daher
+# nur die Sudo-Berechtigung prüfen (`sudo -l`), nicht die Existenz der Datei.
+proof="$backup_dir/proofs/$base.restore-proof"
 ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-  "sudo -n cat -- '$backup_dir/$age_manifest'" > /dev/null
+  "sudo -n -l test -f '$proof' && sudo -n -l cat -- '$proof'" > /dev/null
 ```
 
-Damit werden genau die verpflichtenden privilegierten Leseoperationen
-(`find` und `cat`) geprüft, die auch der Pull verwendet. Befehlsbezogene
+Damit werden genau die privilegierten Operationen geprüft, die auch der Pull
+verwendet: `find` auf die Abschlussmarker, `cat` auf Abschlussmarker,
+Chiffrat und Klartext-Manifest sowie `test -f` und `cat` auf den optionalen
+Restore-Proof unter `proofs/`. Die Proof-Prüfung ist wichtig, weil der Pull
+ein verweigertes `sudo test -f` nicht von einem fehlenden Proof unterscheiden
+kann und den Proof sonst still nie mitnimmt. Befehlsbezogene
 Sudoers-Regeln auf `commonserver` müssen dafür das neue `find`-Muster
 `weltgewebe-postgres-*.age.sha256.manifest` (Abschlussmarker eines
 vollständigen Satzes) und `cat` auf `*.sql.gz.age`,
-`*.age.sha256.manifest` und `*.sha256.manifest` erlauben; `cat` auf den
+`*.age.sha256.manifest` und `*.sha256.manifest` sowie `test -f` und `cat`
+auf `proofs/*.restore-proof` erlauben; `cat` auf den
 Klartext-Dump `*.sql.gz` wird vom Pull nicht mehr benötigt und sollte aus
 den Regeln entfernt werden. `set -euo pipefail` sorgt zusätzlich dafür, dass ein fehlgeschlagenes SSH/`sudo find` nicht durch
 das nachgeschaltete `sort`/`tail` verdeckt wird; ein leerer oder unerwarteter
