@@ -177,6 +177,12 @@ if ((REAL_AGE == 1)); then
   [[ "$(gunzip -c "$restore/$plain")" == "$marker" ]]
 fi
 
+# A corrupt optional weekly proof must fail before any encrypted backup files
+# become visible in the destination (completion receipt is not enough).
+printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=failed\n' > "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/bad-proof" 'remote restore proof is not successful'
+printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=ok\n' > "$remote/proofs/$base.restore-proof"
+
 # A ciphertext sha256 mismatch must fail and must not promote anything.
 write_age_manifest "$(printf '%064d' 0)" "$age_bytes" "$plain_sha"
 expect_pull_failure "$root/bad-sha" 'ciphertext sha256 mismatch'

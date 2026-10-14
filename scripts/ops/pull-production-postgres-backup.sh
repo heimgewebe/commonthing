@@ -87,10 +87,8 @@ plaintext_sha="$(manifest_value plaintext_sha256 "$work_dir/$age_manifest")"
 [[ "$(manifest_value file "$work_dir/$manifest")" == "${base}.sql.gz" ]] || fail "off-host and plaintext metadata manifests disagree"
 [[ "$(manifest_value sha256 "$work_dir/$manifest")" == "$plaintext_sha" ]] || fail "off-host and plaintext metadata manifests disagree"
 
-mv -f "$work_dir/$latest" "$DEST_DIR/$latest"
-mv -f "$work_dir/$manifest" "$DEST_DIR/$manifest"
-mv -f "$work_dir/$age_manifest" "$DEST_DIR/$age_manifest"
-
+# Stage everything first. A malformed weekly proof must not leave
+# newly published ciphertext/manifests behind on a failed pull.
 # A weekly restore proof may not yet exist for the newest daily backup. Copy it
 # when present, but never treat its absence as proof that the backup is invalid.
 # shellcheck disable=SC2029
@@ -101,6 +99,14 @@ if ssh "${ssh_args[@]}" "$REMOTE_HOST" \
     "sudo -n cat -- '$REMOTE_BACKUP_DIR/proofs/$proof'" > "$work_dir/$proof"
   chmod 600 "$work_dir/$proof"
   grep -qx 'result=ok' "$work_dir/$proof" || fail "remote restore proof is not successful"
+fi
+
+# The receipt remains the final completion marker for the complete set.
+# Every optional proof has been validated before the first destination rename.
+mv -f "$work_dir/$latest" "$DEST_DIR/$latest"
+mv -f "$work_dir/$manifest" "$DEST_DIR/$manifest"
+mv -f "$work_dir/$age_manifest" "$DEST_DIR/$age_manifest"
+if [[ -f "$work_dir/$proof" ]]; then
   mv -f "$work_dir/$proof" "$DEST_DIR/$proof"
 fi
 
