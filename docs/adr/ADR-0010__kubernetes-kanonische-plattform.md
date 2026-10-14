@@ -67,6 +67,30 @@ Die nächste Architekturentscheidung über reale Kubernetes-Betriebsmechanismen 
 wurde unter Bureau T085 auf dem älteren Commit
 `5d509feda6db24e294698cb42501fd41ec8e0fbe` terminal belegt und
 die damalige Testumgebung laut Retirement-Receipt anschließend abgebaut.
+
+**Verifizierbarer historischer T085-Abschluss (08.10.2026, nur lokaler
+Operator-Belegbestand):**
+
+- Terminal-Proof: `~/.local/state/commonthing/experiment-b-evidence/5d509fed-final-20261008/terminal-closeout-20261008/terminal-closeout.json`;
+  SHA-256 `97392ceb9f911cdc8eea2cf21604bfacf487b0cb824387b11e7d5fcbb1c8aa5e`,
+  `status=terminal_pass`, `source_commit=5d509feda6db24e294698cb42501fd41ec8e0fbe`.
+- Sein gebundener **Pre-Teardown-Gate-Beleg** liegt unter
+  `~/.local/state/commonthing/experiment-b-evidence/5d509fed-final-20261008/terminal-pass-pre-teardown-20261008/manifest.json`;
+  SHA-256 `4aaef1af5edd223e08fafa6cc7da58a946a910c8abe17c033d895ec7e77302b8`,
+  `experiment_b_gates=PASS`. Erst dieser Manifestbeleg (nicht allein
+  `teardown`) bestätigt erfolgreiche historische Funktions-, T048-,
+  Recovery- und Portabilitätsprüfungen für den genannten Testcommit.
+- Kanonischer Retirement-Receipt:
+  `~/.local/state/commonthing/experiment-b-retirement.json`;
+  SHA-256 `e0e804a864439e58e99c503e41e5b62da561bd98b6ed6310b4125190bed0aab2`,
+  `status=retired`. Der Terminal-Proof bindet dessen Hash sowie den
+  Manifest-Hash und bestätigt entfernte VM, Volumes, Pool und Run-State.
+
+Diese drei Datei-Hashes wurden gegen den real vorhandenen lokalen
+Operator-Belegbestand erneut berechnet; die Belege sind **nicht im Git-Repository
+veröffentlicht** und somit ohne Zugriff auf den ursprünglichen Operator-State
+nicht unabhängig reproduzierbar. Historischer `terminal_pass` und
+`retired` sind keine Freigabe für ein aktuelles T044- oder Produktions-Green.
 Dies ist **kein** Nachweis, dass die danach vorgesehene Extraktion
 portabler Invarianten oder der Abbau kind-/Host-spezifischer Mechanismen
 erledigt wurde. Vor allem ersetzt T085 **nicht** die eigenständige neue,
