@@ -246,6 +246,10 @@ if [[ "$age_manifest" != weltgewebe-postgres-*.age.sha256.manifest ]]; then
   printf 'Kein vollständiges verschlüsseltes PostgreSQL-Backup auf commonserver gefunden.\n' >&2
   exit 1
 fi
+[[ "$age_manifest" =~ ^[A-Za-z0-9._-]+$ && "$age_manifest" != *'..'* ]] || {
+  printf 'Unsafe remote backup filename; preflight stopped.\n' >&2
+  exit 1
+}
 base="${age_manifest%.age.sha256.manifest}"
 for file in "$age_manifest" "$base.sql.gz.age" "$base.sha256.manifest"; do
   ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
@@ -304,14 +308,30 @@ und kein Ersatz für WAL/PITR.
 ### Altbestand unverschlüsselter Off-Host-Kopien
 
 Vor dem age-Vertrag hat der Pull Klartext-Dumps (`weltgewebe-postgres-*.sql.gz`)
-nach `~/merges/weltgewebe-production-backups` kopiert. Die lokale Retention
-löscht sie zwar nach `LOCAL_RETENTION_DAYS` (Default 30 Tage), sie müssen aber
-nach der Umstellung **manuell sofort gelöscht** werden:
+nach `~/merges/weltgewebe-production-backups` kopiert. Ein neuer age-Pull
+verweigert einen Erfolgs-Receipt solange eine solche Datei im Ziel liegt;
+er löscht Wiederherstellungspunkte nicht selbst. Vor der Freigabe von Restic
+und des verschlüsselten Pulls: Eine neue age-Kopie mit der **offline
+verwahrten Identity** in einer isolierten Umgebung tatsächlich entschlüsseln,
+Klartext-SHA256 und gzip-Integrität sowie Restore-Proof prüfen. Erst nach
+diesem Nachweis den Altbestand erfassen und eine ausdrückliche dokumentierte
+Löschentscheidung treffen. Die folgende Inventur verändert keine Daten:
 
 ```bash
 find ~/merges/weltgewebe-production-backups -maxdepth 1 -type f \
-  -name 'weltgewebe-postgres-*.sql.gz' -print -delete
+  -name 'weltgewebe-postgres-*.sql.gz' -print
 ```
+
+Die tatsächliche Bereinigung ist ein separater dokumentierter Operator-
+Eingriff nach Beleg des Ersatz-Restore-Punktes; kein blindes `find -delete`.
+Vor Aktivierung dieses Backup-Skriptstands auf commonserver müssen `age`,
+lesbare öffentliche Empfänger und die erfolgreiche Empfängervalidierung im
+tatsächlichen Systemd-Kontext nachgewiesen sein, andernfalls kein Deploy.
+Zuerst Client und Sudoers ohne Klartext-Pull auf age konvergieren, dann erst
+Producer und neue Backup-Unit aktivieren. Bis zum offline verifizierten
+Chiffrat, gelöschten lokalen Altbeständen und bewerteter Restic-Historie
+keinen weiteren Restic-Snapshot aus diesem Backup-Ziel als sichere age-only
+Kopie ausgeben. Das GREEN isolierter Skripttests ist keine Betriebsfreigabe.
 
 Diese Klartext-Kopien sind zusätzlich in älteren Restic-Snapshots von
 `~/merges` enthalten. Sie verschwinden dort erst, wenn die betroffenen

@@ -122,9 +122,42 @@ expect_pull_failure() {
   fi
 }
 
+# Simulate a denied sudo-find through the remote shell's PATH.
+cat > "$bin/find" << 'FAKE_FIND'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${SIMULATE_SUDO_FIND_DENIED:-0}" == 1 ]]; then
+  printf 'sudo: remote find denied\n' >&2
+  exit 37
+fi
+exec /usr/bin/find "$@"
+FAKE_FIND
+chmod +x "$bin/find"
+if SIMULATE_SUDO_FIND_DENIED=1 pull "$root/denied-find" test-host > /dev/null 2> "$root/denied-find.stderr"; then
+  echo 'denied remote find must fail' >&2
+  exit 1
+fi
+grep -qF 'sudo: remote find denied' "$root/denied-find.stderr"
+if grep -qF 'remote host returned no complete encrypted backup set' "$root/denied-find.stderr"; then
+  echo 'remote find denial was hidden by remote pipeline' >&2
+  exit 1
+fi
+
+# Legacy off-host plaintext must stop before an age success receipt.
+legacy_dest="$root/legacy"
+mkdir -p "$legacy_dest"
+printf 'old private pg dump\n' > "$legacy_dest/weltgewebe-postgres-legacy.sql.gz"
+if pull "$legacy_dest" test-host > /dev/null 2> "$root/legacy.stderr"; then
+  echo 'legacy plaintext alongside successful encrypted pull is forbidden' >&2
+  exit 1
+fi
+grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy.stderr"
+[[ -f "$legacy_dest/weltgewebe-postgres-legacy.sql.gz" ]]
+[[ ! -e "$legacy_dest/latest-pull.receipt" ]]
+
 # Retention fixture: expired local artefacts, including legacy plaintext copies.
 mkdir -p "$dest"
-for suffix in .sql.gz .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; do
+for suffix in .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; do
   touch -d '10 days ago' "$dest/weltgewebe-postgres-20260101T000000Z${suffix}"
 done
 PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST='' REMOTE_BACKUP_DIR="$remote" DEST_DIR="$dest" \
@@ -141,7 +174,7 @@ grep -qx "sha256=$age_sha" "$dest/latest-pull.receipt"
 grep -qx "plaintext_sha256=$plain_sha" "$dest/latest-pull.receipt"
 [[ "$(stat -c %a "$dest/$file")" == 600 ]]
 if compgen -G "$dest/weltgewebe-postgres-20260101T000000Z*" > /dev/null; then
-  echo 'local retention must expire ciphertext, manifests, proofs and legacy plaintext' >&2
+  echo 'local retention must expire ciphertext, manifests and proofs' >&2
   exit 1
 fi
 

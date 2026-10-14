@@ -40,7 +40,7 @@ ssh_args=(-o BatchMode=yes -o ConnectTimeout=15)
 # Values below are validated locally; expansion on the client is intentional.
 # shellcheck disable=SC2029
 age_manifest="$(ssh "${ssh_args[@]}" "$REMOTE_HOST" \
-  "sudo -n find '$REMOTE_BACKUP_DIR' -maxdepth 1 -type f -name '${BACKUP_PREFIX}-*.age.sha256.manifest' -printf '%f\\n' | sort | tail -n1")"
+  "sudo -n find '$REMOTE_BACKUP_DIR' -maxdepth 1 -type f -name '${BACKUP_PREFIX}-*.age.sha256.manifest' -printf '%f\\n'" | LC_ALL=C sort | tail -n1)"
 case "$age_manifest" in
   "${BACKUP_PREFIX}-"*.age.sha256.manifest) ;;
   *) fail "remote host returned no complete encrypted backup set (*.age.sha256.manifest)" ;;
@@ -52,6 +52,12 @@ manifest="${base}.sha256.manifest"
 proof="${base}.restore-proof"
 
 install -d -m 0700 "$DEST_DIR"
+# Fail closed rather than deleting recovery points implicitly or certifying an
+# age-only off-host state while old plaintext can be re-snapshotted by Restic.
+# Manual retirement follows a successful offline decrypt/restore check.
+if compgen -G "$DEST_DIR/${BACKUP_PREFIX}-*.sql.gz" > /dev/null; then
+  fail "legacy plaintext PostgreSQL backups remain in off-host destination; verify an offline restore and retire them deliberately before age-only pull"
+fi
 work_dir="$(mktemp -d "$DEST_DIR/.pull.XXXXXX")"
 trap 'rm -rf "$work_dir"' EXIT
 
