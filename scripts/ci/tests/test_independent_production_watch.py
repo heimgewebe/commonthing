@@ -2951,5 +2951,175 @@ class WatchTests(unittest.TestCase):
                         history[0]["checked_at_utc"], first["checked_at_utc"],
                     )
 
+
+    def test_full_outbox_drains_durable_prefix_before_next_alarm(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.assertIsNone(
+                watch.record(watch.evaluate(NOW, self.fixtures()), directory),
+            )
+            # Simulate sixteen individually valid ALARMs queued while the
+            # event journal was unwritable. It is writable again now.
+            pending = []
+            for index in range(16):
+                report = watch.evaluate(
+                    NOW + timedelta(seconds=index + 1),
+                    self.fixtures(cache="public, max-age=30"),
+                )
+                pending.append({
+                    "event": "ALARM",
+                    "payload": {
+                        "event": "ALARM", **report,
+                        "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939",
+                    },
+                })
+            for name in ("state.json", "heartbeat.json"):
+                target = directory / name
+                saved = json.loads(target.read_text())
+                saved["pending_transitions"] = pending
+                watch.write_json(target, saved)
+            new_alarm = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(new_alarm, directory), "ALARM")
+            history = [json.loads(line) for line in
+                       (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(len(history), 17)
+            self.assertEqual([x["event"] for x in history], ["ALARM"] * 17)
+            self.assertEqual(
+                [x["checked_at_utc"] for x in history[:16]],
+                [x["payload"]["checked_at_utc"] for x in pending],
+            )
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual([x[0] for x in state["severe"]], ["frontend_cache"])
+            self.assertFalse(state.get("pending_transitions"))
+
+
+    def test_full_outbox_drain_fsync_failure_preserves_old_and_new_p1(self):
+        import json
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            watch.record(watch.evaluate(NOW, self.fixtures()), directory)
+            pending = [
+                {
+                    "event": "ALARM",
+                    "payload": {
+                        "event": "ALARM",
+                        **watch.evaluate(
+                            NOW + timedelta(seconds=index + 1),
+                            self.fixtures(cache="public, max-age=30"),
+                        ),
+                        "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939",
+                    },
+                }
+                for index in range(16)
+            ]
+            for name in ("state.json", "heartbeat.json"):
+                path = directory / name
+                old = json.loads(path.read_text())
+                old["pending_transitions"] = pending
+                watch.write_json(path, old)
+            first_alarm = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            real_fsync = watch.os.fsync
+            failure = []
+
+            def fail_first_journal_fsync(fd):
+                file = os.readlink(f"/proc/self/fd/{fd}")
+                if file == str(directory / "events.jsonl") and not failure:
+                    failure.append(True)
+                    raise OSError("journal not yet writable")
+                return real_fsync(fd)
+
+            with patch.object(watch.os, "fsync", side_effect=fail_first_journal_fsync):
+                self.assertEqual(
+                    watch.record(first_alarm, directory), "MONITOR_DATA_FAILURE",
+                )
+            self.assertEqual(failure, [True])
+            self.assertEqual((directory / "events.jsonl").read_bytes(), b"")
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual(len(state["pending_transitions"]), 16)
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("frontend_cache", [x["code"] for x in heartbeat["issues"]])
+            restored = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(restored, directory), "ALARM")
+            history = [json.loads(line) for line in
+                       (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(len(history), 17)
+            self.assertEqual(
+                [x["checked_at_utc"] for x in history[:16]],
+                [x["payload"]["checked_at_utc"] for x in pending],
+            )
+
+    def test_full_outbox_drain_crash_before_next_snapshot_dedupes(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            watch.record(watch.evaluate(NOW, self.fixtures()), directory)
+            pending = [
+                {
+                    "event": "ALARM",
+                    "payload": {
+                        "event": "ALARM",
+                        **watch.evaluate(
+                            NOW + timedelta(seconds=index + 1),
+                            self.fixtures(cache="public, max-age=30"),
+                        ),
+                        "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939",
+                    },
+                }
+                for index in range(16)
+            ]
+            for name in ("state.json", "heartbeat.json"):
+                path = directory / name
+                old = json.loads(path.read_text())
+                old["pending_transitions"] = pending
+                watch.write_json(path, old)
+            first = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            real_write = watch.write_json
+            stopped = []
+
+            def stop_after_drain(path, payload):
+                if (path == directory / "state.json"
+                        and not stopped
+                        and (directory / "events.jsonl").exists()
+                        and len((directory / "events.jsonl").read_text().splitlines()) == 16):
+                    stopped.append(True)
+                    raise KeyboardInterrupt("crash after old durable drain")
+                return real_write(path, payload)
+
+            with patch.object(watch, "write_json", side_effect=stop_after_drain):
+                with self.assertRaises(KeyboardInterrupt):
+                    watch.record(first, directory)
+            self.assertEqual(stopped, [True])
+            resumed = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(resumed, directory), "ALARM")
+            history = [json.loads(line) for line in
+                       (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(len(history), 17)
+            self.assertEqual([x["event"] for x in history], ["ALARM"] * 17)
+            self.assertFalse(json.loads(
+                (directory / "state.json").read_text(),
+            ).get("pending_transitions"))
+
 if __name__ == "__main__":
     unittest.main()

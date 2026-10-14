@@ -460,6 +460,48 @@ def _transition_already_journaled(directory, entry):
         return False
 
 
+def _append_durable_events(directory, journal_events, committed_event_names=None):
+    """Append one atomic JSONL batch; preserve exact old end on failure."""
+    # Prepare one atomic append batch: old pending transitions
+    # always precede subsequent monitor-data evidence.
+    batch = [
+        json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+        for event in journal_events
+    ]
+    # Unbuffered single append with rollback to the exact old
+    # size on a short write or fsync failure. The surrounding
+    # record flock serializes all watcher-owned journal writers.
+    payload = "".join(batch).encode("utf-8")
+    with (directory / "events.jsonl").open("ab", buffering=0) as out:
+        fd = out.fileno()
+        previous_end = os.lseek(fd, 0, os.SEEK_END)
+        try:
+            written = out.write(payload)
+            if written != len(payload):
+                raise OSError("short event history append")
+            os.fsync(fd)
+            # A newly created journal requires a durable directory entry.
+            _fsync_directory(directory)
+            if committed_event_names is not None:
+                committed_event_names.update(
+                    entry["event"] for entry in journal_events
+                )
+        except (OSError, WatchRuntimeExceeded) as append_error:
+            # SIGALRM is one-shot; rollback itself can block on the
+            # same faulty filesystem. Bound this last-resort I/O.
+            if signal.getsignal(signal.SIGALRM) is _watch_deadline:
+                signal.alarm(10)
+            try:
+                os.ftruncate(fd, previous_end)
+                os.fsync(fd)
+            except OSError as rollback_error:
+                raise OSError(
+                    f"event append failed: {append_error}; "
+                    f"rollback failed: {rollback_error}"
+                ) from rollback_error
+            raise
+
+
 def record(result, directory, *, serialized_poll=False, suppress_transition_event=False,
            committed_event_names=None):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -701,6 +743,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         ) if event]
         # Include the actual first-observation payload, not a synthetic later
         # poll's status. Both incident anchors persist this bounded outbox.
+        previous_pending_count = len(pending)
         for event_name in events:
             if event_name in {"ALARM", "RECOVERY"}:
                 # The old state may still contain the incident when the
@@ -732,7 +775,37 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 if entry not in pending:
                     pending.append(entry)
         if len(pending) > 16:
-            raise ValueError("pending transition outbox exceeds bound")
+            # Recovered journals must drain an old full outbox before the
+            # next new P1 is admitted. Previously queued entries are durable
+            # in prior state/heartbeat; an interrupted append will reconcile
+            # against the original outbox after the next restart.
+            uncertain_replay = {
+                "watcher_execution_failed", "unverifiable_state"
+            } & observed_codes
+            ready_old = []
+            for entry in pending[:previous_pending_count]:
+                if entry["event"] == "RECOVERY" and (
+                    uncertain_replay or (severe and old_severe)
+                ):
+                    break
+                ready_old.append(entry)
+            if len(ready_old) < len(pending) - 16:
+                return _record_unverifiable_prior_state(
+                    result, directory, previous_heartbeat,
+                    "pending transition outbox at capacity with blocked recovery",
+                )
+            try:
+                # Old queued entries are not the new poll's event delivery.
+                # Keep their names out of committed_event_names.
+                _append_durable_events(
+                    directory, [entry["payload"] for entry in ready_old],
+                )
+            except OSError as exc:
+                return _record_unverifiable_prior_state(
+                    result, directory, previous_heartbeat,
+                    f"pending outbox drain failed: {type(exc).__name__}",
+                )
+            pending = pending[len(ready_old):]
         # Journal order must follow the outbox exactly. An older RECOVERY
         # can only be committed once its state/heartbeat recovery anchors
         # are verified. If it is still blocked, later ALARMs are held too;
@@ -802,44 +875,9 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         )
         if journal_events:
             try:
-                # Prepare one atomic append batch: old pending transitions
-                # always precede subsequent monitor-data evidence.
-                batch = [
-                    json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
-                    for event in journal_events
-                ]
-                # Unbuffered single append with rollback to the exact old
-                # size on a short write or fsync failure. The surrounding
-                # record flock serializes all watcher-owned journal writers.
-                payload = "".join(batch).encode("utf-8")
-                with (directory / "events.jsonl").open("ab", buffering=0) as out:
-                    fd = out.fileno()
-                    previous_end = os.lseek(fd, 0, os.SEEK_END)
-                    try:
-                        written = out.write(payload)
-                        if written != len(payload):
-                            raise OSError("short event history append")
-                        os.fsync(fd)
-                        # A newly created journal requires a durable directory entry.
-                        _fsync_directory(directory)
-                        if committed_event_names is not None:
-                            committed_event_names.update(
-                                entry["event"] for entry in journal_events
-                            )
-                    except (OSError, WatchRuntimeExceeded) as append_error:
-                        # SIGALRM is one-shot; rollback itself can block on the
-                        # same faulty filesystem. Bound this last-resort I/O.
-                        if signal.getsignal(signal.SIGALRM) is _watch_deadline:
-                            signal.alarm(10)
-                        try:
-                            os.ftruncate(fd, previous_end)
-                            os.fsync(fd)
-                        except OSError as rollback_error:
-                            raise OSError(
-                                f"event append failed: {append_error}; "
-                                f"rollback failed: {rollback_error}"
-                            ) from rollback_error
-                        raise
+                _append_durable_events(
+                    directory, journal_events, committed_event_names,
+                )
                 # Append and both syncs finished; remove only those entries
                 # actually published. Any deferred recovery stays pending.
                 pending[:] = [
