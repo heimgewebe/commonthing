@@ -6,13 +6,13 @@ status: active
 canonicality: operational
 lifecycle_state: active
 owner_task: WELTGEWEBE-OS-V1-T044
-last_reviewed: 2026-09-25
-review_after: 2026-10-07
+last_reviewed: 2026-10-13
+review_after: 2026-10-19
 summary: >
-  Revisionsgebundener R5-Preflight für den Wechsel von Compose/Caddy-Blue auf
-  Kubernetes-Green. Bindet die am 25.09.2026 frisch rückgelesene Produktions- und
-  Referenzplattformwahrheit und blockiert jede Produktionswirkung bis Zielplattform,
-  Capability-Parität, Datenübergang, Backup und Rollback konkret belegt sind.
+  Historischer R5-Preflight vom 25.09.2026 mit separater unvollständiger
+  read-only-Nachbeobachtung vom 12.10.2026 sowie getrenntem
+  PR-/Abnahmevertrags-Readback vom 13.10.2026. Keine dieser Beobachtungen ist
+  eine Produktions- oder R6-Aktivierungsfreigabe.
 relations:
   - type: depends_on
     target: docs/reports/kubernetes-platform-foundation-status.md
@@ -25,6 +25,391 @@ relations:
 ---
 
 # T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates
+
+## Sicherheits-Readback — 13. Oktober 2026 (GitHub/Main, bis nach 20:13 UTC; keine Runtime-Freigabe)
+
+Dieser neueste GitHub-/Main-Readback **ersetzt ältere PR-Status-, Head-,
+CI- und Review-Zuordnungen weiter unten**, insbesondere `#1959 OPEN` und
+frühere `#2352`-Heads. Diese Status- und Freigabeangaben sind **historische
+Momentaufnahmen**, keine parallel gültigen aktuellen Tatsachen. Die
+normativen Sicherheitsgates, Stopbedingungen und die unten erläuterte
+B5-Reihenfolge bleiben dagegen **verbindlich**, soweit sie hier nicht
+ausdrücklich verschärft werden. Das gilt auch für Zwischenstände des
+13. Oktober ohne präzise Uhrzeit.
+Der neueste Abschnitt erneuert **nicht** die Blue-/Green-Laufzeitbeobachtungen
+vom 12. Oktober und autorisiert ausdrücklich keinen produktiven Cutover.
+
+- [Commonthing #1959](https://github.com/heimgewebe/commonthing/pull/1959)
+  wurde laut GitHub am **13.10.2026 um 17:01 UTC** als **MERGED**
+  geschlossen. Der integrierte Head ist
+  `2f011e0a6eca160ba3feb9fa8f32960f931c343f`, der neue
+  `main`-Merge-Commit lautet
+  `f2d9707fc0bceeaa4e4f6a2e007b22dbd95b085f`.
+- Die Freigabe gehört **zum integrierten #1959-Head
+  `2f011e0a6eca160ba3feb9fa8f32960f931c343f`** und nicht zu
+  früheren, inzwischen abgelösten PR-Heads. Vor dem Merge waren 47
+  GitHub-Prüfungen erfolgreich, drei regulär übersprungen; dazu
+  gehörten die YAML-Integrationstests (20 PASS), die Rust-API-Tests,
+  `cargo fmt --check`, `cargo audit` und `cargo deny` sowie der
+  fünfteilige High-Critical-Self-Review. Die unabhängigen PASS-Reviews
+  sind mit Grabowski-Jobs `grabowski-job-5969714b2e24` (Grok 4.6),
+  `grabowski-job-62d62730cb18` (Claude Opus 5.5) und dem weiteren
+  Captain-gebundenen Review `grabowski-job-e0541eb280da` belegt.
+  Dies sind **PR-/Merge-Nachweise**, keine Runtime-Receipts.
+- Das direkt auf dem Main-Merge-Commit
+  `f2d9707fc0bceeaa4e4f6a2e007b22dbd95b085f` gelesene
+  `Cargo.lock` enthält weder `unsafe-libyaml` noch `serde_yaml`,
+  stattdessen `noyalib` und `noyalib-serde-yaml` jeweils in
+  Version `0.0.56` sowie `quinn-proto` in Version `0.11.18`.
+  Das bestätigt die **Repository-Sicherheitsmigration**, nicht
+  eine laufende API- oder Produktionsbereitstellung.
+- [Bureau #2350](https://github.com/heimgewebe/bureau/pull/2350)
+  hat am 13.10.2026 um **04:24 UTC** den **normativen Vertrag mit elf
+  T044-Kriterien** in Main integriert. Für die neun bestehenden Kriterien
+  schlägt der **noch offene** #2352 ausführbare
+  `runtime_proof_bundle`-Verifier-Verträge vor; deren sichere
+  Implementierung ist noch nicht unabhängig freigegeben. Ein produktiv
+  autorisierter Primärreader, eine gebundene Green-Zielidentität und
+  authentische produktive Runtime-Proofs fehlen weiterhin. Weder #2350
+  noch #2352 stellen allein einen bestandenen Runtime-Beweis dar.
+  **Reconciliation der früheren 9/11-Zählung:** Der damalige reine
+  Anzahl-Widerspruch ist seit #2350 für die **normative** TaskSpec-Zahl
+  elf geschlossen. Die neun alten Kriterien sind in Bureau-Main weiterhin
+  nicht als freigegebene Runtime-Verifier ausführbar; die technische
+  §11-Zuordnung, echte Primärreader und unabhängige Prüfungen bleiben
+  eigene **offene R5-Stopgründe**. Eine normativ elfteilige TaskSpec
+  ist kein elfteiliger PASS.
+- [Bureau #2352](https://github.com/heimgewebe/bureau/pull/2352)
+  war beim erneuten GitHub-Readback am 13.10.2026 nach **20:13 UTC**
+  weiterhin **OPEN**, nun auf veröffentlichtem Head
+  `1f76d0f36847f46c0556728e428e171ee1aeeb09`.
+  Der weiter unten dokumentierte ältere Head `6c9d28ff` sowie die
+  im PR-Verlauf nachgewiesenen Heads `2dbf0713` und `a3111fc3`
+  (diese beiden wurden im vorliegenden Runbook zuvor nicht aufgeführt)
+  sind **historische Revisionen desselben offenen PRs**.
+  Auf `1f76d0f3` wurde ein Guard für weiterhin vorhandene exklusive
+  Blue-/Green-Reservierungen beim terminalen Closeout ergänzt; das
+  beseitigt **nicht** automatisch die übrigen offenen P1/P2-Befunde
+  (insbesondere StateStore-TaskSpec, koordinierte Claim-Ressourcen,
+  Primärreader und Zielidentitätsbindung). Für diesen neuen Head
+  sind aktuelle unabhängige R3-PASS-Reviews, vollständige CI und
+  Captain-Freigabe weiterhin gesondert erforderlich.
+
+**Aktuell gültige R5-Abnahmefolge (keine historische Momentaufnahme):**
+Zuerst müssen die neun Runtime-Verifier-Verträge einschließlich
+authentifizierter Primärreader, Claim-/Handoff-/Lease-/Closeout-Autorität
+durch #2352 tatsächlich implementiert, getestet und unabhängig freigegeben
+und über Captain integriert werden. Danach muss ein **isoliertes,
+revisionsgebundenes B5-Staging-/Zieltestbed** mit negativen Blue-Isolations-,
+Search-Kontinuitäts-, Last-, Backup-, Restore- und Recovery-Belegen
+abgenommen werden. Erst danach dürfen Zielidentität und reale
+Produktionsplattform für weitere B1–B6-Gates verbindlich bewertet werden.
+Der noch offene #2352 und die unvollständige isolierte B5-Plattform
+erfüllen diese Vorbedingungen ausdrücklich **nicht**. Ein selbst
+bestandener lokaler B5-Test wäre **kein Ersatz** für negative Blue-Isolation,
+Last-, Recovery-, Such- und Datenprüfungen auf der später tatsächlich
+gewählten produktiven Green-Zielruntime. Jeder Wechsel der Zielidentität
+oder Cutover-Revision erfordert frische zugehörige Abnahmebelege.
+
+**Dokumentationsmerge und Runtime-Freigabe sind unterschiedliche
+Entscheidungen:** Der #1959-RustSec-Merge ist als Repository-Voraussetzung
+für die Korrektheit dieses R5-Dokumentationsnachtrags erfüllt; #2352
+muss für eine dokumentarische Darstellung seines **BLOCKED**-Zustands
+nicht bereits gemergt sein. #1957 selbst darf dennoch **nur** bei
+aktuellen unabhängigen R3-PASS-Reviews, vollständiger Review-Evidence-CI
+und Captain-Freigabe integriert werden. Sein späterer Merge ersetzt
+keine Runtime-/Staging-/Cutover-Abnahme und ändert kein B1–B6-Gate.
+
+**Aktuelle R5-Entscheidung:** R5 **nicht bestanden**. Blue auf
+`commonserver` bleibt alleiniger produktiver Writer; Green ist keine
+freigegebene produktive Zielplattform. Wenn kein isoliertes,
+revisionsgebundenes und durch Recovery-Belege abgesichertes B5-Testbed
+vorliegt, bleiben R6 und alle produktiven Phasen gesperrt.
+
+**Unveränderte Wirkungssperre:** B1–B6 und R6–R9 bleiben BLOCKED.
+Insbesondere ist kein neues produktives Green, keine Writer-Übertragung,
+keine Datenmigration und keine Änderung an DNS oder produktivem Traffic
+in diesem Nachtrag nachgewiesen oder freigegeben.
+
+## R5-Nachbeobachtung — 12. Oktober 2026 (read-only; weiterhin BLOCKED)
+
+Dieser **inkrementelle Live-Readback** ergänzt die historischen Beobachtungen
+in §3–§6 vom 25.09.2026. Deren Werte bleiben ausdrücklich **historische
+Momentaufnahmen** und dürfen nicht unter dem neueren `last_reviewed`-Datum
+als aktueller Produktionszustand gelesen werden. Dieses Addendum ist nur für
+die ausdrücklich erneut geprüften Punkte der jüngere Beobachtungsstand,
+**keine** vollständige R5-Abnahme und **keine** neue Aktivierungsfreigabe.
+Bei widersprechenden oder fehlenden Angaben bleibt das R5-Gate BLOCKED.
+Kein produktiver Writer, Datenstand, DNS, Traffic, Cluster oder Secret wurde
+hierbei verändert. Vor R6 ist eine neue,
+vollständige, gegen die konkrete Zielrevision gebundene Abnahme erforderlich.
+
+### Bindung und Blue-Produktionsbefund
+
+- Öffentlicher und lokaler Commonthing-`main` am 12.10.2026:
+  `59a1bf56c86acdcd355d10604263524c6a551df1`; lokaler Main-Checkout
+  beim Readback sauber.
+- `https://commonthing.net/_app/version.json` (HTTP 200, `no-store`)
+  meldet denselben Commit und den Web-Artefaktbaum
+  `045269e21ef91e126979edbbe7875daf5b42e9c7f885232cb9964919ae18126b`
+  mit 140 Dateien. Der Artefakt-Provenienzstatus ist ausdrücklich
+  `unattested`, also **keine** kryptographisch verifizierte Auslieferung.
+  `/version.json` ist nicht der kanonische Vertragspfad und antwortet 404.
+- `https://commonthing.net/api/version` und
+  `https://api.commonthing.net/version` (HTTP 200) melden den exakt gleichen
+  API-Commit. `/health/ready` meldet HTTP 200 sowie
+  `database=true`, `nats=true`, `event_chain=true` und `policy=true`.
+  Dies ist Readiness, kein Datenparitäts- oder Writer-Fencing-Beweis.
+- Der bestehende read-only-Prüfer
+  `scripts/ops/check_public_live_readiness.py` meldete `status=pass` für
+  die revisionsgebundene öffentliche Prüfung. Dazu gehören kanonische und
+  Legacy-Redirects, API-Erreichbarkeit, geschützte Metrikrouten, die Kartenroute,
+  lokale Style-/Glyph-Auslieferung sowie vier PMTiles-Full-/Range-Verträge.
+  <!-- commonthing-naming: legacy -->
+  `https://weltgewebe.net/` leitet mit HTTP 308 auf
+  `https://commonthing.net/` weiter.
+- `https://commonthing.net/schaubild/manifest.json` antwortet HTTP 200 mit
+  `schauwerk-standalone-editor-manifest.v2` und
+  `schauwerk-native-diagram-v1`; der Legacy-Editor benötigt laut Manifest
+  weiterhin eine externe Browser-Iframe-Runtime. Der öffentliche Manifest-Readback
+  belegt nicht die gesamte interaktive Fachfunktion.
+- `commonserver`: Docker ist aktiv. Ein ausschließlich lesender, privilegierter
+  `docker ps`-Readback zeigt die Compose-Container Caddy, API,
+  `search-worker`, Ollama 0.12.6, Schauwerk/Schaubild, PostgreSQL 16 und NATS
+  2.10. API-/Worker-Image-Tags: `weltgewebe-api:59a1bf56`.
+- Der laufende PostgreSQL-Container führt `POSTGRES_USER=weltgewebe`;
+  die ältere Annahme `-U welt` scheiterte mit `role does not exist`.
+  Ein danach mit dem tatsächlichen Datenbankbenutzer ausgeführtes, durch
+  `BEGIN READ ONLY` und 3 Sekunden Statement-Timeout begrenztes SQL-
+  Aggregat bestätigte frisch die folgenden reinen Zählwerte:
+  `domain_accounts=13`, `domain_nodes=4`, `domain_edges=16`,
+  `domain_outbox=292`, `domain_event_consumptions=292`,
+  `search_index_generations=1`, `search_node_projections=4`,
+  `search_projection_jobs=23`. Die Counts entsprechen den am 25.09.
+  notierten Zahlen; **Zählwertgleichheit beweist weder Inhaltsgleichheit noch
+  Ereignis-/Auth-/Writer-Konvergenz**. Es wurden keine Writer-Übertragungen
+  oder persistenten Suchtests ausgeführt.
+- Kapazitätsmomentaufnahme auf Blue: 7,8 GiB RAM insgesamt, 5,6 GiB
+  verfügbar, kein Swap; Root-Dateisystem 74 GiB frei bei 70 % Belegung.
+  Ein zweiter vollwertiger Stack auf demselben Host ist dadurch **nicht**
+  kapazitiv bewiesen. Diese Momentwerte sind keine SLO-/RTO-/RPO-Grenzen.
+
+### Green-Referenz und getrennte T085-Evidenz
+
+- Der **lokale**, ausdrücklich nicht produktive kind-Cluster
+  `commonthing-staging` ist am 12.10.2026 erreichbar: drei Nodes
+  `Ready` auf Kubernetes v1.36.1.
+- Flux meldet die App-Revision
+  `bb1e26d47b50d38ec720b123d55255c05436100b` und die Datenrevision
+  `6a10c76666b9769fdfddb62ecb3fbf0c2c5df935` als angewandt; beide
+  unterscheiden sich vom aktuellen produktiven Commit. API/Web je 2/2,
+  PostgreSQL/NATS je 1/1 verfügbar, PostgreSQL-PVC 10 GiB und NATS-PVC 5 GiB
+  `Bound`.
+- Das Cilium-Gateway ist `Programmed=True`, seine Adresse
+  `172.20.0.3` ist jedoch eine lokale kind-/Container-Netzadresse.
+  Öffentliche Green-DNS-/TLS-/Load-Balancer- und Produktionswriter-Autorität
+  sind damit nicht nachgewiesen.
+- In der vollständigen Pod- und Deployment-Inventur dieses Referenzclusters
+  erscheinen **kein** Ollama-, Search-Worker- oder Schauwerk-Workload. Eine
+  aktuell gleichwertige Auth-Konfiguration, produktive Datenbasis, JetStream-/
+  Suchindex-Konvergenz und vollständige Fachparität sind nicht nachgewiesen.
+- Der getrennte, temporäre Experiment-B-Zieltest T085 wurde auf
+  `5d509feda6db24e294698cb42501fd41ec8e0fbe` terminal bestanden.
+  Das vor Ort erneut gelesene Retirement-Receipt bestätigt `retired`,
+  entfernte Volumes und entfernten Lauf-State. Der historische PASS beruht
+  außerdem auf dem **vor dem Teardown** archivierten, SHA-256-gebundenen
+  Gate-Manifest (`4aaef1af5edd223e08fafa6cc7da58a946a910c8abe17c033d895ec7e77302b8`,
+  `experiment_b_gates=PASS`), nicht auf dem Abbau-Receipt allein. Der
+  Terminal-Closeout-Hash (`97392ceb9f911cdc8eea2cf21604bfacf487b0cb824387b11e7d5fcbb1c8aa5e`)
+  und der Retirement-Hash (`e0e804a864439e58e99c503e41e5b62da561bd98b6ed6310b4125190bed0aab2`)
+  samt genauen lokalen Belegpfaden sind in
+  [ADR-0010](../adr/ADR-0010__kubernetes-kanonische-plattform.md) dokumentiert.
+  Diese Operator-Dateien sind **nicht in Git veröffentlicht** und ohne
+  Zugriff auf den ursprünglichen lokalen State extern nicht reproduzierbar.
+  Dieses Testergebnis ist
+  **kein** Test des jetzigen Produktionscommits und begründet weder einen
+  bestehenden Produktions-Green-Cluster noch die Freigabe des Cutovers.
+
+### R5-Gate-Entscheidung
+
+| Gate | Status 12.10.2026 | Fehlender wirklicher Beweis |
+| --- | --- | --- |
+| B1 Produktions-Green | **BLOCKED** | Identifizierter, erreichbarer Produktionscluster mit eigener Fehlerdomäne, Public Edge, TLS, Secrets, Kapazität und Eigentümerautorität |
+| B2 Semantic Search | **BLOCKED** | Produktionszielgebundener Ollama-/Embedding-/Search-Worker-Pfad samt Modell- und Indexparität |
+| B3 Public Frontdoor | **BLOCKED** | Schauwerk, PMTiles/Styles/Glyphs, Auth und Legacy-Hosts am echten Green samt TLS und Routing |
+| B4 Datenübergang | **BLOCKED** | Frischer, vollständiger und versionsgebundener PostgreSQL-/Auth-/JetStream-/Outbox-/Projektionsabgleich sowie Writer-Fencing |
+| B5 Zieltestbed | **BLOCKED** | T085 terminal auf älterem Commit bleibt historischer Beleg; eine aktuelle Zieltestbed-Abnahme einschließlich **negativer Blue-/Writer-Isolation**, Last-, Recovery- und Suchbelege auf derselben Zielrevision fehlt |
+| B6 Zwei-Betreiber-Freigabe | **BLOCKED** | Konkrete doppelte Zustimmung, externe Receipt-/Replay-Verifikation und Aktivierungsbeleg derselben Cutover-Revision |
+
+**Zusätzlicher Registry-Readback:** Die GitHub-Registry von
+`heimgewebe/bureau` auf `main`
+`1b96351fa0933e29a4f355f94217c99e65a46beb` führt T044 als
+`state=planned` in der Queue-Lane `later` und zählt **neun**
+Acceptance-Einträge. Die historische Restplanung nennt teils
+`ready`/Revision 5 und elf Einträge. Die neueren Registry-Einträge
+sind keine Autorität, den strengeren bestehenden **elfteiligen**
+Cutover-Abschlussvertrag (§11) durch bloße Dokumentänderung zu verkürzen.
+Das war am 12.10.2026 ein **ungeklärter Vertragswiderspruch und R5-Stopgrund**, nicht
+nur eine vor R9 zu erledigende Formalität. **Späterer Revisionsstand:**
+Der normative 9/11-Zählkonflikt wurde durch #2350 am 13.10.2026
+auf elf Kriterien aufgelöst. Die technisch ausführbaren neun
+Runtime-Verifier, der §11-Abnahmeabgleich und alle Primärbelege sind
+aber durch den weiterhin offenen #2352 beziehungsweise separate
+R5-Prüfungen **nicht** erledigt. Vor Eintritt in **R6** müssen
+die tatsächlichen Kriterien zwischen verantwortlicher Bureau-Control-Plane,
+Cutover-Vertrag und Produktfähigkeiten formell revisionsgebunden
+reconciliiert sein; weder Suchkontinuität noch deklarative
+Staging-Runtime-Wahrheit dürfen still wegfallen. Bis dahin gelten die
+bisherigen strengeren R9-Schranken unverändert und R6 bleibt BLOCKED.
+
+### Historischer PR- und Verifier-Nachtrag — 13. Oktober 2026
+
+Diese erneute Prüfung betrifft **nur GitHub-Revisionen, Review- und
+Abnahmeverträge**. Die Blue-/kind-/T085-Messwerte oberhalb wurden am
+13.10.2026 **nicht** neu gemessen; sie behalten ausdrücklich ihre jeweiligen
+ursprünglichen Beobachtungsdaten. Kein DNS-, Daten-, Writer-, Traffic- oder
+Kubernetes-Cutover wurde hierdurch ausgeführt.
+
+- Ein früherer, **nicht mit Uhrzeit belegter** PR-Zwischenstand notierte
+  Bureau-`main` als `1b96351fa0933e29a4f355f94217c99e65a46beb`
+  und [Bureau PR #2350](https://github.com/heimgewebe/bureau/pull/2350)
+  auf Head `ac42601c2c8f401982ac40241948bafb50ae9e3e` als
+  **OPEN**. Diese Notiz ist **keine verifizierte Zustandsbehauptung
+  für den 13.10.2026**; der nachgewiesene Merge um 04:24 UTC ist unten
+  ausdrücklich maßgeblich. Der damalige PR schlägt **neu** die zwei Kriterien
+  `staging-gitops-runtime` und `semantic-search-continuity` vor; es gibt
+  zu dem undatierten früheren Beobachtungszeitpunkt noch keine verifizierte
+  Bureau-TaskSpec mit elf Einträgen. Diese historische Unsicherheit
+  wurde durch den späteren #2350-Merge um 04:24 UTC aufgelöst.
+  Für die **zwei neuen** Kriterien sind gültige `manual_observation`-
+  Prüfverträge samt unterschiedlichen `observation_scope`-Konfigurationen
+  vorhanden. Der damalige PR-Head besaß grüne GitHub-Validierung und
+  revisionsgebundene unabhängige Reviews, doch ein Captain-Preflight
+  ersetzt keinen Merge: Der tatsächliche Captain-Run war **BLOCKED**,
+  und eine Integration in Bureau-`main` wurde nicht nachgewiesen.
+- Die **neun bestehenden** T044-Acceptance-Kriterien verwenden weiterhin
+  freie `verifier`-Prosa ohne `verifier_config`. Der operative Bureau-
+  Vertrag `validate_acceptance_contract` meldet dadurch je
+  `verifier-unknown` und `verifier-config-missing`, insgesamt **18
+  Alt-Diagnosen**. [Bureau #2351](https://github.com/heimgewebe/bureau/issues/2351)
+  verfolgte damals den separaten, sicherheitsbewussten Fix. Strukturell grüne
+  Registry-CI schließt diesen **Claim-/Dispatcher-Blocker nicht**. Selbst
+  elf formal gültige Prüfverträge wären noch **keine elf bestandenen
+  Produktionsprüfungen**.
+- Commonthing-`main` blieb auf
+  `59a1bf56c86acdcd355d10604263524c6a551df1`.
+  Der Parser-Sicherheitsfix
+  [Commonthing PR #1959](https://github.com/heimgewebe/commonthing/pull/1959)
+  wurde in dieser früheren, noch nicht abschließend datierten Momentaufnahme
+  als **OPEN** auf Head `e92d5c3bea56251a5e9b26ae09f91b2b4b9745d3`
+  beobachtet. Diese historische OPEN-Aussage ist durch den oben
+  nachgewiesenen Merge am 13.10.2026, 17:01 UTC abgelöst. Die YAML-Regressionen und `Cargo.lock`-Sicherheitskorrektur
+  bestanden zuletzt 588 API-Library-Tests sowie `cargo audit` und
+  `cargo deny check`. Ein unabhängiger Review dieses Heads war
+  `PASS` ohne Findings; die vollständige GitHub-/Review-Evidence-
+  Freigabe und ein Captain-Merge waren **nicht** abgeschlossen.
+- Dieser R5-Dokumentations-PR #1957 selbst bleibt eine bloße
+  Readback-/Abnahmebeschreibung. Bureau-Vertrag, produktives Green und
+  B1–B6 sind damit **nicht** freigegeben.
+
+### Historischer Vertrags-Readback — 13. Oktober 2026 (vor #1959-Merge; keine aktuelle Statusautorität)
+
+Dieser **neuere, ausschließlich GitHub-/TaskSpec-bezogene Readback**
+ersetzt die PR-/Registry-Statusbehauptungen des unmittelbar vorangehenden
+Abschnitts, **nicht** jedoch die am 12. Oktober erhobenen Blue-/kind-/T085-
+Messwerte. Die frühere, **nicht uhrzeitgebundene** Notiz
+`#2350 OPEN` wird ausdrücklich **nicht** als historisch korrekt
+bestätigt, sondern durch den unten belegten Merge-Zustand ersetzt.
+Es erfolgte **kein neuer produktiver
+Kubernetes-, DNS-, Daten-, Writer- oder Traffic-Readback** und keine
+Freigabe einer produktiven Green-Zelle.
+
+- [Bureau PR #2350](https://github.com/heimgewebe/bureau/pull/2350)
+  wurde am **13.10.2026, 04:24 UTC** über den vorgesehenen Mergepfad
+  integriert (Merge-Commit
+  `0c5a3d4b50e63d970a5ec61c3b4042941fdb0a86`). Damit ist die
+  **normative Erweiterung auf elf T044-Kriterien** in Bureau-`main`
+  vorhanden. Die zwei neuen Kriterien gelten weiterhin als
+  `manual_observation` mit getrennten Scopes; das ist kein bestandener
+  Staging- oder Suchkontinuitätstest.
+- Die neun älteren Kriterien blieben durch diesen Merge unverändert und
+  ursprünglich **nicht ausführbar**. Der disjunkte Reparatur-PR
+  [Bureau #2352](https://github.com/heimgewebe/bureau/pull/2352)
+  stand in diesem früheren, vor dem oben datierten neuesten #2352-Readback
+  als **OPEN** auf dem damals veröffentlichten Head
+  `6c9d28ffec32319be2be59235eee0e1f23413210`. Dort
+  sind neun spezifische `runtime_proof_bundle`-Verträge sowie
+  im TaskSpec eingefrorene Sollfelder für die Green-Revision
+  und Zielidentität ergänzt. Beide Sollfelder bleiben für
+  das noch nicht ausgewählte Produktions-Green ausdrücklich **null**:
+  dies blockiert die Abnahme statt einen hypothetischen Cluster
+  für real auszugeben. Der neue Codex-P1-Befund auf diesem Head
+  beanstandet den weiterhin fehlenden produktiv verdrahteten,
+  primären Laufzeit-Receipt-Adapter. Ohne dessen echte
+  Autorisierung/Readbacks, aktuelle Reviews und Captain-Merge
+  ist die Änderung keine freigegebene Bureau-Revision.
+  **Kein T044-Verifikationsstempel** wurde dadurch erworben.
+- Der Parser-/Dependency-Sicherheitsfix
+  [Commonthing #1959](https://github.com/heimgewebe/commonthing/pull/1959)
+  war in diesem ausdrücklich historischen GitHub-Snapshot noch **OPEN**,
+  auf dem damals veröffentlichten Head
+  `14408677f105476f6e7e907432a32cceafb4c22f`.
+  Dieser neue beobachtete Head ersetzt die vorangehend
+  notierte `e92d5c3`-Revision; kein älteres Review-PASS
+  oder CI-Ergebnis darf auf `14408677` übertragen werden.
+  Diese damalige Revisionsprüfung war vor dem späteren, oben
+  dokumentierten #1959-Merge erforderlich; sie ist ausdrücklich
+  **keine heutige Forderung, den bereits gemergten PR erneut zu mergen**.
+- Der Dokumentations-PR
+  [#1957](https://github.com/heimgewebe/commonthing/pull/1957)
+  wurde damals erst nach Sicherheitskonvergenz, gültiger eigener CI und
+  unabhängigem R3-Review für Captain vorgemerkt. **Präzisierung zum
+  neueren Stand:** Die für einen dokumentarischen Merge relevante
+  RustSec-Repositorymigration #1959 ist inzwischen integriert. Die
+  weiterhin offenen Bureau-#2352- und Green-Runtime-Sicherheitsgates
+  sperren die **operative** Abnahme, nicht die wahrheitsgemäße
+  Dokumentation des BLOCKED-Zustands. Für #1957 selbst bleiben
+  aktuelle unabhängige R3-PASSes, Review-Evidence-CI und Captain
+  zwingend. Ein Dokumentationsmerge verändert kein B1–B6-Gate.
+
+**Unveränderte Stopentscheidung:** B1–B6 sind weiterhin **BLOCKED**.
+Ein auf die konkrete spätere Green-Zielidentität und Produktiv-Revision
+gebundener, primär authentifizierter Abnahmebeleg fehlt. Weder eine
+strukturell gültige Registry noch ein lokales Referenz-Kubernetes oder
+ein früheres Review-PASS autorisiert R6, R7, R8, R9 oder einen
+Produktionscutover.
+
+Die verbindliche Abfolge lautet: **zuerst** die autoritativen
+Verifier-/Reader-/Claim-/Closeout-Sicherheitsverträge in Bureau
+revisionsgebunden integrieren und unabhängig freigeben; **danach**
+das isolierte, revisionsgebundene **B5-Staging-/Zieltestbed** mit
+negativen Isolationstests, Last-, Recovery- und Suchkontinuitätsbelegen
+abnehmen; **erst nach dessen Abnahme** die reale Produktions-Green-
+Zielidentität samt Kapazitäts- und Paritätsnachweis festlegen und alle
+weiteren B1–B6-Gates gegen die tatsächlich beabsichtigte Zielruntime
+prüfen. Read-only-Staging-Inventur darf als Vorarbeit stattfinden,
+ersetzt aber keine Verifier-Integration oder B5-Abnahme.
+Ohne alle Wirkungsevidenzen bleibt **R6 gesperrt**.
+
+**Disposition:** R5 ist **nicht bestanden**. R6–R9 bleiben gesperrt.
+Die B1–B6-Tabelle wertet nur die konkrete Zielrevision, nicht historische
+Teilbeweise.
+Blue bleibt bis zu einem gesondert beweisgebundenen Fencing-/Cutover-Gate der
+bestehende produktive Pfad. Aus der lokalen kind-Referenz, einem historischen
+Proof-Receipt oder dem öffentlichen Commitgleichstand folgt **keine**
+Produktionsmutationsfreigabe. Die nächste **Staging-Abnahmesequenz nach
+integrierten Sicherheits- und Verifierverträgen** folgt ausschließlich
+§12: **zuerst B5** mit getrenntem,
+zeitlich begrenztem und revisionsgebundenem T044-Staging-/Zieltestbed
+einschließlich **negativer Blue-/Writer-Isolation** sowie Last-,
+Recovery- und Suchbelegen; **erst nach dessen Abnahme**
+folgen die konkrete Produktions-Green-Zielidentität, Kapazitätsprüfung
+und Capability-/Datenparität. Sämtliche für die reale
+Produktions-Green-Runtime erforderlichen Isolations-, Last-, Recovery-
+und Suchbelege sowie **B1–B6 einschließlich B5** sind auf deren eigene
+Zielidentität und Cutover-Revision erneut zu prüfen. Diese Reihenfolge
+selbst erteilt keine
+Staging-, Cluster- oder Produktionsmutationsautorität.
 
 ## 1. Zweck und Autorität
 
@@ -339,6 +724,11 @@ abgenommen sein. Sie darf **zeitlich begrenzt und ausschließlich für diesen
 Proof** betrieben werden. Damit bleibt T044 mit ADR-0010 vereinbar: Das dort
 definierte Experiment B kann diese Abnahme liefern; ein permanenter
 Staging-Dauerbetrieb wird dadurch ausdrücklich **nicht** beschlossen.
+Das inzwischen auf dem **älteren** Commit `5d509feda6db24e294698cb42501fd41ec8e0fbe`
+terminal nachgewiesene und retirierte Experiment B/T085 ist dafür
+**keine** aktuelle Abnahme. B5 erfordert ein **neues, separates**,
+revisionsgebundenes T044-Testbed mit negativen Blue-/Writer-Isolationstests,
+Last-, Recovery- und Suchbelegen.
 
 Die revisionsgebundene Staging-/Zieltestbed-Abnahme umfasst mindestens:
 
@@ -955,7 +1345,11 @@ Stand dieses R5-Preflights:
 - **Kein Traffic-/DNS-/Writer-Cutover.**
 - **Keine neue Plattformschicht.**
 - Nächster harter Hebel ist zuerst ein zeitlich begrenztes reales
-  Kubernetes-Zieltestbed als T044-Staging-/Experiment-B-Abnahme samt
-  produktionsnaher Last-/Recovery-Evidenz. Erst danach folgt die konkrete,
+  Kubernetes-Zieltestbed als **neue T044-B5-Staging-Abnahme**, ausdrücklich
+  **nicht** als Wiederholung oder Übertragung von Experiment B/T085,
+  samt negativer Blue-/Writer-Isolation und revisionsgebundenen
+  Last-, Recovery-, Such- und Backup-/Restore-Belegen. Vorher müssen
+  die autoritativen Bureau-Verifier- und Primärreader-Verträge integriert
+  und unabhängig freigegeben sein. Erst danach folgt die konkrete,
   kapazitiv belegte Produktions-Green-Zielidentität und die Schließung der
   Capability-Lücken gegen genau dieses Ziel.
