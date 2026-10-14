@@ -1274,10 +1274,23 @@ class WatchTests(unittest.TestCase):
             self.assertIsNone(watch.record(stale, directory))
             state_after = json.loads((directory / "state.json").read_text())
             self.assertEqual(state_after, state_before)
+            # A heartbeat failure happens before journal publication now.
+            # The durable state outbox retains the first alarm for later replay.
+            self.assertFalse((directory / "events.jsonl").exists())
             self.assertEqual(
-                [json.loads(line)["event"] for line in
-                 (directory / "events.jsonl").read_text().splitlines()],
+                [x["event"] for x in state_after["pending_transitions"]],
                 ["ALARM"],
+            )
+            later = watch.evaluate(
+                NOW + timedelta(minutes=4),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(later, directory), "ALARM")
+            published = [json.loads(line) for line in
+                         (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual([x["event"] for x in published], ["ALARM"])
+            self.assertEqual(
+                published[0]["checked_at_utc"], newer["checked_at_utc"],
             )
 
 
@@ -1960,9 +1973,16 @@ class WatchTests(unittest.TestCase):
             original = watch.os.fsync
             faults = []
 
+            last_synced_file = [None]
             def fail_first_directory_fsync(fd):
                 destination = os.readlink(f"/proc/self/fd/{fd}")
-                if destination == str(directory) and not faults:
+                if destination == str(directory / "events.jsonl"):
+                    last_synced_file[0] = destination
+                # The ALARM intent is now durably persisted before the journal.
+                # Inject the error on the journal's own directory fsync.
+                if (destination == str(directory)
+                        and last_synced_file[0] == str(directory / "events.jsonl")
+                        and not faults):
                     faults.append(True)
                     raise OSError("simulated journal directory fsync failure")
                 return original(fd)
@@ -2020,7 +2040,7 @@ class WatchTests(unittest.TestCase):
 
             def interrupted_open(path, *args, **kwargs):
                 stream = original_open(path, *args, **kwargs)
-                if path == directory / "events.jsonl":
+                if path == directory / "events.jsonl" and "ab" in args:
                     return InterruptedWriter(stream)
                 return stream
 
@@ -2831,6 +2851,105 @@ class WatchTests(unittest.TestCase):
                 {i["code"] for i in resumed["issues"] if i["severity"] == "P1"},
                 {"stale_frontend", "stale_api"},
             )
+
+
+    def test_pending_recovery_orders_before_independent_new_alarm(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(first, directory), "ALARM")
+            recovered_a = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(),
+            )
+            real_open = Path.open
+            failures = []
+
+            def fail_recovery_append(path, *args, **kwargs):
+                if path == directory / "events.jsonl" and "ab" in args and not failures:
+                    failures.append(True)
+                    raise OSError("first RECOVERY append failed")
+                return real_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", new=fail_recovery_append):
+                self.assertEqual(watch.record(recovered_a, directory), "RECOVERY")
+            self.assertEqual(failures, [True])
+
+            different_alarm = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(frontend=OLD, api=MAIN),
+            )
+            self.assertEqual(watch.record(different_alarm, directory), "ALARM")
+            recovered_b = watch.evaluate(
+                NOW + timedelta(minutes=3), self.fixtures(),
+            )
+            self.assertEqual(watch.record(recovered_b, directory), "RECOVERY")
+            history = [json.loads(line) for line in
+                       (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(
+                [entry["event"] for entry in history],
+                ["ALARM", "RECOVERY", "ALARM", "RECOVERY"],
+            )
+            self.assertEqual(
+                history[1]["checked_at_utc"], recovered_a["checked_at_utc"],
+            )
+            self.assertEqual(
+                history[3]["checked_at_utc"], recovered_b["checked_at_utc"],
+            )
+
+    def test_crash_after_durable_alarm_before_outbox_clear_is_recovered(self):
+        import json
+        from unittest.mock import patch
+
+        for cleared in (False, True):
+            with self.subTest(recovered_next_poll=cleared):
+                with tempfile.TemporaryDirectory() as tmp:
+                    directory = Path(tmp)
+                    first = watch.evaluate(
+                        NOW, self.fixtures(cache="public, max-age=30"),
+                    )
+                    real_write = watch.write_json
+                    interrupted = []
+
+                    def kill_after_alarm_append(path, payload):
+                        if (path == directory / "state.json"
+                                and (directory / "events.jsonl").exists()
+                                and not interrupted):
+                            journal = (directory / "events.jsonl").read_text()
+                            if '"event":"ALARM"' in journal:
+                                interrupted.append(True)
+                                raise KeyboardInterrupt("hard stop after fsynced ALARM")
+                        return real_write(path, payload)
+
+                    with patch.object(
+                        watch, "write_json", side_effect=kill_after_alarm_append,
+                    ), self.assertRaises(KeyboardInterrupt):
+                        watch.record(first, directory)
+                    self.assertEqual(interrupted, [True])
+                    next_poll = watch.evaluate(
+                        NOW + timedelta(minutes=1),
+                        self.fixtures(
+                            cache=("public, no-store" if cleared
+                                   else "public, max-age=30"),
+                        ),
+                    )
+                    self.assertEqual(
+                        watch.record(next_poll, directory),
+                        ("RECOVERY" if cleared else None),
+                    )
+                    history = [json.loads(line) for line in
+                               (directory / "events.jsonl").read_text().splitlines()]
+                    self.assertEqual(
+                        [entry["event"] for entry in history],
+                        (["ALARM", "RECOVERY"] if cleared else ["ALARM"]),
+                    )
+                    self.assertEqual(
+                        history[0]["checked_at_utc"], first["checked_at_utc"],
+                    )
 
 if __name__ == "__main__":
     unittest.main()

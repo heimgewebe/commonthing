@@ -707,10 +707,21 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 # recovery's first snapshot failed before os.replace. The
                 # heartbeat already carries that exact uncommitted RECOVERY;
                 # do not add a second event with a later checked_at timestamp.
-                if event_name == "RECOVERY" and any(
-                    entry["event"] == "RECOVERY" for entry in pending
-                ):
-                    continue
+                if event_name == "RECOVERY":
+                    # A retry of the SAME recovery leaves the earlier
+                    # outbox RECOVERY at its tail. An independent ALARM
+                    # queued after it begins another incident epoch, whose
+                    # later recovery must not be suppressed.
+                    latest_recovery = next(
+                        (index for index in range(len(pending) - 1, -1, -1)
+                         if pending[index]["event"] == "RECOVERY"),
+                        None,
+                    )
+                    if latest_recovery is not None and not any(
+                        entry["event"] == "ALARM"
+                        for entry in pending[latest_recovery + 1:]
+                    ):
+                        continue
                 payload = {
                     "event": event_name,
                     **{key: value for key, value in result.items()
@@ -722,11 +733,21 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                     pending.append(entry)
         if len(pending) > 16:
             raise ValueError("pending transition outbox exceeds bound")
+        # Journal order must follow the outbox exactly. An older RECOVERY
+        # can only be committed once its state/heartbeat recovery anchors
+        # are verified. If it is still blocked, later ALARMs are held too;
+        # otherwise a new incident could overtake an older recovery.
+        # A previous confirmed recovery followed by a NEW P1 is replayable
+        # when the preceding state was already clear (old_severe == []).
         unverified = {"watcher_execution_failed", "unverifiable_state"} & observed_codes
-        ready_pending = ([] if suppress_transition_event else [
-            entry for entry in pending
-            if entry["event"] == "ALARM" or (not severe and not unverified)
-        ])
+        ready_pending = []
+        if not suppress_transition_event:
+            for entry in pending:
+                if entry["event"] == "RECOVERY" and (
+                    unverified or (severe and old_severe)
+                ):
+                    break
+                ready_pending.append(entry)
         replayed_event = next(
             (entry["event"] for entry in ready_pending
              if entry not in _pending_transition_entries(previous)
@@ -757,15 +778,19 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             if not heartbeat_first:
                 write_json(directory / "heartbeat.json", result)
 
-        # New ALARM events precede snapshots so failed writes do not hide P1.
-        # A RECOVERY is the opposite: emit it only after *both* snapshots
-        # are durably committed; otherwise a failed state write can fabricate
-        # recovered history while the confirmed incident remains active.
+        # Durably record ALARM intent before the journal write. Only a
+        # fully committed recovery in both state/heartbeat may be journaled;
+        # failed writes must never fabricate recovered history.
         recovery_before_event = (
             any(entry["event"] == "RECOVERY" for entry in ready_pending)
         )
-        if recovery_before_event:
-            persist_snapshots(heartbeat_first=True)
+        # Persist transition intent BEFORE the first journal append. Without
+        # this durable preimage, a crash after ALARM fsync and before the
+        # later snapshot would lose the state and cause duplicate alarms or
+        # a permanently missing recovery. Recovery still writes heartbeat
+        # first, retaining the original confirmed P1 until state commits.
+        if ready_pending:
+            persist_snapshots(heartbeat_first=recovery_before_event)
         event_log_failed = False
         journal_events = [entry["payload"] for entry in ready_pending]
         journal_events.extend(
