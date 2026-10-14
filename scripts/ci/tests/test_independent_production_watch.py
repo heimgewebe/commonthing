@@ -3121,5 +3121,69 @@ class WatchTests(unittest.TestCase):
                 (directory / "state.json").read_text(),
             ).get("pending_transitions"))
 
+
+    def test_crash_mid_journal_append_repairs_unterminated_tail(self):
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30"),
+            )
+            real_open = Path.open
+            killed = []
+
+            class KillMidWrite:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def __enter__(self):
+                    self.stream.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.stream.__exit__(*args)
+
+                def fileno(self):
+                    return self.stream.fileno()
+
+                def write(self, data):
+                    if not killed:
+                        killed.append(True)
+                        self.stream.write(data[:7])
+                        raise KeyboardInterrupt("power loss mid journal write")
+                    return self.stream.write(data)
+
+            def interrupted_open(path, *args, **kwargs):
+                stream = real_open(path, *args, **kwargs)
+                if path == directory / "events.jsonl" and "ab" in args:
+                    return KillMidWrite(stream)
+                return stream
+
+            with patch.object(Path, "open", new=interrupted_open):
+                with self.assertRaises(KeyboardInterrupt):
+                    watch.record(first, directory)
+            self.assertEqual(killed, [True])
+            journal = directory / "events.jsonl"
+            self.assertEqual(journal.read_bytes(), b'{"check')
+            persisted = json.loads((directory / "state.json").read_text())
+            self.assertEqual(
+                [x["event"] for x in persisted["pending_transitions"]],
+                ["ALARM"],
+            )
+
+            repeat = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(repeat, directory), "ALARM")
+            data = journal.read_bytes()
+            self.assertTrue(data.endswith(b"\n"))
+            self.assertEqual(len(data.splitlines()), 1)
+            decoded = json.loads(data)
+            self.assertEqual(decoded["event"], "ALARM")
+            self.assertEqual(decoded["checked_at_utc"], first["checked_at_utc"])
+
 if __name__ == "__main__":
     unittest.main()

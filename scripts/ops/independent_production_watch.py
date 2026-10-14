@@ -460,6 +460,30 @@ def _transition_already_journaled(directory, entry):
         return False
 
 
+def _last_complete_journal_offset(directory, expected_end):
+    """Return end of the last newline-terminated event using bounded memory.
+
+    A hard crash during an append can leave a partial suffix even though its
+    in-process rollback handler never ran. The watcher emits only newline-
+    terminated events, so an unterminated suffix is not committed evidence.
+    """
+    with (directory / "events.jsonl").open("rb") as reader:
+        if os.fstat(reader.fileno()).st_size != expected_end:
+            raise OSError("journal changed while inspecting incomplete tail")
+        cursor = expected_end
+        while cursor:
+            start = max(0, cursor - 65536)
+            reader.seek(start)
+            data = reader.read(cursor - start)
+            if len(data) != cursor - start:
+                raise OSError("short journal tail read")
+            newline = data.rfind(b"\n")
+            if newline >= 0:
+                return start + newline + 1
+            cursor = start
+    return 0
+
+
 def _append_durable_events(directory, journal_events, committed_event_names=None):
     """Append one atomic JSONL batch; preserve exact old end on failure."""
     # Prepare one atomic append batch: old pending transitions
@@ -475,6 +499,17 @@ def _append_durable_events(directory, journal_events, committed_event_names=None
     with (directory / "events.jsonl").open("ab", buffering=0) as out:
         fd = out.fileno()
         previous_end = os.lseek(fd, 0, os.SEEK_END)
+        if previous_end:
+            complete_end = _last_complete_journal_offset(
+                directory, previous_end,
+            )
+            if complete_end < previous_end:
+                # Only an uncommitted, unterminated suffix is discarded;
+                # earlier complete JSONL rows are never rewritten.
+                os.ftruncate(fd, complete_end)
+                os.fsync(fd)
+                _fsync_directory(directory)
+                previous_end = complete_end
         try:
             written = out.write(payload)
             if written != len(payload):
