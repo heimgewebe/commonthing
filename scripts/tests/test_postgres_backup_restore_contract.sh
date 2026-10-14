@@ -86,7 +86,8 @@ while (($# > 1)); do
   esac
 done
 ((recipients > 0)) && [[ -n "$out" ]] || { echo "age stub: need -r and -o" >&2; exit 2; }
-{ printf 'age-encryption.org/v1\n-> X25519 stub\n--- stub\n'; base64 < "$1"; } > "$out"
+# Read the named input, or stdin like real age (recipient preflight).
+{ printf 'age-encryption.org/v1\n-> X25519 stub\n--- stub\n'; base64 < "${1:-/dev/stdin}"; } > "$out"
 SH
   chmod +x "$MOCK_BIN/age"
 fi
