@@ -945,6 +945,14 @@ def _persist_cycle(result, directory):
         # storage is completely inaccessible; an external liveness watcher
         # remains necessary.
         failure = watcher_failure_report(datetime.now(UTC), exc)
+        # The first write may fail before persisting a fully observed new main
+        # and its frontend/API divergence grace. Keep that primary observation
+        # in the fallback snapshot; a blank failure report would restart the
+        # 45-minute clock on every subsequent failed first write. This is
+        # evidence from the completed poll, not a synthetic healthy status.
+        completed_main = result.get("main_observation")
+        if isinstance(completed_main, dict):
+            failure["main_observation"] = completed_main
         # A failed state replace must not turn a confirmed NEW product P1
         # into generic P2 uncertainty. Preserve the observation from this
         # poll even when no prior state.json contains the incident yet.

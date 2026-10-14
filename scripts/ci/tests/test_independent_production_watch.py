@@ -2784,5 +2784,53 @@ class WatchTests(unittest.TestCase):
                 out.write(b"x" * (len(expected) + 1) + expected)
             self.assertFalse(watch._transition_already_journaled(directory, entry))
 
+
+    def test_failed_snapshot_retry_keeps_new_main_grace_and_mismatch_anchor(self):
+        import json
+        import signal
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            initial = watch.evaluate(
+                NOW, self.fixtures(frontend=OLD, api=OLD, main=OLD),
+            )
+            self.assertIsNone(watch.record(initial, directory))
+            observed = watch.evaluate(
+                NOW + timedelta(minutes=1),
+                self.fixtures(frontend=OLD, api=OLD, main=MAIN),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(observed["status"], "HEALTHY")
+            expected_anchor = observed["main_observation"]
+            self.assertEqual(expected_anchor["sha"], MAIN)
+            self.assertEqual(set(expected_anchor["diverged_since"]),
+                             {"frontend", "api"})
+            actual_write = watch.write_json
+            faults = []
+
+            def fail_once(path, payload):
+                if path == directory / "state.json" and not faults:
+                    faults.append(True)
+                    raise OSError("first new-main state write was interrupted")
+                return actual_write(path, payload)
+
+            with patch.object(watch, "write_json", side_effect=fail_once), \
+                 patch.object(signal, "alarm", return_value=0):
+                self.assertEqual(watch._persist_cycle(observed, directory), 2)
+
+            self.assertEqual(faults, [True])
+            persisted = json.loads((directory / "state.json").read_text())
+            self.assertEqual(persisted["main_observation"], expected_anchor)
+            resumed = watch.evaluate(
+                NOW + timedelta(minutes=47),
+                self.fixtures(frontend=OLD, api=OLD, main=MAIN),
+                previous_main_observation=watch.read_previous_main_observation(directory),
+            )
+            self.assertEqual(
+                {i["code"] for i in resumed["issues"] if i["severity"] == "P1"},
+                {"stale_frontend", "stale_api"},
+            )
+
 if __name__ == "__main__":
     unittest.main()
