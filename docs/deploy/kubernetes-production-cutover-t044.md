@@ -216,7 +216,17 @@ vollständige, gegen die konkrete Zielrevision gebundene Abnahme erforderlich.
 - Der getrennte, temporäre Experiment-B-Zieltest T085 wurde auf
   `5d509feda6db24e294698cb42501fd41ec8e0fbe` terminal bestanden.
   Das vor Ort erneut gelesene Retirement-Receipt bestätigt `retired`,
-  entfernte Volumes und entfernten Lauf-State. Dieses Testergebnis ist
+  entfernte Volumes und entfernten Lauf-State. Der historische PASS beruht
+  außerdem auf dem **vor dem Teardown** archivierten, SHA-256-gebundenen
+  Gate-Manifest (`4aaef1af5edd223e08fafa6cc7da58a946a910c8abe17c033d895ec7e77302b8`,
+  `experiment_b_gates=PASS`), nicht auf dem Abbau-Receipt allein. Der
+  Terminal-Closeout-Hash (`97392ceb9f911cdc8eea2cf21604bfacf487b0cb824387b11e7d5fcbb1c8aa5e`)
+  und der Retirement-Hash (`e0e804a864439e58e99c503e41e5b62da561bd98b6ed6310b4125190bed0aab2`)
+  samt genauen lokalen Belegpfaden sind in
+  [ADR-0010](../adr/ADR-0010__kubernetes-kanonische-plattform.md) dokumentiert.
+  Diese Operator-Dateien sind **nicht in Git veröffentlicht** und ohne
+  Zugriff auf den ursprünglichen lokalen State extern nicht reproduzierbar.
+  Dieses Testergebnis ist
   **kein** Test des jetzigen Produktionscommits und begründet weder einen
   bestehenden Produktions-Green-Cluster noch die Freigabe des Cutovers.
 
