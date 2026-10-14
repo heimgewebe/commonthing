@@ -94,7 +94,7 @@ load_age_recipients() {
   ((${#age_recipient_args[@]} > 0)) || fail "age recipients file contains no age1 recipient: $file"
   # The pattern above cannot see a Bech32 checksum typo. Let age parse every
   # recipient on an empty input now, before any plaintext dump exists.
-  age "${age_recipient_args[@]}" -o /dev/null /dev/null 2> /dev/null ||
+  age "${age_recipient_args[@]}" -o /dev/null < /dev/null 2> /dev/null ||
     fail "age rejected a recipient in $file (check for typos; expected X25519 age1 public keys)"
 }
 
