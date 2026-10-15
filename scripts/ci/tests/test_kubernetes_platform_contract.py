@@ -4783,7 +4783,7 @@ time.sleep(60)
             mock.patch.object(
                 self.reference.subprocess,
                 "run",
-                side_effect=[health, web, api_nodes],
+                side_effect=[health, web, api_nodes] * 3,
             ) as run_mock,
         ):
             result = self.reference.probe_gateway_http(
@@ -4811,6 +4811,74 @@ time.sleep(60)
             run_mock.call_args_list[2].args[0][-1],
             "http://172.22.0.3:80/api/nodes",
         )
+
+    def test_gateway_http_probe_requires_full_node_address_sample_matrix(self) -> None:
+        """A lucky HTTP-200 response must not stand for other kind nodes or Gateway IPs."""
+        seen = []
+        def responding(argv, **_kwargs):
+            seen.append(tuple(argv))
+            url = argv[-1]
+            if url.endswith("/api/nodes"):
+                payload = b"[]"
+            elif url.endswith("/health/live"):
+                payload = b"healthy"
+            else:
+                payload = b"web"
+            return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=b"")
+
+        nodes = ["cluster-worker-a", "cluster-worker-b"]
+        addresses = ["172.22.0.3", "172.22.0.4"]
+        with (
+            mock.patch.object(self.reference, "kind_nodes", return_value=nodes),
+            mock.patch.object(self.reference.subprocess, "run", side_effect=responding),
+        ):
+            self.reference.probe_gateway_http(
+                "kind", "cluster", addresses, 80, timeout_seconds=60
+            )
+        # Three complete samples for each reachable source node / Gateway listener IP.
+        self.assertEqual(len(seen), len(nodes) * len(addresses) * 3 * 3)
+        for node in nodes:
+            for address in addresses:
+                requests = [
+                    call[-1]
+                    for call in seen
+                    if call[:3] == ("docker", "exec", node)
+                    and call[-1].startswith(f"http://{address}:80/")
+                ]
+                self.assertEqual(len(requests), 9)
+                self.assertEqual(
+                    sum(req.endswith("/api/nodes") for req in requests), 3
+                )
+                self.assertEqual(
+                    sum(req.endswith("/health/live") for req in requests), 3
+                )
+                self.assertEqual(sum(req.endswith(":80/") for req in requests), 3)
+
+    def test_gateway_http_probe_rejects_intermittent_503_after_good_sample(self) -> None:
+        """HTTP 503 immediately after an apparently valid triplet must block the proof."""
+        completed = [
+            subprocess.CompletedProcess([], 0, stdout=b"healthy", stderr=b""),
+            subprocess.CompletedProcess([], 0, stdout=b"web", stderr=b""),
+            subprocess.CompletedProcess([], 0, stdout=b"[]", stderr=b""),
+        ]
+        failed = subprocess.CalledProcessError(
+            22, ["docker", "exec", "cluster-worker", "curl"], stderr=b"503"
+        )
+        with (
+            mock.patch.object(
+                self.reference, "kind_nodes", return_value=["cluster-worker"]
+            ),
+            mock.patch.object(
+                self.reference.subprocess, "run", side_effect=completed + [failed]
+            ) as run_mock,
+        ):
+            with self.assertRaisesRegex(
+                self.reference.ProofError, "did not serve listener HTTP"
+            ):
+                self.reference.probe_gateway_http(
+                    "kind", "cluster", ["172.22.0.3"], 80, timeout_seconds=60
+                )
+        self.assertEqual(run_mock.call_count, 4)
 
     def test_gateway_http_probe_rejects_broken_api_rewrite(self) -> None:
         health = subprocess.CompletedProcess(
@@ -4847,7 +4915,7 @@ time.sleep(60)
                     "cluster",
                     ["172.22.0.3"],
                     80,
-                    timeout_seconds=0,
+                    timeout_seconds=30,
                 )
 
     def test_gateway_policy_allows_only_cilium_ingress_identity(self) -> None:

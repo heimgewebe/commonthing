@@ -37,6 +37,7 @@ KUBECONFIGS = CACHE / "kubeconfigs"
 DEFAULT_CLUSTER = "weltgewebe-reference"
 FULL_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 KIND_CREATE_ATTEMPTS = 3
+GATEWAY_HTTP_PROBE_SAMPLES = 3
 KIND_CREATE_BACKOFF_SECONDS = (5.0, 15.0)
 TRANSIENT_KIND_CREATE_MARKERS = (
     "429 too many requests",
@@ -2005,6 +2006,7 @@ def kind_nodes(kind: str, cluster: str) -> list[str]:
     return nodes
 
 
+
 def probe_gateway_http(
     kind: str,
     cluster: str,
@@ -2012,12 +2014,27 @@ def probe_gateway_http(
     port: int,
     timeout_seconds: int = 30,
 ) -> tuple[str, str, bytes, bytes, bytes]:
+    """Fail closed unless every kind node and advertised Gateway IP serves repeatable HTTP.
+
+    One successful request does not prove Gateway delivery: Cilium Envoy can
+    selectively time out on same-node backends while other endpoints are ready.
+    Probe each node × address × route several times, without retrying away a
+    post-readiness 503. Return the first witness only after the full matrix passes.
+    """
     nodes = kind_nodes(kind, cluster)
+    if not addresses:
+        raise ProofError("Gateway status has no advertised listener IPv4 address")
     deadline = time.monotonic() + timeout_seconds
-    last_error: BaseException | None = None
-    while True:
-        for node in nodes:
-            for address in addresses:
+    witness: tuple[str, str, bytes, bytes, bytes] | None = None
+
+    for node in nodes:
+        for address in addresses:
+            for sample in range(1, GATEWAY_HTTP_PROBE_SAMPLES + 1):
+                if time.monotonic() >= deadline:
+                    raise ProofError(
+                        "Gateway status address did not serve listener HTTP from a kind node: "
+                        f"probe timeout at node={node!r} address={address!r} sample={sample}"
+                    )
                 common = [
                     "docker",
                     "exec",
@@ -2029,56 +2046,51 @@ def probe_gateway_http(
                     "--max-time",
                     "10",
                 ]
-                try:
-                    health = subprocess.run(
-                        [*common, f"http://{address}:{port}/health/live"],
-                        cwd=ROOT,
-                        text=False,
-                        capture_output=True,
-                        check=True,
-                        timeout=15,
-                    ).stdout
-                    web = subprocess.run(
-                        [*common, f"http://{address}:{port}/"],
-                        cwd=ROOT,
-                        text=False,
-                        capture_output=True,
-                        check=True,
-                        timeout=15,
-                    ).stdout[:1024]
-                    api_nodes = subprocess.run(
-                        [*common, f"http://{address}:{port}/api/nodes"],
-                        cwd=ROOT,
-                        text=False,
-                        capture_output=True,
-                        check=True,
-                        timeout=15,
-                    ).stdout
+                bodies: dict[str, bytes] = {}
+                for path in ("/health/live", "/", "/api/nodes"):
                     try:
-                        api_payload = json.loads(api_nodes)
-                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                        raise ProofError(
-                            "Gateway /api/nodes route did not return valid JSON"
-                        ) from error
-                    if not isinstance(api_payload, list):
-                        raise ProofError(
-                            "Gateway /api/nodes route did not preserve the API list contract"
+                        response = subprocess.run(
+                            [*common, f"http://{address}:{port}{path}"],
+                            cwd=ROOT,
+                            text=False,
+                            capture_output=True,
+                            check=True,
+                            timeout=15,
                         )
-                    if health and web:
-                        return node, address, health, web, api_nodes
-                    last_error = ProofError("Gateway route returned empty content")
-                except (
-                    subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired,
-                    ProofError,
-                ) as error:
-                    last_error = error
-        if time.monotonic() >= deadline:
-            raise ProofError(
-                "Gateway status address did not serve listener HTTP from a kind node: "
-                f"nodes={nodes!r} addresses={addresses!r} port={port}"
-            ) from last_error
-        time.sleep(1)
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                        raise ProofError(
+                            "Gateway status address did not serve listener HTTP from a kind node: "
+                            f"node={node!r} address={address!r} route={path!r} "
+                            f"sample={sample}"
+                        ) from error
+                    bodies[path] = response.stdout
+                health = bodies["/health/live"]
+                web = bodies["/"][:1024]
+                api_nodes = bodies["/api/nodes"]
+                if not health or not web:
+                    raise ProofError(
+                        "Gateway status address did not serve listener HTTP from a kind node: "
+                        f"empty content at node={node!r} address={address!r} sample={sample}"
+                    )
+                try:
+                    api_payload = json.loads(api_nodes)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ProofError(
+                        "Gateway status address did not serve listener HTTP from a kind node: "
+                        f"invalid /api/nodes JSON at node={node!r} address={address!r}"
+                    ) from error
+                if not isinstance(api_payload, list):
+                    raise ProofError(
+                        "Gateway status address did not serve listener HTTP from a kind node: "
+                        f"invalid /api/nodes list at node={node!r} address={address!r}"
+                    )
+                if witness is None:
+                    witness = (node, address, health, web, api_nodes)
+    if witness is None:
+        raise ProofError("Gateway HTTP proof has no node/address/route witness")
+    if time.monotonic() >= deadline:
+        raise ProofError("Gateway status address did not serve listener HTTP within proof deadline")
+    return witness
 
 
 def prove_gateway(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
