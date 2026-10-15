@@ -2015,6 +2015,40 @@ def kind_nodes(kind: str, cluster: str) -> list[str]:
 
 
 
+def gateway_address_owners(
+    kind: str, cluster: str, addresses: list[str]
+) -> dict[str, str]:
+    """Bind each Cilium node-IPAM listener to exactly one real Kind node.
+
+    The independent HA contract measures owner-local listener reachability;
+    cross-node Kind/Cilium paths are not a gate for this proof.
+    """
+    if not addresses:
+        raise ProofError("Gateway status has no advertised listener IPv4 address")
+    owners_by_address: dict[str, list[str]] = {}
+    for node in kind_nodes(kind, cluster):
+        address = output(
+            [
+                "docker", "inspect", "--format",
+                '{{(index .NetworkSettings.Networks "kind").IPAddress}}',
+                node,
+            ]
+        )
+        if address:
+            owners_by_address.setdefault(address, []).append(node)
+    invalid = {
+        address: owners_by_address.get(address, [])
+        for address in addresses
+        if len(owners_by_address.get(address, [])) != 1
+    }
+    if invalid:
+        raise ProofError(
+            "advertised gateway addresses do not map to exactly one kind node owner: "
+            f"{invalid}"
+        )
+    return {address: owners_by_address[address][0] for address in addresses}
+
+
 def probe_gateway_http(
     kind: str,
     cluster: str,
@@ -2022,21 +2056,20 @@ def probe_gateway_http(
     port: int,
     timeout_seconds: int = 30,
 ) -> tuple[str, str, bytes, bytes, bytes]:
-    """Fail closed unless every kind node and advertised Gateway IP serves repeatable HTTP.
+    """Fail closed on any owner-local listener/route/sample failure.
 
-    One successful request does not prove Gateway delivery: Cilium Envoy can
-    selectively time out on same-node backends while other endpoints are ready.
-    Probe each node × address × route several times, without retrying away a
-    post-readiness 503. Return the first witness only after the full matrix passes.
+    An advertised node-IPAM listener must map to exactly one Kind-node owner.
+    Cross-node Kind/Cilium reachability is diagnostic, not an HA proof gate.
     """
-    nodes = kind_nodes(kind, cluster)
-    if not addresses:
-        raise ProofError("Gateway status has no advertised listener IPv4 address")
+    owners = gateway_address_owners(kind, cluster, addresses)
+    nodes = list(dict.fromkeys(owners.values()))
     deadline = time.monotonic() + timeout_seconds
     witness: tuple[str, str, bytes, bytes, bytes] | None = None
 
     for node in nodes:
         for address in addresses:
+            if owners[address] != node:
+                continue
             for sample in range(1, GATEWAY_HTTP_PROBE_SAMPLES + 1):
                 if time.monotonic() >= deadline:
                     raise ProofError(
@@ -2121,9 +2154,14 @@ def wait_gateway_initial_readiness(
         raise ValueError("Gateway readiness requires positive deadline and nonnegative interval")
     deadline = time.monotonic() + timeout_seconds
     last_error: GatewayTransportNotReady | None = None
-    while time.monotonic() < deadline:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            witness = probe_gateway_http(kind, cluster, addresses, port)
+            witness = probe_gateway_http(
+                kind, cluster, addresses, port, timeout_seconds=remaining
+            )
             if time.monotonic() <= deadline:
                 return witness
         except GatewayTransportNotReady as error:

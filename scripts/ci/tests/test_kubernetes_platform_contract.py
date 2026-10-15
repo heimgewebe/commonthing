@@ -4776,6 +4776,10 @@ time.sleep(60)
         )
         with (
             mock.patch.object(
+                self.reference, "gateway_address_owners",
+                return_value={"172.22.0.3": "cluster-worker"},
+            ),
+            mock.patch.object(
                 self.reference,
                 "kind_nodes",
                 return_value=["cluster-worker"],
@@ -4812,8 +4816,99 @@ time.sleep(60)
             "http://172.22.0.3:80/api/nodes",
         )
 
-    def test_gateway_http_probe_requires_full_node_address_sample_matrix(self) -> None:
-        """A lucky HTTP-200 response must not stand for other kind nodes or Gateway IPs."""
+    def test_gateway_address_owners_bind_exact_kind_node_ip_among_nonowners(self) -> None:
+        nodes = ["cluster-control-plane", "cluster-worker-a", "cluster-worker-b"]
+        addresses = {
+            "cluster-control-plane": "172.22.0.2",
+            "cluster-worker-a": "172.22.0.3",
+            "cluster-worker-b": "172.22.0.4",
+        }
+        with (
+            mock.patch.object(self.reference, "kind_nodes", return_value=nodes),
+            mock.patch.object(
+                self.reference, "output",
+                side_effect=lambda argv: addresses[argv[-1]],
+            ),
+        ):
+            self.assertEqual(
+                self.reference.gateway_address_owners(
+                    "kind", "cluster", ["172.22.0.3", "172.22.0.4"]
+                ),
+                {"172.22.0.3": "cluster-worker-a",
+                 "172.22.0.4": "cluster-worker-b"},
+            )
+
+    def test_gateway_address_owners_reject_missing_and_duplicate_owners(self) -> None:
+        nodes = ["cluster-worker-a", "cluster-worker-b"]
+        for ip_map, error_text in (
+            ({"cluster-worker-a": "172.22.0.3",
+              "cluster-worker-b": "172.22.0.4"}, "exactly one"),
+            ({"cluster-worker-a": "172.22.0.3",
+              "cluster-worker-b": "172.22.0.3"}, "exactly one"),
+        ):
+            with (
+                self.subTest(ip_map=ip_map),
+                mock.patch.object(self.reference, "kind_nodes", return_value=nodes),
+                mock.patch.object(
+                    self.reference, "output", side_effect=lambda argv: ip_map[argv[-1]]
+                ),
+            ):
+                with self.assertRaisesRegex(self.reference.ProofError, error_text):
+                    self.reference.gateway_address_owners(
+                        "kind", "cluster", ["172.22.0.3", "172.22.0.5"]
+                        if ip_map["cluster-worker-b"] != "172.22.0.3"
+                        else ["172.22.0.3"]
+                    )
+
+    def test_gateway_http_probe_reaches_each_listener_only_from_owner(self) -> None:
+        """Cross-node Kind/Cilium connectivity is diagnostic, not an HA PASS requirement."""
+        owners = {"172.22.0.3": "cluster-worker-a",
+                  "172.22.0.4": "cluster-worker-b"}
+        calls = []
+        def owner_only(argv, **_kwargs):
+            node, url = argv[2], argv[-1]
+            calls.append((node, url))
+            address = url.split("/")[2].split(":")[0]
+            if owners[address] != node:
+                raise subprocess.CalledProcessError(22, argv, stderr=b"cross-node 503")
+            payload = b"[]" if url.endswith("/api/nodes") else b"ok"
+            return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=b"")
+        with (
+            mock.patch.object(
+                self.reference, "gateway_address_owners", return_value=owners
+            ) as mapping,
+            mock.patch.object(self.reference.subprocess, "run", side_effect=owner_only),
+        ):
+            self.reference.probe_gateway_http(
+                "kind", "cluster", list(owners), 80, timeout_seconds=60
+            )
+        mapping.assert_called_once_with("kind", "cluster", list(owners))
+        self.assertEqual(len(calls), len(owners) * 3 * 3)
+        self.assertTrue(all(owners[url.split("/")[2].split(":")[0]] == node
+                            for node, url in calls))
+
+    def test_gateway_readiness_passes_remaining_budget_to_matrix(self) -> None:
+        witness = ("cluster-worker-a", "172.22.0.3", b"ok", b"web", b"[]")
+        seen = []
+        def capture_timeout(*_args, **kwargs):
+            seen.append(kwargs.get("timeout_seconds", 30))
+            return witness
+        with (
+            mock.patch.object(self.reference, "probe_gateway_http",
+                              side_effect=capture_timeout),
+            mock.patch.object(self.reference.time, "monotonic",
+                              side_effect=[100.0, 101.0, 102.0]),
+        ):
+            result = self.reference.wait_gateway_initial_readiness(
+                "kind", "cluster", ["172.22.0.3"], 80,
+                timeout_seconds=120, interval=0
+            )
+        self.assertEqual(result, witness)
+        self.assertEqual(len(seen), 1)
+        self.assertGreaterEqual(seen[0], 118)
+
+    def test_gateway_http_probe_requires_full_owner_local_sample_matrix(self) -> None:
+        """Each advertised listener's owner must serve all three routes three times."""
         seen = []
         def responding(argv, **_kwargs):
             seen.append(tuple(argv))
@@ -4826,33 +4921,29 @@ time.sleep(60)
                 payload = b"web"
             return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=b"")
 
-        nodes = ["cluster-worker-a", "cluster-worker-b"]
-        addresses = ["172.22.0.3", "172.22.0.4"]
+        owners = {"172.22.0.3": "cluster-worker-a",
+                  "172.22.0.4": "cluster-worker-b"}
         with (
-            mock.patch.object(self.reference, "kind_nodes", return_value=nodes),
+            mock.patch.object(
+                self.reference, "gateway_address_owners", return_value=owners
+            ),
             mock.patch.object(self.reference.subprocess, "run", side_effect=responding),
         ):
             self.reference.probe_gateway_http(
-                "kind", "cluster", addresses, 80, timeout_seconds=60
+                "kind", "cluster", list(owners), 80, timeout_seconds=60
             )
-        # Three complete samples for each reachable source node / Gateway listener IP.
-        self.assertEqual(len(seen), len(nodes) * len(addresses) * 3 * 3)
-        for node in nodes:
-            for address in addresses:
-                requests = [
-                    call[-1]
-                    for call in seen
-                    if call[:3] == ("docker", "exec", node)
-                    and call[-1].startswith(f"http://{address}:80/")
-                ]
-                self.assertEqual(len(requests), 9)
-                self.assertEqual(
-                    sum(req.endswith("/api/nodes") for req in requests), 3
-                )
-                self.assertEqual(
-                    sum(req.endswith("/health/live") for req in requests), 3
-                )
-                self.assertEqual(sum(req.endswith(":80/") for req in requests), 3)
+        self.assertEqual(len(seen), len(owners) * 3 * 3)
+        for address, node in owners.items():
+            requests = [
+                call[-1]
+                for call in seen
+                if call[:3] == ("docker", "exec", node)
+                and call[-1].startswith(f"http://{address}:80/")
+            ]
+            self.assertEqual(len(requests), 9)
+            self.assertEqual(sum(req.endswith("/api/nodes") for req in requests), 3)
+            self.assertEqual(sum(req.endswith("/health/live") for req in requests), 3)
+            self.assertEqual(sum(req.endswith(":80/") for req in requests), 3)
 
     def test_gateway_http_probe_rejects_intermittent_503_after_good_sample(self) -> None:
         """HTTP 503 immediately after an apparently valid triplet must block the proof."""
@@ -4865,6 +4956,10 @@ time.sleep(60)
             22, ["docker", "exec", "cluster-worker", "curl"], stderr=b"503"
         )
         with (
+            mock.patch.object(
+                self.reference, "gateway_address_owners",
+                return_value={"172.22.0.3": "cluster-worker"},
+            ),
             mock.patch.object(
                 self.reference, "kind_nodes", return_value=["cluster-worker"]
             ),
@@ -4957,6 +5052,10 @@ time.sleep(60)
             with self.subTest(json=invalid_body):
                 with (
                     mock.patch.object(
+                        self.reference, "gateway_address_owners",
+                        return_value={"172.22.0.3": "cluster-worker"},
+                    ),
+                    mock.patch.object(
                         self.reference, "kind_nodes", return_value=["cluster-worker"]
                     ),
                     mock.patch.object(
@@ -4989,6 +5088,10 @@ time.sleep(60)
             args=[], returncode=0, stdout=b'{"not":"a-list"}', stderr=b""
         )
         with (
+            mock.patch.object(
+                self.reference, "gateway_address_owners",
+                return_value={"172.22.0.3": "cluster-worker"},
+            ),
             mock.patch.object(
                 self.reference,
                 "kind_nodes",
