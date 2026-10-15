@@ -4860,90 +4860,158 @@ time.sleep(60)
                         else ["172.22.0.3"]
                     )
 
-    def test_gateway_http_probe_reaches_each_listener_only_from_owner(self) -> None:
-        """Cross-node Kind/Cilium connectivity is diagnostic, not an HA PASS requirement."""
-        owners = {"172.22.0.3": "cluster-worker-a",
-                  "172.22.0.4": "cluster-worker-b"}
-        calls = []
-        def owner_only(argv, **_kwargs):
-            node, url = argv[2], argv[-1]
-            calls.append((node, url))
-            address = url.split("/")[2].split(":")[0]
+    def test_gateway_http_probe_rejects_cross_node_only_503(self) -> None:
+        """A healthy owner-local listener does not excuse a broken cross-node path."""
+        owners = {"172.22.0.3": "cluster-worker-a", "172.22.0.4": "cluster-worker-b"}
+        seen: list[tuple[str, str]] = []
+
+        def respond(argv, **_kwargs):
+            node = argv[2]
+            address = argv[-1].split("/")[2].split(":")[0]
+            seen.append((node, address))
             if owners[address] != node:
-                raise subprocess.CalledProcessError(22, argv, stderr=b"cross-node 503")
-            payload = b"[]" if url.endswith("/api/nodes") else b"ok"
-            return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=b"")
+                raise subprocess.CalledProcessError(22, argv, stderr=b"HTTP 503")
+            body = b"[]" if argv[-1].endswith("/api/nodes") else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+
         with (
+            mock.patch.object(self.reference, "gateway_address_owners", return_value=owners),
             mock.patch.object(
-                self.reference, "gateway_address_owners", return_value=owners
-            ) as mapping,
-            mock.patch.object(self.reference.subprocess, "run", side_effect=owner_only),
-        ):
-            self.reference.probe_gateway_http(
-                "kind", "cluster", list(owners), 80, timeout_seconds=60
-            )
-        mapping.assert_called_once_with("kind", "cluster", list(owners))
-        self.assertEqual(len(calls), len(owners) * 3 * 3)
-        self.assertTrue(all(owners[url.split("/")[2].split(":")[0]] == node
-                            for node, url in calls))
-
-    def test_gateway_readiness_passes_remaining_budget_to_matrix(self) -> None:
-        witness = ("cluster-worker-a", "172.22.0.3", b"ok", b"web", b"[]")
-        seen = []
-        def capture_timeout(*_args, **kwargs):
-            seen.append(kwargs.get("timeout_seconds", 30))
-            return witness
-        with (
-            mock.patch.object(self.reference, "probe_gateway_http",
-                              side_effect=capture_timeout),
-            mock.patch.object(self.reference.time, "monotonic",
-                              side_effect=[100.0, 101.0, 102.0]),
-        ):
-            result = self.reference.wait_gateway_initial_readiness(
-                "kind", "cluster", ["172.22.0.3"], 80,
-                timeout_seconds=120, interval=0
-            )
-        self.assertEqual(result, witness)
-        self.assertEqual(len(seen), 1)
-        self.assertGreaterEqual(seen[0], 118)
-
-    def test_gateway_http_probe_requires_full_owner_local_sample_matrix(self) -> None:
-        """Each advertised listener's owner must serve all three routes three times."""
-        seen = []
-        def responding(argv, **_kwargs):
-            seen.append(tuple(argv))
-            url = argv[-1]
-            if url.endswith("/api/nodes"):
-                payload = b"[]"
-            elif url.endswith("/health/live"):
-                payload = b"healthy"
-            else:
-                payload = b"web"
-            return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=b"")
-
-        owners = {"172.22.0.3": "cluster-worker-a",
-                  "172.22.0.4": "cluster-worker-b"}
-        with (
-            mock.patch.object(
-                self.reference, "gateway_address_owners", return_value=owners
+                self.reference, "kind_nodes",
+                return_value=["cluster-worker-a", "cluster-worker-b"],
             ),
+            mock.patch.object(self.reference.subprocess, "run", side_effect=respond),
+        ):
+            with self.assertRaisesRegex(self.reference.ProofError, "did not serve listener HTTP"):
+                self.reference.probe_gateway_http(
+                    "kind", "cluster", list(owners), 80, timeout_seconds=120
+                )
+        self.assertTrue(any(node != owners[address] for node, address in seen))
+
+    def test_gateway_default_budget_covers_healthy_long_full_matrix(self) -> None:
+        """A full healthy matrix taking longer than 30 seconds must not false-fail."""
+        nodes = ["cluster-worker-a", "cluster-worker-b"]
+        addresses = ["172.22.0.3", "172.22.0.4"]
+        owners = dict(zip(addresses, nodes, strict=True))
+        clock = [0.0]
+        calls = []
+
+        def responding(argv, **_kwargs):
+            calls.append(argv)
+            clock[0] += 2.0
+            body = b"[]" if argv[-1].endswith("/api/nodes") else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+
+        with (
+            mock.patch.object(self.reference, "gateway_address_owners", return_value=owners),
+            mock.patch.object(self.reference, "kind_nodes", return_value=nodes),
+            mock.patch.object(self.reference.subprocess, "run", side_effect=responding),
+            mock.patch.object(self.reference.time, "monotonic", side_effect=lambda: clock[0]),
+        ):
+            self.reference.probe_gateway_http("kind", "cluster", addresses, 80)
+        self.assertGreater(clock[0], 30)
+        self.assertEqual(len(calls), len(nodes) * len(addresses) * 3 * 3)
+
+    def test_gateway_full_matrix_rejects_cross_node_only_503(self) -> None:
+        """T084 must not hide 503s from non-owning Kind source nodes."""
+        owners = {"172.22.0.3": "node-a", "172.22.0.4": "node-b"}
+        seen: list[tuple[str, str]] = []
+
+        def respond(argv, **_kwargs):
+            node = argv[2]
+            address = argv[-1].split("/")[2].split(":")[0]
+            seen.append((node, address))
+            if owners[address] != node:
+                raise subprocess.CalledProcessError(22, argv, stderr=b"HTTP 503")
+            body = b"[]" if argv[-1].endswith("/api/nodes") else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+
+        with (
+            mock.patch.object(self.reference, "gateway_address_owners", return_value=owners),
+            mock.patch.object(self.reference, "kind_nodes", return_value=["node-a", "node-b"]),
+            mock.patch.object(self.reference.subprocess, "run", side_effect=respond),
+        ):
+            with self.assertRaisesRegex(
+                self.reference.ProofError, "did not serve listener HTTP"
+            ):
+                self.reference.probe_gateway_http(
+                    "kind", "cluster", list(owners), 80, timeout_seconds=120
+                )
+        self.assertTrue(any(owners[address] != node for node, address in seen))
+
+    def test_gateway_matrix_visits_all_node_address_route_samples(self) -> None:
+        """The full matrix is two source nodes by two listeners by three routes by three samples."""
+        owners = {"172.22.0.3": "node-a", "172.22.0.4": "node-b"}
+        seen: list[tuple[str, str, str]] = []
+
+        def responding(argv, **_kwargs):
+            node = argv[2]
+            url = argv[-1]
+            address = url.split("/")[2].split(":")[0]
+            route = "/" + "/".join(url.split("/")[3:])
+            seen.append((node, address, route))
+            body = b"[]" if route == "/api/nodes" else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+
+        with (
+            mock.patch.object(self.reference, "gateway_address_owners", return_value=owners),
+            mock.patch.object(self.reference, "kind_nodes", return_value=["node-a", "node-b"]),
             mock.patch.object(self.reference.subprocess, "run", side_effect=responding),
         ):
             self.reference.probe_gateway_http(
-                "kind", "cluster", list(owners), 80, timeout_seconds=60
+                "kind", "cluster", list(owners), 80, timeout_seconds=120
             )
-        self.assertEqual(len(seen), len(owners) * 3 * 3)
-        for address, node in owners.items():
-            requests = [
-                call[-1]
-                for call in seen
-                if call[:3] == ("docker", "exec", node)
-                and call[-1].startswith(f"http://{address}:80/")
-            ]
-            self.assertEqual(len(requests), 9)
-            self.assertEqual(sum(req.endswith("/api/nodes") for req in requests), 3)
-            self.assertEqual(sum(req.endswith("/health/live") for req in requests), 3)
-            self.assertEqual(sum(req.endswith(":80/") for req in requests), 3)
+        self.assertEqual(len(seen), 2 * 2 * 3 * 3)
+        for node in owners.values():
+            for address in owners:
+                for route in ("/health/live", "/", "/api/nodes"):
+                    self.assertEqual(seen.count((node, address, route)), 3)
+
+    def test_gateway_initial_http_503_cannot_be_retried_to_pass(self) -> None:
+        """No HTTP status failure may be swallowed before the acceptance witness."""
+        witness = ("node-a", "172.22.0.3", b"healthy", b"web", b"[]")
+        with (
+            mock.patch.object(
+                self.reference, "probe_gateway_http",
+                side_effect=[self.reference.GatewayTransportNotReady("HTTP 503"), witness],
+            ) as probe,
+            mock.patch.object(self.reference.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(self.reference.ProofError, "HTTP 503"):
+                self.reference.probe_gateway_after_readiness(
+                    "kind", "cluster", ["172.22.0.3"], 80
+                )
+            self.assertEqual(probe.call_count, 1)
+
+    def test_gateway_http_probe_requires_full_source_listener_sample_matrix(self) -> None:
+        """Every source node must serve every advertised Gateway listener."""
+        seen: list[tuple[str, str, str]] = []
+        nodes = ["cluster-worker-a", "cluster-worker-b"]
+        addresses = ["172.22.0.3", "172.22.0.4"]
+        owners = dict(zip(addresses, nodes, strict=True))
+
+        def responding(argv, **_kwargs):
+            node = argv[2]
+            url = argv[-1]
+            address = url.split("/")[2].split(":")[0]
+            route = "/" + "/".join(url.split("/")[3:])
+            seen.append((node, address, route))
+            body = b"[]" if route == "/api/nodes" else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+
+        with (
+            mock.patch.object(self.reference, "gateway_address_owners", return_value=owners),
+            mock.patch.object(self.reference, "kind_nodes", return_value=nodes),
+            mock.patch.object(self.reference.subprocess, "run", side_effect=responding),
+        ):
+            self.reference.probe_gateway_http(
+                "kind", "cluster", addresses, 80, timeout_seconds=120
+            )
+        self.assertEqual(len(seen), len(nodes) * len(addresses) * 3 * 3)
+        for node in nodes:
+            for address in addresses:
+                for route in ("/health/live", "/", "/api/nodes"):
+                    self.assertEqual(seen.count((node, address, route)), 3)
 
     def test_gateway_http_probe_rejects_intermittent_503_after_good_sample(self) -> None:
         """HTTP 503 immediately after an apparently valid triplet must block the proof."""
@@ -4975,48 +5043,32 @@ time.sleep(60)
                 )
         self.assertEqual(run_mock.call_count, 4)
 
-    def test_gateway_initial_readiness_retries_only_transport_before_witness(self) -> None:
+    def test_gateway_first_http_503_blocks_before_followup(self) -> None:
         witness = ("worker", "172.22.0.3", b"ok", b"web", b"[]")
-        with (
-            mock.patch.object(
-                self.reference, "probe_gateway_http",
-                side_effect=[
-                    self.reference.GatewayTransportNotReady("startup HTTP 503"),
-                    witness,
-                ],
-            ) as probe,
-            mock.patch.object(self.reference.time, "sleep") as sleep,
-        ):
-            self.assertEqual(
-                self.reference.wait_gateway_initial_readiness(
-                    "kind", "cluster", ["172.22.0.3"], 80,
-                    timeout_seconds=10, interval=0,
-                ),
-                witness,
-            )
-            self.assertEqual(probe.call_count, 2)
-            sleep.assert_called_once_with(0)
-
-    def test_gateway_initial_readiness_does_not_retry_invalid_json(self) -> None:
-        with (
-            mock.patch.object(
-                self.reference, "probe_gateway_http",
-                side_effect=[
-                    self.reference.ProofError("invalid /api/nodes JSON"),
-                    ("worker", "172.22.0.3", b"ok", b"web", b"[]"),
-                ],
-            ) as probe,
-            mock.patch.object(self.reference.time, "sleep") as sleep,
-        ):
-            with self.assertRaisesRegex(self.reference.ProofError, "invalid /api/nodes"):
-                self.reference.wait_gateway_initial_readiness(
-                    "kind", "cluster", ["172.22.0.3"], 80,
-                    timeout_seconds=10, interval=0,
+        with mock.patch.object(
+            self.reference, "probe_gateway_http",
+            side_effect=[self.reference.GatewayTransportNotReady("startup HTTP 503"), witness],
+        ) as probe:
+            with self.assertRaisesRegex(self.reference.ProofError, "HTTP 503"):
+                self.reference.probe_gateway_after_readiness(
+                    "kind", "cluster", ["172.22.0.3"], 80
                 )
-            self.assertEqual(probe.call_count, 1)
-            sleep.assert_not_called()
+        self.assertEqual(probe.call_count, 1)
 
-    def test_gateway_ready_witness_does_not_mask_subsequent_503(self) -> None:
+    def test_gateway_invalid_json_blocks_without_retry(self) -> None:
+        witness = ("worker", "172.22.0.3", b"ok", b"web", b"[]")
+        with mock.patch.object(
+            self.reference, "probe_gateway_http",
+            side_effect=[self.reference.ProofError("invalid /api/nodes JSON"), witness],
+        ) as probe:
+            with self.assertRaisesRegex(self.reference.ProofError, "invalid /api/nodes"):
+                self.reference.probe_gateway_after_readiness(
+                    "kind", "cluster", ["172.22.0.3"], 80
+                )
+        self.assertEqual(probe.call_count, 1)
+
+    def test_gateway_proof_rejects_first_503_without_any_second_matrix(self) -> None:
+        witness = ("worker", "172.22.0.3", b"ok", b"web", b"[]")
         with (
             mock.patch.object(self.reference, "wait_condition"),
             mock.patch.object(self.reference, "wait_http_route_parent_condition"),
@@ -5025,21 +5077,13 @@ time.sleep(60)
             mock.patch.object(self.reference, "gateway_addresses", return_value=["172.22.0.3"]),
             mock.patch.object(self.reference, "gateway_service_listener_port", return_value=80),
             mock.patch.object(
-                self.reference, "wait_gateway_initial_readiness",
-                return_value=("worker", "172.22.0.3", b"ok", b"web", b"[]"),
-            ) as readiness,
-            mock.patch.object(
                 self.reference, "probe_gateway_http",
-                side_effect=[
-                    self.reference.GatewayTransportNotReady("post-readiness 503"),
-                    ("worker", "172.22.0.3", b"ok", b"web", b"[]"),
-                ],
-            ) as matrix,
+                side_effect=[self.reference.GatewayTransportNotReady("HTTP 503"), witness],
+            ) as probe,
         ):
-            with self.assertRaisesRegex(self.reference.ProofError, "post-readiness 503"):
+            with self.assertRaisesRegex(self.reference.ProofError, "HTTP 503"):
                 self.reference.prove_gateway("kubectl", "kind", "cluster")
-            readiness.assert_called_once()
-            self.assertEqual(matrix.call_count, 1)
+        self.assertEqual(probe.call_count, 1)
 
     def test_gateway_http_probe_rejects_nonstandard_json_numbers(self) -> None:
         valid_health = subprocess.CompletedProcess([], 0, stdout=b"healthy", stderr=b"")

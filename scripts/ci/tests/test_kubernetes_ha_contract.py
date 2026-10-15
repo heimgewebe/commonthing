@@ -78,6 +78,29 @@ class KubernetesHaContractTests(unittest.TestCase):
                         )
                     self.assertEqual(probe.call_count, 1)
 
+    def test_real_gateway_domain_wrapper_propagates_first_http_503(self) -> None:
+        """Cover the actual nested HA Gateway probe path, not a mocked helper."""
+        with (
+            mock.patch.object(self.ha.ref, "wait_condition"),
+            mock.patch.object(self.ha.ref, "output", return_value="gateway-service"),
+            mock.patch.object(self.ha.ref, "gateway_listener_port", return_value=80),
+            mock.patch.object(self.ha.ref, "gateway_addresses", return_value=["172.22.0.3"]),
+            mock.patch.object(self.ha.ref, "gateway_service_listener_port", return_value=80),
+            mock.patch.object(
+                self.ha.ref, "probe_gateway_http",
+                side_effect=[
+                    self.ha.ref.GatewayTransportNotReady("HTTP 503"),
+                    ("worker", "172.22.0.3", b"healthy", b"web", b"[]"),
+                ],
+            ) as probe,
+        ):
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "HTTP 503"):
+                self.ha.wait_for_gateway_domain_node(
+                    "kubectl", "kind", "cluster", "node-id",
+                    timeout_seconds=5, interval=0,
+                )
+        self.assertEqual(probe.call_count, 1)
+
     def test_static_ha_contract_passes(self) -> None:
         self.validator._assert_ha_contract()
 

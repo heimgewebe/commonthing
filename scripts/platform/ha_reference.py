@@ -2419,7 +2419,7 @@ def gateway_contains_node(kubectl: str, kind: str, cluster: str, node_id: str) -
     port = ref.gateway_listener_port(kubectl)
     _, _, _, _, body = ref.probe_gateway_http(
         kind, cluster, ref.gateway_addresses(kubectl),
-        ref.gateway_service_listener_port(kubectl, service, port), timeout_seconds=30,
+        ref.gateway_service_listener_port(kubectl, service, port),
     )
     payload = json.loads(body)
     return any(isinstance(item, dict) and item.get("id") == node_id for item in payload)

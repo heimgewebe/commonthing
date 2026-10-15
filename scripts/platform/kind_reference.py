@@ -2054,22 +2054,26 @@ def probe_gateway_http(
     cluster: str,
     addresses: list[str],
     port: int,
-    timeout_seconds: int = 30,
+    timeout_seconds: float | None = None,
 ) -> tuple[str, str, bytes, bytes, bytes]:
-    """Fail closed on any owner-local listener/route/sample failure.
+    """Require every source Kind node to serve every advertised listener and route.
 
-    An advertised node-IPAM listener must map to exactly one Kind-node owner.
-    Cross-node Kind/Cilium reachability is diagnostic, not an HA proof gate.
+    A single HTTP error, timeout, invalid response or failed sample terminates
+    the proof; no HTTP error may be retried into a passing matrix.
     """
-    owners = gateway_address_owners(kind, cluster, addresses)
-    nodes = list(dict.fromkeys(owners.values()))
+    gateway_address_owners(kind, cluster, addresses)
+    nodes = kind_nodes(kind, cluster)
+    if timeout_seconds is None:
+        # The N x listener x route x sample matrix needs an adequate budget:
+        # each curl has its own independently bounded subprocess deadline.
+        timeout_seconds = len(nodes) * len(addresses) * GATEWAY_HTTP_PROBE_SAMPLES * 3 * 15 + 10
+    if timeout_seconds <= 0:
+        raise ProofError("Gateway HTTP matrix requires a positive time budget")
     deadline = time.monotonic() + timeout_seconds
     witness: tuple[str, str, bytes, bytes, bytes] | None = None
 
     for node in nodes:
         for address in addresses:
-            if owners[address] != node:
-                continue
             for sample in range(1, GATEWAY_HTTP_PROBE_SAMPLES + 1):
                 if time.monotonic() >= deadline:
                     raise ProofError(
@@ -2136,50 +2140,15 @@ def probe_gateway_http(
     return witness
 
 
-def wait_gateway_initial_readiness(
-    kind: str,
-    cluster: str,
-    addresses: list[str],
-    port: int,
-    *,
-    timeout_seconds: int = 120,
-    interval: float = 2.0,
-) -> tuple[str, str, bytes, bytes, bytes]:
-    """Wait for a complete HTTP witness, without swallowing malformed responses.
-
-    Only curl transport failures are retryable during this initial window.
-    The caller MUST run a fresh, non-retrying full matrix after this witness.
-    """
-    if timeout_seconds <= 0 or interval < 0:
-        raise ValueError("Gateway readiness requires positive deadline and nonnegative interval")
-    deadline = time.monotonic() + timeout_seconds
-    last_error: GatewayTransportNotReady | None = None
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        try:
-            witness = probe_gateway_http(
-                kind, cluster, addresses, port, timeout_seconds=remaining
-            )
-            if time.monotonic() <= deadline:
-                return witness
-        except GatewayTransportNotReady as error:
-            last_error = error
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(interval, remaining))
-    raise ProofError(
-        "Gateway did not establish initial HTTP data-plane readiness "
-        f"within {timeout_seconds}s; last transport failure: {last_error}"
-    ) from last_error
-
 
 def probe_gateway_after_readiness(
     kind: str, cluster: str, addresses: list[str], port: int
 ) -> tuple[str, str, bytes, bytes, bytes]:
-    """One full startup witness, then a strict non-retrying HTTP matrix."""
-    wait_gateway_initial_readiness(kind, cluster, addresses, port)
+    """After control-plane readiness, run exactly one fail-closed HTTP matrix.
+
+    HTTP 503 and timeouts cannot be treated as retryable startup observations.
+    The API/Envoy data-plane proof begins on the first sampled request.
+    """
     return probe_gateway_http(kind, cluster, addresses, port)
 
 
