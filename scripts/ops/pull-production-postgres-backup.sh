@@ -87,8 +87,10 @@ if [[ "$PULL_MODE" == migration-stage ]]; then
   [[ "$(stat -c %a -- "$target_dir")" == 700 ]] || fail "migration staging must have mode 0700"
 else
   # Do not certify an age-only off-host state while legacy plaintext can still
-  # be re-snapshotted. Old recovery files are NEVER deleted implicitly.
-  if compgen -G "$DEST_DIR/${BACKUP_PREFIX}-*.sql.gz" > /dev/null; then
+  # be re-snapshotted. Old recovery files are NEVER deleted implicitly. The
+  # check ignores BACKUP_PREFIX: a changed prefix must not hide dumps written
+  # under an earlier one.
+  if compgen -G "$DEST_DIR/*.sql.gz" > /dev/null; then
     fail "legacy plaintext PostgreSQL backups remain in off-host destination; verify an offline restore and retire them deliberately before age-only pull"
   fi
   target_dir="$DEST_DIR"

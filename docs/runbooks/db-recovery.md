@@ -363,7 +363,8 @@ dokumentierte Warnung oder deaktivierter Backup-Timer gilt nicht als Ersatz.
 
 Vor dem age-Vertrag hat der Pull Klartext-Dumps (`weltgewebe-postgres-*.sql.gz`)
 nach `~/merges/weltgewebe-production-backups` kopiert. Ein neuer age-Pull
-verweigert einen Erfolgs-Receipt solange eine solche Datei im Ziel liegt;
+verweigert einen Erfolgs-Receipt, solange irgendeine `*.sql.gz`-Datei im Ziel
+liegt, unabhängig vom aktuell gesetzten `BACKUP_PREFIX`;
 er löscht Wiederherstellungspunkte nicht selbst. Vor der Freigabe von Restic
 und des verschlüsselten Pulls: Eine neue age-Kopie mit der **offline
 verwahrten Identity** in einer isolierten Umgebung tatsächlich entschlüsseln,
@@ -373,7 +374,7 @@ Löschentscheidung treffen. Die folgende Inventur verändert keine Daten:
 
 ```bash
 find ~/merges/weltgewebe-production-backups -maxdepth 1 -type f \
-  -name 'weltgewebe-postgres-*.sql.gz' -print
+  -name '*.sql.gz' -print
 ```
 
 Die tatsächliche Bereinigung ist ein separater dokumentierter Operator-

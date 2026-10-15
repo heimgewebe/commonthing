@@ -155,6 +155,17 @@ grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy.stderr"
 [[ -f "$legacy_dest/weltgewebe-postgres-legacy.sql.gz" ]]
 [[ ! -e "$legacy_dest/latest-pull.receipt" ]]
 
+# The legacy gate must not depend on the active BACKUP_PREFIX.
+other_prefix_dest="$root/legacy-other-prefix"
+mkdir -p "$other_prefix_dest"
+printf 'old private pg dump\n' > "$other_prefix_dest/earlier-prefix-20250101T040000Z.sql.gz"
+if pull "$other_prefix_dest" test-host > /dev/null 2> "$root/legacy-other-prefix.stderr"; then
+  echo 'legacy plaintext under an earlier prefix must block the age receipt' >&2
+  exit 1
+fi
+grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy-other-prefix.stderr"
+[[ ! -e "$other_prefix_dest/latest-pull.receipt" ]]
+
 # Explicit migration staging must permit a ciphertext-only first transfer while
 # legacy recovery points remain untouched, without publishing an age receipt.
 stage_dest="$root/staged-age"
