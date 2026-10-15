@@ -4880,6 +4880,38 @@ time.sleep(60)
                 )
         self.assertEqual(run_mock.call_count, 4)
 
+    def test_gateway_http_probe_rejects_nonstandard_json_numbers(self) -> None:
+        valid_health = subprocess.CompletedProcess([], 0, stdout=b"healthy", stderr=b"")
+        valid_web = subprocess.CompletedProcess([], 0, stdout=b"web", stderr=b"")
+        for invalid_body in (
+            b"[NaN]", b"[Infinity]", b"[-Infinity]",
+            b'[{"value": NaN}]', b'[{"value": Infinity}]',
+            b'[{"value": -Infinity}]',
+        ):
+            with self.subTest(json=invalid_body):
+                with (
+                    mock.patch.object(
+                        self.reference, "kind_nodes", return_value=["cluster-worker"]
+                    ),
+                    mock.patch.object(
+                        self.reference.subprocess, "run",
+                        side_effect=[
+                            valid_health, valid_web,
+                            subprocess.CompletedProcess(
+                                [], 0, stdout=invalid_body, stderr=b""
+                            ),
+                        ],
+                    ) as run_mock,
+                ):
+                    with self.assertRaisesRegex(
+                        self.reference.ProofError, "invalid /api/nodes JSON"
+                    ):
+                        self.reference.probe_gateway_http(
+                            "kind", "cluster", ["172.22.0.3"], 80,
+                            timeout_seconds=60,
+                        )
+                    self.assertEqual(run_mock.call_count, 3)
+
     def test_gateway_http_probe_rejects_broken_api_rewrite(self) -> None:
         health = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=b"healthy", stderr=b""

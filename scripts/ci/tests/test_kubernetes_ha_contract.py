@@ -39,6 +39,45 @@ class KubernetesHaContractTests(unittest.TestCase):
             ROOT / "scripts/platform/validate_platform.py",
         )
 
+    def test_gateway_domain_wait_fails_on_intermediate_503(self) -> None:
+        probe_error = self.ha.ref.ProofError("intermittent Gateway HTTP 503")
+        with mock.patch.object(
+            self.ha, "gateway_contains_node",
+            side_effect=[False, probe_error, True],
+        ) as probe:
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "HTTP 503"):
+                self.ha.wait_for_gateway_domain_node(
+                    "kubectl", "kind", "cluster", "node-id",
+                    timeout_seconds=5, interval=0,
+                )
+        self.assertEqual(probe.call_count, 2)
+
+    def test_gateway_domain_wait_retries_only_absent_domain(self) -> None:
+        with mock.patch.object(
+            self.ha, "gateway_contains_node", side_effect=[False, True]
+        ) as probe:
+            self.assertTrue(
+                self.ha.wait_for_gateway_domain_node(
+                    "kubectl", "kind", "cluster", "node-id",
+                    timeout_seconds=5, interval=0,
+                )
+            )
+        self.assertEqual(probe.call_count, 2)
+
+    def test_gateway_domain_wait_rejects_timeout_or_missing_listener(self) -> None:
+        for problem in ("gateway matrix timeout", "missing listener address"):
+            with self.subTest(problem=problem):
+                with mock.patch.object(
+                    self.ha, "gateway_contains_node",
+                    side_effect=[self.ha.ref.ProofError(problem), True],
+                ) as probe:
+                    with self.assertRaisesRegex(self.ha.ref.ProofError, problem):
+                        self.ha.wait_for_gateway_domain_node(
+                            "kubectl", "kind", "cluster", "node-id",
+                            timeout_seconds=5, interval=0,
+                        )
+                    self.assertEqual(probe.call_count, 1)
+
     def test_static_ha_contract_passes(self) -> None:
         self.validator._assert_ha_contract()
 

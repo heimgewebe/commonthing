@@ -2425,6 +2425,25 @@ def gateway_contains_node(kubectl: str, kind: str, cluster: str, node_id: str) -
     return any(isinstance(item, dict) and item.get("id") == node_id for item in payload)
 
 
+def wait_for_gateway_domain_node(
+    kubectl: str,
+    kind: str,
+    cluster: str,
+    node_id: str,
+    *,
+    timeout_seconds: int = 180,
+    interval: float = 2.0,
+) -> bool:
+    # Absence of the domain node is retryable; a broken Gateway matrix is not.
+    return wait_until(
+        "domain mutation in API projection",
+        lambda: gateway_contains_node(kubectl, kind, cluster, node_id),
+        timeout_seconds=timeout_seconds,
+        interval=interval,
+        retry_on_probe_error=False,
+    )
+
+
 def create_nats_box(
     kubectl: str,
     zone: str,
@@ -2681,7 +2700,7 @@ def prove(args: argparse.Namespace) -> dict[str, Any]:
 
         marker = "00000000-0000-4000-8000-00000000a004"
         insert_domain_node(kubectl, marker, "T004 acknowledged domain mutation")
-        wait_until("domain mutation in API projection", lambda: gateway_contains_node(kubectl, kind, args.cluster, marker), timeout_seconds=180)
+        wait_for_gateway_domain_node(kubectl, kind, args.cluster, marker)
         availability_monitor = ContinuousAvailabilityMonitor(
             kubectl,
             kind,

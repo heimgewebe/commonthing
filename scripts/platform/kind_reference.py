@@ -67,6 +67,10 @@ class ProofError(RuntimeError):
     pass
 
 
+def _reject_gateway_json_constant(value: str) -> None:
+    raise ValueError(f"non-JSON numeric constant {value!r}")
+
+
 def run(
     argv: list[str],
     *,
@@ -2073,8 +2077,10 @@ def probe_gateway_http(
                         f"empty content at node={node!r} address={address!r} sample={sample}"
                     )
                 try:
-                    api_payload = json.loads(api_nodes)
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    api_payload = json.loads(
+                        api_nodes, parse_constant=_reject_gateway_json_constant
+                    )
+                except (UnicodeDecodeError, ValueError) as error:
                     raise ProofError(
                         "Gateway status address did not serve listener HTTP from a kind node: "
                         f"invalid /api/nodes JSON at node={node!r} address={address!r}"

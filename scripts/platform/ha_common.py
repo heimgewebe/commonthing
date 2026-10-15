@@ -16,7 +16,14 @@ ROOT = Path(__file__).resolve().parents[2]
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-def wait_until(description: str, probe, *, timeout_seconds: int = 600, interval: float = 2.0):
+def wait_until(
+    description: str,
+    probe,
+    *,
+    timeout_seconds: int = 600,
+    interval: float = 2.0,
+    retry_on_probe_error: bool = True,
+):
     deadline = time.monotonic() + timeout_seconds
     last: Any = None
     while time.monotonic() < deadline:
@@ -25,7 +32,8 @@ def wait_until(description: str, probe, *, timeout_seconds: int = 600, interval:
             if last:
                 return last
         except (subprocess.CalledProcessError, json.JSONDecodeError, ref.ProofError):
-            pass
+            if not retry_on_probe_error:
+                raise
         time.sleep(interval)
     raise ref.ProofError(f"timed out waiting for {description}; last={last!r}")
 
