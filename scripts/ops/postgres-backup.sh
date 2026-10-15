@@ -88,6 +88,9 @@ load_age_recipients() {
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" || "$line" == '#'* ]] && continue
     [[ "$line" =~ $AGE_RECIPIENT_RE ]] || fail "age recipients file contains an unsupported entry (expected one X25519 age1 recipient per line): $file"
+    # The off-host pull rejects a manifest naming a recipient twice, so a
+    # duplicate must fail here rather than leave every later pull red.
+    [[ ",$age_recipients_csv," != *",$line,"* ]] || fail "age recipients file lists a recipient twice: $file"
     age_recipient_args+=(-r "$line")
     age_recipients_csv="${age_recipients_csv:+${age_recipients_csv},}${line}"
   done < "$file"

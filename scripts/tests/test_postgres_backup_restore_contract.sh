@@ -209,6 +209,8 @@ printf 'ssh-ed25519 AAAAC3Nza fixture\n' > "$TEMP_DIR/foreign-recipients.txt"
 expect_backup_failure foreign "$TEMP_DIR/foreign-recipients.txt" 'unsupported entry'
 printf '%s\nAGE-SECRET-KEY-1FIXTURE\n' "$AGE_RECIPIENT" > "$TEMP_DIR/secret-recipients.txt"
 expect_backup_failure secret "$TEMP_DIR/secret-recipients.txt" 'contains a private age identity'
+printf '%s\n# same key again\n  %s\n' "$AGE_RECIPIENT" "$AGE_RECIPIENT" > "$TEMP_DIR/duplicate-recipients.txt"
+expect_backup_failure duplicate "$TEMP_DIR/duplicate-recipients.txt" 'lists a recipient twice'
 if ((REAL_AGE)); then
   # A one-character typo keeps the age1 shape but breaks the Bech32 checksum;
   # it must fail before pg_dump, not after a full plaintext dump.

@@ -279,17 +279,27 @@ proof="$backup_dir/proofs/$base.restore-proof"
 ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
   "sudo -n -l test -f '$proof' && sudo -n -l cat -- '$proof'" > /dev/null
 # Jeder Empfänger des neuesten Backups muss auf heim-pc gepinnt sein.
+# Gleiche Regeln wie im Pull: genau ein Feld, kanonische Liste, keine Doppelten.
 pinned="$HOME/.config/weltgewebe/postgres-backup-age-recipients.txt"
-recipients="$(
+age_manifest_text="$(
   ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-    "sudo -n cat -- '$backup_dir/$age_manifest'" |
-    awk -F= '$1 == "recipients" {print substr($0, 12); exit}'
+    "sudo -n cat -- '$backup_dir/$age_manifest'"
 )"
-[[ -n "$recipients" ]] || {
-  printf 'Off-Host-Manifest nennt keinen Empfänger.\n' >&2
+[[ "$(grep -c '^recipients=' <<< "$age_manifest_text")" == 1 ]] || {
+  printf 'Off-Host-Manifest muss recipients= genau einmal enthalten.\n' >&2
+  exit 1
+}
+recipients="$(awk -F= '$1 == "recipients" {print substr($0, 12)}' <<< "$age_manifest_text")"
+recipient_list_re='^age1[02-9ac-hj-np-z]{58}(,age1[02-9ac-hj-np-z]{58})*$'
+[[ "$recipients" =~ $recipient_list_re ]] || {
+  printf 'Empfängerliste im Off-Host-Manifest ist nicht kanonisch: %s\n' "$recipients" >&2
   exit 1
 }
 IFS=, read -r -a backup_recipients <<< "$recipients"
+if [[ -n "$(printf '%s\n' "${backup_recipients[@]}" | sort | uniq -d)" ]]; then
+  printf 'Off-Host-Manifest nennt einen Empfänger doppelt.\n' >&2
+  exit 1
+fi
 for recipient in "${backup_recipients[@]}"; do
   grep -qxF -- "$recipient" "$pinned" || {
     printf 'Empfänger nicht in %s gepinnt: %s\n' "$pinned" "$recipient" >&2
