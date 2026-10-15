@@ -155,6 +155,62 @@ grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy.stderr"
 [[ -f "$legacy_dest/weltgewebe-postgres-legacy.sql.gz" ]]
 [[ ! -e "$legacy_dest/latest-pull.receipt" ]]
 
+# Explicit migration staging must permit a ciphertext-only first transfer while
+# legacy recovery points remain untouched, without publishing an age receipt.
+stage_dest="$root/staged-age"
+PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$stage_dest" pull "$legacy_dest" test-host
+[[ -f "$stage_dest/$file" ]]
+[[ -f "$stage_dest/$age_manifest" ]]
+[[ -f "$stage_dest/$manifest" ]]
+[[ -f "$legacy_dest/weltgewebe-postgres-legacy.sql.gz" ]]
+[[ ! -e "$stage_dest/latest-pull.receipt" ]]
+[[ ! -e "$legacy_dest/latest-pull.receipt" ]]
+[[ ! -e "$legacy_dest/$file" ]]
+[[ "$(stat -c %a "$stage_dest")" == 700 ]]
+if PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$legacy_dest/unsafe-staging" \
+  pull "$legacy_dest" test-host > /dev/null 2> "$root/unsafe-staging.stderr"; then
+  echo 'staging inside legacy destination must fail closed' >&2
+  exit 1
+fi
+grep -qF 'outside the normal backup destination' "$root/unsafe-staging.stderr"
+if PULL_MODE=migration-stage pull "$legacy_dest" test-host > /dev/null 2> "$root/missing-staging.stderr"; then
+  echo 'migration-stage must require an explicit destination' >&2
+  exit 1
+fi
+grep -qF 'MIGRATION_STAGE_DIR is required' "$root/missing-staging.stderr"
+
+# Reusing a staging location is forbidden: migration data cannot be overwritten.
+if PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$stage_dest" \
+  pull "$legacy_dest" test-host > /dev/null 2> "$root/duplicate-stage.stderr"; then
+  echo 'existing staging candidate must be create-only' >&2
+  exit 1
+fi
+grep -qF 'migration staging artefact already exists' "$root/duplicate-stage.stderr"
+if PULL_MODE=unsafe pull "$legacy_dest" test-host > /dev/null 2> "$root/unsafe-mode.stderr"; then
+  echo 'unknown pull mode must fail closed' >&2
+  exit 1
+fi
+grep -qF 'PULL_MODE must be normal or migration-stage' "$root/unsafe-mode.stderr"
+if ((REAL_AGE == 1)); then
+  mkdir -m 700 "$root/stage-restore"
+  age -d -i "$root/offline-identity.txt" -o "$root/stage-restore/$plain" "$stage_dest/$file"
+  [[ "$(sha256sum "$root/stage-restore/$plain" | awk '{print $1}')" == "$plain_sha" ]]
+  gzip -t "$root/stage-restore/$plain"
+  [[ "$(gunzip -c "$root/stage-restore/$plain")" == "$marker" ]]
+fi
+
+# The actual nightly Restic job sources ~/artifacts/merges (not ~/merges).
+# Staging inside that backup source is forbidden even if legacy destination differs.
+mkdir -p "$root/controlled-home/artifacts/merges"
+if HOME="$root/controlled-home" PULL_MODE=migration-stage \
+  MIGRATION_STAGE_DIR="$root/controlled-home/artifacts/merges/candidate" \
+  pull "$legacy_dest" test-host > /dev/null 2> "$root/restic-source.stderr"; then
+  echo 'staging inside nightly Restic artifact merges source must fail' >&2
+  exit 1
+fi
+grep -qF 'Restic sources' "$root/restic-source.stderr"
+[[ ! -e "$root/controlled-home/artifacts/merges/candidate/$file" ]]
+
 # Retention fixture: expired local artefacts, including legacy plaintext copies.
 mkdir -p "$dest"
 for suffix in .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; do

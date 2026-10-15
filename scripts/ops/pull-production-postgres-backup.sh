@@ -20,6 +20,11 @@ REMOTE_BACKUP_DIR="${REMOTE_BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-weltgewebe-postgres}"
 DEST_DIR="${DEST_DIR:-${HOME:?HOME must be set}/merges/weltgewebe-production-backups}"
 LOCAL_RETENTION_DAYS="${LOCAL_RETENTION_DAYS:-30}"
+PULL_MODE="${PULL_MODE:-normal}"
+case "$PULL_MODE" in
+  normal | migration-stage) ;;
+  *) fail "PULL_MODE must be normal or migration-stage" ;;
+esac
 case "$LOCAL_RETENTION_DAYS" in '' | *[!0-9]*) fail "LOCAL_RETENTION_DAYS must be a non-negative integer" ;; esac
 # BACKUP_PREFIX enters a remotely evaluated SSH shell command. Treat it as
 # untrusted, like REMOTE_HOST and REMOTE_BACKUP_DIR, before making any SSH call.
@@ -52,13 +57,43 @@ manifest="${base}.sha256.manifest"
 proof="${base}.restore-proof"
 
 install -d -m 0700 "$DEST_DIR"
-# Fail closed rather than deleting recovery points implicitly or certifying an
-# age-only off-host state while old plaintext can be re-snapshotted by Restic.
-# Manual retirement follows a successful offline decrypt/restore check.
-if compgen -G "$DEST_DIR/${BACKUP_PREFIX}-*.sql.gz" > /dev/null; then
-  fail "legacy plaintext PostgreSQL backups remain in off-host destination; verify an offline restore and retire them deliberately before age-only pull"
+# Only the explicit migration mode may transfer ciphertext while legacy dumps
+# still exist. Its output is isolated from the Restic source and has NO success
+# receipt: only an offline decrypt plus actual restore can authorize retirement.
+if [[ "$PULL_MODE" == migration-stage ]]; then
+  [[ -n "${MIGRATION_STAGE_DIR:-}" ]] || fail "MIGRATION_STAGE_DIR is required for migration-stage"
+  require_cmd realpath
+  target_dir="$(realpath -m -- "$MIGRATION_STAGE_DIR")"
+  dest_real="$(realpath -e -- "$DEST_DIR")"
+  # The Heim-PC's live restic-backup-1930 source is artifacts/merges, not
+  # necessarily ~/merges. Exclude BOTH roots, repos and fundus.
+  excluded_sources=("$dest_real")
+  for excluded in "${HOME:?HOME must be set}/merges" "$HOME/artifacts/merges" "$HOME/repos" "$HOME/.local/share/schauwerk/fundus"; do
+    excluded_sources+=("$(realpath -m -- "$excluded")")
+  done
+  for excluded in "${excluded_sources[@]}"; do
+    case "$target_dir" in
+      "$excluded" | "$excluded"/*)
+        fail "migration staging must remain outside the normal backup destination and Restic sources"
+        ;;
+    esac
+  done
+  case "$dest_real" in
+    "$target_dir"/*) fail "migration staging must remain outside the normal backup destination" ;;
+  esac
+  [[ ! -L "$target_dir" ]] || fail "migration staging cannot be a symlink"
+  install -d -m 0700 -- "$target_dir"
+  [[ "$(realpath -e -- "$target_dir")" == "$target_dir" ]] || fail "migration staging target changed during preflight"
+  [[ "$(stat -c %a -- "$target_dir")" == 700 ]] || fail "migration staging must have mode 0700"
+else
+  # Do not certify an age-only off-host state while legacy plaintext can still
+  # be re-snapshotted. Old recovery files are NEVER deleted implicitly.
+  if compgen -G "$DEST_DIR/${BACKUP_PREFIX}-*.sql.gz" > /dev/null; then
+    fail "legacy plaintext PostgreSQL backups remain in off-host destination; verify an offline restore and retire them deliberately before age-only pull"
+  fi
+  target_dir="$DEST_DIR"
 fi
-work_dir="$(mktemp -d "$DEST_DIR/.pull.XXXXXX")"
+work_dir="$(mktemp -d "$target_dir/.pull.XXXXXX")"
 trap 'rm -rf "$work_dir"' EXIT
 
 remote_cat() {
@@ -107,6 +142,23 @@ if ssh "${ssh_args[@]}" "$REMOTE_HOST" \
   grep -qx 'result=ok' "$work_dir/$proof" || fail "remote restore proof is not successful"
 fi
 
+# Staging is a create-only encrypted transfer, not a recovery proof.
+# It never touches DEST_DIR's legacy contents or emits an age completion receipt.
+if [[ "$PULL_MODE" == migration-stage ]]; then
+  for name in "$latest" "$manifest" "$age_manifest" "$proof"; do
+    [[ ! -e "$target_dir/$name" && ! -L "$target_dir/$name" ]] ||
+      fail "migration staging artefact already exists: $name"
+  done
+  mv "$work_dir/$latest" "$target_dir/$latest"
+  mv "$work_dir/$manifest" "$target_dir/$manifest"
+  mv "$work_dir/$age_manifest" "$target_dir/$age_manifest"
+  if [[ -f "$work_dir/$proof" ]]; then
+    mv "$work_dir/$proof" "$target_dir/$proof"
+  fi
+  printf 'Encrypted migration candidate staged (NOT recovery-verified; no completion receipt): %s\n' "$target_dir/$latest"
+  exit 0
+fi
+
 # The receipt remains the final completion marker for the complete set.
 # Every optional proof has been validated before the first destination rename.
 mv -f "$work_dir/$latest" "$DEST_DIR/$latest"
@@ -126,11 +178,11 @@ receipt_tmp="$work_dir/latest-pull.receipt"
 chmod 600 "$receipt_tmp"
 mv -f "$receipt_tmp" "$receipt"
 
-# *.sql.gz only matches legacy plaintext copies pulled before the age contract;
-# retention keeps expiring them, but operators should delete them right away.
+# Retention never deletes legacy plaintext recovery points. Their retirement
+# needs a separately verified age restore and an explicit operator decision.
 if ((LOCAL_RETENTION_DAYS > 0)); then
   find "$DEST_DIR" -maxdepth 1 -type f \
-    \( -name "${BACKUP_PREFIX}-*.sql.gz.age" -o -name "${BACKUP_PREFIX}-*.sql.gz" -o -name "${BACKUP_PREFIX}-*.sha256.manifest" -o -name "${BACKUP_PREFIX}-*.restore-proof" \) \
+    \( -name "${BACKUP_PREFIX}-*.sql.gz.age" -o -name "${BACKUP_PREFIX}-*.sha256.manifest" -o -name "${BACKUP_PREFIX}-*.restore-proof" \) \
     -mtime +"$LOCAL_RETENTION_DAYS" -delete
 fi
 printf 'Encrypted off-host PostgreSQL backup copied and verified: %s\n' "$DEST_DIR/$latest"

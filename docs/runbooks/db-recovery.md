@@ -223,9 +223,16 @@ dass beide Manifeste denselben Klartext-SHA256 nennen. `age` und der private
 Schlüssel werden auf `heim-pc` dafür nicht benötigt. Erst danach schreibt er
 eine `latest-pull.receipt` (`contract=weltgewebe-offhost-backup-pull-v2`,
 `encryption=age`). Ein vorhandener Wochen-Restore-Proof wird
-mitgenommen. Der bestehende Restic-Lauf auf `heim-pc` sichert `~/merges`
-anschließend in das entfernte Restic-Repository und liest einen Sentinel aus
-dem exakten Snapshot zurück.
+mitgenommen. **Restic-Abdeckung ist separat zu prüfen:** Der am
+15. Oktober 2026 tatsächlich gelesene `restic-backup-1930.service` startet
+`heim-pc-restic-backup` mit den Quellen `~/repos`,
+`~/artifacts/merges` und `~/.local/share/schauwerk/fundus` sowie einem
+Sentinel. `~/merges` ist nach `realpath` ein anderer Pfad als
+`~/artifacts/merges` und in diesem Skript **nicht direkt** als Quelle
+aufgeführt. Das allein beweist weder eine vorhandene Off-Host-Sicherung
+dieser PostgreSQL-Dumps noch, dass andere Sicherungspfade sie ausschließen.
+Vor einer age-only-Aussage tatsächliche Backup-Scheduler, Quellen,
+Ausschlüsse und relevante Restic-Snapshotpfade live feststellen.
 
 Systemd auf `heim-pc` wird nicht direkt aus einem beweglichen Checkout
 kopiert. Vor jeder (Re-)Aktivierung muss `commonserver` auf `heim-pc` als
@@ -268,15 +275,18 @@ Chiffrat und Klartext-Manifest sowie `test -f` und `cat` auf den optionalen
 Restore-Proof unter `proofs/`. Die Proof-Prüfung ist wichtig, weil der Pull
 ein verweigertes `sudo test -f` nicht von einem fehlenden Proof unterscheiden
 kann und den Proof sonst still nie mitnimmt. Befehlsbezogene
-Sudoers-Regeln auf `commonserver` müssen dafür das neue `find`-Muster
-`weltgewebe-postgres-*.age.sha256.manifest` (Abschlussmarker eines
-vollständigen Satzes) und `cat` auf `*.sql.gz.age`,
-`*.age.sha256.manifest` und `*.sha256.manifest` sowie `test -f` und `cat`
-auf `proofs/*.restore-proof` erlauben; `cat` auf den
-Klartext-Dump `*.sql.gz` wird vom Pull nicht mehr benötigt und sollte aus
-den Regeln entfernt werden. `set -euo pipefail` sorgt zusätzlich dafür, dass ein fehlgeschlagenes SSH/`sudo find` nicht durch
-das nachgeschaltete `sort`/`tail` verdeckt wird; ein leerer oder unerwarteter
-Dateiname bricht explizit ab. Ein allgemeines `sudo -n true` reicht bei
+**Sicherheitssperre für den aktuellen Entwurf:** Sudoers-Globs wie
+`*.sha256.manifest` sind **keine** enge Argumentautorisierung. In
+Sudoers können Platzhalter auch Leerzeichen, zusätzliche Argumente und
+Pfadkomponenten erfassen. Daher dürfen die unten beschriebenen direkten
+`sudo find`-, `sudo cat`- und `sudo test`-Aufrufe **noch nicht**
+als produktionssichere Freigabe konfiguriert werden. Vor einem Rollout ist
+ein root-eigener, nicht durch den Pull-Account modifizierbarer Lese-Wrapper
+mit strikt geprüftem Basename, no-follow-Dateizugriff und negativ getesteter
+Sudoers-Argumentgrenze notwendig. Anschließend müssen Pullskript und
+produktiver Preflight dieselbe Schnittstelle verwenden.
+
+Ein allgemeines `sudo -n true` reicht bei
 befehlsbezogenen Sudoers-Regeln nicht aus. Der Readback vom 2026-09-10 hat
 DNS/SSH sowie die damalige `find`-/`cat`-Prüfung auf `*.sql.gz` erfolgreich
 bestanden; für das age-Muster liegt noch kein Runtime-Readback vor.
@@ -307,6 +317,50 @@ und kein Ersatz für WAL/PITR.
 
 ### Altbestand unverschlüsselter Off-Host-Kopien
 
+Der reguläre Pull (`PULL_MODE=normal`, Default) bleibt gesperrt, solange
+Altbestände im Ziel liegen. Die explizite Erstübertragung
+`PULL_MODE=migration-stage` darf dagegen ein neues **Chiffrat** in einem
+separaten Verzeichnis bereitstellen. Dieser Modus:
+
+- benötigt ein explizites `MIGRATION_STAGE_DIR` außerhalb von
+  `~/merges`, `~/artifacts/merges`, `~/repos`, dem Schauwerk-Fundus und
+  des regulären `DEST_DIR`;
+- verwendet nur den age-verschlüsselten Dump, beide Metadatenmanifeste und
+  einen optionalen Wochen-Proof;
+- verweigert Überschreiben bereits vorhandener Staging-Artefakte;
+- verändert weder vorhandene Klartext-Restore-Punkte noch den normalen
+  `latest-pull.receipt` und erzeugt **keinen neuen Erfolgs-Receipt**.
+
+Das Staging ist **kein Nachweis der Entschlüsselbarkeit** oder des richtigen
+Empfängers. Vor einer Migration muss die tatsächliche Restic-Quellliste
+bestätigt und das Staging-Verzeichnis auf einem passenden Datenträger mit
+Modus `0700` außerhalb dieser Quellen eingerichtet werden:
+
+```bash
+umask 077
+# STAGE vorher auf einem nicht durch Restic erfassten Pfad festlegen.
+install -d -m 0700 "$STAGE"
+PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$STAGE" \
+  scripts/ops/pull-production-postgres-backup.sh
+```
+
+Die age-Datei und Manifeste danach auf ein vertrauenswürdiges **Offlinegerät**
+übertragen. Dort mit der unabhängig verwahrten Identity entschlüsseln, den
+SHA-256 des entschlüsselten Gzip-Dumps mit dem Klartextmanifest vergleichen,
+`gzip -t` ausführen und einen echten Restore in eine isolierte
+Wegwerfdatenbank durchführen. Den Empfänger unabhängig gegen die ursprünglich
+beabsichtigte öffentliche age-Identität abgleichen. Nur nach protokolliertem
+Recovery-PASS dürfen die alten Off-Host-Klartextkopien separat zur Entfernung
+freigegeben werden; deren Löschung ist **nicht** Teil dieses Skripts.
+
+**Verbleibende technische Sperre:** Das Staging verhindert neue Klartext-Pulls,
+unterbindet aber noch nicht automatisch laufende Restic-Snapshots von
+vorhandenen `*.sql.gz`-Altbeständen. Vor Produktivfreigabe ist eine
+reproduzierbar überprüfte Restic-Einschluss-/Ausschlussregel beziehungsweise
+ein fail-closed Snapshot-Gate mit negativem Test verpflichtend. Eine bloß
+dokumentierte Warnung oder deaktivierter Backup-Timer gilt nicht als Ersatz.
+
+
 Vor dem age-Vertrag hat der Pull Klartext-Dumps (`weltgewebe-postgres-*.sql.gz`)
 nach `~/merges/weltgewebe-production-backups` kopiert. Ein neuer age-Pull
 verweigert einen Erfolgs-Receipt solange eine solche Datei im Ziel liegt;
@@ -333,8 +387,9 @@ Chiffrat, gelöschten lokalen Altbeständen und bewerteter Restic-Historie
 keinen weiteren Restic-Snapshot aus diesem Backup-Ziel als sichere age-only
 Kopie ausgeben. Das GREEN isolierter Skripttests ist keine Betriebsfreigabe.
 
-Diese Klartext-Kopien sind zusätzlich in älteren Restic-Snapshots von
-`~/merges` enthalten. Sie verschwinden dort erst, wenn die betroffenen
+Alte Klartext-Kopien können zusätzlich in früheren Restic-Snapshots von
+`~/merges` enthalten sein. Existenz und Umfang sind durch echte
+Snapshot-Auflistung und Dateipfadprüfung zu belegen, nicht aus Timern abzuleiten. Sie verschwinden dort erst, wenn die betroffenen
 Snapshots bewusst per `restic forget`/`restic prune` entfernt werden; diese
 Entscheidung (Verlust älterer Wiederherstellungspunkte gegen Entfernung der
 Klartextdaten) ist manuell zu treffen und zu dokumentieren.
