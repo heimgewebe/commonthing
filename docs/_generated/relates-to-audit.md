@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 744 |
+| Relationen gesamt | 747 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 687 |
+| — relates_to | 690 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |
@@ -32,7 +32,7 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (295 Dokumente):
+**Cluster 1** (296 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
@@ -243,6 +243,7 @@ _Keine Lücken erkannt._
 - `docs/runbooks/gewebezelle-manual-pilot.md`
 - `docs/runbooks/gewebezelle-two-operator-pilot-v1.md`
 - `docs/runbooks/incident-response.md`
+- `docs/runbooks/independent-production-watch.md`
 - `docs/runbooks/kubernetes-ha-recovery-proof.md`
 - `docs/runbooks/ops.runbook.weltgewebe-selfhost-deploy.md`
 - `docs/runbooks/uv-tooling.md`
@@ -398,6 +399,7 @@ _Keine Lücken erkannt._
 - relates_to → `docs/runbooks/gewebezelle-manual-pilot.md`
 - relates_to → `docs/runbooks/gewebezelle-two-operator-pilot-v1.md`
 - relates_to → `docs/runbooks/incident-response.md`
+- relates_to → `docs/runbooks/independent-production-watch.md`
 - relates_to → `docs/runbooks/ops.runbook.weltgewebe-selfhost-deploy.md`
 - relates_to → `docs/runbooks/uv-tooling.md`
 - relates_to → `docs/runbooks/weltgewebe-ddns-runtime-verification.md`

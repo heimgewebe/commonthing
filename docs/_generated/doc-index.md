@@ -186,6 +186,7 @@ Generated automatically. Do not edit.
 | runbooks.db-recovery | DB Recovery Runbook | runbook | active | docs/runbooks/db-recovery.md |
 | runbooks.domain-mail-cutover | Runbook — Domain-, Mail- und SMTP-Cutover | runbook | deprecated | docs/runbooks/domain-mail-cutover.md |
 | runbooks.incident-response | Incident Response Runbook | reference | active | docs/runbooks/incident-response.md |
+| runbooks.independent-production-watch | Unabhängige Produktionswache | reference | active | docs/runbooks/independent-production-watch.md |
 | runbooks.ops.runbook.weltgewebe-selfhost-deploy | Selfhost-Deploy Runbook | reference | deprecated | docs/runbooks/ops.runbook.weltgewebe-selfhost-deploy.md |
 | runbooks.uv-tooling | UV-Tooling | reference | active | docs/runbooks/uv-tooling.md |
 | runbooks.weltgewebe-ddns-runtime-verification | commonThing Heimberry-DDNS-Stilllegung verifizieren | runbook | active | docs/runbooks/weltgewebe-ddns-runtime-verification.md |

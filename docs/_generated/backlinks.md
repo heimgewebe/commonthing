@@ -1011,6 +1011,7 @@ Generated automatically. Do not edit.
 
 - [relates_to] docs/runbook.md
 - [relates_to] docs/runbooks/incident-response.md
+- [relates_to] docs/runbooks/independent-production-watch.md
 
 ## docs/runbooks/README.md
 
@@ -1019,6 +1020,7 @@ Generated automatically. Do not edit.
 - [relates_to] docs/runbooks/db-recovery.md
 - [relates_to] docs/runbooks/domain-mail-cutover.md
 - [relates_to] docs/runbooks/incident-response.md
+- [relates_to] docs/runbooks/independent-production-watch.md
 - [relates_to] docs/runbooks/ops.runbook.weltgewebe-selfhost-deploy.md
 - [relates_to] docs/runbooks/uv-tooling.md
 - [relates_to] docs/runbooks/weltgewebe-ddns-runtime-verification.md
@@ -1061,6 +1063,10 @@ Generated automatically. Do not edit.
 - [relates_to] docs/runbooks/README.md
 - [relates_to] docs/runbooks/db-recovery.md
 - [relates_to] docs/runbooks/weltgewebe-ddns-runtime-verification.md
+
+## docs/runbooks/independent-production-watch.md
+
+- [relates_to] docs/runbooks/README.md
 
 ## docs/runbooks/kubernetes-ha-recovery-proof.md
 
