@@ -14,6 +14,7 @@ require_cmd find
 require_cmd wc
 require_cmd cmp
 require_cmd grep
+require_cmd flock
 
 REMOTE_HOST="${REMOTE_HOST:-commonserver}"
 REMOTE_BACKUP_DIR="${REMOTE_BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
@@ -79,6 +80,17 @@ manifest="${base}.sha256.manifest"
 proof="${base}.restore-proof"
 
 install -d -m 0700 "$DEST_DIR"
+# One pull at a time per destination. A legacy (pre-age) pull does not take
+# this lock, so the plaintext scan is repeated right before the receipt.
+exec 9> "$DEST_DIR/.pull.lock"
+flock -n 9 || fail "another pull holds $DEST_DIR/.pull.lock"
+assert_no_legacy_plaintext() {
+  local legacy_plaintext
+  legacy_plaintext="$(find "$DEST_DIR" \( -type f -o -type l \) -name '*.sql.gz' -print -quit)" ||
+    fail "could not scan the off-host destination for legacy plaintext"
+  [[ -z "$legacy_plaintext" ]] ||
+    fail "legacy plaintext PostgreSQL backups remain in off-host destination; verify an offline restore and retire them deliberately before age-only pull"
+}
 # Only the explicit migration mode may transfer ciphertext while legacy dumps
 # still exist. Its output is isolated from the Restic source and has NO success
 # receipt: only an offline decrypt plus actual restore can authorize retirement.
@@ -113,11 +125,7 @@ else
   # check ignores BACKUP_PREFIX: a changed prefix must not hide dumps written
   # under an earlier one. It is recursive so that plaintext left in an
   # abandoned .pull.* work directory of an interrupted legacy pull counts too.
-  legacy_plaintext="$(find "$DEST_DIR" \( -type f -o -type l \) -name '*.sql.gz' -print -quit)" ||
-    fail "could not scan the off-host destination for legacy plaintext"
-  if [[ -n "$legacy_plaintext" ]]; then
-    fail "legacy plaintext PostgreSQL backups remain in off-host destination; verify an offline restore and retire them deliberately before age-only pull"
-  fi
+  assert_no_legacy_plaintext
   target_dir="$DEST_DIR"
 fi
 work_dir="$(mktemp -d "$target_dir/.pull.XXXXXX")"
@@ -151,10 +159,20 @@ cmp -s -n "$((${#age_header} + 1))" "$work_dir/$latest" <(printf '%s\n' "$age_he
 # The manifest's recipients line is the producer's claim; X25519 stanzas do not
 # reveal recipients. This catches a misconfigured or swapped producer key, not a
 # compromised producer.
+# Exactly one canonical declaration: no repeated field, no empty, duplicate or
+# malformed member, so the receipt never records an ambiguous value.
+[[ "$(grep -c '^recipients=' "$work_dir/$age_manifest")" == 1 ]] ||
+  fail "off-host manifest must declare age recipients exactly once"
 manifest_recipients="$(manifest_value recipients "$work_dir/$age_manifest")"
-[[ -n "$manifest_recipients" ]] || fail "off-host manifest names no age recipients"
+recipient_list_re='^age1[02-9ac-hj-np-z]{58}(,age1[02-9ac-hj-np-z]{58})*$'
+[[ "$manifest_recipients" =~ $recipient_list_re ]] ||
+  fail "off-host manifest recipients are not a canonical comma-separated age1 list"
 IFS=, read -r -a backup_recipients <<< "$manifest_recipients"
+declare -A seen_recipients=()
 for backup_recipient in "${backup_recipients[@]}"; do
+  [[ -z "${seen_recipients[$backup_recipient]:-}" ]] ||
+    fail "off-host manifest lists an age recipient twice: $backup_recipient"
+  seen_recipients[$backup_recipient]=1
   pinned=0
   for candidate in "${pinned_recipients[@]}"; do
     [[ "$backup_recipient" == "$candidate" ]] && pinned=1
@@ -208,6 +226,10 @@ mv -f "$work_dir/$age_manifest" "$DEST_DIR/$age_manifest"
 if [[ -f "$work_dir/$proof" ]]; then
   mv -f "$work_dir/$proof" "$DEST_DIR/$proof"
 fi
+
+# Re-check under the lock: plaintext created while this pull ran (e.g. by a
+# legacy pull) must not end up beside an age success receipt.
+assert_no_legacy_plaintext
 
 # Every completed pull leaves an immutable receipt under receipts/; the
 # hard link fails rather than replace an existing one. latest-pull.receipt is

@@ -436,6 +436,10 @@ umask 077
 src=~/merges/weltgewebe-production-backups
 base=weltgewebe-postgres-<UTC>
 work="$(mktemp -d)"
+# Der entschlüsselte Dump wird bei jedem Ende dieser Shell entfernt, auch nach
+# einem Fehler in age, SHA-Vergleich, gzip -t oder Restore und nach Abbruch.
+trap 'rm -rf -- "$work"' EXIT
+trap 'exit 130' INT TERM HUP
 age -d -i /pfad/zur/weltgewebe-backup-identity.txt \
   -o "$work/$base.sql.gz" "$src/$base.sql.gz.age"
 cp "$src/$base.sha256.manifest" "$work/"
@@ -444,10 +448,13 @@ expected="$(awk -F= '$1=="sha256" {print $2}' "$work/$base.sha256.manifest")"
 gzip -t "$work/$base.sql.gz"
 ```
 
-Danach kann `scripts/ops/postgres-restore-proof.sh` mit
+In **derselben** Shell kann danach `scripts/ops/postgres-restore-proof.sh` mit
 `BACKUP_FILE="$work/$base.sql.gz"` gegen eine Wegwerfdatenbank laufen
 (Abschnitt 3); anschließend gilt Abschnitt 5. Der entschlüsselte Dump ist
-Klartext mit personenbezogenen Daten und wird nach Gebrauch gelöscht.
+Klartext mit personenbezogenen Daten. Mit dem Ende der Shell ist er gelöscht.
+Verlangt die Vorfallrichtlinie, ihn länger aufzubewahren, ist das eine
+ausdrückliche Entscheidung: vor dem Ende `trap - EXIT` setzen, Ablageort,
+Zweck und Löschtermin im Vorfallprotokoll festhalten.
 
 ## 5. Vorfall und Wiederherstellung
 

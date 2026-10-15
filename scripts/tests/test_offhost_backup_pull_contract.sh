@@ -85,6 +85,11 @@ set -euo pipefail
 cmd="${!#}"
 cmd="${cmd//sudo -n /}"
 printf '%s\n' "$cmd" >> "$SSH_LOG"
+# Simulates another writer (e.g. a legacy pull) dropping plaintext while this
+# pull is still transferring.
+if [[ -n "${INJECT_PLAINTEXT_DURING_CAT:-}" && "$cmd" == *'cat -- '* ]]; then
+  printf 'late legacy dump\n' > "$INJECT_PLAINTEXT_DURING_CAT"
+fi
 exec bash -c "$cmd"
 FAKE
 chmod +x "$bin/ssh"
@@ -281,6 +286,7 @@ if compgen -G "$dest/*.sql.gz" > /dev/null; then
   exit 1
 fi
 for pulled in "$dest"/*; do
+  [[ -f "$pulled" ]] || continue
   if gzip -t "$pulled" 2> /dev/null; then
     echo "pulled file is a plaintext gzip stream: $pulled" >&2
     exit 1
@@ -337,6 +343,38 @@ write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" "$recipient,$foreign_rec
 expect_pull_failure "$root/extra-recipient" 'not pinned'
 write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
 PULL_AGE_RECIPIENTS_FILE="$root/missing-pinned.txt" expect_pull_failure "$root/no-pin" 'pinned age recipients file is missing'
+
+# Recipient declarations must be unambiguous: exactly one field, canonical
+# list, no empty or duplicate member.
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+printf 'recipients=%s\n' "$foreign_recipient" >> "$remote/$age_manifest"
+expect_pull_failure "$root/dup-field" 'declare age recipients exactly once'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" "$recipient,"
+expect_pull_failure "$root/trailing-comma" 'not a canonical comma-separated age1 list'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" ",$recipient"
+expect_pull_failure "$root/leading-comma" 'not a canonical comma-separated age1 list'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" "$recipient,$recipient"
+expect_pull_failure "$root/dup-member" 'lists an age recipient twice'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+
+# Plaintext that appears after the first scan still blocks the receipt.
+late_dest="$root/late-plaintext"
+mkdir -p "$late_dest"
+if INJECT_PLAINTEXT_DURING_CAT="$late_dest/weltgewebe-postgres-late.sql.gz" \
+  pull "$late_dest" test-host > /dev/null 2> "$root/late.stderr"; then
+  echo 'plaintext created during the pull must block the receipt' >&2
+  exit 1
+fi
+grep -qF 'legacy plaintext PostgreSQL backups' "$root/late.stderr"
+[[ ! -e "$late_dest/latest-pull.receipt" && ! -e "$late_dest/receipts" ]]
+
+# Concurrent pulls into one destination are serialized fail-closed.
+locked_dest="$root/locked"
+mkdir -p "$locked_dest"
+exec 8> "$locked_dest/.pull.lock"
+flock -n 8
+expect_pull_failure "$locked_dest" 'another pull holds'
+exec 8>&-
 
 # A host without an encrypted artefact (e.g. no recipient configured) fails closed.
 rm -f "$remote/$file" "$remote/$age_manifest"
