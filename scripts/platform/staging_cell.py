@@ -5376,7 +5376,7 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
             time.sleep(2)
     require_gateway_observation_binding(observed, binding)
     require_gateway_desired_contract(observed, documents)
-    node, address, health, web, api_nodes = reference.probe_gateway_http(
+    node, address, health, web, api_nodes = reference.probe_gateway_after_readiness(
         tools["kind"], args.cluster, observed["gateway_addresses"], observed["listener_port"]
     )
     if address not in observed["gateway_addresses"]:

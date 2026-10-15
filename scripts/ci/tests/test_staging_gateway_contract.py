@@ -144,6 +144,45 @@ class StagingGatewayTests(unittest.TestCase):
             }
         return {}
 
+    def test_ready_witness_precedes_strict_staging_matrix(self):
+        calls = []
+        witness = ("worker", ADDRESSES[0], b"ok", b"<html>", b"[]")
+
+        def initial(*_args):
+            calls.append("initial")
+            return witness
+
+        def strict(*_args):
+            calls.append("strict")
+            return witness
+
+        with mock.patch.object(
+            staging.reference, "wait_gateway_initial_readiness", side_effect=initial
+        ) as initial_probe:
+            self.probe.side_effect = strict
+            staging.command_prove_gateway(self.args)
+        self.assertEqual(calls, ["initial", "strict"])
+        initial_probe.assert_called_once_with(
+            "kind", staging.DEFAULT_CLUSTER, ADDRESSES, 80
+        )
+        self.assertEqual(self.probe.call_count, 1)
+
+    def test_post_ready_staging_503_fails_without_retry(self):
+        with mock.patch.object(
+            staging.reference, "wait_gateway_initial_readiness",
+            return_value=("worker", ADDRESSES[0], b"ok", b"<html>", b"[]"),
+        ) as initial_probe:
+            self.probe.side_effect = [
+                staging.reference.GatewayTransportNotReady("post-ready 503"),
+                ("worker", ADDRESSES[0], b"ok", b"<html>", b"[]"),
+            ]
+            with self.assertRaisesRegex(
+                staging.reference.ProofError, "post-ready 503"
+            ):
+                staging.command_prove_gateway(self.args)
+            initial_probe.assert_called_once()
+            self.assertEqual(self.probe.call_count, 1)
+
     def test_manifests_only_http_canonical_staging_backends(self):
         gateway, route = self.docs
         self.assertEqual(

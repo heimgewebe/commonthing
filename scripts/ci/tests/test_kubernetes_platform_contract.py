@@ -4880,6 +4880,72 @@ time.sleep(60)
                 )
         self.assertEqual(run_mock.call_count, 4)
 
+    def test_gateway_initial_readiness_retries_only_transport_before_witness(self) -> None:
+        witness = ("worker", "172.22.0.3", b"ok", b"web", b"[]")
+        with (
+            mock.patch.object(
+                self.reference, "probe_gateway_http",
+                side_effect=[
+                    self.reference.GatewayTransportNotReady("startup HTTP 503"),
+                    witness,
+                ],
+            ) as probe,
+            mock.patch.object(self.reference.time, "sleep") as sleep,
+        ):
+            self.assertEqual(
+                self.reference.wait_gateway_initial_readiness(
+                    "kind", "cluster", ["172.22.0.3"], 80,
+                    timeout_seconds=10, interval=0,
+                ),
+                witness,
+            )
+            self.assertEqual(probe.call_count, 2)
+            sleep.assert_called_once_with(0)
+
+    def test_gateway_initial_readiness_does_not_retry_invalid_json(self) -> None:
+        with (
+            mock.patch.object(
+                self.reference, "probe_gateway_http",
+                side_effect=[
+                    self.reference.ProofError("invalid /api/nodes JSON"),
+                    ("worker", "172.22.0.3", b"ok", b"web", b"[]"),
+                ],
+            ) as probe,
+            mock.patch.object(self.reference.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(self.reference.ProofError, "invalid /api/nodes"):
+                self.reference.wait_gateway_initial_readiness(
+                    "kind", "cluster", ["172.22.0.3"], 80,
+                    timeout_seconds=10, interval=0,
+                )
+            self.assertEqual(probe.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_gateway_ready_witness_does_not_mask_subsequent_503(self) -> None:
+        with (
+            mock.patch.object(self.reference, "wait_condition"),
+            mock.patch.object(self.reference, "wait_http_route_parent_condition"),
+            mock.patch.object(self.reference, "output", return_value="gateway-service"),
+            mock.patch.object(self.reference, "gateway_listener_port", return_value=80),
+            mock.patch.object(self.reference, "gateway_addresses", return_value=["172.22.0.3"]),
+            mock.patch.object(self.reference, "gateway_service_listener_port", return_value=80),
+            mock.patch.object(
+                self.reference, "wait_gateway_initial_readiness",
+                return_value=("worker", "172.22.0.3", b"ok", b"web", b"[]"),
+            ) as readiness,
+            mock.patch.object(
+                self.reference, "probe_gateway_http",
+                side_effect=[
+                    self.reference.GatewayTransportNotReady("post-readiness 503"),
+                    ("worker", "172.22.0.3", b"ok", b"web", b"[]"),
+                ],
+            ) as matrix,
+        ):
+            with self.assertRaisesRegex(self.reference.ProofError, "post-readiness 503"):
+                self.reference.prove_gateway("kubectl", "kind", "cluster")
+            readiness.assert_called_once()
+            self.assertEqual(matrix.call_count, 1)
+
     def test_gateway_http_probe_rejects_nonstandard_json_numbers(self) -> None:
         valid_health = subprocess.CompletedProcess([], 0, stdout=b"healthy", stderr=b"")
         valid_web = subprocess.CompletedProcess([], 0, stdout=b"web", stderr=b"")

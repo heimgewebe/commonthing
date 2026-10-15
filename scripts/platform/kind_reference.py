@@ -67,6 +67,10 @@ class ProofError(RuntimeError):
     pass
 
 
+class GatewayTransportNotReady(ProofError):
+    """A typed curl failure; retryable only before any full readiness witness."""
+
+
 def _reject_gateway_json_constant(value: str) -> None:
     raise ValueError(f"non-JSON numeric constant {value!r}")
 
@@ -2062,7 +2066,7 @@ def probe_gateway_http(
                             timeout=15,
                         )
                     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-                        raise ProofError(
+                        raise GatewayTransportNotReady(
                             "Gateway status address did not serve listener HTTP from a kind node: "
                             f"node={node!r} address={address!r} route={path!r} "
                             f"sample={sample}"
@@ -2099,6 +2103,48 @@ def probe_gateway_http(
     return witness
 
 
+def wait_gateway_initial_readiness(
+    kind: str,
+    cluster: str,
+    addresses: list[str],
+    port: int,
+    *,
+    timeout_seconds: int = 120,
+    interval: float = 2.0,
+) -> tuple[str, str, bytes, bytes, bytes]:
+    """Wait for a complete HTTP witness, without swallowing malformed responses.
+
+    Only curl transport failures are retryable during this initial window.
+    The caller MUST run a fresh, non-retrying full matrix after this witness.
+    """
+    if timeout_seconds <= 0 or interval < 0:
+        raise ValueError("Gateway readiness requires positive deadline and nonnegative interval")
+    deadline = time.monotonic() + timeout_seconds
+    last_error: GatewayTransportNotReady | None = None
+    while time.monotonic() < deadline:
+        try:
+            witness = probe_gateway_http(kind, cluster, addresses, port)
+            if time.monotonic() <= deadline:
+                return witness
+        except GatewayTransportNotReady as error:
+            last_error = error
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(interval, remaining))
+    raise ProofError(
+        "Gateway did not establish initial HTTP data-plane readiness "
+        f"within {timeout_seconds}s; last transport failure: {last_error}"
+    ) from last_error
+
+
+def probe_gateway_after_readiness(
+    kind: str, cluster: str, addresses: list[str], port: int
+) -> tuple[str, str, bytes, bytes, bytes]:
+    """One full startup witness, then a strict non-retrying HTTP matrix."""
+    wait_gateway_initial_readiness(kind, cluster, addresses, port)
+    return probe_gateway_http(kind, cluster, addresses, port)
+
+
 def prove_gateway(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
     wait_condition(kubectl, "weltgewebe-gateway", "gateway/weltgewebe", "Programmed")
     wait_http_route_parent_condition(
@@ -2133,11 +2179,11 @@ def prove_gateway(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
     if not service:
         raise ProofError("Gateway service was not created")
     listener_port = gateway_listener_port(kubectl)
-    probe_node, address, health, web, api_nodes = probe_gateway_http(
-        kind,
-        cluster,
-        gateway_addresses(kubectl),
-        gateway_service_listener_port(kubectl, service, listener_port),
+    addresses = gateway_addresses(kubectl)
+    service_port = gateway_service_listener_port(kubectl, service, listener_port)
+    # Any 503 or timeout after the full readiness witness is a hard failure.
+    probe_node, address, health, web, api_nodes = probe_gateway_after_readiness(
+        kind, cluster, addresses, service_port
     )
     return {
         "service": service,
