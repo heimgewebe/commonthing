@@ -21,6 +21,11 @@ BACKUP_PREFIX="${BACKUP_PREFIX:-weltgewebe-postgres}"
 DEST_DIR="${DEST_DIR:-${HOME:?HOME must be set}/merges/weltgewebe-production-backups}"
 LOCAL_RETENTION_DAYS="${LOCAL_RETENTION_DAYS:-30}"
 PULL_MODE="${PULL_MODE:-normal}"
+# Public age recipients the pull accepts, pinned on this host independently of
+# commonserver's BACKUP_AGE_RECIPIENTS_FILE. A backup encrypted to any other
+# key is refused: the offline identity could not decrypt it, or a foreign key
+# could.
+PULL_AGE_RECIPIENTS_FILE="${PULL_AGE_RECIPIENTS_FILE-${HOME:?HOME must be set}/.config/weltgewebe/postgres-backup-age-recipients.txt}"
 case "$PULL_MODE" in
   normal | migration-stage) ;;
   *) fail "PULL_MODE must be normal or migration-stage" ;;
@@ -36,6 +41,23 @@ case "$REMOTE_HOST" in '' | *[!A-Za-z0-9._-]*) fail "REMOTE_HOST contains unsupp
 case "$REMOTE_BACKUP_DIR" in
   *..* | *[!A-Za-z0-9._/-]*) fail "REMOTE_BACKUP_DIR contains unsupported characters" ;;
 esac
+
+AGE_RECIPIENT_RE='^age1[02-9ac-hj-np-z]{58}$'
+pinned_recipients=()
+[[ -n "$PULL_AGE_RECIPIENTS_FILE" ]] || fail "PULL_AGE_RECIPIENTS_FILE must name the pinned public age recipients file"
+[[ -f "$PULL_AGE_RECIPIENTS_FILE" && -r "$PULL_AGE_RECIPIENTS_FILE" ]] ||
+  fail "pinned age recipients file is missing or unreadable: $PULL_AGE_RECIPIENTS_FILE (see docs/runbooks/db-recovery.md)"
+if grep -q 'AGE-SECRET-KEY-' "$PULL_AGE_RECIPIENTS_FILE"; then
+  fail "pinned age recipients file contains a private age identity; only public age1 recipients belong there: $PULL_AGE_RECIPIENTS_FILE"
+fi
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  [[ -z "$line" || "$line" == '#'* ]] && continue
+  [[ "$line" =~ $AGE_RECIPIENT_RE ]] || fail "pinned age recipients file contains an unsupported entry (expected one X25519 age1 recipient per line): $PULL_AGE_RECIPIENTS_FILE"
+  pinned_recipients+=("$line")
+done < "$PULL_AGE_RECIPIENTS_FILE"
+((${#pinned_recipients[@]} > 0)) || fail "pinned age recipients file contains no age1 recipient: $PULL_AGE_RECIPIENTS_FILE"
 
 ssh_args=(-o BatchMode=yes -o ConnectTimeout=15)
 # Only the age-encrypted off-host artefact (*.sql.gz.age) is ever selected or
@@ -89,8 +111,11 @@ else
   # Do not certify an age-only off-host state while legacy plaintext can still
   # be re-snapshotted. Old recovery files are NEVER deleted implicitly. The
   # check ignores BACKUP_PREFIX: a changed prefix must not hide dumps written
-  # under an earlier one.
-  if compgen -G "$DEST_DIR/*.sql.gz" > /dev/null; then
+  # under an earlier one. It is recursive so that plaintext left in an
+  # abandoned .pull.* work directory of an interrupted legacy pull counts too.
+  legacy_plaintext="$(find "$DEST_DIR" \( -type f -o -type l \) -name '*.sql.gz' -print -quit)" ||
+    fail "could not scan the off-host destination for legacy plaintext"
+  if [[ -n "$legacy_plaintext" ]]; then
     fail "legacy plaintext PostgreSQL backups remain in off-host destination; verify an offline restore and retire them deliberately before age-only pull"
   fi
   target_dir="$DEST_DIR"
@@ -122,6 +147,20 @@ actual_bytes="$(wc -c < "$work_dir/$latest" | tr -d '[:space:]')"
 [[ "$expected_bytes" =~ ^[0-9]+$ && "$actual_bytes" == "$expected_bytes" ]] || fail "off-host backup ciphertext size mismatch"
 age_header='age-encryption.org/v1'
 cmp -s -n "$((${#age_header} + 1))" "$work_dir/$latest" <(printf '%s\n' "$age_header") || fail "off-host backup is not an age-encrypted file"
+
+# The manifest's recipients line is the producer's claim; X25519 stanzas do not
+# reveal recipients. This catches a misconfigured or swapped producer key, not a
+# compromised producer.
+manifest_recipients="$(manifest_value recipients "$work_dir/$age_manifest")"
+[[ -n "$manifest_recipients" ]] || fail "off-host manifest names no age recipients"
+IFS=, read -r -a backup_recipients <<< "$manifest_recipients"
+for backup_recipient in "${backup_recipients[@]}"; do
+  pinned=0
+  for candidate in "${pinned_recipients[@]}"; do
+    [[ "$backup_recipient" == "$candidate" ]] && pinned=1
+  done
+  ((pinned == 1)) || fail "off-host backup is encrypted to an age recipient that is not pinned in $PULL_AGE_RECIPIENTS_FILE: $backup_recipient"
+done
 
 grep -qx 'contract=weltgewebe-postgres-backup-v1' "$work_dir/$manifest" || fail "plaintext metadata manifest contract is not supported"
 plaintext_sha="$(manifest_value plaintext_sha256 "$work_dir/$age_manifest")"
@@ -170,14 +209,22 @@ if [[ -f "$work_dir/$proof" ]]; then
   mv -f "$work_dir/$proof" "$DEST_DIR/$proof"
 fi
 
+# Every completed pull leaves an immutable receipt under receipts/; the
+# hard link fails rather than replace an existing one. latest-pull.receipt is
+# only a pointer to the newest of them.
 receipt="$DEST_DIR/latest-pull.receipt"
 receipt_tmp="$work_dir/latest-pull.receipt"
+pulled_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 {
   printf 'contract=weltgewebe-offhost-backup-pull-v2\n'
-  printf 'pulled_at=%s\nremote_host=%s\nfile=%s\nsha256=%s\nencryption=age\nplaintext_sha256=%s\nresult=ok\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REMOTE_HOST" "$latest" "$actual" "$plaintext_sha"
+  printf 'pulled_at=%s\nremote_host=%s\nfile=%s\nsha256=%s\nencryption=age\nrecipients=%s\nplaintext_sha256=%s\nresult=ok\n' \
+    "$pulled_at" "$REMOTE_HOST" "$latest" "$actual" "$manifest_recipients" "$plaintext_sha"
 } > "$receipt_tmp"
 chmod 600 "$receipt_tmp"
+install -d -m 0700 "$DEST_DIR/receipts"
+history_receipt="$DEST_DIR/receipts/${base}.pulled-$(date -u +%Y%m%dT%H%M%S.%NZ).receipt"
+cp -- "$receipt_tmp" "$work_dir/history.receipt"
+ln -- "$work_dir/history.receipt" "$history_receipt" || fail "pull receipt already exists: $history_receipt"
 mv -f "$receipt_tmp" "$receipt"
 
 # Retention never deletes legacy plaintext recovery points. Their retirement

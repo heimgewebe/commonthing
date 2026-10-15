@@ -48,11 +48,16 @@ file=$file
 sha256=$1
 bytes=$2
 format=age-encryption.org/v1
-recipients=$recipient
+recipients=${4:-$recipient}
 plaintext_file=$plain
 plaintext_sha256=$3
 MANIFEST
 }
+
+# The pull side pins the accepted recipients independently of the producer.
+pinned="$root/pinned-recipients.txt"
+printf '# offline identity\n%s\n' "$recipient" > "$pinned"
+foreign_recipient="age1$(printf 'z%.0s' $(seq 1 58))"
 
 printf '%s\n' "$marker" | gzip -c > "$remote/$plain"
 plain_sha="$(sha256sum "$remote/$plain" | awk '{print $1}')"
@@ -103,7 +108,7 @@ grep -qF 'BACKUP_PREFIX contains unsupported characters' "$root/unsafe-prefix.st
 pull() {
   local destination="$1"
   PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST="${2-}" REMOTE_BACKUP_DIR="$remote" DEST_DIR="$destination" \
-    scripts/ops/pull-production-postgres-backup.sh
+    PULL_AGE_RECIPIENTS_FILE="${PULL_AGE_RECIPIENTS_FILE-$pinned}" scripts/ops/pull-production-postgres-backup.sh
 }
 expect_pull_failure() {
   local destination="$1" message="$2"
@@ -165,6 +170,18 @@ if pull "$other_prefix_dest" test-host > /dev/null 2> "$root/legacy-other-prefix
 fi
 grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy-other-prefix.stderr"
 [[ ! -e "$other_prefix_dest/latest-pull.receipt" ]]
+
+# Plaintext left in an abandoned work directory of an interrupted legacy pull
+# is below the Restic source too and must block the age receipt.
+abandoned_dest="$root/legacy-abandoned-pull"
+mkdir -p "$abandoned_dest/.pull.Ab12Cd"
+printf 'old private pg dump\n' > "$abandoned_dest/.pull.Ab12Cd/weltgewebe-postgres-legacy.sql.gz"
+if pull "$abandoned_dest" test-host > /dev/null 2> "$root/legacy-abandoned.stderr"; then
+  echo 'legacy plaintext in an abandoned pull directory must block the age receipt' >&2
+  exit 1
+fi
+grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy-abandoned.stderr"
+[[ ! -e "$abandoned_dest/latest-pull.receipt" ]]
 
 # Explicit migration staging must permit a ciphertext-only first transfer while
 # legacy recovery points remain untouched, without publishing an age receipt.
@@ -228,7 +245,7 @@ for suffix in .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; 
   touch -d '10 days ago' "$dest/weltgewebe-postgres-20260101T000000Z${suffix}"
 done
 PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST='' REMOTE_BACKUP_DIR="$remote" DEST_DIR="$dest" \
-  LOCAL_RETENTION_DAYS=1 scripts/ops/pull-production-postgres-backup.sh
+  PULL_AGE_RECIPIENTS_FILE="$pinned" LOCAL_RETENTION_DAYS=1 scripts/ops/pull-production-postgres-backup.sh
 [[ -f "$dest/$file" ]]
 [[ -f "$dest/$age_manifest" ]]
 [[ -f "$dest/$manifest" ]]
@@ -239,6 +256,19 @@ grep -qx 'contract=weltgewebe-offhost-backup-pull-v2' "$dest/latest-pull.receipt
 grep -qx 'encryption=age' "$dest/latest-pull.receipt"
 grep -qx "sha256=$age_sha" "$dest/latest-pull.receipt"
 grep -qx "plaintext_sha256=$plain_sha" "$dest/latest-pull.receipt"
+grep -qx "recipients=$recipient" "$dest/latest-pull.receipt"
+# Each completed pull keeps its own immutable receipt; a later pull adds one
+# and leaves the earlier one byte-identical.
+mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#history[@]} == 1))
+cmp -s "${history[0]}" "$dest/latest-pull.receipt"
+first_receipt="${history[0]}"
+cp "$first_receipt" "$root/first-receipt"
+pull "$dest" test-host > /dev/null
+mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#history[@]} == 2))
+cmp -s "$root/first-receipt" "$first_receipt"
+grep -qx 'remote_host=test-host' "$dest/latest-pull.receipt"
 [[ "$(stat -c %a "$dest/$file")" == 600 ]]
 if compgen -G "$dest/weltgewebe-postgres-20260101T000000Z*" > /dev/null; then
   echo 'local retention must expire ciphertext, manifests and proofs' >&2
@@ -298,6 +328,15 @@ cp "$root/real.age" "$remote/$file"
 write_age_manifest "$age_sha" "$age_bytes" "$(printf '%064d' 1)"
 expect_pull_failure "$root/bad-plain" 'manifests disagree'
 write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+
+# A backup encrypted to a recipient that is not pinned on the pull side fails
+# closed: the offline identity could not decrypt it, or a foreign key could.
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" "$foreign_recipient"
+expect_pull_failure "$root/foreign-recipient" 'not pinned'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" "$recipient,$foreign_recipient"
+expect_pull_failure "$root/extra-recipient" 'not pinned'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+PULL_AGE_RECIPIENTS_FILE="$root/missing-pinned.txt" expect_pull_failure "$root/no-pin" 'pinned age recipients file is missing'
 
 # A host without an encrypted artefact (e.g. no recipient configured) fails closed.
 rm -f "$remote/$file" "$remote/$age_manifest"

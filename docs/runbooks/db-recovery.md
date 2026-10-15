@@ -219,10 +219,21 @@ keinen vollständigen Satz (z. B. weil auf dem Host kein Empfänger
 konfiguriert ist), bricht er ab. Er
 prüft Dateinamen, Vertrag, SHA256 und Größe des Chiffrats gegen das
 Off-Host-Manifest, verlangt den age-Header `age-encryption.org/v1` und prüft,
-dass beide Manifeste denselben Klartext-SHA256 nennen. `age` und der private
+dass beide Manifeste denselben Klartext-SHA256 nennen. Jeder im Off-Host-Manifest
+genannte Empfänger (`recipients=`) muss in der auf `heim-pc` unabhängig
+gepinnten Datei `PULL_AGE_RECIPIENTS_FILE` stehen (Standard
+`~/.config/weltgewebe/postgres-backup-age-recipients.txt`, ein öffentlicher
+`age1…`-Schlüssel pro Zeile, Inhalt = öffentlicher Schlüssel der offline
+verwahrten Identity). Fehlt die Datei oder nennt das Manifest einen anderen
+Empfänger, bricht der Pull ab. Das fängt einen vertauschten oder falsch
+konfigurierten Empfänger auf `commonserver` ab, nicht einen kompromittierten
+Producer: X25519-Stanzas verraten den Empfänger nicht, die Prüfung vertraut
+also der Manifestangabe. `age` und der private
 Schlüssel werden auf `heim-pc` dafür nicht benötigt. Erst danach schreibt er
-eine `latest-pull.receipt` (`contract=weltgewebe-offhost-backup-pull-v2`,
-`encryption=age`). Ein vorhandener Wochen-Restore-Proof wird
+pro Pull einen unveränderlichen Receipt unter `receipts/` (create-only,
+`<backup>.pulled-<UTC>.receipt`) und aktualisiert `latest-pull.receipt` als
+Zeiger auf den neuesten (`contract=weltgewebe-offhost-backup-pull-v2`,
+`encryption=age`, `recipients=`). Receipts unterliegen keiner Retention. Ein vorhandener Wochen-Restore-Proof wird
 mitgenommen. **Restic-Abdeckung ist separat zu prüfen:** Der am
 15. Oktober 2026 tatsächlich gelesene `restic-backup-1930.service` startet
 `heim-pc-restic-backup` mit den Quellen `~/repos`,
@@ -267,6 +278,24 @@ done
 proof="$backup_dir/proofs/$base.restore-proof"
 ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
   "sudo -n -l test -f '$proof' && sudo -n -l cat -- '$proof'" > /dev/null
+# Jeder Empfänger des neuesten Backups muss auf heim-pc gepinnt sein.
+pinned="$HOME/.config/weltgewebe/postgres-backup-age-recipients.txt"
+recipients="$(
+  ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
+    "sudo -n cat -- '$backup_dir/$age_manifest'" |
+    awk -F= '$1 == "recipients" {print substr($0, 12); exit}'
+)"
+[[ -n "$recipients" ]] || {
+  printf 'Off-Host-Manifest nennt keinen Empfänger.\n' >&2
+  exit 1
+}
+IFS=, read -r -a backup_recipients <<< "$recipients"
+for recipient in "${backup_recipients[@]}"; do
+  grep -qxF -- "$recipient" "$pinned" || {
+    printf 'Empfänger nicht in %s gepinnt: %s\n' "$pinned" "$recipient" >&2
+    exit 1
+  }
+done
 ```
 
 Damit werden genau die privilegierten Operationen geprüft, die auch der Pull
@@ -364,7 +393,8 @@ dokumentierte Warnung oder deaktivierter Backup-Timer gilt nicht als Ersatz.
 Vor dem age-Vertrag hat der Pull Klartext-Dumps (`weltgewebe-postgres-*.sql.gz`)
 nach `~/merges/weltgewebe-production-backups` kopiert. Ein neuer age-Pull
 verweigert einen Erfolgs-Receipt, solange irgendeine `*.sql.gz`-Datei im Ziel
-liegt, unabhängig vom aktuell gesetzten `BACKUP_PREFIX`;
+liegt, unabhängig vom aktuell gesetzten `BACKUP_PREFIX` und rekursiv, also auch
+in liegengebliebenen `.pull.*`-Arbeitsverzeichnissen abgebrochener Pulls;
 er löscht Wiederherstellungspunkte nicht selbst. Vor der Freigabe von Restic
 und des verschlüsselten Pulls: Eine neue age-Kopie mit der **offline
 verwahrten Identity** in einer isolierten Umgebung tatsächlich entschlüsseln,
@@ -373,7 +403,7 @@ diesem Nachweis den Altbestand erfassen und eine ausdrückliche dokumentierte
 Löschentscheidung treffen. Die folgende Inventur verändert keine Daten:
 
 ```bash
-find ~/merges/weltgewebe-production-backups -maxdepth 1 -type f \
+find ~/merges/weltgewebe-production-backups \( -type f -o -type l \) \
   -name '*.sql.gz' -print
 ```
 
