@@ -2638,6 +2638,15 @@ def gateway_envoy_nonhttp_snapshot(
             ]
             if len(clusters) != 1:
                 raise ProofError(f"Gateway Envoy CDS cluster missing for {key} on {node}")
+            # Gateway-specific CDS clusters must refer to the exact Service
+            # EDS name; a healthy but unreferenced assignment is not readiness.
+            cds_eds_name = clusters[0]["cluster"].get(
+                "eds_cluster_config", {}
+            ).get("service_name")
+            if cds_eds_name != key:
+                raise ProofError(
+                    f"Gateway Envoy CDS-to-EDS binding missing/mismatched for {key} on {node}"
+                )
             eds = [
                 x for x in dumped["endpoints"]["configs"]
                 if x.get("endpoint_config", {}).get("cluster_name") == key

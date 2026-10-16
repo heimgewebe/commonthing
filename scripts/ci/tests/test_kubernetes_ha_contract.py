@@ -2820,7 +2820,7 @@ spec:
 
     def test_nonhttp_envoy_snapshot_rejects_stale_eds_and_wrong_rds(self) -> None:
         """Exercise actual parser/binding on deterministic, synthetic K8s+xDS JSON."""
-        bad = {"eds": False, "rds": False}
+        bad = {"eds": False, "rds": False, "cds": False}
         namespace, gateway_namespace, gateway_name = "ns", "gw", "testgw"
         cec = "cilium-gateway-testgw"
         full_cluster = "gw/cilium-gateway-testgw/ns:srv:8080"
@@ -2873,7 +2873,15 @@ spec:
                     },
                 }]}
             if part == "clusters":
-                return {"configs": [{"cluster": {"name": full_cluster, "type": "EDS"}}]}
+                return {"configs": [{"cluster": {
+                    "name": full_cluster,
+                    "type": "EDS",
+                    "eds_cluster_config": {
+                        "service_name": (
+                            "ns/misdirected:8080" if bad["cds"] else "ns/srv:8080"
+                        ),
+                    },
+                }}]}
             if part == "endpoints":
                 return {"configs": [{
                     "endpoint_config": {
@@ -2914,6 +2922,12 @@ spec:
             bad["eds"] = False
             bad["rds"] = True
             with self.assertRaisesRegex(self.ha.ref.ProofError, "RDS backend routing"):
+                self.ha.ref.gateway_envoy_nonhttp_snapshot(
+                    "kubectl", "kind", "cluster", **args,
+                )
+            bad["rds"] = False
+            bad["cds"] = True
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "CDS-to-EDS"):
                 self.ha.ref.gateway_envoy_nonhttp_snapshot(
                     "kubectl", "kind", "cluster", **args,
                 )

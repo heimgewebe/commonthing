@@ -5561,35 +5561,35 @@ def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
         if path.is_symlink() or stat.S_IMODE(path.stat().st_mode) != 0o600:
             return False
         binding = cell.get("gateway_proof", {})
-        if binding.get("active_commit") != cell_active_commit(cell) or binding.get(
-            "receipt_sha256"
-        ) != sha256_file(path):
-            return False
-        receipt = json.loads(path.read_text())
-        if any(
-            receipt.get(key) != cell.get(key)
-            for key in ("owner_id", "cluster", "bootstrap_commit", "active_commit")
+        if binding.get("active_commit") != cell_active_commit(cell) or (
+            binding.get("receipt_sha256") != sha256_file(path)
         ):
             return False
+        receipt = json.loads(path.read_text())
+        if any(receipt.get(key) != cell.get(key) for key in
+               ("owner_id", "cluster", "bootstrap_commit", "active_commit")):
+            return False
         observed = staging_gateway_observation(kubectl)
-        expected_binding = {
+        require_gateway_observation_binding(observed, {
             "owner_id": receipt.get("owner_id"),
             "active_commit": receipt.get("active_commit"),
             "manifest_sha256": receipt.get("manifest_sha256"),
-        }
-        require_gateway_observation_binding(observed, expected_binding)
+        })
         matrix = receipt.get("matrix_evidence")
-        if (not isinstance(matrix, dict)
-                or receipt.get("non_http_preflight", {}).get("status")
-                != "non-http-envoy-eds-ready-not-a-gateway-pass"):
+        if not isinstance(matrix, dict):
             return False
-        tool_ref = load_tool_receipt(
-            root, required_tools=("kind",), required_artifacts=()
-        )["tools"]["kind"]
+        tool_ref = load_tool_receipt(root, required_tools=("kind",),
+                                     required_artifacts=())["tools"]["kind"]
         reference.validate_gateway_matrix_live(
             matrix, kind=tool_ref, cluster=receipt["cluster"],
             addresses=observed["gateway_addresses"], port=observed["listener_port"],
             expected_digest=binding["matrix_sha256"],
+        )
+        reference.validate_gateway_nonhttp_current(
+            receipt.get("non_http_preflight"), kubectl=kubectl, kind=tool_ref,
+            cluster=receipt["cluster"], namespace=APP_NAMESPACE,
+            gateway_namespace=APP_NAMESPACE, gateway_name=GATEWAY_NAME,
+            backends=(("commonthing-api", 8080), ("commonthing-web", 8080)),
         )
         implementation_commit = receipt.get("implementation_commit")
         implementation_valid = implementation_commit == cell_active_commit(cell)

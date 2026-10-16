@@ -854,6 +854,30 @@ class StagingGatewayTests(unittest.TestCase):
             self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
         self.assertTrue(staging.gateway_receipt_current(self.root, cell, "kubectl"))
 
+    def test_gateway_receipt_reuse_fails_closed_when_envoy_eds_drifts(self):
+        """R3 P1: unchanged Gateway/Kind identity cannot reuse stale xDS."""
+        staging.command_prove_gateway(self.args)
+        cell = staging.load_cell_receipt(self.root)
+        self.assertTrue(staging.gateway_receipt_current(self.root, cell, "kubectl"))
+        self.non_http_current.reset_mock()
+        self.non_http_current.side_effect = staging.reference.ProofError(
+            "Gateway Envoy/EDS runtime identity drifted after preflight"
+        )
+        self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
+        self.non_http_current.assert_called_once()
+        bound = self.non_http_current.call_args
+        self.assertEqual(
+            bound.args[0]["status"],
+            "non-http-envoy-eds-ready-not-a-gateway-pass",
+        )
+        self.assertEqual(bound.kwargs["kind"], "kind")
+        self.assertEqual(bound.kwargs["cluster"], staging.DEFAULT_CLUSTER)
+        self.assertEqual(bound.kwargs["namespace"], staging.APP_NAMESPACE)
+        self.assertEqual(
+            bound.kwargs["backends"],
+            (("commonthing-api", 8080), ("commonthing-web", 8080)),
+        )
+
     def test_status_rejects_gateway_binding_annotation_drift(self):
         staging.command_prove_gateway(self.args)
         cell = staging.load_cell_receipt(self.root)
