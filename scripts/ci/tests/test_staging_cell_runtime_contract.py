@@ -240,7 +240,9 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             self.assertEqual(sysctl_source.stat().st_mode & 0o777, 0o400)
             self.assertEqual(
                 staging.KIND_WORKER_SRCMARK_CONTENT,
-                "net.ipv4.conf.all.src_valid_mark = 0\n",
+                ("net.ipv4.conf.all.src_valid_mark = 0\n"
+                 "net.ipv4.conf.default.src_valid_mark = 0\n"
+                 "net.ipv4.conf.eth0.src_valid_mark = 0\n"),
             )
             self.assertEqual(
                 sysctl_source.read_text(encoding="utf-8"),
@@ -296,6 +298,13 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             staging.render_kind_config(root)
             self.assertEqual(initial.st_ino, source.lstat().st_ino)
             self.assertEqual(initial.st_dev, source.lstat().st_dev)
+
+            # All-only is insufficient: the kernel uses all OR per-device values.
+            source.chmod(0o600)
+            source.write_text("net.ipv4.conf.all.src_valid_mark = 0\n", encoding="utf-8")
+            source.chmod(0o400)
+            with self.assertRaises(staging.StagingCellError):
+                staging.render_kind_config(root)
 
             source.chmod(0o600)
             with self.assertRaises(staging.StagingCellError):

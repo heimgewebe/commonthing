@@ -51,7 +51,7 @@ STAGING_GATEWAY_NODE_PORT = 31844
 STAGING_GATEWAY_HOST_PORT = 18084
 KIND_WORKER_SRCMARK_PLACEHOLDER = "__COMMONTHING_STAGING_WORKER_SRCMARK_CONF__"
 KIND_WORKER_SRCMARK_DESTINATION = "/etc/sysctl.d/99-commonthing-staging-cilium-srcmark.conf"
-KIND_WORKER_SRCMARK_CONTENT = "net.ipv4.conf.all.src_valid_mark = 0\n"
+KIND_WORKER_SRCMARK_CONTENT = "".join(f"net.ipv4.conf.{name}.src_valid_mark = 0\n" for name in ("all", "default", "eth0"))
 SOURCE_NAME = "commonthing-staging-source"
 APP_SOURCE_NAME = "commonthing-staging-app-source"
 DATA_KUSTOMIZATION = "commonthing-staging-data"
