@@ -137,6 +137,25 @@ grep -qF 'BACKUP_PREFIX contains unsupported characters' "$TEMP_DIR/unsafe-prefi
   exit 1
 }
 
+# Every produced name must be one the off-host reader accepts, or the pull
+# would fail on it forever.
+name_rule='backup name must start with a letter or digit'
+expect_backup_failure "$(printf 'a%.0s' {1..190})" "$RECIPIENTS_FILE" "$name_rule"
+expect_backup_failure 'dot..dot' "$RECIPIENTS_FILE" "$name_rule"
+if BACKUP_PREFIX=-lead run_backup leading-dash "$RECIPIENTS_FILE" \
+  > /dev/null 2> "$TEMP_DIR/leading-dash.stderr"; then
+  echo 'a prefix the reader rejects must fail closed' >&2
+  exit 1
+fi
+grep -qF "$name_rule" "$TEMP_DIR/leading-dash.stderr" || {
+  echo 'producer did not reject a name the reader cannot serve' >&2
+  exit 1
+}
+if compgen -G "$BACKUP_DIR/-lead-*" > /dev/null; then
+  echo 'rejected name must not leave any artefact' >&2
+  exit 1
+fi
+
 # Retention fixture: expired artefacts of every backup kind.
 mkdir -p "$BACKUP_DIR"
 for suffix in .sql.gz .sql.gz.age .sha256.manifest .age.sha256.manifest; do

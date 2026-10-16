@@ -132,6 +132,10 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 label="${BACKUP_LABEL:-$timestamp}"
 case "$label" in '' | *[!A-Za-z0-9._-]*) fail "BACKUP_LABEL contains unsupported characters" ;; esac
 base="${BACKUP_PREFIX}-${label}"
+# The off-host reader (postgres-backup-read.sh) serves only names of this shape;
+# a backup it cannot name would make every later off-host pull fail.
+[[ "$base" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ && "$base" != *..* ]] ||
+  fail "backup name must start with a letter or digit, have at most 200 characters and no '..': $base"
 dump_file="${BACKUP_DIR}/${base}.sql.gz"
 manifest_file="${BACKUP_DIR}/${base}.sha256.manifest"
 age_file="${BACKUP_DIR}/${base}.sql.gz.age"
