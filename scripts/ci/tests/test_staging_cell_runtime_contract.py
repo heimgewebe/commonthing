@@ -234,24 +234,40 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             root = Path(tmp_name)
             rendered_path = staging.render_kind_config(root)
             document = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+            sysctl_source = root / "generated/kind-cilium-srcmark.conf"
+            self.assertTrue(sysctl_source.is_file())
+            self.assertFalse(sysctl_source.is_symlink())
+            self.assertEqual(sysctl_source.stat().st_mode & 0o777, 0o400)
+            self.assertEqual(
+                sysctl_source.read_text(encoding="utf-8"),
+                staging.KIND_WORKER_SRCMARK_CONTENT,
+            )
 
         data_worker = document["nodes"][1]
         mounts = data_worker["extraMounts"]
         self.assertEqual(
-            [mount["containerPath"] for mount in mounts],
+            [mount["containerPath"] for mount in mounts[:2]],
             [
                 "/var/local/commonthing-staging/postgres",
                 "/var/local/commonthing-staging/nats",
             ],
         )
         self.assertEqual(
-            [mount["hostPath"] for mount in mounts],
+            [mount["hostPath"] for mount in mounts[:2]],
             [
                 str((root / "data/postgres").resolve()),
                 str((root / "data/nats").resolve()),
             ],
         )
-        self.assertTrue(all(mount["readOnly"] is False for mount in mounts))
+        self.assertTrue(all(mount["readOnly"] is False for mount in mounts[:2]))
+        sysctl_mount = {
+            "hostPath": str(sysctl_source.resolve()),
+            "containerPath": staging.KIND_WORKER_SRCMARK_DESTINATION,
+            "readOnly": True,
+        }
+        self.assertEqual(mounts[2:], [sysctl_mount])
+        self.assertEqual(document["nodes"][2]["extraMounts"], [sysctl_mount])
+        self.assertFalse(document["nodes"][0].get("extraMounts"))
         self.assertEqual(
             document["nodes"][0].get("extraPortMappings"),
             [
@@ -266,6 +282,63 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         self.assertFalse(
             any(node.get("extraPortMappings") for node in document["nodes"][1:])
         )
+
+    def test_kind_worker_sysctl_source_drift_and_inode_are_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="staging-kind-srcmark-drift-") as tmp_name:
+            root = Path(tmp_name)
+            staging.render_kind_config(root)
+            source = root / "generated/kind-cilium-srcmark.conf"
+            initial = source.lstat()
+            staging.render_kind_config(root)
+            self.assertEqual(initial.st_ino, source.lstat().st_ino)
+            self.assertEqual(initial.st_dev, source.lstat().st_dev)
+
+            source.chmod(0o600)
+            with self.assertRaises(staging.StagingCellError):
+                staging.render_kind_config(root)
+            source.write_text("net.ipv4.conf.all.src_valid_mark = 1\n", encoding="utf-8")
+            source.chmod(0o400)
+            with self.assertRaises(staging.StagingCellError):
+                staging.render_kind_config(root)
+            source.unlink()
+            target = root / "unauthorized.conf"
+            target.write_text(staging.KIND_WORKER_SRCMARK_CONTENT, encoding="utf-8")
+            source.symlink_to(target)
+            with self.assertRaises(staging.StagingCellError):
+                staging.render_kind_config(root)
+
+    def test_kind_worker_sysctl_mount_refuses_template_tampering(self) -> None:
+        original = yaml.safe_load(
+            (ROOT / "platform/clusters/staging/kind.yaml").read_text(encoding="utf-8")
+        )
+        for name in (
+            "writable",
+            "wrong-target",
+            "wrong-source",
+            "control-plane",
+            "unapproved-extra",
+        ):
+            with self.subTest(name=name):
+                document = yaml.safe_load(yaml.safe_dump(original))
+                nodes = document["nodes"]
+                if name == "writable":
+                    nodes[2]["extraMounts"][0]["readOnly"] = False
+                elif name == "wrong-target":
+                    nodes[2]["extraMounts"][0]["containerPath"] = "/etc/sysctl.d/00-all.conf"
+                elif name == "wrong-source":
+                    nodes[1]["extraMounts"][2]["hostPath"] = "/etc/shadow"
+                elif name == "control-plane":
+                    nodes[0]["extraMounts"] = [nodes[2]["extraMounts"][0]]
+                else:
+                    nodes[2]["extraMounts"].append(nodes[2]["extraMounts"][0].copy())
+                with tempfile.TemporaryDirectory() as temp:
+                    fake_repo = Path(temp) / "repo"
+                    template = fake_repo / "platform/clusters/staging/kind.yaml"
+                    template.parent.mkdir(parents=True)
+                    template.write_text(yaml.safe_dump(document), encoding="utf-8")
+                    with mock.patch.object(staging, "ROOT", fake_repo):
+                        with self.assertRaises(staging.StagingCellError):
+                            staging.render_kind_config(Path(temp) / "runtime")
 
     def test_reference_commands_use_scoped_staging_stdout_routing(self) -> None:
         original = staging.reference.run
@@ -478,31 +551,30 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
         )
         nodes = config["nodes"]
         self.assertEqual([node["role"] for node in nodes], ["control-plane", "worker", "worker"])
-        mounted = [
-            (index, node, node.get("extraMounts", []))
-            for index, node in enumerate(nodes)
-            if node.get("extraMounts")
-        ]
-        self.assertEqual(len(mounted), 1)
-        index, node, mounts = mounted[0]
-        self.assertEqual(index, 1)
-        self.assertEqual(node["role"], "worker")
-        self.assertEqual(len(mounts), 2)
+        self.assertFalse(nodes[0].get("extraMounts"))
+        data_mounts = nodes[1]["extraMounts"][:2]
         self.assertEqual(
-            [mount["hostPath"] for mount in mounts],
+            [mount["hostPath"] for mount in data_mounts],
             [
                 "__COMMONTHING_STAGING_POSTGRES_ROOT__",
                 "__COMMONTHING_STAGING_NATS_ROOT__",
             ],
         )
         self.assertEqual(
-            [mount["containerPath"] for mount in mounts],
+            [mount["containerPath"] for mount in data_mounts],
             [
                 "/var/local/commonthing-staging/postgres",
                 "/var/local/commonthing-staging/nats",
             ],
         )
-        self.assertTrue(all(mount["readOnly"] is False for mount in mounts))
+        self.assertTrue(all(mount["readOnly"] is False for mount in data_mounts))
+        expected_sysctl = {
+            "hostPath": "__COMMONTHING_STAGING_WORKER_SRCMARK_CONF__",
+            "containerPath": staging.KIND_WORKER_SRCMARK_DESTINATION,
+            "readOnly": True,
+        }
+        self.assertEqual(nodes[1]["extraMounts"][2:], [expected_sysctl])
+        self.assertEqual(nodes[2]["extraMounts"], [expected_sysctl])
 
     def test_apply_yaml_emits_native_multi_document_stream(self) -> None:
         documents = [

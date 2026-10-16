@@ -20,4 +20,11 @@ nodes:
       - hostPath: __COMMONTHING_STAGING_NATS_ROOT__
         containerPath: /var/local/commonthing-staging/nats
         readOnly: false
+      - hostPath: __COMMONTHING_STAGING_WORKER_SRCMARK_CONF__
+        containerPath: /etc/sysctl.d/99-commonthing-staging-cilium-srcmark.conf
+        readOnly: true
   - role: worker
+    extraMounts:
+      - hostPath: __COMMONTHING_STAGING_WORKER_SRCMARK_CONF__
+        containerPath: /etc/sysctl.d/99-commonthing-staging-cilium-srcmark.conf
+        readOnly: true
