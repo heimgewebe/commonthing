@@ -470,7 +470,17 @@ in einem Verzeichnis mit Modus `0700`:
 set -euo pipefail
 umask 077
 src=~/merges/weltgewebe-production-backups
-base=weltgewebe-postgres-<UTC>
+# Standard ist die neueste gezogene Kopie; ein älterer Restore-Punkt wird
+# vorher per `export BACKUP_BASE=weltgewebe-postgres-…` gewählt.
+base="${BACKUP_BASE:-$(
+  find "$src" -maxdepth 1 -type f -name 'weltgewebe-postgres-*.sql.gz.age' \
+    -printf '%f\n' | sort | tail -n1
+)}"
+base="${base%.sql.gz.age}"
+[[ "$base" =~ ^weltgewebe-postgres-[A-Za-z0-9._-]+$ && "$base" != *..* ]] || {
+  printf 'Kein gültiges verschlüsseltes Backup in %s ausgewählt.\n' "$src" >&2
+  exit 1
+}
 work="$(mktemp -d)"
 # Der entschlüsselte Dump wird bei jedem Ende dieser Shell entfernt, auch nach
 # einem Fehler in age, SHA-Vergleich, gzip -t oder Restore und nach Abbruch.
