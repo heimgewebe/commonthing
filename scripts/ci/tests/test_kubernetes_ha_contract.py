@@ -505,69 +505,131 @@ class KubernetesHaContractTests(unittest.TestCase):
         self.assertLess(preload, ha_data_apply)
 
     def test_continuous_gateway_samples_rebind_listener_owners(self) -> None:
-        """A stale successful cross-node probe cannot become owner-local proof."""
+        """Owner stop degrades a path; IP takeover or container replacement blocks PASS."""
         monitor = self.ha.ContinuousAvailabilityMonitor.__new__(
             self.ha.ContinuousAvailabilityMonitor
         )
         monitor.kubectl = "kubectl"
         monitor.kind = "kind"
         monitor.cluster = "proof"
-        monitor.gateway_addresses = ["10.0.0.1"]
+        monitor.gateway_addresses = ["10.0.0.1", "10.0.0.2"]
         monitor.gateway_port = 80
         monitor.marker = "marker"
         monitor.gateway_binding = {
-            "gateway_addresses": ["10.0.0.1"],
-            "owner_by_address": {"10.0.0.1": "owner-a"},
+            "gateway_addresses": monitor.gateway_addresses,
+            "owner_by_address": {"10.0.0.1": "node-a", "10.0.0.2": "node-b"},
             "observer_node": "proof-control-plane",
             "observer_address": "10.0.0.9",
             "captured_before_failure": True,
         }
-        original = dict(monitor.gateway_binding)
-        moved = {
-            **original,
-            "owner_by_address": {"10.0.0.1": "owner-b"},
-        }
+        ids = {"node-a": "a" * 64, "node-b": "b" * 64,
+               "proof-control-plane": "c" * 64}
+        monitor.gateway_container_ids = dict(ids)
+        running = {"node-a": True, "node-b": True, "proof-control-plane": True}
+        node_ips = {"node-a": "10.0.0.1", "node-b": "10.0.0.2",
+                    "proof-control-plane": "10.0.0.9"}
+
+        def inspect(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[:3], ["docker", "inspect", "--format"])
+            self.assertEqual(kwargs["timeout"], 5)
+            self.assertNotIn("env", argv[3])
+            lines = [
+                f"/{node}|{ids[node]}|{str(running[node]).lower()}|{node_ips[node]}"
+                for node in argv[4:]
+            ]
+            return subprocess.CompletedProcess(argv, 0, stdout="\n".join(lines) + "\n", stderr="")
+
+        def projection(node: str, address: str, _port: int, _marker: str) -> dict:
+            ok = running[node] and node_ips[node] == address
+            return {"available": ok, "returncode": 0 if ok else 1}
+
+        class InlineExecutor:
+            # Thread starvation on a loaded Kind host is not a failure of
+            # the owner/IPAM semantics under test; map still runs every path.
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def __enter__(self) -> "InlineExecutor":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                pass
+
+            def map(self, func: object, items: object) -> object:
+                return map(func, items)
+
         with (
+            mock.patch.object(self.ha._ha_availability, "ThreadPoolExecutor",
+                              InlineExecutor),
             mock.patch.object(self.ha.ref, "gateway_addresses",
-                              return_value=["10.0.0.1"]) as ips,
-            mock.patch.object(self.ha._ha_availability, "gateway_observer_binding",
-                              return_value=original) as live,
-            mock.patch.object(self.ha._ha_availability, "gateway_observer_sample",
-                              return_value={"available": True, "failed_paths": 0}) as http,
+                              return_value=list(monitor.gateway_addresses)) as advertised,
+            mock.patch.object(self.ha.ref, "kind_nodes",
+                              return_value=list(ids)) as nodes,
+            mock.patch.object(self.ha._ha_availability.subprocess, "run",
+                              side_effect=inspect) as docker,
+            mock.patch.object(self.ha._ha_availability, "gateway_projection_sample",
+                              side_effect=projection) as http,
         ):
-            self.assertTrue(monitor._sample("gateway")["available"])
-            self.assertGreaterEqual(ips.call_count, 2)
-            self.assertGreaterEqual(live.call_count, 2)
-            http.assert_called_once_with(
-                "kind", "proof", ["10.0.0.1"], 80, "marker",
-                observer_binding=monitor.gateway_binding,
-            )
-            ips.reset_mock()
-            live.reset_mock()
+            healthy = monitor._sample("gateway")
+            self.assertTrue(healthy["available"])
+            self.assertEqual(healthy["failed_paths"], 0)
+            self.assertEqual(advertised.call_count, 2)
+            self.assertEqual(docker.call_count, 2)
+
+            # Node-a deliberately stopped: old container ID persists but the
+            # Kind bridge IP disappears; live node inventory may omit it.
+            running["node-a"] = False
+            node_ips["node-a"] = ""
+            nodes.return_value = ["node-b", "proof-control-plane"]
+            stopped = monitor._sample("gateway")
+            self.assertTrue(stopped["available"])
+            self.assertEqual(stopped["failed_paths"], 1)
+
+            # IPAM can also withdraw the failed listener from Gateway status.
+            advertised.return_value = ["10.0.0.2"]
+            withdrawn = monitor._sample("gateway")
+            self.assertTrue(withdrawn["available"])
+            self.assertEqual(withdrawn["failed_paths"], 1)
+
+            # A different still-running node acquiring the stopped owner's
+            # address must never be relabeled as an owner-local healthy read.
+            advertised.return_value = list(monitor.gateway_addresses)
+            node_ips["node-b"] = "10.0.0.1"
             http.reset_mock()
-
-            # Current IPAM owner is different, even though old owner curl
-            # returns a healthy response (the forbidden cross-node false PASS).
-            live.return_value = moved
-            changed = monitor._sample("gateway")
-            self.assertFalse(changed["available"])
-            self.assertIn("drift", changed["probe_error"])
+            takeover = monitor._sample("gateway")
+            self.assertFalse(takeover["available"])
+            self.assertIn("drift", takeover["probe_error"])
             http.assert_not_called()
 
-            live.reset_mock()
-            live.return_value = original
-            ips.return_value = ["10.0.0.2"]
-            changed = monitor._sample("gateway")
-            self.assertFalse(changed["available"])
-            self.assertIn("drift", changed["probe_error"])
-            http.assert_not_called()
+            node_ips["node-b"] = "10.0.0.2"
+            ids["node-b"] = "d" * 64
+            replaced = monitor._sample("gateway")
+            self.assertFalse(replaced["available"])
+            self.assertIn("identity drifted", replaced["probe_error"])
+            ids["node-b"] = "b" * 64
 
-            ips.return_value = ["10.0.0.1"]
-            live.side_effect = [original, moved]
+            advertised.return_value = ["10.0.0.3"]
             changed = monitor._sample("gateway")
             self.assertFalse(changed["available"])
             self.assertIn("drift", changed["probe_error"])
-            http.assert_called_once()
+
+            # Drift after the HTTP response is also fatal; one successful
+            # witness from the old owner must not be treated as a valid sample.
+            running["node-a"] = True
+            node_ips["node-a"] = "10.0.0.1"
+            nodes.return_value = list(ids)
+            advertised.return_value = list(monitor.gateway_addresses)
+            def change_during_http(*_args: object, **_kwargs: object) -> dict:
+                node_ips["node-a"] = "10.0.0.7"
+                node_ips["node-b"] = "10.0.0.1"
+                return {"available": True, "failed_paths": 0}
+            with mock.patch.object(
+                self.ha._ha_availability, "gateway_observer_sample",
+                side_effect=change_during_http,
+            ):
+                late = monitor._sample("gateway")
+            self.assertFalse(late["available"])
+            self.assertIn("drift", late["probe_error"])
 
     def test_continuous_failure_snapshot_does_not_require_recovery(self) -> None:
         monitor = self.ha.ContinuousAvailabilityMonitor.__new__(

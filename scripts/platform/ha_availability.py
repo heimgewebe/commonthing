@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import re
 import subprocess
 import threading
 import time
@@ -485,6 +487,11 @@ class ContinuousAvailabilityMonitor:
         self.gateway_binding = gateway_observer_binding(
             kind, cluster, self.gateway_addresses
         )
+        # Docker container identities survive a deliberate stop; a replacement
+        # of an old owner must not be mistaken for continuous availability.
+        self.gateway_container_ids = ref.gateway_node_container_ids(
+            ref.kind_nodes(kind, cluster)
+        )
         self.direct_probe_pods = sorted(set(direct_probe_pods))
         if len(self.direct_probe_pods) != 3:
             raise ref.ProofError("continuous availability monitor requires three direct API probe pods")
@@ -516,39 +523,96 @@ class ContinuousAvailabilityMonitor:
         self._failure_elapsed_seconds = time.monotonic() - self._started
         self._failure_label = label
 
-    def _require_current_gateway_binding(self) -> None:
-        """Prevent a stale owner-local snapshot from accepting cross-node HTTP."""
+    def _require_current_gateway_binding(self) -> list[str]:
+        """Recheck active owners without treating a deliberately stopped owner as drift."""
         observed = sorted(set(ref.gateway_addresses(self.kubectl)))
-        if observed != self.gateway_addresses:
+        if not observed or not set(observed).issubset(self.gateway_addresses):
             raise ref.ProofError("Gateway listener addresses drifted during continuous availability")
-        live = gateway_observer_binding(self.kind, self.cluster, observed)
-        for key in (
-            "gateway_addresses", "owner_by_address",
-            "observer_node", "observer_address",
-        ):
-            if live.get(key) != self.gateway_binding.get(key):
-                raise ref.ProofError(
-                    f"Gateway listener owner binding drifted during continuous availability: {key}"
-                )
+        owners = self.gateway_binding.get("owner_by_address")
+        if not isinstance(owners, dict) or set(owners) != set(self.gateway_addresses):
+            raise ref.ProofError("Gateway continuous owner binding is incomplete")
+        expected_ids = self.gateway_container_ids
+        if not isinstance(expected_ids, dict) or not set(owners.values()).issubset(expected_ids):
+            raise ref.ProofError("Gateway continuous owner container identities are incomplete")
+        # Batch one bounded Docker read. Only node name, immutable container ID,
+        # Running flag and kind-bridge IP are returned; never dump environment.
+        nodes = sorted(set(ref.kind_nodes(self.kind, self.cluster)) | set(expected_ids))
+        template = (
+            '{{.Name}}|{{.Id}}|{{.State.Running}}|'
+            '{{if .State.Running}}{{(index .NetworkSettings.Networks "kind").IPAddress}}{{end}}'
+        )
+        try:
+            response = subprocess.run(
+                ["docker", "inspect", "--format", template, *nodes],
+                cwd=ROOT, text=True, capture_output=True, check=False, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ref.ProofError("Gateway continuous Kind owner identity unavailable") from error
+        lines = response.stdout.splitlines()
+        if (response.returncode != 0 or len(response.stdout) > 16384
+                or len(lines) != len(nodes)):
+            raise ref.ProofError("Gateway continuous Kind owner identity readback incomplete")
+        active_owners: dict[str, str] = {}
+        running: dict[str, bool] = {}
+        for node, line in zip(nodes, lines, strict=True):
+            parts = line.split("|")
+            if len(parts) != 4 or parts[0] != f"/{node}":
+                raise ref.ProofError("Gateway continuous Kind node identity malformed")
+            _, container_id, active, address = parts
+            if (not re.fullmatch(r"[0-9a-f]{64}", container_id)
+                    or active not in {"true", "false"}
+                    or (node in expected_ids and container_id != expected_ids[node])):
+                raise ref.ProofError("Gateway continuous Kind owner container identity drifted")
+            running[node] = active == "true"
+            if not running[node]:
+                # Docker removes network interfaces from stopped containers;
+                # absence of an old owner is an unavailable path, not takeover.
+                continue
+            if not address:
+                raise ref.ProofError("Gateway running Kind node has no bridge IPv4")
+            try:
+                parsed = ipaddress.ip_address(address)
+            except ValueError as error:
+                raise ref.ProofError("Gateway running Kind node IPv4 malformed") from error
+            if parsed.version != 4 or str(parsed) != address:
+                raise ref.ProofError("Gateway running Kind node IPv4 invalid")
+            if address in self.gateway_addresses:
+                if address in active_owners:
+                    raise ref.ProofError("Gateway advertised address has multiple active owners")
+                active_owners[address] = node
+        for address in observed:
+            original = owners[address]
+            actual = active_owners.get(address)
+            if actual is not None and actual != original:
+                raise ref.ProofError("Gateway listener owner binding drifted during continuous availability")
+            if running.get(original) is True and actual != original:
+                raise ref.ProofError("Gateway running listener owner readdressed during continuous availability")
+            if original not in running:
+                raise ref.ProofError("Gateway original listener owner identity disappeared")
+        return observed
 
     def _sample(self, channel: str) -> dict[str, Any]:
         try:
             if channel == "gateway":
-                self._require_current_gateway_binding()
+                addresses = self._require_current_gateway_binding()
                 result = gateway_observer_sample(
                     self.kind,
                     self.cluster,
-                    self.gateway_addresses,
+                    addresses,
                     self.gateway_port,
                     self.marker,
                     observer_binding=self.gateway_binding,
                 )
-                # HTTP can succeed via a stale owner's cross-node path after
-                # readdressing. Bind both sides of the single measured sample.
-                self._require_current_gateway_binding()
+                # A successful old-owner curl cannot mask IPAM takeover between
+                # the two bounded runtime identity reads.
+                if self._require_current_gateway_binding() != addresses:
+                    raise ref.ProofError("Gateway listener addresses drifted during sample")
                 return {
                     "available": bool(result.get("available")),
-                    "failed_paths": int(result.get("failed_paths", 0)),
+                    # Withdrawn listeners count as degraded paths, while a
+                    # surviving owner may still satisfy ADR-0013 availability.
+                    "failed_paths": int(result.get("failed_paths", 0))
+                    + len(self.gateway_addresses) - len(addresses),
                 }
             result = direct_api_probe_sample(
                 self.kubectl, self.direct_probe_pods, self.direct_address, self.direct_port, self.marker
