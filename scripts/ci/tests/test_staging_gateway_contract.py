@@ -127,9 +127,76 @@ class StagingGatewayTests(unittest.TestCase):
                 ),
             )
         )
+        self.gateway_test_nodes = ["kind-worker", "kind-worker-2"]
+        self.gateway_test_owners = {
+            ADDRESSES[0]: self.gateway_test_nodes[0],
+            ADDRESSES[1]: self.gateway_test_nodes[1],
+        }
+        self.gateway_test_containers = {
+            "kind-worker": "a" * 64,
+            "kind-worker-2": "b" * 64,
+        }
+        self.stack.enter_context(mock.patch.object(
+            staging.reference, "kind_nodes", return_value=self.gateway_test_nodes
+        ))
+        self.stack.enter_context(mock.patch.object(
+            staging.reference, "gateway_address_owners",
+            return_value=self.gateway_test_owners,
+        ))
+        self.stack.enter_context(mock.patch.object(
+            staging.reference, "gateway_node_container_ids",
+            return_value=self.gateway_test_containers,
+        ))
+        self.probe.side_effect = self.simulated_gateway_matrix
         self.get = self.stack.enter_context(
             mock.patch.object(staging, "gateway_get", side_effect=self.get_resource)
         )
+
+    def simulated_gateway_matrix(
+        self, kind, cluster, addresses, port, *,
+        owner_local=False, verify_node_ids=False, matrix_evidence=None,
+    ):
+        """Synthetic test-only data; production obtains cells from real curl."""
+        if matrix_evidence is not None:
+            runtime = {
+                "nodes": list(self.gateway_test_nodes),
+                "listeners": list(addresses),
+                "owner_by_address": dict(self.gateway_test_owners),
+                "container_ids": dict(self.gateway_test_containers),
+                "port": port,
+            }
+            cells = [
+                {
+                    "source_node": node,
+                    "listener_ip": ip,
+                    "sample": sample,
+                    "route": path,
+                    "http_status": 200,
+                    "transport_result": "ok",
+                    "body_sha256": staging.sha256_bytes(b"simulated-response"),
+                    "body_bytes": len(b"simulated-response"),
+                }
+                for node in self.gateway_test_nodes
+                for ip in addresses
+                for sample in range(1, staging.reference.GATEWAY_HTTP_PROBE_SAMPLES + 1)
+                for path in staging.reference.GATEWAY_HTTP_ROUTES
+            ]
+            matrix_evidence.update({
+                "schema_version": 1,
+                "kind_cluster": cluster,
+                "probe_mode": "strict-t084-all-nodes",
+                "runtime_before": runtime,
+                "runtime_after": copy.deepcopy(runtime),
+                "routes": list(staging.reference.GATEWAY_HTTP_ROUTES),
+                "samples_per_route": staging.reference.GATEWAY_HTTP_PROBE_SAMPLES,
+                "expected_cells": len(cells),
+                "completed_cells": len(cells),
+                "cells": cells,
+            })
+            matrix_evidence["canonical_sha256"] = (
+                staging.reference.gateway_matrix_evidence_digest(matrix_evidence)
+            )
+        return self.probe.return_value
 
     def get_resource(self, kubectl, kind, name, namespace=""):
         if kind == "GatewayClass":
@@ -149,7 +216,8 @@ class StagingGatewayTests(unittest.TestCase):
         self.probe.return_value = witness
         staging.command_prove_gateway(self.args)
         self.probe.assert_called_once_with(
-            "kind", staging.DEFAULT_CLUSTER, ADDRESSES, 80
+            "kind", staging.DEFAULT_CLUSTER, ADDRESSES, 80,
+            verify_node_ids=True, matrix_evidence=mock.ANY,
         )
 
     def test_staging_gateway_first_503_fails_without_retry(self):
@@ -259,7 +327,10 @@ class StagingGatewayTests(unittest.TestCase):
                         ],
                     },
                 )
-        self.probe.assert_called_with("kind", staging.DEFAULT_CLUSTER, ADDRESSES, 80)
+        self.probe.assert_called_with(
+            "kind", staging.DEFAULT_CLUSTER, ADDRESSES, 80,
+            verify_node_ids=True, matrix_evidence=mock.ANY,
+        )
 
     def test_owner_commit_pending_activation_and_promotion_fail_before_apply(self):
         variants = [
@@ -285,7 +356,7 @@ class StagingGatewayTests(unittest.TestCase):
         self.assertEqual(pending["status"], "gateway-proof-in-progress")
         self.assertNotIn("gateway_proof", pending)
         self.assertFalse((self.root / "receipts/gateway-proof.json").exists())
-        self.probe.side_effect = None
+        self.probe.side_effect = self.simulated_gateway_matrix
         staging.command_prove_gateway(self.args)
         self.assertEqual(
             staging.load_cell_receipt(self.root)["status"], "gateway-ready"
@@ -408,19 +479,19 @@ class StagingGatewayTests(unittest.TestCase):
         observed["service"]["node_port"] = 31844
 
         self.assertTrue(
-            staging._gateway_receipt_observation_matches(receipt, observed)
+            staging.reference.gateway_receipt_observation_matches(receipt, observed)
         )
 
         changed_spec = copy.deepcopy(observed)
         changed_spec["service"]["spec_sha256"] = "b" * 64
         self.assertFalse(
-            staging._gateway_receipt_observation_matches(receipt, changed_spec)
+            staging.reference.gateway_receipt_observation_matches(receipt, changed_spec)
         )
 
         explicit_wrong_port = copy.deepcopy(receipt)
         explicit_wrong_port["service"]["node_port"] = 30001
         self.assertFalse(
-            staging._gateway_receipt_observation_matches(
+            staging.reference.gateway_receipt_observation_matches(
                 explicit_wrong_port, observed
             )
         )
@@ -723,6 +794,37 @@ class StagingGatewayTests(unittest.TestCase):
             self.assertFalse(
                 staging.gateway_receipt_current(self.root, cell, "kubectl")
             )
+
+    def test_gateway_receipt_reuse_rejects_rehashed_missing_matrix_sample(self):
+        result = staging.command_prove_gateway(self.args)
+        path = self.root / "receipts/gateway-proof.json"
+        cell = staging.load_cell_receipt(self.root)
+        damaged = copy.deepcopy(result)
+        damaged["matrix_evidence"]["cells"].pop()
+        damaged["matrix_evidence"]["canonical_sha256"] = (
+            staging.reference.gateway_matrix_evidence_digest(damaged["matrix_evidence"])
+        )
+        staging.atomic_json(path, damaged)
+        cell["gateway_proof"]["receipt_sha256"] = staging.sha256_file(path)
+        cell["gateway_proof"]["matrix_sha256"] = (
+            damaged["matrix_evidence"]["canonical_sha256"]
+        )
+        self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
+
+    def test_gateway_receipt_reuse_rejects_live_owner_and_container_drift(self):
+        staging.command_prove_gateway(self.args)
+        cell = staging.load_cell_receipt(self.root)
+        with mock.patch.object(
+            staging.reference, "gateway_address_owners",
+            return_value={ADDRESSES[0]: "kind-worker-2", ADDRESSES[1]: "kind-worker"},
+        ):
+            self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
+        with mock.patch.object(
+            staging.reference, "gateway_node_container_ids",
+            return_value={"kind-worker": "0" * 64, "kind-worker-2": "b" * 64},
+        ):
+            self.assertFalse(staging.gateway_receipt_current(self.root, cell, "kubectl"))
+        self.assertTrue(staging.gateway_receipt_current(self.root, cell, "kubectl"))
 
     def test_status_rejects_gateway_binding_annotation_drift(self):
         staging.command_prove_gateway(self.args)

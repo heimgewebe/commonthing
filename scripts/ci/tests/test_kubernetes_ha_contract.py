@@ -2608,5 +2608,151 @@ spec:
                 self.ha.ref.prove_gateway("kubectl", "kind", "proof")
 
 
+    def test_gateway_matrix_receipt_contains_all_cells_and_rejects_tampering(self) -> None:
+        """Even with a recomputed digest, partial or reordered paths never pass."""
+        nodes = ["node-a", "node-b"]
+        ips = ["10.0.0.1", "10.0.0.2"]
+        owners = dict(zip(ips, nodes, strict=True))
+        containers = {"node-a": "a" * 64, "node-b": "b" * 64}
+
+        def healthy(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            body = b"[]" if argv[-1].endswith("/api/nodes") else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"200")
+
+        evidence: dict = {}
+        with (
+            mock.patch.object(self.ha.ref, "gateway_address_owners", return_value=owners),
+            mock.patch.object(self.ha.ref, "kind_nodes", return_value=nodes),
+            mock.patch.object(self.ha.ref, "gateway_node_container_ids", return_value=containers),
+            mock.patch.object(self.ha.ref.subprocess, "run", side_effect=healthy) as calls,
+        ):
+            witness = self.ha.ref.probe_gateway_http(
+                "kind", "proof", ips, 80, timeout_seconds=120,
+                matrix_evidence=evidence,
+            )
+        self.assertEqual(witness[0:2], ("node-a", "10.0.0.1"))
+        self.assertEqual(calls.call_count, 36)
+        self.assertEqual(evidence["expected_cells"], 36)
+        self.assertEqual(evidence["completed_cells"], 36)
+        self.assertEqual(len(evidence["cells"]), 36)
+        self.assertEqual(evidence["probe_mode"], "strict-t084-all-nodes")
+        self.assertEqual(evidence["runtime_before"], evidence["runtime_after"])
+        self.assertIn("canonical_sha256", evidence)
+        self.assertNotIn("healthy", json.dumps(evidence))
+        self.ha.ref.validate_gateway_matrix_evidence(
+            evidence, expected_runtime=evidence["runtime_before"],
+            expected_mode="strict-t084-all-nodes",
+        )
+
+        def copy_receipt() -> dict:
+            return json.loads(json.dumps(evidence))
+
+        altered: list[tuple[str, dict]] = []
+        missing = copy_receipt()
+        missing["cells"].pop()
+        altered.append(("missing sample", missing))
+        false_count = copy_receipt()
+        false_count["completed_cells"] = 9
+        altered.append(("falsified count", false_count))
+        reordered = copy_receipt()
+        reordered["cells"][0], reordered["cells"][1] = reordered["cells"][1], reordered["cells"][0]
+        altered.append(("reordered cells", reordered))
+        wrong_owner = copy_receipt()
+        wrong_owner["runtime_before"]["owner_by_address"]["10.0.0.1"] = "node-b"
+        wrong_owner["runtime_after"]["owner_by_address"]["10.0.0.1"] = "node-b"
+        altered.append(("wrong owner", wrong_owner))
+        missing_listener = copy_receipt()
+        missing_listener["runtime_before"]["listeners"].pop()
+        missing_listener["runtime_after"]["listeners"].pop()
+        altered.append(("omitted listener", missing_listener))
+        forged_sample = copy_receipt()
+        forged_sample["cells"][0]["sample"] = 3
+        altered.append(("wrong sample index", forged_sample))
+        tampered_body = copy_receipt()
+        tampered_body["cells"][0]["body_sha256"] = "f" * 64
+        altered.append(("changed response digest", tampered_body))
+        tampered_status = copy_receipt()
+        tampered_status["cells"][0]["http_status"] = 503
+        altered.append(("unhealthy HTTP status", tampered_status))
+        for label, candidate in altered:
+            with self.subTest(label=label):
+                candidate["canonical_sha256"] = self.ha.ref.gateway_matrix_evidence_digest(candidate)
+                with self.assertRaises(self.ha.ref.ProofError):
+                    self.ha.ref.validate_gateway_matrix_evidence(
+                        candidate, expected_runtime=evidence["runtime_before"],
+                        expected_digest=evidence["canonical_sha256"],
+                    )
+        bad_digest = copy_receipt()
+        bad_digest["canonical_sha256"] = "0" * 64
+        with self.assertRaisesRegex(self.ha.ref.ProofError, "digest mismatch"):
+            self.ha.ref.validate_gateway_matrix_evidence(bad_digest)
+        with self.assertRaisesRegex(self.ha.ref.ProofError, "stale"):
+            self.ha.ref.validate_gateway_matrix_evidence(
+                evidence, expected_runtime={**evidence["runtime_before"], "port": 8080},
+            )
+
+    def test_gateway_matrix_receipt_never_accepts_503_after_healthy_responses(self) -> None:
+        owners = {"10.0.0.1": "node-a"}
+        responses = [b"200", b"200", b"200", b"503", b"200"]
+        evidence: dict = {}
+
+        def respond(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            http = responses.pop(0)
+            body = b"[]" if argv[-1].endswith("/api/nodes") else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=http)
+
+        with (
+            mock.patch.object(self.ha.ref, "gateway_address_owners", return_value=owners),
+            mock.patch.object(self.ha.ref, "kind_nodes", return_value=["node-a"]),
+            mock.patch.object(
+                self.ha.ref, "gateway_node_container_ids", return_value={"node-a": "a" * 64}
+            ),
+            mock.patch.object(self.ha.ref.subprocess, "run", side_effect=respond) as http_calls,
+        ):
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "exactly HTTP 200"):
+                self.ha.ref.probe_gateway_http(
+                    "kind", "proof", ["10.0.0.1"], 80,
+                    matrix_evidence=evidence,
+                )
+        self.assertEqual(http_calls.call_count, 4)
+        self.assertEqual(evidence, {})
+        self.assertEqual(responses, [b"200"])
+
+    def test_gateway_owner_local_receipt_only_contains_owner_routes(self) -> None:
+        owners = {"10.0.0.1": "node-a", "10.0.0.2": "node-b"}
+        receipt: dict = {}
+        with (
+            mock.patch.object(self.ha.ref, "gateway_address_owners", return_value=owners),
+            mock.patch.object(self.ha.ref, "kind_nodes", return_value=["node-a", "node-b"]),
+            mock.patch.object(
+                self.ha.ref, "gateway_node_container_ids",
+                return_value={"node-a": "a" * 64, "node-b": "b" * 64},
+            ),
+            mock.patch.object(
+                self.ha.ref.subprocess, "run",
+                side_effect=lambda argv, **kwargs: subprocess.CompletedProcess(
+                    argv, 0,
+                    stdout=b"[]" if argv[-1].endswith("/api/nodes") else b"healthy",
+                    stderr=b"200",
+                ),
+            ),
+        ):
+            self.ha.ref.probe_gateway_http(
+                "kind", "proof", list(owners), 80, owner_local=True,
+                matrix_evidence=receipt,
+            )
+        self.assertEqual(receipt["expected_cells"], 18)
+        self.assertEqual(receipt["probe_mode"], "owner-local-ha")
+        self.assertTrue(
+            all(
+                owners[cell["listener_ip"]] == cell["source_node"]
+                for cell in receipt["cells"]
+            )
+        )
+        self.ha.ref.validate_gateway_matrix_evidence(
+            receipt, expected_mode="owner-local-ha",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

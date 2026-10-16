@@ -2077,6 +2077,191 @@ def gateway_node_container_ids(nodes: list[str]) -> dict[str, str]:
     return identities
 
 
+GATEWAY_HTTP_ROUTES = ("/health/live", "/", "/api/nodes")
+
+
+def gateway_matrix_evidence_digest(document: dict[str, Any]) -> str:
+    """Canonical SHA-256 over the complete (body-free) measured matrix."""
+    unsigned = {key: value for key, value in document.items() if key != "canonical_sha256"}
+    canonical = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_gateway_matrix_evidence(
+    document: dict[str, Any],
+    *,
+    expected_runtime: dict[str, Any] | None = None,
+    expected_mode: str | None = None,
+    expected_digest: str | None = None,
+) -> None:
+    """Reject omitted/reordered cells, stale runtime bindings and forged counters.
+
+    This checks the internal evidence contract. Authenticity of its producer
+    and the actual HTTP observations require the bound external runtime receipt.
+    """
+    required = {
+        "schema_version", "kind_cluster", "probe_mode", "runtime_before",
+        "runtime_after", "routes", "samples_per_route", "expected_cells",
+        "completed_cells", "cells", "canonical_sha256",
+    }
+    if not isinstance(document, dict) or set(document) != required:
+        raise ProofError("Gateway matrix evidence is absent or has invalid fields")
+    if document["schema_version"] != 1 or type(document["schema_version"]) is not int:
+        raise ProofError("Gateway matrix evidence schema is invalid")
+    mode = document["probe_mode"]
+    if mode not in ("strict-t084-all-nodes", "owner-local-ha"):
+        raise ProofError("Gateway matrix evidence has invalid probe mode")
+    if expected_mode is not None and mode != expected_mode:
+        raise ProofError("Gateway matrix evidence is for the wrong probe mode")
+    if not isinstance(document["kind_cluster"], str) or not document["kind_cluster"]:
+        raise ProofError("Gateway matrix evidence has no cluster identity")
+    before, after = document["runtime_before"], document["runtime_after"]
+    runtime_keys = {"nodes", "listeners", "owner_by_address", "container_ids", "port"}
+    if (
+        not isinstance(before, dict) or not isinstance(after, dict)
+        or set(before) != runtime_keys or set(after) != runtime_keys
+        or before != after
+    ):
+        raise ProofError("Gateway matrix runtime identity changed during proof")
+    if expected_runtime is not None and before != expected_runtime:
+        raise ProofError("Gateway matrix runtime identity is stale or differs from live readback")
+    nodes, addresses, owners, containers = (
+        before["nodes"], before["listeners"],
+        before["owner_by_address"], before["container_ids"],
+    )
+    if (
+        not isinstance(nodes, list) or not nodes
+        or not all(isinstance(node, str) and node for node in nodes)
+        or len(nodes) != len(set(nodes))
+        or not isinstance(addresses, list) or not addresses
+        or not all(isinstance(addr, str) and addr for addr in addresses)
+        or len(addresses) != len(set(addresses))
+        or not isinstance(owners, dict) or set(owners) != set(addresses)
+        or any(owner not in nodes for owner in owners.values())
+        or not isinstance(containers, dict) or set(containers) != set(nodes)
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in containers.values()
+        )
+        or type(before["port"]) is not int or not 1 <= before["port"] <= 65535
+    ):
+        raise ProofError("Gateway matrix runtime snapshot is invalid")
+    if document["routes"] != list(GATEWAY_HTTP_ROUTES):
+        raise ProofError("Gateway matrix route contract was modified")
+    if (
+        type(document["samples_per_route"]) is not int
+        or document["samples_per_route"] != GATEWAY_HTTP_PROBE_SAMPLES
+    ):
+        raise ProofError("Gateway matrix sample contract was modified")
+    if not isinstance(document["cells"], list):
+        raise ProofError("Gateway matrix cells are absent")
+    required_cells = [
+        (node, address, sample, route)
+        for node in nodes
+        for address in addresses
+        if mode == "strict-t084-all-nodes" or owners[address] == node
+        for sample in range(1, GATEWAY_HTTP_PROBE_SAMPLES + 1)
+        for route in GATEWAY_HTTP_ROUTES
+    ]
+    if (
+        type(document["expected_cells"]) is not int
+        or type(document["completed_cells"]) is not int
+        or document["expected_cells"] != len(required_cells)
+        or document["completed_cells"] != len(required_cells)
+        or len(document["cells"]) != len(required_cells)
+    ):
+        raise ProofError("Gateway matrix cell count does not match the contract")
+    cell_keys = {
+        "source_node", "listener_ip", "sample", "route",
+        "http_status", "transport_result", "body_sha256", "body_bytes",
+    }
+    for cell, (node, address, sample, route) in zip(
+        document["cells"], required_cells, strict=True,
+    ):
+        if not isinstance(cell, dict) or set(cell) != cell_keys:
+            raise ProofError("Gateway matrix has malformed cell evidence")
+        if (
+            (cell["source_node"], cell["listener_ip"], cell["sample"], cell["route"])
+            != (node, address, sample, route)
+            or type(cell["sample"]) is not int
+            or type(cell["http_status"]) is not int
+            or cell["http_status"] != 200
+            or cell["transport_result"] != "ok"
+            or not isinstance(cell["body_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", cell["body_sha256"]) is None
+            or type(cell["body_bytes"]) is not int
+            or cell["body_bytes"] <= 0
+        ):
+            raise ProofError("Gateway matrix contains a missing, reordered or invalid sample")
+    if (
+        not isinstance(document["canonical_sha256"], str)
+        or document["canonical_sha256"] != gateway_matrix_evidence_digest(document)
+    ):
+        raise ProofError("Gateway matrix evidence canonical digest mismatch")
+    if expected_digest is not None and document["canonical_sha256"] != expected_digest:
+        raise ProofError("Gateway matrix evidence digest differs from externally bound receipt")
+
+
+def gateway_receipt_observation_matches(
+    receipt: dict[str, Any], observed: dict[str, Any]
+) -> bool:
+    if all(receipt.get(key) == value for key, value in observed.items()):
+        return True
+
+    # Gateway receipts created before the host-external proof contract recorded
+    # the complete Service spec hash but not node_port as a separate field.
+    # The spec hash already commits to the live NodePort, so accepting exactly
+    # this missing redundant field preserves the old proof without weakening
+    # any resource, UID, routing, address or Service-spec binding.
+    receipt_service = receipt.get("service")
+    observed_service = observed.get("service")
+    if (
+        not isinstance(receipt_service, dict)
+        or "node_port" in receipt_service
+        or not isinstance(observed_service, dict)
+        or not isinstance(observed_service.get("node_port"), int)
+        or isinstance(observed_service.get("node_port"), bool)
+    ):
+        return False
+    legacy_service = {
+        key: value for key, value in observed_service.items() if key != "node_port"
+    }
+    legacy_observed = {**observed, "service": legacy_service}
+    return all(receipt.get(key) == value for key, value in legacy_observed.items())
+
+def gateway_matrix_live_runtime(
+    kind: str, cluster: str, addresses: list[str], port: int,
+) -> dict[str, Any]:
+    """Authoritative Kind source/owner/container state for receipt validation."""
+    nodes = kind_nodes(kind, cluster)
+    return {
+        "nodes": nodes,
+        "listeners": list(addresses),
+        "owner_by_address": gateway_address_owners(kind, cluster, addresses),
+        "container_ids": gateway_node_container_ids(nodes),
+        "port": port,
+    }
+
+
+def validate_gateway_matrix_live(
+    document: dict[str, Any], *,
+    kind: str, cluster: str, addresses: list[str], port: int,
+    owner_local: bool = False, expected_digest: str | None = None,
+) -> None:
+    """Validate all cells and compare their binding to the actual live runtime."""
+    validate_gateway_matrix_evidence(
+        document,
+        expected_runtime=gateway_matrix_live_runtime(kind, cluster, addresses, port),
+        expected_mode="owner-local-ha" if owner_local else "strict-t084-all-nodes",
+        expected_digest=expected_digest,
+    )
+    if document["kind_cluster"] != cluster:
+        raise ProofError("Gateway matrix proof has a stale cluster identity")
+
+
 def probe_gateway_http(
     kind: str,
     cluster: str,
@@ -2086,6 +2271,7 @@ def probe_gateway_http(
     *,
     owner_local: bool = False,
     verify_node_ids: bool = False,
+    matrix_evidence: dict[str, Any] | None = None,
 ) -> tuple[str, str, bytes, bytes, bytes]:
     """Require strict T084 or explicitly owner-local HA HTTP matrix.
 
@@ -2099,7 +2285,15 @@ def probe_gateway_http(
         raise ProofError(
             f"Gateway owner node missing from current kind node inventory: {sorted(missing_owners)}"
         )
-    before_container_ids = gateway_node_container_ids(nodes) if verify_node_ids else None
+    before_container_ids = gateway_node_container_ids(nodes) if verify_node_ids or matrix_evidence is not None else None
+    runtime_before = {
+        "nodes": list(nodes),
+        "listeners": list(addresses),
+        "owner_by_address": dict(owners),
+        "container_ids": dict(before_container_ids or {}),
+        "port": port,
+    }
+    cells: list[dict[str, Any]] = []
     if timeout_seconds is None:
         # A bounded curl on each required source/listener/route/sample.
         # HA accepts only owner-local paths; T084 remains all-node/all-listener.
@@ -2131,8 +2325,12 @@ def probe_gateway_http(
                     "--max-time",
                     "10",
                 ]
+                if matrix_evidence is not None:
+                    # Capture HTTP status separately from response body, without
+                    # writing response content or credentials to the receipt.
+                    common.extend(("--write-out", "%{stderr}%{http_code}"))
                 bodies: dict[str, bytes] = {}
-                for path in ("/health/live", "/", "/api/nodes"):
+                for path in GATEWAY_HTTP_ROUTES:
                     try:
                         response = subprocess.run(
                             [*common, f"http://{address}:{port}{path}"],
@@ -2148,6 +2346,24 @@ def probe_gateway_http(
                             f"node={node!r} address={address!r} route={path!r} "
                             f"sample={sample}"
                         ) from error
+                    if matrix_evidence is not None:
+                        status_bytes = response.stderr
+                        if status_bytes != b"200":
+                            raise GatewayTransportNotReady(
+                                "Gateway matrix requires exactly HTTP 200: "
+                                f"node={node!r} address={address!r} route={path!r} "
+                                f"sample={sample} status={status_bytes!r}"
+                            )
+                        cells.append({
+                            "source_node": node,
+                            "listener_ip": address,
+                            "sample": sample,
+                            "route": path,
+                            "http_status": 200,
+                            "transport_result": "ok",
+                            "body_sha256": hashlib.sha256(response.stdout).hexdigest(),
+                            "body_bytes": len(response.stdout),
+                        })
                     bodies[path] = response.stdout
                 health = bodies["/health/live"]
                 web = bodies["/"][:1024]
@@ -2186,17 +2402,46 @@ def probe_gateway_http(
     after_owners = gateway_address_owners(kind, cluster, addresses)
     if sorted(after_nodes) != sorted(nodes) or after_owners != owners:
         raise ProofError("Gateway source-node inventory or listener owners drifted during matrix")
+    after_container_ids: dict[str, str] | None = None
     if before_container_ids is not None:
         after_container_ids = gateway_node_container_ids(after_nodes)
         if after_container_ids != before_container_ids:
             raise ProofError("Gateway Kind container identity drifted during matrix")
+    if matrix_evidence is not None:
+        runtime_after = {
+            "nodes": list(after_nodes),
+            "listeners": list(addresses),
+            "owner_by_address": dict(after_owners),
+            "container_ids": dict(after_container_ids or {}),
+            "port": port,
+        }
+        evidence = {
+            "schema_version": 1,
+            "kind_cluster": cluster,
+            "probe_mode": "owner-local-ha" if owner_local else "strict-t084-all-nodes",
+            "runtime_before": runtime_before,
+            "runtime_after": runtime_after,
+            "routes": list(GATEWAY_HTTP_ROUTES),
+            "samples_per_route": GATEWAY_HTTP_PROBE_SAMPLES,
+            "expected_cells": (
+                (len(addresses) if owner_local else len(nodes) * len(addresses))
+                * GATEWAY_HTTP_PROBE_SAMPLES * len(GATEWAY_HTTP_ROUTES)
+            ),
+            "completed_cells": len(cells),
+            "cells": cells,
+        }
+        evidence["canonical_sha256"] = gateway_matrix_evidence_digest(evidence)
+        validate_gateway_matrix_evidence(evidence, expected_runtime=runtime_before)
+        matrix_evidence.clear()
+        matrix_evidence.update(evidence)
     return witness
 
 
 
 def probe_gateway_after_readiness(
     kind: str, cluster: str, addresses: list[str], port: int,
-    *, owner_local: bool = False, verify_node_ids: bool = False
+    *, owner_local: bool = False, verify_node_ids: bool = False,
+    matrix_evidence: dict[str, Any] | None = None,
 ) -> tuple[str, str, bytes, bytes, bytes]:
     """After control-plane readiness, run exactly one fail-closed HTTP matrix.
 
@@ -2207,15 +2452,17 @@ def probe_gateway_after_readiness(
         return probe_gateway_http(
             kind, cluster, addresses, port,
             owner_local=True, verify_node_ids=verify_node_ids,
+            matrix_evidence=matrix_evidence,
         )
     return probe_gateway_http(
         kind, cluster, addresses, port, verify_node_ids=verify_node_ids,
+        matrix_evidence=matrix_evidence,
     )
 
 
 def prove_gateway(
     kubectl: str, kind: str, cluster: str, *, owner_local: bool = False
-) -> dict[str, str]:
+) -> dict[str, Any]:
     wait_condition(kubectl, "weltgewebe-gateway", "gateway/weltgewebe", "Programmed")
     wait_http_route_parent_condition(
         kubectl,
@@ -2253,12 +2500,18 @@ def prove_gateway(
     service_port = gateway_service_listener_port(kubectl, service, listener_port)
     # Neither mode retries a single 503. HA measures owner-local paths;
     # T084 remains strict across every node, listener, route and sample.
+    matrix_evidence: dict[str, Any] = {}
     probe_node, address, health, web, api_nodes = probe_gateway_after_readiness(
         kind, cluster, addresses, service_port,
         owner_local=owner_local, verify_node_ids=True,
+        matrix_evidence=matrix_evidence,
     )
     if sorted(gateway_addresses(kubectl)) != sorted(addresses):
         raise ProofError("Gateway advertised listener IP set drifted during matrix")
+    validate_gateway_matrix_live(
+        matrix_evidence, kind=kind, cluster=cluster, addresses=addresses,
+        port=service_port, owner_local=owner_local,
+    )
     return {
         "service": service,
         "probe_node": probe_node,
@@ -2267,6 +2520,7 @@ def prove_gateway(
         "health_sha256": hashlib.sha256(health).hexdigest(),
         "web_prefix_sha256": hashlib.sha256(web).hexdigest(),
         "api_nodes_sha256": hashlib.sha256(api_nodes).hexdigest(),
+        "matrix_evidence": matrix_evidence,
     }
 
 
