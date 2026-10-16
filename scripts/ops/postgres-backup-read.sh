@@ -1,5 +1,9 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Read-only interface for the off-host PostgreSQL backup pull on commonserver.
+#
+# The interpreter is absolute and privileged mode (-p) is set: it runs as root
+# for a less privileged caller, so neither a caller PATH (without sudo
+# secure_path) nor BASH_ENV, SHELLOPTS or exported functions may choose code.
 #
 # Installed root:root 0755 as /usr/local/libexec/weltgewebe/postgres-backup-read
 # and granted to the pull account by a sudoers rule that names only this path

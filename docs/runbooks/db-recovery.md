@@ -371,6 +371,9 @@ Argumentgrenze liegt daher im Wrapper selbst:
 - Namen nur `^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$` ohne `..`; das
   Backupverzeichnis ist im Wrapper fest verdrahtet und hängt an jeden Namen
   ein festes Suffix, der Klartext-Dump ist damit nicht adressierbar;
+- der Interpreter ist absolut (`#!/bin/bash -p`): weder ein `PATH` des
+  Aufrufers (ohne `secure_path`) noch `BASH_ENV` oder exportierte Funktionen
+  bestimmen, welcher Code als root läuft;
 - Backup- und Proof-Verzeichnis müssen echte, root-eigene Verzeichnisse ohne
   Gruppen-/Weltschreibrecht sein; gelesen werden nur reguläre Dateien, ohne
   Symlinks zu folgen (`dd iflag=nofollow`).

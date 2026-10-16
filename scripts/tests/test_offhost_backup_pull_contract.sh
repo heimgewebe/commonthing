@@ -513,6 +513,20 @@ expect_reader_failure() {
   fi
 }
 [[ "$("$rreader" latest weltgewebe-postgres)" == "$rbase.age.sha256.manifest" ]]
+# The caller's environment must not choose code that runs as root: no PATH
+# lookup for the interpreter, no BASH_ENV, no imported functions.
+[[ "$(head -n1 "$READER_SOURCE")" == '#!/bin/bash -p' ]]
+mkdir -p "$root/evil-bin"
+printf '#!/bin/sh\necho evil-bash-ran\n' > "$root/evil-bin/bash"
+printf 'echo evil-bash-env-ran\n' > "$root/evil-bash-env"
+chmod 755 "$root/evil-bin/bash"
+evil_out="$(env PATH="$root/evil-bin:$PATH" BASH_ENV="$root/evil-bash-env" \
+  'BASH_FUNC_find%%=() { echo evil-function-ran; }' \
+  "$rreader" latest weltgewebe-postgres 2>&1)"
+[[ "$evil_out" == "$rbase.age.sha256.manifest" ]] || {
+  printf 'reader honoured caller-controlled code: %s\n' "$evil_out" >&2
+  exit 1
+}
 cmp -s <("$rreader" read "$rbase" ciphertext) "$rdir/$rbase.sql.gz.age"
 cmp -s <("$rreader" read "$rbase" age-manifest) "$rdir/$rbase.age.sha256.manifest"
 cmp -s <("$rreader" read "$rbase" manifest) "$rdir/$rbase.sha256.manifest"
