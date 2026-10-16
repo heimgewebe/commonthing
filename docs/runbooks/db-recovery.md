@@ -214,7 +214,11 @@ Der Pull läuft fail-closed. Er wählt den neuesten vollständigen Satz über da
 Off-Host-Manifest (`*.age.sha256.manifest`), das `postgres-backup.sh` als
 letzte Datei veröffentlicht; ein abgebrochener Lauf mit Chiffrat ohne dieses
 Manifest wird übergangen. Übertragen wird nur das zugehörige
-`*.sql.gz.age`, der Klartext-Dump wird nie über SSH angefordert. Findet er
+`*.sql.gz.age`, der Klartext-Dump wird nie über SSH angefordert. Jeder
+Fernzugriff läuft über den root-eigenen Lese-Wrapper
+`/usr/local/libexec/weltgewebe/postgres-backup-read`
+(`scripts/ops/postgres-backup-read.sh`, siehe unten); der Pull ruft per
+`sudo -n` nichts anderes auf. Findet er
 keinen vollständigen Satz (z. B. weil auf dem Host kein Empfänger
 konfiguriert ist), bricht er ab. Er
 prüft Dateinamen, Vertrag, SHA256 und Größe des Chiffrats gegen das
@@ -252,13 +256,11 @@ Off-Host-Pull nicht still unterbrechen:
 
 ```bash
 set -euo pipefail
-backup_dir=/var/backups/weltgewebe/postgres
+reader=/usr/local/libexec/weltgewebe/postgres-backup-read
 getent hosts commonserver > /dev/null
 age_manifest="$(
   ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-    "sudo -n find '$backup_dir' -maxdepth 1 -type f -name 'weltgewebe-postgres-*.age.sha256.manifest' -printf '%f\\n'" |
-    sort |
-    tail -n1
+    "sudo -n '$reader' latest weltgewebe-postgres"
 )"
 if [[ "$age_manifest" != weltgewebe-postgres-*.age.sha256.manifest ]]; then
   printf 'Kein vollständiges verschlüsseltes PostgreSQL-Backup auf commonserver gefunden.\n' >&2
@@ -269,15 +271,27 @@ fi
   exit 1
 }
 base="${age_manifest%.age.sha256.manifest}"
-for file in "$age_manifest" "$base.sql.gz.age" "$base.sha256.manifest"; do
+for kind in age-manifest ciphertext manifest; do
   ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-    "sudo -n cat -- '$backup_dir/$file'" > /dev/null
+    "sudo -n '$reader' read '$base' '$kind'" > /dev/null
 done
-# Der Wochen-Proof ist optional und fehlt oft für das neueste Backup. Daher
-# nur die Sudo-Berechtigung prüfen (`sudo -l`), nicht die Existenz der Datei.
-proof="$backup_dir/proofs/$base.restore-proof"
-ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-  "sudo -n -l test -f '$proof' && sudo -n -l cat -- '$proof'" > /dev/null
+# Der Wochen-Proof ist optional und fehlt oft für das neueste Backup. Daher nur
+# einen eindeutigen Zustand verlangen; ein vorhandener Proof muss lesbar sein.
+proof_state="$(
+  ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
+    "sudo -n '$reader' proof-state '$base'"
+)"
+case "$proof_state" in
+  absent) ;;
+  present)
+    ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
+      "sudo -n '$reader' read '$base' proof" > /dev/null
+    ;;
+  *)
+    printf 'Unerwarteter Proof-Zustand: %s\n' "$proof_state" >&2
+    exit 1
+    ;;
+esac
 # Jeder Empfänger des neuesten Backups muss auf heim-pc gepinnt sein.
 # Gleiche Regeln wie im Pull: genau ein Feld, kanonische Liste, keine Doppelten.
 # Die Pin-Datei wird wie im Pull geparst: lesbar, kein privater Schlüssel,
@@ -308,7 +322,7 @@ done < "$pinned"
 }
 age_manifest_text="$(
   ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
-    "sudo -n cat -- '$backup_dir/$age_manifest'"
+    "sudo -n '$reader' read '$base' age-manifest"
 )"
 [[ "$(grep -c '^recipients=' <<< "$age_manifest_text")" == 1 ]] || {
   printf 'Off-Host-Manifest muss recipients= genau einmal enthalten.\n' >&2
@@ -333,30 +347,82 @@ for recipient in "${backup_recipients[@]}"; do
 done
 ```
 
-Damit werden genau die privilegierten Operationen geprüft, die auch der Pull
-verwendet: `find` auf die Abschlussmarker, `cat` auf Abschlussmarker,
-Chiffrat und Klartext-Manifest sowie `test -f` und `cat` auf den optionalen
-Restore-Proof unter `proofs/`. Der Pull selbst prüft dieselbe Berechtigung per
-`sudo -n -l` und bricht ab, wenn sie fehlt oder die SSH-Verbindung bei der
-Proof-Abfrage scheitert; nur ein eindeutig fehlender Proof wird übergangen.
-Der Preflight findet eine fehlende Regel aber schon vor der Aktivierung. Befehlsbezogene
-**Sicherheitssperre für den aktuellen Entwurf:** Sudoers-Globs wie
-`*.sha256.manifest` sind **keine** enge Argumentautorisierung. In
-Sudoers können Platzhalter auch Leerzeichen, zusätzliche Argumente und
-Pfadkomponenten erfassen. Daher dürfen die unten beschriebenen direkten
-`sudo find`-, `sudo cat`- und `sudo test`-Aufrufe **noch nicht**
-als produktionssichere Freigabe konfiguriert werden. Vor einem Rollout ist
-ein root-eigener, nicht durch den Pull-Account modifizierbarer Lese-Wrapper
-mit strikt geprüftem Basename, no-follow-Dateizugriff und negativ getesteter
-Sudoers-Argumentgrenze notwendig. Anschließend müssen Pullskript und
-produktiver Preflight dieselbe Schnittstelle verwenden.
+Damit wird genau die privilegierte Schnittstelle geprüft, die auch der Pull
+verwendet: `latest`, `read` für Off-Host-Manifest, Chiffrat und
+Klartext-Manifest sowie `proof-state` und gegebenenfalls `read … proof` für
+den optionalen Restore-Proof. Der Pull bricht ab, wenn SSH, sudo oder der
+Wrapper bei der Proof-Abfrage scheitern; nur ein eindeutig fehlender Proof
+(`absent`) wird übergangen. Der Preflight findet eine fehlende Regel schon vor
+der Aktivierung.
 
-Ein allgemeines `sudo -n true` reicht bei
-befehlsbezogenen Sudoers-Regeln nicht aus. Der Readback vom 2026-09-10 hat
-DNS/SSH sowie die damalige `find`-/`cat`-Prüfung auf `*.sql.gz` erfolgreich
-bestanden; für das age-Muster liegt noch kein Runtime-Readback vor.
+**Lese-Wrapper und Sudoers auf `commonserver`:**
+
+Direkte `sudo find`-, `sudo cat`- und `sudo test`-Regeln sind **nicht**
+zulässig: Sudoers-Platzhalter wie `*.sha256.manifest` erfassen auch
+Leerzeichen, zusätzliche Argumente und Pfadkomponenten und sind deshalb keine
+enge Argumentautorisierung. Stattdessen erhält das Pull-Konto genau einen
+Befehl, den root-eigenen Wrapper `scripts/ops/postgres-backup-read.sh`. Eine
+Sudoers-Regel ohne Argumentliste erlaubt beliebige Argumente; die
+Argumentgrenze liegt daher im Wrapper selbst:
+
+- nur `latest PREFIX`, `read BASE KIND` (`ciphertext`, `age-manifest`,
+  `manifest`, `proof`) und `proof-state BASE`, jeweils mit exakter
+  Argumentanzahl;
+- Namen nur `^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$` ohne `..`; das
+  Backupverzeichnis ist im Wrapper fest verdrahtet und hängt an jeden Namen
+  ein festes Suffix, der Klartext-Dump ist damit nicht adressierbar;
+- Backup- und Proof-Verzeichnis müssen echte, root-eigene Verzeichnisse ohne
+  Gruppen-/Weltschreibrecht sein; gelesen werden nur reguläre Dateien, ohne
+  Symlinks zu folgen (`dd iflag=nofollow`).
+
+Die negativen Fälle (fremde Operationen, zusätzliche oder fehlende
+Argumente, Pfadbestandteile, Klartext-Suffix, Symlinks, FIFOs, unsichere
+Verzeichnisrechte, fremder Besitzer) prüft
+`scripts/tests/test_offhost_backup_pull_contract.sh`. Installation als root
+auf `commonserver` aus einem geprüften Checkout; `PULL_USER` ist das Konto,
+mit dem `heim-pc` sich per SSH anmeldet:
+
+```bash
+set -euo pipefail
+umask 022
+PULL_USER="${PULL_USER:?PULL_USER auf das SSH-Konto von heim-pc setzen}"
+reader=/usr/local/libexec/weltgewebe/postgres-backup-read
+install -d -o root -g root -m 0755 /usr/local/libexec/weltgewebe
+install -o root -g root -m 0755 scripts/ops/postgres-backup-read.sh "$reader"
+rule="$(mktemp)"
+printf '%s ALL=(root) NOPASSWD: %s\n' "$PULL_USER" "$reader" > "$rule"
+visudo -cf "$rule"
+install -o root -g root -m 0440 "$rule" /etc/sudoers.d/weltgewebe-postgres-backup-read
+rm -f -- "$rule"
+visudo -c
+```
+
+Alte Regeln für `find`, `cat` oder `test` auf das Backupverzeichnis danach
+entfernen. Erst ein Runtime-Readback schließt diese Sperre; isolierte
+Skripttests ersetzen ihn nicht. Von `heim-pc` aus:
+
+```bash
+set -euo pipefail
+reader=/usr/local/libexec/weltgewebe/postgres-backup-read
+ssh commonserver 'sudo -n -l' # nur der Wrapper, keine find/cat/test-Regel
+for denied in \
+  "sudo -n /usr/bin/cat /etc/shadow" \
+  "sudo -n /usr/bin/find /var/backups/weltgewebe/postgres" \
+  "sudo -n '$reader' read '../../../etc/shadow' manifest" \
+  "sudo -n '$reader' read 'weltgewebe-postgres-x' plaintext" \
+  "sudo -n '$reader' cat /var/backups/weltgewebe/postgres"; do
+  if ssh -o BatchMode=yes commonserver "$denied" > /dev/null 2>&1; then
+    printf 'Unerwartet erlaubt: %s\n' "$denied" >&2
+    exit 1
+  fi
+done
+```
+
+Ergebnis von `sudo -n -l`, Schleifenlauf und Datum als Beleg festhalten.
 `REMOTE_HOST` bleibt als expliziter Kompatibilitäts-Override erhalten; der
-Default und neue Installationen verwenden `commonserver`.
+Default und neue Installationen verwenden `commonserver`. `REMOTE_BACKUP_DIR`
+wird nicht mehr unterstützt und lässt den Pull abbrechen, weil der Wrapper das
+Verzeichnis festlegt.
 
 Anschließend installiert der folgende Befehl das Pullskript unter einem
 unveränderlichen, vollständigen Git-Commit, erzeugt daraus die User-Unit, legt
@@ -418,12 +484,46 @@ beabsichtigte öffentliche age-Identität abgleichen. Nur nach protokolliertem
 Recovery-PASS dürfen die alten Off-Host-Klartextkopien separat zur Entfernung
 freigegeben werden; deren Löschung ist **nicht** Teil dieses Skripts.
 
-**Verbleibende technische Sperre:** Das Staging verhindert neue Klartext-Pulls,
-unterbindet aber noch nicht automatisch laufende Restic-Snapshots von
-vorhandenen `*.sql.gz`-Altbeständen. Vor Produktivfreigabe ist eine
-reproduzierbar überprüfte Restic-Einschluss-/Ausschlussregel beziehungsweise
-ein fail-closed Snapshot-Gate mit negativem Test verpflichtend. Eine bloß
-dokumentierte Warnung oder deaktivierter Backup-Timer gilt nicht als Ersatz.
+**Restic-Snapshot-Gate:** Das Staging verhindert neue Klartext-Pulls, aber
+nicht, dass ein laufender Restic-Snapshot vorhandene `*.sql.gz`-Altbestände
+erneut erfasst. Dafür gibt es `scripts/ops/restic-plaintext-gate.sh`. Es
+bekommt die Snapshot-Quellen als absolute Pfade und bricht ab, sobald unter
+einer Quelle eine `*.sql.gz`-Datei oder ein so benannter Symlink liegt, auch
+über eine symlinkte Quellwurzel, sowie wenn eine Quelle fehlt oder nicht
+vollständig lesbar ist. Es liest nur und löscht nichts. Die negativen Fälle
+prüft `scripts/tests/test_offhost_backup_pull_contract.sh`. Der
+Off-Host-Installer legt das Gate commitgebunden neben das Pullskript
+(`~/.local/libexec/weltgewebe/<commit>/restic-plaintext-gate.sh`, Hash im
+`install.receipt`).
+
+Wirksam ist es erst als `ExecStartPre=` der Unit, die den Snapshot startet
+(laut Readback vom 15. Oktober 2026 `restic-backup-1930.service`). Die
+Quellliste des Gates muss exakt der Quellliste dieses Snapshots entsprechen;
+vorher mit `systemctl cat restic-backup-1930.service` (bzw. `--user`,
+passend zur tatsächlichen Unit) und dem gestarteten Skript abgleichen. Mit
+dem dort festgestellten Unit-Verzeichnis, zum Beispiel für eine User-Unit:
+
+```bash
+set -euo pipefail
+commit="$(git rev-parse HEAD)"
+gate="$HOME/.local/libexec/weltgewebe/$commit/restic-plaintext-gate.sh"
+dropin="$HOME/.config/systemd/user/restic-backup-1930.service.d"
+[[ -x "$gate" ]]
+install -d -m 0755 "$dropin"
+printf '[Service]\nExecStartPre=%s %s %s %s\n' "$gate" \
+  "$HOME/repos" "$HOME/artifacts/merges" "$HOME/.local/share/schauwerk/fundus" \
+  > "$dropin/weltgewebe-plaintext-gate.conf"
+systemctl --user daemon-reload
+systemctl --user cat restic-backup-1930.service
+```
+
+Erst ein negativer Lauf auf `heim-pc` schließt diese Sperre: eine
+inhaltsleere Testdatei `weltgewebe-postgres-gate-test.sql.gz` in eine Quelle
+legen, den Snapshot-Service starten und belegen, dass er vor `restic`
+fehlschlägt (`journalctl` zeigt `restic-plaintext-gate:` und keinen neuen
+Snapshot), die Testdatei entfernen und einen erfolgreichen Lauf belegen.
+Eine bloß dokumentierte Warnung oder ein deaktivierter Backup-Timer gilt
+nicht als Ersatz.
 
 
 Vor dem age-Vertrag hat der Pull Klartext-Dumps (`weltgewebe-postgres-*.sql.gz`)

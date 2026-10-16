@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Read-only interface for the off-host PostgreSQL backup pull on commonserver.
+#
+# Installed root:root 0755 as /usr/local/libexec/weltgewebe/postgres-backup-read
+# and granted to the pull account by a sudoers rule that names only this path
+# (scripts/ops/sudoers/weltgewebe-postgres-backup-read). Such a rule allows any
+# argument list, so this script is the argument boundary: it accepts exactly the
+# operations below, validates every name, reads only regular files without
+# following symlinks, and has no operation that can name the plaintext dump.
+#
+#   latest PREFIX           newest PREFIX-*.age.sha256.manifest basename
+#   read BASE KIND          KIND: ciphertext | age-manifest | manifest | proof
+#   proof-state BASE        "present" or "absent" for proofs/BASE.restore-proof
+set -euo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+
+# Fixed at install time; sudo resets the environment, and neither value may be
+# taken from the caller.
+readonly BACKUP_DIR=/var/backups/weltgewebe/postgres
+readonly BACKUP_OWNER_UID=0
+
+fail() {
+  printf 'postgres-backup-read: %s\n' "$*" >&2
+  exit 2
+}
+
+# A trusted directory is a real directory owned by the backup owner and not
+# writable by group or others, so nobody but that owner can plant entries.
+require_trusted_dir() {
+  local dir="$1" owner mode
+  [[ -d "$dir" && ! -L "$dir" ]] || fail "not a directory: $dir"
+  read -r owner mode < <(stat -c '%u %a' -- "$dir") || fail "cannot stat: $dir"
+  [[ "$owner" == "$BACKUP_OWNER_UID" ]] || fail "unexpected owner of $dir"
+  (((8#$mode & 8#022) == 0)) || fail "group or world writable: $dir"
+}
+
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ && "$1" != *..* ]]
+}
+
+read_regular_file() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" ]] || fail "not a regular file: ${path##*/}"
+  # iflag=nofollow closes the window between the check and the open: a symlink
+  # swapped in afterwards makes the open fail instead of being followed.
+  dd if="$path" iflag=nofollow bs=1M status=none
+}
+
+(($# >= 1)) || fail "usage: latest PREFIX | read BASE KIND | proof-state BASE"
+operation="$1"
+shift
+require_trusted_dir "$BACKUP_DIR"
+
+case "$operation" in
+  latest)
+    (($# == 1)) || fail "latest takes exactly one PREFIX"
+    valid_name "$1" || fail "invalid prefix"
+    find -P "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
+      -name "$1-*.age.sha256.manifest" -printf '%f\n' | sort | tail -n1
+    ;;
+  read)
+    (($# == 2)) || fail "read takes exactly BASE and KIND"
+    valid_name "$1" || fail "invalid backup name"
+    case "$2" in
+      ciphertext) read_regular_file "$BACKUP_DIR/$1.sql.gz.age" ;;
+      age-manifest) read_regular_file "$BACKUP_DIR/$1.age.sha256.manifest" ;;
+      manifest) read_regular_file "$BACKUP_DIR/$1.sha256.manifest" ;;
+      proof)
+        require_trusted_dir "$BACKUP_DIR/proofs"
+        read_regular_file "$BACKUP_DIR/proofs/$1.restore-proof"
+        ;;
+      *) fail "unsupported kind" ;;
+    esac
+    ;;
+  proof-state)
+    (($# == 1)) || fail "proof-state takes exactly one BASE"
+    valid_name "$1" || fail "invalid backup name"
+    proofs="$BACKUP_DIR/proofs"
+    if [[ ! -e "$proofs" && ! -L "$proofs" ]]; then
+      echo absent
+      exit 0
+    fi
+    require_trusted_dir "$proofs"
+    proof="$proofs/$1.restore-proof"
+    if [[ -f "$proof" && ! -L "$proof" ]]; then
+      echo present
+    elif [[ ! -e "$proof" && ! -L "$proof" ]]; then
+      echo absent
+    else
+      fail "restore proof is not a regular file"
+    fi
+    ;;
+  *) fail "unsupported operation" ;;
+esac

@@ -18,7 +18,10 @@ require_cmd flock
 require_cmd realpath
 
 REMOTE_HOST="${REMOTE_HOST:-commonserver}"
-REMOTE_BACKUP_DIR="${REMOTE_BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
+# Every remote read goes through one root-owned, argument-validating reader
+# (scripts/ops/postgres-backup-read.sh); sudo grants nothing else. The backup
+# directory is fixed inside that reader, not chosen by this client.
+REMOTE_BACKUP_READER="${REMOTE_BACKUP_READER:-/usr/local/libexec/weltgewebe/postgres-backup-read}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-weltgewebe-postgres}"
 DEST_DIR="${DEST_DIR:-${HOME:?HOME must be set}/merges/weltgewebe-production-backups}"
 LOCAL_RETENTION_DAYS="${LOCAL_RETENTION_DAYS:-30}"
@@ -34,14 +37,21 @@ case "$PULL_MODE" in
 esac
 case "$LOCAL_RETENTION_DAYS" in '' | *[!0-9]*) fail "LOCAL_RETENTION_DAYS must be a non-negative integer" ;; esac
 # BACKUP_PREFIX enters a remotely evaluated SSH shell command. Treat it as
-# untrusted, like REMOTE_HOST and REMOTE_BACKUP_DIR, before making any SSH call.
+# untrusted, like REMOTE_HOST and REMOTE_BACKUP_READER, before making any SSH call.
 case "$BACKUP_PREFIX" in
   '' | *..* | *[!A-Za-z0-9._-]*) fail "BACKUP_PREFIX contains unsupported characters" ;;
 esac
 case "$REMOTE_HOST" in '' | *[!A-Za-z0-9._-]*) fail "REMOTE_HOST contains unsupported characters" ;; esac
-[[ "$REMOTE_BACKUP_DIR" == /var/backups/weltgewebe/* || "${ALLOW_TEST_REMOTE_BACKUP_DIR:-0}" == 1 ]] || fail "REMOTE_BACKUP_DIR must remain below /var/backups/weltgewebe"
-case "$REMOTE_BACKUP_DIR" in
-  *..* | *[!A-Za-z0-9._/-]*) fail "REMOTE_BACKUP_DIR contains unsupported characters" ;;
+# The reader fixes the directory; a leftover override must not be silently ignored.
+[[ -z "${REMOTE_BACKUP_DIR+x}" ]] || fail "REMOTE_BACKUP_DIR is no longer supported; the remote reader fixes the backup directory"
+[[ "$REMOTE_BACKUP_READER" == /usr/local/libexec/weltgewebe/postgres-backup-read || "${ALLOW_TEST_REMOTE_BACKUP_READER:-0}" == 1 ]] ||
+  fail "REMOTE_BACKUP_READER must be /usr/local/libexec/weltgewebe/postgres-backup-read"
+case "$REMOTE_BACKUP_READER" in
+  /*) ;;
+  *) fail "REMOTE_BACKUP_READER must be an absolute path" ;;
+esac
+case "$REMOTE_BACKUP_READER" in
+  *..* | *[!A-Za-z0-9._/-]*) fail "REMOTE_BACKUP_READER contains unsupported characters" ;;
 esac
 
 AGE_RECIPIENT_RE='^age1[02-9ac-hj-np-z]{58}$'
@@ -69,7 +79,8 @@ ssh_args=(-o BatchMode=yes -o ConnectTimeout=15)
 # Values below are validated locally; expansion on the client is intentional.
 # shellcheck disable=SC2029
 age_manifest="$(ssh "${ssh_args[@]}" "$REMOTE_HOST" \
-  "sudo -n find '$REMOTE_BACKUP_DIR' -maxdepth 1 -type f -name '${BACKUP_PREFIX}-*.age.sha256.manifest' -printf '%f\\n'" | LC_ALL=C sort | tail -n1)"
+  "sudo -n '$REMOTE_BACKUP_READER' latest '$BACKUP_PREFIX'")" ||
+  fail "could not list remote backups (SSH, sudo or reader failed)"
 case "$age_manifest" in
   "${BACKUP_PREFIX}-"*.age.sha256.manifest) ;;
   *) fail "remote host returned no complete encrypted backup set (*.age.sha256.manifest)" ;;
@@ -137,19 +148,19 @@ fi
 work_dir="$(mktemp -d "$target_dir/.pull.XXXXXX")"
 trap 'rm -rf "$work_dir"' EXIT
 
-remote_cat() {
-  local relative="$1" destination="$2"
+remote_read() {
+  local kind="$1" destination="$2"
   # shellcheck disable=SC2029
   ssh "${ssh_args[@]}" "$REMOTE_HOST" \
-    "sudo -n cat -- '$REMOTE_BACKUP_DIR/$relative'" > "$destination"
+    "sudo -n '$REMOTE_BACKUP_READER' read '$base' '$kind'" > "$destination"
   chmod 600 "$destination"
 }
 manifest_value() { awk -F= -v key="$1" '$1==key {print substr($0, length(key) + 2); exit}' "$2"; }
-remote_cat "$latest" "$work_dir/$latest"
-remote_cat "$age_manifest" "$work_dir/$age_manifest"
+remote_read ciphertext "$work_dir/$latest"
+remote_read age-manifest "$work_dir/$age_manifest"
 # Metadata only (file name, plaintext sha256, size, tables); it lets an
 # operator verify the decrypted dump and run postgres-restore-proof.sh unchanged.
-remote_cat "$manifest" "$work_dir/$manifest"
+remote_read manifest "$work_dir/$manifest"
 
 grep -qx 'contract=weltgewebe-postgres-backup-age-v1' "$work_dir/$age_manifest" || fail "off-host manifest contract is not weltgewebe-postgres-backup-age-v1"
 [[ "$(manifest_value file "$work_dir/$age_manifest")" == "$latest" ]] || fail "off-host manifest does not describe $latest"
@@ -197,24 +208,19 @@ plaintext_sha="$(manifest_value plaintext_sha256 "$work_dir/$age_manifest")"
 # newly published ciphertext/manifests behind on a failed pull.
 # A weekly restore proof may not yet exist for the newest daily backup. Copy it
 # when present, but never treat its absence as proof that the backup is invalid.
-# Only a definite "absent" may skip the proof. An SSH failure (255) or a sudo
-# rule that does not cover test/cat on the proof must fail the pull instead of
+# Only a definite "absent" from the reader may skip the proof. An SSH, sudo or
+# reader failure (for example a symlinked proof) fails the pull instead of
 # silently dropping restore evidence.
-remote_proof="$REMOTE_BACKUP_DIR/proofs/$proof"
 # shellcheck disable=SC2029
 proof_state="$(ssh "${ssh_args[@]}" "$REMOTE_HOST" \
-  "if ! sudo -n -l test -f '$remote_proof' > /dev/null || ! sudo -n -l cat -- '$remote_proof' > /dev/null; then echo denied; elif sudo -n test -f '$remote_proof'; then echo present; else echo absent; fi")" ||
-  fail "could not probe the remote restore proof (SSH failed)"
+  "sudo -n '$REMOTE_BACKUP_READER' proof-state '$base'")" ||
+  fail "could not probe the remote restore proof (SSH, sudo or reader failed)"
 case "$proof_state" in
   present | absent) ;;
-  denied) fail "sudo does not permit test/cat on the remote restore proof; see docs/runbooks/db-recovery.md" ;;
   *) fail "unexpected remote restore proof probe result" ;;
 esac
 if [[ "$proof_state" == present ]]; then
-  # shellcheck disable=SC2029
-  ssh "${ssh_args[@]}" "$REMOTE_HOST" \
-    "sudo -n cat -- '$remote_proof'" > "$work_dir/$proof"
-  chmod 600 "$work_dir/$proof"
+  remote_read proof "$work_dir/$proof"
   grep -qx 'result=ok' "$work_dir/$proof" || fail "remote restore proof is not successful"
 fi
 

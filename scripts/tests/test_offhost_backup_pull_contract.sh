@@ -2,6 +2,8 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." > /dev/null 2>&1 && pwd)"
 INSTALLER="$REPO_ROOT/scripts/ops/install-postgres-offhost-pull-user-units.sh"
+READER_SOURCE="$REPO_ROOT/scripts/ops/postgres-backup-read.sh"
+GATE="$REPO_ROOT/scripts/ops/restic-plaintext-gate.sh"
 SERVICE_TEMPLATE="$REPO_ROOT/scripts/ops/systemd/weltgewebe-postgres-offhost-pull.service"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
@@ -9,6 +11,16 @@ remote="$root/remote"
 dest="$root/dest"
 bin="$root/bin"
 mkdir -p "$remote/proofs" "$bin"
+chmod 700 "$remote" "$remote/proofs"
+# The production reader fixes its directory and owner; the fixture copy points
+# them at the fake remote, everything else is the shipped script.
+reader="$bin/postgres-backup-read"
+sed -e "s|^readonly BACKUP_DIR=.*|readonly BACKUP_DIR=$remote|" \
+  -e "s|^readonly BACKUP_OWNER_UID=.*|readonly BACKUP_OWNER_UID=$(id -u)|" \
+  "$READER_SOURCE" > "$reader"
+chmod 755 "$reader"
+grep -qx "readonly BACKUP_DIR=$remote" "$reader"
+grep -qx "readonly BACKUP_OWNER_UID=$(id -u)" "$reader"
 base=weltgewebe-postgres-20260712T040000Z
 plain="$base.sql.gz"
 file="$base.sql.gz.age"
@@ -83,22 +95,24 @@ cat > "$bin/ssh" << 'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
 cmd="${!#}"
-# `sudo -n -l CMD` only asks whether CMD is permitted; the fixture permits all
-# unless a test simulates a sudo rule that does not cover the proof.
-if [[ "${SIMULATE_PROOF_SUDO_DENIED:-0}" == 1 ]]; then
-  cmd="${cmd//sudo -n -l /false }"
-else
-  cmd="${cmd//sudo -n -l /true }"
+# The client may only ever run the reader through non-interactive sudo.
+[[ "$cmd" == "sudo -n '"* ]] || {
+  printf 'fake ssh: command does not start with sudo -n: %s\n' "$cmd" >&2
+  exit 99
+}
+if [[ "${SIMULATE_SUDO_DENIED:-0}" == 1 ]]; then
+  printf 'sudo: a password is required\n' >&2
+  exit 1
 fi
-cmd="${cmd//sudo -n /}"
+cmd="${cmd#sudo -n }"
 printf '%s\n' "$cmd" >> "$SSH_LOG"
-if [[ "${SIMULATE_PROOF_SSH_FAILURE:-0}" == 1 && "$cmd" == *proofs/* ]]; then
+if [[ "${SIMULATE_PROOF_SSH_FAILURE:-0}" == 1 && "$cmd" == *' proof-state '* ]]; then
   printf 'ssh: connection reset\n' >&2
   exit 255
 fi
 # Simulates another writer (e.g. a legacy pull) dropping plaintext while this
 # pull is still transferring.
-if [[ -n "${INJECT_PLAINTEXT_DURING_CAT:-}" && "$cmd" == *'cat -- '* ]]; then
+if [[ -n "${INJECT_PLAINTEXT_DURING_CAT:-}" && "$cmd" == *' read '* ]]; then
   printf 'late legacy dump\n' > "$INJECT_PLAINTEXT_DURING_CAT"
 fi
 exec bash -c "$cmd"
@@ -107,8 +121,8 @@ chmod +x "$bin/ssh"
 export SSH_LOG="$root/ssh.log"
 # Prefixes occur inside SSH's remote shell command; reject shell quoting tokens
 # before the first SSH invocation, rather than relying on a later filename check.
-if BACKUP_PREFIX="unsafe'prefix" PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 \
-  REMOTE_HOST=test-host REMOTE_BACKUP_DIR="$remote" DEST_DIR="$root/unsafe-prefix" \
+if BACKUP_PREFIX="unsafe'prefix" PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_READER=1 \
+  REMOTE_HOST=test-host REMOTE_BACKUP_READER="$reader" DEST_DIR="$root/unsafe-prefix" \
   scripts/ops/pull-production-postgres-backup.sh > /dev/null 2> "$root/unsafe-prefix.stderr"; then
   echo 'untrusted BACKUP_PREFIX must fail closed' >&2
   exit 1
@@ -123,7 +137,7 @@ grep -qF 'BACKUP_PREFIX contains unsupported characters' "$root/unsafe-prefix.st
 }
 pull() {
   local destination="$1"
-  PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST="${2-}" REMOTE_BACKUP_DIR="$remote" DEST_DIR="$destination" \
+  PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_READER=1 REMOTE_HOST="${2-}" REMOTE_BACKUP_READER="$reader" DEST_DIR="$destination" \
     PULL_AGE_RECIPIENTS_FILE="${PULL_AGE_RECIPIENTS_FILE-$pinned}" scripts/ops/pull-production-postgres-backup.sh
 }
 expect_pull_failure() {
@@ -143,26 +157,32 @@ expect_pull_failure() {
   fi
 }
 
-# Simulate a denied sudo-find through the remote shell's PATH.
-cat > "$bin/find" << 'FAKE_FIND'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${SIMULATE_SUDO_FIND_DENIED:-0}" == 1 ]]; then
-  printf 'sudo: remote find denied\n' >&2
-  exit 37
-fi
-exec /usr/bin/find "$@"
-FAKE_FIND
-chmod +x "$bin/find"
-if SIMULATE_SUDO_FIND_DENIED=1 pull "$root/denied-find" test-host > /dev/null 2> "$root/denied-find.stderr"; then
-  echo 'denied remote find must fail' >&2
+# A sudo rule that does not grant the reader must surface as such, not as an
+# empty backup listing.
+if SIMULATE_SUDO_DENIED=1 pull "$root/denied-reader" test-host > /dev/null 2> "$root/denied-reader.stderr"; then
+  echo 'denied remote reader must fail' >&2
   exit 1
 fi
-grep -qF 'sudo: remote find denied' "$root/denied-find.stderr"
-if grep -qF 'remote host returned no complete encrypted backup set' "$root/denied-find.stderr"; then
-  echo 'remote find denial was hidden by remote pipeline' >&2
+grep -qF 'sudo: a password is required' "$root/denied-reader.stderr"
+grep -qF 'could not list remote backups' "$root/denied-reader.stderr"
+if grep -qF 'remote host returned no complete encrypted backup set' "$root/denied-reader.stderr"; then
+  echo 'remote reader denial was hidden as an empty listing' >&2
   exit 1
 fi
+
+# The backup directory is fixed in the reader; neither a leftover directory
+# override nor another reader path is accepted outside the test switch.
+if REMOTE_BACKUP_DIR="$remote" pull "$root/dir-override" test-host > /dev/null 2> "$root/dir-override.stderr"; then
+  echo 'REMOTE_BACKUP_DIR must be rejected' >&2
+  exit 1
+fi
+grep -qF 'REMOTE_BACKUP_DIR is no longer supported' "$root/dir-override.stderr"
+if PATH="$bin:$PATH" REMOTE_HOST=test-host REMOTE_BACKUP_READER="$reader" DEST_DIR="$root/reader-override" \
+  PULL_AGE_RECIPIENTS_FILE="$pinned" scripts/ops/pull-production-postgres-backup.sh > /dev/null 2> "$root/reader-override.stderr"; then
+  echo 'a non-default reader path must be rejected' >&2
+  exit 1
+fi
+grep -qF 'REMOTE_BACKUP_READER must be /usr/local/libexec/weltgewebe/postgres-backup-read' "$root/reader-override.stderr"
 
 # Legacy off-host plaintext must stop before an age success receipt.
 legacy_dest="$root/legacy"
@@ -293,7 +313,7 @@ mkdir -p "$dest"
 for suffix in .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; do
   touch -d '10 days ago' "$dest/weltgewebe-postgres-20260101T000000Z${suffix}"
 done
-PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST='' REMOTE_BACKUP_DIR="$remote" DEST_DIR="$dest" \
+PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_READER=1 REMOTE_HOST='' REMOTE_BACKUP_READER="$reader" DEST_DIR="$dest" \
   PULL_AGE_RECIPIENTS_FILE="$pinned" LOCAL_RETENTION_DAYS=1 scripts/ops/pull-production-postgres-backup.sh
 [[ -f "$dest/$file" ]]
 [[ -f "$dest/$age_manifest" ]]
@@ -340,11 +360,16 @@ for pulled in "$dest"/*; do
     exit 1
   fi
 done
-if grep -E "cat -- '[^']*\.sql\.gz'" "$SSH_LOG"; then
-  echo 'pull requested a plaintext dump over SSH' >&2
+# Every remote command is one reader operation; none names a file directly.
+if grep -vE "^'$reader' (latest '[A-Za-z0-9._-]+'|read '[A-Za-z0-9._-]+' '(ciphertext|age-manifest|manifest|proof)'|proof-state '[A-Za-z0-9._-]+')\$" "$SSH_LOG"; then
+  echo 'pull sent a remote command outside the reader interface' >&2
   exit 1
 fi
-grep -qF "cat -- '$remote/$file'" "$SSH_LOG"
+if grep -F '.sql.gz' "$SSH_LOG"; then
+  echo 'pull named a dump file over SSH' >&2
+  exit 1
+fi
+grep -qxF "'$reader' read '$base' 'ciphertext'" "$SSH_LOG"
 
 if ((REAL_AGE == 1)); then
   # Offline restore path: decrypt the pulled copy with the offline identity and
@@ -363,10 +388,14 @@ printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=failed\n' > "$remo
 expect_pull_failure "$root/bad-proof" 'remote restore proof is not successful'
 printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=ok\n' > "$remote/proofs/$base.restore-proof"
 
-# A proof probe that fails for transport or sudo reasons is not "no proof":
+# A proof probe that fails for transport or reader reasons is not "no proof":
 # the pull must fail instead of publishing a receipt without the evidence.
 SIMULATE_PROOF_SSH_FAILURE=1 expect_pull_failure "$root/proof-ssh" 'could not probe the remote restore proof'
-SIMULATE_PROOF_SUDO_DENIED=1 expect_pull_failure "$root/proof-denied" 'sudo does not permit test/cat on the remote restore proof'
+mv "$remote/proofs/$base.restore-proof" "$root/held-proof"
+ln -s "$root/held-proof" "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-symlink" 'could not probe the remote restore proof'
+rm "$remote/proofs/$base.restore-proof"
+mv "$root/held-proof" "$remote/proofs/$base.restore-proof"
 # A definitely absent proof (newest daily backup) is still a successful pull.
 mv "$remote/proofs/$base.restore-proof" "$root/held-proof"
 pull "$root/no-proof" test-host > /dev/null
@@ -434,6 +463,149 @@ exec 8>&-
 # A host without an encrypted artefact (e.g. no recipient configured) fails closed.
 rm -f "$remote/$file" "$remote/$age_manifest"
 expect_pull_failure "$root/no-age" 'no complete encrypted backup set'
+# The reader is the only privileged interface, so its argument and file-type
+# boundary is tested directly: a sudoers rule naming it permits any arguments.
+make_reader() {
+  sed -e "s|^readonly BACKUP_DIR=.*|readonly BACKUP_DIR=$1|" \
+    -e "s|^readonly BACKUP_OWNER_UID=.*|readonly BACKUP_OWNER_UID=$2|" \
+    "$READER_SOURCE" > "$3"
+  chmod 755 "$3"
+}
+rdir="$root/reader-remote"
+mkdir -p "$rdir/proofs"
+chmod 700 "$rdir" "$rdir/proofs"
+rbase=weltgewebe-postgres-20260801T040000Z
+printf '%s\n' "$marker" | gzip -c > "$rdir/$rbase.sql.gz"
+printf 'age-encryption.org/v1\ncipher\n' > "$rdir/$rbase.sql.gz.age"
+printf 'contract=weltgewebe-postgres-backup-age-v1\n' > "$rdir/$rbase.age.sha256.manifest"
+printf 'contract=weltgewebe-postgres-backup-v1\n' > "$rdir/$rbase.sha256.manifest"
+printf 'result=ok\n' > "$rdir/proofs/$rbase.restore-proof"
+rreader="$root/reader-bin"
+make_reader "$rdir" "$(id -u)" "$rreader"
+expect_reader_failure() {
+  local message="$1"
+  shift
+  if timeout 10 "$rreader" "$@" > "$root/reader.stdout" 2> "$root/reader.stderr"; then
+    echo "reader accepted: $* ($message)" >&2
+    exit 1
+  fi
+  grep -qF "postgres-backup-read: $message" "$root/reader.stderr" || {
+    echo "unexpected reader failure for: $* (wanted: $message)" >&2
+    cat "$root/reader.stderr" >&2
+    exit 1
+  }
+  if grep -qF "$marker" "$root/reader.stdout"; then
+    echo "reader leaked plaintext for: $*" >&2
+    exit 1
+  fi
+}
+[[ "$("$rreader" latest weltgewebe-postgres)" == "$rbase.age.sha256.manifest" ]]
+cmp -s <("$rreader" read "$rbase" ciphertext) "$rdir/$rbase.sql.gz.age"
+cmp -s <("$rreader" read "$rbase" age-manifest) "$rdir/$rbase.age.sha256.manifest"
+cmp -s <("$rreader" read "$rbase" manifest) "$rdir/$rbase.sha256.manifest"
+cmp -s <("$rreader" read "$rbase" proof) "$rdir/proofs/$rbase.restore-proof"
+[[ "$("$rreader" proof-state "$rbase")" == present ]]
+[[ "$("$rreader" proof-state weltgewebe-postgres-20990101T000000Z)" == absent ]]
+expect_reader_failure 'usage:'
+expect_reader_failure 'unsupported operation' cat "$rdir/$rbase.sql.gz"
+expect_reader_failure 'unsupported operation' find "$rdir"
+expect_reader_failure 'latest takes exactly one PREFIX' latest
+expect_reader_failure 'latest takes exactly one PREFIX' latest weltgewebe-postgres extra
+expect_reader_failure 'invalid prefix' latest '*'
+expect_reader_failure 'invalid prefix' latest '-name'
+expect_reader_failure 'invalid prefix' latest '../postgres'
+expect_reader_failure 'read takes exactly BASE and KIND' read "$rbase"
+expect_reader_failure 'read takes exactly BASE and KIND' read "$rbase" ciphertext extra
+expect_reader_failure 'unsupported kind' read "$rbase" plaintext
+expect_reader_failure 'unsupported kind' read "$rbase" ''
+expect_reader_failure 'invalid backup name' read "../$rbase" ciphertext
+expect_reader_failure 'invalid backup name' read "proofs/$rbase" proof
+expect_reader_failure 'invalid backup name' read "$rbase x" ciphertext
+expect_reader_failure 'invalid backup name' read "-$rbase" ciphertext
+expect_reader_failure 'invalid backup name' read "$rbase..x" ciphertext
+expect_reader_failure 'invalid backup name' read '' ciphertext
+expect_reader_failure 'invalid backup name' proof-state "../$rbase"
+expect_reader_failure 'proof-state takes exactly one BASE' proof-state
+# Appending a fixed suffix means the plaintext dump has no name at all.
+expect_reader_failure 'not a regular file' read "$rbase.sql.gz" manifest
+# Symlinks and special files are refused, never followed or read.
+ln -s "$rdir/$rbase.sql.gz" "$rdir/linked.sql.gz.age"
+expect_reader_failure 'not a regular file' read linked ciphertext
+mkfifo "$rdir/fifo.sha256.manifest"
+expect_reader_failure 'not a regular file' read fifo manifest
+ln -s "$rdir/$rbase.sql.gz" "$rdir/proofs/linked.restore-proof"
+expect_reader_failure 'restore proof is not a regular file' proof-state linked
+expect_reader_failure 'not a regular file' read linked proof
+# A missing proofs directory means no proof; an untrusted one is refused.
+mv "$rdir/proofs" "$root/held-proofs"
+[[ "$("$rreader" proof-state "$rbase")" == absent ]]
+mv "$root/held-proofs" "$rdir/proofs"
+chmod 770 "$rdir/proofs"
+expect_reader_failure 'group or world writable' proof-state "$rbase"
+expect_reader_failure 'group or world writable' read "$rbase" proof
+chmod 700 "$rdir/proofs"
+# The type check above cannot be raced deterministically here; the open itself
+# must also refuse a symlink swapped in after the check.
+# shellcheck disable=SC2016 # literal source text, not an expansion
+grep -qF 'dd if="$path" iflag=nofollow' "$READER_SOURCE"
+# The backup directory itself must be a real, owner-only directory.
+chmod 750 "$rdir"
+"$rreader" latest weltgewebe-postgres > /dev/null
+chmod 720 "$rdir"
+expect_reader_failure 'group or world writable' latest weltgewebe-postgres
+chmod 700 "$rdir"
+ln -s "$rdir" "$root/reader-remote-alias"
+make_reader "$root/reader-remote-alias" "$(id -u)" "$rreader"
+expect_reader_failure 'not a directory' latest weltgewebe-postgres
+make_reader "$rdir" "$(($(id -u) + 1))" "$rreader"
+expect_reader_failure 'unexpected owner' read "$rbase" ciphertext
+make_reader "$rdir" "$(id -u)" "$rreader"
+"$rreader" latest weltgewebe-postgres > /dev/null
+
+# The Restic snapshot gate refuses a snapshot while plaintext dumps lie below
+# any source, and fails closed when a source cannot be scanned.
+gate_home="$root/gate-home"
+mkdir -p "$gate_home/repos/project" "$gate_home/artifacts/merges" "$gate_home/fundus" "$gate_home/elsewhere"
+printf 'not a dump\n' > "$gate_home/repos/project/notes.sql.gz.age"
+gate_sources=("$gate_home/repos" "$gate_home/artifacts/merges" "$gate_home/fundus")
+"$GATE" "${gate_sources[@]}" > "$root/gate.stdout"
+grep -qF 'no plaintext PostgreSQL dumps below 3 source(s)' "$root/gate.stdout"
+expect_gate_failure() {
+  local message="$1"
+  shift
+  if "$GATE" "$@" > /dev/null 2> "$root/gate.stderr"; then
+    echo "Restic gate accepted: $* ($message)" >&2
+    exit 1
+  fi
+  grep -qF "restic-plaintext-gate: $message" "$root/gate.stderr" || {
+    echo "unexpected Restic gate failure for: $* (wanted: $message)" >&2
+    cat "$root/gate.stderr" >&2
+    exit 1
+  }
+}
+expect_gate_failure 'usage:'
+expect_gate_failure 'source must be an absolute path' repos
+expect_gate_failure 'source does not exist' "$gate_home/missing"
+mkdir -p "$gate_home/artifacts/merges/weltgewebe-production-backups/.pull.Ab12Cd"
+printf 'old private pg dump\n' > "$gate_home/artifacts/merges/weltgewebe-production-backups/.pull.Ab12Cd/weltgewebe-postgres-legacy.sql.gz"
+expect_gate_failure "plaintext PostgreSQL dump below snapshot source $gate_home/artifacts/merges" "${gate_sources[@]}"
+rm -r "$gate_home/artifacts/merges/weltgewebe-production-backups"
+"$GATE" "${gate_sources[@]}" > /dev/null
+# A dump reached through a symlinked source root, or itself a symlink, counts.
+printf 'old private pg dump\n' > "$gate_home/elsewhere/weltgewebe-postgres-legacy.sql.gz"
+ln -s "$gate_home/elsewhere" "$gate_home/fundus-alias"
+expect_gate_failure 'plaintext PostgreSQL dump below snapshot source' "$gate_home/fundus-alias"
+ln -s "$gate_home/elsewhere/weltgewebe-postgres-legacy.sql.gz" "$gate_home/fundus/linked.sql.gz"
+expect_gate_failure 'plaintext PostgreSQL dump below snapshot source' "${gate_sources[@]}"
+rm "$gate_home/fundus/linked.sql.gz"
+# An unreadable subtree is a partial scan, never a pass (root reads everything).
+if (($(id -u) != 0)); then
+  mkdir -m 000 "$gate_home/repos/locked"
+  expect_gate_failure 'could not scan source completely' "${gate_sources[@]}"
+  chmod 700 "$gate_home/repos/locked"
+fi
+"$GATE" "${gate_sources[@]}" > /dev/null
+
 # The user service is generated from a clean commit placeholder and must avoid
 # ProtectKernelModules, which is unsupported by the real user manager on heim-pc.
 grep -q '@WELTGEWEBE_COMMIT@' "$SERVICE_TEMPLATE"
@@ -444,7 +616,7 @@ fi
 install_home="$root/install-home"
 fixture_repo="$root/install-repo"
 mkdir -p "$install_home" "$fixture_repo/scripts/ops/systemd"
-cp "$REPO_ROOT/scripts/ops/pull-production-postgres-backup.sh" "$fixture_repo/scripts/ops/"
+cp "$REPO_ROOT/scripts/ops/pull-production-postgres-backup.sh" "$GATE" "$fixture_repo/scripts/ops/"
 cp "$SERVICE_TEMPLATE" "$fixture_repo/scripts/ops/systemd/"
 cp "$REPO_ROOT/scripts/ops/systemd/weltgewebe-postgres-offhost-pull.timer" "$fixture_repo/scripts/ops/systemd/"
 git -C "$fixture_repo" init -q
@@ -461,6 +633,9 @@ installed_service="$install_home/.config/systemd/user/weltgewebe-postgres-offhos
 receipt="$install_home/.local/libexec/weltgewebe/$commit/install.receipt"
 [[ -x "$installed_pull" ]]
 cmp -s "$fixture_repo/scripts/ops/pull-production-postgres-backup.sh" "$installed_pull"
+installed_gate="$install_home/.local/libexec/weltgewebe/$commit/restic-plaintext-gate.sh"
+[[ -x "$installed_gate" ]]
+cmp -s "$GATE" "$installed_gate"
 grep -qxF "ExecStart=%h/.local/libexec/weltgewebe/$commit/pull-production-postgres-backup.sh" "$installed_service"
 if grep -q '@WELTGEWEBE_COMMIT@' "$installed_service"; then
   echo 'generated service retained the commit placeholder' >&2
@@ -473,6 +648,7 @@ fi
 grep -qxF 'contract=weltgewebe-postgres-offhost-user-install-v1' "$receipt"
 grep -Eq '^installed_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$receipt"
 grep -qxF "git_commit=$commit" "$receipt"
+grep -qxF "restic_gate_sha256=$(sha256sum "$GATE" | awk '{print $1}')" "$receipt"
 [[ "$(stat -c %a "$receipt")" == 600 ]]
 [[ "$(stat -c %a "$install_home/merges/weltgewebe-production-backups")" == 700 ]]
 # Reinstalling the same commit is idempotent.
