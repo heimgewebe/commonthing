@@ -49,6 +49,9 @@ BACKUP_DELETE_TO_PROVE_RECEIPT = "receipts/backup-delete-to-prove.json"
 BACKUP_CONTROLLER_HANDOFF_REASON = "public-main-descendant-recovery-successor"
 STAGING_GATEWAY_NODE_PORT = 31844
 STAGING_GATEWAY_HOST_PORT = 18084
+KIND_WORKER_SRCMARK_PLACEHOLDER = "__COMMONTHING_STAGING_WORKER_SRCMARK_CONF__"
+KIND_WORKER_SRCMARK_DESTINATION = "/etc/sysctl.d/99-commonthing-staging-cilium-srcmark.conf"
+KIND_WORKER_SRCMARK_CONTENT = "".join(f"net.ipv4.conf.{name}.src_valid_mark = 0\n" for name in ("all", "default", "eth0"))
 SOURCE_NAME = "commonthing-staging-source"
 APP_SOURCE_NAME = "commonthing-staging-app-source"
 DATA_KUSTOMIZATION = "commonthing-staging-data"
@@ -934,16 +937,10 @@ def render_kind_config(root: Path) -> Path:
         )
 
     retained_mounts = (
-        (
-            "__COMMONTHING_STAGING_POSTGRES_ROOT__",
-            root / "data/postgres",
-            "/var/local/commonthing-staging/postgres",
-        ),
-        (
-            "__COMMONTHING_STAGING_NATS_ROOT__",
-            root / "data/nats",
-            "/var/local/commonthing-staging/nats",
-        ),
+        ("__COMMONTHING_STAGING_POSTGRES_ROOT__", root / "data/postgres",
+         "/var/local/commonthing-staging/postgres"),
+        ("__COMMONTHING_STAGING_NATS_ROOT__", root / "data/nats",
+         "/var/local/commonthing-staging/nats"),
     )
     for _, host_path, _ in retained_mounts:
         host_path.mkdir(parents=True, exist_ok=True)
@@ -953,30 +950,32 @@ def render_kind_config(root: Path) -> Path:
                 f"staging retained host path must be a real directory: {host_path}"
             )
 
-    for index, node in enumerate(nodes):
-        mounts = node.get("extraMounts", []) if isinstance(node, dict) else []
-        if index != 1:
-            if mounts:
-                raise StagingCellError(
-                    f"staging kind node {index} must not mount persistent data"
-                )
-            continue
-        if not isinstance(mounts, list) or len(mounts) != len(retained_mounts):
-            raise StagingCellError(
-                "staging data worker must bind exactly the PostgreSQL and NATS retained mounts"
-            )
-        for mount, (placeholder, host_path, container_path) in zip(
-            mounts, retained_mounts, strict=True
+    # Exact templates prevent unexpected mounts and keep Blue/host untouched.
+    worker_srcmark = root / "generated/kind-cilium-srcmark.conf"
+    srcmark_mount = (KIND_WORKER_SRCMARK_PLACEHOLDER, worker_srcmark,
+                     KIND_WORKER_SRCMARK_DESTINATION, True)
+    data_mounts = [(*item, False) for item in retained_mounts]
+    expected_nodes = ([], [*data_mounts, srcmark_mount], [srcmark_mount])
+    for index, (node, expected) in enumerate(zip(nodes, expected_nodes, strict=True)):
+        mounts = node.get("extraMounts", [])
+        if not isinstance(mounts, list) or len(mounts) != len(expected):
+            raise StagingCellError(f"staging kind node {index} mount contract drift")
+        for mount, (placeholder, host_path, destination, read_only) in zip(
+            mounts, expected, strict=True
         ):
-            if mount.get("hostPath") != placeholder:
-                raise StagingCellError("staging data worker hostPath template drift")
-            if mount.get("containerPath") != container_path:
-                raise StagingCellError("staging data worker containerPath drift")
-            if mount.get("readOnly") is not False:
-                raise StagingCellError(
-                    "staging data worker persistent mount must be writable"
-                )
+            if mount != dict(
+                hostPath=placeholder, containerPath=destination, readOnly=read_only
+            ):
+                raise StagingCellError("staging kind mount structure or access drift")
             mount["hostPath"] = str(host_path.resolve())
+    try:
+        worker_srcmark.lstat()
+    except FileNotFoundError:
+        atomic_text(worker_srcmark, KIND_WORKER_SRCMARK_CONTENT, mode=0o400)
+    try:
+        reference.require_kind_worker_srcmark_source(worker_srcmark, KIND_WORKER_SRCMARK_CONTENT)
+    except reference.ProofError as exc:
+        raise StagingCellError("kind worker sysctl source is missing, mutable or drifted") from exc
     rendered = yaml.safe_dump(document, sort_keys=False)
     path = root / "generated/kind.yaml"
     atomic_text(path, rendered, mode=0o600)
@@ -3489,6 +3488,8 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
         )
         created = True
 
+    # Ensure worker kernel isolation before touching retained data or Cilium.
+    reference.require_kind_worker_srcmark_runtime(root, args.cluster)
     prepare_volume_permissions(kind, args.cluster, root)
     api_server_host = reference.control_plane_address(args.cluster)
     reference.install_platform_components(
@@ -3505,6 +3506,8 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
         ],
         timeout=360,
     )
+    # Re-check after node readiness; Cilium must not reset the source mark.
+    reference.require_kind_worker_srcmark_runtime(root, args.cluster)
     secret_receipt = inject_external_secrets(kubectl, root)
     apply_yaml(kubectl, flux_documents(commit))
     reconcile_data(kubectl, commit)
@@ -8911,19 +8914,16 @@ def command_self_check() -> dict[str, Any]:
 
         rendered_path = render_kind_config(root)
         rendered = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
-        expected = [
-            str((root / "data/postgres").resolve()),
-            str((root / "data/nats").resolve()),
-        ]
-        observed = [
-            mount.get("hostPath")
-            for node in rendered.get("nodes", [])
-            for mount in node.get("extraMounts", [])
-        ]
-        if observed != expected:
-            raise StagingCellError(
-                "self-check rendered kind data-worker mounts do not bind the exact retained roots"
-            )
+        srcmark = root / "generated/kind-cilium-srcmark.conf"
+        expected = [root / "data/postgres", root / "data/nats", srcmark, srcmark]
+        if (
+            [m["hostPath"] for n in rendered["nodes"] for m in n.get("extraMounts", [])]
+            != [str(p.resolve()) for p in expected]
+            or rendered["nodes"][0].get("extraMounts")
+            or srcmark.read_text(encoding="utf-8") != KIND_WORKER_SRCMARK_CONTENT
+            or stat.S_IMODE(srcmark.lstat().st_mode) != 0o400
+        ):
+            raise StagingCellError("staging kind self-check mount or srcmark drift")
     return {
         "schema_version": 1,
         "status": "pass",

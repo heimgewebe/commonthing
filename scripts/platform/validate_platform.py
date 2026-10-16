@@ -713,37 +713,44 @@ def _assert_staging_cell_contract() -> None:
     if roles != ["control-plane", "worker", "worker"]:
         raise ContractError("staging kind node-role contract drift")
 
-    expected_mounts = [
+    retained_mounts = [
         (
             "__COMMONTHING_STAGING_POSTGRES_ROOT__",
             "/var/local/commonthing-staging/postgres",
+            False,
         ),
         (
             "__COMMONTHING_STAGING_NATS_ROOT__",
             "/var/local/commonthing-staging/nats",
+            False,
         ),
     ]
+    # This is *not* a host sysctl. kind binds one read-only file into each
+    # worker's independent network namespace; the control plane gets none.
+    worker_sysctl = (
+        "__COMMONTHING_STAGING_WORKER_SRCMARK_CONF__",
+        "/etc/sysctl.d/99-commonthing-staging-cilium-srcmark.conf",
+        True,
+    )
     for index, node in enumerate(nodes):
         mounts = node.get("extraMounts", []) if isinstance(node, dict) else []
-        if index != 1:
-            if mounts:
-                raise ContractError(
-                    f"staging non-data node {index} must not expose retained host storage"
-                )
-            continue
+        expected_mounts = (
+            [] if index == 0
+            else [*retained_mounts, worker_sysctl] if index == 1
+            else [worker_sysctl]
+        )
         if not isinstance(mounts, list) or len(mounts) != len(expected_mounts):
-            raise ContractError(
-                "staging data worker must bind exactly the PostgreSQL and NATS retained mounts"
-            )
-        observed_mounts = [
-            (mount.get("hostPath"), mount.get("containerPath"))
+            raise ContractError(f"staging kind node {index} unexpected mount count")
+        observed = [
+            (mount.get("hostPath"), mount.get("containerPath"), mount.get("readOnly"))
             for mount in mounts
             if isinstance(mount, dict)
+            and set(mount) == {"hostPath", "containerPath", "readOnly"}
         ]
-        if observed_mounts != expected_mounts:
-            raise ContractError("staging data-worker persistent host mount drift")
-        if any(mount.get("readOnly") is not False for mount in mounts):
-            raise ContractError("staging data-worker persistent host mounts must be writable")
+        if observed != expected_mounts:
+            raise ContractError(
+                "staging worker kind hostPath, destination or access drift"
+            )
 
     data_root = PLATFORM / "clusters/staging/data"
     documents = [
