@@ -2057,6 +2057,12 @@ def measure_api_transition(
     direct_probe_pods: list[str],
 ) -> dict[str, Any]:
     before_uids = ready_api_pod_uids(kubectl)
+    # Bind every advertised listener to its actual Kind owner BEFORE the
+    # upgrade/rollback begins. Never let a healthy non-owner path mask an outage.
+    gateway_addresses = sorted(set(ref.gateway_addresses(kubectl)))
+    gateway_binding = gateway_observer_binding(kind, cluster, gateway_addresses)
+    owner_nodes = sorted(set(gateway_binding["owner_by_address"].values()))
+    owner_container_ids = ref.gateway_node_container_ids(owner_nodes)
     started = time.monotonic()
     ref.run(action)
     deadline = started + 600
@@ -2070,7 +2076,28 @@ def measure_api_transition(
     degraded_path_samples = 0
     failed_gateway_paths = 0
     max_failed_gateway_paths = 0
-    gateway_addresses = sorted(set(ref.gateway_addresses(kubectl)))
+
+    def require_current_listener_owners() -> None:
+        # The owner can move while a single HTTP request is in flight.
+        # Match current listener addresses and owners at both sides of a
+        # sample, including the final one that ends upgrade or rollback.
+        observed_addresses = sorted(set(ref.gateway_addresses(kubectl)))
+        if observed_addresses != gateway_addresses:
+            raise ref.ProofError(
+                "Gateway listener addresses drifted during API transition: "
+                f"before={gateway_addresses} now={observed_addresses}"
+            )
+        observed_binding = gateway_observer_binding(
+            kind, cluster, gateway_addresses
+        )
+        if observed_binding["owner_by_address"] != gateway_binding["owner_by_address"]:
+            raise ref.ProofError(
+                "Gateway owner mapping drifted during API transition"
+            )
+        if ref.gateway_node_container_ids(owner_nodes) != owner_container_ids:
+            raise ref.ProofError(
+                "Gateway owner container identity drifted during API transition"
+            )
 
     def capture_diagnostic(
         pending: dict[str, Any],
@@ -2119,9 +2146,12 @@ def measure_api_transition(
         rollout_complete = False
         gateway_sample: dict[str, Any] = {"available": False}
         try:
+            require_current_listener_owners()
             gateway_sample = gateway_observer_sample(
-                kind, cluster, gateway_addresses, port, marker
+                kind, cluster, gateway_addresses, port, marker,
+                observer_binding=gateway_binding,
             )
+            require_current_listener_owners()
             available = bool(gateway_sample["available"])
             sample_failed_paths = int(gateway_sample.get("failed_paths", 0))
             if sample_failed_paths:
@@ -2216,7 +2246,8 @@ def measure_api_transition(
         "longest_unavailable_seconds": round(longest_unavailable_seconds, 3),
         "probe_node": probe_node,
         "probe_address": probe_address,
-        "gateway_probe_mode": "non-owner-control-plane-any-advertised-address",
+        "gateway_probe_mode": "owner-local-any-advertised-address",
+        "gateway_owner_by_address": dict(gateway_binding["owner_by_address"]),
         "gateway_observer_node": gateway_sample.get("observer_node"),
         "gateway_observer_address": gateway_sample.get("observer_address"),
         "gateway_addresses": gateway_addresses,
@@ -2413,16 +2444,79 @@ def node_exists(kubectl: str, node_id: str, *, cluster: str = "postgres-ha") -> 
     return psql(kubectl, f"SELECT count(*) FROM domain_nodes WHERE id='{node_id}'", cluster=cluster) == "1"
 
 
-def gateway_contains_node(kubectl: str, kind: str, cluster: str, node_id: str) -> bool:
-    ref.wait_condition(kubectl, "weltgewebe-gateway", "gateway/weltgewebe", "Programmed", "5m")
+def ha_gateway_baseline(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
+    # ADR-0013 measures HA gateways owner-locally, not cross-node Kind paths.
+    return ref.prove_gateway(kubectl, kind, cluster, owner_local=True)
+
+
+def gateway_contains_node(
+    kubectl: str, kind: str, cluster: str, node_id: str, *,
+    timeout_seconds: float | None = None,
+) -> bool:
+    # The outer domain deadline is a hard input to readiness and every HTTP
+    # matrix. Without it, one 3-listener proof can run for 415s inside a 180s
+    # wait_until, which checks its clock only between probe invocations.
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ref.ProofError("Gateway domain wait budget is exhausted")
+    deadline = (
+        time.monotonic() + timeout_seconds
+        if timeout_seconds is not None else None
+    )
+
+    def remaining() -> float | None:
+        if deadline is None:
+            return None
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise ref.ProofError("Gateway domain wait budget is exhausted")
+        return seconds
+
+    left = remaining()
+    if left is not None and left < 1:
+        raise ref.ProofError("Gateway domain readiness budget is exhausted")
+    wait_budget = "5m" if left is None else f"{min(300, int(left))}s"
+    ref.wait_condition(
+        kubectl, "weltgewebe-gateway", "gateway/weltgewebe",
+        "Programmed", wait_budget,
+    )
     service = ref.output([kubectl, "-n", "weltgewebe-gateway", "get", "service", "-l", "gateway.networking.k8s.io/gateway-name=weltgewebe", "-o", "jsonpath={.items[0].metadata.name}"])
     port = ref.gateway_listener_port(kubectl)
+    matrix_budget = remaining()
+    matrix_kwargs = (
+        {} if matrix_budget is None
+        else {"timeout_seconds": matrix_budget}
+    )
     _, _, _, _, body = ref.probe_gateway_http(
         kind, cluster, ref.gateway_addresses(kubectl),
-        ref.gateway_service_listener_port(kubectl, service, port), timeout_seconds=30,
+        ref.gateway_service_listener_port(kubectl, service, port),
+        owner_local=True, **matrix_kwargs,
     )
     payload = json.loads(body)
     return any(isinstance(item, dict) and item.get("id") == node_id for item in payload)
+
+
+def wait_for_gateway_domain_node(
+    kubectl: str,
+    kind: str,
+    cluster: str,
+    node_id: str,
+    *,
+    timeout_seconds: int = 180,
+    interval: float = 2.0,
+) -> bool:
+    # Absence of the domain node is retryable; a broken Gateway matrix is not.
+    # Bind the remaining time before invoking the potentially long HTTP matrix.
+    deadline = time.monotonic() + timeout_seconds
+    return wait_until(
+        "domain mutation in API projection",
+        lambda: gateway_contains_node(
+            kubectl, kind, cluster, node_id,
+            timeout_seconds=deadline - time.monotonic(),
+        ),
+        timeout_seconds=timeout_seconds,
+        interval=interval,
+        retry_on_probe_error=False,
+    )
 
 
 def create_nats_box(
@@ -2665,7 +2759,7 @@ def prove(args: argparse.Namespace) -> dict[str, Any]:
         ref.apply_direct(kubectl, kustomize, "platform/apps/weltgewebe/overlays/ha")
         ref.apply_direct(kubectl, kustomize, "platform/infrastructure/gateway")
         wait_api_replicas(kubectl)
-        gateway_before = ref.prove_gateway(kubectl, kind, args.cluster)
+        gateway_before = ha_gateway_baseline(kubectl, kind, args.cluster)
 
         topology = {
             "postgres": pod_topology(kubectl, "weltgewebe-data", "cnpg.io/cluster=postgres-ha"),
@@ -2681,7 +2775,7 @@ def prove(args: argparse.Namespace) -> dict[str, Any]:
 
         marker = "00000000-0000-4000-8000-00000000a004"
         insert_domain_node(kubectl, marker, "T004 acknowledged domain mutation")
-        wait_until("domain mutation in API projection", lambda: gateway_contains_node(kubectl, kind, args.cluster, marker), timeout_seconds=180)
+        wait_for_gateway_domain_node(kubectl, kind, args.cluster, marker)
         availability_monitor = ContinuousAvailabilityMonitor(
             kubectl,
             kind,

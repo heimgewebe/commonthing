@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -37,6 +38,7 @@ KUBECONFIGS = CACHE / "kubeconfigs"
 DEFAULT_CLUSTER = "weltgewebe-reference"
 FULL_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 KIND_CREATE_ATTEMPTS = 3
+GATEWAY_HTTP_PROBE_SAMPLES = 3
 KIND_CREATE_BACKOFF_SECONDS = (5.0, 15.0)
 TRANSIENT_KIND_CREATE_MARKERS = (
     "429 too many requests",
@@ -64,6 +66,30 @@ GATEWAY_API_ARTIFACTS = (
 
 class ProofError(RuntimeError):
     pass
+
+
+class GatewayTransportNotReady(ProofError):
+    """A hard Gateway HTTP/transport failure, never a retryable proof result."""
+
+
+def _reject_gateway_json_constant(value: str) -> None:
+    raise ValueError(f"non-JSON numeric constant {value!r}")
+
+
+def _strict_gateway_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite /api/nodes JSON number")
+    return parsed
+
+
+def _unique_gateway_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate /api/nodes JSON object key")
+        result[key] = value
+    return result
 
 
 def run(
@@ -2005,19 +2031,289 @@ def kind_nodes(kind: str, cluster: str) -> list[str]:
     return nodes
 
 
+
+def gateway_address_owners(
+    kind: str, cluster: str, addresses: list[str]
+) -> dict[str, str]:
+    """Bind each Cilium node-IPAM listener to exactly one real Kind node.
+
+    The independent HA contract measures owner-local listener reachability;
+    cross-node Kind/Cilium paths are not a gate for this proof.
+    """
+    if not addresses:
+        raise ProofError("Gateway status has no advertised listener IPv4 address")
+    owners_by_address: dict[str, list[str]] = {}
+    for node in kind_nodes(kind, cluster):
+        address = output(
+            [
+                "docker", "inspect", "--format",
+                '{{(index .NetworkSettings.Networks "kind").IPAddress}}',
+                node,
+            ]
+        )
+        if address:
+            owners_by_address.setdefault(address, []).append(node)
+    invalid = {
+        address: owners_by_address.get(address, [])
+        for address in addresses
+        if len(owners_by_address.get(address, [])) != 1
+    }
+    if invalid:
+        raise ProofError(
+            "advertised gateway addresses do not map to exactly one kind node owner: "
+            f"{invalid}"
+        )
+    return {address: owners_by_address[address][0] for address in addresses}
+
+
+def gateway_node_container_ids(nodes: list[str]) -> dict[str, str]:
+    """Bind each source-node name to the running Docker container identity."""
+    identities: dict[str, str] = {}
+    for node in nodes:
+        container_id = output(["docker", "inspect", "--format", "{{.Id}}", node])
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ProofError(f"missing valid container identity for Gateway node {node!r}")
+        identities[node] = container_id
+    return identities
+
+
+GATEWAY_HTTP_ROUTES = ("/health/live", "/", "/api/nodes")
+
+
+def gateway_matrix_evidence_digest(document: dict[str, Any]) -> str:
+    """Canonical SHA-256 over the complete (body-free) measured matrix."""
+    unsigned = {key: value for key, value in document.items() if key != "canonical_sha256"}
+    canonical = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_gateway_matrix_evidence(
+    document: dict[str, Any],
+    *,
+    expected_runtime: dict[str, Any] | None = None,
+    expected_mode: str | None = None,
+    expected_digest: str | None = None,
+) -> None:
+    """Reject omitted/reordered cells, stale runtime bindings and forged counters.
+
+    This checks the internal evidence contract. Authenticity of its producer
+    and the actual HTTP observations require the bound external runtime receipt.
+    """
+    required = {
+        "schema_version", "kind_cluster", "probe_mode", "runtime_before",
+        "runtime_after", "routes", "samples_per_route", "expected_cells",
+        "completed_cells", "cells", "canonical_sha256",
+    }
+    if not isinstance(document, dict) or set(document) != required:
+        raise ProofError("Gateway matrix evidence is absent or has invalid fields")
+    if document["schema_version"] != 1 or type(document["schema_version"]) is not int:
+        raise ProofError("Gateway matrix evidence schema is invalid")
+    mode = document["probe_mode"]
+    if mode not in ("strict-t084-all-nodes", "owner-local-ha"):
+        raise ProofError("Gateway matrix evidence has invalid probe mode")
+    if expected_mode is not None and mode != expected_mode:
+        raise ProofError("Gateway matrix evidence is for the wrong probe mode")
+    if not isinstance(document["kind_cluster"], str) or not document["kind_cluster"]:
+        raise ProofError("Gateway matrix evidence has no cluster identity")
+    before, after = document["runtime_before"], document["runtime_after"]
+    runtime_keys = {"nodes", "listeners", "owner_by_address", "container_ids", "port"}
+    if (
+        not isinstance(before, dict) or not isinstance(after, dict)
+        or set(before) != runtime_keys or set(after) != runtime_keys
+        or before != after
+    ):
+        raise ProofError("Gateway matrix runtime identity changed during proof")
+    if expected_runtime is not None and before != expected_runtime:
+        raise ProofError("Gateway matrix runtime identity is stale or differs from live readback")
+    nodes, addresses, owners, containers = (
+        before["nodes"], before["listeners"],
+        before["owner_by_address"], before["container_ids"],
+    )
+    if (
+        not isinstance(nodes, list) or not nodes
+        or not all(isinstance(node, str) and node for node in nodes)
+        or len(nodes) != len(set(nodes))
+        or not isinstance(addresses, list) or not addresses
+        or not all(isinstance(addr, str) and addr for addr in addresses)
+        or len(addresses) != len(set(addresses))
+        or not isinstance(owners, dict) or set(owners) != set(addresses)
+        or any(owner not in nodes for owner in owners.values())
+        or not isinstance(containers, dict) or set(containers) != set(nodes)
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in containers.values()
+        )
+        or type(before["port"]) is not int or not 1 <= before["port"] <= 65535
+    ):
+        raise ProofError("Gateway matrix runtime snapshot is invalid")
+    if document["routes"] != list(GATEWAY_HTTP_ROUTES):
+        raise ProofError("Gateway matrix route contract was modified")
+    if (
+        type(document["samples_per_route"]) is not int
+        or document["samples_per_route"] != GATEWAY_HTTP_PROBE_SAMPLES
+    ):
+        raise ProofError("Gateway matrix sample contract was modified")
+    if not isinstance(document["cells"], list):
+        raise ProofError("Gateway matrix cells are absent")
+    required_cells = [
+        (node, address, sample, route)
+        for node in nodes
+        for address in addresses
+        if mode == "strict-t084-all-nodes" or owners[address] == node
+        for sample in range(1, GATEWAY_HTTP_PROBE_SAMPLES + 1)
+        for route in GATEWAY_HTTP_ROUTES
+    ]
+    if (
+        type(document["expected_cells"]) is not int
+        or type(document["completed_cells"]) is not int
+        or document["expected_cells"] != len(required_cells)
+        or document["completed_cells"] != len(required_cells)
+        or len(document["cells"]) != len(required_cells)
+    ):
+        raise ProofError("Gateway matrix cell count does not match the contract")
+    cell_keys = {
+        "source_node", "listener_ip", "sample", "route",
+        "http_status", "transport_result", "body_sha256", "body_bytes",
+    }
+    for cell, (node, address, sample, route) in zip(
+        document["cells"], required_cells, strict=True,
+    ):
+        if not isinstance(cell, dict) or set(cell) != cell_keys:
+            raise ProofError("Gateway matrix has malformed cell evidence")
+        if (
+            (cell["source_node"], cell["listener_ip"], cell["sample"], cell["route"])
+            != (node, address, sample, route)
+            or type(cell["sample"]) is not int
+            or type(cell["http_status"]) is not int
+            or cell["http_status"] != 200
+            or cell["transport_result"] != "ok"
+            or not isinstance(cell["body_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", cell["body_sha256"]) is None
+            or type(cell["body_bytes"]) is not int
+            or cell["body_bytes"] <= 0
+        ):
+            raise ProofError("Gateway matrix contains a missing, reordered or invalid sample")
+    if (
+        not isinstance(document["canonical_sha256"], str)
+        or document["canonical_sha256"] != gateway_matrix_evidence_digest(document)
+    ):
+        raise ProofError("Gateway matrix evidence canonical digest mismatch")
+    if expected_digest is not None and document["canonical_sha256"] != expected_digest:
+        raise ProofError("Gateway matrix evidence digest differs from externally bound receipt")
+
+
+def gateway_receipt_observation_matches(
+    receipt: dict[str, Any], observed: dict[str, Any]
+) -> bool:
+    if all(receipt.get(key) == value for key, value in observed.items()):
+        return True
+
+    # Gateway receipts created before the host-external proof contract recorded
+    # the complete Service spec hash but not node_port as a separate field.
+    # The spec hash already commits to the live NodePort, so accepting exactly
+    # this missing redundant field preserves the old proof without weakening
+    # any resource, UID, routing, address or Service-spec binding.
+    receipt_service = receipt.get("service")
+    observed_service = observed.get("service")
+    if (
+        not isinstance(receipt_service, dict)
+        or "node_port" in receipt_service
+        or not isinstance(observed_service, dict)
+        or not isinstance(observed_service.get("node_port"), int)
+        or isinstance(observed_service.get("node_port"), bool)
+    ):
+        return False
+    legacy_service = {
+        key: value for key, value in observed_service.items() if key != "node_port"
+    }
+    legacy_observed = {**observed, "service": legacy_service}
+    return all(receipt.get(key) == value for key, value in legacy_observed.items())
+
+def gateway_matrix_live_runtime(
+    kind: str, cluster: str, addresses: list[str], port: int,
+) -> dict[str, Any]:
+    """Authoritative Kind source/owner/container state for receipt validation."""
+    nodes = kind_nodes(kind, cluster)
+    return {
+        "nodes": nodes,
+        "listeners": list(addresses),
+        "owner_by_address": gateway_address_owners(kind, cluster, addresses),
+        "container_ids": gateway_node_container_ids(nodes),
+        "port": port,
+    }
+
+
+def validate_gateway_matrix_live(
+    document: dict[str, Any], *,
+    kind: str, cluster: str, addresses: list[str], port: int,
+    owner_local: bool = False, expected_digest: str | None = None,
+) -> None:
+    """Validate all cells and compare their binding to the actual live runtime."""
+    validate_gateway_matrix_evidence(
+        document,
+        expected_runtime=gateway_matrix_live_runtime(kind, cluster, addresses, port),
+        expected_mode="owner-local-ha" if owner_local else "strict-t084-all-nodes",
+        expected_digest=expected_digest,
+    )
+    if document["kind_cluster"] != cluster:
+        raise ProofError("Gateway matrix proof has a stale cluster identity")
+
+
 def probe_gateway_http(
     kind: str,
     cluster: str,
     addresses: list[str],
     port: int,
-    timeout_seconds: int = 30,
+    timeout_seconds: float | None = None,
+    *,
+    owner_local: bool = False,
+    verify_node_ids: bool = False,
+    matrix_evidence: dict[str, Any] | None = None,
 ) -> tuple[str, str, bytes, bytes, bytes]:
+    """Require strict T084 or explicitly owner-local HA HTTP matrix.
+
+    A single HTTP error, timeout, invalid response or failed sample terminates
+    the proof; no HTTP error may be retried into a passing matrix.
+    """
+    owners = gateway_address_owners(kind, cluster, addresses)
     nodes = kind_nodes(kind, cluster)
+    missing_owners = set(owners.values()) - set(nodes)
+    if missing_owners:
+        raise ProofError(
+            f"Gateway owner node missing from current kind node inventory: {sorted(missing_owners)}"
+        )
+    before_container_ids = gateway_node_container_ids(nodes) if verify_node_ids or matrix_evidence is not None else None
+    runtime_before = {
+        "nodes": list(nodes),
+        "listeners": list(addresses),
+        "owner_by_address": dict(owners),
+        "container_ids": dict(before_container_ids or {}),
+        "port": port,
+    }
+    cells: list[dict[str, Any]] = []
+    if timeout_seconds is None:
+        # A bounded curl on each required source/listener/route/sample.
+        # HA accepts only owner-local paths; T084 remains all-node/all-listener.
+        required_paths = len(addresses) if owner_local else len(nodes) * len(addresses)
+        timeout_seconds = required_paths * GATEWAY_HTTP_PROBE_SAMPLES * 3 * 15 + 10
+    if timeout_seconds <= 0:
+        raise ProofError("Gateway HTTP matrix requires a positive time budget")
     deadline = time.monotonic() + timeout_seconds
-    last_error: BaseException | None = None
-    while True:
-        for node in nodes:
-            for address in addresses:
+    witness: tuple[str, str, bytes, bytes, bytes] | None = None
+
+    for node in nodes:
+        for address in addresses:
+            if owner_local and owners[address] != node:
+                continue
+            for sample in range(1, GATEWAY_HTTP_PROBE_SAMPLES + 1):
+                if time.monotonic() >= deadline:
+                    raise ProofError(
+                        "Gateway status address did not serve listener HTTP from a kind node: "
+                        f"probe timeout at node={node!r} address={address!r} sample={sample}"
+                    )
                 common = [
                     "docker",
                     "exec",
@@ -2029,59 +2325,537 @@ def probe_gateway_http(
                     "--max-time",
                     "10",
                 ]
-                try:
-                    health = subprocess.run(
-                        [*common, f"http://{address}:{port}/health/live"],
-                        cwd=ROOT,
-                        text=False,
-                        capture_output=True,
-                        check=True,
-                        timeout=15,
-                    ).stdout
-                    web = subprocess.run(
-                        [*common, f"http://{address}:{port}/"],
-                        cwd=ROOT,
-                        text=False,
-                        capture_output=True,
-                        check=True,
-                        timeout=15,
-                    ).stdout[:1024]
-                    api_nodes = subprocess.run(
-                        [*common, f"http://{address}:{port}/api/nodes"],
-                        cwd=ROOT,
-                        text=False,
-                        capture_output=True,
-                        check=True,
-                        timeout=15,
-                    ).stdout
+                if matrix_evidence is not None:
+                    # Capture HTTP status separately from response body, without
+                    # writing response content or credentials to the receipt.
+                    common.extend(("--write-out", "%{stderr}%{http_code}"))
+                bodies: dict[str, bytes] = {}
+                for path in GATEWAY_HTTP_ROUTES:
                     try:
-                        api_payload = json.loads(api_nodes)
-                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                        raise ProofError(
-                            "Gateway /api/nodes route did not return valid JSON"
-                        ) from error
-                    if not isinstance(api_payload, list):
-                        raise ProofError(
-                            "Gateway /api/nodes route did not preserve the API list contract"
+                        response = subprocess.run(
+                            [*common, f"http://{address}:{port}{path}"],
+                            cwd=ROOT,
+                            text=False,
+                            capture_output=True,
+                            check=True,
+                            timeout=15,
                         )
-                    if health and web:
-                        return node, address, health, web, api_nodes
-                    last_error = ProofError("Gateway route returned empty content")
-                except (
-                    subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired,
-                    ProofError,
-                ) as error:
-                    last_error = error
-        if time.monotonic() >= deadline:
-            raise ProofError(
-                "Gateway status address did not serve listener HTTP from a kind node: "
-                f"nodes={nodes!r} addresses={addresses!r} port={port}"
-            ) from last_error
-        time.sleep(1)
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                        raise GatewayTransportNotReady(
+                            "Gateway status address did not serve listener HTTP from a kind node: "
+                            f"node={node!r} address={address!r} route={path!r} "
+                            f"sample={sample}"
+                        ) from error
+                    if matrix_evidence is not None:
+                        status_bytes = response.stderr
+                        if status_bytes != b"200":
+                            raise GatewayTransportNotReady(
+                                "Gateway matrix requires exactly HTTP 200: "
+                                f"node={node!r} address={address!r} route={path!r} "
+                                f"sample={sample} status={status_bytes!r}"
+                            )
+                        cells.append({
+                            "source_node": node,
+                            "listener_ip": address,
+                            "sample": sample,
+                            "route": path,
+                            "http_status": 200,
+                            "transport_result": "ok",
+                            "body_sha256": hashlib.sha256(response.stdout).hexdigest(),
+                            "body_bytes": len(response.stdout),
+                        })
+                    bodies[path] = response.stdout
+                health = bodies["/health/live"]
+                web = bodies["/"][:1024]
+                api_nodes = bodies["/api/nodes"]
+                if not health or not web:
+                    raise ProofError(
+                        "Gateway status address did not serve listener HTTP from a kind node: "
+                        f"empty content at node={node!r} address={address!r} sample={sample}"
+                    )
+                try:
+                    api_payload = json.loads(
+                        api_nodes,
+                        parse_constant=_reject_gateway_json_constant,
+                        parse_float=_strict_gateway_json_float,
+                        object_pairs_hook=_unique_gateway_json_object,
+                    )
+                except (UnicodeDecodeError, ValueError) as error:
+                    raise ProofError(
+                        "Gateway status address did not serve listener HTTP from a kind node: "
+                        f"invalid /api/nodes JSON at node={node!r} address={address!r}"
+                    ) from error
+                if not isinstance(api_payload, list):
+                    raise ProofError(
+                        "Gateway status address did not serve listener HTTP from a kind node: "
+                        f"invalid /api/nodes list at node={node!r} address={address!r}"
+                    )
+                if witness is None:
+                    witness = (node, address, health, web, api_nodes)
+    if witness is None:
+        raise ProofError("Gateway HTTP proof has no node/address/route witness")
+    if time.monotonic() >= deadline:
+        raise ProofError("Gateway status address did not serve listener HTTP within proof deadline")
+    # A healthy probe against the OLD owner map is never a proof about a NEW
+    # owner map. Fail even if node names survive an IP reallocation.
+    after_nodes = kind_nodes(kind, cluster)
+    after_owners = gateway_address_owners(kind, cluster, addresses)
+    if sorted(after_nodes) != sorted(nodes) or after_owners != owners:
+        raise ProofError("Gateway source-node inventory or listener owners drifted during matrix")
+    after_container_ids: dict[str, str] | None = None
+    if before_container_ids is not None:
+        after_container_ids = gateway_node_container_ids(after_nodes)
+        if after_container_ids != before_container_ids:
+            raise ProofError("Gateway Kind container identity drifted during matrix")
+    if matrix_evidence is not None:
+        runtime_after = {
+            "nodes": list(after_nodes),
+            "listeners": list(addresses),
+            "owner_by_address": dict(after_owners),
+            "container_ids": dict(after_container_ids or {}),
+            "port": port,
+        }
+        evidence = {
+            "schema_version": 1,
+            "kind_cluster": cluster,
+            "probe_mode": "owner-local-ha" if owner_local else "strict-t084-all-nodes",
+            "runtime_before": runtime_before,
+            "runtime_after": runtime_after,
+            "routes": list(GATEWAY_HTTP_ROUTES),
+            "samples_per_route": GATEWAY_HTTP_PROBE_SAMPLES,
+            "expected_cells": (
+                (len(addresses) if owner_local else len(nodes) * len(addresses))
+                * GATEWAY_HTTP_PROBE_SAMPLES * len(GATEWAY_HTTP_ROUTES)
+            ),
+            "completed_cells": len(cells),
+            "cells": cells,
+        }
+        evidence["canonical_sha256"] = gateway_matrix_evidence_digest(evidence)
+        validate_gateway_matrix_evidence(evidence, expected_runtime=runtime_before)
+        matrix_evidence.clear()
+        matrix_evidence.update(evidence)
+    return witness
 
 
-def prove_gateway(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
+
+def _gateway_nonhttp_json(argv: list[str], *, deadline: float) -> dict[str, Any]:
+    """Read bounded Kubernetes or Cilium/Envoy state; never probe Gateway HTTP."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProofError("Gateway non-HTTP readiness deadline expired")
+    try:
+        result = subprocess.run(
+            argv, cwd=ROOT, text=True, capture_output=True, check=False,
+            timeout=min(10, max(0.1, remaining)),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ProofError("Gateway non-HTTP readiness source unavailable") from error
+    if result.returncode or len(result.stdout) > 1048576:
+        raise ProofError("Gateway non-HTTP readiness source failed or exceeded size limit")
+    try:
+        document = json.loads(
+            result.stdout,
+            parse_constant=_reject_gateway_json_constant,
+            parse_float=_strict_gateway_json_float,
+            object_pairs_hook=_unique_gateway_json_object,
+        )
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ProofError("Gateway non-HTTP readiness returned malformed JSON") from error
+    if not isinstance(document, dict):
+        raise ProofError("Gateway non-HTTP readiness returned a non-object")
+    return document
+
+
+def gateway_envoy_nonhttp_snapshot(
+    kubectl: str, kind: str, cluster: str, *,
+    namespace: str, gateway_namespace: str, gateway_name: str,
+    backends: tuple[tuple[str, int], ...], deadline: float,
+    owner_local: bool = False, listener_addresses: list[str] | None = None,
+) -> dict[str, Any]:
+    """Bind ready K8s EndpointSlices to real Envoy LDS/CDS/EDS on every Kind node.
+
+    Envoy control-plane convergence is a prerequisite, NEVER a Gateway PASS.
+    The subsequent strict HTTP matrix is the sole acceptance probe.
+    """
+    if not backends or len(set(backends)) != len(backends):
+        raise ProofError("Gateway non-HTTP readiness has no unique backends")
+    all_nodes = kind_nodes(kind, cluster)
+    nodes = all_nodes
+    owners: dict[str, str] = {}
+    if owner_local:
+        if (
+            not isinstance(listener_addresses, list)
+            or not listener_addresses
+            or len(listener_addresses) != len(set(listener_addresses))
+        ):
+            raise ProofError("Gateway HA preflight requires exact advertised owner addresses")
+        # Source ownership is read from Kind IPAM, never inferred from HTTP reachability.
+        owners = gateway_address_owners(kind, cluster, listener_addresses)
+        if set(owners) != set(listener_addresses):
+            raise ProofError("Gateway HA listener owner inventory is incomplete")
+        nodes = sorted(set(owners.values()))
+        if not nodes or not set(nodes).issubset(all_nodes):
+            raise ProofError("Gateway HA listener owner missing from Kind inventory")
+    cec_name = f"cilium-gateway-{gateway_name}"
+    cec = _gateway_nonhttp_json(
+        [kubectl, "-n", gateway_namespace, "get", "ciliumenvoyconfig",
+         cec_name, "-o", "json"], deadline=deadline,
+    )
+    cec_uid = cec.get("metadata", {}).get("uid")
+    if not isinstance(cec_uid, str) or not cec_uid:
+        raise ProofError("Gateway non-HTTP readiness has no CiliumEnvoyConfig UID")
+
+    expected: dict[str, set[tuple[str, int]]] = {}
+    backing: dict[str, Any] = {}
+    for service, port in backends:
+        if (not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", service)
+                or type(port) is not int or not 1 <= port <= 65535):
+            raise ProofError("Gateway non-HTTP readiness has an invalid backend")
+        deployment = _gateway_nonhttp_json(
+            [kubectl, "-n", namespace, "get", "deployment", service, "-o", "json"],
+            deadline=deadline,
+        )
+        meta, status = deployment.get("metadata", {}), deployment.get("status", {})
+        desired = deployment.get("spec", {}).get("replicas", 1)
+        if (type(desired) is not int or desired <= 0
+                or meta.get("generation") != status.get("observedGeneration")
+                or any(status.get(field, 0) != desired for field in
+                       ("readyReplicas", "updatedReplicas", "availableReplicas"))):
+            raise ProofError(f"Gateway non-HTTP backend {service} replicas are not converged")
+        slices = _gateway_nonhttp_json(
+            [kubectl, "-n", namespace, "get", "endpointslices",
+             "-l", f"kubernetes.io/service-name={service}", "-o", "json"],
+            deadline=deadline,
+        )
+        items = slices.get("items")
+        if not isinstance(items, list) or not items:
+            raise ProofError(f"Gateway non-HTTP backend {service} has no EndpointSlices")
+        ips: set[tuple[str, int]] = set()
+        identities: list[tuple[str, str]] = []
+        for item in items:
+            if (not isinstance(item, dict) or item.get("addressType") != "IPv4"
+                    or item.get("metadata", {}).get("labels", {}).get(
+                        "kubernetes.io/service-name") != service
+                    or not any(
+                        isinstance(value, dict) and value.get("port") == port
+                        and value.get("protocol", "TCP") == "TCP"
+                        for value in item.get("ports", [])
+                    )):
+                raise ProofError(f"Gateway non-HTTP backend {service} has invalid EndpointSlice")
+            uid = item.get("metadata", {}).get("uid")
+            rv = item.get("metadata", {}).get("resourceVersion")
+            if not uid or not rv:
+                raise ProofError("Gateway non-HTTP EndpointSlice lacks source identity")
+            identities.append((str(uid), str(rv)))
+            for ep in item.get("endpoints", []):
+                conditions = ep.get("conditions", {})
+                addresses = ep.get("addresses", [])
+                target = ep.get("targetRef", {})
+                # The EndpointSlice API interprets nil serving as true and
+                # nil terminating as false; explicitly unhealthy/non-boolean
+                # values remain fail-closed. Ready must be affirmatively true.
+                if (not isinstance(conditions, dict)
+                        or conditions.get("ready") is not True
+                        or (conditions.get("serving") is not None
+                            and conditions["serving"] is not True)
+                        or (conditions.get("terminating") is not None
+                            and conditions["terminating"] is not False)
+                        or target.get("kind") != "Pod" or not target.get("uid")
+                        or len(addresses) != 1):
+                    raise ProofError(f"Gateway non-HTTP backend {service} has unready EndpointSlice member")
+                try:
+                    ip = ipaddress.ip_address(addresses[0])
+                except ValueError as error:
+                    raise ProofError("Gateway non-HTTP EndpointSlice IP is malformed") from error
+                if ip.version != 4 or (str(ip), port) in ips:
+                    raise ProofError("Gateway non-HTTP EndpointSlice has invalid/duplicate IPv4")
+                ips.add((str(ip), port))
+        if len(ips) != desired:
+            raise ProofError(f"Gateway non-HTTP backend {service} EndpointSlice count differs from replicas")
+        key = f"{namespace}/{service}:{port}"
+        expected[key] = ips
+        backing[key] = {
+            "deployment_uid": meta.get("uid"),
+            "deployment_generation": meta.get("generation"),
+            "endpoint_slices": sorted(identities),
+            "endpoint_ip_port_sha256": hashlib.sha256(
+                json.dumps(sorted(ips), separators=(",", ":")).encode()
+            ).hexdigest(),
+            "replicas": desired,
+        }
+
+    agents = _gateway_nonhttp_json(
+        [kubectl, "-n", "kube-system", "get", "pods",
+         "-l", "k8s-app=cilium", "-o", "json"], deadline=deadline,
+    )
+    envoy_pods = _gateway_nonhttp_json(
+        [kubectl, "-n", "kube-system", "get", "pods",
+         "-l", "k8s-app=cilium-envoy", "-o", "json"], deadline=deadline,
+    )
+
+    def ready_by_node(document: dict[str, Any]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for item in document.get("items", []):
+            meta, spec, state = item.get("metadata", {}), item.get("spec", {}), item.get("status", {})
+            node, pod = spec.get("nodeName"), meta.get("name")
+            if owner_local and node not in nodes:
+                # ADR-0013: non-owner Cilium/Envoy paths are diagnostic only.
+                continue
+            if node not in nodes or not isinstance(pod, str) or not pod or node in result:
+                raise ProofError("Gateway Cilium/Envoy Pod has missing/duplicate Kind node binding")
+            if (state.get("phase") != "Running"
+                    or not any(c.get("type") == "Ready" and c.get("status") == "True"
+                               for c in state.get("conditions", []))
+                    or not state.get("containerStatuses")
+                    or not all(v.get("ready") is True for v in state["containerStatuses"])):
+                raise ProofError("Gateway Cilium/Envoy Pod is not fully ready")
+            result[node] = pod
+        if set(result) != set(nodes):
+            raise ProofError("Gateway Cilium/Envoy Pods do not cover every Kind node")
+        return result
+
+    agent_map = ready_by_node(agents)
+    envoy_map = ready_by_node(envoy_pods)
+    listener_name = f"{gateway_namespace}/{cec_name}/listener"
+    envoy_source_digests: dict[str, dict[str, str]] = {}
+    for node in nodes:
+        dumped: dict[str, dict[str, Any]] = {}
+        for part in ("listeners", "routes", "clusters", "endpoints"):
+            doc = _gateway_nonhttp_json(
+                [kubectl, "-n", "kube-system", "exec", agent_map[node],
+                 "--", "cilium-dbg", "envoy", "admin", "config", part],
+                deadline=deadline,
+            )
+            configs = doc.get("configs")
+            if not isinstance(configs, list):
+                raise ProofError("Gateway Envoy admin did not return its active config")
+            dumped[part] = doc
+        listeners = [
+            x for x in dumped["listeners"]["configs"]
+            if x.get("name") == listener_name and isinstance(x.get("active_state"), dict)
+        ]
+        if len(listeners) != 1:
+            raise ProofError(f"Gateway Envoy active listener is missing on Kind node {node}")
+        route_name = f"{gateway_namespace}/{cec_name}/listener-insecure"
+        routes = [
+            x for x in dumped["routes"]["configs"]
+            if x.get("route_config", {}).get("name") == route_name
+        ]
+        if len(routes) != 1:
+            raise ProofError(f"Gateway Envoy RDS routes are missing on Kind node {node}")
+        route_clusters = [
+            route.get("route", {}).get("cluster")
+            for host in routes[0].get("route_config", {}).get("virtual_hosts", [])
+            for route in host.get("routes", [])
+        ]
+        expected_clusters = {
+            f"{gateway_namespace}/{cec_name}/{namespace}:{key.split('/', 1)[1]}"
+            for key in expected
+        }
+        if set(route_clusters) != expected_clusters or not route_clusters:
+            raise ProofError(f"Gateway Envoy RDS backend routing is incomplete on Kind node {node}")
+        for key, ips in expected.items():
+            service = key.split("/", 1)[1]
+            full_cluster = f"{gateway_namespace}/{cec_name}/{namespace}:{service}"
+            clusters = [
+                x for x in dumped["clusters"]["configs"]
+                if x.get("cluster", {}).get("name") == full_cluster
+                and x.get("cluster", {}).get("type") == "EDS"
+            ]
+            if len(clusters) != 1:
+                raise ProofError(f"Gateway Envoy CDS cluster missing for {key} on {node}")
+            # Gateway-specific CDS clusters must refer to the exact Service
+            # EDS name; a healthy but unreferenced assignment is not readiness.
+            cds_eds_name = clusters[0]["cluster"].get(
+                "eds_cluster_config", {}
+            ).get("service_name")
+            if cds_eds_name != key:
+                raise ProofError(
+                    f"Gateway Envoy CDS-to-EDS binding missing/mismatched for {key} on {node}"
+                )
+            eds = [
+                x for x in dumped["endpoints"]["configs"]
+                if x.get("endpoint_config", {}).get("cluster_name") == key
+            ]
+            if len(eds) != 1:
+                raise ProofError(f"Gateway Envoy EDS assignment missing for {key} on {node}")
+            present: list[tuple[str, int]] = []
+            for locality in eds[0]["endpoint_config"].get("endpoints", []):
+                for lb in locality.get("lb_endpoints", []):
+                    address = lb.get("endpoint", {}).get("address", {}).get("socket_address", {})
+                    if lb.get("health_status") != "HEALTHY":
+                        raise ProofError(f"Gateway Envoy EDS endpoint is unhealthy for {key} on {node}")
+                    present.append((address.get("address"), address.get("port_value")))
+            if len(present) != len(set(present)) or set(present) != ips:
+                raise ProofError(f"Gateway Envoy EDS is stale/incomplete for {key} on {node}")
+        envoy_source_digests[node] = {
+            "agent": agent_map[node],
+            "envoy": envoy_map[node],
+            "lds_sha256": hashlib.sha256(json.dumps(
+                dumped["listeners"], sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+            "rds_sha256": hashlib.sha256(json.dumps(
+                dumped["routes"], sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+            "cds_sha256": hashlib.sha256(json.dumps(
+                dumped["clusters"], sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+            "eds_sha256": hashlib.sha256(json.dumps(
+                dumped["endpoints"], sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+        }
+    return {
+        "status": "non-http-envoy-eds-ready-not-a-gateway-pass",
+        "kind_cluster": cluster,
+        "cec_uid": cec_uid,
+        "namespace": namespace,
+        "gateway_namespace": gateway_namespace,
+        "gateway_name": gateway_name,
+        "backend_binding": backing,
+        "kind_nodes": nodes,
+        "owner_by_address": owners,
+        "envoy_sources": envoy_source_digests,
+    }
+
+
+def wait_gateway_envoy_nonhttp_ready(
+    kubectl: str, kind: str, cluster: str, *,
+    namespace: str, gateway_namespace: str, gateway_name: str,
+    backends: tuple[tuple[str, int], ...], timeout_seconds: float = 120,
+    owner_local: bool = False, listener_addresses: list[str] | None = None,
+) -> dict[str, Any]:
+    """Bounded, non-accepting xDS readiness. No Gateway HTTP request or retry."""
+    if timeout_seconds <= 0 or timeout_seconds > 300:
+        raise ProofError("Gateway non-HTTP readiness has an invalid time budget")
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    checks = 0
+    last_failure = "no observation"
+    while time.monotonic() < deadline:
+        checks += 1
+        try:
+            result = gateway_envoy_nonhttp_snapshot(
+                kubectl, kind, cluster, namespace=namespace,
+                gateway_namespace=gateway_namespace, gateway_name=gateway_name,
+                backends=backends, deadline=deadline,
+                owner_local=owner_local, listener_addresses=listener_addresses,
+            )
+        except (ProofError, subprocess.SubprocessError) as error:
+            last_failure = f"{type(error).__name__}: {error}"[:280]
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(2, remaining))
+            continue
+        return {
+            **result,
+            "preflight_attempts": checks,
+            "preflight_duration_seconds": round(time.monotonic() - started, 3),
+            "gateway_http_requests": 0,
+        }
+    raise ProofError(
+        f"Gateway non-HTTP Envoy readiness did not converge within "
+        f"{timeout_seconds}s after {checks} reads: {last_failure}"
+    )
+
+
+def validate_gateway_nonhttp_current(
+    evidence: dict[str, Any], *,
+    kubectl: str, kind: str, cluster: str,
+    namespace: str, gateway_namespace: str, gateway_name: str,
+    backends: tuple[tuple[str, int], ...],
+    owner_local: bool = False, listener_addresses: list[str] | None = None,
+) -> None:
+    """Reject a stale preflight after HTTP or at receipt reuse; never accept HTTP."""
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("status") != "non-http-envoy-eds-ready-not-a-gateway-pass"
+        or evidence.get("gateway_http_requests") != 0
+    ):
+        raise ProofError("Gateway non-HTTP readiness receipt is missing or invalid")
+    fresh = gateway_envoy_nonhttp_snapshot(
+        kubectl, kind, cluster, namespace=namespace,
+        gateway_namespace=gateway_namespace, gateway_name=gateway_name,
+        backends=backends, deadline=time.monotonic() + 60,
+        owner_local=owner_local, listener_addresses=listener_addresses,
+    )
+    binding_fields = (
+        "kind_cluster", "cec_uid", "namespace", "gateway_namespace",
+        "gateway_name", "backend_binding", "kind_nodes", "owner_by_address", "envoy_sources",
+    )
+    if any(evidence.get(field) != fresh[field] for field in binding_fields):
+        raise ProofError("Gateway Envoy/EDS runtime identity drifted after preflight")
+
+
+def probe_gateway_after_readiness(
+    kind: str, cluster: str, addresses: list[str], port: int,
+    *, owner_local: bool = False, verify_node_ids: bool = False,
+    matrix_evidence: dict[str, Any] | None = None,
+    readiness: dict[str, Any] | None = None,
+    preflight_evidence: dict[str, Any] | None = None,
+) -> tuple[str, str, bytes, bytes, bytes]:
+    """After control-plane readiness, run exactly one fail-closed HTTP matrix.
+
+    HTTP 503 and timeouts cannot be treated as retryable startup observations.
+    The API/Envoy data-plane proof begins on the first sampled request.
+    """
+    if readiness is not None:
+        expected_fields = {
+            "kubectl", "namespace", "gateway_namespace", "gateway_name", "backends"
+        }
+        if set(readiness) != expected_fields:
+            raise ProofError("Gateway non-HTTP preflight binding is incomplete")
+        preflight = wait_gateway_envoy_nonhttp_ready(
+            readiness["kubectl"], kind, cluster,
+            namespace=readiness["namespace"],
+            gateway_namespace=readiness["gateway_namespace"],
+            gateway_name=readiness["gateway_name"],
+            backends=readiness["backends"],
+            owner_local=owner_local,
+            listener_addresses=addresses if owner_local else None,
+        )
+        if (
+            not isinstance(preflight, dict)
+            or preflight.get("status") != "non-http-envoy-eds-ready-not-a-gateway-pass"
+            or preflight.get("kind_cluster") != cluster
+            or preflight.get("gateway_http_requests") != 0
+            or not isinstance(preflight.get("cec_uid"), str)
+            or not preflight["cec_uid"]
+            or not isinstance(preflight.get("backend_binding"), dict)
+            or not preflight["backend_binding"]
+            or not isinstance(preflight.get("envoy_sources"), dict)
+            or not preflight["envoy_sources"]
+        ):
+            raise ProofError("Gateway non-HTTP preflight lacks bound primary-source evidence")
+        if preflight_evidence is not None:
+            preflight_evidence.clear()
+            preflight_evidence.update(preflight)
+    if owner_local:
+        witness = probe_gateway_http(
+            kind, cluster, addresses, port,
+            owner_local=True, verify_node_ids=verify_node_ids,
+            matrix_evidence=matrix_evidence,
+        )
+    else:
+        witness = probe_gateway_http(
+            kind, cluster, addresses, port, verify_node_ids=verify_node_ids,
+            matrix_evidence=matrix_evidence,
+        )
+    if readiness is not None:
+        validate_gateway_nonhttp_current(
+            preflight, kubectl=readiness["kubectl"], kind=kind, cluster=cluster,
+            namespace=readiness["namespace"],
+            gateway_namespace=readiness["gateway_namespace"],
+            gateway_name=readiness["gateway_name"],
+            backends=readiness["backends"],
+            owner_local=owner_local,
+            listener_addresses=addresses if owner_local else None,
+        )
+    return witness
+
+
+def prove_gateway(
+    kubectl: str, kind: str, cluster: str, *, owner_local: bool = False
+) -> dict[str, Any]:
     wait_condition(kubectl, "weltgewebe-gateway", "gateway/weltgewebe", "Programmed")
     wait_http_route_parent_condition(
         kubectl,
@@ -2115,11 +2889,30 @@ def prove_gateway(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
     if not service:
         raise ProofError("Gateway service was not created")
     listener_port = gateway_listener_port(kubectl)
-    probe_node, address, health, web, api_nodes = probe_gateway_http(
-        kind,
-        cluster,
-        gateway_addresses(kubectl),
-        gateway_service_listener_port(kubectl, service, listener_port),
+    addresses = gateway_addresses(kubectl)
+    service_port = gateway_service_listener_port(kubectl, service, listener_port)
+    # Neither mode retries a single 503. HA measures owner-local paths;
+    # T084 remains strict across every node, listener, route and sample.
+    matrix_evidence: dict[str, Any] = {}
+    preflight_evidence: dict[str, Any] = {}
+    probe_node, address, health, web, api_nodes = probe_gateway_after_readiness(
+        kind, cluster, addresses, service_port,
+        owner_local=owner_local, verify_node_ids=True,
+        matrix_evidence=matrix_evidence,
+        readiness={
+            "kubectl": kubectl,
+            "namespace": "weltgewebe",
+            "gateway_namespace": "weltgewebe-gateway",
+            "gateway_name": "weltgewebe",
+            "backends": (("weltgewebe-api", 8080), ("weltgewebe-web", 8080)),
+        },
+        preflight_evidence=preflight_evidence,
+    )
+    if sorted(gateway_addresses(kubectl)) != sorted(addresses):
+        raise ProofError("Gateway advertised listener IP set drifted during matrix")
+    validate_gateway_matrix_live(
+        matrix_evidence, kind=kind, cluster=cluster, addresses=addresses,
+        port=service_port, owner_local=owner_local,
     )
     return {
         "service": service,
@@ -2129,6 +2922,8 @@ def prove_gateway(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
         "health_sha256": hashlib.sha256(health).hexdigest(),
         "web_prefix_sha256": hashlib.sha256(web).hexdigest(),
         "api_nodes_sha256": hashlib.sha256(api_nodes).hexdigest(),
+        "matrix_evidence": matrix_evidence,
+        "non_http_preflight": preflight_evidence,
     }
 
 

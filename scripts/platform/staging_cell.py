@@ -412,8 +412,6 @@ def state_root(value: str | None) -> Path:
     return resolved
 
 
-
-
 @contextmanager
 def lifecycle_lock(root: Path):
     ensure_directory_durable(root, mode=0o700)
@@ -5376,14 +5374,25 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
             time.sleep(2)
     require_gateway_observation_binding(observed, binding)
     require_gateway_desired_contract(observed, documents)
-    node, address, health, web, api_nodes = reference.probe_gateway_http(
-        tools["kind"], args.cluster, observed["gateway_addresses"], observed["listener_port"]
+    matrix_evidence: dict[str, Any] = {}
+    preflight_evidence: dict[str, Any] = {}
+    node, address, health, web, api_nodes = reference.probe_gateway_after_readiness(
+        tools["kind"], args.cluster, observed["gateway_addresses"], observed["listener_port"],
+        verify_node_ids=True, matrix_evidence=matrix_evidence,
+        readiness={"kubectl": kubectl, "namespace": APP_NAMESPACE,
+                   "gateway_namespace": APP_NAMESPACE, "gateway_name": GATEWAY_NAME,
+                   "backends": (("commonthing-api", 8080), ("commonthing-web", 8080))},
+        preflight_evidence=preflight_evidence,
     )
     if address not in observed["gateway_addresses"]:
         raise StagingCellError("HTTP proof selected an unobserved Gateway address")
     require_gateway_app_current(kubectl, cell, promotion)
     if staging_gateway_observation(kubectl) != observed:
         raise StagingCellError("gateway resources changed during HTTP proof")
+    reference.validate_gateway_matrix_live(
+        matrix_evidence, kind=tools["kind"], cluster=args.cluster,
+        addresses=observed["gateway_addresses"], port=observed["listener_port"],
+    )
     result = {
         "schema_version": 1,
         "status": "gateway-ready",
@@ -5400,6 +5409,8 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
         "web_prefix_sha256": sha256_bytes(web),
         "web_prefix_bytes": len(web),
         "api_nodes_sha256": sha256_bytes(api_nodes),
+        "matrix_evidence": matrix_evidence,
+        "non_http_preflight": preflight_evidence,
         "does_not_establish": GATEWAY_LIMITS,
         "production_changed": False,
     }
@@ -5409,7 +5420,8 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
         **pending,
         "status": "gateway-ready",
         "does_not_establish": GATEWAY_LIMITS,
-        "gateway_proof": {"active_commit": commit, "receipt_sha256": sha256_file(path)},
+        "gateway_proof": {"active_commit": commit, "receipt_sha256": sha256_file(path),
+                          "matrix_sha256": matrix_evidence["canonical_sha256"]},
     }
     updated.pop("pending_gateway", None)
     write_cell_receipt(root, updated)
@@ -5541,34 +5553,6 @@ def host_gateway_receipt_current(root: Path, cell: dict[str, Any], kubectl: str)
         return False
 
 
-def _gateway_receipt_observation_matches(
-    receipt: dict[str, Any], observed: dict[str, Any]
-) -> bool:
-    if all(receipt.get(key) == value for key, value in observed.items()):
-        return True
-
-    # Gateway receipts created before the host-external proof contract recorded
-    # the complete Service spec hash but not node_port as a separate field.
-    # The spec hash already commits to the live NodePort, so accepting exactly
-    # this missing redundant field preserves the old proof without weakening
-    # any resource, UID, routing, address or Service-spec binding.
-    receipt_service = receipt.get("service")
-    observed_service = observed.get("service")
-    if (
-        not isinstance(receipt_service, dict)
-        or "node_port" in receipt_service
-        or not isinstance(observed_service, dict)
-        or not isinstance(observed_service.get("node_port"), int)
-        or isinstance(observed_service.get("node_port"), bool)
-    ):
-        return False
-    legacy_service = {
-        key: value for key, value in observed_service.items() if key != "node_port"
-    }
-    legacy_observed = {**observed, "service": legacy_service}
-    return all(receipt.get(key) == value for key, value in legacy_observed.items())
-
-
 def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
     if cell.get("status") != "gateway-ready":
         return False
@@ -5577,23 +5561,36 @@ def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
         if path.is_symlink() or stat.S_IMODE(path.stat().st_mode) != 0o600:
             return False
         binding = cell.get("gateway_proof", {})
-        if binding.get("active_commit") != cell_active_commit(cell) or binding.get(
-            "receipt_sha256"
-        ) != sha256_file(path):
-            return False
-        receipt = json.loads(path.read_text())
-        if any(
-            receipt.get(key) != cell.get(key)
-            for key in ("owner_id", "cluster", "bootstrap_commit", "active_commit")
+        if binding.get("active_commit") != cell_active_commit(cell) or (
+            binding.get("receipt_sha256") != sha256_file(path)
         ):
             return False
+        receipt = json.loads(path.read_text())
+        if any(receipt.get(key) != cell.get(key) for key in
+               ("owner_id", "cluster", "bootstrap_commit", "active_commit")):
+            return False
         observed = staging_gateway_observation(kubectl)
-        expected_binding = {
+        require_gateway_observation_binding(observed, {
             "owner_id": receipt.get("owner_id"),
             "active_commit": receipt.get("active_commit"),
             "manifest_sha256": receipt.get("manifest_sha256"),
-        }
-        require_gateway_observation_binding(observed, expected_binding)
+        })
+        matrix = receipt.get("matrix_evidence")
+        if not isinstance(matrix, dict):
+            return False
+        tool_ref = load_tool_receipt(root, required_tools=("kind",),
+                                     required_artifacts=())["tools"]["kind"]
+        reference.validate_gateway_matrix_live(
+            matrix, kind=tool_ref, cluster=receipt["cluster"],
+            addresses=observed["gateway_addresses"], port=observed["listener_port"],
+            expected_digest=binding["matrix_sha256"],
+        )
+        reference.validate_gateway_nonhttp_current(
+            receipt.get("non_http_preflight"), kubectl=kubectl, kind=tool_ref,
+            cluster=receipt["cluster"], namespace=APP_NAMESPACE,
+            gateway_namespace=APP_NAMESPACE, gateway_name=GATEWAY_NAME,
+            backends=(("commonthing-api", 8080), ("commonthing-web", 8080)),
+        )
         implementation_commit = receipt.get("implementation_commit")
         implementation_valid = implementation_commit == cell_active_commit(cell)
         if not implementation_valid:
@@ -5611,9 +5608,12 @@ def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
         return (
             implementation_valid
             and receipt.get("address") in observed["gateway_addresses"]
-            and _gateway_receipt_observation_matches(receipt, observed)
+            and reference.gateway_receipt_observation_matches(receipt, observed)
         )
-    except (OSError, ValueError, StagingCellError, subprocess.CalledProcessError):
+    except (
+        OSError, ValueError, StagingCellError, subprocess.CalledProcessError,
+        reference.ProofError, KeyError, TypeError,
+    ):
         return False
 
 
