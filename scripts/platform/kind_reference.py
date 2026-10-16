@@ -2470,6 +2470,7 @@ def gateway_envoy_nonhttp_snapshot(
     kubectl: str, kind: str, cluster: str, *,
     namespace: str, gateway_namespace: str, gateway_name: str,
     backends: tuple[tuple[str, int], ...], deadline: float,
+    owner_local: bool = False, listener_addresses: list[str] | None = None,
 ) -> dict[str, Any]:
     """Bind ready K8s EndpointSlices to real Envoy LDS/CDS/EDS on every Kind node.
 
@@ -2478,7 +2479,23 @@ def gateway_envoy_nonhttp_snapshot(
     """
     if not backends or len(set(backends)) != len(backends):
         raise ProofError("Gateway non-HTTP readiness has no unique backends")
-    nodes = kind_nodes(kind, cluster)
+    all_nodes = kind_nodes(kind, cluster)
+    nodes = all_nodes
+    owners: dict[str, str] = {}
+    if owner_local:
+        if (
+            not isinstance(listener_addresses, list)
+            or not listener_addresses
+            or len(listener_addresses) != len(set(listener_addresses))
+        ):
+            raise ProofError("Gateway HA preflight requires exact advertised owner addresses")
+        # Source ownership is read from Kind IPAM, never inferred from HTTP reachability.
+        owners = gateway_address_owners(kind, cluster, listener_addresses)
+        if set(owners) != set(listener_addresses):
+            raise ProofError("Gateway HA listener owner inventory is incomplete")
+        nodes = sorted(set(owners.values()))
+        if not nodes or not set(nodes).issubset(all_nodes):
+            raise ProofError("Gateway HA listener owner missing from Kind inventory")
     cec_name = f"cilium-gateway-{gateway_name}"
     cec = _gateway_nonhttp_json(
         [kubectl, "-n", gateway_namespace, "get", "ciliumenvoyconfig",
@@ -2575,6 +2592,9 @@ def gateway_envoy_nonhttp_snapshot(
         for item in document.get("items", []):
             meta, spec, state = item.get("metadata", {}), item.get("spec", {}), item.get("status", {})
             node, pod = spec.get("nodeName"), meta.get("name")
+            if owner_local and node not in nodes:
+                # ADR-0013: non-owner Cilium/Envoy paths are diagnostic only.
+                continue
             if node not in nodes or not isinstance(pod, str) or not pod or node in result:
                 raise ProofError("Gateway Cilium/Envoy Pod has missing/duplicate Kind node binding")
             if (state.get("phase") != "Running"
@@ -2687,6 +2707,7 @@ def gateway_envoy_nonhttp_snapshot(
         "gateway_name": gateway_name,
         "backend_binding": backing,
         "kind_nodes": nodes,
+        "owner_by_address": owners,
         "envoy_sources": envoy_source_digests,
     }
 
@@ -2695,6 +2716,7 @@ def wait_gateway_envoy_nonhttp_ready(
     kubectl: str, kind: str, cluster: str, *,
     namespace: str, gateway_namespace: str, gateway_name: str,
     backends: tuple[tuple[str, int], ...], timeout_seconds: float = 120,
+    owner_local: bool = False, listener_addresses: list[str] | None = None,
 ) -> dict[str, Any]:
     """Bounded, non-accepting xDS readiness. No Gateway HTTP request or retry."""
     if timeout_seconds <= 0 or timeout_seconds > 300:
@@ -2710,6 +2732,7 @@ def wait_gateway_envoy_nonhttp_ready(
                 kubectl, kind, cluster, namespace=namespace,
                 gateway_namespace=gateway_namespace, gateway_name=gateway_name,
                 backends=backends, deadline=deadline,
+                owner_local=owner_local, listener_addresses=listener_addresses,
             )
         except (ProofError, subprocess.SubprocessError) as error:
             last_failure = f"{type(error).__name__}: {error}"[:280]
@@ -2734,6 +2757,7 @@ def validate_gateway_nonhttp_current(
     kubectl: str, kind: str, cluster: str,
     namespace: str, gateway_namespace: str, gateway_name: str,
     backends: tuple[tuple[str, int], ...],
+    owner_local: bool = False, listener_addresses: list[str] | None = None,
 ) -> None:
     """Reject a stale preflight after HTTP or at receipt reuse; never accept HTTP."""
     if (
@@ -2746,10 +2770,11 @@ def validate_gateway_nonhttp_current(
         kubectl, kind, cluster, namespace=namespace,
         gateway_namespace=gateway_namespace, gateway_name=gateway_name,
         backends=backends, deadline=time.monotonic() + 60,
+        owner_local=owner_local, listener_addresses=listener_addresses,
     )
     binding_fields = (
         "kind_cluster", "cec_uid", "namespace", "gateway_namespace",
-        "gateway_name", "backend_binding", "kind_nodes", "envoy_sources",
+        "gateway_name", "backend_binding", "kind_nodes", "owner_by_address", "envoy_sources",
     )
     if any(evidence.get(field) != fresh[field] for field in binding_fields):
         raise ProofError("Gateway Envoy/EDS runtime identity drifted after preflight")
@@ -2779,6 +2804,8 @@ def probe_gateway_after_readiness(
             gateway_namespace=readiness["gateway_namespace"],
             gateway_name=readiness["gateway_name"],
             backends=readiness["backends"],
+            owner_local=owner_local,
+            listener_addresses=addresses if owner_local else None,
         )
         if (
             not isinstance(preflight, dict)
@@ -2814,6 +2841,8 @@ def probe_gateway_after_readiness(
             gateway_namespace=readiness["gateway_namespace"],
             gateway_name=readiness["gateway_name"],
             backends=readiness["backends"],
+            owner_local=owner_local,
+            listener_addresses=addresses if owner_local else None,
         )
     return witness
 

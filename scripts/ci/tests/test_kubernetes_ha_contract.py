@@ -2932,5 +2932,62 @@ spec:
                     "kubectl", "kind", "cluster", **args,
                 )
 
+        bad["cds"] = False
+
+        def missing_nonowner_envoy(argv: list[str], *, deadline: float) -> dict:
+            document = source(argv, deadline=deadline)
+            if "pods" in argv:
+                document["items"].append({
+                    "metadata": {"name": "nonowner-unready"},
+                    "spec": {"nodeName": "node-b"},
+                    "status": {
+                        "phase": "Pending",
+                        "conditions": [{"type": "Ready", "status": "False"}],
+                        "containerStatuses": [{"ready": False}],
+                    },
+                })
+            if "exec" in argv and "nonowner-unready" in argv:
+                self.fail("HA owner-local readiness must not inspect non-owner xDS")
+            return document
+
+        with (
+            mock.patch.object(self.ha.ref, "kind_nodes", return_value=["node-a", "node-b"]),
+            mock.patch.object(
+                self.ha.ref, "gateway_address_owners",
+                return_value={"10.0.0.1": "node-a"},
+            ),
+            mock.patch.object(
+                self.ha.ref, "_gateway_nonhttp_json",
+                side_effect=missing_nonowner_envoy,
+            ) as nonhttp,
+        ):
+            owner = self.ha.ref.gateway_envoy_nonhttp_snapshot(
+                "kubectl", "kind", "cluster", **args,
+                owner_local=True, listener_addresses=["10.0.0.1"],
+            )
+            self.assertEqual(owner["kind_nodes"], ["node-a"])
+            self.assertEqual(owner["owner_by_address"], {"10.0.0.1": "node-a"})
+            self.assertEqual(set(owner["envoy_sources"]), {"node-a"})
+            self.assertFalse(any("nonowner-unready" in str(x.args)
+                                 for x in nonhttp.call_args_list))
+            with self.assertRaisesRegex(
+                self.ha.ref.ProofError, "not fully ready"
+            ):
+                self.ha.ref.gateway_envoy_nonhttp_snapshot(
+                    "kubectl", "kind", "cluster", **args,
+                )
+
+        owner["gateway_http_requests"] = 0
+        changed = {**owner, "owner_by_address": {"10.0.0.1": "node-b"}}
+        with mock.patch.object(self.ha.ref, "gateway_envoy_nonhttp_snapshot",
+                               return_value=changed):
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "identity drifted"):
+                self.ha.ref.validate_gateway_nonhttp_current(
+                    owner, kubectl="kubectl", kind="kind", cluster="cluster",
+                    namespace=namespace, gateway_namespace=gateway_namespace,
+                    gateway_name=gateway_name, backends=(("srv", 8080),),
+                    owner_local=True, listener_addresses=["10.0.0.1"],
+                )
+
 if __name__ == "__main__":
     unittest.main()
