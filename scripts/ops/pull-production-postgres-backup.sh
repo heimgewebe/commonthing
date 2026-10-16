@@ -136,6 +136,10 @@ if [[ "$PULL_MODE" == migration-stage ]]; then
   install -d -m 0700 -- "$target_dir"
   [[ "$(realpath -e -- "$target_dir")" == "$target_dir" ]] || fail "migration staging target changed during preflight"
   [[ "$(stat -c %a -- "$target_dir")" == 700 ]] || fail "migration staging must have mode 0700"
+  # The DEST_DIR lock does not cover a staging directory shared by pulls with
+  # different destinations; serialize on the staging directory itself.
+  exec 7> "$target_dir/.stage.lock"
+  flock -n 7 || fail "another migration staging holds $target_dir/.stage.lock"
 else
   # Do not certify an age-only off-host state while legacy plaintext can still
   # be re-snapshotted. Old recovery files are NEVER deleted implicitly. The
@@ -231,12 +235,14 @@ if [[ "$PULL_MODE" == migration-stage ]]; then
     [[ ! -e "$target_dir/$name" && ! -L "$target_dir/$name" ]] ||
       fail "migration staging artefact already exists: $name"
   done
-  mv "$work_dir/$latest" "$target_dir/$latest"
-  mv "$work_dir/$manifest" "$target_dir/$manifest"
-  mv "$work_dir/$age_manifest" "$target_dir/$age_manifest"
-  if [[ -f "$work_dir/$proof" ]]; then
-    mv "$work_dir/$proof" "$target_dir/$proof"
-  fi
+  # Hard links are create-only: an artefact that appeared anyway is never
+  # replaced. The work directory (and its links) is removed on exit.
+  staged=("$latest" "$manifest" "$age_manifest")
+  [[ ! -f "$work_dir/$proof" ]] || staged+=("$proof")
+  for name in "${staged[@]}"; do
+    ln -- "$work_dir/$name" "$target_dir/$name" ||
+      fail "migration staging artefact already exists: $name"
+  done
   printf 'Encrypted migration candidate staged (NOT recovery-verified; no completion receipt): %s\n' "$target_dir/$latest"
   exit 0
 fi

@@ -283,6 +283,19 @@ if PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$stage_dest" \
   exit 1
 fi
 grep -qF 'migration staging artefact already exists' "$root/duplicate-stage.stderr"
+# Pulls with different destinations still serialize on a shared staging dir.
+locked_stage="$root/locked-stage"
+mkdir -m 700 "$locked_stage"
+exec 6> "$locked_stage/.stage.lock"
+flock -n 6
+if PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$locked_stage" \
+  pull "$root/other-legacy-dest" test-host > /dev/null 2> "$root/locked-stage.stderr"; then
+  echo 'a held staging lock must block a second migration staging' >&2
+  exit 1
+fi
+grep -qF 'another migration staging holds' "$root/locked-stage.stderr"
+exec 6>&-
+[[ ! -e "$locked_stage/$file" ]]
 if PULL_MODE=unsafe pull "$legacy_dest" test-host > /dev/null 2> "$root/unsafe-mode.stderr"; then
   echo 'unknown pull mode must fail closed' >&2
   exit 1
