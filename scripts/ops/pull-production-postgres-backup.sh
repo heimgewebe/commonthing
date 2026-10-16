@@ -15,6 +15,7 @@ require_cmd wc
 require_cmd cmp
 require_cmd grep
 require_cmd flock
+require_cmd realpath
 
 REMOTE_HOST="${REMOTE_HOST:-commonserver}"
 REMOTE_BACKUP_DIR="${REMOTE_BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
@@ -80,6 +81,11 @@ manifest="${base}.sha256.manifest"
 proof="${base}.restore-proof"
 
 install -d -m 0700 "$DEST_DIR"
+# GNU find -P does not descend into a symlink operand. Keep the entire
+# lock, plaintext scan, publication and retention on one resolved directory,
+# including when a configured destination is an existing symlink.
+DEST_DIR="$(realpath -e -- "$DEST_DIR")" ||
+  fail "off-host destination cannot be resolved"
 # One pull at a time per destination. A legacy (pre-age) pull does not take
 # this lock, so the plaintext scan is repeated right before the receipt.
 exec 9> "$DEST_DIR/.pull.lock"

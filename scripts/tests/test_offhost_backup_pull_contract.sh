@@ -176,6 +176,39 @@ grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy.stderr"
 [[ -f "$legacy_dest/weltgewebe-postgres-legacy.sql.gz" ]]
 [[ ! -e "$legacy_dest/latest-pull.receipt" ]]
 
+# A symlinked destination must not let GNU find -P skip existing legacy
+# plaintext and emit a false age-only success receipt at its real target.
+symlink_real="$root/legacy-symlink-real"
+symlink_dest="$root/legacy-symlink-alias"
+mkdir -p "$symlink_real"
+printf 'old private pg dump\n' > "$symlink_real/earlier-prefix-private.sql.gz"
+ln -s "$symlink_real" "$symlink_dest"
+if pull "$symlink_dest" test-host > /dev/null 2> "$root/legacy-symlink.stderr"; then
+  echo 'symlinked legacy plaintext must block the encrypted pull receipt' >&2
+  exit 1
+fi
+[[ ! -e "$symlink_real/latest-pull.receipt" ]] || {
+  echo 'symlinked legacy plaintext produced a false age-only receipt' >&2
+  exit 1
+}
+[[ -f "$symlink_real/earlier-prefix-private.sql.gz" ]]
+
+# A deliberately configured symlink to a clean destination remains usable;
+# retention must operate on the same real directory as the pull receipt.
+clean_real="$root/clean-symlink-real"
+clean_alias="$root/clean-symlink-alias"
+mkdir -p "$clean_real"
+ln -s "$clean_real" "$clean_alias"
+old_cipher="$clean_real/weltgewebe-postgres-20200101T000000Z.sql.gz.age"
+printf 'old encrypted fixture\n' > "$old_cipher"
+touch -d '10 days ago' "$old_cipher"
+LOCAL_RETENTION_DAYS=1 pull "$clean_alias" test-host > /dev/null
+[[ -f "$clean_real/$file" && -f "$clean_real/latest-pull.receipt" ]]
+[[ ! -e "$old_cipher" ]] || {
+  echo 'symlinked encrypted destination skipped age retention' >&2
+  exit 1
+}
+
 # The legacy gate must not depend on the active BACKUP_PREFIX.
 other_prefix_dest="$root/legacy-other-prefix"
 mkdir -p "$other_prefix_dest"
