@@ -2413,6 +2413,11 @@ def node_exists(kubectl: str, node_id: str, *, cluster: str = "postgres-ha") -> 
     return psql(kubectl, f"SELECT count(*) FROM domain_nodes WHERE id='{node_id}'", cluster=cluster) == "1"
 
 
+def ha_gateway_baseline(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
+    # ADR-0013 measures HA gateways owner-locally, not cross-node Kind paths.
+    return ref.prove_gateway(kubectl, kind, cluster, owner_local=True)
+
+
 def gateway_contains_node(kubectl: str, kind: str, cluster: str, node_id: str) -> bool:
     ref.wait_condition(kubectl, "weltgewebe-gateway", "gateway/weltgewebe", "Programmed", "5m")
     service = ref.output([kubectl, "-n", "weltgewebe-gateway", "get", "service", "-l", "gateway.networking.k8s.io/gateway-name=weltgewebe", "-o", "jsonpath={.items[0].metadata.name}"])
@@ -2420,6 +2425,7 @@ def gateway_contains_node(kubectl: str, kind: str, cluster: str, node_id: str) -
     _, _, _, _, body = ref.probe_gateway_http(
         kind, cluster, ref.gateway_addresses(kubectl),
         ref.gateway_service_listener_port(kubectl, service, port),
+        owner_local=True,
     )
     payload = json.loads(body)
     return any(isinstance(item, dict) and item.get("id") == node_id for item in payload)
@@ -2684,7 +2690,7 @@ def prove(args: argparse.Namespace) -> dict[str, Any]:
         ref.apply_direct(kubectl, kustomize, "platform/apps/weltgewebe/overlays/ha")
         ref.apply_direct(kubectl, kustomize, "platform/infrastructure/gateway")
         wait_api_replicas(kubectl)
-        gateway_before = ref.prove_gateway(kubectl, kind, args.cluster)
+        gateway_before = ha_gateway_baseline(kubectl, kind, args.cluster)
 
         topology = {
             "postgres": pod_topology(kubectl, "weltgewebe-data", "cnpg.io/cluster=postgres-ha"),

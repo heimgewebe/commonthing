@@ -4816,6 +4816,69 @@ time.sleep(60)
             "http://172.22.0.3:80/api/nodes",
         )
 
+    def test_gateway_owner_local_ha_excludes_nonowner_503(self) -> None:
+        """ADR-0013 excludes cross-node Kind/Cilium paths from HA acceptance."""
+        owners = {"172.22.0.3": "node-a", "172.22.0.4": "node-b"}
+        calls = []
+        def responding(argv, **_kwargs):
+            node, url = argv[2], argv[-1]
+            address = url.split("/")[2].split(":")[0]
+            calls.append((node,address))
+            if node != owners[address]:
+                raise subprocess.CalledProcessError(22, argv, stderr=b"cross-node 503")
+            body = b"[]" if url.endswith("/api/nodes") else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+        with (
+            mock.patch.object(self.reference, "gateway_address_owners", return_value=owners),
+            mock.patch.object(self.reference, "kind_nodes", return_value=["node-a","node-b"]),
+            mock.patch.object(self.reference.subprocess, "run", side_effect=responding),
+        ):
+            witness = self.reference.probe_gateway_http(
+                "kind", "cluster", list(owners), 80, owner_local=True
+            )
+        self.assertEqual(witness[0:2], ("node-a", "172.22.0.3"))
+        self.assertEqual(len(calls), len(owners)*3*3)
+        self.assertTrue(all(owners[addr] == node for node,addr in calls))
+
+    def test_gateway_owner_local_ha_still_fails_first_owner_503(self) -> None:
+        """Owner-local mode cannot retry an actual bad listener sample away."""
+        owners = {"172.22.0.3":"node-a"}
+        ok = [
+            subprocess.CompletedProcess([], 0, stdout=b"healthy", stderr=b""),
+            subprocess.CompletedProcess([], 0, stdout=b"web", stderr=b""),
+            subprocess.CompletedProcess([], 0, stdout=b"[]", stderr=b""),
+        ]
+        bad = subprocess.CalledProcessError(22, ["docker","exec","node-a"], stderr=b"503")
+        with (
+            mock.patch.object(self.reference, "gateway_address_owners", return_value=owners),
+            mock.patch.object(self.reference, "kind_nodes", return_value=["node-a"]),
+            mock.patch.object(self.reference.subprocess, "run", side_effect=ok+[bad]) as run,
+        ):
+            with self.assertRaisesRegex(self.reference.ProofError,"did not serve listener HTTP"):
+                self.reference.probe_gateway_http(
+                    "kind","cluster",list(owners),80,owner_local=True
+                )
+        self.assertEqual(run.call_count,4)
+
+    def test_gateway_matrix_fails_if_attested_owner_node_disappears(self) -> None:
+        """A drifting node inventory must never silently omit a listener from proof."""
+        owners = {"172.22.0.3": "node-a", "172.22.0.4": "node-b"}
+        def healthy(argv, **_kwargs):
+            body = b"[]" if argv[-1].endswith("/api/nodes") else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+        for owner_local in (True, False):
+            with (
+                self.subTest(owner_local=owner_local),
+                mock.patch.object(self.reference, "gateway_address_owners", return_value=owners),
+                mock.patch.object(self.reference, "kind_nodes", return_value=["node-a"]),
+                mock.patch.object(self.reference.subprocess, "run", side_effect=healthy) as request,
+            ):
+                with self.assertRaisesRegex(self.reference.ProofError, "owner.*(missing|drift|disappeared)"):
+                    self.reference.probe_gateway_http(
+                        "kind", "cluster", list(owners), 80, owner_local=owner_local
+                    )
+                request.assert_not_called()
+
     def test_gateway_address_owners_bind_exact_kind_node_ip_among_nonowners(self) -> None:
         nodes = ["cluster-control-plane", "cluster-worker-a", "cluster-worker-b"]
         addresses = {

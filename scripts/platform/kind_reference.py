@@ -2055,18 +2055,26 @@ def probe_gateway_http(
     addresses: list[str],
     port: int,
     timeout_seconds: float | None = None,
+    *,
+    owner_local: bool = False,
 ) -> tuple[str, str, bytes, bytes, bytes]:
-    """Require every source Kind node to serve every advertised listener and route.
+    """Require strict T084 or explicitly owner-local HA HTTP matrix.
 
     A single HTTP error, timeout, invalid response or failed sample terminates
     the proof; no HTTP error may be retried into a passing matrix.
     """
-    gateway_address_owners(kind, cluster, addresses)
+    owners = gateway_address_owners(kind, cluster, addresses)
     nodes = kind_nodes(kind, cluster)
+    missing_owners = set(owners.values()) - set(nodes)
+    if missing_owners:
+        raise ProofError(
+            f"Gateway owner node missing from current kind node inventory: {sorted(missing_owners)}"
+        )
     if timeout_seconds is None:
-        # The N x listener x route x sample matrix needs an adequate budget:
-        # each curl has its own independently bounded subprocess deadline.
-        timeout_seconds = len(nodes) * len(addresses) * GATEWAY_HTTP_PROBE_SAMPLES * 3 * 15 + 10
+        # A bounded curl on each required source/listener/route/sample.
+        # HA accepts only owner-local paths; T084 remains all-node/all-listener.
+        required_paths = len(addresses) if owner_local else len(nodes) * len(addresses)
+        timeout_seconds = required_paths * GATEWAY_HTTP_PROBE_SAMPLES * 3 * 15 + 10
     if timeout_seconds <= 0:
         raise ProofError("Gateway HTTP matrix requires a positive time budget")
     deadline = time.monotonic() + timeout_seconds
@@ -2074,6 +2082,8 @@ def probe_gateway_http(
 
     for node in nodes:
         for address in addresses:
+            if owner_local and owners[address] != node:
+                continue
             for sample in range(1, GATEWAY_HTTP_PROBE_SAMPLES + 1):
                 if time.monotonic() >= deadline:
                     raise ProofError(
@@ -2142,17 +2152,22 @@ def probe_gateway_http(
 
 
 def probe_gateway_after_readiness(
-    kind: str, cluster: str, addresses: list[str], port: int
+    kind: str, cluster: str, addresses: list[str], port: int,
+    *, owner_local: bool = False
 ) -> tuple[str, str, bytes, bytes, bytes]:
     """After control-plane readiness, run exactly one fail-closed HTTP matrix.
 
     HTTP 503 and timeouts cannot be treated as retryable startup observations.
     The API/Envoy data-plane proof begins on the first sampled request.
     """
+    if owner_local:
+        return probe_gateway_http(kind, cluster, addresses, port, owner_local=True)
     return probe_gateway_http(kind, cluster, addresses, port)
 
 
-def prove_gateway(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
+def prove_gateway(
+    kubectl: str, kind: str, cluster: str, *, owner_local: bool = False
+) -> dict[str, str]:
     wait_condition(kubectl, "weltgewebe-gateway", "gateway/weltgewebe", "Programmed")
     wait_http_route_parent_condition(
         kubectl,
@@ -2188,9 +2203,10 @@ def prove_gateway(kubectl: str, kind: str, cluster: str) -> dict[str, str]:
     listener_port = gateway_listener_port(kubectl)
     addresses = gateway_addresses(kubectl)
     service_port = gateway_service_listener_port(kubectl, service, listener_port)
-    # Any 503 or timeout after the full readiness witness is a hard failure.
+    # Neither mode retries a single 503. HA measures owner-local paths;
+    # T084 remains strict across every node, listener, route and sample.
     probe_node, address, health, web, api_nodes = probe_gateway_after_readiness(
-        kind, cluster, addresses, service_port
+        kind, cluster, addresses, service_port, owner_local=owner_local
     )
     return {
         "service": service,

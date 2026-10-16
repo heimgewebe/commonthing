@@ -101,6 +101,36 @@ class KubernetesHaContractTests(unittest.TestCase):
                 )
         self.assertEqual(probe.call_count, 1)
 
+    def test_ha_domain_requires_explicit_owner_local_matrix(self) -> None:
+        """HA domain projection uses the ADR-0013 owner-local proof, not T084 strict."""
+        node_id = "node-id"
+        response = b'[{"id":"node-id"}]'
+        with (
+            mock.patch.object(self.ha.ref, "wait_condition"),
+            mock.patch.object(self.ha.ref, "output", return_value="gateway-service"),
+            mock.patch.object(self.ha.ref, "gateway_listener_port", return_value=80),
+            mock.patch.object(self.ha.ref, "gateway_addresses", return_value=["172.22.0.3"]),
+            mock.patch.object(self.ha.ref, "gateway_service_listener_port", return_value=80),
+            mock.patch.object(
+                self.ha.ref,"probe_gateway_http",
+                return_value=("node-a","172.22.0.3",b"ok",b"web",response),
+            ) as probe,
+        ):
+            self.assertTrue(self.ha.gateway_contains_node("kubectl","kind","cluster",node_id))
+        probe.assert_called_once_with(
+            "kind","cluster",["172.22.0.3"],80,owner_local=True
+        )
+
+    def test_ha_startup_selects_owner_local_proof_but_not_t084_default(self) -> None:
+        readback = {"listener_port":"80"}
+        with mock.patch.object(self.ha.ref,"prove_gateway",return_value=readback) as probe:
+            self.assertEqual(
+                self.ha.ha_gateway_baseline("kubectl","kind","cluster"),readback
+            )
+        probe.assert_called_once_with(
+            "kubectl","kind","cluster",owner_local=True
+        )
+
     def test_static_ha_contract_passes(self) -> None:
         self.validator._assert_ha_contract()
 
