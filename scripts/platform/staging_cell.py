@@ -412,8 +412,6 @@ def state_root(value: str | None) -> Path:
     return resolved
 
 
-
-
 @contextmanager
 def lifecycle_lock(root: Path):
     ensure_directory_durable(root, mode=0o700)
@@ -5377,9 +5375,14 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
     require_gateway_observation_binding(observed, binding)
     require_gateway_desired_contract(observed, documents)
     matrix_evidence: dict[str, Any] = {}
+    preflight_evidence: dict[str, Any] = {}
     node, address, health, web, api_nodes = reference.probe_gateway_after_readiness(
         tools["kind"], args.cluster, observed["gateway_addresses"], observed["listener_port"],
         verify_node_ids=True, matrix_evidence=matrix_evidence,
+        readiness={"kubectl": kubectl, "namespace": APP_NAMESPACE,
+                   "gateway_namespace": APP_NAMESPACE, "gateway_name": GATEWAY_NAME,
+                   "backends": (("commonthing-api", 8080), ("commonthing-web", 8080))},
+        preflight_evidence=preflight_evidence,
     )
     if address not in observed["gateway_addresses"]:
         raise StagingCellError("HTTP proof selected an unobserved Gateway address")
@@ -5407,6 +5410,7 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
         "web_prefix_bytes": len(web),
         "api_nodes_sha256": sha256_bytes(api_nodes),
         "matrix_evidence": matrix_evidence,
+        "non_http_preflight": preflight_evidence,
         "does_not_establish": GATEWAY_LIMITS,
         "production_changed": False,
     }
@@ -5416,11 +5420,8 @@ def command_prove_gateway(args: argparse.Namespace) -> dict[str, Any]:
         **pending,
         "status": "gateway-ready",
         "does_not_establish": GATEWAY_LIMITS,
-        "gateway_proof": {
-            "active_commit": commit,
-            "receipt_sha256": sha256_file(path),
-            "matrix_sha256": matrix_evidence["canonical_sha256"],
-        },
+        "gateway_proof": {"active_commit": commit, "receipt_sha256": sha256_file(path),
+                          "matrix_sha256": matrix_evidence["canonical_sha256"]},
     }
     updated.pop("pending_gateway", None)
     write_cell_receipt(root, updated)
@@ -5578,7 +5579,9 @@ def gateway_receipt_current(root: Path, cell: dict, kubectl: str) -> bool:
         }
         require_gateway_observation_binding(observed, expected_binding)
         matrix = receipt.get("matrix_evidence")
-        if not isinstance(matrix, dict):
+        if (not isinstance(matrix, dict)
+                or receipt.get("non_http_preflight", {}).get("status")
+                != "non-http-envoy-eds-ready-not-a-gateway-pass"):
             return False
         tool_ref = load_tool_receipt(
             root, required_tools=("kind",), required_artifacts=()

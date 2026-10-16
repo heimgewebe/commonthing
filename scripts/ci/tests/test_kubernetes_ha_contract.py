@@ -2754,5 +2754,169 @@ spec:
         )
 
 
+    def test_nonhttp_preflight_must_not_start_http_before_eds_is_ready(self) -> None:
+        binding = {
+            "kubectl": "kubectl", "namespace": "ns",
+            "gateway_namespace": "gw", "gateway_name": "testgw",
+            "backends": (("srv", 8080),),
+        }
+        with (
+            mock.patch.object(
+                self.ha.ref, "wait_gateway_envoy_nonhttp_ready",
+                side_effect=self.ha.ref.ProofError("EDS has not converged"),
+            ) as preflight,
+            mock.patch.object(self.ha.ref, "probe_gateway_http") as http,
+        ):
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "EDS has not converged"):
+                self.ha.ref.probe_gateway_after_readiness(
+                    "kind", "cluster", ["10.0.0.1"], 80, readiness=binding,
+                )
+        preflight.assert_called_once()
+        http.assert_not_called()
+
+    def test_nonhttp_preflight_requires_primary_sources_and_cannot_hide_503(self) -> None:
+        binding = {
+            "kubectl": "kubectl", "namespace": "ns",
+            "gateway_namespace": "gw", "gateway_name": "testgw",
+            "backends": (("srv", 8080),),
+        }
+        ready = {
+            "status": "non-http-envoy-eds-ready-not-a-gateway-pass",
+            "kind_cluster": "cluster",
+            "cec_uid": "synthetic-test-only-cec",
+            "backend_binding": {"synthetic-srv": {"replicas": 1}},
+            "envoy_sources": {"synthetic-node": {"rds_sha256": "0" * 64}},
+            "gateway_http_requests": 0,
+        }
+        with (
+            mock.patch.object(self.ha.ref, "wait_gateway_envoy_nonhttp_ready",
+                              return_value={"status": ready["status"]}),
+            mock.patch.object(self.ha.ref, "probe_gateway_http") as http,
+        ):
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "primary-source evidence"):
+                self.ha.ref.probe_gateway_after_readiness(
+                    "kind", "cluster", ["10.0.0.1"], 80, readiness=binding,
+                )
+            http.assert_not_called()
+        with (
+            mock.patch.object(
+                self.ha.ref, "wait_gateway_envoy_nonhttp_ready", return_value=ready,
+            ) as preflight,
+            mock.patch.object(
+                self.ha.ref, "probe_gateway_http",
+                side_effect=[
+                    self.ha.ref.GatewayTransportNotReady("first HTTP 503"),
+                    ("node-a", "10.0.0.1", b"ok", b"web", b"[]"),
+                ],
+            ) as http,
+        ):
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "first HTTP 503"):
+                self.ha.ref.probe_gateway_after_readiness(
+                    "kind", "cluster", ["10.0.0.1"], 80,
+                    readiness=binding, matrix_evidence={},
+                )
+        self.assertEqual(preflight.call_count, 1)
+        self.assertEqual(http.call_count, 1)
+
+    def test_nonhttp_envoy_snapshot_rejects_stale_eds_and_wrong_rds(self) -> None:
+        """Exercise actual parser/binding on deterministic, synthetic K8s+xDS JSON."""
+        bad = {"eds": False, "rds": False}
+        namespace, gateway_namespace, gateway_name = "ns", "gw", "testgw"
+        cec = "cilium-gateway-testgw"
+        full_cluster = "gw/cilium-gateway-testgw/ns:srv:8080"
+
+        def source(argv: list[str], *, deadline: float) -> dict:
+            self.assertGreater(deadline, 0)
+            if "ciliumenvoyconfig" in argv:
+                return {"metadata": {"uid": "synthetic-cec-uid"}}
+            if "deployment" in argv:
+                return {
+                    "metadata": {"uid": "synthetic-dep", "generation": 1},
+                    "spec": {"replicas": 1},
+                    "status": {"observedGeneration": 1, "readyReplicas": 1,
+                               "updatedReplicas": 1, "availableReplicas": 1},
+                }
+            if "endpointslices" in argv:
+                return {"items": [{
+                    "addressType": "IPv4",
+                    "metadata": {"uid": "synthetic-slice", "resourceVersion": "42",
+                                 "labels": {"kubernetes.io/service-name": "srv"}},
+                    "ports": [{"port": 8080, "protocol": "TCP"}],
+                    "endpoints": [{
+                        "conditions": {"ready": True, "serving": True, "terminating": False},
+                        "addresses": ["10.1.1.1"],
+                        "targetRef": {"kind": "Pod", "uid": "synthetic-pod"},
+                    }],
+                }]}
+            if "pods" in argv:
+                label = argv[argv.index("-l") + 1]
+                name = "agent-a" if label == "k8s-app=cilium" else "envoy-a"
+                return {"items": [{
+                    "metadata": {"name": name},
+                    "spec": {"nodeName": "node-a"},
+                    "status": {
+                        "phase": "Running",
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "containerStatuses": [{"ready": True}],
+                    },
+                }]}
+            part = argv[-1]
+            if part == "listeners":
+                return {"configs": [{"name": f"{gateway_namespace}/{cec}/listener",
+                                     "active_state": {"version_info": "2"}}]}
+            if part == "routes":
+                route_to = "wrong-cluster" if bad["rds"] else full_cluster
+                return {"configs": [{
+                    "route_config": {
+                        "name": f"{gateway_namespace}/{cec}/listener-insecure",
+                        "virtual_hosts": [{"routes": [{"route": {"cluster": route_to}}]}],
+                    },
+                }]}
+            if part == "clusters":
+                return {"configs": [{"cluster": {"name": full_cluster, "type": "EDS"}}]}
+            if part == "endpoints":
+                return {"configs": [{
+                    "endpoint_config": {
+                        "cluster_name": "ns/srv:8080",
+                        "endpoints": [{
+                            "lb_endpoints": [] if bad["eds"] else [{
+                                "health_status": "HEALTHY",
+                                "endpoint": {"address": {"socket_address": {
+                                    "address": "10.1.1.1", "port_value": 8080,
+                                }}},
+                            }],
+                        }],
+                    },
+                }]}
+            self.fail(f"unexpected source {argv}")
+
+        with (
+            mock.patch.object(self.ha.ref, "kind_nodes", return_value=["node-a"]),
+            mock.patch.object(self.ha.ref, "_gateway_nonhttp_json", side_effect=source),
+        ):
+            args = {
+                "namespace": namespace,
+                "gateway_namespace": gateway_namespace,
+                "gateway_name": gateway_name,
+                "backends": (("srv", 8080),),
+                "deadline": self.ha.ref.time.monotonic() + 60,
+            }
+            ready = self.ha.ref.gateway_envoy_nonhttp_snapshot(
+                "kubectl", "kind", "cluster", **args,
+            )
+            self.assertEqual(ready["status"], "non-http-envoy-eds-ready-not-a-gateway-pass")
+            self.assertIn("rds_sha256", ready["envoy_sources"]["node-a"])
+            bad["eds"] = True
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "EDS is stale"):
+                self.ha.ref.gateway_envoy_nonhttp_snapshot(
+                    "kubectl", "kind", "cluster", **args,
+                )
+            bad["eds"] = False
+            bad["rds"] = True
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "RDS backend routing"):
+                self.ha.ref.gateway_envoy_nonhttp_snapshot(
+                    "kubectl", "kind", "cluster", **args,
+                )
+
 if __name__ == "__main__":
     unittest.main()

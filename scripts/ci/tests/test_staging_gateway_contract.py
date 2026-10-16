@@ -148,6 +148,21 @@ class StagingGatewayTests(unittest.TestCase):
             return_value=self.gateway_test_containers,
         ))
         self.probe.side_effect = self.simulated_gateway_matrix
+        self.non_http_current = self.stack.enter_context(mock.patch.object(
+            staging.reference, "validate_gateway_nonhttp_current",
+        ))
+        self.non_http_ready = self.stack.enter_context(mock.patch.object(
+            staging.reference, "wait_gateway_envoy_nonhttp_ready",
+            return_value={
+                "status": "non-http-envoy-eds-ready-not-a-gateway-pass",
+                "kind_cluster": staging.DEFAULT_CLUSTER,
+                "cec_uid": "synthetic-test-only-cec",
+                "backend_binding": {"synthetic-test-only-api": {"replicas": 2}},
+                "envoy_sources": {"synthetic-test-only-kind": {"rds_sha256": "0" * 64}},
+                "preflight_attempts": 1,
+                "gateway_http_requests": 0,
+            },
+        ))
         self.get = self.stack.enter_context(
             mock.patch.object(staging, "gateway_get", side_effect=self.get_resource)
         )
@@ -219,6 +234,19 @@ class StagingGatewayTests(unittest.TestCase):
             "kind", staging.DEFAULT_CLUSTER, ADDRESSES, 80,
             verify_node_ids=True, matrix_evidence=mock.ANY,
         )
+
+    def test_staging_gateway_never_persists_pass_after_envoy_drift(self):
+        self.non_http_current.side_effect = staging.reference.ProofError(
+            "Gateway Envoy/EDS runtime identity drifted after preflight"
+        )
+        with self.assertRaisesRegex(
+            staging.reference.ProofError, "runtime identity drifted"
+        ):
+            staging.command_prove_gateway(self.args)
+        self.non_http_ready.assert_called_once()
+        self.non_http_current.assert_called_once()
+        self.assertEqual(self.probe.call_count, 1)
+        self.assertFalse((self.root / "receipts/gateway-proof.json").exists())
 
     def test_staging_gateway_first_503_fails_without_retry(self):
         self.probe.side_effect = [

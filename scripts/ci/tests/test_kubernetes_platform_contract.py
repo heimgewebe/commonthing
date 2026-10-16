@@ -5133,6 +5133,14 @@ time.sleep(60)
     def test_gateway_proof_rejects_first_503_without_any_second_matrix(self) -> None:
         witness = ("worker", "172.22.0.3", b"ok", b"web", b"[]")
         with (
+            mock.patch.object(
+                self.reference, "wait_gateway_envoy_nonhttp_ready",
+                return_value={"status": "non-http-envoy-eds-ready-not-a-gateway-pass",
+                              "kind_cluster": "cluster", "gateway_http_requests": 0,
+                              "cec_uid": "synthetic-test-only-cec",
+                              "backend_binding": {"synthetic-backend": {}},
+                              "envoy_sources": {"synthetic-node": {}}},
+            ),
             mock.patch.object(self.reference, "wait_condition"),
             mock.patch.object(self.reference, "wait_http_route_parent_condition"),
             mock.patch.object(self.reference, "output", return_value="gateway-service"),
@@ -5255,15 +5263,32 @@ time.sleep(60)
 
     def test_gateway_policy_allows_only_cilium_ingress_identity(self) -> None:
         source = (
-            ROOT
-            / "platform/apps/weltgewebe/base/network-policy-gateway-ingress.yaml"
-        ).read_text()
-        self.assertIn("apiVersion: cilium.io/v2", source)
-        self.assertIn("kind: CiliumNetworkPolicy", source)
-        self.assertIn("fromEntities:", source)
-        self.assertIn("- ingress", source)
-        self.assertIn('port: "8080"', source)
-        self.assertNotIn("namespaceSelector:", source)
+            ROOT / "platform/apps/weltgewebe/base/network-policy-gateway-ingress.yaml"
+        ).read_text(encoding="utf-8")
+        expected = {
+            "apiVersion": "cilium.io/v2",
+            "kind": "CiliumNetworkPolicy",
+            "metadata": {"name": "allow-cilium-gateway"},
+            "spec": {
+                "endpointSelector": {"matchExpressions": [{
+                    "key": "app.kubernetes.io/name",
+                    "operator": "In",
+                    "values": ["weltgewebe-api", "weltgewebe-web"],
+                }]},
+                "ingress": [{
+                    "fromEntities": ["ingress"],
+                    "toPorts": [{"ports": [{"port": "8080", "protocol": "TCP"}]}],
+                }],
+            },
+        }
+        self.assertEqual(yaml.safe_load(source), expected)
+        # Cilium ingress rules are additive: either extra rule broadens access.
+        for forbidden_rule in ({}, {"fromCIDR": ["0.0.0.0/0"]},
+                               {"fromEndpoints": [{}]}):
+            with self.subTest(injected_ingress_rule=forbidden_rule):
+                mutated = json.loads(json.dumps(expected))
+                mutated["spec"]["ingress"].append(forbidden_rule)
+                self.assertNotEqual(mutated, expected)
 
     def test_gateway_proof_does_not_port_forward_selectorless_service(self) -> None:
         source = (ROOT / "scripts/platform/kind_reference.py").read_text()

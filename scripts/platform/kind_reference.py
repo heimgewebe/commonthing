@@ -2438,26 +2438,375 @@ def probe_gateway_http(
 
 
 
+def _gateway_nonhttp_json(argv: list[str], *, deadline: float) -> dict[str, Any]:
+    """Read bounded Kubernetes or Cilium/Envoy state; never probe Gateway HTTP."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProofError("Gateway non-HTTP readiness deadline expired")
+    try:
+        result = subprocess.run(
+            argv, cwd=ROOT, text=True, capture_output=True, check=False,
+            timeout=min(10, max(0.1, remaining)),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ProofError("Gateway non-HTTP readiness source unavailable") from error
+    if result.returncode or len(result.stdout) > 1048576:
+        raise ProofError("Gateway non-HTTP readiness source failed or exceeded size limit")
+    try:
+        document = json.loads(
+            result.stdout,
+            parse_constant=_reject_gateway_json_constant,
+            parse_float=_strict_gateway_json_float,
+            object_pairs_hook=_unique_gateway_json_object,
+        )
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ProofError("Gateway non-HTTP readiness returned malformed JSON") from error
+    if not isinstance(document, dict):
+        raise ProofError("Gateway non-HTTP readiness returned a non-object")
+    return document
+
+
+def gateway_envoy_nonhttp_snapshot(
+    kubectl: str, kind: str, cluster: str, *,
+    namespace: str, gateway_namespace: str, gateway_name: str,
+    backends: tuple[tuple[str, int], ...], deadline: float,
+) -> dict[str, Any]:
+    """Bind ready K8s EndpointSlices to real Envoy LDS/CDS/EDS on every Kind node.
+
+    Envoy control-plane convergence is a prerequisite, NEVER a Gateway PASS.
+    The subsequent strict HTTP matrix is the sole acceptance probe.
+    """
+    if not backends or len(set(backends)) != len(backends):
+        raise ProofError("Gateway non-HTTP readiness has no unique backends")
+    nodes = kind_nodes(kind, cluster)
+    cec_name = f"cilium-gateway-{gateway_name}"
+    cec = _gateway_nonhttp_json(
+        [kubectl, "-n", gateway_namespace, "get", "ciliumenvoyconfig",
+         cec_name, "-o", "json"], deadline=deadline,
+    )
+    cec_uid = cec.get("metadata", {}).get("uid")
+    if not isinstance(cec_uid, str) or not cec_uid:
+        raise ProofError("Gateway non-HTTP readiness has no CiliumEnvoyConfig UID")
+
+    expected: dict[str, set[tuple[str, int]]] = {}
+    backing: dict[str, Any] = {}
+    for service, port in backends:
+        if (not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", service)
+                or type(port) is not int or not 1 <= port <= 65535):
+            raise ProofError("Gateway non-HTTP readiness has an invalid backend")
+        deployment = _gateway_nonhttp_json(
+            [kubectl, "-n", namespace, "get", "deployment", service, "-o", "json"],
+            deadline=deadline,
+        )
+        meta, status = deployment.get("metadata", {}), deployment.get("status", {})
+        desired = deployment.get("spec", {}).get("replicas", 1)
+        if (type(desired) is not int or desired <= 0
+                or meta.get("generation") != status.get("observedGeneration")
+                or any(status.get(field, 0) != desired for field in
+                       ("readyReplicas", "updatedReplicas", "availableReplicas"))):
+            raise ProofError(f"Gateway non-HTTP backend {service} replicas are not converged")
+        slices = _gateway_nonhttp_json(
+            [kubectl, "-n", namespace, "get", "endpointslices",
+             "-l", f"kubernetes.io/service-name={service}", "-o", "json"],
+            deadline=deadline,
+        )
+        items = slices.get("items")
+        if not isinstance(items, list) or not items:
+            raise ProofError(f"Gateway non-HTTP backend {service} has no EndpointSlices")
+        ips: set[tuple[str, int]] = set()
+        identities: list[tuple[str, str]] = []
+        for item in items:
+            if (not isinstance(item, dict) or item.get("addressType") != "IPv4"
+                    or item.get("metadata", {}).get("labels", {}).get(
+                        "kubernetes.io/service-name") != service
+                    or not any(
+                        isinstance(value, dict) and value.get("port") == port
+                        and value.get("protocol", "TCP") == "TCP"
+                        for value in item.get("ports", [])
+                    )):
+                raise ProofError(f"Gateway non-HTTP backend {service} has invalid EndpointSlice")
+            uid = item.get("metadata", {}).get("uid")
+            rv = item.get("metadata", {}).get("resourceVersion")
+            if not uid or not rv:
+                raise ProofError("Gateway non-HTTP EndpointSlice lacks source identity")
+            identities.append((str(uid), str(rv)))
+            for ep in item.get("endpoints", []):
+                conditions = ep.get("conditions", {})
+                addresses = ep.get("addresses", [])
+                target = ep.get("targetRef", {})
+                if (conditions.get("ready") is not True
+                        or conditions.get("serving") is not True
+                        or conditions.get("terminating") is not False
+                        or target.get("kind") != "Pod" or not target.get("uid")
+                        or len(addresses) != 1):
+                    raise ProofError(f"Gateway non-HTTP backend {service} has unready EndpointSlice member")
+                try:
+                    ip = ipaddress.ip_address(addresses[0])
+                except ValueError as error:
+                    raise ProofError("Gateway non-HTTP EndpointSlice IP is malformed") from error
+                if ip.version != 4 or (str(ip), port) in ips:
+                    raise ProofError("Gateway non-HTTP EndpointSlice has invalid/duplicate IPv4")
+                ips.add((str(ip), port))
+        if len(ips) != desired:
+            raise ProofError(f"Gateway non-HTTP backend {service} EndpointSlice count differs from replicas")
+        key = f"{namespace}/{service}:{port}"
+        expected[key] = ips
+        backing[key] = {
+            "deployment_uid": meta.get("uid"),
+            "deployment_generation": meta.get("generation"),
+            "endpoint_slices": sorted(identities),
+            "endpoint_ip_port_sha256": hashlib.sha256(
+                json.dumps(sorted(ips), separators=(",", ":")).encode()
+            ).hexdigest(),
+            "replicas": desired,
+        }
+
+    agents = _gateway_nonhttp_json(
+        [kubectl, "-n", "kube-system", "get", "pods",
+         "-l", "k8s-app=cilium", "-o", "json"], deadline=deadline,
+    )
+    envoy_pods = _gateway_nonhttp_json(
+        [kubectl, "-n", "kube-system", "get", "pods",
+         "-l", "k8s-app=cilium-envoy", "-o", "json"], deadline=deadline,
+    )
+
+    def ready_by_node(document: dict[str, Any]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for item in document.get("items", []):
+            meta, spec, state = item.get("metadata", {}), item.get("spec", {}), item.get("status", {})
+            node, pod = spec.get("nodeName"), meta.get("name")
+            if node not in nodes or not isinstance(pod, str) or not pod or node in result:
+                raise ProofError("Gateway Cilium/Envoy Pod has missing/duplicate Kind node binding")
+            if (state.get("phase") != "Running"
+                    or not any(c.get("type") == "Ready" and c.get("status") == "True"
+                               for c in state.get("conditions", []))
+                    or not state.get("containerStatuses")
+                    or not all(v.get("ready") is True for v in state["containerStatuses"])):
+                raise ProofError("Gateway Cilium/Envoy Pod is not fully ready")
+            result[node] = pod
+        if set(result) != set(nodes):
+            raise ProofError("Gateway Cilium/Envoy Pods do not cover every Kind node")
+        return result
+
+    agent_map = ready_by_node(agents)
+    envoy_map = ready_by_node(envoy_pods)
+    listener_name = f"{gateway_namespace}/{cec_name}/listener"
+    envoy_source_digests: dict[str, dict[str, str]] = {}
+    for node in nodes:
+        dumped: dict[str, dict[str, Any]] = {}
+        for part in ("listeners", "routes", "clusters", "endpoints"):
+            doc = _gateway_nonhttp_json(
+                [kubectl, "-n", "kube-system", "exec", agent_map[node],
+                 "--", "cilium-dbg", "envoy", "admin", "config", part],
+                deadline=deadline,
+            )
+            configs = doc.get("configs")
+            if not isinstance(configs, list):
+                raise ProofError("Gateway Envoy admin did not return its active config")
+            dumped[part] = doc
+        listeners = [
+            x for x in dumped["listeners"]["configs"]
+            if x.get("name") == listener_name and isinstance(x.get("active_state"), dict)
+        ]
+        if len(listeners) != 1:
+            raise ProofError(f"Gateway Envoy active listener is missing on Kind node {node}")
+        route_name = f"{gateway_namespace}/{cec_name}/listener-insecure"
+        routes = [
+            x for x in dumped["routes"]["configs"]
+            if x.get("route_config", {}).get("name") == route_name
+        ]
+        if len(routes) != 1:
+            raise ProofError(f"Gateway Envoy RDS routes are missing on Kind node {node}")
+        route_clusters = [
+            route.get("route", {}).get("cluster")
+            for host in routes[0].get("route_config", {}).get("virtual_hosts", [])
+            for route in host.get("routes", [])
+        ]
+        expected_clusters = {
+            f"{gateway_namespace}/{cec_name}/{namespace}:{key.split('/', 1)[1]}"
+            for key in expected
+        }
+        if set(route_clusters) != expected_clusters or not route_clusters:
+            raise ProofError(f"Gateway Envoy RDS backend routing is incomplete on Kind node {node}")
+        for key, ips in expected.items():
+            service = key.split("/", 1)[1]
+            full_cluster = f"{gateway_namespace}/{cec_name}/{namespace}:{service}"
+            clusters = [
+                x for x in dumped["clusters"]["configs"]
+                if x.get("cluster", {}).get("name") == full_cluster
+                and x.get("cluster", {}).get("type") == "EDS"
+            ]
+            if len(clusters) != 1:
+                raise ProofError(f"Gateway Envoy CDS cluster missing for {key} on {node}")
+            eds = [
+                x for x in dumped["endpoints"]["configs"]
+                if x.get("endpoint_config", {}).get("cluster_name") == key
+            ]
+            if len(eds) != 1:
+                raise ProofError(f"Gateway Envoy EDS assignment missing for {key} on {node}")
+            present: list[tuple[str, int]] = []
+            for locality in eds[0]["endpoint_config"].get("endpoints", []):
+                for lb in locality.get("lb_endpoints", []):
+                    address = lb.get("endpoint", {}).get("address", {}).get("socket_address", {})
+                    if lb.get("health_status") != "HEALTHY":
+                        raise ProofError(f"Gateway Envoy EDS endpoint is unhealthy for {key} on {node}")
+                    present.append((address.get("address"), address.get("port_value")))
+            if len(present) != len(set(present)) or set(present) != ips:
+                raise ProofError(f"Gateway Envoy EDS is stale/incomplete for {key} on {node}")
+        envoy_source_digests[node] = {
+            "agent": agent_map[node],
+            "envoy": envoy_map[node],
+            "lds_sha256": hashlib.sha256(json.dumps(
+                dumped["listeners"], sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+            "rds_sha256": hashlib.sha256(json.dumps(
+                dumped["routes"], sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+            "cds_sha256": hashlib.sha256(json.dumps(
+                dumped["clusters"], sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+            "eds_sha256": hashlib.sha256(json.dumps(
+                dumped["endpoints"], sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+        }
+    return {
+        "status": "non-http-envoy-eds-ready-not-a-gateway-pass",
+        "kind_cluster": cluster,
+        "cec_uid": cec_uid,
+        "namespace": namespace,
+        "gateway_namespace": gateway_namespace,
+        "gateway_name": gateway_name,
+        "backend_binding": backing,
+        "kind_nodes": nodes,
+        "envoy_sources": envoy_source_digests,
+    }
+
+
+def wait_gateway_envoy_nonhttp_ready(
+    kubectl: str, kind: str, cluster: str, *,
+    namespace: str, gateway_namespace: str, gateway_name: str,
+    backends: tuple[tuple[str, int], ...], timeout_seconds: float = 120,
+) -> dict[str, Any]:
+    """Bounded, non-accepting xDS readiness. No Gateway HTTP request or retry."""
+    if timeout_seconds <= 0 or timeout_seconds > 300:
+        raise ProofError("Gateway non-HTTP readiness has an invalid time budget")
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    checks = 0
+    last_failure = "no observation"
+    while time.monotonic() < deadline:
+        checks += 1
+        try:
+            result = gateway_envoy_nonhttp_snapshot(
+                kubectl, kind, cluster, namespace=namespace,
+                gateway_namespace=gateway_namespace, gateway_name=gateway_name,
+                backends=backends, deadline=deadline,
+            )
+        except (ProofError, subprocess.SubprocessError) as error:
+            last_failure = f"{type(error).__name__}: {error}"[:280]
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(2, remaining))
+            continue
+        return {
+            **result,
+            "preflight_attempts": checks,
+            "preflight_duration_seconds": round(time.monotonic() - started, 3),
+            "gateway_http_requests": 0,
+        }
+    raise ProofError(
+        f"Gateway non-HTTP Envoy readiness did not converge within "
+        f"{timeout_seconds}s after {checks} reads: {last_failure}"
+    )
+
+
+def validate_gateway_nonhttp_current(
+    evidence: dict[str, Any], *,
+    kubectl: str, kind: str, cluster: str,
+    namespace: str, gateway_namespace: str, gateway_name: str,
+    backends: tuple[tuple[str, int], ...],
+) -> None:
+    """Reject a stale preflight after HTTP or at receipt reuse; never accept HTTP."""
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("status") != "non-http-envoy-eds-ready-not-a-gateway-pass"
+        or evidence.get("gateway_http_requests") != 0
+    ):
+        raise ProofError("Gateway non-HTTP readiness receipt is missing or invalid")
+    fresh = gateway_envoy_nonhttp_snapshot(
+        kubectl, kind, cluster, namespace=namespace,
+        gateway_namespace=gateway_namespace, gateway_name=gateway_name,
+        backends=backends, deadline=time.monotonic() + 60,
+    )
+    binding_fields = (
+        "kind_cluster", "cec_uid", "namespace", "gateway_namespace",
+        "gateway_name", "backend_binding", "kind_nodes", "envoy_sources",
+    )
+    if any(evidence.get(field) != fresh[field] for field in binding_fields):
+        raise ProofError("Gateway Envoy/EDS runtime identity drifted after preflight")
+
+
 def probe_gateway_after_readiness(
     kind: str, cluster: str, addresses: list[str], port: int,
     *, owner_local: bool = False, verify_node_ids: bool = False,
     matrix_evidence: dict[str, Any] | None = None,
+    readiness: dict[str, Any] | None = None,
+    preflight_evidence: dict[str, Any] | None = None,
 ) -> tuple[str, str, bytes, bytes, bytes]:
     """After control-plane readiness, run exactly one fail-closed HTTP matrix.
 
     HTTP 503 and timeouts cannot be treated as retryable startup observations.
     The API/Envoy data-plane proof begins on the first sampled request.
     """
+    if readiness is not None:
+        expected_fields = {
+            "kubectl", "namespace", "gateway_namespace", "gateway_name", "backends"
+        }
+        if set(readiness) != expected_fields:
+            raise ProofError("Gateway non-HTTP preflight binding is incomplete")
+        preflight = wait_gateway_envoy_nonhttp_ready(
+            readiness["kubectl"], kind, cluster,
+            namespace=readiness["namespace"],
+            gateway_namespace=readiness["gateway_namespace"],
+            gateway_name=readiness["gateway_name"],
+            backends=readiness["backends"],
+        )
+        if (
+            not isinstance(preflight, dict)
+            or preflight.get("status") != "non-http-envoy-eds-ready-not-a-gateway-pass"
+            or preflight.get("kind_cluster") != cluster
+            or preflight.get("gateway_http_requests") != 0
+            or not isinstance(preflight.get("cec_uid"), str)
+            or not preflight["cec_uid"]
+            or not isinstance(preflight.get("backend_binding"), dict)
+            or not preflight["backend_binding"]
+            or not isinstance(preflight.get("envoy_sources"), dict)
+            or not preflight["envoy_sources"]
+        ):
+            raise ProofError("Gateway non-HTTP preflight lacks bound primary-source evidence")
+        if preflight_evidence is not None:
+            preflight_evidence.clear()
+            preflight_evidence.update(preflight)
     if owner_local:
-        return probe_gateway_http(
+        witness = probe_gateway_http(
             kind, cluster, addresses, port,
             owner_local=True, verify_node_ids=verify_node_ids,
             matrix_evidence=matrix_evidence,
         )
-    return probe_gateway_http(
-        kind, cluster, addresses, port, verify_node_ids=verify_node_ids,
-        matrix_evidence=matrix_evidence,
-    )
+    else:
+        witness = probe_gateway_http(
+            kind, cluster, addresses, port, verify_node_ids=verify_node_ids,
+            matrix_evidence=matrix_evidence,
+        )
+    if readiness is not None:
+        validate_gateway_nonhttp_current(
+            preflight, kubectl=readiness["kubectl"], kind=kind, cluster=cluster,
+            namespace=readiness["namespace"],
+            gateway_namespace=readiness["gateway_namespace"],
+            gateway_name=readiness["gateway_name"],
+            backends=readiness["backends"],
+        )
+    return witness
 
 
 def prove_gateway(
@@ -2501,10 +2850,19 @@ def prove_gateway(
     # Neither mode retries a single 503. HA measures owner-local paths;
     # T084 remains strict across every node, listener, route and sample.
     matrix_evidence: dict[str, Any] = {}
+    preflight_evidence: dict[str, Any] = {}
     probe_node, address, health, web, api_nodes = probe_gateway_after_readiness(
         kind, cluster, addresses, service_port,
         owner_local=owner_local, verify_node_ids=True,
         matrix_evidence=matrix_evidence,
+        readiness={
+            "kubectl": kubectl,
+            "namespace": "weltgewebe",
+            "gateway_namespace": "weltgewebe-gateway",
+            "gateway_name": "weltgewebe",
+            "backends": (("weltgewebe-api", 8080), ("weltgewebe-web", 8080)),
+        },
+        preflight_evidence=preflight_evidence,
     )
     if sorted(gateway_addresses(kubectl)) != sorted(addresses):
         raise ProofError("Gateway advertised listener IP set drifted during matrix")
@@ -2521,6 +2879,7 @@ def prove_gateway(
         "web_prefix_sha256": hashlib.sha256(web).hexdigest(),
         "api_nodes_sha256": hashlib.sha256(api_nodes).hexdigest(),
         "matrix_evidence": matrix_evidence,
+        "non_http_preflight": preflight_evidence,
     }
 
 
