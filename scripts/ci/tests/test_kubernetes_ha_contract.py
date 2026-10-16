@@ -631,6 +631,70 @@ class KubernetesHaContractTests(unittest.TestCase):
             self.assertFalse(late["available"])
             self.assertIn("drift", late["probe_error"])
 
+    def test_upgrade_transition_revalidates_owner_after_http_sample(self) -> None:
+        """A late IPAM reallocation must never turn old-owner HTTP into HA PASS."""
+        original = {
+            "gateway_addresses": ["10.0.0.1"],
+            "owner_by_address": {"10.0.0.1": "node-a"},
+            "observer_node": "proof-control-plane",
+            "observer_address": "10.0.0.9",
+        }
+        moved = {
+            **original,
+            "owner_by_address": {"10.0.0.1": "node-b"},
+        }
+        # First HTTP request succeeds via a now-stale owner; once the
+        # current owner changes, the next stable sample cannot erase this
+        # observed failure of the zero-outage upgrade contract.
+        with (
+            mock.patch.object(
+                self.ha, "ready_api_pod_uids",
+                side_effect=[{"old-pod"}, {"new-pod"}],
+            ),
+            mock.patch.object(
+                self.ha.ref, "gateway_addresses",
+                return_value=["10.0.0.1"],
+            ) as addresses,
+            mock.patch.object(
+                self.ha, "gateway_observer_binding",
+                side_effect=[original, original, moved, original, original],
+            ) as owner_reads,
+            mock.patch.object(
+                self.ha, "gateway_observer_sample",
+                return_value={
+                    "available": True, "failed_paths": 0,
+                    "observer_node": "proof-control-plane",
+                    "observer_address": "10.0.0.9",
+                },
+            ) as http,
+            mock.patch.object(
+                self.ha, "api_rollout_complete", return_value=True,
+            ) as rollout,
+            mock.patch.object(
+                self.ha, "api_deployment_image", return_value="image:new",
+            ),
+            mock.patch.object(self.ha, "api_transition_diagnostic",
+                              return_value={"status": "observed"}),
+            mock.patch.object(self.ha.ref, "run") as mutation,
+            mock.patch.object(self.ha.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                self.ha.ref.ProofError, "zero-observed-outage"
+            ):
+                self.ha.measure_api_transition(
+                    "kubectl", "marker", "image:new",
+                    ["kubectl", "rollout", "status", "deployment/api"],
+                    "upgrade", kind="kind", cluster="proof",
+                    probe_node="proof-control-plane",
+                    probe_address="10.0.0.9", port=80,
+                    direct_probe_pods=["probe-a"],
+                )
+        mutation.assert_called_once()
+        self.assertEqual(http.call_count, 2)
+        self.assertEqual(owner_reads.call_count, 5)
+        self.assertEqual(addresses.call_count, 5)  # baseline + both sides of 2 samples
+        self.assertEqual(rollout.call_count, 1)
+
     def test_continuous_failure_snapshot_does_not_require_recovery(self) -> None:
         monitor = self.ha.ContinuousAvailabilityMonitor.__new__(
             self.ha.ContinuousAvailabilityMonitor

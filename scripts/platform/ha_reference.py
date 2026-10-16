@@ -2075,6 +2075,24 @@ def measure_api_transition(
     failed_gateway_paths = 0
     max_failed_gateway_paths = 0
 
+    def require_current_listener_owners() -> None:
+        # The owner can move while a single HTTP request is in flight.
+        # Match current listener addresses and owners at both sides of a
+        # sample, including the final one that ends upgrade or rollback.
+        observed_addresses = sorted(set(ref.gateway_addresses(kubectl)))
+        if observed_addresses != gateway_addresses:
+            raise ref.ProofError(
+                "Gateway listener addresses drifted during API transition: "
+                f"before={gateway_addresses} now={observed_addresses}"
+            )
+        observed_binding = gateway_observer_binding(
+            kind, cluster, gateway_addresses
+        )
+        if observed_binding["owner_by_address"] != gateway_binding["owner_by_address"]:
+            raise ref.ProofError(
+                "Gateway owner mapping drifted during API transition"
+            )
+
     def capture_diagnostic(
         pending: dict[str, Any],
         *,
@@ -2122,23 +2140,12 @@ def measure_api_transition(
         rollout_complete = False
         gateway_sample: dict[str, Any] = {"available": False}
         try:
-            observed_addresses = sorted(set(ref.gateway_addresses(kubectl)))
-            if observed_addresses != gateway_addresses:
-                raise ref.ProofError(
-                    "Gateway listener addresses drifted during API transition: "
-                    f"before={gateway_addresses} now={observed_addresses}"
-                )
-            observed_binding = gateway_observer_binding(
-                kind, cluster, gateway_addresses
-            )
-            if observed_binding["owner_by_address"] != gateway_binding["owner_by_address"]:
-                raise ref.ProofError(
-                    "Gateway owner mapping drifted during API transition"
-                )
+            require_current_listener_owners()
             gateway_sample = gateway_observer_sample(
                 kind, cluster, gateway_addresses, port, marker,
                 observer_binding=gateway_binding,
             )
+            require_current_listener_owners()
             available = bool(gateway_sample["available"])
             sample_failed_paths = int(gateway_sample.get("failed_paths", 0))
             if sample_failed_paths:
