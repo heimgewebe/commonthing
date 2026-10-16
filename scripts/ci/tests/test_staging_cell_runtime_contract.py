@@ -239,6 +239,10 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             self.assertFalse(sysctl_source.is_symlink())
             self.assertEqual(sysctl_source.stat().st_mode & 0o777, 0o400)
             self.assertEqual(
+                staging.KIND_WORKER_SRCMARK_CONTENT,
+                "net.ipv4.conf.all.src_valid_mark = 0\n",
+            )
+            self.assertEqual(
                 sysctl_source.read_text(encoding="utf-8"),
                 staging.KIND_WORKER_SRCMARK_CONTENT,
             )
@@ -304,6 +308,11 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             target = root / "unauthorized.conf"
             target.write_text(staging.KIND_WORKER_SRCMARK_CONTENT, encoding="utf-8")
             source.symlink_to(target)
+            with self.assertRaises(staging.StagingCellError):
+                staging.render_kind_config(root)
+            source.unlink()
+            target.chmod(0o400)
+            source.hardlink_to(target)
             with self.assertRaises(staging.StagingCellError):
                 staging.render_kind_config(root)
 

@@ -51,10 +51,7 @@ STAGING_GATEWAY_NODE_PORT = 31844
 STAGING_GATEWAY_HOST_PORT = 18084
 KIND_WORKER_SRCMARK_PLACEHOLDER = "__COMMONTHING_STAGING_WORKER_SRCMARK_CONF__"
 KIND_WORKER_SRCMARK_DESTINATION = "/etc/sysctl.d/99-commonthing-staging-cilium-srcmark.conf"
-KIND_WORKER_SRCMARK_CONTENT = (
-    "# T084 isolated Kind worker network namespace only, never host or production.\n"
-    "net.ipv4.conf.all.src_valid_mark = 0\n"
-)
+KIND_WORKER_SRCMARK_CONTENT = "net.ipv4.conf.all.src_valid_mark = 0\n"
 SOURCE_NAME = "commonthing-staging-source"
 APP_SOURCE_NAME = "commonthing-staging-app-source"
 DATA_KUSTOMIZATION = "commonthing-staging-data"
@@ -940,16 +937,10 @@ def render_kind_config(root: Path) -> Path:
         )
 
     retained_mounts = (
-        (
-            "__COMMONTHING_STAGING_POSTGRES_ROOT__",
-            root / "data/postgres",
-            "/var/local/commonthing-staging/postgres",
-        ),
-        (
-            "__COMMONTHING_STAGING_NATS_ROOT__",
-            root / "data/nats",
-            "/var/local/commonthing-staging/nats",
-        ),
+        ("__COMMONTHING_STAGING_POSTGRES_ROOT__", root / "data/postgres",
+         "/var/local/commonthing-staging/postgres"),
+        ("__COMMONTHING_STAGING_NATS_ROOT__", root / "data/nats",
+         "/var/local/commonthing-staging/nats"),
     )
     for _, host_path, _ in retained_mounts:
         host_path.mkdir(parents=True, exist_ok=True)
@@ -959,51 +950,31 @@ def render_kind_config(root: Path) -> Path:
                 f"staging retained host path must be a real directory: {host_path}"
             )
 
-    # A generated, single-key, read-only sysctl.d file is bound only inside
-    # the two Kind worker network namespaces. The host and control-plane
-    # sysctls are never written or mounted. systemd-sysctl runs on node boot.
+    # Exact templates prevent unexpected mounts and keep Blue/host untouched.
     worker_srcmark = root / "generated/kind-cilium-srcmark.conf"
-    srcmark_mount = (
-        KIND_WORKER_SRCMARK_PLACEHOLDER,
-        worker_srcmark,
-        KIND_WORKER_SRCMARK_DESTINATION,
-        True,
-    )
-    for index, node in enumerate(nodes):
-        mounts = node.get("extraMounts", []) if isinstance(node, dict) else []
-        expected = (
-            ()
-            if index == 0
-            else (*((p, h, c, False) for p, h, c in retained_mounts), srcmark_mount)
-            if index == 1
-            else (srcmark_mount,)
-        )
+    srcmark_mount = (KIND_WORKER_SRCMARK_PLACEHOLDER, worker_srcmark,
+                     KIND_WORKER_SRCMARK_DESTINATION, True)
+    data_mounts = [(*item, False) for item in retained_mounts]
+    expected_nodes = ([], [*data_mounts, srcmark_mount], [srcmark_mount])
+    for index, (node, expected) in enumerate(zip(nodes, expected_nodes, strict=True)):
+        mounts = node.get("extraMounts", [])
         if not isinstance(mounts, list) or len(mounts) != len(expected):
             raise StagingCellError(f"staging kind node {index} mount contract drift")
-        for mount, (placeholder, host_path, container_path, read_only) in zip(
+        for mount, (placeholder, host_path, destination, read_only) in zip(
             mounts, expected, strict=True
         ):
-            if not isinstance(mount, dict) or set(mount) != {
-                "hostPath", "containerPath", "readOnly"
-            }:
-                raise StagingCellError("staging kind mount structure is not minimal")
-            if (
-                mount.get("hostPath") != placeholder
-                or mount.get("containerPath") != container_path
-                or mount.get("readOnly") is not read_only
+            if mount != dict(
+                hostPath=placeholder, containerPath=destination, readOnly=read_only
             ):
-                raise StagingCellError("staging kind mount source, target or access drift")
+                raise StagingCellError("staging kind mount structure or access drift")
             mount["hostPath"] = str(host_path.resolve())
-    # Keep a previously bound file's inode stable across repeated render calls.
-    # An unexpected existing file is *not* overwritten to hide drift.
     try:
-        worker_srcmark.lstat()
+        observed = worker_srcmark.lstat()
     except FileNotFoundError:
         atomic_text(worker_srcmark, KIND_WORKER_SRCMARK_CONTENT, mode=0o400)
-    observed = worker_srcmark.lstat()
+        observed = worker_srcmark.lstat()
     if (
-        not stat.S_ISREG(observed.st_mode)
-        or observed.st_nlink != 1
+        not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1
         or stat.S_IMODE(observed.st_mode) != 0o400
         or worker_srcmark.read_text(encoding="utf-8") != KIND_WORKER_SRCMARK_CONTENT
     ):
@@ -8943,26 +8914,15 @@ def command_self_check() -> dict[str, Any]:
         rendered_path = render_kind_config(root)
         rendered = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
         srcmark = root / "generated/kind-cilium-srcmark.conf"
-        expected = [
-            str((root / "data/postgres").resolve()),
-            str((root / "data/nats").resolve()),
-            str(srcmark.resolve()),
-            str(srcmark.resolve()),
-        ]
-        observed = [
-            mount.get("hostPath")
-            for node in rendered.get("nodes", [])
-            for mount in node.get("extraMounts", [])
-        ]
+        expected = [root / "data/postgres", root / "data/nats", srcmark, srcmark]
         if (
-            observed != expected
+            [m["hostPath"] for n in rendered["nodes"] for m in n.get("extraMounts", [])]
+            != [str(p.resolve()) for p in expected]
             or rendered["nodes"][0].get("extraMounts")
             or srcmark.read_text(encoding="utf-8") != KIND_WORKER_SRCMARK_CONTENT
             or stat.S_IMODE(srcmark.lstat().st_mode) != 0o400
         ):
-            raise StagingCellError(
-                "self-check rendered kind mounts lack exact data roots or worker sysctl isolation"
-            )
+            raise StagingCellError("staging kind self-check mount or srcmark drift")
     return {
         "schema_version": 1,
         "status": "pass",
