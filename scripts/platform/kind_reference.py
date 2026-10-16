@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -68,11 +69,27 @@ class ProofError(RuntimeError):
 
 
 class GatewayTransportNotReady(ProofError):
-    """A typed curl failure; retryable only before any full readiness witness."""
+    """A hard Gateway HTTP/transport failure, never a retryable proof result."""
 
 
 def _reject_gateway_json_constant(value: str) -> None:
     raise ValueError(f"non-JSON numeric constant {value!r}")
+
+
+def _strict_gateway_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite /api/nodes JSON number")
+    return parsed
+
+
+def _unique_gateway_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate /api/nodes JSON object key")
+        result[key] = value
+    return result
 
 
 def run(
@@ -2129,7 +2146,10 @@ def probe_gateway_http(
                     )
                 try:
                     api_payload = json.loads(
-                        api_nodes, parse_constant=_reject_gateway_json_constant
+                        api_nodes,
+                        parse_constant=_reject_gateway_json_constant,
+                        parse_float=_strict_gateway_json_float,
+                        object_pairs_hook=_unique_gateway_json_object,
                     )
                 except (UnicodeDecodeError, ValueError) as error:
                     raise ProofError(

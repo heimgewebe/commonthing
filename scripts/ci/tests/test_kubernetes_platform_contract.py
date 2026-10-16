@@ -5155,6 +5155,10 @@ time.sleep(60)
             b"[NaN]", b"[Infinity]", b"[-Infinity]",
             b'[{"value": NaN}]', b'[{"value": Infinity}]',
             b'[{"value": -Infinity}]',
+            b"[1e999]", b"[-1e999]",
+            b'[{"metric":1e999}]',
+            b'[{"id":"x","id":"y"}]',
+            b'[{"a":{"b":1,"b":2}}]',
         ):
             with self.subTest(json=invalid_body):
                 with (
@@ -5183,6 +5187,29 @@ time.sleep(60)
                             timeout_seconds=60,
                         )
                     self.assertEqual(run_mock.call_count, 3)
+
+    def test_gateway_http_probe_accepts_finite_nested_json_numbers(self) -> None:
+        api_body = b'[{"id":"a","metric":1.25,"nested":{"score":-0.0005}}]'
+        replies = [
+            subprocess.CompletedProcess([], 0, stdout=b"healthy", stderr=b""),
+            subprocess.CompletedProcess([], 0, stdout=b"web", stderr=b""),
+            subprocess.CompletedProcess([], 0, stdout=api_body, stderr=b""),
+        ]
+        with (
+            mock.patch.object(
+                self.reference, "gateway_address_owners",
+                return_value={"172.22.0.3": "node-a"},
+            ),
+            mock.patch.object(self.reference, "kind_nodes", return_value=["node-a"]),
+            mock.patch.object(self.reference.subprocess, "run",
+                              side_effect=replies * 3) as transport,
+        ):
+            result = self.reference.probe_gateway_http(
+                "kind", "cluster", ["172.22.0.3"], 80,
+                timeout_seconds=60,
+            )
+        self.assertEqual(result[-1], api_body)
+        self.assertEqual(transport.call_count, 9)
 
     def test_gateway_http_probe_rejects_broken_api_rewrite(self) -> None:
         health = subprocess.CompletedProcess(
