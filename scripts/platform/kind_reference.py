@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,81 @@ def run(
 
 def output(argv: list[str]) -> str:
     return run(argv, capture=True).stdout.strip()
+
+
+def require_kind_worker_srcmark_source(
+    source: Path, expected_content: str
+) -> os.stat_result:
+    """Read and authenticate the immutable host-side Kind worker sysctl file."""
+    try:
+        observed = source.lstat()
+        data = source.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ProofError("kind worker srcmark source unreadable") from exc
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or stat.S_IMODE(observed.st_mode) != 0o400
+        or data != expected_content
+    ):
+        raise ProofError("kind worker srcmark source invalid or drifted")
+    return observed
+
+
+def require_kind_worker_srcmark_runtime(root: Path, cluster: str) -> None:
+    """Read-only proof of worker sysctl effect; never a Gateway HTTP PASS."""
+    source = root / "generated/kind-cilium-srcmark.conf"
+    destination = "/etc/sysctl.d/99-commonthing-staging-cilium-srcmark.conf"
+    expected_content = "".join(
+        f"net.ipv4.conf.{name}.src_valid_mark = 0\n"
+        for name in ("all", "default", "eth0")
+    )
+    first = require_kind_worker_srcmark_source(source, expected_content)
+    expected_source = str(source.resolve())
+    sysctl_keys = [
+        f"net.ipv4.conf.{name}.src_valid_mark" for name in ("all", "default", "eth0")
+    ]
+    for role in ("control-plane", "worker", "worker2"):
+        node = f"{cluster}-{role}"
+        before_id = output(["docker", "inspect", "--format", "{{.Id}}", node])
+        if len(before_id) != 64 or any(c not in "0123456789abcdef" for c in before_id):
+            raise ProofError("kind worker srcmark node identity invalid")
+        try:
+            mounts = json.loads(
+                output(["docker", "inspect", "--format", "{{json .Mounts}}", node])
+            )
+        except (TypeError, ValueError) as exc:
+            raise ProofError("kind worker srcmark mount inventory invalid") from exc
+        if not isinstance(mounts, list) or not all(isinstance(m, dict) for m in mounts):
+            raise ProofError("kind worker srcmark mount inventory malformed")
+        matched = [
+            m for m in mounts
+            if m.get("Destination") == destination or m.get("Source") == expected_source
+        ]
+        if role == "control-plane":
+            if matched:
+                raise ProofError("kind worker srcmark leaked to control plane")
+        elif (
+            len(matched) != 1
+            or matched[0].get("Type") != "bind"
+            or matched[0].get("Source") != expected_source
+            or matched[0].get("Destination") != destination
+            or matched[0].get("RW") is not False
+        ):
+            raise ProofError("kind worker srcmark read-only mount missing or drifted")
+        if role != "control-plane":
+            live = output(["docker", "exec", node, "sysctl", "-n", *sysctl_keys])
+            if live.splitlines() != ["0", "0", "0"]:
+                raise ProofError("kind worker srcmark live kernel values drifted")
+        after_id = output(["docker", "inspect", "--format", "{{.Id}}", node])
+        if after_id != before_id:
+            raise ProofError("kind worker srcmark node replaced during proof")
+    last = require_kind_worker_srcmark_source(source, expected_content)
+    if (
+        (first.st_dev, first.st_ino, first.st_mode, first.st_nlink)
+        != (last.st_dev, last.st_ino, last.st_mode, last.st_nlink)
+    ):
+        raise ProofError("kind worker srcmark source changed during proof")
 
 
 def control_plane_address(cluster: str) -> str:

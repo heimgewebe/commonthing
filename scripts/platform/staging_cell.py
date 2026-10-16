@@ -969,16 +969,13 @@ def render_kind_config(root: Path) -> Path:
                 raise StagingCellError("staging kind mount structure or access drift")
             mount["hostPath"] = str(host_path.resolve())
     try:
-        observed = worker_srcmark.lstat()
+        worker_srcmark.lstat()
     except FileNotFoundError:
         atomic_text(worker_srcmark, KIND_WORKER_SRCMARK_CONTENT, mode=0o400)
-        observed = worker_srcmark.lstat()
-    if (
-        not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1
-        or stat.S_IMODE(observed.st_mode) != 0o400
-        or worker_srcmark.read_text(encoding="utf-8") != KIND_WORKER_SRCMARK_CONTENT
-    ):
-        raise StagingCellError("kind worker sysctl source is missing, mutable or drifted")
+    try:
+        reference.require_kind_worker_srcmark_source(worker_srcmark, KIND_WORKER_SRCMARK_CONTENT)
+    except reference.ProofError as exc:
+        raise StagingCellError("kind worker sysctl source is missing, mutable or drifted") from exc
     rendered = yaml.safe_dump(document, sort_keys=False)
     path = root / "generated/kind.yaml"
     atomic_text(path, rendered, mode=0o600)
@@ -3491,6 +3488,8 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
         )
         created = True
 
+    # Ensure worker kernel isolation before touching retained data or Cilium.
+    reference.require_kind_worker_srcmark_runtime(root, args.cluster)
     prepare_volume_permissions(kind, args.cluster, root)
     api_server_host = reference.control_plane_address(args.cluster)
     reference.install_platform_components(
@@ -3507,6 +3506,8 @@ def command_up(args: argparse.Namespace) -> dict[str, Any]:
         ],
         timeout=360,
     )
+    # Re-check after node readiness; Cilium must not reset the source mark.
+    reference.require_kind_worker_srcmark_runtime(root, args.cluster)
     secret_receipt = inject_external_secrets(kubectl, root)
     apply_yaml(kubectl, flux_documents(commit))
     reconcile_data(kubectl, commit)

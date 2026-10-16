@@ -782,6 +782,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
                     return_value=persisted_commit,
                 ) as commit_mock,
                 mock.patch.object(staging.reference, "create_kind_cluster") as create_mock,
+                mock.patch.object(staging.reference, "require_kind_worker_srcmark_runtime") as srcmark_mock,
                 mock.patch.object(staging, "prepare_volume_permissions"),
                 mock.patch.object(staging.reference, "control_plane_address", return_value="127.0.0.1"),
                 mock.patch.object(staging.reference, "install_platform_components"),
@@ -822,6 +823,7 @@ class StagingCellRuntimeContractTests(unittest.TestCase):
             reconcile_mock.assert_called_once_with("kubectl", persisted_commit)
             live_mock.assert_called_once_with("kubectl")
             self.assertEqual(result["bootstrap_commit"], persisted_commit)
+            self.assertEqual(srcmark_mock.call_count, 2)
 
     def test_recreate_after_down_rejects_different_owner_before_mutation(self) -> None:
         persisted_commit = "c" * 40
