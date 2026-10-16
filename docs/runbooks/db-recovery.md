@@ -280,7 +280,32 @@ ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
   "sudo -n -l test -f '$proof' && sudo -n -l cat -- '$proof'" > /dev/null
 # Jeder Empfänger des neuesten Backups muss auf heim-pc gepinnt sein.
 # Gleiche Regeln wie im Pull: genau ein Feld, kanonische Liste, keine Doppelten.
+# Die Pin-Datei wird wie im Pull geparst: lesbar, kein privater Schlüssel,
+# nur kanonische age1-Zeilen (getrimmt, `#`-Kommentare erlaubt), nicht leer.
 pinned="$HOME/.config/weltgewebe/postgres-backup-age-recipients.txt"
+[[ -f "$pinned" && -r "$pinned" ]] || {
+  printf 'Pin-Datei fehlt oder ist nicht lesbar: %s\n' "$pinned" >&2
+  exit 1
+}
+if grep -q 'AGE-SECRET-KEY-' "$pinned"; then
+  printf 'Pin-Datei enthält eine private age-Identität: %s\n' "$pinned" >&2
+  exit 1
+fi
+declare -A pinned_set=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  [[ -z "$line" || "$line" == '#'* ]] && continue
+  [[ "$line" =~ ^age1[02-9ac-hj-np-z]{58}$ ]] || {
+    printf 'Pin-Datei enthält einen ungültigen Eintrag: %s\n' "$pinned" >&2
+    exit 1
+  }
+  pinned_set["$line"]=1
+done < "$pinned"
+((${#pinned_set[@]} > 0)) || {
+  printf 'Pin-Datei enthält keinen age1-Empfänger: %s\n' "$pinned" >&2
+  exit 1
+}
 age_manifest_text="$(
   ssh -o BatchMode=yes -o ConnectTimeout=5 commonserver \
     "sudo -n cat -- '$backup_dir/$age_manifest'"
@@ -301,7 +326,7 @@ if [[ -n "$(printf '%s\n' "${backup_recipients[@]}" | sort | uniq -d)" ]]; then
   exit 1
 fi
 for recipient in "${backup_recipients[@]}"; do
-  grep -qxF -- "$recipient" "$pinned" || {
+  [[ -n "${pinned_set[$recipient]:-}" ]] || {
     printf 'Empfänger nicht in %s gepinnt: %s\n' "$pinned" "$recipient" >&2
     exit 1
   }
