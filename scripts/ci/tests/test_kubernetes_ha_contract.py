@@ -660,6 +660,10 @@ class KubernetesHaContractTests(unittest.TestCase):
                 side_effect=[original, original, moved, original, original],
             ) as owner_reads,
             mock.patch.object(
+                self.ha.ref, "gateway_node_container_ids",
+                return_value={"node-a": "a" * 64},
+            ) as container_reads,
+            mock.patch.object(
                 self.ha, "gateway_observer_sample",
                 return_value={
                     "available": True, "failed_paths": 0,
@@ -692,8 +696,110 @@ class KubernetesHaContractTests(unittest.TestCase):
         mutation.assert_called_once()
         self.assertEqual(http.call_count, 2)
         self.assertEqual(owner_reads.call_count, 5)
+        # The owner drift after sample one rejects *before* needless container
+        # inspection; only 1 baseline + 3 clean-side identity reads occur.
+        self.assertEqual(container_reads.call_count, 4)
         self.assertEqual(addresses.call_count, 5)  # baseline + both sides of 2 samples
         self.assertEqual(rollout.call_count, 1)
+
+    def test_upgrade_transition_rejects_owner_container_replacement(self) -> None:
+        """Node name/IP alone cannot establish continuous owner-local availability."""
+        binding = {
+            "gateway_addresses": ["10.0.0.1"],
+            "owner_by_address": {"10.0.0.1": "node-a"},
+            "observer_node": "proof-control-plane",
+            "observer_address": "10.0.0.9",
+        }
+        old_ids = {"node-a": "a" * 64}
+        new_ids = {"node-a": "b" * 64}
+        # A container dies and is recreated with identical node name and IP
+        # after successful HTTP. Second stable probe cannot erase that failure.
+        with (
+            mock.patch.object(
+                self.ha, "ready_api_pod_uids",
+                side_effect=[{"old-pod"}, {"new-pod"}],
+            ),
+            mock.patch.object(
+                self.ha.ref, "gateway_addresses",
+                return_value=["10.0.0.1"],
+            ),
+            mock.patch.object(
+                self.ha, "gateway_observer_binding", return_value=binding,
+            ),
+            mock.patch.object(
+                self.ha.ref, "gateway_node_container_ids",
+                side_effect=[old_ids, old_ids, new_ids, old_ids, old_ids],
+            ) as container_reads,
+            mock.patch.object(
+                self.ha, "gateway_observer_sample",
+                return_value={"available": True, "failed_paths": 0},
+            ) as http,
+            mock.patch.object(
+                self.ha, "api_rollout_complete", return_value=True,
+            ) as rollout,
+            mock.patch.object(
+                self.ha, "api_deployment_image", return_value="image:new",
+            ),
+            mock.patch.object(
+                self.ha, "api_transition_diagnostic",
+                return_value={"status": "observed"},
+            ),
+            mock.patch.object(self.ha.ref, "run"),
+            mock.patch.object(self.ha.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                self.ha.ref.ProofError, "zero-observed-outage"
+            ):
+                self.ha.measure_api_transition(
+                    "kubectl", "marker", "image:new",
+                    ["kubectl", "rollout", "status", "deployment/api"],
+                    "upgrade", kind="kind", cluster="proof",
+                    probe_node="proof-control-plane",
+                    probe_address="10.0.0.9", port=80,
+                    direct_probe_pods=["probe-a"],
+                )
+        self.assertEqual(container_reads.call_count, 5)
+        self.assertEqual(http.call_count, 2)
+        self.assertEqual(rollout.call_count, 1)
+
+    def test_gateway_domain_wait_caps_nested_matrix_budget(self) -> None:
+        """A 180-second outer deadline must never start a 415-second matrix."""
+        node_id = "node-id"
+        response = b'[{"id":"node-id"}]'
+        with (
+            mock.patch.object(self.ha.ref, "wait_condition") as wait,
+            mock.patch.object(
+                self.ha.ref, "output", return_value="gateway-service",
+            ),
+            mock.patch.object(
+                self.ha.ref, "gateway_listener_port", return_value=80,
+            ),
+            mock.patch.object(
+                self.ha.ref, "gateway_addresses",
+                return_value=["172.22.0.3"],
+            ),
+            mock.patch.object(
+                self.ha.ref, "gateway_service_listener_port", return_value=80,
+            ),
+            mock.patch.object(
+                self.ha.ref, "probe_gateway_http",
+                return_value=("worker", "172.22.0.3", b"ok", b"web", response),
+            ) as http,
+        ):
+            self.assertTrue(
+                self.ha.wait_for_gateway_domain_node(
+                    "kubectl", "kind", "proof", node_id,
+                    timeout_seconds=3, interval=0,
+                )
+            )
+        self.assertEqual(http.call_count, 1)
+        self.assertTrue(http.call_args.kwargs.get("owner_local"))
+        budget = http.call_args.kwargs.get("timeout_seconds")
+        self.assertIsNotNone(budget, "nested HTTP matrix has no bounded budget")
+        self.assertGreater(budget, 0)
+        self.assertLessEqual(budget, 3)
+        wait_budget = wait.call_args.args[-1]
+        self.assertRegex(wait_budget, r"^[1-3]s$")
 
     def test_continuous_failure_snapshot_does_not_require_recovery(self) -> None:
         monitor = self.ha.ContinuousAvailabilityMonitor.__new__(

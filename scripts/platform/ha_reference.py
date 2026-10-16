@@ -2061,6 +2061,8 @@ def measure_api_transition(
     # upgrade/rollback begins. Never let a healthy non-owner path mask an outage.
     gateway_addresses = sorted(set(ref.gateway_addresses(kubectl)))
     gateway_binding = gateway_observer_binding(kind, cluster, gateway_addresses)
+    owner_nodes = sorted(set(gateway_binding["owner_by_address"].values()))
+    owner_container_ids = ref.gateway_node_container_ids(owner_nodes)
     started = time.monotonic()
     ref.run(action)
     deadline = started + 600
@@ -2091,6 +2093,10 @@ def measure_api_transition(
         if observed_binding["owner_by_address"] != gateway_binding["owner_by_address"]:
             raise ref.ProofError(
                 "Gateway owner mapping drifted during API transition"
+            )
+        if ref.gateway_node_container_ids(owner_nodes) != owner_container_ids:
+            raise ref.ProofError(
+                "Gateway owner container identity drifted during API transition"
             )
 
     def capture_diagnostic(
@@ -2443,14 +2449,47 @@ def ha_gateway_baseline(kubectl: str, kind: str, cluster: str) -> dict[str, str]
     return ref.prove_gateway(kubectl, kind, cluster, owner_local=True)
 
 
-def gateway_contains_node(kubectl: str, kind: str, cluster: str, node_id: str) -> bool:
-    ref.wait_condition(kubectl, "weltgewebe-gateway", "gateway/weltgewebe", "Programmed", "5m")
+def gateway_contains_node(
+    kubectl: str, kind: str, cluster: str, node_id: str, *,
+    timeout_seconds: float | None = None,
+) -> bool:
+    # The outer domain deadline is a hard input to readiness and every HTTP
+    # matrix. Without it, one 3-listener proof can run for 415s inside a 180s
+    # wait_until, which checks its clock only between probe invocations.
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ref.ProofError("Gateway domain wait budget is exhausted")
+    deadline = (
+        time.monotonic() + timeout_seconds
+        if timeout_seconds is not None else None
+    )
+
+    def remaining() -> float | None:
+        if deadline is None:
+            return None
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise ref.ProofError("Gateway domain wait budget is exhausted")
+        return seconds
+
+    left = remaining()
+    if left is not None and left < 1:
+        raise ref.ProofError("Gateway domain readiness budget is exhausted")
+    wait_budget = "5m" if left is None else f"{min(300, int(left))}s"
+    ref.wait_condition(
+        kubectl, "weltgewebe-gateway", "gateway/weltgewebe",
+        "Programmed", wait_budget,
+    )
     service = ref.output([kubectl, "-n", "weltgewebe-gateway", "get", "service", "-l", "gateway.networking.k8s.io/gateway-name=weltgewebe", "-o", "jsonpath={.items[0].metadata.name}"])
     port = ref.gateway_listener_port(kubectl)
+    matrix_budget = remaining()
+    matrix_kwargs = (
+        {} if matrix_budget is None
+        else {"timeout_seconds": matrix_budget}
+    )
     _, _, _, _, body = ref.probe_gateway_http(
         kind, cluster, ref.gateway_addresses(kubectl),
         ref.gateway_service_listener_port(kubectl, service, port),
-        owner_local=True,
+        owner_local=True, **matrix_kwargs,
     )
     payload = json.loads(body)
     return any(isinstance(item, dict) and item.get("id") == node_id for item in payload)
@@ -2466,9 +2505,14 @@ def wait_for_gateway_domain_node(
     interval: float = 2.0,
 ) -> bool:
     # Absence of the domain node is retryable; a broken Gateway matrix is not.
+    # Bind the remaining time before invoking the potentially long HTTP matrix.
+    deadline = time.monotonic() + timeout_seconds
     return wait_until(
         "domain mutation in API projection",
-        lambda: gateway_contains_node(kubectl, kind, cluster, node_id),
+        lambda: gateway_contains_node(
+            kubectl, kind, cluster, node_id,
+            timeout_seconds=deadline - time.monotonic(),
+        ),
         timeout_seconds=timeout_seconds,
         interval=interval,
         retry_on_probe_error=False,
