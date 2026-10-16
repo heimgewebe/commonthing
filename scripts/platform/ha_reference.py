@@ -2057,6 +2057,10 @@ def measure_api_transition(
     direct_probe_pods: list[str],
 ) -> dict[str, Any]:
     before_uids = ready_api_pod_uids(kubectl)
+    # Bind every advertised listener to its actual Kind owner BEFORE the
+    # upgrade/rollback begins. Never let a healthy non-owner path mask an outage.
+    gateway_addresses = sorted(set(ref.gateway_addresses(kubectl)))
+    gateway_binding = gateway_observer_binding(kind, cluster, gateway_addresses)
     started = time.monotonic()
     ref.run(action)
     deadline = started + 600
@@ -2070,7 +2074,6 @@ def measure_api_transition(
     degraded_path_samples = 0
     failed_gateway_paths = 0
     max_failed_gateway_paths = 0
-    gateway_addresses = sorted(set(ref.gateway_addresses(kubectl)))
 
     def capture_diagnostic(
         pending: dict[str, Any],
@@ -2119,8 +2122,22 @@ def measure_api_transition(
         rollout_complete = False
         gateway_sample: dict[str, Any] = {"available": False}
         try:
+            observed_addresses = sorted(set(ref.gateway_addresses(kubectl)))
+            if observed_addresses != gateway_addresses:
+                raise ref.ProofError(
+                    "Gateway listener addresses drifted during API transition: "
+                    f"before={gateway_addresses} now={observed_addresses}"
+                )
+            observed_binding = gateway_observer_binding(
+                kind, cluster, gateway_addresses
+            )
+            if observed_binding["owner_by_address"] != gateway_binding["owner_by_address"]:
+                raise ref.ProofError(
+                    "Gateway owner mapping drifted during API transition"
+                )
             gateway_sample = gateway_observer_sample(
-                kind, cluster, gateway_addresses, port, marker
+                kind, cluster, gateway_addresses, port, marker,
+                observer_binding=gateway_binding,
             )
             available = bool(gateway_sample["available"])
             sample_failed_paths = int(gateway_sample.get("failed_paths", 0))
@@ -2216,7 +2233,8 @@ def measure_api_transition(
         "longest_unavailable_seconds": round(longest_unavailable_seconds, 3),
         "probe_node": probe_node,
         "probe_address": probe_address,
-        "gateway_probe_mode": "non-owner-control-plane-any-advertised-address",
+        "gateway_probe_mode": "owner-local-any-advertised-address",
+        "gateway_owner_by_address": dict(gateway_binding["owner_by_address"]),
         "gateway_observer_node": gateway_sample.get("observer_node"),
         "gateway_observer_address": gateway_sample.get("observer_address"),
         "gateway_addresses": gateway_addresses,

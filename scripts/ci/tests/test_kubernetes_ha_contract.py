@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1962,7 +1963,7 @@ spec:
         def sample(
             node: str, address: str, port: int, marker: str
         ) -> dict[str, object]:
-            self.assertEqual(node, "proof-control-plane")
+            self.assertEqual(node, {"10.0.0.1": "node-a", "10.0.0.2": "node-b"}[address])
             available = address == "10.0.0.2"
             return {
                 "available": available,
@@ -1989,7 +1990,7 @@ spec:
         self.assertEqual(observed["observer_node"], "proof-control-plane")
         self.assertEqual(
             observed["probe_mode"],
-            "non-owner-control-plane-any-advertised-address",
+            "owner-local-any-advertised-address",
         )
 
     def test_gateway_observer_sample_reuses_pre_failure_binding_after_owner_stops(self) -> None:
@@ -2180,7 +2181,9 @@ spec:
         self.assertIn('probe_address = gateway_probe["address"]', source)
         self.assertIn("gateway_observer_sample(", source)
         self.assertIn("gateway_observer_binding(", source)
-        self.assertIn("non-owner-control-plane-any-advertised-address", source)
+        self.assertIn("gateway_binding = gateway_observer_binding(", source)
+        self.assertIn("observer_binding=gateway_binding", source)
+        self.assertIn("owner-local-any-advertised-address", source)
         self.assertIn("observer_binding=availability_monitor.gateway_binding", source)
         self.assertIn('"degraded_gateway_path_samples"', source)
         self.assertIn('"post-recovery-after-measurement"', source)
@@ -2495,6 +2498,114 @@ spec:
         )
         self.assertEqual(down.commit, "a" * 40)
         self.assertEqual(down.owner_id, "gha-ha-123-1")
+
+
+    def test_owner_local_gateway_outage_cannot_be_rescued_by_nonowner(self) -> None:
+        """ADR-0013: two unreachable owners mean outage even when observer works."""
+        node_ip = {
+            "proof-control-plane": "10.0.0.9",
+            "node-a": "10.0.0.1",
+            "node-b": "10.0.0.2",
+        }
+        called: list[tuple[str, str]] = []
+
+        def sample(node: str, address: str, port: int, marker: str) -> dict[str, object]:
+            called.append((node, address))
+            # Simulates a deceptive cross-node path that remains healthy.
+            return {"available": node == "proof-control-plane", "returncode": 0}
+
+        with (
+            mock.patch.object(
+                self.ha.ref, "kind_nodes", return_value=list(node_ip)
+            ),
+            mock.patch.object(
+                self.ha.ref, "output", side_effect=lambda argv: node_ip[argv[-1]]
+            ),
+            mock.patch.object(
+                self.ha._ha_availability, "gateway_projection_sample", side_effect=sample
+            ),
+        ):
+            measured = self.ha.gateway_observer_sample(
+                "kind", "proof", ["10.0.0.1", "10.0.0.2"], 80, "marker"
+            )
+        self.assertFalse(measured["available"])
+        self.assertEqual(measured["failed_paths"], 2)
+        self.assertEqual(
+            called, [("node-a", "10.0.0.1"), ("node-b", "10.0.0.2")]
+        )
+        self.assertEqual(
+            measured["probe_mode"], "owner-local-any-advertised-address"
+        )
+
+
+    def test_gateway_full_matrix_rejects_post_probe_owner_reallocation(self) -> None:
+        """Same node names with a swapped listener owner must not retain PASS."""
+        before = {"10.0.0.1": "node-a", "10.0.0.2": "node-b"}
+        after = {"10.0.0.1": "node-b", "10.0.0.2": "node-a"}
+
+        def healthy(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            body = b"[]" if argv[-1].endswith("/api/nodes") else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+
+        with (
+            mock.patch.object(
+                self.ha.ref, "gateway_address_owners", side_effect=[before, after]
+            ),
+            mock.patch.object(
+                self.ha.ref, "kind_nodes", return_value=["node-a", "node-b"]
+            ),
+            mock.patch.object(
+                self.ha.ref.subprocess, "run", side_effect=healthy
+            ) as requests,
+        ):
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "owners drifted"):
+                self.ha.ref.probe_gateway_http(
+                    "kind", "proof", list(before), 80, timeout_seconds=120
+                )
+        self.assertEqual(requests.call_count, 2 * 2 * 3 * 3)
+
+    def test_gateway_full_matrix_rejects_container_replacement(self) -> None:
+        owner = {"10.0.0.1": "node-a"}
+
+        def healthy(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            body = b"[]" if argv[-1].endswith("/api/nodes") else b"healthy"
+            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+
+        with (
+            mock.patch.object(self.ha.ref, "gateway_address_owners", return_value=owner),
+            mock.patch.object(self.ha.ref, "kind_nodes", return_value=["node-a"]),
+            mock.patch.object(
+                self.ha.ref, "gateway_node_container_ids",
+                side_effect=[{"node-a": "a" * 64}, {"node-a": "b" * 64}],
+            ),
+            mock.patch.object(self.ha.ref.subprocess, "run", side_effect=healthy),
+        ):
+            with self.assertRaisesRegex(self.ha.ref.ProofError, "container identity drifted"):
+                self.ha.ref.probe_gateway_http(
+                    "kind", "proof", ["10.0.0.1"], 80,
+                    timeout_seconds=60, verify_node_ids=True,
+                )
+
+    def test_gateway_proof_rejects_listener_removed_during_matrix(self) -> None:
+        with (
+            mock.patch.object(self.ha.ref, "wait_condition"),
+            mock.patch.object(self.ha.ref, "wait_http_route_parent_condition"),
+            mock.patch.object(self.ha.ref, "output", return_value="gw-svc"),
+            mock.patch.object(self.ha.ref, "gateway_listener_port", return_value=80),
+            mock.patch.object(
+                self.ha.ref, "gateway_addresses",
+                side_effect=[["10.0.0.1", "10.0.0.2"], ["10.0.0.1"]],
+            ),
+            mock.patch.object(self.ha.ref, "gateway_service_listener_port", return_value=80),
+            mock.patch.object(
+                self.ha.ref, "probe_gateway_after_readiness",
+                return_value=("node-a", "10.0.0.1", b"ok", b"web", b"[]"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                self.ha.ref.ProofError, "listener IP set drifted"
+            ):
+                self.ha.ref.prove_gateway("kubectl", "kind", "proof")
 
 
 if __name__ == "__main__":

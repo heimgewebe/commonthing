@@ -162,19 +162,23 @@ def gateway_observer_sample(
         )
     observer = str(binding.get("observer_node", ""))
     observer_address = str(binding.get("observer_address", ""))
-    if not observer or not observer_address:
-        raise ref.ProofError("gateway observer binding is incomplete")
+    owners = binding.get("owner_by_address")
+    if not observer or not observer_address or not isinstance(owners, dict):
+        raise ref.ProofError("gateway owner-local binding is incomplete")
+    if any(not isinstance(owners.get(addr), str) or not owners[addr] for addr in gateway_addresses):
+        raise ref.ProofError("gateway owner-local binding has missing listener owners")
 
     def run_address(address: str) -> dict[str, Any]:
+        owner = owners[address]
         try:
-            sample = gateway_projection_sample(observer, address, port, marker)
+            sample = gateway_projection_sample(owner, address, port, marker)
         except (subprocess.SubprocessError, OSError) as error:
             sample = {
                 "available": False,
                 "probe_error": f"{type(error).__name__}: {error}",
                 "url": f"http://{address}:{port}/api/nodes",
             }
-        return {"node": observer, "address": address, **sample}
+        return {"node": owner, "address": address, **sample}
 
     with ThreadPoolExecutor(max_workers=min(8, len(gateway_addresses))) as executor:
         probes = list(executor.map(run_address, gateway_addresses))
@@ -185,17 +189,16 @@ def gateway_observer_sample(
         for probe in probes
         if probe.get("available") is True
     ]
-    owner_by_address = binding.get("owner_by_address", {})
     return {
         "available": bool(successful_addresses),
-        "probe_mode": "non-owner-control-plane-any-advertised-address",
+        "probe_mode": "owner-local-any-advertised-address",
         "observer_binding": (
             "pre-failure-snapshot" if observer_binding is not None else "live-preflight"
         ),
         "observer_node": observer,
         "observer_address": observer_address,
         "address_owners": {
-            address: owner_by_address.get(address)
+            address: owners[address]
             for address in gateway_addresses
         },
         "gateway_address_count": len(gateway_addresses),

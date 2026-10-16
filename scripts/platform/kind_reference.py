@@ -2066,6 +2066,17 @@ def gateway_address_owners(
     return {address: owners_by_address[address][0] for address in addresses}
 
 
+def gateway_node_container_ids(nodes: list[str]) -> dict[str, str]:
+    """Bind each source-node name to the running Docker container identity."""
+    identities: dict[str, str] = {}
+    for node in nodes:
+        container_id = output(["docker", "inspect", "--format", "{{.Id}}", node])
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ProofError(f"missing valid container identity for Gateway node {node!r}")
+        identities[node] = container_id
+    return identities
+
+
 def probe_gateway_http(
     kind: str,
     cluster: str,
@@ -2074,6 +2085,7 @@ def probe_gateway_http(
     timeout_seconds: float | None = None,
     *,
     owner_local: bool = False,
+    verify_node_ids: bool = False,
 ) -> tuple[str, str, bytes, bytes, bytes]:
     """Require strict T084 or explicitly owner-local HA HTTP matrix.
 
@@ -2087,6 +2099,7 @@ def probe_gateway_http(
         raise ProofError(
             f"Gateway owner node missing from current kind node inventory: {sorted(missing_owners)}"
         )
+    before_container_ids = gateway_node_container_ids(nodes) if verify_node_ids else None
     if timeout_seconds is None:
         # A bounded curl on each required source/listener/route/sample.
         # HA accepts only owner-local paths; T084 remains all-node/all-listener.
@@ -2167,13 +2180,23 @@ def probe_gateway_http(
         raise ProofError("Gateway HTTP proof has no node/address/route witness")
     if time.monotonic() >= deadline:
         raise ProofError("Gateway status address did not serve listener HTTP within proof deadline")
+    # A healthy probe against the OLD owner map is never a proof about a NEW
+    # owner map. Fail even if node names survive an IP reallocation.
+    after_nodes = kind_nodes(kind, cluster)
+    after_owners = gateway_address_owners(kind, cluster, addresses)
+    if sorted(after_nodes) != sorted(nodes) or after_owners != owners:
+        raise ProofError("Gateway source-node inventory or listener owners drifted during matrix")
+    if before_container_ids is not None:
+        after_container_ids = gateway_node_container_ids(after_nodes)
+        if after_container_ids != before_container_ids:
+            raise ProofError("Gateway Kind container identity drifted during matrix")
     return witness
 
 
 
 def probe_gateway_after_readiness(
     kind: str, cluster: str, addresses: list[str], port: int,
-    *, owner_local: bool = False
+    *, owner_local: bool = False, verify_node_ids: bool = False
 ) -> tuple[str, str, bytes, bytes, bytes]:
     """After control-plane readiness, run exactly one fail-closed HTTP matrix.
 
@@ -2181,8 +2204,13 @@ def probe_gateway_after_readiness(
     The API/Envoy data-plane proof begins on the first sampled request.
     """
     if owner_local:
-        return probe_gateway_http(kind, cluster, addresses, port, owner_local=True)
-    return probe_gateway_http(kind, cluster, addresses, port)
+        return probe_gateway_http(
+            kind, cluster, addresses, port,
+            owner_local=True, verify_node_ids=verify_node_ids,
+        )
+    return probe_gateway_http(
+        kind, cluster, addresses, port, verify_node_ids=verify_node_ids,
+    )
 
 
 def prove_gateway(
@@ -2226,8 +2254,11 @@ def prove_gateway(
     # Neither mode retries a single 503. HA measures owner-local paths;
     # T084 remains strict across every node, listener, route and sample.
     probe_node, address, health, web, api_nodes = probe_gateway_after_readiness(
-        kind, cluster, addresses, service_port, owner_local=owner_local
+        kind, cluster, addresses, service_port,
+        owner_local=owner_local, verify_node_ids=True,
     )
+    if sorted(gateway_addresses(kubectl)) != sorted(addresses):
+        raise ProofError("Gateway advertised listener IP set drifted during matrix")
     return {
         "service": service,
         "probe_node": probe_node,
