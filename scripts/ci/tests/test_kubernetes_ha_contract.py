@@ -504,6 +504,71 @@ class KubernetesHaContractTests(unittest.TestCase):
         )
         self.assertLess(preload, ha_data_apply)
 
+    def test_continuous_gateway_samples_rebind_listener_owners(self) -> None:
+        """A stale successful cross-node probe cannot become owner-local proof."""
+        monitor = self.ha.ContinuousAvailabilityMonitor.__new__(
+            self.ha.ContinuousAvailabilityMonitor
+        )
+        monitor.kubectl = "kubectl"
+        monitor.kind = "kind"
+        monitor.cluster = "proof"
+        monitor.gateway_addresses = ["10.0.0.1"]
+        monitor.gateway_port = 80
+        monitor.marker = "marker"
+        monitor.gateway_binding = {
+            "gateway_addresses": ["10.0.0.1"],
+            "owner_by_address": {"10.0.0.1": "owner-a"},
+            "observer_node": "proof-control-plane",
+            "observer_address": "10.0.0.9",
+            "captured_before_failure": True,
+        }
+        original = dict(monitor.gateway_binding)
+        moved = {
+            **original,
+            "owner_by_address": {"10.0.0.1": "owner-b"},
+        }
+        with (
+            mock.patch.object(self.ha.ref, "gateway_addresses",
+                              return_value=["10.0.0.1"]) as ips,
+            mock.patch.object(self.ha._ha_availability, "gateway_observer_binding",
+                              return_value=original) as live,
+            mock.patch.object(self.ha._ha_availability, "gateway_observer_sample",
+                              return_value={"available": True, "failed_paths": 0}) as http,
+        ):
+            self.assertTrue(monitor._sample("gateway")["available"])
+            self.assertGreaterEqual(ips.call_count, 2)
+            self.assertGreaterEqual(live.call_count, 2)
+            http.assert_called_once_with(
+                "kind", "proof", ["10.0.0.1"], 80, "marker",
+                observer_binding=monitor.gateway_binding,
+            )
+            ips.reset_mock()
+            live.reset_mock()
+            http.reset_mock()
+
+            # Current IPAM owner is different, even though old owner curl
+            # returns a healthy response (the forbidden cross-node false PASS).
+            live.return_value = moved
+            changed = monitor._sample("gateway")
+            self.assertFalse(changed["available"])
+            self.assertIn("drift", changed["probe_error"])
+            http.assert_not_called()
+
+            live.reset_mock()
+            live.return_value = original
+            ips.return_value = ["10.0.0.2"]
+            changed = monitor._sample("gateway")
+            self.assertFalse(changed["available"])
+            self.assertIn("drift", changed["probe_error"])
+            http.assert_not_called()
+
+            ips.return_value = ["10.0.0.1"]
+            live.side_effect = [original, moved]
+            changed = monitor._sample("gateway")
+            self.assertFalse(changed["available"])
+            self.assertIn("drift", changed["probe_error"])
+            http.assert_called_once()
+
     def test_continuous_failure_snapshot_does_not_require_recovery(self) -> None:
         monitor = self.ha.ContinuousAvailabilityMonitor.__new__(
             self.ha.ContinuousAvailabilityMonitor
@@ -2837,7 +2902,7 @@ spec:
 
     def test_nonhttp_envoy_snapshot_rejects_stale_eds_and_wrong_rds(self) -> None:
         """Exercise actual parser/binding on deterministic, synthetic K8s+xDS JSON."""
-        bad = {"eds": False, "rds": False, "cds": False}
+        bad = {"eds": False, "rds": False, "cds": False, "conditions": {"ready": True, "serving": True, "terminating": False}}
         namespace, gateway_namespace, gateway_name = "ns", "gw", "testgw"
         cec = "cilium-gateway-testgw"
         full_cluster = "gw/cilium-gateway-testgw/ns:srv:8080"
@@ -2860,7 +2925,7 @@ spec:
                                  "labels": {"kubernetes.io/service-name": "srv"}},
                     "ports": [{"port": 8080, "protocol": "TCP"}],
                     "endpoints": [{
-                        "conditions": {"ready": True, "serving": True, "terminating": False},
+                        "conditions": bad["conditions"],
                         "addresses": ["10.1.1.1"],
                         "targetRef": {"kind": "Pod", "uid": "synthetic-pod"},
                     }],
@@ -2950,6 +3015,37 @@ spec:
                 )
 
         bad["cds"] = False
+
+        # The EndpointSlice API interprets absent/null serving as true and
+        # absent/null terminating as false. Explicit unhealthy values still
+        # fail closed, even when ready=true (publishNotReadyAddresses).
+        with (
+            mock.patch.object(self.ha.ref, "kind_nodes", return_value=["node-a"]),
+            mock.patch.object(self.ha.ref, "_gateway_nonhttp_json", side_effect=source),
+        ):
+            for conditions in ({"ready": True}, {"ready": True, "serving": None, "terminating": None}):
+                with self.subTest(conditions=conditions):
+                    bad["conditions"] = conditions
+                    result = self.ha.ref.gateway_envoy_nonhttp_snapshot(
+                        "kubectl", "kind", "cluster", **args,
+                    )
+                    self.assertEqual(result["envoy_sources"].keys(), {"node-a"})
+            for conditions in (
+                {"ready": False},
+                {"ready": True, "serving": False},
+                {"ready": True, "terminating": True},
+                {"ready": True, "serving": "true"},
+                {"ready": True, "terminating": 0},
+            ):
+                with self.subTest(reject_conditions=conditions):
+                    bad["conditions"] = conditions
+                    with self.assertRaisesRegex(
+                        self.ha.ref.ProofError, "unready EndpointSlice member"
+                    ):
+                        self.ha.ref.gateway_envoy_nonhttp_snapshot(
+                            "kubectl", "kind", "cluster", **args,
+                        )
+        bad["conditions"] = {"ready": True, "serving": True, "terminating": False}
 
         def missing_nonowner_envoy(argv: list[str], *, deadline: float) -> dict:
             document = source(argv, deadline=deadline)

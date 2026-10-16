@@ -516,9 +516,25 @@ class ContinuousAvailabilityMonitor:
         self._failure_elapsed_seconds = time.monotonic() - self._started
         self._failure_label = label
 
+    def _require_current_gateway_binding(self) -> None:
+        """Prevent a stale owner-local snapshot from accepting cross-node HTTP."""
+        observed = sorted(set(ref.gateway_addresses(self.kubectl)))
+        if observed != self.gateway_addresses:
+            raise ref.ProofError("Gateway listener addresses drifted during continuous availability")
+        live = gateway_observer_binding(self.kind, self.cluster, observed)
+        for key in (
+            "gateway_addresses", "owner_by_address",
+            "observer_node", "observer_address",
+        ):
+            if live.get(key) != self.gateway_binding.get(key):
+                raise ref.ProofError(
+                    f"Gateway listener owner binding drifted during continuous availability: {key}"
+                )
+
     def _sample(self, channel: str) -> dict[str, Any]:
         try:
             if channel == "gateway":
+                self._require_current_gateway_binding()
                 result = gateway_observer_sample(
                     self.kind,
                     self.cluster,
@@ -527,6 +543,9 @@ class ContinuousAvailabilityMonitor:
                     self.marker,
                     observer_binding=self.gateway_binding,
                 )
+                # HTTP can succeed via a stale owner's cross-node path after
+                # readdressing. Bind both sides of the single measured sample.
+                self._require_current_gateway_binding()
                 return {
                     "available": bool(result.get("available")),
                     "failed_paths": int(result.get("failed_paths", 0)),

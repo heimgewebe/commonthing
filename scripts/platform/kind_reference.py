@@ -2551,9 +2551,15 @@ def gateway_envoy_nonhttp_snapshot(
                 conditions = ep.get("conditions", {})
                 addresses = ep.get("addresses", [])
                 target = ep.get("targetRef", {})
-                if (conditions.get("ready") is not True
-                        or conditions.get("serving") is not True
-                        or conditions.get("terminating") is not False
+                # The EndpointSlice API interprets nil serving as true and
+                # nil terminating as false; explicitly unhealthy/non-boolean
+                # values remain fail-closed. Ready must be affirmatively true.
+                if (not isinstance(conditions, dict)
+                        or conditions.get("ready") is not True
+                        or (conditions.get("serving") is not None
+                            and conditions["serving"] is not True)
+                        or (conditions.get("terminating") is not None
+                            and conditions["terminating"] is not False)
                         or target.get("kind") != "Pod" or not target.get("uid")
                         or len(addresses) != 1):
                     raise ProofError(f"Gateway non-HTTP backend {service} has unready EndpointSlice member")
