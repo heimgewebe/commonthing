@@ -570,17 +570,26 @@ in einem Verzeichnis mit Modus `0700`:
 set -euo pipefail
 umask 077
 src=~/merges/weltgewebe-production-backups
-# Standard ist die neueste gezogene Kopie; ein älterer Restore-Punkt wird
+# Standard ist die zuletzt vollständig abgeschlossene Kopie laut
+# latest-pull.receipt, nicht die neueste sichtbare Datei: ein abgebrochener
+# Pull kann Chiffrat ohne Receipt hinterlassen. Ein älterer Restore-Punkt wird
 # vorher per `export BACKUP_BASE=weltgewebe-postgres-…` gewählt.
-base="${BACKUP_BASE:-$(
-  find "$src" -maxdepth 1 -type f -name 'weltgewebe-postgres-*.sql.gz.age' \
-    -printf '%f\n' | sort | tail -n1
-)}"
-base="${base%.sql.gz.age}"
+if [[ -n "${BACKUP_BASE:-}" ]]; then
+  base="${BACKUP_BASE%.sql.gz.age}"
+else
+  receipt="$src/latest-pull.receipt"
+  grep -qx 'result=ok' "$receipt"
+  base="$(awk -F= '$1=="file" {print $2}' "$receipt")"
+  base="${base%.sql.gz.age}"
+fi
 [[ "$base" =~ ^weltgewebe-postgres-[A-Za-z0-9._-]+$ && "$base" != *..* ]] || {
   printf 'Kein gültiges verschlüsseltes Backup in %s ausgewählt.\n' "$src" >&2
   exit 1
 }
+# Chiffrat gegen sein Off-Host-Manifest prüfen, bevor entschlüsselt wird.
+age_expected="$(awk -F= '$1=="sha256" {print $2}' "$src/$base.age.sha256.manifest")"
+[[ "$age_expected" =~ ^[0-9a-f]{64}$ ]]
+[[ "$(sha256sum "$src/$base.sql.gz.age" | awk '{print $1}')" == "$age_expected" ]]
 work="$(mktemp -d)"
 # Der entschlüsselte Dump wird bei jedem Ende dieser Shell entfernt, auch nach
 # einem Fehler in age, SHA-Vergleich, gzip -t oder Restore und nach Abbruch.
