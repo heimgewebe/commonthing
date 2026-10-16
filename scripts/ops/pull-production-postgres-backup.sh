@@ -191,12 +191,23 @@ plaintext_sha="$(manifest_value plaintext_sha256 "$work_dir/$age_manifest")"
 # newly published ciphertext/manifests behind on a failed pull.
 # A weekly restore proof may not yet exist for the newest daily backup. Copy it
 # when present, but never treat its absence as proof that the backup is invalid.
+# Only a definite "absent" may skip the proof. An SSH failure (255) or a sudo
+# rule that does not cover test/cat on the proof must fail the pull instead of
+# silently dropping restore evidence.
+remote_proof="$REMOTE_BACKUP_DIR/proofs/$proof"
 # shellcheck disable=SC2029
-if ssh "${ssh_args[@]}" "$REMOTE_HOST" \
-  "sudo -n test -f '$REMOTE_BACKUP_DIR/proofs/$proof'"; then
+proof_state="$(ssh "${ssh_args[@]}" "$REMOTE_HOST" \
+  "if ! sudo -n -l test -f '$remote_proof' > /dev/null || ! sudo -n -l cat -- '$remote_proof' > /dev/null; then echo denied; elif sudo -n test -f '$remote_proof'; then echo present; else echo absent; fi")" ||
+  fail "could not probe the remote restore proof (SSH failed)"
+case "$proof_state" in
+  present | absent) ;;
+  denied) fail "sudo does not permit test/cat on the remote restore proof; see docs/runbooks/db-recovery.md" ;;
+  *) fail "unexpected remote restore proof probe result" ;;
+esac
+if [[ "$proof_state" == present ]]; then
   # shellcheck disable=SC2029
   ssh "${ssh_args[@]}" "$REMOTE_HOST" \
-    "sudo -n cat -- '$REMOTE_BACKUP_DIR/proofs/$proof'" > "$work_dir/$proof"
+    "sudo -n cat -- '$remote_proof'" > "$work_dir/$proof"
   chmod 600 "$work_dir/$proof"
   grep -qx 'result=ok' "$work_dir/$proof" || fail "remote restore proof is not successful"
 fi

@@ -311,9 +311,10 @@ done
 Damit werden genau die privilegierten Operationen geprüft, die auch der Pull
 verwendet: `find` auf die Abschlussmarker, `cat` auf Abschlussmarker,
 Chiffrat und Klartext-Manifest sowie `test -f` und `cat` auf den optionalen
-Restore-Proof unter `proofs/`. Die Proof-Prüfung ist wichtig, weil der Pull
-ein verweigertes `sudo test -f` nicht von einem fehlenden Proof unterscheiden
-kann und den Proof sonst still nie mitnimmt. Befehlsbezogene
+Restore-Proof unter `proofs/`. Der Pull selbst prüft dieselbe Berechtigung per
+`sudo -n -l` und bricht ab, wenn sie fehlt oder die SSH-Verbindung bei der
+Proof-Abfrage scheitert; nur ein eindeutig fehlender Proof wird übergangen.
+Der Preflight findet eine fehlende Regel aber schon vor der Aktivierung. Befehlsbezogene
 **Sicherheitssperre für den aktuellen Entwurf:** Sudoers-Globs wie
 `*.sha256.manifest` sind **keine** enge Argumentautorisierung. In
 Sudoers können Platzhalter auch Leerzeichen, zusätzliche Argumente und

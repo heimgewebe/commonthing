@@ -83,8 +83,19 @@ cat > "$bin/ssh" << 'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
 cmd="${!#}"
+# `sudo -n -l CMD` only asks whether CMD is permitted; the fixture permits all
+# unless a test simulates a sudo rule that does not cover the proof.
+if [[ "${SIMULATE_PROOF_SUDO_DENIED:-0}" == 1 ]]; then
+  cmd="${cmd//sudo -n -l /false }"
+else
+  cmd="${cmd//sudo -n -l /true }"
+fi
 cmd="${cmd//sudo -n /}"
 printf '%s\n' "$cmd" >> "$SSH_LOG"
+if [[ "${SIMULATE_PROOF_SSH_FAILURE:-0}" == 1 && "$cmd" == *proofs/* ]]; then
+  printf 'ssh: connection reset\n' >&2
+  exit 255
+fi
 # Simulates another writer (e.g. a legacy pull) dropping plaintext while this
 # pull is still transferring.
 if [[ -n "${INJECT_PLAINTEXT_DURING_CAT:-}" && "$cmd" == *'cat -- '* ]]; then
@@ -318,6 +329,17 @@ fi
 printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=failed\n' > "$remote/proofs/$base.restore-proof"
 expect_pull_failure "$root/bad-proof" 'remote restore proof is not successful'
 printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=ok\n' > "$remote/proofs/$base.restore-proof"
+
+# A proof probe that fails for transport or sudo reasons is not "no proof":
+# the pull must fail instead of publishing a receipt without the evidence.
+SIMULATE_PROOF_SSH_FAILURE=1 expect_pull_failure "$root/proof-ssh" 'could not probe the remote restore proof'
+SIMULATE_PROOF_SUDO_DENIED=1 expect_pull_failure "$root/proof-denied" 'sudo does not permit test/cat on the remote restore proof'
+# A definitely absent proof (newest daily backup) is still a successful pull.
+mv "$remote/proofs/$base.restore-proof" "$root/held-proof"
+pull "$root/no-proof" test-host > /dev/null
+grep -qx 'result=ok' "$root/no-proof/latest-pull.receipt"
+[[ ! -e "$root/no-proof/$base.restore-proof" ]]
+mv "$root/held-proof" "$remote/proofs/$base.restore-proof"
 
 # A ciphertext sha256 mismatch must fail and must not promote anything.
 write_age_manifest "$(printf '%064d' 0)" "$age_bytes" "$plain_sha"
