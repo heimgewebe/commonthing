@@ -2647,41 +2647,58 @@ spec:
         def copy_receipt() -> dict:
             return json.loads(json.dumps(evidence))
 
-        altered: list[tuple[str, dict]] = []
+        altered: list[tuple[str, dict, str]] = []
         missing = copy_receipt()
         missing["cells"].pop()
-        altered.append(("missing sample", missing))
+        altered.append(("missing sample", missing, "cell count"))
         false_count = copy_receipt()
         false_count["completed_cells"] = 9
-        altered.append(("falsified count", false_count))
+        altered.append(("falsified count", false_count, "cell count"))
         reordered = copy_receipt()
         reordered["cells"][0], reordered["cells"][1] = reordered["cells"][1], reordered["cells"][0]
-        altered.append(("reordered cells", reordered))
+        altered.append(("reordered cells", reordered, "missing, reordered or invalid sample"))
         wrong_owner = copy_receipt()
         wrong_owner["runtime_before"]["owner_by_address"]["10.0.0.1"] = "node-b"
         wrong_owner["runtime_after"]["owner_by_address"]["10.0.0.1"] = "node-b"
-        altered.append(("wrong owner", wrong_owner))
+        altered.append(("wrong owner", wrong_owner, "runtime identity is stale"))
         missing_listener = copy_receipt()
         missing_listener["runtime_before"]["listeners"].pop()
         missing_listener["runtime_after"]["listeners"].pop()
-        altered.append(("omitted listener", missing_listener))
+        altered.append(("omitted listener", missing_listener, "runtime snapshot is invalid"))
         forged_sample = copy_receipt()
         forged_sample["cells"][0]["sample"] = 3
-        altered.append(("wrong sample index", forged_sample))
-        tampered_body = copy_receipt()
-        tampered_body["cells"][0]["body_sha256"] = "f" * 64
-        altered.append(("changed response digest", tampered_body))
+        altered.append(("wrong sample index", forged_sample, "missing, reordered or invalid sample"))
         tampered_status = copy_receipt()
         tampered_status["cells"][0]["http_status"] = 503
-        altered.append(("unhealthy HTTP status", tampered_status))
-        for label, candidate in altered:
+        altered.append(("unhealthy HTTP status", tampered_status, "missing, reordered or invalid sample"))
+        # Structural violations must fail even when an attacker recomputes the
+        # canonical digest. An externally bound old digest would hide defects
+        # in the order/status/count checks and make these tests vacuous.
+        for label, candidate, error in altered:
             with self.subTest(label=label):
                 candidate["canonical_sha256"] = self.ha.ref.gateway_matrix_evidence_digest(candidate)
-                with self.assertRaises(self.ha.ref.ProofError):
+                with self.assertRaisesRegex(self.ha.ref.ProofError, error):
                     self.ha.ref.validate_gateway_matrix_evidence(
-                        candidate, expected_runtime=evidence["runtime_before"],
-                        expected_digest=evidence["canonical_sha256"],
+                        candidate,
+                        expected_mode="strict-t084-all-nodes",
+                        **(
+                            {"expected_runtime": evidence["runtime_before"]}
+                            if label == "wrong owner" else {}
+                        ),
                     )
+        # Response body digests are opaque; only an externally bound receipt
+        # can detect a rehashed body digest with otherwise valid cell structure.
+        tampered_body = copy_receipt()
+        tampered_body["cells"][0]["body_sha256"] = "f" * 64
+        tampered_body["canonical_sha256"] = self.ha.ref.gateway_matrix_evidence_digest(
+            tampered_body
+        )
+        with self.assertRaisesRegex(
+            self.ha.ref.ProofError, "differs from externally bound receipt"
+        ):
+            self.ha.ref.validate_gateway_matrix_evidence(
+                tampered_body, expected_digest=evidence["canonical_sha256"],
+            )
         bad_digest = copy_receipt()
         bad_digest["canonical_sha256"] = "0" * 64
         with self.assertRaisesRegex(self.ha.ref.ProofError, "digest mismatch"):
