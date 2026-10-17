@@ -141,7 +141,7 @@ manifest_file="${BACKUP_DIR}/${base}.sha256.manifest"
 age_file="${BACKUP_DIR}/${base}.sql.gz.age"
 age_manifest_file="${BACKUP_DIR}/${base}.age.sha256.manifest"
 for target in "$dump_file" "$manifest_file" "$age_file" "$age_manifest_file"; do
-  [[ ! -e "$target" ]] || fail "backup target already exists for label: $label"
+  [[ ! -e "$target" && ! -L "$target" ]] || fail "backup target already exists for label: $label"
 done
 
 work_dir="$(mktemp -d "${BACKUP_DIR}/.tmp.${BACKUP_PREFIX}.XXXXXX")"
@@ -184,12 +184,17 @@ age_bytes="$(wc -c < "$tmp_age" | tr -d '[:space:]')"
 } > "$tmp_age_manifest"
 chmod 600 "$tmp_age_manifest"
 
-# Same-filesystem renames: readers see only complete files. Manifests are
-# promoted last; the off-host manifest is the final file of a complete set.
-mv "$tmp_dump" "$dump_file"
-mv "$tmp_age" "$age_file"
-mv "$tmp_manifest" "$manifest_file"
-mv "$tmp_age_manifest" "$age_manifest_file"
+# Same-filesystem create-only links prevent another producer or symlink
+# appearing after preflight from replacing any historical backup file.
+# The off-host manifest is the final marker of a complete encrypted set.
+ln -T -- "$tmp_dump" "$dump_file" ||
+  fail "backup target appeared during publication: $dump_file"
+ln -T -- "$tmp_age" "$age_file" ||
+  fail "backup target appeared during publication: $age_file"
+ln -T -- "$tmp_manifest" "$manifest_file" ||
+  fail "backup target appeared during publication: $manifest_file"
+ln -T -- "$tmp_age_manifest" "$age_manifest_file" ||
+  fail "backup target appeared during publication: $age_manifest_file"
 
 if ((BACKUP_RETENTION_DAYS > 0)); then
   find "$BACKUP_DIR" -maxdepth 1 -type f \

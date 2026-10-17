@@ -50,6 +50,10 @@ chmod +x "$MOCK_BIN/psql"
 cat > "$MOCK_BIN/pg_dump" << 'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+# Test-only collision injected after producer preflight and before publication.
+if [[ -n "${INJECT_BACKUP_COLLISION:-}" ]]; then
+  printf 'immutable producer collision sentinel\n' > "$INJECT_BACKUP_COLLISION"
+fi
 cat <<'SQL'
 CREATE TABLE domain_accounts (id text primary key);
 CREATE TABLE domain_nodes (id text primary key);
@@ -163,6 +167,28 @@ for suffix in .sql.gz .sql.gz.age .sha256.manifest .age.sha256.manifest; do
 done
 
 run_backup fixture "$RECIPIENTS_FILE" > /dev/null
+
+# A target appearing after the pre-dump collision check must never be
+# overwritten by the producer. This injects it while pg_dump runs.
+collision_target="$BACKUP_DIR/weltgewebe-postgres-collision.sql.gz"
+if INJECT_BACKUP_COLLISION="$collision_target" run_backup collision "$RECIPIENTS_FILE" \
+  > /dev/null 2> "$TEMP_DIR/collision.stderr"; then
+  echo 'producer overwrote a same-label backup artefact during publication' >&2
+  exit 1
+fi
+printf 'immutable producer collision sentinel\n' > "$TEMP_DIR/immutable-sentinel"
+cmp -s "$TEMP_DIR/immutable-sentinel" "$collision_target" || {
+  echo 'producer replaced the collision sentinel' >&2
+  exit 1
+}
+[[ ! -e "$BACKUP_DIR/weltgewebe-postgres-collision.sql.gz.age" ]] || {
+  echo 'producer published an age file after collision failure' >&2
+  exit 1
+}
+[[ ! -e "$BACKUP_DIR/weltgewebe-postgres-collision.age.sha256.manifest" ]] || {
+  echo 'producer published a completion manifest after collision failure' >&2
+  exit 1
+}
 
 backup_file="$BACKUP_DIR/weltgewebe-postgres-fixture.sql.gz"
 manifest_file="$BACKUP_DIR/weltgewebe-postgres-fixture.sha256.manifest"

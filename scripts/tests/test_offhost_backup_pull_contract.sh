@@ -197,6 +197,21 @@ grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy.stderr"
 [[ -f "$legacy_dest/weltgewebe-postgres-legacy.sql.gz" ]]
 [[ ! -e "$legacy_dest/latest-pull.receipt" ]]
 
+# A symlinked *nested directory* can expose plaintext through the
+# encrypted backup destination without a *.sql.gz symlink of its own name.
+# The root alias remains supported; nested directory aliases are rejected.
+nested_legacy="$root/nested-legacy-target"
+nested_dest="$root/nested-dir-alias"
+mkdir -p "$nested_legacy" "$nested_dest"
+printf 'historical plaintext fixture\n' > "$nested_legacy/legacy.sql.gz"
+ln -s "$nested_legacy" "$nested_dest/archive"
+if pull "$nested_dest" test-host > /dev/null 2> "$root/nested-dir.stderr"; then
+  echo 'nested symlink to plaintext bypassed offhost age receipt gate' >&2
+  exit 1
+fi
+grep -qF 'symlinked directory under encrypted backup destination' "$root/nested-dir.stderr"
+[[ ! -e "$nested_dest/latest-pull.receipt" ]]
+
 # A symlinked destination must not let GNU find -P skip existing legacy
 # plaintext and emit a false age-only success receipt at its real target.
 symlink_real="$root/legacy-symlink-real"
@@ -573,9 +588,33 @@ fi
 grep -qF 'normal pull unsafe existing artefact' "$root/unsafe-core.stderr"
 [[ ! -e "$unsafe_core/$manifest" && ! -e "$unsafe_core/latest-pull.receipt" ]]
 
-# A complete old core without an immutable receipt is not an authenticated
-# recovery point. A symlink or forged receipt cannot make it one.
-for scenario in absent symlink forged receipt-only; do
+# A crash can interrupt publication after all three validated core links,
+# but before its immutable receipt. A retry against byte-identical remote
+# content must finish the receipt without rewriting any core byte.
+complete_dest="$root/complete-core-crash"
+mkdir -p "$complete_dest"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$remote/$core" "$complete_dest/$core"
+  cp "$complete_dest/$core" "$root/complete-original-$core"
+done
+pull "$complete_dest" test-host > /dev/null
+[[ -f "$complete_dest/latest-pull.receipt" ]]
+[[ -f "$complete_dest/$proof" ]]
+mapfile -t complete_history < <(find "$complete_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#complete_history[@]} == 1))
+cmp -s "${complete_history[0]}" "$complete_dest/latest-pull.receipt"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cmp -s "$root/complete-original-$core" "$complete_dest/$core" || {
+    echo "crash replay replaced an immutable backup core: $core" >&2
+    exit 1
+  }
+done
+pull "$complete_dest" test-host > /dev/null
+mapfile -t complete_history < <(find "$complete_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#complete_history[@]} == 1))
+
+# Unsafe, forged or orphaned receipts still fail closed.
+for scenario in symlink forged receipt-only; do
   history_dest="$root/history-$scenario"
   mkdir -p "$history_dest/receipts"
   if [[ "$scenario" != receipt-only ]]; then
@@ -585,7 +624,6 @@ for scenario in absent symlink forged receipt-only; do
   fi
   history_path="$history_dest/receipts/$base.pulled-20260712T040000.000000000Z.receipt"
   case "$scenario" in
-    absent) expected_error='normal pull existing core has no historical completion receipt' ;;
     symlink)
       ln -s "$root/first-receipt" "$history_path"
       expected_error='normal pull unsafe existing history receipt'

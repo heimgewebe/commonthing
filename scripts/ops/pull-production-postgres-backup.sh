@@ -102,7 +102,15 @@ DEST_DIR="$(realpath -e -- "$DEST_DIR")" ||
 exec 9> "$DEST_DIR/.pull.lock"
 flock -n 9 || fail "another pull holds $DEST_DIR/.pull.lock"
 assert_no_legacy_plaintext() {
-  local legacy_plaintext
+  local legacy_plaintext nested_dir_link
+  # A nested directory alias can make a legacy dump reachable below the
+  # encrypted destination although find -P cannot follow that alias.
+  # Reject only directory symlinks here; a configured symlink for DEST_DIR
+  # itself has already been resolved to its real directory above.
+  nested_dir_link="$(find -P "$DEST_DIR" -type l -exec /usr/bin/test -d {} \; -print -quit)" ||
+    fail "could not scan encrypted destination for directory symlinks"
+  [[ -z "$nested_dir_link" ]] ||
+    fail "symlinked directory under encrypted backup destination: $nested_dir_link"
   legacy_plaintext="$(find "$DEST_DIR" \( -type f -o -type l \) -name '*.sql.gz' -print -quit)" ||
     fail "could not scan the off-host destination for legacy plaintext"
   [[ -z "$legacy_plaintext" ]] ||
@@ -297,10 +305,12 @@ for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
     latest_history="$historical"
   fi
 done
-if ((present_core == 3)); then
-  ((history_present == 1)) ||
-    fail "normal pull existing core has no historical completion receipt"
-elif ((history_present == 1)); then
+# The remote core was just validated byte-for-byte. A complete existing
+# three-file set without a receipt can be left by a crash between linking the
+# core and creating its history marker; finish that exact set create-only.
+# Partial cores remain fail-closed, and a historical receipt without its core
+# must never be silently reissued after retention.
+if ((history_present == 1 && present_core != 3)); then
   fail "normal pull historical receipt exists without core artefacts"
 fi
 
@@ -323,7 +333,7 @@ fi
 
 # A complete unchanged set is a true no-op, not a new history event.
 assert_no_legacy_plaintext
-if ((${#staged[@]} == 0)); then
+if ((${#staged[@]} == 0 && history_present == 1)); then
   # A crash can occur between the create-only history link and the mutable
   # latest pointer rename. Repair it from the newest verified immutable
   # history receipt without creating a second historical completion record.
