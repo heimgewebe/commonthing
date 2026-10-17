@@ -70,14 +70,54 @@ select coalesce(string_agg(name, ',' order by name), '') from missing;
   [[ -z "$missing" ]] || fail "database is missing required Weltgewebe tables: $missing"
 }
 
+# The off-host copy is always age ciphertext to public recipients only. The
+# private identity stays offline and is never needed on this host.
+AGE_HEADER='age-encryption.org/v1'
+AGE_RECIPIENT_RE='^age1[02-9ac-hj-np-z]{58}$'
+age_recipient_args=()
+age_recipients_csv=""
+load_age_recipients() {
+  local file="$1" line
+  [[ -n "$file" ]] || fail "BACKUP_AGE_RECIPIENTS_FILE must name the public age recipients file for the encrypted off-host copy"
+  [[ -f "$file" && -r "$file" ]] || fail "age recipients file is missing or unreadable: $file (the off-host copy must be encrypted; see docs/runbooks/db-recovery.md)"
+  if grep -q 'AGE-SECRET-KEY-' "$file"; then
+    fail "age recipients file contains a private age identity; only public age1 recipients belong on this host: $file"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == '#'* ]] && continue
+    [[ "$line" =~ $AGE_RECIPIENT_RE ]] || fail "age recipients file contains an unsupported entry (expected one X25519 age1 recipient per line): $file"
+    # The off-host pull rejects a manifest naming a recipient twice, so a
+    # duplicate must fail here rather than leave every later pull red.
+    [[ ",$age_recipients_csv," != *",$line,"* ]] || fail "age recipients file lists a recipient twice: $file"
+    age_recipient_args+=(-r "$line")
+    age_recipients_csv="${age_recipients_csv:+${age_recipients_csv},}${line}"
+  done < "$file"
+  ((${#age_recipient_args[@]} > 0)) || fail "age recipients file contains no age1 recipient: $file"
+  # The pattern above cannot see a Bech32 checksum typo. Let age parse every
+  # recipient on an empty input now, before any plaintext dump exists.
+  age "${age_recipient_args[@]}" -o /dev/null < /dev/null 2> /dev/null ||
+    fail "age rejected a recipient in $file (check for typos; expected X25519 age1 public keys)"
+}
+
 require_cmd gzip
 require_cmd awk
 require_cmd wc
 require_cmd find
+require_cmd grep
+require_cmd cmp
+require_cmd age
+BACKUP_AGE_RECIPIENTS_FILE="${BACKUP_AGE_RECIPIENTS_FILE-/etc/weltgewebe/postgres-backup-age-recipients.txt}"
+load_age_recipients "$BACKUP_AGE_RECIPIENTS_FILE"
 check_connection_config
 
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-weltgewebe-postgres}"
+# A path component used for all create-only backup artefacts must be canonical.
+case "$BACKUP_PREFIX" in
+  '' | *..* | *[!A-Za-z0-9._-]*) fail "BACKUP_PREFIX contains unsupported characters" ;;
+esac
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
 export PGCONNECT_TIMEOUT
@@ -92,14 +132,24 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 label="${BACKUP_LABEL:-$timestamp}"
 case "$label" in '' | *[!A-Za-z0-9._-]*) fail "BACKUP_LABEL contains unsupported characters" ;; esac
 base="${BACKUP_PREFIX}-${label}"
+# The off-host reader (postgres-backup-read.sh) serves only names of this shape;
+# a backup it cannot name would make every later off-host pull fail.
+[[ "$base" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ && "$base" != *..* ]] ||
+  fail "backup name must start with a letter or digit, have at most 200 characters and no '..': $base"
 dump_file="${BACKUP_DIR}/${base}.sql.gz"
 manifest_file="${BACKUP_DIR}/${base}.sha256.manifest"
-[[ ! -e "$dump_file" && ! -e "$manifest_file" ]] || fail "backup target already exists for label: $label"
+age_file="${BACKUP_DIR}/${base}.sql.gz.age"
+age_manifest_file="${BACKUP_DIR}/${base}.age.sha256.manifest"
+for target in "$dump_file" "$manifest_file" "$age_file" "$age_manifest_file"; do
+  [[ ! -e "$target" ]] || fail "backup target already exists for label: $label"
+done
 
 work_dir="$(mktemp -d "${BACKUP_DIR}/.tmp.${BACKUP_PREFIX}.XXXXXX")"
 trap 'rm -rf "$work_dir"' EXIT
 tmp_dump="${work_dir}/${base}.sql.gz"
 tmp_manifest="${work_dir}/${base}.sha256.manifest"
+tmp_age="${work_dir}/${base}.sql.gz.age"
+tmp_age_manifest="${work_dir}/${base}.age.sha256.manifest"
 
 pg_dump_db | gzip -c > "$tmp_dump" || fail "pg_dump or gzip failed"
 chmod 600 "$tmp_dump"
@@ -119,13 +169,32 @@ fi
 } > "$tmp_manifest"
 chmod 600 "$tmp_manifest"
 
-# Same-filesystem renames: readers see only complete files. Manifest is promoted last.
+# Off-host artefact: ciphertext only. The plaintext dump above stays on this host.
+age "${age_recipient_args[@]}" -o "$tmp_age" "$tmp_dump" || fail "age encryption of the off-host copy failed"
+chmod 600 "$tmp_age"
+cmp -s -n "$((${#AGE_HEADER} + 1))" "$tmp_age" <(printf '%s\n' "$AGE_HEADER") || fail "encrypted off-host copy does not carry the age header"
+age_sha256="$(sha256_file "$tmp_age")"
+age_bytes="$(wc -c < "$tmp_age" | tr -d '[:space:]')"
+{
+  printf 'contract=weltgewebe-postgres-backup-age-v1\n'
+  printf 'created_at=%s\nfile=%s.sql.gz.age\nsha256=%s\nbytes=%s\n' "$created_at" "$base" "$age_sha256" "$age_bytes"
+  printf 'format=%s\nrecipients=%s\n' "$AGE_HEADER" "$age_recipients_csv"
+  printf 'plaintext_file=%s.sql.gz\nplaintext_sha256=%s\n' "$base" "$sha256"
+  [[ -z "$git_commit" ]] || printf 'git_commit=%s\n' "$git_commit"
+} > "$tmp_age_manifest"
+chmod 600 "$tmp_age_manifest"
+
+# Same-filesystem renames: readers see only complete files. Manifests are
+# promoted last; the off-host manifest is the final file of a complete set.
 mv "$tmp_dump" "$dump_file"
+mv "$tmp_age" "$age_file"
 mv "$tmp_manifest" "$manifest_file"
+mv "$tmp_age_manifest" "$age_manifest_file"
 
 if ((BACKUP_RETENTION_DAYS > 0)); then
   find "$BACKUP_DIR" -maxdepth 1 -type f \
-    \( -name "${BACKUP_PREFIX}-*.sql.gz" -o -name "${BACKUP_PREFIX}-*.sha256.manifest" \) \
+    \( -name "${BACKUP_PREFIX}-*.sql.gz" -o -name "${BACKUP_PREFIX}-*.sql.gz.age" -o -name "${BACKUP_PREFIX}-*.sha256.manifest" \) \
     -mtime +"$BACKUP_RETENTION_DAYS" -delete
 fi
 printf 'PostgreSQL backup written: %s\nManifest written: %s\n' "$dump_file" "$manifest_file"
+printf 'Encrypted off-host copy written: %s\nOff-host manifest written: %s\n' "$age_file" "$age_manifest_file"

@@ -12,6 +12,7 @@ WorkingDirectory=/opt/weltgewebe
 Environment=POSTGRES_CONTAINER=weltgewebe-db-1
 Environment=BACKUP_DIR=/var/backups/weltgewebe/postgres
 Environment=BACKUP_RETENTION_DAYS=14
+Environment=BACKUP_AGE_RECIPIENTS_FILE=/etc/weltgewebe/postgres-backup-age-recipients.txt
 Environment=GIT_REPO_DIR=/opt/weltgewebe
 ExecStart=/opt/weltgewebe/scripts/ops/postgres-backup.sh
 UMask=0077
