@@ -1,4 +1,4 @@
-import { isValidMapCoordinate } from "$lib/map/coordinates";
+import { isValidMapCoordinate } from "./coordinates";
 import {
   summarizeMapResourceStatus,
   type Account,

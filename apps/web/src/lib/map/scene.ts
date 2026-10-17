@@ -10,7 +10,7 @@
  *
  * The scene is stateless and pure – it has no side effects.
  */
-import { nodeToMapEntity } from "$lib/api/search";
+import { nodeToMapEntity } from "../api/search";
 import type {
   Node,
   Account,
@@ -26,7 +26,7 @@ import type {
   MapDiagnostics,
 } from "$lib/map/types";
 import type { BasemapMode } from "$lib/map/config/basemap.current";
-import { normalizeEdgeLifecycle } from "$lib/map/edgeLifecycle";
+import { normalizeEdgeLifecycle } from "./edgeLifecycle";
 
 /**
  * MapSceneModel: the single source of truth for what the map should display.

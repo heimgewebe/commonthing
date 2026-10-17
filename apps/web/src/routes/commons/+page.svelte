@@ -30,6 +30,7 @@
         items = result.items;
       } else {
         const params = new URLSearchParams({
+          public_only: "true",
           pagination: "cursor",
           limit: "50",
         });

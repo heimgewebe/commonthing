@@ -1,6 +1,81 @@
 import { expect, test } from "@playwright/test";
 import { mockApiResponses, mockListResponse } from "../tests/fixtures/mockApi";
 
+test("commons default list opts into public discovery on every page; search retains owner results", async ({
+  page,
+}) => {
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "commons-owner", role: "weber" },
+  });
+  const listRequests: URL[] = [];
+  const searchRequests: URL[] = [];
+  await page.route("**/api/nodes?**", (route) => {
+    const url = new URL(route.request().url());
+    listRequests.push(url);
+    const more = url.searchParams.has("cursor");
+    return route.fulfill({
+      json: {
+        items: [
+          {
+            id: more ? "public-two" : "public-one",
+            title: more ? "Public two" : "Public one",
+            kind: "knowledge",
+            location: null,
+          },
+        ],
+        page: {
+          next_cursor: more ? null : "next-public-page",
+          has_more: !more,
+        },
+      },
+    });
+  });
+  await page.route("**/api/search?**", (route) => {
+    searchRequests.push(new URL(route.request().url()));
+    return route.fulfill({
+      json: {
+        items: [
+          {
+            id: "owner-private",
+            title: "Owner's private Commons",
+            kind: "knowledge",
+            location: null,
+          },
+        ],
+        mode: "lexical_fallback",
+        generation_id: "test",
+        offset: 0,
+      },
+    });
+  });
+
+  await page.goto("/commons");
+  await expect(
+    page.getByRole("link", { name: "Public one", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Weitere Knoten" }).click();
+  await expect(
+    page.getByRole("link", { name: "Public two", exact: true }),
+  ).toBeVisible();
+  expect(listRequests).toHaveLength(2);
+  for (const url of listRequests) {
+    expect(url.searchParams.get("public_only")).toBe("true");
+    expect(url.searchParams.get("pagination")).toBe("cursor");
+    expect(url.searchParams.has("bbox")).toBe(false);
+  }
+  expect(listRequests[1].searchParams.get("cursor")).toBe("next-public-page");
+
+  await page.getByLabel("Knoten suchen").fill("private Commons");
+  await page.getByRole("button", { name: "Suchen", exact: true }).click();
+  await expect(
+    page.getByRole("link", { name: "Owner's private Commons", exact: true }),
+  ).toBeVisible();
+  expect(listRequests).toHaveLength(2);
+  expect(searchRequests).toHaveLength(1);
+  expect(searchRequests[0].searchParams.get("q")).toBe("private Commons");
+  expect(searchRequests[0].searchParams.has("public_only")).toBe(false);
+});
+
 test("create, search, link, open and edit Commons without a map location", async ({
   page,
 }) => {

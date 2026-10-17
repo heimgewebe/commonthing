@@ -1,5 +1,5 @@
-import { hasRenderableMapPosition } from "$lib/map/coordinates";
-import { knottingTagDisplayLabel } from "$lib/knottingTopics";
+import { hasRenderableMapPosition } from "../map/coordinates";
+import { knottingTagDisplayLabel } from "../knottingTopics";
 import type { MapEntityNode, Node } from "$lib/map/types";
 
 export const MAX_SEARCH_QUERY_CHARS = 512;

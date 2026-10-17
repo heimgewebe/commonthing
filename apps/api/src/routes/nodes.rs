@@ -3944,10 +3944,23 @@ pub async fn list_nodes(
     State(state): State<ApiState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ListResponse<Node>>, StatusCode> {
+    // Opt-in discovery boundary for /commons, not a repair of the pre-existing
+    // unfiltered GET /nodes defaults. Those still need separate rights-policy
+    // work. Apply visibility before pagination, never to a fetched BBOX page.
+    let public_only = match params.get("public_only").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
     let bbox = match params.get("bbox") {
         Some(raw_bbox) => Some(parse_bbox(raw_bbox).ok_or(StatusCode::BAD_REQUEST)?),
         None => None,
     };
+    // Keep the PostgreSQL BBOX query and its collation/pagination unchanged.
+    // Public discovery is strictly a no-BBOX mode over the full node cache.
+    if public_only && bbox.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let limit: usize = parse_usize_param(&params, "limit", 100)?.min(MAX_PAGE_SIZE);
     let (cursor_mode, after_id) = parse_cursor_params(&params)?;
     validate_cursor_limit(cursor_mode, limit)?;
@@ -4022,6 +4035,7 @@ pub async fn list_nodes(
         // independent of the file/insertion order used by the legacy path.
         let refs: Vec<&Node> = cache
             .iter_in_order()
+            .filter(|node| !public_only || node.search_visibility == SearchVisibility::Public)
             .filter(|node| match &bbox {
                 Some(bb) => node
                     .location
@@ -4042,6 +4056,7 @@ pub async fn list_nodes(
         let offset: usize = parse_usize_param(&params, "offset", 0)?;
         let out: Vec<Node> = cache
             .iter_in_order()
+            .filter(|node| !public_only || node.search_visibility == SearchVisibility::Public)
             .filter(|node| match &bbox {
                 Some(bb) => node
                     .location
