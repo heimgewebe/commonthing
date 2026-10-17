@@ -19,6 +19,42 @@ relations:
 Datum: 2026-07-15
 Status: Accepted
 
+## Nachtrag vom 17.10.2026 — strategische Ausführungspause (T044/T084)
+
+Die langfristige Kubernetes-Zielrichtung dieser ADR bleibt als **revidierbare
+Architekturorientierung** bestehen. Sie begründet jedoch **keinen aktiven
+Kubernetes-Produktionsmigrationsauftrag**: T044/B5 und der ausschließlich
+migrationsbedingte T084-Kind-/Cilium-Ausbau sind bis zu einer neuen ausdrücklichen
+Prioritätsentscheidung **strategisch geparkt**. Dies ist weder ein B5-/R5-PASS
+noch eine Freigabe für R6–R9 oder einen Produktionscutover.
+
+- Der auf `commonserver` zuletzt bestätigte Docker-Compose-Betrieb bleibt der
+  maßgebliche Produktionspfad. Keine DNS-, TLS-, Traffic-, Daten-, Secret- oder
+  Writer-Umschaltung wird durch diesen Nachtrag ausgelöst.
+- Keine zusätzlichen migrationsspezifischen Staging-Controller,
+  Kernel-/Sysctl-/Cilium-Reparaturen, permanenten Testumgebungen oder
+  Runtime-Proof-Reader ohne einen neu belegten eigenständigen Bedarf.
+- Bestehende portable Architekturverträge, Sicherheitsinvarianten,
+  Abnahmekriterien, Tests, Belege und isolierte Arbeitsstände bleiben erhalten.
+  Geparkte Draft-PRs und eigentümergebundene Ressourcen werden weder automatisch
+  integriert noch voreilig gelöscht.
+- Die Wiederaufnahme benötigt einen konkreten, belegten Mehrbetreiber-/
+  Mehrhostbedarf, verbindliche unabhängige Verfügbarkeitsanforderungen oder
+  einen gemessenen, mit Compose nicht angemessen lösbaren Engpass sowie eine
+  neue Prioritätsentscheidung mit Alternativen-, Betriebs- und Kostenvergleich.
+- Vor einer möglichen Wiederaufnahme gelten sämtliche ursprünglichen
+  revisionsgebundenen Sicherheits-, Recovery-, Review-, Autorisierungs-,
+  Testbed- und Cutover-Gates **unvermindert**. Historische T085-/T084-Belege
+  ersetzen sie nicht.
+
+Beschluss und ausführliche Begründung:
+[Commonthing #1961](https://github.com/heimgewebe/commonthing/issues/1961#issuecomment-6227993405),
+[T084-Parkregel #1964](https://github.com/heimgewebe/commonthing/issues/1964)
+und [Bureau #2349](https://github.com/heimgewebe/bureau/issues/2349).
+Die Git-Registry und der operative Bureau-StateStore sind gesondert,
+revisionsgebunden auf den Parkzustand abzugleichen; ein Issue-Kommentar
+oder diese ADR allein sperrt keine bereits auf `ready` stehende TaskSpec.
+
 ## Kontext
 
 commonThing soll langfristig hochverfügbar, regional betreibbar, föderierbar und durch Grabowski kontrolliert operierbar sein. Der heutige Produktions- und Entwicklungsbetrieb verwendet Docker Compose und Caddy. Diese Laufzeit ist real und bleibt so lange maßgeblich, bis ein neuer Pfad belegt und kontrolliert umgestellt wurde.
