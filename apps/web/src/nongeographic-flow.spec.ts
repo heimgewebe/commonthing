@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { mockApiResponses, mockListResponse } from "../tests/fixtures/mockApi";
 
-test("commons default list opts into public discovery on every page; search retains owner results", async ({
+test("commons uses dedicated public endpoint for every page; search retains owner results", async ({
   page,
 }) => {
   await mockApiResponses(page, {
@@ -9,7 +9,7 @@ test("commons default list opts into public discovery on every page; search reta
   });
   const listRequests: URL[] = [];
   const searchRequests: URL[] = [];
-  await page.route("**/api/nodes?**", (route) => {
+  await page.route("**/api/public/nodes?**", (route) => {
     const url = new URL(route.request().url());
     listRequests.push(url);
     const more = url.searchParams.has("cursor");
@@ -22,20 +22,6 @@ test("commons default list opts into public discovery on every page; search reta
             kind: "knowledge",
             location: null,
             search_visibility: "public",
-          },
-          {
-            id: more ? "revoked-node" : "private-node",
-            title: more ? "Revoked not listed" : "Private not listed",
-            kind: "knowledge",
-            location: null,
-            search_visibility: more ? "revoked" : "private",
-          },
-          {
-            id: more ? "missing-visibility" : "hidden-node",
-            title: more ? "Missing visibility not listed" : "Hidden not listed",
-            kind: "knowledge",
-            location: null,
-            ...(more ? {} : { search_visibility: "hidden" }),
           },
         ],
         page: {
@@ -72,21 +58,12 @@ test("commons default list opts into public discovery on every page; search reta
   await expect(
     page.getByRole("link", { name: "Public two", exact: true }),
   ).toBeVisible();
-  // A previous API release can ignore public_only; non-public records must
-  // still never appear in the universal list. Owner search is checked below.
-  for (const title of [
-    "Private not listed",
-    "Hidden not listed",
-    "Revoked not listed",
-    "Missing visibility not listed",
-  ]) {
-    await expect(
-      page.getByRole("link", { name: title, exact: true }),
-    ).toHaveCount(0);
-  }
+  // Only the explicit public route may be queried, even when the list
+  // requests a second page. Legacy /nodes is never used by the catalog.
   expect(listRequests).toHaveLength(2);
   for (const url of listRequests) {
-    expect(url.searchParams.get("public_only")).toBe("true");
+    expect(url.pathname).toBe("/api/public/nodes");
+    expect(url.searchParams.has("public_only")).toBe(false);
     expect(url.searchParams.get("pagination")).toBe("cursor");
     expect(url.searchParams.has("bbox")).toBe(false);
   }
@@ -101,6 +78,95 @@ test("commons default list opts into public discovery on every page; search reta
   expect(searchRequests).toHaveLength(1);
   expect(searchRequests[0].searchParams.get("q")).toBe("private Commons");
   expect(searchRequests[0].searchParams.has("public_only")).toBe(false);
+});
+
+test("commons rejects older APIs without the public-only endpoint (no legacy fallback)", async ({
+  page,
+}) => {
+  await mockApiResponses(page);
+  let publicRequests = 0;
+  let legacyRequests = 0;
+  await page.route("**/api/public/nodes?**", (route) => {
+    publicRequests += 1;
+    return route.fulfill({ status: 404, json: { error: "Not found" } });
+  });
+  await page.route("**/api/nodes?**", (route) => {
+    legacyRequests += 1;
+    return route.fulfill({
+      json: {
+        items: [
+          {
+            id: "private",
+            title: "Private leak",
+            search_visibility: "private",
+          },
+        ],
+        page: { next_cursor: "more-private-data", has_more: true },
+      },
+    });
+  });
+
+  await page.goto("/commons");
+  await expect(page.getByRole("alert")).toContainText(
+    "Knoten konnten nicht geladen werden",
+  );
+  await expect(page.getByText("Private leak")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Weitere Knoten" }),
+  ).toHaveCount(0);
+  expect(publicRequests).toBe(1);
+  expect(legacyRequests).toBe(0);
+});
+
+test("commons refuses unexpected nonpublic public-route response and its cursor", async ({
+  page,
+}) => {
+  await mockApiResponses(page);
+  let publicRequests = 0;
+  await page.route("**/api/public/nodes?**", (route) => {
+    publicRequests += 1;
+    return route.fulfill({
+      json: {
+        items: [
+          {
+            id: "public",
+            title: "Invalid public page",
+            search_visibility: "public",
+          },
+          {
+            id: "private",
+            title: "Private title",
+            search_visibility: "private",
+          },
+          { id: "hidden", title: "Hidden title", search_visibility: "hidden" },
+          {
+            id: "revoked",
+            title: "Revoked title",
+            search_visibility: "revoked",
+          },
+          { id: "unknown", title: "Unknown visibility" },
+        ],
+        page: { next_cursor: "more-private-data", has_more: true },
+      },
+    });
+  });
+  await page.goto("/commons");
+  await expect(page.getByRole("alert")).toContainText(
+    "Knoten konnten nicht geladen werden",
+  );
+  await expect(
+    page.getByRole("button", { name: "Weitere Knoten" }),
+  ).toHaveCount(0);
+  await expect(page.getByText("Invalid public page")).toHaveCount(0);
+  for (const title of [
+    "Private title",
+    "Hidden title",
+    "Revoked title",
+    "Unknown visibility",
+  ]) {
+    await expect(page.getByText(title)).toHaveCount(0);
+  }
+  expect(publicRequests).toBe(1);
 });
 
 test("create, search, link, open and edit Commons without a map location", async ({

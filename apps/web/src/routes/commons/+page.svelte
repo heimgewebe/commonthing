@@ -30,27 +30,33 @@
         items = result.items;
       } else {
         const params = new URLSearchParams({
-          public_only: "true",
           pagination: "cursor",
           limit: "50",
         });
         if (more && cursor) params.set("cursor", cursor);
         const base = import.meta.env.PUBLIC_GEWEBE_API_BASE ?? "";
-        const response = await fetch(`${base}/api/nodes?${params}`, {
+        const response = await fetch(`${base}/api/public/nodes?${params}`, {
           signal: request.signal,
         });
         if (!response.ok)
           throw new Error("Knoten konnten nicht geladen werden.");
         const result = await response.json();
-        const candidates: Node[] = Array.isArray(result)
-          ? result
-          : result.items;
-        // Defense in depth during mixed API/web releases: older APIs might
-        // ignore public_only. This display guard does not replace API rights.
-        items = candidates.filter(
-          (node) => node?.search_visibility === "public",
-        );
-        nextCursor = Array.isArray(result) ? null : result.page.next_cursor;
+        // Older APIs do not have this route, and therefore fail with 404
+        // rather than returning private node data from GET /nodes.
+        if (!result || !Array.isArray(result.items) || !result.page)
+          throw new Error("Invalid public node list response.");
+        const candidates: Node[] = result.items;
+        // Even a misconfigured new backend must not be allowed to advance
+        // through private/hidden/revoked pages via an untrusted next_cursor.
+        if (candidates.some((node) => node?.search_visibility !== "public"))
+          throw new Error("Public node list contains non-public records.");
+        if (
+          result.page.next_cursor != null &&
+          typeof result.page.next_cursor !== "string"
+        )
+          throw new Error("Invalid public node cursor.");
+        items = candidates;
+        nextCursor = result.page.next_cursor ?? null;
       }
       if (request.signal.aborted) return;
       nodes = more ? [...nodes, ...items] : items;

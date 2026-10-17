@@ -232,6 +232,12 @@ async fn public_only_lists_exclude_nonpublic_nongeographic_nodes_before_paginati
             vec!["f-public", "b-public"],
         ),
         ("/nodes?public_only=true&limit=2&offset=2", vec!["d-public"]),
+        ("/public/nodes?limit=2", vec!["f-public", "b-public"]),
+        ("/public/nodes?limit=2&offset=2", vec!["d-public"]),
+        (
+            "/public/nodes?public_only=false&limit=2",
+            vec!["f-public", "b-public"],
+        ),
     ] {
         let res = app
             .clone()
@@ -248,33 +254,35 @@ async fn public_only_lists_exclude_nonpublic_nongeographic_nodes_before_paginati
         assert!(items.iter().all(|node| node["location"].is_null()));
     }
 
-    let mut path = "/nodes?public_only=true&pagination=cursor&limit=2".to_string();
-    for (expected, has_more) in [
-        (vec!["b-public", "d-public"], true),
-        (vec!["f-public"], false),
-    ] {
-        let res = app
-            .clone()
-            .oneshot(Request::get(&path).body(body::Body::empty())?)
-            .await?;
-        assert_eq!(res.status(), StatusCode::OK);
-        let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
-        let page: serde_json::Value = serde_json::from_slice(&bytes)?;
-        let items = page["items"].as_array().context("cursor items")?;
-        let ids: Vec<_> = items
-            .iter()
-            .map(|node| node["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids, expected);
-        assert!(items.iter().all(|node| node["location"].is_null()));
-        assert_eq!(page["page"]["has_more"], has_more);
-        if has_more {
-            let cursor = page["page"]["next_cursor"]
-                .as_str()
-                .context("next cursor")?;
-            path = format!("/nodes?public_only=true&cursor={cursor}&limit=2");
-        } else {
-            assert!(page["page"]["next_cursor"].is_null());
+    for prefix in ["/nodes?public_only=true", "/public/nodes?public_only=false"] {
+        let mut path = format!("{prefix}&pagination=cursor&limit=2");
+        for (expected, has_more) in [
+            (vec!["b-public", "d-public"], true),
+            (vec!["f-public"], false),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::get(&path).body(body::Body::empty())?)
+                .await?;
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+            let page: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let items = page["items"].as_array().context("cursor items")?;
+            let ids: Vec<_> = items
+                .iter()
+                .map(|node| node["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected);
+            assert!(items.iter().all(|node| node["location"].is_null()));
+            assert_eq!(page["page"]["has_more"], has_more);
+            if has_more {
+                let cursor = page["page"]["next_cursor"]
+                    .as_str()
+                    .context("next cursor")?;
+                path = format!("{prefix}&cursor={cursor}&limit=2");
+            } else {
+                assert!(page["page"]["next_cursor"].is_null());
+            }
         }
     }
 
@@ -319,6 +327,18 @@ async fn public_only_rejects_bbox_and_invalid_flags() -> anyhow::Result<()> {
                 .await?;
             assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{query}{pagination}");
         }
+    }
+    // The dedicated public catalog refuses a BBOX and cannot be downgraded
+    // by a caller trying to opt back into the legacy unrestricted list.
+    for path in [
+        "/public/nodes?bbox=-180,-90,180,90",
+        "/public/nodes?bbox=-180,-90,180,90&public_only=false",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(Request::get(path).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{path}");
     }
     Ok(())
 }
