@@ -42,7 +42,14 @@
         if (!response.ok)
           throw new Error("Knoten konnten nicht geladen werden.");
         const result = await response.json();
-        items = Array.isArray(result) ? result : result.items;
+        const candidates: Node[] = Array.isArray(result)
+          ? result
+          : result.items;
+        // Defense in depth during mixed API/web releases: older APIs might
+        // ignore public_only. This display guard does not replace API rights.
+        items = candidates.filter(
+          (node) => node?.search_visibility === "public",
+        );
         nextCursor = Array.isArray(result) ? null : result.page.next_cursor;
       }
       if (request.signal.aborted) return;

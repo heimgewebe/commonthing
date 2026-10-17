@@ -22,6 +22,8 @@ export interface Node {
   /** Optional human-readable address, independent of the map projection. */
   address?: string | null;
   location?: Location | null;
+  /** Public discovery visibility. Missing or unknown is non-public in catalog views. */
+  search_visibility?: "public" | "private" | "hidden" | "revoked";
   modules?: Module[];
 }
 

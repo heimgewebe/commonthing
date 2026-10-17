@@ -21,6 +21,21 @@ test("commons default list opts into public discovery on every page; search reta
             title: more ? "Public two" : "Public one",
             kind: "knowledge",
             location: null,
+            search_visibility: "public",
+          },
+          {
+            id: more ? "revoked-node" : "private-node",
+            title: more ? "Revoked not listed" : "Private not listed",
+            kind: "knowledge",
+            location: null,
+            search_visibility: more ? "revoked" : "private",
+          },
+          {
+            id: more ? "missing-visibility" : "hidden-node",
+            title: more ? "Missing visibility not listed" : "Hidden not listed",
+            kind: "knowledge",
+            location: null,
+            ...(more ? {} : { search_visibility: "hidden" }),
           },
         ],
         page: {
@@ -57,6 +72,18 @@ test("commons default list opts into public discovery on every page; search reta
   await expect(
     page.getByRole("link", { name: "Public two", exact: true }),
   ).toBeVisible();
+  // A previous API release can ignore public_only; non-public records must
+  // still never appear in the universal list. Owner search is checked below.
+  for (const title of [
+    "Private not listed",
+    "Hidden not listed",
+    "Revoked not listed",
+    "Missing visibility not listed",
+  ]) {
+    await expect(
+      page.getByRole("link", { name: title, exact: true }),
+    ).toHaveCount(0);
+  }
   expect(listRequests).toHaveLength(2);
   for (const url of listRequests) {
     expect(url.searchParams.get("public_only")).toBe("true");
