@@ -146,6 +146,15 @@ pub struct Location {
     pub lon: f64,
 }
 
+impl Location {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.lat.is_finite()
+            && self.lon.is_finite()
+            && (-90.0..=90.0).contains(&self.lat)
+            && (-180.0..=180.0).contains(&self.lon)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchVisibility {
@@ -239,11 +248,10 @@ pub struct Node {
     pub info: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// Human-readable address. Optional for backward compatibility with
-    /// records persisted before this field existed; `POST /nodes` requires it.
+    /// Optional human-readable address, independent of the map projection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    pub location: Location,
+    pub location: Option<Location>,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,11 +406,11 @@ struct NodeDto {
     tags: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_opt_string_loose")]
     address: Option<String>,
-    location: LocationDto,
+    location: Option<LocationDto>,
 }
 
 fn parse_node_jsonl_dto(line: &str, path: &FsPath, line_number: usize) -> std::io::Result<NodeDto> {
-    serde_json::from_str(line).map_err(|error| {
+    let dto: NodeDto = serde_json::from_str(line).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -410,7 +418,23 @@ fn parse_node_jsonl_dto(line: &str, path: &FsPath, line_number: usize) -> std::i
                 path.display()
             ),
         )
-    })
+    })?;
+    if dto.location.as_ref().is_some_and(|location| {
+        !(Location {
+            lat: location.lat,
+            lon: location.lon,
+        })
+        .is_valid()
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "invalid node location at {} line {line_number}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(dto)
 }
 
 fn deserialize_opt_string_loose<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -514,10 +538,10 @@ impl From<NodeDto> for Node {
             info: dto.info,
             tags: dto.tags,
             address: dto.address,
-            location: Location {
-                lat: dto.location.lat,
-                lon: dto.location.lon,
-            },
+            location: dto.location.map(|location| Location {
+                lat: location.lat,
+                lon: location.lon,
+            }),
         }
     }
 }
@@ -552,14 +576,22 @@ pub(crate) fn map_json_to_node(v: &Value) -> Option<Node> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())?;
 
-    // Parse location object with explicit error handling
-    let location = v.get("location")?;
-    let lon = location
-        .get("lon")
-        .and_then(|val| val.as_f64().or_else(|| val.as_str()?.parse().ok()))?;
-    let lat = location
-        .get("lat")
-        .and_then(|val| val.as_f64().or_else(|| val.as_str()?.parse().ok()))?;
+    let location = match v.get("location") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let lon = value
+                .get("lon")
+                .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))?;
+            let lat = value
+                .get("lat")
+                .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))?;
+            let location = Location { lat, lon };
+            if !location.is_valid() {
+                return None;
+            }
+            Some(location)
+        }
+    };
 
     let title = v
         .get("title")
@@ -633,7 +665,7 @@ pub(crate) fn map_json_to_node(v: &Value) -> Option<Node> {
         info,
         tags,
         address,
-        location: Location { lat, lon },
+        location,
     })
 }
 
@@ -851,9 +883,8 @@ fn node_matches_create(node: &Node, expected: &node_create::ValidatedCreateNode)
     node.title == expected.title
         && node.kind == expected.kind
         && node.search_visibility == expected.search_visibility.unwrap_or_default()
-        && node.address.as_deref() == Some(expected.address.as_str())
-        && node.location.lat == expected.lat
-        && node.location.lon == expected.lon
+        && node.address == expected.address
+        && node.location == expected.location
         && node.summary == expected.summary
         && node.info == expected.info
         && node.tags == expected.tags
@@ -879,11 +910,8 @@ fn build_node_record(
         summary: validated.summary,
         info: validated.info,
         tags: validated.tags,
-        address: Some(validated.address),
-        location: Location {
-            lat: validated.lat,
-            lon: validated.lon,
-        },
+        address: validated.address,
+        location: validated.location,
     };
 
     let mut record = serde_json::Map::new();
@@ -911,10 +939,7 @@ fn build_node_record(
     if let Some(address) = &node.address {
         record.insert("address".into(), json!(address));
     }
-    record.insert(
-        "location".into(),
-        json!({ "lat": node.location.lat, "lon": node.location.lon }),
-    );
+    record.insert("location".into(), json!(node.location));
 
     (node, Value::Object(record))
 }
@@ -1680,7 +1705,7 @@ pub async fn create_node(
 /// Faden projection fails after a JSONL node itself became durable.
 /// PostgreSQL commits both records atomically and never enters this state.
 mod node_create {
-    use super::{SearchVisibility, NODE_INFO_MAX_LEN};
+    use super::{Location, SearchVisibility, NODE_INFO_MAX_LEN};
     use serde::{de, Deserialize, Deserializer};
     use uuid::Uuid;
 
@@ -1699,9 +1724,7 @@ mod node_create {
     const NODE_TITLE_MAX_LEN: usize = 200;
     /// Mirrors `contracts/domain/node.schema.json` (`kind.maxLength`).
     const NODE_KIND_MAX_LEN: usize = 100;
-    /// Address is not yet part of the JSON Schema's `required` set (older
-    /// records may lack it), but `POST /nodes` requires it; 500 chars is a
-    /// generous bound for a real-world postal address.
+    /// Mirrors the optional address bound in the domain contract.
     const NODE_ADDRESS_MAX_LEN: usize = 500;
     /// Mirrors `contracts/domain/node.schema.json` (`summary.maxLength`).
     const NODE_SUMMARY_MAX_LEN: usize = 500;
@@ -1724,8 +1747,8 @@ mod node_create {
     pub(super) struct CreateNodeRequest {
         title: String,
         kind: String,
-        address: String,
-        location: CreateLocation,
+        address: Option<String>,
+        location: Option<CreateLocation>,
         #[serde(default)]
         search_visibility: Option<SearchVisibility>,
         #[serde(default)]
@@ -1742,12 +1765,11 @@ mod node_create {
     pub(super) struct ValidatedCreateNode {
         pub(super) title: String,
         pub(super) kind: String,
-        pub(super) address: String,
+        pub(super) address: Option<String>,
         /// `None` means the client omitted the field. Creation resolves that
         /// to `public`; replacement preserves the existing canonical value.
         pub(super) search_visibility: Option<SearchVisibility>,
-        pub(super) lat: f64,
-        pub(super) lon: f64,
+        pub(super) location: Option<Location>,
         pub(super) summary: Option<String>,
         pub(super) info: Option<String>,
         pub(super) tags: Vec<String>,
@@ -1817,18 +1839,33 @@ mod node_create {
         pub(super) fn validate(self) -> Result<ValidatedCreateNode, NodeCreateValidationError> {
             require_non_blank("title", &self.title)?;
             require_non_blank("kind", &self.kind)?;
-            require_non_blank("address", &self.address)?;
 
             let title = self.title.trim().to_string();
             let kind = self.kind.trim().to_string();
-            let address = self.address.trim().to_string();
+            let address = self
+                .address
+                .map(|value| {
+                    require_non_blank("address", &value)?;
+                    let value = value.trim().to_string();
+                    require_max_len("address", &value, NODE_ADDRESS_MAX_LEN)?;
+                    Ok(value)
+                })
+                .transpose()?;
 
             require_max_len("title", &title, NODE_TITLE_MAX_LEN)?;
             require_max_len("kind", &kind, NODE_KIND_MAX_LEN)?;
-            require_max_len("address", &address, NODE_ADDRESS_MAX_LEN)?;
 
-            require_world_coordinate("location.lat", self.location.lat, -90.0, 90.0)?;
-            require_world_coordinate("location.lon", self.location.lon, -180.0, 180.0)?;
+            let location = self
+                .location
+                .map(|location| {
+                    require_world_coordinate("location.lat", location.lat, -90.0, 90.0)?;
+                    require_world_coordinate("location.lon", location.lon, -180.0, 180.0)?;
+                    Ok(Location {
+                        lat: location.lat,
+                        lon: location.lon,
+                    })
+                })
+                .transpose()?;
 
             let summary = match self.summary {
                 Some(s) => {
@@ -1881,8 +1918,7 @@ mod node_create {
                 kind,
                 address,
                 search_visibility: self.search_visibility,
-                lat: self.location.lat,
-                lon: self.location.lon,
+                location,
                 summary,
                 info,
                 tags: validated_tags,
@@ -1899,11 +1935,11 @@ mod node_create {
             CreateNodeRequest {
                 title: "A Node".to_string(),
                 kind: "Werkstatt".to_string(),
-                address: "Musterstraße 1, 12345 Musterstadt".to_string(),
-                location: CreateLocation {
+                address: Some("Musterstraße 1, 12345 Musterstadt".to_string()),
+                location: Some(CreateLocation {
                     lat: 53.5,
                     lon: 10.0,
-                },
+                }),
                 search_visibility: None,
                 summary: None,
                 info: None,
@@ -1920,9 +1956,9 @@ mod node_create {
             let validated = req.validate().expect("minimal request must validate");
             assert_eq!(validated.title, "A Node");
             assert_eq!(validated.kind, "Werkstatt");
-            assert_eq!(validated.address, "Musterstraße 1");
-            assert_eq!(validated.lat, 53.5);
-            assert_eq!(validated.lon, 10.0);
+            assert_eq!(validated.address.as_deref(), Some("Musterstraße 1"));
+            assert_eq!(validated.location.as_ref().unwrap().lat, 53.5);
+            assert_eq!(validated.location.as_ref().unwrap().lon, 10.0);
             assert_eq!(validated.summary, None);
             assert_eq!(validated.info, None);
             assert!(validated.tags.is_empty());
@@ -1960,11 +1996,11 @@ mod node_create {
             let mut req = valid_request();
             req.title = "  A Node  ".to_string();
             req.kind = "  Werkstatt  ".to_string();
-            req.address = "  Musterstraße 1  ".to_string();
+            req.address = Some("  Musterstraße 1  ".to_string());
             let validated = req.validate().expect("must validate");
             assert_eq!(validated.title, "A Node");
             assert_eq!(validated.kind, "Werkstatt");
-            assert_eq!(validated.address, "Musterstraße 1");
+            assert_eq!(validated.address.as_deref(), Some("Musterstraße 1"));
         }
 
         #[test]
@@ -1980,16 +2016,22 @@ mod node_create {
         }
 
         #[test]
-        fn rejects_missing_address() {
+        fn accepts_missing_address() {
             let json =
                 r#"{"title":"A Node","kind":"Werkstatt","location":{"lat":53.5,"lon":10.0}}"#;
-            assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
+            assert!(serde_json::from_str::<CreateNodeRequest>(json)
+                .unwrap()
+                .validate()
+                .is_ok());
         }
 
         #[test]
-        fn rejects_missing_location() {
+        fn accepts_missing_location() {
             let json = r#"{"title":"A Node","kind":"Werkstatt","address":"Musterstraße 1"}"#;
-            assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
+            assert!(serde_json::from_str::<CreateNodeRequest>(json)
+                .unwrap()
+                .validate()
+                .is_ok());
         }
 
         #[test]
@@ -2015,7 +2057,7 @@ mod node_create {
         #[test]
         fn rejects_blank_address() {
             let mut req = valid_request();
-            req.address = "   ".to_string();
+            req.address = Some("   ".to_string());
             assert_eq!(
                 req.validate(),
                 Err(NodeCreateValidationError::MissingOrEmptyField("address"))
@@ -2045,7 +2087,7 @@ mod node_create {
         #[test]
         fn rejects_address_over_max_length() {
             let mut req = valid_request();
-            req.address = "a".repeat(NODE_ADDRESS_MAX_LEN + 1);
+            req.address = Some("a".repeat(NODE_ADDRESS_MAX_LEN + 1));
             assert_eq!(
                 req.validate(),
                 Err(NodeCreateValidationError::FieldTooLong {
@@ -2058,7 +2100,7 @@ mod node_create {
         #[test]
         fn accepts_address_at_max_length() {
             let mut req = valid_request();
-            req.address = "a".repeat(NODE_ADDRESS_MAX_LEN);
+            req.address = Some("a".repeat(NODE_ADDRESS_MAX_LEN));
             assert!(req.validate().is_ok());
         }
 
@@ -2072,7 +2114,7 @@ mod node_create {
                 (-91.0, 10.0),
             ] {
                 let mut req = valid_request();
-                req.location = CreateLocation { lat, lon };
+                req.location = Some(CreateLocation { lat, lon });
                 assert_eq!(
                     req.validate(),
                     Err(NodeCreateValidationError::InvalidCoordinate {
@@ -2089,7 +2131,7 @@ mod node_create {
                 (10.0, -181.0),
             ] {
                 let mut req = valid_request();
-                req.location = CreateLocation { lat, lon };
+                req.location = Some(CreateLocation { lat, lon });
                 assert_eq!(
                     req.validate(),
                     Err(NodeCreateValidationError::InvalidCoordinate {
@@ -2103,7 +2145,7 @@ mod node_create {
         fn accepts_world_bound_edges() {
             for (lat, lon) in [(90.0, 180.0), (-90.0, -180.0), (0.0, 0.0)] {
                 let mut req = valid_request();
-                req.location = CreateLocation { lat, lon };
+                req.location = Some(CreateLocation { lat, lon });
                 assert!(req.validate().is_ok());
             }
         }
@@ -2238,10 +2280,7 @@ fn set_node_record_fields(record: &mut Value, node: &Node) -> std::io::Result<()
     } else {
         object.remove("created_by_account_id");
     }
-    object.insert(
-        "location".to_string(),
-        json!({ "lat": node.location.lat, "lon": node.location.lon }),
-    );
+    object.insert("location".to_string(), json!(node.location));
     for (key, value) in [
         ("summary", node.summary.as_ref().map(|value| json!(value))),
         ("info", node.info.as_ref().map(|value| json!(value))),
@@ -2412,7 +2451,7 @@ mod node_record_tests {
             "location": {"lat": 53.5, "lon": 10.0}
         });
         let target_line = serde_json::to_string(&target).expect("target node");
-        let original = format!("{target_line}\n{{\"id\":\"bad\"}}\n");
+        let original = format!("{target_line}\n{{\"id\":\"bad\",\"location\":{{\"lat\":53.5}}}}\n");
         fs::write(nodes_path(), original.as_bytes()).expect("write nodes");
         let mut node = map_json_to_node(&target).expect("target projection");
         node.title = "Nachher".to_string();
@@ -2442,7 +2481,8 @@ mod node_record_tests {
             "location": {"lat": 53.5, "lon": 10.0}
         });
         let target_line = serde_json::to_string(&target).expect("target node");
-        let original_nodes = format!("{target_line}\n{{\"id\":\"bad\"}}\n");
+        let original_nodes =
+            format!("{target_line}\n{{\"id\":\"bad\",\"location\":{{\"lat\":53.5}}}}\n");
         fs::write(nodes_path(), original_nodes.as_bytes()).expect("write nodes");
         let node_tmp = in_dir.join("nodes-delete.tmp");
 
@@ -3189,11 +3229,8 @@ pub async fn replace_node(
         summary: validated.summary,
         info: validated.info,
         tags: validated.tags,
-        address: Some(validated.address),
-        location: Location {
-            lat: validated.lat,
-            lon: validated.lon,
-        },
+        address: validated.address,
+        location: validated.location,
     };
     if node == existing {
         let audit = NodeMutationAudit::new(
@@ -3907,10 +3944,23 @@ pub async fn list_nodes(
     State(state): State<ApiState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ListResponse<Node>>, StatusCode> {
+    // Opt-in discovery boundary for /commons, not a repair of the pre-existing
+    // unfiltered GET /nodes defaults. Those still need separate rights-policy
+    // work. Apply visibility before pagination, never to a fetched BBOX page.
+    let public_only = match params.get("public_only").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
     let bbox = match params.get("bbox") {
         Some(raw_bbox) => Some(parse_bbox(raw_bbox).ok_or(StatusCode::BAD_REQUEST)?),
         None => None,
     };
+    // Keep the PostgreSQL BBOX query and its collation/pagination unchanged.
+    // Public discovery is strictly a no-BBOX mode over the full node cache.
+    if public_only && bbox.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let limit: usize = parse_usize_param(&params, "limit", 100)?.min(MAX_PAGE_SIZE);
     let (cursor_mode, after_id) = parse_cursor_params(&params)?;
     validate_cursor_limit(cursor_mode, limit)?;
@@ -3985,8 +4035,12 @@ pub async fn list_nodes(
         // independent of the file/insertion order used by the legacy path.
         let refs: Vec<&Node> = cache
             .iter_in_order()
+            .filter(|node| !public_only || node.search_visibility == SearchVisibility::Public)
             .filter(|node| match &bbox {
-                Some(bb) => point_in_bbox(node.location.lon, node.location.lat, bb),
+                Some(bb) => node
+                    .location
+                    .as_ref()
+                    .is_some_and(|location| point_in_bbox(location.lon, location.lat, bb)),
                 None => true,
             })
             .collect();
@@ -4002,8 +4056,12 @@ pub async fn list_nodes(
         let offset: usize = parse_usize_param(&params, "offset", 0)?;
         let out: Vec<Node> = cache
             .iter_in_order()
+            .filter(|node| !public_only || node.search_visibility == SearchVisibility::Public)
             .filter(|node| match &bbox {
-                Some(bb) => point_in_bbox(node.location.lon, node.location.lat, bb),
+                Some(bb) => node
+                    .location
+                    .as_ref()
+                    .is_some_and(|location| point_in_bbox(location.lon, location.lat, bb)),
                 None => true,
             })
             .skip(offset)

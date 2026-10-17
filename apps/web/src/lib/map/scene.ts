@@ -10,6 +10,7 @@
  *
  * The scene is stateless and pure – it has no side effects.
  */
+import { nodeToMapEntity } from "../api/search";
 import type {
   Node,
   Account,
@@ -25,7 +26,7 @@ import type {
   MapDiagnostics,
 } from "$lib/map/types";
 import type { BasemapMode } from "$lib/map/config/basemap.current";
-import { normalizeEdgeLifecycle } from "$lib/map/edgeLifecycle";
+import { normalizeEdgeLifecycle } from "./edgeLifecycle";
 
 /**
  * MapSceneModel: the single source of truth for what the map should display.
@@ -126,20 +127,10 @@ export function resolveApiMode(
  * Transforms nodes into MapEntityNode[].
  */
 function mapNodesToEntities(nodes: Node[]): MapEntityNode[] {
-  return nodes.map((n) => ({
-    type: "node" as const,
-    id: n.id,
-    title: n.title,
-    lat: n.location.lat,
-    lon: n.location.lon,
-    summary: n.summary,
-    info: n.info,
-    kind: n.kind,
-    tags: n.tags ?? [],
-    modules: n.modules,
-    created_at: n.created_at,
-    updated_at: n.updated_at,
-  }));
+  return nodes.flatMap((node) => {
+    const entity = nodeToMapEntity(node);
+    return entity ? [entity] : [];
+  });
 }
 
 /**

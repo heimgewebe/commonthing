@@ -149,8 +149,8 @@ export function updateOwnGarnrolle(
 export interface CreateNodePayload {
   title: string;
   kind: string;
-  address: string;
-  location: Location;
+  address?: string | null;
+  location?: Location | null;
   summary?: string;
   tags: string[];
   /** Stable UUID for retrying one user action after an uncertain response. */
@@ -165,8 +165,8 @@ export function createNode(payload: CreateNodePayload): Promise<Node> {
 export interface ReplaceNodePayload {
   title: string;
   kind: string;
-  address: string;
-  location: Location;
+  address?: string | null;
+  location?: Location | null;
   summary?: string;
   info?: string;
   tags: string[];

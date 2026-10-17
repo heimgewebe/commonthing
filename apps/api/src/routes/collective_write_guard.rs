@@ -638,7 +638,7 @@ mod tests {
             info: None,
             tags: vec![],
             address: None,
-            location: nodes::Location { lat: 0.0, lon: 0.0 },
+            location: Some(nodes::Location { lat: 0.0, lon: 0.0 }),
         };
 
         let err = check_node_precondition(Some(node), "1", &headers).unwrap_err();
@@ -662,7 +662,7 @@ mod tests {
             info: None,
             tags: vec![],
             address: None,
-            location: nodes::Location { lat: 0.0, lon: 0.0 },
+            location: Some(nodes::Location { lat: 0.0, lon: 0.0 }),
         };
 
         let err = check_node_precondition(Some(node), "1", &headers).unwrap_err();
@@ -686,7 +686,7 @@ mod tests {
             info: None,
             tags: vec![],
             address: None,
-            location: nodes::Location { lat: 0.0, lon: 0.0 },
+            location: Some(nodes::Location { lat: 0.0, lon: 0.0 }),
         };
 
         assert!(check_node_precondition(Some(node), "1", &headers).is_ok());
