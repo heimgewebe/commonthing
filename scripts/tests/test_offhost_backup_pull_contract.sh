@@ -363,6 +363,25 @@ mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.recei
 cmp -s "$root/first-receipt" "$first_receipt"
 cmp -s "$root/first-receipt" "$dest/latest-pull.receipt"
 
+# A crash after publishing immutable history but before updating the mutable
+# latest pointer must be recoverable by a byte-identical no-op rerun.
+# Neither case creates a duplicate immutable completion receipt.
+rm "$dest/latest-pull.receipt"
+pull "$dest" commonserver > /dev/null
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt" || {
+  echo 'missing latest receipt was not repaired on idempotent replay' >&2
+  exit 1
+}
+printf 'stale latest pointer from a previous completed backup\n' > "$dest/latest-pull.receipt"
+pull "$dest" commonserver > /dev/null
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt" || {
+  echo 'stale latest receipt was not repaired on idempotent replay' >&2
+  exit 1
+}
+mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#history[@]} == 1))
+cmp -s "$root/first-receipt" "${history[0]}"
+
 # An equally named backup with a DIFFERENT, correctly manifest-bound
 # ciphertext may not rewrite the historical ciphertext, metadata or proof.
 # With real age this encrypts the same plaintext using a fresh ephemeral key.
@@ -488,6 +507,32 @@ pull "$no_proof_dest" test-host > /dev/null
 mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
 ((${#no_proof_history[@]} == 2))
 cmp -s "$root/late-proof-saved" "$no_proof_dest/$proof"
+
+# With two immutable receipts, recovery must restore the newest receipt
+# (the one reflecting late-proof publication), not the original daily pull.
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 2))
+latest_history="$(printf '%s\n' "${no_proof_history[@]}" | LC_ALL=C sort | tail -n 1)"
+rm "$no_proof_dest/latest-pull.receipt"
+pull "$no_proof_dest" test-host > /dev/null
+cmp -s "$latest_history" "$no_proof_dest/latest-pull.receipt" || {
+  echo 'late-proof history was not restored as latest receipt' >&2
+  exit 1
+}
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 2))
+
+# A symlink must not be followed or silently accepted for the mutable pointer.
+rm "$no_proof_dest/latest-pull.receipt"
+ln -s "$root/no-proof-first-receipt" "$no_proof_dest/latest-pull.receipt"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/unsafe-latest.stderr"; then
+  echo 'symlinked latest receipt was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull unsafe latest receipt pointer' "$root/unsafe-latest.stderr"
+rm "$no_proof_dest/latest-pull.receipt"
+pull "$no_proof_dest" test-host > /dev/null
+cmp -s "$latest_history" "$no_proof_dest/latest-pull.receipt"
 
 # A changed remote proof must never replace the historical local proof.
 printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=ok\nnote=changed\n' > "$remote/proofs/$base.restore-proof"

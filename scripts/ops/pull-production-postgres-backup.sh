@@ -279,6 +279,7 @@ if [[ -e "$DEST_DIR/receipts" ]]; then
     fail "normal pull unsafe existing receipts directory"
 fi
 history_present=0
+latest_history=''
 for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
   [[ -e "$historical" || -L "$historical" ]] || continue
   [[ -f "$historical" && ! -L "$historical" ]] ||
@@ -292,6 +293,9 @@ for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
       fail "normal pull existing history receipt differs: ${binding%%=*}"
   done
   history_present=1
+  if [[ -z "$latest_history" || "$historical" > "$latest_history" ]]; then
+    latest_history="$historical"
+  fi
 done
 if ((present_core == 3)); then
   ((history_present == 1)) ||
@@ -320,6 +324,34 @@ fi
 # A complete unchanged set is a true no-op, not a new history event.
 assert_no_legacy_plaintext
 if ((${#staged[@]} == 0)); then
+  # A crash can occur between the create-only history link and the mutable
+  # latest pointer rename. Repair it from the newest verified immutable
+  # history receipt without creating a second historical completion record.
+  [[ -n "$latest_history" ]] ||
+    fail "normal pull existing core has no historical completion receipt"
+  receipt="$DEST_DIR/latest-pull.receipt"
+  [[ ! -L "$receipt" ]] ||
+    fail "normal pull unsafe latest receipt pointer"
+  [[ ! -e "$receipt" || -f "$receipt" ]] ||
+    fail "normal pull unsafe latest receipt pointer"
+  repair_pointer=0
+  if [[ ! -e "$receipt" ]]; then
+    repair_pointer=1
+  elif cmp -s -- "$latest_history" "$receipt"; then
+    :
+  else
+    cmp_status=$?
+    ((cmp_status == 1)) ||
+      fail "normal pull could not compare latest receipt"
+    repair_pointer=1
+  fi
+  if ((repair_pointer)); then
+    cp -- "$latest_history" "$work_dir/latest-pull.repaired.receipt" ||
+      fail "normal pull could not stage latest receipt recovery"
+    chmod 600 "$work_dir/latest-pull.repaired.receipt"
+    mv -f -- "$work_dir/latest-pull.repaired.receipt" "$receipt" ||
+      fail "normal pull could not restore latest receipt"
+  fi
   printf 'Encrypted off-host PostgreSQL backup already verified: %s\n' "$DEST_DIR/$latest"
   exit 0
 fi
