@@ -248,13 +248,21 @@ if [[ "$PULL_MODE" == migration-stage ]]; then
 fi
 
 # The receipt remains the final completion marker for the complete set.
-# Every optional proof has been validated before the first destination rename.
-mv -f "$work_dir/$latest" "$DEST_DIR/$latest"
-mv -f "$work_dir/$manifest" "$DEST_DIR/$manifest"
-mv -f "$work_dir/$age_manifest" "$DEST_DIR/$age_manifest"
-if [[ -f "$work_dir/$proof" ]]; then
-  mv -f "$work_dir/$proof" "$DEST_DIR/$proof"
-fi
+# All historical ciphertext, manifests and optional restore proofs are
+# immutable, including on a second normal pull of the *same* backup name.
+# Preflight known collisions before publishing any new file; the hard links
+# below are create-only as well, so a path appearing after preflight cannot
+# be overwritten (including an existing symlink or directory).
+staged=("$latest" "$manifest" "$age_manifest")
+[[ ! -f "$work_dir/$proof" ]] || staged+=("$proof")
+for name in "${staged[@]}"; do
+  [[ ! -e "$DEST_DIR/$name" && ! -L "$DEST_DIR/$name" ]] ||
+    fail "normal pull artefact already exists: $name"
+done
+for name in "${staged[@]}"; do
+  ln -T -- "$work_dir/$name" "$DEST_DIR/$name" ||
+    fail "normal pull artefact already exists: $name"
+done
 
 # Re-check under the lock: plaintext created while this pull ran (e.g. by a
 # legacy pull) must not end up beside an age success receipt.

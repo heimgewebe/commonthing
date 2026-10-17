@@ -26,6 +26,7 @@ plain="$base.sql.gz"
 file="$base.sql.gz.age"
 age_manifest="$base.age.sha256.manifest"
 manifest="$base.sha256.manifest"
+proof="$base.restore-proof"
 marker='private-home-anchor-fixture person@example.invalid'
 
 # Real age when available; otherwise an age-shaped stub without cryptography
@@ -339,18 +340,64 @@ grep -qx 'encryption=age' "$dest/latest-pull.receipt"
 grep -qx "sha256=$age_sha" "$dest/latest-pull.receipt"
 grep -qx "plaintext_sha256=$plain_sha" "$dest/latest-pull.receipt"
 grep -qx "recipients=$recipient" "$dest/latest-pull.receipt"
-# Each completed pull keeps its own immutable receipt; a later pull adds one
-# and leaves the earlier one byte-identical.
+# A completed encrypted backup set is immutable by its basename. Repeating
+# the same off-host pull is NOT another success: no artefact or history receipt
+# may be replaced, even when the remote initially supplies identical bytes.
 mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
-((${#history[@]} == 1))
+(( ${#history[@]} == 1 ))
 cmp -s "${history[0]}" "$dest/latest-pull.receipt"
 first_receipt="${history[0]}"
 cp "$first_receipt" "$root/first-receipt"
-pull "$dest" test-host > /dev/null
+cp "$dest/$file" "$root/first-ciphertext"
+cp "$dest/$age_manifest" "$root/first-age-manifest"
+cp "$dest/$manifest" "$root/first-metadata"
+cp "$dest/$proof" "$root/first-proof"
+if pull "$dest" test-host > /dev/null 2> "$root/duplicate-normal.stderr"; then
+  echo 'repeated normal pull overwrote existing encrypted backup artefacts' >&2
+  exit 1
+fi
+grep -qF 'normal pull artefact already exists' "$root/duplicate-normal.stderr"
 mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
-((${#history[@]} == 2))
+(( ${#history[@]} == 1 ))
 cmp -s "$root/first-receipt" "$first_receipt"
-grep -qx 'remote_host=test-host' "$dest/latest-pull.receipt"
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt"
+
+# An equally named backup with a DIFFERENT, correctly manifest-bound
+# ciphertext may not rewrite the historical ciphertext, metadata or proof.
+# With real age this encrypts the same plaintext using a fresh ephemeral key.
+cp "$remote/$file" "$root/remote-original-ciphertext"
+encrypt_fixture "$remote/$plain" "$remote/$file"
+if ((REAL_AGE == 0)); then
+  # The stub has no entropy; force a changed age-shaped fixture.
+  printf '\n' >> "$remote/$file"
+fi
+new_age_sha="$(sha256sum "$remote/$file" | awk '{print $1}')"
+new_age_bytes="$(wc -c < "$remote/$file" | tr -d '[:space:]')"
+write_age_manifest "$new_age_sha" "$new_age_bytes" "$plain_sha"
+if pull "$dest" test-host > /dev/null 2> "$root/overwrite-normal.stderr"; then
+  echo 'normal pull replaced a historically sealed encrypted backup' >&2
+  exit 1
+fi
+grep -qF 'normal pull artefact already exists' "$root/overwrite-normal.stderr"
+for binding in "$file" "$age_manifest" "$manifest" "$proof"; do
+  case "$binding" in
+    "$file") original="$root/first-ciphertext" ;;
+    "$age_manifest") original="$root/first-age-manifest" ;;
+    "$manifest") original="$root/first-metadata" ;;
+    "$proof") original="$root/first-proof" ;;
+  esac
+  cmp -s "$original" "$dest/$binding" || {
+    echo "historical off-host artefact was replaced: $binding" >&2
+    exit 1
+  }
+done
+mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
+(( ${#history[@]} == 1 ))
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt"
+# Restore producer fixtures for subsequent offline-restore and negative tests.
+cp "$root/remote-original-ciphertext" "$remote/$file"
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+grep -qx 'remote_host=commonserver' "$dest/latest-pull.receipt"
 [[ "$(stat -c %a "$dest/$file")" == 600 ]]
 if compgen -G "$dest/weltgewebe-postgres-20260101T000000Z*" > /dev/null; then
   echo 'local retention must expire ciphertext, manifests and proofs' >&2
