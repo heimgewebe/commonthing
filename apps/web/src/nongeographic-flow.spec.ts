@@ -78,6 +78,40 @@ test("commons uses dedicated public endpoint for every page; search retains owne
   expect(searchRequests).toHaveLength(1);
   expect(searchRequests[0].searchParams.get("q")).toBe("private Commons");
   expect(searchRequests[0].searchParams.has("public_only")).toBe(false);
+
+  // Switching an owner-only search back to public discovery must clear the
+  // private result immediately, not after an arbitrarily slow public response.
+  let releasePublicResponse: () => void = () => {};
+  const heldPublicResponse = new Promise<void>((resolve) => {
+    releasePublicResponse = resolve;
+  });
+  await page.route("**/api/public/nodes?**", async (route) => {
+    await heldPublicResponse;
+    return route.fulfill({
+      json: {
+        items: [
+          {
+            id: "public-replacement",
+            title: "Public replacement",
+            kind: "knowledge",
+            location: null,
+            search_visibility: "public",
+          },
+        ],
+        page: { next_cursor: null, has_more: false },
+      },
+    });
+  });
+  await page.getByLabel("Knoten suchen").fill("");
+  await page.getByRole("button", { name: "Suchen", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Knoten werden geladen");
+  await expect(
+    page.getByRole("link", { name: "Owner's private Commons", exact: true }),
+  ).toHaveCount(0);
+  releasePublicResponse();
+  await expect(
+    page.getByRole("link", { name: "Public replacement", exact: true }),
+  ).toBeVisible();
 });
 
 test("commons rejects older APIs without the public-only endpoint (no legacy fallback)", async ({

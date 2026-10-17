@@ -6,7 +6,7 @@
   let query = $state("");
   let nodes: Node[] = $state([]);
   let cursor: string | null = $state(null);
-  let loading = $state(false);
+  let loading = $state(true);
   let error = $state("");
   let searching = $state(false);
   let controller: AbortController | undefined;
@@ -17,6 +17,13 @@
     controller = request;
     loading = true;
     error = "";
+    // Non-append loads may switch between owner-only search and public listing.
+    // Clear previous results before the request so private owner hits cannot
+    // linger in the public catalog while a slow request or retry is in flight.
+    if (!more) {
+      nodes = [];
+      cursor = null;
+    }
     const term = query.trim();
     searching = Boolean(term);
     try {
