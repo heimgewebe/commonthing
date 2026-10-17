@@ -2686,3 +2686,81 @@ async fn canonical_visibility_migration_preserves_public_defaults_and_reprojects
     .expect("owner change projection job");
     assert!(owner_change_job);
 }
+
+#[tokio::test]
+#[ignore = "requires T005_DATABASE_URL pointing to direct disposable PostgreSQL"]
+async fn nongeographic_commons_is_projected_and_searchable() {
+    let pool = pool().await;
+    migrate(&pool).await;
+    reset_search_state(&pool).await;
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,created_at,updated_at,payload) VALUES ('t006-digital','knowledge','Digital Commons',now(),now(),'{\"tags\":[\"commons\"]}'::jsonb)")
+        .execute(&pool).await.expect("create nongeographic Commons");
+    let projection_worker = worker(
+        pool.clone(),
+        "t006-digital-worker",
+        Arc::new(FakeProvider {
+            unavailable: AtomicBool::new(false),
+        }),
+    );
+    let spec = exact_generation_spec("digital", "r1", "ollama:test@http://127.0.0.1:11434", 3);
+    let generation = spec.generation_id.to_owned();
+    projection_worker
+        .start_generation(spec)
+        .await
+        .expect("start generation");
+    while projection_worker
+        .claim_and_process_one()
+        .await
+        .expect("process projection")
+        == ProcessOutcome::Processed
+    {}
+    sqlx::query("SELECT weltgewebe_activate_search_generation($1)")
+        .bind(&generation)
+        .execute(&pool)
+        .await
+        .expect("activate generation");
+    let anonymous = AuthContext {
+        authenticated: false,
+        account_id: None,
+        device_id: None,
+        role: Role::Gast,
+        expires_at: None,
+    };
+    let result = fetch_postgres_candidates(
+        &pool,
+        "Digital Commons",
+        &SearchFilters::default(),
+        &anonymous,
+    )
+    .await
+    .expect("search")
+    .expect("active generation");
+    let commons = result
+        .candidates
+        .iter()
+        .find(|item| item.node.id == "t006-digital")
+        .expect("nongeographic result");
+    assert_ne!(
+        commons.rank_class,
+        u8::MAX,
+        "lexical result is eligible without coordinates"
+    );
+    assert!(commons.node.location.is_none());
+    sqlx::query("UPDATE domain_nodes SET search_visibility='hidden' WHERE id='t006-digital'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let hidden = fetch_postgres_candidates(
+        &pool,
+        "Digital Commons",
+        &SearchFilters::default(),
+        &anonymous,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!hidden
+        .candidates
+        .iter()
+        .any(|item| item.node.id == "t006-digital"));
+}

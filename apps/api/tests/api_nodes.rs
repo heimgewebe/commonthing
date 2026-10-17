@@ -153,6 +153,61 @@ async fn app_with_nodes(in_dir: &std::path::Path, lines: &[&str]) -> (Router, En
 
 #[tokio::test]
 #[serial]
+async fn nongeographic_nodes_remain_readable_but_outside_bbox() -> anyhow::Result<()> {
+    let tmp = make_tmp_dir();
+    let (app, _env) = app_with_nodes(
+        &tmp.path().join("in"),
+        &[
+            r#"{"id":"digital","title":"Digital Commons","location":null,"address":null}"#,
+            r#"{"id":"knowledge","title":"Wissen"}"#,
+            r#"{"id":"place","title":"Ort","location":{"lat":53.5,"lon":10.0}}"#,
+        ],
+    )
+    .await;
+    for path in ["/nodes", "/nodes?pagination=cursor"] {
+        let res = app
+            .clone()
+            .oneshot(Request::get(path).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let items = value
+            .as_array()
+            .or_else(|| value["items"].as_array())
+            .unwrap();
+        assert_eq!(items.len(), 3);
+    }
+    let res = app
+        .clone()
+        .oneshot(Request::get("/nodes/digital").body(body::Body::empty())?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert!(value["location"].is_null());
+    for path in [
+        "/nodes?bbox=-180,-90,180,90",
+        "/nodes?bbox=-180,-90,180,90&pagination=cursor",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(Request::get(path).body(body::Body::empty())?)
+            .await?;
+        let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let items = value
+            .as_array()
+            .or_else(|| value["items"].as_array())
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "place");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn nodes_bbox_and_limit() -> anyhow::Result<()> {
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");
@@ -695,7 +750,10 @@ async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Res
 #[serial]
 async fn nodes_patch_unprojectable_retained_record_keeps_canonical_jsonl_unchanged(
 ) -> anyhow::Result<()> {
-    assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(b"{\"id\":\"bad\"}\n").await
+    assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(
+        b"{\"id\":\"bad\",\"location\":{\"lat\":53.5}}\n",
+    )
+    .await
 }
 
 #[tokio::test]
@@ -1384,7 +1442,7 @@ async fn nodes_post_creates_persists_and_reloads() -> anyhow::Result<()> {
 async fn nodes_post_rejects_corrupt_existing_jsonl_after_startup() -> anyhow::Result<()> {
     for corrupt_line in [
         r#"{broken_json"#,
-        r#"{"id":"missing-required-node-fields"}"#,
+        r#"{"id":"partial-location","location":{"lat":53.5}}"#,
     ] {
         let tmp = make_tmp_dir();
         let in_dir = tmp.path().join("in");
@@ -1618,14 +1676,14 @@ async fn nodes_post_rejects_invalid_payloads_with_stable_400() -> anyhow::Result
     .await;
 
     let cases = [
-        // Missing required address.
-        r#"{"title":"No Address","kind":"Werkstatt","location":{"lat":53.5,"lon":10.0}}"#,
+        // An address, when supplied, must be nonblank.
+        r#"{"title":"Blank Address","kind":"Werkstatt","address":" "}"#,
         // Missing required title.
         r#"{"kind":"Werkstatt","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
         // Missing required kind.
         r#"{"title":"No Kind","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
-        // Missing required location.
-        r#"{"title":"No Location","kind":"Werkstatt","address":"Somewhere"}"#,
+        // An explicit location must contain a complete coordinate pair.
+        r#"{"title":"Partial Location","kind":"Werkstatt","location":{"lat":53.5}}"#,
         // Blank title after trim.
         r#"{"title":"   ","kind":"Werkstatt","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
         // Out-of-bounds latitude.

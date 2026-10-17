@@ -1,3 +1,4 @@
+import { isValidMapCoordinate } from "$lib/map/coordinates";
 import {
   summarizeMapResourceStatus,
   type Account,
@@ -331,11 +332,11 @@ async function fetchFocusedNode(
   if (
     !isRecord(body) ||
     body.id !== nodeId ||
-    !isRecord(body.location) ||
-    typeof body.location.lat !== "number" ||
-    !Number.isFinite(body.location.lat) ||
-    typeof body.location.lon !== "number" ||
-    !Number.isFinite(body.location.lon)
+    (body.location != null &&
+      (!isRecord(body.location) ||
+        typeof body.location.lat !== "number" ||
+        typeof body.location.lon !== "number" ||
+        !isValidMapCoordinate(body.location.lon, body.location.lat)))
   ) {
     throw new CursorPaginationError("Invalid focused node response shape");
   }

@@ -7,7 +7,7 @@
     nodeToMapEntity,
     searchNodes,
   } from "$lib/api/search";
-  import type { MapEntityNode, MapEntityViewModel } from "$lib/map/types";
+  import type { Node, MapEntityViewModel } from "$lib/map/types";
 
   interface Props {
     sourceId: string;
@@ -28,10 +28,15 @@
   }: Props = $props();
 
   const dispatch = createEventDispatcher<{
-    select: { type: "node"; id: string; data: MapEntityViewModel };
+    select: {
+      type: "node";
+      id: string;
+      data?: MapEntityViewModel;
+      title?: string;
+    };
   }>();
 
-  let similarNodes: MapEntityNode[] = $state([]);
+  let similarNodes: Node[] = $state([]);
   let requested = $state(false);
   let loading = $state(false);
   let error = $state("");
@@ -64,7 +69,6 @@
       mode = response.mode;
       similarNodes = response.items
         .filter((item) => item.id !== sourceId)
-        .map(nodeToMapEntity)
         .slice(0, 4);
     } catch {
       if (controller.signal.aborted || sequence !== requestSequence) return;
@@ -156,7 +160,8 @@
                 dispatch("select", {
                   type: "node",
                   id: similar.id,
-                  data: similar,
+                  title: similar.title,
+                  data: nodeToMapEntity(similar) ?? undefined,
                 })}
             >
               <span>{similar.title}</span>
