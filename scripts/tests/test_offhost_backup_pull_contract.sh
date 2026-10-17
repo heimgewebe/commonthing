@@ -340,11 +340,10 @@ grep -qx 'encryption=age' "$dest/latest-pull.receipt"
 grep -qx "sha256=$age_sha" "$dest/latest-pull.receipt"
 grep -qx "plaintext_sha256=$plain_sha" "$dest/latest-pull.receipt"
 grep -qx "recipients=$recipient" "$dest/latest-pull.receipt"
-# A completed encrypted backup set is immutable by its basename. Repeating
-# the same off-host pull is NOT another success: no artefact or history receipt
-# may be replaced, even when the remote initially supplies identical bytes.
+# Byte-identical normal pulls are idempotent: do not replace immutable
+# core artefacts, an existing proof, or any historical completion receipt.
 mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
-(( ${#history[@]} == 1 ))
+((${#history[@]} == 1))
 cmp -s "${history[0]}" "$dest/latest-pull.receipt"
 first_receipt="${history[0]}"
 cp "$first_receipt" "$root/first-receipt"
@@ -352,13 +351,15 @@ cp "$dest/$file" "$root/first-ciphertext"
 cp "$dest/$age_manifest" "$root/first-age-manifest"
 cp "$dest/$manifest" "$root/first-metadata"
 cp "$dest/$proof" "$root/first-proof"
-if pull "$dest" test-host > /dev/null 2> "$root/duplicate-normal.stderr"; then
-  echo 'repeated normal pull overwrote existing encrypted backup artefacts' >&2
-  exit 1
-fi
-grep -qF 'normal pull artefact already exists' "$root/duplicate-normal.stderr"
+pull "$dest" commonserver > /dev/null
+for immutable in "$file" "$age_manifest" "$manifest" "$proof"; do
+  [[ "$(stat -c %h "$dest/$immutable")" == 1 ]] || {
+    echo "idempotent pull created an extra immutable link: $immutable" >&2
+    exit 1
+  }
+done
 mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
-(( ${#history[@]} == 1 ))
+((${#history[@]} == 1))
 cmp -s "$root/first-receipt" "$first_receipt"
 cmp -s "$root/first-receipt" "$dest/latest-pull.receipt"
 
@@ -378,7 +379,7 @@ if pull "$dest" test-host > /dev/null 2> "$root/overwrite-normal.stderr"; then
   echo 'normal pull replaced a historically sealed encrypted backup' >&2
   exit 1
 fi
-grep -qF 'normal pull artefact already exists' "$root/overwrite-normal.stderr"
+grep -qF 'normal pull artefact content differs' "$root/overwrite-normal.stderr"
 for binding in "$file" "$age_manifest" "$manifest" "$proof"; do
   case "$binding" in
     "$file") original="$root/first-ciphertext" ;;
@@ -392,7 +393,7 @@ for binding in "$file" "$age_manifest" "$manifest" "$proof"; do
   }
 done
 mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
-(( ${#history[@]} == 1 ))
+((${#history[@]} == 1))
 cmp -s "$root/first-receipt" "$dest/latest-pull.receipt"
 # Restore producer fixtures for subsequent offline-restore and negative tests.
 cp "$root/remote-original-ciphertext" "$remote/$file"
@@ -456,12 +457,110 @@ ln -s "$root/held-proof" "$remote/proofs/$base.restore-proof"
 expect_pull_failure "$root/proof-symlink" 'could not probe the remote restore proof'
 rm "$remote/proofs/$base.restore-proof"
 mv "$root/held-proof" "$remote/proofs/$base.restore-proof"
-# A definitely absent proof (newest daily backup) is still a successful pull.
+# A definitely absent weekly proof is valid for a new daily backup.
+# When the producer publishes it later, the identical immutable core is
+# accepted and only the proof is added create-only, preserving old receipts.
 mv "$remote/proofs/$base.restore-proof" "$root/held-proof"
-pull "$root/no-proof" test-host > /dev/null
-grep -qx 'result=ok' "$root/no-proof/latest-pull.receipt"
-[[ ! -e "$root/no-proof/$base.restore-proof" ]]
+no_proof_dest="$root/no-proof"
+pull "$no_proof_dest" test-host > /dev/null
+grep -qx 'result=ok' "$no_proof_dest/latest-pull.receipt"
+[[ ! -e "$no_proof_dest/$base.restore-proof" ]]
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 1))
+cp "${no_proof_history[0]}" "$root/no-proof-first-receipt"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$no_proof_dest/$core" "$root/early-$core"
+done
 mv "$root/held-proof" "$remote/proofs/$base.restore-proof"
+pull "$no_proof_dest" test-host > /dev/null
+cmp -s "$remote/proofs/$base.restore-proof" "$no_proof_dest/$proof"
+cmp -s "$root/no-proof-first-receipt" "${no_proof_history[0]}"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cmp -s "$root/early-$core" "$no_proof_dest/$core" || {
+    echo "late proof replaced immutable core: $core" >&2
+    exit 1
+  }
+done
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 2))
+cp "$no_proof_dest/$proof" "$root/late-proof-saved"
+pull "$no_proof_dest" test-host > /dev/null
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 2))
+cmp -s "$root/late-proof-saved" "$no_proof_dest/$proof"
+
+# A changed remote proof must never replace the historical local proof.
+printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=ok\nnote=changed\n' > "$remote/proofs/$base.restore-proof"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/proof-changed.stderr"; then
+  echo 'a changed restore proof replaced immutable history' >&2
+  exit 1
+fi
+grep -qF 'normal pull artefact content differs' "$root/proof-changed.stderr"
+cmp -s "$root/late-proof-saved" "$no_proof_dest/$proof"
+printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=ok\n' > "$remote/proofs/$base.restore-proof"
+
+# Partial core sets and pre-existing symlinks are not an idempotent pull.
+partial_dest="$root/partial-core"
+mkdir -p "$partial_dest"
+cp "$remote/$file" "$partial_dest/$file"
+if pull "$partial_dest" test-host > /dev/null 2> "$root/partial-core.stderr"; then
+  echo 'partial core set was silently accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull incomplete core artefact set' "$root/partial-core.stderr"
+[[ ! -e "$partial_dest/$manifest" && ! -e "$partial_dest/latest-pull.receipt" ]]
+unsafe_dest="$root/unsafe-proof"
+mkdir -p "$unsafe_dest"
+ln -s "$remote/proofs/$base.restore-proof" "$unsafe_dest/$proof"
+if pull "$unsafe_dest" test-host > /dev/null 2> "$root/unsafe-proof.stderr"; then
+  echo 'symlinked local proof was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull unsafe existing artefact' "$root/unsafe-proof.stderr"
+[[ ! -e "$unsafe_dest/$file" && ! -e "$unsafe_dest/latest-pull.receipt" ]]
+unsafe_core="$root/unsafe-core"
+mkdir -p "$unsafe_core"
+ln -s "$remote/$file" "$unsafe_core/$file"
+if pull "$unsafe_core" test-host > /dev/null 2> "$root/unsafe-core.stderr"; then
+  echo 'symlinked local ciphertext was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull unsafe existing artefact' "$root/unsafe-core.stderr"
+[[ ! -e "$unsafe_core/$manifest" && ! -e "$unsafe_core/latest-pull.receipt" ]]
+
+# A complete old core without an immutable receipt is not an authenticated
+# recovery point. A symlink or forged receipt cannot make it one.
+for scenario in absent symlink forged receipt-only; do
+  history_dest="$root/history-$scenario"
+  mkdir -p "$history_dest/receipts"
+  if [[ "$scenario" != receipt-only ]]; then
+    for core in "$file" "$manifest" "$age_manifest"; do
+      cp "$remote/$core" "$history_dest/$core"
+    done
+  fi
+  history_path="$history_dest/receipts/$base.pulled-20260712T040000.000000000Z.receipt"
+  case "$scenario" in
+    absent) expected_error='normal pull existing core has no historical completion receipt' ;;
+    symlink)
+      ln -s "$root/first-receipt" "$history_path"
+      expected_error='normal pull unsafe existing history receipt'
+      ;;
+    forged)
+      printf 'contract=weltgewebe-offhost-backup-pull-v2\nresult=ok\n' > "$history_path"
+      expected_error='normal pull existing history receipt differs'
+      ;;
+    receipt-only)
+      cp "$root/first-receipt" "$history_path"
+      expected_error='normal pull historical receipt exists without core artefacts'
+      ;;
+  esac
+  if pull "$history_dest" commonserver > /dev/null 2> "$root/history-$scenario.stderr"; then
+    echo "inconsistent historical backup was accepted: $scenario" >&2
+    exit 1
+  fi
+  grep -qF "$expected_error" "$root/history-$scenario.stderr"
+  [[ ! -e "$history_dest/latest-pull.receipt" ]]
+done
 
 # A ciphertext sha256 mismatch must fail and must not promote anything.
 write_age_manifest "$(printf '%064d' 0)" "$age_bytes" "$plain_sha"

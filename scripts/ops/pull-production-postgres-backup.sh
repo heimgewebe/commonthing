@@ -248,22 +248,87 @@ if [[ "$PULL_MODE" == migration-stage ]]; then
 fi
 
 # The receipt remains the final completion marker for the complete set.
-# All historical ciphertext, manifests and optional restore proofs are
-# immutable, including on a second normal pull of the *same* backup name.
-# Preflight known collisions before publishing any new file; the hard links
-# below are create-only as well, so a path appearing after preflight cannot
-# be overwritten (including an existing symlink or directory).
-staged=("$latest" "$manifest" "$age_manifest")
-[[ ! -f "$work_dir/$proof" ]] || staged+=("$proof")
-for name in "${staged[@]}"; do
-  [[ ! -e "$DEST_DIR/$name" && ! -L "$DEST_DIR/$name" ]] ||
-    fail "normal pull artefact already exists: $name"
+# Core ciphertext and manifests are immutable: existing files are accepted
+# only as a full three-file set with byte-identical verified remote contents.
+core=("$latest" "$manifest" "$age_manifest")
+staged=()
+present_core=0
+for name in "${core[@]}"; do
+  local_path="$DEST_DIR/$name"
+  [[ ! -L "$local_path" ]] ||
+    fail "normal pull unsafe existing artefact: $name"
+  if [[ -e "$local_path" ]]; then
+    [[ -f "$local_path" ]] ||
+      fail "normal pull unsafe existing artefact: $name"
+    cmp -s -- "$work_dir/$name" "$local_path" ||
+      fail "normal pull artefact content differs: $name"
+    ((present_core += 1))
+  else
+    staged+=("$name")
+  fi
 done
+((present_core == 0 || present_core == 3)) ||
+  fail "normal pull incomplete core artefact set"
+
+# An immutable history receipt seals a published basename; a partial
+# transfer or post-retention reappearance cannot quietly reuse that name.
+[[ ! -L "$DEST_DIR/receipts" ]] ||
+  fail "normal pull unsafe existing receipts directory"
+if [[ -e "$DEST_DIR/receipts" ]]; then
+  [[ -d "$DEST_DIR/receipts" ]] ||
+    fail "normal pull unsafe existing receipts directory"
+fi
+history_present=0
+for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
+  [[ -e "$historical" || -L "$historical" ]] || continue
+  [[ -f "$historical" && ! -L "$historical" ]] ||
+    fail "normal pull unsafe existing history receipt"
+  for binding in \
+    'contract=weltgewebe-offhost-backup-pull-v2' \
+    "remote_host=$REMOTE_HOST" "file=$latest" "sha256=$actual" \
+    'encryption=age' "recipients=$manifest_recipients" \
+    "plaintext_sha256=$plaintext_sha" 'result=ok'; do
+    grep -qxF -- "$binding" "$historical" ||
+      fail "normal pull existing history receipt differs: ${binding%%=*}"
+  done
+  history_present=1
+done
+if ((present_core == 3)); then
+  ((history_present == 1)) ||
+    fail "normal pull existing core has no historical completion receipt"
+elif ((history_present == 1)); then
+  fail "normal pull historical receipt exists without core artefacts"
+fi
+
+# An optional weekly proof can arrive after the daily core was sealed.
+# A previously published proof may not be overwritten, even on retry.
+if [[ -L "$DEST_DIR/$proof" ]]; then
+  fail "normal pull unsafe existing artefact: $proof"
+elif [[ -e "$DEST_DIR/$proof" ]]; then
+  [[ -f "$DEST_DIR/$proof" ]] ||
+    fail "normal pull unsafe existing artefact: $proof"
+  ((present_core == 3)) ||
+    fail "normal pull incomplete core artefact set"
+  [[ -f "$work_dir/$proof" ]] ||
+    fail "normal pull local proof is absent upstream: $proof"
+  cmp -s -- "$work_dir/$proof" "$DEST_DIR/$proof" ||
+    fail "normal pull artefact content differs: $proof"
+elif [[ -f "$work_dir/$proof" ]]; then
+  staged+=("$proof")
+fi
+
+# A complete unchanged set is a true no-op, not a new history event.
+assert_no_legacy_plaintext
+if ((${#staged[@]} == 0)); then
+  printf 'Encrypted off-host PostgreSQL backup already verified: %s\n' "$DEST_DIR/$latest"
+  exit 0
+fi
+# Hardlinks preserve create-only semantics even if a competitor creates
+# a path after the complete preflight under the destination lock.
 for name in "${staged[@]}"; do
   ln -T -- "$work_dir/$name" "$DEST_DIR/$name" ||
-    fail "normal pull artefact already exists: $name"
+    fail "normal pull artefact appeared during publication: $name"
 done
-
 # Re-check under the lock: plaintext created while this pull ran (e.g. by a
 # legacy pull) must not end up beside an age success receipt.
 assert_no_legacy_plaintext
