@@ -16,6 +16,7 @@ require_cmd cmp
 require_cmd grep
 require_cmd flock
 require_cmd realpath
+require_cmd date
 
 REMOTE_HOST="${REMOTE_HOST:-commonserver}"
 # Every remote read goes through one root-owned, argument-validating reader
@@ -168,6 +169,41 @@ remote_read() {
   chmod 600 "$destination"
 }
 manifest_value() { awk -F= -v key="$1" '$1==key {print substr($0, length(key) + 2); exit}' "$2"; }
+# A successful proof is only evidence for this selected ciphertext when its
+# plaintext filename and checksum exactly match both validated manifests.
+# The producer's RESTORE_PROOF_FILE override is never authority here.
+verify_restore_proof() {
+  local candidate="$1" field
+  grep -qx 'result=ok' "$candidate" || fail "remote restore proof is not successful"
+  grep -qx 'contract=weltgewebe-postgres-restore-proof-v1' "$candidate" ||
+    fail "remote restore proof contract mismatch"
+  [[ "$(manifest_value backup_file "$candidate")" == "${base}.sql.gz" ]] ||
+    fail "remote restore proof backup filename mismatch"
+  [[ "$(manifest_value backup_sha256 "$candidate")" == "$plaintext_sha" ]] ||
+    fail "remote restore proof backup sha256 mismatch"
+  [[ "$(manifest_value tables "$candidate")" == 'domain_accounts,domain_nodes,domain_edges,sessions,passkey_credentials,_sqlx_migrations' ]] ||
+    fail "remote restore proof required tables mismatch"
+  local created_at normalized
+  created_at="$(manifest_value created_at "$candidate")"
+  [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+    fail "remote restore proof created_at is not canonical UTC"
+  normalized="$(date -u -d "$created_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" ||
+    fail "remote restore proof created_at is invalid UTC"
+  [[ "$normalized" == "$created_at" ]] ||
+    fail "remote restore proof created_at is not canonical UTC"
+  proof_epoch="$(date -u -d "$created_at" +%s)" ||
+    fail "remote restore proof created_at is invalid UTC"
+  now_epoch="$(date -u +%s)" ||
+    fail "remote restore proof current UTC unavailable"
+  ((proof_epoch <= now_epoch + 300)) ||
+    fail "remote restore proof created_at is in the future"
+  for field in contract result created_at backup_file backup_sha256 tables; do
+    [[ "$(grep -c "^${field}=" "$candidate" || true)" == 1 ]] ||
+      fail "remote restore proof duplicated binding field: $field"
+  done
+  [[ "$(wc -l < "$candidate" | tr -d '[:space:]')" == 6 ]] ||
+    fail "remote restore proof unexpected fields"
+}
 remote_read ciphertext "$work_dir/$latest"
 remote_read age-manifest "$work_dir/$age_manifest"
 # Metadata only (file name, plaintext sha256, size, tables); it lets an
@@ -231,9 +267,11 @@ case "$proof_state" in
   present | absent) ;;
   *) fail "unexpected remote restore proof probe result" ;;
 esac
+remote_proof_sha=''
 if [[ "$proof_state" == present ]]; then
   remote_read proof "$work_dir/$proof"
-  grep -qx 'result=ok' "$work_dir/$proof" || fail "remote restore proof is not successful"
+  verify_restore_proof "$work_dir/$proof"
+  remote_proof_sha="$(sha256sum "$work_dir/$proof" | awk '{print $1}')"
 fi
 
 # Staging is a create-only encrypted transfer, not a recovery proof.
@@ -286,8 +324,25 @@ if [[ -e "$DEST_DIR/receipts" ]]; then
   [[ -d "$DEST_DIR/receipts" ]] ||
     fail "normal pull unsafe existing receipts directory"
 fi
+# Include uncertified, interrupted SHA-addressed proof revisions in integrity
+# scanning; they are not success receipts but still immutable local evidence.
+for revision in "$DEST_DIR/receipts/${base}.restore-proof."*.receipt; do
+  [[ -e "$revision" || -L "$revision" ]] || continue
+  [[ -f "$revision" && ! -L "$revision" ]] ||
+    fail "normal pull unsafe proof revision artefact"
+  revision_sha="${revision##*/}"
+  revision_sha="${revision_sha#"${base}".restore-proof.}"
+  revision_sha="${revision_sha%.receipt}"
+  [[ "$revision_sha" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "normal pull invalid proof revision filename"
+  [[ "$(sha256sum "$revision" | awk '{print $1}')" == "$revision_sha" ]] ||
+    fail "normal pull proof revision content differs"
+  verify_restore_proof "$revision"
+done
+
 history_present=0
 latest_history=''
+declare -A certified_proof_digests=()
 for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
   [[ -e "$historical" || -L "$historical" ]] || continue
   [[ -f "$historical" && ! -L "$historical" ]] ||
@@ -300,6 +355,32 @@ for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
     grep -qxF -- "$binding" "$historical" ||
       fail "normal pull existing history receipt differs: ${binding%%=*}"
   done
+  ((present_core == 3)) ||
+    fail "normal pull historical receipt exists without core artefacts"
+  proof_field_count="$(grep -c '^restore_proof_sha256=' "$historical" || true)"
+  case "$proof_field_count" in
+    0) ;; # Older receipts cannot claim an independently bound restore.
+    1)
+      historical_proof_sha="$(manifest_value restore_proof_sha256 "$historical")"
+      [[ "$historical_proof_sha" =~ ^[0-9a-f]{64}$ ]] ||
+        fail "normal pull invalid historical proof sha256"
+      [[ -z "${certified_proof_digests[$historical_proof_sha]:-}" ]] ||
+        fail "normal pull duplicate historical proof sha256 receipt"
+      certified_proof_digests[$historical_proof_sha]=1
+      archived_proof="$DEST_DIR/$proof"
+      [[ ! -L "$archived_proof" ]] || fail "normal pull unsafe existing artefact: $proof"
+      if [[ ! -f "$archived_proof" ]] ||
+          [[ "$(sha256sum "$archived_proof" | awk '{print $1}')" != "$historical_proof_sha" ]]; then
+        archived_proof="$DEST_DIR/receipts/${base}.restore-proof.${historical_proof_sha}.receipt"
+      fi
+      [[ -f "$archived_proof" && ! -L "$archived_proof" ]] ||
+        fail "normal pull certified restore proof missing"
+      [[ "$(sha256sum "$archived_proof" | awk '{print $1}')" == "$historical_proof_sha" ]] ||
+        fail "normal pull certified restore proof sha256 mismatch"
+      verify_restore_proof "$archived_proof"
+      ;;
+    *) fail "normal pull duplicated historical proof sha256 field" ;;
+  esac
   history_present=1
   if [[ -z "$latest_history" || "$historical" > "$latest_history" ]]; then
     latest_history="$historical"
@@ -314,8 +395,12 @@ if ((history_present == 1 && present_core != 3)); then
   fail "normal pull historical receipt exists without core artefacts"
 fi
 
-# An optional weekly proof can arrive after the daily core was sealed.
-# A previously published proof may not be overwritten, even on retry.
+# Preserve the FIRST published weekly proof. Re-running a weekly restore
+# against the same immutable dump produces a new SHA-addressed proof revision,
+# never an overwrite of the first proof or its historical pull receipt.
+proof_revision_name=''
+proof_revision_link=0
+proof_revision_event=0
 if [[ -L "$DEST_DIR/$proof" ]]; then
   fail "normal pull unsafe existing artefact: $proof"
 elif [[ -e "$DEST_DIR/$proof" ]]; then
@@ -325,15 +410,47 @@ elif [[ -e "$DEST_DIR/$proof" ]]; then
     fail "normal pull incomplete core artefact set"
   [[ -f "$work_dir/$proof" ]] ||
     fail "normal pull local proof is absent upstream: $proof"
-  cmp -s -- "$work_dir/$proof" "$DEST_DIR/$proof" ||
-    fail "normal pull artefact content differs: $proof"
+  verify_restore_proof "$DEST_DIR/$proof"
+  if ! cmp -s -- "$work_dir/$proof" "$DEST_DIR/$proof"; then
+    proof_revision_name="${base}.restore-proof.${remote_proof_sha}.receipt"
+    version_path="$DEST_DIR/receipts/$proof_revision_name"
+    [[ ! -L "$version_path" ]] ||
+      fail "normal pull unsafe proof revision artefact"
+    if [[ -e "$version_path" ]]; then
+      if [[ ! -f "$version_path" ]] || ! cmp -s -- "$work_dir/$proof" "$version_path"; then
+        fail "normal pull proof revision content differs"
+      fi
+    else
+      proof_revision_link=1
+    fi
+    # Complete an interrupted proof revision publication without duplicating
+    # a historical receipt once the same digest is already certified.
+    revision_certified=0
+    for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
+      [[ -f "$historical" && ! -L "$historical" ]] || continue
+      if grep -qxF -- "restore_proof_sha256=$remote_proof_sha" "$historical"; then
+        revision_certified=1
+        break
+      fi
+    done
+    if ((revision_certified && proof_revision_link)); then
+      fail "normal pull certified proof revision is missing"
+    fi
+    ((revision_certified)) || proof_revision_event=1
+  fi
 elif [[ -f "$work_dir/$proof" ]]; then
   staged+=("$proof")
 fi
 
+# An initial proof may have been linked before a crash, while the earlier
+# daily receipt contains no proof SHA. Only a new immutable history receipt
+# certifies that this particular verified restore proof was obtained.
+if [[ -n "$remote_proof_sha" && -z "${certified_proof_digests[$remote_proof_sha]:-}" ]]; then
+  proof_revision_event=1
+fi
 # A complete unchanged set is a true no-op, not a new history event.
 assert_no_legacy_plaintext
-if ((${#staged[@]} == 0 && history_present == 1)); then
+if ((${#staged[@]} == 0 && history_present == 1 && proof_revision_event == 0)); then
   # A crash can occur between the create-only history link and the mutable
   # latest pointer rename. Repair it from the newest verified immutable
   # history receipt without creating a second historical completion record.
@@ -371,6 +488,12 @@ for name in "${staged[@]}"; do
   ln -T -- "$work_dir/$name" "$DEST_DIR/$name" ||
     fail "normal pull artefact appeared during publication: $name"
 done
+if ((proof_revision_link)); then
+  # The canonical proof stays unchanged. Only an immutable revision appears.
+  install -d -m 0700 "$DEST_DIR/receipts"
+  ln -T -- "$work_dir/$proof" "$DEST_DIR/receipts/$proof_revision_name" ||
+    fail "normal pull proof revision appeared during publication"
+fi
 # Re-check under the lock: plaintext created while this pull ran (e.g. by a
 # legacy pull) must not end up beside an age success receipt.
 assert_no_legacy_plaintext
@@ -385,6 +508,7 @@ pulled_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'contract=weltgewebe-offhost-backup-pull-v2\n'
   printf 'pulled_at=%s\nremote_host=%s\nfile=%s\nsha256=%s\nencryption=age\nrecipients=%s\nplaintext_sha256=%s\nresult=ok\n' \
     "$pulled_at" "$REMOTE_HOST" "$latest" "$actual" "$manifest_recipients" "$plaintext_sha"
+  [[ -z "$remote_proof_sha" ]] || printf 'restore_proof_sha256=%s\n' "$remote_proof_sha"
 } > "$receipt_tmp"
 chmod 600 "$receipt_tmp"
 install -d -m 0700 "$DEST_DIR/receipts"

@@ -88,10 +88,19 @@ printf 'newer plaintext\n' | gzip -c > "$remote/weltgewebe-postgres-20260713T040
 # A newer ciphertext whose off-host manifest (the completion marker, published
 # last) is missing is an interrupted run and must not be selected either.
 printf 'age-encryption.org/v1\ninterrupted\n' > "$remote/weltgewebe-postgres-20260713T040000Z.sql.gz.age"
-cat > "$remote/proofs/$base.restore-proof" << PROOF
+# Synthetic proof matches the real producer's filename/hash binding.
+write_restore_proof() {
+  local timestamp="${1:-2026-07-12T05:00:00Z}"
+  cat > "$remote/proofs/$base.restore-proof" << PROOF
 contract=weltgewebe-postgres-restore-proof-v1
+created_at=$timestamp
+backup_file=$plain
+backup_sha256=$plain_sha
+tables=domain_accounts,domain_nodes,domain_edges,sessions,passkey_credentials,_sqlx_migrations
 result=ok
 PROOF
+}
+write_restore_proof
 cat > "$bin/ssh" << 'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -481,7 +490,36 @@ fi
 # become visible in the destination (completion receipt is not enough).
 printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=failed\n' > "$remote/proofs/$base.restore-proof"
 expect_pull_failure "$root/bad-proof" 'remote restore proof is not successful'
-printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=ok\n' > "$remote/proofs/$base.restore-proof"
+write_restore_proof
+
+# 'result=ok' by itself cannot certify this selected dump.
+printf 'result=ok\n' > "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-only-ok" 'remote restore proof contract mismatch'
+write_restore_proof
+sed -i "s|backup_file=$plain|backup_file=other-backup.sql.gz|" "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-wrong-name" 'remote restore proof backup filename mismatch'
+write_restore_proof
+sed -i "s|backup_sha256=$plain_sha|backup_sha256=$(printf 'a%.0s' {1..64})|" "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-wrong-sha" 'remote restore proof backup sha256 mismatch'
+write_restore_proof
+printf 'backup_file=%s\n' "$plain" >> "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-duplicate-binding" 'remote restore proof duplicated binding field'
+write_restore_proof
+sed -i '/^tables=/d' "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-missing-tables" 'remote restore proof required tables mismatch'
+write_restore_proof
+sed -i '/^created_at=/d' "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-missing-date" 'remote restore proof created_at is not canonical UTC'
+write_restore_proof
+sed -i 's/^created_at=.*/created_at=2035-01-01T00:00:00Z/' "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-future-date" 'remote restore proof created_at is in the future'
+write_restore_proof
+printf 'created_at=2026-07-12T05:00:00Z\n' >> "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-duplicate-date" 'remote restore proof duplicated binding field: created_at'
+write_restore_proof
+printf 'unverified_extra_field=ok\n' >> "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-unexpected-field" 'remote restore proof unexpected fields'
+write_restore_proof
 
 # A proof probe that fails for transport or reader reasons is not "no proof":
 # the pull must fail instead of publishing a receipt without the evidence.
@@ -514,6 +552,22 @@ expired_unrelated="$no_proof_dest/weltgewebe-postgres-20200101T000000Z.sql.gz.ag
 printf 'expired unrelated encrypted copy\n' > "$expired_unrelated"
 touch -d '40 days ago' "$expired_unrelated"
 mv "$root/held-proof" "$remote/proofs/$base.restore-proof"
+# Simulate a crash after a first weekly proof hardlink but before its new
+# history receipt: the old daily receipt must not certify an unrecorded proof.
+first_proof_crash="$root/crash-first-proof"
+mkdir -p "$first_proof_crash/receipts"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$no_proof_dest/$core" "$first_proof_crash/$core"
+done
+cp "$remote/proofs/$base.restore-proof" "$first_proof_crash/$proof"
+cp "$root/no-proof-first-receipt" "$first_proof_crash/receipts/$base.pulled-20260712T040000.000000000Z.receipt"
+cp "$root/no-proof-first-receipt" "$first_proof_crash/latest-pull.receipt"
+pull "$first_proof_crash" test-host > /dev/null
+first_proof_sha="$(sha256sum "$remote/proofs/$base.restore-proof" | awk '{print $1}')"
+grep -qx "restore_proof_sha256=$first_proof_sha" "$first_proof_crash/latest-pull.receipt"
+[[ "$(find "$first_proof_crash/receipts" -type f -name "$base.pulled-*.receipt" | wc -l)" -eq 2 ]]
+pull "$first_proof_crash" test-host > /dev/null
+[[ "$(find "$first_proof_crash/receipts" -type f -name "$base.pulled-*.receipt" | wc -l)" -eq 2 ]]
 LOCAL_RETENTION_DAYS=1 pull "$no_proof_dest" test-host > /dev/null
 for core in "$file" "$manifest" "$age_manifest" "$proof"; do
   [[ -f "$no_proof_dest/$core" ]] || {
@@ -568,15 +622,110 @@ rm "$no_proof_dest/latest-pull.receipt"
 pull "$no_proof_dest" test-host > /dev/null
 cmp -s "$latest_history" "$no_proof_dest/latest-pull.receipt"
 
-# A changed remote proof must never replace the historical local proof.
-printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=ok\nnote=changed\n' > "$remote/proofs/$base.restore-proof"
-if pull "$no_proof_dest" test-host > /dev/null 2> "$root/proof-changed.stderr"; then
-  echo 'a changed restore proof replaced immutable history' >&2
+# A renewed real weekly restore of the SAME dump is an immutable revision.
+write_restore_proof '2026-07-19T05:00:00Z'
+renewed_sha="$(sha256sum "$remote/proofs/$base.restore-proof" | awk '{print $1}')"
+LOCAL_RETENTION_DAYS=1 pull "$no_proof_dest" test-host > /dev/null
+cmp -s "$root/late-proof-saved" "$no_proof_dest/$proof"
+revision="$no_proof_dest/receipts/$base.restore-proof.$renewed_sha.receipt"
+cmp -s "$remote/proofs/$base.restore-proof" "$revision" || {
+  echo 'renewed proof revision missing or changed' >&2
+  exit 1
+}
+grep -qx "restore_proof_sha256=$renewed_sha" "$no_proof_dest/latest-pull.receipt"
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 3))
+LOCAL_RETENTION_DAYS=1 pull "$no_proof_dest" test-host > /dev/null
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 3))
+cmp -s "$remote/proofs/$base.restore-proof" "$revision"
+
+# Interrupted proof publication: the new immutable SHA sidecar exists but no
+# matching history receipt was committed. A retry must seal it exactly once.
+crash_revision_dest="$root/crash-revision"
+mkdir -p "$crash_revision_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$no_proof_dest/$core" "$crash_revision_dest/$core"
+done
+for earlier in "$no_proof_dest/receipts/$base.pulled-"*.receipt; do
+  if ! grep -qx "restore_proof_sha256=$renewed_sha" "$earlier"; then
+    cp "$earlier" "$crash_revision_dest/receipts/$(basename "$earlier")"
+  fi
+done
+cp "$revision" "$crash_revision_dest/receipts/$(basename "$revision")"
+prior_latest="$(find "$crash_revision_dest/receipts" -maxdepth 1 -name "$base.pulled-*.receipt" | LC_ALL=C sort | tail -n 1)"
+cp "$prior_latest" "$crash_revision_dest/latest-pull.receipt"
+pull "$crash_revision_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$renewed_sha" "$crash_revision_dest/latest-pull.receipt"
+[[ "$(find "$crash_revision_dest/receipts" -type f -name "$base.pulled-*.receipt" | wc -l)" -eq 3 ]]
+pull "$crash_revision_dest" test-host > /dev/null
+[[ "$(find "$crash_revision_dest/receipts" -type f -name "$base.pulled-*.receipt" | wc -l)" -eq 3 ]]
+
+# Sidecar revisions are immutable too: reject symbolic links and changed bytes.
+cp "$revision" "$root/revision-original"
+rm "$revision"
+ln -s "$root/revision-original" "$revision"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/proof-revision-link.stderr"; then
+  echo 'symlinked immutable proof revision was accepted' >&2
   exit 1
 fi
-grep -qF 'normal pull artefact content differs' "$root/proof-changed.stderr"
-cmp -s "$root/late-proof-saved" "$no_proof_dest/$proof"
-printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=ok\n' > "$remote/proofs/$base.restore-proof"
+grep -qF 'normal pull unsafe proof revision artefact' "$root/proof-revision-link.stderr"
+rm "$revision"
+printf 'malicious altered proof\n' > "$revision"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/proof-revision-drift.stderr"; then
+  echo 'tampered immutable proof revision was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull proof revision content differs' "$root/proof-revision-drift.stderr"
+cp "$root/revision-original" "$revision"
+pull "$no_proof_dest" test-host > /dev/null
+
+# Old certified proof B cannot disappear or change just because the remote
+# source advances to a newer independently valid weekly restore C.
+write_restore_proof '2026-07-26T05:00:00Z'
+third_sha="$(sha256sum "$remote/proofs/$base.restore-proof" | awk '{print $1}')"
+pull "$no_proof_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$third_sha" "$no_proof_dest/latest-pull.receipt"
+cp "$revision" "$root/historical-B-original"
+printf 'tampered previously certified B\n' > "$revision"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/historical-B-tamper.stderr"; then
+  echo 'older certified B proof was ignored after new C became current' >&2
+  exit 1
+fi
+grep -qF 'normal pull proof revision content differs' "$root/historical-B-tamper.stderr"
+cp "$root/historical-B-original" "$revision"
+rm "$revision"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/historical-B-missing.stderr"; then
+  echo 'removed historical B proof went unnoticed' >&2
+  exit 1
+fi
+grep -qF 'normal pull certified restore proof missing' "$root/historical-B-missing.stderr"
+cp "$root/historical-B-original" "$revision"
+
+# The original immutable A proof is equally part of the historical chain.
+printf 'forged original A proof\n' > "$no_proof_dest/$proof"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/historical-A-tamper.stderr"; then
+  echo 'tampered original A proof was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull certified restore proof missing' "$root/historical-A-tamper.stderr"
+cp "$root/late-proof-saved" "$no_proof_dest/$proof"
+
+historical_c="$(grep -l "^restore_proof_sha256=$third_sha$" "$no_proof_dest/receipts/$base.pulled-"*.receipt)"
+cp "$historical_c" "$root/historical-C-original"
+printf 'restore_proof_sha256=%s\n' "$third_sha" >> "$historical_c"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/historical-C-duplicate.stderr"; then
+  echo 'duplicate SHA declaration inside a signed receipt was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull duplicated historical proof sha256 field' "$root/historical-C-duplicate.stderr"
+cp "$root/historical-C-original" "$historical_c"
+
+# Retain the older producer proof as the remote's current document, proving
+# refresh does not accidentally replace our now-certified newer C receipt.
+write_restore_proof '2026-07-19T05:00:00Z'
+pull "$no_proof_dest" test-host > /dev/null
+[[ -f "$no_proof_dest/receipts/$base.restore-proof.$third_sha.receipt" ]]
 
 # Partial core sets and pre-existing symlinks are not an idempotent pull.
 partial_dest="$root/partial-core"
