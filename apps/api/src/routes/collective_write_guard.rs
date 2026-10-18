@@ -291,6 +291,13 @@ fn authorize_node_mutation(
     auth: &AuthContext,
     node: &nodes::Node,
 ) -> Result<(), (StatusCode, &'static str)> {
+    // A mutation precondition includes the entire current node in its 412/428
+    // response. A mutation role alone is not a grant to read private nodes,
+    // and revoked nodes have no ordinary API readers, including their creator.
+    // A separately authorized moderation route is needed for exceptional recovery.
+    if !nodes::node_readable_to(node, Some(auth)) {
+        return Err((StatusCode::NOT_FOUND, "node not found"));
+    }
     if matches!(auth.role, Role::Weber | Role::Admin) {
         return Ok(());
     }
@@ -591,6 +598,56 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn protected_node_preconditions_deny_foreign_weber_admin_and_revoked_owner() {
+        let mut node = nodes::Node {
+            id: "confidential-fixture".into(),
+            kind: "test".into(),
+            title: "Confidential title".into(),
+            created_at: "2026".into(),
+            updated_at: "2026-10-18T12:00:00Z".into(),
+            has_authoritative_created_at: true,
+            created_by_account_id: Some("owner".into()),
+            search_visibility: nodes::SearchVisibility::Private,
+            summary: Some("confidential summary".into()),
+            info: None,
+            tags: vec![],
+            address: None,
+            location: nodes::Location { lat: 0.0, lon: 0.0 },
+        };
+        let viewer = |id: &str, role| AuthContext {
+            authenticated: true,
+            account_id: Some(id.to_string()),
+            device_id: None,
+            role,
+            expires_at: None,
+        };
+        let owner = viewer("owner", Role::Weber);
+        let foreign_weber = viewer("unrelated", Role::Weber);
+        let foreign_admin = viewer("unrelated-admin", Role::Admin);
+
+        for visibility in [
+            nodes::SearchVisibility::Private,
+            nodes::SearchVisibility::Hidden,
+        ] {
+            node.search_visibility = visibility;
+            for actor in [&foreign_weber, &foreign_admin] {
+                assert_eq!(
+                    authorize_node_mutation(actor, &node).unwrap_err().0,
+                    StatusCode::NOT_FOUND,
+                    "a foreign editor must never obtain the protected node precondition body"
+                );
+            }
+            assert!(authorize_node_mutation(&owner, &node).is_ok());
+        }
+        node.search_visibility = nodes::SearchVisibility::Revoked;
+        assert_eq!(
+            authorize_node_mutation(&owner, &node).unwrap_err().0,
+            StatusCode::NOT_FOUND,
+            "revocation prevents its owner from reading precondition content too"
+        );
+    }
 
     #[test]
     fn postgres_mutation_slots_preserve_pool_headroom() {

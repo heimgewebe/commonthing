@@ -1730,6 +1730,56 @@ async fn anonymous_node_reads_do_not_reveal_private_search_visibility() -> anyho
 
 #[tokio::test]
 #[serial]
+async fn protected_nodes_reject_foreign_mutation_before_object_preconditions() -> anyhow::Result<()>
+{
+    use axum::Extension;
+    use weltgewebe_api::middleware::auth::AuthContext;
+
+    let tmp = make_tmp_dir();
+    let (app, _env) = app_with_nodes(
+        &tmp.path().join("in"),
+        &[
+            r#"{"id":"secret-private","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"real-owner"}"#,
+            r#"{"id":"secret-hidden","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"hidden","created_by_account_id":"real-owner"}"#,
+            r#"{"id":"secret-revoked","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"revoked","created_by_account_id":"real-owner"}"#,
+        ],
+    )
+    .await;
+    let foreign_admin = app.layer(Extension(AuthContext {
+        authenticated: true,
+        account_id: Some("unrelated-admin".into()),
+        device_id: None,
+        role: Role::Admin,
+        expires_at: None,
+    }));
+
+    for id in ["secret-private", "secret-hidden", "secret-revoked"] {
+        for method in ["PATCH", "PUT", "DELETE"] {
+            // No If-Match is supplied: before the fix, the 428 body included the
+            // entire protected node even though GET already returned 404.
+            let request = Request::builder()
+                .method(method)
+                .uri(format!("/nodes/{id}"))
+                .header("Content-Type", "application/json")
+                .body(body::Body::from(r#"{"info":"no mutation"}"#))?;
+            let response = foreign_admin.clone().oneshot(request).await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} must not disclose or mutate {id}"
+            );
+            let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("SECRET-PRECONDITION-MARKER"),
+                "{method} must never emit a protected precondition payload"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn private_nodes_are_owner_only_with_cursor_pages() -> anyhow::Result<()> {
     use axum::Extension;
     use weltgewebe_api::middleware::auth::AuthContext;

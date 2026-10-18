@@ -521,8 +521,25 @@ fn check_precondition(
     }
 }
 
-async fn require_conversation_read_access(
+// Authorization and response projection MUST observe one PostgreSQL snapshot.
+// Otherwise a node can become private and receive a new message between the
+// public authorization query and the later message-page query.
+async fn begin_consistent_conversation_read(
     pool: &PgPool,
+) -> Result<Transaction<'_, Postgres>, ConversationApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| database_error("begin conversation read snapshot", error))?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| database_error("configure conversation read snapshot", error))?;
+    Ok(tx)
+}
+
+async fn require_conversation_read_access(
+    tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
     auth: &AuthContext,
 ) -> Result<(), ConversationApiError> {
@@ -531,7 +548,7 @@ async fn require_conversation_read_access(
          WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(conversation_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|error| database_error("classify conversation read target", error))?;
 
@@ -556,7 +573,7 @@ async fn require_conversation_read_access(
                 )
                 .bind(node_id)
                 .bind(reader_account_id(Some(auth)))
-                .fetch_one(pool)
+                .fetch_one(&mut **tx)
                 .await
                 .map_err(|error| database_error("authorize node conversation read", error))?;
                 if !allowed {
@@ -596,7 +613,7 @@ async fn require_conversation_read_access(
         )
         .bind(conversation_id)
         .bind(account_id)
-        .fetch_one(pool)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|error| database_error("authorize direct conversation read", error))?;
         if participant {
@@ -1059,13 +1076,14 @@ pub async fn get_node_conversation(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ConversationView>, ConversationApiError> {
     let pool = require_pool(&state)?;
+    let mut tx = begin_consistent_conversation_read(pool).await?;
     let row: Option<ConversationRow> = sqlx::query_as(
         "SELECT id::text, node_id, node_id_snapshot, node_title_snapshot, \
                 conversation_type, visibility, created_at, updated_at, archived_at, deleted_at \
          FROM domain_conversations WHERE node_id = $1 AND deleted_at IS NULL",
     )
     .bind(node_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| database_error("get node conversation", error))?;
 
@@ -1076,7 +1094,10 @@ pub async fn get_node_conversation(
             "the node conversation does not exist",
         )
     })?;
-    require_conversation_read_access(pool, &row.0, &auth).await?;
+    require_conversation_read_access(&mut tx, &row.0, &auth).await?;
+    tx.commit()
+        .await
+        .map_err(|error| database_error("commit node conversation read snapshot", error))?;
     Ok(Json(conversation_from_row(row)))
 }
 
@@ -1087,24 +1108,29 @@ pub async fn get_conversation(
 ) -> Result<Json<ConversationView>, ConversationApiError> {
     let pool = require_pool(&state)?;
     let id = parse_conversation_id(&id)?;
-    require_conversation_read_access(pool, &id, &auth).await?;
+    let mut tx = begin_consistent_conversation_read(pool).await?;
+    require_conversation_read_access(&mut tx, &id, &auth).await?;
     let row: Option<ConversationRow> = sqlx::query_as(
         "SELECT id::text, node_id, node_id_snapshot, node_title_snapshot, \
                 conversation_type, visibility, created_at, updated_at, archived_at, deleted_at \
          FROM domain_conversations WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| database_error("get conversation", error))?;
 
-    row.map(conversation_from_row).map(Json).ok_or_else(|| {
+    let view = row.map(conversation_from_row).ok_or_else(|| {
         ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
             "the node conversation does not exist",
         )
-    })
+    })?;
+    tx.commit()
+        .await
+        .map_err(|error| database_error("commit conversation read snapshot", error))?;
+    Ok(Json(view))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1121,22 +1147,9 @@ pub async fn list_messages(
 ) -> Result<Json<MessagePage>, ConversationApiError> {
     let pool = require_pool(&state)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
-    require_conversation_read_access(pool, &conversation_id, &auth).await?;
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM domain_conversations \
-         WHERE id = $1::uuid AND deleted_at IS NULL)",
-    )
-    .bind(&conversation_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|error| database_error("check conversation for message list", error))?;
-    if !exists {
-        return Err(ConversationApiError::new(
-            StatusCode::NOT_FOUND,
-            "conversation_not_found",
-            "the node conversation does not exist",
-        ));
-    }
+    let mut tx = begin_consistent_conversation_read(pool).await?;
+    // This already checks existence/deletion in the SAME snapshot.
+    require_conversation_read_access(&mut tx, &conversation_id, &auth).await?;
 
     let limit = query.limit.unwrap_or(DEFAULT_MESSAGE_PAGE_SIZE);
     if limit == 0 || limit > MAX_MESSAGE_PAGE_SIZE {
@@ -1175,7 +1188,7 @@ pub async fn list_messages(
         )
         .bind(cursor_id)
         .bind(&conversation_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|error| database_error("resolve message cursor", error))?;
         let (cursor_created_at, cursor_id) = cursor_position.ok_or_else(|| {
@@ -1197,7 +1210,7 @@ pub async fn list_messages(
         .bind(cursor_created_at)
         .bind(cursor_id)
         .bind((limit + 1) as i64)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|error| database_error("list messages after cursor", error))?
     } else {
@@ -1209,11 +1222,14 @@ pub async fn list_messages(
         )
         .bind(&conversation_id)
         .bind((limit + 1) as i64)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|error| database_error("list messages", error))?
     };
 
+    tx.commit()
+        .await
+        .map_err(|error| database_error("commit message page read snapshot", error))?;
     let has_more = rows.len() > limit;
     let mut items: Vec<MessageView> = rows.into_iter().take(limit).map(message_from_row).collect();
     items.reverse();

@@ -245,7 +245,7 @@ jobs:
             if [[ "${workload}" == "mixed" ]]; then
               write_node_ids="$(psql "${database_url}" -Atc \
                 "SELECT string_agg(id, ',' ORDER BY id) FROM (
-                   SELECT id FROM domain_nodes ORDER BY id LIMIT 8
+                   SELECT id FROM domain_nodes WHERE search_visibility = 'public' ORDER BY id LIMIT 8
                  ) AS writer_nodes")"
               if [[ -z "${write_node_ids}" ]]; then
                 echo "CQ-02 fixture did not provide writer node ids" >&2
