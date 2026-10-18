@@ -187,7 +187,7 @@ verify_restore_proof() {
   created_at="$(manifest_value created_at "$candidate")"
   [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
     fail "remote restore proof created_at is not canonical UTC"
-  normalized="$(date -u -d "$created_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" ||
+  normalized="$(date -u -d "$created_at" +%Y-%m-%dT%H:%M:%SZ 2> /dev/null)" ||
     fail "remote restore proof created_at is invalid UTC"
   [[ "$normalized" == "$created_at" ]] ||
     fail "remote restore proof created_at is not canonical UTC"
@@ -370,7 +370,7 @@ for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
       archived_proof="$DEST_DIR/$proof"
       [[ ! -L "$archived_proof" ]] || fail "normal pull unsafe existing artefact: $proof"
       if [[ ! -f "$archived_proof" ]] ||
-          [[ "$(sha256sum "$archived_proof" | awk '{print $1}')" != "$historical_proof_sha" ]]; then
+        [[ "$(sha256sum "$archived_proof" | awk '{print $1}')" != "$historical_proof_sha" ]]; then
         archived_proof="$DEST_DIR/receipts/${base}.restore-proof.${historical_proof_sha}.receipt"
       fi
       [[ -f "$archived_proof" && ! -L "$archived_proof" ]] ||
