@@ -524,15 +524,31 @@ pub async fn load_edges() -> std::io::Result<OrderedCache<Edge>> {
     Ok(edges)
 }
 
-// A Faden must not disclose the ID or title of an unreadable node.
-/// Legacy untyped Fäden are treated as node references when their ID resolves
-/// to a node; typed account and webgemeindezentrum endpoints are unaffected.
-fn edge_references_hidden_node(edge: &Edge, hidden: &HashSet<String>) -> bool {
-    let references = |kind: Option<&str>, id: &str| {
-        (kind.is_none() || kind == Some("node")) && hidden.contains(id)
+/// Fäden cannot expose hidden nodes, including typed node references whose
+/// cache row is missing. PostgreSQL loader may intentionally omit malformed
+/// node coordinates; absence from its public projection is not authorization.
+/// Legacy untyped endpoints resolve to a node, account or known role; unknown
+/// PostgreSQL endpoints fail closed rather than leaking a removed node id.
+fn edge_exposes_unreadable_node(
+    edge: &Edge,
+    hidden: &HashSet<String>,
+    known_nodes: &HashSet<String>,
+    known_accounts: &HashSet<String>,
+    strict_missing: bool,
+) -> bool {
+    let rejects = |kind: Option<&str>, id: &str| match kind {
+        Some("node") => hidden.contains(id) || (strict_missing && !known_nodes.contains(id)),
+        None => {
+            hidden.contains(id)
+                || (strict_missing
+                    && !known_nodes.contains(id)
+                    && !known_accounts.contains(id)
+                    && !matches!(id, "gast" | "weber" | "admin"))
+        }
+        _ => false,
     };
-    references(edge.source_type.as_deref(), &edge.source_id)
-        || references(edge.target_type.as_deref(), &edge.target_id)
+    rejects(edge.source_type.as_deref(), &edge.source_id)
+        || rejects(edge.target_type.as_deref(), &edge.target_id)
 }
 
 pub async fn list_edges(
@@ -547,20 +563,41 @@ pub async fn list_edges(
     validate_cursor_limit(cursor_mode, limit)?;
 
     let viewer = auth.as_ref().map(|extension| &extension.0);
-    // Snapshot only restricted node IDs; do not acquire node and edge
-    // cache locks simultaneously, keeping established mutation lock order.
-    let hidden_node_ids: HashSet<String> = {
+    // Snapshot reader-relevant identities, never holding node, account, and
+    // edge locks together. PostgreSQL must reject node-typed dangling edges
+    // even if the public node projection deliberately omitted their rows.
+    let strict_missing =
+        state.config.domain_read_source == crate::config::DomainReadSource::Postgres;
+    let (hidden_node_ids, known_nodes): (HashSet<String>, HashSet<String>) = {
         let nodes = state.nodes.read().await;
-        nodes
-            .iter_in_order()
-            .filter(|node| !node_readable_to(node, viewer))
-            .map(|node| node.id.clone())
-            .collect()
+        let mut hidden = HashSet::new();
+        let mut known = HashSet::new();
+        for node in nodes.iter_in_order() {
+            if !node_readable_to(node, viewer) {
+                hidden.insert(node.id.clone());
+            }
+            if strict_missing {
+                known.insert(node.id.clone());
+            }
+        }
+        (hidden, known)
+    };
+    let known_accounts: HashSet<String> = if strict_missing {
+        let accounts = state.accounts.read().await;
+        accounts.iter().map(|(id, _)| id.clone()).collect()
+    } else {
+        HashSet::new()
     };
     let now = Utc::now();
     let matches = |edge: &&Edge| {
         edge_matches_list_at(edge, src, dst, now)
-            && !edge_references_hidden_node(edge, &hidden_node_ids)
+            && !edge_exposes_unreadable_node(
+                edge,
+                &hidden_node_ids,
+                &known_nodes,
+                &known_accounts,
+                strict_missing,
+            )
     };
 
     let cache = state.edges.read().await;
@@ -603,23 +640,47 @@ pub async fn get_edge(
     drop(cache);
 
     let viewer = auth.as_ref().map(|extension| &extension.0);
-    let hidden_node_ids: HashSet<String> = {
+    let strict_missing =
+        state.config.domain_read_source == crate::config::DomainReadSource::Postgres;
+    let (hidden_node_ids, known_nodes): (HashSet<String>, HashSet<String>) = {
         let nodes = state.nodes.read().await;
+        let mut hidden = HashSet::new();
+        let mut known = HashSet::new();
+        for (id, kind) in [
+            (&edge.source_id, edge.source_type.as_deref()),
+            (&edge.target_id, edge.target_type.as_deref()),
+        ] {
+            if kind.is_none() || kind == Some("node") {
+                if let Some(node) = nodes.get(id) {
+                    known.insert(id.clone());
+                    if !node_readable_to(node, viewer) {
+                        hidden.insert(id.clone());
+                    }
+                }
+            }
+        }
+        (hidden, known)
+    };
+    let known_accounts: HashSet<String> = if strict_missing {
+        let accounts = state.accounts.read().await;
         [
             (&edge.source_id, edge.source_type.as_deref()),
             (&edge.target_id, edge.target_type.as_deref()),
         ]
         .into_iter()
-        .filter(|(_, kind)| kind.is_none() || *kind == Some("node"))
-        .filter_map(|(id, _)| {
-            nodes
-                .get(id)
-                .filter(|node| !node_readable_to(node, viewer))
-                .map(|_| id.clone())
-        })
+        .filter(|(_, kind)| kind.is_none())
+        .filter_map(|(id, _)| accounts.get(id).map(|_| id.clone()))
         .collect()
+    } else {
+        HashSet::new()
     };
-    if edge_references_hidden_node(&edge, &hidden_node_ids) {
+    if edge_exposes_unreadable_node(
+        &edge,
+        &hidden_node_ids,
+        &known_nodes,
+        &known_accounts,
+        strict_missing,
+    ) {
         return Err(StatusCode::NOT_FOUND);
     }
 

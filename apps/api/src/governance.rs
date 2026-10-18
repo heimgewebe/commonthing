@@ -546,7 +546,12 @@ pub async fn create_sach_proposal_at_center(
             .await
             .map_err(CreateProposalError::Database)?;
         Some(
-            sqlx::query_scalar("SELECT title FROM domain_nodes WHERE id = $1 FOR SHARE")
+            // This is a PUBLIC Sachantrag: even a private-node owner may
+            // not copy its title/id into the world-readable proposal snapshot.
+            // FOR SHARE keeps public visibility stable until the proposal commits.
+            sqlx::query_scalar(
+                "SELECT title FROM domain_nodes WHERE id = $1 AND search_visibility = 'public' FOR SHARE",
+            )
                 .bind(target_node_id)
                 .fetch_optional(&mut *tx)
                 .await

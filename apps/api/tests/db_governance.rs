@@ -153,6 +153,44 @@ async fn sachantraege_require_weber_allow_multiple_and_accept_without_promotion(
         Err(CreateProposalError::NotSachApplicant)
     ));
 
+    // A public proposal must never snapshot the ID/title of a private,
+    // hidden or revoked node, including if the applicant is its owner.
+    for state in ["private", "hidden", "revoked"] {
+        sqlx::query("UPDATE domain_nodes SET search_visibility = $1 WHERE id = $2")
+            .bind(state)
+            .bind(SACH_NODE)
+            .execute(&pool)
+            .await
+            .expect("test-only visibility change");
+        let rejected = create_sach_proposal(
+            &pool,
+            WEBER_A,
+            "Weber A",
+            "Attempted sensitive reference",
+            None,
+            Some(SACH_NODE),
+            t0,
+        )
+        .await;
+        assert!(
+            matches!(rejected, Err(CreateProposalError::TargetNodeNotFound)),
+            "public proposal accepted sensitive target: {state}"
+        );
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM governance_proposals WHERE target_node_id = $1",
+        )
+        .bind(SACH_NODE)
+        .fetch_one(&pool)
+        .await
+        .expect("read synthetic proposal count");
+        assert_eq!(leaked, 0, "sensitive target was snapshotted: {state}");
+    }
+    sqlx::query("UPDATE domain_nodes SET search_visibility = 'public' WHERE id = $1")
+        .bind(SACH_NODE)
+        .execute(&pool)
+        .await
+        .expect("restore public test fixture");
+
     let first = create_sach_proposal(
         &pool,
         WEBER_A,

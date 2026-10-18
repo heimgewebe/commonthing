@@ -2697,6 +2697,30 @@ async fn private_node_conversations_require_the_owner_at_every_read_entry() {
             "owner must read own conversation: {path}"
         );
     }
+    // A known deterministic conversation ID must not let a foreign Weber
+    // or administrator write a message into a private node.
+    for (foreign, key) in [
+        (other.as_str(), "f0000000-0000-4000-8000-000000000002"),
+        (admin.as_str(), "f0000000-0000-4000-8000-000000000003"),
+    ] {
+        let (status, _) = json_response(
+            &router,
+            request(
+                "POST",
+                &format!("/conversations/{conversation_id}/messages"),
+                Some(foreign),
+                Some(r#"{"content":"Attempted private conversation injection"}"#),
+                Some(key),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "nonowner write confirmed private conversation"
+        );
+    }
     // Canonical deletion of a node with messages must not make its
     // archived private conversation anonymously visible.
     let message_path = format!("/conversations/{conversation_id}/messages");

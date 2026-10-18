@@ -1733,3 +1733,59 @@ async fn anonymous_edges_do_not_expose_private_node_endpoints() -> Result<()> {
     }
     Ok(())
 }
+
+/// PostgreSQL may skip one malformed historic node when constructing its
+/// read cache while retaining neighboring edges. Absence is NOT permission.
+#[tokio::test]
+#[serial]
+async fn postgres_edges_reject_node_references_missing_from_cache() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    write_lines(
+        &in_dir.join("demo.nodes.jsonl"),
+        &[r#"{"id":"known-public","title":"Public node","location":{"lat":53.5,"lon":10.0}}"#],
+    );
+    write_lines(
+        &in_dir.join("demo.edges.jsonl"),
+        &[
+            r#"{"id":"edge-a-public","source_id":"known-public","source_type":"node","target_id":"known-public","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-b-missing","source_id":"omitted-private-node","source_type":"node","target_id":"known-public","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-c-legacy-missing","source_id":"omitted-private-node","target_id":"known-public","edge_kind":"reference"}"#,
+            r#"{"id":"edge-d-account","source_id":"some-account","source_type":"account","target_id":"known-public","target_type":"node","edge_kind":"reference"}"#,
+        ],
+    );
+    let _env = set_gewebe_in_dir(&in_dir);
+    let mut state = test_state().await?;
+    state.config.domain_read_source = DomainReadSource::Postgres;
+    *state.nodes.write().await = weltgewebe_api::routes::nodes::load_nodes().await?;
+    // The route is intentionally mounted without the DB-generation middleware:
+    // here we isolate its own fail-closed endpoint filter.
+    let app = Router::new().merge(api_router()).with_state(state);
+    for uri in ["/edges", "/edges?pagination=cursor&limit=1"] {
+        let result = app
+            .clone()
+            .oneshot(Request::get(uri).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(result.status(), StatusCode::OK, "{uri}");
+        let content = body::to_bytes(result.into_body(), usize::MAX).await?;
+        let text = String::from_utf8(content.to_vec())?;
+        assert!(text.contains("edge-a-public"), "{uri}: {text}");
+        assert!(!text.contains("omitted-private-node"), "{uri}: {text}");
+        assert!(!text.contains("edge-b-missing"), "{uri}: {text}");
+        assert!(!text.contains("edge-c-legacy-missing"), "{uri}: {text}");
+    }
+    for id in ["edge-b-missing", "edge-c-legacy-missing"] {
+        let result = app
+            .clone()
+            .oneshot(Request::get(format!("/edges/{id}")).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(result.status(), StatusCode::NOT_FOUND, "{id}");
+    }
+    assert_eq!(
+        app.oneshot(Request::get("/edges/edge-d-account").body(body::Body::empty())?)
+            .await?
+            .status(),
+        StatusCode::OK,
+    );
+    Ok(())
+}

@@ -28,7 +28,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    auth::role::Role, config::DomainReadSource, middleware::auth::AuthContext, state::ApiState,
+    advisory_lock::node_mutation_lock_key, auth::role::Role, config::DomainReadSource,
+    middleware::auth::AuthContext, state::ApiState,
 };
 
 use super::{
@@ -699,15 +700,18 @@ async fn require_conversation_writable(
     // Fast-path node conversations without touching the global governance cutover row.
     // The first read is only a classification hint; the row is locked and re-read below
     // before the write is authorized, so deletion or an unexpected type change cannot race.
-    let observed_type: Option<String> = sqlx::query_scalar(
-        "SELECT conversation_type FROM domain_conversations WHERE id = $1::uuid AND deleted_at IS NULL",
+    // Initial classification does not lock the conversation yet: the node
+    // mutation advisory lock and node row lock must be acquired FIRST.
+    let observed: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT conversation_type, node_id FROM domain_conversations
+         WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(conversation_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|error| database_error("classify conversation write target", error))?;
 
-    let observed_type = observed_type.ok_or_else(|| {
+    let (observed_type, observed_node_id) = observed.ok_or_else(|| {
         ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
@@ -716,25 +720,74 @@ async fn require_conversation_writable(
     })?;
 
     if observed_type == "node" {
-        let locked_target: Option<(String, Option<String>, Option<DateTime<Utc>>)> =
-            sqlx::query_as(
-                "SELECT conversation_type, node_id, archived_at \
-                 FROM domain_conversations \
-                 WHERE id = $1::uuid AND deleted_at IS NULL FOR SHARE",
+        // Canonical node writes acquire the same advisory key. A FOR SHARE
+        // row lock also serializes visibility changes by other DB writers.
+        // This respects the node -> conversation lock order of node deletion.
+        let allowed_node = if let Some(node_id) = observed_node_id.as_deref() {
+            sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+                .bind(node_mutation_lock_key(node_id))
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| database_error("lock conversation target node", error))?;
+            sqlx::query_scalar::<_, bool>(
+                "SELECT (search_visibility = 'public' OR
+                   (search_visibility IN ('private','hidden')
+                    AND $2::text IS NOT NULL
+                    AND weltgewebe_search_node_owner_account_id(payload) = $2::text))
+                 FROM domain_nodes WHERE id = $1 FOR SHARE",
             )
-            .bind(conversation_id)
+            .bind(node_id)
+            .bind(reader_account_id(Some(auth)))
             .fetch_optional(&mut **tx)
             .await
-            .map_err(|error| database_error("lock node conversation write target", error))?;
+            .map_err(|error| database_error("authorize conversation message node", error))?
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        let locked_target: Option<(
+            String,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT conversation_type, node_id, archived_at, archived_node_visibility
+                 FROM domain_conversations
+                 WHERE id = $1::uuid AND deleted_at IS NULL FOR SHARE",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| database_error("lock node conversation write target", error))?;
 
         return match locked_target {
-            Some((conversation_type, Some(_), None)) if conversation_type == "node" => Ok(()),
-            Some((conversation_type, None, Some(_))) if conversation_type == "node" => {
-                Err(ConversationApiError::new(
-                    StatusCode::CONFLICT,
-                    "conversation_archived",
-                    "the node conversation is archived and read-only",
-                ))
+            Some((conversation_type, Some(node_id), None, _)) if conversation_type == "node" => {
+                if !allowed_node || observed_node_id.as_deref() != Some(node_id.as_str()) {
+                    Err(ConversationApiError::new(
+                        StatusCode::NOT_FOUND,
+                        "conversation_not_found",
+                        "the conversation does not exist",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Some((conversation_type, None, Some(_), archived_visibility))
+                if conversation_type == "node" =>
+            {
+                if archived_visibility.as_deref() != Some("public") {
+                    Err(ConversationApiError::new(
+                        StatusCode::NOT_FOUND,
+                        "conversation_not_found",
+                        "the conversation does not exist",
+                    ))
+                } else {
+                    Err(ConversationApiError::new(
+                        StatusCode::CONFLICT,
+                        "conversation_archived",
+                        "the node conversation is archived and read-only",
+                    ))
+                }
             }
             None => Err(ConversationApiError::new(
                 StatusCode::NOT_FOUND,
