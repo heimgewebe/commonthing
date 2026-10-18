@@ -395,8 +395,10 @@ mv -f "$receipt_tmp" "$receipt"
 
 # Retention never deletes legacy plaintext recovery points. Their retirement
 # needs a separately verified age restore and an explicit operator decision.
+# The just-certified recovery point stays intact even if a restore proof arrived
+# after the ciphertext and manifests passed the normal retention age.
 if ((LOCAL_RETENTION_DAYS > 0)); then
-  find "$DEST_DIR" -maxdepth 1 -type f \
+  find "$DEST_DIR" -maxdepth 1 -type f ! -name "${base}.*" \
     \( -name "${BACKUP_PREFIX}-*.sql.gz.age" -o -name "${BACKUP_PREFIX}-*.sha256.manifest" -o -name "${BACKUP_PREFIX}-*.restore-proof" \) \
     -mtime +"$LOCAL_RETENTION_DAYS" -delete
 fi

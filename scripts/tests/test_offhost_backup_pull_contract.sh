@@ -505,8 +505,27 @@ cp "${no_proof_history[0]}" "$root/no-proof-first-receipt"
 for core in "$file" "$manifest" "$age_manifest"; do
   cp "$no_proof_dest/$core" "$root/early-$core"
 done
+# A weekly proof may arrive long after the encrypted core's retention age.
+# A fresh completion receipt must never certify files deleted in the same run.
+for core in "$file" "$manifest" "$age_manifest"; do
+  touch -d '40 days ago' "$no_proof_dest/$core"
+done
+expired_unrelated="$no_proof_dest/weltgewebe-postgres-20200101T000000Z.sql.gz.age"
+printf 'expired unrelated encrypted copy\n' > "$expired_unrelated"
+touch -d '40 days ago' "$expired_unrelated"
 mv "$root/held-proof" "$remote/proofs/$base.restore-proof"
-pull "$no_proof_dest" test-host > /dev/null
+LOCAL_RETENTION_DAYS=1 pull "$no_proof_dest" test-host > /dev/null
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  [[ -f "$no_proof_dest/$core" ]] || {
+    echo "late restore proof retention deleted its active backup: $core" >&2
+    exit 1
+  }
+done
+[[ ! -e "$expired_unrelated" ]] || {
+  echo 'retention kept unrelated expired ciphertext' >&2
+  exit 1
+}
+grep -qx "file=$file" "$no_proof_dest/latest-pull.receipt"
 cmp -s "$remote/proofs/$base.restore-proof" "$no_proof_dest/$proof"
 cmp -s "$root/no-proof-first-receipt" "${no_proof_history[0]}"
 for core in "$file" "$manifest" "$age_manifest"; do
