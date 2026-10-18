@@ -206,12 +206,16 @@ pub async fn load_nodes_bbox_from_postgres(
     max_lng: f64,
     limit: usize,
     offset: i64,
+    owner_account_id: Option<&str>,
 ) -> Result<Vec<Node>> {
     let limit = i64::try_from(limit).context("node BBOX limit exceeds PostgreSQL integer range")?;
     let rows: Vec<NodeRow> = sqlx::query_as(
         "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility \
          FROM domain_nodes \
          WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 \
+           AND (search_visibility = 'public' OR
+             (search_visibility IN ('private', 'hidden') AND $7::text IS NOT NULL
+              AND weltgewebe_search_node_owner_account_id(payload) = $7::text))
          ORDER BY id ASC LIMIT $5 OFFSET $6",
     )
     .bind(min_lat)
@@ -220,6 +224,7 @@ pub async fn load_nodes_bbox_from_postgres(
     .bind(max_lng)
     .bind(limit)
     .bind(offset)
+    .bind(owner_account_id)
     .fetch_all(pool)
     .await
     .context("failed to load BBOX node page from domain_nodes")?;
@@ -248,6 +253,7 @@ pub async fn load_nodes_bbox_after_id_from_postgres(
     max_lng: f64,
     limit: usize,
     after_id: &str,
+    owner_account_id: Option<&str>,
 ) -> Result<Vec<Node>> {
     let limit = i64::try_from(limit).context("node BBOX limit exceeds PostgreSQL integer range")?;
     let rows: Vec<NodeRow> = sqlx::query_as(
@@ -255,6 +261,9 @@ pub async fn load_nodes_bbox_after_id_from_postgres(
          FROM domain_nodes \
          WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 \
            AND id > $5 \
+           AND (search_visibility = 'public' OR
+             (search_visibility IN ('private', 'hidden') AND $7::text IS NOT NULL
+              AND weltgewebe_search_node_owner_account_id(payload) = $7::text))
          ORDER BY id ASC LIMIT $6",
     )
     .bind(min_lat)
@@ -263,6 +272,7 @@ pub async fn load_nodes_bbox_after_id_from_postgres(
     .bind(max_lng)
     .bind(after_id)
     .bind(limit)
+    .bind(owner_account_id)
     .fetch_all(pool)
     .await
     .context("failed to load cursor-anchored BBOX node page from domain_nodes")?;

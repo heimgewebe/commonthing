@@ -1682,3 +1682,54 @@ async fn post_edges_rejects_create_when_edge_cache_limit_zero_and_file_missing()
 
     Ok(())
 }
+
+/// Synthetic private-node faden: ordinary edge endpoints cannot circumvent
+/// node read authorization, including legacy untyped and cursor list paths.
+#[tokio::test]
+#[serial]
+async fn anonymous_edges_do_not_expose_private_node_endpoints() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    write_lines(
+        &in_dir.join("demo.nodes.jsonl"),
+        &[
+            r#"{"id":"node-public","title":"Public synthetic node","location":{"lat":53.5,"lon":10.0},"search_visibility":"public"}"#,
+            r#"{"id":"node-private","title":"Private synthetic node","location":{"lat":53.6,"lon":10.1},"search_visibility":"private","created_by_account_id":"owner"}"#,
+        ],
+    );
+    write_lines(
+        &in_dir.join("demo.edges.jsonl"),
+        &[
+            r#"{"id":"edge-public","source_id":"node-public","target_id":"node-public","source_type":"node","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-private","source_id":"node-private","target_id":"node-public","source_type":"node","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-legacy-private","source_id":"node-private","target_id":"node-public","edge_kind":"reference"}"#,
+        ],
+    );
+    let _env = set_gewebe_in_dir(&in_dir);
+    let state = test_state().await?;
+    *state.nodes.write().await = weltgewebe_api::routes::nodes::load_nodes().await?;
+    let app = Router::new().merge(api_router()).with_state(state);
+    for uri in ["/edges", "/edges?pagination=cursor&limit=1"] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let payload: serde_json::Value = serde_json::from_slice(&body)?;
+        let items = payload
+            .as_array()
+            .or_else(|| payload.get("items").and_then(|x| x.as_array()))
+            .expect("edge list response");
+        assert_eq!(items.len(), 1, "{uri}");
+        assert_eq!(items[0]["id"], "edge-public");
+    }
+    for id in ["edge-private", "edge-legacy-private"] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(format!("/edges/{id}")).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{id}");
+    }
+    Ok(())
+}

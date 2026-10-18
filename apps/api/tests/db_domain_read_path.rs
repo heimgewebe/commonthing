@@ -14,7 +14,8 @@ use weltgewebe_api::{
         DomainReadSource, PasskeyCredentialSource,
     },
     domain_db::{
-        load_accounts_from_postgres, load_edges_from_postgres, load_nodes_bbox_from_postgres,
+        load_accounts_from_postgres, load_edges_from_postgres,
+        load_nodes_bbox_after_id_from_postgres, load_nodes_bbox_from_postgres,
         load_nodes_from_postgres,
     },
     routes::{accounts::GarnrolleMapState, api_router},
@@ -147,7 +148,7 @@ async fn node_bbox_route_reads_postgres_directly_with_cursor_contract() {
     .await
     .expect("insert BBOX nodes");
 
-    let direct = load_nodes_bbox_from_postgres(&pool, 53.4, 53.7, 9.8, 10.1, 10, 0)
+    let direct = load_nodes_bbox_from_postgres(&pool, 53.4, 53.7, 9.8, 10.1, 10, 0, None)
         .await
         .expect("direct BBOX query");
     let direct_ids = direct
@@ -700,5 +701,80 @@ async fn jsonl_postgres_legacy_list_order_gap_diagnostic() {
     );
 
     // Keep the shared proof database tidy after the successful diagnostic run.
+    clean(&pool).await;
+}
+
+/// Run only against the test harness disposable PostgreSQL DATABASE_URL.
+/// Privacy filtering must happen in SQL before LIMIT/OFFSET and id cursors.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn postgres_bbox_private_node_is_filtered_before_limit_and_cursor() {
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_accounts (id,title,disabled) VALUES ('rp-private-owner','Fixture Owner',FALSE)"
+    ).execute(&pool).await.expect("insert synthetic owner");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility) VALUES \
+        ('rp-a-public','place','A',53.5,10.0,'{}'::jsonb,'public'),\
+        ('rp-b-private','place','B',53.5,10.0,'{\"created_by_account_id\":\"rp-private-owner\"}'::jsonb,'private'),\
+        ('rp-c-public','place','C',53.5,10.0,'{}'::jsonb,'public'),\
+        ('rp-d-hidden','place','D',53.5,10.0,'{\"created_by_account_id\":\"rp-private-owner\"}'::jsonb,'hidden'),\
+        ('rp-e-revoked','place','E',53.5,10.0,'{\"created_by_account_id\":\"rp-private-owner\"}'::jsonb,'revoked')"
+    ).execute(&pool).await.expect("insert mixed-privacy BBOX");
+    let ids = |nodes: Vec<weltgewebe_api::routes::nodes::Node>| {
+        nodes.into_iter().map(|n| n.id).collect::<Vec<_>>()
+    };
+    let public = load_nodes_bbox_from_postgres(&pool, 53.4, 53.6, 9.9, 10.1, 2, 0, None)
+        .await
+        .expect("anonymous BBOX");
+    assert_eq!(ids(public), vec!["rp-a-public", "rp-c-public"]);
+    let cursor = load_nodes_bbox_after_id_from_postgres(
+        &pool,
+        53.4,
+        53.6,
+        9.9,
+        10.1,
+        1,
+        "rp-a-public",
+        None,
+    )
+    .await
+    .expect("anonymous cursor");
+    assert_eq!(ids(cursor), vec!["rp-c-public"]);
+    let wrong =
+        load_nodes_bbox_from_postgres(&pool, 53.4, 53.6, 9.9, 10.1, 10, 0, Some("rp-other-owner"))
+            .await
+            .expect("nonowner BBOX");
+    assert_eq!(ids(wrong), vec!["rp-a-public", "rp-c-public"]);
+    let owner = load_nodes_bbox_from_postgres(
+        &pool,
+        53.4,
+        53.6,
+        9.9,
+        10.1,
+        10,
+        0,
+        Some("rp-private-owner"),
+    )
+    .await
+    .expect("owner BBOX");
+    assert_eq!(
+        ids(owner),
+        vec!["rp-a-public", "rp-b-private", "rp-c-public", "rp-d-hidden"]
+    );
+    let owner_cursor = load_nodes_bbox_after_id_from_postgres(
+        &pool,
+        53.4,
+        53.6,
+        9.9,
+        10.1,
+        1,
+        "rp-a-public",
+        Some("rp-private-owner"),
+    )
+    .await
+    .expect("owner cursor");
+    assert_eq!(ids(owner_cursor), vec!["rp-b-private"]);
     clean(&pool).await;
 }

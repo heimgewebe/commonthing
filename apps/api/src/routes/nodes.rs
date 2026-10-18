@@ -246,6 +246,24 @@ pub struct Node {
     pub location: Location,
 }
 
+/// Common node read policy: public for everyone, private and hidden
+/// for the authenticated owner only, revoked for no ordinary API reader.
+/// Administrative moderation needs its own separately authorized route.
+pub(crate) fn reader_account_id(auth: Option<&AuthContext>) -> Option<&str> {
+    auth.filter(|ctx| ctx.authenticated)
+        .and_then(|ctx| ctx.account_id.as_deref())
+}
+
+pub(crate) fn node_readable_to(node: &Node, auth: Option<&AuthContext>) -> bool {
+    match node.search_visibility {
+        SearchVisibility::Public => true,
+        SearchVisibility::Private | SearchVisibility::Hidden => reader_account_id(auth)
+            .zip(node.created_by_account_id.as_deref())
+            .is_some_and(|(reader, owner)| reader == owner),
+        SearchVisibility::Revoked => false,
+    }
+}
+
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeHistoryKind {
@@ -691,6 +709,7 @@ pub async fn load_nodes() -> std::io::Result<OrderedCache<Node>> {
 pub async fn get_node(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<Json<NodeDetails>, StatusCode> {
     // Clone before reading accounts so this endpoint never holds several state
     // locks at once. The projection middleware keeps both caches on the same
@@ -702,6 +721,9 @@ pub async fn get_node(
         .get(&id)
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
+    if !node_readable_to(&node, auth.as_ref().map(|extension| &extension.0)) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let created_by_account_current_title = match node.created_by_account_id.as_deref() {
         Some(account_id) => state
             .accounts
@@ -3906,7 +3928,10 @@ fn postgres_bbox_cursor_page(mut rows: Vec<Node>, limit: usize) -> CursorPage<No
 pub async fn list_nodes(
     State(state): State<ApiState>,
     Query(params): Query<HashMap<String, String>>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<Json<ListResponse<Node>>, StatusCode> {
+    let viewer = auth.as_ref().map(|extension| &extension.0);
+    let owner_account_id = reader_account_id(viewer);
     let bbox = match params.get("bbox") {
         Some(raw_bbox) => Some(parse_bbox(raw_bbox).ok_or(StatusCode::BAD_REQUEST)?),
         None => None,
@@ -3938,6 +3963,7 @@ pub async fn list_nodes(
                         bb.max_lng,
                         limit.saturating_add(1),
                         after_id,
+                        owner_account_id,
                     )
                     .await
                 }
@@ -3950,6 +3976,7 @@ pub async fn list_nodes(
                         bb.max_lng,
                         limit.saturating_add(1),
                         0,
+                        owner_account_id,
                     )
                     .await
                 }
@@ -3968,7 +3995,14 @@ pub async fn list_nodes(
         // an internal database/read failure.
         let offset = i64::try_from(offset).map_err(|_| StatusCode::BAD_REQUEST)?;
         let rows = load_nodes_bbox_from_postgres(
-            pool, bb.min_lat, bb.max_lat, bb.min_lng, bb.max_lng, limit, offset,
+            pool,
+            bb.min_lat,
+            bb.max_lat,
+            bb.min_lng,
+            bb.max_lng,
+            limit,
+            offset,
+            owner_account_id,
         )
         .await
         .map_err(|error| {
@@ -3985,6 +4019,7 @@ pub async fn list_nodes(
         // independent of the file/insertion order used by the legacy path.
         let refs: Vec<&Node> = cache
             .iter_in_order()
+            .filter(|node| node_readable_to(node, viewer))
             .filter(|node| match &bbox {
                 Some(bb) => point_in_bbox(node.location.lon, node.location.lat, bb),
                 None => true,
@@ -4002,6 +4037,7 @@ pub async fn list_nodes(
         let offset: usize = parse_usize_param(&params, "offset", 0)?;
         let out: Vec<Node> = cache
             .iter_in_order()
+            .filter(|node| node_readable_to(node, viewer))
             .filter(|node| match &bbox {
                 Some(bb) => point_in_bbox(node.location.lon, node.location.lat, bb),
                 None => true,

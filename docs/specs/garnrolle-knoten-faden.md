@@ -138,6 +138,36 @@ Prüfung erfolgt auf dem Server und gilt unabhängig von der sichtbaren
 Oberfläche. Versionsvorbedingungen (`If-Match`) schützen zusätzlich gegen
 überschriebene Paralleländerungen.
 
+### Lesen und Suchsichtbarkeit (Änderungsentwurf zu #1970)
+
+Der serverseitige Zustand search_visibility regelt nicht nur die Aufnahme
+in den Suchindex, sondern begrenzt die gewöhnlichen lesenden API-Projektionen.
+Ein öffentlich zugänglicher Link ist keine Erlaubnis für ein privates Objekt.
+
+| Zustand | Lesen durch Besucher / fremde Accounts | Lesen durch den authentifizierten Urheber |
+|---|---|---|
+| public | ja | ja |
+| private | nein | ja |
+| hidden | nein | ja, direkt und in eigenen Listen, nicht in der semantischen Suche |
+| revoked | nein | nein; Sonderzugriff nur über eigene moderierte APIs |
+
+Für Knoten mit fehlender historischer Urheberbindung gilt: private und
+hidden gewähren kein vermutetes Eigentümerrecht. Für bestehende
+historische Datensätze ohne expliziten Sichtbarkeitszustand bleibt die
+bisherige Vorgabe public erhalten.
+
+Autorisierung geschieht serverseitig **vor** Limits, Offsets und Cursorgrenzen,
+und zwar auch bei PostgreSQL-BBOX-Abfragen. Einzelzugriffe auf unzulässige
+Knoten und Fäden liefern 404 statt objektbezogene Daten. Faden-Endpunkte dürfen
+weder Knoten-IDs noch Knotentitel aus geschützten Knoten offenlegen.
+Aktive Knotengespräche erben diese Lesegrenze, einschließlich einzelner
+Gesprächs-IDs und Nachrichtenlisten. Eine reine Karten-/UI-Ausblendung oder
+ein Clientflag ist keine Autorisierung.
+
+**Noch gesondert zu prüfen:** Löschung und öffentliche Archivierung von
+Knotengesprächen, Caches während gleichzeitiger Sichtbarkeitsänderungen sowie
+bestehende Altclients. Dieser Vertragsentwurf ist keine Produktionsfreigabe.
+
 ## Fäden
 
 Fäden sind Beziehungen zwischen Garnrollen und Knoten. Der produktive
@@ -148,8 +178,8 @@ fremde Garnrolle als handelnden Ausgangspunkt vortäuschen.
 Dieser Schnitt eröffnet bewusst keinen allgemeinen manuellen
 `POST /edges`-Editor. Ein solcher Editor benötigt einen eigenen Vertrag für
 Fadenarten, Eigentum, Änderung, Entfernung und Missbrauchsschutz. Bis dahin
-bleiben Fäden aus den belegten Webungsaktionen abgeleitete, öffentlich lesbare
-Projektionen.
+bleiben Fäden aus den belegten Webungsaktionen abgeleitete Projektionen,
+die nur bei ausreichenden Leserechten an ihren Knotenendpunkten erscheinen.
 
 Freie interne Fadennotizen gehören nicht zur öffentlichen Projektion.
 

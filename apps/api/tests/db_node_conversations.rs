@@ -2636,3 +2636,66 @@ async fn private_direct_conversation_enforces_participants_unread_block_and_iden
 
     database.cleanup().await;
 }
+
+/// Real SQL and session proof, confined to a fresh temporary PostgreSQL schema.
+/// Both direct node and conversation-ID routes must deny anonymous/nonowners.
+#[tokio::test]
+#[serial]
+#[ignore = "requires direct PostgreSQL"]
+async fn private_node_conversations_require_the_owner_at_every_read_entry() {
+    let database = pool().await;
+    let pool = database.app_pool();
+    seed_account(&pool, AUTHOR_ID, "Autorin", "weber").await;
+    seed_account(&pool, OTHER_ID, "Anderer Weber", "weber").await;
+    seed_account(&pool, ADMIN_ID, "Administration", "admin").await;
+    seed_account(&pool, GUEST_ID, "Gast", "gast").await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,created_at,updated_at,payload,search_visibility)
+         VALUES ($1,'Ort','Nur für Eigentümer',NOW(),NOW(),$2::jsonb,'private')",
+    )
+    .bind(NODE_ID)
+    .bind(serde_json::json!({"created_by_account_id":AUTHOR_ID}))
+    .execute(&pool)
+    .await
+    .expect("insert private node and conversation");
+
+    let conversation_id: String =
+        sqlx::query_scalar("SELECT weltgewebe_node_conversation_id($1)::text")
+            .bind(NODE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("conversation ID");
+    let (router, author, other, admin, guest) = app(pool.clone()).await;
+    let paths = [
+        format!("/nodes/{NODE_ID}/conversation"),
+        format!("/conversations/{conversation_id}"),
+        format!("/conversations/{conversation_id}/messages"),
+    ];
+    for path in &paths {
+        for cookie in [
+            None,
+            Some(other.as_str()),
+            Some(admin.as_str()),
+            Some(guest.as_str()),
+        ] {
+            let (status, _) =
+                json_response(&router, request("GET", path, cookie, None, None, None)).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "private read leaked through {path}"
+            );
+        }
+        let (status, _) = json_response(
+            &router,
+            request("GET", path, Some(&author), None, None, None),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "owner must read own conversation: {path}"
+        );
+    }
+    database.cleanup().await;
+}

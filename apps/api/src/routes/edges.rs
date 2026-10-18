@@ -1,5 +1,6 @@
 use super::domain_write_guard::reject_edge_create_unless_writable;
 use super::health::{ensure_jsonl_size, load_policy_limits};
+use super::nodes::node_readable_to;
 use super::query::{
     cursor_page, parse_cursor_params, parse_usize_param, validate_cursor_limit, ListResponse,
     MAX_PAGE_SIZE,
@@ -16,12 +17,12 @@ use crate::utils::edges_path;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use tokio::{
@@ -523,9 +524,21 @@ pub async fn load_edges() -> std::io::Result<OrderedCache<Edge>> {
     Ok(edges)
 }
 
+// A Faden must not disclose the ID or title of an unreadable node.
+/// Legacy untyped Fäden are treated as node references when their ID resolves
+/// to a node; typed account and webgemeindezentrum endpoints are unaffected.
+fn edge_references_hidden_node(edge: &Edge, hidden: &HashSet<String>) -> bool {
+    let references = |kind: Option<&str>, id: &str| {
+        (kind.is_none() || kind == Some("node")) && hidden.contains(id)
+    };
+    references(edge.source_type.as_deref(), &edge.source_id)
+        || references(edge.target_type.as_deref(), &edge.target_id)
+}
+
 pub async fn list_edges(
     State(state): State<ApiState>,
     Query(params): Query<HashMap<String, String>>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<Json<ListResponse<PublicEdge>>, StatusCode> {
     let src = params.get("source_id").map(String::as_str);
     let dst = params.get("target_id").map(String::as_str);
@@ -533,8 +546,22 @@ pub async fn list_edges(
     let (cursor_mode, after_id) = parse_cursor_params(&params)?;
     validate_cursor_limit(cursor_mode, limit)?;
 
+    let viewer = auth.as_ref().map(|extension| &extension.0);
+    // Snapshot only restricted node IDs; do not acquire node and edge
+    // cache locks simultaneously, keeping established mutation lock order.
+    let hidden_node_ids: HashSet<String> = {
+        let nodes = state.nodes.read().await;
+        nodes
+            .iter_in_order()
+            .filter(|node| !node_readable_to(node, viewer))
+            .map(|node| node.id.clone())
+            .collect()
+    };
     let now = Utc::now();
-    let matches = |edge: &&Edge| edge_matches_list_at(edge, src, dst, now);
+    let matches = |edge: &&Edge| {
+        edge_matches_list_at(edge, src, dst, now)
+            && !edge_references_hidden_node(edge, &hidden_node_ids)
+    };
 
     let cache = state.edges.read().await;
 
@@ -566,6 +593,7 @@ pub async fn list_edges(
 pub async fn get_edge(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<Json<EdgeWithDetails>, StatusCode> {
     let cache = state.edges.read().await;
     let edge = cache.get(&id).cloned().ok_or(StatusCode::NOT_FOUND)?;
@@ -573,6 +601,27 @@ pub async fn get_edge(
         return Err(StatusCode::NOT_FOUND);
     }
     drop(cache);
+
+    let viewer = auth.as_ref().map(|extension| &extension.0);
+    let hidden_node_ids: HashSet<String> = {
+        let nodes = state.nodes.read().await;
+        [
+            (&edge.source_id, edge.source_type.as_deref()),
+            (&edge.target_id, edge.target_type.as_deref()),
+        ]
+        .into_iter()
+        .filter(|(_, kind)| kind.is_none() || *kind == Some("node"))
+        .filter_map(|(id, _)| {
+            nodes
+                .get(id)
+                .filter(|node| !node_readable_to(node, viewer))
+                .map(|_| id.clone())
+        })
+        .collect()
+    };
+    if edge_references_hidden_node(&edge, &hidden_node_ids) {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
     let mut source_details = None;
     let mut target_details = None;

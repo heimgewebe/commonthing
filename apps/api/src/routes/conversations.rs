@@ -1,7 +1,8 @@
 //! Public node conversations backed exclusively by PostgreSQL.
 //!
-//! Every PostgreSQL node owns exactly one public conversation through the
-//! migration trigger. Reads are public. Creating, editing and tombstoning
+//! Every PostgreSQL node owns exactly one conversation through the migration
+//! trigger. Active private or hidden nodes restrict conversation reads to
+//! their owner; deleted-node archives retain the existing public contract. Creating, editing and tombstoning
 //! messages uses the existing Weber/Admin write gate in `routes::api_router`;
 //! this module additionally enforces author-or-admin ownership.
 //!
@@ -31,7 +32,7 @@ use crate::{
 };
 
 use super::{
-    nodes::{ensure_node_activity_faden, repair_node_activity_faden},
+    nodes::{ensure_node_activity_faden, reader_account_id, repair_node_activity_faden},
     query::{decode_cursor, encode_cursor},
     webgemeindezentren::{
         ensure_webgemeindezentrum_activity_faden, repair_webgemeindezentrum_activity_faden,
@@ -524,8 +525,8 @@ async fn require_conversation_read_access(
     conversation_id: &str,
     auth: &AuthContext,
 ) -> Result<(), ConversationApiError> {
-    let target: Option<(String, String)> = sqlx::query_as(
-        "SELECT conversation_type, visibility FROM domain_conversations \
+    let target: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT conversation_type, visibility, node_id FROM domain_conversations \
          WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(conversation_id)
@@ -533,7 +534,7 @@ async fn require_conversation_read_access(
     .await
     .map_err(|error| database_error("classify conversation read target", error))?;
 
-    let Some((conversation_type, visibility)) = target else {
+    let Some((conversation_type, visibility, node_id)) = target else {
         return Err(ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
@@ -542,6 +543,31 @@ async fn require_conversation_read_access(
     };
 
     if visibility == "public" {
+        if conversation_type == "node" {
+            if let Some(node_id) = node_id.as_deref() {
+                let allowed: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM domain_nodes n
+                      WHERE n.id = $1 AND
+                       (n.search_visibility = 'public' OR
+                        (n.search_visibility IN ('private','hidden')
+                         AND $2::text IS NOT NULL
+                         AND weltgewebe_search_node_owner_account_id(n.payload) = $2::text)))",
+                )
+                .bind(node_id)
+                .bind(reader_account_id(Some(auth)))
+                .fetch_one(pool)
+                .await
+                .map_err(|error| database_error("authorize node conversation read", error))?;
+                if !allowed {
+                    return Err(ConversationApiError::new(
+                        StatusCode::NOT_FOUND,
+                        "conversation_not_found",
+                        "the conversation does not exist",
+                    ));
+                }
+            }
+            // Archived deleted-node conversations have no active node_id.
+        }
         return Ok(());
     }
 
@@ -963,6 +989,7 @@ fn require_author_or_admin(
 pub async fn get_node_conversation(
     State(state): State<ApiState>,
     Path(node_id): Path<String>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ConversationView>, ConversationApiError> {
     let pool = require_pool(&state)?;
     let row: Option<ConversationRow> = sqlx::query_as(
@@ -975,13 +1002,15 @@ pub async fn get_node_conversation(
     .await
     .map_err(|error| database_error("get node conversation", error))?;
 
-    row.map(conversation_from_row).map(Json).ok_or_else(|| {
+    let row = row.ok_or_else(|| {
         ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
             "the node conversation does not exist",
         )
-    })
+    })?;
+    require_conversation_read_access(pool, &row.0, &auth).await?;
+    Ok(Json(conversation_from_row(row)))
 }
 
 pub async fn get_conversation(
