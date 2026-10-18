@@ -288,13 +288,18 @@ abgeleitet werden.
 
 ## Gespräche
 
-Jeder PostgreSQL-Knoten besitzt genau einen öffentlichen Gesprächsraum.
-Angemeldete Gäste, Weber und Administratoren dürfen während des offenen
-Lebenszyklus Beiträge verfassen. Ein Beitrag besitzt einen Autoren-Snapshot und
-eine aktive Accountbindung:
+Jeder PostgreSQL-Knoten besitzt genau einen Gesprächsraum. Dessen **Lesezugriff**
+erbt die oben definierte Knotensichtbarkeit, einschließlich Metadaten und
+Nachrichten: `public` ist öffentlich lesbar, `private` und `hidden` nur für
+den angemeldeten Knoten-Eigentümer, `revoked` für keinen regulären Leser.
+Weder eine bekannte Gesprächs-ID noch die Rolle Weber/Administrator heben diese
+Lesesperre auf. Schreibberechtigte Accounts dürfen nur in für sie lesbaren,
+aktiven Räumen Beiträge verfassen. Ein Beitrag besitzt einen Autoren-Snapshot
+und eine aktive Accountbindung:
 
 - nur der Autor darf den eigenen Beitrag bearbeiten;
-- Autor oder Administrator dürfen ihn entfernen;
+- Autor oder Administrator dürfen ihn entfernen, jedoch nur bei bestehender
+  Leseberechtigung für den jeweiligen Knoten/Gesprächsraum;
 - beim Löschen eines Accounts wird die aktive Accountbindung entfernt, der
   historische Anzeigename und der Beitrag bleiben erhalten.
 
@@ -304,13 +309,17 @@ Gewebe gelöscht werden. Dabei gelten drei getrennte Wirkungen:
 - der Knoten und seine verbundenen Fadenprojektionen werden regulär entfernt;
 - ein leerer, automatisch erzeugter Gesprächsraum wird mit dem Knoten gelöscht;
 - ein Gesprächsraum mit Beiträgen wird im selben Datenbankvorgang vom Knoten
-  entkoppelt, mit Knoten-ID und letztem Knotentitel gekennzeichnet und als
-  schreibgeschütztes Archiv erhalten.
+  entkoppelt, mit Knoten-ID, letztem Knotentitel und der zuletzt wirksamen
+  Knotensichtbarkeit gekennzeichnet und als schreibgeschütztes Archiv erhalten.
 
-Das Archiv bleibt über seine stabile Gesprächs-ID öffentlich lesbar. Nach der
-Archivierung sind neue Beiträge und normale Inhaltsänderungen ausgeschlossen.
-Autoren dürfen eigene Beiträge weiterhin zurückziehen, Administratoren dürfen
-sie moderativ entfernen; beides erzeugt einen Tombstone statt einer physischen
+Ein Archiv ist über seine stabile Gesprächs-ID **nur dann öffentlich lesbar**,
+wenn sein gelöschter Knoten zuvor ausdrücklich `public` war. Archive von
+`private`, `hidden` oder `revoked` Knoten sowie historische Archive ohne
+nachweisbaren Sichtbarkeitssnapshot bleiben für gewöhnliche Lese- und
+Tombstone-Endpunkte geschlossen (404). Bei öffentlich lesbaren Archiven
+sind neue Beiträge und normale Inhaltsänderungen ausgeschlossen; Autoren
+dürfen ihre eigenen Beiträge weiterhin zurückziehen und Administratoren dürfen
+sie moderativ entfernen. Beides erzeugt einen Tombstone statt einer physischen
 Löschung. Beim Accountaustritt wird weiterhin nur die aktive Accountbindung
 gelöst. Die frühere Diskussion darf nicht durch das Entfernen ihres Kartenobjekts
 verschwinden oder nachträglich wiederbeschrieben werden. Die übergreifenden
