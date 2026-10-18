@@ -505,6 +505,16 @@ def _render_production_bbox_sql(
     query = _production_bbox_sql(function_name).replace(
         "FROM domain_nodes", f"FROM {schema}.domain_nodes", 1
     )
+    # The isolated scale fixture has only public nodes and deliberately does
+    # not install production's canonical owner-account SQL function.
+    # For the proven anonymous viewer ($7 = NULL), the owner-only branch is
+    # unreachable: inline the helper's result as NULL without inventing a
+    # benchmark-specific database function or testing a fake owner identity.
+    owner_function = "weltgewebe_search_node_owner_account_id(payload)"
+    if owner_function in query:
+        if bindings.get(7) != "NULL":
+            raise DomainScaleError("benchmark BBOX reads must use the anonymous viewer")
+        query = query.replace(owner_function, "NULL::text")
     placeholders = {int(value) for value in re.findall(r"\$(\d+)", query)}
     if placeholders != set(bindings):
         raise DomainScaleError(

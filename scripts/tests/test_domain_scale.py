@@ -177,6 +177,8 @@ class DomainScaleTests(unittest.TestCase):
             )
             self.assertIn("NULL::text IS NOT NULL", sql)
             self.assertIn("search_visibility = 'public'", sql)
+            self.assertNotIn("weltgewebe_search_node_owner_account_id", sql)
+            self.assertIn("NULL::text = NULL::text", sql)
             self.assertIn("ORDER BY id ASC LIMIT 1001 OFFSET 0", sql)
             self.assertIn("ORDER BY id ASC LIMIT 1001", sql)
             self.assertNotIn("ORDER BY id ASC LIMIT 5000", sql)
