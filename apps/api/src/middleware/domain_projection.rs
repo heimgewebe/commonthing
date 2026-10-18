@@ -23,8 +23,24 @@ use crate::{config::DomainReadSource, routes::auth::SESSION_COOKIE_NAME, state::
 /// requires updating this classifier before that scheme can be enabled. The read
 /// guard remains held for the full handler so no request can observe a partially replaced
 /// accounts/nodes/edges projection.
-fn may_use_previous_projection(method: &Method, has_session_cookie: bool) -> bool {
-    matches!(*method, Method::GET | Method::HEAD) && !has_session_cookie
+fn may_use_previous_projection(method: &Method, has_session_cookie: bool, path: &str) -> bool {
+    if !matches!(*method, Method::GET | Method::HEAD) || has_session_cookie {
+        return false;
+    }
+    // Anonymous projections are allowed to defer only where stale public
+    // content cannot expose node visibility changes. The old fast-path
+    // must not publish public->private/revoked transitions via graph routes.
+    let path = path.strip_prefix("/api").unwrap_or(path);
+    ![
+        "/nodes",
+        "/edges",
+        "/accounts",
+        "/conversations",
+        "/ortswebereien",
+        "/webgemeindezentren",
+    ]
+    .iter()
+    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
 pub async fn ensure_current_domain_projection(
@@ -38,7 +54,11 @@ pub async fn ensure_current_domain_projection(
     }
 
     let has_session_cookie = jar.get(SESSION_COOKIE_NAME).is_some();
-    let refresh = if may_use_previous_projection(request.method(), has_session_cookie) {
+    let refresh = if may_use_previous_projection(
+        request.method(),
+        has_session_cookie,
+        request.uri().path(),
+    ) {
         state.refresh_domain_projection_for_read().await
     } else {
         state.refresh_domain_projection_if_stale().await
@@ -69,14 +89,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_anonymous_safe_reads_may_use_previous_projection() {
-        assert!(may_use_previous_projection(&Method::GET, false));
-        assert!(may_use_previous_projection(&Method::HEAD, false));
-
-        assert!(!may_use_previous_projection(&Method::GET, true));
-        assert!(!may_use_previous_projection(&Method::HEAD, true));
-        assert!(!may_use_previous_projection(&Method::POST, false));
-        assert!(!may_use_previous_projection(&Method::PATCH, false));
-        assert!(!may_use_previous_projection(&Method::DELETE, false));
+    fn only_non_domain_anonymous_reads_may_use_previous_projection() {
+        assert!(may_use_previous_projection(
+            &Method::GET,
+            false,
+            "/api/health/ready"
+        ));
+        assert!(may_use_previous_projection(
+            &Method::HEAD,
+            false,
+            "/api/version"
+        ));
+        for path in [
+            "/nodes",
+            "/nodes/private",
+            "/api/nodes",
+            "/api/nodes/private",
+            "/edges",
+            "/api/edges/edge-id",
+            "/accounts/account-id",
+            "/api/accounts/account-id",
+            "/conversations/conv-id",
+            "/api/conversations/conv-id/messages",
+            "/api/ortswebereien",
+            "/api/webgemeindezentren/center",
+        ] {
+            assert!(
+                !may_use_previous_projection(&Method::GET, false, path),
+                "{path}"
+            );
+        }
+        assert!(!may_use_previous_projection(
+            &Method::GET,
+            true,
+            "/api/health/ready"
+        ));
+        assert!(!may_use_previous_projection(
+            &Method::HEAD,
+            true,
+            "/api/version"
+        ));
+        assert!(!may_use_previous_projection(
+            &Method::POST,
+            false,
+            "/api/health/ready"
+        ));
+        assert!(!may_use_previous_projection(
+            &Method::PATCH,
+            false,
+            "/api/nodes/private"
+        ));
+        assert!(!may_use_previous_projection(
+            &Method::DELETE,
+            false,
+            "/api/nodes/private"
+        ));
     }
 }

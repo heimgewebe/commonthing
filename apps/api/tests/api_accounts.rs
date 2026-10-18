@@ -767,3 +767,88 @@ async fn guest_account_is_a_public_garnrolle_without_public_position() -> Result
 
     Ok(())
 }
+
+/// A public Garnrolle must not re-publish titles or relationship IDs from a
+/// node its visitor cannot read. No real accounts are loaded by this fixture.
+#[tokio::test]
+async fn private_account_node_relations_require_read_authority() -> Result<()> {
+    use axum::Extension;
+    use weltgewebe_api::middleware::auth::AuthContext;
+    use weltgewebe_api::routes::nodes::SearchVisibility;
+
+    const ACCOUNT_ID: &str = "synthetic-owner";
+    let (created_at, expires_at) = active_faden_timestamps();
+    let mut state = test_state().await?;
+    let mut accounts = AccountStore::new();
+    accounts.insert(seed_account(ACCOUNT_ID));
+    state.accounts = Arc::new(RwLock::new(accounts));
+
+    let mut nodes = OrderedCache::new();
+    let mut private = test_node("private-node", "Confidential synthetic title", None);
+    private.search_visibility = SearchVisibility::Private;
+    private.created_by_account_id = Some(ACCOUNT_ID.to_string());
+    nodes.insert(private.id.clone(), private);
+    let mut public = test_node("public-node", "Public fixture", None);
+    public.search_visibility = SearchVisibility::Public;
+    public.created_by_account_id = Some(ACCOUNT_ID.to_string());
+    nodes.insert(public.id.clone(), public);
+    state.nodes = Arc::new(RwLock::new(nodes));
+
+    let mut edges = OrderedCache::new();
+    for (edge_id, node_id) in [
+        ("private-edge", "private-node"),
+        ("public-edge", "public-node"),
+    ] {
+        edges.insert(
+            edge_id.to_string(),
+            Edge {
+                id: edge_id.to_string(),
+                source_id: ACCOUNT_ID.to_string(),
+                source_type: Some("account".to_string()),
+                target_id: node_id.to_string(),
+                target_type: Some("node".to_string()),
+                edge_kind: "reference".to_string(),
+                faden_type: None,
+                faden_subject_id: None,
+                note: None,
+                created_at: Some(created_at.clone().into()),
+                expires_at: Some(Some(expires_at.clone().into())),
+            },
+        );
+    }
+    state.edges = Arc::new(RwLock::new(edges));
+    let app = Router::new().merge(api_router()).with_state(state);
+    let read = |app: Router| async move {
+        let response = app
+            .oneshot(Request::get("/accounts/synthetic-owner").body(body::Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = body::to_bytes(response.into_body(), usize::MAX).await?;
+        Ok::<String, anyhow::Error>(String::from_utf8(payload.to_vec())?)
+    };
+    let anonymous = read(app.clone()).await?;
+    assert!(anonymous.contains("Public fixture"));
+    assert!(!anonymous.contains("Confidential synthetic title"));
+    assert!(!anonymous.contains("private-node"));
+    assert!(!anonymous.contains("private-edge"));
+    let other = read(app.clone().layer(Extension(AuthContext {
+        authenticated: true,
+        account_id: Some("other".to_string()),
+        device_id: None,
+        role: Role::Admin,
+        expires_at: None,
+    })))
+    .await?;
+    assert!(!other.contains("Confidential synthetic title"));
+    let owner = read(app.layer(Extension(AuthContext {
+        authenticated: true,
+        account_id: Some(ACCOUNT_ID.to_string()),
+        device_id: None,
+        role: Role::Gast,
+        expires_at: None,
+    })))
+    .await?;
+    assert!(owner.contains("Confidential synthetic title"));
+    assert!(owner.contains("private-node"));
+    Ok(())
+}

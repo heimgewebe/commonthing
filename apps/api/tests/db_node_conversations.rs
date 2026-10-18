@@ -2697,5 +2697,54 @@ async fn private_node_conversations_require_the_owner_at_every_read_entry() {
             "owner must read own conversation: {path}"
         );
     }
+    // Canonical deletion of a node with messages must not make its
+    // archived private conversation anonymously visible.
+    let message_path = format!("/conversations/{conversation_id}/messages");
+    let (post_status, _) = json_response(
+        &router,
+        request(
+            "POST",
+            &message_path,
+            Some(&author),
+            Some(r#"{"content":"Synthetic private history"}"#),
+            Some("f0000000-0000-4000-8000-000000000001"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(post_status, StatusCode::CREATED);
+    let deleted = delete_node_with_edges_in_postgres(&pool, NODE_ID)
+        .await
+        .expect("private node deleted and archived");
+    assert_eq!(
+        deleted.conversation,
+        NodeConversationDeleteEffect::Archived {
+            archive_id: conversation_id.clone()
+        },
+    );
+    let visibility: Option<String> = sqlx::query_scalar(
+        "SELECT archived_node_visibility FROM domain_conversations WHERE id = $1::uuid",
+    )
+    .bind(&conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("archive visibility snapshot");
+    assert_eq!(visibility.as_deref(), Some("private"));
+    for path in &paths[1..] {
+        for cookie in [
+            None,
+            Some(author.as_str()),
+            Some(other.as_str()),
+            Some(admin.as_str()),
+        ] {
+            let (status, _) =
+                json_response(&router, request("GET", path, cookie, None, None, None)).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "archived secret exposed through {path}"
+            );
+        }
+    }
     database.cleanup().await;
 }

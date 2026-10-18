@@ -164,9 +164,17 @@ Aktive Knotengespräche erben diese Lesegrenze, einschließlich einzelner
 Gesprächs-IDs und Nachrichtenlisten. Eine reine Karten-/UI-Ausblendung oder
 ein Clientflag ist keine Autorisierung.
 
-**Noch gesondert zu prüfen:** Löschung und öffentliche Archivierung von
-Knotengesprächen, Caches während gleichzeitiger Sichtbarkeitsänderungen sowie
-bestehende Altclients. Dieser Vertragsentwurf ist keine Produktionsfreigabe.
+Bei Knotenlöschung übernimmt ein vorhandenes Gesprächsarchiv die kanonische
+Sichtbarkeit des gelöschten Knotens. Nur ausdrücklich zuvor öffentlich
+sichtbare Knoten erlauben das normale öffentliche Lesen ihrer Archive.
+Historische Archive ohne nachweisbare Sichtbarkeitsherkunft bleiben
+fail-closed; die Wiedersichtbarmachung erfordert einen gesonderten Herkunftsnachweis.
+Private Knotentitel dürfen auch nicht über Account-Aktivitätslisten
+erneut öffentlich ausgegeben werden. Ein automatischer Downgrade, der den
+Archiv-Sichtbarkeitssnapshot entfernt, ist ausdrücklich gesperrt.
+
+**Noch zu prüfen:** bestehende Altclients, Cache-Publikationsleistung und
+historische Archivberechtigungen. Dieser Vertrag ist keine Produktionsfreigabe.
 
 ## Fäden
 

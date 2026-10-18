@@ -1,6 +1,7 @@
 use super::{
     domain_write_guard::reject_account_create_unless_writable,
     edges::edge_is_active_at,
+    nodes::{node_readable_to, reader_account_id},
     query::{
         cursor_page, parse_cursor_params, parse_usize_param, validate_cursor_limit, ListResponse,
         MAX_PAGE_SIZE,
@@ -576,6 +577,7 @@ pub async fn list_accounts(
 async fn load_account_postgres_activity(
     state: &ApiState,
     account_id: &str,
+    viewer_account_id: Option<&str>,
 ) -> Result<Vec<AccountActivity>, StatusCode> {
     let pool = match state.config.domain_read_source {
         DomainReadSource::Jsonl => return Ok(Vec::new()),
@@ -600,6 +602,10 @@ async fn load_account_postgres_activity(
         "SELECT node.created_at, node.title \
          FROM domain_nodes AS node \
          WHERE node.created_at IS NOT NULL \
+           AND (node.search_visibility = 'public' OR \
+                (node.search_visibility IN ('private','hidden') \
+                 AND $2::text IS NOT NULL \
+                 AND weltgewebe_search_node_owner_account_id(node.payload) = $2::text)) \
            AND ( \
                 NULLIF(BTRIM(node.payload ->> 'created_by_account_id'), '') = $1 \
                 OR ( \
@@ -646,6 +652,7 @@ async fn load_account_postgres_activity(
          ORDER BY node.created_at DESC, node.id DESC",
     )
     .bind(account_id)
+    .bind(viewer_account_id)
     .fetch_all(pool)
     .await
     .map_err(|error| {
@@ -670,6 +677,15 @@ async fn load_account_postgres_activity(
          LEFT JOIN domain_nodes AS node ON node.id = conversation.node_id \
          WHERE message.author_account_id = $1 \
            AND conversation.deleted_at IS NULL \
+           AND ( \
+                (node.id IS NOT NULL AND \
+                 (node.search_visibility = 'public' OR \
+                  (node.search_visibility IN ('private','hidden') \
+                   AND $2::text IS NOT NULL \
+                   AND weltgewebe_search_node_owner_account_id(node.payload) = $2::text))) \
+                OR (node.id IS NULL AND conversation.conversation_type = 'node' \
+                    AND conversation.archived_node_visibility = 'public') \
+               ) \
            AND COALESCE(node.title, conversation.node_title_snapshot) IS NOT NULL \
          GROUP BY conversation.id, \
                   COALESCE(node.title, conversation.node_title_snapshot), \
@@ -677,6 +693,7 @@ async fn load_account_postgres_activity(
          ORDER BY MAX(message.created_at) DESC, conversation.id DESC",
     )
     .bind(account_id)
+    .bind(viewer_account_id)
     .fetch_all(pool)
     .await
     .map_err(|error| {
@@ -719,7 +736,10 @@ async fn load_account_postgres_activity(
 pub async fn get_account(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<Json<AccountDetails>, StatusCode> {
+    let viewer = auth.as_ref().map(|extension| &extension.0);
+    let viewer_account_id = reader_account_id(viewer);
     // Clone the public profile before reading the relationship caches so this
     // endpoint never holds several state locks at once.
     let account = {
@@ -770,6 +790,9 @@ pub async fn get_account(
             let Some(node) = node_cache.get(related_id) else {
                 continue;
             };
+            if !node_readable_to(node, viewer) {
+                continue;
+            }
 
             if seen_nodes.insert(node.id.clone()) {
                 nodes.push(AccountNodeRelation {
@@ -787,6 +810,7 @@ pub async fn get_account(
                 .filter(|node| {
                     node.has_authoritative_created_at
                         && node.created_by_account_id.as_deref() == Some(id.as_str())
+                        && node_readable_to(node, viewer)
                 })
                 .map(|node| AccountActivity {
                     date: node.created_at.clone(),
@@ -801,7 +825,7 @@ pub async fn get_account(
 
     // PostgreSQL can reconstruct the complete durable history, including
     // faded origin Fäden and correctly classified conversation contributions.
-    activity.extend(load_account_postgres_activity(&state, &id).await?);
+    activity.extend(load_account_postgres_activity(&state, &id, viewer_account_id).await?);
 
     nodes.sort_by(|left, right| {
         left.node_title

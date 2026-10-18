@@ -525,8 +525,8 @@ async fn require_conversation_read_access(
     conversation_id: &str,
     auth: &AuthContext,
 ) -> Result<(), ConversationApiError> {
-    let target: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT conversation_type, visibility, node_id FROM domain_conversations \
+    let target: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT conversation_type, visibility, node_id, archived_node_visibility FROM domain_conversations \
          WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(conversation_id)
@@ -534,7 +534,7 @@ async fn require_conversation_read_access(
     .await
     .map_err(|error| database_error("classify conversation read target", error))?;
 
-    let Some((conversation_type, visibility, node_id)) = target else {
+    let Some((conversation_type, visibility, node_id, archived_node_visibility)) = target else {
         return Err(ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
@@ -565,8 +565,16 @@ async fn require_conversation_read_access(
                         "the conversation does not exist",
                     ));
                 }
+            } else if archived_node_visibility.as_deref() != Some("public") {
+                // Public conversation metadata does not grant access to
+                // history from a private/revoked deleted node.
+                // Historical archives without provenance are fail-closed.
+                return Err(ConversationApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "conversation_not_found",
+                    "the conversation does not exist",
+                ));
             }
-            // Archived deleted-node conversations have no active node_id.
         }
         return Ok(());
     }
