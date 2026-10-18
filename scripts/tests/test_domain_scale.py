@@ -162,7 +162,7 @@ class DomainScaleTests(unittest.TestCase):
             self.assertIn("WHERE kind = 'Projekt' LIMIT 500", sql)
             self.assertNotIn("WHERE kind = 'Projekt' ORDER BY", sql)
             self.assertIn(
-                "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 ORDER BY id ASC LIMIT 1001 OFFSET 0",
+                "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 AND (search_visibility = 'public' OR",
                 sql,
             )
             self.assertIn(
@@ -175,6 +175,8 @@ class DomainScaleTests(unittest.TestCase):
                 ),
                 2,
             )
+            self.assertIn("NULL::text IS NOT NULL", sql)
+            self.assertIn("search_visibility = 'public'", sql)
             self.assertIn("ORDER BY id ASC LIMIT 1001 OFFSET 0", sql)
             self.assertIn("ORDER BY id ASC LIMIT 1001", sql)
             self.assertNotIn("ORDER BY id ASC LIMIT 5000", sql)
@@ -190,13 +192,13 @@ class DomainScaleTests(unittest.TestCase):
             fake_domain_db.write_text(
                 """pub async fn load_nodes_bbox_from_postgres() {
     let rows = sqlx::query_as(
-        "SELECT id, title, lat, lon FROM domain_nodes WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 ORDER BY id ASC LIMIT $5 OFFSET $6",
+        "SELECT id, title, lat, lon FROM domain_nodes WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 AND (search_visibility = 'public' OR ($7::text IS NOT NULL AND search_visibility = 'private')) ORDER BY id ASC LIMIT $5 OFFSET $6",
     );
 }
 
 pub async fn load_nodes_bbox_after_id_from_postgres() {
     let rows = sqlx::query_as(
-        "SELECT id, title, lat, lon FROM domain_nodes WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 AND id > $5 ORDER BY id ASC LIMIT $6",
+        "SELECT id, title, lat, lon FROM domain_nodes WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 AND id > $5 AND (search_visibility = 'public' OR ($7::text IS NOT NULL AND search_visibility = 'private')) ORDER BY id ASC LIMIT $6",
     );
 }
 """,
@@ -211,7 +213,7 @@ pub async fn load_nodes_bbox_after_id_from_postgres() {
                 )
             sql = output.read_text(encoding="utf-8")
             self.assertIn(
-                "SELECT id, title, lat, lon FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 ORDER BY id ASC LIMIT 1001 OFFSET 0",
+                "SELECT id, title, lat, lon FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 AND (search_visibility = 'public' OR (NULL::text IS NOT NULL AND search_visibility = 'private')) ORDER BY id ASC LIMIT 1001 OFFSET 0",
                 sql,
             )
             self.assertIn(

@@ -198,6 +198,10 @@ pub async fn load_nodes_from_postgres(pool: &PgPool) -> Result<OrderedCache<Node
 /// deployments. PostgreSQL-backed viewport requests use this helper so BBOX
 /// selection no longer iterates the global in-process node cache. Projection
 /// refresh and cache-generation behavior outside this query remain unchanged.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keep BBOX bounds, pagination, and viewer scope explicit at SQL read boundary"
+)]
 pub async fn load_nodes_bbox_from_postgres(
     pool: &PgPool,
     min_lat: f64,
@@ -245,6 +249,10 @@ pub async fn load_nodes_bbox_from_postgres(
 /// nullable `OR` predicate whose generic prepared plan could lose the clear
 /// `id > cursor` selectivity. PostgreSQL owns the ordering; callers must not
 /// re-sort the returned rows under Rust's string ordering.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keep BBOX bounds, pagination, and viewer scope explicit at SQL read boundary"
+)]
 pub async fn load_nodes_bbox_after_id_from_postgres(
     pool: &PgPool,
     min_lat: f64,
