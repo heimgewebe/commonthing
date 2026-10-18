@@ -815,7 +815,7 @@ async fn untyped_account_edge_collision_with_unprojected_node_is_hidden() {
     .execute(&pool)
     .await
     .expect("seed untyped old edges");
-    let mut state = postgres_bbox_route_state(pool.clone());
+    let state = postgres_bbox_route_state(pool.clone());
     *state.accounts.write().await = load_accounts_from_postgres(&pool).await.expect("accounts");
     let mut nodes = load_nodes_from_postgres(&pool)
         .await
