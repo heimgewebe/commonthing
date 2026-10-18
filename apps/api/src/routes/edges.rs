@@ -704,7 +704,7 @@ pub async fn get_edge(
     let viewer = auth.as_ref().map(|extension| &extension.0);
     let strict_missing =
         state.config.domain_read_source == crate::config::DomainReadSource::Postgres;
-    let (hidden_node_ids, known_nodes): (HashSet<String>, HashSet<String>) = {
+    let (hidden_node_ids, known_nodes, source_node_details, target_node_details) = {
         let nodes = state.nodes.read().await;
         let mut hidden = HashSet::new();
         let mut known = HashSet::new();
@@ -721,7 +721,27 @@ pub async fn get_edge(
                 }
             }
         }
-        (hidden, known)
+        // Return the same node version used for this request's visibility check.
+        // A concurrent public-to-private replacement must never provide a new
+        // confidential title to an already-authorized edge response.
+        let snapshot_details = |id: &str| {
+            nodes.get(id).map(|node| EdgeParticipantDetails {
+                id: node.id.clone(),
+                title: node.title.clone(),
+                r#type: Some(node.kind.clone()),
+            })
+        };
+        let source_node_details = if edge.source_type.as_deref() == Some("node") {
+            snapshot_details(&edge.source_id)
+        } else {
+            None
+        };
+        let target_node_details = if edge.target_type.as_deref() == Some("node") {
+            snapshot_details(&edge.target_id)
+        } else {
+            None
+        };
+        (hidden, known, source_node_details, target_node_details)
     };
     let known_accounts: HashSet<String> = if strict_missing {
         let accounts = state.accounts.read().await;
@@ -755,8 +775,8 @@ pub async fn get_edge(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let mut source_details = None;
-    let mut target_details = None;
+    let mut source_details = source_node_details;
+    let mut target_details = target_node_details;
 
     if let Some(src_type) = &edge.source_type {
         if src_type == "account" {
@@ -766,15 +786,6 @@ pub async fn get_edge(
                     id: account.public.id.clone(),
                     title: account.public.title.clone(),
                     r#type: Some(account.public.kind.clone()),
-                });
-            }
-        } else if src_type == "node" {
-            let nodes_cache = state.nodes.read().await;
-            if let Some(node) = nodes_cache.get(&edge.source_id) {
-                source_details = Some(EdgeParticipantDetails {
-                    id: node.id.clone(),
-                    title: node.title.clone(),
-                    r#type: Some(node.kind.clone()),
                 });
             }
         }
@@ -788,15 +799,6 @@ pub async fn get_edge(
                     id: account.public.id.clone(),
                     title: account.public.title.clone(),
                     r#type: Some(account.public.kind.clone()),
-                });
-            }
-        } else if tgt_type == "node" {
-            let nodes_cache = state.nodes.read().await;
-            if let Some(node) = nodes_cache.get(&edge.target_id) {
-                target_details = Some(EdgeParticipantDetails {
-                    id: node.id.clone(),
-                    title: node.title.clone(),
-                    r#type: Some(node.kind.clone()),
                 });
             }
         } else if tgt_type == "webgemeindezentrum" {

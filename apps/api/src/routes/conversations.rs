@@ -750,7 +750,7 @@ async fn require_conversation_writable(
                 "SELECT (search_visibility = 'public' OR
                    (search_visibility IN ('private','hidden')
                     AND $2::text IS NOT NULL
-                    AND weltgewebe_search_node_owner_account_id(payload) = $2::text))
+                    AND weltgewebe_search_node_owner_account_id(payload) = $2::text)) IS TRUE
                  FROM domain_nodes WHERE id = $1 FOR SHARE",
             )
             .bind(node_id)

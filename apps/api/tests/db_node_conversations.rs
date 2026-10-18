@@ -2816,3 +2816,49 @@ async fn private_node_conversations_require_the_owner_at_every_read_entry() {
     }
     database.cleanup().await;
 }
+
+/// Missing historical owner identity must behave like a missing private node,
+/// not as a SQL NULL decoding failure that distinguishes its existence.
+#[tokio::test]
+#[serial]
+#[ignore = "requires direct PostgreSQL"]
+async fn ownerless_private_and_hidden_nodes_reject_message_writes_as_not_found() {
+    for visibility in ["private", "hidden"] {
+        let database = pool().await;
+        let pool = database.app_pool();
+        seed_account(&pool, AUTHOR_ID, "Synthetic foreign author", "weber").await;
+        sqlx::query(
+            "INSERT INTO domain_nodes (id, kind, title, payload, search_visibility)
+             VALUES ($1, 'Ort', 'Confidential ownerless node', '{}'::jsonb, $2)",
+        )
+        .bind(NODE_ID)
+        .bind(visibility)
+        .execute(&pool)
+        .await
+        .expect("insert ownerless protected node");
+        let conversation_id: String =
+            sqlx::query_scalar("SELECT weltgewebe_node_conversation_id($1)::text")
+                .bind(NODE_ID)
+                .fetch_one(&pool)
+                .await
+                .expect("conversation id");
+
+        let (router, author, _, _, _) = app(pool.clone()).await;
+        let (status, response) = json_response(
+            &router,
+            request(
+                "POST",
+                &format!("/conversations/{conversation_id}/messages"),
+                Some(&author),
+                Some(r#"{"content":"Attempted message"}"#),
+                Some("f0000000-0000-4000-8000-000000000081"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{visibility}: {response}");
+        assert_eq!(response["code"], "conversation_not_found");
+        assert!(!response.to_string().contains("Confidential ownerless node"));
+        database.cleanup().await;
+    }
+}
