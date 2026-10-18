@@ -778,3 +778,94 @@ async fn postgres_bbox_private_node_is_filtered_before_limit_and_cursor() {
     assert_eq!(ids(owner_cursor), vec!["rp-b-private"]);
     clean(&pool).await;
 }
+
+/// A canonical private node can be absent from the process read projection
+/// while a legacy edge is untyped and collides with a public account ID.
+/// PostgreSQL must disambiguate it instead of assuming the account grants access.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn untyped_account_edge_collision_with_unprojected_node_is_hidden() {
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_accounts
+            (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)
+         VALUES
+            ('rp-collision','garnrolle','Synthetic Account','not_on_map',0,FALSE,'weber','{}','{}'),
+            ('rp-only-account','garnrolle','Other Account','not_on_map',0,FALSE,'weber','{}','{}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed canonical account identities");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES
+            ('rp-collision','Ort','Confidential node',53.50,10.00,'{}'::jsonb,'private'),
+            ('rp-public-target','Ort','Public target',53.55,10.00,'{}'::jsonb,'public')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed colliding and public node");
+    sqlx::query(
+        "INSERT INTO domain_edges (id,source_id,target_id,edge_kind,payload)
+         VALUES
+            ('rp-untyped-collision','rp-collision','rp-public-target','reference','{}'::jsonb),
+            ('rp-untyped-account','rp-only-account','rp-public-target','reference','{}'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed untyped old edges");
+    let mut state = postgres_bbox_route_state(pool.clone());
+    *state.accounts.write().await = load_accounts_from_postgres(&pool).await.expect("accounts");
+    let mut nodes = load_nodes_from_postgres(&pool)
+        .await
+        .expect("node read cache");
+    assert!(
+        nodes.remove("rp-collision").is_some(),
+        "simulate omitted private node"
+    );
+    *state.nodes.write().await = nodes;
+    *state.edges.write().await = load_edges_from_postgres(&pool).await.expect("edge cache");
+    let app = Router::new().merge(api_router()).with_state(state);
+    let list = app
+        .clone()
+        .oneshot(Request::get("/edges").body(body::Body::empty()).unwrap())
+        .await
+        .expect("list legacy edges");
+    assert_eq!(list.status(), axum::http::StatusCode::OK);
+    let content = String::from_utf8(
+        body::to_bytes(list.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("UTF-8");
+    assert!(
+        !content.contains("rp-untyped-collision"),
+        "private collision leaked: {content}"
+    );
+    assert!(
+        content.contains("rp-untyped-account"),
+        "legacy true account link disappeared"
+    );
+    let blocked = app
+        .clone()
+        .oneshot(
+            Request::get("/edges/rp-untyped-collision")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("read private collision");
+    assert_eq!(blocked.status(), axum::http::StatusCode::NOT_FOUND);
+    let allowed = app
+        .oneshot(
+            Request::get("/edges/rp-untyped-account")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("read real legacy account");
+    assert_eq!(allowed.status(), axum::http::StatusCode::OK);
+    clean(&pool).await;
+}

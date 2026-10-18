@@ -529,17 +529,21 @@ pub async fn load_edges() -> std::io::Result<OrderedCache<Edge>> {
 /// node coordinates; absence from its public projection is not authorization.
 /// Legacy untyped endpoints resolve to a node, account or known role; unknown
 /// PostgreSQL endpoints fail closed rather than leaking a removed node id.
+/// Typed identities cannot grant untyped node authorization when a canonical
+/// node with the same ID was omitted from the projected cache.
 fn edge_exposes_unreadable_node(
     edge: &Edge,
     hidden: &HashSet<String>,
     known_nodes: &HashSet<String>,
     known_accounts: &HashSet<String>,
+    canonical_collisions: &HashSet<String>,
     strict_missing: bool,
 ) -> bool {
     let rejects = |kind: Option<&str>, id: &str| match kind {
         Some("node") => hidden.contains(id) || (strict_missing && !known_nodes.contains(id)),
         None => {
             hidden.contains(id)
+                || canonical_collisions.contains(id)
                 || (strict_missing
                     && !known_nodes.contains(id)
                     && !known_accounts.contains(id)
@@ -549,6 +553,52 @@ fn edge_exposes_unreadable_node(
     };
     rejects(edge.source_type.as_deref(), &edge.source_id)
         || rejects(edge.target_type.as_deref(), &edge.target_id)
+}
+
+// Only ambiguous untyped account/role identities require an extra canonical
+// PostgreSQL lookup. Normal typed Fäden and ordinary untyped node IDs remain
+// cheap. One batched read protects legacy links without fetching private data.
+fn uncertain_untyped_node_id(
+    edge: &Edge,
+    known_nodes: &HashSet<String>,
+    known_accounts: &HashSet<String>,
+) -> Vec<String> {
+    [
+        (&edge.source_id, edge.source_type.as_deref()),
+        (&edge.target_id, edge.target_type.as_deref()),
+    ]
+    .into_iter()
+    .filter(move |(id, kind)| {
+        kind.is_none()
+            && !known_nodes.contains(*id)
+            && (known_accounts.contains(*id) || matches!(id.as_str(), "gast" | "weber" | "admin"))
+    })
+    .map(|(id, _)| id.clone())
+    .collect()
+}
+
+async fn canonical_node_collisions(
+    state: &ApiState,
+    candidates: &HashSet<String>,
+) -> Result<HashSet<String>, StatusCode> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let pool = state
+        .db_pool
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let ids: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let collisions: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM domain_nodes WHERE id = ANY($1::text[])")
+            .bind(ids)
+            .fetch_all(pool)
+            .await
+            .map_err(|error| {
+                tracing::error!(?error, "canonical legacy edge endpoint check failed");
+                StatusCode::SERVICE_UNAVAILABLE
+            })?;
+    Ok(collisions.into_iter().collect())
 }
 
 pub async fn list_edges(
@@ -589,6 +639,17 @@ pub async fn list_edges(
         HashSet::new()
     };
     let now = Utc::now();
+    let candidates: HashSet<String> = if strict_missing {
+        let cache = state.edges.read().await;
+        cache
+            .iter_in_order()
+            .filter(|edge| edge_matches_list_at(edge, src, dst, now))
+            .flat_map(|edge| uncertain_untyped_node_id(edge, &known_nodes, &known_accounts))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let canonical_collisions = canonical_node_collisions(&state, &candidates).await?;
     let matches = |edge: &&Edge| {
         edge_matches_list_at(edge, src, dst, now)
             && !edge_exposes_unreadable_node(
@@ -596,6 +657,7 @@ pub async fn list_edges(
                 &hidden_node_ids,
                 &known_nodes,
                 &known_accounts,
+                &canonical_collisions,
                 strict_missing,
             )
     };
@@ -674,11 +736,20 @@ pub async fn get_edge(
     } else {
         HashSet::new()
     };
+    let candidates: HashSet<String> = if strict_missing {
+        uncertain_untyped_node_id(&edge, &known_nodes, &known_accounts)
+            .into_iter()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let canonical_collisions = canonical_node_collisions(&state, &candidates).await?;
     if edge_exposes_unreadable_node(
         &edge,
         &hidden_node_ids,
         &known_nodes,
         &known_accounts,
+        &canonical_collisions,
         strict_missing,
     ) {
         return Err(StatusCode::NOT_FOUND);

@@ -745,12 +745,15 @@ async fn require_conversation_writable(
         } else {
             false
         };
-        let locked_target: Option<(
+        // Preserve the established tuple row mapping without Clippy's nested
+        // generic type-complexity warning or an extra persistence abstraction.
+        type LockedNodeTarget = (
             String,
             Option<String>,
             Option<DateTime<Utc>>,
             Option<String>,
-        )> = sqlx::query_as(
+        );
+        let locked_target: Option<LockedNodeTarget> = sqlx::query_as(
             "SELECT conversation_type, node_id, archived_at, archived_node_visibility
                  FROM domain_conversations
                  WHERE id = $1::uuid AND deleted_at IS NULL FOR SHARE",
