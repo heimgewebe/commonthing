@@ -14,6 +14,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tower::ServiceExt;
 use weltgewebe_api::{
@@ -40,6 +41,17 @@ const OTHER_ID: &str = "61000000-0000-4000-8000-000000000002";
 const ADMIN_ID: &str = "61000000-0000-4000-8000-000000000003";
 const GUEST_ID: &str = "61000000-0000-4000-8000-000000000004";
 const NODE_ID: &str = "61000000-0000-4000-8000-000000000005";
+
+// Match the application's stable per-node advisory key exactly. The same
+// synthetic PostgreSQL lock must be held by the test and by message writes.
+fn node_mutation_lock_key_for_test(node_id: &str) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"weltgewebe:node-mutation:v1");
+    hasher.update((node_id.len() as u64).to_be_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    i64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"))
+}
 
 fn direct_database_url() -> String {
     let url = std::env::var("DATABASE_URL")
@@ -2861,4 +2873,315 @@ async fn ownerless_private_and_hidden_nodes_reject_message_writes_as_not_found()
         assert!(!response.to_string().contains("Confidential ownerless node"));
         database.cleanup().await;
     }
+}
+
+/// Four message waiters must never occupy the remaining five-connection pool
+/// while an existing-node write holds the cross-instance mutation lock.
+#[tokio::test]
+#[serial]
+#[ignore = "requires direct PostgreSQL"]
+async fn busy_node_message_writes_do_not_starve_postgres_pool() {
+    let database = pool().await;
+    let pool = database.app_pool();
+    seed_account(&pool, AUTHOR_ID, "Synthetic author", "weber").await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility)
+         VALUES ($1,'Ort','Synthetic public node',$2::jsonb,'public')",
+    )
+    .bind(NODE_ID)
+    .bind(serde_json::json!({"created_by_account_id": AUTHOR_ID}))
+    .execute(&pool)
+    .await
+    .expect("seed public node");
+    let conversation_id: String =
+        sqlx::query_scalar("SELECT weltgewebe_node_conversation_id($1)::text")
+            .bind(NODE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("derive conversation ID");
+    let (router, author, _, _, _) = app(pool.clone()).await;
+
+    let mut held_node_lock = pool.begin().await.expect("begin node mutation guard");
+    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+        .bind(node_mutation_lock_key_for_test(NODE_ID))
+        .execute(&mut *held_node_lock)
+        .await
+        .expect("hold same node advisory lock as node writes");
+    let sends = (0..4).map(|n| {
+        let router = router.clone();
+        let author = author.clone();
+        let conversation_id = conversation_id.clone();
+        async move {
+            let key = format!("f0000000-0000-4000-8000-{:012x}", 100 + n);
+            json_response(
+                &router,
+                request(
+                    "POST",
+                    &format!("/conversations/{conversation_id}/messages"),
+                    Some(&author),
+                    Some(r#"{"content":"Synthetic competing node write"}"#),
+                    Some(&key),
+                    None,
+                ),
+            )
+            .await
+        }
+    });
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        futures_util::future::join_all(sends),
+    )
+    .await;
+    held_node_lock.rollback().await.expect("release node lock");
+    database.cleanup().await;
+    let responses = response.expect("node-lock waiters must release pool slots promptly");
+    for (status, result) in responses {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{result}");
+        assert_eq!(result["code"], "conversation_write_busy");
+    }
+}
+
+/// Deleting an account must not deadlock with a message writer that needs
+/// both the creator's FK account row and that account's node mutation lock.
+#[tokio::test]
+#[serial]
+#[ignore = "requires direct PostgreSQL"]
+async fn account_exit_and_node_message_post_preserve_lock_order() {
+    let database = pool().await;
+    let pool = database.app_pool();
+    seed_account(&pool, GUEST_ID, "Synthetic guest", "gast").await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility)
+         VALUES ($1,'Ort','Synthetic guest node',$2::jsonb,'public')",
+    )
+    .bind(NODE_ID)
+    .bind(serde_json::json!({"created_by_account_id": GUEST_ID}))
+    .execute(&pool)
+    .await
+    .expect("seed guest node");
+    let conversation_id: String =
+        sqlx::query_scalar("SELECT weltgewebe_node_conversation_id($1)::text")
+            .bind(NODE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("derive node conversation");
+    let (router, _, _, _, guest) = app(pool.clone()).await;
+
+    let mut exiting = pool.begin().await.expect("begin account exit");
+    sqlx::query("SELECT role FROM domain_accounts WHERE id = $1 FOR UPDATE")
+        .bind(GUEST_ID)
+        .execute(&mut *exiting)
+        .await
+        .expect("hold canonical guest exit account lock");
+    let mut pending = tokio::spawn(async move {
+        json_response(
+            &router,
+            request(
+                "POST",
+                &format!("/conversations/{conversation_id}/messages"),
+                Some(&guest),
+                Some(r#"{"content":"Synthetic guest farewell"}"#),
+                Some("f0000000-0000-4000-8000-000000000083"),
+                None,
+            ),
+        )
+        .await
+    });
+    // Fail promptly while an account-exit transaction holds the author row,
+    // rather than waiting on the FK and creating an account -> node cycle.
+    let competing = tokio::time::timeout(Duration::from_secs(2), &mut pending).await;
+    if competing.is_err() {
+        pending.abort();
+        let _ = pending.await;
+    }
+    let exit_node_guard = tokio::time::timeout(
+        Duration::from_secs(4),
+        sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+            .bind(node_mutation_lock_key_for_test(NODE_ID))
+            .execute(&mut *exiting),
+    )
+    .await;
+    exiting
+        .rollback()
+        .await
+        .expect("release synthetic guest exit");
+    database.cleanup().await;
+    let post = competing
+        .expect("account-locked message must return a controlled retry promptly")
+        .expect("join message task");
+    assert!(
+        matches!(exit_node_guard, Ok(Ok(_))),
+        "account->node lock must not deadlock: {exit_node_guard:?}"
+    );
+    assert_eq!(post.0, StatusCode::SERVICE_UNAVAILABLE, "{:?}", post.1);
+    assert_eq!(post.1["code"], "conversation_write_busy");
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires direct PostgreSQL"]
+async fn unreadable_node_writes_do_not_expose_author_lock_contention() {
+    let database = pool().await;
+    let pool = database.app_pool();
+    seed_account(&pool, AUTHOR_ID, "Synthetic foreign reader", "weber").await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility)
+         VALUES ($1,'Ort','Secret node under account exit',$2::jsonb,'private')",
+    )
+    .bind(NODE_ID)
+    .bind(serde_json::json!({"created_by_account_id": GUEST_ID}))
+    .execute(&pool)
+    .await
+    .expect("seed private foreign-owned node");
+    let conversation_id: String =
+        sqlx::query_scalar("SELECT weltgewebe_node_conversation_id($1)::text")
+            .bind(NODE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("derive private node conversation");
+    let (router, author, _, _, _) = app(pool.clone()).await;
+
+    // Another connection is changing the current author account. A request
+    // for a foreign private node must remain 404, never disclose 503 busy.
+    let mut held_author = pool.begin().await.expect("begin author account mutation");
+    sqlx::query("SELECT id FROM domain_accounts WHERE id = $1 FOR UPDATE")
+        .bind(AUTHOR_ID)
+        .execute(&mut *held_author)
+        .await
+        .expect("hold author lock");
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        json_response(
+            &router,
+            request(
+                "POST",
+                &format!("/conversations/{conversation_id}/messages"),
+                Some(&author),
+                Some(r#"{"content":"Probe protected node during account exit"}"#),
+                Some("f0000000-0000-4000-8000-000000000099"),
+                None,
+            ),
+        ),
+    )
+    .await;
+    held_author.rollback().await.expect("release author lock");
+    database.cleanup().await;
+    let (status, body) = response.expect("unreadable node must not block on author lock");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "conversation_not_found");
+    assert!(!body.to_string().contains("Secret node under account exit"));
+}
+
+/// A public node archived after the initial conversation classification must
+/// retain its explicit 409 contract rather than falling through a missing-node
+/// privacy precheck. This gates the exact interleaving on the PostgreSQL table
+/// lock, without sleeps as the synchronization mechanism.
+#[tokio::test]
+#[serial]
+#[ignore = "requires direct PostgreSQL"]
+async fn public_node_deletion_between_classification_and_precheck_is_archived() {
+    let database = pool().await;
+    let pool = database.app_pool();
+    seed_account(&pool, AUTHOR_ID, "Synthetic archive author", "weber").await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility)
+         VALUES ($1,'Ort','Synthetic public archive race',$2::jsonb,'public')",
+    )
+    .bind(NODE_ID)
+    .bind(serde_json::json!({"created_by_account_id": AUTHOR_ID}))
+    .execute(&pool)
+    .await
+    .expect("seed public node");
+    let conversation_id: String =
+        sqlx::query_scalar("SELECT weltgewebe_node_conversation_id($1)::text")
+            .bind(NODE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("derive conversation");
+    sqlx::query(
+        "INSERT INTO domain_messages
+         (id, conversation_id, author_account_id, author_title, content, idempotency_key)
+         VALUES ('f0000000-0000-4000-8000-000000000091'::uuid,
+                 $1::uuid, $2, 'Synthetic archive author', 'Historical public contribution',
+                 'f0000000-0000-4000-8000-000000000092'::uuid)",
+    )
+    .bind(&conversation_id)
+    .bind(AUTHOR_ID)
+    .execute(&pool)
+    .await
+    .expect("seed durable conversation history");
+    let (router, author, _, _, _) = app(pool.clone()).await;
+
+    let mut deleting = pool.begin().await.expect("start public node deletion");
+    sqlx::query("LOCK TABLE domain_nodes IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *deleting)
+        .await
+        .expect("hold exclusive node table before race");
+    sqlx::query("DELETE FROM domain_nodes WHERE id = $1")
+        .bind(NODE_ID)
+        .execute(&mut *deleting)
+        .await
+        .expect("archive public node with existing history");
+
+    let mut pending = tokio::spawn(async move {
+        json_response(
+            &router,
+            request(
+                "POST",
+                &format!("/conversations/{conversation_id}/messages"),
+                Some(&author),
+                Some(r#"{"content":"Race request after public archive"}"#),
+                Some("f0000000-0000-4000-8000-000000000093"),
+                None,
+            ),
+        )
+        .await
+    });
+    // Wait until the HTTP request has attempted its SELECT on domain_nodes.
+    // The initial conversation classification reads a different table, so a
+    // pending AccessShareLock proves it has crossed that checkpoint.
+    let reached_precheck = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks AS locked
+                 JOIN pg_class AS relation ON relation.oid = locked.relation
+                 WHERE relation.relname = 'domain_nodes'
+                   AND locked.mode = 'AccessShareLock' AND NOT locked.granted",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("inspect synthetic blocked precheck");
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if reached_precheck.is_err() {
+        deleting
+            .rollback()
+            .await
+            .expect("rollback synthetic blocked deletion");
+        pending.abort();
+        let _ = pending.await;
+        database.cleanup().await;
+        panic!("request never reached canonical node privacy precheck");
+    }
+
+    deleting
+        .commit()
+        .await
+        .expect("commit node archival during precheck");
+    let completed = tokio::time::timeout(Duration::from_secs(4), &mut pending).await;
+    if completed.is_err() {
+        pending.abort();
+        let _ = pending.await;
+        database.cleanup().await;
+        panic!("request did not terminate after public node archival");
+    }
+    let (status, body) = completed.unwrap().expect("join raced message request");
+    database.cleanup().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "conversation_archived");
 }

@@ -709,6 +709,51 @@ async fn require_direct_message_send_allowed(
     Ok(())
 }
 
+fn conversation_write_busy() -> ConversationApiError {
+    ConversationApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "conversation_write_busy",
+        "the conversation is temporarily busy; retry this request",
+    )
+    .retry_after(1)
+}
+
+// Classify the current *locked* archive after a previously observed active
+// node has disappeared. A node can be deleted between the initial conversation
+// classification and the read-visibility precheck; only known-public archives
+// may expose the existing 409 conflict. Every other target remains 404.
+async fn unavailable_node_conversation_write_error(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: &str,
+) -> Result<ConversationApiError, ConversationApiError> {
+    let archived_public: bool = sqlx::query_scalar::<_, bool>(
+        "SELECT (archived_at IS NOT NULL AND
+                 archived_node_visibility = 'public') IS TRUE
+         FROM domain_conversations
+         WHERE id = $1::uuid AND deleted_at IS NULL
+           AND conversation_type = 'node' AND node_id IS NULL
+         FOR SHARE",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| database_error("verify archived node write contract", error))?
+    .unwrap_or(false);
+    Ok(if archived_public {
+        ConversationApiError::new(
+            StatusCode::CONFLICT,
+            "conversation_archived",
+            "the node conversation is archived and read-only",
+        )
+    } else {
+        ConversationApiError::new(
+            StatusCode::NOT_FOUND,
+            "conversation_not_found",
+            "the conversation does not exist",
+        )
+    })
+}
+
 async fn require_conversation_writable(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
@@ -737,15 +782,85 @@ async fn require_conversation_writable(
     })?;
 
     if observed_type == "node" {
+        // Account exit locks the author first, then the node. Do not occupy
+        // PostgreSQL pool connections while waiting for this account lock;
+        // a node mutation can need another connection to finish.
+        let author_account_id = reader_account_id(Some(auth)).ok_or_else(|| {
+            ConversationApiError::new(
+                StatusCode::NOT_FOUND,
+                "conversation_not_found",
+                "the conversation does not exist",
+            )
+        })?;
+        // A deleted node has no active advisory key. Preserve the explicit
+        // public-archive 409 contract without consulting or locking the author;
+        // private/revoked/unknown archives remain indistinguishable from absent.
+        if observed_node_id.is_none() {
+            return Err(unavailable_node_conversation_write_error(tx, conversation_id).await?);
+        }
+        // Only known readable nodes may receive a retryable busy response:
+        // private/hidden/revoked nodes must continue to look nonexistent.
+        // The definitive authorization below is repeated after the node lock.
+        let preliminarily_readable = if let Some(node_id) = observed_node_id.as_deref() {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT (search_visibility = 'public' OR
+                   (search_visibility IN ('private','hidden')
+                    AND weltgewebe_search_node_owner_account_id(payload) = $2::text)) IS TRUE
+                 FROM domain_nodes WHERE id = $1",
+            )
+            .bind(node_id)
+            .bind(author_account_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| database_error("precheck node message privacy", error))?
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        if !preliminarily_readable {
+            // Re-read the conversation under a row lock, not the original
+            // classification hint. This distinguishes a concurrently deleted
+            // public node from an unreadable, still-active protected node.
+            return Err(unavailable_node_conversation_write_error(tx, conversation_id).await?);
+        }
+        let active_author: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM domain_accounts
+             WHERE id = $1 AND disabled = FALSE FOR SHARE NOWAIT",
+        )
+        .bind(author_account_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| {
+            if error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .as_deref()
+                == Some("55P03")
+            {
+                conversation_write_busy()
+            } else {
+                database_error("lock node message author before node", error)
+            }
+        })?;
+        if active_author.is_none() {
+            return Err(ConversationApiError::new(
+                StatusCode::NOT_FOUND,
+                "conversation_not_found",
+                "the conversation does not exist",
+            ));
+        }
         // Canonical node writes acquire the same advisory key. A FOR SHARE
         // row lock also serializes visibility changes by other DB writers.
         // This respects the node -> conversation lock order of node deletion.
         let allowed_node = if let Some(node_id) = observed_node_id.as_deref() {
-            sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1::bigint)")
                 .bind(node_mutation_lock_key(node_id))
-                .execute(&mut **tx)
+                .fetch_one(&mut **tx)
                 .await
-                .map_err(|error| database_error("lock conversation target node", error))?;
+                .map_err(|error| database_error("try lock conversation target node", error))?;
+            if !acquired {
+                return Err(conversation_write_busy());
+            }
             sqlx::query_scalar::<_, bool>(
                 "SELECT (search_visibility = 'public' OR
                    (search_visibility IN ('private','hidden')

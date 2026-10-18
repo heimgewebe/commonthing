@@ -1703,6 +1703,8 @@ async fn anonymous_edges_do_not_expose_private_node_endpoints() -> Result<()> {
             r#"{"id":"edge-public","source_id":"node-public","target_id":"node-public","source_type":"node","target_type":"node","edge_kind":"reference"}"#,
             r#"{"id":"edge-private","source_id":"node-private","target_id":"node-public","source_type":"node","target_type":"node","edge_kind":"reference"}"#,
             r#"{"id":"edge-legacy-private","source_id":"node-private","target_id":"node-public","edge_kind":"reference"}"#,
+            r#"{"id":"edge-blank-private","source_id":"node-private","source_type":"","target_id":"node-public","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-unknown-private","source_id":"node-private","source_type":"unknown","target_id":"node-public","target_type":"node","edge_kind":"reference"}"#,
         ],
     );
     let _env = set_gewebe_in_dir(&in_dir);
@@ -1724,7 +1726,12 @@ async fn anonymous_edges_do_not_expose_private_node_endpoints() -> Result<()> {
         assert_eq!(items.len(), 1, "{uri}");
         assert_eq!(items[0]["id"], "edge-public");
     }
-    for id in ["edge-private", "edge-legacy-private"] {
+    for id in [
+        "edge-private",
+        "edge-legacy-private",
+        "edge-blank-private",
+        "edge-unknown-private",
+    ] {
         let response = app
             .clone()
             .oneshot(Request::get(format!("/edges/{id}")).body(body::Body::empty())?)

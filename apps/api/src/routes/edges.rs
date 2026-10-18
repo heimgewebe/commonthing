@@ -541,6 +541,10 @@ fn edge_exposes_unreadable_node(
 ) -> bool {
     let rejects = |kind: Option<&str>, id: &str| match kind {
         Some("node") => hidden.contains(id) || (strict_missing && !known_nodes.contains(id)),
+        Some("account" | "role" | "webgemeindezentrum") => false,
+        // Unknown or blank type hints cannot establish a typed endpoint.
+        // Reject the whole legacy edge instead of exposing a protected node ID.
+        Some(_) => true,
         None => {
             hidden.contains(id)
                 || canonical_collisions.contains(id)
@@ -549,7 +553,6 @@ fn edge_exposes_unreadable_node(
                     && !known_accounts.contains(id)
                     && !matches!(id, "gast" | "weber" | "admin"))
         }
-        _ => false,
     };
     rejects(edge.source_type.as_deref(), &edge.source_id)
         || rejects(edge.target_type.as_deref(), &edge.target_id)

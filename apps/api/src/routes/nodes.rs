@@ -1170,18 +1170,42 @@ async fn ensure_node_faden_with_operation_id(
                 "failed to guard creator account for derived Faden".to_string(),
             )
         })?;
+        // This optional projection already holds the per-node advisory lock.
+        // Guest exit holds the account row before acquiring that node lock.
+        // Waiting here would complete a cross-transaction lock cycle.
+        // A busy account therefore defers the best-effort Faden projection;
+        // the durable source operation remains committed and idempotent replay
+        // can repair the missing projection once account lifecycle settles.
         let active_account: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM domain_accounts WHERE id = $1 AND disabled = FALSE FOR UPDATE",
+            "SELECT id FROM domain_accounts WHERE id = $1 AND disabled = FALSE FOR UPDATE NOWAIT",
         )
         .bind(account_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|error| {
-            tracing::error!(%error, account_id = %account_id, node_id, faden_type = projection.faden_type.as_str(), "failed to lock creator account for node Faden");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to guard creator account for derived Faden".to_string(),
-            )
+            if error
+                .as_database_error()
+                .and_then(|database| database.code())
+                .as_deref()
+                == Some("55P03")
+            {
+                tracing::warn!(
+                    account_id = %account_id,
+                    node_id,
+                    faden_type = projection.faden_type.as_str(),
+                    "creator account lifecycle busy; deferring derived Faden"
+                );
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "creator account lifecycle busy; retry the derived Faden projection".to_string(),
+                )
+            } else {
+                tracing::error!(%error, account_id = %account_id, node_id, faden_type = projection.faden_type.as_str(), "failed to lock creator account for node Faden");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to guard creator account for derived Faden".to_string(),
+                )
+            }
         })?;
         if active_account.is_none() {
             return Err((
