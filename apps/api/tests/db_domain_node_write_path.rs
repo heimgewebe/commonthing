@@ -4002,17 +4002,26 @@ async fn postgres_replace_response_etag_is_reusable() -> Result<()> {
     run_migrations(&pool).await;
     clean(&pool).await;
     seed_node(&pool, NODE_A, Some("before"), None).await;
-    sqlx::query("UPDATE domain_nodes SET search_visibility='private' WHERE id=$1")
-        .bind(NODE_A)
-        .execute(&pool)
-        .await?;
+    // This is an ETag precision test for a PRIVATE node. Seed an actual
+    // canonical creator binding so the authenticated actor is authorized to
+    // read and reuse its version; a foreign Admin must remain denied.
+    let owner_id = "10000000-0000-0000-0000-000000000096";
+    sqlx::query(
+        "UPDATE domain_nodes
+         SET search_visibility='private',
+             payload = jsonb_set(payload, '{created_by_account_id}', to_jsonb($2::text), true)
+         WHERE id=$1",
+    )
+    .bind(NODE_A)
+    .bind(owner_id)
+    .execute(&pool)
+    .await?;
 
     let tmp = tempfile::tempdir()?;
     let in_dir = tmp.path().join("in");
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
-    let (app, cookie, _state) =
-        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000096").await?;
+    let (app, cookie, _state) = postgres_write_app(pool.clone(), owner_id).await?;
 
     let first_response = app
         .clone()
