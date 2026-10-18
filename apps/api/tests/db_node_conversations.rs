@@ -2785,9 +2785,15 @@ async fn private_node_conversations_require_the_owner_at_every_read_entry() {
             request("DELETE", &delete_path, cookie, None, None, Some("stale")),
         )
         .await;
+        // Global write middleware correctly challenges anonymous DELETE
+        // before handler authorization; authenticated nonreaders see 404.
+        let expected = if cookie.is_none() {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::NOT_FOUND
+        };
         assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
+            status, expected,
             "private archived tombstone not fail-closed"
         );
         assert!(!response.to_string().contains("Synthetic private history"));
