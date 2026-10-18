@@ -942,15 +942,15 @@ async fn require_conversation_tombstone_allowed(
     conversation_id: &str,
     auth: &AuthContext,
 ) -> Result<(), ConversationApiError> {
-    let observed_type: Option<String> = sqlx::query_scalar(
-        "SELECT conversation_type FROM domain_conversations WHERE id = $1::uuid AND deleted_at IS NULL",
+    let observed: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT conversation_type, node_id FROM domain_conversations
+         WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(conversation_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|error| database_error("classify conversation tombstone target", error))?;
-
-    let observed_type = observed_type.ok_or_else(|| {
+    let (conversation_type, node_id) = observed.ok_or_else(|| {
         ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
@@ -958,32 +958,35 @@ async fn require_conversation_tombstone_allowed(
         )
     })?;
 
-    if observed_type == "node" {
-        let locked_target: Option<(String, Option<String>, Option<DateTime<Utc>>)> =
-            sqlx::query_as(
-                "SELECT conversation_type, node_id, archived_at \
-                 FROM domain_conversations \
-                 WHERE id = $1::uuid AND deleted_at IS NULL FOR SHARE",
-            )
-            .bind(conversation_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|error| database_error("lock node conversation tombstone target", error))?;
+    if conversation_type == "node" {
+        if node_id.is_some() {
+            // Reuse the same transaction-scoped node advisory/row lock and
+            // visibility check as POST/PATCH. This must run BEFORE loading
+            // the message or returning an If-Match precondition body.
+            return require_conversation_writable(tx, conversation_id, auth).await;
+        }
 
-        return match locked_target {
-            Some((conversation_type, Some(_), None)) if conversation_type == "node" => Ok(()),
-            Some((conversation_type, None, Some(_))) if conversation_type == "node" => Ok(()),
-            None => Err(ConversationApiError::new(
-                StatusCode::NOT_FOUND,
-                "conversation_not_found",
-                "the conversation does not exist",
-            )),
-            Some(_) => Err(ConversationApiError::new(
-                StatusCode::CONFLICT,
-                "conversation_write_target_changed",
-                "the conversation write target changed while the request was in flight",
-            )),
-        };
+        // Archived node histories deliberately allow their original public
+        // message authors to tombstone; private/unknown historical archives
+        // have no such ordinary public capability.
+        let archived_visibility: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT archived_node_visibility FROM domain_conversations
+             WHERE id = $1::uuid AND conversation_type = 'node'
+               AND node_id IS NULL AND archived_at IS NOT NULL
+               AND deleted_at IS NULL FOR SHARE",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| database_error("authorize archived node message tombstone", error))?;
+        if archived_visibility.flatten().as_deref() == Some("public") {
+            return Ok(());
+        }
+        return Err(ConversationApiError::new(
+            StatusCode::NOT_FOUND,
+            "conversation_not_found",
+            "the conversation does not exist",
+        ));
     }
 
     require_conversation_writable(tx, conversation_id, auth).await

@@ -2724,7 +2724,7 @@ async fn private_node_conversations_require_the_owner_at_every_read_entry() {
     // Canonical deletion of a node with messages must not make its
     // archived private conversation anonymously visible.
     let message_path = format!("/conversations/{conversation_id}/messages");
-    let (post_status, _) = json_response(
+    let (post_status, posted_message) = json_response(
         &router,
         request(
             "POST",
@@ -2737,6 +2737,31 @@ async fn private_node_conversations_require_the_owner_at_every_read_entry() {
     )
     .await;
     assert_eq!(post_status, StatusCode::CREATED);
+    let message_id = posted_message["id"].as_str().expect("synthetic message id");
+    let delete_path = format!("/conversations/{conversation_id}/messages/{message_id}");
+    // The foreign Admin once obtained a 412 containing the entire private
+    // message when sending a stale If-Match value. Authorization must precede
+    // loading any message content or checking its ETag, before and after archive.
+    for cookie in [&other, &admin] {
+        let (status, response) = json_response(
+            &router,
+            request(
+                "DELETE",
+                &delete_path,
+                Some(cookie),
+                None,
+                None,
+                Some("stale"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "foreign tombstone exposed private node"
+        );
+        assert!(!response.to_string().contains("Synthetic private history"));
+    }
     let deleted = delete_node_with_edges_in_postgres(&pool, NODE_ID)
         .await
         .expect("private node deleted and archived");
@@ -2754,6 +2779,19 @@ async fn private_node_conversations_require_the_owner_at_every_read_entry() {
     .await
     .expect("archive visibility snapshot");
     assert_eq!(visibility.as_deref(), Some("private"));
+    for cookie in [None, Some(author.as_str()), Some(admin.as_str())] {
+        let (status, response) = json_response(
+            &router,
+            request("DELETE", &delete_path, cookie, None, None, Some("stale")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "private archived tombstone not fail-closed"
+        );
+        assert!(!response.to_string().contains("Synthetic private history"));
+    }
     for path in &paths[1..] {
         for cookie in [
             None,
