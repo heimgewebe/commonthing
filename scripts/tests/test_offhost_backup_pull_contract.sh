@@ -239,7 +239,7 @@ fi
 [[ -f "$symlink_real/earlier-prefix-private.sql.gz" ]]
 
 # A deliberately configured symlink to a clean destination remains usable;
-# retention must operate on the same real directory as the pull receipt.
+# the off-host pull must never remove old data via the resolved path.
 clean_real="$root/clean-symlink-real"
 clean_alias="$root/clean-symlink-alias"
 mkdir -p "$clean_real"
@@ -249,8 +249,8 @@ printf 'old encrypted fixture\n' > "$old_cipher"
 touch -d '10 days ago' "$old_cipher"
 LOCAL_RETENTION_DAYS=1 pull "$clean_alias" test-host > /dev/null
 [[ -f "$clean_real/$file" && -f "$clean_real/latest-pull.receipt" ]]
-[[ ! -e "$old_cipher" ]] || {
-  echo 'symlinked encrypted destination skipped age retention' >&2
+[[ -f "$old_cipher" ]] || {
+  echo 'symlinked encrypted destination deleted an earlier recovery candidate' >&2
   exit 1
 }
 
@@ -346,7 +346,7 @@ fi
 grep -qF 'Restic sources' "$root/restic-source.stderr"
 [[ ! -e "$root/controlled-home/artifacts/merges/candidate/$file" ]]
 
-# Retention fixture: expired local artefacts, including legacy plaintext copies.
+# No-deletion fixture: expired local artefacts must survive even when uncertified.
 mkdir -p "$dest"
 for suffix in .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; do
   touch -d '10 days ago' "$dest/weltgewebe-postgres-20260101T000000Z${suffix}"
@@ -443,10 +443,12 @@ cp "$root/remote-original-ciphertext" "$remote/$file"
 write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
 grep -qx 'remote_host=commonserver' "$dest/latest-pull.receipt"
 [[ "$(stat -c %a "$dest/$file")" == 600 ]]
-if compgen -G "$dest/weltgewebe-postgres-20260101T000000Z*" > /dev/null; then
-  echo 'local retention must expire ciphertext, manifests and proofs' >&2
-  exit 1
-fi
+for suffix in .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; do
+  [[ -f "$dest/weltgewebe-postgres-20260101T000000Z${suffix}" ]] || {
+    echo "off-host pull deleted an old backup artefact without authorized retirement: $suffix" >&2
+    exit 1
+  }
+done
 
 # Plaintext never lands off-host and never crosses the (fake) SSH link.
 if compgen -G "$dest/*.sql.gz" > /dev/null; then
@@ -575,8 +577,8 @@ for core in "$file" "$manifest" "$age_manifest" "$proof"; do
     exit 1
   }
 done
-[[ ! -e "$expired_unrelated" ]] || {
-  echo 'retention kept unrelated expired ciphertext' >&2
+[[ -f "$expired_unrelated" ]] || {
+  echo 'automatic retention deleted unverified expired ciphertext before any real restore' >&2
   exit 1
 }
 grep -qx "file=$file" "$no_proof_dest/latest-pull.receipt"

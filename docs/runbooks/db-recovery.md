@@ -238,13 +238,14 @@ pro Pull einen unveränderlichen Receipt unter `receipts/` (create-only,
 `<backup>.pulled-<UTC>.receipt`) und aktualisiert `latest-pull.receipt` als
 Zeiger auf den neuesten (`contract=weltgewebe-offhost-backup-pull-v2`,
 `encryption=age`, `recipients=`). Receipts unterliegen keiner Retention.
-Die lokale `LOCAL_RETENTION_DAYS`-Bereinigung darf ausschließlich veraltete,
-**nicht** durch einen historischen Erfolgs-Receipt zertifizierte Artefakte
-entfernen. Bei vorhandener Receipt-Historie müssen Chiffrat, beide Manifeste
-und der kanonische Restore-Proof erhalten bleiben, auch wenn ein neuerer
-Sicherungssatz eingetroffen ist. Die spätere Aussonderung zertifizierter
-Recovery-Punkte braucht einen nachgewiesenen Ersatz-Restore und eine gesonderte
-Freigabe; eine erfolgreiche Kopie allein genügt nicht.
+Der Off-Host-Pull löscht derzeit **keine** bestehenden Sicherungen,
+Chiffrate, Manifeste oder Restore-Belege automatisch – auch keine abgelaufenen
+oder noch nicht zertifizierten Artefakte. `LOCAL_RETENTION_DAYS` bleibt zur
+Kompatibilität mit vorhandenen Installationen als Eingabe akzeptiert, löst
+aber ausdrücklich keine Löschung mehr aus. Ein echter Ersatz-Restore mit der
+unabhängigen Offline-Identity und eine gesonderte Freigabe sind die
+Voraussetzung jeder späteren Aussonderung. Dadurch kann der Speicherbedarf
+wachsen; freien Platz und Backup-Alter deshalb unabhängig überwachen.
 Neu erzeugte History-Receipts tragen
 zusätzlich `history_sequence`, eine pro Sicherungsbasis strikt ansteigende
 Veröffentlichungsnummer. Der `latest-pull.receipt`-Zeiger wird anhand dieser

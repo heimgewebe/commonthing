@@ -626,41 +626,12 @@ cp -- "$receipt_tmp" "$work_dir/history.receipt"
 ln -- "$work_dir/history.receipt" "$history_receipt" || fail "pull receipt already exists: $history_receipt"
 mv -f "$receipt_tmp" "$receipt"
 
-# Retention never deletes legacy plaintext recovery points. Their retirement
-# needs a separately verified age restore and an explicit operator decision.
-# The just-certified recovery point stays intact even if a restore proof arrived
-# after the ciphertext and manifests passed the normal retention age.
-if ((LOCAL_RETENTION_DAYS > 0)); then
-  # A history receipt outlives the configured local age limit. Do not make
-  # previously certified recovery points impossible to restore or verify by
-  # deleting their ciphertext, manifests or canonical proof. Uncertified
-  # interrupted/stray artefacts may still be removed after the age limit.
-  retention_candidates="$work_dir/retention-candidates"
-  find "$DEST_DIR" -maxdepth 1 -type f ! -name "${base}.*" \
-    \( -name "${BACKUP_PREFIX}-*.sql.gz.age" -o -name "${BACKUP_PREFIX}-*.sha256.manifest" -o -name "${BACKUP_PREFIX}-*.restore-proof" \) \
-    -mtime +"$LOCAL_RETENTION_DAYS" -print0 > "$retention_candidates" ||
-    fail "normal pull could not enumerate retention candidates"
-  while IFS= read -r -d '' candidate; do
-    candidate_name="${candidate##*/}"
-    case "$candidate_name" in
-      *.sql.gz.age) candidate_base="${candidate_name%.sql.gz.age}" ;;
-      *.age.sha256.manifest) candidate_base="${candidate_name%.age.sha256.manifest}" ;;
-      *.sha256.manifest) candidate_base="${candidate_name%.sha256.manifest}" ;;
-      *.restore-proof) candidate_base="${candidate_name%.restore-proof}" ;;
-      *) fail "normal pull unexpected retention candidate" ;;
-    esac
-    certified=0
-    for prior_receipt in "$DEST_DIR/receipts/${candidate_base}.pulled-"*.receipt; do
-      if [[ -e "$prior_receipt" || -L "$prior_receipt" ]]; then
-        certified=1
-        break
-      fi
-    done
-    ((certified)) && continue
-    [[ -f "$candidate" && ! -L "$candidate" ]] ||
-      fail "normal pull retention candidate changed before removal"
-    rm -- "$candidate" ||
-      fail "normal pull could not retire an uncertified expired artefact"
-  done < "$retention_candidates"
-fi
+# No off-host backup or restore proof is automatically retired here, even
+# when LOCAL_RETENTION_DAYS is configured. This includes interrupted,
+# uncertified and historically certified artefacts. A successful pull or a
+# synthetically valid proof does not establish that recovery is possible.
+# Retirement requires a separately authorized operation after an actual
+# isolated, offline-identity-decrypted PostgreSQL restore of its replacement.
+# Keeping the old config knob accepted avoids breaking installed user units;
+# it is intentionally non-operative until that lifecycle is authorized.
 printf 'Encrypted off-host PostgreSQL backup copied and verified: %s\n' "$DEST_DIR/$latest"
