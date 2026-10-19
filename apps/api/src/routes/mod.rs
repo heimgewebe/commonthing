@@ -1,6 +1,9 @@
 pub mod accounts;
 pub mod auth;
 mod collective_write_guard;
+pub(crate) use collective_write_guard::{
+    postgres_domain_connection_budget, POSTGRES_DOMAIN_OPERATION_UNITS,
+};
 pub mod conversations;
 mod domain_write_guard;
 pub mod edges;

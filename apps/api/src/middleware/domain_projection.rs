@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use sqlx::{PgPool, Postgres, Transaction};
-use tokio::sync::{RwLockReadGuard, Semaphore};
+use tokio::sync::RwLockReadGuard;
 
 use axum::{
     extract::{Request, State},
@@ -14,10 +14,15 @@ use axum::{
 };
 use axum_extra::extract::cookie::CookieJar;
 
-use crate::{config::DomainReadSource, routes::auth::SESSION_COOKIE_NAME, state::ApiState};
-
-static PRIVACY_READ_SLOTS: Semaphore =
-    Semaphore::const_new((crate::DATABASE_POOL_MAX_CONNECTIONS as usize - 1) / 2);
+use crate::{
+    config::DomainReadSource,
+    middleware::auth::AuthContext,
+    routes::{
+        auth::SESSION_COOKIE_NAME, postgres_domain_connection_budget,
+        POSTGRES_DOMAIN_OPERATION_UNITS,
+    },
+    state::ApiState,
+};
 
 // Only fixed-size domain JSON reads get the cross-process database fence.
 // The search endpoint already authorizes against domain_nodes in its SQL query.
@@ -125,15 +130,19 @@ async fn fenced_domain_read(state: &ApiState, request: Request, next: Next) -> R
     let Some(pool) = state.db_pool.as_ref() else {
         return projection_unavailable(state, "PostgreSQL domain pool is missing");
     };
-    // The API's PostgreSQL pool has five connections. Without this bound, five
-    // readers could each hold a connection while their handlers wait for a
-    // sixth one, starving both handlers and privacy writers.
-    let _slot =
-        match tokio::time::timeout(Duration::from_secs(3), PRIVACY_READ_SLOTS.acquire()).await {
-            Ok(Ok(slot)) => slot,
-            Ok(Err(error)) => return projection_unavailable(state, error),
-            Err(_) => return projection_unavailable(state, "privacy read slot timed out"),
-        };
+    // Both fenced reads and advisory-lock node mutations need two database
+    // connections. Reserving the SAME weighted pool budget before either
+    // takes a connection prevents a mixed writer/read deadlock.
+    let _slot = match tokio::time::timeout(
+        Duration::from_secs(3),
+        postgres_domain_connection_budget().acquire_many(POSTGRES_DOMAIN_OPERATION_UNITS),
+    )
+    .await
+    {
+        Ok(Ok(slot)) => slot,
+        Ok(Err(error)) => return projection_unavailable(state, error),
+        Err(_) => return projection_unavailable(state, "privacy read slot timed out"),
+    };
     const MAX_FENCED_GENERATION_ATTEMPTS: usize = 4;
     for _ in 0..MAX_FENCED_GENERATION_ATTEMPTS {
         let wait_started = Instant::now();
@@ -152,6 +161,17 @@ async fn fenced_domain_read(state: &ApiState, request: Request, next: Next) -> R
                 }
             };
         if observed == state.domain_projection_version.load(Ordering::Acquire) {
+            if !auth_matches_guarded_projection(
+                state,
+                request.extensions().get::<AuthContext>().cloned(),
+            )
+            .await
+            {
+                if let Err(error) = tx.rollback().await {
+                    return projection_unavailable(state, error);
+                }
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
             let response = next.run(request).await;
             // Retain BOTH the process-local cache read guard and the database
             // row lock through response creation. A rollback failure must not
@@ -174,6 +194,28 @@ async fn fenced_domain_read(state: &ApiState, request: Request, next: Next) -> R
         state,
         "domain generation changed during fenced privacy read",
     )
+}
+
+// Session authentication happens outside the held PostgreSQL generation-row
+// lock, otherwise its SQL touch can deadlock against guest exit. Re-check the
+// authenticated account against the SAME guarded and current local domain
+// generation before the handler uses the role/owner from AuthContext.
+async fn auth_matches_guarded_projection(state: &ApiState, auth: Option<AuthContext>) -> bool {
+    let Some(auth) = auth else {
+        // Unauthenticated tests may invoke this middleware directly; the
+        // production composition always inserts AuthContext first.
+        return true;
+    };
+    if !auth.authenticated {
+        return true;
+    }
+    let Some(account_id) = auth.account_id.as_deref() else {
+        return false;
+    };
+    let accounts = state.accounts.read().await;
+    accounts
+        .get(account_id)
+        .is_some_and(|account| !account.public.disabled && account.role == auth.role)
 }
 
 fn projection_unavailable(state: &ApiState, error: impl std::fmt::Display) -> Response {
@@ -203,6 +245,12 @@ pub async fn ensure_current_domain_projection(
     }
 
     let has_session_cookie = jar.get(SESSION_COOKIE_NAME).is_some();
+    if has_session_cookie && request.extensions().get::<AuthContext>().is_none() {
+        return projection_unavailable(
+            &state,
+            "session authentication must precede domain projection",
+        );
+    }
     if may_use_previous_projection(request.method(), has_session_cookie, request.uri().path()) {
         if let Err(error) = state.refresh_domain_projection_for_read().await {
             return projection_unavailable(&state, error);
@@ -244,6 +292,14 @@ pub async fn ensure_current_domain_projection(
                 state
                     .metrics
                     .observe_domain_projection_read_gate_wait(wait_duration);
+                if !auth_matches_guarded_projection(
+                    &state,
+                    request.extensions().get::<AuthContext>().cloned(),
+                )
+                .await
+                {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
                 return next.run(request).await;
             }
             Ok((None, wait_duration)) => {

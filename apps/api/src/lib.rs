@@ -543,23 +543,31 @@ async fn start(
         // Serve at root for Caddy (which strips /api prefix)
         .merge(
             api_router()
-                .route_layer(from_fn_with_state(state.clone(), auth_middleware))
-                .layer(axum::middleware::from_fn(require_csrf))
                 .layer(from_fn_with_state(
                     state.clone(),
                     ensure_current_domain_projection,
-                )),
+                ))
+                // Session lookup/touch must finish BEFORE the cross-process
+                // projection row lock. The inner projection middleware
+                // revalidates account status and role against the guarded
+                // current generation before admitting the handler.
+                .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+                .layer(axum::middleware::from_fn(require_csrf)),
         )
         // Serve at /api for direct access (e.g. apps/web fallback)
         .nest(
             "/api",
             api_router()
-                .route_layer(from_fn_with_state(state.clone(), auth_middleware))
-                .layer(axum::middleware::from_fn(require_csrf))
                 .layer(from_fn_with_state(
                     state.clone(),
                     ensure_current_domain_projection,
-                )),
+                ))
+                // Session lookup/touch must finish BEFORE the cross-process
+                // projection row lock. The inner projection middleware
+                // revalidates account status and role against the guarded
+                // current generation before admitting the handler.
+                .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+                .layer(axum::middleware::from_fn(require_csrf)),
         )
         .merge(health_routes())
         .merge(meta_routes())

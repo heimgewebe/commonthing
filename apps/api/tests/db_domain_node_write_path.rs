@@ -36,7 +36,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, watch, Barrier, RwLock};
 use tower::ServiceExt;
 use weltgewebe_api::{
     auth::{
@@ -348,6 +348,9 @@ async fn postgres_write_app_with_account_source(
         .expect("session create");
     let cookie = format!("gewebe_session={}", session.id);
 
+    // Handler-focused tests can directly exercise the write path without the
+    // projection middleware. The explicit projected fixture below covers the
+    // full production request composition.
     let app = Router::new()
         .merge(api_router())
         .layer(from_fn_with_state(state.clone(), auth_middleware))
@@ -355,6 +358,20 @@ async fn postgres_write_app_with_account_source(
         .with_state(state.clone());
 
     Ok((app, cookie, state))
+}
+
+// Production-equivalent ordering for HTTP tests of the privacy projection
+// guard: authentication and session I/O must finish before the DB row fence.
+fn postgres_projected_router(state: &ApiState) -> Router {
+    Router::new()
+        .merge(api_router())
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state.clone())
 }
 
 fn patch_node_req(cookie: &str, id: &str, json_body: &str, etag: &str) -> Request<body::Body> {
@@ -479,12 +496,9 @@ async fn postgres_node_patch_fast_forwards_exact_local_projection_generation() -
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
-    let (app, cookie, state) =
+    let (_app, cookie, state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000091").await?;
-    let app = app.layer(from_fn_with_state(
-        state.clone(),
-        ensure_current_domain_projection,
-    ));
+    let app = postgres_projected_router(&state);
 
     let preload = app
         .clone()
@@ -589,12 +603,9 @@ async fn postgres_node_patch_does_not_fast_forward_over_external_generation() ->
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
-    let (app, cookie, state) =
+    let (_app, cookie, state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000092").await?;
-    let app = app.layer(from_fn_with_state(
-        state.clone(),
-        ensure_current_domain_projection,
-    ));
+    let app = postgres_projected_router(&state);
 
     let preload = app
         .clone()
@@ -1021,18 +1032,12 @@ async fn anonymous_reads_after_visibility_commit_hide_nodes_across_api_instances
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
-    let (first_router, _, first_state) =
+    let (_first_router, _, first_state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-0000000000a1").await?;
-    let (second_router, _, second_state) =
+    let (_second_router, _, second_state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-0000000000a2").await?;
-    let first = first_router.layer(from_fn_with_state(
-        first_state.clone(),
-        ensure_current_domain_projection,
-    ));
-    let second = second_router.layer(from_fn_with_state(
-        second_state.clone(),
-        ensure_current_domain_projection,
-    ));
+    let first = postgres_projected_router(&first_state);
+    let second = postgres_projected_router(&second_state);
 
     for (instance, app) in [("first", first.clone()), ("second", second.clone())] {
         let response = app
@@ -2692,7 +2697,8 @@ async fn postgres_guest_exit_completes_under_projection_middleware() -> Result<(
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
-    let (app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    let (_app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    let app = postgres_projected_router(&state);
     sqlx::query("UPDATE domain_accounts SET role = 'gast' WHERE id = $1")
         .bind(ACTOR_ID)
         .execute(&pool)
@@ -2722,11 +2728,6 @@ async fn postgres_guest_exit_completes_under_projection_middleware() -> Result<(
     .bind(NODE_ID)
     .execute(&pool)
     .await?;
-
-    let app = app.layer(from_fn_with_state(
-        state.clone(),
-        ensure_current_domain_projection,
-    ));
 
     let preload_response = app
         .clone()
@@ -2758,8 +2759,14 @@ async fn postgres_guest_exit_completes_under_projection_middleware() -> Result<(
         tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(exit_request))
             .await
             .context("guest exit challenge must not deadlock under projection middleware")??;
-    assert_eq!(exit_response.status(), StatusCode::FORBIDDEN);
+    let exit_status = exit_response.status();
     let exit_body = body::to_bytes(exit_response.into_body(), usize::MAX).await?;
+    assert_eq!(
+        exit_status,
+        StatusCode::FORBIDDEN,
+        "guest exit challenge body: {}",
+        String::from_utf8_lossy(&exit_body)
+    );
     let exit_payload: serde_json::Value = serde_json::from_slice(&exit_body)?;
     assert_eq!(exit_payload["error"], "STEP_UP_REQUIRED");
     let challenge_id = exit_payload["challenge_id"]
@@ -4371,12 +4378,9 @@ async fn postgres_node_noop_patch_does_not_fast_forward_external_generation() ->
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
-    let (app, cookie, state) =
+    let (_app, cookie, state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000097").await?;
-    let app = app.layer(from_fn_with_state(
-        state.clone(),
-        ensure_current_domain_projection,
-    ));
+    let app = postgres_projected_router(&state);
     state.refresh_domain_projection_if_stale().await?;
     let local_before = state.domain_projection_version.load(Ordering::Acquire);
     assert_eq!(local_before, domain_projection_version(&pool).await?);
@@ -4618,6 +4622,155 @@ async fn strict_projection_refresh_reclassifies_following_local_patch_handoff() 
         Some("handoff B")
     );
 
+    clean(&pool).await;
+    Ok(())
+}
+
+// A five-connection runtime must still have a usable connection while a
+// cross-process GET holds the canonical visibility row and PATCH waits to
+// advance it. Two independent reader/writer admission limits previously let
+// the waiting requests consume the whole SQLx pool (PoolTimedOut).
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_and_node_patch_share_five_connection_budget() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000b4";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await
+        .context("connect five-connection SQLx runtime pool")?;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, None, None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_handler_app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let probe_entered = Arc::clone(&entered);
+    // This handler runs INSIDE the real GET PostgreSQL FOR SHARE fence.
+    let app = Router::new()
+        .merge(api_router())
+        .route(
+            "/nodes/pool-fence-probe",
+            axum::routing::get(move || {
+                let probe_entered = Arc::clone(&probe_entered);
+                let mut release_rx = release_rx.clone();
+                async move {
+                    probe_entered.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    StatusCode::OK
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state.clone());
+
+    let first_app = app.clone();
+    let held_get = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                Request::get("/nodes/pool-fence-probe")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("GET fence probe"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("real PostgreSQL-fenced GET did not reach its handler")?;
+
+    let writer_app = app.clone();
+    let writer = tokio::spawn(async move {
+        writer_app
+            .oneshot(patch_node_req(
+                &cookie,
+                NODE_A,
+                r#"{"info":"fenced mixed load"}"#,
+                SEEDED_NODE_ETAG,
+            ))
+            .await
+    });
+
+    // Confirm the writer is actually blocked by a PostgreSQL lock rather than
+    // merely queued or finished before the test probes the pool.
+    let mut observed_lock_wait = false;
+    for _ in 0..40 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity              WHERE datname = current_database()                AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if waiting > 0 {
+            observed_lock_wait = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        observed_lock_wait,
+        "writer never reached a blocked PostgreSQL lock"
+    );
+    assert!(
+        !writer.is_finished(),
+        "writer bypassed the held visibility fence"
+    );
+
+    // A third protected request must not exhaust all five SQLx connections.
+    let second_app = app.clone();
+    let later_get = tokio::spawn(async move {
+        second_app
+            .oneshot(
+                Request::get("/nodes")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("parallel node list"),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    let headroom: i64 = tokio::time::timeout(
+        Duration::from_secs(2),
+        sqlx::query_scalar("SELECT 1::bigint").fetch_one(&pool),
+    )
+    .await
+    .context("mixed GET/PATCH blocked all five SQLx connections")??;
+    assert_eq!(headroom, 1, "at least one connection must remain usable");
+
+    release_tx.send(true).context("release held GET")?;
+    let first = tokio::time::timeout(Duration::from_secs(7), held_get)
+        .await
+        .context("held GET failed to finish after release")??;
+    assert_eq!(first?.status(), StatusCode::OK);
+    let patched = tokio::time::timeout(Duration::from_secs(7), writer)
+        .await
+        .context("waiting writer did not finish after GET released fence")??;
+    assert_eq!(patched?.status(), StatusCode::OK);
+    let second = tokio::time::timeout(Duration::from_secs(7), later_get)
+        .await
+        .context("later GET starved after writer finished")??;
+    assert_eq!(second?.status(), StatusCode::OK);
+
+    let persisted: Option<String> =
+        sqlx::query_scalar("SELECT payload ->> 'info' FROM domain_nodes WHERE id = $1")
+            .bind(NODE_A)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(persisted.as_deref(), Some("fenced mixed load"));
     clean(&pool).await;
     Ok(())
 }

@@ -1092,3 +1092,172 @@ async fn own_profile_get_does_not_hold_generation_row_while_waiting_for_profile_
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     clean(&pool).await;
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn authenticated_node_get_does_not_hold_generation_lock_during_session_io() {
+    use axum::{middleware::from_fn_with_state, routing::get};
+    use tokio::time::{timeout, Duration};
+    use weltgewebe_api::{
+        auth::session_db::DbSessionStore,
+        middleware::{auth::auth_middleware, domain_projection::ensure_current_domain_projection},
+        routes::auth::SESSION_COOKIE_NAME,
+    };
+
+    let pool = prepare_pool().await;
+    let account_id = "rp-guest-exit-fence";
+    sqlx::query(
+        "INSERT INTO domain_accounts \
+         (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload) \
+         VALUES ($1,'garnrolle','Guest exit fence','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("seed guest");
+    let mut state = postgres_bbox_route_state(pool.clone());
+    state.sessions = SessionBackend::new(DbSessionStore::new(pool.clone()));
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("initial current account cache");
+    let session = state
+        .sessions
+        .create(account_id.to_string(), None)
+        .await
+        .expect("create DB-backed session");
+    sqlx::query("UPDATE sessions SET last_active = NOW() - INTERVAL '10 minutes' WHERE id = $1")
+        .bind(&session.id)
+        .execute(&pool)
+        .await
+        .expect("force real session touch");
+
+    // The actual request nesting must match the production Router: session
+    // get/touch on the outside, then the canonical PostgreSQL visibility fence.
+    let app = Router::new()
+        .route(
+            "/nodes/fence-probe",
+            get(|| async { axum::http::StatusCode::OK }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state);
+
+    let mut exiting = pool.begin().await.expect("guest exit transaction");
+    let locked = sqlx::query("DELETE FROM sessions WHERE id = $1")
+        .bind(&session.id)
+        .execute(&mut *exiting)
+        .await
+        .expect("lock session row before domain node reader");
+    assert_eq!(locked.rows_affected(), 1);
+
+    let mut reader = tokio::spawn(async move {
+        app.oneshot(
+            Request::get("/nodes/fence-probe")
+                .header("cookie", format!("{SESSION_COOKIE_NAME}={}", session.id))
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("GET with a concurrently departing guest")
+    });
+
+    assert!(
+        timeout(Duration::from_millis(150), &mut reader)
+            .await
+            .is_err(),
+        "the GET should be awaiting the session row before exit commits"
+    );
+
+    // On the broken ordering, the GET already owns SELECT generation FOR
+    // SHARE and waits for this session DELETE, while this account DELETE
+    // waits for the generation row: an application-level cross-connection
+    // deadlock. The writer must commit while the GET is still pending.
+    timeout(
+        Duration::from_secs(3),
+        sqlx::query("DELETE FROM domain_accounts WHERE id = $1")
+            .bind(account_id)
+            .execute(&mut *exiting),
+    )
+    .await
+    .expect("guest exit must not wait for the GET generation fence")
+    .expect("delete departing account");
+    exiting.commit().await.expect("commit guest exit");
+    let response = timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("GET resumed after guest exit")
+        .expect("GET task");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "deleted guest sessions must not retain authorization after the exit commit"
+    );
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn authenticated_role_is_revalidated_after_post_session_projection_refresh() {
+    use axum::{middleware::from_fn_with_state, routing::get};
+    use weltgewebe_api::{
+        auth::role::Role,
+        middleware::{auth::AuthContext, domain_projection::ensure_current_domain_projection},
+    };
+
+    let pool = prepare_pool().await;
+    let account_id = "rp-guarded-role-downgrade";
+    sqlx::query(
+        "INSERT INTO domain_accounts \
+         (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload) \
+         VALUES ($1,'garnrolle','Guarded role','not_on_map',0,FALSE,'admin','{}','{}')",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("seed admin");
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("initial cached admin");
+    let stale_authenticated = AuthContext {
+        authenticated: true,
+        account_id: Some(account_id.to_string()),
+        device_id: None,
+        role: Role::Admin,
+        expires_at: None,
+    };
+    sqlx::query("UPDATE domain_accounts SET role = 'gast' WHERE id = $1")
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .expect("admin was downgraded in another API process");
+
+    let app = Router::new()
+        .route(
+            "/nodes/role-probe",
+            get(|| async { axum::http::StatusCode::OK }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+    let mut request = Request::get("/nodes/role-probe")
+        .body(body::Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(stale_authenticated);
+
+    let response = app.oneshot(request).await.expect("guarded request");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "a stale Admin session must not retain authority after the current DB generation downgrades it"
+    );
+    clean(&pool).await;
+}
