@@ -1,4 +1,8 @@
-use std::time::Instant;
+use std::future::Future;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
+
+use tokio::sync::RwLockReadGuard;
 
 use axum::{
     extract::{Request, State},
@@ -43,6 +47,45 @@ fn may_use_previous_projection(method: &Method, has_session_cookie: bool, path: 
     .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
+// Acquire the request's actual snapshot guard before checking the canonical
+// DB generation. A pre-gate check can be invalidated while waiting for the
+// read guard, especially by another request publishing a new cache generation.
+async fn current_generation_under_read_gate<'a, F, Fut>(
+    gate: &'a tokio::sync::RwLock<()>,
+    local_version: &AtomicI64,
+    db_version: F,
+) -> anyhow::Result<(Option<RwLockReadGuard<'a, ()>>, Duration)>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<i64>>,
+{
+    let wait_started = Instant::now();
+    let guard = gate.read().await;
+    let waited = wait_started.elapsed();
+    let observed = db_version().await?;
+    if observed == local_version.load(Ordering::Acquire) {
+        Ok((Some(guard), waited))
+    } else {
+        Ok((None, waited))
+    }
+}
+
+fn projection_unavailable(state: &ApiState, error: impl std::fmt::Display) -> Response {
+    state.metrics.domain_projection_refresh_failed();
+    tracing::error!(
+        event = "domain.projection_refresh_failed",
+        error = %error,
+        "PostgreSQL domain projection is not current for this request"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "DOMAIN_PROJECTION_UNAVAILABLE",
+        })),
+    )
+        .into_response()
+}
+
 pub async fn ensure_current_domain_projection(
     State(state): State<ApiState>,
     jar: CookieJar,
@@ -54,39 +97,119 @@ pub async fn ensure_current_domain_projection(
     }
 
     let has_session_cookie = jar.get(SESSION_COOKIE_NAME).is_some();
-    let refresh = if may_use_previous_projection(
-        request.method(),
-        has_session_cookie,
-        request.uri().path(),
-    ) {
-        state.refresh_domain_projection_for_read().await
-    } else {
-        state.refresh_domain_projection_if_stale().await
-    };
-    if let Err(error) = refresh {
-        state.metrics.domain_projection_refresh_failed();
-        tracing::error!(
-            event = "domain.projection_refresh_failed",
-            error = %error,
-            "PostgreSQL domain projection could not be refreshed"
-        );
-        let body = serde_json::json!({
-            "error": "DOMAIN_PROJECTION_UNAVAILABLE",
-        });
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    if may_use_previous_projection(request.method(), has_session_cookie, request.uri().path()) {
+        if let Err(error) = state.refresh_domain_projection_for_read().await {
+            return projection_unavailable(&state, error);
+        }
+        let read_gate_wait_started = Instant::now();
+        let _projection_read = state.domain_projection_gate.read().await;
+        state
+            .metrics
+            .observe_domain_projection_read_gate_wait(read_gate_wait_started.elapsed());
+        return next.run(request).await;
     }
 
-    let read_gate_wait_started = Instant::now();
-    let _projection_read = state.domain_projection_gate.read().await;
-    state
-        .metrics
-        .observe_domain_projection_read_gate_wait(read_gate_wait_started.elapsed());
-    next.run(request).await
+    // Sensitive reads use a single generation admission point while their
+    // handler's read guard is held. A later committed generation is observed
+    // by a later request; any generation found stale here must be reloaded.
+    const MAX_CURRENT_GENERATION_ATTEMPTS: usize = 4;
+    let Some(pool) = state.db_pool.as_ref() else {
+        return projection_unavailable(&state, "PostgreSQL domain pool is missing");
+    };
+    for _ in 0..MAX_CURRENT_GENERATION_ATTEMPTS {
+        let checked = current_generation_under_read_gate(
+            &state.domain_projection_gate,
+            &state.domain_projection_version,
+            || async {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    crate::domain_db::domain_projection_version(pool),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("domain generation read timed out"))?
+            },
+        )
+        .await;
+        match checked {
+            Ok((Some(_projection_read), wait_duration)) => {
+                state
+                    .metrics
+                    .observe_domain_projection_read_gate_wait(wait_duration);
+                return next.run(request).await;
+            }
+            Ok((None, wait_duration)) => {
+                state
+                    .metrics
+                    .observe_domain_projection_read_gate_wait(wait_duration);
+            }
+            Err(error) => return projection_unavailable(&state, error),
+        }
+        // Release the read guard before refresh, which may need the write guard.
+        if let Err(error) = state.refresh_domain_projection_if_stale().await {
+            return projection_unavailable(&state, error);
+        }
+    }
+    projection_unavailable(
+        &state,
+        "domain generation changed during bounded read admission",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn generation_is_checked_after_acquiring_the_snapshot_guard() {
+        let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        let local = std::sync::Arc::new(AtomicI64::new(1));
+        let writer = gate.write().await;
+        let waiting_gate = std::sync::Arc::clone(&gate);
+        let waiting_local = std::sync::Arc::clone(&local);
+        let reader = tokio::spawn(async move {
+            let (read, _) =
+                current_generation_under_read_gate(&waiting_gate, &waiting_local, || async {
+                    Ok(2)
+                })
+                .await
+                .expect("canonical generation");
+            assert!(read.is_some(), "post-writer read must see new generation");
+        });
+        tokio::task::yield_now().await;
+        assert!(!reader.is_finished(), "read must wait for writer guard");
+        local.store(2, Ordering::Release);
+        drop(writer);
+        reader.await.expect("read completed");
+    }
+
+    #[tokio::test]
+    async fn generation_drift_and_errors_release_the_read_guard() {
+        let gate = tokio::sync::RwLock::new(());
+        let local = AtomicI64::new(1);
+        let (stale, _) = current_generation_under_read_gate(&gate, &local, || async { Ok(2) })
+            .await
+            .expect("canonical generation");
+        assert!(stale.is_none(), "DB advance requires fresh projection");
+        assert!(gate.try_write().is_ok(), "stale gate must be released");
+
+        let (current, _) = current_generation_under_read_gate(&gate, &local, || async { Ok(1) })
+            .await
+            .expect("canonical generation");
+        assert!(current.is_some());
+        assert!(gate.try_write().is_err(), "handler must retain guard");
+        drop(current);
+        assert!(gate.try_write().is_ok());
+
+        let missing = current_generation_under_read_gate(&gate, &local, || async {
+            Err(anyhow::anyhow!("no authoritative version"))
+        })
+        .await;
+        assert!(missing.is_err());
+        assert!(
+            gate.try_write().is_ok(),
+            "failed DB read must not strand gate"
+        );
+    }
 
     #[test]
     fn only_non_domain_anonymous_reads_may_use_previous_projection() {
