@@ -196,10 +196,10 @@ ln -T -- "$tmp_manifest" "$manifest_file" ||
 ln -T -- "$tmp_age_manifest" "$age_manifest_file" ||
   fail "backup target appeared during publication: $age_manifest_file"
 
-if ((BACKUP_RETENTION_DAYS > 0)); then
-  find "$BACKUP_DIR" -maxdepth 1 -type f \
-    \( -name "${BACKUP_PREFIX}-*.sql.gz" -o -name "${BACKUP_PREFIX}-*.sql.gz.age" -o -name "${BACKUP_PREFIX}-*.sha256.manifest" \) \
-    -mtime +"$BACKUP_RETENTION_DAYS" -delete
-fi
+# The producer must not silently retire previously usable local recovery
+# points. BACKUP_RETENTION_DAYS remains accepted for old unit compatibility,
+# but neither plaintext, ciphertext nor either manifest is age-deleted here.
+# Only a separately authorized retirement after a real offline-identity
+# decrypt and isolated PostgreSQL restore may remove historic backups.
 printf 'PostgreSQL backup written: %s\nManifest written: %s\n' "$dump_file" "$manifest_file"
 printf 'Encrypted off-host copy written: %s\nOff-host manifest written: %s\n' "$age_file" "$age_manifest_file"

@@ -83,8 +83,14 @@ des Chiffrats, das Format `age-encryption.org/v1`, die öffentlichen
 Empfänger sowie Dateiname und SHA256 des zugehörigen Klartext-Dumps.
 Unvollständige temporäre Dateien werden nicht sichtbar; das
 Off-Host-Manifest wird als letzte Datei eines vollständigen Satzes
-veröffentlicht. Die Standard-Retention beträgt 14 Tage und gilt für alle
-vier Dateiarten.
+veröffentlicht. **Der Producer löscht keine dieser vier Dateiarten
+automatisch.** Der bisherige Konfigurationswert `BACKUP_RETENTION_DAYS`
+(Default 14) bleibt nur kompatibel lesbar und bewirkt keine Aussonderung:
+Solange kein echter isolierter Restore eines geeigneten Ersatz-Backups
+belegt und eine eigene Freigabe erteilt ist, dürfen auch alte oder
+unvollständige Sicherungen nicht allein wegen ihres Alters verschwinden.
+Das lässt den benötigten Speicherplatz wachsen; Kapazität und Sicherungsalter
+müssen deshalb weiterhin aktiv überwacht werden.
 
 Der Dump enthält E-Mail-Adressen und private Kartenanker. Der
 Klartext-Dump liegt auf demselben Host wie das Datenbankvolume und erzeugt

@@ -160,7 +160,7 @@ if compgen -G "$BACKUP_DIR/-lead-*" > /dev/null; then
   exit 1
 fi
 
-# Retention fixture: expired artefacts of every backup kind.
+# Historical-backup fixture: all four expired artefacts must remain intact.
 mkdir -p "$BACKUP_DIR"
 for suffix in .sql.gz .sql.gz.age .sha256.manifest .age.sha256.manifest; do
   touch -d '10 days ago' "$BACKUP_DIR/weltgewebe-postgres-expired${suffix}"
@@ -210,10 +210,15 @@ for artefact in "$backup_file" "$manifest_file" "$age_file" "$age_manifest_file"
     exit 1
   fi
 done
-if compgen -G "$BACKUP_DIR/weltgewebe-postgres-expired*" > /dev/null; then
-  echo "retention must expire plaintext, ciphertext and both manifest kinds" >&2
-  exit 1
-fi
+# A synthetic producer run must not destroy an earlier recovery candidate.
+# Until the replacement was actually restored with the offline identity, even
+# an expired and uncertified dump may be the last usable PostgreSQL snapshot.
+for suffix in .sql.gz .sql.gz.age .sha256.manifest .age.sha256.manifest; do
+  [[ -f "$BACKUP_DIR/weltgewebe-postgres-expired${suffix}" ]] || {
+    echo "producer auto-retention destroyed an old backup artefact: $suffix" >&2
+    exit 1
+  }
+done
 
 # Off-host artefact: age ciphertext bound to a manifest over the ciphertext.
 cmp -s -n 22 "$age_file" <(printf 'age-encryption.org/v1\n')
