@@ -993,6 +993,32 @@ pull "$complete_dest" test-host > /dev/null
 mapfile -t complete_history < <(find "$complete_dest/receipts" -type f -name "$base.pulled-*.receipt")
 ((${#complete_history[@]} == 1))
 
+# Historical receipts must be unambiguous. Even duplicate *matching* core
+# fields make an old proof unusable by the offline restore procedure. A retry
+# must not promote a corrupted receipt to latest or claim verified success.
+for field in contract pulled_at remote_host file sha256 encryption recipients plaintext_sha256 result; do
+  duplicate_dest="$root/history-duplicate-$field"
+  mkdir -p "$duplicate_dest"
+  cp -a "$complete_dest/." "$duplicate_dest/"
+  duplicate_history="$duplicate_dest/receipts/$(basename "${complete_history[0]}")"
+  field_value="$(awk -F= -v key="$field" '$1==key {print substr($0,length(key)+2); exit}' "$duplicate_history")"
+  [[ -n "$field_value" ]] || {
+    echo "missing original receipt field $field" >&2
+    exit 1
+  }
+  printf '%s=%s\n' "$field" "$field_value" >> "$duplicate_history"
+  rm "$duplicate_dest/latest-pull.receipt"
+  if pull "$duplicate_dest" test-host > /dev/null 2> "$root/history-duplicate-$field.stderr"; then
+    echo "duplicate historical core receipt field $field accepted" >&2
+    exit 1
+  fi
+  grep -qF "normal pull duplicate historical field: $field" "$root/history-duplicate-$field.stderr"
+  [[ ! -e "$duplicate_dest/latest-pull.receipt" ]] || {
+    echo "ambiguous historical receipt $field wrongly promoted to latest" >&2
+    exit 1
+  }
+done
+
 # Unsafe, forged or orphaned receipts still fail closed.
 for scenario in symlink forged receipt-only; do
   history_dest="$root/history-$scenario"

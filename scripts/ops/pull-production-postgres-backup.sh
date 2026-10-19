@@ -360,6 +360,18 @@ for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
   [[ -e "$historical" || -L "$historical" ]] || continue
   [[ -f "$historical" && ! -L "$historical" ]] ||
     fail "normal pull unsafe existing history receipt"
+  # An immutable history receipt must remain independently restorable.
+  # Merely finding one expected line is insufficient: a second conflicting
+  # or matching core field can make an offline restore reject this receipt
+  # after it was promoted to latest-pull.receipt.
+  for key in contract pulled_at remote_host file sha256 encryption recipients plaintext_sha256 result; do
+    count="$(grep -c "^$key=" "$historical" || true)"
+    case "$count" in
+      1) ;;
+      0) fail "normal pull existing history receipt differs: $key" ;;
+      *) fail "normal pull duplicate historical field: $key" ;;
+    esac
+  done
   for binding in \
     'contract=weltgewebe-offhost-backup-pull-v2' \
     "remote_host=$REMOTE_HOST" "file=$latest" "sha256=$actual" \
