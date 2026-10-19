@@ -532,20 +532,45 @@ maßgebliche Schutz ist eine Ausschlussregel, die **Restic selbst beim
 Snapshot** anwendet. Auf `heim-pc` verwendet der live geprüfte Aufruf
 `heim-pc-restic-backup run` die Datei
 `$HOME/.config/restic/heim-pc-excludes` über `--exclude-file`. Diese
-Datei muss nach gesonderter Betriebsfreigabe eine eigene Zeile enthalten:
+Datei darf **nicht** die ungeankerte Zeile `**/*.sql.gz` enthalten:
+Der tatsächlich laufende Scope-Validator in `heim-pc-restic-backup`
+weist diese als außerhalb der genehmigten Snapshotquellen zurück; der
+Restic-Dienst würde fehlschlagen. Stattdessen sind nach gesonderter
+Betriebsfreigabe diese **drei absolut verankerten** Muster für die
+aktuell beobachteten Heim-PC-Quellen vorgesehen:
 
 ```text
-**/*.sql.gz
+/home/alex/repos/**/*.sql.gz
+/home/alex/artifacts/merges/**/*.sql.gz
+/home/alex/.local/share/schauwerk/fundus/**/*.sql.gz
 ```
 
-Die Regel schließt SQL-Klartext-Gzip-Dateien auch in Unterverzeichnissen
-aus, ohne `*.sql.gz.age`-Chiffrate zu erfassen. Ein isolierter
-Restic-0.12.1-Test mit **nach einem erfolgreichen Vorabscan** angelegten
-Klartext-Testdateien bestätigte: beide Dumps fehlten im Snapshot,
-während normale Dateien und eine `*.sql.gz.age`-Testdatei enthalten
-blieben. Das ist ein **synthetischer** Nachweis und ersetzt **nicht**
-die Kontrolle der tatsächlich aktiven Live-Exclude-Datei oder eines
-produktiven Snapshots.
+**Installationsreihenfolge ist verbindlich:** Die beiden ersten
+Muster werden vom aktuellen Wrapper akzeptiert, das Fundus-Muster
+jedoch erst nach Integration, unabhängig geprüfter Freigabe und
+gesondert autorisiertem Rollout von
+[infra-PR #165](https://github.com/heimgewebe/infra/pull/165).
+Dieser eng begrenzte Fix erlaubt ausschließlich
+`$FUNDUS/**/*.sql.gz`; er lässt Ausschlüsse des gesamten Fundus oder
+von `*.sql.gz.age` weiterhin nicht zu. **Kein Muster in der
+produktiven Datei aktivieren, solange das tatsächlich installierte
+Wrapper-Release den vollständigen Satz nicht annimmt.** Den
+Hostpfad vor einer Freigabe frisch lesen, nicht aus dem Runbook
+als zeitlose Konstante ableiten.
+
+Ein synthetischer Test gegen den tatsächlichen
+Restic-Snapshot-Mechanismus bestätigte: Sechs **erst nach dem
+Vorabscan** entstandene `*.sql.gz`-Dateien unter den drei
+Quellwurzeln wurden beim Backup ausgeschlossen; normale Dateien,
+Fundus-Material und `*.sql.gz.age` blieben erhalten. Der
+frühere Live-Wrapper wies das Fundus-Muster noch zurück; der
+geänderte Quellstand aus infra-PR #165 akzeptiert es bei weiterhin
+verbotenen breiten Fundus-Ausschlüssen (RED/GREEN und 61/61
+Restic-Runtime-Tests). Diese synthetischen Nachweise ersetzen
+**nicht** einen tatsächlichen Produktiv-Snapshot. Sollte der Fundus
+jemals eine legitime `*.sql.gz`-Quelldatei enthalten, kann sein
+bestehender Inventar-/Restore-Vergleich fail-closed abbrechen;
+diesen Konflikt vor einer Betriebsfreigabe inventarisieren.
 
 Vor einer Betriebsfreigabe die aktive Exclude-Datei, `ExecStart`,
 `--exclude-file` und alle Snapshot-Quellen erneut lesen; die Regel
