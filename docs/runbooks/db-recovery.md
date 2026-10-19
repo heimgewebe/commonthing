@@ -608,26 +608,66 @@ in einem Verzeichnis mit Modus `0700`:
 set -euo pipefail
 umask 077
 src=~/merges/weltgewebe-production-backups
-# Standard ist die zuletzt vollständig abgeschlossene Kopie laut
-# latest-pull.receipt, nicht die neueste sichtbare Datei: ein abgebrochener
-# Pull kann Chiffrat ohne Receipt hinterlassen. Ein älterer Restore-Punkt wird
-# vorher per `export BACKUP_BASE=weltgewebe-postgres-…` gewählt.
-if [[ -n "${BACKUP_BASE:-}" ]]; then
-  base="${BACKUP_BASE%.sql.gz.age}"
-else
-  receipt="$src/latest-pull.receipt"
-  grep -qx 'result=ok' "$receipt"
-  base="$(awk -F= '$1=="file" {print $2}' "$receipt")"
-  base="${base%.sql.gz.age}"
-fi
-[[ "$base" =~ ^weltgewebe-postgres-[A-Za-z0-9._-]+$ && "$base" != *..* ]] || {
-  printf 'Kein gültiges verschlüsseltes Backup in %s ausgewählt.\n' "$src" >&2
+# Für einen älteren Restore-Punkt BACKUP_RECEIPT auf einen passenden
+# unveränderten receipts/<backup>.pulled-*.receipt setzen. BACKUP_BASE allein
+# ist kein Integritätsbeleg. Für den neuesten Punkt gilt latest-pull.receipt.
+receipt="${BACKUP_RECEIPT:-$src/latest-pull.receipt}"
+case "$receipt" in
+  "$src/latest-pull.receipt" | "$src/receipts/"*.receipt) ;;
+  *) printf 'Ungültiger Pull-Receipt-Pfad.\n' >&2; exit 1 ;;
+esac
+[[ -f "$receipt" && ! -L "$receipt" ]] || {
+  printf 'Pull-Receipt fehlt oder ist ein Symlink.\n' >&2
   exit 1
 }
-# Chiffrat gegen sein Off-Host-Manifest prüfen, bevor entschlüsselt wird.
-age_expected="$(awk -F= '$1=="sha256" {print $2}' "$src/$base.age.sha256.manifest")"
-[[ "$age_expected" =~ ^[0-9a-f]{64}$ ]]
-[[ "$(sha256sum "$src/$base.sql.gz.age" | awk '{print $1}')" == "$age_expected" ]]
+field() { awk -F= -v key="$1" '$1==key { print substr($0, length(key)+2); exit }' "$2"; }
+for key in contract file sha256 plaintext_sha256 encryption recipients result; do
+  [[ "$(grep -c "^$key=" "$receipt" || true)" == 1 ]] || {
+    printf 'Pull-Receipt-Feld fehlt oder kommt mehrfach vor: %s\n' "$key" >&2
+    exit 1
+  }
+done
+[[ "$(field contract "$receipt")" == weltgewebe-offhost-backup-pull-v2 &&
+   "$(field result "$receipt")" == ok && "$(field encryption "$receipt")" == age ]] || exit 1
+file="$(field file "$receipt")"
+[[ "$file" =~ ^weltgewebe-postgres-[A-Za-z0-9._-]+\.sql\.gz\.age$ && "$file" != *..* ]] || exit 1
+base="${file%.sql.gz.age}"
+[[ -z "${BACKUP_BASE:-}" || "${BACKUP_BASE%.sql.gz.age}" == "$base" ]] || {
+  printf 'BACKUP_BASE stimmt nicht mit dem ausgewählten Receipt überein.\n' >&2
+  exit 1
+}
+# Die mutable latest-Datei allein genügt nicht: exakt derselbe Beleg muss
+# als create-only veröffentlichte historische Version vorhanden sein.
+matched_history=0
+for historical in "$src/receipts/${base}.pulled-"*.receipt; do
+  [[ -e "$historical" || -L "$historical" ]] || continue
+  [[ -f "$historical" && ! -L "$historical" ]] || exit 1
+  cmp -s -- "$receipt" "$historical" && matched_history=1
+done
+((matched_history == 1)) || {
+  printf 'Kein passender unveränderlicher Pull-Receipt vorhanden.\n' >&2
+  exit 1
+}
+cipher_sha="$(field sha256 "$receipt")"
+plaintext_sha="$(field plaintext_sha256 "$receipt")"
+[[ "$cipher_sha" =~ ^[0-9a-f]{64}$ && "$plaintext_sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
+for manifest_path in "$src/$base.age.sha256.manifest" "$src/$base.sha256.manifest"; do
+  [[ -f "$manifest_path" && ! -L "$manifest_path" ]] || exit 1
+done
+[[ "$(field file "$src/$base.age.sha256.manifest")" == "$file" &&
+   "$(field plaintext_file "$src/$base.age.sha256.manifest")" == "$base.sql.gz" &&
+   "$(field sha256 "$src/$base.age.sha256.manifest")" == "$cipher_sha" &&
+   "$(field plaintext_sha256 "$src/$base.age.sha256.manifest")" == "$plaintext_sha" &&
+   "$(field file "$src/$base.sha256.manifest")" == "$base.sql.gz" &&
+   "$(field sha256 "$src/$base.sha256.manifest")" == "$plaintext_sha" ]] || {
+  printf 'Manifeste stimmen nicht mit dem Pull-Receipt überein.\n' >&2
+  exit 1
+}
+[[ -f "$src/$file" && ! -L "$src/$file" &&
+   "$(sha256sum "$src/$file" | awk '{print $1}')" == "$cipher_sha" ]] || {
+  printf 'Chiffrat stimmt nicht mit dem Pull-Receipt überein.\n' >&2
+  exit 1
+}
 work="$(mktemp -d)"
 # Der entschlüsselte Dump wird bei jedem Ende dieser Shell entfernt, auch nach
 # einem Fehler in age, SHA-Vergleich, gzip -t oder Restore und nach Abbruch.
@@ -636,10 +676,21 @@ trap 'exit 130' INT TERM HUP
 age -d -i /pfad/zur/weltgewebe-backup-identity.txt \
   -o "$work/$base.sql.gz" "$src/$base.sql.gz.age"
 cp "$src/$base.sha256.manifest" "$work/"
-expected="$(awk -F= '$1=="sha256" {print $2}' "$work/$base.sha256.manifest")"
-[[ "$(sha256sum "$work/$base.sql.gz" | awk '{print $1}')" == "$expected" ]]
+[[ "$(sha256sum "$work/$base.sql.gz" | awk '{print $1}')" == "$plaintext_sha" ]]
 gzip -t "$work/$base.sql.gz"
 ```
+
+Für einen historischen Wiederherstellungspunkt das passende
+`BACKUP_RECEIPT` aus `receipts/` explizit auswählen; `BACKUP_BASE` ist
+allenfalls eine zusätzliche Gleichheitsprüfung. Dieser Ablauf gilt für den
+`normal`-Pull **mit** Erfolgs-Receipt, nicht für das ausdrücklich
+noch unzertifizierte `migration-stage`-Staging ohne Receipt. Die
+create-only gespeicherten Receipts verhindern versehentliche Verwechslungen,
+sind aber **keine kryptografischen Signaturen** gegen einen Angreifer mit
+Schreibzugriff auf Sicherung *und* Receipt. Die Prüfung wurde mit einer echten
+synthetischen age-Verschlüsselung und positiven sowie manipulierten
+Sicherungs-/Receipt-Kombinationen ausgeführt; ein echter produktiver Restore
+ist damit nicht belegt.
 
 In **derselben** Shell kann danach `scripts/ops/postgres-restore-proof.sh` mit
 `BACKUP_FILE="$work/$base.sql.gz"` gegen eine Wegwerfdatenbank laufen
