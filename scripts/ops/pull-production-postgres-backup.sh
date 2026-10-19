@@ -333,6 +333,7 @@ if ((${#proof_revision_prefix} + 64 + 8 > 255)); then
 fi
 # Include uncertified, interrupted SHA-addressed proof revisions in integrity
 # scanning; they are not success receipts but still immutable local evidence.
+verified_sidecar_shas=()
 for revision in "$DEST_DIR/receipts/${proof_revision_prefix}"*.receipt; do
   [[ -e "$revision" || -L "$revision" ]] || continue
   [[ -f "$revision" && ! -L "$revision" ]] ||
@@ -345,10 +346,14 @@ for revision in "$DEST_DIR/receipts/${proof_revision_prefix}"*.receipt; do
   [[ "$(sha256sum "$revision" | awk '{print $1}')" == "$revision_sha" ]] ||
     fail "normal pull proof revision content differs"
   verify_restore_proof "$revision"
+  verified_sidecar_shas+=("$revision_sha")
 done
 
 history_present=0
 latest_history=''
+latest_history_sequence=0
+legacy_history_count=0
+declare -A seen_history_sequences=()
 declare -A certified_proof_digests=()
 for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
   [[ -e "$historical" || -L "$historical" ]] || continue
@@ -388,11 +393,33 @@ for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
       ;;
     *) fail "normal pull duplicated historical proof sha256 field" ;;
   esac
+  # New receipts carry a monotonic publication order independent of NTP or
+  # system clock rollback. Pre-sequence legacy receipts remain readable.
+  history_sequence_count="$(grep -c '^history_sequence=' "$historical" || true)"
+  case "$history_sequence_count" in
+    0)
+      historical_sequence=0
+      ((legacy_history_count += 1))
+      ;;
+    1)
+      historical_sequence="$(manifest_value history_sequence "$historical")"
+      [[ "$historical_sequence" =~ ^[1-9][0-9]{0,14}$ ]] ||
+        fail "normal pull invalid historical sequence"
+      [[ -z "${seen_history_sequences[$historical_sequence]:-}" ]] ||
+        fail "normal pull duplicate historical sequence"
+      seen_history_sequences[$historical_sequence]=1
+      ;;
+    *) fail "normal pull duplicated historical sequence field" ;;
+  esac
   history_present=1
-  if [[ -z "$latest_history" || "$historical" > "$latest_history" ]]; then
+  if [[ -z "$latest_history" ]] ||
+    ((historical_sequence > latest_history_sequence)) ||
+    { ((historical_sequence == latest_history_sequence)) && [[ "$historical" > "$latest_history" ]]; }; then
     latest_history="$historical"
+    latest_history_sequence="$historical_sequence"
   fi
 done
+next_history_sequence=$((latest_history_sequence + 1))
 # The remote core was just validated byte-for-byte. A complete existing
 # three-file set without a receipt can be left by a crash between linking the
 # core and creating its history marker; finish that exact set create-only.
@@ -457,6 +484,34 @@ if [[ -n "$remote_proof_sha" && -z "${certified_proof_digests[$remote_proof_sha]
 fi
 # A complete unchanged set is a true no-op, not a new history event.
 assert_no_legacy_plaintext
+# A crash may leave an already validated, create-only sidecar B without its
+# history receipt. If the producer has advanced to C, certifying C alone would
+# permanently strand B. Seal every verified local orphan under the same backup
+# and checksum contract before publishing the current remote revision.
+# The sidecars themselves are discoverable interrupted work: no new queue.
+for orphan_sha in "${verified_sidecar_shas[@]}"; do
+  [[ -z "${certified_proof_digests[$orphan_sha]:-}" && "$orphan_sha" != "$remote_proof_sha" ]] ||
+    continue
+  orphan_receipt_tmp="$(mktemp "$work_dir/.orphan-receipt.XXXXXX")"
+  pulled_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  {
+    printf 'contract=weltgewebe-offhost-backup-pull-v2\n'
+    printf 'pulled_at=%s\nremote_host=%s\nfile=%s\nsha256=%s\nencryption=age\nrecipients=%s\nplaintext_sha256=%s\nresult=ok\n' \
+      "$pulled_at" "$REMOTE_HOST" "$latest" "$actual" "$manifest_recipients" "$plaintext_sha"
+    printf 'restore_proof_sha256=%s\n' "$orphan_sha"
+    printf 'history_sequence=%s\n' "$next_history_sequence"
+  } > "$orphan_receipt_tmp"
+  chmod 600 "$orphan_receipt_tmp"
+  orphan_history="$DEST_DIR/receipts/${base}.pulled-$(date -u +%Y%m%dT%H%M%S.%NZ).receipt"
+  ln -- "$orphan_receipt_tmp" "$orphan_history" ||
+    fail "orphan proof history already exists: $orphan_history"
+  certified_proof_digests[$orphan_sha]=1
+  history_present=1
+  latest_history="$orphan_history"
+  latest_history_sequence="$next_history_sequence"
+  next_history_sequence=$((next_history_sequence + 1))
+done
+
 if ((${#staged[@]} == 0 && history_present == 1 && proof_revision_event == 0)); then
   # A crash can occur between the create-only history link and the mutable
   # latest pointer rename. Repair it from the newest verified immutable
@@ -464,6 +519,23 @@ if ((${#staged[@]} == 0 && history_present == 1 && proof_revision_event == 0)); 
   [[ -n "$latest_history" ]] ||
     fail "normal pull existing core has no historical completion receipt"
   receipt="$DEST_DIR/latest-pull.receipt"
+  # Old v2 receipts did not record a sequence. Multiple such history entries
+  # cannot be ordered safely after a clock rollback; preserve a verified
+  # existing pointer, or fail closed if that pointer is missing/untrusted.
+  if ((latest_history_sequence == 0 && legacy_history_count > 1)); then
+    [[ -f "$receipt" && ! -L "$receipt" ]] ||
+      fail "normal pull ambiguous unsequenced history without latest receipt"
+    legacy_pointer_verified=0
+    for legacy in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
+      if cmp -s -- "$receipt" "$legacy"; then
+        legacy_pointer_verified=1
+        break
+      fi
+    done
+    ((legacy_pointer_verified)) ||
+      fail "normal pull ambiguous unsequenced history with unmatched latest receipt"
+    latest_history="$receipt"
+  fi
   [[ ! -L "$receipt" ]] ||
     fail "normal pull unsafe latest receipt pointer"
   [[ ! -e "$receipt" || -f "$receipt" ]] ||
@@ -516,6 +588,7 @@ pulled_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'pulled_at=%s\nremote_host=%s\nfile=%s\nsha256=%s\nencryption=age\nrecipients=%s\nplaintext_sha256=%s\nresult=ok\n' \
     "$pulled_at" "$REMOTE_HOST" "$latest" "$actual" "$manifest_recipients" "$plaintext_sha"
   [[ -z "$remote_proof_sha" ]] || printf 'restore_proof_sha256=%s\n' "$remote_proof_sha"
+  printf 'history_sequence=%s\n' "$next_history_sequence"
 } > "$receipt_tmp"
 chmod 600 "$receipt_tmp"
 install -d -m 0700 "$DEST_DIR/receipts"

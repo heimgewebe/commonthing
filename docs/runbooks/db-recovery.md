@@ -237,7 +237,14 @@ Schlüssel werden auf `heim-pc` dafür nicht benötigt. Erst danach schreibt er
 pro Pull einen unveränderlichen Receipt unter `receipts/` (create-only,
 `<backup>.pulled-<UTC>.receipt`) und aktualisiert `latest-pull.receipt` als
 Zeiger auf den neuesten (`contract=weltgewebe-offhost-backup-pull-v2`,
-`encryption=age`, `recipients=`). Receipts unterliegen keiner Retention. Ein vorhandener Wochen-Restore-Proof wird
+`encryption=age`, `recipients=`). Receipts unterliegen keiner Retention. Neu erzeugte History-Receipts tragen
+zusätzlich `history_sequence`, eine pro Sicherungsbasis strikt ansteigende
+Veröffentlichungsnummer. Der `latest-pull.receipt`-Zeiger wird anhand dieser
+Nummer statt anhand der möglicherweise rückläufigen Systemuhr repariert.
+Alte Receipts ohne dieses Feld bleiben lesbar; bei mehreren alten
+unsequenzierten Receipts und verlorenem oder nicht zuordenbarem Latest-Zeiger
+bricht die automatische Wahl jedoch sicher ab, statt einen möglicherweise
+falschen neuesten Stand zu behaupten. Ein vorhandener Wochen-Restore-Proof wird
 mitgenommen. **Restic-Abdeckung ist separat zu prüfen:** Der am
 15. Oktober 2026 tatsächlich gelesene `restic-backup-1930.service` startet
 `heim-pc-restic-backup` mit den Quellen `~/repos`,

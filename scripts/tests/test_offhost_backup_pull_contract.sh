@@ -760,6 +760,97 @@ write_restore_proof '2026-07-19T05:00:00Z'
 pull "$no_proof_dest" test-host > /dev/null
 [[ -f "$no_proof_dest/receipts/$base.restore-proof.$third_sha.receipt" ]]
 
+# If the client crashed after persisting revision B but before recording B's
+# history receipt, and the producer has advanced to C, recovering C alone may
+# not silently strand the otherwise valid local B revision without provenance.
+orphan_dest="$root/crash-orphan-then-next-proof"
+mkdir -p "$orphan_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$no_proof_dest/$core" "$orphan_dest/$core"
+done
+for existing_history in "$no_proof_dest/receipts/$base.pulled-"*.receipt; do
+  if grep -qx "restore_proof_sha256=$renewed_sha" "$existing_history" ||
+    grep -qx "restore_proof_sha256=$third_sha" "$existing_history"; then
+    continue
+  fi
+  cp "$existing_history" "$orphan_dest/receipts/$(basename "$existing_history")"
+done
+cp "$root/no-proof-first-receipt" "$orphan_dest/latest-pull.receipt"
+cp "$revision" "$orphan_dest/receipts/$(basename "$revision")"
+write_restore_proof '2026-07-26T05:00:00Z'
+pull "$orphan_dest" test-host > /dev/null
+grep -lqx "restore_proof_sha256=$renewed_sha" "$orphan_dest/receipts/$base.pulled-"*.receipt > /dev/null || {
+  echo 'orphaned B proof was not certified before remote C' >&2
+  exit 1
+}
+grep -lqx "restore_proof_sha256=$third_sha" "$orphan_dest/receipts/$base.pulled-"*.receipt > /dev/null
+orphan_events="$(find "$orphan_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)"
+pull "$orphan_dest" test-host > /dev/null
+[[ "$(find "$orphan_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)" == "$orphan_events" ]] || {
+  echo 'crash replay duplicated an already certified event' >&2
+  exit 1
+}
+write_restore_proof '2026-07-19T05:00:00Z'
+
+# Receipt filenames contain wall-clock timestamps: a clock correction must
+# not roll back the latest pointer to an older proof event. Move C's immutable
+# receipt to a lexicographically earlier name while retaining its content.
+clock_dest="$root/backwards-clock"
+mkdir -p "$clock_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$no_proof_dest/$core" "$clock_dest/$core"
+done
+cp "$no_proof_dest/receipts/"*.receipt "$clock_dest/receipts/"
+cp "$no_proof_dest/latest-pull.receipt" "$clock_dest/latest-pull.receipt"
+clock_c="$(grep -lx "restore_proof_sha256=$third_sha" "$clock_dest/receipts/$base.pulled-"*.receipt)"
+[[ -n "$clock_c" ]] || {
+  echo 'clock fixture C receipt missing' >&2
+  exit 1
+}
+mv "$clock_c" "$clock_dest/receipts/$base.pulled-20000101T000000.000000001Z.receipt"
+pull "$clock_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$third_sha" "$clock_dest/latest-pull.receipt" || {
+  echo 'clock rollback wrongly replaced latest receipt with old history' >&2
+  exit 1
+}
+rm "$clock_dest/latest-pull.receipt"
+pull "$clock_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$third_sha" "$clock_dest/latest-pull.receipt" || {
+  echo 'crash recovery under clock rollback selected old history' >&2
+  exit 1
+}
+
+# Duplicate sequence declarations are ambiguous rather than tie-broken.
+clock_c_history="$clock_dest/receipts/$base.pulled-20000101T000000.000000001Z.receipt"
+cp "$clock_c_history" "$root/clock-c-prior"
+printf 'history_sequence=4\n' >> "$clock_c_history"
+if pull "$clock_dest" test-host > /dev/null 2> "$root/clock-duplicate-seq.stderr"; then
+  echo 'duplicate history sequence field was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull duplicated historical sequence field' "$root/clock-duplicate-seq.stderr"
+cp "$root/clock-c-prior" "$clock_c_history"
+
+# Multiple old receipts without history_sequence cannot be ordered from
+# their wall-clock names alone. A verified existing pointer is preserved;
+# without it the automatic rollback must fail closed.
+legacy_sequence_dest="$root/pre-sequence-history"
+mkdir -p "$legacy_sequence_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$clock_dest/$core" "$legacy_sequence_dest/$core"
+done
+cp "$clock_dest/receipts/"*.receipt "$legacy_sequence_dest/receipts/"
+cp "$clock_dest/latest-pull.receipt" "$legacy_sequence_dest/latest-pull.receipt"
+sed -i '/^history_sequence=/d' "$legacy_sequence_dest/receipts/$base.pulled-"*.receipt "$legacy_sequence_dest/latest-pull.receipt"
+pull "$legacy_sequence_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$third_sha" "$legacy_sequence_dest/latest-pull.receipt"
+rm "$legacy_sequence_dest/latest-pull.receipt"
+if pull "$legacy_sequence_dest" test-host > /dev/null 2> "$root/legacy-sequence-ambiguous.stderr"; then
+  echo 'ambiguous legacy sequence without latest was silently guessed' >&2
+  exit 1
+fi
+grep -qF 'normal pull ambiguous unsequenced history without latest receipt' "$root/legacy-sequence-ambiguous.stderr"
+
 # Partial core sets and pre-existing symlinks are not an idempotent pull.
 partial_dest="$root/partial-core"
 mkdir -p "$partial_dest"
