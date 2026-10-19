@@ -464,6 +464,13 @@ elif [[ -e "$DEST_DIR/$proof" ]]; then
     fail "normal pull local proof is absent upstream: $proof"
   verify_restore_proof "$DEST_DIR/$proof"
   if ! cmp -s -- "$work_dir/$proof" "$DEST_DIR/$proof"; then
+    # A crash can leave the FIRST canonical proof already linked while its
+    # first history receipt is still missing. If upstream has advanced, seal
+    # that valid earlier proof A before certifying the new remote proof B.
+    canonical_proof_sha="$(sha256sum "$DEST_DIR/$proof" | awk '{print $1}')"
+    if [[ -z "${certified_proof_digests[$canonical_proof_sha]:-}" ]]; then
+      verified_sidecar_shas+=("$canonical_proof_sha")
+    fi
     proof_revision_name="${proof_revision_prefix}${remote_proof_sha}.receipt"
     version_path="$DEST_DIR/receipts/$proof_revision_name"
     [[ ! -L "$version_path" ]] ||

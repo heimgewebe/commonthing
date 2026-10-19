@@ -792,6 +792,32 @@ pull "$orphan_dest" test-host > /dev/null
 }
 write_restore_proof '2026-07-19T05:00:00Z'
 
+# A canonical first proof can be linked immediately before a crash, while the
+# older no-proof history remains. If the remote proof becomes B, the on-disk
+# original A must also acquire a matching immutable certification.
+canonical_orphan_dest="$root/canonical-proof-A-before-remote-B"
+mkdir -p "$canonical_orphan_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$no_proof_dest/$core" "$canonical_orphan_dest/$core"
+done
+cp "$root/late-proof-saved" "$canonical_orphan_dest/$proof"
+cp "$root/no-proof-first-receipt" \
+  "$canonical_orphan_dest/receipts/$base.pulled-20260712T040000.000000000Z.receipt"
+cp "$root/no-proof-first-receipt" "$canonical_orphan_dest/latest-pull.receipt"
+write_restore_proof '2026-07-19T05:00:00Z'
+pull "$canonical_orphan_dest" test-host > /dev/null
+grep -lqx "restore_proof_sha256=$first_proof_sha" \
+  "$canonical_orphan_dest/receipts/$base.pulled-"*.receipt > /dev/null || {
+  echo 'canonical orphan A was not certified before remote B' >&2
+  exit 1
+}
+grep -lqx "restore_proof_sha256=$renewed_sha" \
+  "$canonical_orphan_dest/receipts/$base.pulled-"*.receipt > /dev/null
+grep -qx "restore_proof_sha256=$renewed_sha" "$canonical_orphan_dest/latest-pull.receipt"
+canonical_count="$(find "$canonical_orphan_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)"
+pull "$canonical_orphan_dest" test-host > /dev/null
+[[ "$(find "$canonical_orphan_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)" == "$canonical_count" ]]
+
 # Upgrade from an older client: C is already certified while B is still
 # an orphan sidecar. Re-sealing B must not demote valid current C on this or any
 # later no-op/crash replay, even when C predates history_sequence support.
