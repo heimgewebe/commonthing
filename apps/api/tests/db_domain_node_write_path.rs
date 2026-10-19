@@ -1004,6 +1004,122 @@ async fn strict_projection_refresh_waits_for_exact_local_patch_handoff() -> Resu
     Ok(())
 }
 
+/// A5b-privacy. An anonymous GET started AFTER the PostgreSQL commit must not
+/// read stale public data on either API replica. Overlapping pre-commit GETs
+/// are a different linearization case and are not claimed by this proof.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn anonymous_reads_after_visibility_commit_hide_nodes_across_api_instances() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("PRIVATE-AFTER-COMMIT-MARKER"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (first_router, _, first_state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-0000000000a1").await?;
+    let (second_router, _, second_state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-0000000000a2").await?;
+    let first = first_router.layer(from_fn_with_state(
+        first_state.clone(),
+        ensure_current_domain_projection,
+    ));
+    let second = second_router.layer(from_fn_with_state(
+        second_state.clone(),
+        ensure_current_domain_projection,
+    ));
+
+    for (instance, app) in [("first", first.clone()), ("second", second.clone())] {
+        let response = app
+            .oneshot(
+                Request::get(format!("/nodes/{NODE_B}"))
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{instance} must preload public node"
+        );
+    }
+
+    let mut committed_version = domain_projection_version(&pool).await?;
+    for visibility in ["private", "hidden", "revoked"] {
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility = $2, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(NODE_B)
+        .bind(visibility)
+        .execute(&pool)
+        .await?;
+        let new_version = domain_projection_version(&pool).await?;
+        assert!(
+            new_version > committed_version,
+            "visibility commit must advance projection"
+        );
+
+        for (instance, app) in [("first", first.clone()), ("second", second.clone())] {
+            let detail = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/nodes/{NODE_B}"))
+                        .header("Host", "localhost")
+                        .body(body::Body::empty())?,
+                )
+                .await?;
+            assert_eq!(
+                detail.status(),
+                StatusCode::NOT_FOUND,
+                "{instance} leaked {visibility} detail after commit"
+            );
+            let listing = app
+                .oneshot(
+                    Request::get("/nodes")
+                        .header("Host", "localhost")
+                        .body(body::Body::empty())?,
+                )
+                .await?;
+            assert_eq!(listing.status(), StatusCode::OK);
+            let bytes = body::to_bytes(listing.into_body(), usize::MAX).await?;
+            let rendered = String::from_utf8_lossy(&bytes);
+            assert!(
+                !rendered.contains(NODE_B) && !rendered.contains("PRIVATE-AFTER-COMMIT-MARKER"),
+                "{instance} leaked {visibility} in public list"
+            );
+        }
+
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility = 'public', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(NODE_B)
+        .execute(&pool)
+        .await?;
+        committed_version = domain_projection_version(&pool).await?;
+        for app in [first.clone(), second.clone()] {
+            let response = app
+                .oneshot(
+                    Request::get(format!("/nodes/{NODE_B}"))
+                        .header("Host", "localhost")
+                        .body(body::Body::empty())?,
+                )
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "public restoration must be readable"
+            );
+        }
+    }
+    clean(&pool).await;
+    Ok(())
+}
+
 /// A5c. A strict request must not wait forever when a transaction-proven local
 /// handoff remains visible but its writer never publishes the local cache/version.
 /// The refresh fails closed within the bounded handoff budget and does not start
