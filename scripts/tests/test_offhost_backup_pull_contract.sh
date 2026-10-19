@@ -622,6 +622,39 @@ rm "$no_proof_dest/latest-pull.receipt"
 pull "$no_proof_dest" test-host > /dev/null
 cmp -s "$latest_history" "$no_proof_dest/latest-pull.receipt"
 
+# Reader-valid long backup basenames must survive a renewed restore proof:
+# original proof files fit NAME_MAX; adding a full digest to the basename does not.
+long_prefix="$(printf 'x%.0s' {1..175})"
+long_base="${long_prefix}-20260712T040000Z"
+long_file="${long_base}.sql.gz.age"
+long_plain="${long_base}.sql.gz"
+long_manifest="${long_base}.sha256.manifest"
+long_age_manifest="${long_base}.age.sha256.manifest"
+long_proof="${long_base}.restore-proof"
+[[ ${#long_base} -le 200 ]]
+cp "$remote/$file" "$remote/$long_file"
+sed "s|^file=$plain\$|file=$long_plain|" "$remote/$manifest" > "$remote/$long_manifest"
+sed -e "s|^file=$file\$|file=$long_file|" \
+  -e "s|^plaintext_file=$plain\$|plaintext_file=$long_plain|" \
+  "$remote/$age_manifest" > "$remote/$long_age_manifest"
+sed "s|^backup_file=$plain\$|backup_file=$long_plain|" \
+  "$remote/proofs/$proof" > "$remote/proofs/$long_proof"
+long_dest="$root/long-backup-name"
+BACKUP_PREFIX="$long_prefix" pull "$long_dest" test-host > /dev/null
+sed -i 's/^created_at=.*/created_at=2026-07-19T05:00:00Z/' "$remote/proofs/$long_proof"
+long_second_sha="$(sha256sum "$remote/proofs/$long_proof" | awk '{print $1}')"
+BACKUP_PREFIX="$long_prefix" pull "$long_dest" test-host > /dev/null
+long_revision="$(find "$long_dest/receipts" -maxdepth 1 -type f -name "*.${long_second_sha}.receipt" -print -quit)"
+long_revision_name="${long_revision##*/}"
+[[ -n "$long_revision" && ${#long_revision_name} -le 255 ]] || {
+  echo 'reader-valid long backup basename did not produce a short proof revision' >&2
+  exit 1
+}
+cmp -s "$remote/proofs/$long_proof" "$long_revision"
+grep -qx "restore_proof_sha256=$long_second_sha" "$long_dest/latest-pull.receipt"
+BACKUP_PREFIX="$long_prefix" pull "$long_dest" test-host > /dev/null
+cmp -s "$remote/proofs/$long_proof" "$long_revision"
+
 # A renewed real weekly restore of the SAME dump is an immutable revision.
 write_restore_proof '2026-07-19T05:00:00Z'
 renewed_sha="$(sha256sum "$remote/proofs/$base.restore-proof" | awk '{print $1}')"

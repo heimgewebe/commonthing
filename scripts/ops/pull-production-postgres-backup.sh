@@ -324,14 +324,21 @@ if [[ -e "$DEST_DIR/receipts" ]]; then
   [[ -d "$DEST_DIR/receipts" ]] ||
     fail "normal pull unsafe existing receipts directory"
 fi
+# Preserve the original sidecar names when they fit. For a reader-valid BASE
+# near the 200-character limit, the appended SHA would exceed NAME_MAX (255).
+# Address long names by the complete BASE digest instead of rejecting valid dumps.
+proof_revision_prefix="${base}.restore-proof."
+if ((${#proof_revision_prefix} + 64 + 8 > 255)); then
+  proof_revision_prefix="proof.$(printf '%s' "$base" | sha256sum | awk '{print $1}')."
+fi
 # Include uncertified, interrupted SHA-addressed proof revisions in integrity
 # scanning; they are not success receipts but still immutable local evidence.
-for revision in "$DEST_DIR/receipts/${base}.restore-proof."*.receipt; do
+for revision in "$DEST_DIR/receipts/${proof_revision_prefix}"*.receipt; do
   [[ -e "$revision" || -L "$revision" ]] || continue
   [[ -f "$revision" && ! -L "$revision" ]] ||
     fail "normal pull unsafe proof revision artefact"
   revision_sha="${revision##*/}"
-  revision_sha="${revision_sha#"${base}".restore-proof.}"
+  revision_sha="${revision_sha#"${proof_revision_prefix}"}"
   revision_sha="${revision_sha%.receipt}"
   [[ "$revision_sha" =~ ^[0-9a-f]{64}$ ]] ||
     fail "normal pull invalid proof revision filename"
@@ -371,7 +378,7 @@ for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
       [[ ! -L "$archived_proof" ]] || fail "normal pull unsafe existing artefact: $proof"
       if [[ ! -f "$archived_proof" ]] ||
         [[ "$(sha256sum "$archived_proof" | awk '{print $1}')" != "$historical_proof_sha" ]]; then
-        archived_proof="$DEST_DIR/receipts/${base}.restore-proof.${historical_proof_sha}.receipt"
+        archived_proof="$DEST_DIR/receipts/${proof_revision_prefix}${historical_proof_sha}.receipt"
       fi
       [[ -f "$archived_proof" && ! -L "$archived_proof" ]] ||
         fail "normal pull certified restore proof missing"
@@ -412,7 +419,7 @@ elif [[ -e "$DEST_DIR/$proof" ]]; then
     fail "normal pull local proof is absent upstream: $proof"
   verify_restore_proof "$DEST_DIR/$proof"
   if ! cmp -s -- "$work_dir/$proof" "$DEST_DIR/$proof"; then
-    proof_revision_name="${base}.restore-proof.${remote_proof_sha}.receipt"
+    proof_revision_name="${proof_revision_prefix}${remote_proof_sha}.receipt"
     version_path="$DEST_DIR/receipts/$proof_revision_name"
     [[ ! -L "$version_path" ]] ||
       fail "normal pull unsafe proof revision artefact"
