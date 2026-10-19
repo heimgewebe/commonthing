@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use sqlx::{PgPool, Postgres, Transaction};
-use tokio::sync::RwLockReadGuard;
+use tokio::sync::{RwLock, RwLockReadGuard, Semaphore, SemaphorePermit};
 
 use axum::{
     extract::{Request, State},
@@ -126,30 +126,52 @@ async fn begin_fenced_generation(
     Ok((tx, observed))
 }
 
-async fn fenced_domain_read(state: &ApiState, request: Request, next: Next) -> Response {
-    let Some(pool) = state.db_pool.as_ref() else {
-        return projection_unavailable(state, "PostgreSQL domain pool is missing");
-    };
-    // Both fenced reads and advisory-lock node mutations need two database
-    // connections. Reserving the SAME weighted pool budget before either
-    // takes a connection prevents a mixed writer/read deadlock.
-    let _slot = match tokio::time::timeout(
+// Every protected operation that needs two pooled connections must acquire
+// the process-local projection read gate BEFORE reserving connection capacity.
+// Mutations already enter their handlers under that read gate. Reserving GET
+// permits first creates a cycle when a refresh has queued its write gate and
+// an in-flight mutation holds a read gate while waiting for the same permits.
+async fn acquire_fenced_read_admission<'a>(
+    gate: &'a RwLock<()>,
+    budget: &'a Semaphore,
+) -> Result<(RwLockReadGuard<'a, ()>, SemaphorePermit<'a>, Duration), &'static str> {
+    let started = Instant::now();
+    let projection_guard = gate.read().await;
+    let gate_wait = started.elapsed();
+    let slot = match tokio::time::timeout(
         Duration::from_secs(3),
-        postgres_domain_connection_budget().acquire_many(POSTGRES_DOMAIN_OPERATION_UNITS),
+        budget.acquire_many(POSTGRES_DOMAIN_OPERATION_UNITS),
     )
     .await
     {
         Ok(Ok(slot)) => slot,
-        Ok(Err(error)) => return projection_unavailable(state, error),
-        Err(_) => return projection_unavailable(state, "privacy read slot timed out"),
+        Ok(Err(_)) => return Err("privacy read slot closed"),
+        Err(_) => return Err("privacy read slot timed out"),
+    };
+    Ok((projection_guard, slot, gate_wait))
+}
+
+async fn fenced_domain_read(state: &ApiState, request: Request, next: Next) -> Response {
+    let Some(pool) = state.db_pool.as_ref() else {
+        return projection_unavailable(state, "PostgreSQL domain pool is missing");
     };
     const MAX_FENCED_GENERATION_ATTEMPTS: usize = 4;
     for _ in 0..MAX_FENCED_GENERATION_ATTEMPTS {
-        let wait_started = Instant::now();
-        let projection_guard = state.domain_projection_gate.read().await;
+        // The slot belongs to THIS snapshot attempt only. In particular a
+        // stale GET must not hoard permits while a cache refresh obtains the
+        // exclusive write gate and uses the database itself.
+        let (projection_guard, slot, gate_wait) = match acquire_fenced_read_admission(
+            &state.domain_projection_gate,
+            postgres_domain_connection_budget(),
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => return projection_unavailable(state, error),
+        };
         state
             .metrics
-            .observe_domain_projection_read_gate_wait(wait_started.elapsed());
+            .observe_domain_projection_read_gate_wait(gate_wait);
 
         let (tx, observed) =
             match tokio::time::timeout(Duration::from_secs(3), begin_fenced_generation(pool)).await
@@ -181,10 +203,13 @@ async fn fenced_domain_read(state: &ApiState, request: Request, next: Next) -> R
                 Err(error) => projection_unavailable(state, error),
             };
         }
-        // Release the database fence AND the local gate before reloading.
+        // Release the database fence, pool reservation AND read gate before
+        // refreshing; otherwise refresh may queue behind a waiter that is
+        // holding permits it no longer needs.
         if let Err(error) = tx.rollback().await {
             return projection_unavailable(state, error);
         }
+        drop(slot);
         drop(projection_guard);
         if let Err(error) = state.refresh_domain_projection_if_stale().await {
             return projection_unavailable(state, error);
@@ -323,6 +348,37 @@ pub async fn ensure_current_domain_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_projection_writer_is_not_blocked_by_fenced_gets_budget_admission() {
+        let gate = std::sync::Arc::new(RwLock::new(()));
+        let budget = std::sync::Arc::new(Semaphore::new(4));
+        let writer = gate.write().await;
+        let reader_gate = gate.clone();
+        let reader_budget = budget.clone();
+        let mut queued = tokio::spawn(async move {
+            let (_read, _slot, _) = acquire_fenced_read_admission(&reader_gate, &reader_budget)
+                .await
+                .expect("queued read should be admitted");
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut queued)
+                .await
+                .is_err(),
+            "GET must await a queued projection writer"
+        );
+        assert_eq!(
+            budget.available_permits(),
+            4,
+            "blocked GET must not reserve a pool connection slot before the read gate"
+        );
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(3), queued)
+            .await
+            .expect("read must finish after projection writer")
+            .expect("GET task");
+        assert_eq!(budget.available_permits(), 4);
+    }
 
     #[tokio::test]
     async fn generation_is_checked_after_acquiring_the_snapshot_guard() {

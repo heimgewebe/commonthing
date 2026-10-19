@@ -4774,3 +4774,150 @@ async fn fenced_get_and_node_patch_share_five_connection_budget() -> Result<()> 
     clean(&pool).await;
     Ok(())
 }
+
+// An ordinary node CREATE uses one PostgreSQL transaction, which holds a
+// connection while its INSERT trigger waits for the GET's generation FOR SHARE.
+// Four unbudgeted CREATEs once exhausted the remaining four connections,
+// preventing the GET handler's second query from ever completing.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_survives_four_concurrent_node_creations() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000c4";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await
+        .context("five-connection production-sized runtime pool")?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await
+        .context("separate read-only PostgreSQL lock monitor")?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_handler_app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let get_pool = pool.clone();
+    let entered_handler = Arc::clone(&entered);
+    let app = Router::new()
+        .merge(api_router())
+        .route(
+            "/nodes/create-fence-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let get_pool = get_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    // This actual query must have a connection while
+                    // the PostgreSQL generation row is still FOR SHARE.
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&get_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state);
+
+    let first_app = app.clone();
+    let fenced_get = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                Request::get("/nodes/create-fence-probe")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("fenced get"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("fenced GET handler did not start")?;
+
+    let mut creates = Vec::new();
+    for index in 0..4 {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        creates.push(tokio::spawn(async move {
+            let payload = serde_json::json!({
+                "title": format!("Concurrent Create {index}"),
+                "kind": "Werkstatt",
+                "address": "Poolkreuzung 2",
+                "location": {"lat": 53.5, "lon": 10.0},
+                "operation_id": format!("30000000-0000-4000-8000-{index:012}")
+            })
+            .to_string();
+            app.oneshot(post_node_req(&cookie, &payload)).await
+        }));
+    }
+    let mut lock_wait_observed = false;
+    for _ in 0..80 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database()                AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting > 0 {
+            lock_wait_observed = true;
+        }
+        // Give all four launched CREATEs the chance to occupy the SQLx pool
+        // on the old, unbudgeted path. The fixed path intentionally admits
+        // fewer, so do not assert a fixed number of PostgreSQL lock waiters.
+        if lock_wait_observed && waiting >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        lock_wait_observed,
+        "at least one node writer must wait behind GET fence"
+    );
+    assert!(creates.iter().all(|task| !task.is_finished()));
+
+    release_tx
+        .send(true)
+        .context("let fenced GET query the still-blocked pool")?;
+    let first = tokio::time::timeout(Duration::from_secs(6), fenced_get)
+        .await
+        .context("fenced GET failed to complete under concurrent CREATEs")??;
+    assert_eq!(first?.status(), StatusCode::OK);
+    for task in creates {
+        let response = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .context("node creation did not complete after fence release")??;
+        assert_eq!(response?.status(), StatusCode::CREATED);
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM domain_nodes          WHERE payload ->> 'created_by_account_id' = $1",
+    )
+    .bind(ACTOR_ID)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 4);
+    clean_all_nodes(&pool).await;
+    Ok(())
+}

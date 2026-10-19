@@ -1425,6 +1425,20 @@ pub async fn create_node(
     // only after commit. An operation replay can repair an older partial node,
     // but cannot attach a Faden when the original request semantics differ.
     if postgres_atomic_create {
+        // CREATE also writes the canonical projection-generation row. Without
+        // this shared admission, four in-flight INSERT transactions can hold
+        // every remaining pool connection while an existing GET's FOR SHARE
+        // fence needs a second connection to finish its response.
+        let _pool_budget = super::postgres_domain_connection_budget()
+            .acquire_many(super::POSTGRES_DOMAIN_OPERATION_UNITS)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "PostgreSQL node creation admission unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "failed to reserve PostgreSQL node creation capacity".to_string(),
+                )
+            })?;
         let pool = state.db_pool.as_ref().ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
