@@ -533,6 +533,7 @@ for orphan_sha in "${verified_sidecar_shas[@]}"; do
   # immediately before each independent backfill success receipt (the native
   # Restic snapshot exclusion remains mandatory for the remaining race).
   assert_no_legacy_plaintext
+  install -d -m 0700 "$DEST_DIR/receipts"
   ln -- "$orphan_receipt_tmp" "$orphan_history" ||
     fail "orphan proof history already exists: $orphan_history"
   certified_proof_digests[$orphan_sha]=1

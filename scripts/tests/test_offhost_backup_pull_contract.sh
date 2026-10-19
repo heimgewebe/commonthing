@@ -818,6 +818,29 @@ canonical_count="$(find "$canonical_orphan_dest/receipts" -maxdepth 1 -type f -n
 pull "$canonical_orphan_dest" test-host > /dev/null
 [[ "$(find "$canonical_orphan_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)" == "$canonical_count" ]]
 
+# Crash even earlier: canonical A and the encrypted core were linked, but
+# neither receipts/ nor latest-pull.receipt was created. A subsequent proof B
+# must be able to certify both; it may not require a directory from an
+# incomplete earlier pull.
+no_receipts_dest="$root/canonical-orphan-before-receipt-directory"
+mkdir -p "$no_receipts_dest"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$no_proof_dest/$core" "$no_receipts_dest/$core"
+done
+cp "$root/late-proof-saved" "$no_receipts_dest/$proof"
+write_restore_proof '2026-07-19T05:00:00Z'
+pull "$no_receipts_dest" test-host > /dev/null
+[[ -d "$no_receipts_dest/receipts" ]]
+grep -lqx "restore_proof_sha256=$first_proof_sha" \
+  "$no_receipts_dest/receipts/$base.pulled-"*.receipt > /dev/null || {
+  echo 'first canonical A without receipts directory was not certified' >&2
+  exit 1
+}
+grep -qx "restore_proof_sha256=$renewed_sha" "$no_receipts_dest/latest-pull.receipt"
+no_receipts_count="$(find "$no_receipts_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)"
+pull "$no_receipts_dest" test-host > /dev/null
+[[ "$(find "$no_receipts_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)" == "$no_receipts_count" ]]
+
 # Upgrade from an older client: C is already certified while B is still
 # an orphan sidecar. Re-sealing B must not demote valid current C on this or any
 # later no-op/crash replay, even when C predates history_sequence support.
