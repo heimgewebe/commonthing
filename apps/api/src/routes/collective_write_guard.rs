@@ -1,5 +1,7 @@
 use std::{future::Future, sync::OnceLock, time::Instant};
 
+#[cfg(test)]
+use crate::state::POSTGRES_DOMAIN_CONNECTION_UNITS;
 use axum::{
     extract::{Path, State},
     http::{header::IF_MATCH, HeaderMap, StatusCode},
@@ -8,7 +10,9 @@ use axum::{
 };
 use serde_json::Value;
 use sqlx::{Postgres, Transaction};
-use tokio::sync::{Mutex, MutexGuard, Semaphore, SemaphorePermit};
+#[cfg(test)]
+use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, MutexGuard, SemaphorePermit};
 
 use crate::{
     advisory_lock::node_mutation_lock_key,
@@ -20,7 +24,7 @@ use crate::{
     domain_db,
     middleware::auth::AuthContext,
     node_mutation::NodeMutationOperation,
-    state::ApiState,
+    state::{postgres_domain_connection_budget, ApiState, POSTGRES_DOMAIN_OPERATION_UNITS},
     telemetry::NodeMutationOutcome,
 };
 
@@ -38,13 +42,10 @@ const LOCAL_NODE_LOCK_STRIPES: usize = 64;
 // a second connection for its handler. They MUST share one weighted admission
 // budget: two independent semaphores could jointly occupy all five connections
 // and deadlock while writers wait for held read fences.
+#[cfg(test)]
 const LOCAL_POSTGRES_NODE_MUTATION_SLOTS: usize =
     (crate::DATABASE_POOL_MAX_CONNECTIONS as usize - 1) / 2;
-pub(crate) const POSTGRES_DOMAIN_OPERATION_UNITS: u32 = 2;
-const POSTGRES_DOMAIN_CONNECTION_UNITS: usize =
-    LOCAL_POSTGRES_NODE_MUTATION_SLOTS * POSTGRES_DOMAIN_OPERATION_UNITS as usize;
 static LOCAL_NODE_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
-static POSTGRES_DOMAIN_CONNECTION_BUDGET: OnceLock<Semaphore> = OnceLock::new();
 
 enum NodeMutationGuard {
     Local {
@@ -73,11 +74,6 @@ fn local_node_lock_index(node_id: &str) -> usize {
 
 fn local_node_lock(node_id: &str) -> &'static Mutex<()> {
     &local_node_locks()[local_node_lock_index(node_id)]
-}
-
-pub(crate) fn postgres_domain_connection_budget() -> &'static Semaphore {
-    POSTGRES_DOMAIN_CONNECTION_BUDGET
-        .get_or_init(|| Semaphore::new(POSTGRES_DOMAIN_CONNECTION_UNITS))
 }
 
 fn uses_postgres_node_persistence(state: &ApiState) -> bool {

@@ -1733,6 +1733,9 @@ pub async fn insert_account_from_jsonl_record(
     record: &Value,
 ) -> Result<(), AccountWriteError> {
     let row = NewDomainAccountRow::from_jsonl_record(record).map_err(AccountWriteError::Mapping)?;
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(AccountWriteError::Database)?;
 
     let result = sqlx::query(
         "INSERT INTO domain_accounts \
@@ -1849,6 +1852,9 @@ pub async fn update_account_profile_in_postgres(
     account_id: &str,
     update: &AccountProfileUpdate,
 ) -> Result<StoredAccountProfile, AccountProfileUpdateError> {
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(AccountProfileUpdateError::Database)?;
     let mut tx = pool
         .begin()
         .await
@@ -2006,6 +2012,9 @@ pub async fn update_account_email_in_postgres(
     if new_email.is_empty() || new_email.len() > MAX_EMAIL_LEN {
         return Err(AccountEmailUpdateError::InvalidEmail);
     }
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(AccountEmailUpdateError::Database)?;
 
     let result = sqlx::query_scalar::<_, DateTime<Utc>>(
         "UPDATE domain_accounts \

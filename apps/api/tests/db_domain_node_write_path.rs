@@ -4921,3 +4921,138 @@ async fn fenced_get_survives_four_concurrent_node_creations() -> Result<()> {
     clean_all_nodes(&pool).await;
     Ok(())
 }
+
+// A guest exit updates nodes/edges/accounts under a single PostgreSQL
+// transaction. Four simultaneous exits can each occupy a pooled connection
+// waiting for the held GET generation row, starving that GET's next DB query.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_survives_four_concurrent_guest_exits() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000d4";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    for index in 0..4 {
+        let guest_id = format!("writepath-guest-budget-{index}");
+        sqlx::query(
+            "INSERT INTO domain_accounts              (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)              VALUES ($1,'garnrolle','Guest budget','not_on_map',0,FALSE,'gast','{}','{}')",
+        )
+        .bind(&guest_id)
+        .execute(&pool)
+        .await?;
+    }
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_handler_app, _cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let get_pool = pool.clone();
+    let app = Router::new()
+        .route(
+            "/nodes/guest-exit-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let get_pool = get_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&get_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+
+    let first_app = app.clone();
+    let fenced_get = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                Request::get("/nodes/guest-exit-budget-probe")
+                    .body(body::Body::empty())
+                    .expect("GET budget probe"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("privacy-fenced guest-exit GET did not start")?;
+
+    let mut exits = Vec::new();
+    for index in 0..4 {
+        let pool = pool.clone();
+        exits.push(tokio::spawn(async move {
+            let guest_id = format!("writepath-guest-budget-{index}");
+            delete_guest_account(&pool, &guest_id).await
+        }));
+    }
+
+    let mut saw_lock_wait = false;
+    for _ in 0..80 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database()                AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting > 0 {
+            saw_lock_wait = true;
+        }
+        if waiting >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        saw_lock_wait,
+        "guest exit must actually wait on a canonical PG lock"
+    );
+    assert!(exits.iter().all(|task| !task.is_finished()));
+    release_tx
+        .send(true)
+        .context("allow fenced GET's second SQLx connection")?;
+
+    let first = tokio::time::timeout(Duration::from_secs(6), fenced_get)
+        .await
+        .context("fenced GET stuck under four guest exits")??;
+    assert_eq!(first?.status(), StatusCode::OK);
+    for task in exits {
+        tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .context("guest exit starved after releasing GET fence")???
+    }
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM domain_accounts WHERE id LIKE 'writepath-guest-budget-%'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(remaining, 0, "all four guests must be deleted");
+    clean_all_nodes(&pool).await;
+    Ok(())
+}

@@ -1076,6 +1076,11 @@ pub async fn add_message(
 /// Die Rollenbedingung schützt gegen versehentliches Löschen eines Webers oder
 /// Administrators.
 pub async fn delete_guest_account(pool: &PgPool, account_id: &str) -> Result<(), GuestExitError> {
+    // Reserve the same shared admission as the GET generation fence BEFORE
+    // obtaining any connection or account/node lifecycle lock. Four parallel
+    // exits otherwise occupy the remaining pool slots while their triggers
+    // wait for that fence, starving the reader's response query.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation().await?;
     let mut tx = pool.begin().await?;
 
     // Serialize the complete account lifecycle before taking row or per-node
@@ -1447,6 +1452,9 @@ async fn finalize_one(
     proposal_id: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<FinalizationOutcome>, sqlx::Error> {
+    // Accepting a Weberantrag writes the canonical account generation.
+    // This path is also invoked by the background sweeper, outside HTTP.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation().await?;
     let mut tx = pool.begin().await?;
 
     // Account exit locks account -> proposal. Finalization must use the same
