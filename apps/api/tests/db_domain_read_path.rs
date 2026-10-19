@@ -869,3 +869,226 @@ async fn untyped_account_edge_collision_with_unprojected_node_is_hidden() {
     assert_eq!(allowed.status(), axum::http::StatusCode::OK);
     clean(&pool).await;
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn sensitive_get_holds_global_visibility_version_fence_until_response() {
+    use axum::{middleware::from_fn_with_state, routing::get, Json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    use tokio::time::{timeout, Duration};
+    use weltgewebe_api::middleware::domain_projection::ensure_current_domain_projection;
+
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES ('rp-fenced-privacy','place','Previously Public',53.6,10.0,'{}'::jsonb,'public')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed public node");
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("materialize initial public projection");
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/nodes/fence-probe",
+            get({
+                let state = state.clone();
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let calls = Arc::clone(&calls);
+                move || {
+                    let state = state.clone();
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        // Read the same process-local projection that node and
+                        // related account/edge APIs authorize against.
+                        let visibility = state
+                            .nodes
+                            .read()
+                            .await
+                            .get("rp-fenced-privacy")
+                            .map(|node| node.search_visibility.as_str().to_string());
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            // Keep the first response incomplete while a second
+                            // DB connection attempts public -> private.
+                            entered.notify_one();
+                            release.notified().await;
+                        }
+                        Json(serde_json::json!({ "visibility": visibility }))
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+
+    let first_request = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::get("/nodes/fence-probe")
+                    .body(body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("first fenced GET")
+        }
+    });
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("GET reached cache-backed handler");
+
+    // A different PgPool emulates a second API process with no shared Tokio
+    // RwLock. Its visibility commit updates domain_projection_state through the
+    // installed trigger and MUST wait for the in-flight response's SQL row fence.
+    let other_pool = direct_pool().await;
+    let mut writer = tokio::spawn(async move {
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility='private'
+             WHERE id='rp-fenced-privacy'",
+        )
+        .execute(&other_pool)
+        .await
+        .expect("cross-process visibility change");
+    });
+    assert!(
+        timeout(Duration::from_millis(200), &mut writer)
+            .await
+            .is_err(),
+        "the private visibility commit must not overtake an in-flight public response",
+    );
+
+    release.notify_one();
+    let initial = timeout(Duration::from_secs(5), first_request)
+        .await
+        .expect("public response completed")
+        .expect("GET task");
+    assert_eq!(initial.status(), axum::http::StatusCode::OK);
+    let initial_json: serde_json::Value = serde_json::from_slice(
+        &body::to_bytes(initial.into_body(), usize::MAX)
+            .await
+            .expect("public response bytes"),
+    )
+    .expect("public response JSON");
+    assert_eq!(initial_json["visibility"], "public");
+    timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("writer commits after read fence releases")
+        .expect("writer task");
+
+    let later = app
+        .oneshot(
+            Request::get("/nodes/fence-probe")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("second fenced GET");
+    assert_eq!(later.status(), axum::http::StatusCode::OK);
+    let later_json: serde_json::Value = serde_json::from_slice(
+        &body::to_bytes(later.into_body(), usize::MAX)
+            .await
+            .expect("private response bytes"),
+    )
+    .expect("private response JSON");
+    assert_eq!(
+        later_json["visibility"], "private",
+        "next GET must refresh the committed PostgreSQL visibility"
+    );
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn own_profile_get_does_not_hold_generation_row_while_waiting_for_profile_writer() {
+    use axum::{routing::get, Json};
+    use tokio::{
+        sync::Notify,
+        time::{timeout, Duration},
+    };
+    use weltgewebe_api::middleware::domain_projection::ensure_current_domain_projection;
+
+    let pool = prepare_pool().await;
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("initial projection loaded");
+
+    let account_writer = state.accounts_persist.lock().await;
+    let reached_handler = Arc::new(Notify::new());
+    let app = Router::new()
+        .route(
+            "/accounts/me/profile",
+            get({
+                let state = state.clone();
+                let reached_handler = Arc::clone(&reached_handler);
+                move || {
+                    let state = state.clone();
+                    let reached_handler = Arc::clone(&reached_handler);
+                    async move {
+                        reached_handler.notify_one();
+                        let _profile_guard = state.accounts_persist.lock().await;
+                        Json(serde_json::json!({"ok": true}))
+                    }
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state.clone());
+
+    let reader = tokio::spawn(async move {
+        app.oneshot(
+            Request::get("/accounts/me/profile")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("own profile request")
+    });
+    timeout(Duration::from_secs(5), reached_handler.notified())
+        .await
+        .expect("profile handler was admitted and is waiting for accounts_persist");
+
+    // Account PATCH owns accounts_persist before its domain_accounts UPDATE.
+    // Simulate the trigger's exact singleton row update from a second
+    // connection while the GET is still waiting for the writer mutex.
+    // If GET holds a global FOR SHARE lock already, neither can finish.
+    let second_pool = direct_pool().await;
+    timeout(
+        Duration::from_secs(2),
+        sqlx::query(
+            "UPDATE domain_projection_state SET version = version + 1 WHERE singleton = TRUE",
+        )
+        .execute(&second_pool),
+    )
+    .await
+    .expect("profile writer cannot wait on GET's generation lock")
+    .expect("simulated profile writer committed");
+
+    drop(account_writer);
+    let response = timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("GET completed after profile writer")
+        .expect("GET task");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    clean(&pool).await;
+}

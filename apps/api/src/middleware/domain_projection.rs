@@ -2,7 +2,8 @@ use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLockReadGuard;
+use sqlx::{PgPool, Postgres, Transaction};
+use tokio::sync::{RwLockReadGuard, Semaphore};
 
 use axum::{
     extract::{Request, State},
@@ -14,6 +15,47 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 
 use crate::{config::DomainReadSource, routes::auth::SESSION_COOKIE_NAME, state::ApiState};
+
+static PRIVACY_READ_SLOTS: Semaphore =
+    Semaphore::const_new((crate::DATABASE_POOL_MAX_CONNECTIONS as usize - 1) / 2);
+
+// Only fixed-size domain JSON reads get the cross-process database fence.
+// The search endpoint already authorizes against domain_nodes in its SQL query.
+// Mutations MUST NOT hold a shared fence while their own transactions update
+// domain_projection_state, or they would deadlock themselves.
+fn privacy_sensitive_domain_path(path: &str) -> bool {
+    let path = path.strip_prefix("/api").unwrap_or(path);
+    [
+        "/nodes",
+        "/edges",
+        "/accounts",
+        "/conversations",
+        "/ortswebereien",
+        "/webgemeindezentren",
+    ]
+    .iter()
+    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+fn requires_database_privacy_fence(method: &Method, path: &str) -> bool {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    let path = path.strip_prefix("/api").unwrap_or(path);
+    // GET /accounts/me/profile takes accounts_persist before its DB read,
+    // just like PATCH /accounts/me/profile does before a domain_accounts UPDATE.
+    // A PG shared generation row lock acquired here before accounts_persist
+    // would invert that order and deadlock with a simultaneous profile PATCH.
+    if path == "/accounts/me/profile" || path == "/nodes/search" {
+        return false;
+    }
+    // Other unlisted domain views read canonical PostgreSQL directly.
+    // Only cache-derived node/account/edge and conversation GETs need a
+    // cross-process fence; otherwise reserve pooled connections for writers.
+    ["/nodes", "/edges", "/accounts", "/conversations"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
 
 /// Keep PostgreSQL-backed requests on one internally consistent process-local
 /// projection. Mutating requests and authenticated requests require the current
@@ -34,17 +76,7 @@ fn may_use_previous_projection(method: &Method, has_session_cookie: bool, path: 
     // Anonymous projections are allowed to defer only where stale public
     // content cannot expose node visibility changes. The old fast-path
     // must not publish public->private/revoked transitions via graph routes.
-    let path = path.strip_prefix("/api").unwrap_or(path);
-    ![
-        "/nodes",
-        "/edges",
-        "/accounts",
-        "/conversations",
-        "/ortswebereien",
-        "/webgemeindezentren",
-    ]
-    .iter()
-    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    !privacy_sensitive_domain_path(path)
 }
 
 // Acquire the request's actual snapshot guard before checking the canonical
@@ -68,6 +100,80 @@ where
     } else {
         Ok((None, waited))
     }
+}
+
+// Only the transaction-held PostgreSQL row lock can exclude visibility commits
+// by OTHER API processes. A process-local RwLock or a second generation query
+// after the handler cannot close the check-to-response race.
+async fn begin_fenced_generation(
+    pool: &PgPool,
+) -> anyhow::Result<(Transaction<'static, Postgres>, i64)> {
+    let mut tx = pool.begin().await?;
+    // Every domain_nodes/accounts/edges writer updates this singleton row in
+    // the SAME transaction via weltgewebe_enqueue_domain_event(). A FOR SHARE
+    // lock prevents any of those writes from committing until we finish the
+    // complete JSON handler response (including cache-based authorization).
+    let observed: i64 = sqlx::query_scalar(
+        "SELECT version FROM domain_projection_state WHERE singleton = TRUE FOR SHARE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    Ok((tx, observed))
+}
+
+async fn fenced_domain_read(state: &ApiState, request: Request, next: Next) -> Response {
+    let Some(pool) = state.db_pool.as_ref() else {
+        return projection_unavailable(state, "PostgreSQL domain pool is missing");
+    };
+    // The API's PostgreSQL pool has five connections. Without this bound, five
+    // readers could each hold a connection while their handlers wait for a
+    // sixth one, starving both handlers and privacy writers.
+    let _slot =
+        match tokio::time::timeout(Duration::from_secs(3), PRIVACY_READ_SLOTS.acquire()).await {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(error)) => return projection_unavailable(state, error),
+            Err(_) => return projection_unavailable(state, "privacy read slot timed out"),
+        };
+    const MAX_FENCED_GENERATION_ATTEMPTS: usize = 4;
+    for _ in 0..MAX_FENCED_GENERATION_ATTEMPTS {
+        let wait_started = Instant::now();
+        let projection_guard = state.domain_projection_gate.read().await;
+        state
+            .metrics
+            .observe_domain_projection_read_gate_wait(wait_started.elapsed());
+
+        let (tx, observed) =
+            match tokio::time::timeout(Duration::from_secs(3), begin_fenced_generation(pool)).await
+            {
+                Ok(Ok(checked)) => checked,
+                Ok(Err(error)) => return projection_unavailable(state, error),
+                Err(_) => {
+                    return projection_unavailable(state, "PostgreSQL privacy fence timed out")
+                }
+            };
+        if observed == state.domain_projection_version.load(Ordering::Acquire) {
+            let response = next.run(request).await;
+            // Retain BOTH the process-local cache read guard and the database
+            // row lock through response creation. A rollback failure must not
+            // release a potentially stale private payload to the caller.
+            return match tx.rollback().await {
+                Ok(()) => response,
+                Err(error) => projection_unavailable(state, error),
+            };
+        }
+        // Release the database fence AND the local gate before reloading.
+        if let Err(error) = tx.rollback().await {
+            return projection_unavailable(state, error);
+        }
+        drop(projection_guard);
+        if let Err(error) = state.refresh_domain_projection_if_stale().await {
+            return projection_unavailable(state, error);
+        }
+    }
+    projection_unavailable(
+        state,
+        "domain generation changed during fenced privacy read",
+    )
 }
 
 fn projection_unavailable(state: &ApiState, error: impl std::fmt::Display) -> Response {
@@ -109,9 +215,12 @@ pub async fn ensure_current_domain_projection(
         return next.run(request).await;
     }
 
-    // Sensitive reads use a single generation admission point while their
-    // handler's read guard is held. A later committed generation is observed
-    // by a later request; any generation found stale here must be reloaded.
+    if requires_database_privacy_fence(request.method(), request.uri().path()) {
+        return fenced_domain_read(&state, request, next).await;
+    }
+
+    // Non-cache-sensitive routes retain their existing strict admission logic.
+    // Cache-derived privacy JSON gets a PostgreSQL cross-process fence above.
     const MAX_CURRENT_GENERATION_ATTEMPTS: usize = 4;
     let Some(pool) = state.db_pool.as_ref() else {
         return projection_unavailable(&state, "PostgreSQL domain pool is missing");
@@ -209,6 +318,71 @@ mod tests {
             gate.try_write().is_ok(),
             "failed DB read must not strand gate"
         );
+    }
+
+    #[test]
+    fn database_fence_covers_sensitive_json_reads_not_writes() {
+        for path in [
+            "/nodes",
+            "/api/nodes/id",
+            "/edges/id",
+            "/api/accounts/account",
+            "/api/conversations/id/messages",
+        ] {
+            assert!(
+                requires_database_privacy_fence(&Method::GET, path),
+                "{path}"
+            );
+            assert!(
+                requires_database_privacy_fence(&Method::HEAD, path),
+                "{path}"
+            );
+            assert!(
+                !requires_database_privacy_fence(&Method::POST, path),
+                "{path}"
+            );
+            assert!(
+                !requires_database_privacy_fence(&Method::PATCH, path),
+                "{path}"
+            );
+        }
+        // Governance GETs finalize due proposals (writes). GET own profile
+        // takes a mutex also held by the profile PATCH writer: both stay
+        // strict-generation but cannot hold the shared DB row fence.
+        for path in [
+            "/health/ready",
+            "/api/version",
+            "/api/search",
+            "/auth/me",
+            "/api/proposals/id",
+            "/accounts/me/profile",
+            "/api/accounts/me/profile",
+            "/nodes/search",
+            "/api/nodes/search",
+            "/ortswebereien",
+            "/api/webgemeindezentren/id",
+        ] {
+            assert!(
+                !requires_database_privacy_fence(&Method::GET, path),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn intentionally_unfenced_domain_gets_remain_strict_generation() {
+        for path in [
+            "/accounts/me/profile",
+            "/api/accounts/me/profile",
+            "/api/nodes/search",
+            "/api/ortswebereien",
+            "/api/webgemeindezentren/id",
+        ] {
+            assert!(
+                !may_use_previous_projection(&Method::GET, false, path),
+                "unfenced domain GET must not fall back to previous cache: {path}"
+            );
+        }
     }
 
     #[test]

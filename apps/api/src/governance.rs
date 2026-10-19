@@ -1190,7 +1190,9 @@ pub async fn delete_guest_account(pool: &PgPool, account_id: &str) -> Result<(),
 // ---------------------------------------------------------------------------
 
 const PROPOSAL_WITH_COUNTS_SELECT: &str = "SELECT p.id::text AS id, p.kind, \
-        p.webgemeindezentrum_id, p.title, p.target_node_id, p.target_node_title, \
+        p.webgemeindezentrum_id, p.title, \
+        CASE WHEN public_target.id IS NOT NULL THEN p.target_node_id END AS target_node_id, \
+        CASE WHEN public_target.id IS NOT NULL THEN p.target_node_title END AS target_node_title, \
         p.repeals_proposal_id::text AS repeals_proposal_id, \
         (SELECT r.id::text FROM governance_proposals r \
             WHERE r.repeals_proposal_id = p.id AND r.status IN ('consent', 'voting') \
@@ -1228,7 +1230,10 @@ const PROPOSAL_WITH_COUNTS_SELECT: &str = "SELECT p.id::text AS id, p.kind, \
             WHERE gv.proposal_id = p.id AND gv.choice = 'nein') AS no_votes, \
         (SELECT count(*) FROM governance_votes gv \
             WHERE gv.proposal_id = p.id AND gv.choice = 'enthaltung') AS abstain_votes \
-     FROM governance_proposals p";
+     FROM governance_proposals p \
+     LEFT JOIN domain_nodes public_target \
+       ON public_target.id = p.target_node_id \
+      AND public_target.search_visibility = 'public'";
 
 fn proposal_from_row(row: &sqlx::postgres::PgRow) -> Result<ProposalWithCounts, sqlx::Error> {
     Ok(ProposalWithCounts {
