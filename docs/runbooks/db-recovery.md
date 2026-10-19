@@ -499,6 +499,41 @@ Off-Host-Installer legt das Gate commitgebunden neben das Pullskript
 (`~/.local/libexec/weltgewebe/<commit>/restic-plaintext-gate.sh`, Hash im
 `install.receipt`).
 
+**Verbindliche Grenze des Preflight-Gates:** Der Dateiscan endet **vor**
+dem eigentlichen Restic-Snapshot. Entsteht danach ein neuer
+`*.sql.gz`-Dump, kann Restic ihn trotz erfolgreichem Gate erfassen.
+Der Scan allein ist daher **kein** vollständiger Datenschutzschutz. Der
+maßgebliche Schutz ist eine Ausschlussregel, die **Restic selbst beim
+Snapshot** anwendet. Auf `heim-pc` verwendet der live geprüfte Aufruf
+`heim-pc-restic-backup run` die Datei
+`$HOME/.config/restic/heim-pc-excludes` über `--exclude-file`. Diese
+Datei muss nach gesonderter Betriebsfreigabe eine eigene Zeile enthalten:
+
+```text
+**/*.sql.gz
+```
+
+Die Regel schließt SQL-Klartext-Gzip-Dateien auch in Unterverzeichnissen
+aus, ohne `*.sql.gz.age`-Chiffrate zu erfassen. Ein isolierter
+Restic-0.12.1-Test mit **nach einem erfolgreichen Vorabscan** angelegten
+Klartext-Testdateien bestätigte: beide Dumps fehlten im Snapshot,
+während normale Dateien und eine `*.sql.gz.age`-Testdatei enthalten
+blieben. Das ist ein **synthetischer** Nachweis und ersetzt **nicht**
+die Kontrolle der tatsächlich aktiven Live-Exclude-Datei oder eines
+produktiven Snapshots.
+
+Vor einer Betriebsfreigabe die aktive Exclude-Datei, `ExecStart`,
+`--exclude-file` und alle Snapshot-Quellen erneut lesen; die Regel
+unter derselben Serviceidentität mit einem isolierten Test und einem
+frisch erstellten Snapshot nachweisen. Dabei auch prüfen, ob
+sicherungswürdige andere `*.sql.gz`-Dateien ausgenommen würden. Die
+historischen PostgreSQL-Klartextbestände **nicht** löschen. Der bisherige
+Preflight-Scanner kann bestehende Dumps weiterhin erkennen und den
+ganzen Snapshot blockieren; seine spätere Deaktivierung oder Anpassung
+bedarf ebenfalls einer gesonderten Freigabe und darf erst nach dem
+wirksamen nativen Restic-Ausschluss erfolgen. Neue Scanner,
+Watcher oder Dienste sind dafür nicht nötig.
+
 Wirksam ist es erst als `ExecStartPre=` der Unit, die den Snapshot startet
 (laut Readback vom 15. Oktober 2026 `restic-backup-1930.service`). Die
 Quellliste des Gates muss exakt der Quellliste dieses Snapshots entsprechen;
