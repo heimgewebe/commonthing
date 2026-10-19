@@ -1080,6 +1080,40 @@ flock -n 8
 expect_pull_failure "$locked_dest" 'another pull holds'
 exec 8>&-
 
+# Immutable successful history receipts outlive LOCAL_RETENTION_DAYS. When a
+# newer valid encrypted backup is pulled, do not destroy the earlier certified
+# ciphertext/manifests/canonical proof, or its receipt ceases to represent a
+# restorable recovery point. This remains blocked until explicit retirement.
+certified_old_dest="$root/retention-certified-old"
+mkdir -p "$certified_old_dest"
+cp -a "$no_proof_dest/." "$certified_old_dest/"
+for retained in "$file" "$manifest" "$age_manifest" "$proof"; do
+  touch -d '40 days ago' "$certified_old_dest/$retained"
+done
+old_canonical_sha="$(sha256sum "$certified_old_dest/$proof" | awk '{print $1}')"
+old_history_count="$(find "$certified_old_dest/receipts" -maxdepth 1 -name "$base.pulled-*.receipt" -type f | wc -l)"
+newer_base=weltgewebe-postgres-20260901T040000Z
+newer_file="$newer_base.sql.gz.age"
+newer_manifest="$newer_base.sha256.manifest"
+newer_age_manifest="$newer_base.age.sha256.manifest"
+cp "$remote/$file" "$remote/$newer_file"
+sed "s|^file=$plain$|file=$newer_base.sql.gz|" \
+  "$remote/$manifest" > "$remote/$newer_manifest"
+sed -e "s|^file=$file$|file=$newer_file|" \
+  -e "s|^plaintext_file=$plain$|plaintext_file=$newer_base.sql.gz|" \
+  "$remote/$age_manifest" > "$remote/$newer_age_manifest"
+LOCAL_RETENTION_DAYS=1 pull "$certified_old_dest" test-host > /dev/null
+for retained in "$file" "$manifest" "$age_manifest" "$proof"; do
+  [[ -f "$certified_old_dest/$retained" ]] || {
+    echo "retention destroyed certified historical restore artefact: $retained" >&2
+    exit 1
+  }
+done
+[[ "$(sha256sum "$certified_old_dest/$proof" | awk '{print $1}')" == "$old_canonical_sha" ]]
+[[ -f "$certified_old_dest/$newer_file" ]]
+[[ "$(find "$certified_old_dest/receipts" -maxdepth 1 -name "$base.pulled-*.receipt" -type f | wc -l)" == "$old_history_count" ]]
+rm "$remote/$newer_file" "$remote/$newer_manifest" "$remote/$newer_age_manifest"
+
 # A host without an encrypted artefact (e.g. no recipient configured) fails closed.
 rm -f "$remote/$file" "$remote/$age_manifest"
 expect_pull_failure "$root/no-age" 'no complete encrypted backup set'

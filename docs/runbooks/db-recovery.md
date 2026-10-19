@@ -237,7 +237,15 @@ Schlüssel werden auf `heim-pc` dafür nicht benötigt. Erst danach schreibt er
 pro Pull einen unveränderlichen Receipt unter `receipts/` (create-only,
 `<backup>.pulled-<UTC>.receipt`) und aktualisiert `latest-pull.receipt` als
 Zeiger auf den neuesten (`contract=weltgewebe-offhost-backup-pull-v2`,
-`encryption=age`, `recipients=`). Receipts unterliegen keiner Retention. Neu erzeugte History-Receipts tragen
+`encryption=age`, `recipients=`). Receipts unterliegen keiner Retention.
+Die lokale `LOCAL_RETENTION_DAYS`-Bereinigung darf ausschließlich veraltete,
+**nicht** durch einen historischen Erfolgs-Receipt zertifizierte Artefakte
+entfernen. Bei vorhandener Receipt-Historie müssen Chiffrat, beide Manifeste
+und der kanonische Restore-Proof erhalten bleiben, auch wenn ein neuerer
+Sicherungssatz eingetroffen ist. Die spätere Aussonderung zertifizierter
+Recovery-Punkte braucht einen nachgewiesenen Ersatz-Restore und eine gesonderte
+Freigabe; eine erfolgreiche Kopie allein genügt nicht.
+Neu erzeugte History-Receipts tragen
 zusätzlich `history_sequence`, eine pro Sicherungsbasis strikt ansteigende
 Veröffentlichungsnummer. Der `latest-pull.receipt`-Zeiger wird anhand dieser
 Nummer statt anhand der möglicherweise rückläufigen Systemuhr repariert.
