@@ -352,6 +352,7 @@ done
 history_present=0
 latest_history=''
 latest_history_sequence=0
+max_history_sequence=0
 legacy_history_count=0
 declare -A seen_history_sequences=()
 declare -A certified_proof_digests=()
@@ -411,15 +412,32 @@ for historical in "$DEST_DIR/receipts/${base}.pulled-"*.receipt; do
       ;;
     *) fail "normal pull duplicated historical sequence field" ;;
   esac
+  # Crash-recovered sidecars are certified historical evidence, not a new
+  # claim that the recovered old proof is now the latest remote revision.
+  history_backfill_count="$(grep -c '^history_backfill=' "$historical" || true)"
+  case "$history_backfill_count" in
+    0) historical_backfill=0 ;;
+    1)
+      grep -qxF 'history_backfill=1' "$historical" ||
+        fail "normal pull invalid history backfill"
+      historical_backfill=1
+      ;;
+    *) fail "normal pull duplicated history backfill field" ;;
+  esac
   history_present=1
-  if [[ -z "$latest_history" ]] ||
-    ((historical_sequence > latest_history_sequence)) ||
-    { ((historical_sequence == latest_history_sequence)) && [[ "$historical" > "$latest_history" ]]; }; then
-    latest_history="$historical"
-    latest_history_sequence="$historical_sequence"
+  if ((historical_sequence > max_history_sequence)); then
+    max_history_sequence="$historical_sequence"
+  fi
+  if ((historical_backfill == 0)); then
+    if [[ -z "$latest_history" ]] ||
+      ((historical_sequence > latest_history_sequence)) ||
+      { ((historical_sequence == latest_history_sequence)) && [[ "$historical" > "$latest_history" ]]; }; then
+      latest_history="$historical"
+      latest_history_sequence="$historical_sequence"
+    fi
   fi
 done
-next_history_sequence=$((latest_history_sequence + 1))
+next_history_sequence=$((max_history_sequence + 1))
 # The remote core was just validated byte-for-byte. A complete existing
 # three-file set without a receipt can be left by a crash between linking the
 # core and creating its history marker; finish that exact set create-only.
@@ -500,15 +518,18 @@ for orphan_sha in "${verified_sidecar_shas[@]}"; do
       "$pulled_at" "$REMOTE_HOST" "$latest" "$actual" "$manifest_recipients" "$plaintext_sha"
     printf 'restore_proof_sha256=%s\n' "$orphan_sha"
     printf 'history_sequence=%s\n' "$next_history_sequence"
+    printf 'history_backfill=1\n'
   } > "$orphan_receipt_tmp"
   chmod 600 "$orphan_receipt_tmp"
   orphan_history="$DEST_DIR/receipts/${base}.pulled-$(date -u +%Y%m%dT%H%M%S.%NZ).receipt"
+  # A legacy plaintext writer is not covered by the pull lock. Re-check
+  # immediately before each independent backfill success receipt (the native
+  # Restic snapshot exclusion remains mandatory for the remaining race).
+  assert_no_legacy_plaintext
   ln -- "$orphan_receipt_tmp" "$orphan_history" ||
     fail "orphan proof history already exists: $orphan_history"
   certified_proof_digests[$orphan_sha]=1
   history_present=1
-  latest_history="$orphan_history"
-  latest_history_sequence="$next_history_sequence"
   next_history_sequence=$((next_history_sequence + 1))
 done
 

@@ -241,7 +241,10 @@ Zeiger auf den neuesten (`contract=weltgewebe-offhost-backup-pull-v2`,
 zusätzlich `history_sequence`, eine pro Sicherungsbasis strikt ansteigende
 Veröffentlichungsnummer. Der `latest-pull.receipt`-Zeiger wird anhand dieser
 Nummer statt anhand der möglicherweise rückläufigen Systemuhr repariert.
-Alte Receipts ohne dieses Feld bleiben lesbar; bei mehreren alten
+Nach einem Absturz wiedergefundene ältere Proof-Versionen erhalten zusätzlich
+`history_backfill=1`: Sie bleiben als geprüfte historische Belege erhalten,
+überschreiben aber niemals eine bereits zertifizierte neuere
+`latest-pull.receipt`-Version. Alte Receipts ohne dieses Feld bleiben lesbar; bei mehreren alten
 unsequenzierten Receipts und verlorenem oder nicht zuordenbarem Latest-Zeiger
 bricht die automatische Wahl jedoch sicher ab, statt einen möglicherweise
 falschen neuesten Stand zu behaupten. Ein vorhandener Wochen-Restore-Proof wird

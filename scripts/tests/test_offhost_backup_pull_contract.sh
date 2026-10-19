@@ -792,6 +792,43 @@ pull "$orphan_dest" test-host > /dev/null
 }
 write_restore_proof '2026-07-19T05:00:00Z'
 
+# Upgrade from an older client: C is already certified while B is still
+# an orphan sidecar. Re-sealing B must not demote valid current C on this or any
+# later no-op/crash replay, even when C predates history_sequence support.
+upgrade_dest="$root/upgrade-orphan-B-after-certified-C"
+mkdir -p "$upgrade_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$no_proof_dest/$core" "$upgrade_dest/$core"
+done
+cp "$no_proof_dest/receipts/"*.receipt "$upgrade_dest/receipts/"
+for old_history in "$upgrade_dest/receipts/$base.pulled-"*.receipt; do
+  if grep -qx "restore_proof_sha256=$renewed_sha" "$old_history"; then
+    rm "$old_history"
+  else
+    sed -i '/^history_sequence=/d' "$old_history"
+  fi
+done
+cp "$no_proof_dest/latest-pull.receipt" "$upgrade_dest/latest-pull.receipt"
+sed -i '/^history_sequence=/d' "$upgrade_dest/latest-pull.receipt"
+write_restore_proof '2026-07-26T05:00:00Z'
+pull "$upgrade_dest" test-host > /dev/null
+if ! grep -qx "restore_proof_sha256=$third_sha" "$upgrade_dest/latest-pull.receipt"; then
+  echo 'sealing orphan B demoted already-certified latest C' >&2
+  exit 1
+fi
+grep -lqx "restore_proof_sha256=$renewed_sha" "$upgrade_dest/receipts/$base.pulled-"*.receipt > /dev/null || {
+  echo 'orphan B not certified during C-preserving upgrade' >&2
+  exit 1
+}
+rm "$upgrade_dest/latest-pull.receipt"
+if pull "$upgrade_dest" test-host > /dev/null 2> "$root/upgrade-unsequenced-pointer-loss.stderr"; then
+  echo 'legacy unsequenced C pointer was guessed after loss' >&2
+  exit 1
+fi
+grep -qF 'normal pull ambiguous unsequenced history without latest receipt' "$root/upgrade-unsequenced-pointer-loss.stderr"
+[[ ! -e "$upgrade_dest/latest-pull.receipt" ]]
+write_restore_proof '2026-07-19T05:00:00Z'
+
 # Receipt filenames contain wall-clock timestamps: a clock correction must
 # not roll back the latest pointer to an older proof event. Move C's immutable
 # receipt to a lexicographically earlier name while retaining its content.
