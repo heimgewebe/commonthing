@@ -5517,6 +5517,12 @@ async fn magic_link_login_releases_cache_lock_before_pg_admission() -> Result<()
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
     let (_app, _cookie, mut state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.sessions = SessionBackend::new(DbSessionStore::new(pool.clone()));
+    state.config.auth_public_login = true;
+    state.config.app_base_url = Some("http://localhost".to_string());
+    state.refresh_domain_projection_if_stale().await?;
+    // Refresh reloads the canonical account projection; install the test-only
+    // login address AFTER it so the magic link reaches PostgreSQL session IO.
     {
         let mut accounts = state.accounts.write().await;
         let mut account = accounts
@@ -5526,10 +5532,10 @@ async fn magic_link_login_releases_cache_lock_before_pg_admission() -> Result<()
         account.email = Some(EMAIL.to_string());
         accounts.insert(account);
     }
-    state.sessions = SessionBackend::new(DbSessionStore::new(pool.clone()));
-    state.config.auth_public_login = true;
-    state.config.app_base_url = Some("http://localhost".to_string());
-    state.refresh_domain_projection_if_stale().await?;
+    assert!(
+        state.accounts.read().await.get_by_email(EMAIL).is_some(),
+        "fixture must resolve the login email after projection refresh"
+    );
 
     // Both readers enter their handler while holding the shared canonical
     // projection generation and both weighted admission reservations.
@@ -5781,8 +5787,32 @@ async fn notification_preferences_share_guest_exit_privacy_pool_budget() -> Resu
         "guest exit must hold canonical account FOR UPDATE"
     );
 
+    // Observe the actual HTTP handler boundary after canonical authentication:
+    // all three real PUTs must reach the notification writer before the held
+    // GET is released. This distinguishes queued SQLx admission from requests
+    // that never reached the competing operation.
+    let arrived = Arc::new(Barrier::new(4));
+    let arrived_handler = Arc::clone(&arrived);
     let preferences_app = Router::new()
-        .merge(api_router())
+        .route(
+            "/notifications/preferences",
+            axum::routing::put(
+                move |state: axum::extract::State<ApiState>,
+                      auth: axum::Extension<weltgewebe_api::middleware::auth::AuthContext>,
+                      request: axum::Json<
+                    weltgewebe_api::notifications::UpdateNotificationPreferencesRequest,
+                >| {
+                    let arrived_handler = Arc::clone(&arrived_handler);
+                    async move {
+                        arrived_handler.wait().await;
+                        weltgewebe_api::notifications::update_notification_preferences(
+                            state, auth, request,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
         .layer(from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
     let mut notifications = Vec::new();
@@ -5801,23 +5831,36 @@ async fn notification_preferences_share_guest_exit_privacy_pool_budget() -> Resu
             .await
         }));
     }
-    let mut observed_contention = false;
-    for _ in 0..80 {
+    tokio::time::timeout(Duration::from_secs(5), arrived.wait())
+        .await
+        .context("all three notification PUTs must pass authentication")?;
+    // The guest exit must be the only PG lock waiter: with the shared budget,
+    // all three PUTs queue BEFORE SQLx. The unfixed code instead checks out
+    // three connections, waits on the guest's FK row, and exhausts the pool.
+    let mut observed_exit_wait = false;
+    for _ in 0..40 {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM pg_stat_activity
              WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'",
         )
         .fetch_one(&monitor)
         .await?;
-        if waiting >= 2 {
-            observed_contention = true;
-            break;
+        assert!(
+            waiting <= 1,
+            "notification PUTs must not occupy SQLx connections waiting on guest FK locks: {waiting}"
+        );
+        if waiting == 1 {
+            observed_exit_wait = true;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(
-        observed_contention,
-        "test must observe real PostgreSQL lock waits"
+        observed_exit_wait,
+        "guest exit must actually wait for generation fence"
+    );
+    assert!(
+        notifications.iter().all(|task| !task.is_finished()),
+        "notification PUTs must queue while the protected GET and exit hold admission"
     );
     assert!(
         !exit.is_finished(),
