@@ -5257,3 +5257,224 @@ async fn fenced_get_survives_guest_exit_and_three_direct_conversation_writers() 
     clean_all_nodes(&pool).await;
     Ok(())
 }
+
+// A protected GET, guest exit, two proposal-message writes and an expired
+// session touch share only five SQLx connections. Each of the latter operations
+// can wait on the exit's domain-account/session locks. Every one must be
+// admitted through the SAME pool budget instead of occupying the GET's second
+// handler connection while its generation FOR SHARE lock is still held.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_survives_guest_exit_governance_and_session_touch() -> Result<()> {
+    use weltgewebe_api::{
+        auth::{session::SessionOps, session_db::DbSessionStore},
+        governance::{add_message, create_weber_proposal, MessageError},
+    };
+
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000f4";
+    const GUEST_ID: &str = "writepath-gov-session-budget";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO domain_accounts          (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)          VALUES ($1,'garnrolle','Guest governance budget','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(GUEST_ID)
+    .execute(&pool)
+    .await?;
+    let proposal = create_weber_proposal(
+        &pool,
+        GUEST_ID,
+        "Guest governance budget",
+        None,
+        chrono::Utc::now(),
+    )
+    .await?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO sessions (id, account_id, device_id, created_at, last_active, expires_at)          VALUES ($1, $2, $3, NOW(), NOW() - INTERVAL '10 minutes', NOW() + INTERVAL '1 day')",
+    )
+    .bind(&session_id)
+    .bind(GUEST_ID)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .execute(&pool)
+    .await?;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, _cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let get_pool = pool.clone();
+    let app = Router::new()
+        .route(
+            "/nodes/governance-session-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let get_pool = get_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&get_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+    let fenced_get = tokio::spawn(async move {
+        app.oneshot(
+            Request::get("/nodes/governance-session-budget-probe")
+                .header("Host", "localhost")
+                .body(body::Body::empty())
+                .expect("fenced GET"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("fenced GET must hold canonical generation")?;
+
+    let exit_pool = pool.clone();
+    let exit = tokio::spawn(async move { delete_guest_account(&exit_pool, GUEST_ID).await });
+    let mut exit_row_locked = false;
+    for _ in 0..80 {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT id FROM domain_accounts WHERE id = $1 FOR SHARE NOWAIT",
+        )
+        .bind(GUEST_ID)
+        .fetch_one(&monitor)
+        .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                exit_row_locked = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(exit_row_locked, "guest exit must hold account FOR UPDATE");
+
+    // Wait until the exit is blocked by the GET generation row. Guest exit
+    // deletes the sessions first, so their TOUCH would otherwise retain
+    // pooled connections while waiting on the uncommitted session deletes.
+    let mut exit_generation_wait = false;
+    for _ in 0..80 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting >= 1 {
+            exit_generation_wait = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        exit_generation_wait,
+        "guest exit must wait behind held GET generation"
+    );
+
+    let mut governance_writers = Vec::new();
+    for index in 0..2 {
+        let pool = pool.clone();
+        let proposal_id = proposal.id.clone();
+        governance_writers.push(tokio::spawn(async move {
+            add_message(
+                &pool,
+                &proposal_id,
+                GUEST_ID,
+                "Guest governance budget",
+                &format!("blocked proposal-message {index}"),
+                chrono::Utc::now(),
+            )
+            .await
+        }));
+    }
+    let session_store = DbSessionStore::new(pool.clone());
+    let touch = tokio::spawn(async move { session_store.touch(&session_id).await });
+
+    // The previous unbudgeted path consumes three pool connections here:
+    // two account-lock waiters and one session-row UPDATE waiter. The fixed
+    // path queues them before SQLx admission. Exercise both for long enough.
+    for _ in 0..60 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !exit.is_finished(),
+        "guest exit bypassed canonical visibility fence"
+    );
+    release_tx
+        .send(true)
+        .context("allow protected GET's second SQLx read")?;
+    let response = tokio::time::timeout(Duration::from_secs(7), fenced_get)
+        .await
+        .context("GET stalled behind pool-blocked governance/session writers")??;
+    assert_eq!(response?.status(), StatusCode::OK);
+
+    tokio::time::timeout(Duration::from_secs(10), exit)
+        .await
+        .context("guest exit did not complete")???;
+    for task in governance_writers {
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .context("governance writer did not complete")??;
+        assert!(
+            matches!(
+                outcome,
+                Ok(_) | Err(MessageError::Database(sqlx::Error::RowNotFound))
+            ),
+            "governance writer may only complete or observe the deleted guest, never time out"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(10), touch)
+        .await
+        .context("SQLx session touch did not complete")??
+        .expect("session touch must be a completed no-op after guest exit");
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM domain_accounts WHERE id = $1")
+            .bind(GUEST_ID)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining, 0);
+    clean_all_nodes(&pool).await;
+    Ok(())
+}

@@ -409,6 +409,12 @@ pub async fn create_weber_proposal_at_center(
     let id = Uuid::new_v4().to_string();
     let consent_until = now + Duration::days(CONSENT_PHASE_DAYS);
 
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(CreateProposalError::Database)?;
     let mut tx = pool.begin().await.map_err(CreateProposalError::Database)?;
     let applicant_role: Option<String> = sqlx::query_scalar(
         "SELECT role FROM domain_accounts \
@@ -520,6 +526,12 @@ pub async fn create_sach_proposal_at_center(
 ) -> Result<ProposalWithCounts, CreateProposalError> {
     let id = Uuid::new_v4().to_string();
     let consent_until = now + Duration::days(CONSENT_PHASE_DAYS);
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(CreateProposalError::Database)?;
     let mut tx = pool.begin().await.map_err(CreateProposalError::Database)?;
 
     let applicant_role: Option<String> = sqlx::query_scalar(
@@ -630,6 +642,12 @@ pub async fn withdraw_proposal(
     applicant_account_id: &str,
     now: DateTime<Utc>,
 ) -> Result<ProposalWithCounts, WithdrawProposalError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(WithdrawProposalError::Database)?;
     let mut tx = pool
         .begin()
         .await
@@ -693,6 +711,12 @@ pub async fn create_repeal_proposal(
     summary: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<ProposalWithCounts, RepealProposalError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(RepealProposalError::Database)?;
     let mut tx = pool.begin().await.map_err(RepealProposalError::Database)?;
 
     // Gleiche Lock-Reihenfolge wie Veto, Stimme, Nachricht und Finalisierung:
@@ -849,6 +873,12 @@ pub async fn add_veto(
     reason: &str,
     now: DateTime<Utc>,
 ) -> Result<Veto, VetoError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(VetoError::Database)?;
     let mut tx = pool.begin().await.map_err(VetoError::Database)?;
 
     // Guest exit uses account -> proposal lock ordering. Formal actions use the
@@ -917,6 +947,12 @@ pub async fn upsert_vote(
     choice: VoteChoice,
     now: DateTime<Utc>,
 ) -> Result<VoteWriteOutcome, VoteError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(VoteError::Database)?;
     let mut tx = pool.begin().await.map_err(VoteError::Database)?;
 
     let actor_role: Option<String> = sqlx::query_scalar(
@@ -1004,6 +1040,12 @@ pub async fn add_message(
     body: &str,
     now: DateTime<Utc>,
 ) -> Result<ProposalMessage, MessageError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(MessageError::Database)?;
     let mut tx = pool.begin().await.map_err(MessageError::Database)?;
 
     // Guest exit and proposal finalization use account -> proposal ordering.
