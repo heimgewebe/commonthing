@@ -25,6 +25,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Transaction};
+use tokio::sync::SemaphorePermit;
 use uuid::Uuid;
 
 use crate::{
@@ -315,6 +316,20 @@ fn database_error(context: &'static str, error: sqlx::Error) -> ConversationApiE
         "conversation_database_error",
         "the conversation store could not complete the request",
     )
+}
+
+// Every conversation writer that waits for PostgreSQL account or advisory
+// locks must share the same five-connection SQLx admission budget as fenced
+// privacy GETs, guest exit, and canonical account/node writers. Otherwise
+// waiters hold all remaining connections and prevent a fenced GET's handler
+// from releasing its generation FOR SHARE lock. Keep read-only snapshot
+// transactions outside this helper: their outer fence already reserves slots.
+async fn reserve_conversation_pool_capacity(
+    context: &'static str,
+) -> Result<SemaphorePermit<'static>, ConversationApiError> {
+    crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(|error| database_error(context, error))
 }
 
 fn require_pool(state: &ApiState) -> Result<&PgPool, ConversationApiError> {
@@ -1385,6 +1400,8 @@ pub async fn create_message(
     let content = validate_content(&request.content)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
 
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1453,6 +1470,8 @@ pub async fn create_message(
         tx.commit()
             .await
             .map_err(|error| database_error("commit idempotent message replay", error))?;
+        // The post-commit Faden projection acquires the same shared budget.
+        drop(_conversation_budget);
         project_message_participation_faden(
             &state,
             &auth,
@@ -1553,6 +1572,8 @@ pub async fn create_message(
     tx.commit()
         .await
         .map_err(|error| database_error("commit message create", error))?;
+    // The post-commit Faden projection acquires the same shared budget.
+    drop(_conversation_budget);
     project_message_participation_faden(
         &state,
         &auth,
@@ -1583,6 +1604,8 @@ pub async fn update_message(
     let content = validate_content(&request.content)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
     let message_id = parse_message_id(&message_id)?;
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1627,6 +1650,8 @@ pub async fn delete_message(
     let pool = require_pool(&state)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
     let message_id = parse_message_id(&message_id)?;
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1746,6 +1771,8 @@ pub async fn create_direct_conversation(
     }
 
     let pair_key = direct_pair_key(&sender_id, &recipient_id);
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1918,6 +1945,8 @@ pub async fn mark_direct_conversation_read(
     let account_id = account_id(&auth)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
     let through_message_id = parse_message_id(&request.through_message_id)?;
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1999,6 +2028,8 @@ async fn set_direct_conversation_block(
     let pool = require_pool(state)?;
     let account_id = account_id(auth)?;
     let conversation_id = parse_conversation_id(conversation_id)?;
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve direct conversation block pool").await?;
     let result = if blocked {
         sqlx::query(
             "UPDATE domain_direct_conversation_participants AS participant

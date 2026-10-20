@@ -5056,3 +5056,204 @@ async fn fenced_get_survives_four_concurrent_guest_exits() -> Result<()> {
     clean_all_nodes(&pool).await;
     Ok(())
 }
+
+// A single guest exit holds the guest-account row FOR UPDATE and eventually
+// waits for the GET's canonical generation fence. Three concurrent real HTTP
+// POST /direct-conversations requests FOR SHARE that same guest row. Without
+// shared SQLx admission, they occupy the last three pool connections and the
+// GET cannot obtain the second connection needed to complete its JSON handler.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_survives_guest_exit_and_three_direct_conversation_writers() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000e4";
+    const GUEST_ID: &str = "writepath-direct-guest-budget";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO domain_accounts          (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)          VALUES ($1,'garnrolle','Guest inbox budget','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(GUEST_ID)
+    .execute(&pool)
+    .await?;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let get_pool = pool.clone();
+    let app = Router::new()
+        .merge(api_router())
+        .route(
+            "/nodes/direct-conversation-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let get_pool = get_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&get_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state);
+
+    let first_app = app.clone();
+    let fenced_get = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                Request::get("/nodes/direct-conversation-budget-probe")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("privacy-fenced GET"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("fenced GET did not enter handler")?;
+
+    let exit_pool = pool.clone();
+    let exit = tokio::spawn(async move { delete_guest_account(&exit_pool, GUEST_ID).await });
+
+    let mut row_is_locked = false;
+    for _ in 0..80 {
+        // A short NOWAIT read identifies the real FOR UPDATE lock held by the
+        // active guest exit. Do not infer the ordering from arbitrary sleeps.
+        match sqlx::query_scalar::<_, String>(
+            "SELECT id FROM domain_accounts WHERE id=$1 FOR SHARE NOWAIT",
+        )
+        .bind(GUEST_ID)
+        .fetch_one(&monitor)
+        .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                row_is_locked = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        row_is_locked,
+        "guest exit must hold the guest account FOR UPDATE"
+    );
+
+    let mut conversations = Vec::new();
+    for _ in 0..3 {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        conversations.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/direct-conversations")
+                    .header("Host", "localhost")
+                    .header("Origin", "http://localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Cookie", cookie)
+                    .body(body::Body::from(
+                        serde_json::json!({"recipient_account_id": GUEST_ID}).to_string(),
+                    ))
+                    .expect("direct conversation request"),
+            )
+            .await
+        }));
+    }
+
+    // The guest exit must reach the PostgreSQL visibility lock before
+    // releasing GET. On the broken path all three POSTs can then occupy
+    // connections while waiting on the guest. The fixed path deliberately
+    // admits fewer: requiring multiple DB waiters would reject the fix.
+    let mut lock_wait_observed = false;
+    for _ in 0..80 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'"
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting >= 1 {
+            lock_wait_observed = true;
+        }
+        if waiting >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        lock_wait_observed,
+        "guest exit must be waiting on the canonical visibility fence"
+    );
+    assert!(
+        !exit.is_finished(),
+        "guest exit bypassed held generation fence"
+    );
+
+    release_tx
+        .send(true)
+        .context("allow GET to acquire second SQLx connection")?;
+    let get_response = tokio::time::timeout(Duration::from_secs(7), fenced_get)
+        .await
+        .context("GET starved by direct-conversation/guest-exit DB locks")??;
+    assert_eq!(
+        get_response?.status(),
+        StatusCode::OK,
+        "GET must not starve"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), exit)
+        .await
+        .context("guest exit failed to finish")???;
+    for writer in conversations {
+        let response = tokio::time::timeout(Duration::from_secs(9), writer)
+            .await
+            .context("direct-conversation POST did not finish")??;
+        let status = response?.status();
+        assert!(
+            !status.is_server_error(),
+            "conversation writer must finish without 5xx: {status}"
+        );
+    }
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM domain_accounts WHERE id=$1")
+            .bind(GUEST_ID)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining, 0);
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
