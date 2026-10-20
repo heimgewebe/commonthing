@@ -549,7 +549,7 @@ aktuell beobachteten Heim-PC-Quellen vorgesehen:
 Muster werden vom aktuellen Wrapper akzeptiert, das Fundus-Muster
 jedoch erst nach Integration, unabhängig geprüfter Freigabe und
 gesondert autorisiertem Rollout von
-[infra-PR #165](https://github.com/heimgewebe/infra/pull/165).
+infra-PR `heimgewebe/infra#165` (für den CI-Linkcheck nicht erreichbar).
 Dieser eng begrenzte Fix erlaubt ausschließlich
 `$FUNDUS/**/*.sql.gz`; er lässt Ausschlüsse des gesamten Fundus oder
 von `*.sql.gz.age` weiterhin nicht zu. **Kein Muster in der
