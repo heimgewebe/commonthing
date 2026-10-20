@@ -5898,3 +5898,233 @@ async fn notification_preferences_share_guest_exit_privacy_pool_budget() -> Resu
     clean_all_nodes(&pool).await;
     Ok(())
 }
+
+// Regression: WebAuthn login credential updates must queue before SQLx when
+// a fenced GET and guest exit have consumed the shared five-connection budget.
+// Otherwise three row-lock waiters starve the GET's second connection.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct disposable PostgreSQL"]
+#[serial]
+async fn passkey_updates_share_guest_exit_privacy_pool_budget() -> Result<()> {
+    use base64::Engine;
+    use webauthn_rs::prelude::{AuthenticationResult, Passkey};
+    use weltgewebe_api::auth::passkeys_db::{
+        credential_id_key, DbPasskeyStore, DbPasskeyStoreError,
+    };
+
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000f7";
+    const GUEST_ID: &str = "writepath-passkey-budget-guest";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    sqlx::query(
+        "INSERT INTO domain_accounts
+         (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)
+         VALUES ($1,'garnrolle','Passkey budget guest','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(GUEST_ID)
+    .execute(&pool)
+    .await?;
+
+    let credential_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([77_u8; 32]);
+    let passkey: Passkey = serde_json::from_value(serde_json::json!({
+        "cred": {
+            "cred_id": credential_b64,
+            "cred": {"type_": "ES256", "key": {
+                "EC_EC2": {"curve": "SECP256R1", "x": vec![1_u8; 32], "y": vec![2_u8; 32]}
+            }},
+            "counter": 0,
+            "transports": null,
+            "user_verified": false,
+            "backup_eligible": false,
+            "backup_state": false,
+            "registration_policy": "preferred",
+            "extensions": {"cred_protect": "NotRequested", "hmac_create_secret": "NotRequested"},
+            "attestation": {"data": "None", "metadata": "None"},
+            "attestation_format": "None"
+        }
+    }))?;
+    let store = DbPasskeyStore::new(pool.clone());
+    store
+        .insert(GUEST_ID, uuid::Uuid::new_v4(), &passkey)
+        .await?;
+    let credential_key = credential_id_key(passkey.cred_id());
+    let auth_result: AuthenticationResult = serde_json::from_value(serde_json::json!({
+        "cred_id": serde_json::to_value(passkey.cred_id())?,
+        "needs_update": true,
+        "user_verified": true,
+        "backup_state": false,
+        "backup_eligible": false,
+        "counter": 1,
+        "extensions": {}
+    }))?;
+    let auth_result = Arc::new(auth_result);
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, _cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let read_pool = pool.clone();
+    let get_app = Router::new()
+        .route(
+            "/nodes/passkey-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let read_pool = read_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&read_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+    let protected_get = tokio::spawn(async move {
+        get_app
+            .oneshot(
+                Request::get("/nodes/passkey-budget-probe")
+                    .body(body::Body::empty())
+                    .expect("protected GET"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("GET must hold the canonical generation fence")?;
+
+    let exit_pool = pool.clone();
+    let exit = tokio::spawn(async move { delete_guest_account(&exit_pool, GUEST_ID).await });
+    let mut passkey_row_locked = false;
+    for _ in 0..100 {
+        let locked = sqlx::query_scalar::<_, String>(
+            "SELECT credential_id FROM passkey_credentials
+             WHERE credential_id = $1 FOR UPDATE NOWAIT",
+        )
+        .bind(&credential_key)
+        .fetch_optional(&monitor)
+        .await;
+        match locked {
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                passkey_row_locked = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        passkey_row_locked,
+        "guest exit must have deleted/locked the credential before awaiting generation fence"
+    );
+    assert!(
+        !exit.is_finished(),
+        "guest exit must still await fenced GET"
+    );
+
+    let ready = Arc::new(Barrier::new(4));
+    let mut updates = Vec::new();
+    for _ in 0..3 {
+        let store = store.clone();
+        let auth_result = Arc::clone(&auth_result);
+        let ready = Arc::clone(&ready);
+        updates.push(tokio::spawn(async move {
+            ready.wait().await;
+            store.update_credential(GUEST_ID, &auth_result).await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), ready.wait())
+        .await
+        .context("all three passkey verifications must reach update boundary")?;
+
+    let mut observed_exit_wait = false;
+    let mut observed_extra_waiters = false;
+    for _ in 0..40 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        observed_exit_wait |= waiting >= 1;
+        observed_extra_waiters |= waiting > 1;
+        if observed_extra_waiters {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Release the GET even on the RED path, so all competing SQL transactions
+    // can unwind before the assertion is checked.
+    release_tx.send(true).context("release protected GET")?;
+    let response = tokio::time::timeout(Duration::from_secs(9), protected_get)
+        .await
+        .context("protected GET must complete without passkey pool starvation")??;
+    let status = response?.status();
+    tokio::time::timeout(Duration::from_secs(9), exit)
+        .await
+        .context("guest exit must complete after fence release")???;
+    for update in updates {
+        let outcome = tokio::time::timeout(Duration::from_secs(9), update)
+            .await
+            .context("passkey verification must stop waiting")??;
+        assert!(
+            matches!(outcome, Err(DbPasskeyStoreError::NotFound)),
+            "deleted guest credential must remain absent: {outcome:?}"
+        );
+    }
+    assert!(
+        observed_exit_wait,
+        "guest exit must block on real PostgreSQL generation lock"
+    );
+    assert!(
+        !observed_extra_waiters,
+        "passkey updates must queue before SQLx rather than occupy connections waiting on deleted guest credentials"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fenced GET must retain its second connection"
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM domain_accounts WHERE id = $1")
+            .bind(GUEST_ID)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining, 0, "guest deletion must be durable");
+    sqlx::query("DELETE FROM domain_accounts WHERE id = $1")
+        .bind(ACTOR_ID)
+        .execute(&pool)
+        .await?;
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
