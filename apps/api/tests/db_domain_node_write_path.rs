@@ -1430,8 +1430,20 @@ async fn postgres_read_jsonl_node_write_is_blocked() -> Result<()> {
         webauthn_rp_name: None,
     };
 
+    // Authentication now validates canonical PostgreSQL identity even when
+    // the mutation source is deliberately JSONL/read-only. Seed both stores
+    // so this test exercises the expected 409 write-source guard, not a 401.
+    const OPERATOR_ID: &str = "10000000-0000-0000-0000-000000000004";
+    sqlx::query(
+        "INSERT INTO domain_accounts (id,kind,title,map_state,role,disabled) \
+         VALUES ($1,'garnrolle','Mixed source operator','not_on_map','admin',FALSE) \
+         ON CONFLICT (id) DO UPDATE SET role = 'admin', disabled = FALSE",
+    )
+    .bind(OPERATOR_ID)
+    .execute(&pool)
+    .await?;
     let mut accounts = AccountStore::new();
-    accounts.insert(admin_operator("10000000-0000-0000-0000-000000000004"));
+    accounts.insert(admin_operator(OPERATOR_ID));
     let rate_limiter = Arc::new(AuthRateLimiter::new(&config));
 
     let state = ApiState {
@@ -1466,10 +1478,7 @@ async fn postgres_read_jsonl_node_write_is_blocked() -> Result<()> {
         web_push: None,
     };
 
-    let session = state
-        .sessions
-        .create("10000000-0000-0000-0000-000000000004".to_string(), None)
-        .await?;
+    let session = state.sessions.create(OPERATOR_ID.to_string(), None).await?;
     let cookie = format!("gewebe_session={}", session.id);
 
     let app = Router::new()
@@ -1510,6 +1519,10 @@ async fn postgres_read_jsonl_node_write_is_blocked() -> Result<()> {
     );
 
     clean(&pool).await;
+    sqlx::query("DELETE FROM domain_accounts WHERE id = $1")
+        .bind(OPERATOR_ID)
+        .execute(&pool)
+        .await?;
     Ok(())
 }
 
@@ -5475,6 +5488,370 @@ async fn fenced_get_survives_guest_exit_governance_and_session_touch() -> Result
             .fetch_one(&pool)
             .await?;
     assert_eq!(remaining, 0);
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+// Regression: a magic-link login must release its account-cache read guard
+// before its PostgreSQL session creation queues behind two fenced readers.
+// Otherwise a waiting account-cache writer can deadlock the second reader.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct disposable PostgreSQL"]
+#[serial]
+async fn magic_link_login_releases_cache_lock_before_pg_admission() -> Result<()> {
+    use axum::extract::connect_info::MockConnectInfo;
+    use weltgewebe_api::auth::session_db::DbSessionStore;
+    use weltgewebe_api::routes::auth::NONCE_COOKIE_NAME;
+
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000f5";
+    const EMAIL: &str = "privacy-admission-login@example.test";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, _cookie, mut state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    {
+        let mut accounts = state.accounts.write().await;
+        let mut account = accounts
+            .get(ACTOR_ID)
+            .context("seed login account")?
+            .clone();
+        account.email = Some(EMAIL.to_string());
+        accounts.insert(account);
+    }
+    state.sessions = SessionBackend::new(DbSessionStore::new(pool.clone()));
+    state.config.auth_public_login = true;
+    state.config.app_base_url = Some("http://localhost".to_string());
+    state.refresh_domain_projection_if_stale().await?;
+
+    // Both readers enter their handler while holding the shared canonical
+    // projection generation and both weighted admission reservations.
+    let entered = Arc::new(Barrier::new(3));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let read_pool = pool.clone();
+    let get_app = Router::new()
+        .route(
+            "/nodes/login-lock-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let read_pool = read_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match sqlx::query_scalar::<_, i64>("SELECT 1::bigint")
+                        .fetch_one(&read_pool)
+                        .await
+                    {
+                        Ok(1) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state.clone());
+    let mut readers = Vec::new();
+    for _ in 0..2 {
+        let app = get_app.clone();
+        readers.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::get("/nodes/login-lock-probe")
+                    .body(body::Body::empty())
+                    .expect("protected GET"),
+            )
+            .await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("both protected readers must reserve their PG admission")?;
+
+    let token = state.tokens.create(EMAIL.to_string());
+    let nonce = "privacy-cache-lock-nonce";
+    let cookie = format!(
+        "{}={}.{}",
+        NONCE_COOKIE_NAME,
+        hex::encode(Sha256::digest(token.as_bytes())),
+        nonce
+    );
+    let login_app = Router::new()
+        .merge(api_router())
+        .layer(MockConnectInfo(
+            "127.0.0.1:8080".parse::<std::net::SocketAddr>()?,
+        ))
+        .with_state(state.clone());
+    let login_token = token.clone();
+    let login = tokio::spawn(async move {
+        login_app
+            .oneshot(
+                Request::post("/auth/magic-link/consume")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .header("Cookie", cookie)
+                    .body(body::Body::from(format!(
+                        "token={login_token}&nonce={nonce}"
+                    )))
+                    .expect("login request"),
+            )
+            .await
+    });
+
+    let mut consumed = false;
+    for _ in 0..100 {
+        if state.tokens.peek(&token).is_none() {
+            consumed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        consumed,
+        "login must consume token before testing lock order"
+    );
+    assert!(
+        !login.is_finished(),
+        "login must wait on occupied PG admission"
+    );
+    // Allow the login task to reach session admission after consuming its
+    // token. The writer must not depend on release of the two PG readers.
+    tokio::task::yield_now().await;
+    let accounts = Arc::clone(&state.accounts);
+    let mut cache_writer = tokio::spawn(async move {
+        let _guard = accounts.write().await;
+    });
+    let writer_before_release =
+        tokio::time::timeout(Duration::from_secs(2), &mut cache_writer).await;
+    // Always unwind the held readers, even when asserting the old deadlock.
+    release_tx.send(true).context("release protected readers")?;
+    for reader in readers {
+        let response = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .context("protected reader completion")??;
+        assert_eq!(response?.status(), StatusCode::OK);
+    }
+    let response = tokio::time::timeout(Duration::from_secs(5), login)
+        .await
+        .context("login completes once admission is released")??;
+    assert_eq!(response?.status(), StatusCode::SEE_OTHER);
+    if writer_before_release.is_err() {
+        tokio::time::timeout(Duration::from_secs(5), cache_writer)
+            .await
+            .context("cache writer completes after release")??;
+    }
+    assert!(
+        writer_before_release.is_ok(),
+        "login retained the account-cache read lock across PostgreSQL admission"
+    );
+    sqlx::query("DELETE FROM sessions WHERE account_id = $1")
+        .bind(ACTOR_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM domain_accounts WHERE id = $1")
+        .bind(ACTOR_ID)
+        .execute(&pool)
+        .await?;
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+// Regression: three real notification preference PUTs must not fill the
+// five-connection SQLx pool while the guest-exit writer holds their FK row
+// and waits on the generation fence of a protected GET.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct disposable PostgreSQL"]
+#[serial]
+async fn notification_preferences_share_guest_exit_privacy_pool_budget() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000f6";
+    const GUEST_ID: &str = "writepath-notification-budget-guest";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    sqlx::query(
+        "INSERT INTO domain_accounts
+         (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)
+         VALUES ($1,'garnrolle','Notification guest budget','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(GUEST_ID)
+    .execute(&pool)
+    .await?;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, _cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    {
+        let mut guest = admin_operator(GUEST_ID);
+        guest.role = Role::Gast;
+        state.accounts.write().await.insert(guest);
+    }
+    let session = state.sessions.create(GUEST_ID.to_string(), None).await?;
+    let cookie = format!("gewebe_session={}", session.id);
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let read_pool = pool.clone();
+    let get_app = Router::new()
+        .route(
+            "/nodes/notification-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let read_pool = read_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&read_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state.clone());
+    let protected_get = tokio::spawn(async move {
+        get_app
+            .oneshot(
+                Request::get("/nodes/notification-budget-probe")
+                    .body(body::Body::empty())
+                    .expect("protected GET"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("protected GET must hold PG generation fence")?;
+
+    let exit_pool = pool.clone();
+    let exit = tokio::spawn(async move { delete_guest_account(&exit_pool, GUEST_ID).await });
+    let mut row_locked = false;
+    for _ in 0..80 {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT id FROM domain_accounts WHERE id = $1 FOR SHARE NOWAIT",
+        )
+        .bind(GUEST_ID)
+        .fetch_one(&monitor)
+        .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                row_locked = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        row_locked,
+        "guest exit must hold canonical account FOR UPDATE"
+    );
+
+    let preferences_app = Router::new()
+        .merge(api_router())
+        .layer(from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state);
+    let mut notifications = Vec::new();
+    for _ in 0..3 {
+        let app = preferences_app.clone();
+        let cookie = cookie.clone();
+        notifications.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::put("/notifications/preferences")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Cookie", cookie)
+                    .body(body::Body::from(r#"{"direct_messages_push":true}"#))
+                    .expect("notification PUT"),
+            )
+            .await
+        }));
+    }
+    let mut observed_contention = false;
+    for _ in 0..80 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting >= 2 {
+            observed_contention = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        observed_contention,
+        "test must observe real PostgreSQL lock waits"
+    );
+    assert!(
+        !exit.is_finished(),
+        "guest exit must still wait on GET's fence"
+    );
+    release_tx
+        .send(true)
+        .context("release GET's second SQLx read")?;
+    let response = tokio::time::timeout(Duration::from_secs(7), protected_get)
+        .await
+        .context("protected GET starved by notification pool waiters")??;
+    assert_eq!(response?.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(10), exit)
+        .await
+        .context("guest exit must complete")???;
+    for request in notifications {
+        let response = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .context("notification PUT must terminate after guest exit")??;
+        // FK failure after guest deletion is valid; indefinite DB pool wait is not.
+        assert!(
+            matches!(
+                response?.status(),
+                StatusCode::OK | StatusCode::INTERNAL_SERVER_ERROR
+            ),
+            "notification must reach SQLx instead of being rejected by auth"
+        );
+    }
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM domain_accounts WHERE id = $1")
+            .bind(GUEST_ID)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining, 0, "guest deletion must be durable");
     clean_all_nodes(&pool).await;
     Ok(())
 }
