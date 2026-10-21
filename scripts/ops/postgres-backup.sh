@@ -107,9 +107,7 @@ require_cmd wc
 require_cmd find
 require_cmd grep
 require_cmd cmp
-require_cmd age
 BACKUP_AGE_RECIPIENTS_FILE="${BACKUP_AGE_RECIPIENTS_FILE-/etc/weltgewebe/postgres-backup-age-recipients.txt}"
-load_age_recipients "$BACKUP_AGE_RECIPIENTS_FILE"
 check_connection_config
 
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
@@ -125,6 +123,17 @@ case "$BACKUP_RETENTION_DAYS" in '' | *[!0-9]*) fail "BACKUP_RETENTION_DAYS must
 
 install -d -m 0700 "$BACKUP_DIR"
 [[ -w "$BACKUP_DIR" ]] || fail "backup directory is not writable: $BACKUP_DIR"
+# The PostgreSQL data volume may share this filesystem. Do not start a new
+# plaintext + ciphertext backup when a conservative recovery reserve is gone.
+# This is a preflight guard, not an atomic disk quota or a retention policy.
+BACKUP_MIN_FREE_KIB="${BACKUP_MIN_FREE_KIB:-4194304}"
+[[ "$BACKUP_MIN_FREE_KIB" =~ ^[1-9][0-9]{0,11}$ ]] ||
+  fail "BACKUP_MIN_FREE_KIB must be a positive integer (at most 12 digits)"
+require_cmd df
+available_kib="$(LC_ALL=C df -Pk -- "$BACKUP_DIR" | awk 'NR==2 {print $4}')"
+[[ "$available_kib" =~ ^[0-9]{1,12}$ ]] || fail "backup disk free space could not be determined"
+((available_kib >= BACKUP_MIN_FREE_KIB)) ||
+  fail "insufficient free backup disk space: ${available_kib}KiB available, ${BACKUP_MIN_FREE_KIB}KiB required"
 [[ "$(psql_db -Atc 'select 1' | tr -d '[:space:]')" == "1" ]] || fail "PostgreSQL health check failed"
 check_required_tables
 
@@ -169,6 +178,23 @@ fi
 } > "$tmp_manifest"
 chmod 600 "$tmp_manifest"
 
+# The host-local recovery pair is independent from the additional age off-host
+# copy. Publish its dump first, then the digest manifest as completion marker,
+# before checking age or its recipients. An off-host failure must remain a
+# nonzero job result without losing the already completed local recovery.
+# Same-filesystem hard links are create-only even if a target appears during
+# the dump, protecting all older recovery points.
+ln -T -- "$tmp_dump" "$dump_file" ||
+  fail "backup target appeared during publication: $dump_file"
+ln -T -- "$tmp_manifest" "$manifest_file" ||
+  fail "backup target appeared during publication: $manifest_file"
+printf 'PostgreSQL backup written: %s\nManifest written: %s\n' "$dump_file" "$manifest_file"
+
+# Only now validate the independently optional off-host encryption layer.
+# Its failure is explicit; no age completion manifest may be published.
+require_cmd age
+load_age_recipients "$BACKUP_AGE_RECIPIENTS_FILE"
+
 # Off-host artefact: ciphertext only. The plaintext dump above stays on this host.
 age "${age_recipient_args[@]}" -o "$tmp_age" "$tmp_dump" || fail "age encryption of the off-host copy failed"
 chmod 600 "$tmp_age"
@@ -184,15 +210,10 @@ age_bytes="$(wc -c < "$tmp_age" | tr -d '[:space:]')"
 } > "$tmp_age_manifest"
 chmod 600 "$tmp_age_manifest"
 
-# Same-filesystem create-only links prevent another producer or symlink
-# appearing after preflight from replacing any historical backup file.
-# The off-host manifest is the final marker of a complete encrypted set.
-ln -T -- "$tmp_dump" "$dump_file" ||
-  fail "backup target appeared during publication: $dump_file"
+# Off-host publication also uses create-only hard links. Its age manifest
+# is published LAST and is the sole encrypted-set completion marker.
 ln -T -- "$tmp_age" "$age_file" ||
   fail "backup target appeared during publication: $age_file"
-ln -T -- "$tmp_manifest" "$manifest_file" ||
-  fail "backup target appeared during publication: $manifest_file"
 ln -T -- "$tmp_age_manifest" "$age_manifest_file" ||
   fail "backup target appeared during publication: $age_manifest_file"
 
@@ -201,5 +222,4 @@ ln -T -- "$tmp_age_manifest" "$age_manifest_file" ||
 # but neither plaintext, ciphertext nor either manifest is age-deleted here.
 # Only a separately authorized retirement after a real offline-identity
 # decrypt and isolated PostgreSQL restore may remove historic backups.
-printf 'PostgreSQL backup written: %s\nManifest written: %s\n' "$dump_file" "$manifest_file"
 printf 'Encrypted off-host copy written: %s\nOff-host manifest written: %s\n' "$age_file" "$age_manifest_file"

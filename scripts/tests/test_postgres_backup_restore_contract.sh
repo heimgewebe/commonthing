@@ -129,6 +129,49 @@ expect_backup_failure() {
   fi
 }
 
+# An unavailable or invalid off-host age recipient must NOT discard local
+# recoverability: the dump and its digest manifest remain, while the producer
+# returns failure and never certifies a complete encrypted off-host copy.
+expect_offhost_failure_with_local_recovery() {
+  local label="$1" recipients_file="$2" message="$3"
+  local stderr_file="$TEMP_DIR/stderr-$1"
+  if run_backup "$label" "$recipients_file" > /dev/null 2> "$stderr_file"; then
+    echo "off-host encryption must report failure: $label" >&2
+    exit 1
+  fi
+  grep -qF "$message" "$stderr_file" || {
+    echo "unexpected off-host failure output for $label:" >&2
+    cat "$stderr_file" >&2
+    exit 1
+  }
+  local local_dump="$BACKUP_DIR/weltgewebe-postgres-${label}.sql.gz"
+  local local_manifest="$BACKUP_DIR/weltgewebe-postgres-${label}.sha256.manifest"
+  [[ -f "$local_dump" && ! -L "$local_dump" && -f "$local_manifest" && ! -L "$local_manifest" ]] || {
+    echo "age failure lost the required local dump or manifest: $label" >&2
+    exit 1
+  }
+  gzip -t "$local_dump"
+  grep -qx "sha256=$(sha256sum "$local_dump" | awk '{print $1}')" "$local_manifest"
+  grep -qx "file=weltgewebe-postgres-${label}.sql.gz" "$local_manifest"
+  [[ "$(stat -c %a "$local_dump")" == 600 && "$(stat -c %a "$local_manifest")" == 600 ]]
+  for suffix in .sql.gz.age .age.sha256.manifest; do
+    [[ ! -e "$BACKUP_DIR/weltgewebe-postgres-${label}${suffix}" && ! -L "$BACKUP_DIR/weltgewebe-postgres-${label}${suffix}" ]] || {
+      echo "age failure incorrectly published an off-host artefact: $label$suffix" >&2
+      exit 1
+    }
+  done
+}
+
+# A full filesystem must fail before pg_dump creates any plaintext or age output.
+# Keep old recovery points unchanged; reject the new run instead.
+BACKUP_MIN_FREE_KIB=not-a-number expect_backup_failure invalid-capacity "$RECIPIENTS_FILE" 'BACKUP_MIN_FREE_KIB must be a positive integer'
+BACKUP_MIN_FREE_KIB=999999999999 INJECT_BACKUP_COLLISION="$TEMP_DIR/disk-guard-pg-dump-ran" \
+  expect_backup_failure low-disk "$RECIPIENTS_FILE" 'insufficient free backup disk space'
+[[ ! -e "$TEMP_DIR/disk-guard-pg-dump-ran" ]] || {
+  echo 'low free disk space reached pg_dump despite preflight' >&2
+  exit 1
+}
+
 # The producer must reject unsafe filename prefixes before creating any
 # plaintext or ciphertext artefact, even with otherwise valid DB credentials.
 if BACKUP_PREFIX="unsafe'prefix" run_backup unsafe-prefix "$RECIPIENTS_FILE" \
@@ -250,25 +293,25 @@ if ((REAL_AGE == 1)); then
   fi
 fi
 
-# Fail closed: no recipient configuration means no backup set at all.
-expect_backup_failure missing "$TEMP_DIR/does-not-exist.txt" 'age recipients file is missing or unreadable'
-expect_backup_failure unset "" 'BACKUP_AGE_RECIPIENTS_FILE must name the public age recipients file'
+# Fail closed for off-host ciphertext, but retain the local recovery pair.
+expect_offhost_failure_with_local_recovery missing "$TEMP_DIR/does-not-exist.txt" 'age recipients file is missing or unreadable'
+expect_offhost_failure_with_local_recovery unset "" 'BACKUP_AGE_RECIPIENTS_FILE must name the public age recipients file'
 printf '# no recipient yet\n\n' > "$TEMP_DIR/empty-recipients.txt"
-expect_backup_failure empty "$TEMP_DIR/empty-recipients.txt" 'contains no age1 recipient'
+expect_offhost_failure_with_local_recovery empty "$TEMP_DIR/empty-recipients.txt" 'contains no age1 recipient'
 printf 'ssh-ed25519 AAAAC3Nza fixture\n' > "$TEMP_DIR/foreign-recipients.txt"
-expect_backup_failure foreign "$TEMP_DIR/foreign-recipients.txt" 'unsupported entry'
+expect_offhost_failure_with_local_recovery foreign "$TEMP_DIR/foreign-recipients.txt" 'unsupported entry'
 printf '%s\nAGE-SECRET-KEY-1FIXTURE\n' "$AGE_RECIPIENT" > "$TEMP_DIR/secret-recipients.txt"
-expect_backup_failure secret "$TEMP_DIR/secret-recipients.txt" 'contains a private age identity'
+expect_offhost_failure_with_local_recovery secret "$TEMP_DIR/secret-recipients.txt" 'contains a private age identity'
 printf '%s\n# same key again\n  %s\n' "$AGE_RECIPIENT" "$AGE_RECIPIENT" > "$TEMP_DIR/duplicate-recipients.txt"
-expect_backup_failure duplicate "$TEMP_DIR/duplicate-recipients.txt" 'lists a recipient twice'
+expect_offhost_failure_with_local_recovery duplicate "$TEMP_DIR/duplicate-recipients.txt" 'lists a recipient twice'
 if ((REAL_AGE)); then
   # A one-character typo keeps the age1 shape but breaks the Bech32 checksum;
-  # it must fail before pg_dump, not after a full plaintext dump.
+  # off-host failure must leave the local dump and integrity manifest usable.
   last="${AGE_RECIPIENT: -1}"
   typo="q"
   [[ "$last" != q ]] || typo="p"
   printf '%s%s\n' "${AGE_RECIPIENT%?}" "$typo" > "$TEMP_DIR/typo-recipients.txt"
-  expect_backup_failure typo "$TEMP_DIR/typo-recipients.txt" 'age rejected a recipient'
+  expect_offhost_failure_with_local_recovery typo "$TEMP_DIR/typo-recipients.txt" 'age rejected a recipient'
 fi
 
 BACKUP_FILE="$backup_file" \

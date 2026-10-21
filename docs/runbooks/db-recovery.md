@@ -90,7 +90,18 @@ Solange kein echter isolierter Restore eines geeigneten Ersatz-Backups
 belegt und eine eigene Freigabe erteilt ist, dürfen auch alte oder
 unvollständige Sicherungen nicht allein wegen ihres Alters verschwinden.
 Das lässt den benötigten Speicherplatz wachsen; Kapazität und Sicherungsalter
-müssen deshalb weiterhin aktiv überwacht werden.
+müssen deshalb weiterhin aktiv überwacht werden. Vor `pg_dump` prüft der
+Producer deshalb mit `df -Pk` den freien Speicher im Backup-Dateisystem:
+`BACKUP_MIN_FREE_KIB` muss eine positive Ganzzahl sein (Default `4194304`,
+also 4 GiB). Fehlen verlässliche Angaben oder wird die Mindestreserve
+unterschritten, bricht dieser Lauf vor dem Dump ohne neue Sicherungsdateien
+ab; historische Recoverypunkte bleiben unverändert.
+
+**Grenze:** Diese Vorabprüfung ist weder ein Dateisystem-Quota noch eine
+atomare Reservierung. Wachsende Dumps und gleichzeitige andere Schreiber
+können den Datenträger weiterhin füllen. Daher Kapazität weiter überwachen
+und einen getrennten Backup-Speicherbereich prüfen; die Schwelle darf
+nicht als vollständiger ENOSPC-Schutz bewertet werden.
 
 Der Dump enthält E-Mail-Adressen und private Kartenanker. Der
 Klartext-Dump liegt auf demselben Host wie das Datenbankvolume und erzeugt
@@ -110,18 +121,20 @@ Default im Skript). Pro Zeile steht ein `age1…`-Empfänger; Leerzeilen und
 `#`-Kommentare sind erlaubt. Mehrere Empfänger (z. B. ein zweiter
 Notfallschlüssel) sind möglich.
 
-Verhalten: **fail-closed.** Fehlt `age`, fehlt die Empfängerdatei, ist sie
-leer, enthält sie einen anderen Eintrag als einen `age1…`-Empfänger oder
-versehentlich einen privaten Schlüssel (`AGE-SECRET-KEY-…`), bricht das
-Skript vor dem Dump ab und schreibt keine Datei. Begründung: Das Skript prüft
-alle Pflichtvoraussetzungen (Werkzeuge, Verbindung, Schreibrecht, Health,
-Pflichttabellen) vor dem ersten Artefakt und veröffentlicht nur vollständige
-Sätze; ein unverschlüsselter Teilstand ohne Chiffrat würde diesen Vertrag
-aufweichen. Ein Abschalten der Verschlüsselung ist nicht vorgesehen. Der
-Ausfall ist über den fehlgeschlagenen Systemd-Dienst sichtbar.
+Verhalten: **lokale Recovery unabhängig, externe Verschlüsselung
+fail-closed.** Der Producer veröffentlicht erst den lokalen `.sql.gz`-Dump
+und sein `.sha256.manifest` (Manifest zuletzt). Fehlt danach `age`, fehlt
+die öffentliche Empfängerdatei oder enthält diese ungültige beziehungsweise
+private Schlüssel, schlägt **die zusätzliche externe Kopie** mit
+Nichtnull-Exitstatus fehl. Der bereits fertig geprüfte lokale Dump samt
+SHA256-Manifest bleibt erhalten. Weder ein vollständiges `.sql.gz.age`
+noch das abschließende `.age.sha256.manifest` werden dann veröffentlicht.
+Die fehlgeschlagene Off-Host-Sicherung bleibt im Systemd-Dienst sichtbar und
+muss alarmiert und behoben werden; ein lokaler Dump ist **kein** Nachweis
+einer Off-Host-Recovery.
 
-Deployment-Voraussetzungen auf `commonserver` (vor dem ersten Lauf dieses
-Skriptstands, sonst schlägt der tägliche Backupdienst fehl):
+Deployment-Voraussetzungen auf `commonserver` für eine **vollständig
+verschlüsselte externe** Backupkette (ohne sie läuft nur das lokale Backup):
 
 1. `age` installieren, z. B. `apt-get install age` (stellt `/usr/bin/age`
    bereit).
