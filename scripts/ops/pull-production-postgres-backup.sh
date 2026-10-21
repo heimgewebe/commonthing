@@ -286,7 +286,7 @@ if [[ "$PULL_MODE" == migration-stage ]]; then
   staged=("$latest" "$manifest" "$age_manifest")
   [[ ! -f "$work_dir/$proof" ]] || staged+=("$proof")
   for name in "${staged[@]}"; do
-    ln -- "$work_dir/$name" "$target_dir/$name" ||
+    ln -T -- "$work_dir/$name" "$target_dir/$name" ||
       fail "migration staging artefact already exists: $name"
   done
   printf 'Encrypted migration candidate staged (NOT recovery-verified; no completion receipt): %s\n' "$target_dir/$latest"
@@ -546,7 +546,7 @@ for orphan_sha in "${verified_sidecar_shas[@]}"; do
   # Restic snapshot exclusion remains mandatory for the remaining race).
   assert_no_legacy_plaintext
   install -d -m 0700 "$DEST_DIR/receipts"
-  ln -- "$orphan_receipt_tmp" "$orphan_history" ||
+  ln -T -- "$orphan_receipt_tmp" "$orphan_history" ||
     fail "orphan proof history already exists: $orphan_history"
   certified_proof_digests[$orphan_sha]=1
   history_present=1
@@ -596,8 +596,12 @@ if ((${#staged[@]} == 0 && history_present == 1 && proof_revision_event == 0)); 
     cp -- "$latest_history" "$work_dir/latest-pull.repaired.receipt" ||
       fail "normal pull could not stage latest receipt recovery"
     chmod 600 "$work_dir/latest-pull.repaired.receipt"
-    mv -f -- "$work_dir/latest-pull.repaired.receipt" "$receipt" ||
+    mv -fT -- "$work_dir/latest-pull.repaired.receipt" "$receipt" ||
       fail "normal pull could not restore latest receipt"
+    if [[ ! -f "$receipt" || -L "$receipt" ]] ||
+      ! cmp -s -- "$latest_history" "$receipt"; then
+      fail "normal pull restored latest receipt is not the verified history receipt"
+    fi
   fi
   printf 'Encrypted off-host PostgreSQL backup already verified: %s\n' "$DEST_DIR/$latest"
   exit 0
@@ -635,8 +639,14 @@ chmod 600 "$receipt_tmp"
 install -d -m 0700 "$DEST_DIR/receipts"
 history_receipt="$DEST_DIR/receipts/${base}.pulled-$(date -u +%Y%m%dT%H%M%S.%NZ).receipt"
 cp -- "$receipt_tmp" "$work_dir/history.receipt"
-ln -- "$work_dir/history.receipt" "$history_receipt" || fail "pull receipt already exists: $history_receipt"
-mv -f "$receipt_tmp" "$receipt"
+ln -T -- "$work_dir/history.receipt" "$history_receipt" || fail "pull receipt already exists: $history_receipt"
+[[ ! -L "$receipt" && (! -e "$receipt" || -f "$receipt") ]] ||
+  fail "normal pull unsafe latest receipt pointer"
+mv -fT -- "$receipt_tmp" "$receipt" || fail "normal pull could not publish latest receipt"
+if [[ ! -f "$receipt" || -L "$receipt" ]] ||
+  ! cmp -s -- "$history_receipt" "$receipt"; then
+  fail "normal pull published latest receipt is not its immutable history receipt"
+fi
 
 # No off-host backup or restore proof is automatically retired here, even
 # when LOCAL_RETENTION_DAYS is configured. This includes interrupted,

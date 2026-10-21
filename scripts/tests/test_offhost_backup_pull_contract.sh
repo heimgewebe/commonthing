@@ -346,6 +346,88 @@ fi
 grep -qF 'Restic sources' "$root/restic-source.stderr"
 [[ ! -e "$root/controlled-home/artifacts/merges/candidate/$file" ]]
 
+# A source-validated pull may still encounter an unexpected target directory
+# immediately before hardlink/rename. GNU ln without -T and mv without -T
+# silently place the file *inside* that directory and report false success.
+# Use a private fixture command interceptor, never any production path.
+inject_bin="$root/ln-no-target-race-bin"
+mkdir -p "$inject_bin"
+cat > "$inject_bin/ln" << 'FAKE_LN_RACE'
+#!/usr/bin/env bash
+set -euo pipefail
+target="${!#}"
+if [[ -n "${INJECT_LN_EXACT_DIR:-}" && "$target" == "$INJECT_LN_EXACT_DIR" ]]; then
+  /usr/bin/mkdir -p -- "$target"
+fi
+if [[ -n "${INJECT_LN_HISTORY_ROOT:-}" && "$target" == "$INJECT_LN_HISTORY_ROOT"/*.pulled-*.receipt ]]; then
+  /usr/bin/mkdir -p -- "$target"
+fi
+exec /usr/bin/ln "$@"
+FAKE_LN_RACE
+chmod 755 "$inject_bin/ln"
+
+race_stage="$root/staging-directory-race"
+if INJECT_LN_EXACT_DIR="$race_stage/$file" PATH="$inject_bin:$PATH" \
+  PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$race_stage" \
+  pull "$legacy_dest" test-host > /dev/null 2> "$root/staging-directory-race.stderr"; then
+  echo 'directory replacing create-only migration target must never report success' >&2
+  exit 1
+fi
+[[ -d "$race_stage/$file" && ! -f "$race_stage/$file" ]]
+[[ ! -e "$race_stage/latest-pull.receipt" ]]
+
+history_race_dest="$root/history-directory-race"
+mkdir -p "$history_race_dest/receipts"
+if INJECT_LN_HISTORY_ROOT="$history_race_dest/receipts" PATH="$inject_bin:$PATH" \
+  pull "$history_race_dest" test-host > /dev/null 2> "$root/history-directory-race.stderr"; then
+  echo 'directory replacing immutable history receipt must never report success' >&2
+  exit 1
+fi
+[[ ! -e "$history_race_dest/latest-pull.receipt" ]]
+
+pointer_directory_dest="$root/latest-directory-race"
+mkdir -p "$pointer_directory_dest/latest-pull.receipt"
+if pull "$pointer_directory_dest" test-host > /dev/null 2> "$root/latest-directory-race.stderr"; then
+  echo 'directory-valued latest receipt pointer must never report success' >&2
+  exit 1
+fi
+[[ -d "$pointer_directory_dest/latest-pull.receipt" ]]
+
+pointer_link_dest="$root/latest-symlink-directory-race"
+mkdir -p "$pointer_link_dest/untrusted-target"
+ln -s "$pointer_link_dest/untrusted-target" "$pointer_link_dest/latest-pull.receipt"
+if pull "$pointer_link_dest" test-host > /dev/null 2> "$root/latest-symlink-directory-race.stderr"; then
+  echo 'symlink-to-directory latest receipt pointer must never report success' >&2
+  exit 1
+fi
+[[ -L "$pointer_link_dest/latest-pull.receipt" ]]
+
+# Intercept the final rename *after* the script's latest-pointer type check.
+# A directory that appears at that instant must never be treated as the
+# destination of a successful receipt publication.
+inject_mv_bin="$root/mv-no-target-race-bin"
+mkdir -p "$inject_mv_bin"
+cat > "$inject_mv_bin/mv" << 'FAKE_MV_RACE'
+#!/usr/bin/env bash
+set -euo pipefail
+target="${!#}"
+if [[ -n "${INJECT_MV_EXACT_DIR:-}" && "$target" == "$INJECT_MV_EXACT_DIR" ]]; then
+  /usr/bin/mkdir -p -- "$target"
+fi
+exec /usr/bin/mv "$@"
+FAKE_MV_RACE
+chmod 755 "$inject_mv_bin/mv"
+
+pointer_move_race_dest="$root/latest-move-directory-race"
+mkdir -p "$pointer_move_race_dest"
+if INJECT_MV_EXACT_DIR="$pointer_move_race_dest/latest-pull.receipt" PATH="$inject_mv_bin:$PATH" \
+  pull "$pointer_move_race_dest" test-host > /dev/null 2> "$root/latest-move-directory-race.stderr"; then
+  echo 'directory appearing immediately before receipt rename must never report success' >&2
+  exit 1
+fi
+[[ -d "$pointer_move_race_dest/latest-pull.receipt" ]]
+[[ ! -f "$pointer_move_race_dest/latest-pull.receipt" ]]
+
 # No-deletion fixture: expired local artefacts must survive even when uncertified.
 mkdir -p "$dest"
 for suffix in .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; do
