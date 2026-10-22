@@ -16,6 +16,147 @@ OLD = "b" * 40
 
 
 class WatchTests(unittest.TestCase):
+
+    def test_crash_surge_capacity_fails_closed_without_corrupting_old_outbox(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            stamp = NOW.isoformat().replace("+00:00", "Z")
+            entries = []
+            for index in range(17):
+                payload = {
+                    "event": "ALARM", "status": "ALARM",
+                    "checked_at_utc": stamp, "issues": [
+                        {"code": f"old_{index}", "severity": "P1"}
+                    ], "sequence": index,
+                }
+                entries.append({"event": "ALARM", "payload": payload})
+            for name in ("state.json", "heartbeat.json"):
+                anchor = ({"severe": [], "uncertain": []} if name == "state.json"
+                          else {"status": "HEALTHY", "issues": []})
+                anchor["checked_at_utc"] = stamp
+                anchor["pending_transitions"] = entries
+                (directory / name).write_text(json.dumps(anchor), encoding="utf-8")
+
+            fresh = {
+                "checked_at_utc": (NOW + timedelta(minutes=1)).isoformat(),
+                "status": "ALARM", "issues": [
+                    {"code": "new_p1", "actual": "new failure",
+                     "severity": "P1", "component": "test"}
+                ], "commits": {}, "main_observation": None,
+                "latest_schedule": None,
+            }
+            self.assertEqual(watch.record(fresh, directory, serialized_poll=True),
+                             "MONITOR_DATA_FAILURE")
+            unchanged = json.loads((directory / "state.json").read_text())
+            self.assertEqual(unchanged["severe"], [])
+            self.assertEqual(len(unchanged["pending_transitions"]), 17)
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertEqual(len(heartbeat["pending_transitions"]), 17)
+            self.assertIn("new_p1",
+                          {row["code"] for row in heartbeat["issues"]})
+            self.assertIn("unverifiable_state",
+                          {row["code"] for row in heartbeat["issues"]})
+            self.assertFalse((directory / "events.jsonl").exists())
+
+
+    def test_missing_state_retains_active_heartbeat_p1_when_endpoint_unverifiable(self):
+        """A missing state.json is not proof that a confirmed incident ended."""
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = watch.evaluate(NOW, self.fixtures(cache="public, max-age=30"))
+            self.assertEqual(watch.record(first, directory), "ALARM")
+            self.assertEqual(json.loads((directory / "heartbeat.json").read_text())
+                             ["status"], "ALARM")
+            (directory / "state.json").unlink()
+
+            normal = self.fixtures()
+            def missing_frontend(name):
+                if name == "frontend":
+                    raise TimeoutError("frontend observation unavailable")
+                return normal(name)
+
+            uncertain = watch.evaluate(NOW + timedelta(minutes=1),
+                                       missing_frontend)
+            self.assertEqual(uncertain["status"], "MONITOR_DATA_FAILURE")
+            self.assertEqual(watch.record(uncertain, directory),
+                             "MONITOR_DATA_FAILURE")
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("frontend_cache",
+                          {item["code"] for item in heartbeat["issues"]})
+            self.assertIn("unverifiable_state",
+                          {item["code"] for item in heartbeat["issues"]})
+            self.assertFalse((directory / "state.json").exists())
+
+
+    def test_crash_during_full_outbox_drain_keeps_seventeenth_alarm(self):
+        """The newly confirmed P1 must be durable before draining old events."""
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            stamp = NOW.isoformat().replace("+00:00", "Z")
+            backlog = []
+            for index in range(16):
+                payload = {
+                    "event": "ALARM",
+                    "status": "ALARM",
+                    "checked_at_utc": stamp,
+                    "issues": [{"code": f"prior_{index}", "severity": "P1",
+                                "actual": "prior"}],
+                    "sequence": index,
+                }
+                backlog.append({"event": "ALARM", "payload": payload})
+            (directory / "state.json").write_text(json.dumps({
+                "severe": [], "uncertain": [], "checked_at_utc": stamp,
+                "pending_transitions": backlog,
+            }), encoding="utf-8")
+            (directory / "heartbeat.json").write_text(json.dumps({
+                "status": "HEALTHY", "issues": [], "checked_at_utc": stamp,
+                "pending_transitions": backlog,
+            }), encoding="utf-8")
+
+            def observation():
+                return {
+                    "checked_at_utc": (NOW + timedelta(minutes=1)).isoformat(),
+                    "status": "ALARM", "commits": {}, "main_observation": None,
+                    "latest_schedule": None,
+                    "issues": [{"code": "frontend_cache", "component": "frontend",
+                                "actual": "missing no-store", "expected": "no-store",
+                                "source": "fixture", "severity": "P1"}],
+                }
+
+            # Model sudden process death exactly at the first journal drain:
+            # a normal caught OSError would not reproduce the crash window.
+            with patch.object(watch, "_append_durable_events",
+                              side_effect=SystemExit("simulated power loss")):
+                with self.assertRaises(SystemExit):
+                    watch.record(observation(), directory, serialized_poll=True)
+            durable = json.loads((directory / "state.json").read_text())
+            self.assertEqual(len(durable["pending_transitions"]), 17)
+            self.assertEqual(durable["severe"], [["frontend_cache", "missing no-store"]])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(len(heartbeat["pending_transitions"]), 17)
+
+            # Once storage works, all 16 older events precede the P1; nothing
+            # is lost or duplicated despite the previous hard process crash.
+            watch.record(observation(), directory, serialized_poll=True)
+            journal = [json.loads(line) for line in
+                       (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(len(journal), 17)
+            self.assertEqual([row["sequence"] for row in journal[:16]],
+                             list(range(16)))
+            self.assertEqual(journal[-1]["event"], "ALARM")
+            self.assertEqual(journal[-1]["issues"][0]["code"], "frontend_cache")
+            self.assertNotIn("pending_transitions",
+                             json.loads((directory / "state.json").read_text()))
+
     def fixtures(self, *, frontend=MAIN, api=MAIN, main=MAIN,
                  commit_age=5, schedule_age=5, cache="public, no-store",
                  schedule_event="schedule", status="completed", conclusion="success"):
@@ -3045,8 +3186,14 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(failure, [True])
             self.assertEqual((directory / "events.jsonl").read_bytes(), b"")
             state = json.loads((directory / "state.json").read_text())
-            self.assertEqual(len(state["pending_transitions"]), 16)
+            # The failed fsync cannot erase the seventeenth confirmed ALARM.
+            self.assertEqual(len(state["pending_transitions"]), 17)
+            self.assertEqual(
+                state["pending_transitions"][-1]["payload"]["checked_at_utc"],
+                first_alarm["checked_at_utc"],
+            )
             heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(len(heartbeat["pending_transitions"]), 17)
             self.assertEqual(heartbeat["status"], "ALARM")
             self.assertIn("frontend_cache", [x["code"] for x in heartbeat["issues"]])
             restored = watch.evaluate(

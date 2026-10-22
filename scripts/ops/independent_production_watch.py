@@ -31,6 +31,10 @@ UTC = timezone.utc
 LIMIT = 512 * 1024
 THRESHOLD = 45 * 60
 WATCH_MAX_SECONDS = 240
+# The ordinary outbox holds 16 entries. One crash-recoverable surge slot
+# permits a newly detected P1 to be snapshotted before the old queue drains.
+OUTBOX_NORMAL_LIMIT = 16
+OUTBOX_SURGE_LIMIT = OUTBOX_NORMAL_LIMIT + 1
 
 
 class WatchRuntimeExceeded(BaseException):
@@ -397,6 +401,19 @@ def _record_unverifiable_prior_state(result, directory, heartbeat, cause):
     if confirmed:
         failure["issues"].extend(confirmed)
         failure["status"] = "ALARM"
+    # An attempted journal drain can fail after both snapshots have
+    # already recorded an additional P1. Do not erase that durable outbox
+    # when replacing the heartbeat with the failure report: otherwise a
+    # later loss of state.json would make the unjournaled alarm disappear.
+    # The current poll owns the newest outbox; older heartbeat is fallback.
+    for anchor in (result, heartbeat):
+        try:
+            durable_intent = _pending_transition_entries(anchor)
+        except (ValueError, TypeError):
+            continue
+        if durable_intent:
+            failure["pending_transitions"] = durable_intent
+            break
     result.clear()
     result.update(failure)
     write_json(directory / "heartbeat.json", result)
@@ -408,7 +425,7 @@ def _pending_transition_entries(snapshot):
     if not isinstance(snapshot, dict):
         return []
     entries = snapshot.get("pending_transitions", [])
-    if not isinstance(entries, list) or len(entries) > 16:
+    if not isinstance(entries, list) or len(entries) > OUTBOX_SURGE_LIMIT:
         raise ValueError("malformed pending transition outbox")
     validated = []
     for entry in entries:
@@ -581,6 +598,55 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             return _record_unverifiable_prior_state(
                 result, directory, previous_heartbeat, "state root is not object",
             )
+        if no_prior_state and isinstance(previous_heartbeat, dict):
+            # A deleted or lost state.json must never make a previously
+            # confirmed P1 disappear on the next uncertain observation.
+            # The heartbeat is evidence of incident history, not proof of
+            # recovery. Keep it until the lost state can be reconstructed.
+            past_issues = previous_heartbeat.get("issues")
+            prior_alarm = (
+                previous_heartbeat.get("status") == "ALARM"
+                or bool(previous_heartbeat.get("retained_prior_p1"))
+                or bool(previous_heartbeat.get("pending_transitions"))
+                or (isinstance(past_issues, list) and any(
+                    isinstance(item, dict) and item.get("severity") == "P1"
+                    for item in past_issues
+                ))
+            )
+            if prior_alarm:
+                previous_codes = {
+                    item["code"] for item in (past_issues or [])
+                    if isinstance(item, dict) and item.get("severity") == "P1"
+                    and isinstance(item.get("code"), str)
+                }
+                prior_retained = previous_heartbeat.get("retained_prior_p1")
+                if isinstance(prior_retained, list):
+                    previous_codes.update(
+                        item[0] for item in prior_retained
+                        if isinstance(item, list) and len(item) == 2
+                        and isinstance(item[0], str)
+                    )
+                confirmed_now = {
+                    item["code"] for item in result.get("issues", [])
+                    if isinstance(item, dict) and item.get("severity") == "P1"
+                    and isinstance(item.get("code"), str)
+                }
+                # A failed first state read may have persisted the first
+                # P1 only in the heartbeat. If the same incident is again
+                # fully confirmed, with no event ever journaled or queued,
+                # allow it to enter the ordinary first-ALARM journal path.
+                # Otherwise loss of state is uncertainty, not recovery.
+                safe_new_alarm = (
+                    bool(previous_codes)
+                    and previous_codes.issubset(confirmed_now)
+                    and not previous_heartbeat.get("pending_transitions")
+                    and not (directory / "events.jsonl").exists()
+                )
+                if not safe_new_alarm:
+                    return _record_unverifiable_prior_state(
+                        result, directory, previous_heartbeat,
+                        "state.json missing while heartbeat retains incident evidence",
+                    )
         # Evaluation may have been unable to read this same file, but the
         # locked persistence step can now read the original anchor. Keep the
         # independently observed current main SHA, and merge only mismatches
@@ -703,7 +769,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 for entry in _pending_transition_entries(anchor):
                     if entry not in pending:
                         pending.append(entry)
-            if len(pending) > 16:
+            if len(pending) > OUTBOX_SURGE_LIMIT:
                 raise ValueError("pending transition outbox exceeds bound")
             # Crash-consistent exact-once retry: the first append may be
             # durable even when its following state-clear fsync failed.
@@ -779,6 +845,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         # Include the actual first-observation payload, not a synthetic later
         # poll's status. Both incident anchors persist this bounded outbox.
         previous_pending_count = len(pending)
+        drained_event = None
         for event_name in events:
             if event_name in {"ALARM", "RECOVERY"}:
                 # The old state may still contain the incident when the
@@ -809,7 +876,38 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 entry = {"event": event_name, "payload": payload}
                 if entry not in pending:
                     pending.append(entry)
-        if len(pending) > 16:
+
+        def persist_snapshots(*, heartbeat_first=False):
+            if pending:
+                result["pending_transitions"] = pending
+            else:
+                result.pop("pending_transitions", None)
+            state_snapshot = {
+                "severe": severe, "uncertain": uncertain,
+                "main_observation": current_main,
+                "checked_at_utc": result["checked_at_utc"],
+            }
+            if pending:
+                state_snapshot["pending_transitions"] = pending
+            if heartbeat_first:
+                # A recovery cannot destroy the only durable prior-P1 anchor
+                # before the heartbeat update succeeds. This ordering also
+                # keeps the journal from advertising an uncommitted recovery.
+                write_json(directory / "heartbeat.json", result)
+            write_json(path, state_snapshot)
+            if not heartbeat_first:
+                write_json(directory / "heartbeat.json", result)
+
+
+        if len(pending) > OUTBOX_NORMAL_LIMIT:
+            # Never persist an outbox that the following invocation would
+            # reject as malformed. Keep the old durable queue and publish
+            # monitor uncertainty rather than acknowledging an unqueued P1.
+            if len(pending) > OUTBOX_SURGE_LIMIT:
+                return _record_unverifiable_prior_state(
+                    result, directory, previous_heartbeat,
+                    "pending transition outbox exceeds crash-safe surge bound",
+                )
             # Recovered journals must drain an old full outbox before the
             # next new P1 is admitted. Previously queued entries are durable
             # in prior state/heartbeat; an interrupted append will reconcile
@@ -824,11 +922,19 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 ):
                     break
                 ready_old.append(entry)
-            if len(ready_old) < len(pending) - 16:
+            if len(ready_old) < len(pending) - OUTBOX_NORMAL_LIMIT:
                 return _record_unverifiable_prior_state(
                     result, directory, previous_heartbeat,
                     "pending transition outbox at capacity with blocked recovery",
                 )
+
+            # The seventeenth incident must be durable BEFORE draining any
+            # older entries. A hard crash after the append then replays the
+            # exact saved outbox; already journaled entries are reconciled by
+            # _transition_already_journaled on the following poll.
+            persist_snapshots(heartbeat_first=any(
+                entry["event"] == "RECOVERY" for entry in pending
+            ))
             try:
                 # Old queued entries are not the new poll's event delivery.
                 # Keep their names out of committed_event_names.
@@ -840,6 +946,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                     result, directory, previous_heartbeat,
                     f"pending outbox drain failed: {type(exc).__name__}",
                 )
+            drained_event = ready_old[-1]["event"] if ready_old else None
             pending = pending[len(ready_old):]
         # Journal order must follow the outbox exactly. An older RECOVERY
         # can only be committed once its state/heartbeat recovery anchors
@@ -864,27 +971,6 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         )
         if replayed_event is None and ready_pending:
             replayed_event = ready_pending[0]["event"]
-
-        def persist_snapshots(*, heartbeat_first=False):
-            if pending:
-                result["pending_transitions"] = pending
-            else:
-                result.pop("pending_transitions", None)
-            state_snapshot = {
-                "severe": severe, "uncertain": uncertain,
-                "main_observation": current_main,
-                "checked_at_utc": result["checked_at_utc"],
-            }
-            if pending:
-                state_snapshot["pending_transitions"] = pending
-            if heartbeat_first:
-                # A recovery cannot destroy the only durable prior-P1 anchor
-                # before the heartbeat update succeeds. This ordering also
-                # keeps the journal from advertising an uncommitted recovery.
-                write_json(directory / "heartbeat.json", result)
-            write_json(path, state_snapshot)
-            if not heartbeat_first:
-                write_json(directory / "heartbeat.json", result)
 
         # Durably record ALARM intent before the journal write. Only a
         # fully committed recovery in both state/heartbeat may be journaled;
@@ -939,7 +1025,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         # ordinary observations keep the established write order.
         if not recovery_before_event or event_log_failed or ready_pending:
             persist_snapshots()
-    return new_event or (replayed_event if not event_log_failed else None)
+    return new_event or (replayed_event if not event_log_failed else None) or drained_event
 
 
 def read_previous_main_observation(directory):
