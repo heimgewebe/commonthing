@@ -94,6 +94,89 @@ class WatchTests(unittest.TestCase):
             self.assertFalse((directory / "state.json").exists())
 
 
+    def test_missing_state_reconfirmed_journaled_alarm_reconstructs_for_recovery(self):
+        """An already journaled P1 must not strand a missing state.json forever."""
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            broken = self.fixtures(cache="public, max-age=30")
+            first = watch.evaluate(NOW, broken)
+            self.assertEqual(watch.record(first, directory), "ALARM")
+            self.assertTrue((directory / "events.jsonl").exists())
+            (directory / "state.json").unlink()
+
+            reconfirmed = watch.evaluate(NOW + timedelta(minutes=1), broken)
+            self.assertIsNone(watch.record(reconfirmed, directory))
+            rebuilt = json.loads((directory / "state.json").read_text())
+            self.assertEqual(
+                [item[0] for item in rebuilt["severe"]], ["frontend_cache"],
+            )
+            self.assertEqual(
+                [json.loads(x)["event"] for x in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM"],  # no second ALARM for the same durable incident
+            )
+
+            healthy = watch.evaluate(NOW + timedelta(minutes=2), self.fixtures())
+            self.assertEqual(watch.record(healthy, directory), "RECOVERY")
+            self.assertEqual(
+                [json.loads(x)["event"] for x in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM", "RECOVERY"],
+            )
+
+    def test_missing_state_heartbeat_without_matching_journal_gets_new_alarm(self):
+        """An older, completed incident is not proof that a new P1 was journaled."""
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            broken = self.fixtures(cache="public, max-age=30")
+            self.assertEqual(watch.record(watch.evaluate(NOW, broken), directory),
+                             "ALARM")
+            self.assertEqual(watch.record(
+                watch.evaluate(NOW + timedelta(minutes=1), self.fixtures()),
+                directory), "RECOVERY")
+            # Model the fallback heartbeat written when a new observation
+            # committed neither state.json nor a fresh ALARM journal record.
+            pending_alarm = watch.evaluate(NOW + timedelta(minutes=2), broken)
+            watch.write_json(directory / "heartbeat.json", pending_alarm)
+            (directory / "state.json").unlink()
+
+            reconfirmed = watch.evaluate(NOW + timedelta(minutes=3), broken)
+            self.assertEqual(watch.record(reconfirmed, directory), "ALARM")
+            self.assertEqual(
+                [json.loads(x)["event"] for x in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM", "RECOVERY", "ALARM"],
+            )
+            rebuilt = json.loads((directory / "state.json").read_text())
+            self.assertEqual([item[0] for item in rebuilt["severe"]],
+                             ["frontend_cache"])
+
+    def test_missing_state_reconstruction_rejects_corrupt_journal_tail(self):
+        """Partial journal data is uncertainty, never committed ALARM proof."""
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            broken = self.fixtures(cache="public, max-age=30")
+            self.assertEqual(watch.record(watch.evaluate(NOW, broken), directory),
+                             "ALARM")
+            (directory / "state.json").unlink()
+            with (directory / "events.jsonl").open("ab") as out:
+                out.write(b'{"event":"ALARM"')  # interrupted, not fsynced
+
+            reconfirmed = watch.evaluate(NOW + timedelta(minutes=1), broken)
+            self.assertEqual(watch.record(reconfirmed, directory),
+                             "MONITOR_DATA_FAILURE")
+            self.assertFalse((directory / "state.json").exists())
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(heartbeat["status"], "ALARM")
+            self.assertIn("unverifiable_state",
+                          {item["code"] for item in heartbeat["issues"]})
+
     def test_crash_during_full_outbox_drain_keeps_seventeenth_alarm(self):
         """The newly confirmed P1 must be durable before draining old events."""
         import json

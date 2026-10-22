@@ -477,6 +477,32 @@ def _transition_already_journaled(directory, entry):
         return False
 
 
+def _last_journaled_transition(directory):
+    """Read the last complete durable ALARM/RECOVERY, never journal existence.
+
+    A preexisting events.jsonl may contain an already recovered incident or
+    only observation diagnostics. Neither proves the newest heartbeat P1 was
+    journaled. Bound each line, reject an incomplete/corrupt journal, and sync
+    the observed bytes before using them as crash-recovery evidence.
+    """
+    last = None
+    try:
+        with (directory / "events.jsonl").open("rb") as reader:
+            while line := reader.readline(65537):
+                if len(line) > 65536 or not line.endswith(b"\n"):
+                    raise ValueError("unverifiable journal line")
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise ValueError("invalid journal record")
+                if event.get("event") in {"ALARM", "RECOVERY"}:
+                    last = event
+            os.fsync(reader.fileno())
+        _fsync_directory(directory)
+    except FileNotFoundError:
+        return None
+    return last
+
+
 def _last_complete_journal_offset(directory, expected_end):
     """Return end of the last newline-terminated event using bounded memory.
 
@@ -599,10 +625,9 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 result, directory, previous_heartbeat, "state root is not object",
             )
         if no_prior_state and isinstance(previous_heartbeat, dict):
-            # A deleted or lost state.json must never make a previously
-            # confirmed P1 disappear on the next uncertain observation.
-            # The heartbeat is evidence of incident history, not proof of
-            # recovery. Keep it until the lost state can be reconstructed.
+            # Losing state.json cannot prove that a confirmed incident ended.
+            # A reconfirmed P1 may reconstruct the missing state only after
+            # checking whether its ALARM is the last journaled incident epoch.
             past_issues = previous_heartbeat.get("issues")
             prior_alarm = (
                 previous_heartbeat.get("status") == "ALARM"
@@ -614,38 +639,85 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 ))
             )
             if prior_alarm:
-                previous_codes = {
-                    item["code"] for item in (past_issues or [])
+                prior_actuals = {
+                    item["code"]: str(item.get("actual", ""))[:160]
+                    for item in (past_issues if isinstance(past_issues, list) else [])
                     if isinstance(item, dict) and item.get("severity") == "P1"
                     and isinstance(item.get("code"), str)
                 }
                 prior_retained = previous_heartbeat.get("retained_prior_p1")
                 if isinstance(prior_retained, list):
-                    previous_codes.update(
-                        item[0] for item in prior_retained
+                    prior_actuals.update({
+                        item[0]: item[1][:160] for item in prior_retained
                         if isinstance(item, list) and len(item) == 2
-                        and isinstance(item[0], str)
-                    )
+                        and all(isinstance(x, str) for x in item)
+                        and item[0] not in prior_actuals
+                    })
                 confirmed_now = {
-                    item["code"] for item in result.get("issues", [])
+                    item["code"]: str(item.get("actual", ""))[:160]
+                    for item in result.get("issues", [])
                     if isinstance(item, dict) and item.get("severity") == "P1"
                     and isinstance(item.get("code"), str)
                 }
-                # A failed first state read may have persisted the first
-                # P1 only in the heartbeat. If the same incident is again
-                # fully confirmed, with no event ever journaled or queued,
-                # allow it to enter the ordinary first-ALARM journal path.
-                # Otherwise loss of state is uncertainty, not recovery.
-                safe_new_alarm = (
-                    bool(previous_codes)
-                    and previous_codes.issubset(confirmed_now)
-                    and not previous_heartbeat.get("pending_transitions")
-                    and not (directory / "events.jsonl").exists()
-                )
-                if not safe_new_alarm:
+                try:
+                    pending_heartbeat = _pending_transition_entries(previous_heartbeat)
+                    journal = _last_journaled_transition(directory)
+                except (OSError, ValueError, UnicodeError, TypeError) as exc:
+                    return _record_unverifiable_prior_state(
+                        result, directory, previous_heartbeat,
+                        f"cannot validate lost-state journal: {type(exc).__name__}",
+                    )
+                # Partial confirmation or a pending outbox cannot establish
+                # the previous incident's complete committed state.
+                if not prior_actuals or not prior_actuals.keys() <= confirmed_now.keys() or pending_heartbeat:
                     return _record_unverifiable_prior_state(
                         result, directory, previous_heartbeat,
                         "state.json missing while heartbeat retains incident evidence",
+                    )
+                journaled_codes = set()
+                if journal is not None and journal.get("event") == "ALARM":
+                    issues = journal.get("issues")
+                    if not isinstance(issues, list):
+                        return _record_unverifiable_prior_state(
+                            result, directory, previous_heartbeat,
+                            "last ALARM journal payload malformed",
+                        )
+                    journaled_codes = {
+                        item["code"] for item in issues
+                        if isinstance(item, dict) and item.get("severity") == "P1"
+                        and isinstance(item.get("code"), str)
+                    }
+                    retained = journal.get("retained_prior_p1")
+                    if isinstance(retained, list):
+                        journaled_codes.update(
+                            item[0] for item in retained
+                            if isinstance(item, list) and len(item) == 2
+                            and isinstance(item[0], str)
+                        )
+                if prior_actuals.keys() <= journaled_codes:
+                    # The ALARM was already fsynced. Reconstruct its active
+                    # incident snapshot without emitting an identical ALARM;
+                    # the next verified healthy poll can finally log RECOVERY.
+                    previous = {
+                        "severe": sorted([
+                            code, confirmed_now.get(code, old_actual)
+                        ] for code, old_actual in prior_actuals.items()),
+                        "uncertain": [],
+                        "main_observation": previous_heartbeat.get("main_observation"),
+                        "checked_at_utc": previous_heartbeat.get("checked_at_utc"),
+                    }
+                    no_prior_state = False
+                elif journal is None or journal.get("event") == "RECOVERY":
+                    # The heartbeat came from a pre-journal failure, or the
+                    # history belongs to an earlier, recovered epoch. Admit
+                    # one new durable ALARM instead of trapping it forever.
+                    pass
+                else:
+                    # A different active journal incident is inconsistent
+                    # with this heartbeat. Never overwrite it by guessing.
+                    return _record_unverifiable_prior_state(
+                        result, directory, previous_heartbeat,
+                        "state.json missing and active journal disagrees with heartbeat",
                     )
         # Evaluation may have been unable to read this same file, but the
         # locked persistence step can now read the original anchor. Keep the
