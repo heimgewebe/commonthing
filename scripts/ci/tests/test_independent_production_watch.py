@@ -3077,6 +3077,148 @@ class WatchTests(unittest.TestCase):
             )
 
 
+    def test_heartbeat_first_recovery_failure_does_not_block_new_independent_alarm(self):
+        """A stale state(A) must not block RECOVERY(A) then ALARM(B)."""
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            alarm_a = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(alarm_a, directory), "ALARM")
+            recovered_a = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(),
+            )
+            original_write = watch.write_json
+            faults = []
+
+            def abort_after_recovery_heartbeat(path, value):
+                if path == directory / "state.json" and not faults:
+                    faults.append(True)
+                    raise OSError("state write failed after durable recovery heartbeat")
+                return original_write(path, value)
+
+            with patch.object(watch, "write_json",
+                              side_effect=abort_after_recovery_heartbeat):
+                with self.assertRaises(OSError):
+                    watch.record(recovered_a, directory)
+            self.assertEqual(faults, [True])
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual([x[0] for x in state["severe"]], ["frontend_cache"])
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertTrue(any(
+                entry["event"] == "RECOVERY"
+                for entry in heartbeat["pending_transitions"]
+            ))
+
+            alarm_b = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(frontend=OLD, api=MAIN),
+            )
+            self.assertEqual(
+                {x["code"] for x in alarm_b["issues"] if x["severity"] == "P1"},
+                {"frontend_api_diverge"},
+            )
+            self.assertEqual(watch.record(alarm_b, directory), "ALARM")
+            history = [json.loads(row) for row in
+                       (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(
+                [row["event"] for row in history],
+                ["ALARM", "RECOVERY", "ALARM"],
+                "new P1 B must be emitted before it recovers, after recovery A",
+            )
+            self.assertEqual(history[1]["checked_at_utc"],
+                             recovered_a["checked_at_utc"])
+            self.assertEqual(history[2]["checked_at_utc"],
+                             alarm_b["checked_at_utc"])
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual([x[0] for x in state["severe"]],
+                             ["frontend_api_diverge"])
+            self.assertFalse(state.get("pending_transitions"))
+
+            recovered_b = watch.evaluate(
+                NOW + timedelta(minutes=3), self.fixtures(),
+            )
+            self.assertEqual(watch.record(recovered_b, directory), "RECOVERY")
+            history = [json.loads(row)["event"] for row in
+                       (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(
+                history, ["ALARM", "RECOVERY", "ALARM", "RECOVERY"],
+            )
+
+    def test_heartbeat_recovery_and_new_alarm_survive_failed_replay(self):
+        """Journal outage must not strand RECOVERY(A) behind a live P1 B."""
+        import json
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = watch.evaluate(
+                NOW, self.fixtures(cache="public, max-age=30"),
+            )
+            self.assertEqual(watch.record(first, directory), "ALARM")
+            recovered_a = watch.evaluate(
+                NOW + timedelta(minutes=1), self.fixtures(),
+            )
+            original_write = watch.write_json
+            recovery_failed = []
+
+            def fail_recovery_state_once(path, value):
+                if path == directory / "state.json" and not recovery_failed:
+                    recovery_failed.append(True)
+                    raise OSError("first recovery state write unavailable")
+                return original_write(path, value)
+
+            with patch.object(watch, "write_json",
+                              side_effect=fail_recovery_state_once):
+                with self.assertRaises(OSError):
+                    watch.record(recovered_a, directory)
+            alarm_b = watch.evaluate(
+                NOW + timedelta(minutes=2),
+                self.fixtures(frontend=OLD, api=MAIN),
+            )
+            original_open = Path.open
+            append_failed = []
+
+            def fail_first_a_then_b_append(path, *args, **kwargs):
+                if (path == directory / "events.jsonl"
+                        and "ab" in args and not append_failed):
+                    append_failed.append(True)
+                    raise OSError("temporary journal outage")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", new=fail_first_a_then_b_append):
+                watch.record(alarm_b, directory)
+            self.assertEqual(append_failed, [True])
+            self.assertEqual(
+                [row["event"] for row in map(
+                    json.loads, (directory / "events.jsonl").read_text().splitlines()
+                )], ["ALARM"],
+            )
+            retained = json.loads((directory / "state.json").read_text())
+            self.assertEqual(
+                [entry["event"] for entry in retained["pending_transitions"]],
+                ["RECOVERY", "ALARM"],
+            )
+
+            still_b = watch.evaluate(
+                NOW + timedelta(minutes=3),
+                self.fixtures(frontend=OLD, api=MAIN),
+            )
+            watch.record(still_b, directory)
+            self.assertEqual(
+                [json.loads(row)["event"] for row in
+                 (directory / "events.jsonl").read_text().splitlines()],
+                ["ALARM", "RECOVERY", "ALARM"],
+            )
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual(
+                [item[0] for item in state["severe"]], ["frontend_api_diverge"],
+            )
+            self.assertFalse(state.get("pending_transitions"))
+
     def test_pending_recovery_orders_before_independent_new_alarm(self):
         import json
         from unittest.mock import patch

@@ -949,6 +949,22 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 if entry not in pending:
                     pending.append(entry)
 
+        def recovery_replay_blocked(index, unknown_codes):
+            # A prior state can still mention incident A when its already
+            # durable heartbeat records RECOVERY(A). Independently confirmed
+            # incident B must not hold that recovery behind itself.
+            # If any old P1 code is still active, permit the older recovery
+            # only when a NEW ALARM has been queued after it. This preserves
+            # FIFO episode order across transient journal failures without
+            # clearing a continuing old incident on an uncertain observation.
+            if unknown_codes:
+                return True
+            if not (old_codes & new_codes):
+                return False
+            return not any(
+                later["event"] == "ALARM" for later in pending[index + 1:]
+            )
+
         def persist_snapshots(*, heartbeat_first=False):
             if pending:
                 result["pending_transitions"] = pending
@@ -988,9 +1004,9 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 "watcher_execution_failed", "unverifiable_state"
             } & observed_codes
             ready_old = []
-            for entry in pending[:previous_pending_count]:
-                if entry["event"] == "RECOVERY" and (
-                    uncertain_replay or (severe and old_severe)
+            for index, entry in enumerate(pending[:previous_pending_count]):
+                if entry["event"] == "RECOVERY" and recovery_replay_blocked(
+                    index, uncertain_replay,
                 ):
                     break
                 ready_old.append(entry)
@@ -1029,9 +1045,9 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         unverified = {"watcher_execution_failed", "unverifiable_state"} & observed_codes
         ready_pending = []
         if not suppress_transition_event:
-            for entry in pending:
-                if entry["event"] == "RECOVERY" and (
-                    unverified or (severe and old_severe)
+            for index, entry in enumerate(pending):
+                if entry["event"] == "RECOVERY" and recovery_replay_blocked(
+                    index, unverified,
                 ):
                     break
                 ready_pending.append(entry)
