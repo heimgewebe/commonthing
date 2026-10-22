@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { hasRenderableMapPosition } from "$lib/map/coordinates";
   import { browser } from "$app/environment";
   import { goto, invalidateAll } from "$app/navigation";
   import {
@@ -23,7 +24,7 @@
   let titleInput: HTMLInputElement | null = $state(null);
 
   let titleError = $state(false);
-  let addressError = $state(false);
+  let geographic = $state(true);
   let formError: string | null = $state(null);
 
   // One operation id identifies one semantic user action. A transport failure
@@ -37,7 +38,7 @@
     $kompositionDraft?.mode === "place-garnrolle",
   );
   let canSubmit = $derived(
-    !!$kompositionDraft?.lngLat && !!title.trim() && !!address.trim(),
+    !!title.trim() && (!geographic || !!$kompositionDraft?.lngLat),
   );
 
   onMount(async () => {
@@ -48,8 +49,8 @@
   function operationIdForNode(payload: {
     title: string;
     kind: string;
-    address: string;
-    location: { lat: number; lon: number };
+    address: string | null;
+    location: { lat: number; lon: number } | null;
     summary?: string;
     tags: string[];
   }): string {
@@ -104,7 +105,7 @@
         return "Du hast keine Berechtigung, einen Knoten anzulegen.";
       }
       if (err.status === 400) {
-        return "Bitte prüfe deine Eingaben: Name, Knotenart, Adresse und Ort müssen ausgefüllt sein.";
+        return "Bitte prüfe deine Eingaben: Name und Knotenart sowie ein gültiger optionaler Ort werden benötigt.";
       }
       if (err.status === 409) {
         return "Dieser Knoten existiert bereits.";
@@ -115,17 +116,18 @@
 
   async function finalizeSuccess(nodeId: string) {
     await invalidateAll();
-    lastCreatedNodeId.set(nodeId);
+    if (geographic) lastCreatedNodeId.set(nodeId);
     leaveToNavigation();
+    if (!geographic)
+      await goto(`/map?focus=node:${encodeURIComponent(nodeId)}`);
   }
 
   async function handleSubmit(e: Event) {
     e.preventDefault();
     formError = null;
     titleError = !title.trim();
-    addressError = !address.trim();
 
-    if (titleError || addressError || !$kompositionDraft?.lngLat || !canWrite) {
+    if (!canSubmit || titleError || !canWrite) {
       return;
     }
 
@@ -133,13 +135,20 @@
     try {
       // Create a local snapshot to guard against stale state transitions
       const submitDraft = $kompositionDraft;
-      const [lon, lat] = submitDraft.lngLat!;
+      const location =
+        geographic && submitDraft?.lngLat
+          ? { lat: submitDraft.lngLat[1], lon: submitDraft.lngLat[0] }
+          : null;
+      if (location && !hasRenderableMapPosition(location)) {
+        formError = "Die Koordinaten sind ungültig.";
+        return;
+      }
 
       const nodePayload = {
         title: title.trim(),
         kind: nodeType,
-        address: address.trim(),
-        location: { lat, lon },
+        address: address.trim() || null,
+        location,
         summary: description.trim() || undefined,
         tags: combineKnottingTags(topics, []),
       };
@@ -221,7 +230,19 @@
     </div>
   {:else}
     <form onsubmit={handleSubmit} class="komposition-form">
-      {#if $kompositionDraft?.lngLat}
+      <label
+        ><input
+          type="checkbox"
+          bind:checked={geographic}
+          disabled={isSubmitting}
+        /> Mit Kartenort</label
+      >
+      {#if !geographic}
+        <p>
+          Dieser Knoten hat keinen Kartenort. Er bleibt über die Knotenansicht,
+          Suche und Links erreichbar.
+        </p>
+      {:else if $kompositionDraft?.lngLat}
         <div class="state-set">
           <p><strong>Ort gewählt</strong></p>
           <p class="ghost">
@@ -283,24 +304,15 @@
       />
 
       <div class="form-group">
-        <label for="address">Adresse *</label>
+        <label for="address">Adresse (optional)</label>
         <input
           type="text"
           id="address"
           bind:value={address}
           class="input"
-          class:error={addressError}
           placeholder="Straße, Hausnummer, Ort"
           disabled={isSubmitting}
-          required
-          aria-invalid={addressError}
-          aria-describedby={addressError ? "address-error" : undefined}
         />
-        {#if addressError}
-          <span id="address-error" class="error-msg"
-            >Adresse ist erforderlich</span
-          >
-        {/if}
       </div>
 
       <div class="form-group">

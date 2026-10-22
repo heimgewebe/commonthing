@@ -250,6 +250,87 @@ async fn nodes_loader_reconstructs_public_shape() {
 #[tokio::test]
 #[ignore]
 #[serial]
+async fn historical_invalid_node_coordinates_do_not_abort_full_load() {
+    // A NOT VALID check preserves pre-migration rows even when their complete
+    // coordinate pair is out of range. This proof only uses a disposable PG URL
+    // (enforced by prepare_pool), never a production schema.
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id, kind, title, lat, lon, payload) VALUES \
+         ('rp-valid-legacy-neighbor', 'place', 'Valid Neighbor', 53.55, 9.99, '{}'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert valid neighbor");
+
+    // Reproduce the pre-migration historical state atomically: temporarily
+    // remove the new CHECK, insert the old bad row, restore CHECK ... NOT VALID
+    // within the same transaction before exposing anything to other sessions.
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin legacy fixture transaction");
+    sqlx::query("ALTER TABLE domain_nodes DROP CONSTRAINT domain_nodes_location_pair")
+        .execute(&mut *tx)
+        .await
+        .expect("temporarily drop location check in disposable DB");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id, kind, title, lat, lon, payload) VALUES \
+         ('rp-invalid-historical', 'place', 'Historical Invalid', 123.45, 9.99, '{}'::jsonb)",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("insert legacy coordinate outside valid latitude");
+    sqlx::query(
+        "ALTER TABLE domain_nodes ADD CONSTRAINT domain_nodes_location_pair CHECK (\
+          (lat IS NULL AND lon IS NULL) OR (lat IS NOT NULL AND lon IS NOT NULL \
+          AND lat BETWEEN -90 AND 90 AND lon BETWEEN -180 AND 180)\
+        ) NOT VALID",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("reinstate NOT VALID protection before commit");
+    tx.commit().await.expect("commit protected legacy fixture");
+
+    let nodes = load_nodes_from_postgres(&pool)
+        .await
+        .expect("a historical bad row must not abort a complete node load");
+    assert!(nodes.get("rp-valid-legacy-neighbor").is_some());
+    assert!(nodes.get("rp-invalid-historical").is_none());
+
+    let bbox = load_nodes_bbox_from_postgres(&pool, 53.4, 53.7, 9.8, 10.1, 10, 0)
+        .await
+        .expect("valid geographic bounding box must remain usable");
+    assert!(bbox
+        .iter()
+        .any(|node| node.id == "rp-valid-legacy-neighbor"));
+    assert!(!bbox.iter().any(|node| node.id == "rp-invalid-historical"));
+
+    // An explicit by-id read still fails visibly rather than rewriting
+    // corrupt historical coordinates into a fabricated null location.
+    let err = weltgewebe_api::domain_db::load_node_from_postgres(&pool, "rp-invalid-historical")
+        .await
+        .expect_err("direct corrupt row must remain invalid");
+    assert!(matches!(
+        err,
+        weltgewebe_api::domain_db::NodeWriteError::Mapping(_)
+    ));
+
+    // Re-added CHECK is NOT VALID only for historical rows. New bad writes
+    // must still be rejected by the database.
+    assert!(sqlx::query(
+        "INSERT INTO domain_nodes (id, kind, title, lat, lon, payload) VALUES \
+         ('rp-new-invalid', 'place', 'Not Allowed', 123.45, 9.99, '{}'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .is_err());
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
 async fn edges_loader_respects_max_edges_cache_limit() {
     let pool = prepare_pool().await;
     let _limit = EnvGuard::set("MAX_EDGES_CACHE", "1");

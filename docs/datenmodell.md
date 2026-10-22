@@ -121,6 +121,35 @@ Administratoren jedoch gemeinschaftlich pflegen.
 Es gibt derzeit keine PostGIS-Geometrie. Der Geoindex ist ein einfacher B-Tree
 auf `(lat, lon)`.
 
+Knoten können auch Wissen, Dokumente und digitale Commons ohne festen Ort
+beschreiben. `address` und `location` sind unabhängig optional: fehlend oder
+`null` bedeutet jeweils „nicht angegeben“. Eine vorhandene Position enthält
+immer beide endlichen WGS84-Werte (`lat` −90 bis 90, `lon` −180 bis 180).
+`POST` und vollständiges `PUT` akzeptieren beide Formen; beim `PUT` entfernt
+ein fehlender oder `null` gesetzter Ortswert die bisherige Projektion. `PATCH`
+behält seinen bestehenden Teilvertrag für Info und Suchsichtbarkeit.
+
+Die additive Migration `20261017000001_optional_node_location` ergänzt einen
+`NOT VALID`-Check für vollständige, gültige Koordinatenpaare. Sie schreibt keine
+Bestandsdaten um; die bereits nullable Spalten speichern ortslose Knoten als
+`NULL`/`NULL`. Neue Schreibvorgänge werden geprüft, historisch ungültige
+Teilpaare benötigen weiterhin eine explizite Datenbereinigung. Der Loader liest
+gültige ortslose Knoten regulär. BBOX-Abfragen liefern ausschließlich verortete
+Knoten; allgemeine Listen, Einzelabruf, Suche, Urheberbindung und abgeleitete
+Fäden setzen keinen Ort voraus. `/commons` bietet eine gemeinsame Listen- und
+Suchansicht; Detail-Links nutzen weiter `/map?focus=node:<id>` ohne erfundene
+Kartenposition oder Kamerafahrt für ortslose Knoten.
+
+Contract-Weiterentwicklung zu Issue #1466: Der bestehende Node-Schema-Identifier
+und die API-Endpunkte bleiben bestehen; das Antwortwertespektrum erweitert sich
+um fehlende beziehungsweise `null` gesetzte Ortswerte. Vorhandene geografische
+Requests und Antworten behalten ihre Form. Clients mit bisher zwingendem
+`location`-Typ müssen vor Freischaltung ortsloser Schreibvorgänge aktualisiert
+werden. Migration, API und nullable-fähiger Webclient gehören deshalb in einen
+gemeinsamen Release; ein alter Client ist für neue ortslose Datensätze nicht
+kompatibel. Ein Rollback darf keine Ersatzkoordinaten erzeugen oder diese
+Datensätze löschen; der Migration-Down entfernt nur den zusätzlichen Check.
+
 `create_actor_id` und `create_operation_id` sind entweder gemeinsam gesetzt
 oder gemeinsam `NULL`. Der Accountwert muss nichtleer und die Vorgangskennung
 eine kanonische UUID sein. Ein partieller Unique-Index erlaubt pro Account nur

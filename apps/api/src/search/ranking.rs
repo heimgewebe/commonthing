@@ -161,10 +161,10 @@ mod tests {
             info: Some("Test info".to_string()),
             tags: tags.into_iter().map(String::from).collect(),
             address: Some("Test str. 1".to_string()),
-            location: Location {
+            location: Some(Location {
                 lat: 52.5,
                 lon: 13.4,
-            },
+            }),
         }
     }
 

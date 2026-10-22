@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { parseOptionalNodeLocation } from "$lib/api/nodeLocation";
   import { createEventDispatcher, onDestroy, tick } from "svelte";
   import { selection } from "$lib/stores/uiView";
   import { authStore } from "$lib/auth/store";
@@ -76,7 +77,7 @@
     info?: string | null;
     tags?: string[];
     address?: string | null;
-    location?: { lat: number; lon: number };
+    location?: { lat: number; lon: number } | null;
     created_at?: string;
     updated_at?: string;
     created_by_account_id?: string | null;
@@ -157,11 +158,11 @@
 
   function beginEdit() {
     const fallback = $selection?.data;
-    const location =
-      nodeDetails?.location ??
-      (typeof fallback?.lat === "number" && typeof fallback?.lon === "number"
+    const location = nodeDetails
+      ? nodeDetails.location
+      : typeof fallback?.lat === "number" && typeof fallback?.lon === "number"
         ? { lat: fallback.lat, lon: fallback.lon }
-        : undefined);
+        : undefined;
     formTitle = nodeDetails?.title || fallback?.title || "";
     formKind = nodeDetails?.kind || fallback?.kind || "";
     formSummary = nodeDetails?.summary || fallback?.summary || "";
@@ -189,22 +190,14 @@
 
   async function saveNode() {
     const id = nodeDetails?.id || $selection?.id;
-    const lat = Number(formLat);
-    const lon = Number(formLon);
+    const location = parseOptionalNodeLocation(formLat, formLon);
     if (!id) return;
-    if (!formTitle.trim() || !formKind.trim() || !formAddress.trim()) {
-      mutationError = "Titel, Knotenart und Adresse werden benötigt.";
+    if (!formTitle.trim() || !formKind.trim()) {
+      mutationError = "Titel und Knotenart werden benötigt.";
       return;
     }
-    if (
-      !Number.isFinite(lat) ||
-      !Number.isFinite(lon) ||
-      lat < -90 ||
-      lat > 90 ||
-      lon < -180 ||
-      lon > 180
-    ) {
-      mutationError = "Die Koordinaten sind ungültig.";
+    if (location === undefined) {
+      mutationError = "Bitte beide Koordinaten angeben oder beide leer lassen.";
       return;
     }
 
@@ -216,8 +209,8 @@
         {
           title: formTitle.trim(),
           kind: formKind.trim(),
-          address: formAddress.trim(),
-          location: { lat, lon },
+          address: formAddress.trim() || null,
+          location,
           summary: formSummary.trim() || undefined,
           info: formInfo.trim() || undefined,
           tags: combineKnottingTags(formTopics, formKeywords.split(",")),
@@ -415,16 +408,17 @@
         </label>
         <label>
           Adresse
-          <input bind:value={formAddress} maxlength="500" required />
+          <input bind:value={formAddress} maxlength="500" />
         </label>
+        <p class="field-help">Ohne Kartenort: beide Koordinaten leer lassen.</p>
         <div class="coordinate-grid">
           <label>
             Breitengrad
-            <input bind:value={formLat} inputmode="decimal" required />
+            <input bind:value={formLat} inputmode="decimal" />
           </label>
           <label>
             Längengrad
-            <input bind:value={formLon} inputmode="decimal" required />
+            <input bind:value={formLon} inputmode="decimal" />
           </label>
         </div>
         <KnottingTopicsSelector
@@ -465,7 +459,7 @@
                   <dd>{conflictNode.info}</dd>
                 </div>{/if}
               {#if conflictNode.address}<div>
-                  <dt>Adresse</dt>
+                  <dt>Adresse (optional)</dt>
                   <dd>{conflictNode.address}</dd>
                 </div>{/if}
               {#if conflictTagSplit.topics.length}<div>

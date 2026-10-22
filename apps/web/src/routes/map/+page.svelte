@@ -174,7 +174,9 @@
         });
         if (controller.signal.aborted || sequence !== nodeSearchSequence)
           return;
-        nodeSearchItems = response.items.map(nodeToMapEntity);
+        nodeSearchItems = response.items
+          .map(nodeToMapEntity)
+          .filter((item) => item !== null);
         nodeSearchStatus = "ready";
         nodeSearchMode = response.mode;
         nodeSearchFallbackReason = response.fallback_reason ?? null;
@@ -1408,6 +1410,16 @@
       // compose is final; without a valid focus there is nothing for the focus
       // pass to do. Either way the focus lock is satisfied for this query.
       if (parsed.compose || !parsed.focus) {
+        lastResolvedFocusUrlSearch = search;
+      }
+    }
+    if (
+      parsed.focus?.type === "node" &&
+      search !== lastResolvedFocusUrlSearch
+    ) {
+      const node = data.nodes?.find((item) => item.id === parsed.focus?.id);
+      if (node && !node.location) {
+        enterFokus({ type: "node", id: node.id, data: node });
         lastResolvedFocusUrlSearch = search;
       }
     }

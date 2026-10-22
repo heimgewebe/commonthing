@@ -19,9 +19,11 @@ export interface Node {
   summary?: string | null;
   info?: string | null;
   tags: string[];
-  /** Human-readable address. Optional for nodes persisted before this field existed. */
+  /** Optional human-readable address, independent of the map projection. */
   address?: string | null;
-  location: Location;
+  location?: Location | null;
+  /** Public discovery visibility. Missing or unknown is non-public in catalog views. */
+  search_visibility?: "public" | "private" | "hidden" | "revoked";
   modules?: Module[];
 }
 
