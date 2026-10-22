@@ -43,9 +43,23 @@ fn privacy_sensitive_domain_path(path: &str) -> bool {
     .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
+// Search performs potentially slow external embedding before any privacy data
+// is read. Only its handler may acquire the response-lifetime PostgreSQL fence,
+// AFTER that preparation, not this outer middleware.
+fn is_deferred_search_privacy_path(method: &Method, path: &str) -> bool {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    let path = path.strip_prefix("/api").unwrap_or(path);
+    matches!(path, "/search" | "/nodes/search")
+}
+
 fn requires_database_privacy_fence(method: &Method, path: &str) -> bool {
     if !matches!(*method, Method::GET | Method::HEAD) {
         return false;
+    }
+    if is_deferred_search_privacy_path(method, path) {
+        return false; // response fence is acquired by the route after embedding
     }
     let path = path.strip_prefix("/api").unwrap_or(path);
     // GET /accounts/me/profile takes accounts_persist before its DB read,
@@ -58,10 +72,10 @@ fn requires_database_privacy_fence(method: &Method, path: &str) -> bool {
     // Other unlisted domain views read canonical PostgreSQL directly.
     // Governance GETs explicitly hold a response-lifetime fence inside their
     // handlers AFTER due-proposal finalization; finalization itself can write.
-    // Search also needs a fence: its canonical SQL filters candidates, but
-    // another process can revoke them before ranking and JSON construction.
+    // Search is deliberately handled after embedding inside its route, not
+    // under an outer lock held across HTTP calls to its provider.
     // Otherwise reserve pooled connections for writers.
-    ["/nodes", "/search", "/edges", "/accounts", "/conversations"]
+    ["/nodes", "/edges", "/accounts", "/conversations"]
         .iter()
         .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
@@ -247,6 +261,71 @@ async fn auth_matches_guarded_projection(state: &ApiState, auth: Option<AuthCont
         .is_some_and(|account| !account.public.disabled && account.role == auth.role)
 }
 
+/// A response-lifetime PostgreSQL search fence, acquired only after the slow
+/// embedding provider has finished. The local read guard and existing two-unit
+/// connection reservation are held together with the row lock.
+pub struct SearchPrivacyFence<'a> {
+    _projection_guard: RwLockReadGuard<'a, ()>,
+    _slot: SemaphorePermit<'a>,
+    tx: Transaction<'static, Postgres>,
+}
+
+impl SearchPrivacyFence<'_> {
+    /// Serialize the JSON body before calling this method. If rollback fails,
+    /// the already-built response must never be delivered to the client.
+    pub async fn finish(self, response: Response) -> anyhow::Result<Response> {
+        self.tx.rollback().await?;
+        Ok(response)
+    }
+}
+
+/// Reuse the normal PostgreSQL admission and version checks for search, but
+/// perform them *after* provider I/O. Ok(None) means the authenticated account
+/// was revoked or changed role while embedding; errors fail closed as 503.
+pub async fn acquire_search_privacy_fence<'a>(
+    state: &'a ApiState,
+    auth: Option<AuthContext>,
+) -> anyhow::Result<Option<SearchPrivacyFence<'a>>> {
+    let pool = state
+        .db_pool
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("PostgreSQL domain pool is missing"))?;
+    for _ in 0..4 {
+        let (projection_guard, slot, gate_wait) = acquire_fenced_read_admission(
+            &state.domain_projection_gate,
+            postgres_domain_connection_budget(),
+        )
+        .await
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+        state
+            .metrics
+            .observe_domain_projection_read_gate_wait(gate_wait);
+
+        let (tx, observed) =
+            tokio::time::timeout(Duration::from_secs(3), begin_fenced_generation(pool))
+                .await
+                .map_err(|_| anyhow::anyhow!("PostgreSQL search privacy fence timed out"))??;
+        if observed == state.domain_projection_version.load(Ordering::Acquire) {
+            if !auth_matches_guarded_projection(state, auth.clone()).await {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            return Ok(Some(SearchPrivacyFence {
+                _projection_guard: projection_guard,
+                _slot: slot,
+                tx,
+            }));
+        }
+        // No stale cache is ever admitted. Release all read resources before
+        // a refresh, which may need the projection writer gate and pool slots.
+        tx.rollback().await?;
+        drop(slot);
+        drop(projection_guard);
+        state.refresh_domain_projection_if_stale().await?;
+    }
+    anyhow::bail!("domain generation changed during bounded search admission")
+}
+
 fn projection_unavailable(state: &ApiState, error: impl std::fmt::Display) -> Response {
     state.metrics.domain_projection_refresh_failed();
     tracing::error!(
@@ -279,6 +358,11 @@ pub async fn ensure_current_domain_projection(
             &state,
             "session authentication must precede domain projection",
         );
+    }
+    if is_deferred_search_privacy_path(request.method(), request.uri().path()) {
+        // The search service owns the canonical read fence after embedding and
+        // revalidates generation + account authorization before reading nodes.
+        return next.run(request).await;
     }
     if may_use_previous_projection(request.method(), has_session_cookie, request.uri().path()) {
         if let Err(error) = state.refresh_domain_projection_for_read().await {
@@ -444,10 +528,6 @@ mod tests {
             "/edges/id",
             "/api/accounts/account",
             "/api/conversations/id/messages",
-            "/search",
-            "/api/search",
-            "/nodes/search",
-            "/api/nodes/search",
         ] {
             assert!(
                 requires_database_privacy_fence(&Method::GET, path),
@@ -472,6 +552,10 @@ mod tests {
         for path in [
             "/health/ready",
             "/api/version",
+            "/search",
+            "/api/search",
+            "/nodes/search",
+            "/api/nodes/search",
             "/auth/me",
             "/api/proposals/id",
             "/accounts/me/profile",

@@ -870,19 +870,21 @@ async fn untyped_account_edge_collision_with_unprojected_node_is_hidden() {
     clean(&pool).await;
 }
 
-// A real PostgreSQL + HTTP middleware proof for the two search aliases.
-// The handler simulates SQL candidate selection followed by slow ranking; it
-// does not pretend to cover Ollama embedding, exact search ranking, or E2E UI.
+// A real PostgreSQL + HTTP proof for the delayed search fence on both aliases.
+// The handler simulates SQL candidate selection followed by ranking; the
+// external embedding boundary is covered in the T006 service proof.
 #[tokio::test]
 #[ignore = "requires an isolated DATABASE_URL"]
 #[serial]
 async fn search_aliases_fence_sql_candidates_until_http_response() {
-    use axum::{middleware::from_fn_with_state, routing::get, Json};
+    use axum::{middleware::from_fn_with_state, response::IntoResponse, routing::get, Json};
     use tokio::{
         sync::{oneshot, Notify},
         time::{sleep, timeout, Duration},
     };
-    use weltgewebe_api::middleware::domain_projection::ensure_current_domain_projection;
+    use weltgewebe_api::middleware::domain_projection::{
+        acquire_search_privacy_fence, ensure_current_domain_projection,
+    };
 
     let pool = prepare_pool().await;
     sqlx::query(
@@ -906,15 +908,21 @@ async fn search_aliases_fence_sql_candidates_until_http_response() {
                 path,
                 get({
                     let pool = pool.clone();
+                    let state = state.clone();
                     let entered = Arc::clone(&entered);
                     let release = Arc::clone(&release);
                     move || {
                         let pool = pool.clone();
+                        let state = state.clone();
                         let entered = Arc::clone(&entered);
                         let release = Arc::clone(&release);
                         async move {
-                            // Match the real search's canonical SQL visibility
-                            // check before its subsequent response construction.
+                            // Match the actual search's canonical selection
+                            // after (not during) the embedding provider phase.
+                            let fence = acquire_search_privacy_fence(&state, None)
+                                .await
+                                .expect("acquire delayed search privacy fence")
+                                .expect("anonymous search authorized");
                             let title: String = sqlx::query_scalar(
                                 "SELECT title FROM domain_nodes
                                  WHERE id='rp-search-fence' AND search_visibility='public'",
@@ -923,8 +931,13 @@ async fn search_aliases_fence_sql_candidates_until_http_response() {
                             .await
                             .expect("read still-public SQL search candidate");
                             entered.notify_one();
-                            release.notified().await; // simulated slow ranking
-                            Json(serde_json::json!({"title": title}))
+                            release.notified().await; // simulated ranking/JSON
+                            let response =
+                                Json(serde_json::json!({"title": title})).into_response();
+                            fence
+                                .finish(response)
+                                .await
+                                .expect("release search privacy fence")
                         }
                     }
                 }),

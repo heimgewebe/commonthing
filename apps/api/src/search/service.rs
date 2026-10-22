@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::DomainReadSource,
-    middleware::auth::AuthContext,
+    middleware::{
+        auth::AuthContext,
+        domain_projection::{acquire_search_privacy_fence, SearchPrivacyFence},
+    },
     routes::nodes::Node,
     search::{
         ranking::{
@@ -161,6 +164,8 @@ pub enum SearchError {
     ProviderContractError(#[from] EmbeddingProviderError),
     #[error("search service unavailable")]
     Unavailable,
+    #[error("search authorization expired")]
+    Unauthorized,
     #[error("invalid search request")]
     InvalidRequest,
     #[error("internal search error")]
@@ -177,6 +182,7 @@ impl IntoResponse for SearchError {
                 (StatusCode::INTERNAL_SERVER_ERROR, error.code())
             }
             SearchError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "search_unavailable"),
+            SearchError::Unauthorized => (StatusCode::UNAUTHORIZED, "search_unauthorized"),
             SearchError::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_search_request"),
             SearchError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "search_internal_error"),
         };
@@ -269,18 +275,55 @@ fn runtime_provider(
     )))
 }
 
+/// Retained for direct search-service consumers and existing PostgreSQL tests.
+/// Only the HTTP handler needs the response-lifetime privacy fence.
 pub async fn execute_search(
     state: &ApiState,
     auth: &AuthContext,
     params: SearchQueryParams,
     provider_override: Option<Arc<dyn EmbeddingProvider>>,
 ) -> Result<SearchResponse, SearchError> {
+    let (response, _) =
+        execute_search_with_mode(state, auth, params, provider_override, false).await?;
+    Ok(response)
+}
+
+/// The HTTP variant acquires the database fence only after the potentially
+/// slow provider has finished. JSON must be fully serialized before unlock.
+pub async fn execute_search_http(
+    state: &ApiState,
+    auth: &AuthContext,
+    params: SearchQueryParams,
+    provider_override: Option<Arc<dyn EmbeddingProvider>>,
+) -> Result<Response, SearchError> {
+    let (result, fence) =
+        execute_search_with_mode(state, auth, params, provider_override, true).await?;
+    let response = axum::Json(result).into_response();
+    fence
+        .ok_or(SearchError::Unavailable)?
+        .finish(response)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "cannot release search privacy fence");
+            SearchError::Unavailable
+        })
+}
+
+async fn execute_search_with_mode<'a>(
+    state: &'a ApiState,
+    auth: &AuthContext,
+    params: SearchQueryParams,
+    provider_override: Option<Arc<dyn EmbeddingProvider>>,
+    fence_for_http: bool,
+) -> Result<(SearchResponse, Option<SearchPrivacyFence<'a>>), SearchError> {
     let request_started = Instant::now();
-    let result = execute_search_inner(state, auth, params, provider_override).await;
+    let result = execute_search_inner(state, auth, params, provider_override, fence_for_http).await;
     let outcome = match &result {
-        Ok(response) => response.mode.into(),
+        Ok((response, _)) => response.mode.into(),
         Err(SearchError::ProviderContractError(_)) => SearchRequestOutcome::ProviderContractError,
-        Err(SearchError::Unavailable) => SearchRequestOutcome::Unavailable,
+        Err(SearchError::Unavailable | SearchError::Unauthorized) => {
+            SearchRequestOutcome::Unavailable
+        }
         Err(SearchError::InvalidRequest) => SearchRequestOutcome::InvalidRequest,
         Err(SearchError::Internal) => SearchRequestOutcome::Internal,
     };
@@ -291,12 +334,13 @@ pub async fn execute_search(
     result
 }
 
-async fn execute_search_inner(
-    state: &ApiState,
+async fn execute_search_inner<'a>(
+    state: &'a ApiState,
     auth: &AuthContext,
     params: SearchQueryParams,
     provider_override: Option<Arc<dyn EmbeddingProvider>>,
-) -> Result<SearchResponse, SearchError> {
+    fence_for_http: bool,
+) -> Result<(SearchResponse, Option<SearchPrivacyFence<'a>>), SearchError> {
     if state.config.domain_read_source != DomainReadSource::Postgres {
         return Err(SearchError::Unavailable);
     }
@@ -359,6 +403,23 @@ async fn execute_search_inner(
     state
         .metrics
         .observe_search_provider_duration(provider_started.elapsed());
+
+    // Never reserve pooled connections or hold the global visibility row
+    // lock during provider I/O. It may take multiple 10-second HTTP attempts.
+    // Re-check both the domain generation and AuthContext under the fence
+    // before selecting candidates, then hold through JSON serialization.
+    let privacy_fence = if fence_for_http {
+        match acquire_search_privacy_fence(state, Some(auth.clone())).await {
+            Ok(Some(fence)) => Some(fence),
+            Ok(None) => return Err(SearchError::Unauthorized),
+            Err(error) => {
+                tracing::warn!(%error, "cannot acquire current search privacy fence");
+                return Err(SearchError::Unavailable);
+            }
+        }
+    } else {
+        None
+    };
 
     let candidate_started = Instant::now();
     let candidate_result = fetch_postgres_candidates_for_generation(
@@ -425,13 +486,16 @@ async fn execute_search_inner(
         .map(|candidate| candidate.node)
         .collect();
 
-    Ok(SearchResponse {
-        items,
-        mode,
-        fallback_reason,
-        generation_id: candidate_set.generation.generation_id,
-        offset,
-    })
+    Ok((
+        SearchResponse {
+            items,
+            mode,
+            fallback_reason,
+            generation_id: candidate_set.generation.generation_id,
+            offset,
+        },
+        privacy_fence,
+    ))
 }
 
 #[cfg(test)]
