@@ -538,7 +538,7 @@ pub async fn create_proposal(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
     Json(payload): Json<Value>,
-) -> Result<(StatusCode, Json<ProposalView>), ApiError> {
+) -> Result<Response, ApiError> {
     let account_id = require_account_id(&auth)?;
 
     let pool = require_pool(&state)?;
@@ -669,7 +669,26 @@ pub async fn create_proposal(
     );
 
     let now = Utc::now();
-    Ok((StatusCode::CREATED, Json(proposal_view(proposal, now))))
+    // The proposal has already committed, and its Faden may have performed
+    // additional writes. Acquire the existing DB generation-row privacy fence
+    // only NOW, never while our own transaction or Faden writer is active.
+    // Creation's original target snapshot may no longer be publicly visible:
+    // re-read the canonical, visibility-masked proposal under the same fence
+    // kept through completed HTTP JSON construction.
+    if proposal.target_node_id.is_some() {
+        let (_slot, visibility_tx) = begin_proposal_privacy_fence(pool).await?;
+        let current = governance::get_proposal(pool, &proposal.id)
+            .await
+            .map_err(internal_error("get_proposal_after_create"))?
+            .ok_or_else(proposal_privacy_unavailable)?;
+        let response = (
+            StatusCode::CREATED,
+            private_no_store_json(proposal_view(current, now)),
+        )
+            .into_response();
+        return finish_proposal_privacy_fence(visibility_tx, response).await;
+    }
+    Ok((StatusCode::CREATED, Json(proposal_view(proposal, now))).into_response())
 }
 
 /// POST /proposals/{id}/withdraw — der Antragsteller beendet das eigene offene

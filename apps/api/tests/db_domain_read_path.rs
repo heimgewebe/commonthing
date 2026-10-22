@@ -1432,6 +1432,187 @@ async fn authenticated_role_is_revalidated_after_post_session_projection_refresh
     clean(&pool).await;
 }
 
+// A genuine HTTP POST race: the proposal commits while its node is public.
+// Pause its post-commit Faden projection on the real account advisory lock;
+// a separate PostgreSQL pool can then revoke the node before the POST replies.
+#[tokio::test]
+#[serial]
+#[ignore = "requires an isolated DATABASE_URL"]
+async fn proposal_post_response_masks_target_after_visibility_commit() {
+    use axum::{routing::post, Extension};
+    use sha2::{Digest, Sha256};
+    use tokio::time::{sleep, timeout, Duration};
+    use weltgewebe_api::{
+        auth::role::Role, middleware::auth::AuthContext, routes::governance::create_proposal,
+    };
+    let pool = direct_pool().await;
+    run_migrations(&pool).await;
+    let owner = "2fbc2488-45e9-4a96-84cc-2f8df70ed881";
+    let target = "rp-post-fence-target";
+    // Clean only our synthetic IDs; proposals must precede referenced nodes.
+    sqlx::query("DELETE FROM governance_proposals WHERE applicant_account_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("remove old proof proposal");
+    sqlx::query("DELETE FROM domain_edges WHERE source_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("remove old Faden");
+    sqlx::query("DELETE FROM domain_nodes WHERE id=$1")
+        .bind(target)
+        .execute(&pool)
+        .await
+        .expect("remove old target");
+    sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("remove old actor");
+
+    sqlx::query(
+        "INSERT INTO domain_accounts
+          (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)
+         VALUES ($1,'garnrolle','Proof Weber','not_on_map',0,FALSE,'weber','{}','{}')",
+    )
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .expect("seed Weber account");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES ($1,'place','Previously Public Target',53.6,10.0,'{}'::jsonb,'public')",
+    )
+    .bind(target)
+    .execute(&pool)
+    .await
+    .expect("seed public target");
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("load account projection");
+
+    // This is the precise account-lifecycle lock the post-commit Faden uses.
+    let mut h = Sha256::new();
+    h.update(b"weltgewebe:account-lifecycle:v1");
+    h.update((owner.len() as u64).to_be_bytes());
+    h.update(owner.as_bytes());
+    let digest = h.finalize();
+    let key = i64::from_be_bytes(digest[..8].try_into().expect("hash prefix"));
+    let other_pool = direct_pool().await;
+    let mut held_faden = other_pool.begin().await.expect("begin blocker");
+    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+        .bind(key)
+        .execute(&mut *held_faden)
+        .await
+        .expect("hold Faden advisory lock");
+
+    let auth = AuthContext {
+        authenticated: true,
+        account_id: Some(owner.to_owned()),
+        device_id: None,
+        role: Role::Weber,
+        expires_at: None,
+    };
+    let app = Router::new()
+        .route("/proposals", post(create_proposal))
+        .layer(Extension(auth))
+        .with_state(state);
+    let req = Request::post("/proposals")
+        .header("content-type", "application/json")
+        .body(body::Body::from(
+            serde_json::json!({
+                "kind": "sachantrag",
+                "title": "Proof public target",
+                "target_node_id": target
+            })
+            .to_string(),
+        ))
+        .expect("real HTTP POST");
+    let mut task = tokio::spawn(async move { app.oneshot(req).await.expect("POST handler") });
+
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM governance_proposals
+                 WHERE applicant_account_id=$1 AND target_node_id=$2",
+            )
+            .bind(owner)
+            .bind(target)
+            .fetch_one(&other_pool)
+            .await
+            .expect("read committed proof proposal");
+            if n == 1 {
+                break;
+            }
+            assert!(!task.is_finished(), "POST finished before proposal commit");
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("proposal commit was not observable");
+    assert!(
+        timeout(Duration::from_millis(200), &mut task)
+            .await
+            .is_err(),
+        "POST was not held after the durable proposal commit",
+    );
+    // This must commit after the original proposal but before its JSON reply.
+    timeout(
+        Duration::from_secs(4),
+        sqlx::query("UPDATE domain_nodes SET search_visibility='private' WHERE id=$1")
+            .bind(target)
+            .execute(&other_pool),
+    )
+    .await
+    .expect("writer did not commit while Faden blocked")
+    .expect("commit private target");
+    held_faden
+        .rollback()
+        .await
+        .expect("release synthetic Faden blocker");
+
+    let response = timeout(Duration::from_secs(8), task)
+        .await
+        .expect("POST completes")
+        .expect("POST task");
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let json: serde_json::Value = serde_json::from_slice(
+        &body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("POST JSON bytes"),
+    )
+    .expect("decode POST response");
+    assert_eq!(json["kind"], "sachantrag");
+    assert!(
+        json.get("target_node_id").is_none() && json.get("target_node_title").is_none(),
+        "public-to-private committed before POST reply but target leaked: {json}",
+    );
+
+    sqlx::query("DELETE FROM governance_proposals WHERE applicant_account_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("clean proof proposal");
+    sqlx::query("DELETE FROM domain_edges WHERE source_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("clean proof Faden");
+    sqlx::query("DELETE FROM domain_nodes WHERE id=$1")
+        .bind(target)
+        .execute(&pool)
+        .await
+        .expect("clean proof target");
+    sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("clean proof actor");
+}
+
 #[tokio::test]
 #[serial]
 #[ignore = "requires an isolated DATABASE_URL"]
