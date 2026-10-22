@@ -188,6 +188,43 @@ async fn finish_proposal_privacy_fence(
     Ok(response)
 }
 
+// A governance mutation has ALREADY COMMITTED when its response is built.
+// Preserve its success status even if post-commit privacy checks are unavailable.
+// On success, the canonical read is fenced through complete JSON construction;
+// on failure, suppress both target fields rather than leaking stale metadata.
+async fn committed_proposal_response(
+    pool: &PgPool,
+    mut proposal: ProposalWithCounts,
+    status: StatusCode,
+    now: DateTime<Utc>,
+) -> Response {
+    if proposal.target_node_id.is_some() || proposal.target_node_title.is_some() {
+        let checked: Result<Response, ApiError> = async {
+            let (_slot, visibility_tx) = begin_proposal_privacy_fence(pool).await?;
+            let current = governance::get_proposal(pool, &proposal.id)
+                .await
+                .map_err(internal_error("get_proposal_after_mutation"))?
+                .ok_or_else(proposal_privacy_unavailable)?;
+            let response =
+                (status, private_no_store_json(proposal_view(current, now))).into_response();
+            finish_proposal_privacy_fence(visibility_tx, response).await
+        }
+        .await;
+        match checked {
+            Ok(response) => return response,
+            Err((error_status, _)) => {
+                tracing::warn!(
+                    %error_status,
+                    "Post-commit proposal privacy snapshot unavailable; returning successful redacted mutation result"
+                );
+                proposal.target_node_id = None;
+                proposal.target_node_title = None;
+            }
+        }
+    }
+    (status, private_no_store_json(proposal_view(proposal, now))).into_response()
+}
+
 fn require_account_id(auth: &AuthContext) -> Result<String, ApiError> {
     if !auth.authenticated {
         return Err((
@@ -404,7 +441,7 @@ pub async fn governance_testing_advance_proposal(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(payload): Json<GovernanceTestingAdvancePayload>,
-) -> Result<Json<ProposalView>, ApiError> {
+) -> Result<Response, ApiError> {
     let pool = require_pool(&state)?;
     let before = governance::get_proposal(pool, &id)
         .await
@@ -429,7 +466,7 @@ pub async fn governance_testing_advance_proposal(
         .await
         .map_err(internal_error("get_proposal"))?
         .ok_or((StatusCode::NOT_FOUND, "proposal not found".to_string()))?;
-    Ok(Json(proposal_view(after, payload.now)))
+    Ok(committed_proposal_response(pool, after, StatusCode::OK, payload.now).await)
 }
 
 /// GET /proposals — öffentliche Liste, neueste zuerst.
@@ -668,27 +705,7 @@ pub async fn create_proposal(
         "Governance proposal created"
     );
 
-    let now = Utc::now();
-    // The proposal has already committed, and its Faden may have performed
-    // additional writes. Acquire the existing DB generation-row privacy fence
-    // only NOW, never while our own transaction or Faden writer is active.
-    // Creation's original target snapshot may no longer be publicly visible:
-    // re-read the canonical, visibility-masked proposal under the same fence
-    // kept through completed HTTP JSON construction.
-    if proposal.target_node_id.is_some() {
-        let (_slot, visibility_tx) = begin_proposal_privacy_fence(pool).await?;
-        let current = governance::get_proposal(pool, &proposal.id)
-            .await
-            .map_err(internal_error("get_proposal_after_create"))?
-            .ok_or_else(proposal_privacy_unavailable)?;
-        let response = (
-            StatusCode::CREATED,
-            private_no_store_json(proposal_view(current, now)),
-        )
-            .into_response();
-        return finish_proposal_privacy_fence(visibility_tx, response).await;
-    }
-    Ok((StatusCode::CREATED, Json(proposal_view(proposal, now))).into_response())
+    Ok(committed_proposal_response(pool, proposal, StatusCode::CREATED, Utc::now()).await)
 }
 
 /// POST /proposals/{id}/withdraw — der Antragsteller beendet das eigene offene
@@ -697,7 +714,7 @@ pub async fn withdraw_proposal(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<String>,
-) -> Result<Json<ProposalView>, ApiError> {
+) -> Result<Response, ApiError> {
     let account_id = require_account_id(&auth)?;
     let pool = require_pool(&state)?;
     let proposal = governance::withdraw_proposal(pool, &id, &account_id, Utc::now())
@@ -729,7 +746,7 @@ pub async fn withdraw_proposal(
         applicant_account_id = %account_id,
         "Governance proposal withdrawn"
     );
-    Ok(Json(proposal_view(proposal, Utc::now())))
+    Ok(committed_proposal_response(pool, proposal, StatusCode::OK, Utc::now()).await)
 }
 
 /// POST /proposals/{id}/repeal — eröffnet einen neuen Sachantrag, der einen
@@ -739,7 +756,7 @@ pub async fn request_repeal(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<String>,
     Json(payload): Json<Value>,
-) -> Result<(StatusCode, Json<ProposalView>), ApiError> {
+) -> Result<Response, ApiError> {
     let account_id = require_formal_governance_actor(&auth)?;
     let pool = require_pool(&state)?;
     let object = payload
@@ -821,10 +838,7 @@ pub async fn request_repeal(
         applicant_account_id = %account_id,
         "Governance repeal proposal created"
     );
-    Ok((
-        StatusCode::CREATED,
-        Json(proposal_view(proposal, Utc::now())),
-    ))
+    Ok(committed_proposal_response(pool, proposal, StatusCode::CREATED, Utc::now()).await)
 }
 
 /// POST /proposals/{id}/veto — begründetes Veto eines angemeldeten Accounts.
@@ -1199,6 +1213,51 @@ mod tests {
     };
     use axum::http::header;
     use chrono::{Duration, Utc};
+
+    #[tokio::test]
+    async fn committed_mutation_privacy_failure_preserves_success_and_redacts_target() {
+        use axum::{body::to_bytes, http::StatusCode};
+        use sqlx::postgres::PgPoolOptions;
+        use std::time::Duration as StdDuration;
+
+        // Never connect to any real database: the pool is intentionally lazy
+        // and points at a non-listening loopback port. The irreversible write
+        // has already happened in the scenario this helper serves.
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(StdDuration::from_millis(200))
+            .connect_lazy("postgresql://synthetic:synthetic@127.0.0.1:1/weltgewebe_postcommit_test")
+            .expect("synthetic connection options");
+        for status in [StatusCode::CREATED, StatusCode::OK] {
+            let mut proposal =
+                proposal_entry(ProposalStatus::Consent, "proof-owner", None, false).proposal;
+            proposal.target_node_id = Some("now-private-target".to_string());
+            proposal.target_node_title = Some("Must never be published".to_string());
+            let response =
+                super::committed_proposal_response(&pool, proposal, status, Utc::now()).await;
+            assert_eq!(
+                response.status(),
+                status,
+                "durable mutation must not return 503"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store")
+            );
+            let body: serde_json::Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body"),
+            )
+            .expect("JSON");
+            assert!(body.get("target_node_id").is_none(), "{body}");
+            assert!(body.get("target_node_title").is_none(), "{body}");
+            assert_eq!(body["kind"], "sachantrag");
+        }
+        pool.close().await;
+    }
 
     fn proposal_entry(
         status: ProposalStatus,
