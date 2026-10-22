@@ -1275,7 +1275,17 @@ async fn public_proposal_http_read_fences_target_visibility_through_response() {
         routes::governance::{get_proposal, list_proposals},
     };
 
-    let pool = prepare_pool().await;
+    // A previous failed isolated run can have left a proposal referencing
+    // this fixture node. Clear only our own proposal before generic rp-* cleanup.
+    let pool = direct_pool().await;
+    run_migrations(&pool).await;
+    sqlx::query(
+        "DELETE FROM governance_proposals WHERE applicant_account_id = 'rp-proposal-fence-author'",
+    )
+    .execute(&pool)
+    .await
+    .expect("clean any previous failed proposal proof");
+    clean(&pool).await;
     let account = "rp-proposal-fence-author";
     let target = "rp-proposal-fence-target";
     sqlx::query(
@@ -1387,6 +1397,39 @@ async fn public_proposal_http_read_fences_target_visibility_through_response() {
             .execute(&other_pool)
             .await
         });
+        // Do not treat slow scheduling/connection setup as proof of privacy.
+        // Observe a real PostgreSQL lock wait from THIS node writer, blocked
+        // by a backend that holds RowShareLock on the generation singleton.
+        let mut writer_blocked_on_privacy_fence = false;
+        for _ in 0..150 {
+            if writer.is_finished() {
+                break;
+            }
+            let waiting: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM pg_stat_activity writer
+                   WHERE writer.datname = current_database()
+                     AND writer.wait_event_type = 'Lock'
+                     AND writer.query LIKE 'UPDATE domain_nodes SET search_visibility = %'
+                     AND EXISTS (
+                         SELECT 1 FROM pg_locks guard
+                         WHERE guard.pid = ANY(pg_blocking_pids(writer.pid))
+                           AND guard.relation = 'domain_projection_state'::regclass
+                           AND guard.mode = 'RowShareLock' AND guard.granted
+                     )"#,
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("inspect exact blocked privacy writer");
+            if waiting > 0 {
+                writer_blocked_on_privacy_fence = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            writer_blocked_on_privacy_fence,
+            "independent writer did not wait on the in-flight proposal generation fence at {path}",
+        );
         assert!(
             timeout(Duration::from_millis(300), &mut writer)
                 .await
