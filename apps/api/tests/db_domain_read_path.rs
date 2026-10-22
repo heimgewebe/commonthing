@@ -870,6 +870,163 @@ async fn untyped_account_edge_collision_with_unprojected_node_is_hidden() {
     clean(&pool).await;
 }
 
+// A real PostgreSQL + HTTP middleware proof for the two search aliases.
+// The handler simulates SQL candidate selection followed by slow ranking; it
+// does not pretend to cover Ollama embedding, exact search ranking, or E2E UI.
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn search_aliases_fence_sql_candidates_until_http_response() {
+    use axum::{middleware::from_fn_with_state, routing::get, Json};
+    use tokio::{
+        sync::{oneshot, Notify},
+        time::{sleep, timeout, Duration},
+    };
+    use weltgewebe_api::middleware::domain_projection::ensure_current_domain_projection;
+
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES ('rp-search-fence','place','Private Search Marker',53.6,10.0,'{}'::jsonb,'public')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed public searchable node");
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("load public projection");
+
+    for path in ["/search", "/nodes/search"] {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = Router::new()
+            .route(
+                path,
+                get({
+                    let pool = pool.clone();
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    move || {
+                        let pool = pool.clone();
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        async move {
+                            // Match the real search's canonical SQL visibility
+                            // check before its subsequent response construction.
+                            let title: String = sqlx::query_scalar(
+                                "SELECT title FROM domain_nodes
+                                 WHERE id='rp-search-fence' AND search_visibility='public'",
+                            )
+                            .fetch_one(&pool)
+                            .await
+                            .expect("read still-public SQL search candidate");
+                            entered.notify_one();
+                            release.notified().await; // simulated slow ranking
+                            Json(serde_json::json!({"title": title}))
+                        }
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                state.clone(),
+                ensure_current_domain_projection,
+            ))
+            .with_state(state.clone());
+
+        let reader = tokio::spawn(async move {
+            app.oneshot(Request::get(path).body(body::Body::empty()).unwrap())
+                .await
+                .expect("search HTTP response")
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("search selected SQL candidate before visibility commit");
+
+        let other_pool = direct_pool().await;
+        let (pid_tx, pid_rx) = oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let mut connection = other_pool
+                .acquire()
+                .await
+                .expect("separate writer connection");
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("writer PID");
+            pid_tx.send(pid).expect("send writer PID");
+            sqlx::query(
+                "UPDATE domain_nodes SET search_visibility='private'
+                 WHERE id='rp-search-fence'",
+            )
+            .execute(&mut *connection)
+            .await
+            .expect("cross-process private commit");
+        });
+        let writer_pid = timeout(Duration::from_secs(3), pid_rx)
+            .await
+            .expect("writer connection ready")
+            .expect("writer PID available");
+        // A mere delay could be falsely green on a slow CI runner: demand
+        // the real PostgreSQL blocking PID while the HTTP response is held.
+        let blockers = timeout(Duration::from_secs(4), async {
+            loop {
+                let blocker_pids: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+                    .bind(writer_pid)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read actual PostgreSQL lock blockers");
+                if !blocker_pids.is_empty() {
+                    break blocker_pids;
+                }
+                assert!(
+                    !writer.is_finished(),
+                    "private commit overtook search response on {path}"
+                );
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("writer must wait for held HTTP privacy fence");
+        assert!(
+            !blockers.is_empty(),
+            "actual PostgreSQL lock wait on {path}"
+        );
+
+        release.notify_one();
+        let response = timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("complete held search response")
+            .expect("search handler task");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(
+            &body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("search JSON bytes"),
+        )
+        .expect("parse search JSON");
+        assert_eq!(json["title"], "Private Search Marker");
+        timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("private commit after search reply")
+            .expect("writer task");
+
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility='public'
+             WHERE id='rp-search-fence'",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset public synthetic node for next alias");
+        state
+            .refresh_domain_projection_if_stale()
+            .await
+            .expect("refresh reset search visibility");
+    }
+    clean(&pool).await;
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated DATABASE_URL"]
 #[serial]

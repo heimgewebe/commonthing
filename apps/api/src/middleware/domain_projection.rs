@@ -24,14 +24,15 @@ use crate::{
     state::ApiState,
 };
 
-// Only fixed-size domain JSON reads get the cross-process database fence.
-// The search endpoint already authorizes against domain_nodes in its SQL query.
+// Privacy-sensitive JSON reads need the cross-process fence through response
+// construction. Search SQL checks visibility but not subsequent ranking/JSON.
 // Mutations MUST NOT hold a shared fence while their own transactions update
 // domain_projection_state, or they would deadlock themselves.
 fn privacy_sensitive_domain_path(path: &str) -> bool {
     let path = path.strip_prefix("/api").unwrap_or(path);
     [
         "/nodes",
+        "/search",
         "/edges",
         "/accounts",
         "/conversations",
@@ -51,15 +52,16 @@ fn requires_database_privacy_fence(method: &Method, path: &str) -> bool {
     // just like PATCH /accounts/me/profile does before a domain_accounts UPDATE.
     // A PG shared generation row lock acquired here before accounts_persist
     // would invert that order and deadlock with a simultaneous profile PATCH.
-    if path == "/accounts/me/profile" || path == "/nodes/search" {
+    if path == "/accounts/me/profile" {
         return false;
     }
     // Other unlisted domain views read canonical PostgreSQL directly.
     // Governance GETs explicitly hold a response-lifetime fence inside their
     // handlers AFTER due-proposal finalization; finalization itself can write.
-    // Only cache-derived node/account/edge and conversation GETs need a
-    // cross-process fence; otherwise reserve pooled connections for writers.
-    ["/nodes", "/edges", "/accounts", "/conversations"]
+    // Search also needs a fence: its canonical SQL filters candidates, but
+    // another process can revoke them before ranking and JSON construction.
+    // Otherwise reserve pooled connections for writers.
+    ["/nodes", "/search", "/edges", "/accounts", "/conversations"]
         .iter()
         .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
@@ -442,6 +444,10 @@ mod tests {
             "/edges/id",
             "/api/accounts/account",
             "/api/conversations/id/messages",
+            "/search",
+            "/api/search",
+            "/nodes/search",
+            "/api/nodes/search",
         ] {
             assert!(
                 requires_database_privacy_fence(&Method::GET, path),
@@ -466,13 +472,10 @@ mod tests {
         for path in [
             "/health/ready",
             "/api/version",
-            "/api/search",
             "/auth/me",
             "/api/proposals/id",
             "/accounts/me/profile",
             "/api/accounts/me/profile",
-            "/nodes/search",
-            "/api/nodes/search",
             "/ortswebereien",
             "/api/webgemeindezentren/id",
         ] {
@@ -488,7 +491,6 @@ mod tests {
         for path in [
             "/accounts/me/profile",
             "/api/accounts/me/profile",
-            "/api/nodes/search",
             "/api/ortswebereien",
             "/api/webgemeindezentren/id",
         ] {
@@ -516,6 +518,10 @@ mod tests {
             "/nodes/private",
             "/api/nodes",
             "/api/nodes/private",
+            "/search",
+            "/api/search",
+            "/nodes/search",
+            "/api/nodes/search",
             "/edges",
             "/api/edges/edge-id",
             "/accounts/account-id",
