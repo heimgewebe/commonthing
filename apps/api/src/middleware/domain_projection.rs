@@ -55,6 +55,8 @@ fn requires_database_privacy_fence(method: &Method, path: &str) -> bool {
         return false;
     }
     // Other unlisted domain views read canonical PostgreSQL directly.
+    // Governance GETs explicitly hold a response-lifetime fence inside their
+    // handlers AFTER due-proposal finalization; finalization itself can write.
     // Only cache-derived node/account/edge and conversation GETs need a
     // cross-process fence; otherwise reserve pooled connections for writers.
     ["/nodes", "/edges", "/accounts", "/conversations"]
@@ -110,7 +112,7 @@ where
 // Only the transaction-held PostgreSQL row lock can exclude visibility commits
 // by OTHER API processes. A process-local RwLock or a second generation query
 // after the handler cannot close the check-to-response race.
-async fn begin_fenced_generation(
+pub(crate) async fn begin_fenced_generation(
     pool: &PgPool,
 ) -> anyhow::Result<(Transaction<'static, Postgres>, i64)> {
     let mut tx = pool.begin().await?;

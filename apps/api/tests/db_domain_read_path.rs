@@ -1261,3 +1261,187 @@ async fn authenticated_role_is_revalidated_after_post_session_projection_refresh
     );
     clean(&pool).await;
 }
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires an isolated DATABASE_URL"]
+async fn public_proposal_http_read_fences_target_visibility_through_response() {
+    use axum::{routing::get, Extension};
+    use tokio::time::{sleep, timeout, Duration};
+    use weltgewebe_api::{
+        auth::role::Role,
+        governance::create_sach_proposal,
+        middleware::auth::AuthContext,
+        routes::governance::{get_proposal, list_proposals},
+    };
+
+    let pool = prepare_pool().await;
+    let account = "rp-proposal-fence-author";
+    let target = "rp-proposal-fence-target";
+    sqlx::query(
+        "INSERT INTO domain_accounts \
+         (id, kind, title, map_state, radius_m, disabled, role, public_payload, private_payload) \
+         VALUES ($1, 'garnrolle', 'Proof author', 'not_on_map', 0, FALSE, 'weber', '{}', '{}')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("seed proposal author");
+    sqlx::query(
+        "INSERT INTO domain_nodes \
+         (id, kind, title, lat, lon, payload, search_visibility) \
+         VALUES ($1, 'place', 'Private-after-commit target', 53.5, 9.9, '{}'::jsonb, 'public')",
+    )
+    .bind(target)
+    .execute(&pool)
+    .await
+    .expect("seed public proposal target");
+    let proposal = create_sach_proposal(
+        &pool,
+        account,
+        "Proof author",
+        "Visibility fence",
+        None,
+        Some(target),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("create proposal referencing public target");
+
+    // The actual Governance HTTP handlers run with a deliberately anonymous
+    // authentication context. No test-only middleware is allowed to supply the
+    // visibility fence that production handlers must own after finalize_due.
+    let app = Router::new()
+        .route("/proposals", get(list_proposals))
+        .route("/proposals/{id}", get(get_proposal))
+        .with_state(postgres_bbox_route_state(pool.clone()))
+        .layer(Extension(AuthContext {
+            authenticated: false,
+            account_id: None,
+            device_id: None,
+            role: Role::Gast,
+            expires_at: None,
+        }));
+
+    for path in [
+        format!("/proposals/{}", proposal.id),
+        "/proposals".to_string(),
+    ] {
+        sqlx::query("UPDATE domain_nodes SET search_visibility = 'public' WHERE id = $1")
+            .bind(target)
+            .execute(&pool)
+            .await
+            .expect("regrant public fixture");
+
+        // Block the proposal SELECT on its veto-count subquery. This creates
+        // an observable interval during response construction without any
+        // synthetic pause or production-only instrumentation.
+        let mut blocker = pool.begin().await.expect("begin veto table blocker");
+        sqlx::query("LOCK TABLE governance_vetoes IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .expect("hold unrelated veto read until test releases it");
+
+        let request = tokio::spawn({
+            let app = app.clone();
+            let path = path.clone();
+            async move {
+                app.oneshot(Request::get(path).body(body::Body::empty()).unwrap())
+                    .await
+                    .expect("public proposal HTTP response")
+            }
+        });
+
+        let mut blocked_select_seen = false;
+        for _ in 0..150 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks \
+                 WHERE relation = 'governance_vetoes'::regclass AND NOT granted",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("observe real PostgreSQL query waiter");
+            if waiting > 0 {
+                blocked_select_seen = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            blocked_select_seen,
+            "real HTTP proposal query never reached veto table"
+        );
+        assert!(
+            !request.is_finished(),
+            "request must be in flight before privacy mutation"
+        );
+
+        // An independent PgPool (no Tokio/cache sharing) commits the canonical
+        // privacy change. It may not overtake the in-flight public response.
+        let other_pool = direct_pool().await;
+        let mut writer = tokio::spawn(async move {
+            sqlx::query(
+                "UPDATE domain_nodes SET search_visibility = 'private' \
+                 WHERE id = 'rp-proposal-fence-target'",
+            )
+            .execute(&other_pool)
+            .await
+        });
+        assert!(
+            timeout(Duration::from_millis(300), &mut writer)
+                .await
+                .is_err(),
+            "public-to-private DB commit overtook the in-flight proposal response on {path}",
+        );
+        blocker
+            .rollback()
+            .await
+            .expect("release veto table blocker");
+        let initial = timeout(Duration::from_secs(7), request)
+            .await
+            .expect("public response finished")
+            .expect("public HTTP task");
+        assert_eq!(initial.status(), axum::http::StatusCode::OK);
+        let initial_bytes = body::to_bytes(initial.into_body(), usize::MAX)
+            .await
+            .expect("serialize public response");
+        let initial_body: serde_json::Value =
+            serde_json::from_slice(&initial_bytes).expect("decode public proposal JSON");
+        assert!(
+            initial_body.to_string().contains(target),
+            "public target must be present before private commit at {path}",
+        );
+        timeout(Duration::from_secs(7), writer)
+            .await
+            .expect("privacy writer completes after read fence drops")
+            .expect("privacy writer task")
+            .expect("privacy writer commit");
+
+        let private = app
+            .clone()
+            .oneshot(
+                Request::get(path.clone())
+                    .body(body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("private proposal HTTP response");
+        assert_eq!(private.status(), axum::http::StatusCode::OK);
+        let private_bytes = body::to_bytes(private.into_body(), usize::MAX)
+            .await
+            .expect("serialize private response");
+        let private_body: serde_json::Value =
+            serde_json::from_slice(&private_bytes).expect("decode private proposal JSON");
+        assert!(
+            !private_body.to_string().contains(target),
+            "private target ID leaked in later HTTP proposal response at {path}",
+        );
+    }
+
+    sqlx::query("DELETE FROM governance_proposals WHERE id = $1::uuid")
+        .bind(&proposal.id)
+        .execute(&pool)
+        .await
+        .expect("clean proposal fixture before deleting target");
+    clean(&pool).await;
+}
