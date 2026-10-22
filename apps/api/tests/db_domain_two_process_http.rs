@@ -2,6 +2,8 @@
 //!
 //! This is deliberately NOT two Axum routers in one process. It starts the
 //! actual production API binary twice, with separate process-local node caches.
+//! This checks post-commit cache coherence, not concurrent GET/write overlap;
+//! in-flight exclusion is proved separately in db_domain_read_path tests.
 //! Run only against a disposable direct PostgreSQL DATABASE_URL via the
 //! existing run-postgres-integration-proofs.sh reset/guard contract.
 
@@ -142,8 +144,6 @@ async fn committed_visibility_is_coherent_across_two_real_http_api_processes() -
 
     let temp = tempfile::tempdir()?;
     let first = free_loopback_port()?;
-    let second = free_loopback_port()?;
-    anyhow::ensure!(first != second, "API child ports must be distinct");
     let mut children = ApiChildren(Vec::new());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(7))
@@ -151,6 +151,10 @@ async fn committed_visibility_is_coherent_across_two_real_http_api_processes() -
 
     start_api(&mut children, &temp.path().join("first"), &db_url, first)?;
     wait_for_listener(&mut children, first, &client).await?;
+    // First is now bound by a live API process, so the kernel cannot recycle
+    // its port when selecting the independent second process listener.
+    let second = free_loopback_port()?;
+    anyhow::ensure!(first != second, "API child ports must be distinct");
     start_api(&mut children, &temp.path().join("second"), &db_url, second)?;
     wait_for_listener(&mut children, second, &client).await?;
     anyhow::ensure!(
