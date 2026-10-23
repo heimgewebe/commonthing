@@ -123,6 +123,13 @@ if [[ "${SIMULATE_PROOF_SSH_FAILURE:-0}" == 1 && "$cmd" == *' proof-state '* ]];
   printf 'ssh: connection reset\n' >&2
   exit 255
 fi
+# Return deliberately corrupted metadata only after the privileged latest
+# selector has validated the real upstream manifest. This covers the local
+# consumer guard instead of merely retesting the upstream reader.
+if [[ -n "${INJECT_AGE_MANIFEST_FROM:-}" && "$cmd" == *" read "* && "$cmd" == *"'age-manifest'" ]]; then
+  cat -- "$INJECT_AGE_MANIFEST_FROM"
+  exit 0
+fi
 # Simulates another writer (e.g. a legacy pull) dropping plaintext while this
 # pull is still transferring.
 if [[ -n "${INJECT_PLAINTEXT_DURING_CAT:-}" && "$cmd" == *' read '* ]]; then
@@ -178,17 +185,43 @@ PULL_MAX_BACKUP_AGE_HOURS=1 expect_pull_failure "$root/stale-age" 'encrypted bac
 # override this only for other historical-replay regression scenarios.
 if env -u PULL_MAX_BACKUP_AGE_HOURS PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_READER=1 \
   REMOTE_HOST=test-host REMOTE_BACKUP_READER="$reader" DEST_DIR="$root/stale-default" \
-  PULL_AGE_RECIPIENTS_FILE="$pinned" scripts/ops/pull-production-postgres-backup.sh > /dev/null 2> "$root/stale-default.stderr"; then
+  PULL_AGE_RECIPIENTS_FILE="$pinned" "$REPO_ROOT/scripts/ops/pull-production-postgres-backup.sh" > /dev/null 2> "$root/stale-default.stderr"; then
   echo 'default freshness limit accepted a months-old encrypted backup' >&2
   exit 1
 fi
 grep -qF 'encrypted backup is too old' "$root/stale-default.stderr"
 [[ ! -e "$root/stale-default/latest-pull.receipt" ]]
+if compgen -G "$root/stale-default/weltgewebe-postgres-*" > /dev/null; then
+  echo 'stale default pull must not promote any encrypted artefact' >&2
+  exit 1
+fi
 if PULL_MAX_BACKUP_AGE_HOURS=broken pull "$root/bad-age-limit" test-host > /dev/null 2> "$root/bad-age-limit.stderr"; then
   echo 'invalid offhost freshness limit must fail closed' >&2
   exit 1
 fi
 grep -qF 'PULL_MAX_BACKUP_AGE_HOURS must be a positive integer' "$root/bad-age-limit.stderr"
+
+# Negative producer-metadata cases test the consumer's own guard even though
+# the root reader independently validates the upstream latest selector.
+sed '/^created_at=/d' "$remote/$age_manifest" > "$root/age-date-missing.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-missing.manifest" \
+  expect_pull_failure "$root/age-date-missing" 'encrypted backup created_at is missing or duplicated'
+cp "$remote/$age_manifest" "$root/age-date-duplicated.manifest"
+printf 'created_at=2026-07-12T04:00:00Z\n' >> "$root/age-date-duplicated.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-duplicated.manifest" \
+  expect_pull_failure "$root/age-date-duplicated" 'encrypted backup created_at is missing or duplicated'
+sed 's/^created_at=.*/created_at=2026-07-12T04:00:00+00:00/' \
+  "$remote/$age_manifest" > "$root/age-date-offset.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-offset.manifest" \
+  expect_pull_failure "$root/age-date-offset" 'encrypted backup created_at is not canonical UTC'
+sed 's/^created_at=.*/created_at=2026-02-30T00:00:00Z/' \
+  "$remote/$age_manifest" > "$root/age-date-invalid.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-invalid.manifest" \
+  expect_pull_failure "$root/age-date-invalid" 'encrypted backup created_at is invalid UTC'
+sed 's/^created_at=.*/created_at=2035-01-01T00:00:00Z/' \
+  "$remote/$age_manifest" > "$root/age-date-future.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-future.manifest" \
+  expect_pull_failure "$root/age-date-future" 'encrypted backup created_at is in the future'
 
 # A sudo rule that does not grant the reader must surface as such, not as an
 # empty backup listing.
