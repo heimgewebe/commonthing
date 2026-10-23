@@ -85,7 +85,7 @@ case "$operation" in
       )" || fail "encrypted backup manifest has missing or duplicate created_at"
       [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
         fail "encrypted backup manifest created_at is not canonical UTC"
-      normalized="$(date -u -d "$created_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" ||
+      normalized="$(date -u -d "$created_at" +%Y-%m-%dT%H:%M:%SZ 2> /dev/null)" ||
         fail "encrypted backup manifest created_at is invalid UTC"
       [[ "$normalized" == "$created_at" ]] ||
         fail "encrypted backup manifest created_at is not canonical UTC"
