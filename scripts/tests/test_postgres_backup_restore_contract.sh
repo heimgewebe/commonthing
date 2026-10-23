@@ -340,6 +340,95 @@ if BACKUP_FILE="$backup_file" \
   exit 1
 fi
 
+# Weekly proof must select by completion-manifest created_at, never by
+# the lexically highest manual BACKUP_LABEL. This test never uses real Docker.
+weekly_dir="$TEMP_DIR/weekly-selector"
+weekly_bin="$weekly_dir/bin"
+weekly_backups="$weekly_dir/backups"
+weekly_selected="$weekly_dir/selected"
+mkdir -p "$weekly_bin" "$weekly_backups" "$weekly_dir/proofs"
+cp "$REPO_ROOT/scripts/ops/postgres-restore-latest-proof.sh" "$weekly_bin/postgres-restore-latest-proof.sh"
+cat > "$weekly_bin/docker" << 'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  run) printf 'synthetic-disposable-container\n' ;;
+  exec) [[ "$3" == pg_isready ]] ;;
+  rm) exit 0 ;;
+  *) echo "mock docker: unsupported operation $1" >&2; exit 1 ;;
+esac
+SH
+cat > "$weekly_bin/postgres-restore-proof.sh" << 'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -f "$BACKUP_FILE" && -f "$BACKUP_MANIFEST" ]] || exit 4
+basename "$BACKUP_FILE" > "$WEEKLY_SELECTED_LOG"
+SH
+chmod 755 "$weekly_bin/docker" "$weekly_bin/postgres-restore-proof.sh"
+daily_base=weltgewebe-postgres-20260801T040000Z
+manual_base=weltgewebe-postgres-pre-upgrade
+for weekly_base in "$daily_base" "$manual_base"; do
+  printf 'synthetic dump\n' > "$weekly_backups/$weekly_base.sql.gz"
+done
+weekly_manifest() {
+  local label="$1" stamp="$2"
+  printf 'contract=weltgewebe-postgres-backup-v1\ncreated_at=%s\nfile=%s.sql.gz\nsha256=%064d\n' \
+    "$stamp" "$label" 0 > "$weekly_backups/$label.sha256.manifest"
+}
+weekly_run() {
+  WEEKLY_SELECTED_LOG="$weekly_selected" \
+    PATH="$weekly_bin:$PATH" BACKUP_DIR="$weekly_backups" \
+    BACKUP_PREFIX=weltgewebe-postgres RESTORE_PROOF_DIR="$weekly_dir/proofs" \
+    bash "$weekly_bin/postgres-restore-latest-proof.sh" > /dev/null
+}
+weekly_manifest "$daily_base" 2026-08-01T04:00:00Z
+weekly_manifest "$manual_base" 2026-07-31T04:00:00Z
+# The encrypted completion marker is NOT a plaintext restore candidate.
+printf 'created_at=2999-01-01T00:00:00Z\n' > "$weekly_backups/$manual_base.age.sha256.manifest"
+weekly_run
+if [[ "$(cat "$weekly_selected")" != "$daily_base.sql.gz" ]]; then
+  echo "weekly restore selected stale manual label instead of daily created_at" >&2
+  exit 1
+fi
+weekly_manifest "$manual_base" 2026-08-02T04:00:00Z
+weekly_run
+[[ "$(cat "$weekly_selected")" == "$manual_base.sql.gz" ]] || {
+  echo "weekly restore ignored actually newer manual backup" >&2
+  exit 1
+}
+weekly_manifest "$manual_base" 2026-02-30T04:00:00Z
+if weekly_run > /dev/null 2> "$weekly_dir/error"; then
+  echo "weekly restore accepted impossible calendar date" >&2
+  exit 1
+fi
+grep -q 'invalid UTC' "$weekly_dir/error"
+weekly_manifest "$manual_base" 2999-01-01T04:00:00Z
+if weekly_run > /dev/null 2> "$weekly_dir/error"; then
+  echo "weekly restore accepted future timestamp" >&2
+  exit 1
+fi
+grep -q 'in the future' "$weekly_dir/error"
+printf 'contract=weltgewebe-postgres-backup-v1\ncreated_at=2026-07-31T04:00:00Z\ncreated_at=2026-08-02T04:00:00Z\nfile=%s.sql.gz\n' \
+  "$manual_base" > "$weekly_backups/$manual_base.sha256.manifest"
+if weekly_run > /dev/null 2> "$weekly_dir/error"; then
+  echo "weekly restore accepted duplicate created_at" >&2
+  exit 1
+fi
+grep -q 'missing or duplicate' "$weekly_dir/error"
+weekly_manifest "$manual_base" 2026-07-31T04:00:00Z
+mv "$weekly_backups/$manual_base.sql.gz" "$weekly_dir/orphan.sql.gz"
+if weekly_run > /dev/null 2> "$weekly_dir/error"; then
+  echo "weekly restore accepted a manifest with missing dump" >&2
+  exit 1
+fi
+grep -q 'incomplete backup pair' "$weekly_dir/error"
+mv "$weekly_dir/orphan.sql.gz" "$weekly_backups/$manual_base.sql.gz"
+weekly_run
+[[ "$(cat "$weekly_selected")" == "$daily_base.sql.gz" ]] || {
+  echo "weekly restore failed after correcting invalid manifest" >&2
+  exit 1
+}
+
 if ((REAL_AGE == 1)); then
   echo "PASS: postgres backup and restore-proof contract (real age round trip)"
 else
