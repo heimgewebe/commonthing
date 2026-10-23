@@ -95,6 +95,22 @@ done
 SH
   chmod +x "$MOCK_BIN/age"
 fi
+# df wrapper: real df unless MOCK_DF_AVAILABLE_KIB lists the "Available" KiB
+# for each successive call (comma separated; the last value repeats).
+REAL_DF="$(command -v df)"
+cat > "$MOCK_BIN/df" << SH
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -n "\${MOCK_DF_AVAILABLE_KIB:-}" ]] || exec "$REAL_DF" "\$@"
+counter="\${MOCK_DF_COUNTER_FILE:?}"
+n="\$(cat "\$counter" 2> /dev/null || echo 0)"
+printf '%s\n' "\$((n + 1))" > "\$counter"
+IFS=, read -r -a values <<< "\$MOCK_DF_AVAILABLE_KIB"
+((n < \${#values[@]})) || n=\$((\${#values[@]} - 1))
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'mock 999999999 1 %s 1%% /\n' "\${values[n]}"
+SH
+chmod +x "$MOCK_BIN/df"
 RECIPIENTS_FILE="$TEMP_DIR/age-recipients.txt"
 printf '# public offline-backup recipient\n\n%s\n' "$AGE_RECIPIENT" > "$RECIPIENTS_FILE"
 
@@ -171,6 +187,37 @@ BACKUP_MIN_FREE_KIB=999999999999 INJECT_BACKUP_COLLISION="$TEMP_DIR/disk-guard-p
   echo 'low free disk space reached pg_dump despite preflight' >&2
   exit 1
 }
+
+# The preflight budgets the next plaintext + ciphertext from the largest
+# previous dump (factor 2.5) on top of the reserve, before pg_dump runs.
+# A sparse 4096 KiB prior dump needs 1000 + 10240 KiB; 11000 KiB is too little.
+mkdir -p "$BACKUP_DIR"
+truncate -s 4M "$BACKUP_DIR/weltgewebe-postgres-sizing-prior.sql.gz"
+rm -f "$TEMP_DIR/df-count"
+BACKUP_MIN_FREE_KIB=1000 MOCK_DF_AVAILABLE_KIB=11000 MOCK_DF_COUNTER_FILE="$TEMP_DIR/df-count" \
+  INJECT_BACKUP_COLLISION="$TEMP_DIR/size-guard-pg-dump-ran" \
+  expect_backup_failure size-estimate "$RECIPIENTS_FILE" \
+  'insufficient free backup disk space: 11000KiB available, 11240KiB required'
+[[ ! -e "$TEMP_DIR/size-guard-pg-dump-ran" ]] || {
+  echo 'size-aware preflight let pg_dump run without room for the next backup' >&2
+  exit 1
+}
+rm -f "$BACKUP_DIR/weltgewebe-postgres-sizing-prior.sql.gz"
+
+# Capacity is verified again before encryption. Too little room for the
+# ciphertext fails the run but keeps the already published local recovery pair.
+rm -f "$TEMP_DIR/df-count"
+BACKUP_MIN_FREE_KIB=1000 MOCK_DF_AVAILABLE_KIB=5000,1000 MOCK_DF_COUNTER_FILE="$TEMP_DIR/df-count" \
+  expect_offhost_failure_with_local_recovery pre-encrypt-capacity "$RECIPIENTS_FILE" \
+  'insufficient free backup disk space for the encrypted off-host copy'
+[[ "$(cat "$TEMP_DIR/df-count")" == 2 ]] || {
+  echo 'capacity was not re-checked exactly once before encryption' >&2
+  exit 1
+}
+rm -f "$BACKUP_DIR"/weltgewebe-postgres-pre-encrypt-capacity.*
+
+# A label ending in .age would forge an age completion-marker name.
+expect_backup_failure foo.age "$RECIPIENTS_FILE" 'BACKUP_LABEL must not end in .age'
 
 # The producer must reject unsafe filename prefixes before creating any
 # plaintext or ciphertext artefact, even with otherwise valid DB credentials.

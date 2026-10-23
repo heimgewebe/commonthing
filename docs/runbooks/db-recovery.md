@@ -93,9 +93,18 @@ Das lässt den benötigten Speicherplatz wachsen; Kapazität und Sicherungsalter
 müssen deshalb weiterhin aktiv überwacht werden. Vor `pg_dump` prüft der
 Producer deshalb mit `df -Pk` den freien Speicher im Backup-Dateisystem:
 `BACKUP_MIN_FREE_KIB` muss eine positive Ganzzahl sein (Default `4194304`,
-also 4 GiB). Fehlen verlässliche Angaben oder wird die Mindestreserve
-unterschritten, bricht dieser Lauf vor dem Dump ohne neue Sicherungsdateien
-ab; historische Recoverypunkte bleiben unverändert.
+also 4 GiB). Zusätzlich zur Reserve verlangt die Vorabprüfung Platz für
+den nächsten Lauf, geschätzt aus dem größten vorhandenen lokalen
+`*.sql.gz`: Faktor 2,5 (Klartext mit 25 % Wachstum plus Chiffrat in gleicher
+Größe). Fehlen verlässliche Angaben oder reicht der Platz nicht, bricht
+dieser Lauf vor dem Dump ohne neue Sicherungsdateien ab; historische
+Recoverypunkte bleiben unverändert. Vor der age-Verschlüsselung prüft der
+Producer erneut mit der gemessenen Dumpgröße. Reicht der Platz dann nicht,
+bleibt das bereits veröffentlichte lokale Paar (`.sql.gz` plus
+`.sha256.manifest`) erhalten, der Lauf endet mit Fehler und es entsteht kein
+age-Abschlussmarker. Platz wird nie durch automatisches Löschen geschaffen.
+Ein `BACKUP_LABEL` mit Endung `.age` wird abgelehnt, weil sein
+Klartext-Manifest sonst wie ein age-Abschlussmarker benannt wäre.
 
 **Grenze:** Diese Vorabprüfung ist weder ein Dateisystem-Quota noch eine
 atomare Reservierung. Wachsende Dumps und gleichzeitige andere Schreiber

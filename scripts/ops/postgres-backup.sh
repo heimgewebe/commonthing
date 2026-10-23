@@ -124,22 +124,41 @@ case "$BACKUP_RETENTION_DAYS" in '' | *[!0-9]*) fail "BACKUP_RETENTION_DAYS must
 install -d -m 0700 "$BACKUP_DIR"
 [[ -w "$BACKUP_DIR" ]] || fail "backup directory is not writable: $BACKUP_DIR"
 # The PostgreSQL data volume may share this filesystem. Do not start a new
-# plaintext + ciphertext backup when a conservative recovery reserve is gone.
-# This is a preflight guard, not an atomic disk quota or a retention policy.
+# plaintext + ciphertext backup that would eat into a conservative recovery
+# reserve. The next run is estimated from the largest previous local dump:
+# x1.25 growth for the plaintext plus the same again for its ciphertext
+# (factor 2.5). This is a preflight guard, not an atomic disk quota and not a
+# retention policy: nothing is ever deleted to make room.
 BACKUP_MIN_FREE_KIB="${BACKUP_MIN_FREE_KIB:-4194304}"
 [[ "$BACKUP_MIN_FREE_KIB" =~ ^[1-9][0-9]{0,11}$ ]] ||
   fail "BACKUP_MIN_FREE_KIB must be a positive integer (at most 12 digits)"
 require_cmd df
-available_kib="$(LC_ALL=C df -Pk -- "$BACKUP_DIR" | awk 'NR==2 {print $4}')"
-[[ "$available_kib" =~ ^[0-9]{1,12}$ ]] || fail "backup disk free space could not be determined"
-((available_kib >= BACKUP_MIN_FREE_KIB)) ||
-  fail "insufficient free backup disk space: ${available_kib}KiB available, ${BACKUP_MIN_FREE_KIB}KiB required"
+# Sets available_kib; fails in this shell (not a subshell) when unknown.
+read_available_kib() {
+  available_kib="$(LC_ALL=C df -Pk -- "$BACKUP_DIR" | awk 'NR==2 {print $4}')" ||
+    fail "backup disk free space could not be determined"
+  [[ "$available_kib" =~ ^[0-9]{1,15}$ ]] || fail "backup disk free space could not be determined"
+}
+previous_max_bytes="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "${BACKUP_PREFIX}-*.sql.gz" -printf '%s\n' |
+  awk 'BEGIN {max = 0} $1 > max {max = $1} END {printf "%.0f\n", max}')" ||
+  fail "previous backup size could not be determined"
+[[ "$previous_max_bytes" =~ ^[0-9]{1,18}$ ]] || fail "previous backup size could not be determined"
+previous_max_kib=$(((previous_max_bytes + 1023) / 1024))
+estimated_kib=$(((previous_max_kib * 5 + 1) / 2))
+required_kib=$((BACKUP_MIN_FREE_KIB + estimated_kib))
+read_available_kib
+((available_kib >= required_kib)) ||
+  fail "insufficient free backup disk space: ${available_kib}KiB available, ${required_kib}KiB required (reserve ${BACKUP_MIN_FREE_KIB}KiB + estimated next backup ${estimated_kib}KiB from largest previous dump ${previous_max_kib}KiB)"
 [[ "$(psql_db -Atc 'select 1' | tr -d '[:space:]')" == "1" ]] || fail "PostgreSQL health check failed"
 check_required_tables
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 label="${BACKUP_LABEL:-$timestamp}"
 case "$label" in '' | *[!A-Za-z0-9._-]*) fail "BACKUP_LABEL contains unsupported characters" ;; esac
+# A label ending in .age would make the plaintext completion manifest
+# (<base>.sha256.manifest) look like the age completion manifest of another
+# backup (<other>.age.sha256.manifest) to every *.age.sha256.manifest scan.
+case "$label" in *.age) fail "BACKUP_LABEL must not end in .age" ;; esac
 base="${BACKUP_PREFIX}-${label}"
 # The off-host reader (postgres-backup-read.sh) serves only names of this shape;
 # a backup it cannot name would make every later off-host pull fail.
@@ -194,6 +213,15 @@ printf 'PostgreSQL backup written: %s\nManifest written: %s\n' "$dump_file" "$ma
 # Its failure is explicit; no age completion manifest may be published.
 require_cmd age
 load_age_recipients "$BACKUP_AGE_RECIPIENTS_FILE"
+
+# Re-check capacity with the measured dump size before writing the ciphertext
+# (about the size of the dump plus age's per-chunk overhead), so encryption does
+# not consume the reserve. The local recovery pair above is kept either way.
+dump_kib=$(((bytes + 1023) / 1024))
+encrypt_required_kib=$((BACKUP_MIN_FREE_KIB + dump_kib + dump_kib / 1000 + 64))
+read_available_kib
+((available_kib >= encrypt_required_kib)) ||
+  fail "insufficient free backup disk space for the encrypted off-host copy: ${available_kib}KiB available, ${encrypt_required_kib}KiB required (reserve ${BACKUP_MIN_FREE_KIB}KiB + ciphertext of a ${dump_kib}KiB dump)"
 
 # Off-host artefact: ciphertext only. The plaintext dump above stays on this host.
 age "${age_recipient_args[@]}" -o "$tmp_age" "$tmp_dump" || fail "age encryption of the off-host copy failed"
