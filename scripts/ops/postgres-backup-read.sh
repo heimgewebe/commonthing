@@ -6,8 +6,8 @@
 # secure_path) nor BASH_ENV, SHELLOPTS or exported functions may choose code.
 #
 # Installed root:root 0755 as /usr/local/libexec/weltgewebe/postgres-backup-read
-# and granted to the pull account by a sudoers rule that names only this path
-# (scripts/ops/sudoers/weltgewebe-postgres-backup-read). Such a rule allows any
+# and granted to the pull account by the narrowly scoped inline sudoers rule
+# installed as documented in docs/runbooks/db-recovery.md. The rule allows any
 # argument list, so this script is the argument boundary: it accepts exactly the
 # operations below, validates every name, reads only regular files without
 # following symlinks, and has no operation that can name the plaintext dump.

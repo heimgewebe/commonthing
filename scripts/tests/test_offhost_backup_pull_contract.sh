@@ -7,6 +7,9 @@ GATE="$REPO_ROOT/scripts/ops/restic-plaintext-gate.sh"
 SERVICE_TEMPLATE="$REPO_ROOT/scripts/ops/systemd/weltgewebe-postgres-offhost-pull.service"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
+# Historic fixed-date fixtures must remain usable independently of today's date.
+# Each negative freshness test overrides this fixture-only relaxed threshold.
+export PULL_MAX_BACKUP_AGE_HOURS=87600
 remote="$root/remote"
 dest="$root/dest"
 bin="$root/bin"
@@ -167,6 +170,26 @@ expect_pull_failure() {
   fi
 }
 
+# A newer host-local plaintext dump exists above, but has no complete age
+# manifest. An old encrypted recovery point must not keep a normal pull green
+# forever. The refusal must happen before any off-host success artefact exists.
+PULL_MAX_BACKUP_AGE_HOURS=1 expect_pull_failure "$root/stale-age" 'encrypted backup is too old'
+# Unset policy in the real user unit must keep its safe default; test fixtures
+# override this only for other historical-replay regression scenarios.
+if env -u PULL_MAX_BACKUP_AGE_HOURS PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_READER=1 \
+  REMOTE_HOST=test-host REMOTE_BACKUP_READER="$reader" DEST_DIR="$root/stale-default" \
+  PULL_AGE_RECIPIENTS_FILE="$pinned" scripts/ops/pull-production-postgres-backup.sh > /dev/null 2> "$root/stale-default.stderr"; then
+  echo 'default freshness limit accepted a months-old encrypted backup' >&2
+  exit 1
+fi
+grep -qF 'encrypted backup is too old' "$root/stale-default.stderr"
+[[ ! -e "$root/stale-default/latest-pull.receipt" ]]
+if PULL_MAX_BACKUP_AGE_HOURS=broken pull "$root/bad-age-limit" test-host > /dev/null 2> "$root/bad-age-limit.stderr"; then
+  echo 'invalid offhost freshness limit must fail closed' >&2
+  exit 1
+fi
+grep -qF 'PULL_MAX_BACKUP_AGE_HOURS must be a positive integer' "$root/bad-age-limit.stderr"
+
 # A sudo rule that does not grant the reader must surface as such, not as an
 # empty backup listing.
 if SIMULATE_SUDO_DENIED=1 pull "$root/denied-reader" test-host > /dev/null 2> "$root/denied-reader.stderr"; then
@@ -280,7 +303,7 @@ grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy-abandoned.stderr"
 # Explicit migration staging must permit a ciphertext-only first transfer while
 # legacy recovery points remain untouched, without publishing an age receipt.
 stage_dest="$root/staged-age"
-PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$stage_dest" pull "$legacy_dest" test-host
+PULL_MAX_BACKUP_AGE_HOURS=1 PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$stage_dest" pull "$legacy_dest" test-host
 [[ -f "$stage_dest/$file" ]]
 [[ -f "$stage_dest/$age_manifest" ]]
 [[ -f "$stage_dest/$manifest" ]]
@@ -457,6 +480,14 @@ cp "$dest/$file" "$root/first-ciphertext"
 cp "$dest/$age_manifest" "$root/first-age-manifest"
 cp "$dest/$manifest" "$root/first-metadata"
 cp "$dest/$proof" "$root/first-proof"
+# Even with a previously successful immutable history receipt, no-op must
+# fail when the newest complete encrypted backup has become too old.
+if PULL_MAX_BACKUP_AGE_HOURS=1 pull "$dest" commonserver > /dev/null 2> "$root/stale-noop.stderr"; then
+  echo 'idempotent pull disguised a stale encrypted recovery point' >&2
+  exit 1
+fi
+grep -qF 'encrypted backup is too old' "$root/stale-noop.stderr"
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt"
 pull "$dest" commonserver > /dev/null
 for immutable in "$file" "$age_manifest" "$manifest" "$proof"; do
   [[ "$(stat -c %h "$dest/$immutable")" == 1 ]] || {

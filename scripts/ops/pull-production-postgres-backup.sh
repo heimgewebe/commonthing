@@ -36,6 +36,14 @@ case "$PULL_MODE" in
   normal | migration-stage) ;;
   *) fail "PULL_MODE must be normal or migration-stage" ;;
 esac
+# Normal daily pulls are an RPO signal, not only an integrity check. A producer
+# whose age step fails can leave the last valid ciphertext untouched forever.
+# Explicit historical migration staging remains possible without false freshness
+# claims. The 36-hour default tolerates a delayed daily backup without hiding
+# multiple missed cycles.
+PULL_MAX_BACKUP_AGE_HOURS="${PULL_MAX_BACKUP_AGE_HOURS:-36}"
+[[ "$PULL_MAX_BACKUP_AGE_HOURS" =~ ^[1-9][0-9]{0,4}$ ]] ||
+  fail "PULL_MAX_BACKUP_AGE_HOURS must be a positive integer (up to five digits)"
 case "$LOCAL_RETENTION_DAYS" in '' | *[!0-9]*) fail "LOCAL_RETENTION_DAYS must be a non-negative integer" ;; esac
 # BACKUP_PREFIX enters a remotely evaluated SSH shell command. Treat it as
 # untrusted, like REMOTE_HOST and REMOTE_BACKUP_READER, before making any SSH call.
@@ -251,6 +259,30 @@ plaintext_sha="$(manifest_value plaintext_sha256 "$work_dir/$age_manifest")"
 [[ "$(manifest_value plaintext_file "$work_dir/$age_manifest")" == "${base}.sql.gz" ]] || fail "off-host and plaintext metadata manifests disagree"
 [[ "$(manifest_value file "$work_dir/$manifest")" == "${base}.sql.gz" ]] || fail "off-host and plaintext metadata manifests disagree"
 [[ "$(manifest_value sha256 "$work_dir/$manifest")" == "$plaintext_sha" ]] || fail "off-host and plaintext metadata manifests disagree"
+
+# Fail both initial publications and idempotent no-op pulls when the newest
+# complete encrypted backup is too old. This catches a producer that continues
+# to make host-local plaintext dumps but stopped producing age manifests.
+# Migration-stage deliberately accepts historical recovery candidates; it
+# cannot emit an age success receipt.
+if [[ "$PULL_MODE" == normal ]]; then
+  [[ "$(grep -c '^created_at=' "$work_dir/$age_manifest" || true)" == 1 ]] ||
+    fail "encrypted backup created_at is missing or duplicated"
+  backup_created_at="$(manifest_value created_at "$work_dir/$age_manifest")"
+  [[ "$backup_created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+    fail "encrypted backup created_at is not canonical UTC"
+  normalized_created_at="$(date -u -d "$backup_created_at" +%Y-%m-%dT%H:%M:%SZ 2> /dev/null)" ||
+    fail "encrypted backup created_at is invalid UTC"
+  [[ "$normalized_created_at" == "$backup_created_at" ]] ||
+    fail "encrypted backup created_at is not canonical UTC"
+  backup_created_epoch="$(date -u -d "$backup_created_at" +%s)" ||
+    fail "encrypted backup created_at cannot be converted to Unix time"
+  current_epoch="$(date -u +%s)" || fail "off-host pull current UTC is unavailable"
+  ((backup_created_epoch <= current_epoch + 300)) ||
+    fail "encrypted backup created_at is in the future"
+  ((current_epoch - backup_created_epoch <= PULL_MAX_BACKUP_AGE_HOURS * 3600)) ||
+    fail "encrypted backup is too old: latest complete age backup exceeds ${PULL_MAX_BACKUP_AGE_HOURS}h"
+fi
 
 # Stage everything first. A malformed weekly proof must not leave
 # newly published ciphertext/manifests behind on a failed pull.
