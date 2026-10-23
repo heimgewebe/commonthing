@@ -80,13 +80,21 @@ timer_target="$unit_dir/weltgewebe-postgres-offhost-pull.timer"
 
 install -d -m 0755 "$release_dir" "$unit_dir"
 install -d -m 0700 "$destination_dir"
-if [[ -e "$pull_target" ]]; then
+if [[ -e "$pull_target" || -L "$pull_target" ]]; then
+  [[ -f "$pull_target" && ! -L "$pull_target" ]] || fail "commit runtime pull program is not a regular file"
   cmp -s "$REPO_DIR/$pull_rel" "$pull_target" || fail "commit runtime already exists with different pull program"
+  # Identical content alone is not enough: a lost execute bit would leave the
+  # unit (or Restic's ExecStartPre) unable to run despite a success receipt.
+  chmod 0755 "$pull_target"
 else
   install -m 0755 "$REPO_DIR/$pull_rel" "$pull_target"
 fi
-if [[ -e "$gate_target" ]]; then
+if [[ -e "$gate_target" || -L "$gate_target" ]]; then
+  [[ -f "$gate_target" && ! -L "$gate_target" ]] || fail "commit runtime Restic plaintext gate is not a regular file"
   cmp -s "$REPO_DIR/$gate_rel" "$gate_target" || fail "commit runtime already exists with different Restic plaintext gate"
+  # Identical content alone is not enough: a lost execute bit would leave the
+  # unit (or Restic's ExecStartPre) unable to run despite a success receipt.
+  chmod 0755 "$gate_target"
 else
   install -m 0755 "$REPO_DIR/$gate_rel" "$gate_target"
 fi

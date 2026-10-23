@@ -1466,10 +1466,27 @@ grep -qxF "git_commit=$commit" "$receipt"
 grep -qxF "restic_gate_sha256=$(sha256sum "$GATE" | awk '{print $1}')" "$receipt"
 [[ "$(stat -c %a "$receipt")" == 600 ]]
 [[ "$(stat -c %a "$install_home/merges/weltgewebe-production-backups")" == 700 ]]
-# Reinstalling the same commit is idempotent.
+# Reinstalling the same commit is idempotent and restores a lost execute bit,
+# so a success receipt never covers a runtime systemd cannot execute.
+chmod 0644 "$installed_pull" "$installed_gate"
 HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
   EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=/bin/true \
   "$INSTALLER" > /dev/null
+[[ "$(stat -c %a "$installed_pull")" == 755 && "$(stat -c %a "$installed_gate")" == 755 ]] || {
+  echo 'reinstall must restore mode 0755 on the installed runtime' >&2
+  exit 1
+}
+# An existing runtime path that is a symlink must be rejected, not trusted.
+mv "$installed_gate" "$installed_gate.real"
+ln -s "$installed_gate.real" "$installed_gate"
+if HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
+  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=/bin/true \
+  "$INSTALLER" > /dev/null 2>&1; then
+  echo 'reinstall must reject a symlinked runtime gate' >&2
+  exit 1
+fi
+rm "$installed_gate"
+mv "$installed_gate.real" "$installed_gate"
 
 if ((REAL_AGE == 1)); then
   printf 'test_offhost_backup_pull_contract: OK (real age round trip)\n'
