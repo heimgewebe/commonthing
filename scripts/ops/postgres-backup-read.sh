@@ -61,8 +61,33 @@ case "$operation" in
   latest)
     (($# == 1)) || fail "latest takes exactly one PREFIX"
     valid_name "$1" || fail "invalid prefix"
-    find -P "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
-      -name "$1-*.age.sha256.manifest" -printf '%f\n' | sort | tail -n1
+    # A free-form manual BACKUP_LABEL can sort after every UTC daily name.
+    # Ordering only by filename would then silently pin the off-host pull to
+    # one old ciphertext forever. Compare the signed-off age manifest's own
+    # canonical UTC creation time; break exact-second ties deterministically.
+    candidates="$(find -P "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
+      -name "$1-*.age.sha256.manifest" -printf '%f\n')" ||
+      fail "cannot list encrypted backup manifests"
+    latest_name=""
+    latest_created_at=""
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] || continue
+      candidate_base="${candidate%.age.sha256.manifest}"
+      valid_name "$candidate_base" || fail "invalid encrypted backup manifest name"
+      created_at="$(
+        read_regular_file "$BACKUP_DIR/$candidate" |
+          awk -F= '$1 == "created_at" { count++; stamp=$2 }
+            END { if (count != 1) exit 1; print stamp }'
+      )" || fail "encrypted backup manifest has missing or duplicate created_at"
+      [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+        fail "encrypted backup manifest created_at is not canonical UTC"
+      if [[ -z "$latest_name" || "$created_at" > "$latest_created_at" ]] ||
+        [[ "$created_at" == "$latest_created_at" && "$candidate" > "$latest_name" ]]; then
+        latest_name="$candidate"
+        latest_created_at="$created_at"
+      fi
+    done <<< "$candidates"
+    [[ -z "$latest_name" ]] || printf '%s\n' "$latest_name"
     ;;
   read)
     (($# == 2)) || fail "read takes exactly BASE and KIND"

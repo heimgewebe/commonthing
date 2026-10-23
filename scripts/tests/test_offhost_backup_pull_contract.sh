@@ -1241,7 +1241,7 @@ chmod 700 "$rdir" "$rdir/proofs"
 rbase=weltgewebe-postgres-20260801T040000Z
 printf '%s\n' "$marker" | gzip -c > "$rdir/$rbase.sql.gz"
 printf 'age-encryption.org/v1\ncipher\n' > "$rdir/$rbase.sql.gz.age"
-printf 'contract=weltgewebe-postgres-backup-age-v1\n' > "$rdir/$rbase.age.sha256.manifest"
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-08-01T04:00:00Z\n' > "$rdir/$rbase.age.sha256.manifest"
 printf 'contract=weltgewebe-postgres-backup-v1\n' > "$rdir/$rbase.sha256.manifest"
 printf 'result=ok\n' > "$rdir/proofs/$rbase.restore-proof"
 rreader="$root/reader-bin"
@@ -1264,6 +1264,24 @@ expect_reader_failure() {
   fi
 }
 [[ "$("$rreader" latest weltgewebe-postgres)" == "$rbase.age.sha256.manifest" ]]
+
+# Created-at, not a lexically dominant operator label, defines the latest backup.
+# An older manual "pre-upgrade" label must not hide all newer daily backups.
+manual_base=weltgewebe-postgres-pre-upgrade
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-31T03:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+if [[ "$("$rreader" latest weltgewebe-postgres)" != "$rbase.age.sha256.manifest" ]]; then
+  echo 'reader selected stale manual label instead of newer created_at' >&2
+  exit 1
+fi
+# A genuinely newer manual backup should still be offered to the pull.
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-08-02T04:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+if [[ "$("$rreader" latest weltgewebe-postgres)" != "$manual_base.age.sha256.manifest" ]]; then
+  echo 'reader ignored newer manually labelled backup created_at' >&2
+  exit 1
+fi
+rm "$rdir/$manual_base.age.sha256.manifest"
 # The caller's environment must not choose code that runs as root: no PATH
 # lookup for the interpreter, no BASH_ENV, no imported functions.
 [[ "$(head -n1 "$READER_SOURCE")" == '#!/bin/bash -p' ]]
@@ -1292,6 +1310,19 @@ expect_reader_failure 'latest takes exactly one PREFIX' latest weltgewebe-postgr
 expect_reader_failure 'invalid prefix' latest '*'
 expect_reader_failure 'invalid prefix' latest '-name'
 expect_reader_failure 'invalid prefix' latest '../postgres'
+
+# Malformed or duplicate age-manifest creation timestamps fail closed before
+# the reader can select an arbitrary old ciphertext as successful "latest".
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=untrusted\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest created_at is not canonical UTC' latest weltgewebe-postgres
+printf 'contract=weltgewebe-postgres-backup-age-v1\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest has missing or duplicate created_at' latest weltgewebe-postgres
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-31T03:00:00Z\ncreated_at=2026-08-02T04:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest has missing or duplicate created_at' latest weltgewebe-postgres
+rm "$rdir/$manual_base.age.sha256.manifest"
 expect_reader_failure 'read takes exactly BASE and KIND' read "$rbase"
 expect_reader_failure 'read takes exactly BASE and KIND' read "$rbase" ciphertext extra
 expect_reader_failure 'unsupported kind' read "$rbase" plaintext
