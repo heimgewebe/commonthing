@@ -140,7 +140,7 @@ if ! docker run --rm \
   --osm-path="/data/$OSM_FILE" \
   --output="/data/$PARTIAL_PMTILES" \
   --download=true \
-    --water-polygons-path="/data/data/sources/water-polygons-split-3857.zip" \
+  --water-polygons-path="/data/data/sources/water-polygons-split-3857.zip" \
   --http-timeout="$PLANETILER_HTTP_TIMEOUT" \
   --http-retries="$PLANETILER_HTTP_RETRIES" \
   --http-retry-wait="$PLANETILER_HTTP_RETRY_WAIT"; then

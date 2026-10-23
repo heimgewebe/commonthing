@@ -26,6 +26,19 @@ class SchleswigHolsteinBasemapBuilderTest(unittest.TestCase):
             script.parent.mkdir(parents=True)
             shutil.copy2(BUILDER, script)
 
+            # The isolated retry fixture must not download a real 930 MB
+            # archive. Dedicated tests cover the pinned production downloader.
+            self._write_executable(
+                script.parent / "prepare-water-polygons.py",
+                """#!/usr/bin/env python3
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]) / "data" / "sources" / "water-polygons-split-3857.zip"
+source.parent.mkdir(parents=True, exist_ok=True)
+source.write_bytes(b"fixture-water-polygons")
+""",
+            )
+
             basemap_dir = root / "build" / "basemap"
             basemap_dir.mkdir(parents=True)
             (basemap_dir / "schleswig-holstein-260101.osm.pbf").write_bytes(b"fixture")
@@ -58,6 +71,11 @@ for argument in "$@"; do
   esac
 done
 [[ -n "$output_name" ]]
+case " $* " in
+  *" --water-polygons-path=/data/data/sources/water-polygons-split-3857.zip "*) ;;
+  *) echo "water polygons path was not passed" >&2; exit 95 ;;
+esac
+[[ -s "$MOCK_BASEMAP_DIR/data/sources/water-polygons-split-3857.zip" ]]
 output_path="$MOCK_BASEMAP_DIR/$output_name"
 printf '%s\\n' "$output_path" > "$MOCK_PARTIAL_PATH_MARKER"
 
