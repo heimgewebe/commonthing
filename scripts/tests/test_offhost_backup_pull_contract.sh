@@ -1316,6 +1316,12 @@ expect_reader_failure 'invalid prefix' latest '../postgres'
 printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=untrusted\n' \
   > "$rdir/$manual_base.age.sha256.manifest"
 expect_reader_failure 'encrypted backup manifest created_at is not canonical UTC' latest weltgewebe-postgres
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-02-30T03:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest created_at is invalid UTC' latest weltgewebe-postgres
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2999-01-01T03:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest created_at is in the future' latest weltgewebe-postgres
 printf 'contract=weltgewebe-postgres-backup-age-v1\n' \
   > "$rdir/$manual_base.age.sha256.manifest"
 expect_reader_failure 'encrypted backup manifest has missing or duplicate created_at' latest weltgewebe-postgres

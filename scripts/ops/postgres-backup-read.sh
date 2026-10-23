@@ -63,13 +63,17 @@ case "$operation" in
     valid_name "$1" || fail "invalid prefix"
     # A free-form manual BACKUP_LABEL can sort after every UTC daily name.
     # Ordering only by filename would then silently pin the off-host pull to
-    # one old ciphertext forever. Compare the signed-off age manifest's own
+    # one old ciphertext forever. Compare the root-owned producer manifest's
     # canonical UTC creation time; break exact-second ties deterministically.
     candidates="$(find -P "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
       -name "$1-*.age.sha256.manifest" -printf '%f\n')" ||
       fail "cannot list encrypted backup manifests"
     latest_name=""
     latest_created_at=""
+    # The producer uses the host UTC clock. Impossible calendar dates or far-
+    # future timestamps must not silently dominate subsequent daily backups.
+    max_created_at="$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)" ||
+      fail "cannot read current UTC"
     while IFS= read -r candidate; do
       [[ -n "$candidate" ]] || continue
       candidate_base="${candidate%.age.sha256.manifest}"
@@ -81,6 +85,12 @@ case "$operation" in
       )" || fail "encrypted backup manifest has missing or duplicate created_at"
       [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
         fail "encrypted backup manifest created_at is not canonical UTC"
+      normalized="$(date -u -d "$created_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" ||
+        fail "encrypted backup manifest created_at is invalid UTC"
+      [[ "$normalized" == "$created_at" ]] ||
+        fail "encrypted backup manifest created_at is not canonical UTC"
+      [[ "$created_at" > "$max_created_at" ]] &&
+        fail "encrypted backup manifest created_at is in the future"
       if [[ -z "$latest_name" || "$created_at" > "$latest_created_at" ]] ||
         [[ "$created_at" == "$latest_created_at" && "$candidate" > "$latest_name" ]]; then
         latest_name="$candidate"
