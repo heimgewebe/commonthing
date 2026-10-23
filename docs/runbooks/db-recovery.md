@@ -701,8 +701,12 @@ for key in contract file sha256 plaintext_sha256 encryption recipients result; d
 done
 [[ "$(field contract "$receipt")" == weltgewebe-offhost-backup-pull-v2 &&
    "$(field result "$receipt")" == ok && "$(field encryption "$receipt")" == age ]] || exit 1
+# Gleiches BACKUP_PREFIX wie Producer und Pull (Default weltgewebe-postgres).
+prefix="${BACKUP_PREFIX:-weltgewebe-postgres}"
+[[ "$prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ && "$prefix" != *..* ]] || exit 1
 file="$(field file "$receipt")"
-[[ "$file" =~ ^weltgewebe-postgres-[A-Za-z0-9._-]+\.sql\.gz\.age$ && "$file" != *..* ]] || exit 1
+[[ "$file" == "$prefix"-?*.sql.gz.age && "$file" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.sql\.gz\.age$ &&
+   "$file" != *..* ]] || exit 1
 base="${file%.sql.gz.age}"
 [[ -z "${BACKUP_BASE:-}" || "${BACKUP_BASE%.sql.gz.age}" == "$base" ]] || {
   printf 'BACKUP_BASE stimmt nicht mit dem ausgewählten Receipt überein.\n' >&2
