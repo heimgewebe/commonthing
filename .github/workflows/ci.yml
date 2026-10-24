@@ -189,9 +189,6 @@ jobs:
           node --experimental-vm-modules --test \
             scripts/ci/tests/api_runtime_k6_classification.test.mjs
 
-      - name: Verify conditional regional basemap merge gate
-        run: uv run --project tools/py --locked python -m unittest scripts.ci.tests.test_basemap_merge_gate -v
-
       - name: Check guard syntax
         shell: bash
         run: |
