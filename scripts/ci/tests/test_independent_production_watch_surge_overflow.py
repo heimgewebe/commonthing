@@ -415,5 +415,56 @@ class FullSurgeRegression(unittest.TestCase):
                 })
 
 
+    def test_same_code_recurrence_after_recovery_heartbeat_crash(self):
+        # The heartbeat has a durable RECOVERY, but state.json still carries
+        # the old severe code because the process died before state replace.
+        # A newly confirmed same-code P1 must be a *new* incident epoch.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            original_write = watch.write_json
+            with patch.object(watch, "_append_durable_events",
+                              side_effect=OSError("journal outage")):
+                for idx in range(1, 19):
+                    codes = ["frontend_cache"] if idx % 2 else []
+                    watch.record(self._poll(idx, codes), directory,
+                                 serialized_poll=True)
+                watch.record(self._poll(19, ["frontend_cache"]), directory,
+                             serialized_poll=True)
+                before = json.loads((directory / "state.json").read_text())
+                self.assertEqual(before["severe"],
+                                 [["frontend_cache", "incident frontend_cache"]])
+
+                interrupted = []
+                def heartbeat_then_die(path, value):
+                    if path == directory / "state.json" and not interrupted:
+                        interrupted.append(True)
+                        raise KeyboardInterrupt("crash before state snapshot")
+                    return original_write(path, value)
+                with patch.object(watch, "write_json",
+                                  side_effect=heartbeat_then_die):
+                    with self.assertRaises(KeyboardInterrupt):
+                        watch.record(self._poll(20, []), directory,
+                                     serialized_poll=True)
+                self.assertEqual(interrupted, [True])
+                heartbeat = json.loads((directory / "heartbeat.json").read_text())
+                self.assertEqual(
+                    watch._pending_transition_entries(heartbeat)[-1]["event"],
+                    "RECOVERY",
+                )
+                self.assertEqual(json.loads((directory / "state.json").read_text())
+                                 ["severe"], before["severe"])
+            self.assertIsNotNone(watch.record(
+                self._poll(21, ["frontend_cache"]), directory,
+                serialized_poll=True,
+            ))
+            watch.record(self._poll(22, []), directory, serialized_poll=True)
+            history = self._history(directory)
+            self.assertEqual(
+                [e["event"] for e in history],
+                ["ALARM", "RECOVERY"] * 11,
+                "stale severe state suppressed recurrent confirmed P1",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

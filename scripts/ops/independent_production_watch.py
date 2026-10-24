@@ -894,6 +894,37 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 result, directory, previous_heartbeat,
                 f"invalid pending transition outbox: {type(exc).__name__}",
             )
+        # A RECOVERY is committed to heartbeat before state to avoid
+        # inventing a recovered incident on a failed state write. If that
+        # precise newer heartbeat exists but state still owns the older
+        # severe episode, a separately confirmed recurrence is a NEW epoch,
+        # not a continuation of the stale state. The old RECOVERY remains
+        # pending and must be persisted before any journal append.
+        if old_severe and isinstance(previous_heartbeat, dict):
+            heartbeat_pending = _pending_transition_entries(previous_heartbeat)
+            state_pending = _pending_transition_entries(previous)
+            heartbeat_recovery = (
+                heartbeat_pending[-1] if heartbeat_pending
+                and heartbeat_pending[-1]["event"] == "RECOVERY" else None
+            )
+            heartbeat_time = timestamp(previous_heartbeat.get("checked_at_utc"))
+            state_time = timestamp(previous.get("checked_at_utc"))
+            if (
+                # Failure heartbeats preserve uncertainty: never translate a
+                # failed recovery write into a newly verified healthy state.
+                result.get("status") in {"ALARM", "HEALTHY"}
+                and heartbeat_recovery is not None
+                and heartbeat_recovery not in state_pending
+                and heartbeat_recovery in pending
+                and pending[-1] == heartbeat_recovery
+                and heartbeat_time is not None
+                and state_time is not None
+                and heartbeat_time >= state_time
+                and timestamp(
+                    heartbeat_recovery["payload"]["checked_at_utc"]
+                ) == heartbeat_time
+            ):
+                old_severe = []
         # The emergency heartbeat may have observed B before the old queue
         # could be drained and state.json replaced. B is a *durable* prior P1
         # even when it vanishes on the very next poll; otherwise its journaled
