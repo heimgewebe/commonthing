@@ -48,6 +48,8 @@ name: Basemap Runtime Proof
       - "infra/caddy/**"
       - "scripts/basemap/build-hamburg-pmtiles.sh"
       - "scripts/basemap/build-schleswig-holstein-pmtiles.sh"
+      - "scripts/basemap/prepare-water-polygons.py"
+      - "scripts/basemap/test_prepare_water_polygons.py"
       - "scripts/basemap/publish-basemap.sh"
       - "scripts/guard/basemap-runtime-proof.sh"
       - "apps/web/tests/proofs/**"
@@ -71,6 +73,8 @@ name: Basemap Runtime Proof
       - "infra/caddy/**"
       - "scripts/basemap/build-hamburg-pmtiles.sh"
       - "scripts/basemap/build-schleswig-holstein-pmtiles.sh"
+      - "scripts/basemap/prepare-water-polygons.py"
+      - "scripts/basemap/test_prepare_water_polygons.py"
       - "scripts/basemap/publish-basemap.sh"
       - "scripts/guard/basemap-runtime-proof.sh"
       - "apps/web/tests/proofs/**"
@@ -110,6 +114,9 @@ jobs:
       BASEMAP_PROOF_MODE: skip
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
+
+      - name: Offline pinned water-polygon source security tests
+        run: python3 scripts/basemap/test_prepare_water_polygons.py
 
       - name: Check guard script is executable
         run: test -x scripts/guard/basemap-runtime-proof.sh
