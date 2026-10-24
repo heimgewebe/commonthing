@@ -132,6 +132,20 @@ pub(crate) async fn begin_fenced_generation(
     pool: &PgPool,
 ) -> anyhow::Result<(Transaction<'static, Postgres>, i64)> {
     let mut tx = pool.begin().await?;
+    // PostgreSQL's FOR SHARE can admit a late compatible reader ahead of a
+    // writer already waiting to UPDATE the singleton row. Without a
+    // process-independent fair queue, a stream of GETs across API replicas
+    // can starve public->private commits indefinitely. The paired BEFORE
+    // STATEMENT node/edge/account writer triggers take the same transaction
+    // advisory lock exclusively, BEFORE they modify domain row tuples.
+    // Heavyweight advisory wait queues then admit the writer before newly
+    // arriving shared readers. Both locks release on transaction rollback.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock_shared(\
+         hashtextextended('weltgewebe.domain.generation.fair_queue.v1', 0))",
+    )
+    .execute(&mut *tx)
+    .await?;
     // Every domain_nodes/accounts/edges writer updates this singleton row in
     // the SAME transaction via weltgewebe_enqueue_domain_event(). A FOR SHARE
     // lock prevents any of those writes from committing until we finish the

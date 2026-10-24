@@ -1185,6 +1185,191 @@ async fn sensitive_get_holds_global_visibility_version_fence_until_response() {
 #[tokio::test]
 #[ignore = "requires an isolated DATABASE_URL"]
 #[serial]
+async fn queued_visibility_writer_precedes_new_privacy_get_across_api_states() {
+    use axum::{middleware::from_fn_with_state, routing::get, Json};
+    use tokio::{
+        sync::Notify,
+        time::{sleep, timeout, Duration},
+    };
+    use weltgewebe_api::middleware::domain_projection::ensure_current_domain_projection;
+
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES ('rp-fair-writer','place','Writer fairness',53.6,10.0,'{}'::jsonb,'public')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed fair writer fixture");
+
+    // Independent app states and SQL pools model separate API replicas; a
+    // local Tokio gate in either replica must not hide a PostgreSQL bypass.
+    let first_state = postgres_bbox_route_state(pool.clone());
+    first_state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("first API state ready");
+    let second_pool = direct_pool().await;
+    let second_state = postgres_bbox_route_state(second_pool);
+    second_state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("second independent API state ready");
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let app1 = Router::new()
+        .route(
+            "/nodes/fair-queue",
+            get({
+                let state = first_state.clone();
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move || {
+                    let state = state.clone();
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    async move {
+                        let visibility = state
+                            .nodes
+                            .read()
+                            .await
+                            .get("rp-fair-writer")
+                            .map(|node| node.search_visibility.as_str().to_string());
+                        entered.notify_one();
+                        release.notified().await;
+                        Json(serde_json::json!({"visibility": visibility}))
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            first_state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(first_state);
+    let app2 = Router::new()
+        .route(
+            "/nodes/fair-queue",
+            get({
+                let state = second_state.clone();
+                move || {
+                    let state = state.clone();
+                    async move {
+                        let visibility = state
+                            .nodes
+                            .read()
+                            .await
+                            .get("rp-fair-writer")
+                            .map(|node| node.search_visibility.as_str().to_string());
+                        Json(serde_json::json!({"visibility": visibility}))
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            second_state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(second_state);
+
+    let first = tokio::spawn(async move {
+        app1.oneshot(
+            Request::get("/nodes/fair-queue")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("first API response")
+    });
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("first GET must own its full-response PG generation fence");
+
+    let writer_pool = direct_pool().await;
+    let writer = tokio::spawn(async move {
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility='private'
+             WHERE id='rp-fair-writer' /* fair-writer-probe */",
+        )
+        .execute(&writer_pool)
+        .await
+        .expect("actual privacy writer commits");
+    });
+    // Do not guess that the writer is waiting: prove a live PG lock conflict.
+    let mut observed_waiting_writer = false;
+    for _ in 0..70 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE query LIKE '%fair-writer-probe%'
+               AND wait_event_type = 'Lock'
+               AND cardinality(pg_blocking_pids(pid)) > 0
+               AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("observe actual PostgreSQL lock wait");
+        if waiting > 0 {
+            observed_waiting_writer = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        observed_waiting_writer,
+        "privacy writer never reached PG lock wait"
+    );
+
+    let mut second = tokio::spawn(async move {
+        app2.oneshot(
+            Request::get("/nodes/fair-queue")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("second API response")
+    });
+    let early_second = timeout(Duration::from_millis(400), &mut second).await;
+    let barged = early_second.is_ok();
+
+    release.notify_one();
+    let first_result = timeout(Duration::from_secs(6), first)
+        .await
+        .expect("first response completes")
+        .expect("first task");
+    assert_eq!(first_result.status(), axum::http::StatusCode::OK);
+    timeout(Duration::from_secs(6), writer)
+        .await
+        .expect("queued visibility writer must commit after first reader")
+        .expect("writer task");
+    let second_result = match early_second {
+        Ok(result) => result.expect("second task"),
+        Err(_) => timeout(Duration::from_secs(6), second)
+            .await
+            .expect("second reader continues after writer")
+            .expect("second task"),
+    };
+    assert_eq!(second_result.status(), axum::http::StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(
+        &body::to_bytes(second_result.into_body(), usize::MAX)
+            .await
+            .expect("second response bytes"),
+    )
+    .expect("parse second JSON");
+    assert!(
+        !barged,
+        "new FOR SHARE privacy GET bypassed an already queued public->private writer",
+    );
+    assert_eq!(
+        parsed["visibility"], "private",
+        "second independent API response must reflect committed privacy change"
+    );
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
 async fn own_profile_get_does_not_hold_generation_row_while_waiting_for_profile_writer() {
     use axum::{routing::get, Json};
     use tokio::{
