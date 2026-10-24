@@ -862,20 +862,6 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 entry for entry in pending
                 if not _transition_already_journaled(directory, entry)
             ]
-            if len(pending) > OUTBOX_SURGE_LIMIT:
-                # A previous invocation durably recorded its eighteenth
-                # intent in heartbeat, but crashed before journal drain.
-                # Make room without overwriting that sole evidence. Only
-                # old ALARMs can safely drain before a fresh observation;
-                # a RECOVERY still requires the ordinary state gate below.
-                drain_count = len(pending) - OUTBOX_NORMAL_LIMIT
-                if any(entry["event"] != "ALARM"
-                       for entry in pending[:drain_count]):
-                    raise ValueError("overflow blocked by prior recovery")
-                _append_durable_events(
-                    directory, [entry["payload"] for entry in pending[:drain_count]],
-                )
-                pending = pending[drain_count:]
         except (OSError, ValueError, TypeError) as exc:
             return _record_unverifiable_prior_state(
                 result, directory, previous_heartbeat,
@@ -953,6 +939,59 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
         uncertainty_event = ("MONITOR_DATA_FAILURE"
                              if uncertain and uncertain != old_uncertain else None)
         new_event = transition or uncertainty_event
+
+        def recovery_replay_blocked(index, unknown_codes):
+            # A prior state can still mention incident A when its already
+            # durable heartbeat records RECOVERY(A). Independently confirmed
+            # incident B must not hold that recovery behind itself.
+            # If any old P1 code is still active, permit the older recovery
+            # only when a NEW ALARM has been queued after it. This preserves
+            # FIFO episode order across transient journal failures without
+            # clearing a continuing old incident on an uncertain observation.
+            if unknown_codes:
+                return True
+            if not (old_codes & new_codes):
+                return False
+            return not any(
+                later["event"] == "ALARM" for later in pending[index + 1:]
+            )
+
+        # Replay an already durable emergency heartbeat before admitting a
+        # subsequent poll's transition. Its entire 18-entry intent is
+        # retained in the previous heartbeat; it must not be rejected forever
+        # just because the oldest prefix contains a genuine RECOVERY.
+        if len(pending) > OUTBOX_SURGE_LIMIT:
+            if len(pending) != OUTBOX_SURGE_LIMIT + 1:
+                return _record_unverifiable_prior_state(
+                    result, directory, previous_heartbeat,
+                    "persisted surge overflow exceeds contract",
+                )
+            required = len(pending) - OUTBOX_NORMAL_LIMIT
+            replay_unknown = {
+                "watcher_execution_failed", "unverifiable_state"
+            } & observed_codes
+            ready_prior = []
+            for index, entry in enumerate(pending[:required]):
+                if entry["event"] == "RECOVERY" and recovery_replay_blocked(
+                    index, replay_unknown,
+                ):
+                    break
+                ready_prior.append(entry)
+            if len(ready_prior) != required:
+                return _record_unverifiable_prior_state(
+                    result, directory, previous_heartbeat,
+                    "persisted surge overflow has blocked older recovery",
+                )
+            try:
+                _append_durable_events(
+                    directory, [entry["payload"] for entry in ready_prior],
+                )
+            except OSError as exc:
+                return _record_unverifiable_prior_state(
+                    result, directory, previous_heartbeat,
+                    f"persisted surge prefix drain failed: {type(exc).__name__}",
+                )
+            pending = pending[required:]
         # The fallback retry must not re-emit a transition the first call
         # may already have committed to the local event journal.
         events = [event for event in (
@@ -992,22 +1031,6 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 entry = {"event": event_name, "payload": payload}
                 if entry not in pending:
                     pending.append(entry)
-
-        def recovery_replay_blocked(index, unknown_codes):
-            # A prior state can still mention incident A when its already
-            # durable heartbeat records RECOVERY(A). Independently confirmed
-            # incident B must not hold that recovery behind itself.
-            # If any old P1 code is still active, permit the older recovery
-            # only when a NEW ALARM has been queued after it. This preserves
-            # FIFO episode order across transient journal failures without
-            # clearing a continuing old incident on an uncertain observation.
-            if unknown_codes:
-                return True
-            if not (old_codes & new_codes):
-                return False
-            return not any(
-                later["event"] == "ALARM" for later in pending[index + 1:]
-            )
 
         def persist_snapshots(*, heartbeat_first=False):
             if pending:
@@ -1051,11 +1074,18 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 result["pending_surge_overflow"] = [pending[-1]]
                 write_json(directory / "heartbeat.json", result)
                 drain_count = len(pending) - OUTBOX_NORMAL_LIMIT
-                if any(entry["event"] != "ALARM"
-                       for entry in pending[:drain_count]):
+                uncertain_replay = {
+                    "watcher_execution_failed", "unverifiable_state"
+                } & observed_codes
+                if any(
+                    entry["event"] == "RECOVERY" and recovery_replay_blocked(
+                        index, uncertain_replay,
+                    )
+                    for index, entry in enumerate(pending[:drain_count])
+                ):
                     return _record_unverifiable_prior_state(
                         result, directory, previous_heartbeat,
-                        "pending surge overflow blocked by older recovery",
+                        "pending surge overflow blocked by unverifiable recovery",
                     )
                 try:
                     _append_durable_events(

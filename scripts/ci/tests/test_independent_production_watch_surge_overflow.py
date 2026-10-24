@@ -149,5 +149,70 @@ class FullSurgeRegression(unittest.TestCase):
             self._assert_b_exactly_once(history)
 
 
+    def _initial_with_recoveries(self, directory):
+        entries = self._initial(directory)
+        # A persistently queued chronological chain can contain recoveries
+        # between independent incident epochs.
+        for index in range(1, len(entries), 2):
+            entries[index] = {
+                "event": "RECOVERY",
+                "payload": {
+                    "event": "RECOVERY", "status": "HEALTHY",
+                    "checked_at_utc": entries[index]["payload"]["checked_at_utc"],
+                    "issues": [], "sequence": index,
+                },
+            }
+        for name in ("state.json", "heartbeat.json"):
+            path = directory / name
+            data = json.loads(path.read_text())
+            data["pending_transitions"] = entries
+            watch.write_json(path, data)
+        return entries
+
+    def test_recovery_prefix_drain_permits_eighteenth_alarm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            entries = self._initial_with_recoveries(directory)
+            self.assertEqual(watch.record(
+                self._poll(1, ["a", "b"]), directory, serialized_poll=True,
+            ), "ALARM")
+            history = self._history(directory)
+            self.assertEqual(len(history), 18)
+            self.assertEqual([h["event"] for h in history[:17]],
+                             [e["event"] for e in entries])
+            self._assert_b_exactly_once(history)
+            self.assertEqual(watch.record(
+                self._poll(2, []), directory, serialized_poll=True,
+            ), "RECOVERY")
+            history = self._history(directory)
+            self.assertEqual(len(history), 19)
+            self.assertEqual(history[-1]["event"], "RECOVERY")
+
+    def test_recovery_prefix_replays_durable_overflow_after_outage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            entries = self._initial_with_recoveries(directory)
+            with patch.object(watch, "_append_durable_events",
+                              side_effect=OSError("temporary journal outage")):
+                self.assertEqual(watch.record(
+                    self._poll(1, ["a", "b"]), directory, serialized_poll=True,
+                ), "MONITOR_DATA_FAILURE")
+            heartbeat = json.loads((directory / "heartbeat.json").read_text())
+            self.assertEqual(len(watch._pending_transition_entries(heartbeat)), 18)
+            self.assertEqual(self._history(directory), [])
+            self.assertIsNotNone(watch.record(
+                self._poll(2, ["a"]), directory, serialized_poll=True,
+            ))
+            history = self._history(directory)
+            self.assertEqual(len(history), 18)
+            self.assertEqual([h["event"] for h in history[:17]],
+                             [e["event"] for e in entries])
+            self._assert_b_exactly_once(history)
+            self.assertEqual(watch.record(
+                self._poll(3, []), directory, serialized_poll=True,
+            ), "RECOVERY")
+            self.assertEqual(self._history(directory)[-1]["event"], "RECOVERY")
+
+
 if __name__ == "__main__":
     unittest.main()
