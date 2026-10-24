@@ -78,8 +78,8 @@ permissions:
   contents: read
 
 concurrency:
-  # A reusable workflow inherits the caller workflow name; avoid canceling CI.
-  group: basemap-proof-${{ github.ref }}
+  # Called workflows inherit the caller name; standalone push and CI must not cancel each other.
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

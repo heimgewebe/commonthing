@@ -108,7 +108,7 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
         self.assertIn('[[ "${basemap_result}" == "skipped" ]] || failed=1', ci)
         self.assertIn("  workflow_call: {}", bm)
         self.assertNotIn("  pull_request:", bm.split("jobs:", 1)[0])
-        self.assertIn("group: basemap-proof-${{ github.ref }}", bm)
+        self.assertIn("group: ${{ github.workflow }}-${{ github.ref }}", bm)
         self.assertIn("  required-basemap-proofs:", bm)
         self.assertIn("- basemap-pmtiles-content-proof", bm)
         self.assertIn("- basemap-schleswig-holstein-content-proof", bm)
