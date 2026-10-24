@@ -92,6 +92,19 @@ im Repository noch in Receipts, Cronzeilen oder Logs erscheinen.
 Das Sendeskript enthält keine Empfängeradresse und keine
 umgebungsvariablengesteuerte Ausweichadresse.
 
+**Bereits vorhandene Journal-/Lockdateien behalten ihre alten Dateimodi.**
+Der tatsächliche Heimberry-Readback vom 24. Oktober zeigte für
+`events.jsonl` **0664** und den gemeinsamen Watcher-`lock` **0664**.
+Der Transport verweigert diese gruppenschreibbaren Bestandsdateien.
+Die neue Watcher-Revision verwendet für *neu* angelegte Dateien
+`umask 0077`, ändert bestehende Dateien aber nicht rückwirkend.
+Eine Umstellung der vorhandenen Dateimodi auf 0600 ist erst nach
+frischer Prüfung von Eigentum, Dateityp, Hardlinks, Mounts, aktivem
+Cron-Lauf und Operatorautorität im regulären Heimberry-Betriebspfad
+zulässig; anschließend die unveränderten Journalbytes und Modi
+erneut ablesen. Nicht ohne Prüfung chmod, löschen oder ersetzen.
+Bis dahin ist die externe Alarmzustellung **nicht freigegeben**.
+
 Die Enrollment-Operation versendet selbst keine Nachricht:
 
 ```bash

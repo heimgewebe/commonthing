@@ -1262,6 +1262,9 @@ def main():
                         default=Path.home() / ".local/commonthing-watch-state")
     args = parser.parse_args()
     previous_handler = signal.signal(signal.SIGALRM, _watch_deadline)
+    # Cron inherits the user's umask (observed 0002 on Heimberry). New
+    # incident journals and lockfiles must not be writable by the group.
+    previous_umask = os.umask(0o077)
     signal.alarm(WATCH_MAX_SECONDS)
     try:
         if args.dry_run:
@@ -1282,6 +1285,7 @@ def main():
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
+        os.umask(previous_umask)
 
 
 if __name__ == "__main__":

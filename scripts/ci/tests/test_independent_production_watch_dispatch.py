@@ -256,6 +256,62 @@ class WatchDispatchTests(unittest.TestCase):
             self.assertEqual(self.run_transport()["accepted"], 1)
         self.assertEqual(len(self.calls), 2)
 
+    def test_preexisting_group_writable_journal_or_lock_blocks_delivery(self):
+        self.journal.chmod(0o664)
+        with self.assertRaises(dispatch.TransportBlocked):
+            self.enroll()
+        self.journal.chmod(0o600)
+        self.enroll()
+        self.append(self.event("ALARM", "down"))
+        with (self.state / "lock").open("a+") as handle:
+            handle.flush()
+        (self.state / "lock").chmod(0o664)
+        with self.assertRaises(dispatch.TransportBlocked):
+            self.run_transport()
+        self.assertEqual(self.calls, [])
+
+    def test_watcher_creates_private_files_under_permissive_cron_umask(self):
+        import stat
+        import sys
+
+        source = SCRIPT.parent / "independent_production_watch.py"
+        spec = importlib.util.spec_from_file_location("private_watch_fixture", source)
+        assert spec is not None and spec.loader is not None
+        watch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(watch)
+        directory = self.root / "fresh-watch"
+        report = {
+            "checked_at_utc": STAMP,
+            "status": "ALARM",
+            "commits": {}, "main_observation": None,
+            "latest_schedule": None,
+            "issues": [{
+                "code": "frontend_cache", "severity": "P1",
+                "component": "frontend", "source": "fixture",
+                "actual": "unsafe_cache", "expected": "no-store",
+            }],
+        }
+        original_umask = os.umask(0o002)
+        try:
+            with (
+                mock.patch.object(watch, "_evaluate_cycle", return_value=report),
+                mock.patch.object(sys, "argv", ["watch", "--state-dir", str(directory)]),
+            ):
+                self.assertEqual(watch.main(), 2)
+            observed_umask = os.umask(0o002)
+            self.assertEqual(observed_umask, 0o002)
+            for name in (
+                "poll.lock", "lock", "heartbeat.json", "state.json",
+                "events.jsonl",
+            ):
+                self.assertEqual(
+                    stat.S_IMODE((directory / name).stat().st_mode),
+                    0o600,
+                    name,
+                )
+        finally:
+            os.umask(original_umask)
+
     def test_cron_keeps_poll_and_opt_in_transport_in_one_five_minute_schedule(self):
         crontab = (SCRIPT.parent / "independent_production_watch.crontab").read_text()
         self.assertIn("*/5 * * * *", crontab)
