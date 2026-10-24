@@ -1362,7 +1362,7 @@ mod tests {
         let (recipient, auth) =
             ece::generate_keypair_and_auth_secret().expect("test receiver keypair");
         let p256dh = URL_SAFE_NO_PAD.encode(recipient.pub_as_raw().expect("test public key"));
-        let encoded_auth = URL_SAFE_NO_PAD.encode(&auth);
+        let encoded_auth = URL_SAFE_NO_PAD.encode(auth);
         let (public_key, auth_secret) =
             decode_subscription_keys(&p256dh, &encoded_auth).expect("valid browser keys");
         let payload = private_message_payload("11111111-1111-4111-8111-111111111111")
@@ -1385,7 +1385,7 @@ mod tests {
             ece::generate_keypair_and_auth_secret().expect("test receiver keypair");
         let valid_public_key =
             URL_SAFE_NO_PAD.encode(recipient.pub_as_raw().expect("test public key"));
-        let valid_auth = URL_SAFE_NO_PAD.encode(&auth);
+        let valid_auth = URL_SAFE_NO_PAD.encode(auth);
         assert!(decode_subscription_keys(&valid_public_key, &valid_auth).is_ok());
         assert!(decode_subscription_keys(&valid_public_key, "bad-key").is_err());
         assert!(decode_subscription_keys("not-a-p256-key", &valid_auth).is_err());
