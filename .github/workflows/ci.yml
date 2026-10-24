@@ -33,6 +33,7 @@ jobs:
       hygiene: ${{ steps.filter.outputs.hygiene }}
       heavy: ${{ steps.filter.outputs.heavy }}
       api_runtime: ${{ steps.filter.outputs.api_runtime }}
+      basemap: ${{ steps.filter.outputs.basemap }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
         with:
@@ -75,6 +76,40 @@ jobs:
               - 'apps/api/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+            basemap:
+              # Changes to the gate itself never silently exempt this PR.
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/basemap-runtime-proof.yml'
+              - 'scripts/ci/tests/test_basemap_merge_gate.py'
+              - 'infra/caddy/**'
+              - 'scripts/basemap/**'
+              - 'scripts/guard/basemap-runtime-proof.sh'
+              - 'apps/web/tests/proofs/**'
+              - 'apps/web/tests/fixtures/**'
+              - 'apps/web/package.json'
+              - 'apps/web/pnpm-lock.yaml'
+              - 'apps/web/basemap-mode.policy.json'
+              - 'apps/web/scripts/basemap-mode-resolve.mjs'
+              - 'apps/web/scripts/generate-basemap-config.js'
+              - 'apps/web/scripts/validate-pmtiles.mjs'
+              - 'apps/web/scripts/validate-pmtiles.test.mjs'
+              - 'apps/web/src/lib/map/**'
+              - 'apps/web/src/lib/maplibre/**'
+              - 'apps/web/src/lib/components/map/**'
+              - 'apps/web/src/app.html'
+              - 'apps/web/src/hooks.client.ts'
+              - 'apps/web/src/lib/utils/inert-polyfill.ts'
+              - 'apps/web/src/lib/utils/preloadRecovery.ts'
+              - 'apps/web/src/lib/utils/ua-flags.ts'
+              - 'apps/web/static/theme-init.js'
+              - 'apps/web/src/app.css'
+              - 'apps/web/src/lib/styles/tokens.css'
+              - 'apps/web/src/routes/+layout.svelte'
+              - 'apps/web/src/routes/map/**'
+              - 'apps/web/playwright.proof.config.ts'
+              - 'apps/web/playwright.config.ts'
+              - 'apps/web/vite.config.ts'
+              - 'map-style/**'
             heavy:
               - '.github/workflows/*.yml'
               - '.github/workflows/*.yaml'
@@ -107,6 +142,16 @@ jobs:
         needs.docs-changes.outputs.api_runtime == 'true'
       }}
     uses: ./.github/workflows/domain-scale.yml
+
+  basemap-proofs:
+    name: Regional basemap proofs
+    needs: docs-changes
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        needs.docs-changes.outputs.basemap == 'true'
+      }}
+    uses: ./.github/workflows/basemap-runtime-proof.yml
 
   guard-tests:
     name: Core Guard Tests
@@ -274,6 +319,9 @@ jobs:
 
       - name: Validate merge governance contracts
         run: uv run --project tools/py --locked python -m unittest scripts.quality.tests.test_review_governance -v
+
+      - name: Test mandatory regional basemap evidence and path scope
+        run: python3 -m unittest scripts.ci.tests.test_basemap_merge_gate -v
 
   ci:
     needs: docs-changes
@@ -750,6 +798,7 @@ jobs:
     needs:
       - docs-changes
       - api-runtime-proof
+      - basemap-proofs
       - guard-tests
       - ci
       - web-e2e
@@ -789,6 +838,19 @@ jobs:
             [[ "${api_runtime_result}" == "success" ]] || failed=1
           else
             [[ "${api_runtime_result}" == "skipped" ]] || failed=1
+          fi
+
+          basemap_required="${{
+            github.event_name == 'workflow_dispatch' ||
+            needs.docs-changes.outputs.basemap == 'true'
+          }}"
+          basemap_result="${{ needs.basemap-proofs.result }}"
+          printf 'basemap-required=%s\n' "${basemap_required}"
+          printf 'basemap-proof=%s\n' "${basemap_result}"
+          if [[ "${basemap_required}" == "true" ]]; then
+            [[ "${basemap_result}" == "success" ]] || failed=1
+          else
+            [[ "${basemap_result}" == "skipped" ]] || failed=1
           fi
 
           (( failed == 0 )) || exit 1

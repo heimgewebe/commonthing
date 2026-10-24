@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -15,6 +17,7 @@ STYLE_VERSION_PATH = (
 COLORS_PATH = REPO / "map-style" / "colors.json"
 UP_SCRIPT_PATH = REPO / "scripts" / "weltgewebe-up"
 WORKFLOW_PATH = REPO / ".github" / "workflows" / "basemap-runtime-proof.yml"
+CI_WORKFLOW_PATH = REPO / ".github" / "workflows" / "ci.yml"
 PACKAGE_PATH = REPO / "apps" / "web" / "package.json"
 CADDY_PATHS = (
     REPO / "infra" / "caddy" / "Caddyfile",
@@ -273,21 +276,73 @@ class RegionalBasemapStyleTest(unittest.TestCase):
 
 
     def test_runtime_proof_triggers_on_basemap_runtime_inputs(self) -> None:
+        # PRs use the conditional CI path filter and workflow_call; main-push
+        # changes use the standalone Basemap Runtime Proof push.paths filter.
+        ci = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn("uses: ./.github/workflows/basemap-runtime-proof.yml", ci)
+        self.assertIn("  workflow_call: {}", workflow)
+        self.assertNotIn("  pull_request:", workflow.split("jobs:", 1)[0])
+
+        pr_filter = ci.split("            basemap:\n", 1)[1].split(
+            "            heavy:\n", 1
+        )[0]
+        push_filter = workflow.split("  push:\n", 1)[1].split(
+            "  workflow_dispatch:", 1
+        )[0]
+        pr_patterns = re.findall(r"(?m)^              - '([^']+)'$", pr_filter)
+        push_patterns = re.findall(r'(?m)^      - "([^"]+)"$', push_filter)
+        self.assertTrue(pr_patterns)
+        self.assertTrue(push_patterns)
+
         for trigger_path in (
             "apps/web/basemap-mode.policy.json",
             "apps/web/scripts/basemap-mode-resolve.mjs",
             "apps/web/scripts/generate-basemap-config.js",
-            "apps/web/src/**",
-            "apps/web/tests/fixtures/**",
+            "apps/web/tests/fixtures/basemap.json",
             "apps/web/playwright.config.ts",
+            "apps/web/src/lib/map/basemap.ts",
+            "apps/web/src/lib/maplibre/runtime.ts",
+            "apps/web/src/lib/components/map/MapRouteSurface.svelte",
+            "apps/web/src/routes/map/+page.svelte",
+            "apps/web/src/routes/+layout.svelte",
+            "apps/web/src/app.css",
+            "apps/web/src/lib/styles/tokens.css",
+            "apps/web/src/hooks.client.ts",
+            "scripts/basemap/prepare-water-polygons.py",
         ):
-            with self.subTest(trigger_path=trigger_path):
-                self.assertEqual(
-                    workflow.count(f'      - "{trigger_path}"'),
-                    2,
-                    f"expected pull_request and push coverage for {trigger_path}",
-                )
+            for source, patterns in (
+                ("pull_request", pr_patterns),
+                ("main_push", push_patterns),
+            ):
+                with self.subTest(trigger_path=trigger_path, source=source):
+                    self.assertTrue(
+                        any(
+                            fnmatch.fnmatchcase(trigger_path, pattern)
+                            for pattern in patterns
+                        ),
+                        f"{source} misses regional map input {trigger_path}",
+                    )
+
+        # No blanket apps/web/src/** trigger: unrelated /build and /settings
+        # navigation does not impose the expensive map proofs.
+        for unrelated_path in (
+            "apps/web/src/routes/build/+page.svelte",
+            "apps/web/src/routes/settings/+page.svelte",
+            "apps/api/src/notifications.rs",
+        ):
+            for source, patterns in (
+                ("pull_request", pr_patterns),
+                ("main_push", push_patterns),
+            ):
+                with self.subTest(unrelated_path=unrelated_path, source=source):
+                    self.assertFalse(
+                        any(
+                            fnmatch.fnmatchcase(unrelated_path, pattern)
+                            for pattern in patterns
+                        ),
+                        f"{source} unexpectedly triggers maps for {unrelated_path}",
+                    )
 
     def test_regional_proof_command_pins_regional_build_variant(self) -> None:
         package = json.loads(PACKAGE_PATH.read_text(encoding="utf-8"))
