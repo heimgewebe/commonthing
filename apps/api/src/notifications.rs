@@ -408,6 +408,15 @@ fn account_id(auth: &AuthContext) -> Result<&str, NotificationApiError> {
     })
 }
 
+// Notification writes can wait on guest-exit account FKs while occupying
+// SQLx connections. Reserve from the same budget as generation-fenced GETs.
+async fn reserve_notification_capacity(
+) -> Result<tokio::sync::SemaphorePermit<'static>, NotificationApiError> {
+    crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(|error| database_error("reserve notification pool", error))
+}
+
 fn database_pool(state: &ApiState) -> Result<&PgPool, NotificationApiError> {
     state.db_pool.as_ref().ok_or_else(|| {
         NotificationApiError::new(
@@ -559,6 +568,7 @@ pub async fn update_notification_preferences(
 ) -> Result<Json<NotificationPreferencesView>, NotificationApiError> {
     let account_id = account_id(&auth)?;
     let pool = database_pool(&state)?;
+    let _notification_budget = reserve_notification_capacity().await?;
     let mut tx = pool
         .begin()
         .await
@@ -713,6 +723,7 @@ pub async fn register_push_subscription(
         })?;
 
     let endpoint_hash = hex::encode(Sha256::digest(request.endpoint.as_bytes()));
+    let _notification_budget = reserve_notification_capacity().await?;
     let mut tx = pool
         .begin()
         .await
@@ -815,6 +826,7 @@ pub async fn delete_push_subscription(
         ));
     }
     let endpoint_hash = hex::encode(Sha256::digest(request.endpoint.as_bytes()));
+    let _notification_budget = reserve_notification_capacity().await?;
     let mut tx = pool
         .begin()
         .await
@@ -870,6 +882,7 @@ pub async fn disable_push_subscription_by_id(
     let Ok(subscription_id) = Uuid::parse_str(&subscription_id) else {
         return Ok(StatusCode::NO_CONTENT);
     };
+    let _notification_budget = reserve_notification_capacity().await?;
     let mut tx = pool
         .begin()
         .await
@@ -1038,6 +1051,8 @@ async fn materialize_direct_message_deliveries(
     event_id: i64,
     message_id: &str,
 ) -> anyhow::Result<u64> {
+    // Reserve only during PostgreSQL I/O; network push sends stay outside.
+    let _notification_budget = crate::state::reserve_postgres_domain_operation().await?;
     let result = sqlx::query(
         "INSERT INTO web_push_deliveries ( \
              source_event_id, subscription_id, conversation_id, notification_kind \
@@ -1074,6 +1089,8 @@ async fn materialize_direct_message_deliveries(
 type DeliveryRow = (i64, String, String, i32, String, String, String);
 
 async fn claim_deliveries(pool: &PgPool) -> anyhow::Result<Vec<DeliveryRow>> {
+    // Reserve only during PostgreSQL I/O; network push sends stay outside.
+    let _notification_budget = crate::state::reserve_postgres_domain_operation().await?;
     sqlx::query_as(
         "WITH picked AS ( \
              SELECT delivery.source_event_id, delivery.subscription_id \
@@ -1156,6 +1173,8 @@ async fn finish_delivery(
     attempt_count: i32,
     outcome: PushSendOutcome,
 ) -> anyhow::Result<()> {
+    // Reserve only during PostgreSQL I/O; network push sends stay outside.
+    let _notification_budget = crate::state::reserve_postgres_domain_operation().await?;
     match outcome {
         PushSendOutcome::Sent => {
             sqlx::query(

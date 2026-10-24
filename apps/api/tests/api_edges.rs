@@ -1682,3 +1682,176 @@ async fn post_edges_rejects_create_when_edge_cache_limit_zero_and_file_missing()
 
     Ok(())
 }
+
+/// Synthetic private-node faden: ordinary edge endpoints cannot circumvent
+/// node read authorization, including legacy untyped and cursor list paths.
+#[tokio::test]
+#[serial]
+async fn anonymous_edges_do_not_expose_private_node_endpoints() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    write_lines(
+        &in_dir.join("demo.nodes.jsonl"),
+        &[
+            r#"{"id":"node-public","title":"Public synthetic node","location":{"lat":53.5,"lon":10.0},"search_visibility":"public"}"#,
+            r#"{"id":"node-private","title":"Private synthetic node","location":{"lat":53.6,"lon":10.1},"search_visibility":"private","created_by_account_id":"owner"}"#,
+        ],
+    );
+    write_lines(
+        &in_dir.join("demo.edges.jsonl"),
+        &[
+            r#"{"id":"edge-public","source_id":"node-public","target_id":"node-public","source_type":"node","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-private","source_id":"node-private","target_id":"node-public","source_type":"node","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-legacy-private","source_id":"node-private","target_id":"node-public","edge_kind":"reference"}"#,
+            r#"{"id":"edge-blank-private","source_id":"node-private","source_type":"","target_id":"node-public","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-unknown-private","source_id":"node-private","source_type":"unknown","target_id":"node-public","target_type":"node","edge_kind":"reference"}"#,
+        ],
+    );
+    let _env = set_gewebe_in_dir(&in_dir);
+    let state = test_state().await?;
+    *state.nodes.write().await = weltgewebe_api::routes::nodes::load_nodes().await?;
+    let app = Router::new().merge(api_router()).with_state(state);
+    for uri in ["/edges", "/edges?pagination=cursor&limit=1"] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let payload: serde_json::Value = serde_json::from_slice(&body)?;
+        let items = payload
+            .as_array()
+            .or_else(|| payload.get("items").and_then(|x| x.as_array()))
+            .expect("edge list response");
+        assert_eq!(items.len(), 1, "{uri}");
+        assert_eq!(items[0]["id"], "edge-public");
+    }
+    for id in [
+        "edge-private",
+        "edge-legacy-private",
+        "edge-blank-private",
+        "edge-unknown-private",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(format!("/edges/{id}")).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{id}");
+    }
+    Ok(())
+}
+
+/// The privacy verdict and endpoint titles must describe one node-cache snapshot.
+/// Keep the account cache write-locked so get_edge can be paused immediately
+/// after its first node authorization read, without production test hooks.
+#[tokio::test]
+#[serial]
+async fn edge_details_do_not_reopen_newly_private_node_titles() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    write_lines(
+        &in_dir.join("demo.nodes.jsonl"),
+        &[
+            r#"{"id":"race-node","title":"Previously public title","location":{"lat":53.5,"lon":10.0},"search_visibility":"public"}"#,
+        ],
+    );
+    write_lines(
+        &in_dir.join("demo.edges.jsonl"),
+        &[
+            r#"{"id":"race-edge","source_id":"race-account","source_type":"account","target_id":"race-node","target_type":"node","edge_kind":"reference"}"#,
+        ],
+    );
+    let _env = set_gewebe_in_dir(&in_dir);
+    let state = test_state().await?;
+    *state.nodes.write().await = weltgewebe_api::routes::nodes::load_nodes().await?;
+    let nodes = state.nodes.clone();
+    let accounts = state.accounts.clone();
+    // Source-account details are loaded only after the first node visibility
+    // check. Force that await point while retaining a deterministic Node edit.
+    let account_guard = accounts.write().await;
+    let app = Router::new().merge(api_router()).with_state(state);
+    let mut pending =
+        Box::pin(app.oneshot(Request::get("/edges/race-edge").body(body::Body::empty())?));
+    assert!(
+        matches!(
+            futures_util::poll!(pending.as_mut()),
+            std::task::Poll::Pending
+        ),
+        "the edge request must pause while its source account is locked"
+    );
+    {
+        let mut cache = nodes.write().await;
+        let mut private = cache.get("race-node").context("race fixture node")?.clone();
+        private.title = "Fresh confidential title".to_string();
+        private.search_visibility = weltgewebe_api::routes::nodes::SearchVisibility::Private;
+        cache.insert(private.id.clone(), private);
+    }
+    drop(account_guard);
+
+    let response = pending.await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(
+        payload["target_details"]["title"],
+        "Previously public title"
+    );
+    assert!(!payload.to_string().contains("Fresh confidential title"));
+    Ok(())
+}
+
+/// PostgreSQL may skip one malformed historic node when constructing its
+/// read cache while retaining neighboring edges. Absence is NOT permission.
+#[tokio::test]
+#[serial]
+async fn postgres_edges_reject_node_references_missing_from_cache() -> Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    write_lines(
+        &in_dir.join("demo.nodes.jsonl"),
+        &[r#"{"id":"known-public","title":"Public node","location":{"lat":53.5,"lon":10.0}}"#],
+    );
+    write_lines(
+        &in_dir.join("demo.edges.jsonl"),
+        &[
+            r#"{"id":"edge-a-public","source_id":"known-public","source_type":"node","target_id":"known-public","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-b-missing","source_id":"omitted-private-node","source_type":"node","target_id":"known-public","target_type":"node","edge_kind":"reference"}"#,
+            r#"{"id":"edge-c-legacy-missing","source_id":"omitted-private-node","target_id":"known-public","edge_kind":"reference"}"#,
+            r#"{"id":"edge-d-account","source_id":"some-account","source_type":"account","target_id":"known-public","target_type":"node","edge_kind":"reference"}"#,
+        ],
+    );
+    let _env = set_gewebe_in_dir(&in_dir);
+    let mut state = test_state().await?;
+    state.config.domain_read_source = DomainReadSource::Postgres;
+    *state.nodes.write().await = weltgewebe_api::routes::nodes::load_nodes().await?;
+    // The route is intentionally mounted without the DB-generation middleware:
+    // here we isolate its own fail-closed endpoint filter.
+    let app = Router::new().merge(api_router()).with_state(state);
+    for uri in ["/edges", "/edges?pagination=cursor&limit=1"] {
+        let result = app
+            .clone()
+            .oneshot(Request::get(uri).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(result.status(), StatusCode::OK, "{uri}");
+        let content = body::to_bytes(result.into_body(), usize::MAX).await?;
+        let text = String::from_utf8(content.to_vec())?;
+        assert!(text.contains("edge-a-public"), "{uri}: {text}");
+        assert!(!text.contains("omitted-private-node"), "{uri}: {text}");
+        assert!(!text.contains("edge-b-missing"), "{uri}: {text}");
+        assert!(!text.contains("edge-c-legacy-missing"), "{uri}: {text}");
+    }
+    for id in ["edge-b-missing", "edge-c-legacy-missing"] {
+        let result = app
+            .clone()
+            .oneshot(Request::get(format!("/edges/{id}")).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(result.status(), StatusCode::NOT_FOUND, "{id}");
+    }
+    assert_eq!(
+        app.oneshot(Request::get("/edges/edge-d-account").body(body::Body::empty())?)
+            .await?
+            .status(),
+        StatusCode::OK,
+    );
+    Ok(())
+}

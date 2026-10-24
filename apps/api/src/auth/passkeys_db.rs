@@ -130,6 +130,11 @@ impl DbPasskeyStore {
     ) -> Result<(), DbPasskeyStoreError> {
         let key = credential_id_key(passkey.cred_id());
         let credential = passkey_to_text(passkey)?;
+        // Coordinate passkey writes with generation-fenced GETs and guest exit.
+        // Reserve before SQLx can acquire a connection and wait on FK locks.
+        let _pool_budget = crate::state::reserve_postgres_domain_operation()
+            .await
+            .map_err(DbPasskeyStoreError::Backend)?;
 
         let result = sqlx::query(
             "INSERT INTO passkey_credentials \
@@ -251,6 +256,9 @@ impl DbPasskeyStore {
         credential_id: &CredentialID,
     ) -> Result<bool, DbPasskeyStoreError> {
         let key = credential_id_key(credential_id);
+        let _pool_budget = crate::state::reserve_postgres_domain_operation()
+            .await
+            .map_err(DbPasskeyStoreError::Backend)?;
         let result = sqlx::query(
             "DELETE FROM passkey_credentials \
              WHERE account_id = $1 AND credential_id = $2",
@@ -281,6 +289,12 @@ impl DbPasskeyStore {
         auth_result: &AuthenticationResult,
     ) -> Result<bool, DbPasskeyStoreError> {
         let key = credential_id_key(auth_result.cred_id());
+        // UPDATE ... FOR UPDATE can wait for a guest-exit DELETE while that exit
+        // waits for a protected GET's generation row lock. Join the existing
+        // weighted pool budget before checking out the SQLx transaction.
+        let _pool_budget = crate::state::reserve_postgres_domain_operation()
+            .await
+            .map_err(DbPasskeyStoreError::Backend)?;
 
         let mut tx = self
             .pool

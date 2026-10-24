@@ -2466,6 +2466,95 @@ async fn t006_search_api_against_postgres_projections() {
         "a single provider-contract-error search must record exactly one provider_contract_error outcome"
     );
 
+    // A real T006 HTTP search must NOT reserve pooled connections or hold a
+    // PostgreSQL generation-row lock during potentially slow provider I/O.
+    // A second physical PostgreSQL pool must be free to commit public->private
+    // while embedding waits; the resumed result must exclude that node.
+    let provider_entered = Arc::new(Notify::new());
+    let provider_release = Arc::new(Notify::new());
+    let paused_state = state.clone();
+    let paused_auth = anonymous.clone();
+    let paused_search = tokio::spawn({
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(BlockingProvider {
+            entered: Arc::clone(&provider_entered),
+            release: Arc::clone(&provider_release),
+        });
+        async move {
+            weltgewebe_api::search::execute_search_http(
+                &paused_state,
+                &paused_auth,
+                SearchQueryParams {
+                    q: Some("Fahrrad Werkstatt".to_string()),
+                    ..Default::default()
+                },
+                Some(provider),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), provider_entered.notified())
+        .await
+        .expect("provider must pause before canonical candidate read");
+    let other_pool = crate::pool().await;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility='private'
+             WHERE id='t005-public-node'",
+        )
+        .execute(&other_pool),
+    )
+    .await
+    .expect("visibility commit must NOT wait for slow embedding")
+    .expect("independent private visibility commit");
+    let committed: String = sqlx::query_scalar(
+        "SELECT search_visibility FROM domain_nodes WHERE id='t005-public-node'",
+    )
+    .fetch_one(&other_pool)
+    .await
+    .expect("read committed visibility");
+    assert_eq!(committed, "private");
+    provider_release.notify_one();
+    let search_response = tokio::time::timeout(Duration::from_secs(7), paused_search)
+        .await
+        .expect("search completes after provider")
+        .expect("search task join")
+        .expect("search HTTP result");
+    assert_eq!(search_response.status(), axum::http::StatusCode::OK);
+    let response_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(search_response.into_body(), usize::MAX)
+            .await
+            .expect("search JSON bytes"),
+    )
+    .expect("parse search JSON");
+    assert!(
+        !response_json["items"]
+            .as_array()
+            .expect("search items")
+            .iter()
+            .any(|node| node["id"] == "t005-public-node"),
+        "private canonical node escaped after provider: {response_json}"
+    );
+    // Restore the disposable PostgreSQL fixture for the following T004 tests.
+    sqlx::query("UPDATE domain_nodes SET search_visibility='public' WHERE id='t005-public-node'")
+        .execute(&pool)
+        .await
+        .expect("restore public test node");
+    sqlx::query(
+        "UPDATE search_node_projections p
+         SET source_version=v.source_version, source_revision=v.source_revision
+         FROM search_node_versions v
+         WHERE p.generation_id=$1 AND p.node_id='t005-public-node' AND v.node_id=p.node_id",
+    )
+    .bind(&gen_id)
+    .execute(&pool)
+    .await
+    .expect("reconcile search projection after reset");
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("refresh restored public node");
+
     // The verified T004 core rejects candidate sets above 1000. T006 mirrors
     // that bound and fetches only one sentinel row beyond it, preventing an
     // unbounded transfer of embedding arrays into the API process.

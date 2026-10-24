@@ -1673,3 +1673,202 @@ async fn nodes_post_rejects_invalid_payloads_with_stable_400() -> anyhow::Result
 
     Ok(())
 }
+
+/// Candidate privacy contract for #1970. This is a synthetic regression test:
+/// no real private nodes or account data are fetched or logged.
+#[tokio::test]
+#[serial]
+async fn anonymous_node_reads_do_not_reveal_private_search_visibility() -> anyhow::Result<()> {
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let (app, _env) = app_with_nodes(
+        &in_dir,
+        &[
+            r#"{"id":"public-fixture","title":"Public synthetic node","location":{"lon":10.0,"lat":53.5},"search_visibility":"public"}"#,
+            r#"{"id":"private-fixture","title":"Confidential synthetic node","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"synthetic-owner"}"#,
+        ],
+    )
+    .await;
+
+    for uri in ["/nodes", "/nodes?bbox=9.9,53.4,10.2,53.7"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let nodes: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let items = nodes.as_array().expect("legacy list wire shape");
+        assert!(
+            items.iter().any(|node| node["id"] == "public-fixture"),
+            "{uri}"
+        );
+        assert!(
+            !items.iter().any(|node| node["id"] == "private-fixture"),
+            "anonymous node list leaked private fixture through {uri}"
+        );
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/nodes/private-fixture")
+                .body(axum::body::Body::empty())?,
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "anonymous direct object URL must not bypass visibility"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn protected_nodes_reject_foreign_mutation_before_object_preconditions() -> anyhow::Result<()>
+{
+    use axum::Extension;
+    use weltgewebe_api::middleware::auth::AuthContext;
+
+    let tmp = make_tmp_dir();
+    let (app, _env) = app_with_nodes(
+        &tmp.path().join("in"),
+        &[
+            r#"{"id":"secret-private","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"real-owner"}"#,
+            r#"{"id":"secret-hidden","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"hidden","created_by_account_id":"real-owner"}"#,
+            r#"{"id":"secret-revoked","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"revoked","created_by_account_id":"real-owner"}"#,
+        ],
+    )
+    .await;
+    let foreign_admin = app.layer(Extension(AuthContext {
+        authenticated: true,
+        account_id: Some("unrelated-admin".into()),
+        device_id: None,
+        role: Role::Admin,
+        expires_at: None,
+    }));
+
+    for id in ["secret-private", "secret-hidden", "secret-revoked"] {
+        for method in ["PATCH", "PUT", "DELETE"] {
+            // No If-Match is supplied: before the fix, the 428 body included the
+            // entire protected node even though GET already returned 404.
+            let request = Request::builder()
+                .method(method)
+                .uri(format!("/nodes/{id}"))
+                .header("Content-Type", "application/json")
+                .body(body::Body::from(r#"{"info":"no mutation"}"#))?;
+            let response = foreign_admin.clone().oneshot(request).await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} must not disclose or mutate {id}"
+            );
+            let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("SECRET-PRECONDITION-MARKER"),
+                "{method} must never emit a protected precondition payload"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn private_nodes_are_owner_only_with_cursor_pages() -> anyhow::Result<()> {
+    use axum::Extension;
+    use weltgewebe_api::middleware::auth::AuthContext;
+
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    let (app, _env) = app_with_nodes(
+        &in_dir,
+        &[
+            r#"{"id":"a-public","title":"Public","location":{"lon":10.0,"lat":53.5},"search_visibility":"public"}"#,
+            r#"{"id":"b-private","title":"Secret","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"acct-owner"}"#,
+            r#"{"id":"c-public","title":"Second public","location":{"lon":10.2,"lat":53.6},"search_visibility":"public"}"#,
+            r#"{"id":"d-hidden","title":"Hidden","location":{"lon":10.3,"lat":53.6},"search_visibility":"hidden","created_by_account_id":"acct-owner"}"#,
+            r#"{"id":"e-revoked","title":"Revoked","location":{"lon":10.4,"lat":53.6},"search_visibility":"revoked","created_by_account_id":"acct-owner"}"#,
+        ],
+    ).await;
+
+    let anonymous = app
+        .clone()
+        .oneshot(Request::get("/nodes?pagination=cursor&limit=1").body(body::Body::empty())?)
+        .await?;
+    assert_eq!(anonymous.status(), StatusCode::OK);
+    let bytes = body::to_bytes(anonymous.into_body(), usize::MAX).await?;
+    let page: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(page["items"][0]["id"], "a-public");
+    assert!(page["page"]["has_more"].as_bool().unwrap_or_default());
+    let cursor = page["page"]["next_cursor"].as_str().expect("cursor");
+    let follow = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/nodes?pagination=cursor&limit=1&cursor={cursor}"))
+                .body(body::Body::empty())?,
+        )
+        .await?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body::to_bytes(follow.into_body(), usize::MAX).await?)?;
+    assert_eq!(payload["items"][0]["id"], "c-public");
+
+    let owner = app.clone().layer(Extension(AuthContext {
+        authenticated: true,
+        account_id: Some("acct-owner".into()),
+        device_id: None,
+        role: Role::Gast,
+        expires_at: None,
+    }));
+    let owner_list = owner
+        .clone()
+        .oneshot(Request::get("/nodes").body(body::Body::empty())?)
+        .await?;
+    let owner_nodes: serde_json::Value =
+        serde_json::from_slice(&body::to_bytes(owner_list.into_body(), usize::MAX).await?)?;
+    let ids: Vec<&str> = owner_nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"b-private"));
+    assert!(ids.contains(&"d-hidden"));
+    assert!(!ids.contains(&"e-revoked"));
+    assert_eq!(
+        owner
+            .clone()
+            .oneshot(Request::get("/nodes/b-private").body(body::Body::empty())?)
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        owner
+            .oneshot(Request::get("/nodes/e-revoked").body(body::Body::empty())?)
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let other_admin = app.layer(Extension(AuthContext {
+        authenticated: true,
+        account_id: Some("other-account".into()),
+        device_id: None,
+        role: Role::Admin,
+        expires_at: None,
+    }));
+    assert_eq!(
+        other_admin
+            .oneshot(Request::get("/nodes/b-private").body(body::Body::empty())?)
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    Ok(())
+}

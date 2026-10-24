@@ -409,6 +409,12 @@ pub async fn create_weber_proposal_at_center(
     let id = Uuid::new_v4().to_string();
     let consent_until = now + Duration::days(CONSENT_PHASE_DAYS);
 
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(CreateProposalError::Database)?;
     let mut tx = pool.begin().await.map_err(CreateProposalError::Database)?;
     let applicant_role: Option<String> = sqlx::query_scalar(
         "SELECT role FROM domain_accounts \
@@ -520,6 +526,12 @@ pub async fn create_sach_proposal_at_center(
 ) -> Result<ProposalWithCounts, CreateProposalError> {
     let id = Uuid::new_v4().to_string();
     let consent_until = now + Duration::days(CONSENT_PHASE_DAYS);
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(CreateProposalError::Database)?;
     let mut tx = pool.begin().await.map_err(CreateProposalError::Database)?;
 
     let applicant_role: Option<String> = sqlx::query_scalar(
@@ -546,7 +558,12 @@ pub async fn create_sach_proposal_at_center(
             .await
             .map_err(CreateProposalError::Database)?;
         Some(
-            sqlx::query_scalar("SELECT title FROM domain_nodes WHERE id = $1 FOR SHARE")
+            // This is a PUBLIC Sachantrag: even a private-node owner may
+            // not copy its title/id into the world-readable proposal snapshot.
+            // FOR SHARE keeps public visibility stable until the proposal commits.
+            sqlx::query_scalar(
+                "SELECT title FROM domain_nodes WHERE id = $1 AND search_visibility = 'public' FOR SHARE",
+            )
                 .bind(target_node_id)
                 .fetch_optional(&mut *tx)
                 .await
@@ -625,6 +642,12 @@ pub async fn withdraw_proposal(
     applicant_account_id: &str,
     now: DateTime<Utc>,
 ) -> Result<ProposalWithCounts, WithdrawProposalError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(WithdrawProposalError::Database)?;
     let mut tx = pool
         .begin()
         .await
@@ -688,6 +711,12 @@ pub async fn create_repeal_proposal(
     summary: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<ProposalWithCounts, RepealProposalError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(RepealProposalError::Database)?;
     let mut tx = pool.begin().await.map_err(RepealProposalError::Database)?;
 
     // Gleiche Lock-Reihenfolge wie Veto, Stimme, Nachricht und Finalisierung:
@@ -844,6 +873,12 @@ pub async fn add_veto(
     reason: &str,
     now: DateTime<Utc>,
 ) -> Result<Veto, VetoError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(VetoError::Database)?;
     let mut tx = pool.begin().await.map_err(VetoError::Database)?;
 
     // Guest exit uses account -> proposal lock ordering. Formal actions use the
@@ -912,6 +947,12 @@ pub async fn upsert_vote(
     choice: VoteChoice,
     now: DateTime<Utc>,
 ) -> Result<VoteWriteOutcome, VoteError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(VoteError::Database)?;
     let mut tx = pool.begin().await.map_err(VoteError::Database)?;
 
     let actor_role: Option<String> = sqlx::query_scalar(
@@ -999,6 +1040,12 @@ pub async fn add_message(
     body: &str,
     now: DateTime<Utc>,
 ) -> Result<ProposalMessage, MessageError> {
+    // Reserve before checking out any PostgreSQL connection or taking account
+    // and proposal locks. Otherwise an exiting guest and a fenced GET can be
+    // starved by several unrelated lock-waiting governance transactions.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(MessageError::Database)?;
     let mut tx = pool.begin().await.map_err(MessageError::Database)?;
 
     // Guest exit and proposal finalization use account -> proposal ordering.
@@ -1071,6 +1118,11 @@ pub async fn add_message(
 /// Die Rollenbedingung schützt gegen versehentliches Löschen eines Webers oder
 /// Administrators.
 pub async fn delete_guest_account(pool: &PgPool, account_id: &str) -> Result<(), GuestExitError> {
+    // Reserve the same shared admission as the GET generation fence BEFORE
+    // obtaining any connection or account/node lifecycle lock. Four parallel
+    // exits otherwise occupy the remaining pool slots while their triggers
+    // wait for that fence, starving the reader's response query.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation().await?;
     let mut tx = pool.begin().await?;
 
     // Serialize the complete account lifecycle before taking row or per-node
@@ -1185,7 +1237,9 @@ pub async fn delete_guest_account(pool: &PgPool, account_id: &str) -> Result<(),
 // ---------------------------------------------------------------------------
 
 const PROPOSAL_WITH_COUNTS_SELECT: &str = "SELECT p.id::text AS id, p.kind, \
-        p.webgemeindezentrum_id, p.title, p.target_node_id, p.target_node_title, \
+        p.webgemeindezentrum_id, p.title, \
+        CASE WHEN public_target.id IS NOT NULL THEN p.target_node_id END AS target_node_id, \
+        CASE WHEN public_target.id IS NOT NULL THEN p.target_node_title END AS target_node_title, \
         p.repeals_proposal_id::text AS repeals_proposal_id, \
         (SELECT r.id::text FROM governance_proposals r \
             WHERE r.repeals_proposal_id = p.id AND r.status IN ('consent', 'voting') \
@@ -1223,7 +1277,10 @@ const PROPOSAL_WITH_COUNTS_SELECT: &str = "SELECT p.id::text AS id, p.kind, \
             WHERE gv.proposal_id = p.id AND gv.choice = 'nein') AS no_votes, \
         (SELECT count(*) FROM governance_votes gv \
             WHERE gv.proposal_id = p.id AND gv.choice = 'enthaltung') AS abstain_votes \
-     FROM governance_proposals p";
+     FROM governance_proposals p \
+     LEFT JOIN domain_nodes public_target \
+       ON public_target.id = p.target_node_id \
+      AND public_target.search_visibility = 'public'";
 
 fn proposal_from_row(row: &sqlx::postgres::PgRow) -> Result<ProposalWithCounts, sqlx::Error> {
     Ok(ProposalWithCounts {
@@ -1437,6 +1494,9 @@ async fn finalize_one(
     proposal_id: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<FinalizationOutcome>, sqlx::Error> {
+    // Accepting a Weberantrag writes the canonical account generation.
+    // This path is also invoked by the background sweeper, outside HTTP.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation().await?;
     let mut tx = pool.begin().await?;
 
     // Account exit locks account -> proposal. Finalization must use the same

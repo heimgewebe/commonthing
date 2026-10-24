@@ -1,5 +1,6 @@
 use super::domain_write_guard::reject_edge_create_unless_writable;
 use super::health::{ensure_jsonl_size, load_policy_limits};
+use super::nodes::node_readable_to;
 use super::query::{
     cursor_page, parse_cursor_params, parse_usize_param, validate_cursor_limit, ListResponse,
     MAX_PAGE_SIZE,
@@ -16,12 +17,12 @@ use crate::utils::edges_path;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use tokio::{
@@ -523,9 +524,90 @@ pub async fn load_edges() -> std::io::Result<OrderedCache<Edge>> {
     Ok(edges)
 }
 
+/// Fäden cannot expose hidden nodes, including typed node references whose
+/// cache row is missing. PostgreSQL loader may intentionally omit malformed
+/// node coordinates; absence from its public projection is not authorization.
+/// Legacy untyped endpoints resolve to a node, account or known role; unknown
+/// PostgreSQL endpoints fail closed rather than leaking a removed node id.
+/// Typed identities cannot grant untyped node authorization when a canonical
+/// node with the same ID was omitted from the projected cache.
+fn edge_exposes_unreadable_node(
+    edge: &Edge,
+    hidden: &HashSet<String>,
+    known_nodes: &HashSet<String>,
+    known_accounts: &HashSet<String>,
+    canonical_collisions: &HashSet<String>,
+    strict_missing: bool,
+) -> bool {
+    let rejects = |kind: Option<&str>, id: &str| match kind {
+        Some("node") => hidden.contains(id) || (strict_missing && !known_nodes.contains(id)),
+        Some("account" | "role" | "webgemeindezentrum") => false,
+        // Unknown or blank type hints cannot establish a typed endpoint.
+        // Reject the whole legacy edge instead of exposing a protected node ID.
+        Some(_) => true,
+        None => {
+            hidden.contains(id)
+                || canonical_collisions.contains(id)
+                || (strict_missing
+                    && !known_nodes.contains(id)
+                    && !known_accounts.contains(id)
+                    && !matches!(id, "gast" | "weber" | "admin"))
+        }
+    };
+    rejects(edge.source_type.as_deref(), &edge.source_id)
+        || rejects(edge.target_type.as_deref(), &edge.target_id)
+}
+
+// Only ambiguous untyped account/role identities require an extra canonical
+// PostgreSQL lookup. Normal typed Fäden and ordinary untyped node IDs remain
+// cheap. One batched read protects legacy links without fetching private data.
+fn uncertain_untyped_node_id(
+    edge: &Edge,
+    known_nodes: &HashSet<String>,
+    known_accounts: &HashSet<String>,
+) -> Vec<String> {
+    [
+        (&edge.source_id, edge.source_type.as_deref()),
+        (&edge.target_id, edge.target_type.as_deref()),
+    ]
+    .into_iter()
+    .filter(move |(id, kind)| {
+        kind.is_none()
+            && !known_nodes.contains(*id)
+            && (known_accounts.contains(*id) || matches!(id.as_str(), "gast" | "weber" | "admin"))
+    })
+    .map(|(id, _)| id.clone())
+    .collect()
+}
+
+async fn canonical_node_collisions(
+    state: &ApiState,
+    candidates: &HashSet<String>,
+) -> Result<HashSet<String>, StatusCode> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let pool = state
+        .db_pool
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let ids: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let collisions: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM domain_nodes WHERE id = ANY($1::text[])")
+            .bind(ids)
+            .fetch_all(pool)
+            .await
+            .map_err(|error| {
+                tracing::error!(?error, "canonical legacy edge endpoint check failed");
+                StatusCode::SERVICE_UNAVAILABLE
+            })?;
+    Ok(collisions.into_iter().collect())
+}
+
 pub async fn list_edges(
     State(state): State<ApiState>,
     Query(params): Query<HashMap<String, String>>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<Json<ListResponse<PublicEdge>>, StatusCode> {
     let src = params.get("source_id").map(String::as_str);
     let dst = params.get("target_id").map(String::as_str);
@@ -533,8 +615,55 @@ pub async fn list_edges(
     let (cursor_mode, after_id) = parse_cursor_params(&params)?;
     validate_cursor_limit(cursor_mode, limit)?;
 
+    let viewer = auth.as_ref().map(|extension| &extension.0);
+    // Snapshot reader-relevant identities, never holding node, account, and
+    // edge locks together. PostgreSQL must reject node-typed dangling edges
+    // even if the public node projection deliberately omitted their rows.
+    let strict_missing =
+        state.config.domain_read_source == crate::config::DomainReadSource::Postgres;
+    let (hidden_node_ids, known_nodes): (HashSet<String>, HashSet<String>) = {
+        let nodes = state.nodes.read().await;
+        let mut hidden = HashSet::new();
+        let mut known = HashSet::new();
+        for node in nodes.iter_in_order() {
+            if !node_readable_to(node, viewer) {
+                hidden.insert(node.id.clone());
+            }
+            if strict_missing {
+                known.insert(node.id.clone());
+            }
+        }
+        (hidden, known)
+    };
+    let known_accounts: HashSet<String> = if strict_missing {
+        let accounts = state.accounts.read().await;
+        accounts.iter().map(|(id, _)| id.clone()).collect()
+    } else {
+        HashSet::new()
+    };
     let now = Utc::now();
-    let matches = |edge: &&Edge| edge_matches_list_at(edge, src, dst, now);
+    let candidates: HashSet<String> = if strict_missing {
+        let cache = state.edges.read().await;
+        cache
+            .iter_in_order()
+            .filter(|edge| edge_matches_list_at(edge, src, dst, now))
+            .flat_map(|edge| uncertain_untyped_node_id(edge, &known_nodes, &known_accounts))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let canonical_collisions = canonical_node_collisions(&state, &candidates).await?;
+    let matches = |edge: &&Edge| {
+        edge_matches_list_at(edge, src, dst, now)
+            && !edge_exposes_unreadable_node(
+                edge,
+                &hidden_node_ids,
+                &known_nodes,
+                &known_accounts,
+                &canonical_collisions,
+                strict_missing,
+            )
+    };
 
     let cache = state.edges.read().await;
 
@@ -566,6 +695,7 @@ pub async fn list_edges(
 pub async fn get_edge(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<Json<EdgeWithDetails>, StatusCode> {
     let cache = state.edges.read().await;
     let edge = cache.get(&id).cloned().ok_or(StatusCode::NOT_FOUND)?;
@@ -574,8 +704,82 @@ pub async fn get_edge(
     }
     drop(cache);
 
-    let mut source_details = None;
-    let mut target_details = None;
+    let viewer = auth.as_ref().map(|extension| &extension.0);
+    let strict_missing =
+        state.config.domain_read_source == crate::config::DomainReadSource::Postgres;
+    let (hidden_node_ids, known_nodes, source_node_details, target_node_details) = {
+        let nodes = state.nodes.read().await;
+        let mut hidden = HashSet::new();
+        let mut known = HashSet::new();
+        for (id, kind) in [
+            (&edge.source_id, edge.source_type.as_deref()),
+            (&edge.target_id, edge.target_type.as_deref()),
+        ] {
+            if kind.is_none() || kind == Some("node") {
+                if let Some(node) = nodes.get(id) {
+                    known.insert(id.clone());
+                    if !node_readable_to(node, viewer) {
+                        hidden.insert(id.clone());
+                    }
+                }
+            }
+        }
+        // Return the same node version used for this request's visibility check.
+        // A concurrent public-to-private replacement must never provide a new
+        // confidential title to an already-authorized edge response.
+        let snapshot_details = |id: &str| {
+            nodes.get(id).map(|node| EdgeParticipantDetails {
+                id: node.id.clone(),
+                title: node.title.clone(),
+                r#type: Some(node.kind.clone()),
+            })
+        };
+        let source_node_details = if edge.source_type.as_deref() == Some("node") {
+            snapshot_details(&edge.source_id)
+        } else {
+            None
+        };
+        let target_node_details = if edge.target_type.as_deref() == Some("node") {
+            snapshot_details(&edge.target_id)
+        } else {
+            None
+        };
+        (hidden, known, source_node_details, target_node_details)
+    };
+    let known_accounts: HashSet<String> = if strict_missing {
+        let accounts = state.accounts.read().await;
+        [
+            (&edge.source_id, edge.source_type.as_deref()),
+            (&edge.target_id, edge.target_type.as_deref()),
+        ]
+        .into_iter()
+        .filter(|(_, kind)| kind.is_none())
+        .filter_map(|(id, _)| accounts.get(id).map(|_| id.clone()))
+        .collect()
+    } else {
+        HashSet::new()
+    };
+    let candidates: HashSet<String> = if strict_missing {
+        uncertain_untyped_node_id(&edge, &known_nodes, &known_accounts)
+            .into_iter()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let canonical_collisions = canonical_node_collisions(&state, &candidates).await?;
+    if edge_exposes_unreadable_node(
+        &edge,
+        &hidden_node_ids,
+        &known_nodes,
+        &known_accounts,
+        &canonical_collisions,
+        strict_missing,
+    ) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let mut source_details = source_node_details;
+    let mut target_details = target_node_details;
 
     if let Some(src_type) = &edge.source_type {
         if src_type == "account" {
@@ -585,15 +789,6 @@ pub async fn get_edge(
                     id: account.public.id.clone(),
                     title: account.public.title.clone(),
                     r#type: Some(account.public.kind.clone()),
-                });
-            }
-        } else if src_type == "node" {
-            let nodes_cache = state.nodes.read().await;
-            if let Some(node) = nodes_cache.get(&edge.source_id) {
-                source_details = Some(EdgeParticipantDetails {
-                    id: node.id.clone(),
-                    title: node.title.clone(),
-                    r#type: Some(node.kind.clone()),
                 });
             }
         }
@@ -607,15 +802,6 @@ pub async fn get_edge(
                     id: account.public.id.clone(),
                     title: account.public.title.clone(),
                     r#type: Some(account.public.kind.clone()),
-                });
-            }
-        } else if tgt_type == "node" {
-            let nodes_cache = state.nodes.read().await;
-            if let Some(node) = nodes_cache.get(&edge.target_id) {
-                target_details = Some(EdgeParticipantDetails {
-                    id: node.id.clone(),
-                    title: node.title.clone(),
-                    r#type: Some(node.kind.clone()),
                 });
             }
         } else if tgt_type == "webgemeindezentrum" {

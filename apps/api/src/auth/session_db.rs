@@ -7,6 +7,16 @@ use super::session::{Session, SessionBackendError, SessionLifetime, SessionOps, 
 // Trusted static SQL fragment shared by the session queries below. It must
 // never contain configuration or request data; all external values remain
 // parameter-bound through sqlx.
+// Session IO runs outside the projection fence in authentication middleware,
+// but can block on row locks held by guest exit. All SQLx session operations
+// must therefore share the same admission budget with generation-fenced reads
+// and canonical domain writers; no new queue or connection pool is needed.
+async fn reserve_sqlx_session_capacity() -> SessionResult<tokio::sync::SemaphorePermit<'static>> {
+    crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(|_| SessionBackendError::Unavailable)
+}
+
 const SESSION_COLUMNS_WITH_REMAINING_LIFETIME: &str =
     "id, account_id, device_id, created_at, last_active, expires_at, \
      GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (expires_at - NOW()))))::BIGINT \
@@ -59,6 +69,7 @@ impl SessionOps for DbSessionStore {
         account_id: String,
         existing_device_id: Option<String>,
     ) -> SessionResult<Session> {
+        let _session_budget = reserve_sqlx_session_capacity().await?;
         let session_id = Uuid::new_v4().to_string();
         let device_id = existing_device_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         // SAFETY: the only interpolated fragment is the trusted module constant;
@@ -88,6 +99,7 @@ impl SessionOps for DbSessionStore {
         // the expiry predicate still prevents the stale row from being returned.
         // SAFETY: the only interpolated fragment is the trusted module constant;
         // the session id remains parameter-bound below.
+        let _session_budget = reserve_sqlx_session_capacity().await?;
         let query = format!(
             "WITH expired AS (
                  DELETE FROM sessions
@@ -112,6 +124,7 @@ impl SessionOps for DbSessionStore {
     }
 
     async fn delete(&self, session_id: &str) -> SessionResult<()> {
+        let _session_budget = reserve_sqlx_session_capacity().await?;
         sqlx::query("DELETE FROM sessions WHERE id = $1")
             .bind(session_id)
             .execute(&self.pool)
@@ -122,6 +135,7 @@ impl SessionOps for DbSessionStore {
     }
 
     async fn touch(&self, session_id: &str) -> SessionResult<()> {
+        let _session_budget = reserve_sqlx_session_capacity().await?;
         sqlx::query(
             "UPDATE sessions
              SET last_active = NOW()
@@ -140,6 +154,7 @@ impl SessionOps for DbSessionStore {
     async fn list_by_account(&self, account_id: &str) -> SessionResult<Vec<Session>> {
         // SAFETY: the only interpolated fragment is the trusted module constant;
         // the account id remains parameter-bound below.
+        let _session_budget = reserve_sqlx_session_capacity().await?;
         let query = format!(
             "SELECT {SESSION_COLUMNS_WITH_REMAINING_LIFETIME}
              FROM sessions
@@ -159,6 +174,7 @@ impl SessionOps for DbSessionStore {
     }
 
     async fn delete_by_device(&self, account_id: &str, device_id: &str) -> SessionResult<()> {
+        let _session_budget = reserve_sqlx_session_capacity().await?;
         sqlx::query(
             "DELETE FROM sessions 
              WHERE account_id = $1 AND device_id = $2",
@@ -173,6 +189,7 @@ impl SessionOps for DbSessionStore {
     }
 
     async fn delete_all_by_account(&self, account_id: &str) -> SessionResult<()> {
+        let _session_budget = reserve_sqlx_session_capacity().await?;
         sqlx::query("DELETE FROM sessions WHERE account_id = $1")
             .bind(account_id)
             .execute(&self.pool)
