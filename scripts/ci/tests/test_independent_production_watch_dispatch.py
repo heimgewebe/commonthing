@@ -312,6 +312,44 @@ class WatchDispatchTests(unittest.TestCase):
         finally:
             os.umask(original_umask)
 
+    def test_slow_http_stream_uses_total_deadline_and_preserves_cursor(self):
+        import signal
+        import time
+
+        self.enroll()
+        self.append(self.event("ALARM", "slow_response"))
+        previous_handler = signal.getsignal(signal.SIGALRM)
+
+        class SlowResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *unused):
+                return False
+
+            def read(self, _limit):
+                # A stream that keeps making progress below the per-socket
+                # timeout must still be interrupted by the total deadline.
+                end = time.monotonic() + 0.4
+                while time.monotonic() < end:
+                    time.sleep(0.01)
+                return b"accepted"
+
+        with (
+            mock.patch.object(dispatch, "urlopen", return_value=SlowResponse()),
+            mock.patch.object(dispatch, "HTTP_TOTAL_TIMEOUT_SECONDS", 0.05),
+        ):
+            with self.assertRaises(TimeoutError):
+                self.run_transport(publisher=dispatch._post_ntfy)
+
+        self.assertIs(signal.getsignal(signal.SIGALRM), previous_handler)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertEqual(self.cursor()["offset"], 0)
+        self.assertEqual(self.cursor()["accepted"], 0)
+        self.assertEqual(self.run_transport()["accepted"], 1)
+
     def test_cron_keeps_poll_and_opt_in_transport_in_one_five_minute_schedule(self):
         crontab = (SCRIPT.parent / "independent_production_watch.crontab").read_text()
         self.assertIn("*/5 * * * *", crontab)

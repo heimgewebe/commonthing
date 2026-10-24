@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import stat
 import sys
 from urllib.request import Request, urlopen
@@ -29,6 +30,7 @@ MAX_JOURNAL_BYTES = 32 * 1024 * 1024
 MAX_LINE_BYTES = 65536
 MAX_CURSOR_BYTES = 8192
 MAX_BATCH = 8
+HTTP_TOTAL_TIMEOUT_SECONDS = 8
 TOPIC_RE = re.compile(r"[A-Za-z0-9]{32,128}\Z")
 EVENTS = frozenset({"ALARM", "RECOVERY", "MONITOR_DATA_FAILURE"})
 TRANSPORT_NON_CLAIMS = [
@@ -224,6 +226,26 @@ def enroll(directory: Path, topic_file: Path, *, acknowledge_prior_history: bool
                 "previous_history_not_delivered": True}
 
 
+@contextmanager
+def _bounded_http_deadline():
+    """Bound the entire network exchange, not just individual socket operations."""
+    if any(signal.getitimer(signal.ITIMER_REAL)):
+        raise TransportBlocked("another process-wide SIGALRM deadline is active")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def expire(_signum, _frame):
+        raise TimeoutError("notification HTTP total deadline exceeded")
+
+    signal.signal(signal.SIGALRM, expire)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, HTTP_TOTAL_TIMEOUT_SECONDS)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def _post_ntfy(topic: str, event: dict, event_id: str) -> int:
     codes = sorted({
         x["code"] for x in event["issues"]
@@ -244,9 +266,10 @@ def _post_ntfy(topic: str, event: dict, event_id: str) -> int:
             "User-Agent": "commonthing-independent-watch-transport/1",
         },
     )
-    with urlopen(request, timeout=6) as response:
-        code = int(response.status)
-        response.read(1024)
+    with _bounded_http_deadline():
+        with urlopen(request, timeout=6) as response:
+            code = int(response.status)
+            response.read(1024)
     return code
 
 
