@@ -23,6 +23,7 @@ SCHAUWERK_MANIFEST_URL="${WELTGEWEBE_SCHAUWERK_MANIFEST_URL:-https://commonthing
 API_URL="${WELTGEWEBE_API_VERSION_URL:-https://commonthing.net/api/version}"
 NODE_BUILD_IMAGE="${WELTGEWEBE_NODE_BUILD_IMAGE:-docker.io/library/node@sha256:8898f8ed3c0126667837b678979b4ed83306c856a1227c8bf5f5f77740c25cd6}"
 DEPLOY_HELPER="${WELTGEWEBE_DEPLOY_HELPER:-/usr/local/libexec/weltgewebe-deploy-exact-commit}"
+AUTHORIZER="/usr/local/libexec/weltgewebe-verify-production-hold-release"
 LIVE_VERIFIER="${WELTGEWEBE_LIVE_VERIFIER:-/usr/local/libexec/weltgewebe-verify-public-release}"
 ARCHIVE_VALIDATOR="${WELTGEWEBE_ARCHIVE_VALIDATOR:-/usr/local/libexec/weltgewebe-validate-web-deploy-archive}"
 readonly PRODUCTION_LOCK_DOMAIN="weltgewebe-production-deployment-v1"
@@ -1507,6 +1508,33 @@ for command_name in git docker sha256sum flock install id rm mv awk getent chmod
   require_command "$command_name"
 done
 
+# No state dirs, lock-file creation, Git tracking ref updates, build-cache prune,
+# migrations or Compose calls are permitted under an uncleared production HOLD.
+[[ -f "$AUTHORIZER" && -x "$AUTHORIZER" && ! -L "$AUTHORIZER" ]] ||
+  fail "root-owned production HOLD release checker is not installed"
+[[ "$(stat --format=%u "$AUTHORIZER")" == "0" ]] ||
+  fail "production HOLD checker is not root-owned"
+checker_mode="$(stat --format=%a "$AUTHORIZER")"
+(((8#$checker_mode & 022) == 0)) ||
+  fail "production HOLD checker is group/world writable"
+python3 -I "$AUTHORIZER" --preflight ||
+  fail "production HOLD release missing or invalid"
+[[ "$(stat --format=%u "$SOURCE_CHECKOUT")" == "0" ]] || fail "source checkout is not root-owned"
+git_common_dir="$(git -C "$SOURCE_CHECKOUT" rev-parse --git-common-dir)"
+[[ "$git_common_dir" == /* ]] || git_common_dir="$SOURCE_CHECKOUT/$git_common_dir"
+git_common_dir="$(readlink -f "$git_common_dir")"
+unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
+[[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
+
+# Read-only remote identity check BEFORE creating state directories or locks.
+# The later, lock-held fetch must agree and still match this root decision.
+preflight_main="$(git -C "$SOURCE_CHECKOUT" ls-remote --exit-code origin refs/heads/main | awk 'NR==1 {print $1}')" ||
+  fail "cannot determine exact remote main before reconciliation"
+[[ "$preflight_main" =~ ^[0-9a-f]{40}$ ]] ||
+  fail "preflight remote main is invalid"
+python3 -I "$AUTHORIZER" --commit "$preflight_main" ||
+  fail "production HOLD authorization does not cover live remote main"
+
 install -d -o root -g root -m 0711 "$STATE_ROOT"
 install -d -o root -g root -m 0700 \
   "$ARTIFACT_ROOT" "$RECEIPT_ROOT" "$DEPLOY_RECEIPT_ROOT" "$DOCKER_CONFIG"
@@ -1519,15 +1547,11 @@ available_kib="$(df -Pk "$ARTIFACT_ROOT" | awk 'NR==2 {print $4}')"
 [[ "$available_kib" =~ ^[0-9]+$ ]] || fail "could not determine free disk space"
 ((available_kib >= MIN_FREE_KIB)) || fail "insufficient free disk space: ${available_kib}KiB available"
 
-[[ "$(stat --format=%u "$SOURCE_CHECKOUT")" == "0" ]] || fail "source checkout is not root-owned"
-git_common_dir="$(git -C "$SOURCE_CHECKOUT" rev-parse --git-common-dir)"
-[[ "$git_common_dir" == /* ]] || git_common_dir="$SOURCE_CHECKOUT/$git_common_dir"
-git_common_dir="$(readlink -f "$git_common_dir")"
-unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
-[[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
 
 target_commit="$(fetch_main)"
 [[ "$target_commit" =~ ^[0-9a-f]{40}$ ]] || fail "origin/main did not resolve to a full commit"
+python3 -I "$AUTHORIZER" --commit "$target_commit" ||
+  fail "origin/main does not equal the authorized production release"
 write_state "observed" "$target_commit" "reconcile started"
 
 # Schaubild is a separately versioned native runtime served by this edge.
@@ -1579,6 +1603,9 @@ PY_SCHAUWERK_RUNTIME_LOCK
   fail "target Schaubild image reference is invalid"
 [[ "$expected_schauwerk_source_commit" =~ ^[0-9a-f]{40}$ ]] ||
   fail "target Schaubild source commit is invalid"
+python3 -I "$AUTHORIZER" --commit "$target_commit" \
+  --image-digest "${expected_schauwerk_image_ref##*@}" ||
+  fail "target OCI digest is not authorized by the production HOLD release"
 
 # Nationwide Germany is the production sovereign contract. Bind the no-op
 # decision to the exact Germany style in this commit before public readback.
@@ -1703,6 +1730,9 @@ if "$LIVE_VERIFIER" \
   fi
 fi
 
+python3 -I "$AUTHORIZER" --commit "$target_commit" \
+  --image-digest "${expected_schauwerk_image_ref##*@}" ||
+  fail "production HOLD was withdrawn before build-cache or release mutation"
 ensure_production_build_disk_headroom "$target_commit"
 
 build_uid="$(id -u "$BUILD_USER")"
@@ -1817,6 +1847,10 @@ deploy_invocation_id="$(new_deploy_invocation_id)"
 [[ "$deploy_invocation_id" =~ ^[0-9a-f]{64}$ ]] ||
   fail "deploy invocation identity generation failed"
 set +e
+python3 -I "$AUTHORIZER" --commit "$target_commit" \
+  --image-digest "${expected_schauwerk_image_ref##*@}" ||
+  fail "production HOLD was withdrawn before deploy and migrations"
+
 WELTGEWEBE_PRODUCTION_LOCK_FD="$PRODUCTION_LOCK_FD" \
   WELTGEWEBE_PRODUCTION_LOCK_DOMAIN="$PRODUCTION_LOCK_DOMAIN" \
   WELTGEWEBE_PRODUCTION_LOCK_OWNER_ENTRYPOINT="reconciler" \

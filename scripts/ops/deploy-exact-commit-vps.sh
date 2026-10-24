@@ -15,6 +15,7 @@ ARTIFACT_ROOT="$STATE_ROOT/artifacts"
 FRONTEND_URL="${WELTGEWEBE_FRONTEND_VERSION_URL:-https://commonthing.net/_app/version.json}"
 API_URL="${WELTGEWEBE_API_VERSION_URL:-https://commonthing.net/api/version}"
 ARCHIVE_VALIDATOR="${WELTGEWEBE_ARCHIVE_VALIDATOR:-/usr/local/libexec/weltgewebe-validate-web-deploy-archive}"
+AUTHORIZER="/usr/local/libexec/weltgewebe-verify-production-hold-release"
 readonly PRODUCTION_LOCK_DOMAIN="weltgewebe-production-deployment-v1"
 readonly PRODUCTION_LOCK_FILE="${STATE_ROOT}/production-deployment.lock"
 readonly PRODUCTION_LOCK_FD=9
@@ -423,6 +424,18 @@ for command_name in git docker curl jq sha256sum tar flock install rm python3 aw
   require_command "$command_name"
 done
 
+# A direct deploy-helper invocation must not bypass the HOLD enforced by
+# the normal timer/reconciler entrypoint. Verify before any directory/lock writes.
+[[ -f "$AUTHORIZER" && -x "$AUTHORIZER" && ! -L "$AUTHORIZER" ]] ||
+  fail "root-owned production HOLD release checker is not installed"
+[[ "$(stat --format=%u "$AUTHORIZER")" == "0" ]] ||
+  fail "production HOLD checker is not root-owned"
+auth_mode="$(stat --format=%a "$AUTHORIZER")"
+(((8#$auth_mode & 022) == 0)) ||
+  fail "production HOLD checker is group/world writable"
+python3 -I "$AUTHORIZER" --commit "$COMMIT" ||
+  fail "direct deploy is not authorized for the requested production commit"
+
 install -d -o root -g root -m 0711 "$STATE_ROOT"
 install -d -o root -g root -m 0700 "$STATE_ROOT/receipts" "$ARTIFACT_ROOT"
 install -d -o root -g root -m 0700 "$STATE_ROOT/receipts/contention"
@@ -529,6 +542,12 @@ last_observed_main="$remote_main"
 [[ "$remote_main" == "$COMMIT" ]] ||
   fail "origin/main advanced immediately before deployment: expected $COMMIT, got $remote_main"
 
+# Exact OCI source identity comes from the checked-out, immutable release.
+image_digest="$(jq -er '.image_digest' "$release_dir/infra/schauwerk-editor/release-lock.json")" ||
+  fail "released commit lacks a valid Schauwerk runtime lock"
+python3 -I "$AUTHORIZER" --commit "$COMMIT" --image-digest "$image_digest" ||
+  fail "requested Schaubild image is not part of the authorized production release"
+
 started_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
 write_deploy_receipt "deploying" "" "" "" "$remote_main"
 receipt_started=true
@@ -539,6 +558,8 @@ receipt_started=true
 # Caddy container untouched. This is intentionally idempotent when no migration
 # is pending. The receipt records completion for diagnosis, but never authorizes
 # a later retry to skip database verification.
+python3 -I "$AUTHORIZER" --commit "$COMMIT" --image-digest "$image_digest" ||
+  fail "production HOLD withdrawn immediately before database migration"
 echo "production_deployment_phase=migration state=starting commit=$COMMIT" >&2
 run_release_deploy migration
 migration_completed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
@@ -555,6 +576,8 @@ if [[ "$remote_main" != "$COMMIT" ]]; then
   exit "$EXIT_SUPERSEDED_AFTER_MIGRATION"
 fi
 
+python3 -I "$AUTHORIZER" --commit "$COMMIT" --image-digest "$image_digest" ||
+  fail "production HOLD withdrawn before full deployment"
 echo "production_deployment_phase=full state=starting commit=$COMMIT" >&2
 run_release_deploy full
 echo "production_deployment_phase=full state=completed commit=$COMMIT" >&2

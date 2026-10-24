@@ -97,7 +97,7 @@ class ProductionReceiptResilienceTests(unittest.TestCase):
 
         result = fixture.reconcile_stale_public_commit(
             deploy_helper=wrapper,
-            extra_env={"TEST_DEPLOY_SCRIPT": str(DEPLOY_SCRIPT)},
+            extra_env={"TEST_DEPLOY_SCRIPT": str(fixture.test_deploy_script)},
         )
         fixture.restore_test_ownership()
 
@@ -140,7 +140,7 @@ class ProductionReceiptResilienceTests(unittest.TestCase):
 
         result = fixture.reconcile_stale_public_commit(
             deploy_helper=wrapper,
-            extra_env={"TEST_DEPLOY_SCRIPT": str(DEPLOY_SCRIPT)},
+            extra_env={"TEST_DEPLOY_SCRIPT": str(fixture.test_deploy_script)},
         )
         fixture.restore_test_ownership()
 
