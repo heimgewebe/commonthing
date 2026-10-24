@@ -126,7 +126,9 @@ jobs:
       - name: Install Playwright browsers
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: ""
-        run: pnpm playwright install --with-deps
+        # The default test suite has no Firefox/WebKit projects; installing them
+        # pulls large unused APT dependencies and can exceed the 20-minute gate.
+        run: pnpm playwright install --with-deps chromium
 
       - name: Validate requested Playwright suite
         env:
