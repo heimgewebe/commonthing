@@ -82,6 +82,20 @@ fi
 [[ "$release_head" == "$COMMIT" ]] ||
   fail "release HEAD does not match commit: expected $COMMIT, got $release_head"
 
+authorization_checker="$release_dir_real/scripts/ops/verify_production_hold_release.py"
+require_root_safe_regular_file "$authorization_checker" "production HOLD release checker"
+python3 -I "$authorization_checker" --commit "$COMMIT" ||
+  fail "production HOLD authorization missing or mismatched"
+
+# A disabled production timer is an intentional HOLD, not a VAPID provisioning
+# opportunity. The installer preflight must succeed before touching secrets.
+WELTGEWEBE_SOURCE_CHECKOUT="$SOURCE_CHECKOUT" \
+  "$installer" \
+  --commit "$COMMIT" \
+  --build-user "$BUILD_USER" \
+  --defer-reconcile \
+  --preflight-only
+
 web_push_bootstrap="$release_dir_real/scripts/ops/ensure_web_push_vapid_env.py"
 require_root_safe_regular_file "$web_push_bootstrap" "Web Push VAPID bootstrap"
 require_root_safe_regular_file "$RUNTIME_ENV" "runtime environment"

@@ -932,6 +932,8 @@ prune_releases
         self.assertIn("TimeoutStartSec=7200", service)
         self.assertIn("NoNewPrivileges=true", service)
         self.assertIn("OnUnitInactiveSec=2min", timer)
+        self.assertIn("OnActiveSec=2min", timer)
+        self.assertNotIn("OnBootSec=", timer)
         self.assertNotIn("OnUnitActiveSec", timer)
         self.assertNotIn("Persistent=true", timer)
         self.assertIn(
@@ -939,6 +941,66 @@ prune_releases
             service,
         )
         self.assertIn("Unit=weltgewebe-production-reconcile.service", timer)
+
+    def test_first_activation_holds_all_mutations_until_root_release(self) -> None:
+        installer = self.read("scripts/ops/install-production-reconciler.sh")
+        activator = self.read(
+            "scripts/ops/activate-production-reconciler-from-release.sh"
+        )
+        reconciler = self.read("scripts/ops/reconcile-production-main-vps.sh")
+        timer = self.read("infra/systemd/system/weltgewebe-production-reconcile.timer")
+
+        approval = 'python3 -I "$authorization_checker" --commit "$COMMIT"'
+        self.assertIn(approval, installer)
+        self.assertLess(
+            installer.index(approval),
+            installer.index('git -C "$REPO_DIR" ls-remote'),
+        )
+        self.assertLess(
+            installer.index(approval),
+            installer.index("systemctl disable --now"),
+        )
+        self.assertLess(
+            installer.index('if ((PREFLIGHT_ONLY == 1)); then'),
+            installer.index("staging=" + '"$(mktemp'),
+        )
+        self.assertLess(
+            installer.index("systemctl start weltgewebe-production-reconcile.service",
+                            installer.index("systemctl daemon-reload")),
+            installer.index("systemctl enable --now weltgewebe-production-reconcile.timer"),
+        )
+        self.assertLess(
+            activator.index('--preflight-only'),
+            activator.index('python3 -I "$web_push_bootstrap"'),
+        )
+        self.assertLess(
+            activator.index('python3 -I "$authorization_checker" --commit "$COMMIT"'),
+            activator.index('--preflight-only'),
+        )
+        self.assertLess(
+            reconciler.index('python3 -I "$AUTHORIZER" --preflight'),
+            reconciler.index('install -d -o root -g root -m 0711 "$STATE_ROOT"'),
+        )
+        self.assertLess(
+            reconciler.index('python3 -I "$AUTHORIZER" --commit "$target_commit"'),
+            reconciler.index('write_state "observed"'),
+        )
+        self.assertIn('--image-digest "${expected_schauwerk_image_ref##*@}"', reconciler)
+        direct_deploy = self.read("scripts/ops/deploy-exact-commit-vps.sh")
+        self.assertLess(
+            direct_deploy.index('python3 -I "$AUTHORIZER" --commit "$COMMIT"'),
+            direct_deploy.index('install -d -o root -g root -m 0711 "$STATE_ROOT"'),
+        )
+        self.assertLess(
+            direct_deploy.index('production HOLD withdrawn immediately before database migration'),
+            direct_deploy.index("run_release_deploy migration"),
+        )
+        self.assertLess(
+            direct_deploy.index('production HOLD withdrawn before full deployment'),
+            direct_deploy.index("run_release_deploy full"),
+        )
+        self.assertIn("OnActiveSec=2min", timer)
+        self.assertNotIn("OnBootSec=", timer)
 
     def test_installer_is_exact_commit_bound_and_parameterizes_build_user(self) -> None:
         script = self.read("scripts/ops/install-production-reconciler.sh")
@@ -1031,6 +1093,7 @@ prune_releases
         self.assertIn("release directory is not a valid Git repository", activator)
         self.assertIn('release_head" == "$COMMIT', activator)
         self.assertIn("--defer-reconcile", activator)
+        self.assertIn("--preflight-only", activator)
         self.assertIn(
             'if [[ "$DEPLOY_TARGET" == "vps" && "$PLAN_ONLY" == "0" ]]; then',
             up,
