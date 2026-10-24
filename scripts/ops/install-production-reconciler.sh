@@ -102,6 +102,10 @@ if ((DEFER_RECONCILE == 1)) &&
   ((timer_was_enabled != 1 || timer_was_active != 1)); then
   fail "deferred installation requires an existing enabled and active production reconcile timer"
 fi
+if ((DEFER_RECONCILE != 1)) &&
+  ((timer_was_enabled == 1 || timer_was_active == 1)); then
+  fail "initial installation requires disabled and inactive production reconcile timer"
+fi
 if ((PREFLIGHT_ONLY == 1)); then
   echo "production_reconciler_preflight=passed commit=$COMMIT"
   exit 0

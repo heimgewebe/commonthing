@@ -942,6 +942,91 @@ prune_releases
         )
         self.assertIn("Unit=weltgewebe-production-reconcile.service", timer)
 
+    def test_activator_timer_mode_selection_is_fail_closed(self) -> None:
+        script_text = self.read(
+            "scripts/ops/activate-production-reconciler-from-release.sh"
+        )
+        start = script_text.index("select_reconciler_start_mode() {")
+        end = script_text.index("\n}\n", start) + 2
+        selector = script_text[start:end]
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "systemctl"
+            binary.write_text(
+                "#!/bin/bash\n"
+                "set -euo pipefail\n"
+                'case "$*" in\n'
+                '  *UnitFileState*) echo "$TEST_FILE_STATE" ;;\n'
+                '  *ActiveState*) echo "$TEST_ACTIVE_STATE" ;;\n'
+                "  *) exit 92 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o755)
+            probe_script = (
+                "set -euo pipefail\n"
+                'fail() { echo "$*" >&2; exit 1; }\n'
+                + selector
+                + "\nselect_reconciler_start_mode\n"
+            )
+            for file_state, active_state, expected in (
+                ("disabled", "inactive", "initial"),
+                ("enabled", "active", "deferred"),
+                ("disabled", "active", None),
+                ("enabled", "inactive", None),
+                ("masked", "inactive", None),
+                ("not-found", "inactive", None),
+            ):
+                with self.subTest(file_state=file_state, active_state=active_state):
+                    env = os.environ.copy()
+                    env["PATH"] = tmp + os.pathsep + env["PATH"]
+                    env["TEST_FILE_STATE"] = file_state
+                    env["TEST_ACTIVE_STATE"] = active_state
+                    actual = subprocess.run(
+                        ["bash", "-c", probe_script],
+                        check=False, env=env, text=True, capture_output=True,
+                    )
+                    if expected is None:
+                        self.assertNotEqual(actual.returncode, 0)
+                        self.assertIn("unsupported production timer state", actual.stderr)
+                    else:
+                        self.assertEqual(actual.returncode, 0, actual.stderr)
+                        self.assertEqual(actual.stdout.strip(), expected)
+
+    def test_reentrant_activation_requires_exact_handoff(self) -> None:
+        activator = self.read("scripts/ops/activate-production-reconciler-from-release.sh")
+        hold = activator.index('python3 -I "$authorization_checker" --commit "$COMMIT"')
+        start = activator.index("if systemctl is-active --quiet weltgewebe-production-reconcile.service; then")
+        end = activator.index("\nfi\n", start) + 3
+        self.assertLess(hold, start)
+        self.assertLess(end, activator.index('install_mode="$(select_reconciler_start_mode)"'))
+        script = (
+            'set -euo pipefail\nfail() { echo "$*" >&2; exit 1; }\n'
+            'COMMIT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+            'release_dir_real="/isolated"\n'
+            + activator[start:end] + "\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "systemctl"
+            fake.write_text('#!/bin/bash\n[[ "$*" == "is-active --quiet weltgewebe-production-reconcile.service" ]]\n')
+            fake.chmod(0o755)
+            valid = {
+                "WELTGEWEBE_PRODUCTION_LOCK_OWNER_ENTRYPOINT": "reconciler",
+                "WELTGEWEBE_PRODUCTION_LOCK_DOMAIN": "weltgewebe-production-deployment-v1",
+                "WELTGEWEBE_DEPLOY_INVOCATION_ID": "b" * 64,
+            }
+            for omitted in (None, *valid):
+                with self.subTest(omitted=omitted):
+                    env = {**os.environ, **valid, "PATH": tmp + os.pathsep + os.environ["PATH"]}
+                    if omitted:
+                        del env[omitted]
+                    result = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True)
+                    if omitted is None:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn("activation=already_running", result.stdout)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("requires exact inherited deployment handoff", result.stderr)
+
     def test_first_activation_holds_all_mutations_until_root_release(self) -> None:
         installer = self.read("scripts/ops/install-production-reconciler.sh")
         activator = self.read(
@@ -972,6 +1057,14 @@ prune_releases
         self.assertLess(
             activator.index('--preflight-only'),
             activator.index('python3 -I "$web_push_bootstrap"'),
+        )
+        self.assertLess(
+            activator.index("production timer state changed before VAPID provisioning"),
+            activator.index('python3 -I "$web_push_bootstrap"'),
+        )
+        self.assertIn(
+            "initial installation requires disabled and inactive production reconcile timer",
+            installer,
         )
         self.assertLess(
             activator.index('python3 -I "$authorization_checker" --commit "$COMMIT"'),
