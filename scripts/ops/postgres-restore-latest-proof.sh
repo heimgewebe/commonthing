@@ -13,10 +13,59 @@ BACKUP_DIR="${BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-weltgewebe-postgres}"
 RESTORE_PROOF_DIR="${RESTORE_PROOF_DIR:-${BACKUP_DIR}/proofs}"
 RESTORE_POSTGRES_IMAGE="${RESTORE_POSTGRES_IMAGE:-postgres:16@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c}"
-[[ -d "$BACKUP_DIR" ]] || fail "backup directory does not exist: $BACKUP_DIR"
-latest="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "${BACKUP_PREFIX}-*.sql.gz" -printf '%f\n' | sort | tail -n1)"
-[[ -n "$latest" ]] || fail "no backup files found in $BACKUP_DIR"
-latest="${BACKUP_DIR}/${latest}"
+# The plaintext checksum manifest is published AFTER its dump, and remains a
+# completion marker if optional age encryption subsequently fails.
+# Free-form manual BACKUP_LABEL values may sort behind all daily UTC labels.
+export LC_ALL=C
+[[ -d "$BACKUP_DIR" && ! -L "$BACKUP_DIR" ]] ||
+  fail "backup directory does not exist or is a symlink: $BACKUP_DIR"
+[[ "$BACKUP_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ && "$BACKUP_PREFIX" != *..* ]] ||
+  fail "invalid backup prefix"
+candidates="$(find -P "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
+  -name "${BACKUP_PREFIX}-*.sha256.manifest" ! -name '*.age.sha256.manifest' -printf '%f\n')" ||
+  fail "cannot list backup completion manifests"
+max_created_at="$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)" ||
+  fail "cannot read current UTC"
+latest_base=""
+latest_name=""
+latest_created_at=""
+while IFS= read -r candidate; do
+  [[ -n "$candidate" ]] || continue
+  base="${candidate%.sha256.manifest}"
+  [[ "$base" == "$BACKUP_PREFIX"-* && "$base" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ && "$base" != *..* ]] ||
+    fail "invalid backup completion manifest name"
+  manifest_path="$BACKUP_DIR/$candidate"
+  [[ -f "$manifest_path" && ! -L "$manifest_path" ]] ||
+    fail "backup completion manifest is not a regular file"
+  fields="$(dd if="$manifest_path" iflag=nofollow bs=1M status=none |
+    awk -F= '
+      $1 == "created_at" { created_count++; stamp=substr($0, 12) }
+      $1 == "file" { file_count++; file=substr($0, 6) }
+      END { if (created_count != 1 || file_count != 1) exit 1; print stamp "|" file }
+    ')" || fail "backup manifest has missing or duplicate created_at/file"
+  IFS='|' read -r created_at manifest_file <<< "$fields"
+  [[ "$manifest_file" == "$base.sql.gz" ]] ||
+    fail "backup completion manifest file mismatch"
+  [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+    fail "backup manifest created_at is not canonical UTC"
+  normalized="$(date -u -d "$created_at" +%Y-%m-%dT%H:%M:%SZ 2> /dev/null)" ||
+    fail "backup manifest created_at is invalid UTC"
+  [[ "$created_at" == "$normalized" ]] ||
+    fail "backup manifest created_at is not canonical UTC"
+  if [[ "$created_at" > "$max_created_at" ]]; then
+    fail "backup manifest created_at is in the future"
+  fi
+  [[ -f "$BACKUP_DIR/$base.sql.gz" && ! -L "$BACKUP_DIR/$base.sql.gz" ]] ||
+    fail "incomplete backup pair: $base"
+  if [[ -z "$latest_base" || "$created_at" > "$latest_created_at" ]] ||
+    [[ "$created_at" == "$latest_created_at" && "$candidate" > "$latest_name" ]]; then
+    latest_base="$base"
+    latest_name="$candidate"
+    latest_created_at="$created_at"
+  fi
+done <<< "$candidates"
+[[ -n "$latest_base" ]] || fail "no complete backup files found in $BACKUP_DIR"
+latest="$BACKUP_DIR/$latest_base.sql.gz"
 container="weltgewebe-restore-proof-$(date -u +%Y%m%d%H%M%S)-$$"
 cleanup() { docker rm -f "$container" > /dev/null 2>&1 || true; }
 trap cleanup EXIT

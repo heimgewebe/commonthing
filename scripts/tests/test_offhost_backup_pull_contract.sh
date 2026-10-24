@@ -2,49 +2,1489 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." > /dev/null 2>&1 && pwd)"
 INSTALLER="$REPO_ROOT/scripts/ops/install-postgres-offhost-pull-user-units.sh"
+READER_SOURCE="$REPO_ROOT/scripts/ops/postgres-backup-read.sh"
+GATE="$REPO_ROOT/scripts/ops/restic-plaintext-gate.sh"
 SERVICE_TEMPLATE="$REPO_ROOT/scripts/ops/systemd/weltgewebe-postgres-offhost-pull.service"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
+# Historic fixed-date fixtures must remain usable independently of today's date.
+# Each negative freshness test overrides this fixture-only relaxed threshold.
+export PULL_MAX_BACKUP_AGE_HOURS=87600
 remote="$root/remote"
 dest="$root/dest"
 bin="$root/bin"
 mkdir -p "$remote/proofs" "$bin"
-file=weltgewebe-postgres-20260712T040000Z.sql.gz
-printf 'test dump\n' | gzip -c > "$remote/$file"
-sha="$(sha256sum "$remote/$file" | awk '{print $1}')"
-cat > "$remote/${file%.sql.gz}.sha256.manifest" << MANIFEST
-contract=weltgewebe-postgres-backup-v1
+chmod 700 "$remote" "$remote/proofs"
+# The production reader fixes its directory and owner; the fixture copy points
+# them at the fake remote, everything else is the shipped script.
+reader="$bin/postgres-backup-read"
+sed -e "s|^readonly BACKUP_DIR=.*|readonly BACKUP_DIR=$remote|" \
+  -e "s|^readonly BACKUP_OWNER_UID=.*|readonly BACKUP_OWNER_UID=$(id -u)|" \
+  "$READER_SOURCE" > "$reader"
+chmod 755 "$reader"
+grep -qx "readonly BACKUP_DIR=$remote" "$reader"
+grep -qx "readonly BACKUP_OWNER_UID=$(id -u)" "$reader"
+base=weltgewebe-postgres-20260712T040000Z
+plain="$base.sql.gz"
+file="$base.sql.gz.age"
+age_manifest="$base.age.sha256.manifest"
+manifest="$base.sha256.manifest"
+proof="$base.restore-proof"
+marker='private-home-anchor-fixture person@example.invalid'
+
+# Real age when available; otherwise an age-shaped stub without cryptography
+# (the pull side never needs age, only the producer and the offline restore do).
+REAL_AGE=0
+if [[ "${WELTGEWEBE_TEST_FORCE_AGE_STUB:-0}" != 1 ]] && command -v age > /dev/null 2>&1 && command -v age-keygen > /dev/null 2>&1; then
+  REAL_AGE=1
+  age-keygen -o "$root/offline-identity.txt" 2> /dev/null
+  recipient="$(age-keygen -y "$root/offline-identity.txt")"
+else
+  [[ "${WELTGEWEBE_TEST_REQUIRE_REAL_AGE:-0}" != 1 ]] || {
+    echo 'real age/age-keygen required but not found' >&2
+    exit 1
+  }
+  recipient="age1$(printf 'q%.0s' $(seq 1 58))"
+fi
+encrypt_fixture() {
+  if ((REAL_AGE == 1)); then
+    age -r "$recipient" -o "$2" "$1"
+  else
+    {
+      printf 'age-encryption.org/v1\n-> X25519 stub\n--- stub\n'
+      base64 < "$1"
+    } > "$2"
+  fi
+}
+write_age_manifest() {
+  cat > "$remote/$age_manifest" << MANIFEST
+contract=weltgewebe-postgres-backup-age-v1
+created_at=2026-07-12T04:00:00Z
 file=$file
-sha256=$sha
+sha256=$1
+bytes=$2
+format=age-encryption.org/v1
+recipients=${4:-$recipient}
+plaintext_file=$plain
+plaintext_sha256=$3
 MANIFEST
-cat > "$remote/proofs/${file%.sql.gz}.restore-proof" << PROOF
+}
+
+# The pull side pins the accepted recipients independently of the producer.
+pinned="$root/pinned-recipients.txt"
+printf '# offline identity\n%s\n' "$recipient" > "$pinned"
+foreign_recipient="age1$(printf 'z%.0s' $(seq 1 58))"
+
+printf '%s\n' "$marker" | gzip -c > "$remote/$plain"
+plain_sha="$(sha256sum "$remote/$plain" | awk '{print $1}')"
+cat > "$remote/$manifest" << MANIFEST
+contract=weltgewebe-postgres-backup-v1
+file=$plain
+sha256=$plain_sha
+MANIFEST
+encrypt_fixture "$remote/$plain" "$remote/$file"
+age_sha="$(sha256sum "$remote/$file" | awk '{print $1}')"
+age_bytes="$(wc -c < "$remote/$file" | tr -d '[:space:]')"
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+# A newer host-local plaintext dump without ciphertext must never be selected.
+printf 'newer plaintext\n' | gzip -c > "$remote/weltgewebe-postgres-20260713T040000Z.sql.gz"
+# A newer ciphertext whose off-host manifest (the completion marker, published
+# last) is missing is an interrupted run and must not be selected either.
+printf 'age-encryption.org/v1\ninterrupted\n' > "$remote/weltgewebe-postgres-20260713T040000Z.sql.gz.age"
+# Synthetic proof matches the real producer's filename/hash binding.
+write_restore_proof() {
+  local timestamp="${1:-2026-07-12T05:00:00Z}"
+  cat > "$remote/proofs/$base.restore-proof" << PROOF
 contract=weltgewebe-postgres-restore-proof-v1
+created_at=$timestamp
+backup_file=$plain
+backup_sha256=$plain_sha
+tables=domain_accounts,domain_nodes,domain_edges,sessions,passkey_credentials,_sqlx_migrations
 result=ok
 PROOF
+}
+write_restore_proof
 cat > "$bin/ssh" << 'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
 cmd="${!#}"
-cmd="${cmd//sudo -n /}"
+# The client may only ever run the reader through non-interactive sudo.
+[[ "$cmd" == "sudo -n '"* ]] || {
+  printf 'fake ssh: command does not start with sudo -n: %s\n' "$cmd" >&2
+  exit 99
+}
+if [[ "${SIMULATE_SUDO_DENIED:-0}" == 1 ]]; then
+  printf 'sudo: a password is required\n' >&2
+  exit 1
+fi
+cmd="${cmd#sudo -n }"
+printf '%s\n' "$cmd" >> "$SSH_LOG"
+if [[ "${SIMULATE_PROOF_SSH_FAILURE:-0}" == 1 && "$cmd" == *' proof-state '* ]]; then
+  printf 'ssh: connection reset\n' >&2
+  exit 255
+fi
+# Return deliberately corrupted metadata only after the privileged latest
+# selector has validated the real upstream manifest. This covers the local
+# consumer guard instead of merely retesting the upstream reader.
+if [[ -n "${INJECT_AGE_MANIFEST_FROM:-}" && "$cmd" == *" read "* && "$cmd" == *"'age-manifest'" ]]; then
+  cat -- "$INJECT_AGE_MANIFEST_FROM"
+  exit 0
+fi
+# Simulates another writer (e.g. a legacy pull) dropping plaintext while this
+# pull is still transferring.
+if [[ -n "${INJECT_PLAINTEXT_DURING_CAT:-}" && "$cmd" == *' read '* ]]; then
+  printf 'late legacy dump\n' > "$INJECT_PLAINTEXT_DURING_CAT"
+fi
 exec bash -c "$cmd"
 FAKE
 chmod +x "$bin/ssh"
-PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST='' REMOTE_BACKUP_DIR="$remote" DEST_DIR="$dest" \
-  scripts/ops/pull-production-postgres-backup.sh
-[[ -f "$dest/$file" ]]
-[[ -f "$dest/${file%.sql.gz}.sha256.manifest" ]]
-[[ -f "$dest/${file%.sql.gz}.restore-proof" ]]
-grep -qx 'result=ok' "$dest/latest-pull.receipt"
-grep -qx 'remote_host=commonserver' "$dest/latest-pull.receipt"
-[[ "$(stat -c %a "$dest/$file")" == 600 ]]
-
-# A manifest mismatch must fail and must not overwrite the verified copy.
-printf 'sha256=%064d\n' 0 > "$remote/${file%.sql.gz}.sha256.manifest"
-if PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_DIR=1 REMOTE_HOST=test-host REMOTE_BACKUP_DIR="$remote" DEST_DIR="$root/bad" \
-  scripts/ops/pull-production-postgres-backup.sh > /dev/null 2>&1; then
-  echo 'expected sha mismatch to fail' >&2
+export SSH_LOG="$root/ssh.log"
+# Prefixes occur inside SSH's remote shell command; reject shell quoting tokens
+# before the first SSH invocation, rather than relying on a later filename check.
+if BACKUP_PREFIX="unsafe'prefix" PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_READER=1 \
+  REMOTE_HOST=test-host REMOTE_BACKUP_READER="$reader" DEST_DIR="$root/unsafe-prefix" \
+  scripts/ops/pull-production-postgres-backup.sh > /dev/null 2> "$root/unsafe-prefix.stderr"; then
+  echo 'untrusted BACKUP_PREFIX must fail closed' >&2
   exit 1
 fi
+grep -qF 'BACKUP_PREFIX contains unsupported characters' "$root/unsafe-prefix.stderr" || {
+  echo 'untrusted prefix was not rejected before SSH' >&2
+  exit 1
+}
+[[ ! -s "$SSH_LOG" ]] || {
+  echo 'unsafe prefix reached SSH command' >&2
+  exit 1
+}
+pull() {
+  local destination="$1"
+  PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_READER=1 REMOTE_HOST="${2-}" REMOTE_BACKUP_READER="$reader" DEST_DIR="$destination" \
+    PULL_AGE_RECIPIENTS_FILE="${PULL_AGE_RECIPIENTS_FILE-$pinned}" scripts/ops/pull-production-postgres-backup.sh
+}
+expect_pull_failure() {
+  local destination="$1" message="$2"
+  if pull "$destination" test-host > /dev/null 2> "$root/pull.stderr"; then
+    echo "expected pull to fail: $message" >&2
+    exit 1
+  fi
+  grep -qF "$message" "$root/pull.stderr" || {
+    echo "unexpected pull failure output (wanted: $message):" >&2
+    cat "$root/pull.stderr" >&2
+    exit 1
+  }
+  if compgen -G "$destination/weltgewebe-postgres-*" > /dev/null; then
+    echo "failed pull must not promote any artefact: $message" >&2
+    exit 1
+  fi
+}
+
+# A newer host-local plaintext dump exists above, but has no complete age
+# manifest. An old encrypted recovery point must not keep a normal pull green
+# forever. The refusal must happen before any off-host success artefact exists.
+PULL_MAX_BACKUP_AGE_HOURS=1 expect_pull_failure "$root/stale-age" 'encrypted backup is too old'
+# Unset policy in the real user unit must keep its safe default; test fixtures
+# override this only for other historical-replay regression scenarios.
+if env -u PULL_MAX_BACKUP_AGE_HOURS PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_READER=1 \
+  REMOTE_HOST=test-host REMOTE_BACKUP_READER="$reader" DEST_DIR="$root/stale-default" \
+  PULL_AGE_RECIPIENTS_FILE="$pinned" "$REPO_ROOT/scripts/ops/pull-production-postgres-backup.sh" > /dev/null 2> "$root/stale-default.stderr"; then
+  echo 'default freshness limit accepted a months-old encrypted backup' >&2
+  exit 1
+fi
+grep -qF 'encrypted backup is too old' "$root/stale-default.stderr"
+[[ ! -e "$root/stale-default/latest-pull.receipt" ]]
+if compgen -G "$root/stale-default/weltgewebe-postgres-*" > /dev/null; then
+  echo 'stale default pull must not promote any encrypted artefact' >&2
+  exit 1
+fi
+if PULL_MAX_BACKUP_AGE_HOURS=broken pull "$root/bad-age-limit" test-host > /dev/null 2> "$root/bad-age-limit.stderr"; then
+  echo 'invalid offhost freshness limit must fail closed' >&2
+  exit 1
+fi
+grep -qF 'PULL_MAX_BACKUP_AGE_HOURS must be a positive integer' "$root/bad-age-limit.stderr"
+
+# Negative producer-metadata cases test the consumer's own guard even though
+# the root reader independently validates the upstream latest selector.
+sed '/^created_at=/d' "$remote/$age_manifest" > "$root/age-date-missing.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-missing.manifest" \
+  expect_pull_failure "$root/age-date-missing" 'encrypted backup created_at is missing or duplicated'
+cp "$remote/$age_manifest" "$root/age-date-duplicated.manifest"
+printf 'created_at=2026-07-12T04:00:00Z\n' >> "$root/age-date-duplicated.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-duplicated.manifest" \
+  expect_pull_failure "$root/age-date-duplicated" 'encrypted backup created_at is missing or duplicated'
+sed 's/^created_at=.*/created_at=2026-07-12T04:00:00+00:00/' \
+  "$remote/$age_manifest" > "$root/age-date-offset.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-offset.manifest" \
+  expect_pull_failure "$root/age-date-offset" 'encrypted backup created_at is not canonical UTC'
+sed 's/^created_at=.*/created_at=2026-02-30T00:00:00Z/' \
+  "$remote/$age_manifest" > "$root/age-date-invalid.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-invalid.manifest" \
+  expect_pull_failure "$root/age-date-invalid" 'encrypted backup created_at is invalid UTC'
+sed 's/^created_at=.*/created_at=2035-01-01T00:00:00Z/' \
+  "$remote/$age_manifest" > "$root/age-date-future.manifest"
+INJECT_AGE_MANIFEST_FROM="$root/age-date-future.manifest" \
+  expect_pull_failure "$root/age-date-future" 'encrypted backup created_at is in the future'
+
+# A sudo rule that does not grant the reader must surface as such, not as an
+# empty backup listing.
+if SIMULATE_SUDO_DENIED=1 pull "$root/denied-reader" test-host > /dev/null 2> "$root/denied-reader.stderr"; then
+  echo 'denied remote reader must fail' >&2
+  exit 1
+fi
+grep -qF 'sudo: a password is required' "$root/denied-reader.stderr"
+grep -qF 'could not list remote backups' "$root/denied-reader.stderr"
+if grep -qF 'remote host returned no complete encrypted backup set' "$root/denied-reader.stderr"; then
+  echo 'remote reader denial was hidden as an empty listing' >&2
+  exit 1
+fi
+
+# The backup directory is fixed in the reader; neither a leftover directory
+# override nor another reader path is accepted outside the test switch.
+if REMOTE_BACKUP_DIR="$remote" pull "$root/dir-override" test-host > /dev/null 2> "$root/dir-override.stderr"; then
+  echo 'REMOTE_BACKUP_DIR must be rejected' >&2
+  exit 1
+fi
+grep -qF 'REMOTE_BACKUP_DIR is no longer supported' "$root/dir-override.stderr"
+if PATH="$bin:$PATH" REMOTE_HOST=test-host REMOTE_BACKUP_READER="$reader" DEST_DIR="$root/reader-override" \
+  PULL_AGE_RECIPIENTS_FILE="$pinned" scripts/ops/pull-production-postgres-backup.sh > /dev/null 2> "$root/reader-override.stderr"; then
+  echo 'a non-default reader path must be rejected' >&2
+  exit 1
+fi
+grep -qF 'REMOTE_BACKUP_READER must be /usr/local/libexec/weltgewebe/postgres-backup-read' "$root/reader-override.stderr"
+
+# Legacy off-host plaintext must stop before an age success receipt.
+legacy_dest="$root/legacy"
+mkdir -p "$legacy_dest"
+printf 'old private pg dump\n' > "$legacy_dest/weltgewebe-postgres-legacy.sql.gz"
+if pull "$legacy_dest" test-host > /dev/null 2> "$root/legacy.stderr"; then
+  echo 'legacy plaintext alongside successful encrypted pull is forbidden' >&2
+  exit 1
+fi
+grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy.stderr"
+[[ -f "$legacy_dest/weltgewebe-postgres-legacy.sql.gz" ]]
+[[ ! -e "$legacy_dest/latest-pull.receipt" ]]
+
+# A symlinked *nested directory* can expose plaintext through the
+# encrypted backup destination without a *.sql.gz symlink of its own name.
+# The root alias remains supported; nested directory aliases are rejected.
+nested_legacy="$root/nested-legacy-target"
+nested_dest="$root/nested-dir-alias"
+mkdir -p "$nested_legacy" "$nested_dest"
+printf 'historical plaintext fixture\n' > "$nested_legacy/legacy.sql.gz"
+ln -s "$nested_legacy" "$nested_dest/archive"
+if pull "$nested_dest" test-host > /dev/null 2> "$root/nested-dir.stderr"; then
+  echo 'nested symlink to plaintext bypassed offhost age receipt gate' >&2
+  exit 1
+fi
+grep -qF 'symlinked directory under encrypted backup destination' "$root/nested-dir.stderr"
+[[ ! -e "$nested_dest/latest-pull.receipt" ]]
+
+# A symlinked destination must not let GNU find -P skip existing legacy
+# plaintext and emit a false age-only success receipt at its real target.
+symlink_real="$root/legacy-symlink-real"
+symlink_dest="$root/legacy-symlink-alias"
+mkdir -p "$symlink_real"
+printf 'old private pg dump\n' > "$symlink_real/earlier-prefix-private.sql.gz"
+ln -s "$symlink_real" "$symlink_dest"
+if pull "$symlink_dest" test-host > /dev/null 2> "$root/legacy-symlink.stderr"; then
+  echo 'symlinked legacy plaintext must block the encrypted pull receipt' >&2
+  exit 1
+fi
+[[ ! -e "$symlink_real/latest-pull.receipt" ]] || {
+  echo 'symlinked legacy plaintext produced a false age-only receipt' >&2
+  exit 1
+}
+[[ -f "$symlink_real/earlier-prefix-private.sql.gz" ]]
+
+# A deliberately configured symlink to a clean destination remains usable;
+# the off-host pull must never remove old data via the resolved path.
+clean_real="$root/clean-symlink-real"
+clean_alias="$root/clean-symlink-alias"
+mkdir -p "$clean_real"
+ln -s "$clean_real" "$clean_alias"
+old_cipher="$clean_real/weltgewebe-postgres-20200101T000000Z.sql.gz.age"
+printf 'old encrypted fixture\n' > "$old_cipher"
+touch -d '10 days ago' "$old_cipher"
+LOCAL_RETENTION_DAYS=1 pull "$clean_alias" test-host > /dev/null
+[[ -f "$clean_real/$file" && -f "$clean_real/latest-pull.receipt" ]]
+[[ -f "$old_cipher" ]] || {
+  echo 'symlinked encrypted destination deleted an earlier recovery candidate' >&2
+  exit 1
+}
+
+# The legacy gate must not depend on the active BACKUP_PREFIX.
+other_prefix_dest="$root/legacy-other-prefix"
+mkdir -p "$other_prefix_dest"
+printf 'old private pg dump\n' > "$other_prefix_dest/earlier-prefix-20250101T040000Z.sql.gz"
+if pull "$other_prefix_dest" test-host > /dev/null 2> "$root/legacy-other-prefix.stderr"; then
+  echo 'legacy plaintext under an earlier prefix must block the age receipt' >&2
+  exit 1
+fi
+grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy-other-prefix.stderr"
+[[ ! -e "$other_prefix_dest/latest-pull.receipt" ]]
+
+# Plaintext left in an abandoned work directory of an interrupted legacy pull
+# is below the Restic source too and must block the age receipt.
+abandoned_dest="$root/legacy-abandoned-pull"
+mkdir -p "$abandoned_dest/.pull.Ab12Cd"
+printf 'old private pg dump\n' > "$abandoned_dest/.pull.Ab12Cd/weltgewebe-postgres-legacy.sql.gz"
+if pull "$abandoned_dest" test-host > /dev/null 2> "$root/legacy-abandoned.stderr"; then
+  echo 'legacy plaintext in an abandoned pull directory must block the age receipt' >&2
+  exit 1
+fi
+grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy-abandoned.stderr"
+[[ ! -e "$abandoned_dest/latest-pull.receipt" ]]
+
+# Explicit migration staging must permit a ciphertext-only first transfer while
+# legacy recovery points remain untouched, without publishing an age receipt.
+stage_dest="$root/staged-age"
+PULL_MAX_BACKUP_AGE_HOURS=1 PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$stage_dest" pull "$legacy_dest" test-host
+[[ -f "$stage_dest/$file" ]]
+[[ -f "$stage_dest/$age_manifest" ]]
+[[ -f "$stage_dest/$manifest" ]]
+[[ -f "$legacy_dest/weltgewebe-postgres-legacy.sql.gz" ]]
+[[ ! -e "$stage_dest/latest-pull.receipt" ]]
+[[ ! -e "$legacy_dest/latest-pull.receipt" ]]
+[[ ! -e "$legacy_dest/$file" ]]
+[[ "$(stat -c %a "$stage_dest")" == 700 ]]
+if PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$legacy_dest/unsafe-staging" \
+  pull "$legacy_dest" test-host > /dev/null 2> "$root/unsafe-staging.stderr"; then
+  echo 'staging inside legacy destination must fail closed' >&2
+  exit 1
+fi
+grep -qF 'outside the normal backup destination' "$root/unsafe-staging.stderr"
+if PULL_MODE=migration-stage pull "$legacy_dest" test-host > /dev/null 2> "$root/missing-staging.stderr"; then
+  echo 'migration-stage must require an explicit destination' >&2
+  exit 1
+fi
+grep -qF 'MIGRATION_STAGE_DIR is required' "$root/missing-staging.stderr"
+
+# Reusing a staging location is forbidden: migration data cannot be overwritten.
+if PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$stage_dest" \
+  pull "$legacy_dest" test-host > /dev/null 2> "$root/duplicate-stage.stderr"; then
+  echo 'existing staging candidate must be create-only' >&2
+  exit 1
+fi
+grep -qF 'migration staging artefact already exists' "$root/duplicate-stage.stderr"
+# Pulls with different destinations still serialize on a shared staging dir.
+locked_stage="$root/locked-stage"
+mkdir -m 700 "$locked_stage"
+exec 6> "$locked_stage/.stage.lock"
+flock -n 6
+if PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$locked_stage" \
+  pull "$root/other-legacy-dest" test-host > /dev/null 2> "$root/locked-stage.stderr"; then
+  echo 'a held staging lock must block a second migration staging' >&2
+  exit 1
+fi
+grep -qF 'another migration staging holds' "$root/locked-stage.stderr"
+exec 6>&-
+[[ ! -e "$locked_stage/$file" ]]
+if PULL_MODE=unsafe pull "$legacy_dest" test-host > /dev/null 2> "$root/unsafe-mode.stderr"; then
+  echo 'unknown pull mode must fail closed' >&2
+  exit 1
+fi
+grep -qF 'PULL_MODE must be normal or migration-stage' "$root/unsafe-mode.stderr"
+if ((REAL_AGE == 1)); then
+  mkdir -m 700 "$root/stage-restore"
+  age -d -i "$root/offline-identity.txt" -o "$root/stage-restore/$plain" "$stage_dest/$file"
+  [[ "$(sha256sum "$root/stage-restore/$plain" | awk '{print $1}')" == "$plain_sha" ]]
+  gzip -t "$root/stage-restore/$plain"
+  [[ "$(gunzip -c "$root/stage-restore/$plain")" == "$marker" ]]
+fi
+
+# The actual nightly Restic job sources ~/artifacts/merges (not ~/merges).
+# Staging inside that backup source is forbidden even if legacy destination differs.
+mkdir -p "$root/controlled-home/artifacts/merges"
+if HOME="$root/controlled-home" PULL_MODE=migration-stage \
+  MIGRATION_STAGE_DIR="$root/controlled-home/artifacts/merges/candidate" \
+  pull "$legacy_dest" test-host > /dev/null 2> "$root/restic-source.stderr"; then
+  echo 'staging inside nightly Restic artifact merges source must fail' >&2
+  exit 1
+fi
+grep -qF 'Restic sources' "$root/restic-source.stderr"
+[[ ! -e "$root/controlled-home/artifacts/merges/candidate/$file" ]]
+
+# A source-validated pull may still encounter an unexpected target directory
+# immediately before hardlink/rename. GNU ln without -T and mv without -T
+# silently place the file *inside* that directory and report false success.
+# Use a private fixture command interceptor, never any production path.
+inject_bin="$root/ln-no-target-race-bin"
+mkdir -p "$inject_bin"
+cat > "$inject_bin/ln" << 'FAKE_LN_RACE'
+#!/usr/bin/env bash
+set -euo pipefail
+target="${!#}"
+if [[ -n "${INJECT_LN_EXACT_DIR:-}" && "$target" == "$INJECT_LN_EXACT_DIR" ]]; then
+  /usr/bin/mkdir -p -- "$target"
+fi
+if [[ -n "${INJECT_LN_HISTORY_ROOT:-}" && "$target" == "$INJECT_LN_HISTORY_ROOT"/*.pulled-*.receipt ]]; then
+  /usr/bin/mkdir -p -- "$target"
+fi
+exec /usr/bin/ln "$@"
+FAKE_LN_RACE
+chmod 755 "$inject_bin/ln"
+
+race_stage="$root/staging-directory-race"
+if INJECT_LN_EXACT_DIR="$race_stage/$file" PATH="$inject_bin:$PATH" \
+  PULL_MODE=migration-stage MIGRATION_STAGE_DIR="$race_stage" \
+  pull "$legacy_dest" test-host > /dev/null 2> "$root/staging-directory-race.stderr"; then
+  echo 'directory replacing create-only migration target must never report success' >&2
+  exit 1
+fi
+[[ -d "$race_stage/$file" && ! -f "$race_stage/$file" ]]
+[[ ! -e "$race_stage/latest-pull.receipt" ]]
+
+history_race_dest="$root/history-directory-race"
+mkdir -p "$history_race_dest/receipts"
+if INJECT_LN_HISTORY_ROOT="$history_race_dest/receipts" PATH="$inject_bin:$PATH" \
+  pull "$history_race_dest" test-host > /dev/null 2> "$root/history-directory-race.stderr"; then
+  echo 'directory replacing immutable history receipt must never report success' >&2
+  exit 1
+fi
+[[ ! -e "$history_race_dest/latest-pull.receipt" ]]
+
+pointer_directory_dest="$root/latest-directory-race"
+mkdir -p "$pointer_directory_dest/latest-pull.receipt"
+if pull "$pointer_directory_dest" test-host > /dev/null 2> "$root/latest-directory-race.stderr"; then
+  echo 'directory-valued latest receipt pointer must never report success' >&2
+  exit 1
+fi
+[[ -d "$pointer_directory_dest/latest-pull.receipt" ]]
+
+pointer_link_dest="$root/latest-symlink-directory-race"
+mkdir -p "$pointer_link_dest/untrusted-target"
+ln -s "$pointer_link_dest/untrusted-target" "$pointer_link_dest/latest-pull.receipt"
+if pull "$pointer_link_dest" test-host > /dev/null 2> "$root/latest-symlink-directory-race.stderr"; then
+  echo 'symlink-to-directory latest receipt pointer must never report success' >&2
+  exit 1
+fi
+[[ -L "$pointer_link_dest/latest-pull.receipt" ]]
+
+# Intercept the final rename *after* the script's latest-pointer type check.
+# A directory that appears at that instant must never be treated as the
+# destination of a successful receipt publication.
+inject_mv_bin="$root/mv-no-target-race-bin"
+mkdir -p "$inject_mv_bin"
+cat > "$inject_mv_bin/mv" << 'FAKE_MV_RACE'
+#!/usr/bin/env bash
+set -euo pipefail
+target="${!#}"
+if [[ -n "${INJECT_MV_EXACT_DIR:-}" && "$target" == "$INJECT_MV_EXACT_DIR" ]]; then
+  /usr/bin/mkdir -p -- "$target"
+fi
+exec /usr/bin/mv "$@"
+FAKE_MV_RACE
+chmod 755 "$inject_mv_bin/mv"
+
+pointer_move_race_dest="$root/latest-move-directory-race"
+mkdir -p "$pointer_move_race_dest"
+if INJECT_MV_EXACT_DIR="$pointer_move_race_dest/latest-pull.receipt" PATH="$inject_mv_bin:$PATH" \
+  pull "$pointer_move_race_dest" test-host > /dev/null 2> "$root/latest-move-directory-race.stderr"; then
+  echo 'directory appearing immediately before receipt rename must never report success' >&2
+  exit 1
+fi
+[[ -d "$pointer_move_race_dest/latest-pull.receipt" ]]
+[[ ! -f "$pointer_move_race_dest/latest-pull.receipt" ]]
+
+# No-deletion fixture: expired local artefacts must survive even when uncertified.
+mkdir -p "$dest"
+for suffix in .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; do
+  touch -d '10 days ago' "$dest/weltgewebe-postgres-20260101T000000Z${suffix}"
+done
+PATH="$bin:$PATH" ALLOW_TEST_REMOTE_BACKUP_READER=1 REMOTE_HOST='' REMOTE_BACKUP_READER="$reader" DEST_DIR="$dest" \
+  PULL_AGE_RECIPIENTS_FILE="$pinned" LOCAL_RETENTION_DAYS=1 scripts/ops/pull-production-postgres-backup.sh
+[[ -f "$dest/$file" ]]
+[[ -f "$dest/$age_manifest" ]]
+[[ -f "$dest/$manifest" ]]
+[[ -f "$dest/$base.restore-proof" ]]
+grep -qx 'result=ok' "$dest/latest-pull.receipt"
+grep -qx 'remote_host=commonserver' "$dest/latest-pull.receipt"
+grep -qx 'contract=weltgewebe-offhost-backup-pull-v2' "$dest/latest-pull.receipt"
+grep -qx 'encryption=age' "$dest/latest-pull.receipt"
+grep -qx "sha256=$age_sha" "$dest/latest-pull.receipt"
+grep -qx "plaintext_sha256=$plain_sha" "$dest/latest-pull.receipt"
+grep -qx "recipients=$recipient" "$dest/latest-pull.receipt"
+# Byte-identical normal pulls are idempotent: do not replace immutable
+# core artefacts, an existing proof, or any historical completion receipt.
+mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#history[@]} == 1))
+cmp -s "${history[0]}" "$dest/latest-pull.receipt"
+first_receipt="${history[0]}"
+cp "$first_receipt" "$root/first-receipt"
+cp "$dest/$file" "$root/first-ciphertext"
+cp "$dest/$age_manifest" "$root/first-age-manifest"
+cp "$dest/$manifest" "$root/first-metadata"
+cp "$dest/$proof" "$root/first-proof"
+# Even with a previously successful immutable history receipt, no-op must
+# fail when the newest complete encrypted backup has become too old.
+if PULL_MAX_BACKUP_AGE_HOURS=1 pull "$dest" commonserver > /dev/null 2> "$root/stale-noop.stderr"; then
+  echo 'idempotent pull disguised a stale encrypted recovery point' >&2
+  exit 1
+fi
+grep -qF 'encrypted backup is too old' "$root/stale-noop.stderr"
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt"
+pull "$dest" commonserver > /dev/null
+for immutable in "$file" "$age_manifest" "$manifest" "$proof"; do
+  [[ "$(stat -c %h "$dest/$immutable")" == 1 ]] || {
+    echo "idempotent pull created an extra immutable link: $immutable" >&2
+    exit 1
+  }
+done
+mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#history[@]} == 1))
+cmp -s "$root/first-receipt" "$first_receipt"
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt"
+
+# A crash after publishing immutable history but before updating the mutable
+# latest pointer must be recoverable by a byte-identical no-op rerun.
+# Neither case creates a duplicate immutable completion receipt.
+rm "$dest/latest-pull.receipt"
+pull "$dest" commonserver > /dev/null
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt" || {
+  echo 'missing latest receipt was not repaired on idempotent replay' >&2
+  exit 1
+}
+printf 'stale latest pointer from a previous completed backup\n' > "$dest/latest-pull.receipt"
+pull "$dest" commonserver > /dev/null
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt" || {
+  echo 'stale latest receipt was not repaired on idempotent replay' >&2
+  exit 1
+}
+mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#history[@]} == 1))
+cmp -s "$root/first-receipt" "${history[0]}"
+
+# An equally named backup with a DIFFERENT, correctly manifest-bound
+# ciphertext may not rewrite the historical ciphertext, metadata or proof.
+# With real age this encrypts the same plaintext using a fresh ephemeral key.
+cp "$remote/$file" "$root/remote-original-ciphertext"
+encrypt_fixture "$remote/$plain" "$remote/$file"
+if ((REAL_AGE == 0)); then
+  # The stub has no entropy; force a changed age-shaped fixture.
+  printf '\n' >> "$remote/$file"
+fi
+new_age_sha="$(sha256sum "$remote/$file" | awk '{print $1}')"
+new_age_bytes="$(wc -c < "$remote/$file" | tr -d '[:space:]')"
+write_age_manifest "$new_age_sha" "$new_age_bytes" "$plain_sha"
+if pull "$dest" test-host > /dev/null 2> "$root/overwrite-normal.stderr"; then
+  echo 'normal pull replaced a historically sealed encrypted backup' >&2
+  exit 1
+fi
+grep -qF 'normal pull artefact content differs' "$root/overwrite-normal.stderr"
+for binding in "$file" "$age_manifest" "$manifest" "$proof"; do
+  case "$binding" in
+    "$file") original="$root/first-ciphertext" ;;
+    "$age_manifest") original="$root/first-age-manifest" ;;
+    "$manifest") original="$root/first-metadata" ;;
+    "$proof") original="$root/first-proof" ;;
+  esac
+  cmp -s "$original" "$dest/$binding" || {
+    echo "historical off-host artefact was replaced: $binding" >&2
+    exit 1
+  }
+done
+mapfile -t history < <(find "$dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#history[@]} == 1))
+cmp -s "$root/first-receipt" "$dest/latest-pull.receipt"
+# Restore producer fixtures for subsequent offline-restore and negative tests.
+cp "$root/remote-original-ciphertext" "$remote/$file"
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+grep -qx 'remote_host=commonserver' "$dest/latest-pull.receipt"
+[[ "$(stat -c %a "$dest/$file")" == 600 ]]
+for suffix in .sql.gz.age .sha256.manifest .age.sha256.manifest .restore-proof; do
+  [[ -f "$dest/weltgewebe-postgres-20260101T000000Z${suffix}" ]] || {
+    echo "off-host pull deleted an old backup artefact without authorized retirement: $suffix" >&2
+    exit 1
+  }
+done
+
+# Plaintext never lands off-host and never crosses the (fake) SSH link.
+if compgen -G "$dest/*.sql.gz" > /dev/null; then
+  echo 'plaintext dump landed in the off-host destination' >&2
+  exit 1
+fi
+for pulled in "$dest"/*; do
+  [[ -f "$pulled" ]] || continue
+  if gzip -t "$pulled" 2> /dev/null; then
+    echo "pulled file is a plaintext gzip stream: $pulled" >&2
+    exit 1
+  fi
+  if grep -qF "$marker" "$pulled"; then
+    echo "pulled file contains plaintext dump content: $pulled" >&2
+    exit 1
+  fi
+done
+# Every remote command is one reader operation; none names a file directly.
+if grep -vE "^'$reader' (latest '[A-Za-z0-9._-]+'|read '[A-Za-z0-9._-]+' '(ciphertext|age-manifest|manifest|proof)'|proof-state '[A-Za-z0-9._-]+')\$" "$SSH_LOG"; then
+  echo 'pull sent a remote command outside the reader interface' >&2
+  exit 1
+fi
+if grep -F '.sql.gz' "$SSH_LOG"; then
+  echo 'pull named a dump file over SSH' >&2
+  exit 1
+fi
+grep -qxF "'$reader' read '$base' 'ciphertext'" "$SSH_LOG"
+
+if ((REAL_AGE == 1)); then
+  # Offline restore path: decrypt the pulled copy with the offline identity and
+  # verify it against the pulled plaintext metadata manifest.
+  restore="$root/offline-restore"
+  mkdir -m 700 "$restore"
+  age -d -i "$root/offline-identity.txt" -o "$restore/$plain" "$dest/$file"
+  cmp -s "$restore/$plain" "$remote/$plain"
+  [[ "$(sha256sum "$restore/$plain" | awk '{print $1}')" == "$(awk -F= '$1=="sha256" {print $2}' "$dest/$manifest")" ]]
+  [[ "$(gunzip -c "$restore/$plain")" == "$marker" ]]
+fi
+
+# A corrupt optional weekly proof must fail before any encrypted backup files
+# become visible in the destination (completion receipt is not enough).
+printf 'contract=weltgewebe-postgres-restore-proof-v1\nresult=failed\n' > "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/bad-proof" 'remote restore proof is not successful'
+write_restore_proof
+
+# 'result=ok' by itself cannot certify this selected dump.
+printf 'result=ok\n' > "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-only-ok" 'remote restore proof contract mismatch'
+write_restore_proof
+sed -i "s|backup_file=$plain|backup_file=other-backup.sql.gz|" "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-wrong-name" 'remote restore proof backup filename mismatch'
+write_restore_proof
+sed -i "s|backup_sha256=$plain_sha|backup_sha256=$(printf 'a%.0s' {1..64})|" "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-wrong-sha" 'remote restore proof backup sha256 mismatch'
+write_restore_proof
+printf 'backup_file=%s\n' "$plain" >> "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-duplicate-binding" 'remote restore proof duplicated binding field'
+write_restore_proof
+sed -i '/^tables=/d' "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-missing-tables" 'remote restore proof required tables mismatch'
+write_restore_proof
+sed -i '/^created_at=/d' "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-missing-date" 'remote restore proof created_at is not canonical UTC'
+write_restore_proof
+sed -i 's/^created_at=.*/created_at=2035-01-01T00:00:00Z/' "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-future-date" 'remote restore proof created_at is in the future'
+write_restore_proof
+printf 'created_at=2026-07-12T05:00:00Z\n' >> "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-duplicate-date" 'remote restore proof duplicated binding field: created_at'
+write_restore_proof
+printf 'unverified_extra_field=ok\n' >> "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-unexpected-field" 'remote restore proof unexpected fields'
+write_restore_proof
+
+# A proof probe that fails for transport or reader reasons is not "no proof":
+# the pull must fail instead of publishing a receipt without the evidence.
+SIMULATE_PROOF_SSH_FAILURE=1 expect_pull_failure "$root/proof-ssh" 'could not probe the remote restore proof'
+mv "$remote/proofs/$base.restore-proof" "$root/held-proof"
+ln -s "$root/held-proof" "$remote/proofs/$base.restore-proof"
+expect_pull_failure "$root/proof-symlink" 'could not probe the remote restore proof'
+rm "$remote/proofs/$base.restore-proof"
+mv "$root/held-proof" "$remote/proofs/$base.restore-proof"
+# A definitely absent weekly proof is valid for a new daily backup.
+# When the producer publishes it later, the identical immutable core is
+# accepted and only the proof is added create-only, preserving old receipts.
+mv "$remote/proofs/$base.restore-proof" "$root/held-proof"
+no_proof_dest="$root/no-proof"
+pull "$no_proof_dest" test-host > /dev/null
+grep -qx 'result=ok' "$no_proof_dest/latest-pull.receipt"
+[[ ! -e "$no_proof_dest/$base.restore-proof" ]]
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 1))
+cp "${no_proof_history[0]}" "$root/no-proof-first-receipt"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$no_proof_dest/$core" "$root/early-$core"
+done
+# A weekly proof may arrive long after the encrypted core's retention age.
+# A fresh completion receipt must never certify files deleted in the same run.
+for core in "$file" "$manifest" "$age_manifest"; do
+  touch -d '40 days ago' "$no_proof_dest/$core"
+done
+expired_unrelated="$no_proof_dest/weltgewebe-postgres-20200101T000000Z.sql.gz.age"
+printf 'expired unrelated encrypted copy\n' > "$expired_unrelated"
+touch -d '40 days ago' "$expired_unrelated"
+mv "$root/held-proof" "$remote/proofs/$base.restore-proof"
+# Simulate a crash after a first weekly proof hardlink but before its new
+# history receipt: the old daily receipt must not certify an unrecorded proof.
+first_proof_crash="$root/crash-first-proof"
+mkdir -p "$first_proof_crash/receipts"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$no_proof_dest/$core" "$first_proof_crash/$core"
+done
+cp "$remote/proofs/$base.restore-proof" "$first_proof_crash/$proof"
+cp "$root/no-proof-first-receipt" "$first_proof_crash/receipts/$base.pulled-20260712T040000.000000000Z.receipt"
+cp "$root/no-proof-first-receipt" "$first_proof_crash/latest-pull.receipt"
+pull "$first_proof_crash" test-host > /dev/null
+first_proof_sha="$(sha256sum "$remote/proofs/$base.restore-proof" | awk '{print $1}')"
+grep -qx "restore_proof_sha256=$first_proof_sha" "$first_proof_crash/latest-pull.receipt"
+[[ "$(find "$first_proof_crash/receipts" -type f -name "$base.pulled-*.receipt" | wc -l)" -eq 2 ]]
+pull "$first_proof_crash" test-host > /dev/null
+[[ "$(find "$first_proof_crash/receipts" -type f -name "$base.pulled-*.receipt" | wc -l)" -eq 2 ]]
+LOCAL_RETENTION_DAYS=1 pull "$no_proof_dest" test-host > /dev/null
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  [[ -f "$no_proof_dest/$core" ]] || {
+    echo "late restore proof retention deleted its active backup: $core" >&2
+    exit 1
+  }
+done
+[[ -f "$expired_unrelated" ]] || {
+  echo 'automatic retention deleted unverified expired ciphertext before any real restore' >&2
+  exit 1
+}
+grep -qx "file=$file" "$no_proof_dest/latest-pull.receipt"
+cmp -s "$remote/proofs/$base.restore-proof" "$no_proof_dest/$proof"
+cmp -s "$root/no-proof-first-receipt" "${no_proof_history[0]}"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cmp -s "$root/early-$core" "$no_proof_dest/$core" || {
+    echo "late proof replaced immutable core: $core" >&2
+    exit 1
+  }
+done
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 2))
+cp "$no_proof_dest/$proof" "$root/late-proof-saved"
+pull "$no_proof_dest" test-host > /dev/null
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 2))
+cmp -s "$root/late-proof-saved" "$no_proof_dest/$proof"
+
+# With two immutable receipts, recovery must restore the newest receipt
+# (the one reflecting late-proof publication), not the original daily pull.
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 2))
+latest_history="$(printf '%s\n' "${no_proof_history[@]}" | LC_ALL=C sort | tail -n 1)"
+rm "$no_proof_dest/latest-pull.receipt"
+pull "$no_proof_dest" test-host > /dev/null
+cmp -s "$latest_history" "$no_proof_dest/latest-pull.receipt" || {
+  echo 'late-proof history was not restored as latest receipt' >&2
+  exit 1
+}
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 2))
+
+# A symlink must not be followed or silently accepted for the mutable pointer.
+rm "$no_proof_dest/latest-pull.receipt"
+ln -s "$root/no-proof-first-receipt" "$no_proof_dest/latest-pull.receipt"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/unsafe-latest.stderr"; then
+  echo 'symlinked latest receipt was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull unsafe latest receipt pointer' "$root/unsafe-latest.stderr"
+rm "$no_proof_dest/latest-pull.receipt"
+pull "$no_proof_dest" test-host > /dev/null
+cmp -s "$latest_history" "$no_proof_dest/latest-pull.receipt"
+
+# Reader-valid long backup basenames must survive a renewed restore proof:
+# original proof files fit NAME_MAX; adding a full digest to the basename does not.
+long_prefix="$(printf 'x%.0s' {1..175})"
+long_base="${long_prefix}-20260712T040000Z"
+long_file="${long_base}.sql.gz.age"
+long_plain="${long_base}.sql.gz"
+long_manifest="${long_base}.sha256.manifest"
+long_age_manifest="${long_base}.age.sha256.manifest"
+long_proof="${long_base}.restore-proof"
+[[ ${#long_base} -le 200 ]]
+cp "$remote/$file" "$remote/$long_file"
+sed "s|^file=$plain\$|file=$long_plain|" "$remote/$manifest" > "$remote/$long_manifest"
+sed -e "s|^file=$file\$|file=$long_file|" \
+  -e "s|^plaintext_file=$plain\$|plaintext_file=$long_plain|" \
+  "$remote/$age_manifest" > "$remote/$long_age_manifest"
+sed "s|^backup_file=$plain\$|backup_file=$long_plain|" \
+  "$remote/proofs/$proof" > "$remote/proofs/$long_proof"
+long_dest="$root/long-backup-name"
+BACKUP_PREFIX="$long_prefix" pull "$long_dest" test-host > /dev/null
+sed -i 's/^created_at=.*/created_at=2026-07-19T05:00:00Z/' "$remote/proofs/$long_proof"
+long_second_sha="$(sha256sum "$remote/proofs/$long_proof" | awk '{print $1}')"
+BACKUP_PREFIX="$long_prefix" pull "$long_dest" test-host > /dev/null
+long_revision="$(find "$long_dest/receipts" -maxdepth 1 -type f -name "*.${long_second_sha}.receipt" -print -quit)"
+long_revision_name="${long_revision##*/}"
+[[ -n "$long_revision" && ${#long_revision_name} -le 255 ]] || {
+  echo 'reader-valid long backup basename did not produce a short proof revision' >&2
+  exit 1
+}
+cmp -s "$remote/proofs/$long_proof" "$long_revision"
+grep -qx "restore_proof_sha256=$long_second_sha" "$long_dest/latest-pull.receipt"
+BACKUP_PREFIX="$long_prefix" pull "$long_dest" test-host > /dev/null
+cmp -s "$remote/proofs/$long_proof" "$long_revision"
+
+# A renewed real weekly restore of the SAME dump is an immutable revision.
+write_restore_proof '2026-07-19T05:00:00Z'
+renewed_sha="$(sha256sum "$remote/proofs/$base.restore-proof" | awk '{print $1}')"
+LOCAL_RETENTION_DAYS=1 pull "$no_proof_dest" test-host > /dev/null
+cmp -s "$root/late-proof-saved" "$no_proof_dest/$proof"
+revision="$no_proof_dest/receipts/$base.restore-proof.$renewed_sha.receipt"
+cmp -s "$remote/proofs/$base.restore-proof" "$revision" || {
+  echo 'renewed proof revision missing or changed' >&2
+  exit 1
+}
+grep -qx "restore_proof_sha256=$renewed_sha" "$no_proof_dest/latest-pull.receipt"
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 3))
+LOCAL_RETENTION_DAYS=1 pull "$no_proof_dest" test-host > /dev/null
+mapfile -t no_proof_history < <(find "$no_proof_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#no_proof_history[@]} == 3))
+cmp -s "$remote/proofs/$base.restore-proof" "$revision"
+
+# Interrupted proof publication: the new immutable SHA sidecar exists but no
+# matching history receipt was committed. A retry must seal it exactly once.
+crash_revision_dest="$root/crash-revision"
+mkdir -p "$crash_revision_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$no_proof_dest/$core" "$crash_revision_dest/$core"
+done
+for earlier in "$no_proof_dest/receipts/$base.pulled-"*.receipt; do
+  if ! grep -qx "restore_proof_sha256=$renewed_sha" "$earlier"; then
+    cp "$earlier" "$crash_revision_dest/receipts/$(basename "$earlier")"
+  fi
+done
+cp "$revision" "$crash_revision_dest/receipts/$(basename "$revision")"
+prior_latest="$(find "$crash_revision_dest/receipts" -maxdepth 1 -name "$base.pulled-*.receipt" | LC_ALL=C sort | tail -n 1)"
+cp "$prior_latest" "$crash_revision_dest/latest-pull.receipt"
+pull "$crash_revision_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$renewed_sha" "$crash_revision_dest/latest-pull.receipt"
+[[ "$(find "$crash_revision_dest/receipts" -type f -name "$base.pulled-*.receipt" | wc -l)" -eq 3 ]]
+pull "$crash_revision_dest" test-host > /dev/null
+[[ "$(find "$crash_revision_dest/receipts" -type f -name "$base.pulled-*.receipt" | wc -l)" -eq 3 ]]
+
+# Sidecar revisions are immutable too: reject symbolic links and changed bytes.
+cp "$revision" "$root/revision-original"
+rm "$revision"
+ln -s "$root/revision-original" "$revision"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/proof-revision-link.stderr"; then
+  echo 'symlinked immutable proof revision was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull unsafe proof revision artefact' "$root/proof-revision-link.stderr"
+rm "$revision"
+printf 'malicious altered proof\n' > "$revision"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/proof-revision-drift.stderr"; then
+  echo 'tampered immutable proof revision was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull proof revision content differs' "$root/proof-revision-drift.stderr"
+cp "$root/revision-original" "$revision"
+pull "$no_proof_dest" test-host > /dev/null
+
+# Old certified proof B cannot disappear or change just because the remote
+# source advances to a newer independently valid weekly restore C.
+write_restore_proof '2026-07-26T05:00:00Z'
+third_sha="$(sha256sum "$remote/proofs/$base.restore-proof" | awk '{print $1}')"
+pull "$no_proof_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$third_sha" "$no_proof_dest/latest-pull.receipt"
+cp "$revision" "$root/historical-B-original"
+printf 'tampered previously certified B\n' > "$revision"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/historical-B-tamper.stderr"; then
+  echo 'older certified B proof was ignored after new C became current' >&2
+  exit 1
+fi
+grep -qF 'normal pull proof revision content differs' "$root/historical-B-tamper.stderr"
+cp "$root/historical-B-original" "$revision"
+rm "$revision"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/historical-B-missing.stderr"; then
+  echo 'removed historical B proof went unnoticed' >&2
+  exit 1
+fi
+grep -qF 'normal pull certified restore proof missing' "$root/historical-B-missing.stderr"
+cp "$root/historical-B-original" "$revision"
+
+# The original immutable A proof is equally part of the historical chain.
+printf 'forged original A proof\n' > "$no_proof_dest/$proof"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/historical-A-tamper.stderr"; then
+  echo 'tampered original A proof was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull certified restore proof missing' "$root/historical-A-tamper.stderr"
+cp "$root/late-proof-saved" "$no_proof_dest/$proof"
+
+historical_c="$(grep -l "^restore_proof_sha256=$third_sha$" "$no_proof_dest/receipts/$base.pulled-"*.receipt)"
+cp "$historical_c" "$root/historical-C-original"
+printf 'restore_proof_sha256=%s\n' "$third_sha" >> "$historical_c"
+if pull "$no_proof_dest" test-host > /dev/null 2> "$root/historical-C-duplicate.stderr"; then
+  echo 'duplicate SHA declaration inside a signed receipt was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull duplicated historical proof sha256 field' "$root/historical-C-duplicate.stderr"
+cp "$root/historical-C-original" "$historical_c"
+
+# Retain the older producer proof as the remote's current document, proving
+# refresh does not accidentally replace our now-certified newer C receipt.
+write_restore_proof '2026-07-19T05:00:00Z'
+pull "$no_proof_dest" test-host > /dev/null
+[[ -f "$no_proof_dest/receipts/$base.restore-proof.$third_sha.receipt" ]]
+
+# If the client crashed after persisting revision B but before recording B's
+# history receipt, and the producer has advanced to C, recovering C alone may
+# not silently strand the otherwise valid local B revision without provenance.
+orphan_dest="$root/crash-orphan-then-next-proof"
+mkdir -p "$orphan_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$no_proof_dest/$core" "$orphan_dest/$core"
+done
+for existing_history in "$no_proof_dest/receipts/$base.pulled-"*.receipt; do
+  if grep -qx "restore_proof_sha256=$renewed_sha" "$existing_history" ||
+    grep -qx "restore_proof_sha256=$third_sha" "$existing_history"; then
+    continue
+  fi
+  cp "$existing_history" "$orphan_dest/receipts/$(basename "$existing_history")"
+done
+cp "$root/no-proof-first-receipt" "$orphan_dest/latest-pull.receipt"
+cp "$revision" "$orphan_dest/receipts/$(basename "$revision")"
+write_restore_proof '2026-07-26T05:00:00Z'
+pull "$orphan_dest" test-host > /dev/null
+grep -lqx "restore_proof_sha256=$renewed_sha" "$orphan_dest/receipts/$base.pulled-"*.receipt > /dev/null || {
+  echo 'orphaned B proof was not certified before remote C' >&2
+  exit 1
+}
+grep -lqx "restore_proof_sha256=$third_sha" "$orphan_dest/receipts/$base.pulled-"*.receipt > /dev/null
+orphan_events="$(find "$orphan_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)"
+pull "$orphan_dest" test-host > /dev/null
+[[ "$(find "$orphan_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)" == "$orphan_events" ]] || {
+  echo 'crash replay duplicated an already certified event' >&2
+  exit 1
+}
+write_restore_proof '2026-07-19T05:00:00Z'
+
+# A canonical first proof can be linked immediately before a crash, while the
+# older no-proof history remains. If the remote proof becomes B, the on-disk
+# original A must also acquire a matching immutable certification.
+canonical_orphan_dest="$root/canonical-proof-A-before-remote-B"
+mkdir -p "$canonical_orphan_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$no_proof_dest/$core" "$canonical_orphan_dest/$core"
+done
+cp "$root/late-proof-saved" "$canonical_orphan_dest/$proof"
+cp "$root/no-proof-first-receipt" \
+  "$canonical_orphan_dest/receipts/$base.pulled-20260712T040000.000000000Z.receipt"
+cp "$root/no-proof-first-receipt" "$canonical_orphan_dest/latest-pull.receipt"
+write_restore_proof '2026-07-19T05:00:00Z'
+pull "$canonical_orphan_dest" test-host > /dev/null
+grep -lqx "restore_proof_sha256=$first_proof_sha" \
+  "$canonical_orphan_dest/receipts/$base.pulled-"*.receipt > /dev/null || {
+  echo 'canonical orphan A was not certified before remote B' >&2
+  exit 1
+}
+grep -lqx "restore_proof_sha256=$renewed_sha" \
+  "$canonical_orphan_dest/receipts/$base.pulled-"*.receipt > /dev/null
+grep -qx "restore_proof_sha256=$renewed_sha" "$canonical_orphan_dest/latest-pull.receipt"
+canonical_count="$(find "$canonical_orphan_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)"
+pull "$canonical_orphan_dest" test-host > /dev/null
+[[ "$(find "$canonical_orphan_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)" == "$canonical_count" ]]
+
+# Crash even earlier: canonical A and the encrypted core were linked, but
+# neither receipts/ nor latest-pull.receipt was created. A subsequent proof B
+# must be able to certify both; it may not require a directory from an
+# incomplete earlier pull.
+no_receipts_dest="$root/canonical-orphan-before-receipt-directory"
+mkdir -p "$no_receipts_dest"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$no_proof_dest/$core" "$no_receipts_dest/$core"
+done
+cp "$root/late-proof-saved" "$no_receipts_dest/$proof"
+write_restore_proof '2026-07-19T05:00:00Z'
+pull "$no_receipts_dest" test-host > /dev/null
+[[ -d "$no_receipts_dest/receipts" ]]
+grep -lqx "restore_proof_sha256=$first_proof_sha" \
+  "$no_receipts_dest/receipts/$base.pulled-"*.receipt > /dev/null || {
+  echo 'first canonical A without receipts directory was not certified' >&2
+  exit 1
+}
+grep -qx "restore_proof_sha256=$renewed_sha" "$no_receipts_dest/latest-pull.receipt"
+no_receipts_count="$(find "$no_receipts_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)"
+pull "$no_receipts_dest" test-host > /dev/null
+[[ "$(find "$no_receipts_dest/receipts" -maxdepth 1 -type f -name "$base.pulled-*.receipt" | wc -l)" == "$no_receipts_count" ]]
+
+# Upgrade from an older client: C is already certified while B is still
+# an orphan sidecar. Re-sealing B must not demote valid current C on this or any
+# later no-op/crash replay, even when C predates history_sequence support.
+upgrade_dest="$root/upgrade-orphan-B-after-certified-C"
+mkdir -p "$upgrade_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$no_proof_dest/$core" "$upgrade_dest/$core"
+done
+cp "$no_proof_dest/receipts/"*.receipt "$upgrade_dest/receipts/"
+for old_history in "$upgrade_dest/receipts/$base.pulled-"*.receipt; do
+  if grep -qx "restore_proof_sha256=$renewed_sha" "$old_history"; then
+    rm "$old_history"
+  else
+    sed -i '/^history_sequence=/d' "$old_history"
+  fi
+done
+cp "$no_proof_dest/latest-pull.receipt" "$upgrade_dest/latest-pull.receipt"
+sed -i '/^history_sequence=/d' "$upgrade_dest/latest-pull.receipt"
+write_restore_proof '2026-07-26T05:00:00Z'
+pull "$upgrade_dest" test-host > /dev/null
+if ! grep -qx "restore_proof_sha256=$third_sha" "$upgrade_dest/latest-pull.receipt"; then
+  echo 'sealing orphan B demoted already-certified latest C' >&2
+  exit 1
+fi
+grep -lqx "restore_proof_sha256=$renewed_sha" "$upgrade_dest/receipts/$base.pulled-"*.receipt > /dev/null || {
+  echo 'orphan B not certified during C-preserving upgrade' >&2
+  exit 1
+}
+rm "$upgrade_dest/latest-pull.receipt"
+if pull "$upgrade_dest" test-host > /dev/null 2> "$root/upgrade-unsequenced-pointer-loss.stderr"; then
+  echo 'legacy unsequenced C pointer was guessed after loss' >&2
+  exit 1
+fi
+grep -qF 'normal pull ambiguous unsequenced history without latest receipt' "$root/upgrade-unsequenced-pointer-loss.stderr"
+[[ ! -e "$upgrade_dest/latest-pull.receipt" ]]
+write_restore_proof '2026-07-19T05:00:00Z'
+
+# Receipt filenames contain wall-clock timestamps: a clock correction must
+# not roll back the latest pointer to an older proof event. Move C's immutable
+# receipt to a lexicographically earlier name while retaining its content.
+clock_dest="$root/backwards-clock"
+mkdir -p "$clock_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$no_proof_dest/$core" "$clock_dest/$core"
+done
+cp "$no_proof_dest/receipts/"*.receipt "$clock_dest/receipts/"
+cp "$no_proof_dest/latest-pull.receipt" "$clock_dest/latest-pull.receipt"
+clock_c="$(grep -lx "restore_proof_sha256=$third_sha" "$clock_dest/receipts/$base.pulled-"*.receipt)"
+[[ -n "$clock_c" ]] || {
+  echo 'clock fixture C receipt missing' >&2
+  exit 1
+}
+mv "$clock_c" "$clock_dest/receipts/$base.pulled-20000101T000000.000000001Z.receipt"
+pull "$clock_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$third_sha" "$clock_dest/latest-pull.receipt" || {
+  echo 'clock rollback wrongly replaced latest receipt with old history' >&2
+  exit 1
+}
+rm "$clock_dest/latest-pull.receipt"
+pull "$clock_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$third_sha" "$clock_dest/latest-pull.receipt" || {
+  echo 'crash recovery under clock rollback selected old history' >&2
+  exit 1
+}
+
+# Duplicate sequence declarations are ambiguous rather than tie-broken.
+clock_c_history="$clock_dest/receipts/$base.pulled-20000101T000000.000000001Z.receipt"
+cp "$clock_c_history" "$root/clock-c-prior"
+printf 'history_sequence=4\n' >> "$clock_c_history"
+if pull "$clock_dest" test-host > /dev/null 2> "$root/clock-duplicate-seq.stderr"; then
+  echo 'duplicate history sequence field was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull duplicated historical sequence field' "$root/clock-duplicate-seq.stderr"
+cp "$root/clock-c-prior" "$clock_c_history"
+
+# Multiple old receipts without history_sequence cannot be ordered from
+# their wall-clock names alone. A verified existing pointer is preserved;
+# without it the automatic rollback must fail closed.
+legacy_sequence_dest="$root/pre-sequence-history"
+mkdir -p "$legacy_sequence_dest/receipts"
+for core in "$file" "$manifest" "$age_manifest" "$proof"; do
+  cp "$clock_dest/$core" "$legacy_sequence_dest/$core"
+done
+cp "$clock_dest/receipts/"*.receipt "$legacy_sequence_dest/receipts/"
+cp "$clock_dest/latest-pull.receipt" "$legacy_sequence_dest/latest-pull.receipt"
+sed -i '/^history_sequence=/d' "$legacy_sequence_dest/receipts/$base.pulled-"*.receipt "$legacy_sequence_dest/latest-pull.receipt"
+pull "$legacy_sequence_dest" test-host > /dev/null
+grep -qx "restore_proof_sha256=$third_sha" "$legacy_sequence_dest/latest-pull.receipt"
+rm "$legacy_sequence_dest/latest-pull.receipt"
+if pull "$legacy_sequence_dest" test-host > /dev/null 2> "$root/legacy-sequence-ambiguous.stderr"; then
+  echo 'ambiguous legacy sequence without latest was silently guessed' >&2
+  exit 1
+fi
+grep -qF 'normal pull ambiguous unsequenced history without latest receipt' "$root/legacy-sequence-ambiguous.stderr"
+
+# Partial core sets and pre-existing symlinks are not an idempotent pull.
+partial_dest="$root/partial-core"
+mkdir -p "$partial_dest"
+cp "$remote/$file" "$partial_dest/$file"
+if pull "$partial_dest" test-host > /dev/null 2> "$root/partial-core.stderr"; then
+  echo 'partial core set was silently accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull incomplete core artefact set' "$root/partial-core.stderr"
+[[ ! -e "$partial_dest/$manifest" && ! -e "$partial_dest/latest-pull.receipt" ]]
+unsafe_dest="$root/unsafe-proof"
+mkdir -p "$unsafe_dest"
+ln -s "$remote/proofs/$base.restore-proof" "$unsafe_dest/$proof"
+if pull "$unsafe_dest" test-host > /dev/null 2> "$root/unsafe-proof.stderr"; then
+  echo 'symlinked local proof was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull unsafe existing artefact' "$root/unsafe-proof.stderr"
+[[ ! -e "$unsafe_dest/$file" && ! -e "$unsafe_dest/latest-pull.receipt" ]]
+unsafe_core="$root/unsafe-core"
+mkdir -p "$unsafe_core"
+ln -s "$remote/$file" "$unsafe_core/$file"
+if pull "$unsafe_core" test-host > /dev/null 2> "$root/unsafe-core.stderr"; then
+  echo 'symlinked local ciphertext was accepted' >&2
+  exit 1
+fi
+grep -qF 'normal pull unsafe existing artefact' "$root/unsafe-core.stderr"
+[[ ! -e "$unsafe_core/$manifest" && ! -e "$unsafe_core/latest-pull.receipt" ]]
+
+# A crash can interrupt publication after all three validated core links,
+# but before its immutable receipt. A retry against byte-identical remote
+# content must finish the receipt without rewriting any core byte.
+complete_dest="$root/complete-core-crash"
+mkdir -p "$complete_dest"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cp "$remote/$core" "$complete_dest/$core"
+  cp "$complete_dest/$core" "$root/complete-original-$core"
+done
+pull "$complete_dest" test-host > /dev/null
+[[ -f "$complete_dest/latest-pull.receipt" ]]
+[[ -f "$complete_dest/$proof" ]]
+mapfile -t complete_history < <(find "$complete_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#complete_history[@]} == 1))
+cmp -s "${complete_history[0]}" "$complete_dest/latest-pull.receipt"
+for core in "$file" "$manifest" "$age_manifest"; do
+  cmp -s "$root/complete-original-$core" "$complete_dest/$core" || {
+    echo "crash replay replaced an immutable backup core: $core" >&2
+    exit 1
+  }
+done
+pull "$complete_dest" test-host > /dev/null
+mapfile -t complete_history < <(find "$complete_dest/receipts" -type f -name "$base.pulled-*.receipt")
+((${#complete_history[@]} == 1))
+
+# Historical receipts must be unambiguous. Even duplicate *matching* core
+# fields make an old proof unusable by the offline restore procedure. A retry
+# must not promote a corrupted receipt to latest or claim verified success.
+for field in contract pulled_at remote_host file sha256 encryption recipients plaintext_sha256 result; do
+  duplicate_dest="$root/history-duplicate-$field"
+  mkdir -p "$duplicate_dest"
+  cp -a "$complete_dest/." "$duplicate_dest/"
+  duplicate_history="$duplicate_dest/receipts/$(basename "${complete_history[0]}")"
+  field_value="$(awk -F= -v key="$field" '$1==key {print substr($0,length(key)+2); exit}' "$duplicate_history")"
+  [[ -n "$field_value" ]] || {
+    echo "missing original receipt field $field" >&2
+    exit 1
+  }
+  printf '%s=%s\n' "$field" "$field_value" >> "$duplicate_history"
+  rm "$duplicate_dest/latest-pull.receipt"
+  if pull "$duplicate_dest" test-host > /dev/null 2> "$root/history-duplicate-$field.stderr"; then
+    echo "duplicate historical core receipt field $field accepted" >&2
+    exit 1
+  fi
+  grep -qF "normal pull duplicate historical field: $field" "$root/history-duplicate-$field.stderr"
+  [[ ! -e "$duplicate_dest/latest-pull.receipt" ]] || {
+    echo "ambiguous historical receipt $field wrongly promoted to latest" >&2
+    exit 1
+  }
+done
+
+# Unsafe, forged or orphaned receipts still fail closed.
+for scenario in symlink forged receipt-only; do
+  history_dest="$root/history-$scenario"
+  mkdir -p "$history_dest/receipts"
+  if [[ "$scenario" != receipt-only ]]; then
+    for core in "$file" "$manifest" "$age_manifest"; do
+      cp "$remote/$core" "$history_dest/$core"
+    done
+  fi
+  history_path="$history_dest/receipts/$base.pulled-20260712T040000.000000000Z.receipt"
+  case "$scenario" in
+    symlink)
+      ln -s "$root/first-receipt" "$history_path"
+      expected_error='normal pull unsafe existing history receipt'
+      ;;
+    forged)
+      printf 'contract=weltgewebe-offhost-backup-pull-v2\nresult=ok\n' > "$history_path"
+      expected_error='normal pull existing history receipt differs'
+      ;;
+    receipt-only)
+      cp "$root/first-receipt" "$history_path"
+      expected_error='normal pull historical receipt exists without core artefacts'
+      ;;
+  esac
+  if pull "$history_dest" commonserver > /dev/null 2> "$root/history-$scenario.stderr"; then
+    echo "inconsistent historical backup was accepted: $scenario" >&2
+    exit 1
+  fi
+  grep -qF "$expected_error" "$root/history-$scenario.stderr"
+  [[ ! -e "$history_dest/latest-pull.receipt" ]]
+done
+
+# A ciphertext sha256 mismatch must fail and must not promote anything.
+write_age_manifest "$(printf '%064d' 0)" "$age_bytes" "$plain_sha"
+expect_pull_failure "$root/bad-sha" 'ciphertext sha256 mismatch'
+
+# A plaintext file disguised as the encrypted artefact (matching sha) is rejected.
+cp "$remote/$file" "$root/real.age"
+cp "$remote/$plain" "$remote/$file"
+write_age_manifest "$(sha256sum "$remote/$file" | awk '{print $1}')" "$(wc -c < "$remote/$file" | tr -d '[:space:]')" "$plain_sha"
+expect_pull_failure "$root/bad-format" 'is not an age-encrypted file'
+cp "$root/real.age" "$remote/$file"
+
+# Manifests that disagree about the plaintext are rejected.
+write_age_manifest "$age_sha" "$age_bytes" "$(printf '%064d' 1)"
+expect_pull_failure "$root/bad-plain" 'manifests disagree'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+
+# A backup encrypted to a recipient that is not pinned on the pull side fails
+# closed: the offline identity could not decrypt it, or a foreign key could.
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" "$foreign_recipient"
+expect_pull_failure "$root/foreign-recipient" 'not pinned'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" "$recipient,$foreign_recipient"
+expect_pull_failure "$root/extra-recipient" 'not pinned'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+PULL_AGE_RECIPIENTS_FILE="$root/missing-pinned.txt" expect_pull_failure "$root/no-pin" 'pinned age recipients file is missing'
+
+# Recipient declarations must be unambiguous: exactly one field, canonical
+# list, no empty or duplicate member.
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+printf 'recipients=%s\n' "$foreign_recipient" >> "$remote/$age_manifest"
+expect_pull_failure "$root/dup-field" 'declare age recipients exactly once'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" "$recipient,"
+expect_pull_failure "$root/trailing-comma" 'not a canonical comma-separated age1 list'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" ",$recipient"
+expect_pull_failure "$root/leading-comma" 'not a canonical comma-separated age1 list'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha" "$recipient,$recipient"
+expect_pull_failure "$root/dup-member" 'lists an age recipient twice'
+write_age_manifest "$age_sha" "$age_bytes" "$plain_sha"
+
+# Plaintext that appears after the first scan still blocks the receipt.
+late_dest="$root/late-plaintext"
+mkdir -p "$late_dest"
+if INJECT_PLAINTEXT_DURING_CAT="$late_dest/weltgewebe-postgres-late.sql.gz" \
+  pull "$late_dest" test-host > /dev/null 2> "$root/late.stderr"; then
+  echo 'plaintext created during the pull must block the receipt' >&2
+  exit 1
+fi
+grep -qF 'legacy plaintext PostgreSQL backups' "$root/late.stderr"
+[[ ! -e "$late_dest/latest-pull.receipt" && ! -e "$late_dest/receipts" ]]
+
+# Concurrent pulls into one destination are serialized fail-closed.
+locked_dest="$root/locked"
+mkdir -p "$locked_dest"
+exec 8> "$locked_dest/.pull.lock"
+flock -n 8
+expect_pull_failure "$locked_dest" 'another pull holds'
+exec 8>&-
+
+# Immutable successful history receipts outlive LOCAL_RETENTION_DAYS. When a
+# newer valid encrypted backup is pulled, do not destroy the earlier certified
+# ciphertext/manifests/canonical proof, or its receipt ceases to represent a
+# restorable recovery point. This remains blocked until explicit retirement.
+certified_old_dest="$root/retention-certified-old"
+mkdir -p "$certified_old_dest"
+cp -a "$no_proof_dest/." "$certified_old_dest/"
+for retained in "$file" "$manifest" "$age_manifest" "$proof"; do
+  touch -d '40 days ago' "$certified_old_dest/$retained"
+done
+old_canonical_sha="$(sha256sum "$certified_old_dest/$proof" | awk '{print $1}')"
+old_history_count="$(find "$certified_old_dest/receipts" -maxdepth 1 -name "$base.pulled-*.receipt" -type f | wc -l)"
+newer_base=weltgewebe-postgres-20260901T040000Z
+newer_file="$newer_base.sql.gz.age"
+newer_manifest="$newer_base.sha256.manifest"
+newer_age_manifest="$newer_base.age.sha256.manifest"
+cp "$remote/$file" "$remote/$newer_file"
+sed "s|^file=$plain$|file=$newer_base.sql.gz|" \
+  "$remote/$manifest" > "$remote/$newer_manifest"
+sed -e "s|^file=$file$|file=$newer_file|" \
+  -e "s|^plaintext_file=$plain$|plaintext_file=$newer_base.sql.gz|" \
+  "$remote/$age_manifest" > "$remote/$newer_age_manifest"
+LOCAL_RETENTION_DAYS=1 pull "$certified_old_dest" test-host > /dev/null
+for retained in "$file" "$manifest" "$age_manifest" "$proof"; do
+  [[ -f "$certified_old_dest/$retained" ]] || {
+    echo "retention destroyed certified historical restore artefact: $retained" >&2
+    exit 1
+  }
+done
+[[ "$(sha256sum "$certified_old_dest/$proof" | awk '{print $1}')" == "$old_canonical_sha" ]]
+[[ -f "$certified_old_dest/$newer_file" ]]
+[[ "$(find "$certified_old_dest/receipts" -maxdepth 1 -name "$base.pulled-*.receipt" -type f | wc -l)" == "$old_history_count" ]]
+rm "$remote/$newer_file" "$remote/$newer_manifest" "$remote/$newer_age_manifest"
+
+# A host without an encrypted artefact (e.g. no recipient configured) fails closed.
+rm -f "$remote/$file" "$remote/$age_manifest"
+expect_pull_failure "$root/no-age" 'no complete encrypted backup set'
+# The reader is the only privileged interface, so its argument and file-type
+# boundary is tested directly: a sudoers rule naming it permits any arguments.
+make_reader() {
+  sed -e "s|^readonly BACKUP_DIR=.*|readonly BACKUP_DIR=$1|" \
+    -e "s|^readonly BACKUP_OWNER_UID=.*|readonly BACKUP_OWNER_UID=$2|" \
+    "$READER_SOURCE" > "$3"
+  chmod 755 "$3"
+}
+rdir="$root/reader-remote"
+mkdir -p "$rdir/proofs"
+chmod 700 "$rdir" "$rdir/proofs"
+rbase=weltgewebe-postgres-20260801T040000Z
+printf '%s\n' "$marker" | gzip -c > "$rdir/$rbase.sql.gz"
+printf 'age-encryption.org/v1\ncipher\n' > "$rdir/$rbase.sql.gz.age"
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-08-01T04:00:00Z\n' > "$rdir/$rbase.age.sha256.manifest"
+printf 'contract=weltgewebe-postgres-backup-v1\n' > "$rdir/$rbase.sha256.manifest"
+printf 'result=ok\n' > "$rdir/proofs/$rbase.restore-proof"
+rreader="$root/reader-bin"
+make_reader "$rdir" "$(id -u)" "$rreader"
+expect_reader_failure() {
+  local message="$1"
+  shift
+  if timeout 10 "$rreader" "$@" > "$root/reader.stdout" 2> "$root/reader.stderr"; then
+    echo "reader accepted: $* ($message)" >&2
+    exit 1
+  fi
+  grep -qF "postgres-backup-read: $message" "$root/reader.stderr" || {
+    echo "unexpected reader failure for: $* (wanted: $message)" >&2
+    cat "$root/reader.stderr" >&2
+    exit 1
+  }
+  if grep -qF "$marker" "$root/reader.stdout"; then
+    echo "reader leaked plaintext for: $*" >&2
+    exit 1
+  fi
+}
+[[ "$("$rreader" latest weltgewebe-postgres)" == "$rbase.age.sha256.manifest" ]]
+
+# Created-at, not a lexically dominant operator label, defines the latest backup.
+# An older manual "pre-upgrade" label must not hide all newer daily backups.
+manual_base=weltgewebe-postgres-pre-upgrade
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-31T03:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+if [[ "$("$rreader" latest weltgewebe-postgres)" != "$rbase.age.sha256.manifest" ]]; then
+  echo 'reader selected stale manual label instead of newer created_at' >&2
+  exit 1
+fi
+# A genuinely newer manual backup should still be offered to the pull.
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-08-02T04:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+if [[ "$("$rreader" latest weltgewebe-postgres)" != "$manual_base.age.sha256.manifest" ]]; then
+  echo 'reader ignored newer manually labelled backup created_at' >&2
+  exit 1
+fi
+rm "$rdir/$manual_base.age.sha256.manifest"
+# The caller's environment must not choose code that runs as root: no PATH
+# lookup for the interpreter, no BASH_ENV, no imported functions.
+[[ "$(head -n1 "$READER_SOURCE")" == '#!/bin/bash -p' ]]
+mkdir -p "$root/evil-bin"
+printf '#!/bin/sh\necho evil-bash-ran\n' > "$root/evil-bin/bash"
+printf 'echo evil-bash-env-ran\n' > "$root/evil-bash-env"
+chmod 755 "$root/evil-bin/bash"
+evil_out="$(env PATH="$root/evil-bin:$PATH" BASH_ENV="$root/evil-bash-env" \
+  'BASH_FUNC_find%%=() { echo evil-function-ran; }' \
+  "$rreader" latest weltgewebe-postgres 2>&1)"
+[[ "$evil_out" == "$rbase.age.sha256.manifest" ]] || {
+  printf 'reader honoured caller-controlled code: %s\n' "$evil_out" >&2
+  exit 1
+}
+cmp -s <("$rreader" read "$rbase" ciphertext) "$rdir/$rbase.sql.gz.age"
+cmp -s <("$rreader" read "$rbase" age-manifest) "$rdir/$rbase.age.sha256.manifest"
+cmp -s <("$rreader" read "$rbase" manifest) "$rdir/$rbase.sha256.manifest"
+cmp -s <("$rreader" read "$rbase" proof) "$rdir/proofs/$rbase.restore-proof"
+[[ "$("$rreader" proof-state "$rbase")" == present ]]
+[[ "$("$rreader" proof-state weltgewebe-postgres-20990101T000000Z)" == absent ]]
+expect_reader_failure 'usage:'
+expect_reader_failure 'unsupported operation' cat "$rdir/$rbase.sql.gz"
+expect_reader_failure 'unsupported operation' find "$rdir"
+expect_reader_failure 'latest takes exactly one PREFIX' latest
+expect_reader_failure 'latest takes exactly one PREFIX' latest weltgewebe-postgres extra
+expect_reader_failure 'invalid prefix' latest '*'
+expect_reader_failure 'invalid prefix' latest '-name'
+expect_reader_failure 'invalid prefix' latest '../postgres'
+
+# Malformed or duplicate age-manifest creation timestamps fail closed before
+# the reader can select an arbitrary old ciphertext as successful "latest".
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=untrusted\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest created_at is not canonical UTC' latest weltgewebe-postgres
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-02-30T03:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest created_at is invalid UTC' latest weltgewebe-postgres
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2999-01-01T03:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest created_at is in the future' latest weltgewebe-postgres
+printf 'contract=weltgewebe-postgres-backup-age-v1\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest has missing or duplicate created_at' latest weltgewebe-postgres
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-31T03:00:00Z\ncreated_at=2026-08-02T04:00:00Z\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest has missing or duplicate created_at' latest weltgewebe-postgres
+rm "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'read takes exactly BASE and KIND' read "$rbase"
+expect_reader_failure 'read takes exactly BASE and KIND' read "$rbase" ciphertext extra
+expect_reader_failure 'unsupported kind' read "$rbase" plaintext
+expect_reader_failure 'unsupported kind' read "$rbase" ''
+expect_reader_failure 'invalid backup name' read "../$rbase" ciphertext
+expect_reader_failure 'invalid backup name' read "proofs/$rbase" proof
+expect_reader_failure 'invalid backup name' read "$rbase x" ciphertext
+expect_reader_failure 'invalid backup name' read "-$rbase" ciphertext
+expect_reader_failure 'invalid backup name' read "$rbase..x" ciphertext
+expect_reader_failure 'invalid backup name' read '' ciphertext
+expect_reader_failure 'invalid backup name' proof-state "../$rbase"
+expect_reader_failure 'proof-state takes exactly one BASE' proof-state
+# Appending a fixed suffix means the plaintext dump has no name at all.
+expect_reader_failure 'not a regular file' read "$rbase.sql.gz" manifest
+# Symlinks and special files are refused, never followed or read.
+ln -s "$rdir/$rbase.sql.gz" "$rdir/linked.sql.gz.age"
+expect_reader_failure 'not a regular file' read linked ciphertext
+mkfifo "$rdir/fifo.sha256.manifest"
+expect_reader_failure 'not a regular file' read fifo manifest
+ln -s "$rdir/$rbase.sql.gz" "$rdir/proofs/linked.restore-proof"
+expect_reader_failure 'restore proof is not a regular file' proof-state linked
+expect_reader_failure 'not a regular file' read linked proof
+# A missing proofs directory means no proof; an untrusted one is refused.
+mv "$rdir/proofs" "$root/held-proofs"
+[[ "$("$rreader" proof-state "$rbase")" == absent ]]
+mv "$root/held-proofs" "$rdir/proofs"
+chmod 770 "$rdir/proofs"
+expect_reader_failure 'group or world writable' proof-state "$rbase"
+expect_reader_failure 'group or world writable' read "$rbase" proof
+chmod 700 "$rdir/proofs"
+# The type check above cannot be raced deterministically here; the open itself
+# must also refuse a symlink swapped in after the check.
+# shellcheck disable=SC2016 # literal source text, not an expansion
+grep -qF 'dd if="$path" iflag=nofollow' "$READER_SOURCE"
+# The backup directory itself must be a real, owner-only directory.
+chmod 750 "$rdir"
+"$rreader" latest weltgewebe-postgres > /dev/null
+chmod 720 "$rdir"
+expect_reader_failure 'group or world writable' latest weltgewebe-postgres
+chmod 700 "$rdir"
+ln -s "$rdir" "$root/reader-remote-alias"
+make_reader "$root/reader-remote-alias" "$(id -u)" "$rreader"
+expect_reader_failure 'not a directory' latest weltgewebe-postgres
+make_reader "$rdir" "$(($(id -u) + 1))" "$rreader"
+expect_reader_failure 'unexpected owner' read "$rbase" ciphertext
+make_reader "$rdir" "$(id -u)" "$rreader"
+"$rreader" latest weltgewebe-postgres > /dev/null
+
+# The Restic snapshot gate refuses a snapshot while plaintext dumps lie below
+# any source, and fails closed when a source cannot be scanned.
+gate_home="$root/gate-home"
+mkdir -p "$gate_home/repos/project" "$gate_home/artifacts/merges" "$gate_home/fundus" "$gate_home/elsewhere"
+printf 'not a dump\n' > "$gate_home/repos/project/notes.sql.gz.age"
+gate_sources=("$gate_home/repos" "$gate_home/artifacts/merges" "$gate_home/fundus")
+"$GATE" "${gate_sources[@]}" > "$root/gate.stdout"
+grep -qF 'no plaintext PostgreSQL dumps below 3 source(s)' "$root/gate.stdout"
+expect_gate_failure() {
+  local message="$1"
+  shift
+  if "$GATE" "$@" > /dev/null 2> "$root/gate.stderr"; then
+    echo "Restic gate accepted: $* ($message)" >&2
+    exit 1
+  fi
+  grep -qF "restic-plaintext-gate: $message" "$root/gate.stderr" || {
+    echo "unexpected Restic gate failure for: $* (wanted: $message)" >&2
+    cat "$root/gate.stderr" >&2
+    exit 1
+  }
+}
+expect_gate_failure 'usage:'
+expect_gate_failure 'source must be an absolute path' repos
+expect_gate_failure 'source does not exist' "$gate_home/missing"
+mkdir -p "$gate_home/artifacts/merges/weltgewebe-production-backups/.pull.Ab12Cd"
+printf 'old private pg dump\n' > "$gate_home/artifacts/merges/weltgewebe-production-backups/.pull.Ab12Cd/weltgewebe-postgres-legacy.sql.gz"
+expect_gate_failure "plaintext PostgreSQL dump below snapshot source $gate_home/artifacts/merges" "${gate_sources[@]}"
+rm -r "$gate_home/artifacts/merges/weltgewebe-production-backups"
+"$GATE" "${gate_sources[@]}" > /dev/null
+# A dump reached through a symlinked source root, or itself a symlink, counts.
+printf 'old private pg dump\n' > "$gate_home/elsewhere/weltgewebe-postgres-legacy.sql.gz"
+ln -s "$gate_home/elsewhere" "$gate_home/fundus-alias"
+expect_gate_failure 'plaintext PostgreSQL dump below snapshot source' "$gate_home/fundus-alias"
+ln -s "$gate_home/elsewhere/weltgewebe-postgres-legacy.sql.gz" "$gate_home/fundus/linked.sql.gz"
+expect_gate_failure 'plaintext PostgreSQL dump below snapshot source' "${gate_sources[@]}"
+rm "$gate_home/fundus/linked.sql.gz"
+# An unreadable subtree is a partial scan, never a pass (root reads everything).
+if (($(id -u) != 0)); then
+  mkdir -m 000 "$gate_home/repos/locked"
+  expect_gate_failure 'could not scan source completely' "${gate_sources[@]}"
+  chmod 700 "$gate_home/repos/locked"
+fi
+"$GATE" "${gate_sources[@]}" > /dev/null
+
 # The user service is generated from a clean commit placeholder and must avoid
 # ProtectKernelModules, which is unsupported by the real user manager on heim-pc.
 grep -q '@WELTGEWEBE_COMMIT@' "$SERVICE_TEMPLATE"
@@ -55,7 +1495,7 @@ fi
 install_home="$root/install-home"
 fixture_repo="$root/install-repo"
 mkdir -p "$install_home" "$fixture_repo/scripts/ops/systemd"
-cp "$REPO_ROOT/scripts/ops/pull-production-postgres-backup.sh" "$fixture_repo/scripts/ops/"
+cp "$REPO_ROOT/scripts/ops/pull-production-postgres-backup.sh" "$GATE" "$fixture_repo/scripts/ops/"
 cp "$SERVICE_TEMPLATE" "$fixture_repo/scripts/ops/systemd/"
 cp "$REPO_ROOT/scripts/ops/systemd/weltgewebe-postgres-offhost-pull.timer" "$fixture_repo/scripts/ops/systemd/"
 git -C "$fixture_repo" init -q
@@ -72,6 +1512,9 @@ installed_service="$install_home/.config/systemd/user/weltgewebe-postgres-offhos
 receipt="$install_home/.local/libexec/weltgewebe/$commit/install.receipt"
 [[ -x "$installed_pull" ]]
 cmp -s "$fixture_repo/scripts/ops/pull-production-postgres-backup.sh" "$installed_pull"
+installed_gate="$install_home/.local/libexec/weltgewebe/$commit/restic-plaintext-gate.sh"
+[[ -x "$installed_gate" ]]
+cmp -s "$GATE" "$installed_gate"
 grep -qxF "ExecStart=%h/.local/libexec/weltgewebe/$commit/pull-production-postgres-backup.sh" "$installed_service"
 if grep -q '@WELTGEWEBE_COMMIT@' "$installed_service"; then
   echo 'generated service retained the commit placeholder' >&2
@@ -84,11 +1527,33 @@ fi
 grep -qxF 'contract=weltgewebe-postgres-offhost-user-install-v1' "$receipt"
 grep -Eq '^installed_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$receipt"
 grep -qxF "git_commit=$commit" "$receipt"
+grep -qxF "restic_gate_sha256=$(sha256sum "$GATE" | awk '{print $1}')" "$receipt"
 [[ "$(stat -c %a "$receipt")" == 600 ]]
 [[ "$(stat -c %a "$install_home/merges/weltgewebe-production-backups")" == 700 ]]
-# Reinstalling the same commit is idempotent.
+# Reinstalling the same commit is idempotent and restores a lost execute bit,
+# so a success receipt never covers a runtime systemd cannot execute.
+chmod 0644 "$installed_pull" "$installed_gate"
 HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
   EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=/bin/true \
   "$INSTALLER" > /dev/null
+[[ "$(stat -c %a "$installed_pull")" == 755 && "$(stat -c %a "$installed_gate")" == 755 ]] || {
+  echo 'reinstall must restore mode 0755 on the installed runtime' >&2
+  exit 1
+}
+# An existing runtime path that is a symlink must be rejected, not trusted.
+mv "$installed_gate" "$installed_gate.real"
+ln -s "$installed_gate.real" "$installed_gate"
+if HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
+  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=/bin/true \
+  "$INSTALLER" > /dev/null 2>&1; then
+  echo 'reinstall must reject a symlinked runtime gate' >&2
+  exit 1
+fi
+rm "$installed_gate"
+mv "$installed_gate.real" "$installed_gate"
 
-printf 'test_offhost_backup_pull_contract: OK\n'
+if ((REAL_AGE == 1)); then
+  printf 'test_offhost_backup_pull_contract: OK (real age round trip)\n'
+else
+  printf 'test_offhost_backup_pull_contract: OK (age stub; round trip skipped)\n'
+fi
