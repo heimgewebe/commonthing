@@ -57,7 +57,8 @@ class WatchTests(unittest.TestCase):
                     "MONITOR_DATA_FAILURE",
                 )
             unchanged = json.loads((directory / "state.json").read_text())
-            self.assertEqual(unchanged["severe"], [])
+            self.assertEqual(unchanged["severe"], [["new_p1", "new failure"]])
+            self.assertEqual(len(watch._pending_transition_entries(unchanged)), 18)
             self.assertEqual(len(unchanged["pending_transitions"]), 17)
             heartbeat = json.loads((directory / "heartbeat.json").read_text())
             self.assertEqual(heartbeat["status"], "ALARM")
