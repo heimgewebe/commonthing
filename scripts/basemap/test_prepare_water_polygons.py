@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import io
+import signal
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -139,6 +141,24 @@ class PinnedSourceTests(unittest.TestCase):
         with mock.patch.object(water.os, "link", side_effect=FileExistsError):
             with self.assertRaisesRegex(water.SourceError, "appeared concurrently"):
                 self.run_ensure()
+        self.assertFalse(self.file.exists())
+        self.assertEqual(list(self.file.parent.iterdir()), [])
+
+    @unittest.skipUnless(hasattr(signal, "setitimer"), "POSIX deadline required")
+    def test_stalled_socket_read_exceeds_hard_deadline_without_publishing(self) -> None:
+        class StalledResponse(Response):
+            def read(self, size: int = -1) -> bytes:
+                time.sleep(0.4)
+                return super().read(size)
+
+        before = time.monotonic()
+        with mock.patch.object(water, "MAX_DOWNLOAD_SECONDS", 0.03):
+            with self.assertRaisesRegex(water.SourceError, "deadline exceeded"):
+                water.ensure(
+                    self.base, expected_sha256=HASH, expected_size=len(ZIP),
+                    opener=lambda *_args, **_kwargs: StalledResponse(ZIP),
+                )
+        self.assertLess(time.monotonic() - before, 0.25, "read was not interrupted")
         self.assertFalse(self.file.exists())
         self.assertEqual(list(self.file.parent.iterdir()), [])
 

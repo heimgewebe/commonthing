@@ -7,8 +7,10 @@ No fallback to live, unpinned data is permitted.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import os
+import signal
 from pathlib import Path
 import stat
 import sys
@@ -32,6 +34,27 @@ MAX_DOWNLOAD_SECONDS = 900
 
 class SourceError(RuntimeError):
     """The input source cannot be trusted; do not build or publish PMTiles."""
+
+
+@contextmanager
+def _hard_download_deadline(seconds: float):
+    """Interrupt a stalled HTTP read, not merely check time after it returns."""
+    if not hasattr(signal, "setitimer"):
+        raise SourceError("hard download deadline unavailable on this host")
+    alarm = signal.ITIMER_REAL
+    if signal.getitimer(alarm)[0] > 0:
+        raise SourceError("download deadline alarm is already in use")
+
+    def expired(_signum, _frame):
+        raise SourceError("water-polygon download deadline exceeded")
+
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(alarm, seconds)
+        yield
+    finally:
+        signal.setitimer(alarm, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _directory(path: Path) -> None:
@@ -107,26 +130,27 @@ def ensure(
         digest = hashlib.sha256()
         size = 0
         started = time.monotonic()
-        request = Request(url, headers={"User-Agent": "commonThing-regional-pmtiles/1"})
-        with os.fdopen(fd, "wb") as output:
-            with opener(request, timeout=30) as response:
-                effective = urlsplit(response.geturl())
-                if (
-                    effective.scheme != "https"
-                    or effective.netloc != "ftp.uni-erlangen.de"
-                    or getattr(response, "status", None) != 200
-                ):
-                    raise SourceError("unapproved redirect or HTTP status")
-                while block := response.read(CHUNK):
-                    size += len(block)
-                    if size > expected_size:
-                        raise SourceError("water-polygon download exceeds pinned size")
-                    if time.monotonic() - started > MAX_DOWNLOAD_SECONDS:
-                        raise SourceError("water-polygon download deadline exceeded")
-                    digest.update(block)
-                    output.write(block)
-            output.flush()
-            os.fsync(output.fileno())
+        with _hard_download_deadline(MAX_DOWNLOAD_SECONDS):
+            request = Request(url, headers={"User-Agent": "commonThing-regional-pmtiles/1"})
+            with os.fdopen(fd, "wb") as output:
+                with opener(request, timeout=30) as response:
+                    effective = urlsplit(response.geturl())
+                    if (
+                        effective.scheme != "https"
+                        or effective.netloc != "ftp.uni-erlangen.de"
+                        or getattr(response, "status", None) != 200
+                    ):
+                        raise SourceError("unapproved redirect or HTTP status")
+                    while block := response.read(CHUNK):
+                        size += len(block)
+                        if size > expected_size:
+                            raise SourceError("water-polygon download exceeds pinned size")
+                        if time.monotonic() - started > MAX_DOWNLOAD_SECONDS:
+                            raise SourceError("water-polygon download deadline exceeded")
+                        digest.update(block)
+                        output.write(block)
+                output.flush()
+                os.fsync(output.fileno())
         if size != expected_size:
             raise SourceError("water-polygon download is incomplete")
         if digest.hexdigest() != expected_sha256:
