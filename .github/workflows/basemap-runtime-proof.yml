@@ -60,6 +60,7 @@ name: Basemap Runtime Proof
       - "apps/web/scripts/basemap-mode-resolve.mjs"
       - "apps/web/scripts/generate-basemap-config.js"
       - "apps/web/src/lib/map/**"
+      - "apps/web/src/lib/maplibre/**"
       - "apps/web/src/lib/components/map/**"
       - "apps/web/src/routes/map/**"
       - "apps/web/scripts/validate-pmtiles.mjs"

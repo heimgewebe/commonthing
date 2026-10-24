@@ -77,6 +77,7 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
             "scripts/basemap/test_prepare_water_polygons.py",
             "scripts/basemap/build-hamburg-pmtiles.sh",
             "apps/web/src/lib/map/basemap.ts",
+            "apps/web/src/lib/maplibre/runtime.ts",
             "apps/web/src/lib/components/map/MapRouteSurface.svelte",
             "apps/web/src/routes/map/+page.svelte",
             "map-style/regions.json",

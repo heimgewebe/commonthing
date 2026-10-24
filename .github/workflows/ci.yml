@@ -94,6 +94,7 @@ jobs:
               - 'apps/web/scripts/validate-pmtiles.mjs'
               - 'apps/web/scripts/validate-pmtiles.test.mjs'
               - 'apps/web/src/lib/map/**'
+              - 'apps/web/src/lib/maplibre/**'
               - 'apps/web/src/lib/components/map/**'
               - 'apps/web/src/routes/map/**'
               - 'apps/web/playwright.proof.config.ts'
