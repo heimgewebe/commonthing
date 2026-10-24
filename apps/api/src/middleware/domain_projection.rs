@@ -135,9 +135,9 @@ pub(crate) async fn begin_fenced_generation(
     // PostgreSQL's FOR SHARE can admit a late compatible reader ahead of a
     // writer already waiting to UPDATE the singleton row. Without a
     // process-independent fair queue, a stream of GETs across API replicas
-    // can starve public->private commits indefinitely. The paired BEFORE
-    // STATEMENT node/edge/account writer triggers take the same transaction
-    // advisory lock exclusively, BEFORE they modify domain row tuples.
+    // can starve public->private commits indefinitely. The BEFORE STATEMENT
+    // trigger on the singleton generation UPDATE acquires the exclusive
+    // advisory lock before attempting the version-row lock itself.
     // Heavyweight advisory wait queues then admit the writer before newly
     // arriving shared readers. Both locks release on transaction rollback.
     sqlx::query(

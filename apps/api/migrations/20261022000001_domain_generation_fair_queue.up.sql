@@ -1,10 +1,10 @@
--- Public->private visibility writes must not starve behind newly admitted
--- FOR SHARE readers. PostgreSQL row FOR SHARE allows a later compatible
--- reader to pass a waiting UPDATE; an advisory rw-lock uses the fair
--- heavyweight waiter queue instead. A BEFORE ROW gate runs for each affected
--- row, including no-op updates, but not for updates matching zero rows. Readers acquire the
--- SAME key in shared mode through their response-lifetime generation fence.
--- The original singleton FOR SHARE check remains necessary as an invariant.
+-- Fair admission before any actual domain generation-row UPDATE.
+-- Each domain AFTER ROW outbox trigger updates this singleton only when it
+-- enqueues a real change. No-op domain UPDATEs and failed INSERT conflicts
+-- do not need a global writer barrier.
+-- A BEFORE STATEMENT trigger acquires the exclusive advisory queue lock
+-- before PostgreSQL attempts the singleton version-row lock. This prevents
+-- new privacy GETs from overtaking a waiting public-to-private writer.
 CREATE FUNCTION weltgewebe_domain_writer_fair_generation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -13,21 +13,10 @@ BEGIN
     PERFORM pg_advisory_xact_lock(
         hashtextextended('weltgewebe.domain.generation.fair_queue.v1', 0)
     );
-    IF TG_OP = 'DELETE' THEN
-        RETURN OLD;
-    END IF;
-    RETURN NEW;
+    RETURN NULL; -- ignored for a statement-level trigger
 END;
 $$;
 
-CREATE TRIGGER domain_nodes_generation_fair_writer
-BEFORE INSERT OR UPDATE OR DELETE ON domain_nodes
-FOR EACH ROW EXECUTE FUNCTION weltgewebe_domain_writer_fair_generation();
-
-CREATE TRIGGER domain_edges_generation_fair_writer
-BEFORE INSERT OR UPDATE OR DELETE ON domain_edges
-FOR EACH ROW EXECUTE FUNCTION weltgewebe_domain_writer_fair_generation();
-
-CREATE TRIGGER domain_accounts_generation_fair_writer
-BEFORE INSERT OR UPDATE OR DELETE ON domain_accounts
-FOR EACH ROW EXECUTE FUNCTION weltgewebe_domain_writer_fair_generation();
+CREATE TRIGGER domain_projection_state_generation_fair_writer
+BEFORE UPDATE ON domain_projection_state
+FOR EACH STATEMENT EXECUTE FUNCTION weltgewebe_domain_writer_fair_generation();
