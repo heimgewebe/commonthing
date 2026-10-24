@@ -109,11 +109,25 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
         self.assertIn('[[ "${basemap_result}" == "skipped" ]] || failed=1', ci)
         self.assertIn("  workflow_call: {}", bm)
         self.assertNotIn("  pull_request:", bm.split("jobs:", 1)[0])
-        self.assertIn("group: ${{ github.workflow }}-${{ github.ref }}", bm)
+        self.assertIn("group: basemap-regional-${{ github.workflow }}-${{ github.ref }}", bm)
         self.assertIn("  required-basemap-proofs:", bm)
         self.assertIn("- basemap-pmtiles-content-proof", bm)
         self.assertIn("- basemap-schleswig-holstein-content-proof", bm)
         self.assertIn("- basemap-visual-proof", bm)
+
+
+    def test_reusable_concurrency_does_not_cancel_caller(self) -> None:
+        # A called workflow inherits github.workflow from CI. Using the same
+        # group with cancel-in-progress would cancel its own caller.
+        ci = CI.read_text(encoding="utf-8")
+        bm = BASEMAP.read_text(encoding="utf-8")
+
+        def concurrency_group(workflow: str) -> str:
+            match = re.search(r"(?m)^concurrency:\n(?:  #[^\n]*\n)*  group: ([^\n]+)$", workflow)
+            self.assertIsNotNone(match)
+            return match.group(1)
+
+        self.assertNotEqual(concurrency_group(ci), concurrency_group(bm))
 
 
 if __name__ == "__main__":

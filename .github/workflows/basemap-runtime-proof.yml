@@ -79,8 +79,9 @@ permissions:
   contents: read
 
 concurrency:
-  # Called workflows inherit the caller name; standalone push and CI must not cancel each other.
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A workflow_call inherits github.workflow from CI; use a distinct group so
+  # its proofs cannot cancel their caller or the standalone main-push workflow.
+  group: basemap-regional-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
