@@ -39,7 +39,6 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use url::Url;
 use uuid::Uuid;
-use web_push_native::{Auth, WebPushBuilder};
 
 use crate::{middleware::auth::AuthContext, outbox, state::ApiState};
 
@@ -108,7 +107,7 @@ impl WebPushService {
         }
 
         let public_key =
-            URL_SAFE_NO_PAD.encode(vapid_key.verifying_key().to_encoded_point(false).as_bytes());
+            URL_SAFE_NO_PAD.encode(vapid_key.verifying_key().to_sec1_point(false).as_bytes());
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
@@ -188,17 +187,9 @@ impl WebPushService {
         let endpoint = self.validate_endpoint(endpoint)?;
         let (user_public_key, auth_secret) = decode_subscription_keys(p256dh, auth)?;
         let payload = private_message_payload(conversation_id)?;
-        let builder = WebPushBuilder::new(
-            endpoint
-                .as_str()
-                .parse()
-                .context("push endpoint URI is invalid")?,
-            user_public_key,
-            auth_secret,
-        )
-        .with_valid_duration(PUSH_TTL);
-        let request = builder
-            .build(payload)
+        // RFC 8291/8188 ciphertext embeds the fresh salt and ephemeral sender
+        // key. Preserve the existing VAPID key and explicit HTTPS host policy.
+        let encrypted = ece::encrypt(&user_public_key, &auth_secret, &payload)
             .context("failed to encrypt Web Push payload")?;
         let authorization = vapid_authorization(
             &self.vapid_key,
@@ -207,16 +198,14 @@ impl WebPushService {
             &self.contact,
             PUSH_TTL,
         )?;
-        let (parts, body) = request.into_parts();
-        let mut outgoing = self
+        let response = self
             .client
-            .request(reqwest::Method::POST, parts.uri.to_string())
-            .header(reqwest::header::AUTHORIZATION, authorization);
-        for (name, value) in &parts.headers {
-            outgoing = outgoing.header(name.as_str(), value.as_bytes());
-        }
-        let response = outgoing
-            .body(body)
+            .post(endpoint.as_str())
+            .header(reqwest::header::AUTHORIZATION, authorization)
+            .header(reqwest::header::CONTENT_ENCODING, "aes128gcm")
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header("TTL", PUSH_TTL.as_secs().to_string())
+            .body(encrypted)
             .send()
             .await
             .context("Web Push provider request failed")?;
@@ -328,7 +317,7 @@ fn normalize_host_suffix(value: &str) -> anyhow::Result<String> {
     Ok(value)
 }
 
-fn decode_subscription_keys(p256dh: &str, auth: &str) -> anyhow::Result<(PublicKey, Auth)> {
+fn decode_subscription_keys(p256dh: &str, auth: &str) -> anyhow::Result<(Vec<u8>, [u8; 16])> {
     if p256dh.len() > 128 || auth.len() > 64 {
         return Err(anyhow!("push subscription key is too long"));
     }
@@ -341,11 +330,11 @@ fn decode_subscription_keys(p256dh: &str, auth: &str) -> anyhow::Result<(PublicK
     if auth.len() != 16 {
         return Err(anyhow!("push auth secret must decode to exactly 16 bytes"));
     }
-    let public_key = PublicKey::from_sec1_bytes(&p256dh)
+    PublicKey::from_sec1_bytes(&p256dh)
         .map_err(|_| anyhow!("p256dh is not a valid P-256 public key"))?;
-    let mut auth_secret = Auth::default();
+    let mut auth_secret = [0_u8; 16];
     auth_secret.copy_from_slice(&auth);
-    Ok((public_key, auth_secret))
+    Ok((p256dh, auth_secret))
 }
 
 fn private_message_payload(conversation_id: &str) -> anyhow::Result<Vec<u8>> {
@@ -1366,6 +1355,40 @@ mod tests {
                 &signature,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn push_ciphertext_round_trips_for_real_subscription_keys() {
+        let (recipient, auth) =
+            ece::generate_keypair_and_auth_secret().expect("test receiver keypair");
+        let p256dh = URL_SAFE_NO_PAD.encode(recipient.pub_as_raw().expect("test public key"));
+        let encoded_auth = URL_SAFE_NO_PAD.encode(&auth);
+        let (public_key, auth_secret) =
+            decode_subscription_keys(&p256dh, &encoded_auth).expect("valid browser keys");
+        let payload = private_message_payload("11111111-1111-4111-8111-111111111111")
+            .expect("neutral push payload");
+        let ciphertext =
+            ece::encrypt(&public_key, &auth_secret, &payload).expect("RFC8291 encryption");
+        assert_ne!(ciphertext, payload);
+        let plaintext = ece::decrypt(
+            &recipient.raw_components().expect("test private key"),
+            &auth,
+            &ciphertext,
+        )
+        .expect("RFC8291 decryption");
+        assert_eq!(plaintext, payload);
+    }
+
+    #[test]
+    fn invalid_subscription_keys_fail_before_encryption() {
+        let (recipient, auth) =
+            ece::generate_keypair_and_auth_secret().expect("test receiver keypair");
+        let valid_public_key =
+            URL_SAFE_NO_PAD.encode(recipient.pub_as_raw().expect("test public key"));
+        let valid_auth = URL_SAFE_NO_PAD.encode(&auth);
+        assert!(decode_subscription_keys(&valid_public_key, &valid_auth).is_ok());
+        assert!(decode_subscription_keys(&valid_public_key, "bad-key").is_err());
+        assert!(decode_subscription_keys("not-a-p256-key", &valid_auth).is_err());
     }
 
     #[test]
