@@ -407,24 +407,30 @@ def _record_unverifiable_prior_state(result, directory, heartbeat, cause):
     if confirmed:
         failure["issues"].extend(confirmed)
         failure["status"] = "ALARM"
-    # An attempted journal drain can fail after both snapshots have
-    # already recorded an additional P1. Do not erase that durable outbox
-    # when replacing the heartbeat with the failure report: otherwise a
-    # later loss of state.json would make the unjournaled alarm disappear.
-    # Prefer the most complete durable anchor after an interrupted drain.
-    # Preserve every confirmed intent in the same bounded state outbox.
+    # A crash may leave different confirmed intents in the heartbeat and
+    # in the just-attempted state update. Choosing only the longer snapshot
+    # silently loses a same-sized, non-overlapping P1. Retain the older
+    # heartbeat prefix first, then the newer observation, deduplicating only
+    # exact entries. Never discard a confirmed intent to satisfy the budget.
     durable_intent = []
-    for anchor in (result, heartbeat):
+    for anchor in (heartbeat, result):
         try:
             entries = _pending_transition_entries(anchor)
         except (ValueError, TypeError):
             continue
-        if len(entries) > len(durable_intent):
-            durable_intent = entries
+        for entry in entries:
+            if entry not in durable_intent:
+                durable_intent.append(entry)
     if durable_intent:
-        failure["pending_transitions"] = durable_intent[:OUTBOX_SURGE_LIMIT]
+        outbox = {
+            "pending_transitions": durable_intent[:OUTBOX_SURGE_LIMIT],
+        }
         if len(durable_intent) > OUTBOX_SURGE_LIMIT:
-            failure["pending_surge_overflow"] = durable_intent[OUTBOX_SURGE_LIMIT:]
+            outbox["pending_surge_overflow"] = durable_intent[OUTBOX_SURGE_LIMIT:]
+        # A full combined outbox must block the overwrite, not silently
+        # truncate it. The preexisting heartbeat remains authoritative.
+        _pending_transition_entries(outbox)
+        failure.update(outbox)
     result.clear()
     result.update(failure)
     write_json(directory / "heartbeat.json", result)

@@ -3583,5 +3583,51 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(decoded["event"], "ALARM")
             self.assertEqual(decoded["checked_at_utc"], first["checked_at_utc"])
 
+    def test_unverifiable_fallback_preserves_both_distinct_pending_anchors(self):
+        """A failed state read must not silently drop an older confirmed P1."""
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+
+            def pending_alarm(code, minute):
+                return {
+                    "event": "ALARM",
+                    "payload": {
+                        "event": "ALARM", "status": "ALARM",
+                        "checked_at_utc": (NOW + timedelta(minutes=minute)).isoformat(),
+                        "issues": [{"code": code, "severity": "P1",
+                                    "actual": code, "component": "fixture"}],
+                    },
+                }
+
+            old = pending_alarm("durable_before_crash", 0)
+            new = pending_alarm("confirmed_after_crash", 1)
+            heartbeat = {
+                "checked_at_utc": NOW.isoformat(), "status": "ALARM",
+                "issues": old["payload"]["issues"],
+                "pending_transitions": [old],
+            }
+            result = {
+                "checked_at_utc": (NOW + timedelta(minutes=1)).isoformat(),
+                "status": "ALARM", "issues": new["payload"]["issues"],
+                "commits": {}, "main_observation": None,
+                "latest_schedule": None, "pending_transitions": [new],
+            }
+            self.assertEqual(
+                watch._record_unverifiable_prior_state(
+                    result, directory, heartbeat,
+                    "injected failure to read state after pending writes",
+                ),
+                "MONITOR_DATA_FAILURE",
+            )
+            persisted = json.loads((directory / "heartbeat.json").read_text())
+            pending = watch._pending_transition_entries(persisted)
+            self.assertEqual(
+                [x["payload"]["issues"][0]["code"] for x in pending],
+                ["durable_before_crash", "confirmed_after_crash"],
+            )
+            self.assertFalse((directory / "events.jsonl").exists())
+
 if __name__ == "__main__":
     unittest.main()
