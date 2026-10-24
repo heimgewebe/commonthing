@@ -21,6 +21,15 @@ def affected_paths() -> list[str]:
     return re.findall(r"^              - '([^']+)'$", filtered, re.MULTILINE)
 
 
+def standalone_push_paths() -> list[str]:
+    """Read main-push regional-proof triggers independently of the PR filter."""
+    workflow = BASEMAP.read_text(encoding="utf-8")
+    filtered = workflow.split("  push:\n", 1)[1].split(
+        "  workflow_dispatch:", 1
+    )[0]
+    return re.findall(r'^      - "([^"]+)"$', filtered, re.MULTILINE)
+
+
 def proof_gate_script() -> str:
     workflow = BASEMAP.read_text(encoding="utf-8")
     marker = (
@@ -88,6 +97,22 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(any(fnmatch.fnmatchcase(path, g) for g in globs))
 
+    def test_shared_map_layout_and_styles_trigger_both_proof_paths(self) -> None:
+        # /map inherits the root layout, app.css and token-based map controls.
+        for path in (
+            "apps/web/src/routes/+layout.svelte",
+            "apps/web/src/app.css",
+            "apps/web/src/lib/styles/tokens.css",
+        ):
+            for source, globs in (
+                ("pull_request", affected_paths()),
+                ("main_push", standalone_push_paths()),
+            ):
+                with self.subTest(path=path, source=source):
+                    self.assertTrue(
+                        any(fnmatch.fnmatchcase(path, pattern) for pattern in globs)
+                    )
+
     def test_unrelated_mobile_navigation_does_not_build_maps(self) -> None:
         globs = affected_paths()
         for path in (
@@ -98,6 +123,9 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertFalse(any(fnmatch.fnmatchcase(path, g) for g in globs))
+                self.assertFalse(
+                    any(fnmatch.fnmatchcase(path, g) for g in standalone_push_paths())
+                )
 
     def test_same_run_proofs_are_required_by_global_gate(self) -> None:
         ci = CI.read_text(encoding="utf-8")
