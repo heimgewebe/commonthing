@@ -318,6 +318,8 @@ fn normalize_host_suffix(value: &str) -> anyhow::Result<String> {
 }
 
 fn decode_subscription_keys(p256dh: &str, auth: &str) -> anyhow::Result<(Vec<u8>, [u8; 16])> {
+    use p256::elliptic_curve::sec1::ToSec1Point;
+
     if p256dh.len() > 128 || auth.len() > 64 {
         return Err(anyhow!("push subscription key is too long"));
     }
@@ -330,11 +332,16 @@ fn decode_subscription_keys(p256dh: &str, auth: &str) -> anyhow::Result<(Vec<u8>
     if auth.len() != 16 {
         return Err(anyhow!("push auth secret must decode to exactly 16 bytes"));
     }
-    PublicKey::from_sec1_bytes(&p256dh)
+    let public_key = PublicKey::from_sec1_bytes(&p256dh)
         .map_err(|_| anyhow!("p256dh is not a valid P-256 public key"))?;
     let mut auth_secret = [0_u8; 16];
     auth_secret.copy_from_slice(&auth);
-    Ok((p256dh, auth_secret))
+    // RFC 8291 key_info binds the canonical uncompressed 65-byte P-256 point.
+    // SEC1 parsing permits compressed points, so normalize before ECE encryption.
+    Ok((
+        public_key.to_sec1_point(false).as_bytes().to_vec(),
+        auth_secret,
+    ))
 }
 
 fn private_message_payload(conversation_id: &str) -> anyhow::Result<Vec<u8>> {
@@ -1377,6 +1384,45 @@ mod tests {
         )
         .expect("RFC8291 decryption");
         assert_eq!(plaintext, payload);
+    }
+
+    #[test]
+    fn compressed_subscription_keys_use_canonical_uncompressed_rfc8291_bytes() {
+        use p256::elliptic_curve::sec1::ToSec1Point;
+
+        let receiver = p256::SecretKey::from_slice(&[3_u8; 32]).expect("P-256 test key");
+        let compressed =
+            URL_SAFE_NO_PAD.encode(receiver.public_key().to_sec1_point(true).as_bytes());
+        let uncompressed =
+            URL_SAFE_NO_PAD.encode(receiver.public_key().to_sec1_point(false).as_bytes());
+        let auth = URL_SAFE_NO_PAD.encode([5_u8; 16]);
+        let (compressed_bytes, _) =
+            decode_subscription_keys(&compressed, &auth).expect("valid SEC1 compressed point");
+        let (uncompressed_bytes, _) =
+            decode_subscription_keys(&uncompressed, &auth).expect("valid SEC1 public key");
+        assert_eq!(compressed_bytes, uncompressed_bytes);
+        assert_eq!(compressed_bytes.len(), 65);
+        assert_eq!(compressed_bytes[0], 0x04);
+    }
+
+    #[test]
+    fn rfc8291_known_ciphertext_decrypts() {
+        // RFC 8291 reference case, independent of this application's encrypt path.
+        let receiver = ece::EcKeyComponents::new(
+            hex::decode("ab5757a70dd4a53e553a6bbf71ffefea2874ec07a6b379e3c48f895a02dc33de")
+                .unwrap(),
+            hex::decode(concat!(
+                "042571b2becdfde360551aaf1ed0f4cd366c11cebe555f89bcb7b186a53339173168",
+                "ece2ebe018597bd30479b86e3c8f8eced577ca59187e9246990db682008b0e",
+            ))
+            .unwrap(),
+        );
+        let auth = hex::decode("05305932a1c7eabe13b6cec9fda48882").unwrap();
+        let encrypted = hex::decode("0c6bfaadad67958803092d454676f397000010004104fe33f4ab0dea71914db55823f73b54948f41306d920732dbb9a59a53286482200e597a7b7bc260ba1c227998580992e93973002f3012a28ae8f06bbb78e5ec0ff297de5b429bba7153d3a4ae0caa091fd425f3b4b5414add8ab37a19c1bbb05cf5cb5b2a2e0562d558635641ec52812c6c8ff42e95ccb86be7cd").unwrap();
+        assert_eq!(
+            ece::decrypt(&receiver, &auth, &encrypted).expect("RFC 8291 ciphertext"),
+            b"When I grow up, I want to be a watermelon",
+        );
     }
 
     #[test]

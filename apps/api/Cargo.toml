@@ -45,10 +45,10 @@ url = "2"
 serde_jcs = "0.1"
 unicode-normalization = "0.1"
 p256 = { version = "0.14.0", features = ["ecdsa"] }
-# Mozilla's RFC 8291/RFC 8188 payload encryption; VAPID stays locally
-# signed with current p256. The former web-push-native crate holds p256 0.13
-# and its vulnerable crypto-bigint 0.5 dependency in the lockfile.
-ece = "2.3.1"
+# Mozilla's RFC 8291/RFC 8188 payload encryption (OpenSSL backend;
+# OpenSSL is already a production dependency via webauthn-rs). VAPID is
+# signed locally with current p256; web-push-native held vulnerable p256 0.13.
+ece = "2.4.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
