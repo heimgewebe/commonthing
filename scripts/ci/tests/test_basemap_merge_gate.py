@@ -113,6 +113,26 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
                         any(fnmatch.fnmatchcase(path, pattern) for pattern in globs)
                     )
 
+    def test_shared_map_bootstrap_security_inputs_enable_regional_proofs(self) -> None:
+        # Browser /map boots via hooks.client and the shared document/layout.
+        # Their direct loaders affect regional MapLibre and CSP evidence.
+        for path in (
+            "apps/web/src/hooks.client.ts",
+            "apps/web/src/lib/utils/preloadRecovery.ts",
+            "apps/web/src/app.html",
+            "apps/web/static/theme-init.js",
+            "apps/web/src/lib/utils/inert-polyfill.ts",
+            "apps/web/src/lib/utils/ua-flags.ts",
+        ):
+            for source, globs in (
+                ("pull_request", affected_paths()),
+                ("main_push", standalone_push_paths()),
+            ):
+                with self.subTest(path=path, source=source):
+                    self.assertTrue(
+                        any(fnmatch.fnmatchcase(path, pattern) for pattern in globs)
+                    )
+
     def test_unrelated_mobile_navigation_does_not_build_maps(self) -> None:
         globs = affected_paths()
         for path in (
