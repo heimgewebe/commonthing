@@ -405,15 +405,20 @@ def _record_unverifiable_prior_state(result, directory, heartbeat, cause):
     # already recorded an additional P1. Do not erase that durable outbox
     # when replacing the heartbeat with the failure report: otherwise a
     # later loss of state.json would make the unjournaled alarm disappear.
-    # The current poll owns the newest outbox; older heartbeat is fallback.
+    # Prefer the most complete durable anchor, preserving a one-entry
+    # emergency overflow without turning it into an invalid 18-entry outbox.
+    durable_intent = []
     for anchor in (result, heartbeat):
         try:
-            durable_intent = _pending_transition_entries(anchor)
+            entries = _pending_transition_entries(anchor)
         except (ValueError, TypeError):
             continue
-        if durable_intent:
-            failure["pending_transitions"] = durable_intent
-            break
+        if len(entries) > len(durable_intent):
+            durable_intent = entries
+    if durable_intent:
+        failure["pending_transitions"] = durable_intent[:OUTBOX_SURGE_LIMIT]
+        if len(durable_intent) > OUTBOX_SURGE_LIMIT:
+            failure["pending_surge_overflow"] = durable_intent[OUTBOX_SURGE_LIMIT:]
     result.clear()
     result.update(failure)
     write_json(directory / "heartbeat.json", result)
@@ -427,6 +432,13 @@ def _pending_transition_entries(snapshot):
     entries = snapshot.get("pending_transitions", [])
     if not isinstance(entries, list) or len(entries) > OUTBOX_SURGE_LIMIT:
         raise ValueError("malformed pending transition outbox")
+    # A newly confirmed P1 can arrive while the persisted 17-slot queue is
+    # full. Only its emergency intent is kept outside that bounded queue,
+    # in the *same* durable incident anchor, until the oldest ALARMs drain.
+    overflow = snapshot.get("pending_surge_overflow", [])
+    if not isinstance(overflow, list) or len(overflow) > 1:
+        raise ValueError("malformed pending surge overflow")
+    entries = [*entries, *overflow]
     validated = []
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != {"event", "payload"}:
@@ -841,8 +853,8 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 for entry in _pending_transition_entries(anchor):
                     if entry not in pending:
                         pending.append(entry)
-            if len(pending) > OUTBOX_SURGE_LIMIT:
-                raise ValueError("pending transition outbox exceeds bound")
+            if len(pending) > OUTBOX_SURGE_LIMIT + 1:
+                raise ValueError("pending transition anchors exceed bound")
             # Crash-consistent exact-once retry: the first append may be
             # durable even when its following state-clear fsync failed.
             # Any read failure remains an error, preserving prior anchors.
@@ -850,11 +862,43 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 entry for entry in pending
                 if not _transition_already_journaled(directory, entry)
             ]
-        except (ValueError, TypeError) as exc:
+            if len(pending) > OUTBOX_SURGE_LIMIT:
+                # A previous invocation durably recorded its eighteenth
+                # intent in heartbeat, but crashed before journal drain.
+                # Make room without overwriting that sole evidence. Only
+                # old ALARMs can safely drain before a fresh observation;
+                # a RECOVERY still requires the ordinary state gate below.
+                drain_count = len(pending) - OUTBOX_NORMAL_LIMIT
+                if any(entry["event"] != "ALARM"
+                       for entry in pending[:drain_count]):
+                    raise ValueError("overflow blocked by prior recovery")
+                _append_durable_events(
+                    directory, [entry["payload"] for entry in pending[:drain_count]],
+                )
+                pending = pending[drain_count:]
+        except (OSError, ValueError, TypeError) as exc:
             return _record_unverifiable_prior_state(
                 result, directory, previous_heartbeat,
                 f"invalid pending transition outbox: {type(exc).__name__}",
             )
+        # The emergency heartbeat may have observed B before the old queue
+        # could be drained and state.json replaced. B is a *durable* prior P1
+        # even when it vanishes on the very next poll; otherwise its journaled
+        # ALARM could never receive a genuine aggregate RECOVERY.
+        if isinstance(previous_heartbeat, dict):
+            overflow = previous_heartbeat.get("pending_surge_overflow", [])
+            known_codes = {item[0] for item in old_severe}
+            for entry in overflow:
+                for issue in entry["payload"]["issues"]:
+                    if not isinstance(issue, dict):
+                        continue
+                    code = issue.get("code")
+                    if (issue.get("severity") == "P1"
+                            and isinstance(code, str) and code
+                            and code not in known_codes):
+                        old_severe.append([code, str(issue.get("actual", ""))[:160]])
+                        known_codes.add(code)
+            old_severe.sort()
         old_uncertain = previous.get("uncertain")
         old_uncertain = old_uncertain if isinstance(old_uncertain, list) else []
         severe = sorted([x["code"], str(x["actual"])[:160]]
@@ -992,10 +1036,40 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             # reject as malformed. Keep the old durable queue and publish
             # monitor uncertainty rather than acknowledging an unqueued P1.
             if len(pending) > OUTBOX_SURGE_LIMIT:
-                return _record_unverifiable_prior_state(
-                    result, directory, previous_heartbeat,
-                    "pending transition outbox exceeds crash-safe surge bound",
-                )
+                if (len(pending) != OUTBOX_SURGE_LIMIT + 1
+                        or previous_pending_count != OUTBOX_SURGE_LIMIT
+                        or pending[-1]["event"] != "ALARM"):
+                    return _record_unverifiable_prior_state(
+                        result, directory, previous_heartbeat,
+                        "pending transition overflow cannot be preserved safely",
+                    )
+                # Persist B's exact original payload *before* any old journal
+                # event can move. The state still owns the 17 old events;
+                # heartbeat retains all 17 plus a separate one-entry intent.
+                # Either anchor survives a crash in the following drain.
+                result["pending_transitions"] = pending[:OUTBOX_SURGE_LIMIT]
+                result["pending_surge_overflow"] = [pending[-1]]
+                write_json(directory / "heartbeat.json", result)
+                drain_count = len(pending) - OUTBOX_NORMAL_LIMIT
+                if any(entry["event"] != "ALARM"
+                       for entry in pending[:drain_count]):
+                    return _record_unverifiable_prior_state(
+                        result, directory, previous_heartbeat,
+                        "pending surge overflow blocked by older recovery",
+                    )
+                try:
+                    _append_durable_events(
+                        directory,
+                        [entry["payload"] for entry in pending[:drain_count]],
+                    )
+                except OSError as exc:
+                    return _record_unverifiable_prior_state(
+                        result, directory, previous_heartbeat,
+                        f"pending surge prefix drain failed: {type(exc).__name__}",
+                    )
+                pending = pending[drain_count:]
+                previous_pending_count -= drain_count
+                result.pop("pending_surge_overflow", None)
             # Recovered journals must drain an old full outbox before the
             # next new P1 is admitted. Previously queued entries are durable
             # in prior state/heartbeat; an interrupted append will reconcile

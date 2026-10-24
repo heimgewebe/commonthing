@@ -47,19 +47,44 @@ class WatchTests(unittest.TestCase):
                 ], "commits": {}, "main_observation": None,
                 "latest_schedule": None,
             }
-            self.assertEqual(watch.record(fresh, directory, serialized_poll=True),
-                             "MONITOR_DATA_FAILURE")
+            from unittest.mock import patch
+            # Even when the journal stays unavailable, admitting the 18th
+            # confirmed incident must not corrupt the original 17 entries.
+            with patch.object(watch, "_append_durable_events",
+                              side_effect=OSError("fsync temporarily failed")):
+                self.assertEqual(
+                    watch.record(fresh, directory, serialized_poll=True),
+                    "MONITOR_DATA_FAILURE",
+                )
             unchanged = json.loads((directory / "state.json").read_text())
             self.assertEqual(unchanged["severe"], [])
             self.assertEqual(len(unchanged["pending_transitions"]), 17)
             heartbeat = json.loads((directory / "heartbeat.json").read_text())
             self.assertEqual(heartbeat["status"], "ALARM")
             self.assertEqual(len(heartbeat["pending_transitions"]), 17)
+            self.assertEqual(len(watch._pending_transition_entries(heartbeat)), 18)
             self.assertIn("new_p1",
                           {row["code"] for row in heartbeat["issues"]})
             self.assertIn("unverifiable_state",
                           {row["code"] for row in heartbeat["issues"]})
             self.assertFalse((directory / "events.jsonl").exists())
+
+            # Transient B disappears before the next poll. Its durable intent
+            # still requires exactly one ALARM and a non-synthetic RECOVERY.
+            recovered = {
+                "checked_at_utc": (NOW + timedelta(minutes=2)).isoformat(),
+                "status": "HEALTHY", "issues": [], "commits": {},
+                "main_observation": None, "latest_schedule": None,
+            }
+            self.assertEqual(watch.record(
+                recovered, directory, serialized_poll=True,
+            ), "RECOVERY")
+            history = [json.loads(line) for line in
+                       (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual([entry["event"] for entry in history],
+                             ["ALARM"] * 18 + ["RECOVERY"])
+            self.assertEqual([i["code"] for i in history[-2]["issues"]],
+                             ["new_p1"])
 
 
     def test_missing_state_retains_active_heartbeat_p1_when_endpoint_unverifiable(self):
