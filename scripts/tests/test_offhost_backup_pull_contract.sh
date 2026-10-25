@@ -18,10 +18,24 @@ chmod 700 "$remote" "$remote/proofs"
 # The production reader fixes its directory and owner; the fixture copy points
 # them at the fake remote, everything else is the shipped script.
 reader="$bin/postgres-backup-read"
-sed -e "s|^readonly BACKUP_DIR=.*|readonly BACKUP_DIR=$remote|" \
-  -e "s|^readonly BACKUP_OWNER_UID=.*|readonly BACKUP_OWNER_UID=$(id -u)|" \
-  "$READER_SOURCE" > "$reader"
-chmod 755 "$reader"
+# Fixture portability (e.g. NixOS without /bin/bash or /usr/bin tools): the test
+# copies run the bash resolved now and append today's PATH, captured before any
+# mock directory exists, after the reader's fixed system PATH. The shipped
+# reader keeps '#!/bin/bash -p' and its fixed PATH; both are asserted here.
+READER_FIXED_PATH='export PATH=/usr/sbin:/usr/bin:/sbin:/bin'
+grep -qxF "$READER_FIXED_PATH" "$READER_SOURCE"
+FIXTURE_BASH="$(command -v bash)" FIXTURE_PATH="$PATH"
+reader_fixture_sed() {
+  sed -e "1s|^#!/bin/bash -p\$|#!$FIXTURE_BASH -p|" \
+    -e "s|^$READER_FIXED_PATH\$|$READER_FIXED_PATH:$FIXTURE_PATH|" \
+    -e "s|^readonly BACKUP_DIR=.*|readonly BACKUP_DIR=$1|" \
+    -e "s|^readonly BACKUP_OWNER_UID=.*|readonly BACKUP_OWNER_UID=$2|" \
+    "$READER_SOURCE" > "$3"
+  chmod 755 "$3"
+  [[ "$(head -n1 "$3")" == "#!$FIXTURE_BASH -p" ]]
+  grep -qxF "$READER_FIXED_PATH:$FIXTURE_PATH" "$3"
+}
+reader_fixture_sed "$remote" "$(id -u)" "$reader"
 grep -qx "readonly BACKUP_DIR=$remote" "$reader"
 grep -qx "readonly BACKUP_OWNER_UID=$(id -u)" "$reader"
 base=weltgewebe-postgres-20260712T040000Z
@@ -262,6 +276,14 @@ grep -qF 'legacy plaintext PostgreSQL backups' "$root/legacy.stderr"
 [[ -f "$legacy_dest/weltgewebe-postgres-legacy.sql.gz" ]]
 [[ ! -e "$legacy_dest/latest-pull.receipt" ]]
 
+# The pull host may lack FHS paths (NixOS has no /usr/bin/test). A guard that
+# runs a fixed-path helper fails open there, so the pull must not hardcode any.
+if grep -vE '^[[:space:]]*#' "$REPO_ROOT/scripts/ops/pull-production-postgres-backup.sh" |
+  grep -nE '(^|[^A-Za-z_./-])/(usr/)?s?bin/'; then
+  echo 'pull script must not depend on fixed /usr/bin or /bin tool paths' >&2
+  exit 1
+fi
+
 # A symlinked *nested directory* can expose plaintext through the
 # encrypted backup destination without a *.sql.gz symlink of its own name.
 # The root alias remains supported; nested directory aliases are rejected.
@@ -406,6 +428,10 @@ grep -qF 'Restic sources' "$root/restic-source.stderr"
 # immediately before hardlink/rename. GNU ln without -T and mv without -T
 # silently place the file *inside* that directory and report false success.
 # Use a private fixture command interceptor, never any production path.
+# Resolve the real tools before any interceptor shadows them on PATH; NixOS
+# has no /usr/bin/{mkdir,ln,mv}.
+REAL_MKDIR="$(command -v mkdir)" REAL_LN="$(command -v ln)" REAL_MV="$(command -v mv)"
+export REAL_MKDIR REAL_LN REAL_MV
 inject_bin="$root/ln-no-target-race-bin"
 mkdir -p "$inject_bin"
 cat > "$inject_bin/ln" << 'FAKE_LN_RACE'
@@ -413,12 +439,12 @@ cat > "$inject_bin/ln" << 'FAKE_LN_RACE'
 set -euo pipefail
 target="${!#}"
 if [[ -n "${INJECT_LN_EXACT_DIR:-}" && "$target" == "$INJECT_LN_EXACT_DIR" ]]; then
-  /usr/bin/mkdir -p -- "$target"
+  "$REAL_MKDIR" -p -- "$target"
 fi
 if [[ -n "${INJECT_LN_HISTORY_ROOT:-}" && "$target" == "$INJECT_LN_HISTORY_ROOT"/*.pulled-*.receipt ]]; then
-  /usr/bin/mkdir -p -- "$target"
+  "$REAL_MKDIR" -p -- "$target"
 fi
-exec /usr/bin/ln "$@"
+exec "$REAL_LN" "$@"
 FAKE_LN_RACE
 chmod 755 "$inject_bin/ln"
 
@@ -468,9 +494,9 @@ cat > "$inject_mv_bin/mv" << 'FAKE_MV_RACE'
 set -euo pipefail
 target="${!#}"
 if [[ -n "${INJECT_MV_EXACT_DIR:-}" && "$target" == "$INJECT_MV_EXACT_DIR" ]]; then
-  /usr/bin/mkdir -p -- "$target"
+  "$REAL_MKDIR" -p -- "$target"
 fi
-exec /usr/bin/mv "$@"
+exec "$REAL_MV" "$@"
 FAKE_MV_RACE
 chmod 755 "$inject_mv_bin/mv"
 
@@ -1293,12 +1319,7 @@ rm -f "$remote/$file" "$remote/$age_manifest"
 expect_pull_failure "$root/no-age" 'no complete encrypted backup set'
 # The reader is the only privileged interface, so its argument and file-type
 # boundary is tested directly: a sudoers rule naming it permits any arguments.
-make_reader() {
-  sed -e "s|^readonly BACKUP_DIR=.*|readonly BACKUP_DIR=$1|" \
-    -e "s|^readonly BACKUP_OWNER_UID=.*|readonly BACKUP_OWNER_UID=$2|" \
-    "$READER_SOURCE" > "$3"
-  chmod 755 "$3"
-}
+make_reader() { reader_fixture_sed "$@"; }
 rdir="$root/reader-remote"
 mkdir -p "$rdir/proofs"
 chmod 700 "$rdir" "$rdir/proofs"
@@ -1505,7 +1526,7 @@ git -C "$fixture_repo" add scripts
 git -C "$fixture_repo" commit -qm 'test: bind off-host installer fixture'
 commit="$(git -C "$fixture_repo" rev-parse HEAD)"
 HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
-  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=/bin/true \
+  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=true \
   "$INSTALLER" --enable-now > /dev/null
 installed_pull="$install_home/.local/libexec/weltgewebe/$commit/pull-production-postgres-backup.sh"
 installed_service="$install_home/.config/systemd/user/weltgewebe-postgres-offhost-pull.service"
@@ -1534,7 +1555,7 @@ grep -qxF "restic_gate_sha256=$(sha256sum "$GATE" | awk '{print $1}')" "$receipt
 # so a success receipt never covers a runtime systemd cannot execute.
 chmod 0644 "$installed_pull" "$installed_gate"
 HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
-  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=/bin/true \
+  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=true \
   "$INSTALLER" > /dev/null
 [[ "$(stat -c %a "$installed_pull")" == 755 && "$(stat -c %a "$installed_gate")" == 755 ]] || {
   echo 'reinstall must restore mode 0755 on the installed runtime' >&2
@@ -1544,7 +1565,7 @@ HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
 mv "$installed_gate" "$installed_gate.real"
 ln -s "$installed_gate.real" "$installed_gate"
 if HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
-  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=/bin/true \
+  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=true \
   "$INSTALLER" > /dev/null 2>&1; then
   echo 'reinstall must reject a symlinked runtime gate' >&2
   exit 1

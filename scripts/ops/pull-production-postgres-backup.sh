@@ -116,7 +116,10 @@ assert_no_legacy_plaintext() {
   # encrypted destination although find -P cannot follow that alias.
   # Reject only directory symlinks here; a configured symlink for DEST_DIR
   # itself has already been resolved to its real directory above.
-  nested_dir_link="$(find -P "$DEST_DIR" -type l -exec /usr/bin/test -d {} \; -print -quit)" ||
+  # -xtype tests the link target inside find itself. An -exec helper must not
+  # be used: GNU find exits 0 when it cannot run the helper (for example
+  # /usr/bin/test on NixOS), which silently disabled this guard.
+  nested_dir_link="$(find -P "$DEST_DIR" -type l -xtype d -print -quit)" ||
     fail "could not scan encrypted destination for directory symlinks"
   [[ -z "$nested_dir_link" ]] ||
     fail "symlinked directory under encrypted backup destination: $nested_dir_link"
