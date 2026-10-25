@@ -1,3 +1,16 @@
+---
+id: deploy.production-hold-first-start
+title: "Production HOLD: autorisierter erster Reconciler-Start"
+doc_type: runbook
+status: active
+summary: "Nachweisgrenzen und Freigabeablauf für den ersten produktiven Reconciler-Start; keine eigenständige Produktionsfreigabe."
+relations:
+  - type: relates_to
+    target: docs/deploy/merge-to-live.md
+  - type: relates_to
+    target: scripts/ops/verify_production_hold_release.py
+---
+
 # Production HOLD: ausdrücklich autorisierter erster Reconciler-Start
 
 Status: Sicherheitsvertrag, **keine** Produktionsfreigabe. Der absichtlich deaktivierte
