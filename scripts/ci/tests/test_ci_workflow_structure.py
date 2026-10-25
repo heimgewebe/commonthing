@@ -66,13 +66,27 @@ def test_repository_workflows_use_the_reusable_web_check_without_direct_playwrig
 
 
 def test_guard_rejects_reintroduced_direct_playwright_execution() -> None:
+    for installer in ("pnpm playwright install --with-deps", "pnpm playwright install --with-deps chromium"):
+        texts = _texts()
+        texts["heavy.yml"] += chr(10).join(
+            ("", f"      - run: {installer}", "      - run: pnpm test", "")
+        )
+        errors = validate_workflow_texts(texts)
+        assert any("heavy.yml must not reinstall Playwright directly" in error for error in errors)
+        assert any("heavy.yml must not invoke the shared Playwright suites directly" in error for error in errors)
+
+
+def test_reusable_playwright_installer_requires_only_default_chromium() -> None:
     texts = _texts()
-    texts["heavy.yml"] += chr(10).join(
-        ("", "      - run: pnpm playwright install --with-deps", "      - run: pnpm test", "")
+    installer = "pnpm playwright install --with-deps chromium"
+    assert f"run: {installer}" in texts["reusable-web-check.yml"]
+    # The Chromium-only default suite must never regress into installing all
+    # browsers and their large unnecessary system dependency set.
+    texts["reusable-web-check.yml"] = texts["reusable-web-check.yml"].replace(
+        installer, "pnpm playwright install --with-deps", 1
     )
     errors = validate_workflow_texts(texts)
-    assert any("heavy.yml must not reinstall Playwright directly" in error for error in errors)
-    assert any("heavy.yml must not invoke the shared Playwright suites directly" in error for error in errors)
+    assert any("reusable web check must own Playwright browser installation" in error for error in errors)
 
 
 def test_guard_rejects_reusable_workflow_without_workflow_call() -> None:
