@@ -147,6 +147,20 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
                     any(fnmatch.fnmatchcase(path, g) for g in standalone_push_paths())
                 )
 
+    def test_pr_path_filter_uses_readonly_pr_api(self) -> None:
+        # dorny/paths-filter reads the changed-file REST API on pull_request.
+        # Without this scope, conditional regional evidence never runs.
+        ci = CI.read_text(encoding="utf-8")
+        docs_changes = re.search(
+            r"(?ms)^  docs-changes:\n(.*?)(?=^  [A-Za-z][\w-]*:\n|\Z)",
+            ci,
+        )
+        self.assertIsNotNone(docs_changes)
+        self.assertIn(
+            "    permissions:\n      contents: read\n      pull-requests: read\n",
+            docs_changes.group(1),
+        )
+
     def test_same_run_proofs_are_required_by_global_gate(self) -> None:
         ci = CI.read_text(encoding="utf-8")
         bm = BASEMAP.read_text(encoding="utf-8")
