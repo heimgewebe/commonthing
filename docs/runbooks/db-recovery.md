@@ -107,8 +107,10 @@ Ein `BACKUP_LABEL` mit Endung `.age` wird abgelehnt, weil sein
 Klartext-Manifest sonst wie ein age-Abschlussmarker benannt wäre.
 
 **Reihenfolge unabhängig von Uhrzeit:** Der Producer vergibt unter einem
-privaten, für die gesamte Laufzeit gehaltenen `flock` pro `BACKUP_PREFIX`
-eine ansteigende `publication_sequence`. Als Ausgangspunkt dienen die
+privaten, für die gesamte Laufzeit gehaltenen `flock` pro `BACKUP_DIR`
+eine ansteigende `publication_sequence`. Sie ist für alle Präfixe in diesem
+Verzeichnis gemeinsam, weil sich Präfixe wie `demo` und `demo-extra` in der
+Auswahl überschneiden. Als Ausgangspunkt dienen die
 bereits veröffentlichten **lokalen** `*.sha256.manifest`-Abschlussmarker:
 Auch ein erfolgreicher Klartext-Dump mit anschließend fehlgeschlagener
 age-Verschlüsselung verbraucht seine bestätigte Nummer. Der gleiche Zähler

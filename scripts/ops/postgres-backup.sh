@@ -128,12 +128,15 @@ install -d -m 0700 "$BACKUP_DIR"
 # derived ONLY from completed local backup manifests (published after dumps),
 # including when age encryption later fails. No independent counter store.
 # This is not a second publication database and does not use wall-clock order.
+# The lock covers the whole directory, so the scan does too: prefixes such as
+# demo and demo-extra overlap in the readers' globs and must never share a
+# sequence number.
 [[ ! -L "$BACKUP_DIR/.age-publication.lock" ]] ||
   fail "unsafe age publication lock symlink"
 exec 8> "$BACKUP_DIR/.age-publication.lock"
 flock -n 8 || fail "another PostgreSQL backup producer is active"
 published_manifests="$(find -P "$BACKUP_DIR" -mindepth 1 -maxdepth 1 \
-  \( -type f -o -type l \) -name "${BACKUP_PREFIX}-*.sha256.manifest" \
+  \( -type f -o -type l \) -name '*.sha256.manifest' \
   ! -name '*.age.sha256.manifest' -printf '%f\n')" ||
   fail "cannot scan existing local completion manifests"
 max_publication_sequence=0

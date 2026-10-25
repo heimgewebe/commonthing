@@ -366,6 +366,17 @@ grep -qx 'publication_sequence=4' "$BACKUP_DIR/weltgewebe-postgres-local-only-se
 run_backup following-local-only "$RECIPIENTS_FILE" > /dev/null
 grep -qx 'publication_sequence=5' "$BACKUP_DIR/weltgewebe-postgres-following-local-only.sha256.manifest"
 grep -qx 'publication_sequence=5' "$BACKUP_DIR/weltgewebe-postgres-following-local-only.age.sha256.manifest"
+# Overlapping prefixes share one locked directory. Their sequences must stay
+# unique, or the next producer run and the restore selector fail closed.
+(
+  BACKUP_DIR="$TEMP_DIR/overlap-backups"
+  BACKUP_PREFIX=demo run_backup a "$RECIPIENTS_FILE" > /dev/null
+  BACKUP_PREFIX=demo-extra run_backup b "$RECIPIENTS_FILE" > /dev/null
+  BACKUP_PREFIX=demo run_backup c "$RECIPIENTS_FILE" > /dev/null
+  grep -qx 'publication_sequence=1' "$BACKUP_DIR/demo-a.sha256.manifest"
+  grep -qx 'publication_sequence=2' "$BACKUP_DIR/demo-extra-b.sha256.manifest"
+  grep -qx 'publication_sequence=3' "$BACKUP_DIR/demo-c.sha256.manifest"
+)
 
 if ((REAL_AGE == 1)); then
   # Offline restore path: only the offline identity can decrypt the copy.
