@@ -338,7 +338,7 @@ exec 7>&-
 # Resolve the real clock before adding the date mock to PATH.
 REAL_DATE="$(command -v date)"
 export REAL_DATE
-cat > "$MOCK_BIN/date" <<'MOCK_DATE'
+cat > "$MOCK_BIN/date" << 'MOCK_DATE'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ -n "${MOCK_PRODUCER_CREATED_AT:-}" && "$#" == 2 && "$1" == "-u" &&
@@ -350,12 +350,12 @@ fi
 MOCK_DATE
 chmod +x "$MOCK_BIN/date"
 rolled_back="$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)"
-MOCK_PRODUCER_CREATED_AT="$rolled_back" run_backup clock-rollback "$RECIPIENTS_FILE" >/dev/null
+MOCK_PRODUCER_CREATED_AT="$rolled_back" run_backup clock-rollback "$RECIPIENTS_FILE" > /dev/null
 rolled_manifest="$BACKUP_DIR/weltgewebe-postgres-clock-rollback.age.sha256.manifest"
 grep -qx 'publication_sequence=2' "$rolled_manifest"
 grep -qx "created_at=$rolled_back" "$rolled_manifest"
 # A second backup in the same rolled-back second still gets a new identity.
-MOCK_PRODUCER_CREATED_AT="$rolled_back" run_backup same-second "$RECIPIENTS_FILE" >/dev/null
+MOCK_PRODUCER_CREATED_AT="$rolled_back" run_backup same-second "$RECIPIENTS_FILE" > /dev/null
 grep -qx 'publication_sequence=3' "$BACKUP_DIR/weltgewebe-postgres-same-second.age.sha256.manifest"
 grep -qx 'publication_sequence=3' "$BACKUP_DIR/weltgewebe-postgres-same-second.sha256.manifest"
 # The locally completed plaintext pair remains authoritative even when age
@@ -363,7 +363,7 @@ grep -qx 'publication_sequence=3' "$BACKUP_DIR/weltgewebe-postgres-same-second.s
 expect_offhost_failure_with_local_recovery local-only-sequence "$TEMP_DIR/does-not-exist.txt" \
   'age recipients file is missing or unreadable'
 grep -qx 'publication_sequence=4' "$BACKUP_DIR/weltgewebe-postgres-local-only-sequence.sha256.manifest"
-run_backup following-local-only "$RECIPIENTS_FILE" >/dev/null
+run_backup following-local-only "$RECIPIENTS_FILE" > /dev/null
 grep -qx 'publication_sequence=5' "$BACKUP_DIR/weltgewebe-postgres-following-local-only.sha256.manifest"
 grep -qx 'publication_sequence=5' "$BACKUP_DIR/weltgewebe-postgres-following-local-only.age.sha256.manifest"
 

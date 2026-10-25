@@ -61,8 +61,9 @@ while IFS= read -r candidate; do
     fail "incomplete backup pair: $base"
   # Local completion markers also carry a monotonic publication order.
   # Unlike age markers, they persist even when optional encryption fails.
-  sequence_record="$(dd if="$manifest_path" iflag=nofollow bs=1M status=none |
-    awk -F= '$1 == "publication_sequence" { count++; seq=$2 }
+  sequence_record="$(
+    dd if="$manifest_path" iflag=nofollow bs=1M status=none |
+      awk -F= '$1 == "publication_sequence" { count++; seq=$2 }
       END { if (count > 1) exit 1; printf "%d:%s\n", count, seq }'
   )" || fail "backup manifest has duplicate publication_sequence"
   if [[ "$sequence_record" != "0:" ]]; then
