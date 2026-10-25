@@ -12,7 +12,7 @@ use axum::{
     Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -184,7 +184,7 @@ fn test_web_push_service() -> Arc<WebPushService> {
 
 fn valid_push_subscription_body(endpoint: &str) -> String {
     let secret = p256::SecretKey::from_slice(&[2_u8; 32]).expect("valid test subscription key");
-    let public = secret.public_key().to_encoded_point(false);
+    let public = secret.public_key().to_sec1_point(false);
     serde_json::json!({
         "endpoint": endpoint,
         "p256dh": URL_SAFE_NO_PAD.encode(public.as_bytes()),
