@@ -1367,6 +1367,35 @@ if [[ "$("$rreader" latest weltgewebe-postgres)" != "$manual_base.age.sha256.man
   exit 1
 fi
 rm "$rdir/$manual_base.age.sha256.manifest"
+# A new completion marker is ordered by a durable publication sequence, not
+# by a clock that may have been set backwards after the earlier backup.
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-08-01T04:00:00Z\npublication_sequence=1\n' \
+  > "$rdir/$rbase.age.sha256.manifest"
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-31T03:00:00Z\npublication_sequence=2\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+[[ "$("$rreader" latest weltgewebe-postgres)" == "$manual_base.age.sha256.manifest" ]] || {
+  echo 'root reader selected older age ciphertext after producer clock rollback' >&2
+  exit 1
+}
+# Repeated sequence IDs are ambiguous even when the collision is not largest.
+collision_base=weltgewebe-postgres-collision
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-30T03:00:00Z\npublication_sequence=1\n' \
+  > "$rdir/$collision_base.age.sha256.manifest"
+expect_reader_failure 'duplicate publication sequence' latest weltgewebe-postgres
+rm "$rdir/$collision_base.age.sha256.manifest"
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-31T03:00:00Z\npublication_sequence=\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest has invalid publication_sequence' latest weltgewebe-postgres
+# A mixed legacy/new set still prefers the new completion marker, even if it
+# carries a lower UTC audit time. An all-legacy set retains UTC sorting.
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-08-01T04:00:00Z\n' \
+  > "$rdir/$rbase.age.sha256.manifest"
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-31T03:00:00Z\npublication_sequence=2\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+[[ "$("$rreader" latest weltgewebe-postgres)" == "$manual_base.age.sha256.manifest" ]]
+rm "$rdir/$manual_base.age.sha256.manifest"
+[[ "$("$rreader" latest weltgewebe-postgres)" == "$rbase.age.sha256.manifest" ]]
+
 # The caller's environment must not choose code that runs as root: no PATH
 # lookup for the interpreter, no BASH_ENV, no imported functions.
 [[ "$(head -n1 "$READER_SOURCE")" == '#!/bin/bash -p' ]]

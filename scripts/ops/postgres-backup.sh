@@ -107,6 +107,7 @@ require_cmd wc
 require_cmd find
 require_cmd grep
 require_cmd cmp
+require_cmd flock
 BACKUP_AGE_RECIPIENTS_FILE="${BACKUP_AGE_RECIPIENTS_FILE-/etc/weltgewebe/postgres-backup-age-recipients.txt}"
 check_connection_config
 
@@ -123,6 +124,44 @@ case "$BACKUP_RETENTION_DAYS" in '' | *[!0-9]*) fail "BACKUP_RETENTION_DAYS must
 
 install -d -m 0700 "$BACKUP_DIR"
 [[ -w "$BACKUP_DIR" ]] || fail "backup directory is not writable: $BACKUP_DIR"
+# Serialize all producers using the same root-owned directory. The sequence is
+# derived ONLY from completed local backup manifests (published after dumps),
+# including when age encryption later fails. No independent counter store.
+# This is not a second publication database and does not use wall-clock order.
+[[ ! -L "$BACKUP_DIR/.age-publication.lock" ]] ||
+  fail "unsafe age publication lock symlink"
+exec 8> "$BACKUP_DIR/.age-publication.lock"
+flock -n 8 || fail "another PostgreSQL backup producer is active"
+published_manifests="$(find -P "$BACKUP_DIR" -mindepth 1 -maxdepth 1 \
+  \( -type f -o -type l \) -name "${BACKUP_PREFIX}-*.sha256.manifest" \
+  ! -name '*.age.sha256.manifest' -printf '%f\n')" ||
+  fail "cannot scan existing local completion manifests"
+max_publication_sequence=0
+declare -A known_publication_sequences=()
+while IFS= read -r prior_name; do
+  [[ -n "$prior_name" ]] || continue
+  [[ "$prior_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,249}$ && "$prior_name" != *..* ]] ||
+    fail "unsafe existing local completion manifest name"
+  prior_manifest="$BACKUP_DIR/$prior_name"
+  [[ -f "$prior_manifest" && ! -L "$prior_manifest" ]] ||
+    fail "existing local completion manifest is not regular"
+  prior_sequence_record="$(awk -F= '$1 == "publication_sequence" { count++; seq=$2 }
+    END { if (count > 1) exit 1; printf "%d:%s\n", count, seq }' "$prior_manifest")" ||
+    fail "existing local completion manifest has duplicate publication_sequence"
+  [[ "$prior_sequence_record" != "0:" ]] || continue
+  [[ "$prior_sequence_record" =~ ^1:([1-9][0-9]{0,17})$ ]] ||
+    fail "existing local completion manifest has invalid publication_sequence"
+  prior_sequence="${BASH_REMATCH[1]}"
+  [[ -z "${known_publication_sequences[$prior_sequence]:-}" ]] ||
+    fail "duplicate publication sequence in existing local backups"
+  known_publication_sequences["$prior_sequence"]="$prior_name"
+  if ((10#$prior_sequence > max_publication_sequence)); then
+    max_publication_sequence=$((10#$prior_sequence))
+  fi
+done <<< "$published_manifests"
+((max_publication_sequence < 999999999999999999)) ||
+  fail "encrypted publication sequence exhausted"
+next_publication_sequence=$((max_publication_sequence + 1))
 # The PostgreSQL data volume may share this filesystem. Do not start a new
 # plaintext + ciphertext backup that would eat into a conservative recovery
 # reserve. The next run is estimated from the largest previous local dump:
@@ -191,7 +230,7 @@ if [[ -z "$git_commit" && -n "${GIT_REPO_DIR:-}" ]]; then
 fi
 {
   printf 'contract=weltgewebe-postgres-backup-v1\n'
-  printf 'created_at=%s\nfile=%s.sql.gz\nsha256=%s\nbytes=%s\n' "$created_at" "$base" "$sha256" "$bytes"
+  printf 'created_at=%s\npublication_sequence=%s\nfile=%s.sql.gz\nsha256=%s\nbytes=%s\n' "$created_at" "$next_publication_sequence" "$base" "$sha256" "$bytes"
   [[ -z "$git_commit" ]] || printf 'git_commit=%s\n' "$git_commit"
   printf 'tables=domain_accounts,domain_nodes,domain_edges,sessions,passkey_credentials,_sqlx_migrations\n'
 } > "$tmp_manifest"
@@ -231,7 +270,7 @@ age_sha256="$(sha256_file "$tmp_age")"
 age_bytes="$(wc -c < "$tmp_age" | tr -d '[:space:]')"
 {
   printf 'contract=weltgewebe-postgres-backup-age-v1\n'
-  printf 'created_at=%s\nfile=%s.sql.gz.age\nsha256=%s\nbytes=%s\n' "$created_at" "$base" "$age_sha256" "$age_bytes"
+  printf 'created_at=%s\npublication_sequence=%s\nfile=%s.sql.gz.age\nsha256=%s\nbytes=%s\n' "$created_at" "$next_publication_sequence" "$base" "$age_sha256" "$age_bytes"
   printf 'format=%s\nrecipients=%s\n' "$AGE_HEADER" "$age_recipients_csv"
   printf 'plaintext_file=%s.sql.gz\nplaintext_sha256=%s\n' "$base" "$sha256"
   [[ -z "$git_commit" ]] || printf 'git_commit=%s\n' "$git_commit"

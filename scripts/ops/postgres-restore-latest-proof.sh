@@ -29,6 +29,8 @@ max_created_at="$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)" ||
 latest_base=""
 latest_name=""
 latest_created_at=""
+latest_sequence=""
+declare -A seen_sequences=()
 while IFS= read -r candidate; do
   [[ -n "$candidate" ]] || continue
   base="${candidate%.sha256.manifest}"
@@ -57,11 +59,35 @@ while IFS= read -r candidate; do
   fi
   [[ -f "$BACKUP_DIR/$base.sql.gz" && ! -L "$BACKUP_DIR/$base.sql.gz" ]] ||
     fail "incomplete backup pair: $base"
-  if [[ -z "$latest_base" || "$created_at" > "$latest_created_at" ]] ||
-    [[ "$created_at" == "$latest_created_at" && "$candidate" > "$latest_name" ]]; then
-    latest_base="$base"
-    latest_name="$candidate"
-    latest_created_at="$created_at"
+  # Local completion markers also carry a monotonic publication order.
+  # Unlike age markers, they persist even when optional encryption fails.
+  sequence_record="$(dd if="$manifest_path" iflag=nofollow bs=1M status=none |
+    awk -F= '$1 == "publication_sequence" { count++; seq=$2 }
+      END { if (count > 1) exit 1; printf "%d:%s\n", count, seq }'
+  )" || fail "backup manifest has duplicate publication_sequence"
+  if [[ "$sequence_record" != "0:" ]]; then
+    [[ "$sequence_record" =~ ^1:([1-9][0-9]{0,17})$ ]] ||
+      fail "backup manifest has invalid publication_sequence"
+    candidate_sequence="${BASH_REMATCH[1]}"
+    [[ -z "${seen_sequences[$candidate_sequence]:-}" ]] ||
+      fail "duplicate publication sequence in completed local backups"
+    seen_sequences["$candidate_sequence"]="$candidate"
+    if [[ -z "$latest_sequence" ]] ||
+      ((10#$candidate_sequence > 10#$latest_sequence)); then
+      latest_sequence="$candidate_sequence"
+      latest_base="$base"
+      latest_name="$candidate"
+      latest_created_at="$created_at"
+    fi
+  elif [[ -z "$latest_sequence" ]]; then
+    # Historical local manifests have no sequence; retain created_at order
+    # until a new sequence-bound completion manifest exists.
+    if [[ -z "$latest_base" || "$created_at" > "$latest_created_at" ]] ||
+      [[ "$created_at" == "$latest_created_at" && "$candidate" > "$latest_name" ]]; then
+      latest_base="$base"
+      latest_name="$candidate"
+      latest_created_at="$created_at"
+    fi
   fi
 done <<< "$candidates"
 [[ -n "$latest_base" ]] || fail "no complete backup files found in $BACKUP_DIR"

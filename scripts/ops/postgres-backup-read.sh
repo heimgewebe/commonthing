@@ -61,17 +61,19 @@ case "$operation" in
   latest)
     (($# == 1)) || fail "latest takes exactly one PREFIX"
     valid_name "$1" || fail "invalid prefix"
-    # A free-form manual BACKUP_LABEL can sort after every UTC daily name.
-    # Ordering only by filename would then silently pin the off-host pull to
-    # one old ciphertext forever. Compare the root-owned producer manifest's
-    # canonical UTC creation time; break exact-second ties deterministically.
+    # A rollback of the producer clock can make a truly newer ciphertext's
+    # created_at smaller than an older one's. Once the producer publishes
+    # monotonic publication_sequence values, rank by that durable sequence,
+    # not by producer wall time. Legacy-only sets retain their old selector.
     candidates="$(find -P "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
       -name "$1-*.age.sha256.manifest" -printf '%f\n')" ||
       fail "cannot list encrypted backup manifests"
     latest_name=""
     latest_created_at=""
-    # The producer uses the host UTC clock. Impossible calendar dates or far-
-    # future timestamps must not silently dominate subsequent daily backups.
+    latest_sequence=""
+    declare -A seen_sequences=()
+    # Invalid producer timestamps must still fail closed, even if a sequence
+    # is present. They remain audit timestamps, not publication authority.
     max_created_at="$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)" ||
       fail "cannot read current UTC"
     while IFS= read -r candidate; do
@@ -91,10 +93,32 @@ case "$operation" in
         fail "encrypted backup manifest created_at is not canonical UTC"
       [[ "$created_at" > "$max_created_at" ]] &&
         fail "encrypted backup manifest created_at is in the future"
-      if [[ -z "$latest_name" || "$created_at" > "$latest_created_at" ]] ||
-        [[ "$created_at" == "$latest_created_at" && "$candidate" > "$latest_name" ]]; then
-        latest_name="$candidate"
-        latest_created_at="$created_at"
+      sequence_record="$(
+        read_regular_file "$BACKUP_DIR/$candidate" |
+          awk -F= '$1 == "publication_sequence" { count++; seq=$2 }
+            END { if (count > 1) exit 1; printf "%d:%s\n", count, seq }'
+      )" || fail "encrypted backup manifest has duplicate publication_sequence"
+      if [[ "$sequence_record" != "0:" ]]; then
+        [[ "$sequence_record" =~ ^1:([1-9][0-9]{0,17})$ ]] ||
+          fail "encrypted backup manifest has invalid publication_sequence"
+        publication_sequence="${BASH_REMATCH[1]}"
+        [[ -z "${seen_sequences[$publication_sequence]:-}" ]] ||
+          fail "duplicate publication sequence in complete encrypted backups"
+        seen_sequences["$publication_sequence"]="$candidate"
+        if [[ -z "$latest_sequence" ]] ||
+          ((10#$publication_sequence > 10#$latest_sequence)); then
+          latest_sequence="$publication_sequence"
+          latest_name="$candidate"
+          latest_created_at="$created_at"
+        fi
+      elif [[ -z "$latest_sequence" ]]; then
+        # Old manifests had only created_at. They are eligible only until
+        # the first sequence-bound completion marker has been published.
+        if [[ -z "$latest_name" || "$created_at" > "$latest_created_at" ]] ||
+          [[ "$created_at" == "$latest_created_at" && "$candidate" > "$latest_name" ]]; then
+          latest_name="$candidate"
+          latest_created_at="$created_at"
+        fi
       fi
     done <<< "$candidates"
     [[ -z "$latest_name" ]] || printf '%s\n' "$latest_name"

@@ -325,6 +325,48 @@ grep -qx 'plaintext_file=weltgewebe-postgres-fixture.sql.gz' "$age_manifest_file
 grep -qx "plaintext_sha256=$(sha256sum "$backup_file" | awk '{print $1}')" "$age_manifest_file"
 grep -qx "$(grep '^sha256=' "$manifest_file" | sed 's/^/plaintext_/')" "$age_manifest_file"
 
+# Complete encrypted backups carry a publication order independent of the
+# producer's wall clock; a later clock correction may move created_at back.
+grep -qx 'publication_sequence=1' "$age_manifest_file"
+# A concurrent producer must never claim the same next sequence. Preserve the
+# existing completed backup rather than racing a second completion marker.
+exec 7> "$BACKUP_DIR/.age-publication.lock"
+flock -n 7
+expect_backup_failure concurrent "$RECIPIENTS_FILE" 'another PostgreSQL backup producer is active'
+flock -u 7
+exec 7>&-
+# Resolve the real clock before adding the date mock to PATH.
+REAL_DATE="$(command -v date)"
+export REAL_DATE
+cat > "$MOCK_BIN/date" <<'MOCK_DATE'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${MOCK_PRODUCER_CREATED_AT:-}" && "$#" == 2 && "$1" == "-u" &&
+      "$2" == "+%Y-%m-%dT%H:%M:%SZ" ]]; then
+  printf '%s\n' "$MOCK_PRODUCER_CREATED_AT"
+else
+  exec "${REAL_DATE:?}" "$@"
+fi
+MOCK_DATE
+chmod +x "$MOCK_BIN/date"
+rolled_back="$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)"
+MOCK_PRODUCER_CREATED_AT="$rolled_back" run_backup clock-rollback "$RECIPIENTS_FILE" >/dev/null
+rolled_manifest="$BACKUP_DIR/weltgewebe-postgres-clock-rollback.age.sha256.manifest"
+grep -qx 'publication_sequence=2' "$rolled_manifest"
+grep -qx "created_at=$rolled_back" "$rolled_manifest"
+# A second backup in the same rolled-back second still gets a new identity.
+MOCK_PRODUCER_CREATED_AT="$rolled_back" run_backup same-second "$RECIPIENTS_FILE" >/dev/null
+grep -qx 'publication_sequence=3' "$BACKUP_DIR/weltgewebe-postgres-same-second.age.sha256.manifest"
+grep -qx 'publication_sequence=3' "$BACKUP_DIR/weltgewebe-postgres-same-second.sha256.manifest"
+# The locally completed plaintext pair remains authoritative even when age
+# recipients cannot be loaded; the next run may not reuse its sequence.
+expect_offhost_failure_with_local_recovery local-only-sequence "$TEMP_DIR/does-not-exist.txt" \
+  'age recipients file is missing or unreadable'
+grep -qx 'publication_sequence=4' "$BACKUP_DIR/weltgewebe-postgres-local-only-sequence.sha256.manifest"
+run_backup following-local-only "$RECIPIENTS_FILE" >/dev/null
+grep -qx 'publication_sequence=5' "$BACKUP_DIR/weltgewebe-postgres-following-local-only.sha256.manifest"
+grep -qx 'publication_sequence=5' "$BACKUP_DIR/weltgewebe-postgres-following-local-only.age.sha256.manifest"
+
 if ((REAL_AGE == 1)); then
   # Offline restore path: only the offline identity can decrypt the copy.
   age -d -i "$TEMP_DIR/offline-identity.txt" -o "$TEMP_DIR/decrypted.sql.gz" "$age_file"
@@ -418,9 +460,10 @@ for weekly_base in "$daily_base" "$manual_base"; do
   printf 'synthetic dump\n' > "$weekly_backups/$weekly_base.sql.gz"
 done
 weekly_manifest() {
-  local label="$1" stamp="$2"
+  local label="$1" stamp="$2" sequence="${3:-}"
   printf 'contract=weltgewebe-postgres-backup-v1\ncreated_at=%s\nfile=%s.sql.gz\nsha256=%064d\n' \
     "$stamp" "$label" 0 > "$weekly_backups/$label.sha256.manifest"
+  [[ -z "$sequence" ]] || printf 'publication_sequence=%s\n' "$sequence" >> "$weekly_backups/$label.sha256.manifest"
 }
 weekly_run() {
   WEEKLY_SELECTED_LOG="$weekly_selected" \
@@ -475,6 +518,28 @@ weekly_run
   echo "weekly restore failed after correcting invalid manifest" >&2
   exit 1
 }
+# Local restore selection must also survive a later producer-clock rollback.
+weekly_manifest "$daily_base" 2026-08-01T04:00:00Z 1
+weekly_manifest "$manual_base" 2026-07-31T04:00:00Z 2
+weekly_run
+[[ "$(cat "$weekly_selected")" == "$manual_base.sql.gz" ]] || {
+  echo "weekly restore selected an older local dump after clock rollback" >&2
+  exit 1
+}
+weekly_manifest "$daily_base" 2026-08-01T04:00:00Z 2
+if weekly_run > /dev/null 2> "$weekly_dir/error"; then
+  echo "weekly restore accepted duplicate local publication sequence" >&2
+  exit 1
+fi
+grep -q 'duplicate publication sequence' "$weekly_dir/error"
+weekly_manifest "$daily_base" 2026-08-01T04:00:00Z 1
+weekly_manifest "$manual_base" 2026-07-31T04:00:00Z ""
+printf 'publication_sequence=\n' >> "$weekly_backups/$manual_base.sha256.manifest"
+if weekly_run > /dev/null 2> "$weekly_dir/error"; then
+  echo "weekly restore accepted empty local publication sequence" >&2
+  exit 1
+fi
+grep -q 'invalid publication_sequence' "$weekly_dir/error"
 
 if ((REAL_AGE == 1)); then
   echo "PASS: postgres backup and restore-proof contract (real age round trip)"

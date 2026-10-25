@@ -106,6 +106,29 @@ age-Abschlussmarker. Platz wird nie durch automatisches Löschen geschaffen.
 Ein `BACKUP_LABEL` mit Endung `.age` wird abgelehnt, weil sein
 Klartext-Manifest sonst wie ein age-Abschlussmarker benannt wäre.
 
+**Reihenfolge unabhängig von Uhrzeit:** Der Producer vergibt unter einem
+privaten, für die gesamte Laufzeit gehaltenen `flock` pro `BACKUP_PREFIX`
+eine ansteigende `publication_sequence`. Als Ausgangspunkt dienen die
+bereits veröffentlichten **lokalen** `*.sha256.manifest`-Abschlussmarker:
+Auch ein erfolgreicher Klartext-Dump mit anschließend fehlgeschlagener
+age-Verschlüsselung verbraucht seine bestätigte Nummer. Der gleiche Zähler
+wird bei erfolgreicher Verschlüsselung in den letzten
+`*.age.sha256.manifest`-Marker übernommen. Ein Abbruch vor dem lokalen
+Abschlussmarker verbraucht keine bestätigte Nummer.
+`created_at` bleibt eine echte UTC-Beobachtungszeit und darf nach einer
+Uhrzeitrückstellung sinken. Der privilegierte Off-Host-Reader und der
+wöchentliche lokale Restore-Proof wählen bei sequenzierten Backups den
+größten gültigen Zähler, nicht das größte `created_at`. Doppelte oder
+fehlerhafte Zähler werden abgewiesen; bei ausschließlich historischen
+Manifesten ohne Zähler bleibt die frühere UTC-Auswahl erhalten.
+Producer, Root-Reader und lokaler Restore-Selector müssen gemeinsam
+kontrolliert installiert werden; ein nach dem Umschalten weiterlaufender
+alter Producer ohne Zähler ist nicht unterstützt. Der Zähler gilt für die
+aktuell vorhandenen lokalen Abschlussmarker, nicht als unveränderliche
+globale Historie nach einer gesondert autorisierten Retention. Für RPO
+und Wiederherstellbarkeit sind weiterhin unabhängige Backup- und
+Restore-Belege erforderlich.
+
 **Grenze:** Diese Vorabprüfung ist weder ein Dateisystem-Quota noch eine
 atomare Reservierung. Wachsende Dumps und gleichzeitige andere Schreiber
 können den Datenträger weiterhin füllen. Daher Kapazität weiter überwachen
