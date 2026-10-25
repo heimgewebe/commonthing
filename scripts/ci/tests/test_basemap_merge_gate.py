@@ -97,12 +97,22 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(any(fnmatch.fnmatchcase(path, g) for g in globs))
 
+    def test_push_patterns_do_not_use_unescaped_plus_quantifier(self) -> None:
+        # GitHub Actions path globs treat an unescaped '+' as a quantifier,
+        # unlike Python fnmatch, which treats it literally.
+        for pattern in standalone_push_paths():
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(re.search(r"(?<!\\)\+", pattern))
+
     def test_shared_map_layout_and_styles_trigger_both_proof_paths(self) -> None:
         # /map inherits the root layout, app.css and token-based map controls.
         for path in (
             "apps/web/src/routes/+layout.svelte",
             "apps/web/src/app.css",
             "apps/web/src/lib/styles/tokens.css",
+            "apps/web/src/routes/+layout.ts",
+            "apps/web/src/routes/+layout.server.ts",
+            "apps/web/svelte.config.js",
         ):
             for source, globs in (
                 ("pull_request", affected_paths()),
@@ -118,6 +128,11 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
         # Their direct loaders affect regional MapLibre and CSP evidence.
         for path in (
             "apps/web/src/hooks.client.ts",
+            "apps/web/src/hooks.server.ts",
+            "apps/web/src/lib/stores/mapSession.ts",
+            "apps/web/src/lib/api/mapTiles.ts",
+            "apps/web/src/service-worker.ts",
+            "apps/web/static/fonts/regional-glyph.pbf",
             "apps/web/src/lib/utils/preloadRecovery.ts",
             "apps/web/src/app.html",
             "apps/web/static/theme-init.js",
@@ -138,7 +153,6 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
         for path in (
             "apps/web/src/routes/build/+page.svelte",
             "apps/web/src/routes/settings/+page.svelte",
-            "apps/web/src/lib/components/NotificationSettings.svelte",
             "apps/api/src/notifications.rs",
         ):
             with self.subTest(path=path):
