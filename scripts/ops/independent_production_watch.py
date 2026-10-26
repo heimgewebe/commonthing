@@ -711,9 +711,53 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                         result, directory, previous_heartbeat,
                         f"cannot validate lost-state journal: {type(exc).__name__}",
                     )
-                # Partial confirmation or a pending outbox cannot establish
-                # the previous incident's complete committed state.
-                if not prior_actuals or not prior_actuals.keys() <= confirmed_now.keys() or pending_heartbeat:
+                # Only a single reconfirmed ALARM is recoverable when the
+                # journal is empty, its last RECOVERY predates the intent,
+                # or the identical ALARM was already fsynced before a crash.
+                # Ambiguous or mixed outboxes remain fail-closed.
+                pending_alarm_codes = []
+                if len(pending_heartbeat) == 1 and pending_heartbeat[0]["event"] == "ALARM":
+                    pending_alarm_codes = [
+                        item.get("code")
+                        for item in pending_heartbeat[0]["payload"]["issues"]
+                        if isinstance(item, dict) and item.get("severity") == "P1"
+                    ]
+                journal_precedes_pending = (
+                    journal is None
+                    or (
+                        len(pending_heartbeat) == 1
+                        and journal == pending_heartbeat[0]["payload"]
+                        and journal.get("event") == "ALARM"
+                    )
+                )
+                if (
+                    not journal_precedes_pending
+                    and journal.get("event") == "RECOVERY"
+                    and len(pending_heartbeat) == 1
+                ):
+                    pending_at = timestamp(
+                        pending_heartbeat[0]["payload"].get("checked_at_utc")
+                    )
+                    journal_at = timestamp(journal.get("checked_at_utc"))
+                    journal_precedes_pending = (
+                        pending_at is not None
+                        and journal_at is not None
+                        and pending_at > journal_at
+                    )
+                pending_replay = (
+                    journal_precedes_pending
+                    and len(pending_heartbeat) == 1
+                    and previous_heartbeat.get("status") == "ALARM"
+                    and bool(pending_alarm_codes)
+                    and all(isinstance(code, str) and code for code in pending_alarm_codes)
+                    and len(pending_alarm_codes) == len(set(pending_alarm_codes))
+                    and set(pending_alarm_codes) == set(prior_actuals)
+                )
+                if (
+                    not prior_actuals
+                    or not prior_actuals.keys() <= confirmed_now.keys()
+                    or (pending_heartbeat and not pending_replay)
+                ):
                     return _record_unverifiable_prior_state(
                         result, directory, previous_heartbeat,
                         "state.json missing while heartbeat retains incident evidence",
@@ -738,10 +782,11 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                             if isinstance(item, list) and len(item) == 2
                             and isinstance(item[0], str)
                         )
-                if prior_actuals.keys() <= journaled_codes:
-                    # The ALARM was already fsynced. Reconstruct its active
-                    # incident snapshot without emitting an identical ALARM;
-                    # the next verified healthy poll can finally log RECOVERY.
+                if prior_actuals.keys() <= journaled_codes or pending_replay:
+                    # The ALARM was already fsynced or is one reconfirmed
+                    # heartbeat intent awaiting replay. Rebuild active state;
+                    # exact-byte journal deduplication prevents a second ALARM.
+                    # A later healthy poll can then journal RECOVERY.
                     previous = {
                         "severe": sorted([
                             code, confirmed_now.get(code, old_actual)
