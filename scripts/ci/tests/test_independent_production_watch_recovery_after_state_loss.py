@@ -85,7 +85,7 @@ class PendingRecoveryAfterLostStateTests(unittest.TestCase):
         self.assertNotIn(original, self.journal())
 
     def test_recovery_intent_not_replayed_from_uncertain_product_observation(self) -> None:
-        original = self.pending_recovery_after_lost_state()
+        self.pending_recovery_after_lost_state()
         self.assertEqual(
             watch.record(observation(2, active=False, unverifiable=True),
                          self.directory, serialized_poll=True),
