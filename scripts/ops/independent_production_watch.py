@@ -1337,7 +1337,15 @@ def _observation_admitted(directory):
                 snapshot = json.loads((directory / name).read_text(encoding="utf-8"))
             except FileNotFoundError:
                 continue
-            except (OSError, ValueError, UnicodeError):
+            except (ValueError, UnicodeError):
+                if name == "state.json":
+                    # A corrupt incident anchor is not proof of a full outbox.
+                    # Observe product endpoints anyway; record() preserves the
+                    # original bytes and reports new P1s in the heartbeat.
+                    # The separately readable heartbeat still limits capacity.
+                    continue
+                return False
+            except OSError:
                 return False
             try:
                 pending = _pending_transition_entries(snapshot)
