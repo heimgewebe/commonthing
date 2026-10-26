@@ -951,8 +951,18 @@ def _validate_evidence_bindings(
 
 def _cleanup_staging(parent_fd: int, staging_fd: int, staging_name: str) -> None:
     cleanup_errors: list[str] = []
+    # Enumerate through a fresh, no-follow FD: the original directory stream
+    # may be stale when it was opened before the evidence files were created.
     try:
-        names = os.listdir(staging_fd)
+        scan_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
+        try:
+            existing = os.fstat(staging_fd)
+            scanned = os.fstat(scan_fd)
+            if (existing.st_dev, existing.st_ino) != (scanned.st_dev, scanned.st_ino):
+                raise OSError("staging directory identity changed during cleanup")
+            names = os.listdir(scan_fd)
+        finally:
+            os.close(scan_fd)
     except OSError as exc:
         names = []
         cleanup_errors.append(str(exc))
@@ -1151,7 +1161,24 @@ def publish_evidence_bundle(
         staging_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
         for name, payload in staged_payloads.items():
             _write_file_sync_at(staging_fd, name, payload)
-        if set(os.listdir(staging_fd)) != set(EVIDENCE_FILES):
+        # A directory FD opened before writing can have a stale readdir
+        # cursor on some filesystems. Reopen the same inode after writes,
+        # preserving no-follow and the exact four-file integrity check.
+        verification_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
+        try:
+            staged_identity = os.fstat(staging_fd)
+            verified_identity = os.fstat(verification_fd)
+            if (staged_identity.st_dev, staged_identity.st_ino) != (
+                verified_identity.st_dev, verified_identity.st_ino
+            ):
+                raise RunnerError(
+                    "OUTPUT_LOCATION_CHANGED",
+                    "Staging directory identity changed before verification",
+                )
+            staged_names = set(os.listdir(verification_fd))
+        finally:
+            os.close(verification_fd)
+        if staged_names != set(EVIDENCE_FILES):
             raise RunnerError(
                 "RUN_EVIDENCE_INCOMPLETE",
                 "Staged evidence bundle does not contain exactly four files",

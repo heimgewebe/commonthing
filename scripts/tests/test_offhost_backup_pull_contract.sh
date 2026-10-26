@@ -2,6 +2,8 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." > /dev/null 2>&1 && pwd)"
 INSTALLER="$REPO_ROOT/scripts/ops/install-postgres-offhost-pull-user-units.sh"
+TRUE_BIN="$(type -P true)"
+[[ -x "$TRUE_BIN" ]] || { echo "coreutils true is unavailable" >&2; exit 1; }
 SERVICE_TEMPLATE="$REPO_ROOT/scripts/ops/systemd/weltgewebe-postgres-offhost-pull.service"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
@@ -65,7 +67,7 @@ git -C "$fixture_repo" add scripts
 git -C "$fixture_repo" commit -qm 'test: bind off-host installer fixture'
 commit="$(git -C "$fixture_repo" rev-parse HEAD)"
 HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
-  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=/bin/true \
+  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN="$TRUE_BIN" \
   "$INSTALLER" --enable-now > /dev/null
 installed_pull="$install_home/.local/libexec/weltgewebe/$commit/pull-production-postgres-backup.sh"
 installed_service="$install_home/.config/systemd/user/weltgewebe-postgres-offhost-pull.service"
@@ -88,7 +90,7 @@ grep -qxF "git_commit=$commit" "$receipt"
 [[ "$(stat -c %a "$install_home/merges/weltgewebe-production-backups")" == 700 ]]
 # Reinstalling the same commit is idempotent.
 HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
-  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=/bin/true \
+  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN="$TRUE_BIN" \
   "$INSTALLER" > /dev/null
 
 printf 'test_offhost_backup_pull_contract: OK\n'
