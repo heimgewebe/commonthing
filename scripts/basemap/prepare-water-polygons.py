@@ -18,7 +18,7 @@ import tempfile
 import time
 from typing import Callable
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 URL = (
     "https://ftp.uni-erlangen.de/pub/openstreetmapdata.com-archive/"
@@ -34,6 +34,21 @@ MAX_DOWNLOAD_SECONDS = 900
 
 class SourceError(RuntimeError):
     """The input source cannot be trusted; do not build or publish PMTiles."""
+
+
+class _RejectHTTPRedirects(HTTPRedirectHandler):
+    """Reject 30x *before* urllib contacts an arbitrary redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise SourceError("unapproved HTTP redirect")
+
+
+# The real CLI always uses this opener; only isolated tests inject a substitute.
+_PINNED_OPENER = build_opener(_RejectHTTPRedirects())
+
+
+def _pinned_open(request: Request, timeout: float):
+    return _PINNED_OPENER.open(request, timeout=timeout)
 
 
 @contextmanager
@@ -94,7 +109,7 @@ def ensure(
     url: str = URL,
     expected_sha256: str = SHA256,
     expected_size: int = SIZE,
-    opener: Callable = urlopen,
+    opener: Callable = _pinned_open,
 ) -> str:
     """Verify existing bytes or atomically add a fully verified pinned source.
 
