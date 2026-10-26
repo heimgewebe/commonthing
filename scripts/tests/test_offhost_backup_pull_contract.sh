@@ -3,7 +3,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." > /dev/null 2>&1 && pwd)"
 INSTALLER="$REPO_ROOT/scripts/ops/install-postgres-offhost-pull-user-units.sh"
 TRUE_BIN="$(type -P true)"
-[[ -x "$TRUE_BIN" ]] || { echo "coreutils true is unavailable" >&2; exit 1; }
+[[ -x "$TRUE_BIN" ]] || {
+  echo "coreutils true is unavailable" >&2
+  exit 1
+}
 SERVICE_TEMPLATE="$REPO_ROOT/scripts/ops/systemd/weltgewebe-postgres-offhost-pull.service"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
