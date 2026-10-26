@@ -110,13 +110,18 @@ if ((PREFLIGHT_ONLY == 1)); then
   echo "production_reconciler_preflight=passed commit=$COMMIT"
   exit 0
 fi
+# Quiesce the timer in BOTH modes before mutable Git refs or helper replacement.
+# Disable rather than merely stop: an interrupted install or reboot must never
+# re-activate a partially updated production contract. Failure remains HOLD.
+if systemctl cat weltgewebe-production-reconcile.timer > /dev/null 2>&1; then
+  systemctl disable --now weltgewebe-production-reconcile.timer ||
+    fail "cannot safely disable production reconcile timer before installation"
+fi
+systemctl is-enabled --quiet weltgewebe-production-reconcile.timer &&
+  fail "production reconcile timer stayed enabled before contract installation"
+systemctl is-active --quiet weltgewebe-production-reconcile.timer &&
+  fail "production reconcile timer stayed active before contract installation"
 if ((DEFER_RECONCILE != 1)); then
-  # Disable first; otherwise a stale OnBootSec timer or reboot could run
-  # an older unguarded reconciler while its installation is being replaced.
-  if systemctl cat weltgewebe-production-reconcile.timer > /dev/null 2>&1; then
-    systemctl disable --now weltgewebe-production-reconcile.timer ||
-      fail "cannot safely disable production reconcile timer before installation"
-  fi
   systemctl is-active --quiet weltgewebe-production-reconcile.service &&
     fail "production reconcile service is already active"
 fi
@@ -258,10 +263,18 @@ atomic_install "$staging/installed-contract.sha256" "$manifest" 0600
 
 systemctl daemon-reload
 if ((DEFER_RECONCILE == 1)); then
+  # The current service may already be running (and must not be restarted).
+  # Only after every installed helper and unit has been hash-checked may a
+  # previously enabled timer become eligible for a new scheduled invocation.
+  systemctl is-enabled --quiet weltgewebe-production-reconcile.timer &&
+    fail "production reconcile timer re-enabled during deferred installation"
+  systemctl is-active --quiet weltgewebe-production-reconcile.timer &&
+    fail "production reconcile timer restarted during deferred installation"
+  systemctl enable --now weltgewebe-production-reconcile.timer
   systemctl is-enabled --quiet weltgewebe-production-reconcile.timer ||
-    fail "production reconcile timer lost its enabled state during deferred installation"
+    fail "production reconcile timer was not enabled after deferred installation"
   systemctl is-active --quiet weltgewebe-production-reconcile.timer ||
-    fail "production reconcile timer lost its active state during deferred installation"
+    fail "production reconcile timer was not active after deferred installation"
   install_mode="deferred"
 else
   # Service runs exactly once first. OnActiveSec starts a fresh timer window;

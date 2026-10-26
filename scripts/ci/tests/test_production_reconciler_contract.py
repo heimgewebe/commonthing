@@ -952,7 +952,7 @@ prune_releases
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "systemctl"
             binary.write_text(
-                "#!/bin/bash\n"
+                "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
                 'case "$*" in\n'
                 '  *UnitFileState*) echo "$TEST_FILE_STATE" ;;\n'
@@ -1007,7 +1007,15 @@ prune_releases
         )
         with tempfile.TemporaryDirectory() as tmp:
             fake = Path(tmp) / "systemctl"
-            fake.write_text('#!/bin/bash\n[[ "$*" == "is-active --quiet weltgewebe-production-reconcile.service" ]]\n')
+            fake.write_text(
+                '#!/usr/bin/env bash\n'
+                'case "$*" in\n'
+                '  "is-active --quiet weltgewebe-production-reconcile.service") exit 0 ;;\n'
+                '  *UnitFileState*) echo disabled ;;\n'
+                '  *ActiveState*) echo inactive ;;\n'
+                '  *) exit 91 ;;\n'
+                'esac\n'
+            )
             fake.chmod(0o755)
             valid = {
                 "WELTGEWEBE_PRODUCTION_LOCK_OWNER_ENTRYPOINT": "reconciler",
@@ -1052,7 +1060,11 @@ prune_releases
         self.assertLess(
             installer.index("systemctl start weltgewebe-production-reconcile.service",
                             installer.index("systemctl daemon-reload")),
-            installer.index("systemctl enable --now weltgewebe-production-reconcile.timer"),
+            installer.index(
+                "systemctl enable --now weltgewebe-production-reconcile.timer",
+                installer.index("systemctl start weltgewebe-production-reconcile.service",
+                                installer.index("systemctl daemon-reload")),
+            ),
         )
         self.assertLess(
             activator.index('--preflight-only'),

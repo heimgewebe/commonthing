@@ -96,8 +96,22 @@ if systemctl is-active --quiet weltgewebe-production-reconcile.service; then
     "${WELTGEWEBE_PRODUCTION_LOCK_DOMAIN:-}" == "weltgewebe-production-deployment-v1" &&
     "${WELTGEWEBE_DEPLOY_INVOCATION_ID:-}" =~ ^[0-9a-f]{64}$ ]] ||
     fail "active reconciler service requires exact inherited deployment handoff"
-  echo "production_reconciler_activation=already_running commit=$COMMIT release=$release_dir_real"
-  exit 0
+  # During first-start bootstrap the timer is deliberately disabled while
+  # this active service performs its initial reconcile. Never recurse there.
+  # On later scheduled upgrades the timer is enabled; update the installed
+  # helper contract in deferred mode, without restarting the active service.
+  timer_unit_state="$(systemctl show --property=UnitFileState --value weltgewebe-production-reconcile.timer)" ||
+    fail "cannot inspect timer enablement during active reconciliation"
+  timer_active_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.timer)" ||
+    fail "cannot inspect timer activity during active reconciliation"
+  case "$timer_unit_state:$timer_active_state" in
+    disabled:inactive)
+      echo "production_reconciler_activation=already_running commit=$COMMIT release=$release_dir_real"
+      exit 0
+      ;;
+    enabled:active) ;; # deferred upgrade is safe after timer quiescence
+    *) fail "active reconciler has unsupported timer state: $timer_unit_state:$timer_active_state" ;;
+  esac
 fi
 
 # The release authorization above is a prerequisite, not a consequence of
