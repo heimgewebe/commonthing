@@ -354,7 +354,7 @@ def write_json(path, value):
     _fsync_directory(path.parent)
 
 
-def _record_unverifiable_prior_state(result, directory, heartbeat, cause):
+def _record_unverifiable_prior_state(result, directory, heartbeat, cause, *, state_read_uncertain=False):
     # Never replace incident history if its old P1 entries cannot be parsed.
     # The local heartbeat is a separate best-effort liveness channel, not a
     # substitute for the corrupted original state.json.
@@ -421,6 +421,40 @@ def _record_unverifiable_prior_state(result, directory, heartbeat, cause):
         for entry in entries:
             if entry not in durable_intent:
                 durable_intent.append(entry)
+    # A confirmed product P1 during a transient state read failure is real
+    # evidence, but cannot yet be classified against the unknown prior epoch.
+    # Preserve an explicitly provisional, typed ALARM intent under the same
+    # fsynced heartbeat FIFO. A later readable state/journal must reconcile it
+    # before any delivery or inferred RECOVERY.
+    if state_read_uncertain and result.get("status") == "ALARM":
+        already_pending = set()
+        for entry in durable_intent:
+            if entry["event"] != "ALARM":
+                continue
+            for item in entry["payload"].get("issues", []):
+                if isinstance(item, dict) and item.get("severity") == "P1":
+                    code = item.get("code")
+                    if isinstance(code, str):
+                        already_pending.add(code)
+        newly_confirmed = []
+        for item in result.get("issues", []):
+            if not isinstance(item, dict) or item.get("severity") != "P1":
+                continue
+            code = item.get("code")
+            if isinstance(code, str) and code and code not in already_pending:
+                already_pending.add(code)
+                newly_confirmed.append(item)
+        if newly_confirmed:
+            original = {
+                "event": "ALARM",
+                **{key: value for key, value in result.items()
+                   if key not in {"pending_transitions", "pending_surge_overflow"}},
+                "status": "ALARM",
+                "issues": newly_confirmed,
+                "state_read_unverified": True,
+                "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939",
+            }
+            durable_intent.append({"event": "ALARM", "payload": original})
     if durable_intent:
         outbox = {
             "pending_transitions": durable_intent[:OUTBOX_SURGE_LIMIT],
@@ -547,6 +581,68 @@ def _last_journaled_transition(directory):
     return last
 
 
+def _verified_lost_state_recovery(directory, heartbeat, result):
+    """Rebuild only a single confirmed, journal-anchored pending RECOVERY.
+
+    Deleting state.json cannot erase a fsynced recovery intent. Conversely,
+    an ambiguous journal, newer ALARM epoch or unverified current product
+    observation must never manufacture recovery.
+    """
+    if not isinstance(heartbeat, dict) or result.get("status") != "HEALTHY":
+        return None
+    issues = result.get("issues")
+    if not isinstance(issues, list) or any(
+        isinstance(item, dict) and item.get("severity") in {"P1", "P2"}
+        for item in issues
+    ):
+        return None
+    entries = _pending_transition_entries(heartbeat)
+    if len(entries) != 1 or entries[0]["event"] != "RECOVERY":
+        return None
+    recovery = entries[0]["payload"]
+    if recovery.get("status") != "HEALTHY" or any(
+        isinstance(item, dict) and item.get("severity") == "P1"
+        for item in recovery["issues"]
+    ):
+        return None
+    journal = _last_journaled_transition(directory)
+    if not isinstance(journal, dict) or journal.get("event") != "ALARM":
+        return None
+    if journal.get("status") != "ALARM":
+        return None
+    journal_at = timestamp(journal.get("checked_at_utc"))
+    recovery_at = timestamp(recovery.get("checked_at_utc"))
+    heartbeat_at = timestamp(heartbeat.get("checked_at_utc"))
+    observed_at = timestamp(result.get("checked_at_utc"))
+    if (
+        journal_at is None or recovery_at is None
+        or heartbeat_at is None or observed_at is None
+        or not journal_at < recovery_at <= heartbeat_at <= observed_at
+    ):
+        return None
+    old_issues = journal.get("issues")
+    if not isinstance(old_issues, list):
+        return None
+    severe = []
+    seen = set()
+    for item in old_issues:
+        if not isinstance(item, dict) or item.get("severity") != "P1":
+            continue
+        code = item.get("code")
+        if not isinstance(code, str) or not code or code in seen:
+            return None
+        seen.add(code)
+        severe.append([code, str(item.get("actual", ""))[:160]])
+    if not severe:
+        return None
+    return {
+        "severe": sorted(severe),
+        "uncertain": [],
+        "main_observation": heartbeat.get("main_observation"),
+        "checked_at_utc": heartbeat.get("checked_at_utc"),
+    }
+
+
 def _last_complete_journal_offset(directory, expected_end):
     """Return end of the last newline-terminated event using bounded memory.
 
@@ -658,17 +754,32 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             return _record_unverifiable_prior_state(
                 result, directory, previous_heartbeat,
                 f"unreadable state JSON: {type(exc).__name__}",
+                state_read_uncertain=True,
             )
         except (ValueError, UnicodeError) as exc:
             return _record_unverifiable_prior_state(
                 result, directory, previous_heartbeat,
                 f"malformed state JSON: {type(exc).__name__}",
+                state_read_uncertain=True,
             )
         if not no_prior_state and not isinstance(previous, dict):
             return _record_unverifiable_prior_state(
                 result, directory, previous_heartbeat, "state root is not object",
+                state_read_uncertain=True,
             )
         if no_prior_state and isinstance(previous_heartbeat, dict):
+            try:
+                recovery_preimage = _verified_lost_state_recovery(
+                    directory, previous_heartbeat, result,
+                )
+            except (OSError, ValueError, UnicodeError, TypeError) as exc:
+                return _record_unverifiable_prior_state(
+                    result, directory, previous_heartbeat,
+                    f"cannot verify lost-state recovery: {type(exc).__name__}",
+                )
+            if recovery_preimage is not None:
+                previous = recovery_preimage
+                no_prior_state = False
             # Losing state.json cannot prove that a confirmed incident ended.
             # A reconfirmed P1 may reconstruct the missing state only after
             # checking whether its ALARM is the last journaled incident epoch.
@@ -682,7 +793,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                     for item in past_issues
                 ))
             )
-            if prior_alarm:
+            if no_prior_state and prior_alarm:
                 prior_actuals = {
                     item["code"]: str(item.get("actual", ""))[:160]
                     for item in (past_issues if isinstance(past_issues, list) else [])
@@ -945,6 +1056,86 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 result, directory, previous_heartbeat,
                 f"invalid pending transition outbox: {type(exc).__name__}",
             )
+        # A transient read EIO must not drop an independently confirmed P1
+        # from the fsynced heartbeat when the next poll is already HEALTHY.
+        # Import it as an older episode only after the real state and journal
+        # are readable and their timestamps/incident codes are consistent.
+        tentative = []
+        for anchor in (previous, previous_heartbeat):
+            for entry in _pending_transition_entries(anchor):
+                if (
+                    entry["event"] == "ALARM"
+                    and entry["payload"].get("state_read_unverified") is True
+                    and entry not in tentative
+                ):
+                    tentative.append(entry)
+        if tentative:
+            try:
+                journal_last = _last_journaled_transition(directory)
+            except (OSError, ValueError, UnicodeError, TypeError) as exc:
+                return _record_unverifiable_prior_state(
+                    result, directory, previous_heartbeat,
+                    f"cannot verify tentative P1 journal: {type(exc).__name__}",
+                )
+            journal_codes = set()
+            journal_at = None
+            if journal_last is not None:
+                journal_at = timestamp(journal_last.get("checked_at_utc"))
+                if journal_last.get("event") == "ALARM":
+                    journal_issues = journal_last.get("issues")
+                    if not isinstance(journal_issues, list):
+                        return _record_unverifiable_prior_state(
+                            result, directory, previous_heartbeat,
+                            "tentative P1 conflicts with invalid ALARM journal",
+                        )
+                    journal_codes = {
+                        item.get("code") for item in journal_issues
+                        if isinstance(item, dict) and item.get("severity") == "P1"
+                        and isinstance(item.get("code"), str)
+                    }
+            checked = timestamp(result.get("checked_at_utc"))
+            state_checked = timestamp(previous.get("checked_at_utc"))
+            old_codes = {item[0] for item in old_severe}
+            for entry in tentative:
+                payload = entry["payload"]
+                at = timestamp(payload.get("checked_at_utc"))
+                items = payload.get("issues")
+                if (
+                    not isinstance(items, list) or not items
+                    or payload.get("status") != "ALARM"
+                    or at is None or checked is None or at > checked
+                    or (state_checked is not None and at < state_checked)
+                    or (journal_last is not None and (
+                        journal_at is None or journal_at > at
+                    ))
+                ):
+                    return _record_unverifiable_prior_state(
+                        result, directory, previous_heartbeat,
+                        "unverifiable transient P1 timeline",
+                    )
+                p1 = [
+                    item for item in items
+                    if isinstance(item, dict) and item.get("severity") == "P1"
+                    and isinstance(item.get("code"), str) and item["code"]
+                ]
+                codes = [item["code"] for item in p1]
+                if not codes or len(codes) != len(set(codes)) or len(p1) != len(items):
+                    return _record_unverifiable_prior_state(
+                        result, directory, previous_heartbeat,
+                        "malformed transient P1 evidence",
+                    )
+                if set(codes) <= old_codes and set(codes) <= journal_codes:
+                    # This old incident is already represented and journaled.
+                    # Never emit a second ALARM just for a transient read EIO.
+                    if entry in pending:
+                        pending.remove(entry)
+                    continue
+                for item in p1:
+                    code = item["code"]
+                    if code not in old_codes:
+                        old_severe.append([code, str(item.get("actual", ""))[:160]])
+                        old_codes.add(code)
+            old_severe.sort()
         # A RECOVERY is committed to heartbeat before state to avoid
         # inventing a recovered incident on a failed state write. If that
         # precise newer heartbeat exists but state still owns the older
