@@ -81,6 +81,7 @@
 </svelte:head>
 
 <div class="container">
+  <a class="back-link" href="/settings">← Zu den Einstellungen</a>
   <h1>Build-Diagnose</h1>
   <p class="intro">
     Diese Seite zeigt die im Browser geladene Build-Identität und vergleicht sie
@@ -176,6 +177,13 @@
 </div>
 
 <style>
+  .back-link {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    min-height: 44px;
+    color: var(--text);
+  }
   .container {
     max-width: 720px;
     margin: 40px auto;
