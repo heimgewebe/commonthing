@@ -100,7 +100,7 @@ remote_main="$(git -C "$REPO_DIR" ls-remote --exit-code origin refs/heads/main |
 # A new, approved main may not yet be in the local object database. Fetch
 # only its immutable objects, without updating FETCH_HEAD or tracking refs.
 if ! git -C "$REPO_DIR" cat-file -e "$COMMIT^{commit}" 2> /dev/null; then
-  git -C "$REPO_DIR" fetch --no-write-fetch-head --no-tags     --no-auto-gc --no-recurse-submodules origin "$COMMIT" ||
+  git -C "$REPO_DIR" fetch --no-write-fetch-head --no-tags --no-auto-gc --no-recurse-submodules origin "$COMMIT" ||
     fail "authorized source commit cannot be inspected before installation"
 fi
 python3 -I "$authorization_checker" --commit "$COMMIT" \

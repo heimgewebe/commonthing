@@ -1146,7 +1146,11 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                     if case == "wrong_commit":
                         blocked["commit"] = "0" * 40
                     else:
-                        blocked["schaubild_image_digest"] = "sha256:" + "d" * 64
+                        blocked["schaubild_image_digest"] = "sha256:" + "e" * 64
+                        self.assertNotEqual(
+                            blocked["schaubild_image_digest"],
+                            self.hold_data["schaubild_image_digest"],
+                        )
                     self.install_root_json(self.hold_file, blocked)
                 result = self.reconcile_stale_public_commit(
                     deploy_helper=self.test_deploy_script
