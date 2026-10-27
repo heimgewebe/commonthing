@@ -88,10 +88,18 @@ getrennte Nachweise. Der Watcher darf den Empfang nicht selbst behaupten.
   deaktiviert er einen vorhandenen Timer vor Systemd-Installation, startet
   danach **zuerst** den Service und aktiviert den Timer erst nach dessen Erfolg.
 - Der Timer verwendet `OnActiveSec=2min` statt `OnBootSec=45s`, somit keine
-  rückwirkend fällige Boot-Auslösung beim Enable. Der Reconciler prüft die
-  Root-Freigabe und den exakten Remote-Main vor Zustandsschreibvorgängen,
-  erneut nach Fetch, mit dem OCI-Digest sowie vor Build-Cache- und
-  Deployment-/Migrationsänderungen.
+  rückwirkend fällige Boot-Auslösung beim Enable. Vor jeder gemeinsam genutzten
+  State-, Lock-, Git-Tracking-Ref-, Timer-, VAPID- oder Release-Wirkung prüfen
+  Installer, Aktivator, Reconciler und direkter Deploy-Helfer **beide**
+  Root-HOLD-Identitäten: den exakten Main-Commit und den OCI-Digest aus dem
+  unveränderlichen Git-Objekt `<commit>:infra/schauwerk-editor/release-lock.json`.
+  Ist der genehmigte Commit noch nicht lokal vorhanden, darf ausschließlich
+  dessen Objektinhalt mit `--no-write-fetch-head` und ohne Tracking-Ref-Ziel
+  aus dem Git-Remote geholt werden. Dies verändert den lokalen Git-Objektspeicher,
+  aber weder FETCH_HEAD noch Branch-/Remote-Refs; es ist kein Deploymentbeweis
+  und keine Freigabe für weitere Nebenwirkungen. Der Reconciler validiert beide
+  Identitäten erneut nach dem regulären lockgebundenen Fetch, vor Build-Cache-
+  sowie vor Deployment- und Migrationsänderungen.
 - Ein erfolgreicher Installer, manueller Service-Run oder aktivierter Timer
   **beweist noch kein Produktions-PASS**. Erforderlich sind ein terminaler
   Reconcile-Receipt, tatsächliche Docker-OCI-Identität, Frontend/API-Identität,

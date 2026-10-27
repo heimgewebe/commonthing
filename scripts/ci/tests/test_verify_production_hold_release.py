@@ -133,5 +133,61 @@ class HoldReleaseVerificationTests(unittest.TestCase):
         self.assertIn('if os.geteuid() != 0:', source)
 
 
+    def test_exact_commit_lock_digest_rejects_mismatched_root_grant(self) -> None:
+        import subprocess
+
+        repo = self.root / "producer"
+        repo.mkdir()
+        lock = repo / "infra" / "schauwerk-editor"
+        lock.mkdir(parents=True)
+        data = {
+            "schema_version": "weltgewebe-schauwerk-runtime-lock.v1",
+            "source_repository": "heimgewebe/schauwerk",
+            "source_commit": "c" * 40,
+            "image_repository": "ghcr.io/heimgewebe/schauwerk-schaubild",
+            "image_digest": IMAGE,
+            "public_base_path": "/schaubild",
+        }
+        (lock / "release-lock.json").write_text(json.dumps(data), encoding="utf-8")
+        for command in (
+            ["git", "init", "-q", str(repo)],
+            ["git", "-C", str(repo), "add", "infra/schauwerk-editor/release-lock.json"],
+            ["git", "-C", str(repo), "-c", "user.name=Fixture", "-c",
+             "user.email=fixture@example.invalid", "commit", "-qm", "lock"],
+        ):
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        commit = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        self.data["commit"] = commit
+        self.write()
+        self.assertEqual(
+            verifier.read_locked_image_digest(repo, commit, expected_uid=self.uid),
+            IMAGE,
+        )
+        alternate = repo / ".git" / "objects" / "info" / "alternates"
+        alternate.write_text(str(self.root / "untrusted-objects") + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(verifier.HoldReleaseError, "alternate"):
+            verifier.read_locked_image_digest(repo, commit, expected_uid=self.uid)
+        alternate.unlink()
+        self.assertEqual(self.check(commit=commit, image=IMAGE)["commit"], commit)
+        self.data["schaubild_image_digest"] = "sha256:" + "d" * 64
+        self.write()
+        # The caller must bind the same immutable source digest before effects.
+        self.reject(commit=commit, image=verifier.read_locked_image_digest(
+            repo, commit, expected_uid=self.uid
+        ))
+        data["image_digest"] = "latest"
+        (lock / "release-lock.json").write_text(json.dumps(data), encoding="utf-8")
+        # An unchanged immutable source SHA must still resolve to the old blob.
+        self.assertEqual(
+            verifier.read_locked_image_digest(repo, commit, expected_uid=self.uid),
+            IMAGE,
+        )
+        with self.assertRaises(verifier.HoldReleaseError):
+            verifier.read_locked_image_digest(repo, "e" * 40, expected_uid=self.uid)
+
+
+
 if __name__ == "__main__":
     unittest.main()

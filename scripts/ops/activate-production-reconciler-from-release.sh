@@ -84,8 +84,9 @@ fi
 
 authorization_checker="$release_dir_real/scripts/ops/verify_production_hold_release.py"
 require_root_safe_regular_file "$authorization_checker" "production HOLD release checker"
-python3 -I "$authorization_checker" --commit "$COMMIT" ||
-  fail "production HOLD authorization missing or mismatched"
+python3 -I "$authorization_checker" --commit "$COMMIT" \
+  --source-repository "$release_dir_real" ||
+  fail "production HOLD authorization or source OCI digest is mismatched"
 
 # A reconciler-triggered deployment re-enters weltgewebe-up while the first
 # service is running but before its completion-relative timer is enabled.

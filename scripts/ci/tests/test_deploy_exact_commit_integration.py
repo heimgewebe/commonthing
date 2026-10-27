@@ -1136,19 +1136,25 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         )
         return run(argv, check=False)
 
-    def test_hold_blocks_missing_and_wrong_commit_before_deploy_effects(self) -> None:
-        for case in ("missing", "wrong_commit"):
+    def test_hold_blocks_missing_wrong_commit_and_oci_before_deploy_effects(self) -> None:
+        for case in ("missing", "wrong_commit", "wrong_digest"):
             with self.subTest(case=case):
                 if case == "missing":
                     run(self.privileged(["rm", "--", str(self.hold_file)]))
                 else:
-                    blocked = {**self.hold_data, "commit": "0" * 40}
+                    blocked = dict(self.hold_data)
+                    if case == "wrong_commit":
+                        blocked["commit"] = "0" * 40
+                    else:
+                        blocked["schaubild_image_digest"] = "sha256:" + "d" * 64
                     self.install_root_json(self.hold_file, blocked)
                 result = self.reconcile_stale_public_commit(
                     deploy_helper=self.test_deploy_script
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("production_hold_release=blocked:", result.stderr)
+                if case == "wrong_digest":
+                    self.assertIn("Schaubild OCI digest differs", result.stderr)
                 self.assertFalse((self.root / "weltgewebe-up.log").exists())
                 self.assertFalse((self.root / "deploy-complete").exists())
 

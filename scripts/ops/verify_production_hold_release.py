@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -134,20 +135,162 @@ def read_authorization(
     return data
 
 
+LOCK_SOURCE_PATH = "infra/schauwerk-editor/release-lock.json"
+LOCK_SOURCE_FIELDS = frozenset({
+    "schema_version", "source_repository", "source_commit",
+    "image_repository", "image_digest", "public_base_path",
+})
+
+
+def read_locked_image_digest(
+    source_repository: Path, commit: str, *, expected_uid: int = 0,
+) -> str:
+    """Read the exact Git object, not a mutable worktree or caller-supplied digest.
+
+    The commit object must already exist locally. The production reconciler
+    may fetch immutable objects without updating any remote-tracking refs,
+    but only after the root HOLD authorizes the exact remote commit.
+    """
+    if not SHA40.fullmatch(commit):
+        raise HoldReleaseError("source commit must be an exact lowercase SHA")
+    repository = Path(source_repository)
+    if not repository.is_absolute():
+        raise HoldReleaseError("source repository must be an absolute directory")
+    try:
+        info = repository.lstat()
+    except OSError as exc:
+        raise HoldReleaseError("source repository is unavailable") from exc
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != expected_uid
+            or stat.S_IMODE(info.st_mode) & 0o022):
+        raise HoldReleaseError("source repository is not securely owned")
+
+    # Never consult inherited Git aliases, replacements, a user config or
+    # Git environment overrides while opening a root-authorized commit.
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    environment.update({
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    source = f"{commit}:{LOCK_SOURCE_PATH}"
+    command = ["git", "--no-optional-locks", "-C", str(repository)]
+    # A trusted repo directory alone is insufficient: objects/info/alternates
+    # can redirect object lookups to a writable store without a SHA collision.
+    # Verify every effective on-disk object entry before reading release bytes.
+    try:
+        common_output = subprocess.run(
+            [*command, "rev-parse", "--git-common-dir"],
+            check=False, capture_output=True, text=True, timeout=20,
+            env=environment,
+        )
+        if common_output.returncode != 0 or not common_output.stdout.strip():
+            raise HoldReleaseError("Git common object directory is unavailable")
+        common_dir = Path(common_output.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = repository / common_dir
+        common_dir = common_dir.resolve(strict=True)
+        common_mode = common_dir.stat()
+        if (not stat.S_ISDIR(common_mode.st_mode)
+                or common_mode.st_uid != expected_uid
+                or stat.S_IMODE(common_mode.st_mode) & 0o022):
+            raise HoldReleaseError("Git common object directory is not securely owned")
+        objects = common_dir / "objects"
+        if not objects.is_dir() or objects.is_symlink():
+            raise HoldReleaseError("Git object directory is missing or redirected")
+        alternates = objects / "info" / "alternates"
+        if alternates.exists() or alternates.is_symlink():
+            raise HoldReleaseError("Git alternate object stores are forbidden")
+
+        def walk_error(error: OSError) -> None:
+            raise HoldReleaseError("Git object store traversal failed") from error
+
+        for directory, subdirs, files in os.walk(
+            objects, followlinks=False, onerror=walk_error,
+        ):
+            for name in (*subdirs, *files):
+                entry = Path(directory) / name
+                metadata = entry.lstat()
+                if (stat.S_ISLNK(metadata.st_mode)
+                        or metadata.st_uid != expected_uid
+                        or stat.S_IMODE(metadata.st_mode) & 0o022):
+                    raise HoldReleaseError("Git object store contains an untrusted entry")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HoldReleaseError("Git object store inspection failed") from exc
+    try:
+        size = subprocess.run(
+            [*command, "cat-file", "-s", source],
+            check=False, capture_output=True, text=True, timeout=20,
+            env=environment,
+        )
+        if size.returncode != 0:
+            raise HoldReleaseError("source commit lock is unavailable")
+        try:
+            blob_size = int(size.stdout.strip())
+        except ValueError as exc:
+            raise HoldReleaseError("source commit lock size is invalid") from exc
+        if not 1 <= blob_size <= 4096:
+            raise HoldReleaseError("source commit lock exceeds admission budget")
+        result = subprocess.run(
+            [*command, "show", source],
+            check=False, capture_output=True, timeout=20, env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HoldReleaseError("source commit lock inspection failed") from exc
+    if result.returncode != 0 or len(result.stdout) != blob_size:
+        raise HoldReleaseError("source commit lock bytes could not be verified")
+    try:
+        record = json.loads(
+            result.stdout.decode("utf-8"), object_pairs_hook=_unique_pairs,
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise HoldReleaseError("source commit lock JSON is invalid") from exc
+    if not isinstance(record, dict) or set(record) != LOCK_SOURCE_FIELDS:
+        raise HoldReleaseError("source commit lock fields are invalid")
+    if (record["schema_version"] != "weltgewebe-schauwerk-runtime-lock.v1"
+            or record["source_repository"] != "heimgewebe/schauwerk"
+            or record["image_repository"] != "ghcr.io/heimgewebe/schauwerk-schaubild"
+            or record["public_base_path"] != "/schaubild"
+            or not isinstance(record["source_commit"], str)
+            or not SHA40.fullmatch(record["source_commit"])):
+        raise HoldReleaseError("source commit lock identity is invalid")
+    digest = record["image_digest"]
+    if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+        raise HoldReleaseError("source commit lock OCI digest is invalid")
+    return digest
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--preflight", action="store_true")
     mode.add_argument("--commit")
     parser.add_argument("--image-digest")
+    parser.add_argument("--source-repository")
     args = parser.parse_args(argv)
     if args.image_digest is not None and args.commit is None:
         parser.error("--image-digest requires --commit")
+    if args.source_repository is not None and args.commit is None:
+        parser.error("--source-repository requires --commit")
     if os.geteuid() != 0:
         print("production HOLD release verifier must run as root", file=sys.stderr)
         return 1
     try:
-        read_authorization(expected_commit=args.commit, expected_image=args.image_digest)
+        locked_digest = (
+            read_locked_image_digest(Path(args.source_repository), args.commit)
+            if args.source_repository is not None else None
+        )
+        if (locked_digest is not None and args.image_digest is not None
+                and locked_digest != args.image_digest):
+            raise HoldReleaseError("provided OCI digest differs from the exact source commit")
+        read_authorization(
+            expected_commit=args.commit,
+            expected_image=locked_digest or args.image_digest,
+        )
     except HoldReleaseError as exc:
         print(f"production_hold_release=blocked: {exc}", file=sys.stderr)
         return 1

@@ -65,6 +65,14 @@ git_common_dir="$(realpath "$git_common_dir")"
 [[ "$(stat --format=%u "$REPO_DIR")" == "0" ]] || fail "source checkout is not root-owned"
 unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
 [[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
+# A root-owned alternates pointer may reference an attacker-writable external
+# object store. Reject all Git object indirection before any root Git operation.
+[[ -z "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" && -z "${GIT_OBJECT_DIRECTORY:-}" ]] ||
+  fail "Git object database environment overrides are not allowed"
+[[ ! -e "$git_common_dir/objects/info/alternates" && ! -L "$git_common_dir/objects/info/alternates" ]] ||
+  fail "Git alternate object stores are not trusted for production"
+[[ -z "$(find "$git_common_dir/objects" -xdev -type l -print -quit)" ]] ||
+  fail "Git object store contains a symlink outside the trust boundary"
 
 # The authority is outside Git and cannot be manufactured by this installer.
 # Validate it BEFORE changing VAPID, systemd, Git tracking refs or state.
@@ -89,6 +97,15 @@ remote_main="$(git -C "$REPO_DIR" ls-remote --exit-code origin refs/heads/main |
   fail "cannot verify current remote main"
 [[ "$remote_main" == "$COMMIT" ]] ||
   fail "installation commit is not current origin/main: expected $COMMIT, got $remote_main"
+# A new, approved main may not yet be in the local object database. Fetch
+# only its immutable objects, without updating FETCH_HEAD or tracking refs.
+if ! git -C "$REPO_DIR" cat-file -e "$COMMIT^{commit}" 2> /dev/null; then
+  git -C "$REPO_DIR" fetch --no-write-fetch-head --no-tags     --no-auto-gc --no-recurse-submodules origin "$COMMIT" ||
+    fail "authorized source commit cannot be inspected before installation"
+fi
+python3 -I "$authorization_checker" --commit "$COMMIT" \
+  --source-repository "$REPO_DIR" ||
+  fail "source commit OCI digest is not authorized before timer or VAPID changes"
 
 timer_was_enabled=0
 timer_was_active=0

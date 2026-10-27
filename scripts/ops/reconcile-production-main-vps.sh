@@ -1525,6 +1525,14 @@ git_common_dir="$(git -C "$SOURCE_CHECKOUT" rev-parse --git-common-dir)"
 git_common_dir="$(readlink -f "$git_common_dir")"
 unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
 [[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
+# A root-owned alternates pointer may reference an attacker-writable external
+# object store. Reject all Git object indirection before any root Git operation.
+[[ -z "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" && -z "${GIT_OBJECT_DIRECTORY:-}" ]] ||
+  fail "Git object database environment overrides are not allowed"
+[[ ! -e "$git_common_dir/objects/info/alternates" && ! -L "$git_common_dir/objects/info/alternates" ]] ||
+  fail "Git alternate object stores are not trusted for production"
+[[ -z "$(find "$git_common_dir/objects" -xdev -type l -print -quit)" ]] ||
+  fail "Git object store contains a symlink outside the trust boundary"
 
 # Read-only remote identity check BEFORE creating state directories or locks.
 # The later, lock-held fetch must agree and still match this root decision.
@@ -1534,6 +1542,18 @@ preflight_main="$(git -C "$SOURCE_CHECKOUT" ls-remote --exit-code origin refs/he
   fail "preflight remote main is invalid"
 python3 -I "$AUTHORIZER" --commit "$preflight_main" ||
   fail "production HOLD authorization does not cover live remote main"
+# Admission must bind the OCI digest from immutable source bytes before
+# shared state directories, tracking refs, timers, locks or Docker effects.
+# A new main may require a bounded object-only fetch. It must not write
+# FETCH_HEAD or any remote-tracking ref; normal fetch_main stays lock-held.
+if ! git -C "$SOURCE_CHECKOUT" cat-file -e "$preflight_main^{commit}" 2> /dev/null; then
+  git -C "$SOURCE_CHECKOUT" fetch --no-write-fetch-head --no-tags \
+    --no-auto-gc --no-recurse-submodules origin "$preflight_main" ||
+    fail "authorized source object preflight could not fetch exact commit"
+fi
+python3 -I "$AUTHORIZER" --commit "$preflight_main" \
+  --source-repository "$SOURCE_CHECKOUT" ||
+  fail "source OCI digest differs from the production HOLD release"
 
 install -d -o root -g root -m 0711 "$STATE_ROOT"
 install -d -o root -g root -m 0700 \

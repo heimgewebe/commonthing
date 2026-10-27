@@ -1035,6 +1035,73 @@ prune_releases
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn("requires exact inherited deployment handoff", result.stderr)
 
+    def test_production_git_object_store_rejects_alternates_and_symlinks(self) -> None:
+        for file in (
+            "scripts/ops/install-production-reconciler.sh",
+            "scripts/ops/reconcile-production-main-vps.sh",
+            "scripts/ops/deploy-exact-commit-vps.sh",
+        ):
+            with self.subTest(file=file):
+                source = self.read(file)
+                self.assertIn('objects/info/alternates', source)
+                self.assertIn('Git alternate object stores are not trusted', source)
+                self.assertIn('find "$git_common_dir/objects" -xdev -type l', source)
+                self.assertLess(
+                    source.index('Git alternate object stores are not trusted'),
+                    source.index('ls-remote'),
+                )
+        checker = self.read("scripts/ops/verify_production_hold_release.py")
+        self.assertIn("Git alternate object stores are forbidden", checker)
+        self.assertIn("os.walk(", checker)
+
+    def test_oci_grant_is_bound_before_all_root_side_effects(self) -> None:
+        installer = self.read("scripts/ops/install-production-reconciler.sh")
+        activator = self.read("scripts/ops/activate-production-reconciler-from-release.sh")
+        reconciler = self.read("scripts/ops/reconcile-production-main-vps.sh")
+        deploy = self.read("scripts/ops/deploy-exact-commit-vps.sh")
+
+        checked_installer = 'python3 -I "$authorization_checker" --commit "$COMMIT" \\\n  --source-repository "$REPO_DIR"'
+        checked_activator = 'python3 -I "$authorization_checker" --commit "$COMMIT" \\\n  --source-repository "$release_dir_real"'
+        checked_reconciler = 'python3 -I "$AUTHORIZER" --commit "$preflight_main" \\\n  --source-repository "$SOURCE_CHECKOUT"'
+        checked_deploy = 'python3 -I "$AUTHORIZER" --commit "$COMMIT" \\\n  --source-repository "$SOURCE_CHECKOUT"'
+        self.assertIn(checked_installer, installer)
+        self.assertLess(
+            installer.index(checked_installer), installer.index("systemctl disable --now"),
+        )
+        self.assertLess(
+            installer.index(checked_installer), installer.index('if ((PREFLIGHT_ONLY == 1)); then'),
+        )
+        self.assertIn(checked_activator, activator)
+        self.assertLess(
+            activator.index(checked_activator),
+            activator.index('python3 -I "$web_push_bootstrap"'),
+        )
+        self.assertIn(checked_reconciler, reconciler)
+        self.assertLess(
+            reconciler.index(checked_reconciler),
+            reconciler.index('install -d -o root -g root -m 0711 "$STATE_ROOT"'),
+        )
+        self.assertIn("--no-write-fetch-head", reconciler)
+        self.assertLess(
+            reconciler.index('python3 -I "$AUTHORIZER" --commit "$preflight_main"'),
+            reconciler.index("--no-write-fetch-head"),
+        )
+        self.assertLess(
+            reconciler.index("--no-write-fetch-head"), reconciler.index(checked_reconciler),
+        )
+        self.assertIn(checked_deploy, deploy)
+        # No externally configured Git transport may run as root until
+        # repository and Git common-dir provenance have been checked.
+        first_network_git = deploy.index('preflight_main="$(git -C "$SOURCE_CHECKOUT" ls-remote')
+        owner_check = deploy.index('[[ "$(stat --format=%u "$SOURCE_CHECKOUT")" == "0" ]]')
+        common_dir_guard = deploy.index('unsafe_git_path="$(find "$git_common_dir"')
+        self.assertLess(owner_check, first_network_git)
+        self.assertLess(common_dir_guard, first_network_git)
+        self.assertLess(
+            deploy.index(checked_deploy),
+            deploy.index('install -d -o root -g root -m 0711 "$STATE_ROOT"'),
+        )
+
     def test_first_activation_holds_all_mutations_until_root_release(self) -> None:
         installer = self.read("scripts/ops/install-production-reconciler.sh")
         activator = self.read(
