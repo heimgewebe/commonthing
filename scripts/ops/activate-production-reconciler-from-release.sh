@@ -92,7 +92,13 @@ python3 -I "$authorization_checker" --commit "$COMMIT" \
 # service is running but before its completion-relative timer is enabled.
 # The root grant above was checked; only the existing inherited deployment
 # lock handoff may skip recursive installation of the same service.
-if systemctl is-active --quiet weltgewebe-production-reconcile.service; then
+reconciler_service_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.service)" ||
+  fail "cannot inspect current reconciler service ActiveState"
+case "$reconciler_service_state" in
+  active|activating|inactive) ;;
+  *) fail "unsupported reconciler service state: $reconciler_service_state" ;;
+esac
+if [[ "$reconciler_service_state" == "active" || "$reconciler_service_state" == "activating" ]]; then
   [[ "${WELTGEWEBE_PRODUCTION_LOCK_OWNER_ENTRYPOINT:-}" == "reconciler" &&
     "${WELTGEWEBE_PRODUCTION_LOCK_DOMAIN:-}" == "weltgewebe-production-deployment-v1" &&
     "${WELTGEWEBE_DEPLOY_INVOCATION_ID:-}" =~ ^[0-9a-f]{64}$ ]] ||

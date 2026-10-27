@@ -41,10 +41,10 @@ class ProductionTimerUpgradeTests(unittest.TestCase):
 
     def _invoke_running_service_gate(
         self, *, timer_enabled: str, timer_active: str,
-        service_active: bool = True, valid_handoff: bool = True
+        service_state: str = "activating", valid_handoff: bool = True
     ) -> subprocess.CompletedProcess[str]:
         source = ACTIVATOR.read_text(encoding="utf-8")
-        begin = source.index("if systemctl is-active --quiet " + SERVICE + "; then")
+        begin = source.index('reconciler_service_state="$(systemctl show --property=ActiveState --value ' + SERVICE + ')"')
         end = source.index("\n# The release authorization above", begin)
         actual_guard = source[begin:end]
         with tempfile.TemporaryDirectory(prefix="timer-upgrade-gate-") as temp:
@@ -59,7 +59,7 @@ class ProductionTimerUpgradeTests(unittest.TestCase):
                 "  show)\n"
                 "    case \"$2\" in\n"
                 "      --property=UnitFileState) echo \"$MOCK_TIMER_ENABLED\" ;;\n"
-                "      --property=ActiveState) echo \"$MOCK_TIMER_ACTIVE\" ;;\n"
+                "      --property=ActiveState) if [[ \"$4\" == \"weltgewebe-production-reconcile.service\" ]]; then echo \"$MOCK_SERVICE_STATE\"; else echo \"$MOCK_TIMER_ACTIVE\"; fi ;;\n"
                 "      *) exit 22 ;;\n"
                 "    esac ;;\n"
                 "  *) exit 23 ;;\n"
@@ -70,7 +70,7 @@ class ProductionTimerUpgradeTests(unittest.TestCase):
             env = {
                 **os.environ,
                 "PATH": temp + os.pathsep + os.environ.get("PATH", ""),
-                "MOCK_SERVICE_ACTIVE": "1" if service_active else "0",
+                "MOCK_SERVICE_STATE": service_state,
                 "MOCK_TIMER_ENABLED": timer_enabled,
                 "MOCK_TIMER_ACTIVE": timer_active,
                 "WELTGEWEBE_PRODUCTION_LOCK_OWNER_ENTRYPOINT":
@@ -116,9 +116,30 @@ class ProductionTimerUpgradeTests(unittest.TestCase):
         self.assertNotEqual(invalid.returncode, 0)
         self.assertIn("exact inherited deployment handoff", invalid.stderr)
 
+    def test_oneshot_activating_and_active_both_block_recursive_bootstrap(self) -> None:
+        for service_state in ("activating", "active"):
+            with self.subTest(service_state=service_state):
+                result = self._invoke_running_service_gate(
+                    timer_enabled="disabled", timer_active="inactive",
+                    service_state=service_state,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("already_running", result.stdout)
+                self.assertNotIn("CONTINUED", result.stdout)
+
+    def test_unknown_and_failed_service_states_fail_closed(self) -> None:
+        for service_state in ("failed", "deactivating", "reloading", ""):
+            with self.subTest(service_state=service_state):
+                result = self._invoke_running_service_gate(
+                    timer_enabled="disabled", timer_active="inactive",
+                    service_state=service_state,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unsupported reconciler service state", result.stderr)
+
     def test_non_reentrant_path_proceeds_without_active_service(self) -> None:
         result = self._invoke_running_service_gate(
-            timer_enabled="disabled", timer_active="inactive", service_active=False
+            timer_enabled="disabled", timer_active="inactive", service_state="inactive"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CONTINUED", result.stdout)

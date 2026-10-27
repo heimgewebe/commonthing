@@ -897,6 +897,14 @@ prune_releases
             for expected in expected_fields:
                 self.assertIn(expected, entry)
 
+    def test_production_hold_verifier_is_registered_as_critical_guard(self) -> None:
+        registry = self.read("audit/impl-registry.yaml")
+        self.assertIn("id: impl.guard.production-hold-release", registry)
+        self.assertIn("path: scripts/ops/verify_production_hold_release.py", registry)
+        self.assertIn("docs/deploy/production-hold-first-start.md", registry)
+        self.assertIn("scripts/ci/tests/test_verify_production_hold_release.py", registry)
+        self.assertIn(".github/workflows/production-live-contract.yml", registry)
+
     def test_secure_receipt_helper_is_in_critical_impl_registry(self) -> None:
         registry = self.read("audit/impl-registry.yaml")
         self.assertIn("id: impl.guard.secure-receipt-io", registry)
@@ -996,7 +1004,7 @@ prune_releases
     def test_reentrant_activation_requires_exact_handoff(self) -> None:
         activator = self.read("scripts/ops/activate-production-reconciler-from-release.sh")
         hold = activator.index('python3 -I "$authorization_checker" --commit "$COMMIT"')
-        start = activator.index("if systemctl is-active --quiet weltgewebe-production-reconcile.service; then")
+        start = activator.index('reconciler_service_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.service)"')
         end = activator.index("\nfi\n", start) + 3
         self.assertLess(hold, start)
         self.assertLess(end, activator.index('install_mode="$(select_reconciler_start_mode)"'))
@@ -1011,7 +1019,7 @@ prune_releases
             fake.write_text(
                 '#!/usr/bin/env bash\n'
                 'case "$*" in\n'
-                '  "is-active --quiet weltgewebe-production-reconcile.service") exit 0 ;;\n'
+                '  "show --property=ActiveState --value weltgewebe-production-reconcile.service") echo activating ;;\n'
                 '  *UnitFileState*) echo disabled ;;\n'
                 '  *ActiveState*) echo inactive ;;\n'
                 '  *) exit 91 ;;\n'
