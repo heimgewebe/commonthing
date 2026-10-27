@@ -1578,6 +1578,8 @@ prune_releases
                 ],
                 check=True,
             )
+            true_bin = shutil.which("true")
+            self.assertIsNotNone(true_bin)
             subprocess.run(
                 [
                     "sudo",
@@ -1589,7 +1591,7 @@ prune_releases
                     "root",
                     "-m",
                     "0755",
-                    "/bin/true",
+                    true_bin,
                     str(installer),
                 ],
                 check=True,

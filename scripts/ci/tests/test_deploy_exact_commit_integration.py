@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -547,6 +548,9 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         )
         docker.chmod(0o755)
 
+        real_df = shutil.which("df")
+        if real_df is None:
+            raise RuntimeError("df is required by the reconciler integration fixture")
         df = self.bin / "df"
         df.write_text(
             textwrap.dedent(
@@ -557,9 +561,9 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                   printf 'Avail\n100000000000\n'
                   exit 0
                 fi
-                exec /usr/bin/df "$@"
+                exec __REAL_DF__ "$@"
                 """
-            ),
+            ).replace("__REAL_DF__", shlex.quote(real_df)),
             encoding="utf-8",
         )
         df.chmod(0o755)
