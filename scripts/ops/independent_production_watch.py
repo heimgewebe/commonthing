@@ -588,22 +588,16 @@ def _verified_lost_state_recovery(directory, heartbeat, result):
     an ambiguous journal, newer ALARM epoch or unverified current product
     observation must never manufacture recovery.
     """
-    if not isinstance(heartbeat, dict) or result.get("status") != "HEALTHY":
-        return None
-    issues = result.get("issues")
-    if not isinstance(issues, list) or any(
-        isinstance(item, dict) and item.get("severity") in {"P1", "P2"}
-        for item in issues
+    if (
+        not isinstance(heartbeat, dict)
+        or result.get("status") not in {"HEALTHY", "MONITOR_DATA_FAILURE"}
     ):
         return None
     entries = _pending_transition_entries(heartbeat)
     if len(entries) != 1 or entries[0]["event"] != "RECOVERY":
         return None
     recovery = entries[0]["payload"]
-    if recovery.get("status") != "HEALTHY" or any(
-        isinstance(item, dict) and item.get("severity") == "P1"
-        for item in recovery["issues"]
-    ):
+    if recovery.get("status") not in {"HEALTHY", "MONITOR_DATA_FAILURE"}:
         return None
     journal = _last_journaled_transition(directory)
     if not isinstance(journal, dict) or journal.get("event") != "ALARM":
@@ -635,6 +629,37 @@ def _verified_lost_state_recovery(directory, heartbeat, result):
         severe.append([code, str(item.get("actual", ""))[:160]])
     if not severe:
         return None
+    # P2 observations about an unrelated dependency do not erase an
+    # independently confirmed RECOVERY. But either the historical recovery
+    # or the current poll must retain uncertainty when it masks any
+    # earlier P1's required observation. Unknown P2 codes stay fail-closed.
+    admissible_p2 = {
+        "unavailable_frontend", "unavailable_api", "unavailable_main",
+        "invalid_commit_main", "main_time_unreliable",
+        "schedule_deadline_exceeded", "event_log_write_failed",
+    }
+    old_codes = {entry[0] for entry in severe}
+    for observed in (recovery, result):
+        observed_issues = observed.get("issues")
+        if not isinstance(observed_issues, list):
+            return None
+        p2_codes = set()
+        for issue in observed_issues:
+            if not isinstance(issue, dict):
+                return None
+            severity = issue.get("severity")
+            if severity == "P1":
+                return None
+            if severity == "P2":
+                code = issue.get("code")
+                if not isinstance(code, str) or code not in admissible_p2:
+                    return None
+                p2_codes.add(code)
+            elif severity != "INFO":
+                return None
+        if any(P1_UNVERIFIABLE_ON.get(code, set()) & p2_codes
+               for code in old_codes):
+            return None
     return {
         "severe": sorted(severe),
         "uncertain": [],
@@ -1100,11 +1125,50 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 payload = entry["payload"]
                 at = timestamp(payload.get("checked_at_utc"))
                 items = payload.get("issues")
+                # The earlier read-EIO P1 can be incorporated into the
+                # authoritative state before its original journal append
+                # succeeds. Retrying after another journal fsync failure
+                # must not reject that same persisted intent just because
+                # state.checked_at advanced. Require exact state-outbox
+                # membership and either still-active codes or a later
+                # independently confirmed pending RECOVERY.
+                state_entries = _pending_transition_entries(previous)
+                position = next(
+                    (i for i, value in enumerate(state_entries) if value == entry),
+                    None,
+                )
+                p1_codes = {
+                    item.get("code") for item in items
+                    if isinstance(item, dict)
+                    and item.get("severity") == "P1"
+                    and isinstance(item.get("code"), str) and item["code"]
+                } if isinstance(items, list) else set()
+                followed_by_recovery = False
+                if position is not None and at is not None and state_checked is not None:
+                    followed_by_recovery = any(
+                        later["event"] == "RECOVERY"
+                        and later["payload"].get("status")
+                            in {"HEALTHY", "MONITOR_DATA_FAILURE"}
+                        and isinstance(later["payload"].get("issues"), list)
+                        and not any(
+                            isinstance(issue, dict) and issue.get("severity") == "P1"
+                            for issue in later["payload"]["issues"]
+                        )
+                        and timestamp(later["payload"].get("checked_at_utc")) is not None
+                        and at < timestamp(later["payload"]["checked_at_utc"])
+                            <= state_checked
+                        for later in state_entries[position + 1:]
+                    )
+                state_reconciled = (
+                    position is not None and bool(p1_codes)
+                    and (p1_codes <= old_codes or followed_by_recovery)
+                )
                 if (
                     not isinstance(items, list) or not items
                     or payload.get("status") != "ALARM"
                     or at is None or checked is None or at > checked
-                    or (state_checked is not None and at < state_checked)
+                    or (state_checked is not None and at < state_checked
+                        and not state_reconciled)
                     or (journal_last is not None and (
                         journal_at is None or journal_at > at
                     ))
@@ -1129,6 +1193,11 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                     # Never emit a second ALARM just for a transient read EIO.
                     if entry in pending:
                         pending.remove(entry)
+                    continue
+                if followed_by_recovery:
+                    # The state already durably owns a newer confirmed
+                    # recovery epoch. Replay the older ALARM before its
+                    # pending RECOVERY; never re-activate its P1 as current.
                     continue
                 for item in p1:
                     code = item["code"]
