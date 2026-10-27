@@ -126,6 +126,9 @@ if [[ "$ACTUAL_SHA256" != "$OSM_SHA256" ]]; then
 fi
 echo "   [✓] Integrity verified (SHA256 match)."
 
+# Always bind Planetiler to the same dated, fully hashed coastline archive.
+python3 "$SCRIPT_DIR/prepare-water-polygons.py" "$BASEMAP_DIR"
+
 rm -f -- "$PARTIAL_PMTILES_PATH" "$PARTIAL_LAYERSTATS_PATH"
 rm -rf -- "$BASEMAP_DIR/tmp"
 echo "=> Running Planetiler via Docker to generate $OUTPUT_PMTILES..."
@@ -137,6 +140,7 @@ if ! docker run --rm \
   --osm-path="/data/$OSM_FILE" \
   --output="/data/$PARTIAL_PMTILES" \
   --download=true \
+  --water-polygons-path="/data/data/sources/water-polygons-split-3857.zip" \
   --http-timeout="$PLANETILER_HTTP_TIMEOUT" \
   --http-retries="$PLANETILER_HTTP_RETRIES" \
   --http-retry-wait="$PLANETILER_HTTP_RETRY_WAIT"; then
