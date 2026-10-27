@@ -336,6 +336,44 @@ class TestRunTask(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertEqual(list(Path(tmp).glob(".agent-run-staging-*")), [])
 
+    def test_cleanup_wipes_original_staging_after_path_replacement(self):
+        # The staging name can be replaced after writing but before publish.
+        # Private task contents must be removed via the original directory FD.
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            output = parent / "run"
+            renamed_staging = parent / "renamed-staging"
+            original_write = run_task._write_file_sync_at
+
+            def replace_staging_after_last_write(directory_fd, name, content):
+                original_write(directory_fd, name, content)
+                if name == "run-result.json":
+                    staged = list(parent.glob(".agent-run-staging-*"))
+                    self.assertEqual(len(staged), 1)
+                    staged[0].rename(renamed_staging)
+                    staged[0].mkdir(mode=0o700)
+
+            with unittest.mock.patch.object(
+                run_task,
+                "_write_file_sync_at",
+                side_effect=replace_staging_after_last_write,
+            ):
+                with self.assertRaises(run_task.RunnerError) as ctx:
+                    run_task._run_dry_run(
+                        repo_root=self.root,
+                        task_file=self._fixture("valid-doc-drift-task.json"),
+                        source_revision_resolver=lambda _root: self.source_revision,
+                        output_dir=output,
+                    )
+            self.assertEqual(ctx.exception.code, "OUTPUT_LOCATION_CHANGED")
+            self.assertFalse(output.exists())
+            self.assertTrue(renamed_staging.is_dir())
+            self.assertEqual(list(renamed_staging.iterdir()), [])
+            replacement = list(parent.glob(".agent-run-staging-*"))
+            self.assertEqual(len(replacement), 1)
+            self.assertTrue(replacement[0].is_dir())
+            self.assertEqual(list(replacement[0].iterdir()), [])
+
     def test_default_persistence_and_no_persist_are_distinct(self):
         run_id = "RUN-20990101T000001Z-abcdef123456"
         target = self.root / "artifacts" / "agent-runs" / run_id

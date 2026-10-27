@@ -951,10 +951,11 @@ def _validate_evidence_bindings(
 
 def _cleanup_staging(parent_fd: int, staging_fd: int, staging_name: str) -> None:
     cleanup_errors: list[str] = []
-    # Enumerate through a fresh, no-follow FD: the original directory stream
-    # may be stale when it was opened before the evidence files were created.
+    # Reopen the pinned staging inode, not its mutable original name: a
+    # rename/replacement must not strand private evidence during rollback.
+    # A fresh stream also sees files created after staging_fd was opened.
     try:
-        scan_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
+        scan_fd = os.open(".", _directory_flags(), dir_fd=staging_fd)
         try:
             existing = os.fstat(staging_fd)
             scanned = os.fstat(scan_fd)
@@ -971,14 +972,33 @@ def _cleanup_staging(parent_fd: int, staging_fd: int, staging_name: str) -> None
             os.unlink(name, dir_fd=staging_fd)
         except OSError as exc:
             cleanup_errors.append(str(exc))
+
+    # Never remove a directory that replaced the original staging name.
+    # The bound FD remains authoritative for scrubbing the private payloads.
+    name_still_identifies_staging = False
+    try:
+        named_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
+        try:
+            bound = os.fstat(staging_fd)
+            named = os.fstat(named_fd)
+            name_still_identifies_staging = (
+                (bound.st_dev, bound.st_ino) == (named.st_dev, named.st_ino)
+            )
+            if not name_still_identifies_staging:
+                cleanup_errors.append("staging directory name changed during cleanup")
+        finally:
+            os.close(named_fd)
+    except OSError as exc:
+        cleanup_errors.append(str(exc))
     try:
         os.close(staging_fd)
     except OSError as exc:
         cleanup_errors.append(str(exc))
-    try:
-        os.rmdir(staging_name, dir_fd=parent_fd)
-    except OSError as exc:
-        cleanup_errors.append(str(exc))
+    if name_still_identifies_staging:
+        try:
+            os.rmdir(staging_name, dir_fd=parent_fd)
+        except OSError as exc:
+            cleanup_errors.append(str(exc))
     if cleanup_errors:
         raise OSError("; ".join(cleanup_errors))
 
