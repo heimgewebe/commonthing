@@ -425,12 +425,33 @@ if [[ "$DEPLOY_TARGET" == "vps" && "$PLAN_ONLY" == "0" ]]; then
         echo "ERROR: production reconciler activator has unsafe ownership or mode: $reconciler_activator" >&2
         exit 1
       fi
+      # Scoped initial bootstrap Compose lock handoff BEGIN
+      # Only an inactive first-start service recursively needs this same lock.
+      # No Compose effects happen between the unlock and exclusive reacquire.
+      timer_unit_state="$(systemctl show --property=UnitFileState --value weltgewebe-production-reconcile.timer)" || exit 1
+      timer_active_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.timer)" || exit 1
+      service_active_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.service)" || exit 1
+      compose_lock_released_for_first_start=0
+      if [[ "$timer_unit_state:$timer_active_state:$service_active_state" == "disabled:inactive:inactive" ]]; then
+        if ! flock -u "$DEPLOY_LOCK_FD"; then
+          echo "ERROR: cannot release Compose lock for initial reconciliation." >&2
+          exit 1
+        fi
+        compose_lock_released_for_first_start=1
+      fi
       echo
       echo ">> Production reconciler contract activation:"
       "$reconciler_activator" \
         --release-dir "$release_dir" \
         --commit "$release_commit" \
         --build-user "${WELTGEWEBE_BUILD_USER:-alex}"
+      if ((compose_lock_released_for_first_start == 1)); then
+        if ! flock -n "$DEPLOY_LOCK_FD"; then
+          echo "ERROR: Compose lock claimed during initial reconciliation; no further deployment effects allowed." >&2
+          exit 1
+        fi
+      fi
+      # Scoped initial bootstrap Compose lock handoff END
       ;;
   esac
 fi

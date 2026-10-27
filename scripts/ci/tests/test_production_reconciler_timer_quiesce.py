@@ -137,6 +137,96 @@ class ProductionTimerUpgradeTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("unsupported reconciler service state", result.stderr)
 
+
+    def _execute_compose_lock_handoff(
+        self, *, timer_unit: str, timer_active: str, service_state: str,
+        child_expects_lock_free: bool, child_fails: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        wrapper = (ROOT / "scripts/weltgewebe-up").read_text(encoding="utf-8")
+        begin = wrapper.index("      # Scoped initial bootstrap Compose lock handoff BEGIN")
+        end = wrapper.index("      # Scoped initial bootstrap Compose lock handoff END", begin)
+        actual_code = wrapper[begin:end]
+        with tempfile.TemporaryDirectory(prefix="production-compose-lock-test-") as temp:
+            directory = Path(temp)
+            lock_file = directory / "compose.lock"
+            activator = directory / "activator.sh"
+            activator.write_text(
+                '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+                'if [[ "$CHILD_EXPECTS_LOCK_FREE" == "1" ]]; then\n'
+                '  flock -n "$LOCK_FILE" -c true || exit 73\n'
+                'else\n'
+                '  if flock -n "$LOCK_FILE" -c true; then exit 74; fi\n'
+                'fi\n'
+                'if [[ "$CHILD_FAILS" == "1" ]]; then exit 77; fi\n'
+                'echo INNER_ACTIVATOR_PASSED\n',
+                encoding="utf-8",
+            )
+            activator.chmod(0o755)
+            script = (
+                'set -Eeuo pipefail\n'
+                'systemctl() {\n'
+                '  case "$*" in\n'
+                '    "show --property=UnitFileState --value weltgewebe-production-reconcile.timer") echo "$TIMER_UNIT" ;;\n'
+                '    "show --property=ActiveState --value weltgewebe-production-reconcile.timer") echo "$TIMER_ACTIVE" ;;\n'
+                '    "show --property=ActiveState --value weltgewebe-production-reconcile.service") echo "$SERVICE_STATE" ;;\n'
+                '    *) return 92 ;;\n'
+                '  esac\n'
+                '}\n'
+                'exec {DEPLOY_LOCK_FD}> "$LOCK_FILE"\n'
+                'flock -n "$DEPLOY_LOCK_FD" || exit 81\n'
+                'reconciler_activator="$FAKE_ACTIVATOR"\n'
+                'release_dir="/fake/release"\n'
+                'release_commit="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+                + actual_code
+                + '\nif flock -n "$LOCK_FILE" -c true; then exit 82; fi\n'
+                'echo OUTER_COMPOSE_LOCK_REACQUIRED\n'
+            )
+            environment = {
+                **os.environ,
+                "LOCK_FILE": str(lock_file),
+                "FAKE_ACTIVATOR": str(activator),
+                "TIMER_UNIT": timer_unit,
+                "TIMER_ACTIVE": timer_active,
+                "SERVICE_STATE": service_state,
+                "CHILD_EXPECTS_LOCK_FREE": "1" if child_expects_lock_free else "0",
+                "CHILD_FAILS": "1" if child_fails else "0",
+            }
+            return subprocess.run(
+                ["bash", "-c", script], env=environment,
+                text=True, capture_output=True, timeout=10,
+            )
+
+    def test_initial_reconciler_first_start_releases_and_restores_compose_lock(self) -> None:
+        result = self._execute_compose_lock_handoff(
+            timer_unit="disabled", timer_active="inactive",
+            service_state="inactive", child_expects_lock_free=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("INNER_ACTIVATOR_PASSED", result.stdout)
+        self.assertIn("OUTER_COMPOSE_LOCK_REACQUIRED", result.stdout)
+
+    def test_deferred_and_reentrant_activators_preserve_compose_exclusion(self) -> None:
+        for timer_unit, timer_active, service_state in (
+            ("enabled", "active", "inactive"),
+            ("disabled", "inactive", "activating"),
+        ):
+            with self.subTest(state=(timer_unit, timer_active, service_state)):
+                result = self._execute_compose_lock_handoff(
+                    timer_unit=timer_unit, timer_active=timer_active,
+                    service_state=service_state, child_expects_lock_free=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("OUTER_COMPOSE_LOCK_REACQUIRED", result.stdout)
+
+    def test_failed_first_start_never_continues_after_unlocked_activation(self) -> None:
+        result = self._execute_compose_lock_handoff(
+            timer_unit="disabled", timer_active="inactive",
+            service_state="inactive", child_expects_lock_free=True,
+            child_fails=True,
+        )
+        self.assertEqual(result.returncode, 77, result.stderr)
+        self.assertNotIn("OUTER_COMPOSE_LOCK_REACQUIRED", result.stdout)
+
     def test_non_reentrant_path_proceeds_without_active_service(self) -> None:
         result = self._invoke_running_service_gate(
             timer_enabled="disabled", timer_active="inactive", service_state="inactive"
