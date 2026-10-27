@@ -299,6 +299,13 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
             )
         )
 
+        # Model the production trust boundary: an unprivileged test runner
+        # may write sibling artifacts but must not replace this root-owned
+        # source checkout. The root-owned sticky parent protects the existing
+        # child while allowing the test runner group to manage its own files.
+        run(self.privileged(["chown", f"root:{os.getgid()}", str(self.root)]))
+        run(self.privileged(["chmod", "1770", str(self.root)]))
+
     def restore_test_ownership(self) -> None:
         if not self.root.exists():
             return
