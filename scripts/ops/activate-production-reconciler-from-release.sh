@@ -95,7 +95,7 @@ python3 -I "$authorization_checker" --commit "$COMMIT" \
 reconciler_service_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.service)" ||
   fail "cannot inspect current reconciler service ActiveState"
 case "$reconciler_service_state" in
-  active|activating|inactive) ;;
+  active | activating | inactive) ;;
   *) fail "unsupported reconciler service state: $reconciler_service_state" ;;
 esac
 if [[ "$reconciler_service_state" == "active" || "$reconciler_service_state" == "activating" ]]; then
