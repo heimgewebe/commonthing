@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1078,6 +1079,17 @@ prune_releases
                 self.assertLess(marker_guard, first_common_git)
                 self.assertLess(first_common_git, common_guard)
                 self.assertIn("Git metadata is group/world writable", source)
+                self.assertIn('find "$git_marker" -xdev -type l -print -quit', source)
+                self.assertLess(
+                    source.index('find "$git_marker" -xdev -type l -print -quit'),
+                    first_common_git,
+                )
+                self.assertIn('find "$git_common_dir" -xdev -type l -print -quit', source)
+                self.assertLess(
+                    source.index('Git common metadata contains a symlink'),
+                    source.index('ls-remote'),
+                )
+
 
                 # Invoke the real, shipped predicate without filesystem writes.
                 # /etc has a root-owned path chain; /tmp is root-owned sticky,
@@ -1107,6 +1119,38 @@ prune_releases
                         result.returncode == 0, allowed,
                         f"{script_name}:{directory}: {result.stderr}",
                     )
+
+    def test_root_git_metadata_config_symlink_is_rejected_before_git(self) -> None:
+        for script_name in (
+            "scripts/ops/install-production-reconciler.sh",
+            "scripts/ops/reconcile-production-main-vps.sh",
+            "scripts/ops/deploy-exact-commit-vps.sh",
+        ):
+            with self.subTest(script=script_name):
+                source = self.read(script_name)
+                start = source.index('if [[ -d "$git_marker" ]]; then')
+                end = source.index("\nfi", start) + 3
+                guard = source[start:end]
+                with tempfile.TemporaryDirectory() as temp:
+                    marker = Path(temp) / ".git"
+                    marker.mkdir()
+                    config = marker / "config"
+                    outside = Path(temp) / "untrusted-config"
+                    outside.write_text("[core]\n", encoding="utf-8")
+                    script = (
+                        "set -euo pipefail\n"
+                        'fail() { echo "REJECT:$*" >&2; exit 1; }\n'
+                        + "git_marker=" + shlex.quote(str(marker)) + "\n"
+                        + guard + "\n"
+                    )
+                    config.write_text("[core]\n", encoding="utf-8")
+                    ok = subprocess.run(["bash", "-c", script], check=False, capture_output=True, text=True)
+                    self.assertEqual(ok.returncode, 0, ok.stderr)
+                    config.unlink()
+                    config.symlink_to(outside)
+                    denied = subprocess.run(["bash", "-c", script], check=False, capture_output=True, text=True)
+                    self.assertNotEqual(denied.returncode, 0)
+                    self.assertIn("Git metadata contains a symlink", denied.stderr)
 
     def test_oci_grant_is_bound_before_all_root_side_effects(self) -> None:
         installer = self.read("scripts/ops/install-production-reconciler.sh")

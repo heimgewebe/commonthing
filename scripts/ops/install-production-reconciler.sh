@@ -97,6 +97,13 @@ git_marker_mode="$(stat --format=%a -- "$git_marker")" ||
 (((8#$git_marker_mode & 022) == 0)) ||
   fail "Git metadata is group/world writable: $git_marker"
 
+# Forbid metadata links before Git can read a redirected config as root.
+# A root-owned symlink itself says nothing about who can edit its target.
+if [[ -d "$git_marker" ]]; then
+  [[ -z "$(find "$git_marker" -xdev -type l -print -quit)" ]] ||
+    fail "Git metadata contains a symlink before privileged Git access"
+fi
+
 git_common_dir="$(git -C "$REPO_DIR" rev-parse --git-common-dir)"
 if [[ "$git_common_dir" != /* ]]; then
   git_common_dir="$REPO_DIR/$git_common_dir"
@@ -105,6 +112,10 @@ git_common_dir="$(realpath "$git_common_dir")"
 [[ -d "$git_common_dir" && ! -L "$git_common_dir" ]] || fail "Git object store is unsafe"
 [[ "$(stat --format=%u "$REPO_DIR")" == "0" ]] || fail "source checkout is not root-owned"
 require_root_trusted_git_directory_chain "$git_common_dir" "Git common directory"
+# Linked worktrees can store Git metadata outside the .git marker.
+# Deny symlinks in the resolved common directory before remote Git access.
+[[ -z "$(find "$git_common_dir" -xdev -type l -print -quit)" ]] ||
+  fail "Git common metadata contains a symlink"
 unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
 [[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
 # A root-owned alternates pointer may reference an attacker-writable external
