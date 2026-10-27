@@ -42,39 +42,14 @@ name: Basemap Runtime Proof
 #   - caddy-basemap-route-guard.sh (static Caddyfile structure check)
 
 "on":
-  pull_request:
-    branches: [main]
-    paths:
-      - "infra/caddy/**"
-      - "scripts/basemap/build-hamburg-pmtiles.sh"
-      - "scripts/basemap/build-schleswig-holstein-pmtiles.sh"
-      - "scripts/basemap/prepare-water-polygons.py"
-      - "scripts/basemap/test_prepare_water_polygons.py"
-      - "scripts/basemap/publish-basemap.sh"
-      - "scripts/guard/basemap-runtime-proof.sh"
-      - "apps/web/tests/proofs/**"
-      - "apps/web/tests/fixtures/**"
-      - "apps/web/package.json"
-      - "apps/web/pnpm-lock.yaml"
-      - "apps/web/basemap-mode.policy.json"
-      - "apps/web/scripts/basemap-mode-resolve.mjs"
-      - "apps/web/scripts/generate-basemap-config.js"
-      - "apps/web/src/**"
-      - "apps/web/scripts/validate-pmtiles.mjs"
-      - "apps/web/scripts/validate-pmtiles.test.mjs"
-      - "apps/web/playwright.proof.config.ts"
-      - "apps/web/playwright.config.ts"
-      - "apps/web/vite.config.ts"
-      - "map-style/**"
-      - ".github/workflows/basemap-runtime-proof.yml"
+  workflow_call: {}
   push:
     branches: [main]
     paths:
       - "infra/caddy/**"
       - "scripts/basemap/build-hamburg-pmtiles.sh"
       - "scripts/basemap/build-schleswig-holstein-pmtiles.sh"
-      - "scripts/basemap/prepare-water-polygons.py"
-      - "scripts/basemap/test_prepare_water_polygons.py"
+      - "scripts/basemap/**"
       - "scripts/basemap/publish-basemap.sh"
       - "scripts/guard/basemap-runtime-proof.sh"
       - "apps/web/tests/proofs/**"
@@ -84,12 +59,31 @@ name: Basemap Runtime Proof
       - "apps/web/basemap-mode.policy.json"
       - "apps/web/scripts/basemap-mode-resolve.mjs"
       - "apps/web/scripts/generate-basemap-config.js"
-      - "apps/web/src/**"
+      # Map runtime can import transitive dependencies from the shared library.
+      - "apps/web/src/lib/**"
+      - "apps/web/src/lib/map/**"
+      - "apps/web/src/lib/maplibre/**"
+      - "apps/web/src/lib/components/map/**"
+      - "apps/web/src/app.html"
+      - "apps/web/src/hooks.*"
+      - "apps/web/src/hooks.client.ts"
+      - "apps/web/src/lib/utils/inert-polyfill.ts"
+      - "apps/web/src/lib/utils/preloadRecovery.ts"
+      - "apps/web/src/lib/utils/ua-flags.ts"
+      - "apps/web/static/**"
+      - "apps/web/static/theme-init.js"
+      - "apps/web/src/service-worker.*"
+      - "apps/web/src/app.css"
+      - "apps/web/src/lib/styles/tokens.css"
+      # Avoid an unescaped + quantifier in GitHub push.paths matching.
+      - "apps/web/src/routes/*layout*"
+      - "apps/web/src/routes/map/**"
       - "apps/web/scripts/validate-pmtiles.mjs"
       - "apps/web/scripts/validate-pmtiles.test.mjs"
       - "apps/web/playwright.proof.config.ts"
       - "apps/web/playwright.config.ts"
       - "apps/web/vite.config.ts"
+      - "apps/web/svelte.config.*"
       - "map-style/**"
       - ".github/workflows/basemap-runtime-proof.yml"
   workflow_dispatch: {}
@@ -101,7 +95,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A workflow_call inherits github.workflow from CI; use a distinct group so
+  # its proofs cannot cancel their caller or the standalone main-push workflow.
+  group: basemap-regional-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -844,3 +840,23 @@ jobs:
           if not all_proven:
               raise SystemExit(1)
           PY
+  required-basemap-proofs:
+    name: Required regional basemap evidence
+    if: ${{ always() }}
+    needs:
+      - basemap-pmtiles-content-proof
+      - basemap-schleswig-holstein-content-proof
+      - basemap-visual-proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Fail closed on any missing, skipped or failed regional proof
+        run: |
+          set -euo pipefail
+          for result in \
+            "hamburg=${{ needs.basemap-pmtiles-content-proof.result }}" \
+            "schleswig-holstein=${{ needs.basemap-schleswig-holstein-content-proof.result }}" \
+            "visual=${{ needs.basemap-visual-proof.result }}"; do
+            printf '%s\n' "${result}"
+            [[ "${result}" == *=success ]] || exit 1
+          done
