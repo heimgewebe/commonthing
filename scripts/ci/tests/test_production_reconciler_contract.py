@@ -1084,7 +1084,15 @@ prune_releases
                 # but must never itself be an effective writable checkout.
                 end = source.index("\n}", definition) + 2
                 function = source[definition:end]
-                for directory, allowed in (("/etc", True), ("/tmp", False)):
+                # Rootless reviewer sandboxes can map host UID 0 to overflow
+                # UID 65534. Expect rejection there rather than inventing a
+                # trusted root directory, while keeping the static guards.
+                trusted_etc = all(
+                    os.stat(candidate).st_uid == 0
+                    and not (os.stat(candidate).st_mode & 0o022)
+                    for candidate in ("/", "/etc")
+                ) and not Path("/etc").is_symlink()
+                for directory, allowed in (("/etc", trusted_etc), ("/tmp", False)):
                     command = (
                         "set -euo pipefail\n"
                         'fail() { echo "REJECT:$*" >&2; exit 1; }\n'
