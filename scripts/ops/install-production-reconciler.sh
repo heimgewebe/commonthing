@@ -56,6 +56,47 @@ done
 getent passwd "$BUILD_USER" > /dev/null || fail "build user does not exist: $BUILD_USER"
 [[ -d "$REPO_DIR" && ! -L "$REPO_DIR" ]] || fail "source checkout is missing or unsafe: $REPO_DIR"
 
+# A root-owned checkout can still be replaced through a writable ancestor.
+# Reject replaceable Git metadata before privileged Git invocations.
+require_root_trusted_git_directory_chain() {
+  local target="${1%/}" label="$2" path mode uid
+  [[ -n "$target" ]] || target="/"
+  [[ "$target" == /* ]] || fail "$label must be absolute"
+  [[ "$(realpath -e -- "$target")" == "$target" ]] ||
+    fail "$label must be canonical and symlink-free: $target"
+  path="$target"
+  while :; do
+    [[ -d "$path" && ! -L "$path" ]] ||
+      fail "$label contains an unsafe directory: $path"
+    uid="$(stat --format=%u -- "$path")" ||
+      fail "$label ownership cannot be inspected: $path"
+    [[ "$uid" == "0" ]] ||
+      fail "$label includes a non-root-owned directory: $path"
+    mode="$(stat --format=%a -- "$path")" ||
+      fail "$label mode cannot be inspected: $path"
+    if (((8#$mode & 022) != 0)); then
+      # Root-owned sticky parents protect root-owned entries; never allow
+      # a writable checkout or common directory as the trust target itself.
+      if [[ "$path" == "$target" ]] || (((8#$mode & 01000) == 0)); then
+        fail "$label includes a replaceable directory: $path"
+      fi
+    fi
+    [[ "$path" == "/" ]] && break
+    path="${path%/*}"
+    [[ -n "$path" ]] || path="/"
+  done
+}
+require_root_trusted_git_directory_chain "$REPO_DIR" "source checkout"
+git_marker="$REPO_DIR/.git"
+[[ (-f "$git_marker" || -d "$git_marker") && ! -L "$git_marker" ]] ||
+  fail "Git metadata marker is missing or symlinked: $git_marker"
+[[ "$(stat --format=%u -- "$git_marker")" == "0" ]] ||
+  fail "Git metadata marker is not root-owned: $git_marker"
+git_marker_mode="$(stat --format=%a -- "$git_marker")" ||
+  fail "Git metadata marker mode cannot be inspected"
+(((8#$git_marker_mode & 022) == 0)) ||
+  fail "Git metadata is group/world writable: $git_marker"
+
 git_common_dir="$(git -C "$REPO_DIR" rev-parse --git-common-dir)"
 if [[ "$git_common_dir" != /* ]]; then
   git_common_dir="$REPO_DIR/$git_common_dir"
@@ -63,6 +104,7 @@ fi
 git_common_dir="$(realpath "$git_common_dir")"
 [[ -d "$git_common_dir" && ! -L "$git_common_dir" ]] || fail "Git object store is unsafe"
 [[ "$(stat --format=%u "$REPO_DIR")" == "0" ]] || fail "source checkout is not root-owned"
+require_root_trusted_git_directory_chain "$git_common_dir" "Git common directory"
 unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
 [[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
 # A root-owned alternates pointer may reference an attacker-writable external

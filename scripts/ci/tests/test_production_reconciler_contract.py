@@ -1054,6 +1054,52 @@ prune_releases
         self.assertIn("Git alternate object stores are forbidden", checker)
         self.assertIn("os.walk(", checker)
 
+    def test_root_git_checkout_path_and_metadata_are_trusted_before_git(self) -> None:
+        for script_name, variable in (
+            ("scripts/ops/install-production-reconciler.sh", "$REPO_DIR"),
+            ("scripts/ops/reconcile-production-main-vps.sh", "$SOURCE_CHECKOUT"),
+            ("scripts/ops/deploy-exact-commit-vps.sh", "$SOURCE_CHECKOUT"),
+        ):
+            with self.subTest(script=script_name):
+                source = self.read(script_name)
+                definition = source.index("require_root_trusted_git_directory_chain() {")
+                checkout_guard = source.index(
+                    f'require_root_trusted_git_directory_chain "{variable}" "source checkout"'
+                )
+                marker_guard = source.index(f'git_marker="{variable}/.git"')
+                first_common_git = source.index(
+                    f'git -C "{variable}" rev-parse --git-common-dir'
+                )
+                common_guard = source.index(
+                    'require_root_trusted_git_directory_chain "$git_common_dir" "Git common directory"'
+                )
+                self.assertLess(definition, checkout_guard)
+                self.assertLess(checkout_guard, marker_guard)
+                self.assertLess(marker_guard, first_common_git)
+                self.assertLess(first_common_git, common_guard)
+                self.assertIn("Git metadata is group/world writable", source)
+
+                # Invoke the real, shipped predicate without filesystem writes.
+                # /etc has a root-owned path chain; /tmp is root-owned sticky,
+                # but must never itself be an effective writable checkout.
+                end = source.index("\n}", definition) + 2
+                function = source[definition:end]
+                for directory, allowed in (("/etc", True), ("/tmp", False)):
+                    command = (
+                        "set -euo pipefail\n"
+                        'fail() { echo "REJECT:$*" >&2; exit 1; }\n'
+                        + function + "\n"
+                        + f'require_root_trusted_git_directory_chain "{directory}" "source checkout"\n'
+                    )
+                    result = subprocess.run(
+                        ["bash", "-c", command], check=False,
+                        text=True, capture_output=True,
+                    )
+                    self.assertEqual(
+                        result.returncode == 0, allowed,
+                        f"{script_name}:{directory}: {result.stderr}",
+                    )
+
     def test_oci_grant_is_bound_before_all_root_side_effects(self) -> None:
         installer = self.read("scripts/ops/install-production-reconciler.sh")
         activator = self.read("scripts/ops/activate-production-reconciler-from-release.sh")
