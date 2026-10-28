@@ -537,6 +537,26 @@ weekly_run
   echo "weekly restore selected an older local dump after clock rollback" >&2
   exit 1
 }
+# A previously fast producer clock can leave a completed historical dump
+# dated in the future after a correction. A newer publication sequence must
+# remain selectable, while the winning backup still must not be future-dated.
+future_audit="$(date -u -d '+2 hours' +%Y-%m-%dT%H:%M:%SZ)"
+current_audit="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+weekly_manifest "$daily_base" "$future_audit" 1
+weekly_manifest "$manual_base" "$current_audit" 2
+weekly_run
+[[ "$(cat "$weekly_selected")" == "$manual_base.sql.gz" ]] || {
+  echo "weekly restore rejected newer sequence due to old future timestamp" >&2
+  exit 1
+}
+weekly_manifest "$manual_base" "$future_audit" 2
+if weekly_run > /dev/null 2> "$weekly_dir/error"; then
+  echo "weekly restore accepted future-dated winning publication" >&2
+  exit 1
+fi
+grep -q 'backup manifest created_at is in the future' "$weekly_dir/error"
+weekly_manifest "$daily_base" 2026-08-01T04:00:00Z 1
+weekly_manifest "$manual_base" 2026-07-31T04:00:00Z 2
 weekly_manifest "$daily_base" 2026-08-01T04:00:00Z 2
 if weekly_run > /dev/null 2> "$weekly_dir/error"; then
   echo "weekly restore accepted duplicate local publication sequence" >&2

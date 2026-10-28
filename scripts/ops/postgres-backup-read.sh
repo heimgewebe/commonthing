@@ -72,8 +72,9 @@ case "$operation" in
     latest_created_at=""
     latest_sequence=""
     declare -A seen_sequences=()
-    # Invalid producer timestamps must still fail closed, even if a sequence
-    # is present. They remain audit timestamps, not publication authority.
+    # Validate UTC syntax for every candidate. A corrected fast producer clock
+    # can leave older sequenced audit timestamps ahead of current wall time;
+    # only the selected newest backup needs to pass the future-time bound.
     max_created_at="$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)" ||
       fail "cannot read current UTC"
     while IFS= read -r candidate; do
@@ -91,8 +92,6 @@ case "$operation" in
         fail "encrypted backup manifest created_at is invalid UTC"
       [[ "$normalized" == "$created_at" ]] ||
         fail "encrypted backup manifest created_at is not canonical UTC"
-      [[ "$created_at" > "$max_created_at" ]] &&
-        fail "encrypted backup manifest created_at is in the future"
       sequence_record="$(
         read_regular_file "$BACKUP_DIR/$candidate" |
           awk -F= '$1 == "publication_sequence" { count++; seq=$2 }
@@ -121,6 +120,11 @@ case "$operation" in
         fi
       fi
     done <<< "$candidates"
+    # Newest is selected by durable sequence (or by UTC for legacy-only sets).
+    # Historical future-dated markers must not wedge all later recovery.
+    if [[ -n "$latest_name" && "$latest_created_at" > "$max_created_at" ]]; then
+      fail "encrypted backup manifest created_at is in the future"
+    fi
     [[ -z "$latest_name" ]] || printf '%s\n' "$latest_name"
     ;;
   read)

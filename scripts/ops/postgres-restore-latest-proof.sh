@@ -54,9 +54,6 @@ while IFS= read -r candidate; do
     fail "backup manifest created_at is invalid UTC"
   [[ "$created_at" == "$normalized" ]] ||
     fail "backup manifest created_at is not canonical UTC"
-  if [[ "$created_at" > "$max_created_at" ]]; then
-    fail "backup manifest created_at is in the future"
-  fi
   [[ -f "$BACKUP_DIR/$base.sql.gz" && ! -L "$BACKUP_DIR/$base.sql.gz" ]] ||
     fail "incomplete backup pair: $base"
   # Local completion markers also carry a monotonic publication order.
@@ -92,6 +89,12 @@ while IFS= read -r candidate; do
   fi
 done <<< "$candidates"
 [[ -n "$latest_base" ]] || fail "no complete backup files found in $BACKUP_DIR"
+# Canonical UTC is checked on every candidate; only the chosen latest backup
+# may be rejected for future wall time. Historical fast-clock stamps can
+# remain after correction without blocking a newer publication sequence.
+if [[ "$latest_created_at" > "$max_created_at" ]]; then
+  fail "backup manifest created_at is in the future"
+fi
 latest="$BACKUP_DIR/$latest_base.sql.gz"
 container="weltgewebe-restore-proof-$(date -u +%Y%m%d%H%M%S)-$$"
 cleanup() { docker rm -f "$container" > /dev/null 2>&1 || true; }

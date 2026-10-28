@@ -1382,6 +1382,29 @@ printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-31T03:00:
   echo 'root reader selected older age ciphertext after producer clock rollback' >&2
   exit 1
 }
+# A historical sequenced backup can have a future audit timestamp after
+# the producer's previously fast clock is corrected backwards. Selection must
+# use the newer publication sequence, not reject every older future timestamp.
+future_audit="$(date -u -d '+2 hours' +%Y-%m-%dT%H:%M:%SZ)"
+current_audit="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=%s\npublication_sequence=1\n' \
+  "$future_audit" > "$rdir/$rbase.age.sha256.manifest"
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=%s\npublication_sequence=2\n' \
+  "$current_audit" > "$rdir/$manual_base.age.sha256.manifest"
+[[ "$("$rreader" latest weltgewebe-postgres)" == "$manual_base.age.sha256.manifest" ]] || {
+  echo 'root reader rejected current sequenced backup due to older future timestamp' >&2
+  exit 1
+}
+# Reject a future timestamp if it belongs to the selected newest backup.
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=%s\npublication_sequence=2\n' \
+  "$future_audit" > "$rdir/$manual_base.age.sha256.manifest"
+expect_reader_failure 'encrypted backup manifest created_at is in the future' latest weltgewebe-postgres
+# Restore fixtures for duplicate-sequence and legacy tests below.
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-08-01T04:00:00Z\npublication_sequence=1\n' \
+  > "$rdir/$rbase.age.sha256.manifest"
+printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-31T03:00:00Z\npublication_sequence=2\n' \
+  > "$rdir/$manual_base.age.sha256.manifest"
+
 # Repeated sequence IDs are ambiguous even when the collision is not largest.
 collision_base=weltgewebe-postgres-collision
 printf 'contract=weltgewebe-postgres-backup-age-v1\ncreated_at=2026-07-30T03:00:00Z\npublication_sequence=1\n' \
