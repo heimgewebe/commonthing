@@ -117,6 +117,34 @@ class GitFixtureIsolationTests(unittest.TestCase):
             check=False,
         )
 
+    def test_timer_status_shim_is_rootless_and_strict(self) -> None:
+        # This helper is test-only. Run the fixture under a normal user, even
+        # when root-only integration cases cannot execute without sudo.
+        with tempfile.TemporaryDirectory(prefix="timer-status-fixture-") as tmp:
+            fixture = object.__new__(DeployExactCommitIntegrationTests)
+            fixture.bin = Path(tmp)
+            for enabled in (True, False):
+                with self.subTest(enabled=enabled):
+                    shim = fixture._stub_reconciler_timer(enabled=enabled)
+                    try:
+                        for args, expected in (
+                            (["is-enabled", "--quiet", "weltgewebe-production-reconcile.timer"], 0 if enabled else 1),
+                            (["is-active", "--quiet", "weltgewebe-production-reconcile.timer"], 0 if enabled else 1),
+                            (["is-active", "--quiet", "unrelated.service"], 94),
+                        ):
+                            with self.subTest(argv=args):
+                                observed = subprocess.run(
+                                    [str(shim), *args],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=5,
+                                    check=False,
+                                )
+                                self.assertEqual(observed.returncode, expected, observed.stderr)
+                    finally:
+                        shim.unlink()
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
     def test_docker_shim_expands_schauwerk_drift_controls(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             case = object.__new__(DeployExactCommitIntegrationTests)
@@ -272,6 +300,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         (self.source / "build/basemap/basemap-germany.meta.json").symlink_to(germany_meta.name)
 
         self.make_artifact()
+        self.make_hold_test_fixture()
         self.make_command_shims()
 
         run(
@@ -298,6 +327,13 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                 ]
             )
         )
+
+        # Model the production trust boundary: an unprivileged test runner
+        # may write sibling artifacts but must not replace this root-owned
+        # source checkout. The root-owned sticky parent protects the existing
+        # child while allowing the test runner group to manage its own files.
+        run(self.privileged(["chown", f"root:{os.getgid()}", str(self.root)]))
+        run(self.privileged(["chmod", "1770", str(self.root)]))
 
     def restore_test_ownership(self) -> None:
         if not self.root.exists():
@@ -399,6 +435,73 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
             )
             staged_artifact.unlink()
         self.artifact_sha = staged_artifact_sha
+
+    def make_hold_test_fixture(self) -> None:
+        """Run copied production scripts against a separate root-owned test grant.
+
+        Only the temporary script copies bind the test checker; no environment
+        override or writable authorizer is introduced in production entrypoints.
+        """
+        self.test_ops = self.root / "test-ops"
+        self.test_ops.mkdir(mode=0o755)
+        self.test_deploy_script = self.test_ops / DEPLOY_SCRIPT.name
+        self.test_reconcile_script = self.test_ops / RECONCILE_SCRIPT.name
+        self.test_hold_checker = self.test_ops / "verify_production_hold_release.py"
+        self.hold_etc = self.root / "hold-etc"
+        self.hold_file = self.hold_etc / "weltgewebe" / "production-hold-release.json"
+        self.hold_data = {
+            "schema_version": 1,
+            "kind": "weltgewebe.production-hold-release.v1",
+            "environment": "production",
+            "decision": "release",
+            "commit": self.commit,
+            "schaubild_image_digest": "sha256:" + "d" * 64,
+            "offhost_age_recovery_sha256": "1" * 64,
+            "restic_authority_sha256": "2" * 64,
+            "privacy_acceptance_sha256": "3" * 64,
+            "alarm_delivery_sha256": "4" * 64,
+            "human_acknowledgement_sha256": "5" * 64,
+            "approved_at": "2026-10-24T07:00:00+00:00",
+            "authorized_by": "operator:isolated-test-fixture",
+        }
+        run(self.privileged([
+            "install", "-d", "-o", "root", "-g", "root", "-m", "0700",
+            str(self.hold_etc), str(self.hold_file.parent),
+        ]))
+        self.install_root_json(self.hold_file, self.hold_data)
+        checker_source = (ROOT / "scripts/ops/verify_production_hold_release.py").read_text(
+            encoding="utf-8"
+        )
+        original_root = 'root: Path = Path("/etc"), *, expected_uid: int = 0,'
+        if checker_source.count(original_root) != 1:
+            raise AssertionError("test HOLD checker source changed unexpectedly")
+        checker_source = checker_source.replace(
+            original_root,
+            f"root: Path = Path({str(self.hold_etc)!r}), *, expected_uid: int = 0,",
+            1,
+        )
+        self.test_hold_checker.write_text(checker_source, encoding="utf-8")
+        self.test_hold_checker.chmod(0o755)
+
+        assignment = 'AUTHORIZER="/usr/local/libexec/weltgewebe-verify-production-hold-release"'
+        for source, target in (
+            (DEPLOY_SCRIPT, self.test_deploy_script),
+            (RECONCILE_SCRIPT, self.test_reconcile_script),
+        ):
+            content = source.read_text(encoding="utf-8")
+            if content.count(assignment) != 1:
+                raise AssertionError(f"production HOLD assignment changed: {source.name}")
+            target.write_text(
+                content.replace(assignment, f'AUTHORIZER="{self.test_hold_checker}"', 1),
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+        shutil.copy2(
+            ROOT / "scripts/ops/weltgewebe_secure_receipt_io.py",
+            self.test_ops / "weltgewebe_secure_receipt_io.py",
+        )
+        run(self.privileged(["chown", "-R", "root:root", str(self.test_ops)]))
+        run(self.privileged(["chmod", "go-w", str(self.test_ops)]))
 
     def make_command_shims(self) -> None:
         docker = self.bin / "docker"
@@ -920,7 +1023,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         command = [
             "env",
             *[f"{key}={value}" for key, value in deploy_env.items()],
-            str(DEPLOY_SCRIPT),
+            str(self.test_deploy_script),
             "--commit",
             self.commit,
             "--web-artifact",
@@ -955,7 +1058,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                 "WELTGEWEBE_PRODUCTION_LOCK_OWNER_ENTRYPOINT": "reconciler",
                 "WELTGEWEBE_DEPLOY_INVOCATION_ID": "a" * 64,
                 "TEST_INHERITED_LOCK_TARGET": str(lock_target),
-                "TEST_DEPLOY_SCRIPT": str(DEPLOY_SCRIPT),
+                "TEST_DEPLOY_SCRIPT": str(self.test_deploy_script),
             }
         )
         if environment_overrides:
@@ -1033,7 +1136,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
             [
                 "env",
                 *[f"{key}={value}" for key, value in reconcile_env.items()],
-                str(RECONCILE_SCRIPT),
+                str(self.test_reconcile_script),
             ]
         )
         return run(argv, check=False)
@@ -1043,7 +1146,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         *,
         advance_after_migration: bool = False,
         advance_during_deploy: bool = False,
-        deploy_helper: Path = DEPLOY_SCRIPT,
+        deploy_helper: Path | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         reconcile_env = self.base_environment()
@@ -1051,7 +1154,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
             {
                 "WELTGEWEBE_BUILD_USER": "root",
                 "WELTGEWEBE_LIVE_VERIFIER": str(self.bin / "verify-public"),
-                "WELTGEWEBE_DEPLOY_HELPER": str(deploy_helper),
+                "WELTGEWEBE_DEPLOY_HELPER": str(deploy_helper or self.test_deploy_script),
                 "WELTGEWEBE_MIN_FREE_KIB": "1",
                 "PUBLIC_COMMIT": "0" * 40,
                 "TEST_DEPLOY_MARKER": str(self.root / "deploy-complete"),
@@ -1067,16 +1170,42 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
             [
                 "env",
                 *[f"{key}={value}" for key, value in reconcile_env.items()],
-                str(RECONCILE_SCRIPT),
+                str(self.test_reconcile_script),
             ]
         )
         return run(argv, check=False)
+
+    def test_hold_blocks_missing_wrong_commit_and_oci_before_deploy_effects(self) -> None:
+        for case in ("missing", "wrong_commit", "wrong_digest"):
+            with self.subTest(case=case):
+                if case == "missing":
+                    run(self.privileged(["rm", "--", str(self.hold_file)]))
+                else:
+                    blocked = dict(self.hold_data)
+                    if case == "wrong_commit":
+                        blocked["commit"] = "0" * 40
+                    else:
+                        blocked["schaubild_image_digest"] = "sha256:" + "e" * 64
+                        self.assertNotEqual(
+                            blocked["schaubild_image_digest"],
+                            self.hold_data["schaubild_image_digest"],
+                        )
+                    self.install_root_json(self.hold_file, blocked)
+                result = self.reconcile_stale_public_commit(
+                    deploy_helper=self.test_deploy_script
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("production_hold_release=blocked:", result.stderr)
+                if case == "wrong_digest":
+                    self.assertIn("Schaubild OCI digest differs", result.stderr)
+                self.assertFalse((self.root / "weltgewebe-up.log").exists())
+                self.assertFalse((self.root / "deploy-complete").exists())
 
     def test_reconciler_repairs_same_commit_regional_public_bundle(self) -> None:
         marker = self.root / "deploy-complete"
         result = self.reconcile_existing_public_commit(
             extra_env={
-                "WELTGEWEBE_DEPLOY_HELPER": str(DEPLOY_SCRIPT),
+                "WELTGEWEBE_DEPLOY_HELPER": str(self.test_deploy_script),
                 "PUBLIC_COMMIT": self.commit,
                 "TEST_PUBLIC_BASEMAP_VARIANT": "regional",
                 "TEST_DEPLOY_MARKER": str(marker),
@@ -1105,7 +1234,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         marker = self.root / "deploy-complete"
         result = self.reconcile_existing_public_commit(
             extra_env={
-                "WELTGEWEBE_DEPLOY_HELPER": str(DEPLOY_SCRIPT),
+                "WELTGEWEBE_DEPLOY_HELPER": str(self.test_deploy_script),
                 "PUBLIC_COMMIT": self.commit,
                 "TEST_PUBLIC_SCHAUWERK_MANIFEST_BROKEN": "1",
                 "TEST_DEPLOY_MARKER": str(marker),
@@ -1122,7 +1251,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         marker = self.root / "deploy-complete"
         result = self.reconcile_existing_public_commit(
             extra_env={
-                "WELTGEWEBE_DEPLOY_HELPER": str(DEPLOY_SCRIPT),
+                "WELTGEWEBE_DEPLOY_HELPER": str(self.test_deploy_script),
                 "PUBLIC_COMMIT": self.commit,
                 "TEST_PUBLIC_SCHAUWERK_REVISION_BROKEN": "1",
                 "TEST_DEPLOY_MARKER": str(marker),
@@ -1471,7 +1600,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
     def test_reconciler_identifies_actual_inherited_lock_contention(self) -> None:
         result = self.reconcile_stale_public_commit(
             deploy_helper=self.bin / "lock-contention-deploy",
-            extra_env={"TEST_DEPLOY_SCRIPT": str(DEPLOY_SCRIPT)},
+            extra_env={"TEST_DEPLOY_SCRIPT": str(self.test_deploy_script)},
         )
         self.restore_test_ownership()
         self.assertNotEqual(result.returncode, 0)
@@ -1575,7 +1704,7 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
             [
                 "env",
                 *[f"{key}={value}" for key, value in reconcile_env.items()],
-                str(RECONCILE_SCRIPT),
+                str(self.test_reconcile_script),
             ]
         )
         process = subprocess.Popen(
@@ -1613,14 +1742,39 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stderr)
         return stdout, stderr
 
+    def _stub_reconciler_timer(self, *, enabled: bool) -> Path:
+        # Only this integration fixture owns the fake systemd command. This
+        # proves the scheduled-duplicate branch without changing production.
+        stub = self.bin / "systemctl"
+        if stub.exists() or stub.is_symlink():
+            raise AssertionError("systemctl fixture already exists")
+        ok = "0" if enabled else "1"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'case "$*" in\n'
+            '  "is-enabled --quiet weltgewebe-production-reconcile.timer" | '
+            '"is-active --quiet weltgewebe-production-reconcile.timer") '
+            f'exit {ok} ;;\n'
+            "  *) exit 94 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        return stub
+
     def test_timer_and_installer_reconcile_starts_share_one_owner(self) -> None:
-        owner, release = self.start_blocking_reconciler()
+        systemctl = self._stub_reconciler_timer(enabled=True)
         try:
-            contender = self.reconcile_existing_public_commit()
-            self.assertEqual(contender.returncode, 0, contender.stderr)
-            self.assertIn("production_reconcile=already_running", contender.stdout)
+            owner, release = self.start_blocking_reconciler()
+            try:
+                contender = self.reconcile_existing_public_commit()
+                self.assertEqual(contender.returncode, 0, contender.stderr)
+                self.assertIn("production_reconcile=already_running", contender.stdout)
+            finally:
+                self.finish_blocking_reconciler(owner, release)
         finally:
-            self.finish_blocking_reconciler(owner, release)
+            systemctl.unlink()
         self.restore_test_ownership()
         receipt = json.loads(
             (self.state / "reconcile-receipts" / "last-contention.json").read_text()
@@ -1629,6 +1783,27 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.assertEqual(receipt["entrypoint"], "reconciler")
         self.assertEqual(receipt["result"], "already_running")
         self.assertEqual(receipt["lock_domain"], "weltgewebe-production-deployment-v1")
+        self.assertFalse((self.root / "weltgewebe-up.log").exists())
+
+    def test_initial_reconciler_lock_contention_does_not_report_success(self) -> None:
+        systemctl = self._stub_reconciler_timer(enabled=False)
+        try:
+            owner, release = self.start_blocking_reconciler()
+            try:
+                contender = self.reconcile_existing_public_commit()
+                self.assertEqual(contender.returncode, 75, contender.stderr)
+                self.assertIn("initial reconciliation lock contention", contender.stderr)
+                self.assertNotIn("production_reconcile=already_running", contender.stdout)
+            finally:
+                self.finish_blocking_reconciler(owner, release)
+        finally:
+            systemctl.unlink()
+        self.restore_test_ownership()
+        receipt = json.loads(
+            (self.state / "reconcile-receipts" / "last-contention.json").read_text()
+        )
+        self.assertEqual(receipt["result"], "already_running")
+        self.assertEqual(receipt["entrypoint"], "reconciler")
         self.assertFalse((self.root / "weltgewebe-up.log").exists())
 
     def test_reconciler_owner_rejects_direct_helper_without_deploy_effects(

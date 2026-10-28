@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -896,6 +897,14 @@ prune_releases
             for expected in expected_fields:
                 self.assertIn(expected, entry)
 
+    def test_production_hold_verifier_is_registered_as_critical_guard(self) -> None:
+        registry = self.read("audit/impl-registry.yaml")
+        self.assertIn("id: impl.guard.production-hold-release", registry)
+        self.assertIn("path: scripts/ops/verify_production_hold_release.py", registry)
+        self.assertIn("docs/deploy/production-hold-first-start.md", registry)
+        self.assertIn("scripts/ci/tests/test_verify_production_hold_release.py", registry)
+        self.assertIn(".github/workflows/production-live-contract.yml", registry)
+
     def test_secure_receipt_helper_is_in_critical_impl_registry(self) -> None:
         registry = self.read("audit/impl-registry.yaml")
         self.assertIn("id: impl.guard.secure-receipt-io", registry)
@@ -932,6 +941,8 @@ prune_releases
         self.assertIn("TimeoutStartSec=7200", service)
         self.assertIn("NoNewPrivileges=true", service)
         self.assertIn("OnUnitInactiveSec=2min", timer)
+        self.assertIn("OnActiveSec=2min", timer)
+        self.assertNotIn("OnBootSec=", timer)
         self.assertNotIn("OnUnitActiveSec", timer)
         self.assertNotIn("Persistent=true", timer)
         self.assertIn(
@@ -939,6 +950,335 @@ prune_releases
             service,
         )
         self.assertIn("Unit=weltgewebe-production-reconcile.service", timer)
+
+    def test_activator_timer_mode_selection_is_fail_closed(self) -> None:
+        script_text = self.read(
+            "scripts/ops/activate-production-reconciler-from-release.sh"
+        )
+        start = script_text.index("select_reconciler_start_mode() {")
+        end = script_text.index("\n}\n", start) + 2
+        selector = script_text[start:end]
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "systemctl"
+            binary.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'case "$*" in\n'
+                '  *UnitFileState*) echo "$TEST_FILE_STATE" ;;\n'
+                '  *ActiveState*) echo "$TEST_ACTIVE_STATE" ;;\n'
+                "  *) exit 92 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o755)
+            probe_script = (
+                "set -euo pipefail\n"
+                'fail() { echo "$*" >&2; exit 1; }\n'
+                + selector
+                + "\nselect_reconciler_start_mode\n"
+            )
+            for file_state, active_state, expected in (
+                ("disabled", "inactive", "initial"),
+                ("enabled", "active", "deferred"),
+                ("disabled", "active", None),
+                ("enabled", "inactive", None),
+                ("masked", "inactive", None),
+                ("not-found", "inactive", None),
+            ):
+                with self.subTest(file_state=file_state, active_state=active_state):
+                    env = os.environ.copy()
+                    env["PATH"] = tmp + os.pathsep + env["PATH"]
+                    env["TEST_FILE_STATE"] = file_state
+                    env["TEST_ACTIVE_STATE"] = active_state
+                    actual = subprocess.run(
+                        ["bash", "-c", probe_script],
+                        check=False, env=env, text=True, capture_output=True,
+                    )
+                    if expected is None:
+                        self.assertNotEqual(actual.returncode, 0)
+                        self.assertIn("unsupported production timer state", actual.stderr)
+                    else:
+                        self.assertEqual(actual.returncode, 0, actual.stderr)
+                        self.assertEqual(actual.stdout.strip(), expected)
+
+    def test_reentrant_activation_requires_exact_handoff(self) -> None:
+        activator = self.read("scripts/ops/activate-production-reconciler-from-release.sh")
+        hold = activator.index('python3 -I "$authorization_checker" --commit "$COMMIT"')
+        start = activator.index('reconciler_service_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.service)"')
+        end = activator.index("\nfi\n", start) + 3
+        self.assertLess(hold, start)
+        self.assertLess(end, activator.index('install_mode="$(select_reconciler_start_mode)"'))
+        script = (
+            'set -euo pipefail\nfail() { echo "$*" >&2; exit 1; }\n'
+            'COMMIT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+            'release_dir_real="/isolated"\n'
+            + activator[start:end] + "\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "systemctl"
+            fake.write_text(
+                '#!/usr/bin/env bash\n'
+                'case "$*" in\n'
+                '  "show --property=ActiveState --value weltgewebe-production-reconcile.service") echo activating ;;\n'
+                '  *UnitFileState*) echo disabled ;;\n'
+                '  *ActiveState*) echo inactive ;;\n'
+                '  *) exit 91 ;;\n'
+                'esac\n'
+            )
+            fake.chmod(0o755)
+            valid = {
+                "WELTGEWEBE_PRODUCTION_LOCK_OWNER_ENTRYPOINT": "reconciler",
+                "WELTGEWEBE_PRODUCTION_LOCK_DOMAIN": "weltgewebe-production-deployment-v1",
+                "WELTGEWEBE_DEPLOY_INVOCATION_ID": "b" * 64,
+            }
+            for omitted in (None, *valid):
+                with self.subTest(omitted=omitted):
+                    env = {**os.environ, **valid, "PATH": tmp + os.pathsep + os.environ["PATH"]}
+                    if omitted:
+                        del env[omitted]
+                    result = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True)
+                    if omitted is None:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn("activation=already_running", result.stdout)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("requires exact inherited deployment handoff", result.stderr)
+
+    def test_production_git_object_store_rejects_alternates_and_symlinks(self) -> None:
+        for file in (
+            "scripts/ops/install-production-reconciler.sh",
+            "scripts/ops/reconcile-production-main-vps.sh",
+            "scripts/ops/deploy-exact-commit-vps.sh",
+        ):
+            with self.subTest(file=file):
+                source = self.read(file)
+                self.assertIn('objects/info/alternates', source)
+                self.assertIn('Git alternate object stores are not trusted', source)
+                self.assertIn('find "$git_common_dir/objects" -xdev -type l', source)
+                self.assertLess(
+                    source.index('Git alternate object stores are not trusted'),
+                    source.index('ls-remote'),
+                )
+        checker = self.read("scripts/ops/verify_production_hold_release.py")
+        self.assertIn("Git alternate object stores are forbidden", checker)
+        self.assertIn("os.walk(", checker)
+
+    def test_root_git_checkout_path_and_metadata_are_trusted_before_git(self) -> None:
+        for script_name, variable in (
+            ("scripts/ops/install-production-reconciler.sh", "$REPO_DIR"),
+            ("scripts/ops/reconcile-production-main-vps.sh", "$SOURCE_CHECKOUT"),
+            ("scripts/ops/deploy-exact-commit-vps.sh", "$SOURCE_CHECKOUT"),
+        ):
+            with self.subTest(script=script_name):
+                source = self.read(script_name)
+                definition = source.index("require_root_trusted_git_directory_chain() {")
+                checkout_guard = source.index(
+                    f'require_root_trusted_git_directory_chain "{variable}" "source checkout"'
+                )
+                marker_guard = source.index(f'git_marker="{variable}/.git"')
+                first_common_git = source.index(
+                    f'git -C "{variable}" rev-parse --git-common-dir'
+                )
+                common_guard = source.index(
+                    'require_root_trusted_git_directory_chain "$git_common_dir" "Git common directory"'
+                )
+                self.assertLess(definition, checkout_guard)
+                self.assertLess(checkout_guard, marker_guard)
+                self.assertLess(marker_guard, first_common_git)
+                self.assertLess(first_common_git, common_guard)
+                self.assertIn("Git metadata is group/world writable", source)
+                self.assertIn('find "$git_marker" -xdev -type l -print -quit', source)
+                self.assertLess(
+                    source.index('find "$git_marker" -xdev -type l -print -quit'),
+                    first_common_git,
+                )
+                self.assertIn('find "$git_common_dir" -xdev -type l -print -quit', source)
+                self.assertLess(
+                    source.index('Git common metadata contains a symlink'),
+                    source.index('ls-remote'),
+                )
+
+
+                # Invoke the real, shipped predicate without filesystem writes.
+                # /etc has a root-owned path chain; /tmp is root-owned sticky,
+                # but must never itself be an effective writable checkout.
+                end = source.index("\n}", definition) + 2
+                function = source[definition:end]
+                # Rootless reviewer sandboxes can map host UID 0 to overflow
+                # UID 65534. Expect rejection there rather than inventing a
+                # trusted root directory, while keeping the static guards.
+                trusted_etc = all(
+                    os.stat(candidate).st_uid == 0
+                    and not (os.stat(candidate).st_mode & 0o022)
+                    for candidate in ("/", "/etc")
+                ) and not Path("/etc").is_symlink()
+                for directory, allowed in (("/etc", trusted_etc), ("/tmp", False)):
+                    command = (
+                        "set -euo pipefail\n"
+                        'fail() { echo "REJECT:$*" >&2; exit 1; }\n'
+                        + function + "\n"
+                        + f'require_root_trusted_git_directory_chain "{directory}" "source checkout"\n'
+                    )
+                    result = subprocess.run(
+                        ["bash", "-c", command], check=False,
+                        text=True, capture_output=True,
+                    )
+                    self.assertEqual(
+                        result.returncode == 0, allowed,
+                        f"{script_name}:{directory}: {result.stderr}",
+                    )
+
+    def test_root_git_metadata_config_symlink_is_rejected_before_git(self) -> None:
+        for script_name in (
+            "scripts/ops/install-production-reconciler.sh",
+            "scripts/ops/reconcile-production-main-vps.sh",
+            "scripts/ops/deploy-exact-commit-vps.sh",
+        ):
+            with self.subTest(script=script_name):
+                source = self.read(script_name)
+                start = source.index('if [[ -d "$git_marker" ]]; then')
+                end = source.index("\nfi", start) + 3
+                guard = source[start:end]
+                with tempfile.TemporaryDirectory() as temp:
+                    marker = Path(temp) / ".git"
+                    marker.mkdir()
+                    config = marker / "config"
+                    outside = Path(temp) / "untrusted-config"
+                    outside.write_text("[core]\n", encoding="utf-8")
+                    script = (
+                        "set -euo pipefail\n"
+                        'fail() { echo "REJECT:$*" >&2; exit 1; }\n'
+                        + "git_marker=" + shlex.quote(str(marker)) + "\n"
+                        + guard + "\n"
+                    )
+                    config.write_text("[core]\n", encoding="utf-8")
+                    ok = subprocess.run(["bash", "-c", script], check=False, capture_output=True, text=True)
+                    self.assertEqual(ok.returncode, 0, ok.stderr)
+                    config.unlink()
+                    config.symlink_to(outside)
+                    denied = subprocess.run(["bash", "-c", script], check=False, capture_output=True, text=True)
+                    self.assertNotEqual(denied.returncode, 0)
+                    self.assertIn("Git metadata contains a symlink", denied.stderr)
+
+    def test_oci_grant_is_bound_before_all_root_side_effects(self) -> None:
+        installer = self.read("scripts/ops/install-production-reconciler.sh")
+        activator = self.read("scripts/ops/activate-production-reconciler-from-release.sh")
+        reconciler = self.read("scripts/ops/reconcile-production-main-vps.sh")
+        deploy = self.read("scripts/ops/deploy-exact-commit-vps.sh")
+
+        checked_installer = 'python3 -I "$authorization_checker" --commit "$COMMIT" \\\n  --source-repository "$REPO_DIR"'
+        checked_activator = 'python3 -I "$authorization_checker" --commit "$COMMIT" \\\n  --source-repository "$release_dir_real"'
+        checked_reconciler = 'python3 -I "$AUTHORIZER" --commit "$preflight_main" \\\n  --source-repository "$SOURCE_CHECKOUT"'
+        checked_deploy = 'python3 -I "$AUTHORIZER" --commit "$COMMIT" \\\n  --source-repository "$SOURCE_CHECKOUT"'
+        self.assertIn(checked_installer, installer)
+        self.assertLess(
+            installer.index(checked_installer), installer.index("systemctl disable --now"),
+        )
+        self.assertLess(
+            installer.index(checked_installer), installer.index('if ((PREFLIGHT_ONLY == 1)); then'),
+        )
+        self.assertIn(checked_activator, activator)
+        self.assertLess(
+            activator.index(checked_activator),
+            activator.index('python3 -I "$web_push_bootstrap"'),
+        )
+        self.assertIn(checked_reconciler, reconciler)
+        self.assertLess(
+            reconciler.index(checked_reconciler),
+            reconciler.index('install -d -o root -g root -m 0711 "$STATE_ROOT"'),
+        )
+        self.assertIn("--no-write-fetch-head", reconciler)
+        self.assertLess(
+            reconciler.index('python3 -I "$AUTHORIZER" --commit "$preflight_main"'),
+            reconciler.index("--no-write-fetch-head"),
+        )
+        self.assertLess(
+            reconciler.index("--no-write-fetch-head"), reconciler.index(checked_reconciler),
+        )
+        self.assertIn(checked_deploy, deploy)
+        # No externally configured Git transport may run as root until
+        # repository and Git common-dir provenance have been checked.
+        first_network_git = deploy.index('preflight_main="$(git -C "$SOURCE_CHECKOUT" ls-remote')
+        owner_check = deploy.index('[[ "$(stat --format=%u "$SOURCE_CHECKOUT")" == "0" ]]')
+        common_dir_guard = deploy.index('unsafe_git_path="$(find "$git_common_dir"')
+        self.assertLess(owner_check, first_network_git)
+        self.assertLess(common_dir_guard, first_network_git)
+        self.assertLess(
+            deploy.index(checked_deploy),
+            deploy.index('install -d -o root -g root -m 0711 "$STATE_ROOT"'),
+        )
+
+    def test_first_activation_holds_all_mutations_until_root_release(self) -> None:
+        installer = self.read("scripts/ops/install-production-reconciler.sh")
+        activator = self.read(
+            "scripts/ops/activate-production-reconciler-from-release.sh"
+        )
+        reconciler = self.read("scripts/ops/reconcile-production-main-vps.sh")
+        timer = self.read("infra/systemd/system/weltgewebe-production-reconcile.timer")
+
+        approval = 'python3 -I "$authorization_checker" --commit "$COMMIT"'
+        self.assertIn(approval, installer)
+        self.assertLess(
+            installer.index(approval),
+            installer.index('git -C "$REPO_DIR" ls-remote'),
+        )
+        self.assertLess(
+            installer.index(approval),
+            installer.index("systemctl disable --now"),
+        )
+        self.assertLess(
+            installer.index('if ((PREFLIGHT_ONLY == 1)); then'),
+            installer.index("staging=" + '"$(mktemp'),
+        )
+        self.assertLess(
+            installer.index("systemctl start weltgewebe-production-reconcile.service",
+                            installer.index("systemctl daemon-reload")),
+            installer.index(
+                "systemctl enable --now weltgewebe-production-reconcile.timer",
+                installer.index("systemctl start weltgewebe-production-reconcile.service",
+                                installer.index("systemctl daemon-reload")),
+            ),
+        )
+        self.assertLess(
+            activator.index('--preflight-only'),
+            activator.index('python3 -I "$web_push_bootstrap"'),
+        )
+        self.assertLess(
+            activator.index("production timer state changed before VAPID provisioning"),
+            activator.index('python3 -I "$web_push_bootstrap"'),
+        )
+        self.assertIn(
+            "initial installation requires disabled and inactive production reconcile timer",
+            installer,
+        )
+        self.assertLess(
+            activator.index('python3 -I "$authorization_checker" --commit "$COMMIT"'),
+            activator.index('--preflight-only'),
+        )
+        self.assertLess(
+            reconciler.index('python3 -I "$AUTHORIZER" --preflight'),
+            reconciler.index('install -d -o root -g root -m 0711 "$STATE_ROOT"'),
+        )
+        self.assertLess(
+            reconciler.index('python3 -I "$AUTHORIZER" --commit "$target_commit"'),
+            reconciler.index('write_state "observed"'),
+        )
+        self.assertIn('--image-digest "${expected_schauwerk_image_ref##*@}"', reconciler)
+        direct_deploy = self.read("scripts/ops/deploy-exact-commit-vps.sh")
+        self.assertLess(
+            direct_deploy.index('python3 -I "$AUTHORIZER" --commit "$COMMIT"'),
+            direct_deploy.index('install -d -o root -g root -m 0711 "$STATE_ROOT"'),
+        )
+        self.assertLess(
+            direct_deploy.index('production HOLD withdrawn immediately before database migration'),
+            direct_deploy.index("run_release_deploy migration"),
+        )
+        self.assertLess(
+            direct_deploy.index('production HOLD withdrawn before full deployment'),
+            direct_deploy.index("run_release_deploy full"),
+        )
+        self.assertIn("OnActiveSec=2min", timer)
+        self.assertNotIn("OnBootSec=", timer)
 
     def test_installer_is_exact_commit_bound_and_parameterizes_build_user(self) -> None:
         script = self.read("scripts/ops/install-production-reconciler.sh")
@@ -1031,6 +1371,7 @@ prune_releases
         self.assertIn("release directory is not a valid Git repository", activator)
         self.assertIn('release_head" == "$COMMIT', activator)
         self.assertIn("--defer-reconcile", activator)
+        self.assertIn("--preflight-only", activator)
         self.assertIn(
             'if [[ "$DEPLOY_TARGET" == "vps" && "$PLAN_ONLY" == "0" ]]; then',
             up,
@@ -1122,7 +1463,25 @@ prune_releases
             )
             activator.chmod(0o755)
 
+            # The release wrapper now queries systemd before running a
+            # trusted activator; this isolated fixture cannot use host systemd.
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            fake_systemctl = fake_bin / "systemctl"
+            fake_systemctl.write_text(
+                '#!/usr/bin/env bash\n'
+                'case "$*" in\n'
+                '  "show --property=UnitFileState --value weltgewebe-production-reconcile.timer") echo disabled ;;\n'
+                '  "show --property=ActiveState --value weltgewebe-production-reconcile.timer") echo inactive ;;\n'
+                '  "show --property=ActiveState --value weltgewebe-production-reconcile.service") echo inactive ;;\n'
+                '  *) exit 94 ;;\n'
+                'esac\n',
+                encoding="utf-8",
+            )
+            fake_systemctl.chmod(0o755)
+
             env = os.environ.copy()
+            env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
             env.update(
                 {
                     "DEPLOY_TARGET": "vps",
