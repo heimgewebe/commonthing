@@ -1,6 +1,7 @@
 """Executable branch and ordering checks for safe production timer upgrade."""
 from __future__ import annotations
 
+import fcntl
 import os
 import subprocess
 import tempfile
@@ -15,6 +16,44 @@ TIMER = "weltgewebe-production-reconcile.timer"
 
 
 class ProductionTimerUpgradeTests(unittest.TestCase):
+    def test_initial_root_production_lock_conflict(self) -> None:
+        src = INSTALLER.read_text(encoding="utf-8")
+        start = src.index("probe_initial_root_deploy_lock() {")
+        end = src.index("\n}\n", start) + len("\n}")
+        body = src[start:end]
+        shell = (
+            "set -Eeuo pipefail\n"
+            'fail() { echo "ERROR: $*" >&2; exit 1; }\n'
+            + body + '\nprobe_initial_root_deploy_lock "$LOCK_TEST_FILE"\n'
+            + "echo PROBE_PASSED\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "production-deployment.lock"
+            lock.touch(mode=0o600)
+            env = {**os.environ, "LOCK_TEST_FILE": str(lock)}
+            with lock.open("rb") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                denied = subprocess.run(["bash", "-c", shell], env=env,
+                                        text=True, capture_output=True, timeout=10)
+                self.assertNotEqual(denied.returncode, 0)
+                self.assertIn("another deployment holds the root production lock",
+                              denied.stderr)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            success = subprocess.run(["bash", "-c", shell], env=env,
+                                     text=True, capture_output=True, timeout=10)
+            self.assertEqual(success.returncode, 0, success.stderr)
+            self.assertIn("PROBE_PASSED", success.stdout)
+
+    def test_initial_root_lock_preflight_before_install(self) -> None:
+        src = INSTALLER.read_text(encoding="utf-8")
+        proof = src.index('probe_initial_root_deploy_lock "$production_lock"')
+        preflight = src.index("if ((PREFLIGHT_ONLY == 1)); then")
+        mutation = src.index("systemctl disable --now weltgewebe-production-reconcile.timer")
+        self.assertLess(proof, preflight)
+        self.assertLess(preflight, mutation)
+        self.assertIn('[[ -f "$production_lock" && ! -L "$production_lock" ]]', src)
+        self.assertIn('stat -c %u -- "$production_lock"', src)
+
     def test_deferred_update_quiesces_timer_before_install_and_restores_last(self) -> None:
         source = INSTALLER.read_text(encoding="utf-8")
         preflight_end = source.index("if ((PREFLIGHT_ONLY == 1)); then")

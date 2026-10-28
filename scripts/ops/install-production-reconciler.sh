@@ -176,6 +176,38 @@ if ((DEFER_RECONCILE != 1)) &&
   ((timer_was_enabled == 1 || timer_was_active == 1)); then
   fail "initial installation requires disabled and inactive production reconcile timer"
 fi
+# An external direct deploy helper may already hold this root production lock.
+# In that case the new oneshot reconciler would merely return "already_running"
+# with exit 0 and the initial timer would falsely become enabled.
+probe_initial_root_deploy_lock() {
+  local filename="$1" probe_fd
+  exec {probe_fd}< "$filename" || fail "initial production lock probe cannot open lock"
+  if ! flock -n "$probe_fd"; then
+    fail "first-start blocked: another deployment holds the root production lock"
+  fi
+  flock -u "$probe_fd" || fail "initial production lock probe cannot unlock"
+  exec {probe_fd}<&-
+}
+
+if ((DEFER_RECONCILE != 1)); then
+  production_state_root="${WELTGEWEBE_DEPLOY_STATE_ROOT:-/var/lib/weltgewebe-main-reconciler}"
+  production_lock="$production_state_root/production-deployment.lock"
+  if [[ -e "$production_lock" || -L "$production_lock" ]]; then
+    [[ -d "$production_state_root" && ! -L "$production_state_root" ]] ||
+      fail "initial production lock parent is unsafe"
+    [[ "$(stat -c %u -- "$production_state_root")" == "0" ]] ||
+      fail "initial production lock parent is not root-owned"
+    [[ -f "$production_lock" && ! -L "$production_lock" ]] ||
+      fail "initial production lock is unsafe"
+    [[ "$(stat -c %u -- "$production_lock")" == "0" ]] ||
+      fail "initial production lock is not root-owned"
+    lock_mode="$(stat -c %a -- "$production_lock")"
+    (((8#$lock_mode & 022) == 0)) ||
+      fail "initial production lock is group/world writable"
+    probe_initial_root_deploy_lock "$production_lock"
+  fi
+fi
+
 if ((PREFLIGHT_ONLY == 1)); then
   echo "production_reconciler_preflight=passed commit=$COMMIT"
   exit 0
