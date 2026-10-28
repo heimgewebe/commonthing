@@ -1714,14 +1714,39 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stderr)
         return stdout, stderr
 
+    def _stub_reconciler_timer(self, *, enabled: bool) -> Path:
+        # Only this integration fixture owns the fake systemd command. This
+        # proves the scheduled-duplicate branch without changing production.
+        stub = self.bin / "systemctl"
+        if stub.exists() or stub.is_symlink():
+            raise AssertionError("systemctl fixture already exists")
+        ok = "0" if enabled else "1"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'case "$*" in\n'
+            '  "is-enabled --quiet weltgewebe-production-reconcile.timer" | '
+            '"is-active --quiet weltgewebe-production-reconcile.timer") '
+            f'exit {ok} ;;\n'
+            "  *) exit 94 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        return stub
+
     def test_timer_and_installer_reconcile_starts_share_one_owner(self) -> None:
-        owner, release = self.start_blocking_reconciler()
+        systemctl = self._stub_reconciler_timer(enabled=True)
         try:
-            contender = self.reconcile_existing_public_commit()
-            self.assertEqual(contender.returncode, 0, contender.stderr)
-            self.assertIn("production_reconcile=already_running", contender.stdout)
+            owner, release = self.start_blocking_reconciler()
+            try:
+                contender = self.reconcile_existing_public_commit()
+                self.assertEqual(contender.returncode, 0, contender.stderr)
+                self.assertIn("production_reconcile=already_running", contender.stdout)
+            finally:
+                self.finish_blocking_reconciler(owner, release)
         finally:
-            self.finish_blocking_reconciler(owner, release)
+            systemctl.unlink()
         self.restore_test_ownership()
         receipt = json.loads(
             (self.state / "reconcile-receipts" / "last-contention.json").read_text()
@@ -1730,6 +1755,27 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         self.assertEqual(receipt["entrypoint"], "reconciler")
         self.assertEqual(receipt["result"], "already_running")
         self.assertEqual(receipt["lock_domain"], "weltgewebe-production-deployment-v1")
+        self.assertFalse((self.root / "weltgewebe-up.log").exists())
+
+    def test_initial_reconciler_lock_contention_does_not_report_success(self) -> None:
+        systemctl = self._stub_reconciler_timer(enabled=False)
+        try:
+            owner, release = self.start_blocking_reconciler()
+            try:
+                contender = self.reconcile_existing_public_commit()
+                self.assertEqual(contender.returncode, 75, contender.stderr)
+                self.assertIn("initial reconciliation lock contention", contender.stderr)
+                self.assertNotIn("production_reconcile=already_running", contender.stdout)
+            finally:
+                self.finish_blocking_reconciler(owner, release)
+        finally:
+            systemctl.unlink()
+        self.restore_test_ownership()
+        receipt = json.loads(
+            (self.state / "reconcile-receipts" / "last-contention.json").read_text()
+        )
+        self.assertEqual(receipt["result"], "already_running")
+        self.assertEqual(receipt["entrypoint"], "reconciler")
         self.assertFalse((self.root / "weltgewebe-up.log").exists())
 
     def test_reconciler_owner_rejects_direct_helper_without_deploy_effects(
