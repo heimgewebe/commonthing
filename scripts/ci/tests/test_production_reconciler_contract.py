@@ -1463,7 +1463,25 @@ prune_releases
             )
             activator.chmod(0o755)
 
+            # The release wrapper now queries systemd before running a
+            # trusted activator; this isolated fixture cannot use host systemd.
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            fake_systemctl = fake_bin / "systemctl"
+            fake_systemctl.write_text(
+                '#!/usr/bin/env bash\n'
+                'case "$*" in\n'
+                '  "show --property=UnitFileState --value weltgewebe-production-reconcile.timer") echo disabled ;;\n'
+                '  "show --property=ActiveState --value weltgewebe-production-reconcile.timer") echo inactive ;;\n'
+                '  "show --property=ActiveState --value weltgewebe-production-reconcile.service") echo inactive ;;\n'
+                '  *) exit 94 ;;\n'
+                'esac\n',
+                encoding="utf-8",
+            )
+            fake_systemctl.chmod(0o755)
+
             env = os.environ.copy()
+            env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
             env.update(
                 {
                     "DEPLOY_TARGET": "vps",
