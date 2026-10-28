@@ -16,6 +16,70 @@ TIMER = "weltgewebe-production-reconcile.timer"
 
 
 class ProductionTimerUpgradeTests(unittest.TestCase):
+    def _probe_reconciler_contention(
+        self, *, timer_enabled: bool, hold_lock: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        script = (ROOT / "scripts/ops/reconcile-production-main-vps.sh").read_text(
+            encoding="utf-8",
+        )
+        start = script.index("acquire_production_lock() {")
+        end = script.index("\n}\n", start) + len("\n}")
+        fn = script[start:end]
+        with tempfile.TemporaryDirectory(prefix="root-reconcile-contention-") as tmp:
+            file = Path(tmp) / "deployment.lock"
+            file.touch(mode=0o600)
+            command = (
+                "set -Eeuo pipefail\n"
+                'fail() { echo "ERROR: $*" >&2; exit 1; }\n'
+                "PRODUCTION_LOCK_FILE=$TEST_LOCK_FILE\n"
+                'PRODUCTION_LOCK_DOMAIN="weltgewebe-production-deployment-v1"\n'
+                "PRODUCTION_LOCK_FD=9\n"
+                "EX_TEMPFAIL=75\n"
+                "prepare_production_lock_file() { :; }\n"
+                "write_lock_contention_receipt() { printf 'contention-id\\n'; }\n"
+                "systemctl() {\n"
+                '  case "$*" in\n'
+                '    "is-enabled --quiet weltgewebe-production-reconcile.timer" | '
+                '"is-active --quiet weltgewebe-production-reconcile.timer") '
+                '[[ "$TIMER_ENABLED" == "1" ]] ;;\n'
+                "    *) return 82 ;;\n"
+                "  esac\n"
+                "}\n"
+                + fn + "\n"
+                "acquire_production_lock\n"
+                "printf 'LOCK_ACQUIRED\\n'\n"
+            )
+            env = {
+                **os.environ,
+                "TEST_LOCK_FILE": str(file),
+                "TIMER_ENABLED": "1" if timer_enabled else "0",
+            }
+            with file.open("rb") as handle:
+                if hold_lock:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                return subprocess.run(
+                    ["bash", "-c", command], env=env, text=True,
+                    capture_output=True, timeout=10,
+                )
+
+    def test_reconciler_initial_contention_exits_nonzero_without_timer(self) -> None:
+        failed = self._probe_reconciler_contention(timer_enabled=False)
+        self.assertEqual(failed.returncode, 75, failed.stderr)
+        self.assertIn("initial reconciliation lock contention", failed.stderr)
+        self.assertNotIn("LOCK_ACQUIRED", failed.stdout)
+
+    def test_reconciler_scheduled_duplicate_preserves_idempotent_success(self) -> None:
+        duplicate = self._probe_reconciler_contention(timer_enabled=True)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.assertIn("production_reconcile=already_running", duplicate.stdout)
+
+    def test_reconciler_with_free_lock_can_reconcile_initially(self) -> None:
+        free = self._probe_reconciler_contention(
+            timer_enabled=False, hold_lock=False,
+        )
+        self.assertEqual(free.returncode, 0, free.stderr)
+        self.assertIn("LOCK_ACQUIRED", free.stdout)
+
     def test_initial_root_production_lock_conflict(self) -> None:
         src = INSTALLER.read_text(encoding="utf-8")
         start = src.index("probe_initial_root_deploy_lock() {")

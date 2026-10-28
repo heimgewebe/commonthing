@@ -105,8 +105,16 @@ acquire_production_lock() {
   exec 9<> "$PRODUCTION_LOCK_FILE"
   if ! flock -n "$PRODUCTION_LOCK_FD"; then
     contention_receipt="$(write_lock_contention_receipt)"
-    echo "production_reconcile=already_running lock_domain=$PRODUCTION_LOCK_DOMAIN receipt=$contention_receipt"
-    exit 0
+    # Scheduled duplicate invocations may be harmless, but initial start
+    # must not treat a lock-contention receipt as completed reconciliation.
+    # The installer enables this timer only after the first service succeeded.
+    if systemctl is-enabled --quiet weltgewebe-production-reconcile.timer &&
+      systemctl is-active --quiet weltgewebe-production-reconcile.timer; then
+      echo "production_reconcile=already_running lock_domain=$PRODUCTION_LOCK_DOMAIN receipt=$contention_receipt"
+      exit 0
+    fi
+    echo "ERROR: initial reconciliation lock contention; no successful first-start receipt=$contention_receipt" >&2
+    exit "$EX_TEMPFAIL"
   fi
 }
 
