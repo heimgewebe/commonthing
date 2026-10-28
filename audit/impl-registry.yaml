@@ -329,11 +329,36 @@ implementations:
     impl_type: workflow
     status: active
     criticality: high
-    evidence_level: test
+    evidence_level: ci
     documented_by:
       - docs/runbooks/db-recovery.md
     verified_by:
       - scripts/tests/test_offhost_backup_pull_contract.sh
+      - .github/workflows/ci.yml
+
+  - id: impl.ops.postgres-backup-read
+    path: scripts/ops/postgres-backup-read.sh
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/runbooks/db-recovery.md
+    verified_by:
+      - scripts/tests/test_offhost_backup_pull_contract.sh
+      - .github/workflows/ci.yml
+
+  - id: impl.ops.postgres-restic-plaintext-gate
+    path: scripts/ops/restic-plaintext-gate.sh
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/runbooks/db-recovery.md
+    verified_by:
+      - scripts/tests/test_offhost_backup_pull_contract.sh
+      - .github/workflows/ci.yml
 
   - id: impl.ops.web-artifact-install
     path: scripts/ops/install-web-artifact.sh
