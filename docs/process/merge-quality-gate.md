@@ -42,14 +42,13 @@ Der Normalfall soll ohne manuelle Hasharbeit auskommen:
    Default-Branch-Pfad besitzt die nötige Statusberechtigung.
 3. **R2/R3 – Produktlogik oder sicherheitsrelevante Änderung:** Das automatisch
    erzeugte Reviewpaket verwenden und die vollständigen hashgebundenen Berichte
-   als PR-Kommentare attestieren. Zwei verschiedene Prüfer bleiben der bevorzugte
-   Normalfall. Ist ein Fremdreview nach einem dokumentierten Versuch wegen Quote,
-   Authentifizierung, Transport oder Werkzeugausfall nicht verfügbar, darf derselbe
-   Prüfer einen zweiten, methodisch getrennten Self-Review durchführen. Dafür müssen
-   die Belege `review_mode: self-primary` und `review_mode: self-fallback`,
-   unterschiedliche `review_session`-Werte, unterschiedliche Reviewachsen und
-   Berichtshashes sowie ein konkreter `fallback_reason` vorliegen. Diese Ausnahme
-   behauptet keine personelle oder technische Unabhängigkeit.
+   als PR-Kommentare attestieren. Zwei methodisch getrennte Eigenreviews desselben
+   Prüfers sind regulär zulässig: `review_mode: self-primary` und
+   `review_mode: self-secondary`, unterschiedliche `review_session`-Werte,
+   Reviewachsen und Berichtshashes. Ein externes Review bleibt optional; ein
+   erfolgloser vorheriger Fremdreview-Versuch ist keine Voraussetzung.
+   Historische `self-fallback`-Belege bleiben weiterhin mit dokumentiertem
+   `fallback_reason` gültig. Die Eigenreviews behaupten keine Unabhängigkeit.
    Alternativ darf ein in der Attester-Liste autorisierter Maintainer einen von
    außen eingeholten und an den Operator weitergereichten vollständigen Reviewbericht
    mit `weltgewebe-forwarded-review` attestieren. Dieser vereinfachte Beleg muss
@@ -86,8 +85,8 @@ Jeder Pull Request enthält genau einen maschinenlesbaren Marker:
 | --- | --- | --- |
 | R0 | kleine reine Markdown-Änderung, höchstens 50 geänderte Zeilen | keine externe Reviewpflicht |
 | R1 | Konfiguration, Metadaten, sichere Rastergrafiken | eine native GitHub-Freigabe auf dem aktuellen Head oder ein exakter PASS-Beleg |
-| R2 | Produktlogik, API, UI, Persistenz, nichtprivilegierte CI | zwei hashgebundene Berichte und zwei Reviewachsen; zwei Prüfer oder explizites Self-Review-Fallback |
-| R3 | Authentifizierung, Datenschutz, Sicherheit, Migration, Deployment, privilegierte Workflows | zwei Berichte und zwei Reviewachsen; zwei Prüfer oder explizites Self-Review-Fallback; mindestens eine Hochrisikoachse |
+| R2 | Produktlogik, API, UI, Persistenz, nichtprivilegierte CI | zwei hashgebundene Berichte und verschiedene Reviewachsen; zwei Prüfer oder ein reguläres `self-primary`/`self-secondary`-Paar |
+| R3 | Authentifizierung, Datenschutz, Sicherheit, Migration, Deployment, privilegierte Workflows | zwei hashgebundene Berichte mit verschiedenen Achsen und Sessions beim Eigenreview; mindestens eine Hochrisikoachse |
 
 Bestimmte Pfade erzwingen automatisch eine Mindestklasse. Eine niedrigere
 Deklaration führt fail-closed zum Gatefehler. R0 ist nur für kleine reine
@@ -149,13 +148,14 @@ damit Browser und Betriebssysteme denselben Berichtshash erzeugen. Berichte unte
 120 Byte, mehrere Belegblöcke in einem Kommentar oder doppelt verwendete
 Berichtshashes zählen nicht als getrennte Reviews.
 
-Normale und weitergeleitete Fremdreviews benötigen keine Zusatzfelder. Für die
-Self-Review-Ausnahme sind im selben Beleg zusätzlich `review_mode`,
-`review_session` und beim Fallback `fallback_reason` erforderlich. Zulässig sind
-`self-primary` und `self-fallback`. Der Sitzungsbezeichner ist kein Identitätsbeweis,
-sondern erzwingt zwei ausdrücklich getrennte Prüfpässe. Ein Self-Review-Fallback
-ersetzt nur die zweite Prüferidentität; zwei Achsen, zwei Berichtshashes, die
-Hochrisikoachse bei R3 und alle exakten SHA-Bindungen bleiben unverändert.
+Normale und weitergeleitete Fremdreviews benötigen keine Zusatzfelder. Für
+reguläre Eigenreviews sind `review_mode: self-primary` beziehungsweise
+`review_mode: self-secondary` sowie zwei unterschiedliche `review_session`-Werte
+erforderlich. Historische `self-fallback`-Belege bleiben erlaubt und verlangen
+weiterhin einen konkreten `fallback_reason`. Der Sitzungsbezeichner ist kein
+Identitäts- oder Unabhängigkeitsbeweis, sondern trennt die Prüfpässe methodisch.
+Zwei Achsen, zwei Berichtshashes, die Hochrisikoachse bei R3 sowie alle
+SHA- und Attester-Bindungen bleiben unverändert.
 
 Für R1 kann statt des Belegblocks eine native GitHub-Review mit `Approve` zählen.
 Sie muss von einem durch GitHub als `OWNER`, `MEMBER` oder `COLLABORATOR`
@@ -218,7 +218,7 @@ manuell:
 1. finalen Head und aktuellen Basiscommit lesen;
 2. vollständigen aktuellen GitHub-Diff und Patch erzeugen;
 3. SHA-256 und Dateiliste sichern;
-4. zwei R3-Reviews einholen; beim dokumentierten Ausfall eines Fremdreviews darf das explizite Self-Review-Fallback verwendet werden;
+4. zwei getrennte R3-Reviewberichte einholen (reguläres Eigenreview-Paar oder zwei Prüfer);
 5. jeden Beleg an Basis, Head und Diff-SHA-256 binden;
 6. erst danach mergen;
 7. den neuen Workflow gegen einen offenen PR live auslösen;
@@ -247,13 +247,13 @@ vom Attestierer benannten Prüfer; der GitHub-Kommentarautor muss zusätzlich in
 versionierten Allowlist `.github/review-evidence-authorities.json` stehen.
 Repositoryrollen allein reichen nicht aus. Der Hash bindet die Attestation an den
 sichtbaren vollständigen Bericht. Für R2 und R3 müssen Reviewachse und Berichtshash jeweils verschieden sein.
-Im Normalfall müssen auch die Prüferidentitäten verschieden sein. Nur das explizite
-`self-primary`/`self-fallback`-Paar darf dieselbe Prüferidentität verwenden; es
-benötigt zwei verschiedene Sitzungsbezeichner und einen konkreten Ausfallgrund.
-Technisch bewiesen werden die Identität des Attestierers, der Berichtshash, die
-Diffbindung und die formale Trennung der Prüfpässe – nicht eine unabhängige
-Authentifizierung der frei benannten externen Prüferidentität und auch nicht die
-Unabhängigkeit zweier Self-Review-Pässe.
+Zwei verschiedene Prüfer sind zulässig, aber nicht verpflichtend. Das reguläre
+Paar `self-primary`/`self-secondary` darf dieselbe Prüferidentität verwenden,
+wenn Sessions, Achsen und Berichtshashes verschieden sind. Das historische
+Paar `self-primary`/`self-fallback` bleibt nur mit konkretem Ausfallgrund gültig.
+Nachgewiesen werden Attestiereridentität, Berichtshash, Diffbindung und
+formale Trennung der Prüfpässe – nicht die Unabhängigkeit zweier Eigenreviews
+oder die unabhängige Authentifizierung frei benannter externer Prüfer.
 
 Alle Parser- und Bundlefunktionen stammen aus `main`. API-Daten werden nur als
 Bytes oder JSON geparst. Eine unvollständige Dateiliste, ein SHA-Wechsel, eine

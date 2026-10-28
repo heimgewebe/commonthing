@@ -4,6 +4,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." > /dev/null 2>&1 && pwd)"
 INSTALLER="$REPO_ROOT/scripts/ops/install-postgres-offhost-pull-user-units.sh"
 READER_SOURCE="$REPO_ROOT/scripts/ops/postgres-backup-read.sh"
 GATE="$REPO_ROOT/scripts/ops/restic-plaintext-gate.sh"
+TRUE_BIN="$(type -P true)"
+[[ -x "$TRUE_BIN" ]] || {
+  echo "coreutils true is unavailable" >&2
+  exit 1
+}
 SERVICE_TEMPLATE="$REPO_ROOT/scripts/ops/systemd/weltgewebe-postgres-offhost-pull.service"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
@@ -1555,7 +1560,7 @@ git -C "$fixture_repo" add scripts
 git -C "$fixture_repo" commit -qm 'test: bind off-host installer fixture'
 commit="$(git -C "$fixture_repo" rev-parse HEAD)"
 HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
-  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=true \
+  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN="$TRUE_BIN" \
   "$INSTALLER" --enable-now > /dev/null
 installed_pull="$install_home/.local/libexec/weltgewebe/$commit/pull-production-postgres-backup.sh"
 installed_service="$install_home/.config/systemd/user/weltgewebe-postgres-offhost-pull.service"
@@ -1584,7 +1589,7 @@ grep -qxF "restic_gate_sha256=$(sha256sum "$GATE" | awk '{print $1}')" "$receipt
 # so a success receipt never covers a runtime systemd cannot execute.
 chmod 0644 "$installed_pull" "$installed_gate"
 HOME="$install_home" TARGET_HOME="$install_home" REPO_DIR="$fixture_repo" \
-  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN=true \
+  EXPECTED_COMMIT="$commit" SYSTEMCTL_BIN="$TRUE_BIN" \
   "$INSTALLER" > /dev/null
 [[ "$(stat -c %a "$installed_pull")" == 755 && "$(stat -c %a "$installed_gate")" == 755 ]] || {
   echo 'reinstall must restore mode 0755 on the installed runtime' >&2

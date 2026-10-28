@@ -83,6 +83,7 @@ class GitFixtureMaintenanceIsolationTests(unittest.TestCase):
             remote=ROOT / ".fixture-remote.git",
             artifact=ROOT / ".fixture-artifact.tar.gz",
             artifact_sha="b" * 64,
+            test_deploy_script=ROOT / ".fixture-ops/deploy-exact-commit-vps.sh",
             root=ROOT / ".fixture-root",
         )
         fixture.base_environment = lambda: (
@@ -110,7 +111,7 @@ class GitFixtureMaintenanceIsolationTests(unittest.TestCase):
 
         command = run_mock.call_args.args[0]
         self.assertEqual(command[:3], ["/usr/bin/sudo", "-n", "env"])
-        deploy_index = command.index(str(deploy_integration.DEPLOY_SCRIPT))
+        deploy_index = command.index(str(fixture.test_deploy_script))
         for key, value in EXPECTED_GIT_MAINTENANCE_ENV.items():
             assignment = f"{key}={value}"
             self.assertIn(assignment, command)

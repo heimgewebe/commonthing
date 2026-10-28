@@ -552,6 +552,19 @@ implementations:
       - scripts/ci/tests/test_verify_public_release_commit.py
       - .github/workflows/production-live-contract.yml
 
+  - id: impl.guard.production-hold-release
+    path: scripts/ops/verify_production_hold_release.py
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/deploy/production-hold-first-start.md
+    verified_by:
+      - scripts/ci/tests/test_verify_production_hold_release.py
+      - scripts/ci/tests/test_production_reconciler_contract.py
+      - .github/workflows/production-live-contract.yml
+
   - id: impl.guard.public-release-verifier
     path: scripts/ops/verify_public_release_commit.py
     impl_type: guard

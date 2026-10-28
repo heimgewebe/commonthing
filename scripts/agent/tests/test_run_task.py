@@ -269,6 +269,111 @@ class TestRunTask(unittest.TestCase):
                 self.assertNotIn(str(base).encode(), artifact_path.read_bytes())
                 self.assertEqual(stat.S_IMODE(artifact_path.stat().st_mode), 0o600)
 
+    def test_staging_reopens_original_inode_after_writes(self):
+        # NixOS filesystems may return an empty stale stream for a directory
+        # descriptor opened before children were written.
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "run"
+            original_open = run_task.os.open
+            original_listdir = run_task.os.listdir
+            initial_staging_fd = None
+
+            def observe_open(path, flags, *args, **kwargs):
+                nonlocal initial_staging_fd
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if (
+                    initial_staging_fd is None
+                    and isinstance(path, str)
+                    and path.startswith(".agent-run-staging-")
+                ):
+                    initial_staging_fd = descriptor
+                return descriptor
+
+            def stale_initial_listdir(descriptor):
+                if descriptor == initial_staging_fd:
+                    return []
+                return original_listdir(descriptor)
+
+            with (
+                unittest.mock.patch.object(run_task.os, "open", side_effect=observe_open),
+                unittest.mock.patch.object(
+                    run_task.os, "listdir", side_effect=stale_initial_listdir
+                ),
+            ):
+                result = run_task._run_dry_run(
+                    repo_root=self.root,
+                    task_file=self._fixture("valid-doc-drift-task.json"),
+                    source_revision_resolver=lambda _root: self.source_revision,
+                    output_dir=output,
+                )
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(
+                sorted(path.name for path in output.iterdir()),
+                sorted(run_task.EVIDENCE_FILES),
+            )
+
+    def test_staging_rejects_an_unexpected_fifth_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "run"
+            original = run_task._write_file_sync_at
+
+            def inject_extra_file(directory_fd, name, content):
+                original(directory_fd, name, content)
+                if name == "run-result.json":
+                    original(directory_fd, "unexpected.txt", b"unexpected")
+
+            with unittest.mock.patch.object(
+                run_task, "_write_file_sync_at", side_effect=inject_extra_file
+            ):
+                with self.assertRaises(run_task.RunnerError) as ctx:
+                    run_task._run_dry_run(
+                        repo_root=self.root,
+                        task_file=self._fixture("valid-doc-drift-task.json"),
+                        source_revision_resolver=lambda _root: self.source_revision,
+                        output_dir=output,
+                    )
+            self.assertEqual(ctx.exception.code, "RUN_EVIDENCE_INCOMPLETE")
+            self.assertFalse(output.exists())
+            self.assertEqual(list(Path(tmp).glob(".agent-run-staging-*")), [])
+
+    def test_cleanup_wipes_original_staging_after_path_replacement(self):
+        # The staging name can be replaced after writing but before publish.
+        # Private task contents must be removed via the original directory FD.
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            output = parent / "run"
+            renamed_staging = parent / "renamed-staging"
+            original_write = run_task._write_file_sync_at
+
+            def replace_staging_after_last_write(directory_fd, name, content):
+                original_write(directory_fd, name, content)
+                if name == "run-result.json":
+                    staged = list(parent.glob(".agent-run-staging-*"))
+                    self.assertEqual(len(staged), 1)
+                    staged[0].rename(renamed_staging)
+                    staged[0].mkdir(mode=0o700)
+
+            with unittest.mock.patch.object(
+                run_task,
+                "_write_file_sync_at",
+                side_effect=replace_staging_after_last_write,
+            ):
+                with self.assertRaises(run_task.RunnerError) as ctx:
+                    run_task._run_dry_run(
+                        repo_root=self.root,
+                        task_file=self._fixture("valid-doc-drift-task.json"),
+                        source_revision_resolver=lambda _root: self.source_revision,
+                        output_dir=output,
+                    )
+            self.assertEqual(ctx.exception.code, "OUTPUT_LOCATION_CHANGED")
+            self.assertFalse(output.exists())
+            self.assertTrue(renamed_staging.is_dir())
+            self.assertEqual(list(renamed_staging.iterdir()), [])
+            replacement = list(parent.glob(".agent-run-staging-*"))
+            self.assertEqual(len(replacement), 1)
+            self.assertTrue(replacement[0].is_dir())
+            self.assertEqual(list(replacement[0].iterdir()), [])
+
     def test_default_persistence_and_no_persist_are_distinct(self):
         run_id = "RUN-20990101T000001Z-abcdef123456"
         target = self.root / "artifacts" / "agent-runs" / run_id

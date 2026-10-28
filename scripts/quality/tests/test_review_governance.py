@@ -1021,6 +1021,61 @@ class EvidenceTests(unittest.TestCase):
             {"self-primary", "self-fallback"},
         )
 
+    def test_r2_accepts_regular_self_review_pair_without_provider_attempt(self) -> None:
+        bundle = _bundle(paths=("apps/web/src/app.ts",))
+        primary = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2")
+        primary.update({"review_mode": "self-primary", "review_session": "review-correctness"})
+        secondary = _record(bundle, reviewer="Reviewer A", axis="testing", risk="R2")
+        secondary.update({"review_mode": "self-secondary", "review_session": "review-testing"})
+        result = _evaluate(
+            bundle=bundle, risk_class="R2",
+            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+        )
+        self.assertTrue(result["pass"], result["reasons"])
+        self.assertEqual(
+            {entry["review_mode"] for entry in result["accepted_reviews"]},
+            {"self-primary", "self-secondary"},
+        )
+
+    def test_r3_regular_self_review_pair_requires_security_axis(self) -> None:
+        bundle = _bundle(paths=(".github/workflows/ci.yml",))
+        primary = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R3")
+        primary.update({"review_mode": "self-primary", "review_session": "review-contract"})
+        secondary = _record(bundle, reviewer="Reviewer A", axis="testing", risk="R3")
+        secondary.update({"review_mode": "self-secondary", "review_session": "review-tests"})
+        result = _evaluate(
+            bundle=bundle, risk_class="R3",
+            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+        )
+        self.assertFalse(result["pass"])
+        self.assertIn("R3 requires", " ".join(result["reasons"]))
+        secondary["review_axis"] = "security"
+        result = _evaluate(
+            bundle=bundle, risk_class="R3",
+            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+        )
+        self.assertTrue(result["pass"], result["reasons"])
+
+    def test_regular_self_review_pair_rejects_same_session_or_extraneous_reason(self) -> None:
+        bundle = _bundle(paths=("apps/web/src/app.ts",))
+        primary = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2")
+        primary.update({"review_mode": "self-primary", "review_session": "shared"})
+        secondary = _record(bundle, reviewer="Reviewer A", axis="testing", risk="R2")
+        secondary.update({"review_mode": "self-secondary", "review_session": "shared"})
+        result = _evaluate(
+            bundle=bundle, risk_class="R2",
+            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+        )
+        self.assertFalse(result["pass"])
+        secondary["review_session"] = "new-pass"
+        secondary["fallback_reason"] = "Provider failures are not required for regular self review"
+        result = _evaluate(
+            bundle=bundle, risk_class="R2",
+            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+        )
+        self.assertFalse(result["pass"])
+        self.assertGreaterEqual(result["malformed_evidence_count"], 1)
+
     def test_self_review_fallback_requires_distinct_sessions_and_reason(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",))
         primary = _record(

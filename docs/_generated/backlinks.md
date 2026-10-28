@@ -546,6 +546,7 @@ Generated automatically. Do not edit.
 ## docs/deploy/merge-to-live.md
 
 - [relates_to] docs/deploy/map-html-canonical-route.md
+- [relates_to] docs/deploy/production-hold-first-start.md
 
 ## docs/deploy/secondary-domain-web-surfaces.md
 
@@ -1507,6 +1508,10 @@ Generated automatically. Do not edit.
 ## scripts/ops/resolve_vps_public_bind.py
 
 - [relates_to] docs/deploy/vps.md
+
+## scripts/ops/verify_production_hold_release.py
+
+- [relates_to] docs/deploy/production-hold-first-start.md
 
 ## scripts/performance/domain_projection_k6.js
 

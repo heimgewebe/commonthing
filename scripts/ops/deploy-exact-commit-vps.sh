@@ -15,6 +15,7 @@ ARTIFACT_ROOT="$STATE_ROOT/artifacts"
 FRONTEND_URL="${WELTGEWEBE_FRONTEND_VERSION_URL:-https://commonthing.net/_app/version.json}"
 API_URL="${WELTGEWEBE_API_VERSION_URL:-https://commonthing.net/api/version}"
 ARCHIVE_VALIDATOR="${WELTGEWEBE_ARCHIVE_VALIDATOR:-/usr/local/libexec/weltgewebe-validate-web-deploy-archive}"
+AUTHORIZER="/usr/local/libexec/weltgewebe-verify-production-hold-release"
 readonly PRODUCTION_LOCK_DOMAIN="weltgewebe-production-deployment-v1"
 readonly PRODUCTION_LOCK_FILE="${STATE_ROOT}/production-deployment.lock"
 readonly PRODUCTION_LOCK_FD=9
@@ -423,6 +424,104 @@ for command_name in git docker curl jq sha256sum tar flock install rm python3 aw
   require_command "$command_name"
 done
 
+# Trust the complete Git metadata tree before any privileged Git remote access.
+# An untrusted repository configuration could otherwise execute an ext:: helper
+# as root even if the OCI-grant preflight would ultimately reject the digest.
+[[ "$(stat --format=%u "$SOURCE_CHECKOUT")" == "0" ]] || fail "source checkout is not root-owned"
+# A root-owned checkout can still be replaced through a writable ancestor.
+# Reject replaceable Git metadata before privileged Git invocations.
+require_root_trusted_git_directory_chain() {
+  local target="${1%/}" label="$2" path mode uid
+  [[ -n "$target" ]] || target="/"
+  [[ "$target" == /* ]] || fail "$label must be absolute"
+  [[ "$(realpath -e -- "$target")" == "$target" ]] ||
+    fail "$label must be canonical and symlink-free: $target"
+  path="$target"
+  while :; do
+    [[ -d "$path" && ! -L "$path" ]] ||
+      fail "$label contains an unsafe directory: $path"
+    uid="$(stat --format=%u -- "$path")" ||
+      fail "$label ownership cannot be inspected: $path"
+    [[ "$uid" == "0" ]] ||
+      fail "$label includes a non-root-owned directory: $path"
+    mode="$(stat --format=%a -- "$path")" ||
+      fail "$label mode cannot be inspected: $path"
+    if (((8#$mode & 022) != 0)); then
+      # Root-owned sticky parents protect root-owned entries; never allow
+      # a writable checkout or common directory as the trust target itself.
+      if [[ "$path" == "$target" ]] || (((8#$mode & 01000) == 0)); then
+        fail "$label includes a replaceable directory: $path"
+      fi
+    fi
+    [[ "$path" == "/" ]] && break
+    path="${path%/*}"
+    [[ -n "$path" ]] || path="/"
+  done
+}
+require_root_trusted_git_directory_chain "$SOURCE_CHECKOUT" "source checkout"
+git_marker="$SOURCE_CHECKOUT/.git"
+[[ (-f "$git_marker" || -d "$git_marker") && ! -L "$git_marker" ]] ||
+  fail "Git metadata marker is missing or symlinked: $git_marker"
+[[ "$(stat --format=%u -- "$git_marker")" == "0" ]] ||
+  fail "Git metadata marker is not root-owned: $git_marker"
+git_marker_mode="$(stat --format=%a -- "$git_marker")" ||
+  fail "Git metadata marker mode cannot be inspected"
+(((8#$git_marker_mode & 022) == 0)) ||
+  fail "Git metadata is group/world writable: $git_marker"
+
+# Forbid metadata links before Git can read a redirected config as root.
+# A root-owned symlink itself says nothing about who can edit its target.
+if [[ -d "$git_marker" ]]; then
+  [[ -z "$(find "$git_marker" -xdev -type l -print -quit)" ]] ||
+    fail "Git metadata contains a symlink before privileged Git access"
+fi
+
+git_common_dir="$(git -C "$SOURCE_CHECKOUT" rev-parse --git-common-dir)"
+[[ "$git_common_dir" == /* ]] || git_common_dir="$SOURCE_CHECKOUT/$git_common_dir"
+git_common_dir="$(readlink -f "$git_common_dir")"
+require_root_trusted_git_directory_chain "$git_common_dir" "Git common directory"
+# Linked worktrees can store Git metadata outside the .git marker.
+# Deny symlinks in the resolved common directory before remote Git access.
+[[ -z "$(find "$git_common_dir" -xdev -type l -print -quit)" ]] ||
+  fail "Git common metadata contains a symlink"
+unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
+[[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
+# A root-owned alternates pointer may reference an attacker-writable external
+# object store. Reject all Git object indirection before any root Git operation.
+[[ -z "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" && -z "${GIT_OBJECT_DIRECTORY:-}" ]] ||
+  fail "Git object database environment overrides are not allowed"
+[[ ! -e "$git_common_dir/objects/info/alternates" && ! -L "$git_common_dir/objects/info/alternates" ]] ||
+  fail "Git alternate object stores are not trusted for production"
+[[ -z "$(find "$git_common_dir/objects" -xdev -type l -print -quit)" ]] ||
+  fail "Git object store contains a symlink outside the trust boundary"
+
+# A direct deploy-helper invocation must not bypass the HOLD enforced by
+# the normal timer/reconciler entrypoint. Verify before any directory/lock writes.
+[[ -f "$AUTHORIZER" && -x "$AUTHORIZER" && ! -L "$AUTHORIZER" ]] ||
+  fail "root-owned production HOLD release checker is not installed"
+[[ "$(stat --format=%u "$AUTHORIZER")" == "0" ]] ||
+  fail "production HOLD checker is not root-owned"
+auth_mode="$(stat --format=%a "$AUTHORIZER")"
+(((8#$auth_mode & 022) == 0)) ||
+  fail "production HOLD checker is group/world writable"
+python3 -I "$AUTHORIZER" --commit "$COMMIT" ||
+  fail "direct deploy is not authorized for the requested production commit"
+# Direct recovery may start before this exact commit is locally available.
+# Resolve only the authorized remote HEAD, then fetch immutable objects
+# without updating FETCH_HEAD or any tracking refs.
+preflight_main="$(git -C "$SOURCE_CHECKOUT" ls-remote --exit-code origin refs/heads/main | awk 'NR==1 {print $1}')" ||
+  fail "direct deploy could not read the remote production commit"
+[[ "$preflight_main" == "$COMMIT" ]] ||
+  fail "direct deploy target is not the current authorized remote main"
+if ! git -C "$SOURCE_CHECKOUT" cat-file -e "$COMMIT^{commit}" 2> /dev/null; then
+  git -C "$SOURCE_CHECKOUT" fetch --no-write-fetch-head --no-tags \
+    --no-auto-gc --no-recurse-submodules origin "$COMMIT" ||
+    fail "direct deploy could not inspect authorized source commit"
+fi
+python3 -I "$AUTHORIZER" --commit "$COMMIT" \
+  --source-repository "$SOURCE_CHECKOUT" ||
+  fail "direct deploy commit or source OCI digest is not authorized"
+
 install -d -o root -g root -m 0711 "$STATE_ROOT"
 install -d -o root -g root -m 0700 "$STATE_ROOT/receipts" "$ARTIFACT_ROOT"
 install -d -o root -g root -m 0700 "$STATE_ROOT/receipts/contention"
@@ -442,12 +541,6 @@ artifact_mode="$(stat --format=%a "$artifact_real")"
 runtime_mode="$(stat --format=%a "$RUNTIME_ENV")"
 (((8#$runtime_mode & 022) == 0)) || fail "runtime environment is group- or world-writable"
 
-[[ "$(stat --format=%u "$SOURCE_CHECKOUT")" == "0" ]] || fail "source checkout is not root-owned"
-git_common_dir="$(git -C "$SOURCE_CHECKOUT" rev-parse --git-common-dir)"
-[[ "$git_common_dir" == /* ]] || git_common_dir="$SOURCE_CHECKOUT/$git_common_dir"
-git_common_dir="$(readlink -f "$git_common_dir")"
-unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
-[[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
 acquire_production_lock
 
 actual_artifact_sha="$(sha256sum "$artifact_real" | awk '{print $1}')"
@@ -529,6 +622,12 @@ last_observed_main="$remote_main"
 [[ "$remote_main" == "$COMMIT" ]] ||
   fail "origin/main advanced immediately before deployment: expected $COMMIT, got $remote_main"
 
+# Exact OCI source identity comes from the checked-out, immutable release.
+image_digest="$(jq -er '.image_digest' "$release_dir/infra/schauwerk-editor/release-lock.json")" ||
+  fail "released commit lacks a valid Schauwerk runtime lock"
+python3 -I "$AUTHORIZER" --commit "$COMMIT" --image-digest "$image_digest" ||
+  fail "requested Schaubild image is not part of the authorized production release"
+
 started_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
 write_deploy_receipt "deploying" "" "" "" "$remote_main"
 receipt_started=true
@@ -539,6 +638,8 @@ receipt_started=true
 # Caddy container untouched. This is intentionally idempotent when no migration
 # is pending. The receipt records completion for diagnosis, but never authorizes
 # a later retry to skip database verification.
+python3 -I "$AUTHORIZER" --commit "$COMMIT" --image-digest "$image_digest" ||
+  fail "production HOLD withdrawn immediately before database migration"
 echo "production_deployment_phase=migration state=starting commit=$COMMIT" >&2
 run_release_deploy migration
 migration_completed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
@@ -555,6 +656,8 @@ if [[ "$remote_main" != "$COMMIT" ]]; then
   exit "$EXIT_SUPERSEDED_AFTER_MIGRATION"
 fi
 
+python3 -I "$AUTHORIZER" --commit "$COMMIT" --image-digest "$image_digest" ||
+  fail "production HOLD withdrawn before full deployment"
 echo "production_deployment_phase=full state=starting commit=$COMMIT" >&2
 run_release_deploy full
 echo "production_deployment_phase=full state=completed commit=$COMMIT" >&2

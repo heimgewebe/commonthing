@@ -82,18 +82,85 @@ fi
 [[ "$release_head" == "$COMMIT" ]] ||
   fail "release HEAD does not match commit: expected $COMMIT, got $release_head"
 
+authorization_checker="$release_dir_real/scripts/ops/verify_production_hold_release.py"
+require_root_safe_regular_file "$authorization_checker" "production HOLD release checker"
+python3 -I "$authorization_checker" --commit "$COMMIT" \
+  --source-repository "$release_dir_real" ||
+  fail "production HOLD authorization or source OCI digest is mismatched"
+
+# A reconciler-triggered deployment re-enters weltgewebe-up while the first
+# service is running but before its completion-relative timer is enabled.
+# The root grant above was checked; only the existing inherited deployment
+# lock handoff may skip recursive installation of the same service.
+reconciler_service_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.service)" ||
+  fail "cannot inspect current reconciler service ActiveState"
+case "$reconciler_service_state" in
+  active | activating | inactive) ;;
+  *) fail "unsupported reconciler service state: $reconciler_service_state" ;;
+esac
+if [[ "$reconciler_service_state" == "active" || "$reconciler_service_state" == "activating" ]]; then
+  [[ "${WELTGEWEBE_PRODUCTION_LOCK_OWNER_ENTRYPOINT:-}" == "reconciler" &&
+    "${WELTGEWEBE_PRODUCTION_LOCK_DOMAIN:-}" == "weltgewebe-production-deployment-v1" &&
+    "${WELTGEWEBE_DEPLOY_INVOCATION_ID:-}" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "active reconciler service requires exact inherited deployment handoff"
+  # During first-start bootstrap the timer is deliberately disabled while
+  # this active service performs its initial reconcile. Never recurse there.
+  # On later scheduled upgrades the timer is enabled; update the installed
+  # helper contract in deferred mode, without restarting the active service.
+  timer_unit_state="$(systemctl show --property=UnitFileState --value weltgewebe-production-reconcile.timer)" ||
+    fail "cannot inspect timer enablement during active reconciliation"
+  timer_active_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.timer)" ||
+    fail "cannot inspect timer activity during active reconciliation"
+  case "$timer_unit_state:$timer_active_state" in
+    disabled:inactive)
+      echo "production_reconciler_activation=already_running commit=$COMMIT release=$release_dir_real"
+      exit 0
+      ;;
+    enabled:active) ;; # deferred upgrade is safe after timer quiescence
+    *) fail "active reconciler has unsupported timer state: $timer_unit_state:$timer_active_state" ;;
+  esac
+fi
+
+# The release authorization above is a prerequisite, not a consequence of
+# the timer state. The intentional first-start HOLD uses disabled/inactive.
+# Only a completely active existing timer may use a deferred upgrade.
+select_reconciler_start_mode() {
+  local unit_state active_state
+  unit_state="$(systemctl show --property=UnitFileState --value weltgewebe-production-reconcile.timer)" ||
+    fail "cannot inspect production timer installation state"
+  active_state="$(systemctl show --property=ActiveState --value weltgewebe-production-reconcile.timer)" ||
+    fail "cannot inspect production timer runtime state"
+  case "$unit_state:$active_state" in
+    disabled:inactive) printf '%s\n' initial ;;
+    enabled:active) printf '%s\n' deferred ;;
+    *) fail "unsupported production timer state: enabled=$unit_state active=$active_state" ;;
+  esac
+}
+
+install_mode="$(select_reconciler_start_mode)"
+installer_options=(--commit "$COMMIT" --build-user "$BUILD_USER")
+if [[ "$install_mode" == "deferred" ]]; then
+  installer_options+=(--defer-reconcile)
+fi
+# The exact, authorized mode is preflighted before any VAPID write.
+WELTGEWEBE_SOURCE_CHECKOUT="$SOURCE_CHECKOUT" \
+  "$installer" "${installer_options[@]}" --preflight-only
+
 web_push_bootstrap="$release_dir_real/scripts/ops/ensure_web_push_vapid_env.py"
 require_root_safe_regular_file "$web_push_bootstrap" "Web Push VAPID bootstrap"
 require_root_safe_regular_file "$RUNTIME_ENV" "runtime environment"
+[[ "$(select_reconciler_start_mode)" == "$install_mode" ]] ||
+  fail "production timer state changed before VAPID provisioning"
 python3 -I "$web_push_bootstrap" \
   --env-file "$RUNTIME_ENV" \
   --contact "$WEB_PUSH_CONTACT" \
   --allowed-host-suffixes "$WEB_PUSH_ALLOWED_HOST_SUFFIXES"
 
+# A second read-only mode check before installation prevents a changed timer
+# from silently turning a deferred update into an initial service start.
+[[ "$(select_reconciler_start_mode)" == "$install_mode" ]] ||
+  fail "production timer state changed after first-start preflight"
 WELTGEWEBE_SOURCE_CHECKOUT="$SOURCE_CHECKOUT" \
-  "$installer" \
-  --commit "$COMMIT" \
-  --build-user "$BUILD_USER" \
-  --defer-reconcile
+  "$installer" "${installer_options[@]}"
 
-echo "production_reconciler_activation=installed commit=$COMMIT release=$release_dir_real"
+echo "production_reconciler_activation=installed commit=$COMMIT release=$release_dir_real mode=$install_mode"
