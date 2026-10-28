@@ -559,9 +559,8 @@ beabsichtigte öffentliche age-Identität abgleichen. Nur nach protokolliertem
 Recovery-PASS dürfen die alten Off-Host-Klartextkopien separat zur Entfernung
 freigegeben werden; deren Löschung ist **nicht** Teil dieses Skripts.
 
-**Restic-Snapshot: produktiver Heim-PC unter NixOS (Live-Readback vom 28.10.2026)**
-
-Der produktive Backupdienst heißt `restic-backups-heim-pc.service` und
+**Restic-Snapshot auf dem produktiven Heim-PC unter NixOS:** Stand ist
+der Live-Readback vom 28.10.2026. Der produktive Backupdienst heißt `restic-backups-heim-pc.service` und
 läuft als **Systemdienst**; sein System-Timer
 `restic-backups-heim-pc.timer` hat zwei tägliche Zeitfenster.
 Der tatsächlich gestartete Befehl verwendet Restic aus dem Nix-Store
