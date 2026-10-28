@@ -117,6 +117,34 @@ class GitFixtureIsolationTests(unittest.TestCase):
             check=False,
         )
 
+    def test_timer_status_shim_is_rootless_and_strict(self) -> None:
+        # This helper is test-only. Run the fixture under a normal user, even
+        # when root-only integration cases cannot execute without sudo.
+        with tempfile.TemporaryDirectory(prefix="timer-status-fixture-") as tmp:
+            fixture = object.__new__(DeployExactCommitIntegrationTests)
+            fixture.bin = Path(tmp)
+            for enabled in (True, False):
+                with self.subTest(enabled=enabled):
+                    shim = fixture._stub_reconciler_timer(enabled=enabled)
+                    try:
+                        for args, expected in (
+                            (["is-enabled", "--quiet", "weltgewebe-production-reconcile.timer"], 0 if enabled else 1),
+                            (["is-active", "--quiet", "weltgewebe-production-reconcile.timer"], 0 if enabled else 1),
+                            (["is-active", "--quiet", "unrelated.service"], 94),
+                        ):
+                            with self.subTest(argv=args):
+                                observed = subprocess.run(
+                                    [str(shim), *args],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=5,
+                                    check=False,
+                                )
+                                self.assertEqual(observed.returncode, expected, observed.stderr)
+                    finally:
+                        shim.unlink()
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
     def test_docker_shim_expands_schauwerk_drift_controls(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             case = object.__new__(DeployExactCommitIntegrationTests)
