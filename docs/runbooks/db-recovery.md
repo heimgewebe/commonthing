@@ -559,107 +559,58 @@ beabsichtigte öffentliche age-Identität abgleichen. Nur nach protokolliertem
 Recovery-PASS dürfen die alten Off-Host-Klartextkopien separat zur Entfernung
 freigegeben werden; deren Löschung ist **nicht** Teil dieses Skripts.
 
-**Restic-Snapshot-Gate:** Das Staging verhindert neue Klartext-Pulls, aber
-nicht, dass ein laufender Restic-Snapshot vorhandene `*.sql.gz`-Altbestände
-erneut erfasst. Dafür gibt es `scripts/ops/restic-plaintext-gate.sh`. Es
-bekommt die Snapshot-Quellen als absolute Pfade und bricht ab, sobald unter
-einer Quelle eine `*.sql.gz`-Datei oder ein so benannter Symlink liegt, auch
-über eine symlinkte Quellwurzel, sowie wenn eine Quelle fehlt oder nicht
-vollständig lesbar ist. Es liest nur und löscht nichts. Die negativen Fälle
-prüft `scripts/tests/test_offhost_backup_pull_contract.sh`. Der
-Off-Host-Installer legt das Gate commitgebunden neben das Pullskript
-(`~/.local/libexec/weltgewebe/<commit>/restic-plaintext-gate.sh`, Hash im
-`install.receipt`).
+**Restic-Snapshot: produktiver Heim-PC unter NixOS (Live-Readback vom 28.10.2026)**
 
-**Verbindliche Grenze des Preflight-Gates:** Der Dateiscan endet **vor**
-dem eigentlichen Restic-Snapshot. Entsteht danach ein neuer
-`*.sql.gz`-Dump, kann Restic ihn trotz erfolgreichem Gate erfassen.
-Der Scan allein ist daher **kein** vollständiger Datenschutzschutz. Der
-maßgebliche Schutz ist eine Ausschlussregel, die **Restic selbst beim
-Snapshot** anwendet. Auf `heim-pc` verwendet der live geprüfte Aufruf
-`heim-pc-restic-backup run` die Datei
-`$HOME/.config/restic/heim-pc-excludes` über `--exclude-file`. Diese
-Datei darf **nicht** die ungeankerte Zeile `**/*.sql.gz` enthalten:
-Der tatsächlich laufende Scope-Validator in `heim-pc-restic-backup`
-weist diese als außerhalb der genehmigten Snapshotquellen zurück; der
-Restic-Dienst würde fehlschlagen. Stattdessen sind nach gesonderter
-Betriebsfreigabe diese **drei absolut verankerten** Muster für die
-aktuell beobachteten Heim-PC-Quellen vorgesehen:
+Der produktive Backupdienst heißt `restic-backups-heim-pc.service` und
+läuft als **Systemdienst**; sein System-Timer
+`restic-backups-heim-pc.timer` hat zwei tägliche Zeitfenster.
+Der tatsächlich gestartete Befehl verwendet Restic aus dem Nix-Store
+mit folgenden `--exclude-file`-Quellen in dieser Reihenfolge:
 
-```text
-/home/alex/repos/**/*.sql.gz
-/home/alex/artifacts/merges/**/*.sql.gz
-/home/alex/.local/share/schauwerk/fundus/**/*.sql.gz
-```
+1. `/persist/secrets/restic/heim-pc-excludes` (geschützte private Konfiguration);
+2. `heim-pc-restic-hard-xrdp-excludes` aus dem Nix-Store
+   mit `/home/alex/thinclient_drives`;
+3. **zuletzt** `heim-pc-restic-hard-plaintext-excludes` aus dem
+   unveränderlichen Nix-Store mit dem vollständigen Inhalt
+   `**/*.sql.gz`.
 
-**Installationsreihenfolge ist verbindlich:** Die beiden ersten
-Muster werden vom aktuellen Wrapper akzeptiert, das Fundus-Muster
-jedoch erst nach Integration, unabhängig geprüfter Freigabe und
-gesondert autorisiertem Rollout von
-infra-PR `heimgewebe/infra#165` (für den CI-Linkcheck nicht erreichbar).
-Dieser eng begrenzte Fix erlaubt ausschließlich
-`$FUNDUS/**/*.sql.gz`; er lässt Ausschlüsse des gesamten Fundus oder
-von `*.sql.gz.age` weiterhin nicht zu. **Kein Muster in der
-produktiven Datei aktivieren, solange das tatsächlich installierte
-Wrapper-Release den vollständigen Satz nicht annimmt.** Den
-Hostpfad vor einer Freigabe frisch lesen, nicht aus dem Runbook
-als zeitlose Konstante ableiten.
+Die letzte Regel greift **während des eigentlichen Restic-Snapshots**,
+auch wenn eine Klartextdatei erst nach einem Vorabscan entsteht.
+Sie bleibt wirksam, selbst wenn die private vorherige Exclude-Datei
+eine Negativregel `!**/*.sql.gz` enthält. Chiffrate
+`*.sql.gz.age` werden durch diese Regel nicht ausgeschlossen.
+Dafür werden alle `*.sql.gz` innerhalb der Snapshotquellen
+ausgeschlossen, auch andere legitime SQL-Archive: Falls solche
+Dateien benötigt werden, ist vor einer Änderung der Ausschlussregel
+ein separater geeigneter Sicherungsweg nachzuweisen.
 
-Ein synthetischer Test gegen den tatsächlichen
-Restic-Snapshot-Mechanismus bestätigte: Sechs **erst nach dem
-Vorabscan** entstandene `*.sql.gz`-Dateien unter den drei
-Quellwurzeln wurden beim Backup ausgeschlossen; normale Dateien,
-Fundus-Material und `*.sql.gz.age` blieben erhalten. Der
-frühere Live-Wrapper wies das Fundus-Muster noch zurück; der
-geänderte Quellstand aus infra-PR #165 akzeptiert es bei weiterhin
-verbotenen breiten Fundus-Ausschlüssen (RED/GREEN und 61/61
-Restic-Runtime-Tests). Diese synthetischen Nachweise ersetzen
-**nicht** einen tatsächlichen Produktiv-Snapshot. Sollte der Fundus
-jemals eine legitime `*.sql.gz`-Quelldatei enthalten, kann sein
-bestehender Inventar-/Restore-Vergleich fail-closed abbrechen;
-diesen Konflikt vor einer Betriebsfreigabe inventarisieren.
+Der echte Restic-Lauf am 28.10.2026, 11:26:59–11:28:00 CET
+endete mit `Result=success` und `ExecMainStatus=0`, Snapshot
+`f98cad16`. Dieser Lauf beweist einen vollständigen Snapshot,
+**nicht** bereits einen aktuellen Repository-/Datei-Restore.
+Die unabhängige root-eigene NixOS-Recovery-Probe ist Gegenstand
+von heim-pc PR #263; ein externer age-PostgreSQL-Restore ist
+separat erforderlich.
 
-Vor einer Betriebsfreigabe die aktive Exclude-Datei, `ExecStart`,
-`--exclude-file` und alle Snapshot-Quellen erneut lesen; die Regel
-unter derselben Serviceidentität mit einem isolierten Test und einem
-frisch erstellten Snapshot nachweisen. Dabei auch prüfen, ob
-sicherungswürdige andere `*.sql.gz`-Dateien ausgenommen würden. Die
-historischen PostgreSQL-Klartextbestände **nicht** löschen. Der bisherige
-Preflight-Scanner kann bestehende Dumps weiterhin erkennen und den
-ganzen Snapshot blockieren; seine spätere Deaktivierung oder Anpassung
-bedarf ebenfalls einer gesonderten Freigabe und darf erst nach dem
-wirksamen nativen Restic-Ausschluss erfolgen. Neue Scanner,
-Watcher oder Dienste sind dafür nicht nötig.
+**Nicht mehr als Produktionsanleitung verwenden:** Der frühere
+Pop!_OS-Pfad `restic-backup-1930.service` (User-Unit) und
+`heim-pc-restic-backup` (Infra-Wrapper) sind nicht Teil des
+heutigen aktiven NixOS-Backupdienstes. Infra PR #165 ist deshalb
+für dessen native SQL-Ausschlussregel keine Voraussetzung.
+Das alte `scripts/ops/restic-plaintext-gate.sh` bleibt nur als
+ergänzende Diagnose-/Kompatibilitätsdatei samt Regressionstests
+vorhanden. Sein einmaliger `ExecStartPre`-Scan kann einen späteren
+Klartextzugang **nicht** verhindern und darf den nativen Ausschluss
+niemals ersetzen. Der Off-Host-Installer installiert die Datei,
+aber **kein** NixOS-Restic-Drop-in. Insbesondere den früher
+dokumentierten `systemctl --user`-Drop-in nicht auf NixOS nachbauen.
 
-Wirksam ist es erst als `ExecStartPre=` der Unit, die den Snapshot startet
-(laut Readback vom 15. Oktober 2026 `restic-backup-1930.service`). Die
-Quellliste des Gates muss exakt der Quellliste dieses Snapshots entsprechen;
-vorher mit `systemctl cat restic-backup-1930.service` (bzw. `--user`,
-passend zur tatsächlichen Unit) und dem gestarteten Skript abgleichen. Mit
-dem dort festgestellten Unit-Verzeichnis, zum Beispiel für eine User-Unit:
-
-```bash
-set -euo pipefail
-commit="$(git rev-parse HEAD)"
-gate="$HOME/.local/libexec/weltgewebe/$commit/restic-plaintext-gate.sh"
-dropin="$HOME/.config/systemd/user/restic-backup-1930.service.d"
-[[ -x "$gate" ]]
-install -d -m 0755 "$dropin"
-printf '[Service]\nExecStartPre=%s %s %s %s\n' "$gate" \
-  "$HOME/repos" "$HOME/artifacts/merges" "$HOME/.local/share/schauwerk/fundus" \
-  > "$dropin/weltgewebe-plaintext-gate.conf"
-systemctl --user daemon-reload
-systemctl --user cat restic-backup-1930.service
-```
-
-Erst ein negativer Lauf auf `heim-pc` schließt diese Sperre: eine
-inhaltsleere Testdatei `weltgewebe-postgres-gate-test.sql.gz` in eine Quelle
-legen, den Snapshot-Service starten und belegen, dass er vor `restic`
-fehlschlägt (`journalctl` zeigt `restic-plaintext-gate:` und keinen neuen
-Snapshot), die Testdatei entfernen und einen erfolgreichen Lauf belegen.
-Eine bloß dokumentierte Warnung oder ein deaktivierter Backup-Timer gilt
-nicht als Ersatz.
-
+Zur aktuellen Abnahme immer die tatsächlich aktivierte NixOS-Revision,
+`systemctl cat restic-backups-heim-pc.service`, die wirksame
+Ausschluss-Reihenfolge, Snapshotquellen, Timer, Exitstatus,
+Repository-Check und echte Restore-Prüfung neu lesen. Historische
+Klartextkopien und Snapshots niemals ohne separaten erfolgreichen
+Off-Host-Restore- und Löschentscheid entfernen.
 
 Vor dem age-Vertrag hat der Pull Klartext-Dumps (`weltgewebe-postgres-*.sql.gz`)
 nach `~/merges/weltgewebe-production-backups` kopiert. Ein neuer age-Pull
