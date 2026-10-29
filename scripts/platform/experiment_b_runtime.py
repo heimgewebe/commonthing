@@ -11176,7 +11176,7 @@ def _t048_canonical_visibility(fixture: dict[str, Any]) -> str:
     kind = fixture.get("kind")
     if not isinstance(kind, str) or not kind:
         raise RuntimeErrorEB("T048 fixture node has no canonical kind")
-    return "public" if kind == "Projekt" else "hidden"
+    return "public" if kind == "project" else "hidden"
 
 
 def _t048_expected_projection_row(

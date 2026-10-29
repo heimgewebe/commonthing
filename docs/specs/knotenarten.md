@@ -3,6 +3,8 @@ id: specs.knotenarten
 title: Knotenarten – fachlicher Katalog v2
 doc_type: specification
 status: canonical
+last_reviewed: 2026-10-29
+review_after: 2027-01-29
 canonicality: normative
 lifecycle_state: active
 role: norm

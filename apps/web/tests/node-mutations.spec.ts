@@ -290,7 +290,7 @@ test.describe("Knoten bearbeiten und löschen", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           title: "Eigener Gastknoten",
-          kind: "Ort",
+          kind: "place",
           address: "Gastweg 1",
           location: { lat: 53.5, lon: 10.0 },
           tags: [],
@@ -503,7 +503,7 @@ test.describe("Knoten bearbeiten und löschen", () => {
         body: JSON.stringify({
           id: requestedNodeId,
           title: "Zwischenzeitlich aktualisierter Knoten",
-          kind: "Ort",
+          kind: "place",
           summary: "Dieser aktuelle Stand darf nicht gelöscht werden.",
           address: "Aktuelle Adresse",
           location: { lat: 53.5, lon: 10 },
@@ -567,7 +567,7 @@ test.describe("Knoten bearbeiten und löschen", () => {
           body: JSON.stringify({
             id: requestedNodeId,
             title: "Neuer Titel vom Server",
-            kind: "Ort",
+            kind: "place",
             summary: "Neue Kurzbeschreibung vom Server",
             address: "Adresse",
             location: { lat: 0, lon: 0 },
