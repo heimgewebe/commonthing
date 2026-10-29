@@ -13,15 +13,17 @@ relations:
 
 # Production HOLD: ausdrücklich autorisierter erster Reconciler-Start
 
-Status: Sicherheitsvertrag, **keine** Produktionsfreigabe. Der absichtlich deaktivierte
-`weltgewebe-production-reconcile.timer` bleibt deaktiviert, solange irgendein
-Backup-, Offline-Restore-, Privacy-, Alarmierungs-, Review- oder Captain-Gate offen ist.
+Status: technischer Root-Freigabevertrag, **keine** automatische Produktionsfreigabe.
+Vor dem ersten Start müssen ein echter Restic-Restore, der verschlüsselte
+Off-Host-PostgreSQL-Restore und die exakte Main-/OCI-Identität nachgewiesen sein.
+Privacy-, Alarm- und Empfangsprozesse werden separat betrieben; sie sind keine
+zusätzlichen Hash-Pflichtfelder für den technischen Produktionsstart.
 
 ## Root-gebundene Releaseentscheidung
 
-Nur ein gesondert autorisierter Root-Operator darf nach unabhängiger Prüfung
-der **tatsächlich ausgeführten** Primärbelege die Datei
-`/etc/weltgewebe/production-hold-release.json` erzeugen. Die Datei gehört
+Ein autorisierter Root-Operator erstellt nach Prüfung der **tatsächlich
+ausgeführten Wiederherstellungen** die Datei
+`/etc/weltgewebe/production-hold-release.json`. Die Datei gehört
 root, ist kein Symlink/Hardlink und besitzt Modus `0600`. Weder dieses
 Repository noch der Installer erzeugen oder überschreiben sie.
 
@@ -38,21 +40,21 @@ schematische Platzhalter):
   "schaubild_image_digest": "sha256:<64-stelliger akzeptierter OCI-Digest>",
   "offhost_age_recovery_sha256": "<SHA-256 des echten externen Entschlüsselungs- und PostgreSQL-Restore-Receipts>",
   "restic_authority_sha256": "<SHA-256 eines unabhängigen Restic-Authority-Receipts>",
-  "privacy_acceptance_sha256": "<SHA-256 der revisionsgültigen Datenschutzfreigabe>",
-  "alarm_delivery_sha256": "<SHA-256 der automatischen externen Alarmzustellung>",
-  "human_acknowledgement_sha256": "<SHA-256 der konkreten menschlichen Empfangsbestätigung>",
   "authorized_by": "<autorisierte Person oder Rolle>",
   "approved_at": "<ISO-8601-Zeitpunkt mit Zeitzone>"
 }
 ```
 
-Die Hashfelder sind nur **Referenzen auf vorher unabhängig geprüfte
-Artefakte**. Der Validator prüft das Format, den root-geschützten Speicherort,
-die Identität von Main und OCI und die formale Entscheidung. Er überprüft nicht
-selbst die Richtigkeit oder Unveränderlichkeit der referenzierten externen
-Receipts. Ein syntaktisch gültiger Freigabedatensatz ist **kein** Ersatz für
-tatsächlichen age-Off-Host-Restore, getrennte Key-Verwahrung, Datenschutz-R3,
-nachgewiesene Alarmzustellung und menschliche Kenntnisnahme.
+Die beiden Hashfelder sind **Referenzen auf echte Wiederherstellungsbelege**.
+Der Validator prüft Format, root-geschützten Speicherort, Identität von Main
+und OCI sowie die Entscheidung; die Belege muss der Operator tatsächlich lesen.
+Ein syntaktisch gültiger Datensatz ersetzt keinen realen age-Off-Host-Restore.
+Die bisherigen Felder `privacy_acceptance_sha256`,
+`alarm_delivery_sha256` und `human_acknowledgement_sha256`
+werden aus Kompatibilitätsgründen weiterhin akzeptiert und bei Angabe
+validiert, sind aber für neue Releases **nicht nötig**. Ein privater age-Key
+auf dem getrennten Wiederherstellungsrechner genügt; ein dritter Offline-Rechner
+ist keine Release-Bedingung.
 
 Die Freigabe gilt ausschließlich für den angegebenen Main-Commit und
 Schaubild-OCI-Digest. Fortschreitendes `main` benötigt eine neue dokumentierte
@@ -61,7 +63,7 @@ Zum erneuten HOLD die Root-Freigabe entziehen und den Timer unter der zuständig
 Operatorautorität deaktivieren. Bereits laufende Deployments benötigen zusätzlich
 sicheres Betriebshandling; die reine Dateientfernung ist kein atomarer Kill-Switch.
 
-## Recovery-Frische und menschliche Alarmbestätigung
+## Recovery-Frische und Alarmierung im Betrieb
 
 Die früheren Prüfverträge nennen **26 Stunden** für den lokalen Backup-Nachweis,
 **36 Stunden** für den verschlüsselten Off-Host-Pull und **192 Stunden** für
@@ -72,10 +74,11 @@ das Alter der echten extern restaurierten Kopie müssen anhand eines separaten
 fachlichen Recovery-Receipts entschieden werden. Ein lokaler 192-Stunden-Test
 ersetzt niemals die isolierte Entschlüsselung einer externen age-Kopie.
 
-Der menschliche Alarmempfänger muss vor Freigabe explizit autorisiert und
-erreichbar sein. Die automatische Zustellbestätigung und die an **dieses
-konkrete Ereignis** gebundene menschliche Empfangsbestätigung bleiben
-getrennte Nachweise. Der Watcher darf den Empfang nicht selbst behaupten.
+Ein unabhängiger Watcher soll Versionsdrift, Backupfehler und Störungen
+erkennen. Alarmzustellung und tatsächliche Kenntnisnahme müssen als eigene
+Betriebsaussagen dokumentiert werden, dürfen aber den technischen Reconcile
+nach bestandenem Recovery nicht künstlich blockieren. Der Watcher darf nicht
+behaupten, dass ein Mensch eine Nachricht gelesen hat.
 
 ## Aktivierung und Readback
 

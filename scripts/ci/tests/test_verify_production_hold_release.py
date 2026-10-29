@@ -64,6 +64,21 @@ class HoldReleaseVerificationTests(unittest.TestCase):
         self.assertEqual(self.check()["schaubild_image_digest"], IMAGE)
         self.assertEqual(self.check(commit=None, image=None)["kind"], verifier.KIND)
 
+    def test_genuine_recovery_only_release_needs_no_formal_ack_hashes(self) -> None:
+        for key in verifier.OPTIONAL_RECEIPTS:
+            del self.data[key]
+        self.write()
+        self.assertEqual(self.check()["commit"], COMMIT)
+        self.assertEqual(self.check()["restic_authority_sha256"], "2" * 64)
+
+    def test_both_recovery_receipts_remain_mandatory(self) -> None:
+        for key in verifier.REQUIRED_RECEIPTS:
+            with self.subTest(key=key):
+                original = self.data.pop(key)
+                self.write()
+                self.reject()
+                self.data[key] = original
+
     def test_hold_missing_wrong_commit_or_wrong_oci_deny(self) -> None:
         self.reject(commit="b" * 40)
         self.reject(image="sha256:" + "a" * 64)
