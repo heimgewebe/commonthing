@@ -2,7 +2,7 @@
 Description=Check every two minutes whether Weltgewebe main is live
 
 [Timer]
-OnBootSec=45s
+OnActiveSec=2min
 OnUnitInactiveSec=2min
 RandomizedDelaySec=15s
 AccuracySec=10s

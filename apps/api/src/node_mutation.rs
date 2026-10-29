@@ -669,6 +669,11 @@ mod tests {
 
         // Drop the append after a varying number of polls, the way an
         // aborted startup drops `recover_jsonl_audit`.
+        // Cancellation before first poll need not write any record.
+        // Seed one durable event so this checks torn appended lines rather
+        // than how the executor schedules an unpolled cancelled future.
+        prepare_jsonl_audit(&audit).await.unwrap();
+
         for polls in 0..64 {
             let mut append = Box::pin(prepare_jsonl_audit(&audit));
             for _ in 0..polls {

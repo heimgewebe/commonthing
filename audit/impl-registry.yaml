@@ -329,11 +329,36 @@ implementations:
     impl_type: workflow
     status: active
     criticality: high
-    evidence_level: test
+    evidence_level: ci
     documented_by:
       - docs/runbooks/db-recovery.md
     verified_by:
       - scripts/tests/test_offhost_backup_pull_contract.sh
+      - .github/workflows/ci.yml
+
+  - id: impl.ops.postgres-backup-read
+    path: scripts/ops/postgres-backup-read.sh
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/runbooks/db-recovery.md
+    verified_by:
+      - scripts/tests/test_offhost_backup_pull_contract.sh
+      - .github/workflows/ci.yml
+
+  - id: impl.ops.postgres-restic-plaintext-gate
+    path: scripts/ops/restic-plaintext-gate.sh
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/runbooks/db-recovery.md
+    verified_by:
+      - scripts/tests/test_offhost_backup_pull_contract.sh
+      - .github/workflows/ci.yml
 
   - id: impl.ops.web-artifact-install
     path: scripts/ops/install-web-artifact.sh
@@ -525,6 +550,19 @@ implementations:
       - scripts/ci/tests/test_secure_receipt_io.py
       - scripts/ci/tests/test_production_reconciler_contract.py
       - scripts/ci/tests/test_verify_public_release_commit.py
+      - .github/workflows/production-live-contract.yml
+
+  - id: impl.guard.production-hold-release
+    path: scripts/ops/verify_production_hold_release.py
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/deploy/production-hold-first-start.md
+    verified_by:
+      - scripts/ci/tests/test_verify_production_hold_release.py
+      - scripts/ci/tests/test_production_reconciler_contract.py
       - .github/workflows/production-live-contract.yml
 
   - id: impl.guard.public-release-verifier

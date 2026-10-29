@@ -42,7 +42,10 @@ fi
 # Verify that documented_by links exist.
 # Fail closed: ein Parse-Fehler in der Registry darf hier nicht zu einer leeren
 # Liste und damit zu einem stillen Pass werden.
-if ! DOC_REFS=$(uv run --project tools/py --locked python -c "
+# Anchor the locked Python tools to this script, not the caller working directory.
+UV_PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../tools/py" && pwd -P)"
+
+if ! DOC_REFS=$(uv run --project "$UV_PROJECT_ROOT" --locked python -c "
 import sys
 
 import yaml
