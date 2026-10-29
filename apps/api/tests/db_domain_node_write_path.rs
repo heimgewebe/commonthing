@@ -184,7 +184,7 @@ async fn seed_node(pool: &PgPool, id: &str, info: Option<&str>, steckbrief: Opti
     };
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, lat, lon, created_at, updated_at, payload) \
-         VALUES ($1, 'test', 'Test Node', 53.5, 10.0, \
+         VALUES ($1, 'place', 'Test Node', 53.5, 10.0, \
                  '2026-01-01T00:00:00Z'::timestamptz, \
                  '2026-01-01T00:00:00Z'::timestamptz, $2::jsonb)",
     )
@@ -1458,7 +1458,7 @@ async fn jsonl_default_node_patch_compiles_and_routes_correctly() -> Result<()> 
     let nodes_file = in_dir.join("demo.nodes.jsonl");
     std::fs::write(
         &nodes_file,
-        r#"{"id":"writepath-node-jsonl-1","kind":"test","title":"T","location":{"lat":53.5,"lon":10.0},"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}"#,
+        r#"{"id":"writepath-node-jsonl-1","kind":"place","title":"T","location":{"lat":53.5,"lon":10.0},"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}"#,
     )?;
 
     let config = AppConfig {
@@ -1576,7 +1576,7 @@ async fn postgres_node_patch_mapping_failure_does_not_commit() -> Result<()> {
     // Seed a row with NULL lat/lon and a known payload.
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, lat, lon, payload) \
-         VALUES ($1, 'test', 'Null Loc', NULL, NULL, '{\"info\":\"original\"}'::jsonb)",
+         VALUES ($1, 'place', 'Null Loc', NULL, NULL, '{\"info\":\"original\"}'::jsonb)",
     )
     .bind(NODE_NULL_LOC)
     .execute(&pool)
@@ -1637,7 +1637,7 @@ async fn postgres_node_patch_non_object_payload_is_rejected_without_commit() -> 
     // Seed a row with an array payload (non-object JSONB — data corruption scenario).
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, lat, lon, payload) \
-         VALUES ($1, 'test', 'Bad Payload', 53.5, 10.0, '[]'::jsonb)",
+         VALUES ($1, 'place', 'Bad Payload', 53.5, 10.0, '[]'::jsonb)",
     )
     .bind(NODE_BAD_PAYLOAD)
     .execute(&pool)
@@ -2588,7 +2588,7 @@ async fn postgres_guest_exit_completes_under_projection_middleware() -> Result<(
     sqlx::query(
         "INSERT INTO domain_nodes \
          (id, kind, title, lat, lon, created_at, updated_at, payload) \
-         VALUES ($1, 'Ort', 'Exit cache node', 53.5, 10.0, NOW(), NOW(), \
+         VALUES ($1, 'place', 'Exit cache node', 53.5, 10.0, NOW(), NOW(), \
                  jsonb_build_object('created_by_account_id', $2::text))",
     )
     .bind(NODE_ID)

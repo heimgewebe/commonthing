@@ -457,7 +457,7 @@ async fn governance_conversation_target_is_additive_deterministic_and_reversible
 
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, created_at, updated_at, payload)
-         VALUES ($1, 'Ort', 'T018 Knotenkontrolle', NOW(), NOW(), '{}')",
+         VALUES ($1, 'place', 'T018 Knotenkontrolle', NOW(), NOW(), '{}')",
     )
     .bind(NODE_ID)
     .execute(&pool)

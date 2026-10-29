@@ -159,8 +159,8 @@ class DomainScaleTests(unittest.TestCase):
                 self.assertIn(f"{workload}.json", sql)
             self.assertIn("WHERE id >", sql)
             self.assertIn("ORDER BY id ASC LIMIT 1000", sql)
-            self.assertIn("WHERE kind = 'Projekt' LIMIT 500", sql)
-            self.assertNotIn("WHERE kind = 'Projekt' ORDER BY", sql)
+            self.assertIn("WHERE kind = 'project' LIMIT 500", sql)
+            self.assertNotIn("WHERE kind = 'project' ORDER BY", sql)
             self.assertIn(
                 "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 ORDER BY id ASC LIMIT 1001 OFFSET 0",
                 sql,

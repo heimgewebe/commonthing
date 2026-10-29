@@ -5606,7 +5606,7 @@ spec:
     def test_t048_expected_projection_row_binds_complete_synthetic_state(self) -> None:
         public = {
             "id": "node-public",
-            "kind": "Projekt",
+            "kind": "project",
             "title": "Public node",
             "payload": {"tags": ["scale", "public"], "summary": "Public summary"},
         }
@@ -5627,7 +5627,7 @@ spec:
                 "tags": ["scale", "public"],
                 "searchable_text": "Public summary",
                 "language": "de",
-                "kind": "Projekt",
+                "kind": "project",
                 "status": "active",
                 "visibility_scopes": ["public"],
                 "semantic_state": "ready",
@@ -5662,7 +5662,7 @@ spec:
     def test_t048_live_binding_rejects_complete_projection_drift(self) -> None:
         fixture_node = {
             "id": "node-1",
-            "kind": "Projekt",
+            "kind": "project",
             "title": "Node",
             "lat": 53.5,
             "lon": 10.0,
@@ -5789,7 +5789,7 @@ spec:
     def test_t048_live_binding_rejects_version_drift(self) -> None:
         fixture_node = {
             "id": "node-1",
-            "kind": "Projekt",
+            "kind": "project",
             "title": "Node",
             "lat": 53.5,
             "lon": 10.0,
@@ -5872,7 +5872,7 @@ spec:
     def test_t048_live_binding_rejects_edge_content_drift(self) -> None:
         fixture_node = {
             "id": "node-1",
-            "kind": "Projekt",
+            "kind": "project",
             "title": "Node",
             "lat": 53.5,
             "lon": 10.0,
@@ -5949,7 +5949,7 @@ spec:
 
     def test_t048_canonical_visibility_is_fixture_derived(self) -> None:
         self.assertEqual(
-            runtime._t048_canonical_visibility({"kind": "Projekt"}),
+            runtime._t048_canonical_visibility({"kind": "project"}),
             "public",
         )
         self.assertEqual(
