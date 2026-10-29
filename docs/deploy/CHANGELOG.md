@@ -27,11 +27,15 @@ revisionsgebundene CI und Security-Review auf dem PR-Head nachzuweisen.
 Der erste lokale Build und beide Config-Validierungen bestanden am
 22.10.2026; diese historischen Resultate ersetzen keine aktuelle CI.
 
-**Produktionsgrenze:** Auf `commonserver` sind laufende Caddy-Prozesse
-in Docker-Scopes belegt, ihre Image-/Binary-Version ist mangels
-Docker-Socket-Berechtigung nicht nachgewiesen. Erst ein autorisierter
-Container-Versionsreadback samt öffentlichem Funktionstest nach
-Deployment belegt die produktive Behebung. Ein Merge genügt nicht.
+**Produktionsnachweis vor dem Fix (29.10.2026):** Auf `commonserver`
+läuft der Docker-Container `weltgewebe-caddy-1` (`weltgewebe-caddy`).
+Seine Binary meldet über den bestehenden autorisierten Read-only-Weg
+`sudo -n docker exec weltgewebe-caddy-1 caddy version` **v2.8.4**.
+Die verwundbare Version ist damit nicht nur im Git-Pin, sondern in der
+laufenden Produktion nachgewiesen. Eine konkrete Pfadschutzumgehung ist
+nicht reproduziert. Erst ein autorisierter Container-Versionsreadback
+(`v2.11.7`) und öffentlicher Funktionstest nach dem Captain-Deploy
+belegen die produktive Behebung. Ein Merge genügt nicht.
 
 ## 2026-09-19 - CSP: `style-src` ohne `'unsafe-inline'`
 
