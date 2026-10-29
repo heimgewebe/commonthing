@@ -12,7 +12,7 @@ fn candidate(id: &str, rank_class: u8, rank_score: f64, embedding: [f64; 2]) -> 
     ScoredNode {
         node: Node {
             id: id.to_string(),
-            kind: "Werkstatt".to_string(),
+            kind: "place".to_string(),
             title: id.to_string(),
             created_at: "2026-07-22T00:00:00Z".to_string(),
             updated_at: "2026-07-22T00:00:00Z".to_string(),

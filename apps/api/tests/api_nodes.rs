@@ -332,7 +332,9 @@ async fn nodes_patch_info_lifecycle() -> anyhow::Result<()> {
 
     write_lines(
         &nodes_path,
-        &[r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#],
+        &[
+            r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#,
+        ],
     );
     let _env = set_gewebe_in_dir(&in_dir);
 
@@ -704,8 +706,7 @@ async fn postgres_read_source_blocks_node_patch_without_persisting() -> anyhow::
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");
     let nodes_path = in_dir.join("demo.nodes.jsonl");
-    let original_line =
-        r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#;
+    let original_line = r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#;
     write_lines(&nodes_path, &[original_line]);
     let _env = set_gewebe_in_dir(&in_dir);
 
@@ -854,7 +855,9 @@ async fn nodes_patch_without_origin_fails() -> anyhow::Result<()> {
     // Initial node
     write_lines(
         &nodes,
-        &[r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#],
+        &[
+            r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#,
+        ],
     );
 
     // Setup Auth State with Account

@@ -618,7 +618,7 @@ async fn domain_schema_basic_insert_and_read() {
     // --- domain_nodes: insert and read back ---
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, lat, lon, payload)
-         VALUES ('test-node-schema-probe', 'TestKind', 'Test Node', 53.55, 10.00, '{\"info\":\"probe\"}'::jsonb)",
+         VALUES ('test-node-schema-probe', 'place', 'Test Node', 53.55, 10.00, '{\"info\":\"probe\"}'::jsonb)",
     )
     .execute(&pool)
     .await
@@ -631,7 +631,7 @@ async fn domain_schema_basic_insert_and_read() {
             .await
             .expect("failed to read back test row from domain_nodes");
 
-    assert_eq!(kind, "TestKind");
+    assert_eq!(kind, "place");
     assert_eq!(title, "Test Node");
 
     sqlx::query("DELETE FROM domain_nodes WHERE id = 'test-node-schema-probe'")

@@ -7478,7 +7478,7 @@ CREATE TABLE public._sqlx_migrations (
 INSERT INTO public.domain_nodes
   (id, kind, title, lat, lon, payload)
 VALUES
-  ('schema-restore-proof-node', 'TestKind', 'Restore Proof', 53.55, 10.0,
+  ('schema-restore-proof-node', 'place', 'Restore Proof', 53.55, 10.0,
    '{"info":"source-to-restore"}'::jsonb);
 """,
             )

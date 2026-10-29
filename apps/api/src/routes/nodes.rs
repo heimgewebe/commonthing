@@ -419,6 +419,42 @@ where
     Ok(kind)
 }
 
+#[cfg(test)]
+mod node_kind_jsonl_tests {
+    use super::{is_canonical_node_kind, NodeDto};
+    use serde_json::json;
+
+    #[test]
+    fn rejects_old_missing_or_arbitrary_jsonl_kinds() {
+        let base = json!({
+            "id": "test-node",
+            "title": "Example",
+            "location": { "lat": 53.5, "lon": 10.0 }
+        });
+        assert!(serde_json::from_value::<NodeDto>(base.clone()).is_err());
+        for kind in ["standard", "Unknown", "unclassified", "Werkstatt"] {
+            let mut node = base.clone();
+            node["kind"] = json!(kind);
+            assert!(serde_json::from_value::<NodeDto>(node).is_err(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn every_allowed_kind_deserializes_without_default() {
+        for kind in ["place", "resource", "project", "event", "need", "offer"] {
+            assert!(is_canonical_node_kind(kind));
+            let node = json!({
+                "id": "typed-node",
+                "kind": kind,
+                "title": "Example",
+                "location": { "lat": 53.5, "lon": 10.0 }
+            });
+            let parsed = serde_json::from_value::<NodeDto>(node).expect("valid kind");
+            assert_eq!(parsed.kind, kind);
+        }
+    }
+}
+
 fn parse_node_jsonl_dto(line: &str, path: &FsPath, line_number: usize) -> std::io::Result<NodeDto> {
     serde_json::from_str(line).map_err(|error| {
         std::io::Error::new(
@@ -1942,6 +1978,15 @@ mod node_create {
             }
         }
 
+        #[test]
+        fn accepts_all_six_canonical_kinds() {
+            for kind in super::super::CANONICAL_NODE_KINDS {
+                let mut req = valid_request();
+                req.kind = kind.to_string();
+                assert_eq!(req.validate().expect("canonical kind").kind, kind);
+            }
+        }
+
         fn valid_request() -> CreateNodeRequest {
             CreateNodeRequest {
                 title: "A Node".to_string(),
@@ -2016,7 +2061,8 @@ mod node_create {
 
         #[test]
         fn rejects_missing_title() {
-            let json = r#"{"kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0}}"#;
+            let json =
+                r#"{"kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0}}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
         }
 
@@ -2028,8 +2074,7 @@ mod node_create {
 
         #[test]
         fn rejects_missing_address() {
-            let json =
-                r#"{"title":"A Node","kind":"place","location":{"lat":53.5,"lon":10.0}}"#;
+            let json = r#"{"title":"A Node","kind":"place","location":{"lat":53.5,"lon":10.0}}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
         }
 
