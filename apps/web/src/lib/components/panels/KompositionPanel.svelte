@@ -11,13 +11,14 @@
   import { sensitiveSession } from "$lib/auth/sensitiveSession";
   import { createNode, ApiRequestError } from "$lib/api/domainWrites";
   import { combineKnottingTags, type KnottingTopic } from "$lib/knottingTopics";
+  import { NODE_KIND_OPTIONS, isNodeKind } from "$lib/ui/productLanguage";
   import KnottingTopicsSelector from "$lib/components/KnottingTopicsSelector.svelte";
   import { onMount, tick } from "svelte";
 
   let title = $state("");
   let description = $state("");
   let address = $state("");
-  let nodeType = $state("standard");
+  let nodeType = $state("");
   let topics: KnottingTopic[] = $state([]);
   let isSubmitting = $state(false);
   let titleInput: HTMLInputElement | null = $state(null);
@@ -37,7 +38,10 @@
     $kompositionDraft?.mode === "place-garnrolle",
   );
   let canSubmit = $derived(
-    !!$kompositionDraft?.lngLat && !!title.trim() && !!address.trim(),
+    !!$kompositionDraft?.lngLat &&
+      isNodeKind(nodeType) &&
+      !!title.trim() &&
+      !!address.trim(),
   );
 
   onMount(async () => {
@@ -125,7 +129,13 @@
     titleError = !title.trim();
     addressError = !address.trim();
 
-    if (titleError || addressError || !$kompositionDraft?.lngLat || !canWrite) {
+    if (
+      titleError ||
+      addressError ||
+      !$kompositionDraft?.lngLat ||
+      !isNodeKind(nodeType) ||
+      !canWrite
+    ) {
       return;
     }
 
@@ -250,9 +260,10 @@
           class="input"
           disabled={isSubmitting}
         >
-          <option value="standard">Allgemeiner Knoten</option>
-          <option value="event">Ereignis</option>
-          <option value="resource">Ressource</option>
+          <option value="" disabled>Art auswählen</option>
+          {#each NODE_KIND_OPTIONS as option}
+            <option value={option.id}>{option.label}</option>
+          {/each}
         </select>
       </div>
 

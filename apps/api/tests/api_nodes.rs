@@ -160,9 +160,9 @@ async fn nodes_bbox_and_limit() -> anyhow::Result<()> {
     let (app, _env) = app_with_nodes(
         &in_dir,
         &[
-            r#"{"id":"n1","location":{"lon":9.9,"lat":53.55},"title":"A"}"#,
-            r#"{"id":"n2","location":{"lon":11.0,"lat":54.2},"title":"B"}"#,
-            r#"{"id":"n3","location":{"lon":10.2,"lat":53.6},"title":"C"}"#,
+            r#"{"id":"n1","kind":"place","location":{"lon":9.9,"lat":53.55},"title":"A"}"#,
+            r#"{"id":"n2","kind":"place","location":{"lon":11.0,"lat":54.2},"title":"B"}"#,
+            r#"{"id":"n3","kind":"place","location":{"lon":10.2,"lat":53.6},"title":"C"}"#,
         ],
     )
     .await;
@@ -238,11 +238,11 @@ async fn node_details_include_only_current_public_creator_titles() -> anyhow::Re
     write_lines(
         &in_dir.join("demo.nodes.jsonl"),
         &[
-            r#"{"id":"active-node","location":{"lon":10.0,"lat":53.5},"title":"A","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-01-02T12:00:00Z","created_by_account_id":"active-account"}"#,
-            r#"{"id":"disabled-node","location":{"lon":10.1,"lat":53.6},"title":"B","created_by_account_id":"disabled-account"}"#,
-            r#"{"id":"missing-node","location":{"lon":10.2,"lat":53.7},"title":"C","created_by_account_id":"missing-account"}"#,
-            r#"{"id":"blank-node","location":{"lon":10.3,"lat":53.8},"title":"D","created_by_account_id":"blank-account"}"#,
-            r#"{"id":"anonymous-node","location":{"lon":10.4,"lat":53.9},"title":"E"}"#,
+            r#"{"id":"active-node","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-01-02T12:00:00Z","created_by_account_id":"active-account"}"#,
+            r#"{"id":"disabled-node","kind":"place","location":{"lon":10.1,"lat":53.6},"title":"B","created_by_account_id":"disabled-account"}"#,
+            r#"{"id":"missing-node","kind":"place","location":{"lon":10.2,"lat":53.7},"title":"C","created_by_account_id":"missing-account"}"#,
+            r#"{"id":"blank-node","kind":"place","location":{"lon":10.3,"lat":53.8},"title":"D","created_by_account_id":"blank-account"}"#,
+            r#"{"id":"anonymous-node","kind":"place","location":{"lon":10.4,"lat":53.9},"title":"E"}"#,
         ],
     );
     let _env = set_gewebe_in_dir(&in_dir);
@@ -332,7 +332,7 @@ async fn nodes_patch_info_lifecycle() -> anyhow::Result<()> {
 
     write_lines(
         &nodes_path,
-        &[r#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#],
+        &[r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#],
     );
     let _env = set_gewebe_in_dir(&in_dir);
 
@@ -453,7 +453,7 @@ async fn nodes_patch_legacy_null_visibility_stays_public_across_cache_and_restar
     write_lines(
         &nodes_path,
         &[
-            r#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old","search_visibility":null}"#,
+            r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old","search_visibility":null}"#,
         ],
     );
 
@@ -518,7 +518,7 @@ async fn nodes_patch_rejects_oversized_info_without_side_effects() -> anyhow::Re
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");
     let nodes_path = in_dir.join("demo.nodes.jsonl");
-    let original_line = r#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info","updated_at":"2026-01-01T00:00:00Z"}"#;
+    let original_line = r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info","updated_at":"2026-01-01T00:00:00Z"}"#;
     write_lines(&nodes_path, &[original_line]);
     let _env = set_gewebe_in_dir(&in_dir);
 
@@ -597,7 +597,7 @@ async fn assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(
     let nodes_path = in_dir.join("demo.nodes.jsonl");
     fs::create_dir_all(&in_dir)?;
 
-    let valid_line = br#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info","updated_at":"2026-01-01T00:00:00Z"}"#;
+    let valid_line = br#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info","updated_at":"2026-01-01T00:00:00Z"}"#;
     let mut startup_bytes = valid_line.to_vec();
     startup_bytes.extend_from_slice(b"\n");
     fs::write(&nodes_path, &startup_bytes)?;
@@ -705,7 +705,7 @@ async fn postgres_read_source_blocks_node_patch_without_persisting() -> anyhow::
     let in_dir = tmp.path().join("in");
     let nodes_path = in_dir.join("demo.nodes.jsonl");
     let original_line =
-        r#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#;
+        r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#;
     write_lines(&nodes_path, &[original_line]);
     let _env = set_gewebe_in_dir(&in_dir);
 
@@ -775,7 +775,7 @@ async fn nodes_accept_string_coordinates() -> anyhow::Result<()> {
 
     let (app, _env) = app_with_nodes(
         &in_dir,
-        &[r#"{"id":"n1","location":{"lon":"9.9","lat":"53.55"},"title":"A"}"#],
+        &[r#"{"id":"n1","kind":"place","location":{"lon":"9.9","lat":"53.55"},"title":"A"}"#],
     )
     .await;
 
@@ -814,7 +814,7 @@ async fn nodes_fill_missing_updated_at_from_created_at() -> anyhow::Result<()> {
     let in_dir = tmp.path().join("in");
 
     let (app, _env) = app_with_nodes(&in_dir, &[
-        r#"{"id":"n1","location":{"lon":9.9,"lat":53.55},"title":"A","created_at":"2024-01-02T03:04:05Z"}"#,
+        r#"{"id":"n1","kind":"place","location":{"lon":9.9,"lat":53.55},"title":"A","created_at":"2024-01-02T03:04:05Z"}"#,
     ]).await;
 
     let res = app
@@ -854,7 +854,7 @@ async fn nodes_patch_without_origin_fails() -> anyhow::Result<()> {
     // Initial node
     write_lines(
         &nodes,
-        &[r#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#],
+        &[r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A","info":"Old Info"}"#],
     );
 
     // Setup Auth State with Account
@@ -916,9 +916,9 @@ async fn nodes_offset_pagination() -> anyhow::Result<()> {
     let (app, _env) = app_with_nodes(
         &in_dir,
         &[
-            r#"{"id":"n1","location":{"lon":9.9,"lat":53.55},"title":"A"}"#,
-            r#"{"id":"n2","location":{"lon":10.1,"lat":53.6},"title":"B"}"#,
-            r#"{"id":"n3","location":{"lon":10.2,"lat":53.7},"title":"C"}"#,
+            r#"{"id":"n1","kind":"place","location":{"lon":9.9,"lat":53.55},"title":"A"}"#,
+            r#"{"id":"n2","kind":"place","location":{"lon":10.1,"lat":53.6},"title":"B"}"#,
+            r#"{"id":"n3","kind":"place","location":{"lon":10.2,"lat":53.7},"title":"C"}"#,
         ],
     )
     .await;
@@ -982,7 +982,7 @@ async fn nodes_invalid_limit() -> anyhow::Result<()> {
 
     let (app, _env) = app_with_nodes(
         &in_dir,
-        &[r#"{"id":"n1","location":{"lon":9.9,"lat":53.55},"title":"A"}"#],
+        &[r#"{"id":"n1","kind":"place","location":{"lon":9.9,"lat":53.55},"title":"A"}"#],
     )
     .await;
 
@@ -1009,20 +1009,20 @@ async fn nodes_robustness_with_dirty_data() -> anyhow::Result<()> {
     let in_dir = tmp.path().join("in");
 
     // We verify:
-    // n1: Clean
-    // n2: Kind is number -> Unknown
+    // n1: A valid place kind.
+    // n2: A canonical resource kind (never guessed from an invalid value).
     // n3: Summary is array -> None
     // n4: Title is boolean -> Untitled
     // n5: Info is object -> None
     let (app, _env) = app_with_nodes(
         &in_dir,
         &[
-            r#"{"id": "n1", "kind": "Clean", "title": "Clean Node", "location": {"lat": 52.5, "lon": 13.4}}"#,
-            r#"{"id": "n2", "kind": 123, "title": "Dirty Kind", "location": {"lat": 52.5, "lon": 13.4}}"#,
-            r#"{"id": "n3", "kind": "Dirty Summary", "title": "Dirty Summary", "summary": ["oops"], "location": {"lat": 52.5, "lon": 13.4}}"#,
-            r#"{"id": "n4", "kind": "Dirty Title", "title": true, "location": {"lat": 52.5, "lon": 13.4}}"#,
-            r#"{"id": "n5", "kind": "Dirty Info", "title": "Dirty Info", "info": {"foo": "bar"}, "location": {"lat": 52.5, "lon": 13.4}}"#,
-            r#"{"id": "n6", "title": "Dirty Tags", "tags": ["clean", 123, null, "also-clean"], "location": {"lat": 52.5, "lon": 13.4}}"#,
+            r#"{"id": "n1", "kind": "place", "title": "Clean Node", "location": {"lat": 52.5, "lon": 13.4}}"#,
+            r#"{"id": "n2", "kind": "resource", "title": "Dirty Kind", "location": {"lat": 52.5, "lon": 13.4}}"#,
+            r#"{"id": "n3", "kind": "project", "title": "Dirty Summary", "summary": ["oops"], "location": {"lat": 52.5, "lon": 13.4}}"#,
+            r#"{"id": "n4", "kind": "event", "title": true, "location": {"lat": 52.5, "lon": 13.4}}"#,
+            r#"{"id": "n5", "kind": "need", "title": "Dirty Info", "info": {"foo": "bar"}, "location": {"lat": 52.5, "lon": 13.4}}"#,
+            r#"{"id": "n6","kind":"offer", "title": "Dirty Tags", "tags": ["clean", 123, null, "also-clean"], "location": {"lat": 52.5, "lon": 13.4}}"#,
         ],
     )
     .await;
@@ -1042,13 +1042,13 @@ async fn nodes_robustness_with_dirty_data() -> anyhow::Result<()> {
     // Helper to find node by id
     let find_node = |id: &str| arr.iter().find(|n| n["id"] == id).unwrap();
 
-    // n1: Clean
+    // n1: A valid place kind.
     let n1 = find_node("n1");
-    assert_eq!(n1["kind"], "Clean");
+    assert_eq!(n1["kind"], "place");
 
-    // n2: Kind is number -> Unknown
+    // n2: A canonical resource kind (never guessed from an invalid value).
     let n2 = find_node("n2");
-    assert_eq!(n2["kind"], "Unknown");
+    assert_eq!(n2["kind"], "resource");
 
     // n3: Summary is array -> None (null)
     let n3 = find_node("n3");
@@ -1080,7 +1080,7 @@ async fn nodes_limit_is_clamped_to_max_page_size() -> anyhow::Result<()> {
 
     // Seed more nodes than the page-size cap so the clamp is observable.
     let lines: Vec<String> = (0..1100)
-        .map(|i| format!(r#"{{"id":"n{i}","location":{{"lon":10.0,"lat":53.5}},"title":"N{i}"}}"#))
+        .map(|i| format!(r#"{{"id":"n{i}","kind":"place","location":{{"lon":10.0,"lat":53.5}},"title":"N{i}"}}"#))
         .collect();
     let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
 
@@ -1109,11 +1109,11 @@ async fn nodes_cursor_pagination_envelope_and_walk() -> anyhow::Result<()> {
     let (app, _env) = app_with_nodes(
         &in_dir,
         &[
-            r#"{"id":"n3","location":{"lon":10.0,"lat":53.5},"title":"C"}"#,
-            r#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"A"}"#,
-            r#"{"id":"n5","location":{"lon":10.0,"lat":53.5},"title":"E"}"#,
-            r#"{"id":"n2","location":{"lon":10.0,"lat":53.5},"title":"B"}"#,
-            r#"{"id":"n4","location":{"lon":10.0,"lat":53.5},"title":"D"}"#,
+            r#"{"id":"n3","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"C"}"#,
+            r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"A"}"#,
+            r#"{"id":"n5","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"E"}"#,
+            r#"{"id":"n2","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"B"}"#,
+            r#"{"id":"n4","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"D"}"#,
         ],
     )
     .await;
@@ -1185,7 +1185,7 @@ async fn nodes_cursor_invalid_is_bad_request() -> anyhow::Result<()> {
     let in_dir = tmp.path().join("in");
     let (app, _env) = app_with_nodes(
         &in_dir,
-        &[r#"{"id":"n1","location":{"lon":9.9,"lat":53.55},"title":"A"}"#],
+        &[r#"{"id":"n1","kind":"place","location":{"lon":9.9,"lat":53.55},"title":"A"}"#],
     )
     .await;
 
@@ -1207,7 +1207,7 @@ async fn nodes_cursor_limit_is_clamped_to_max_page_size() -> anyhow::Result<()> 
     // Zero-padded ids keep lexicographic order aligned with numeric order.
     let lines: Vec<String> = (0..1100)
         .map(|i| {
-            format!(r#"{{"id":"n{i:04}","location":{{"lon":10.0,"lat":53.5}},"title":"N{i}"}}"#)
+            format!(r#"{{"id":"n{i:04}","kind":"place","location":{{"lon":10.0,"lat":53.5}},"title":"N{i}"}}"#)
         })
         .collect();
     let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -1235,8 +1235,8 @@ async fn nodes_cursor_limit_zero_is_bad_request() -> anyhow::Result<()> {
     let in_dir = tmp.path().join("in");
 
     let lines = vec![
-        r#"{"id":"n1","location":{"lon":10.0,"lat":53.5},"title":"N1"}"#,
-        r#"{"id":"n2","location":{"lon":10.0,"lat":53.5},"title":"N2"}"#,
+        r#"{"id":"n1","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"N1"}"#,
+        r#"{"id":"n2","kind":"place","location":{"lon":10.0,"lat":53.5},"title":"N2"}"#,
     ];
     let (app, _env) = app_with_nodes(&in_dir, &lines).await;
 
@@ -1327,7 +1327,7 @@ async fn nodes_post_creates_persists_and_reloads() -> anyhow::Result<()> {
     )
     .await;
 
-    let body = r#"{"title":"New Node","kind":"Werkstatt","address":"Musterstraße 1, 12345 Musterstadt","location":{"lat":53.55,"lon":9.99},"summary":"Short summary","tags":["a","b"],"operation_id":"10000000-0000-0000-0000-000000000010"}"#;
+    let body = r#"{"title":"New Node","kind":"place","address":"Musterstraße 1, 12345 Musterstadt","location":{"lat":53.55,"lon":9.99},"summary":"Short summary","tags":["a","b"],"operation_id":"10000000-0000-0000-0000-000000000010"}"#;
     let res = app
         .clone()
         .oneshot(post_node_req(Some(&cookie), body))
@@ -1342,7 +1342,7 @@ async fn nodes_post_creates_persists_and_reloads() -> anyhow::Result<()> {
         "server must generate a UUID id"
     );
     assert_eq!(created["title"], "New Node");
-    assert_eq!(created["kind"], "Werkstatt");
+    assert_eq!(created["kind"], "place");
     assert_eq!(created["address"], "Musterstraße 1, 12345 Musterstadt");
     assert_eq!(created["location"]["lat"], 53.55);
     assert_eq!(created["location"]["lon"], 9.99);
@@ -1398,7 +1398,7 @@ async fn nodes_post_rejects_corrupt_existing_jsonl_after_startup() -> anyhow::Re
         let nodes_path = in_dir.join("demo.nodes.jsonl");
         fs::write(&nodes_path, corrupt_line)?;
         let before = fs::read(&nodes_path)?;
-        let request_body = r#"{"title":"New Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.55,"lon":9.99},"operation_id":"10000000-0000-0000-0000-000000000099"}"#;
+        let request_body = r#"{"title":"New Node","kind":"place","address":"Musterstraße 1","location":{"lat":53.55,"lon":9.99},"operation_id":"10000000-0000-0000-0000-000000000099"}"#;
 
         let res = app
             .oneshot(post_node_req(Some(&cookie), request_body))
@@ -1440,7 +1440,7 @@ async fn nodes_post_replays_same_operation_without_second_write() -> anyhow::Res
     )
     .await;
     let request_body = format!(
-        r#"{{"title":"Retry Safe Node","kind":"Werkstatt","address":"Musterstraße 1","location":{{"lat":53.55,"lon":9.99}},"summary":"Same action","operation_id":"{OPERATION_ID}"}}"#
+        r#"{{"title":"Retry Safe Node","kind":"place","address":"Musterstraße 1","location":{{"lat":53.55,"lon":9.99}},"summary":"Same action","operation_id":"{OPERATION_ID}"}}"#
     );
 
     let first_attempt = app
@@ -1497,7 +1497,7 @@ async fn nodes_post_replays_same_operation_without_second_write() -> anyhow::Res
     // The key identifies one semantic action. Reusing it for changed data is a
     // conflict and must still leave exactly one durable node.
     let changed_body = format!(
-        r#"{{"title":"Different Node","kind":"Werkstatt","address":"Musterstraße 1","location":{{"lat":53.55,"lon":9.99}},"summary":"Same action","operation_id":"{OPERATION_ID}"}}"#
+        r#"{{"title":"Different Node","kind":"place","address":"Musterstraße 1","location":{{"lat":53.55,"lon":9.99}},"summary":"Same action","operation_id":"{OPERATION_ID}"}}"#
     );
     let conflict = restarted_app
         .oneshot(post_node_req(Some(&restarted_cookie), &changed_body))
@@ -1536,7 +1536,7 @@ async fn nodes_post_requires_authentication() -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn(require_csrf))
         .with_state(state);
 
-    let body = r#"{"title":"New Node","kind":"Werkstatt","address":"Somewhere","location":{"lat":53.55,"lon":9.99}}"#;
+    let body = r#"{"title":"New Node","kind":"place","address":"Somewhere","location":{"lat":53.55,"lon":9.99}}"#;
     let res = app.oneshot(post_node_req(None, body)).await?;
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
@@ -1553,7 +1553,7 @@ async fn nodes_post_allows_gast_and_binds_creator() -> anyhow::Result<()> {
 
     let (app, cookie, state, _env) = app_with_account(&in_dir, gast_account(guest_id)).await;
 
-    let body = r#"{"title":"Gastknoten","kind":"Werkstatt","address":"Somewhere","location":{"lat":53.55,"lon":9.99},"operation_id":"10000000-0000-0000-0000-000000000011"}"#;
+    let body = r#"{"title":"Gastknoten","kind":"place","address":"Somewhere","location":{"lat":53.55,"lon":9.99},"operation_id":"10000000-0000-0000-0000-000000000011"}"#;
     let res = app.oneshot(post_node_req(Some(&cookie), body)).await?;
     assert_eq!(res.status(), StatusCode::CREATED);
     let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
@@ -1595,7 +1595,7 @@ async fn nodes_post_without_origin_fails() -> anyhow::Result<()> {
         .header("Host", "localhost")
         // No Origin, No Referer.
         .body(body::Body::from(
-            r#"{"title":"New Node","kind":"Werkstatt","address":"Somewhere","location":{"lat":53.55,"lon":9.99}}"#,
+            r#"{"title":"New Node","kind":"place","address":"Somewhere","location":{"lat":53.55,"lon":9.99}}"#,
         ))?;
     let res = app.oneshot(req).await?;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -1619,30 +1619,30 @@ async fn nodes_post_rejects_invalid_payloads_with_stable_400() -> anyhow::Result
 
     let cases = [
         // Missing required address.
-        r#"{"title":"No Address","kind":"Werkstatt","location":{"lat":53.5,"lon":10.0}}"#,
+        r#"{"title":"No Address","kind":"place","location":{"lat":53.5,"lon":10.0}}"#,
         // Missing required title.
-        r#"{"kind":"Werkstatt","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
+        r#"{"kind":"place","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
         // Missing required kind.
         r#"{"title":"No Kind","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
         // Missing required location.
-        r#"{"title":"No Location","kind":"Werkstatt","address":"Somewhere"}"#,
+        r#"{"title":"No Location","kind":"place","address":"Somewhere"}"#,
         // Blank title after trim.
-        r#"{"title":"   ","kind":"Werkstatt","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
+        r#"{"title":"   ","kind":"place","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
         // Out-of-bounds latitude.
-        r#"{"title":"Bad Lat","kind":"Werkstatt","address":"Somewhere","location":{"lat":999.0,"lon":10.0}}"#,
+        r#"{"title":"Bad Lat","kind":"place","address":"Somewhere","location":{"lat":999.0,"lon":10.0}}"#,
         // Non-finite longitude.
-        r#"{"title":"Bad Lon","kind":"Werkstatt","address":"Somewhere","location":{"lat":10.0,"lon":1e400}}"#,
+        r#"{"title":"Bad Lon","kind":"place","address":"Somewhere","location":{"lat":10.0,"lon":1e400}}"#,
         // Unknown top-level field.
-        r#"{"title":"Extra","kind":"Werkstatt","address":"Somewhere","location":{"lat":10.0,"lon":10.0},"wat":true}"#,
+        r#"{"title":"Extra","kind":"place","address":"Somewhere","location":{"lat":10.0,"lon":10.0},"wat":true}"#,
         // Server-owned id supplied by client.
-        r#"{"id":"00000000-0000-0000-0000-000000000001","title":"Client Id","kind":"Werkstatt","address":"Somewhere","location":{"lat":10.0,"lon":10.0}}"#,
+        r#"{"id":"00000000-0000-0000-0000-000000000001","title":"Client Id","kind":"place","address":"Somewhere","location":{"lat":10.0,"lon":10.0}}"#,
         // Client operation id must be a UUID.
-        r#"{"title":"Bad Operation","kind":"Werkstatt","address":"Somewhere","location":{"lat":10.0,"lon":10.0},"operation_id":"not-a-uuid"}"#,
+        r#"{"title":"Bad Operation","kind":"place","address":"Somewhere","location":{"lat":10.0,"lon":10.0},"operation_id":"not-a-uuid"}"#,
         // Explicit null is not the same as omitting the optional operation id.
-        r#"{"title":"Null Operation","kind":"Werkstatt","address":"Somewhere","location":{"lat":10.0,"lon":10.0},"operation_id":null}"#,
+        r#"{"title":"Null Operation","kind":"place","address":"Somewhere","location":{"lat":10.0,"lon":10.0},"operation_id":null}"#,
         // Too many tags.
         &format!(
-            r#"{{"title":"Too Many Tags","kind":"Werkstatt","address":"Somewhere","location":{{"lat":10.0,"lon":10.0}},"tags":[{}]}}"#,
+            r#"{{"title":"Too Many Tags","kind":"place","address":"Somewhere","location":{{"lat":10.0,"lon":10.0}},"tags":[{}]}}"#,
             (0..40)
                 .map(|i| format!("\"t{i}\""))
                 .collect::<Vec<_>>()

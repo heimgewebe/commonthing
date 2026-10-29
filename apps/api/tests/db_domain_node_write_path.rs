@@ -382,7 +382,7 @@ fn replace_node_req(cookie: &str, id: &str, title: &str, etag: &str) -> Request<
         .body(body::Body::from(
             serde_json::json!({
                 "title": title,
-                "kind": "Werkstatt",
+                "kind": "place",
                 "address": "Neue Straße 1",
                 "location": {"lat": 53.55, "lon": 10.05},
                 "tags": ["parallel"]
@@ -1721,7 +1721,7 @@ async fn postgres_node_create_persists_and_reload_sees_it() -> Result<()> {
 
     let (app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
 
-    let body = r#"{"title":"New Node","kind":"Werkstatt","address":"Musterstraße 1, 12345 Musterstadt","location":{"lat":53.55,"lon":9.99},"summary":"Short summary","tags":["a","b"]}"#;
+    let body = r#"{"title":"New Node","kind":"place","address":"Musterstraße 1, 12345 Musterstadt","location":{"lat":53.55,"lon":9.99},"summary":"Short summary","tags":["a","b"]}"#;
     let res = app.clone().oneshot(post_node_req(&cookie, body)).await?;
     assert_eq!(res.status(), StatusCode::CREATED);
 
@@ -1733,7 +1733,7 @@ async fn postgres_node_create_persists_and_reload_sees_it() -> Result<()> {
         "server must generate a UUID id"
     );
     assert_eq!(created["title"], "New Node");
-    assert_eq!(created["kind"], "Werkstatt");
+    assert_eq!(created["kind"], "place");
     assert_eq!(created["address"], "Musterstraße 1, 12345 Musterstadt");
     assert_eq!(created["location"]["lat"], 53.55);
     assert_eq!(created["location"]["lon"], 9.99);
@@ -1747,7 +1747,7 @@ async fn postgres_node_create_persists_and_reload_sees_it() -> Result<()> {
             .fetch_one(&pool)
             .await
             .expect("node row must exist after create");
-    assert_eq!(kind, "Werkstatt");
+    assert_eq!(kind, "place");
     assert_eq!(title, "New Node");
     assert!((lat.unwrap() - 53.55).abs() < 1e-9);
     assert!((lon.unwrap() - 9.99).abs() < 1e-9);
@@ -1809,7 +1809,7 @@ async fn postgres_node_create_persists_and_reload_sees_it() -> Result<()> {
         .expect("reload nodes from postgres");
     let node = reloaded.get(&id).expect("node reloaded from postgres");
     assert_eq!(node.title, "New Node");
-    assert_eq!(node.kind, "Werkstatt");
+    assert_eq!(node.kind, "place");
     assert_eq!(
         node.address.as_deref(),
         Some("Musterstraße 1, 12345 Musterstadt")
@@ -1856,7 +1856,7 @@ async fn postgres_node_create_allows_jsonl_account_write_source() -> Result<()> 
     let response = app
         .oneshot(post_node_req(
             &cookie,
-            r#"{"title":"Staged Migration Node","kind":"Werkstatt","address":"Migrationsweg 1","location":{"lat":53.55,"lon":9.99},"operation_id":"30000000-0000-4000-8000-000000000123"}"#,
+            r#"{"title":"Staged Migration Node","kind":"place","address":"Migrationsweg 1","location":{"lat":53.55,"lon":9.99},"operation_id":"30000000-0000-4000-8000-000000000123"}"#,
         ))
         .await?;
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -1926,7 +1926,7 @@ async fn postgres_node_edits_reuse_stable_expiring_faden_without_noop_inflation(
         .clone()
         .oneshot(post_node_req(
             &cookie,
-            r#"{"title":"Aktiver Knoten","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.55,"lon":9.99}}"#,
+            r#"{"title":"Aktiver Knoten","kind":"place","address":"Musterstraße 1","location":{"lat":53.55,"lon":9.99}}"#,
         ))
         .await?;
     assert_eq!(created_response.status(), StatusCode::CREATED);
@@ -2208,7 +2208,7 @@ async fn postgres_node_edit_projection_serializes_with_delete() -> Result<()> {
         .clone()
         .oneshot(post_node_req(
             &cookie,
-            r#"{"title":"Race node","kind":"Werkstatt","address":"Musterstraße 2","location":{"lat":53.56,"lon":9.98}}"#,
+            r#"{"title":"Race node","kind":"place","address":"Musterstraße 2","location":{"lat":53.56,"lon":9.98}}"#,
         ))
         .await?;
     assert_eq!(created_response.status(), StatusCode::CREATED);
@@ -2338,7 +2338,7 @@ async fn postgres_node_create_operation_replays_after_restart() -> Result<()> {
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
     let request_body = format!(
-        r#"{{"title":"Postgres Retry Node","kind":"Werkstatt","address":"Musterstraße 1","location":{{"lat":53.55,"lon":9.99}},"summary":"durable","operation_id":"{OPERATION_ID}"}}"#
+        r#"{{"title":"Postgres Retry Node","kind":"place","address":"Musterstraße 1","location":{{"lat":53.55,"lon":9.99}},"summary":"durable","operation_id":"{OPERATION_ID}"}}"#
     );
 
     let (first_app, first_cookie, _) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
@@ -2379,7 +2379,7 @@ async fn postgres_node_create_operation_replays_after_restart() -> Result<()> {
     assert_eq!(restarted_state.nodes.read().await.len(), 1);
 
     let changed_body = format!(
-        r#"{{"title":"Changed Retry Node","kind":"Werkstatt","address":"Musterstraße 1","location":{{"lat":53.55,"lon":9.99}},"summary":"durable","operation_id":"{OPERATION_ID}"}}"#
+        r#"{{"title":"Changed Retry Node","kind":"place","address":"Musterstraße 1","location":{{"lat":53.55,"lon":9.99}},"summary":"durable","operation_id":"{OPERATION_ID}"}}"#
     );
     let conflict = restarted_app
         .oneshot(post_node_req(&restarted_cookie, &changed_body))
@@ -2430,7 +2430,7 @@ async fn postgres_node_create_rejects_invalid_payload_without_side_effects() -> 
         .clone()
         .oneshot(post_node_req(
             &cookie,
-            r#"{"title":"No Address","kind":"Werkstatt","location":{"lat":53.5,"lon":10.0}}"#,
+            r#"{"title":"No Address","kind":"place","location":{"lat":53.5,"lon":10.0}}"#,
         ))
         .await?;
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -2440,7 +2440,7 @@ async fn postgres_node_create_rejects_invalid_payload_without_side_effects() -> 
         .clone()
         .oneshot(post_node_req(
             &cookie,
-            r#"{"title":"Bad Coords","kind":"Werkstatt","address":"Somewhere","location":{"lat":999.0,"lon":10.0}}"#,
+            r#"{"title":"Bad Coords","kind":"place","address":"Somewhere","location":{"lat":999.0,"lon":10.0}}"#,
         ))
         .await?;
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -2484,7 +2484,7 @@ async fn postgres_node_create_rejects_creator_deleted_by_inflight_exit() -> Resu
 
     let node = Node {
         id: node_id.to_string(),
-        kind: "Werkstatt".to_string(),
+        kind: "place".to_string(),
         title: "Race-konsistenter Gastknoten".to_string(),
         created_at: "2026-07-20T15:00:00+00:00".to_string(),
         updated_at: "2026-07-20T15:00:00+00:00".to_string(),
@@ -2776,7 +2776,7 @@ async fn concurrent_node_creates_preserve_runtime_pool_headroom() -> Result<()> 
         tasks.push(tokio::spawn(async move {
             let body = serde_json::json!({
                 "title": format!("Pool Headroom {index}"),
-                "kind": "Werkstatt",
+                "kind": "place",
                 "address": format!("Poolweg {index}"),
                 "location": {"lat": 53.5 + f64::from(index) / 1000.0, "lon": 10.0},
                 "operation_id": format!("30000000-0000-4000-8000-{index:012}")
@@ -2860,7 +2860,7 @@ async fn node_create_rolls_back_when_derived_faden_is_rejected() -> Result<()> {
 
     let body = serde_json::json!({
         "title": "Rollback Node",
-        "kind": "Werkstatt",
+        "kind": "place",
         "address": "Rollbackweg 1",
         "location": {"lat": 53.5, "lon": 10.0},
         "operation_id": "30000000-0000-4000-8000-000000000096"
@@ -2936,7 +2936,7 @@ async fn guest_node_limit_allows_replay_but_rejects_new_operation() -> Result<()
 
     let first = serde_json::json!({
         "title": "Limit One",
-        "kind": "Werkstatt",
+        "kind": "place",
         "address": "Limitweg 1",
         "location": {"lat": 53.5, "lon": 10.0},
         "operation_id": "30000000-0000-4000-8000-000000000095"
@@ -2949,7 +2949,7 @@ async fn guest_node_limit_allows_replay_but_rejects_new_operation() -> Result<()
 
     let second = serde_json::json!({
         "title": "Limit Two",
-        "kind": "Werkstatt",
+        "kind": "place",
         "address": "Limitweg 2",
         "location": {"lat": 53.6, "lon": 10.0},
         "operation_id": "30000000-0000-4000-8000-000000000094"
@@ -2998,7 +2998,7 @@ async fn concurrent_guest_node_creates_cannot_overshoot_limit() -> Result<()> {
 
     let first = serde_json::json!({
         "title": "Concurrent Limit A",
-        "kind": "Werkstatt",
+        "kind": "place",
         "address": "Limitweg A",
         "location": {"lat": 53.5, "lon": 10.0},
         "operation_id": "30000000-0000-4000-8000-000000000091"
@@ -3006,7 +3006,7 @@ async fn concurrent_guest_node_creates_cannot_overshoot_limit() -> Result<()> {
     .to_string();
     let second = serde_json::json!({
         "title": "Concurrent Limit B",
-        "kind": "Werkstatt",
+        "kind": "place",
         "address": "Limitweg B",
         "location": {"lat": 53.6, "lon": 10.0},
         "operation_id": "30000000-0000-4000-8000-000000000092"
@@ -3073,7 +3073,7 @@ async fn node_create_replay_locks_existing_node_before_faden_repair() -> Result<
 
     let request_body = serde_json::json!({
         "title": "Replay Lock",
-        "kind": "Werkstatt",
+        "kind": "place",
         "address": "Replayweg 1",
         "location": {"lat": 53.5, "lon": 10.0},
         "operation_id": "30000000-0000-4000-8000-000000000093"
@@ -3191,7 +3191,7 @@ async fn node_faden_cache_publication_is_delete_race_safe() -> Result<()> {
     let create = |title: &str, operation_id: &str| {
         serde_json::json!({
             "title": title,
-            "kind": "Werkstatt",
+            "kind": "place",
             "address": "Publikationsweg 1",
             "location": {"lat": 53.5, "lon": 10.0},
             "operation_id": operation_id
@@ -3315,7 +3315,7 @@ async fn node_and_faden_caches_publish_in_one_critical_section() -> Result<()> {
 
     let request = post_node_req(
         &cookie,
-        r#"{"title":"Atomic Cache Pair","kind":"Werkstatt","address":"Cacheweg 1","location":{"lat":53.5,"lon":10.0},"operation_id":"30000000-0000-4000-8000-000000000097"}"#,
+        r#"{"title":"Atomic Cache Pair","kind":"place","address":"Cacheweg 1","location":{"lat":53.5,"lon":10.0},"operation_id":"30000000-0000-4000-8000-000000000097"}"#,
     );
     let create_app = app.clone();
     let mut create_task = tokio::spawn(async move { create_app.oneshot(request).await });
@@ -3418,7 +3418,7 @@ async fn postgres_node_create_faden_projection_serializes_with_guest_exit() -> R
 
     let request = post_node_req(
         &cookie,
-        r#"{"title":"Exit Race Node","kind":"Werkstatt","address":"Race 1","location":{"lat":53.55,"lon":9.99}}"#,
+        r#"{"title":"Exit Race Node","kind":"place","address":"Race 1","location":{"lat":53.55,"lon":9.99}}"#,
     );
     let create_app = app.clone();
     let mut create_task = tokio::spawn(async move { create_app.oneshot(request).await });
@@ -3535,7 +3535,7 @@ async fn insert_domain_node_classifies_duplicate_id() -> Result<()> {
     let id = "writepath-node-dup-id";
     let make_node = |title: &str| Node {
         id: id.to_string(),
-        kind: "Werkstatt".to_string(),
+        kind: "place".to_string(),
         title: title.to_string(),
         created_at: "2026-06-12T10:00:00+00:00".to_string(),
         updated_at: "2026-06-12T10:00:00+00:00".to_string(),
@@ -3614,7 +3614,7 @@ async fn replace_and_delete_node_cascade_is_transactional_in_postgres() -> Resul
         .context("seeded node must exist")?;
     let replacement = Node {
         id: NODE_A.to_string(),
-        kind: "Werkstatt".to_string(),
+        kind: "place".to_string(),
         title: "Gemeinsam gepflegt".to_string(),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-07-15T04:00:00Z".to_string(),
@@ -3649,7 +3649,7 @@ async fn replace_and_delete_node_cascade_is_transactional_in_postgres() -> Resul
     .fetch_one(&pool)
     .await
     .context("read replaced node")?;
-    assert_eq!(row.0, "Werkstatt");
+    assert_eq!(row.0, "place");
     assert_eq!(row.1, "Gemeinsam gepflegt");
     assert_eq!(row.2, 53.55);
     assert_eq!(row.3, 10.05);

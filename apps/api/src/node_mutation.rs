@@ -489,7 +489,7 @@ mod tests {
     fn node(id: &str, title: &str) -> Node {
         Node {
             id: id.to_string(),
-            kind: "commons".to_string(),
+            kind: "resource".to_string(),
             title: title.to_string(),
             created_at: "2026-07-31T00:00:00Z".to_string(),
             updated_at: "2026-07-31T00:00:00Z".to_string(),
