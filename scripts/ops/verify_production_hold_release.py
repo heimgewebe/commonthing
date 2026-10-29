@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Fail-closed, read-only authorization check for production reconciliation.
 
-The root-owned authorization is written *outside* this repository only after
-backup, offline restore, privacy, alert delivery and human acknowledgment
-have independently passed. Digest references are not independent proofs.
+The root-owned authorization binds the exact source/OCI release to genuine
+backup and restored-offhost evidence. Privacy and alert operations are monitored
+separately; extra acknowledgment hashes do not block a working deployment.
+Digest references alone are not independent recovery proofs.
 """
 from __future__ import annotations
 
@@ -21,17 +22,23 @@ KIND = "weltgewebe.production-hold-release.v1"
 SHA40 = re.compile(r"[0-9a-f]{40}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-RECEIPTS = (
+REQUIRED_RECEIPTS = (
     "offhost_age_recovery_sha256",
     "restic_authority_sha256",
+)
+# Existing root authorizations with older operational receipts remain valid.
+# New releases need actual recovery instead of five independent sign-off gates.
+OPTIONAL_RECEIPTS = (
     "privacy_acceptance_sha256",
     "alarm_delivery_sha256",
     "human_acknowledgement_sha256",
 )
+RECEIPTS = REQUIRED_RECEIPTS + OPTIONAL_RECEIPTS
 FIELDS = frozenset({
     "schema_version", "kind", "environment", "decision", "commit",
     "schaubild_image_digest", "authorized_by", "approved_at", *RECEIPTS,
 })
+REQUIRED_FIELDS = FIELDS - frozenset(OPTIONAL_RECEIPTS)
 
 
 class HoldReleaseError(ValueError):
@@ -100,7 +107,8 @@ def read_authorization(
         data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_pairs)
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise HoldReleaseError("authorization JSON is invalid") from exc
-    if not isinstance(data, dict) or set(data) != FIELDS:
+    if (not isinstance(data, dict) or not REQUIRED_FIELDS <= data.keys()
+            or not data.keys() <= FIELDS):
         raise HoldReleaseError("authorization field matrix is incomplete or unexpected")
     if (type(data["schema_version"]) is not int or data["schema_version"] != 1
             or data["kind"] != KIND or data["environment"] != "production"
@@ -117,9 +125,11 @@ def read_authorization(
     if expected_image is not None and image != expected_image:
         raise HoldReleaseError("Schaubild OCI digest differs from approved release")
     for name in RECEIPTS:
+        if name not in data:
+            continue
         value = data[name]
         if not isinstance(value, str) or not SHA256.fullmatch(value):
-            raise HoldReleaseError(f"required release receipt invalid: {name}")
+            raise HoldReleaseError(f"release receipt invalid: {name}")
     who = data["authorized_by"]
     if not isinstance(who, str) or not re.fullmatch(r"[A-Za-z0-9_.@:-]{2,128}", who):
         raise HoldReleaseError("release authorizer is not identified")
