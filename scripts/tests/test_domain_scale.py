@@ -74,6 +74,21 @@ class DomainScaleTests(unittest.TestCase):
         with self.assertRaisesRegex(domain_scale.DomainScaleError, "required_index"):
             domain_scale.validate_config(broken)
 
+    def test_runtime_search_public_kind_matches_canonical_scale_fixture(self) -> None:
+        # The API-runtime proof selects only project nodes for public search.
+        # The SQL predicate must remain bound to the generated primary kind;
+        # a stale localized label silently produces an empty search result.
+        workflow = (ROOT / ".github/workflows/domain-scale.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(domain_scale.RARE_NODE_KIND, "project")
+        public_kind_predicate = (
+            f"CASE WHEN kind = '{domain_scale.RARE_NODE_KIND}' "
+            "THEN 'public' ELSE 'hidden' END"
+        )
+        self.assertIn(public_kind_predicate, workflow)
+        self.assertNotIn("kind = 'Projekt'", workflow)
+
     def test_smoke_fixture_is_deterministic_and_has_exact_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
