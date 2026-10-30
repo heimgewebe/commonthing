@@ -65,7 +65,7 @@ class GarnrolleOntologyContractTests(unittest.TestCase):
             # Legacy kind migration may change only kind; preserve the rest.
             initial[-1]["kind"] = "Knoten"
             initial[-1]["summary"] = "Eigene Notiz zum Lastenrad"
-            path.write_text("".join(json.dumps(node) + "\n" for node in initial))
+            path.write_text("".join(json.dumps(node, sort_keys=True) + "\n" for node in initial))
             upgraded = run_seed()
             self.assertEqual(len(upgraded), 6)
             self.assertTrue({node["kind"] for node in upgraded} <= valid_kinds)

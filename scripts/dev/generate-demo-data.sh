@@ -23,8 +23,8 @@ trap cleanup EXIT
 remove_line_by_id() {
   local file="$1"
   local id="$2"
-  # Use regex anchor to match start of line for robustness: ^{"id":"UUID"
-  local match_pattern="^{\"id\"[[:space:]]*:[[:space:]]*\"$id\""
+  # Match the JSONL record ID in any property order, including serde-sorted keys.
+  local match_pattern="\"id\"[[:space:]]*:[[:space:]]*\"$id\""
 
   if [ -s "$file" ] && grep -q "$match_pattern" "$file"; then
     echo "→ removing legacy/stale ID $id from $(basename "$file")"
@@ -47,8 +47,8 @@ ensure_jsonl_line() {
   local check_field="${4:-}"
   local expected_value="${5:-}"
 
-  # Use regex anchor to match start of line for robustness
-  local match_pattern="^{\"id\"[[:space:]]*:[[:space:]]*\"$id\""
+  # Match the exact JSONL ID property regardless of property ordering.
+  local match_pattern="\"id\"[[:space:]]*:[[:space:]]*\"$id\""
   local needs_migration=0
 
   if [ -s "$file" ]; then
@@ -87,10 +87,10 @@ ensure_jsonl_line() {
             existing_kind=$(printf '%s\n' "$existing_line" | sed -nE 's/.*"kind"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
           fi
           case "$existing_kind" in
-            place|resource|project|event|need|offer)
+            place | resource | project | event | need | offer)
               : # Preserve valid existing records verbatim.
               ;;
-            Ort|Initiative|Projekt|Knoten|standard|Unknown|unclassified)
+            Ort | Initiative | Projekt | Knoten | standard | Unknown | unclassified)
               if command -v jq > /dev/null 2>&1; then
                 canonical_json=$(printf '%s\n' "$existing_line" | jq -c --arg kind "$expected_value" '.kind = $kind') || return 1
               else
