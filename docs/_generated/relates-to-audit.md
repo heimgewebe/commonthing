@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 746 |
+| Relationen gesamt | 750 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 689 |
+| — relates_to | 693 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |
@@ -32,7 +32,7 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (297 Dokumente):
+**Cluster 1** (298 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
@@ -259,6 +259,7 @@ _Keine Lücken erkannt._
 - `docs/specs/garnrolle-knoten-faden.md`
 - `docs/specs/governance-antraege.md`
 - `docs/specs/knoten-gewebe-visualisierung.md`
+- `docs/specs/knotenarten.md`
 - `docs/specs/list-pagination-api.md`
 - `docs/specs/map-experience.md`
 - `docs/specs/objektlebenszyklen-und-loeschwirkungen.md`

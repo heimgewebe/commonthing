@@ -638,6 +638,7 @@ Generated automatically. Do not edit.
 - [relates_to] docs/specs/contract.md
 - [relates_to] docs/specs/garnrolle-knoten-faden.md
 - [relates_to] docs/specs/governance-antraege.md
+- [relates_to] docs/specs/knotenarten.md
 - [relates_to] docs/specs/objektlebenszyklen-und-loeschwirkungen.md
 
 ## docs/inhalt.md
@@ -1141,6 +1142,10 @@ Generated automatically. Do not edit.
 - [relates_to] docs/specs/knoten-gewebe-visualisierung.md
 - [relates_to] docs/specs/objektlebenszyklen-und-loeschwirkungen.md
 
+## docs/specs/knotenarten.md
+
+- [relates_to] docs/domain/vocabulary.md
+
 ## docs/specs/list-pagination-api.md
 
 - [relates_to] docs/blueprints/domain-data-postgres-cutover.md
@@ -1152,6 +1157,7 @@ Generated automatically. Do not edit.
 - [implements] docs/deploy/germany-basemap-rollout.md
 - [verifies] docs/reports/map-status.md
 - [depends_on] docs/roadmap.md
+- [relates_to] docs/specs/knotenarten.md
 - [relates_to] docs/specs/ortsweberei-webgemeindezentrum.md
 - [relates_to] docs/vision.md
 
@@ -1187,6 +1193,7 @@ Generated automatically. Do not edit.
 - [relates_to] docs/adr/ADR-0009__garnrolle-verortung-sichtbarkeit.md
 - [relates_to] docs/adr/ADR-0014__accountable-collective-node-mutations.md
 - [depends_on] docs/roadmap.md
+- [relates_to] docs/specs/knotenarten.md
 - [relates_to] docs/vision.md
 
 ## docs/specs/ui-state-machine.md
