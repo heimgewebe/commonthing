@@ -358,7 +358,8 @@
     padding: 0.65rem;
     border: 1px solid var(--panel-border-strong);
     border-radius: 16px;
-    background: var(--panel);
+    background-color: var(--panel);
+    background-image: var(--context-weave);
     box-shadow: var(--shadow);
     backdrop-filter: blur(var(--map-lens-blur));
     display: flex;
@@ -555,7 +556,7 @@
 
   @media (prefers-reduced-transparency: reduce) {
     .search-overlay {
-      background: var(--panel-solid);
+      background-color: var(--panel-solid);
       backdrop-filter: none;
     }
   }

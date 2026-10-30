@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { mockApiResponses } from "./fixtures/mockApi";
+import { activateToolFanAction } from "./fixtures/toolFan";
 
 const themeRoot = (page: Page) => page.locator("html");
 
@@ -77,6 +78,119 @@ async function expectNoStripePattern(locator: Locator, label: string) {
 }
 
 test.describe("Farbschema", () => {
+  for (const width of [1280, 390]) {
+    for (const mode of ["light", "dark"] as const) {
+      test(`Porzellanflächen: ${mode}, ${width}px`, async ({
+        page,
+      }, testInfo) => {
+        await page.setViewportSize({ width, height: 844 });
+        await page.emulateMedia({ reducedMotion: "reduce" });
+        await page.addInitScript((theme) => {
+          localStorage.setItem("weltgewebe.theme", theme);
+        }, mode);
+        await mockApiResponses(page, {
+          auth: { authenticated: true, account_id: "e2e-weber", role: "weber" },
+        });
+        const expectMaterial = async (surface: Locator, backing: string) => {
+          await expect(surface).toBeVisible();
+          const style = await surface.evaluate((element, color) => {
+            const computed = getComputedStyle(element);
+            const probe = document.createElement("div");
+            probe.style.backgroundColor = color;
+            element.append(probe);
+            const expectedColor = getComputedStyle(probe).backgroundColor;
+            probe.remove();
+            return {
+              image: computed.backgroundImage,
+              color: computed.backgroundColor,
+              expectedColor,
+              blur: computed.backdropFilter,
+            };
+          }, backing);
+          expect(style.image).toContain(`/textures/porcelain-${mode}.svg`);
+          expect(style.image).not.toContain("repeating-");
+          expect(style.color).toBe(style.expectedColor);
+          return style;
+        };
+        await page.goto("/settings");
+        await expectMaterial(page.locator(".panel").first(), "var(--panel)");
+        await page.goto("/login");
+        await expectMaterial(
+          page.locator(".wg-card").first(),
+          "color-mix(in srgb, var(--wg-surface) 94%, transparent)",
+        );
+        await page.goto("/map");
+        await page.getByTestId("tool-fan-trigger").click();
+        await expect(page.locator(".fan-panel.root")).toHaveCSS(
+          "background-image",
+          "none",
+        );
+        await page.getByTestId("tool-fan-weave").click();
+        const fan = await expectMaterial(
+          page.locator(".fan-panel"),
+          "var(--panel)",
+        );
+        expect(fan.blur).toBe("blur(12px)");
+        await expect(page.getByTestId("tool-fan-create-node")).toHaveCSS(
+          "background-image",
+          "none",
+        );
+        await page.keyboard.press("Escape");
+        await activateToolFanAction(page, "sight");
+        const filter = await expectMaterial(
+          page.getByTestId("filter-overlay"),
+          "var(--panel)",
+        );
+        expect(filter.blur).toBe("blur(12px)");
+        await activateToolFanAction(page, "find");
+        const search = await expectMaterial(
+          page.getByTestId("search-overlay"),
+          "var(--panel)",
+        );
+        expect(search.blur).toBe("blur(12px)");
+        await expect(
+          page.getByRole("combobox", { name: "Suchbegriff" }),
+        ).toBeFocused();
+        await expect(page.locator("#map")).toHaveCSS(
+          "background-image",
+          "none",
+        );
+        const screenshot = testInfo.outputPath(
+          `porcelain-${mode}-${width}.png`,
+        );
+        await page.screenshot({ path: screenshot });
+        await testInfo.attach(`porcelain-${mode}-${width}`, {
+          path: screenshot,
+          contentType: "image/png",
+        });
+      });
+    }
+  }
+
+  test("lädt lokale Porzellantexturen und setzt Materialfarben beim Moduswechsel zurück", async ({
+    page,
+  }) => {
+    await page.goto("/settings");
+    const select = page.getByTestId("theme-select");
+    for (const mode of ["dark", "light"] as const) {
+      await select.selectOption(mode);
+      await expect(themeRoot(page)).toHaveAttribute("data-color-scheme", mode);
+      const material = await page.evaluate(() => {
+        const style = getComputedStyle(document.documentElement);
+        return {
+          weave: style.getPropertyValue("--context-weave"),
+          color: style.getPropertyValue("--context-material").trim(),
+        };
+      });
+      expect(material.weave).toContain(`/textures/porcelain-${mode}.svg`);
+      expect(material.color).toBe(mode === "dark" ? "#202b33" : "#fbf8f1");
+      const asset = await page.request.get(`/textures/porcelain-${mode}.svg`);
+      expect(asset.ok()).toBe(true);
+      expect(asset.headers()["content-type"]).toContain("image/svg+xml");
+      expect((await asset.body()).length).toBeLessThan(30 * 1024);
+    }
+  });
+
   test("steuert das Farbschema im Einstellungsmenü und behält es auf der Karte", async ({
     page,
   }) => {

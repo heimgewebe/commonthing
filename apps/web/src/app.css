@@ -44,6 +44,7 @@ body {
 
 .panel {
   background: var(--panel);
+  background-image: var(--context-weave);
   border: 1px solid var(--panel-border);
   border-radius: var(--radius);
   padding: 0.75rem;

@@ -91,6 +91,7 @@
   border: 1px solid var(--wg-border);
   border-radius: var(--radius);
   background: color-mix(in srgb, var(--wg-surface) 94%, transparent);
+  background-image: var(--context-weave);
   box-shadow: var(--shadow);
 }
 
