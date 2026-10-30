@@ -1693,8 +1693,8 @@ async fn anonymous_edges_do_not_expose_private_node_endpoints() -> Result<()> {
     write_lines(
         &in_dir.join("demo.nodes.jsonl"),
         &[
-            r#"{"id":"node-public","title":"Public synthetic node","location":{"lat":53.5,"lon":10.0},"search_visibility":"public"}"#,
-            r#"{"id":"node-private","title":"Private synthetic node","location":{"lat":53.6,"lon":10.1},"search_visibility":"private","created_by_account_id":"owner"}"#,
+            r#"{"id":"node-public","kind":"place","title":"Public synthetic node","location":{"lat":53.5,"lon":10.0},"search_visibility":"public"}"#,
+            r#"{"id":"node-private","kind":"place","title":"Private synthetic node","location":{"lat":53.6,"lon":10.1},"search_visibility":"private","created_by_account_id":"owner"}"#,
         ],
     );
     write_lines(
@@ -1752,7 +1752,7 @@ async fn edge_details_do_not_reopen_newly_private_node_titles() -> Result<()> {
     write_lines(
         &in_dir.join("demo.nodes.jsonl"),
         &[
-            r#"{"id":"race-node","title":"Previously public title","location":{"lat":53.5,"lon":10.0},"search_visibility":"public"}"#,
+            r#"{"id":"race-node","kind":"place","title":"Previously public title","location":{"lat":53.5,"lon":10.0},"search_visibility":"public"}"#,
         ],
     );
     write_lines(
@@ -1809,7 +1809,7 @@ async fn postgres_edges_reject_node_references_missing_from_cache() -> Result<()
     let in_dir = tmp.path().join("in");
     write_lines(
         &in_dir.join("demo.nodes.jsonl"),
-        &[r#"{"id":"known-public","title":"Public node","location":{"lat":53.5,"lon":10.0}}"#],
+        &[r#"{"id":"known-public","kind":"place","title":"Public node","location":{"lat":53.5,"lon":10.0}}"#],
     );
     write_lines(
         &in_dir.join("demo.edges.jsonl"),
