@@ -130,6 +130,7 @@ class DomainProjectionLoadContractTests(unittest.TestCase):
         self.assertEqual(workflow.count('--duration-seconds "${sampler_duration_seconds}"'), 2)
         self.assertIn('--env "CQ02_DURATION_SECONDS=${workload_duration_seconds}"', workflow)
         self.assertIn("--max-reloads 0", workflow)
+        self.assertIn("CASE WHEN kind = 'project' THEN 'public' ELSE 'hidden' END", workflow)
 
     def make_args(
         self, root: Path, workload: str, *, include_reload: bool
