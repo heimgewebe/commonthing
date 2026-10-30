@@ -159,7 +159,8 @@
     padding: 0.75rem;
     border: 1px solid var(--panel-border);
     border-radius: 18px;
-    background: var(--panel);
+    background-color: var(--panel);
+    background-image: var(--context-weave);
     box-shadow: var(--shadow);
     backdrop-filter: blur(var(--map-lens-blur));
     opacity: 0;
@@ -313,7 +314,7 @@
 
   @media (prefers-reduced-transparency: reduce) {
     .fan-panel:not(.root) {
-      background: var(--panel-solid);
+      background-color: var(--panel-solid);
       backdrop-filter: none;
     }
   }
