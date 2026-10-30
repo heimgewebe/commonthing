@@ -24,8 +24,8 @@ DOMAIN_DB_SOURCE = ROOT / "apps/api/src/domain_db.rs"
 BENCHMARK_SCHEMA = "weltgewebe_perf"
 SCHEMA_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 PSQL_SAFE_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
-NODE_KINDS = ("Ort", "Projekt", "Person", "Ressource", "Gespraech")
-RARE_NODE_KIND = "Projekt"
+NODE_KINDS = ("place", "project", "event", "resource", "need", "offer")
+RARE_NODE_KIND = "project"
 COMMON_NODE_KINDS = tuple(kind for kind in NODE_KINDS if kind != RARE_NODE_KIND)
 RARE_NODE_KIND_INTERVAL = 100
 EDGE_KINDS = ("bezieht_sich_auf", "wirkt_mit", "liegt_bei", "teilt", "antwortet_auf")
@@ -584,7 +584,7 @@ def render_workload_sql(
         _explain_block(
             "kind_filter",
             plan_dir,
-            f"SELECT id, kind, title FROM {schema}.domain_nodes WHERE kind = 'Projekt' LIMIT 500",
+            f"SELECT id, kind, title FROM {schema}.domain_nodes WHERE kind = 'project' LIMIT 500",
         ),
     ]
     sql = "\\set ON_ERROR_STOP on\n\\pset format unaligned\n\\pset tuples_only on\n" + "\n".join(blocks)

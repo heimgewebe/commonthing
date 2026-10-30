@@ -1,4 +1,5 @@
 import { knottingTagDisplayLabel } from "$lib/knottingTopics";
+import { nodeKindLabel } from "$lib/ui/productLanguage";
 import type { MapEntityViewModel } from "$lib/map/types";
 
 const normalizedTermsByEntity = new WeakMap<
@@ -15,7 +16,7 @@ function buildMapSearchTermsNormalized(
 ): readonly string[] {
   const semanticTerms =
     marker.type === "node"
-      ? ["Knoten", marker.kind]
+      ? ["Knoten", marker.kind, nodeKindLabel(marker.kind)]
       : marker.type === "webgemeindezentrum"
         ? [
             "Webgemeindezentrum",

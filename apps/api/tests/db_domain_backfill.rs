@@ -148,11 +148,15 @@ async fn import_nodes(pool: &sqlx::PgPool, content: &str) -> BackfillReport {
             }
         };
 
-        let kind = v
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown")
-            .to_string();
+        let kind = match v.get("kind").and_then(|value| value.as_str()) {
+            Some(kind @ ("place" | "resource" | "project" | "event" | "need" | "offer")) => {
+                kind.to_string()
+            }
+            _ => {
+                report.skipped_records += 1;
+                continue;
+            }
+        };
         let title = v
             .get("title")
             .and_then(|v| v.as_str())
@@ -492,9 +496,9 @@ async fn import_accounts(pool: &sqlx::PgPool, content: &str) -> BackfillReport {
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const NODE_FIXTURE: &str = r#"
-{"id":"backfill-proof-node-alpha","kind":"Ort","title":"Alpha Node","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","location":{"lat":53.5,"lon":10.0},"summary":"Alpha summary","tags":["tag-a"],"_create_actor_id":"backfill-actor-node","_create_operation_id":"70000000-0000-0000-0000-000000000001"}
-{"id":"backfill-proof-node-beta","kind":"Person","title":"Beta Node","created_at":"2026-02-01T00:00:00Z","updated_at":"2026-02-02T00:00:00Z","location":{"lat":48.1,"lon":11.6},"info":"Beta info"}
-{"id":"backfill-proof-node-gamma","kind":"Unknown","title":"Gamma Node","location":{"lat":52.5,"lon":13.4}}
+{"id":"backfill-proof-node-alpha","kind":"place","title":"Alpha Node","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","location":{"lat":53.5,"lon":10.0},"summary":"Alpha summary","tags":["tag-a"],"_create_actor_id":"backfill-actor-node","_create_operation_id":"70000000-0000-0000-0000-000000000001"}
+{"id":"backfill-proof-node-beta","kind":"offer","title":"Beta Node","created_at":"2026-02-01T00:00:00Z","updated_at":"2026-02-02T00:00:00Z","location":{"lat":48.1,"lon":11.6},"info":"Beta info"}
+{"id":"backfill-proof-node-gamma","kind":"resource","title":"Gamma Node","location":{"lat":52.5,"lon":13.4}}
 "#;
 
 const EDGE_FIXTURE: &str = r#"
@@ -508,15 +512,15 @@ const ACCOUNT_FIXTURE: &str = r#"
 "#;
 
 const MALFORMED_NODE_FIXTURE: &str = r#"
-{"id":"backfill-proof-node-valid-1","kind":"Test","title":"Valid One","location":{"lat":50.0,"lon":9.0}}
+{"id":"backfill-proof-node-valid-1","kind":"place","title":"Valid One","location":{"lat":50.0,"lon":9.0}}
 not valid json at all {{{
-{"id":"backfill-proof-node-valid-2","kind":"Test","title":"Valid Two","location":{"lat":51.0,"lon":9.0}}
-{"id":"backfill-proof-node-invalid-operation","kind":"Test","title":"Invalid Operation","location":{"lat":51.5,"lon":9.5},"_create_actor_id":"actor-without-operation"}
+{"id":"backfill-proof-node-valid-2","kind":"place","title":"Valid Two","location":{"lat":51.0,"lon":9.0}}
+{"id":"backfill-proof-node-invalid-operation","kind":"place","title":"Invalid Operation","location":{"lat":51.5,"lon":9.5},"_create_actor_id":"actor-without-operation"}
 "#;
 
 const DUPLICATE_ID_NODE_FIXTURE: &str = r#"
-{"id":"backfill-proof-node-dup","kind":"First","title":"First Version","location":{"lat":50.0,"lon":9.0}}
-{"id":"backfill-proof-node-dup","kind":"Second","title":"Second Version","location":{"lat":51.0,"lon":10.0}}
+{"id":"backfill-proof-node-dup","kind":"place","title":"First Version","location":{"lat":50.0,"lon":9.0}}
+{"id":"backfill-proof-node-dup","kind":"resource","title":"Second Version","location":{"lat":51.0,"lon":10.0}}
 "#;
 
 const DUPLICATE_EMAIL_ACCOUNT_FIXTURE: &str = r#"
@@ -564,7 +568,7 @@ async fn domain_backfill_nodes_deterministic_and_idempotent() {
             .fetch_one(&pool)
             .await
             .expect("node alpha must exist after import");
-    assert_eq!(kind, "Ort");
+    assert_eq!(kind, "place");
     assert_eq!(title, "Alpha Node");
 
     let (actor, operation, payload_actor, payload_operation): (
@@ -922,7 +926,7 @@ async fn domain_backfill_duplicate_id_converges() {
             .expect("count query failed");
     assert_eq!(count, 1, "duplicate ID must not create a second row");
 
-    // Last-write-wins: the second record's kind is "Second"
+    // Last-write-wins: the second record has the canonical kind "resource"
     let (kind, title): (String, String) =
         sqlx::query_as("SELECT kind, title FROM domain_nodes WHERE id = $1")
             .bind("backfill-proof-node-dup")
@@ -930,7 +934,7 @@ async fn domain_backfill_duplicate_id_converges() {
             .await
             .expect("dup node must be readable");
     assert_eq!(
-        kind, "Second",
+        kind, "resource",
         "last-write-wins: second record's kind must prevail"
     );
     assert_eq!(title, "Second Version");

@@ -26,7 +26,7 @@ import { selection, systemState, leaveToNavigation } from "./uiView";
 
 const makeNode = (overrides: Partial<Node> = {}): Node => ({
   id: "node-1",
-  kind: "Werkstatt",
+  kind: "place",
   title: "Hammer Park",
   created_at: "2025-01-01T00:00:00Z",
   updated_at: "2025-01-01T00:00:00Z",
@@ -143,8 +143,8 @@ describe("mapView presentation helpers", () => {
   it("derives filterable types with counts and labels", () => {
     const scene = sceneFrom(
       [
-        makeNode({ id: "n1", kind: "werkstatt" }),
-        makeNode({ id: "n2", kind: "werkstatt" }),
+        makeNode({ id: "n1", kind: "place" }),
+        makeNode({ id: "n2", kind: "place" }),
       ],
       [makeAccount()],
     );
@@ -154,12 +154,12 @@ describe("mapView presentation helpers", () => {
         .contentTypes,
     ).toEqual([
       { id: "Garnrolle", label: "Garnrolle", count: 1 },
-      { id: "werkstatt", label: "Werkstatt", count: 2 },
+      { id: "place", label: "Ort", count: 2 },
     ]);
   });
 
   it("filters markers by the active filter set", () => {
-    const scene = sceneFrom([makeNode({ kind: "Werkstatt" })], [makeAccount()]);
+    const scene = sceneFrom([makeNode({ kind: "place" })], [makeAccount()]);
 
     expect(
       evaluateMapContentFilters(scene.entities, createEmptyMapContentFilters())
@@ -198,7 +198,7 @@ describe("mapView presentation helpers", () => {
         type: "node",
         id: `node-${index}`,
         title: `Needle ${index}`,
-        kind: "Werkstatt",
+        kind: "place",
         tags: [],
         created_at: "2025-01-01T00:00:00Z",
         lat: 53.5 + index * 0.001,
@@ -273,19 +273,19 @@ describe("mapView presentation helpers", () => {
 
   it("finds Knoten by semantic type and kind", () => {
     const scene = sceneFrom(
-      [makeNode({ title: "Fairschenkbox", kind: "Resource" })],
+      [makeNode({ title: "Fairschenkbox", kind: "resource" })],
       [],
     );
 
     expect(deriveSearchResults(scene.entities, "Knoten", true)).toHaveLength(1);
-    expect(deriveSearchResults(scene.entities, "Resource", true)).toHaveLength(
+    expect(deriveSearchResults(scene.entities, "resource", true)).toHaveLength(
       1,
     );
   });
 
   it("scopes search to the visible markers it is handed", () => {
     const scene = sceneFrom(
-      [makeNode({ title: "Findbar", kind: "Werkstatt" })],
+      [makeNode({ title: "Findbar", kind: "place" })],
       [makeAccount({ title: "Findbar" })],
     );
 
@@ -342,7 +342,7 @@ describe("mapView presentation helpers", () => {
     // Filtering out the Garnrolle removes the target body and therefore both
     // the Gewebekante and its strictere Linienkante.
     const onlyNodes = evaluateMapContentFilters(scene.entities, {
-      contentTypes: new Set(["Werkstatt"]),
+      contentTypes: new Set(["place"]),
       topics: new Set(),
     }).entities;
     expect(deriveWeaveEdges(edges, onlyNodes)).toHaveLength(0);
@@ -375,7 +375,7 @@ describe("mapView presentation helpers", () => {
       title: "Test Node",
       lat: 53.5,
       lon: 10.0,
-      kind: "Werkstatt",
+      kind: "place",
       tags: [],
       created_at: "2025-01-01T00:00:00Z",
     };
@@ -391,7 +391,7 @@ describe("mapView presentation helpers", () => {
     };
     const centerEntity = sceneFrom([], [], [], [makeCenter()]).entities[0];
 
-    expect(getMapContentType(nodeEntity)).toBe("Werkstatt");
+    expect(getMapContentType(nodeEntity)).toBe("place");
     expect(getMapContentType(garnrolleEntity)).toBe("Garnrolle");
     expect(getMapContentType(centerEntity)).toBe("Webgemeindezentrum");
   });
@@ -403,7 +403,7 @@ describe("mapView presentation helpers", () => {
       title: "Hammer Park",
       lat: 53.5,
       lon: 10.0,
-      kind: "Werkstatt",
+      kind: "place",
       tags: [],
       created_at: "2025-01-01T00:00:00Z",
     };
@@ -419,7 +419,7 @@ describe("mapView presentation helpers", () => {
       title: "Hammer Park",
       lat: 53.5,
       lon: 10.0,
-      kind: "Werkstatt",
+      kind: "place",
       tags: [],
       created_at: "2025-01-01T00:00:00Z",
     };

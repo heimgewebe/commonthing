@@ -203,7 +203,7 @@ function seedPostgresNodes(cardinality: Cardinality): void {
     )
     SELECT
       'benchmark-node-' || lpad((g - 1)::text, 6, '0'),
-      'Knoten',
+      'place',
       'Benchmark ' || (g - 1)::text,
       CASE
         WHEN g <= ${visibleItems}

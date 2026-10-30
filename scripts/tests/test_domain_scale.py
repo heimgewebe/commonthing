@@ -74,6 +74,21 @@ class DomainScaleTests(unittest.TestCase):
         with self.assertRaisesRegex(domain_scale.DomainScaleError, "required_index"):
             domain_scale.validate_config(broken)
 
+    def test_runtime_search_public_kind_matches_canonical_scale_fixture(self) -> None:
+        # The API-runtime proof selects only project nodes for public search.
+        # The SQL predicate must remain bound to the generated primary kind;
+        # a stale localized label silently produces an empty search result.
+        workflow = (ROOT / ".github/workflows/domain-scale.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(domain_scale.RARE_NODE_KIND, "project")
+        public_kind_predicate = (
+            f"CASE WHEN kind = '{domain_scale.RARE_NODE_KIND}' "
+            "THEN 'public' ELSE 'hidden' END"
+        )
+        self.assertIn(public_kind_predicate, workflow)
+        self.assertNotIn("kind = 'Projekt'", workflow)
+
     def test_smoke_fixture_is_deterministic_and_has_exact_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -159,8 +174,8 @@ class DomainScaleTests(unittest.TestCase):
                 self.assertIn(f"{workload}.json", sql)
             self.assertIn("WHERE id >", sql)
             self.assertIn("ORDER BY id ASC LIMIT 1000", sql)
-            self.assertIn("WHERE kind = 'Projekt' LIMIT 500", sql)
-            self.assertNotIn("WHERE kind = 'Projekt' ORDER BY", sql)
+            self.assertIn("WHERE kind = 'project' LIMIT 500", sql)
+            self.assertNotIn("WHERE kind = 'project' ORDER BY", sql)
             self.assertIn(
                 "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 ORDER BY id ASC LIMIT 1001 OFFSET 0",
                 sql,

@@ -986,7 +986,7 @@ async fn node_conversation_vertical_slice() {
         .expect("clean empty-node proof");
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, created_at, updated_at, payload)
-         VALUES ($1, 'Ort', 'Leerer Gesprächsknoten', NOW(), NOW(), '{}')",
+         VALUES ($1, 'place', 'Leerer Gesprächsknoten', NOW(), NOW(), '{}')",
     )
     .bind(EMPTY_NODE_ID)
     .execute(&pool)
@@ -1030,7 +1030,7 @@ async fn node_conversation_vertical_slice() {
             .expect("projection version before node");
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, created_at, updated_at, payload)
-         VALUES ($1, 'Ort', 'Gesprächsknoten', NOW(), NOW(), '{}')",
+         VALUES ($1, 'place', 'Gesprächsknoten', NOW(), NOW(), '{}')",
     )
     .bind(NODE_ID)
     .execute(&pool)

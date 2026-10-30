@@ -6,7 +6,7 @@
 export const demoNodes = [
   {
     id: "b52be17c-4ab7-4434-98ce-520f86290cf0",
-    kind: "Knoten", // Schema: 'kind' is free-text string (no enum in node.schema.json). 'Knoten' is valid.
+    kind: "resource", // Die Fair-Schenk-Box ist eine gemeinschaftlich nutzbare Ressource.
     title: "fairschenkbox",
     summary: "Öffentliche Fair-Schenk-Box",
     // Schema requirement: location must have lat/lon

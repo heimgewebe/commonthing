@@ -64,6 +64,8 @@ test.describe("Komposition Flow (weber)", () => {
 
     await longPressMapCenter(page);
     await expect(panel.locator(".state-set")).toContainText("Ort gewählt");
+    await expect(submitBtn).toBeDisabled(); // even with location and title: kind is required
+    await page.selectOption("#nodeType", "place");
     await expect(submitBtn).toBeEnabled();
 
     await page.fill("#address", "");
@@ -254,6 +256,7 @@ test.describe("Komposition Flow (weber)", () => {
     await longPressMapCenter(page);
     await page.fill("#title", "Retry Node");
     await page.fill("#address", "Retrystraße 1");
+    await page.selectOption("#nodeType", "resource");
 
     await panel.locator('button[type="submit"]').click();
     await expect(panel.locator('[role="alert"]')).toBeVisible();

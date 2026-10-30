@@ -198,6 +198,7 @@ Generated automatically. Do not edit.
 | specs.garnrolle-knoten-faden | Garnrolle, Knoten und Faden | specification | canonical | docs/specs/garnrolle-knoten-faden.md |
 | specs.governance-antraege | Anträge, Konsent, Veto und Abstimmung | specification | canonical | docs/specs/governance-antraege.md |
 | specs.knoten-gewebe-visualisierung | Knoten-Gewebevisualisierung | specification | canonical | docs/specs/knoten-gewebe-visualisierung.md |
+| specs.knotenarten | Knotenarten – fachlicher Katalog v2 | specification | canonical | docs/specs/knotenarten.md |
 | specs.list-pagination-api | List Pagination API Spec | reference | active | docs/specs/list-pagination-api.md |
 | specs.map-experience | Kartenerlebnis | specification | canonical | docs/specs/map-experience.md |
 | specs.objektlebenszyklen-und-loeschwirkungen | Objektlebenszyklen und Löschwirkungen | specification | canonical | docs/specs/objektlebenszyklen-und-loeschwirkungen.md |

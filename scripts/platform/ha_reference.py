@@ -2403,7 +2403,7 @@ def insert_domain_node(kubectl: str, node_id: str, title: str, *, cluster: str =
     payload = json.dumps({"summary": "HA recovery proof", "tags": ["ha-proof"]}, separators=(",", ":"))
     sql = (
         "INSERT INTO domain_nodes (id,kind,title,lat,lon,created_at,updated_at,payload) VALUES ("
-        + "'" + node_id + "','Werkstatt','" + title.replace("'", "''") + "',53.55,9.99,clock_timestamp(),clock_timestamp(),'"
+        + "'" + node_id + "','place','" + title.replace("'", "''") + "',53.55,9.99,clock_timestamp(),clock_timestamp(),'"
         + payload.replace("'", "''") + "'::jsonb) ON CONFLICT (id) DO NOTHING"
     )
     psql(kubectl, sql, cluster=cluster)
