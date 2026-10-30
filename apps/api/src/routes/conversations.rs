@@ -1,7 +1,8 @@
 //! Public node conversations backed exclusively by PostgreSQL.
 //!
-//! Every PostgreSQL node owns exactly one public conversation through the
-//! migration trigger. Reads are public. Creating, editing and tombstoning
+//! Every PostgreSQL node owns exactly one conversation through the migration
+//! trigger. Active private or hidden nodes restrict conversation reads to
+//! their owner; deleted-node archives retain the existing public contract. Creating, editing and tombstoning
 //! messages uses the existing Weber/Admin write gate in `routes::api_router`;
 //! this module additionally enforces author-or-admin ownership.
 //!
@@ -24,14 +25,16 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Transaction};
+use tokio::sync::SemaphorePermit;
 use uuid::Uuid;
 
 use crate::{
-    auth::role::Role, config::DomainReadSource, middleware::auth::AuthContext, state::ApiState,
+    advisory_lock::node_mutation_lock_key, auth::role::Role, config::DomainReadSource,
+    middleware::auth::AuthContext, state::ApiState,
 };
 
 use super::{
-    nodes::{ensure_node_activity_faden, repair_node_activity_faden},
+    nodes::{ensure_node_activity_faden, reader_account_id, repair_node_activity_faden},
     query::{decode_cursor, encode_cursor},
     webgemeindezentren::{
         ensure_webgemeindezentrum_activity_faden, repair_webgemeindezentrum_activity_faden,
@@ -315,6 +318,20 @@ fn database_error(context: &'static str, error: sqlx::Error) -> ConversationApiE
     )
 }
 
+// Every conversation writer that waits for PostgreSQL account or advisory
+// locks must share the same five-connection SQLx admission budget as fenced
+// privacy GETs, guest exit, and canonical account/node writers. Otherwise
+// waiters hold all remaining connections and prevent a fenced GET's handler
+// from releasing its generation FOR SHARE lock. Keep read-only snapshot
+// transactions outside this helper: their outer fence already reserves slots.
+async fn reserve_conversation_pool_capacity(
+    context: &'static str,
+) -> Result<SemaphorePermit<'static>, ConversationApiError> {
+    crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(|error| database_error(context, error))
+}
+
 fn require_pool(state: &ApiState) -> Result<&PgPool, ConversationApiError> {
     if state.config.domain_read_source != DomainReadSource::Postgres {
         return Err(ConversationApiError::new(
@@ -519,21 +536,38 @@ fn check_precondition(
     }
 }
 
-async fn require_conversation_read_access(
+// Authorization and response projection MUST observe one PostgreSQL snapshot.
+// Otherwise a node can become private and receive a new message between the
+// public authorization query and the later message-page query.
+async fn begin_consistent_conversation_read(
     pool: &PgPool,
+) -> Result<Transaction<'_, Postgres>, ConversationApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| database_error("begin conversation read snapshot", error))?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| database_error("configure conversation read snapshot", error))?;
+    Ok(tx)
+}
+
+async fn require_conversation_read_access(
+    tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
     auth: &AuthContext,
 ) -> Result<(), ConversationApiError> {
-    let target: Option<(String, String)> = sqlx::query_as(
-        "SELECT conversation_type, visibility FROM domain_conversations \
+    let target: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT conversation_type, visibility, node_id, archived_node_visibility FROM domain_conversations \
          WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(conversation_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|error| database_error("classify conversation read target", error))?;
 
-    let Some((conversation_type, visibility)) = target else {
+    let Some((conversation_type, visibility, node_id, archived_node_visibility)) = target else {
         return Err(ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
@@ -542,6 +576,39 @@ async fn require_conversation_read_access(
     };
 
     if visibility == "public" {
+        if conversation_type == "node" {
+            if let Some(node_id) = node_id.as_deref() {
+                let allowed: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM domain_nodes n
+                      WHERE n.id = $1 AND
+                       (n.search_visibility = 'public' OR
+                        (n.search_visibility IN ('private','hidden')
+                         AND $2::text IS NOT NULL
+                         AND weltgewebe_search_node_owner_account_id(n.payload) = $2::text)))",
+                )
+                .bind(node_id)
+                .bind(reader_account_id(Some(auth)))
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|error| database_error("authorize node conversation read", error))?;
+                if !allowed {
+                    return Err(ConversationApiError::new(
+                        StatusCode::NOT_FOUND,
+                        "conversation_not_found",
+                        "the conversation does not exist",
+                    ));
+                }
+            } else if archived_node_visibility.as_deref() != Some("public") {
+                // Public conversation metadata does not grant access to
+                // history from a private/revoked deleted node.
+                // Historical archives without provenance are fail-closed.
+                return Err(ConversationApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "conversation_not_found",
+                    "the conversation does not exist",
+                ));
+            }
+        }
         return Ok(());
     }
 
@@ -561,7 +628,7 @@ async fn require_conversation_read_access(
         )
         .bind(conversation_id)
         .bind(account_id)
-        .fetch_one(pool)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|error| database_error("authorize direct conversation read", error))?;
         if participant {
@@ -657,6 +724,51 @@ async fn require_direct_message_send_allowed(
     Ok(())
 }
 
+fn conversation_write_busy() -> ConversationApiError {
+    ConversationApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "conversation_write_busy",
+        "the conversation is temporarily busy; retry this request",
+    )
+    .retry_after(1)
+}
+
+// Classify the current *locked* archive after a previously observed active
+// node has disappeared. A node can be deleted between the initial conversation
+// classification and the read-visibility precheck; only known-public archives
+// may expose the existing 409 conflict. Every other target remains 404.
+async fn unavailable_node_conversation_write_error(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: &str,
+) -> Result<ConversationApiError, ConversationApiError> {
+    let archived_public: bool = sqlx::query_scalar::<_, bool>(
+        "SELECT (archived_at IS NOT NULL AND
+                 archived_node_visibility = 'public') IS TRUE
+         FROM domain_conversations
+         WHERE id = $1::uuid AND deleted_at IS NULL
+           AND conversation_type = 'node' AND node_id IS NULL
+         FOR SHARE",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| database_error("verify archived node write contract", error))?
+    .unwrap_or(false);
+    Ok(if archived_public {
+        ConversationApiError::new(
+            StatusCode::CONFLICT,
+            "conversation_archived",
+            "the node conversation is archived and read-only",
+        )
+    } else {
+        ConversationApiError::new(
+            StatusCode::NOT_FOUND,
+            "conversation_not_found",
+            "the conversation does not exist",
+        )
+    })
+}
+
 async fn require_conversation_writable(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
@@ -665,15 +777,18 @@ async fn require_conversation_writable(
     // Fast-path node conversations without touching the global governance cutover row.
     // The first read is only a classification hint; the row is locked and re-read below
     // before the write is authorized, so deletion or an unexpected type change cannot race.
-    let observed_type: Option<String> = sqlx::query_scalar(
-        "SELECT conversation_type FROM domain_conversations WHERE id = $1::uuid AND deleted_at IS NULL",
+    // Initial classification does not lock the conversation yet: the node
+    // mutation advisory lock and node row lock must be acquired FIRST.
+    let observed: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT conversation_type, node_id FROM domain_conversations
+         WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(conversation_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|error| database_error("classify conversation write target", error))?;
 
-    let observed_type = observed_type.ok_or_else(|| {
+    let (observed_type, observed_node_id) = observed.ok_or_else(|| {
         ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
@@ -682,25 +797,147 @@ async fn require_conversation_writable(
     })?;
 
     if observed_type == "node" {
-        let locked_target: Option<(String, Option<String>, Option<DateTime<Utc>>)> =
-            sqlx::query_as(
-                "SELECT conversation_type, node_id, archived_at \
-                 FROM domain_conversations \
-                 WHERE id = $1::uuid AND deleted_at IS NULL FOR SHARE",
+        // Account exit locks the author first, then the node. Do not occupy
+        // PostgreSQL pool connections while waiting for this account lock;
+        // a node mutation can need another connection to finish.
+        let author_account_id = reader_account_id(Some(auth)).ok_or_else(|| {
+            ConversationApiError::new(
+                StatusCode::NOT_FOUND,
+                "conversation_not_found",
+                "the conversation does not exist",
             )
-            .bind(conversation_id)
+        })?;
+        // A deleted node has no active advisory key. Preserve the explicit
+        // public-archive 409 contract without consulting or locking the author;
+        // private/revoked/unknown archives remain indistinguishable from absent.
+        if observed_node_id.is_none() {
+            return Err(unavailable_node_conversation_write_error(tx, conversation_id).await?);
+        }
+        // Only known readable nodes may receive a retryable busy response:
+        // private/hidden/revoked nodes must continue to look nonexistent.
+        // The definitive authorization below is repeated after the node lock.
+        let preliminarily_readable = if let Some(node_id) = observed_node_id.as_deref() {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT (search_visibility = 'public' OR
+                   (search_visibility IN ('private','hidden')
+                    AND weltgewebe_search_node_owner_account_id(payload) = $2::text)) IS TRUE
+                 FROM domain_nodes WHERE id = $1",
+            )
+            .bind(node_id)
+            .bind(author_account_id)
             .fetch_optional(&mut **tx)
             .await
-            .map_err(|error| database_error("lock node conversation write target", error))?;
+            .map_err(|error| database_error("precheck node message privacy", error))?
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        if !preliminarily_readable {
+            // Re-read the conversation under a row lock, not the original
+            // classification hint. This distinguishes a concurrently deleted
+            // public node from an unreadable, still-active protected node.
+            return Err(unavailable_node_conversation_write_error(tx, conversation_id).await?);
+        }
+        let active_author: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM domain_accounts
+             WHERE id = $1 AND disabled = FALSE FOR SHARE NOWAIT",
+        )
+        .bind(author_account_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| {
+            if error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .as_deref()
+                == Some("55P03")
+            {
+                conversation_write_busy()
+            } else {
+                database_error("lock node message author before node", error)
+            }
+        })?;
+        if active_author.is_none() {
+            return Err(ConversationApiError::new(
+                StatusCode::NOT_FOUND,
+                "conversation_not_found",
+                "the conversation does not exist",
+            ));
+        }
+        // Canonical node writes acquire the same advisory key. A FOR SHARE
+        // row lock also serializes visibility changes by other DB writers.
+        // This respects the node -> conversation lock order of node deletion.
+        let allowed_node = if let Some(node_id) = observed_node_id.as_deref() {
+            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1::bigint)")
+                .bind(node_mutation_lock_key(node_id))
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|error| database_error("try lock conversation target node", error))?;
+            if !acquired {
+                return Err(conversation_write_busy());
+            }
+            sqlx::query_scalar::<_, bool>(
+                "SELECT (search_visibility = 'public' OR
+                   (search_visibility IN ('private','hidden')
+                    AND $2::text IS NOT NULL
+                    AND weltgewebe_search_node_owner_account_id(payload) = $2::text)) IS TRUE
+                 FROM domain_nodes WHERE id = $1 FOR SHARE",
+            )
+            .bind(node_id)
+            .bind(reader_account_id(Some(auth)))
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| database_error("authorize conversation message node", error))?
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        // Preserve the established tuple row mapping without Clippy's nested
+        // generic type-complexity warning or an extra persistence abstraction.
+        type LockedNodeTarget = (
+            String,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+        );
+        let locked_target: Option<LockedNodeTarget> = sqlx::query_as(
+            "SELECT conversation_type, node_id, archived_at, archived_node_visibility
+                 FROM domain_conversations
+                 WHERE id = $1::uuid AND deleted_at IS NULL FOR SHARE",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| database_error("lock node conversation write target", error))?;
 
         return match locked_target {
-            Some((conversation_type, Some(_), None)) if conversation_type == "node" => Ok(()),
-            Some((conversation_type, None, Some(_))) if conversation_type == "node" => {
-                Err(ConversationApiError::new(
-                    StatusCode::CONFLICT,
-                    "conversation_archived",
-                    "the node conversation is archived and read-only",
-                ))
+            Some((conversation_type, Some(node_id), None, _)) if conversation_type == "node" => {
+                if !allowed_node || observed_node_id.as_deref() != Some(node_id.as_str()) {
+                    Err(ConversationApiError::new(
+                        StatusCode::NOT_FOUND,
+                        "conversation_not_found",
+                        "the conversation does not exist",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Some((conversation_type, None, Some(_), archived_visibility))
+                if conversation_type == "node" =>
+            {
+                if archived_visibility.as_deref() != Some("public") {
+                    Err(ConversationApiError::new(
+                        StatusCode::NOT_FOUND,
+                        "conversation_not_found",
+                        "the conversation does not exist",
+                    ))
+                } else {
+                    Err(ConversationApiError::new(
+                        StatusCode::CONFLICT,
+                        "conversation_archived",
+                        "the node conversation is archived and read-only",
+                    ))
+                }
             }
             None => Err(ConversationApiError::new(
                 StatusCode::NOT_FOUND,
@@ -852,15 +1089,15 @@ async fn require_conversation_tombstone_allowed(
     conversation_id: &str,
     auth: &AuthContext,
 ) -> Result<(), ConversationApiError> {
-    let observed_type: Option<String> = sqlx::query_scalar(
-        "SELECT conversation_type FROM domain_conversations WHERE id = $1::uuid AND deleted_at IS NULL",
+    let observed: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT conversation_type, node_id FROM domain_conversations
+         WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(conversation_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|error| database_error("classify conversation tombstone target", error))?;
-
-    let observed_type = observed_type.ok_or_else(|| {
+    let (conversation_type, node_id) = observed.ok_or_else(|| {
         ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
@@ -868,32 +1105,35 @@ async fn require_conversation_tombstone_allowed(
         )
     })?;
 
-    if observed_type == "node" {
-        let locked_target: Option<(String, Option<String>, Option<DateTime<Utc>>)> =
-            sqlx::query_as(
-                "SELECT conversation_type, node_id, archived_at \
-                 FROM domain_conversations \
-                 WHERE id = $1::uuid AND deleted_at IS NULL FOR SHARE",
-            )
-            .bind(conversation_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|error| database_error("lock node conversation tombstone target", error))?;
+    if conversation_type == "node" {
+        if node_id.is_some() {
+            // Reuse the same transaction-scoped node advisory/row lock and
+            // visibility check as POST/PATCH. This must run BEFORE loading
+            // the message or returning an If-Match precondition body.
+            return require_conversation_writable(tx, conversation_id, auth).await;
+        }
 
-        return match locked_target {
-            Some((conversation_type, Some(_), None)) if conversation_type == "node" => Ok(()),
-            Some((conversation_type, None, Some(_))) if conversation_type == "node" => Ok(()),
-            None => Err(ConversationApiError::new(
-                StatusCode::NOT_FOUND,
-                "conversation_not_found",
-                "the conversation does not exist",
-            )),
-            Some(_) => Err(ConversationApiError::new(
-                StatusCode::CONFLICT,
-                "conversation_write_target_changed",
-                "the conversation write target changed while the request was in flight",
-            )),
-        };
+        // Archived node histories deliberately allow their original public
+        // message authors to tombstone; private/unknown historical archives
+        // have no such ordinary public capability.
+        let archived_visibility: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT archived_node_visibility FROM domain_conversations
+             WHERE id = $1::uuid AND conversation_type = 'node'
+               AND node_id IS NULL AND archived_at IS NOT NULL
+               AND deleted_at IS NULL FOR SHARE",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| database_error("authorize archived node message tombstone", error))?;
+        if archived_visibility.flatten().as_deref() == Some("public") {
+            return Ok(());
+        }
+        return Err(ConversationApiError::new(
+            StatusCode::NOT_FOUND,
+            "conversation_not_found",
+            "the conversation does not exist",
+        ));
     }
 
     require_conversation_writable(tx, conversation_id, auth).await
@@ -963,25 +1203,32 @@ fn require_author_or_admin(
 pub async fn get_node_conversation(
     State(state): State<ApiState>,
     Path(node_id): Path<String>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ConversationView>, ConversationApiError> {
     let pool = require_pool(&state)?;
+    let mut tx = begin_consistent_conversation_read(pool).await?;
     let row: Option<ConversationRow> = sqlx::query_as(
         "SELECT id::text, node_id, node_id_snapshot, node_title_snapshot, \
                 conversation_type, visibility, created_at, updated_at, archived_at, deleted_at \
          FROM domain_conversations WHERE node_id = $1 AND deleted_at IS NULL",
     )
     .bind(node_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| database_error("get node conversation", error))?;
 
-    row.map(conversation_from_row).map(Json).ok_or_else(|| {
+    let row = row.ok_or_else(|| {
         ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
             "the node conversation does not exist",
         )
-    })
+    })?;
+    require_conversation_read_access(&mut tx, &row.0, &auth).await?;
+    tx.commit()
+        .await
+        .map_err(|error| database_error("commit node conversation read snapshot", error))?;
+    Ok(Json(conversation_from_row(row)))
 }
 
 pub async fn get_conversation(
@@ -991,24 +1238,29 @@ pub async fn get_conversation(
 ) -> Result<Json<ConversationView>, ConversationApiError> {
     let pool = require_pool(&state)?;
     let id = parse_conversation_id(&id)?;
-    require_conversation_read_access(pool, &id, &auth).await?;
+    let mut tx = begin_consistent_conversation_read(pool).await?;
+    require_conversation_read_access(&mut tx, &id, &auth).await?;
     let row: Option<ConversationRow> = sqlx::query_as(
         "SELECT id::text, node_id, node_id_snapshot, node_title_snapshot, \
                 conversation_type, visibility, created_at, updated_at, archived_at, deleted_at \
          FROM domain_conversations WHERE id = $1::uuid AND deleted_at IS NULL",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| database_error("get conversation", error))?;
 
-    row.map(conversation_from_row).map(Json).ok_or_else(|| {
+    let view = row.map(conversation_from_row).ok_or_else(|| {
         ConversationApiError::new(
             StatusCode::NOT_FOUND,
             "conversation_not_found",
             "the node conversation does not exist",
         )
-    })
+    })?;
+    tx.commit()
+        .await
+        .map_err(|error| database_error("commit conversation read snapshot", error))?;
+    Ok(Json(view))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1025,22 +1277,9 @@ pub async fn list_messages(
 ) -> Result<Json<MessagePage>, ConversationApiError> {
     let pool = require_pool(&state)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
-    require_conversation_read_access(pool, &conversation_id, &auth).await?;
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM domain_conversations \
-         WHERE id = $1::uuid AND deleted_at IS NULL)",
-    )
-    .bind(&conversation_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|error| database_error("check conversation for message list", error))?;
-    if !exists {
-        return Err(ConversationApiError::new(
-            StatusCode::NOT_FOUND,
-            "conversation_not_found",
-            "the node conversation does not exist",
-        ));
-    }
+    let mut tx = begin_consistent_conversation_read(pool).await?;
+    // This already checks existence/deletion in the SAME snapshot.
+    require_conversation_read_access(&mut tx, &conversation_id, &auth).await?;
 
     let limit = query.limit.unwrap_or(DEFAULT_MESSAGE_PAGE_SIZE);
     if limit == 0 || limit > MAX_MESSAGE_PAGE_SIZE {
@@ -1079,7 +1318,7 @@ pub async fn list_messages(
         )
         .bind(cursor_id)
         .bind(&conversation_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|error| database_error("resolve message cursor", error))?;
         let (cursor_created_at, cursor_id) = cursor_position.ok_or_else(|| {
@@ -1101,7 +1340,7 @@ pub async fn list_messages(
         .bind(cursor_created_at)
         .bind(cursor_id)
         .bind((limit + 1) as i64)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|error| database_error("list messages after cursor", error))?
     } else {
@@ -1113,11 +1352,14 @@ pub async fn list_messages(
         )
         .bind(&conversation_id)
         .bind((limit + 1) as i64)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|error| database_error("list messages", error))?
     };
 
+    tx.commit()
+        .await
+        .map_err(|error| database_error("commit message page read snapshot", error))?;
     let has_more = rows.len() > limit;
     let mut items: Vec<MessageView> = rows.into_iter().take(limit).map(message_from_row).collect();
     items.reverse();
@@ -1158,6 +1400,8 @@ pub async fn create_message(
     let content = validate_content(&request.content)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
 
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1226,6 +1470,8 @@ pub async fn create_message(
         tx.commit()
             .await
             .map_err(|error| database_error("commit idempotent message replay", error))?;
+        // The post-commit Faden projection acquires the same shared budget.
+        drop(_conversation_budget);
         project_message_participation_faden(
             &state,
             &auth,
@@ -1326,6 +1572,8 @@ pub async fn create_message(
     tx.commit()
         .await
         .map_err(|error| database_error("commit message create", error))?;
+    // The post-commit Faden projection acquires the same shared budget.
+    drop(_conversation_budget);
     project_message_participation_faden(
         &state,
         &auth,
@@ -1356,6 +1604,8 @@ pub async fn update_message(
     let content = validate_content(&request.content)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
     let message_id = parse_message_id(&message_id)?;
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1400,6 +1650,8 @@ pub async fn delete_message(
     let pool = require_pool(&state)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
     let message_id = parse_message_id(&message_id)?;
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1519,6 +1771,8 @@ pub async fn create_direct_conversation(
     }
 
     let pair_key = direct_pair_key(&sender_id, &recipient_id);
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1691,6 +1945,8 @@ pub async fn mark_direct_conversation_read(
     let account_id = account_id(&auth)?;
     let conversation_id = parse_conversation_id(&conversation_id)?;
     let through_message_id = parse_message_id(&request.through_message_id)?;
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve conversation transaction pool").await?;
     let mut tx = pool
         .begin()
         .await
@@ -1772,6 +2028,8 @@ async fn set_direct_conversation_block(
     let pool = require_pool(state)?;
     let account_id = account_id(auth)?;
     let conversation_id = parse_conversation_id(conversation_id)?;
+    let _conversation_budget =
+        reserve_conversation_pool_capacity("reserve direct conversation block pool").await?;
     let result = if blocked {
         sqlx::query(
             "UPDATE domain_direct_conversation_participants AS participant

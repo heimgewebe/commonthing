@@ -246,6 +246,24 @@ pub struct Node {
     pub location: Location,
 }
 
+/// Common node read policy: public for everyone, private and hidden
+/// for the authenticated owner only, revoked for no ordinary API reader.
+/// Administrative moderation needs its own separately authorized route.
+pub(crate) fn reader_account_id(auth: Option<&AuthContext>) -> Option<&str> {
+    auth.filter(|ctx| ctx.authenticated)
+        .and_then(|ctx| ctx.account_id.as_deref())
+}
+
+pub(crate) fn node_readable_to(node: &Node, auth: Option<&AuthContext>) -> bool {
+    match node.search_visibility {
+        SearchVisibility::Public => true,
+        SearchVisibility::Private | SearchVisibility::Hidden => reader_account_id(auth)
+            .zip(node.created_by_account_id.as_deref())
+            .is_some_and(|(reader, owner)| reader == owner),
+        SearchVisibility::Revoked => false,
+    }
+}
+
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeHistoryKind {
@@ -744,6 +762,7 @@ pub async fn load_nodes() -> std::io::Result<OrderedCache<Node>> {
 pub async fn get_node(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<Json<NodeDetails>, StatusCode> {
     // Clone before reading accounts so this endpoint never holds several state
     // locks at once. The projection middleware keeps both caches on the same
@@ -755,6 +774,9 @@ pub async fn get_node(
         .get(&id)
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
+    if !node_readable_to(&node, auth.as_ref().map(|extension| &extension.0)) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let created_by_account_current_title = match node.created_by_account_id.as_deref() {
         Some(account_id) => state
             .accounts
@@ -1202,18 +1224,42 @@ async fn ensure_node_faden_with_operation_id(
                 "failed to guard creator account for derived Faden".to_string(),
             )
         })?;
+        // This optional projection already holds the per-node advisory lock.
+        // Guest exit holds the account row before acquiring that node lock.
+        // Waiting here would complete a cross-transaction lock cycle.
+        // A busy account therefore defers the best-effort Faden projection;
+        // the durable source operation remains committed and idempotent replay
+        // can repair the missing projection once account lifecycle settles.
         let active_account: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM domain_accounts WHERE id = $1 AND disabled = FALSE FOR UPDATE",
+            "SELECT id FROM domain_accounts WHERE id = $1 AND disabled = FALSE FOR UPDATE NOWAIT",
         )
         .bind(account_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|error| {
-            tracing::error!(%error, account_id = %account_id, node_id, faden_type = projection.faden_type.as_str(), "failed to lock creator account for node Faden");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to guard creator account for derived Faden".to_string(),
-            )
+            if error
+                .as_database_error()
+                .and_then(|database| database.code())
+                .as_deref()
+                == Some("55P03")
+            {
+                tracing::warn!(
+                    account_id = %account_id,
+                    node_id,
+                    faden_type = projection.faden_type.as_str(),
+                    "creator account lifecycle busy; deferring derived Faden"
+                );
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "creator account lifecycle busy; retry the derived Faden projection".to_string(),
+                )
+            } else {
+                tracing::error!(%error, account_id = %account_id, node_id, faden_type = projection.faden_type.as_str(), "failed to lock creator account for node Faden");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to guard creator account for derived Faden".to_string(),
+                )
+            }
         })?;
         if active_account.is_none() {
             return Err((
@@ -1433,6 +1479,20 @@ pub async fn create_node(
     // only after commit. An operation replay can repair an older partial node,
     // but cannot attach a Faden when the original request semantics differ.
     if postgres_atomic_create {
+        // CREATE also writes the canonical projection-generation row. Without
+        // this shared admission, four in-flight INSERT transactions can hold
+        // every remaining pool connection while an existing GET's FOR SHARE
+        // fence needs a second connection to finish its response.
+        let _pool_budget = super::postgres_domain_connection_budget()
+            .acquire_many(super::POSTGRES_DOMAIN_OPERATION_UNITS)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "PostgreSQL node creation admission unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "failed to reserve PostgreSQL node creation capacity".to_string(),
+                )
+            })?;
         let pool = state.db_pool.as_ref().ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4000,7 +4060,10 @@ fn postgres_bbox_cursor_page(mut rows: Vec<Node>, limit: usize) -> CursorPage<No
 pub async fn list_nodes(
     State(state): State<ApiState>,
     Query(params): Query<HashMap<String, String>>,
+    auth: Option<Extension<AuthContext>>,
 ) -> Result<Json<ListResponse<Node>>, StatusCode> {
+    let viewer = auth.as_ref().map(|extension| &extension.0);
+    let owner_account_id = reader_account_id(viewer);
     let bbox = match params.get("bbox") {
         Some(raw_bbox) => Some(parse_bbox(raw_bbox).ok_or(StatusCode::BAD_REQUEST)?),
         None => None,
@@ -4032,6 +4095,7 @@ pub async fn list_nodes(
                         bb.max_lng,
                         limit.saturating_add(1),
                         after_id,
+                        owner_account_id,
                     )
                     .await
                 }
@@ -4044,6 +4108,7 @@ pub async fn list_nodes(
                         bb.max_lng,
                         limit.saturating_add(1),
                         0,
+                        owner_account_id,
                     )
                     .await
                 }
@@ -4062,7 +4127,14 @@ pub async fn list_nodes(
         // an internal database/read failure.
         let offset = i64::try_from(offset).map_err(|_| StatusCode::BAD_REQUEST)?;
         let rows = load_nodes_bbox_from_postgres(
-            pool, bb.min_lat, bb.max_lat, bb.min_lng, bb.max_lng, limit, offset,
+            pool,
+            bb.min_lat,
+            bb.max_lat,
+            bb.min_lng,
+            bb.max_lng,
+            limit,
+            offset,
+            owner_account_id,
         )
         .await
         .map_err(|error| {
@@ -4079,6 +4151,7 @@ pub async fn list_nodes(
         // independent of the file/insertion order used by the legacy path.
         let refs: Vec<&Node> = cache
             .iter_in_order()
+            .filter(|node| node_readable_to(node, viewer))
             .filter(|node| match &bbox {
                 Some(bb) => point_in_bbox(node.location.lon, node.location.lat, bb),
                 None => true,
@@ -4096,6 +4169,7 @@ pub async fn list_nodes(
         let offset: usize = parse_usize_param(&params, "offset", 0)?;
         let out: Vec<Node> = cache
             .iter_in_order()
+            .filter(|node| node_readable_to(node, viewer))
             .filter(|node| match &bbox {
                 Some(bb) => point_in_bbox(node.location.lon, node.location.lat, bb),
                 None => true,

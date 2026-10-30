@@ -84,8 +84,8 @@ async fn run_migrations(pool: &PgPool) {
 
 // Account ids created through `POST /accounts` must be valid UUIDs (the route
 // validates them), so fixtures use a recognizable UUID namespace that the
-// cleanup matches with LIKE. Operator ids are in-memory only (never written to
-// the database) and need not be UUIDs.
+// cleanup matches with LIKE. Operator ids are also canonical PostgreSQL
+// accounts in these fixtures and need not be UUIDs.
 const RADIUS_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-000000000002";
 const DUP_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-000000000003";
 const WEBAUTHN_STABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-000000000004";
@@ -150,12 +150,35 @@ fn admin_operator(id: &str) -> AccountInternal {
 }
 
 /// Build a router with PostgreSQL read+write account sources, a real pool, and a
-/// single in-memory admin operator with an active session. Returns
+/// canonical PostgreSQL admin operator with an active session. Returns
 /// (app, session_cookie, state). The returned `state` shares the same Arcs and
 /// pool as the router, so direct cache/DB assertions observe route effects.
 async fn postgres_write_app(pool: PgPool, operator_id: &str) -> Result<(Router, String, ApiState)> {
+    // PostgreSQL mode must authenticate a real canonical account. A synthetic
+    // in-memory-only admin was accepted by the old middleware but is correctly
+    // rejected by the new DB-backed role/disabled check.
+    let operator = admin_operator(operator_id);
+    sqlx::query(
+        "INSERT INTO domain_accounts (id, kind, title, map_state, role, disabled, webauthn_user_id) \
+         VALUES ($1, 'garnrolle', $2, 'not_on_map', 'admin', FALSE, $3::uuid) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(operator_id)
+    .bind(&operator.public.title)
+    .bind(operator.webauthn_user_id.to_string())
+    .execute(&pool)
+    .await
+    .context("seed canonical PostgreSQL admin operator")?;
+    // A fixture may already represent a real profile; never mutate its
+    // WebAuthn identifier or private data just to construct a test router.
+    let canonical_operator = load_accounts_from_postgres(&pool)
+        .await
+        .context("load canonical test accounts")?
+        .get(operator_id)
+        .cloned()
+        .context("canonical test admin missing")?;
     let mut accounts = AccountStore::new();
-    accounts.insert(admin_operator(operator_id));
+    accounts.insert(canonical_operator);
 
     let config = AppConfig {
         max_guest_owned_nodes: 1_000,

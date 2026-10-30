@@ -1,12 +1,13 @@
 //! T006 server-side search route.
 use axum::{
     extract::{Query, State},
-    Extension, Json,
+    response::Response,
+    Extension,
 };
 
 use crate::{
     middleware::auth::AuthContext,
-    search::{execute_search, SearchError, SearchQueryParams, SearchResponse},
+    search::{execute_search_http, SearchError, SearchQueryParams},
     state::ApiState,
 };
 
@@ -19,6 +20,6 @@ pub async fn search_nodes(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<SearchQueryParams>,
-) -> Result<Json<SearchResponse>, SearchError> {
-    Ok(Json(execute_search(&state, &auth, params, None).await?))
+) -> Result<Response, SearchError> {
+    execute_search_http(&state, &auth, params, None).await
 }
