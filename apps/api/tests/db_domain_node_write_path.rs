@@ -4878,7 +4878,7 @@ async fn fenced_get_survives_four_concurrent_node_creations() -> Result<()> {
         creates.push(tokio::spawn(async move {
             let payload = serde_json::json!({
                 "title": format!("Concurrent Create {index}"),
-                "kind": "Werkstatt",
+                "kind": "resource",
                 "address": "Poolkreuzung 2",
                 "location": {"lat": 53.5, "lon": 10.0},
                 "operation_id": format!("30000000-0000-4000-8000-{index:012}")
