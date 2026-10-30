@@ -102,18 +102,13 @@ test.describe("Farbschema", () => {
             probe.remove();
             return {
               image: computed.backgroundImage,
-              size: computed.backgroundSize,
-              repeat: computed.backgroundRepeat,
               color: computed.backgroundColor,
               expectedColor,
               blur: computed.backdropFilter,
             };
           }, backing);
           expect(style.image).toContain(`/textures/porcelain-${mode}.svg`);
-          expect(style.image).toContain("linear-gradient(145deg");
           expect(style.image).not.toContain("repeating-");
-          expect(style.size).toBe("192px 192px, 100% 100%");
-          expect(style.repeat).toBe("repeat, no-repeat");
           expect(style.color).toBe(style.expectedColor);
           return style;
         };
@@ -184,14 +179,10 @@ test.describe("Farbschema", () => {
         const style = getComputedStyle(document.documentElement);
         return {
           weave: style.getPropertyValue("--context-weave"),
-          supportingImage: style.getPropertyValue("--panel-porcelain-image"),
           color: style.getPropertyValue("--context-material").trim(),
         };
       });
       expect(material.weave).toContain(`/textures/porcelain-${mode}.svg`);
-      expect(material.supportingImage).toContain(
-        `/textures/porcelain-${mode}.svg`,
-      );
       expect(material.color).toBe(mode === "dark" ? "#202b33" : "#fbf8f1");
       const asset = await page.request.get(`/textures/porcelain-${mode}.svg`);
       expect(asset.ok()).toBe(true);

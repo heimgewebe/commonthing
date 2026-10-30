@@ -160,11 +160,7 @@
     border: 1px solid var(--panel-border);
     border-radius: 18px;
     background-color: var(--panel);
-    background-image: var(--panel-porcelain-image);
-    background-size:
-      192px 192px,
-      100% 100%;
-    background-repeat: repeat, no-repeat;
+    background-image: var(--context-weave);
     box-shadow: var(--shadow);
     backdrop-filter: blur(var(--map-lens-blur));
     opacity: 0;
