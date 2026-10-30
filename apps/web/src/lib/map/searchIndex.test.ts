@@ -7,7 +7,7 @@ function makeNode(title: string, tags = ["Commons"]): MapEntityViewModel {
     type: "node",
     id: title,
     title,
-    kind: "Werkstatt",
+    kind: "resource",
     tags,
     created_at: "2025-01-01T00:00:00Z",
     lat: 53.5,
@@ -27,6 +27,20 @@ describe("map search index", () => {
     expect(second).not.toBe(first);
     expect(second).toContain("beta");
     expect(second).not.toContain("alpha");
+  });
+
+  it.each([
+    ["place", "ort"],
+    ["resource", "ressource"],
+    ["project", "projekt"],
+    ["event", "ereignis"],
+    ["need", "bedarf"],
+    ["offer", "angebot"],
+  ])("indexes German label %s for canonical kind", (kind, label) => {
+    const node = { ...makeNode("Nachbarschaft"), kind };
+    const terms = getMapSearchTermsNormalized(node);
+    expect(terms).toContain(kind);
+    expect(terms).toContain(label);
   });
 
   it("indexes stable topic tags under their human-readable labels", () => {
