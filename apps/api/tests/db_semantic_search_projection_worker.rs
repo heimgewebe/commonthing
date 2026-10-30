@@ -307,7 +307,7 @@ async fn private_nodes_stay_lexical_without_calling_the_provider_and_can_activat
         .execute(&pool)
         .await
         .expect("insert active private owner");
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload,search_visibility) VALUES ($1,'Privatwerkstatt','Vertraulicher Titel',$2::jsonb,'private')")
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload,search_visibility) VALUES ($1,'place','Vertraulicher Titel',$2::jsonb,'private')")
         .bind(node)
         .bind(r#"{"summary":"Vertrauliche Zusammenfassung","address":"Geheimer Weg 9","created_by_account_id":"owner-private"}"#)
         .execute(&pool)
@@ -349,7 +349,7 @@ async fn private_nodes_stay_lexical_without_calling_the_provider_and_can_activat
         .contains("Vertrauliche Zusammenfassung"));
     assert!(!projection.searchable_text.contains("Geheimer Weg 9"));
     assert_eq!(projection.language, "und");
-    assert_eq!(projection.kind, "Privatwerkstatt");
+    assert_eq!(projection.kind, "place");
     assert_eq!(projection.visibility_scopes, ["owner"]);
     assert_eq!(projection.status, "active");
     assert_eq!(projection.semantic_state, "unavailable");
@@ -2477,7 +2477,7 @@ async fn t006_search_api_against_postgres_projections() {
     // unbounded transfer of embedding arrays into the API process.
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, lat, lon, created_at, updated_at, payload) \
-         SELECT 't006-overflow-' || lpad(value::text, 4, '0'), 'Overflow', 'Overflow ' || value::text, 0.0, 0.0, NOW(), NOW(), '{}'::jsonb \
+         SELECT 't006-overflow-' || lpad(value::text, 4, '0'), 'resource', 'Overflow ' || value::text, 0.0, 0.0, NOW(), NOW(), '{}'::jsonb \
            FROM generate_series(1, $1::integer) AS value",
     )
     .bind((MAX_AUTHORIZED_CANDIDATES + 1) as i32)
@@ -2487,7 +2487,7 @@ async fn t006_search_api_against_postgres_projections() {
     sqlx::query(
         "INSERT INTO search_node_projections (generation_id, node_id, source_version, source_revision, content_sha256, title, tags, searchable_text, language, kind, status, visibility_scopes, semantic_state, embedding) \
          SELECT $1, v.node_id, v.source_version, v.source_revision, repeat('a', 64), n.title, ARRAY[]::text[], n.title, 'de', n.kind, 'active', ARRAY['public'], 'ready', ARRAY[1.0,-1.0]::double precision[] \
-           FROM search_node_versions v JOIN domain_nodes n ON n.id=v.node_id WHERE n.kind='Overflow'",
+           FROM search_node_versions v JOIN domain_nodes n ON n.id=v.node_id WHERE n.id LIKE 't006-overflow-%'",
     )
     .bind(&gen_id)
     .execute(&pool)
@@ -2497,7 +2497,7 @@ async fn t006_search_api_against_postgres_projections() {
         &pool,
         "kein lexikalischer treffer",
         &SearchFilters {
-            kinds: vec!["Overflow".to_string()],
+            kinds: vec!["resource".to_string()],
             ..Default::default()
         },
         &anonymous,
@@ -2513,7 +2513,7 @@ async fn t006_search_api_against_postgres_projections() {
         &anonymous,
         SearchQueryParams {
             q: Some("kein lexikalischer treffer".to_string()),
-            kind: Some("Overflow".to_string()),
+            kind: Some("resource".to_string()),
             ..Default::default()
         },
         Some(unavailable_provider()),
