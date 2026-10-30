@@ -23,6 +23,7 @@ SCHAUWERK_MANIFEST_URL="${WELTGEWEBE_SCHAUWERK_MANIFEST_URL:-https://commonthing
 API_URL="${WELTGEWEBE_API_VERSION_URL:-https://commonthing.net/api/version}"
 NODE_BUILD_IMAGE="${WELTGEWEBE_NODE_BUILD_IMAGE:-docker.io/library/node@sha256:8898f8ed3c0126667837b678979b4ed83306c856a1227c8bf5f5f77740c25cd6}"
 DEPLOY_HELPER="${WELTGEWEBE_DEPLOY_HELPER:-/usr/local/libexec/weltgewebe-deploy-exact-commit}"
+AUTHORIZER="/usr/local/libexec/weltgewebe-verify-production-hold-release"
 LIVE_VERIFIER="${WELTGEWEBE_LIVE_VERIFIER:-/usr/local/libexec/weltgewebe-verify-public-release}"
 ARCHIVE_VALIDATOR="${WELTGEWEBE_ARCHIVE_VALIDATOR:-/usr/local/libexec/weltgewebe-validate-web-deploy-archive}"
 readonly PRODUCTION_LOCK_DOMAIN="weltgewebe-production-deployment-v1"
@@ -104,8 +105,16 @@ acquire_production_lock() {
   exec 9<> "$PRODUCTION_LOCK_FILE"
   if ! flock -n "$PRODUCTION_LOCK_FD"; then
     contention_receipt="$(write_lock_contention_receipt)"
-    echo "production_reconcile=already_running lock_domain=$PRODUCTION_LOCK_DOMAIN receipt=$contention_receipt"
-    exit 0
+    # Scheduled duplicate invocations may be harmless, but initial start
+    # must not treat a lock-contention receipt as completed reconciliation.
+    # The installer enables this timer only after the first service succeeded.
+    if systemctl is-enabled --quiet weltgewebe-production-reconcile.timer &&
+      systemctl is-active --quiet weltgewebe-production-reconcile.timer; then
+      echo "production_reconcile=already_running lock_domain=$PRODUCTION_LOCK_DOMAIN receipt=$contention_receipt"
+      exit 0
+    fi
+    echo "ERROR: initial reconciliation lock contention; no successful first-start receipt=$contention_receipt" >&2
+    exit "$EX_TEMPFAIL"
   fi
 }
 
@@ -1507,6 +1516,106 @@ for command_name in git docker sha256sum flock install id rm mv awk getent chmod
   require_command "$command_name"
 done
 
+# No state dirs, lock-file creation, Git tracking ref updates, build-cache prune,
+# migrations or Compose calls are permitted under an uncleared production HOLD.
+[[ -f "$AUTHORIZER" && -x "$AUTHORIZER" && ! -L "$AUTHORIZER" ]] ||
+  fail "root-owned production HOLD release checker is not installed"
+[[ "$(stat --format=%u "$AUTHORIZER")" == "0" ]] ||
+  fail "production HOLD checker is not root-owned"
+checker_mode="$(stat --format=%a "$AUTHORIZER")"
+(((8#$checker_mode & 022) == 0)) ||
+  fail "production HOLD checker is group/world writable"
+python3 -I "$AUTHORIZER" --preflight ||
+  fail "production HOLD release missing or invalid"
+[[ "$(stat --format=%u "$SOURCE_CHECKOUT")" == "0" ]] || fail "source checkout is not root-owned"
+# A root-owned checkout can still be replaced through a writable ancestor.
+# Reject replaceable Git metadata before privileged Git invocations.
+require_root_trusted_git_directory_chain() {
+  local target="${1%/}" label="$2" path mode uid
+  [[ -n "$target" ]] || target="/"
+  [[ "$target" == /* ]] || fail "$label must be absolute"
+  [[ "$(realpath -e -- "$target")" == "$target" ]] ||
+    fail "$label must be canonical and symlink-free: $target"
+  path="$target"
+  while :; do
+    [[ -d "$path" && ! -L "$path" ]] ||
+      fail "$label contains an unsafe directory: $path"
+    uid="$(stat --format=%u -- "$path")" ||
+      fail "$label ownership cannot be inspected: $path"
+    [[ "$uid" == "0" ]] ||
+      fail "$label includes a non-root-owned directory: $path"
+    mode="$(stat --format=%a -- "$path")" ||
+      fail "$label mode cannot be inspected: $path"
+    if (((8#$mode & 022) != 0)); then
+      # Root-owned sticky parents protect root-owned entries; never allow
+      # a writable checkout or common directory as the trust target itself.
+      if [[ "$path" == "$target" ]] || (((8#$mode & 01000) == 0)); then
+        fail "$label includes a replaceable directory: $path"
+      fi
+    fi
+    [[ "$path" == "/" ]] && break
+    path="${path%/*}"
+    [[ -n "$path" ]] || path="/"
+  done
+}
+require_root_trusted_git_directory_chain "$SOURCE_CHECKOUT" "source checkout"
+git_marker="$SOURCE_CHECKOUT/.git"
+[[ (-f "$git_marker" || -d "$git_marker") && ! -L "$git_marker" ]] ||
+  fail "Git metadata marker is missing or symlinked: $git_marker"
+[[ "$(stat --format=%u -- "$git_marker")" == "0" ]] ||
+  fail "Git metadata marker is not root-owned: $git_marker"
+git_marker_mode="$(stat --format=%a -- "$git_marker")" ||
+  fail "Git metadata marker mode cannot be inspected"
+(((8#$git_marker_mode & 022) == 0)) ||
+  fail "Git metadata is group/world writable: $git_marker"
+
+# Forbid metadata links before Git can read a redirected config as root.
+# A root-owned symlink itself says nothing about who can edit its target.
+if [[ -d "$git_marker" ]]; then
+  [[ -z "$(find "$git_marker" -xdev -type l -print -quit)" ]] ||
+    fail "Git metadata contains a symlink before privileged Git access"
+fi
+
+git_common_dir="$(git -C "$SOURCE_CHECKOUT" rev-parse --git-common-dir)"
+[[ "$git_common_dir" == /* ]] || git_common_dir="$SOURCE_CHECKOUT/$git_common_dir"
+git_common_dir="$(readlink -f "$git_common_dir")"
+require_root_trusted_git_directory_chain "$git_common_dir" "Git common directory"
+# Linked worktrees can store Git metadata outside the .git marker.
+# Deny symlinks in the resolved common directory before remote Git access.
+[[ -z "$(find "$git_common_dir" -xdev -type l -print -quit)" ]] ||
+  fail "Git common metadata contains a symlink"
+unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
+[[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
+# A root-owned alternates pointer may reference an attacker-writable external
+# object store. Reject all Git object indirection before any root Git operation.
+[[ -z "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" && -z "${GIT_OBJECT_DIRECTORY:-}" ]] ||
+  fail "Git object database environment overrides are not allowed"
+[[ ! -e "$git_common_dir/objects/info/alternates" && ! -L "$git_common_dir/objects/info/alternates" ]] ||
+  fail "Git alternate object stores are not trusted for production"
+[[ -z "$(find "$git_common_dir/objects" -xdev -type l -print -quit)" ]] ||
+  fail "Git object store contains a symlink outside the trust boundary"
+
+# Read-only remote identity check BEFORE creating state directories or locks.
+# The later, lock-held fetch must agree and still match this root decision.
+preflight_main="$(git -C "$SOURCE_CHECKOUT" ls-remote --exit-code origin refs/heads/main | awk 'NR==1 {print $1}')" ||
+  fail "cannot determine exact remote main before reconciliation"
+[[ "$preflight_main" =~ ^[0-9a-f]{40}$ ]] ||
+  fail "preflight remote main is invalid"
+python3 -I "$AUTHORIZER" --commit "$preflight_main" ||
+  fail "production HOLD authorization does not cover live remote main"
+# Admission must bind the OCI digest from immutable source bytes before
+# shared state directories, tracking refs, timers, locks or Docker effects.
+# A new main may require a bounded object-only fetch. It must not write
+# FETCH_HEAD or any remote-tracking ref; normal fetch_main stays lock-held.
+if ! git -C "$SOURCE_CHECKOUT" cat-file -e "$preflight_main^{commit}" 2> /dev/null; then
+  git -C "$SOURCE_CHECKOUT" fetch --no-write-fetch-head --no-tags \
+    --no-auto-gc --no-recurse-submodules origin "$preflight_main" ||
+    fail "authorized source object preflight could not fetch exact commit"
+fi
+python3 -I "$AUTHORIZER" --commit "$preflight_main" \
+  --source-repository "$SOURCE_CHECKOUT" ||
+  fail "source OCI digest differs from the production HOLD release"
+
 install -d -o root -g root -m 0711 "$STATE_ROOT"
 install -d -o root -g root -m 0700 \
   "$ARTIFACT_ROOT" "$RECEIPT_ROOT" "$DEPLOY_RECEIPT_ROOT" "$DOCKER_CONFIG"
@@ -1519,15 +1628,10 @@ available_kib="$(df -Pk "$ARTIFACT_ROOT" | awk 'NR==2 {print $4}')"
 [[ "$available_kib" =~ ^[0-9]+$ ]] || fail "could not determine free disk space"
 ((available_kib >= MIN_FREE_KIB)) || fail "insufficient free disk space: ${available_kib}KiB available"
 
-[[ "$(stat --format=%u "$SOURCE_CHECKOUT")" == "0" ]] || fail "source checkout is not root-owned"
-git_common_dir="$(git -C "$SOURCE_CHECKOUT" rev-parse --git-common-dir)"
-[[ "$git_common_dir" == /* ]] || git_common_dir="$SOURCE_CHECKOUT/$git_common_dir"
-git_common_dir="$(readlink -f "$git_common_dir")"
-unsafe_git_path="$(find "$git_common_dir" -xdev \( ! -user root -o -perm /022 \) -print -quit)"
-[[ -z "$unsafe_git_path" ]] || fail "Git object store is not entirely root-owned and non-writable by group/world: $unsafe_git_path"
-
 target_commit="$(fetch_main)"
 [[ "$target_commit" =~ ^[0-9a-f]{40}$ ]] || fail "origin/main did not resolve to a full commit"
+python3 -I "$AUTHORIZER" --commit "$target_commit" ||
+  fail "origin/main does not equal the authorized production release"
 write_state "observed" "$target_commit" "reconcile started"
 
 # Schaubild is a separately versioned native runtime served by this edge.
@@ -1579,6 +1683,9 @@ PY_SCHAUWERK_RUNTIME_LOCK
   fail "target Schaubild image reference is invalid"
 [[ "$expected_schauwerk_source_commit" =~ ^[0-9a-f]{40}$ ]] ||
   fail "target Schaubild source commit is invalid"
+python3 -I "$AUTHORIZER" --commit "$target_commit" \
+  --image-digest "${expected_schauwerk_image_ref##*@}" ||
+  fail "target OCI digest is not authorized by the production HOLD release"
 
 # Nationwide Germany is the production sovereign contract. Bind the no-op
 # decision to the exact Germany style in this commit before public readback.
@@ -1703,6 +1810,9 @@ if "$LIVE_VERIFIER" \
   fi
 fi
 
+python3 -I "$AUTHORIZER" --commit "$target_commit" \
+  --image-digest "${expected_schauwerk_image_ref##*@}" ||
+  fail "production HOLD was withdrawn before build-cache or release mutation"
 ensure_production_build_disk_headroom "$target_commit"
 
 build_uid="$(id -u "$BUILD_USER")"
@@ -1817,6 +1927,10 @@ deploy_invocation_id="$(new_deploy_invocation_id)"
 [[ "$deploy_invocation_id" =~ ^[0-9a-f]{64}$ ]] ||
   fail "deploy invocation identity generation failed"
 set +e
+python3 -I "$AUTHORIZER" --commit "$target_commit" \
+  --image-digest "${expected_schauwerk_image_ref##*@}" ||
+  fail "production HOLD was withdrawn before deploy and migrations"
+
 WELTGEWEBE_PRODUCTION_LOCK_FD="$PRODUCTION_LOCK_FD" \
   WELTGEWEBE_PRODUCTION_LOCK_DOMAIN="$PRODUCTION_LOCK_DOMAIN" \
   WELTGEWEBE_PRODUCTION_LOCK_OWNER_ENTRYPOINT="reconciler" \

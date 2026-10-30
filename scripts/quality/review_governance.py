@@ -71,7 +71,7 @@ ALLOWED_AXES = HIGH_RISK_AXES | {
     "user-experience",
     "testing",
 }
-REVIEW_MODES = {"external", "self-primary", "self-fallback"}
+REVIEW_MODES = {"external", "self-primary", "self-secondary", "self-fallback"}
 REVIEW_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
 MAX_FALLBACK_REASON_BYTES = 512
 RISK_RE = re.compile(r"<!--\s*weltgewebe-risk:\s*(R[0-3])\s*-->", re.IGNORECASE)
@@ -568,12 +568,14 @@ zu kurze, mehrfach markierte oder nicht zum Berichtshash passende Kommentare
 zählen nicht. Jeder neue Push, Basiswechsel oder Diffwechsel entwertet den Beleg
 automatisch.
 
-Ist nach einem dokumentierten Versuch kein Fremdreview verfügbar, darf dieselbe
-Prüferidentität zwei getrennte Pässe attestieren. Der erste ergänzt
-`"review_mode": "self-primary"` und eine eindeutige `review_session`; der zweite
-verwendet `"review_mode": "self-fallback"`, eine andere `review_session` und einen
-konkreten `fallback_reason`. Reviewachsen und Berichtshashes müssen verschieden
-bleiben; eine Unabhängigkeit der beiden Self-Reviews wird nicht behauptet.
+Bei R2/R3 darf dieselbe Prüferidentität zwei methodisch getrennte
+Eigenreview-Pässe attestieren, ohne zuvor ein Fremdreview anzufordern.
+Der erste ergänzt "review_mode": "self-primary", der zweite
+"review_mode": "self-secondary"; beide benötigen unterschiedliche
+review_session-Werte. Reviewachsen und Berichtshashes müssen ebenfalls
+verschieden sein. Bei R3 muss mindestens eine Hochrisikoachse vorliegen.
+Eine Unabhängigkeit der beiden Self-Reviews wird nicht behauptet.
+Historische self-fallback-Belege mit dokumentiertem fallback_reason bleiben gültig.
 """
     request_path.write_text(request, encoding="utf-8")
     return Bundle(
@@ -1184,7 +1186,7 @@ def evaluate_evidence(
                 and not review_session_present
                 and not fallback_reason_present
             )
-        elif review_mode in {"self-primary", "self-fallback"}:
+        elif review_mode in {"self-primary", "self-secondary", "self-fallback"}:
             self_review_fields_valid = bool(
                 review_mode_present
                 and isinstance(review_mode_raw, str)
@@ -1194,7 +1196,7 @@ def evaluate_evidence(
                 and review_session_raw == review_session_raw.strip()
                 and REVIEW_SESSION_RE.fullmatch(review_session)
             )
-            if review_mode == "self-primary":
+            if review_mode in {"self-primary", "self-secondary"}:
                 self_review_fields_valid = (
                     self_review_fields_valid and not fallback_reason_present
                 )
@@ -1387,6 +1389,9 @@ def evaluate_evidence(
         self_primary = [
             record for record in accepted if record.get("review_mode") == "self-primary"
         ]
+        self_secondary = [
+            record for record in accepted if record.get("review_mode") == "self-secondary"
+        ]
         self_fallback = [
             record for record in accepted if record.get("review_mode") == "self-fallback"
         ]
@@ -1395,11 +1400,22 @@ def evaluate_evidence(
             for record in self_primary
             if record.get("review_session")
         }
+        secondary_sessions = {
+            record.get("review_session")
+            for record in self_secondary
+            if record.get("review_session")
+        }
         fallback_sessions = {
             record.get("review_session")
             for record in self_fallback
             if record.get("review_session")
         }
+        regular_self_pair = (
+            len(reviewer_names) == 1
+            and bool(primary_sessions)
+            and bool(secondary_sessions)
+            and primary_sessions.isdisjoint(secondary_sessions)
+        )
         explicit_self_fallback = (
             len(reviewer_names) == 1
             and bool(primary_sessions)
@@ -1407,10 +1423,11 @@ def evaluate_evidence(
             and primary_sessions.isdisjoint(fallback_sessions)
             and all(record.get("fallback_reason") for record in self_fallback)
         )
-        if len(reviewer_names) < 2 and not explicit_self_fallback:
+        if len(reviewer_names) < 2 and not (regular_self_pair or explicit_self_fallback):
             reasons.append(
-                "R2/R3 require at least two distinct reviewer identities or an "
-                "explicit self-primary/self-fallback pair with distinct review sessions"
+                "R2/R3 require two distinct reviewer identities or a "
+                "self-primary/self-secondary pair with distinct review sessions "
+                "(legacy self-fallback with a documented reason remains valid)"
             )
         if len(report_hashes) < 2:
             reasons.append("R2/R3 require at least two distinct review reports")

@@ -24,8 +24,8 @@ DOMAIN_DB_SOURCE = ROOT / "apps/api/src/domain_db.rs"
 BENCHMARK_SCHEMA = "weltgewebe_perf"
 SCHEMA_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 PSQL_SAFE_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
-NODE_KINDS = ("Ort", "Projekt", "Person", "Ressource", "Gespraech")
-RARE_NODE_KIND = "Projekt"
+NODE_KINDS = ("place", "project", "event", "resource", "need", "offer")
+RARE_NODE_KIND = "project"
 COMMON_NODE_KINDS = tuple(kind for kind in NODE_KINDS if kind != RARE_NODE_KIND)
 RARE_NODE_KIND_INTERVAL = 100
 EDGE_KINDS = ("bezieht_sich_auf", "wirkt_mit", "liegt_bei", "teilt", "antwortet_auf")
@@ -505,6 +505,16 @@ def _render_production_bbox_sql(
     query = _production_bbox_sql(function_name).replace(
         "FROM domain_nodes", f"FROM {schema}.domain_nodes", 1
     )
+    # The isolated scale fixture has only public nodes and deliberately does
+    # not install production's canonical owner-account SQL function.
+    # For the proven anonymous viewer ($7 = NULL), the owner-only branch is
+    # unreachable: inline the helper's result as NULL without inventing a
+    # benchmark-specific database function or testing a fake owner identity.
+    owner_function = "weltgewebe_search_node_owner_account_id(payload)"
+    if owner_function in query:
+        if bindings.get(7) != "NULL":
+            raise DomainScaleError("benchmark BBOX reads must use the anonymous viewer")
+        query = query.replace(owner_function, "NULL::text")
     placeholders = {int(value) for value in re.findall(r"\$(\d+)", query)}
     if placeholders != set(bindings):
         raise DomainScaleError(
@@ -544,7 +554,7 @@ def render_workload_sql(
     bbox_initial_query = _render_production_bbox_sql(
         "load_nodes_bbox_from_postgres",
         schema,
-        {1: "-10.0", 2: "10.0", 3: "-10.0", 4: "10.0", 5: "1001", 6: "0"},
+        {1: "-10.0", 2: "10.0", 3: "-10.0", 4: "10.0", 5: "1001", 6: "0", 7: "NULL"},
     )
     bbox_cursor_query = _render_production_bbox_sql(
         "load_nodes_bbox_after_id_from_postgres",
@@ -556,6 +566,7 @@ def render_workload_sql(
             4: "10.0",
             5: _sql_literal(middle_node),
             6: "1001",
+            7: "NULL",
         },
     )
     blocks = [
@@ -584,7 +595,7 @@ def render_workload_sql(
         _explain_block(
             "kind_filter",
             plan_dir,
-            f"SELECT id, kind, title FROM {schema}.domain_nodes WHERE kind = 'Projekt' LIMIT 500",
+            f"SELECT id, kind, title FROM {schema}.domain_nodes WHERE kind = 'project' LIMIT 500",
         ),
     ]
     sql = "\\set ON_ERROR_STOP on\n\\pset format unaligned\n\\pset tuples_only on\n" + "\n".join(blocks)

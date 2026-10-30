@@ -212,7 +212,7 @@ async fn private_owner_lifecycle_is_account_bound_redacted_and_recoverable() {
     sqlx::query(
         "INSERT INTO domain_nodes \
          (id,kind,title,lat,lon,payload,search_visibility,created_at,updated_at) \
-         VALUES ($1,'Werkstatt',$2,54.9,8.3,$3::jsonb,'private',clock_timestamp(),clock_timestamp())",
+         VALUES ($1,'place',$2,54.9,8.3,$3::jsonb,'private',clock_timestamp(),clock_timestamp())",
     )
     .bind(NODE_ID)
     .bind(PRIVATE_TITLE)
@@ -279,7 +279,7 @@ async fn private_owner_lifecycle_is_account_bound_redacted_and_recoverable() {
     sqlx::query(
         "INSERT INTO search_node_projections \
          (generation_id,node_id,source_version,source_revision,content_sha256,title,tags,searchable_text,language,kind,status,visibility_scopes,semantic_state,embedding) \
-         SELECT $1,v.node_id,v.source_version,v.source_revision,$3,$4,'{}'::TEXT[],$5,'de','Werkstatt','active',ARRAY['owner']::TEXT[],'unavailable',NULL \
+         SELECT $1,v.node_id,v.source_version,v.source_revision,$3,$4,'{}'::TEXT[],$5,'de','place','active',ARRAY['owner']::TEXT[],'unavailable',NULL \
          FROM search_node_versions v WHERE v.node_id=$2",
     )
     .bind(&generation)
@@ -393,7 +393,7 @@ async fn private_worker_locks_owner_before_projection_state() {
     sqlx::query(
         "INSERT INTO domain_nodes \
          (id,kind,title,lat,lon,payload,search_visibility,created_at,updated_at) \
-         VALUES ($1,'Werkstatt',$2,54.9,8.3,$3::jsonb,'private',clock_timestamp(),clock_timestamp())",
+         VALUES ($1,'place',$2,54.9,8.3,$3::jsonb,'private',clock_timestamp(),clock_timestamp())",
     )
     .bind(NODE_ID)
     .bind(PRIVATE_TITLE)

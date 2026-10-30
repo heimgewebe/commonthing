@@ -151,14 +151,18 @@ class WebPushVapidEnvTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WebPushEnvError, "safe regular file"):
                 MODULE.ensure_web_push_env(symlink)
 
-    def test_release_activation_bootstraps_before_reconciler_install(self) -> None:
+    def test_release_activation_preflights_hold_and_timer_before_vapid(self) -> None:
         activation = (
             ROOT / "scripts/ops/activate-production-reconciler-from-release.sh"
         ).read_text(encoding="utf-8")
+        hold = activation.index('python3 -I "$authorization_checker" --commit "$COMMIT"')
+        timer_preflight = activation.index("--preflight-only")
         bootstrap = activation.index('python3 -I "$web_push_bootstrap"')
         installer = activation.index(
             'WELTGEWEBE_SOURCE_CHECKOUT="$SOURCE_CHECKOUT"', bootstrap
         )
+        self.assertLess(hold, timer_preflight)
+        self.assertLess(timer_preflight, bootstrap)
         self.assertLess(bootstrap, installer)
         self.assertIn(
             'require_root_safe_regular_file "$RUNTIME_ENV" "runtime environment"',

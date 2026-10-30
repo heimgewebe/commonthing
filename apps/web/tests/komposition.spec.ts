@@ -65,6 +65,8 @@ test.describe("Komposition Flow (weber)", () => {
 
     await longPressMapCenter(page);
     await expect(panel.locator(".state-set")).toContainText("Ort gewählt");
+    await expect(submitBtn).toBeDisabled(); // even with location and title: kind is required
+    await page.selectOption("#nodeType", "place");
     await expect(submitBtn).toBeEnabled();
 
     await page.fill("#address", "");
@@ -89,7 +91,7 @@ test.describe("Komposition Flow (weber)", () => {
     expect(payload.location.lon).toBeLessThanOrEqual(180);
   });
 
-  test("Nongeographic Komposition needs only a name and sends no incomplete location", async ({
+  test("Nongeographic Komposition requires a kind and a name but no map location", async ({
     page,
   }) => {
     await activateToolFanAction(page, "weave");
@@ -102,6 +104,8 @@ test.describe("Komposition Flow (weber)", () => {
     await geographic.uncheck();
     await expect(submitBtn).toBeDisabled();
     await page.fill("#title", "Digital Commons");
+    await expect(submitBtn).toBeDisabled(); // kind is mandatory even without a map location
+    await page.selectOption("#nodeType", "resource");
     await expect(submitBtn).toBeEnabled();
     await expect(page.locator("#address")).toHaveValue("");
 
@@ -115,7 +119,7 @@ test.describe("Komposition Flow (weber)", () => {
     await submitBtn.click();
     expect((await nodeRequest).postDataJSON()).toMatchObject({
       title: "Digital Commons",
-      kind: "standard",
+      kind: "resource",
       address: null,
       location: null,
     });
@@ -300,6 +304,7 @@ test.describe("Komposition Flow (weber)", () => {
     await longPressMapCenter(page);
     await page.fill("#title", "Retry Node");
     await page.fill("#address", "Retrystraße 1");
+    await page.selectOption("#nodeType", "resource");
 
     await panel.locator('button[type="submit"]').click();
     await expect(panel.locator('[role="alert"]')).toBeVisible();

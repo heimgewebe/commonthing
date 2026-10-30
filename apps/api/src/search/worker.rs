@@ -1111,7 +1111,7 @@ mod tests {
     fn document_excludes_address_and_fails_closed_visibility() {
         let unknown = SearchDocument::from_row(
             "node-1",
-            "Werkstatt",
+            "place",
             "Fahrradhilfe",
             r#"{"summary":"Reparatur","address":"secret lane 9","tags":["Rad"]}"#,
             "hidden",
@@ -1124,7 +1124,7 @@ mod tests {
 
         let private = SearchDocument::from_row(
             "node-1",
-            "Werkstatt",
+            "place",
             "Fahrradhilfe",
             r#"{"created_by_account_id":"owner-a","summary":"Reparatur","address":"secret lane 9","tags":["Rad"]}"#,
             "private",
@@ -1137,7 +1137,7 @@ mod tests {
 
         let sql_canonical_private = SearchDocument::from_row(
             "node-1",
-            "Werkstatt",
+            "place",
             "Fahrradhilfe",
             r#"{"created_by_account_id":"\t","summary":"Reparatur"}"#,
             "private",
@@ -1149,7 +1149,7 @@ mod tests {
 
         let public = SearchDocument::from_row(
             "node-1",
-            "Werkstatt",
+            "place",
             "Fahrradhilfe",
             r#"{"summary":"Reparatur","tags":["Rad"]}"#,
             "public",
@@ -1160,7 +1160,7 @@ mod tests {
         assert_eq!(public.scopes, ["public"]);
         assert_eq!(
             public.embedding_text(),
-            "Titel: Fahrradhilfe\nKurzbeschreibung: Reparatur\nInformation: \nTags: Rad\nArt: Werkstatt\nSprache: und"
+            "Titel: Fahrradhilfe\nKurzbeschreibung: Reparatur\nInformation: \nTags: Rad\nArt: place\nSprache: und"
         );
     }
 

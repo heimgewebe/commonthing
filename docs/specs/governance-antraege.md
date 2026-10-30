@@ -126,7 +126,15 @@ Webrat des Zentrums und zusätzlich über den Knoten erreichbar.
 
 Wird der referenzierte Knoten später regulär aus dem aktiven Gewebe entfernt,
 wird die aktive Knotenbindung gelöst. Der Titelsnapshot und der Sachantrag
-bleiben als Verfahrens- und Beschlussspur erhalten.
+bleiben als Verfahrens- und Beschlussspur **intern gespeichert**. Öffentliche
+Antragslisten und -details geben `target_node_id` und `target_node_title` nur aus,
+solange der referenzierte Knoten **aktuell** als `public` lesbar ist. Bei
+`private`, `hidden`, `revoked`, Löschung oder unbekannter Sichtbarkeit
+bleiben beide Felder in der öffentlichen Antwort leer. Auch zuvor öffentliche
+Titelsnapshots dürfen nicht durch spätere Sichtbarkeitsänderungen erneut
+veröffentlicht werden. Antragstitel und frei verfasste Begründungen bleiben
+eigenständige öffentliche Verfahrensinhalte; sie dürfen deshalb nicht als
+automatisch geschützte Knotenmetadaten verstanden werden.
 
 ## Rücknahme eines offenen Antrags
 

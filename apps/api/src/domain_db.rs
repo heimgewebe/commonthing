@@ -198,6 +198,10 @@ pub async fn load_nodes_from_postgres(pool: &PgPool) -> Result<OrderedCache<Node
 /// deployments. PostgreSQL-backed viewport requests use this helper so BBOX
 /// selection no longer iterates the global in-process node cache. Projection
 /// refresh and cache-generation behavior outside this query remain unchanged.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keep BBOX bounds, pagination, and viewer scope explicit at SQL read boundary"
+)]
 pub async fn load_nodes_bbox_from_postgres(
     pool: &PgPool,
     min_lat: f64,
@@ -206,12 +210,16 @@ pub async fn load_nodes_bbox_from_postgres(
     max_lng: f64,
     limit: usize,
     offset: i64,
+    owner_account_id: Option<&str>,
 ) -> Result<Vec<Node>> {
     let limit = i64::try_from(limit).context("node BBOX limit exceeds PostgreSQL integer range")?;
     let rows: Vec<NodeRow> = sqlx::query_as(
         "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility \
          FROM domain_nodes \
          WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 \
+           AND (search_visibility = 'public' OR
+             (search_visibility IN ('private', 'hidden') AND $7::text IS NOT NULL
+              AND weltgewebe_search_node_owner_account_id(payload) = $7::text))
          ORDER BY id ASC LIMIT $5 OFFSET $6",
     )
     .bind(min_lat)
@@ -220,6 +228,7 @@ pub async fn load_nodes_bbox_from_postgres(
     .bind(max_lng)
     .bind(limit)
     .bind(offset)
+    .bind(owner_account_id)
     .fetch_all(pool)
     .await
     .context("failed to load BBOX node page from domain_nodes")?;
@@ -240,6 +249,10 @@ pub async fn load_nodes_bbox_from_postgres(
 /// nullable `OR` predicate whose generic prepared plan could lose the clear
 /// `id > cursor` selectivity. PostgreSQL owns the ordering; callers must not
 /// re-sort the returned rows under Rust's string ordering.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keep BBOX bounds, pagination, and viewer scope explicit at SQL read boundary"
+)]
 pub async fn load_nodes_bbox_after_id_from_postgres(
     pool: &PgPool,
     min_lat: f64,
@@ -248,6 +261,7 @@ pub async fn load_nodes_bbox_after_id_from_postgres(
     max_lng: f64,
     limit: usize,
     after_id: &str,
+    owner_account_id: Option<&str>,
 ) -> Result<Vec<Node>> {
     let limit = i64::try_from(limit).context("node BBOX limit exceeds PostgreSQL integer range")?;
     let rows: Vec<NodeRow> = sqlx::query_as(
@@ -255,6 +269,9 @@ pub async fn load_nodes_bbox_after_id_from_postgres(
          FROM domain_nodes \
          WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 \
            AND id > $5 \
+           AND (search_visibility = 'public' OR
+             (search_visibility IN ('private', 'hidden') AND $7::text IS NOT NULL
+              AND weltgewebe_search_node_owner_account_id(payload) = $7::text))
          ORDER BY id ASC LIMIT $6",
     )
     .bind(min_lat)
@@ -263,6 +280,7 @@ pub async fn load_nodes_bbox_after_id_from_postgres(
     .bind(max_lng)
     .bind(after_id)
     .bind(limit)
+    .bind(owner_account_id)
     .fetch_all(pool)
     .await
     .context("failed to load cursor-anchored BBOX node page from domain_nodes")?;
@@ -1716,6 +1734,9 @@ pub async fn insert_account_from_jsonl_record(
     record: &Value,
 ) -> Result<(), AccountWriteError> {
     let row = NewDomainAccountRow::from_jsonl_record(record).map_err(AccountWriteError::Mapping)?;
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(AccountWriteError::Database)?;
 
     let result = sqlx::query(
         "INSERT INTO domain_accounts \
@@ -1832,6 +1853,9 @@ pub async fn update_account_profile_in_postgres(
     account_id: &str,
     update: &AccountProfileUpdate,
 ) -> Result<StoredAccountProfile, AccountProfileUpdateError> {
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(AccountProfileUpdateError::Database)?;
     let mut tx = pool
         .begin()
         .await
@@ -1989,6 +2013,9 @@ pub async fn update_account_email_in_postgres(
     if new_email.is_empty() || new_email.len() > MAX_EMAIL_LEN {
         return Err(AccountEmailUpdateError::InvalidEmail);
     }
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(AccountEmailUpdateError::Database)?;
 
     let result = sqlx::query_scalar::<_, DateTime<Utc>>(
         "UPDATE domain_accounts \

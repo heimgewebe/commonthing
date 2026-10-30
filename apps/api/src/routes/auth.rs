@@ -1297,26 +1297,30 @@ pub async fn consume_login_post(
         }
     };
     if let Some(email) = email {
-        // Find account
-        let accounts = state.accounts.read().await;
-        // email in AccountStore index is normalized to lowercase
-        let account = accounts.get_by_email(&email);
+        // Snapshot identity/activation; drop the cache read guard before
+        // session creation waits for the shared PostgreSQL pool budget.
+        let account = {
+            let accounts = state.accounts.read().await;
+            accounts
+                .get_by_email(&email)
+                .map(|acc| (acc.public.id.clone(), acc.public.disabled))
+        };
 
-        if let Some(acc) = account {
-            if acc.public.disabled {
+        if let Some((account_id, disabled)) = account {
+            if disabled {
                 tracing::warn!(
                     event = "login.failed_disabled",
                     request_id = %request_id,
                     client_ip = %client_ip,
                     remote_ip = %addr.ip(),
                     proxy_trusted = proxy_trusted,
-                    account_id = %acc.public.id,
+                    account_id = %account_id,
                     "Login consume failed: Account disabled"
                 );
                 return Redirect::to("/login?error=account_disabled").into_response();
             }
 
-            let session = match state.sessions.create(acc.public.id.clone(), None).await {
+            let session = match state.sessions.create(account_id.clone(), None).await {
                 Ok(session) => session,
                 Err(error) => {
                     return session_backend_status_response("consume_login_post.create", &error);
@@ -1341,7 +1345,7 @@ pub async fn consume_login_post(
                 client_ip = %client_ip,
                 remote_ip = %addr.ip(),
                 proxy_trusted = proxy_trusted,
-                account_id = %acc.public.id,
+                account_id = %account_id,
                 "Login successful"
             );
 

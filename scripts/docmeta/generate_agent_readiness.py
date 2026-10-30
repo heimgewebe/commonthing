@@ -380,6 +380,7 @@ def _evaluate_dry_run_runner(root: Path) -> CapabilityResult:
         completed = subprocess.run(
             [
                 sys.executable,
+                "-B",
                 "-m",
                 "scripts.agent.run_task",
                 "--dry-run",
@@ -475,6 +476,7 @@ def _evaluate_run_evidence_lite(root: Path) -> CapabilityResult:
             completed = subprocess.run(
                 [
                     sys.executable,
+                    "-B",
                     "-m",
                     "scripts.agent.run_task",
                     "--dry-run",

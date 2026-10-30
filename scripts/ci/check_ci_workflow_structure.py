@@ -137,7 +137,7 @@ def validate_workflow_texts(texts: dict[str, str]) -> list[str]:
         errors.append("reusable-web-check.yml must expose the workflow_call contract")
     if "permissions:" in reusable.splitlines():
         errors.append("reusable-web-check.yml must inherit token permissions from each caller")
-    if not _has_run_line(reusable, "pnpm playwright install --with-deps"):
+    if not _has_run_line(reusable, "pnpm playwright install --with-deps chromium"):
         errors.append("reusable web check must own Playwright browser installation")
     if 'PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: ""' not in reusable:
         errors.append("reusable web check must force-enable Playwright browser installation")
@@ -148,7 +148,13 @@ def validate_workflow_texts(texts: dict[str, str]) -> list[str]:
         text = texts[caller]
         if f"uses: {REUSABLE}" not in text:
             errors.append(f"{caller} must call {REUSABLE}")
-        if _has_run_line(text, "pnpm playwright install --with-deps"):
+        if any(
+            _has_run_line(text, installer)
+            for installer in (
+                "pnpm playwright install --with-deps",
+                "pnpm playwright install --with-deps chromium",
+            )
+        ):
             errors.append(f"{caller} must not reinstall Playwright directly")
         if _has_run_line(text, "pnpm test:ci") or _has_run_line(text, "pnpm test"):
             errors.append(f"{caller} must not invoke the shared Playwright suites directly")

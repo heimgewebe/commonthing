@@ -99,6 +99,12 @@ Antworten.
 
 ## Knoten
 
+**Knoten ist ein Oberbegriff, keine eigene Art.** Neue Knoten besitzen genau eine
+fachliche Primärart aus dem kanonischen [Knotenartenvertrag](knotenarten.md).
+Eine generische Art `standard` oder ein stiller `Unknown`-Default ist nicht mehr
+Bestandteil neuer Schreibvorgänge. Die Freigabe des Quellcodes gilt nicht als
+Nachweis eines produktiven Bestands-Datencutovers.
+
 Knoten beschreiben Orte, Kollektivgüter, Ressourcen, Vorhaben, Bedürfnisse oder
 Angebote, ebenso Dokumente, Wissen und digitale Commons. Adresse und Kartenort
 sind unabhängige optionale Aspekte, keine Existenzvoraussetzung. Fehlend oder
@@ -148,6 +154,44 @@ Prüfung erfolgt auf dem Server und gilt unabhängig von der sichtbaren
 Oberfläche. Versionsvorbedingungen (`If-Match`) schützen zusätzlich gegen
 überschriebene Paralleländerungen.
 
+### Lesen und Suchsichtbarkeit (Änderungsentwurf zu #1970)
+
+Der serverseitige Zustand search_visibility regelt nicht nur die Aufnahme
+in den Suchindex, sondern begrenzt die gewöhnlichen lesenden API-Projektionen.
+Ein öffentlich zugänglicher Link ist keine Erlaubnis für ein privates Objekt.
+
+| Zustand | Lesen durch Besucher / fremde Accounts | Lesen durch den authentifizierten Urheber |
+|---|---|---|
+| public | ja | ja |
+| private | nein | ja |
+| hidden | nein | ja, direkt und in eigenen Listen, nicht in der semantischen Suche |
+| revoked | nein | nein; Sonderzugriff nur über eigene moderierte APIs |
+
+Für Knoten mit fehlender historischer Urheberbindung gilt: private und
+hidden gewähren kein vermutetes Eigentümerrecht. Für bestehende
+historische Datensätze ohne expliziten Sichtbarkeitszustand bleibt die
+bisherige Vorgabe public erhalten.
+
+Autorisierung geschieht serverseitig **vor** Limits, Offsets und Cursorgrenzen,
+und zwar auch bei PostgreSQL-BBOX-Abfragen. Einzelzugriffe auf unzulässige
+Knoten und Fäden liefern 404 statt objektbezogene Daten. Faden-Endpunkte dürfen
+weder Knoten-IDs noch Knotentitel aus geschützten Knoten offenlegen.
+Aktive Knotengespräche erben diese Lesegrenze, einschließlich einzelner
+Gesprächs-IDs und Nachrichtenlisten. Eine reine Karten-/UI-Ausblendung oder
+ein Clientflag ist keine Autorisierung.
+
+Bei Knotenlöschung übernimmt ein vorhandenes Gesprächsarchiv die kanonische
+Sichtbarkeit des gelöschten Knotens. Nur ausdrücklich zuvor öffentlich
+sichtbare Knoten erlauben das normale öffentliche Lesen ihrer Archive.
+Historische Archive ohne nachweisbare Sichtbarkeitsherkunft bleiben
+fail-closed; die Wiedersichtbarmachung erfordert einen gesonderten Herkunftsnachweis.
+Private Knotentitel dürfen auch nicht über Account-Aktivitätslisten
+erneut öffentlich ausgegeben werden. Ein automatischer Downgrade, der den
+Archiv-Sichtbarkeitssnapshot entfernt, ist ausdrücklich gesperrt.
+
+**Noch zu prüfen:** bestehende Altclients, Cache-Publikationsleistung und
+historische Archivberechtigungen. Dieser Vertrag ist keine Produktionsfreigabe.
+
 ## Fäden
 
 Fäden sind Beziehungen zwischen Garnrollen und Knoten. Der produktive
@@ -158,8 +202,8 @@ fremde Garnrolle als handelnden Ausgangspunkt vortäuschen.
 Dieser Schnitt eröffnet bewusst keinen allgemeinen manuellen
 `POST /edges`-Editor. Ein solcher Editor benötigt einen eigenen Vertrag für
 Fadenarten, Eigentum, Änderung, Entfernung und Missbrauchsschutz. Bis dahin
-bleiben Fäden aus den belegten Webungsaktionen abgeleitete, öffentlich lesbare
-Projektionen.
+bleiben Fäden aus den belegten Webungsaktionen abgeleitete Projektionen,
+die nur bei ausreichenden Leserechten an ihren Knotenendpunkten erscheinen.
 
 Freie interne Fadennotizen gehören nicht zur öffentlichen Projektion.
 
@@ -260,13 +304,18 @@ abgeleitet werden.
 
 ## Gespräche
 
-Jeder PostgreSQL-Knoten besitzt genau einen öffentlichen Gesprächsraum.
-Angemeldete Gäste, Weber und Administratoren dürfen während des offenen
-Lebenszyklus Beiträge verfassen. Ein Beitrag besitzt einen Autoren-Snapshot und
-eine aktive Accountbindung:
+Jeder PostgreSQL-Knoten besitzt genau einen Gesprächsraum. Dessen **Lesezugriff**
+erbt die oben definierte Knotensichtbarkeit, einschließlich Metadaten und
+Nachrichten: `public` ist öffentlich lesbar, `private` und `hidden` nur für
+den angemeldeten Knoten-Eigentümer, `revoked` für keinen regulären Leser.
+Weder eine bekannte Gesprächs-ID noch die Rolle Weber/Administrator heben diese
+Lesesperre auf. Schreibberechtigte Accounts dürfen nur in für sie lesbaren,
+aktiven Räumen Beiträge verfassen. Ein Beitrag besitzt einen Autoren-Snapshot
+und eine aktive Accountbindung:
 
 - nur der Autor darf den eigenen Beitrag bearbeiten;
-- Autor oder Administrator dürfen ihn entfernen;
+- Autor oder Administrator dürfen ihn entfernen, jedoch nur bei bestehender
+  Leseberechtigung für den jeweiligen Knoten/Gesprächsraum;
 - beim Löschen eines Accounts wird die aktive Accountbindung entfernt, der
   historische Anzeigename und der Beitrag bleiben erhalten.
 
@@ -276,13 +325,17 @@ Gewebe gelöscht werden. Dabei gelten drei getrennte Wirkungen:
 - der Knoten und seine verbundenen Fadenprojektionen werden regulär entfernt;
 - ein leerer, automatisch erzeugter Gesprächsraum wird mit dem Knoten gelöscht;
 - ein Gesprächsraum mit Beiträgen wird im selben Datenbankvorgang vom Knoten
-  entkoppelt, mit Knoten-ID und letztem Knotentitel gekennzeichnet und als
-  schreibgeschütztes Archiv erhalten.
+  entkoppelt, mit Knoten-ID, letztem Knotentitel und der zuletzt wirksamen
+  Knotensichtbarkeit gekennzeichnet und als schreibgeschütztes Archiv erhalten.
 
-Das Archiv bleibt über seine stabile Gesprächs-ID öffentlich lesbar. Nach der
-Archivierung sind neue Beiträge und normale Inhaltsänderungen ausgeschlossen.
-Autoren dürfen eigene Beiträge weiterhin zurückziehen, Administratoren dürfen
-sie moderativ entfernen; beides erzeugt einen Tombstone statt einer physischen
+Ein Archiv ist über seine stabile Gesprächs-ID **nur dann öffentlich lesbar**,
+wenn sein gelöschter Knoten zuvor ausdrücklich `public` war. Archive von
+`private`, `hidden` oder `revoked` Knoten sowie historische Archive ohne
+nachweisbaren Sichtbarkeitssnapshot bleiben für gewöhnliche Lese- und
+Tombstone-Endpunkte geschlossen (404). Bei öffentlich lesbaren Archiven
+sind neue Beiträge und normale Inhaltsänderungen ausgeschlossen; Autoren
+dürfen ihre eigenen Beiträge weiterhin zurückziehen und Administratoren dürfen
+sie moderativ entfernen. Beides erzeugt einen Tombstone statt einer physischen
 Löschung. Beim Accountaustritt wird weiterhin nur die aktive Accountbindung
 gelöst. Die frühere Diskussion darf nicht durch das Entfernen ihres Kartenobjekts
 verschwinden oder nachträglich wiederbeschrieben werden. Die übergreifenden

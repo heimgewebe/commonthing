@@ -193,14 +193,14 @@ async fn node_replace_requires_current_if_match_version() -> Result<()> {
     write_fixture(
         &nodes_path,
         concat!(
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
         ),
     );
     let _env = set_gewebe_in_dir(&in_dir);
     let state = state_for_role(Role::Weber).await?;
     let (app, cookie) = authenticated_app(state.clone()).await;
-    let payload = r#"{"title":"Neu","kind":"Werkstatt","address":"Neu 1","location":{"lat":53.55,"lon":10.05},"tags":[]}"#;
+    let payload = r#"{"title":"Neu","kind":"place","address":"Neu 1","location":{"lat":53.55,"lon":10.05},"tags":[]}"#;
 
     let missing = mutation_request_with_etag("PUT", "/nodes/n1", &cookie, payload, None);
     let response = app.clone().oneshot(missing).await?;
@@ -293,7 +293,7 @@ async fn no_op_replace_is_still_actor_audited_without_advancing_version() -> Res
     let in_dir = tmp.path().join("in");
     let nodes_path = in_dir.join("demo.nodes.jsonl");
     let original = concat!(
-        r#"{"id":"n1","kind":"Werkstatt","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        r#"{"id":"n1","kind":"place","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
         "
 ",
     );
@@ -305,7 +305,7 @@ async fn no_op_replace_is_still_actor_audited_without_advancing_version() -> Res
         "PUT",
         "/nodes/n1",
         &cookie,
-        r#"{"title":"Alt","kind":"Werkstatt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"tags":[]}"#,
+        r#"{"title":"Alt","kind":"place","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"tags":[]}"#,
         Some(INITIAL_NODE_ETAG),
     );
 
@@ -343,9 +343,9 @@ async fn weber_can_replace_shared_node_and_delete_node_cascade() -> Result<()> {
     write_fixture(
         &nodes_path,
         concat!(
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
-            r#"{"id":"n2","kind":"Ort","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n2","kind":"place","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
         ),
     );
@@ -380,7 +380,7 @@ async fn weber_can_replace_shared_node_and_delete_node_cascade() -> Result<()> {
         "PUT",
         "/nodes/n1",
         &cookie,
-        r#"{"title":"Gemeinsam gepflegt","kind":"Werkstatt","address":"Neu 1","location":{"lat":53.55,"lon":10.05},"summary":"Gemeinsamer Knoten","info":"Pflegbar durch alle Weber","tags":["commons"]}"#,
+        r#"{"title":"Gemeinsam gepflegt","kind":"place","address":"Neu 1","location":{"lat":53.55,"lon":10.05},"summary":"Gemeinsamer Knoten","info":"Pflegbar durch alle Weber","tags":["commons"]}"#,
     );
     let response = app.clone().oneshot(replace).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -402,7 +402,7 @@ async fn weber_can_replace_shared_node_and_delete_node_cascade() -> Result<()> {
         "PUT",
         "/nodes/n1",
         &cookie,
-        r#"{"title":"Falscher Vertrag","kind":"Werkstatt","address":"Neu 1","lat":53.55,"lon":10.05,"tags":[]}"#,
+        r#"{"title":"Falscher Vertrag","kind":"place","address":"Neu 1","lat":53.55,"lon":10.05,"tags":[]}"#,
         Some(&current_etag),
     );
     let response = app.clone().oneshot(flat_location).await?;
@@ -518,7 +518,7 @@ async fn permanent_node_delete_does_not_expose_public_purge() -> Result<()> {
     write_fixture(
         &in_dir.join("demo.nodes.jsonl"),
         concat!(
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
         ),
     );
@@ -538,9 +538,9 @@ async fn node_delete_rejects_mixed_node_and_edge_write_sources() -> Result<()> {
     let in_dir = tmp.path().join("in");
     let nodes_path = in_dir.join("demo.nodes.jsonl");
     let original = concat!(
-        r#"{"id":"n1","kind":"Werkstatt","title":"Altbestand","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        r#"{"id":"n1","kind":"place","title":"Altbestand","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
         "\n",
-        r#"{"id":"n2","kind":"Werkstatt","title":"Fremd","address":"Fremd 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","created_by_account_id":"other"}"#,
+        r#"{"id":"n2","kind":"place","title":"Fremd","address":"Fremd 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","created_by_account_id":"other"}"#,
         "\n",
     );
     write_fixture(&nodes_path, original);
@@ -567,9 +567,9 @@ async fn node_delete_jsonl_keeps_account_and_role_endpoint_collisions() -> Resul
     write_fixture(
         &nodes_path,
         concat!(
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
-            r#"{"id":"n2","kind":"Ort","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n2","kind":"place","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
         ),
     );
@@ -650,9 +650,9 @@ async fn node_delete_jsonl_deletes_unique_untyped_legacy_edge() -> Result<()> {
     write_fixture(
         &nodes_path,
         concat!(
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
-            r#"{"id":"n2","kind":"Ort","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n2","kind":"place","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
         ),
     );
@@ -715,7 +715,7 @@ async fn node_delete_jsonl_rejects_untyped_account_collision_without_partial_mut
     let nodes_path = in_dir.join("demo.nodes.jsonl");
     let edges_path = in_dir.join("demo.edges.jsonl");
     let nodes_original = concat!(
-        r#"{"id":"n1","kind":"Werkstatt","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        r#"{"id":"n1","kind":"place","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
         "\n",
     );
     let edges_original = concat!(
@@ -785,9 +785,9 @@ async fn node_delete_jsonl_rejects_untyped_role_collision_without_partial_mutati
     let nodes_path = in_dir.join("demo.nodes.jsonl");
     let edges_path = in_dir.join("demo.edges.jsonl");
     let nodes_original = concat!(
-        r#"{"id":"n1","kind":"Werkstatt","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        r#"{"id":"n1","kind":"place","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
         "\n",
-        r#"{"id":"n2","kind":"Ort","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        r#"{"id":"n2","kind":"place","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
         "\n",
     );
     let edges_original = concat!(
@@ -863,9 +863,9 @@ async fn node_delete_jsonl_rejects_invalid_endpoint_type_without_partial_mutatio
     let nodes_path = in_dir.join("demo.nodes.jsonl");
     let edges_path = in_dir.join("demo.edges.jsonl");
     let nodes_original = concat!(
-        r#"{"id":"n1","kind":"Werkstatt","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        r#"{"id":"n1","kind":"place","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
         "\n",
-        r#"{"id":"n2","kind":"Ort","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        r#"{"id":"n2","kind":"place","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
         "\n",
     );
     let edges_original = concat!(
@@ -918,9 +918,9 @@ async fn concurrent_replace_and_delete_leave_one_coherent_jsonl_result() -> Resu
     write_fixture(
         &nodes_path,
         concat!(
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
-            r#"{"id":"n2","kind":"Ort","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+            r#"{"id":"n2","kind":"place","title":"Ziel","address":"Ziel 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
             "\n",
         ),
     );
@@ -955,7 +955,7 @@ async fn concurrent_replace_and_delete_leave_one_coherent_jsonl_result() -> Resu
         "PUT",
         "/nodes/n1",
         &cookie,
-        r#"{"title":"Parallel gepflegt","kind":"Werkstatt","address":"Neu 1","location":{"lat":53.55,"lon":10.05},"tags":[]}"#,
+        r#"{"title":"Parallel gepflegt","kind":"place","address":"Neu 1","location":{"lat":53.55,"lon":10.05},"tags":[]}"#,
     );
     let delete = mutation_request("DELETE", "/nodes/n1", &cookie, "");
     let (replace_response, delete_response) =
@@ -1004,7 +1004,7 @@ async fn guest_can_create_and_mutate_own_node_with_server_owned_creator() -> Res
         "POST",
         "/nodes",
         &cookie,
-        r#"{"title":"Gastknoten","kind":"Werkstatt","address":"Gastweg 1","location":{"lat":53.5,"lon":10.0},"tags":[],"operation_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}"#,
+        r#"{"title":"Gastknoten","kind":"place","address":"Gastweg 1","location":{"lat":53.5,"lon":10.0},"tags":[],"operation_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}"#,
     );
     let response = app.clone().oneshot(create).await?;
     let status = response.status();
@@ -1027,7 +1027,7 @@ async fn guest_can_create_and_mutate_own_node_with_server_owned_creator() -> Res
         "PUT",
         &format!("/nodes/{node_id}"),
         &cookie,
-        r#"{"title":"Eigener Gastknoten","kind":"Werkstatt","address":"Gastweg 2","location":{"lat":53.51,"lon":10.01},"tags":["eigen"]}"#,
+        r#"{"title":"Eigener Gastknoten","kind":"place","address":"Gastweg 2","location":{"lat":53.51,"lon":10.01},"tags":["eigen"]}"#,
         Some(&etag),
     );
     let response = app.oneshot(replace).await?;
@@ -1080,9 +1080,9 @@ async fn guest_cannot_mutate_legacy_or_foreign_nodes() -> Result<()> {
     let in_dir = tmp.path().join("in");
     let nodes_path = in_dir.join("demo.nodes.jsonl");
     let original = concat!(
-        r#"{"id":"n1","kind":"Werkstatt","title":"Altbestand","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
+        r#"{"id":"n1","kind":"place","title":"Altbestand","address":"Alt 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#,
         "\n",
-        r#"{"id":"n2","kind":"Werkstatt","title":"Fremd","address":"Fremd 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","created_by_account_id":"other"}"#,
+        r#"{"id":"n2","kind":"place","title":"Fremd","address":"Fremd 2","location":{"lat":53.6,"lon":10.1},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","created_by_account_id":"other"}"#,
         "\n",
     );
     write_fixture(&nodes_path, original);
@@ -1095,7 +1095,7 @@ async fn guest_cannot_mutate_legacy_or_foreign_nodes() -> Result<()> {
             "PUT",
             &format!("/nodes/{node_id}"),
             &cookie,
-            r#"{"title":"Verboten","kind":"Werkstatt","address":"Neu 1","location":{"lat":53.55,"lon":10.05}}"#,
+            r#"{"title":"Verboten","kind":"place","address":"Neu 1","location":{"lat":53.55,"lon":10.05}}"#,
             None,
         );
         assert_eq!(
@@ -1110,7 +1110,7 @@ async fn guest_cannot_mutate_legacy_or_foreign_nodes() -> Result<()> {
             "PUT",
             &format!("/nodes/{node_id}"),
             &cookie,
-            r#"{"title":"Verboten","kind":"Werkstatt","address":"Neu 1","location":{"lat":53.55,"lon":10.05}}"#,
+            r#"{"title":"Verboten","kind":"place","address":"Neu 1","location":{"lat":53.55,"lon":10.05}}"#,
         );
         assert_eq!(
             app.clone().oneshot(replace).await?.status(),

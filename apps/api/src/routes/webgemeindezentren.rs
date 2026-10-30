@@ -12,25 +12,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::json;
 use sqlx::{PgPool, Row};
-use std::{collections::HashMap, sync::OnceLock};
-use tokio::sync::Semaphore;
+use std::collections::HashMap;
 use uuid::Uuid;
-
-// A center activity projection temporarily owns one connection for the
-// account-lifecycle advisory lock and a second one in the edge writer. Bound
-// concurrent projections so waiters can never occupy the complete pool while
-// each waits for its second connection.
-const fn center_activity_slot_count(pool_max_connections: usize) -> usize {
-    pool_max_connections.saturating_sub(1) / 2
-}
-
-const LOCAL_CENTER_ACTIVITY_SLOTS: usize =
-    center_activity_slot_count(crate::DATABASE_POOL_MAX_CONNECTIONS as usize);
-static CENTER_ACTIVITY_SLOTS: OnceLock<Semaphore> = OnceLock::new();
-
-fn center_activity_slots() -> &'static Semaphore {
-    CENTER_ACTIVITY_SLOTS.get_or_init(|| Semaphore::new(LOCAL_CENTER_ACTIVITY_SLOTS))
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -453,13 +436,19 @@ async fn project_webgemeindezentrum_activity_faden(
         return Ok(());
     }
 
-    let _slot = center_activity_slots().acquire().await.map_err(|error| {
-        tracing::error!(%error, center_id, "center activity projection limiter closed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to reserve Webgemeindezentrum Faden capacity".to_string(),
-        )
-    })?;
+    // Center Faden projection holds an account-lifecycle SQL transaction and
+    // obtains a second pooled connection for its edge writer. It must share
+    // the SAME budget with privacy-fenced GETs, node CREATEs and node edits.
+    let _slot = super::postgres_domain_connection_budget()
+        .acquire_many(super::POSTGRES_DOMAIN_OPERATION_UNITS)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, center_id, "center activity projection admission closed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to reserve Webgemeindezentrum Faden capacity".to_string(),
+            )
+        })?;
 
     let pool = database_pool(state).map_err(|status| {
         (
@@ -570,9 +559,7 @@ async fn project_webgemeindezentrum_activity_faden(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        center_activity_operation_id, center_activity_slot_count, WebgemeindezentrumLocationState,
-    };
+    use super::{center_activity_operation_id, WebgemeindezentrumLocationState};
 
     #[test]
     fn location_state_labels_do_not_claim_confirmation_for_intentions() {
@@ -591,12 +578,12 @@ mod tests {
     }
 
     #[test]
-    fn center_activity_projection_reserves_pool_capacity() {
-        for pool_max_connections in [3, 4, 5, 32] {
-            let slots = center_activity_slot_count(pool_max_connections);
-            assert!(slots > 0);
-            assert!(slots * 2 < pool_max_connections);
-        }
+    fn center_activity_projection_shares_global_pool_headroom() {
+        let pool_connections = crate::DATABASE_POOL_MAX_CONNECTIONS as usize;
+        let per_operation = super::super::POSTGRES_DOMAIN_OPERATION_UNITS as usize;
+        assert_eq!(pool_connections, 5);
+        assert_eq!(per_operation, 2);
+        assert!(per_operation * 2 < pool_connections);
     }
 
     #[test]

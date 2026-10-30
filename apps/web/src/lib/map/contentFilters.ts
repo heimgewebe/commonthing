@@ -4,6 +4,7 @@ import {
   type KnottingTopic,
 } from "$lib/knottingTopics";
 import type { MapEntityViewModel } from "$lib/map/types";
+import { nodeKindLabel } from "$lib/ui/productLanguage";
 
 /**
  * Explicit filter axes for the loaded map projection. Empty sets mean "all"
@@ -48,7 +49,7 @@ export function hasActiveMapContentFilters(
 
 /** The existing content-type bucket: node kind, Garnrolle or center. */
 export function getMapContentType(entity: MapEntityViewModel): string {
-  if (entity.type === "node") return entity.kind || "Knoten";
+  if (entity.type === "node") return entity.kind;
   if (entity.type === "webgemeindezentrum") return "Webgemeindezentrum";
   return "Garnrolle";
 }
@@ -142,7 +143,10 @@ export function evaluateMapContentFilters(
 
   const contentTypes = Array.from(contentTypeCounts, ([id, count]) => ({
     id,
-    label: id.charAt(0).toUpperCase() + id.slice(1),
+    label:
+      id === "Garnrolle" || id === "Webgemeindezentrum"
+        ? id
+        : nodeKindLabel(id),
     count,
   })).sort((left, right) => left.label.localeCompare(right.label, "de"));
   const topics = KNOTTING_TOPICS.filter((topic) => topicCounts.has(topic)).map(

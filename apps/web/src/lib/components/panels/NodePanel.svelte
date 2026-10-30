@@ -10,7 +10,11 @@
   } from "$lib/panels/panelDetails";
   import { formatDate } from "$lib/utils/formatDate";
   import type { MapDomainChanged } from "$lib/components/map/mapRouteEvents";
-  import { nodeKindLabel } from "$lib/ui/productLanguage";
+  import {
+    nodeKindLabel,
+    NODE_KIND_OPTIONS,
+    isNodeKind,
+  } from "$lib/ui/productLanguage";
   import type { MapEntityViewModel } from "$lib/map/types";
   import {
     combineKnottingTags,
@@ -192,8 +196,8 @@
     const id = nodeDetails?.id || $selection?.id;
     const location = parseOptionalNodeLocation(formLat, formLon);
     if (!id) return;
-    if (!formTitle.trim() || !formKind.trim()) {
-      mutationError = "Titel und Knotenart werden benötigt.";
+    if (!formTitle.trim() || !isNodeKind(formKind)) {
+      mutationError = "Titel und eine gültige Knotenart werden benötigt.";
       return;
     }
     if (location === undefined) {
@@ -395,7 +399,12 @@
         </label>
         <label>
           Knotenart
-          <input bind:value={formKind} maxlength="100" required />
+          <select bind:value={formKind} required>
+            <option value="" disabled>Art auswählen</option>
+            {#each NODE_KIND_OPTIONS as option}
+              <option value={option.id}>{option.label}</option>
+            {/each}
+          </select>
         </label>
         <label>
           Kurzbeschreibung

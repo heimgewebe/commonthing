@@ -1,5 +1,7 @@
 use std::{future::Future, sync::OnceLock, time::Instant};
 
+#[cfg(test)]
+use crate::state::POSTGRES_DOMAIN_CONNECTION_UNITS;
 use axum::{
     extract::{Path, State},
     http::{header::IF_MATCH, HeaderMap, StatusCode},
@@ -8,7 +10,9 @@ use axum::{
 };
 use serde_json::Value;
 use sqlx::{Postgres, Transaction};
-use tokio::sync::{Mutex, MutexGuard, Semaphore, SemaphorePermit};
+#[cfg(test)]
+use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, MutexGuard, SemaphorePermit};
 
 use crate::{
     advisory_lock::node_mutation_lock_key,
@@ -20,7 +24,7 @@ use crate::{
     domain_db,
     middleware::auth::AuthContext,
     node_mutation::NodeMutationOperation,
-    state::ApiState,
+    state::{postgres_domain_connection_budget, ApiState, POSTGRES_DOMAIN_OPERATION_UNITS},
     telemetry::NodeMutationOutcome,
 };
 
@@ -32,14 +36,16 @@ use super::{domain_write_guard::reject_node_patch_unless_writable, nodes};
 // Different node ids can proceed concurrently; rare stripe collisions only
 // reduce local parallelism and never weaken correctness.
 const LOCAL_NODE_LOCK_STRIPES: usize = 64;
-// Each PostgreSQL mutation temporarily needs two pool connections: one holds
-// the advisory-lock transaction and one performs the existing mutation helper.
-// Leave one connection available for unrelated requests and cap concurrent
-// mutations to the remaining connection pairs.
+// Each PostgreSQL node mutation temporarily needs two pool connections: one
+// holds the advisory-lock transaction, another runs the mutation helper.
+// A privacy-fenced GET likewise needs one held generation-row transaction plus
+// a second connection for its handler. They MUST share one weighted admission
+// budget: two independent semaphores could jointly occupy all five connections
+// and deadlock while writers wait for held read fences.
+#[cfg(test)]
 const LOCAL_POSTGRES_NODE_MUTATION_SLOTS: usize =
     (crate::DATABASE_POOL_MAX_CONNECTIONS as usize - 1) / 2;
 static LOCAL_NODE_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
-static POSTGRES_NODE_MUTATION_SLOTS: OnceLock<Semaphore> = OnceLock::new();
 
 enum NodeMutationGuard {
     Local {
@@ -70,10 +76,6 @@ fn local_node_lock(node_id: &str) -> &'static Mutex<()> {
     &local_node_locks()[local_node_lock_index(node_id)]
 }
 
-fn postgres_node_mutation_slots() -> &'static Semaphore {
-    POSTGRES_NODE_MUTATION_SLOTS.get_or_init(|| Semaphore::new(LOCAL_POSTGRES_NODE_MUTATION_SLOTS))
-}
-
 fn uses_postgres_node_persistence(state: &ApiState) -> bool {
     state.config.domain_read_source == DomainReadSource::Postgres
         && state.config.domain_node_write_source == DomainNodeWriteSource::Postgres
@@ -95,8 +97,8 @@ async fn acquire_node_mutation_guard(
     // Same-node waiters do not consume the global pool budget. The slot then
     // guarantees enough free connections for the authoritative version read,
     // the mutation helper, and unrelated database traffic.
-    let slot = postgres_node_mutation_slots()
-        .acquire()
+    let slot = postgres_domain_connection_budget()
+        .acquire_many(POSTGRES_DOMAIN_OPERATION_UNITS)
         .await
         .map_err(|error| {
             tracing::error!(%error, node_id, "PostgreSQL node mutation limiter closed");
@@ -291,6 +293,13 @@ fn authorize_node_mutation(
     auth: &AuthContext,
     node: &nodes::Node,
 ) -> Result<(), (StatusCode, &'static str)> {
+    // A mutation precondition includes the entire current node in its 412/428
+    // response. A mutation role alone is not a grant to read private nodes,
+    // and revoked nodes have no ordinary API readers, including their creator.
+    // A separately authorized moderation route is needed for exceptional recovery.
+    if !nodes::node_readable_to(node, Some(auth)) {
+        return Err((StatusCode::NOT_FOUND, "node not found"));
+    }
     if matches!(auth.role, Role::Weber | Role::Admin) {
         return Ok(());
     }
@@ -593,13 +602,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protected_node_preconditions_deny_foreign_weber_admin_and_revoked_owner() {
+        let mut node = nodes::Node {
+            id: "confidential-fixture".into(),
+            kind: "test".into(),
+            title: "Confidential title".into(),
+            created_at: "2026".into(),
+            updated_at: "2026-10-18T12:00:00Z".into(),
+            has_authoritative_created_at: true,
+            created_by_account_id: Some("owner".into()),
+            search_visibility: nodes::SearchVisibility::Private,
+            summary: Some("confidential summary".into()),
+            info: None,
+            tags: vec![],
+            address: None,
+            location: nodes::Location { lat: 0.0, lon: 0.0 },
+        };
+        let viewer = |id: &str, role| AuthContext {
+            authenticated: true,
+            account_id: Some(id.to_string()),
+            device_id: None,
+            role,
+            expires_at: None,
+        };
+        let owner = viewer("owner", Role::Weber);
+        let foreign_weber = viewer("unrelated", Role::Weber);
+        let foreign_admin = viewer("unrelated-admin", Role::Admin);
+
+        for visibility in [
+            nodes::SearchVisibility::Private,
+            nodes::SearchVisibility::Hidden,
+        ] {
+            node.search_visibility = visibility;
+            for actor in [&foreign_weber, &foreign_admin] {
+                assert_eq!(
+                    authorize_node_mutation(actor, &node).unwrap_err().0,
+                    StatusCode::NOT_FOUND,
+                    "a foreign editor must never obtain the protected node precondition body"
+                );
+            }
+            assert!(authorize_node_mutation(&owner, &node).is_ok());
+        }
+        node.search_visibility = nodes::SearchVisibility::Revoked;
+        assert_eq!(
+            authorize_node_mutation(&owner, &node).unwrap_err().0,
+            StatusCode::NOT_FOUND,
+            "revocation prevents its owner from reading precondition content too"
+        );
+    }
+
+    #[test]
     fn postgres_mutation_slots_preserve_pool_headroom() {
         assert_eq!(crate::DATABASE_POOL_MAX_CONNECTIONS, 5);
+        assert_eq!(POSTGRES_DOMAIN_OPERATION_UNITS, 2);
+        assert_eq!(POSTGRES_DOMAIN_CONNECTION_UNITS, 4);
         assert_eq!(LOCAL_POSTGRES_NODE_MUTATION_SLOTS, 2);
-        assert!(
-            LOCAL_POSTGRES_NODE_MUTATION_SLOTS * 2 < crate::DATABASE_POOL_MAX_CONNECTIONS as usize,
-            "lock and mutation connection pairs must leave one pool connection free"
+        assert_eq!(
+            LOCAL_POSTGRES_NODE_MUTATION_SLOTS * POSTGRES_DOMAIN_OPERATION_UNITS as usize,
+            POSTGRES_DOMAIN_CONNECTION_UNITS,
+            "fenced reads and guarded writers must reserve the same connection pairs"
         );
+        assert!(
+            POSTGRES_DOMAIN_CONNECTION_UNITS < crate::DATABASE_POOL_MAX_CONNECTIONS as usize,
+            "concurrent guarded operations must leave one pool connection free"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_weighted_budget_cannot_admit_two_readers_and_a_writer() {
+        let budget = Semaphore::new(POSTGRES_DOMAIN_CONNECTION_UNITS);
+        let reader = budget
+            .acquire_many(POSTGRES_DOMAIN_OPERATION_UNITS)
+            .await
+            .unwrap();
+        let writer = budget
+            .acquire_many(POSTGRES_DOMAIN_OPERATION_UNITS)
+            .await
+            .unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        assert!(
+            budget
+                .try_acquire_many(POSTGRES_DOMAIN_OPERATION_UNITS)
+                .is_err(),
+            "a second fenced read or mutation must not occupy more pool connections"
+        );
+        drop(reader);
+        let next = budget
+            .try_acquire_many(POSTGRES_DOMAIN_OPERATION_UNITS)
+            .expect("releasing one fenced read allows the next two-connection operation");
+        drop(writer);
+        drop(next);
+        assert_eq!(budget.available_permits(), POSTGRES_DOMAIN_CONNECTION_UNITS);
     }
 
     #[test]

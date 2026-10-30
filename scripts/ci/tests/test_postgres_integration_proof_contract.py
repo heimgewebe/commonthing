@@ -26,6 +26,7 @@ TARGETS = {
     "db_governance",
     "db_multi_instance_foundation",
     "db_domain_read_path",
+    "db_domain_two_process_http",
     "db_domain_schema_migrations",
     "db_passkey_fk_readiness",
     "db_passkey_schema_preflight",

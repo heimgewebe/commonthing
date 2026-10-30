@@ -19,7 +19,7 @@ test("commons uses dedicated public endpoint for every page; search retains owne
           {
             id: more ? "public-two" : "public-one",
             title: more ? "Public two" : "Public one",
-            kind: "knowledge",
+            kind: "resource",
             location: null,
             search_visibility: "public",
           },
@@ -39,7 +39,7 @@ test("commons uses dedicated public endpoint for every page; search retains owne
           {
             id: "owner-private",
             title: "Owner's private Commons",
-            kind: "knowledge",
+            kind: "resource",
             location: null,
           },
         ],
@@ -93,7 +93,7 @@ test("commons uses dedicated public endpoint for every page; search retains owne
           {
             id: "public-replacement",
             title: "Public replacement",
-            kind: "knowledge",
+            kind: "resource",
             location: null,
             search_visibility: "public",
           },
@@ -212,7 +212,7 @@ test("create, search, link, open and edit Commons without a map location", async
   let node = {
     id: "digital-commons",
     title: "Digital Commons",
-    kind: "knowledge",
+    kind: "resource",
     tags: ["commons"],
     address: null,
     location: null,
@@ -228,6 +228,7 @@ test("create, search, link, open and edit Commons without a map location", async
       const payload = request.postDataJSON();
       expect(payload.location).toBeNull();
       expect(payload.address).toBeNull();
+      expect(payload.kind).toBe("resource");
       expect(payload.operation_id).toMatch(/^[0-9a-f-]{36}$/);
       node = { ...node, ...payload };
       created = true;
@@ -265,6 +266,7 @@ test("create, search, link, open and edit Commons without a map location", async
     .getByLabel("Name", { exact: false })
     .first()
     .fill("Digital Commons");
+  await page.selectOption("#nodeType", "resource");
   await page
     .getByRole("button", { name: "Knoten knüpfen", exact: true })
     .click();

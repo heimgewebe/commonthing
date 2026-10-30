@@ -23,8 +23,8 @@ trap cleanup EXIT
 remove_line_by_id() {
   local file="$1"
   local id="$2"
-  # Use regex anchor to match start of line for robustness: ^{"id":"UUID"
-  local match_pattern="^{\"id\":\"$id\""
+  # Match the JSONL record ID in any property order, including serde-sorted keys.
+  local match_pattern="\"id\"[[:space:]]*:[[:space:]]*\"$id\""
 
   if [ -s "$file" ] && grep -q "$match_pattern" "$file"; then
     echo "→ removing legacy/stale ID $id from $(basename "$file")"
@@ -37,7 +37,7 @@ remove_line_by_id() {
   fi
 }
 
-# ensure_jsonl_line <file> <id> <canonical_json> [check_field]
+# ensure_jsonl_line <file> <id> <canonical_json> [check_field] [expected_value]
 # Ensures that exactly one valid entry for the given ID exists.
 # If multiple exist, or if the existing one lacks 'check_field', it replaces them.
 ensure_jsonl_line() {
@@ -45,9 +45,10 @@ ensure_jsonl_line() {
   local id="$2"
   local canonical_json="$3"
   local check_field="${4:-}"
+  local expected_value="${5:-}"
 
-  # Use regex anchor to match start of line for robustness
-  local match_pattern="^{\"id\":\"$id\""
+  # Match the exact JSONL ID property regardless of property ordering.
+  local match_pattern="\"id\"[[:space:]]*:[[:space:]]*\"$id\""
   local needs_migration=0
 
   if [ -s "$file" ]; then
@@ -62,7 +63,11 @@ ensure_jsonl_line() {
       echo "$canonical_json" >> "$file"
       return 0
     elif [ "$count" -gt 1 ]; then
-      # Case: Duplicates found
+      # Do not overwrite user fields when duplicate reserved demo IDs are ambiguous.
+      if [ -n "$expected_value" ]; then
+        echo "→ duplicate demo node ID $id needs explicit repair; no records changed" >&2
+        return 1
+      fi
       echo "→ migrating: deduplicating $id in $(basename "$file")"
       needs_migration=1
     else
@@ -72,18 +77,41 @@ ensure_jsonl_line() {
         # Do NOT use -F here either.
         existing_line=$(grep "$match_pattern" "$file")
 
-        if command -v jq > /dev/null 2>&1; then
-          # Robust check using jq
+        if [ -n "$expected_value" ]; then
+          # User-edited canonical kinds are valid even when different from the seed.
+          # For known legacy values change only the kind, not other node fields.
+          local existing_kind
+          if command -v jq > /dev/null 2>&1; then
+            existing_kind=$(printf '%s\n' "$existing_line" | jq -r '.kind // empty') || return 1
+          else
+            existing_kind=$(printf '%s\n' "$existing_line" | sed -nE 's/.*"kind"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
+          fi
+          case "$existing_kind" in
+            place | resource | project | event | need | offer)
+              : # Preserve valid existing records verbatim.
+              ;;
+            Ort | Initiative | Projekt | Knoten | standard | Unknown | unclassified)
+              if command -v jq > /dev/null 2>&1; then
+                canonical_json=$(printf '%s\n' "$existing_line" | jq -c --arg kind "$expected_value" '.kind = $kind') || return 1
+              else
+                canonical_json=$(printf '%s\n' "$existing_line" | sed -E "s/(\"kind\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")/\1${expected_value}\2/")
+              fi
+              echo "→ migrating: canonical kind for reserved demo ID $id in $(basename "$file")"
+              needs_migration=1
+              ;;
+            *)
+              echo "→ unknown demo-node kind for $id; not overwriting existing data" >&2
+              return 1
+              ;;
+          esac
+        elif command -v jq > /dev/null 2>&1; then
           if echo "$existing_line" | jq -e "has(\"$check_field\") | not" > /dev/null 2>&1; then
             echo "→ migrating: fixing stale entry (missing $check_field) $id in $(basename "$file")"
             needs_migration=1
           fi
-        else
-          # Fallback: simple text check
-          if ! echo "$existing_line" | grep -q "\"$check_field\"[[:space:]]*:"; then
-            echo "→ migrating: fixing stale entry (missing $check_field) $id in $(basename "$file")"
-            needs_migration=1
-          fi
+        elif ! echo "$existing_line" | grep -q "\"$check_field\"[[:space:]]*:"; then
+          echo "→ migrating: fixing stale entry (missing $check_field) $id in $(basename "$file")"
+          needs_migration=1
         fi
       fi
     fi
@@ -117,25 +145,21 @@ ensure_jsonl_line "$DIR/demo.accounts.jsonl" "$ACCOUNT_ID" "$ACCOUNT_JSON" "map_
 
 # --- NODES ---
 NODE_ID="b52be17c-4ab7-4434-98ce-520f86290cf0"
-NODE_LINE='{"id":"b52be17c-4ab7-4434-98ce-520f86290cf0","kind":"Knoten","title":"fairschenkbox","summary":"Öffentliche Fair-Schenk-Box","info":"Dies ist eine **Demo-Info** für den Test.","created_at":"2025-12-22T00:00:00Z","updated_at":"2025-12-22T00:00:00Z","location":{"lat":53.558894813662505,"lon":10.060228407382967}}'
+NODE_LINE='{"id":"b52be17c-4ab7-4434-98ce-520f86290cf0","kind":"resource","title":"fairschenkbox","summary":"Öffentliche Fair-Schenk-Box","info":"Dies ist eine **Demo-Info** für den Test.","created_at":"2025-12-22T00:00:00Z","updated_at":"2025-12-22T00:00:00Z","location":{"lat":53.558894813662505,"lon":10.060228407382967}}'
 
-# Pre-seed bulk data if missing
-if [ ! -s "$DIR/demo.nodes.jsonl" ]; then
-  echo "→ seeds: nodes"
-  cat > "$DIR/demo.nodes.jsonl" << EOF
-{"id":"00000000-0000-0000-0000-000000000001","kind":"Ort","title":"Marktplatz Hamburg","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-11-01T09:00:00Z","location":{"lon":9.9937,"lat":53.5511}}
-{"id":"00000000-0000-0000-0000-000000000002","kind":"Initiative","title":"Nachbarschaftshaus","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-11-02T12:15:00Z","location":{"lon":10.0002,"lat":53.5523}}
-{"id":"00000000-0000-0000-0000-000000000003","kind":"Projekt","title":"Tauschbox Altona","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-10-30T18:45:00Z","location":{"lon":9.9813,"lat":53.5456}}
-{"id":"00000000-0000-0000-0000-000000000004","kind":"Ort","title":"Gemeinschaftsgarten","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-11-05T10:00:00Z","location":{"lon":10.0184,"lat":53.5631}}
-{"id":"00000000-0000-0000-0000-000000000005","kind":"Initiative","title":"Reparaturcafé","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-11-03T16:20:00Z","location":{"lon":9.9708,"lat":53.5615}}
-EOF
-fi
+# Seed known demo records with canonical identities. Upgrade only these reserved
+# demo IDs on existing installations; never rewrite unrelated user nodes.
+ensure_jsonl_line "$DIR/demo.nodes.jsonl" "00000000-0000-0000-0000-000000000001" '{"id":"00000000-0000-0000-0000-000000000001","kind":"place","title":"Marktplatz Hamburg","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-11-01T09:00:00Z","location":{"lon":9.9937,"lat":53.5511}}' "kind" "place"
+ensure_jsonl_line "$DIR/demo.nodes.jsonl" "00000000-0000-0000-0000-000000000002" '{"id":"00000000-0000-0000-0000-000000000002","kind":"place","title":"Nachbarschaftshaus","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-11-02T12:15:00Z","location":{"lon":10.0002,"lat":53.5523}}' "kind" "place"
+ensure_jsonl_line "$DIR/demo.nodes.jsonl" "00000000-0000-0000-0000-000000000003" '{"id":"00000000-0000-0000-0000-000000000003","kind":"resource","title":"Tauschbox Altona","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-10-30T18:45:00Z","location":{"lon":9.9813,"lat":53.5456}}' "kind" "resource"
+ensure_jsonl_line "$DIR/demo.nodes.jsonl" "00000000-0000-0000-0000-000000000004" '{"id":"00000000-0000-0000-0000-000000000004","kind":"place","title":"Gemeinschaftsgarten","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-11-05T10:00:00Z","location":{"lon":10.0184,"lat":53.5631}}' "kind" "place"
+ensure_jsonl_line "$DIR/demo.nodes.jsonl" "00000000-0000-0000-0000-000000000005" '{"id":"00000000-0000-0000-0000-000000000005","kind":"project","title":"Reparaturcafé","created_at":"2025-01-01T12:00:00Z","updated_at":"2025-11-03T16:20:00Z","location":{"lon":9.9708,"lat":53.5615}}' "kind" "project"
 
-# Clean up legacy node
+# Clean up one superseded legacy demo ID.
 remove_line_by_id "$DIR/demo.nodes.jsonl" "00000000-0000-0000-0000-000000000006"
 
-# Ensure canonical node
-ensure_jsonl_line "$DIR/demo.nodes.jsonl" "$NODE_ID" "$NODE_LINE"
+# Migrate the known fairschenkbox ID from legacy "Knoten" to resource.
+ensure_jsonl_line "$DIR/demo.nodes.jsonl" "$NODE_ID" "$NODE_LINE" "kind" "resource"
 
 # --- EDGES ---
 EDGE_ID="00000000-0000-0000-0000-00000000E001"

@@ -14,6 +14,7 @@ name: Production live contract
       - "scripts/ops/weltgewebe_secure_receipt_io.py"
       - "scripts/ops/validate_web_deploy_archive.py"
       - "scripts/ops/ensure_web_push_vapid_env.py"
+      - "scripts/ops/verify_production_hold_release.py"
       - "scripts/ops/deploy-exact-commit-vps.sh"
       - "scripts/ops/reconcile-production-main-vps.sh"
       - "scripts/preflight/schauwerk_editor_release.py"
@@ -33,6 +34,7 @@ name: Production live contract
       - "scripts/ci/tests/test_secure_receipt_io.py"
       - "scripts/ci/tests/test_validate_web_deploy_archive.py"
       - "scripts/ci/tests/test_ensure_web_push_vapid_env.py"
+      - "scripts/ci/tests/test_verify_production_hold_release.py"
       - "scripts/ci/tests/test_production_reconciler_contract.py"
       - "scripts/ci/tests/test_production_disk_pressure.py"
       - "scripts/ci/tests/test_deploy_exact_commit_integration.py"
@@ -98,6 +100,7 @@ jobs:
           python -m py_compile scripts/ops/weltgewebe_secure_receipt_io.py
           python -m py_compile scripts/ops/validate_web_deploy_archive.py
           python -m py_compile scripts/ops/ensure_web_push_vapid_env.py
+          python -m py_compile scripts/ops/verify_production_hold_release.py
           python -m py_compile scripts/preflight/schauwerk_editor_release.py
           python -m py_compile scripts/preflight/schauwerk_release_convergence.py
           python -m py_compile scripts/preflight/schauwerk_editor_promotion.py
@@ -150,6 +153,10 @@ jobs:
         run: >-
           python -m unittest -v
           scripts/ci/tests/test_ensure_web_push_vapid_env.py
+      - name: Verify production HOLD release authorization
+        run: >-
+          python -m unittest -v
+          scripts/ci/tests/test_verify_production_hold_release.py
       - name: Verify Schaubild release identity and convergence contracts
         run: >-
           uv run --project tools/py --locked python -m pytest -q

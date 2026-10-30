@@ -5,7 +5,7 @@ use std::{
         Arc, OnceLock,
     },
 };
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, SemaphorePermit};
 
 use crate::{
     auth::{
@@ -22,6 +22,34 @@ use crate::{
 };
 
 use async_nats::Client as NatsClient;
+
+// The API's five-connection PostgreSQL pool is shared across ALL canonical
+// domain writers, not just node edits. A fenced GET holds one connection while
+// building its response with another; two admitted two-connection operations
+// consume at most four budget units, leaving one database connection available.
+// Keeping this single semaphore in the shared state module lets low-level
+// PostgreSQL helpers participate without introducing a second queue/service.
+pub(crate) const POSTGRES_DOMAIN_OPERATION_UNITS: u32 = 2;
+pub(crate) const POSTGRES_DOMAIN_CONNECTION_UNITS: usize =
+    ((crate::DATABASE_POOL_MAX_CONNECTIONS as usize - 1) / 2)
+        * POSTGRES_DOMAIN_OPERATION_UNITS as usize;
+static POSTGRES_DOMAIN_CONNECTION_BUDGET: OnceLock<Semaphore> = OnceLock::new();
+
+pub(crate) fn postgres_domain_connection_budget() -> &'static Semaphore {
+    POSTGRES_DOMAIN_CONNECTION_BUDGET
+        .get_or_init(|| Semaphore::new(POSTGRES_DOMAIN_CONNECTION_UNITS))
+}
+
+// This never closes during normal runtime. Preserve existing SQLx error
+// contracts at each canonical writer boundary rather than adding a new error
+// or silently falling back to an unprotected pool connection.
+pub(crate) async fn reserve_postgres_domain_operation(
+) -> Result<SemaphorePermit<'static>, sqlx::Error> {
+    postgres_domain_connection_budget()
+        .acquire_many(POSTGRES_DOMAIN_OPERATION_UNITS)
+        .await
+        .map_err(|_| sqlx::Error::PoolClosed)
+}
 
 /// A cache that provides $O(1)$ lookups by ID while preserving the original
 /// load/insertion order for deterministic list responses.

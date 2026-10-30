@@ -174,8 +174,10 @@ Ein sicherer Wiederherstellungstest muss in einer entbehrlichen Umgebung:
 4. Migrationen über `_sqlx_migrations` und den konfigurierten
    `WELTGEWEBE_API_STARTUP_MIGRATIONS`-Modus prüfen,
 5. die effektiven Domainquellen dokumentieren,
-6. den Off-Host-Pull nach `~/merges/weltgewebe-production-backups` und den
-   nachfolgenden Restic-Snapshot belegen,
+6. den Off-Host-Pull des age-Chiffrats nach
+   `~/merges/weltgewebe-production-backups` und den nachfolgenden
+   Restic-Snapshot belegen (Details:
+   [`runbooks/db-recovery.md`](runbooks/db-recovery.md)),
 7. API-Readiness, Auth-Sitzung, Passkey-Credential-Store und repräsentative
    Domänenlesevorgänge testen,
 8. Ergebnis, Dauer, Datenstand und Restlücken festhalten.

@@ -54,14 +54,15 @@ expected_commit="${EXPECTED_COMMIT:-$repo_commit}"
 [[ "$repo_commit" == "$expected_commit" ]] || fail "checkout HEAD does not match EXPECTED_COMMIT"
 
 pull_rel=scripts/ops/pull-production-postgres-backup.sh
+gate_rel=scripts/ops/restic-plaintext-gate.sh
 service_rel=scripts/ops/systemd/weltgewebe-postgres-offhost-pull.service
 timer_rel=scripts/ops/systemd/weltgewebe-postgres-offhost-pull.timer
-for relative in "$pull_rel" "$service_rel" "$timer_rel"; do
+for relative in "$pull_rel" "$gate_rel" "$service_rel" "$timer_rel"; do
   [[ -f "$REPO_DIR/$relative" && ! -L "$REPO_DIR/$relative" ]] || fail "required source file missing or unsafe: $relative"
   git -C "$REPO_DIR" ls-files --error-unmatch "$relative" > /dev/null 2>&1 || fail "required source file is not bound to Git: $relative"
 done
-git -C "$REPO_DIR" diff --quiet -- "$pull_rel" "$service_rel" "$timer_rel" || fail "off-host install sources contain uncommitted changes"
-git -C "$REPO_DIR" diff --cached --quiet -- "$pull_rel" "$service_rel" "$timer_rel" || fail "off-host install sources contain staged changes"
+git -C "$REPO_DIR" diff --quiet -- "$pull_rel" "$gate_rel" "$service_rel" "$timer_rel" || fail "off-host install sources contain uncommitted changes"
+git -C "$REPO_DIR" diff --cached --quiet -- "$pull_rel" "$gate_rel" "$service_rel" "$timer_rel" || fail "off-host install sources contain staged changes"
 
 token_count="$(awk '{ count += gsub(/@WELTGEWEBE_COMMIT@/, "&") } END { print count + 0 }' "$REPO_DIR/$service_rel")"
 [[ "$token_count" == 1 ]] || fail "off-host service template must contain exactly one commit placeholder"
@@ -71,16 +72,31 @@ release_dir="$TARGET_HOME/.local/libexec/weltgewebe/$expected_commit"
 unit_dir="$TARGET_HOME/.config/systemd/user"
 destination_dir="$TARGET_HOME/merges/weltgewebe-production-backups"
 pull_target="$release_dir/pull-production-postgres-backup.sh"
+# The Restic snapshot service runs this gate as ExecStartPre (see runbook).
+gate_target="$release_dir/restic-plaintext-gate.sh"
 receipt="$release_dir/install.receipt"
 service_target="$unit_dir/weltgewebe-postgres-offhost-pull.service"
 timer_target="$unit_dir/weltgewebe-postgres-offhost-pull.timer"
 
 install -d -m 0755 "$release_dir" "$unit_dir"
 install -d -m 0700 "$destination_dir"
-if [[ -e "$pull_target" ]]; then
+if [[ -e "$pull_target" || -L "$pull_target" ]]; then
+  [[ -f "$pull_target" && ! -L "$pull_target" ]] || fail "commit runtime pull program is not a regular file"
   cmp -s "$REPO_DIR/$pull_rel" "$pull_target" || fail "commit runtime already exists with different pull program"
+  # Identical content alone is not enough: a lost execute bit would leave the
+  # unit (or Restic's ExecStartPre) unable to run despite a success receipt.
+  chmod 0755 "$pull_target"
 else
   install -m 0755 "$REPO_DIR/$pull_rel" "$pull_target"
+fi
+if [[ -e "$gate_target" || -L "$gate_target" ]]; then
+  [[ -f "$gate_target" && ! -L "$gate_target" ]] || fail "commit runtime Restic plaintext gate is not a regular file"
+  cmp -s "$REPO_DIR/$gate_rel" "$gate_target" || fail "commit runtime already exists with different Restic plaintext gate"
+  # Identical content alone is not enough: a lost execute bit would leave the
+  # unit (or Restic's ExecStartPre) unable to run despite a success receipt.
+  chmod 0755 "$gate_target"
+else
+  install -m 0755 "$REPO_DIR/$gate_rel" "$gate_target"
 fi
 
 service_tmp="$(mktemp "$unit_dir/.weltgewebe-postgres-offhost-pull.service.XXXXXX")"
@@ -113,6 +129,7 @@ receipt_tmp="$(mktemp "$release_dir/.install.receipt.XXXXXX")"
   printf 'installed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'git_commit=%s\n' "$expected_commit"
   printf 'pull_sha256=%s\n' "$(sha256_file "$pull_target")"
+  printf 'restic_gate_sha256=%s\n' "$(sha256_file "$gate_target")"
   printf 'service_sha256=%s\n' "$(sha256_file "$service_target")"
   printf 'timer_sha256=%s\n' "$(sha256_file "$timer_target")"
 } > "$receipt_tmp"
