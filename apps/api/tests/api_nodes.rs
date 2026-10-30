@@ -1687,8 +1687,8 @@ async fn anonymous_node_reads_do_not_reveal_private_search_visibility() -> anyho
     let (app, _env) = app_with_nodes(
         &in_dir,
         &[
-            r#"{"id":"public-fixture","title":"Public synthetic node","location":{"lon":10.0,"lat":53.5},"search_visibility":"public"}"#,
-            r#"{"id":"private-fixture","title":"Confidential synthetic node","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"synthetic-owner"}"#,
+            r#"{"id":"public-fixture","kind":"place","title":"Public synthetic node","location":{"lon":10.0,"lat":53.5},"search_visibility":"public"}"#,
+            r#"{"id":"private-fixture","kind":"place","title":"Confidential synthetic node","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"synthetic-owner"}"#,
         ],
     )
     .await;
@@ -1742,9 +1742,9 @@ async fn protected_nodes_reject_foreign_mutation_before_object_preconditions() -
     let (app, _env) = app_with_nodes(
         &tmp.path().join("in"),
         &[
-            r#"{"id":"secret-private","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"real-owner"}"#,
-            r#"{"id":"secret-hidden","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"hidden","created_by_account_id":"real-owner"}"#,
-            r#"{"id":"secret-revoked","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"revoked","created_by_account_id":"real-owner"}"#,
+            r#"{"id":"secret-private","kind":"place","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"real-owner"}"#,
+            r#"{"id":"secret-hidden","kind":"place","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"hidden","created_by_account_id":"real-owner"}"#,
+            r#"{"id":"secret-revoked","kind":"place","title":"SECRET-PRECONDITION-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"revoked","created_by_account_id":"real-owner"}"#,
         ],
     )
     .await;
@@ -1792,11 +1792,11 @@ async fn private_nodes_are_owner_only_with_cursor_pages() -> anyhow::Result<()> 
     let (app, _env) = app_with_nodes(
         &in_dir,
         &[
-            r#"{"id":"a-public","title":"Public","location":{"lon":10.0,"lat":53.5},"search_visibility":"public"}"#,
-            r#"{"id":"b-private","title":"Secret","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"acct-owner"}"#,
-            r#"{"id":"c-public","title":"Second public","location":{"lon":10.2,"lat":53.6},"search_visibility":"public"}"#,
-            r#"{"id":"d-hidden","title":"Hidden","location":{"lon":10.3,"lat":53.6},"search_visibility":"hidden","created_by_account_id":"acct-owner"}"#,
-            r#"{"id":"e-revoked","title":"Revoked","location":{"lon":10.4,"lat":53.6},"search_visibility":"revoked","created_by_account_id":"acct-owner"}"#,
+            r#"{"id":"a-public","kind":"place","title":"Public","location":{"lon":10.0,"lat":53.5},"search_visibility":"public"}"#,
+            r#"{"id":"b-private","kind":"place","title":"Secret","location":{"lon":10.1,"lat":53.6},"search_visibility":"private","created_by_account_id":"acct-owner"}"#,
+            r#"{"id":"c-public","kind":"place","title":"Second public","location":{"lon":10.2,"lat":53.6},"search_visibility":"public"}"#,
+            r#"{"id":"d-hidden","kind":"place","title":"Hidden","location":{"lon":10.3,"lat":53.6},"search_visibility":"hidden","created_by_account_id":"acct-owner"}"#,
+            r#"{"id":"e-revoked","kind":"place","title":"Revoked","location":{"lon":10.4,"lat":53.6},"search_visibility":"revoked","created_by_account_id":"acct-owner"}"#,
         ],
     ).await;
 
