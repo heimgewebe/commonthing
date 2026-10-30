@@ -23,7 +23,7 @@ fn candidate(id: &str, rank_class: u8, rank_score: f64, embedding: [f64; 2]) -> 
             info: None,
             tags: vec![],
             address: None,
-            location: Location { lat: 0.0, lon: 0.0 },
+            location: Some(Location { lat: 0.0, lon: 0.0 }),
         },
         rank_class,
         rank_score,

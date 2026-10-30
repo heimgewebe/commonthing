@@ -1694,15 +1694,11 @@ async fn jsonl_default_node_patch_compiles_and_routes_correctly() -> Result<()> 
     Ok(())
 }
 
-/// G. Mapping failure (NULL lat/lon) does not commit — payload stays unchanged.
-///
-/// Inserts a row with NULL lat and lon (schema allows it). `patch_node_in_postgres`
-/// must fail with `NodeWriteError::Mapping` before committing, leaving the payload
-/// untouched.
+/// NULL coordinate pairs are valid nodes and remain editable.
 #[tokio::test]
 #[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
 #[serial]
-async fn postgres_node_patch_mapping_failure_does_not_commit() -> Result<()> {
+async fn postgres_nongeographic_node_patch_persists() -> Result<()> {
     let pool = connect_pool().await;
     run_migrations(&pool).await;
     clean(&pool).await;
@@ -1710,14 +1706,14 @@ async fn postgres_node_patch_mapping_failure_does_not_commit() -> Result<()> {
     // Seed a row with NULL lat/lon and a known payload.
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, lat, lon, payload) \
-         VALUES ($1, 'place', 'Null Loc', NULL, NULL, '{\"info\":\"original\"}'::jsonb)",
+         VALUES ($1, 'resource', 'Null Loc', NULL, NULL, '{\"info\":\"original\"}'::jsonb)",
     )
     .bind(NODE_NULL_LOC)
     .execute(&pool)
     .await
     .expect("seed null-location node");
 
-    let result = patch_node_in_postgres(
+    let node = patch_node_in_postgres(
         &pool,
         NODE_NULL_LOC,
         NodePatchInput {
@@ -1725,33 +1721,13 @@ async fn postgres_node_patch_mapping_failure_does_not_commit() -> Result<()> {
             search_visibility: None,
         },
     )
-    .await;
-
-    // Must fail with a Mapping error — NULL location cannot be projected.
-    let err = match result {
-        Err(e) => e,
-        Ok(_) => panic!("patch must fail for a node with NULL location, but returned Ok"),
-    };
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("failed to map"),
-        "expected Mapping error, got: {err_str}"
-    );
-
-    // DB payload must be unchanged — no commit should have occurred.
-    let (payload_text,): (String,) =
-        sqlx::query_as("SELECT payload::text FROM domain_nodes WHERE id = $1")
-            .bind(NODE_NULL_LOC)
-            .fetch_one(&pool)
-            .await
-            .expect("row still present");
-    let payload: serde_json::Value = serde_json::from_str(&payload_text)?;
+    .await?;
+    assert!(node.location.is_none());
+    let reloaded = load_nodes_from_postgres(&pool).await?;
     assert_eq!(
-        payload.get("info").and_then(|v| v.as_str()),
-        Some("original"),
-        "payload must not have been modified by a failed patch"
+        reloaded.get(NODE_NULL_LOC).unwrap().info.as_deref(),
+        Some("changed")
     );
-
     clean(&pool).await;
     Ok(())
 }
@@ -1950,8 +1926,8 @@ async fn postgres_node_create_persists_and_reload_sees_it() -> Result<()> {
     );
     assert_eq!(node.summary.as_deref(), Some("Short summary"));
     assert_eq!(node.tags, vec!["a".to_string(), "b".to_string()]);
-    assert!((node.location.lat - 53.55).abs() < 1e-9);
-    assert!((node.location.lon - 9.99).abs() < 1e-9);
+    assert!((node.location.as_ref().unwrap().lat - 53.55).abs() < 1e-9);
+    assert!((node.location.as_ref().unwrap().lon - 9.99).abs() < 1e-9);
 
     clean_all_nodes(&pool).await;
     Ok(())
@@ -2559,12 +2535,12 @@ async fn postgres_node_create_rejects_invalid_payload_without_side_effects() -> 
     let (app, cookie, state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000004").await?;
 
-    // Missing required `address`.
+    // Missing required `kind`.
     let res = app
         .clone()
         .oneshot(post_node_req(
             &cookie,
-            r#"{"title":"No Address","kind":"place","location":{"lat":53.5,"lon":10.0}}"#,
+            r#"{"title":"No Kind","location":{"lat":53.5,"lon":10.0}}"#,
         ))
         .await?;
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -2629,10 +2605,10 @@ async fn postgres_node_create_rejects_creator_deleted_by_inflight_exit() -> Resu
         info: None,
         tags: vec![],
         address: Some("Somewhere 2".to_string()),
-        location: Location {
+        location: Some(Location {
             lat: 53.5,
             lon: 10.0,
-        },
+        }),
     };
 
     let mut exit_tx = pool.begin().await.context("begin simulated guest exit")?;
@@ -3682,10 +3658,10 @@ async fn insert_domain_node_classifies_duplicate_id() -> Result<()> {
         info: None,
         tags: vec![],
         address: Some("Somewhere 1".to_string()),
-        location: Location {
+        location: Some(Location {
             lat: 53.5,
             lon: 10.0,
-        },
+        }),
     };
 
     insert_domain_node(&pool, &make_node("First"), None)
@@ -3761,10 +3737,10 @@ async fn replace_and_delete_node_cascade_is_transactional_in_postgres() -> Resul
         info: Some("Neue Information".to_string()),
         tags: vec!["commons".to_string()],
         address: Some("Neue Straße 1".to_string()),
-        location: Location {
+        location: Some(Location {
             lat: 53.55,
             lon: 10.05,
-        },
+        }),
     };
     let replace_audit = NodeMutationAudit::new(
         NodeMutationOperation::Replace,
@@ -6125,6 +6101,114 @@ async fn passkey_updates_share_guest_exit_privacy_pool_budget() -> Result<()> {
         .bind(ACTOR_ID)
         .execute(&pool)
         .await?;
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+/// A digital Commons is durable, linked by the normal server action, editable,
+/// directly readable and absent from map-only BBOX queries even after reload.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn postgres_nongeographic_commons_vertical_flow() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let actor = "10000000-0000-0000-0000-000000000146";
+    let (app, cookie, state) = postgres_write_app(pool.clone(), actor).await?;
+    let payload = r#"{"title":"Digital Commons","kind":"resource","tags":["commons"],"address":null,"location":null,"operation_id":"30000000-0000-4000-8000-000000000146"}"#;
+    let response = app.clone().oneshot(post_node_req(&cookie, payload)).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+    let created: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let id = created["id"].as_str().unwrap();
+    assert!(created["location"].is_null());
+    assert!(created["address"].is_null());
+    let row: (Option<f64>, Option<f64>) =
+        sqlx::query_as("SELECT lat, lon FROM domain_nodes WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(row, (None, None));
+    assert!(load_nodes_from_postgres(&pool)
+        .await?
+        .get(id)
+        .unwrap()
+        .location
+        .is_none());
+    let edges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM domain_edges WHERE source_id=$1 AND target_id=$2")
+            .bind(actor)
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        edges, 1,
+        "the ordinary create action links the Commons to its author"
+    );
+    let retry = app.clone().oneshot(post_node_req(&cookie, payload)).await?;
+    assert!(retry.status().is_success());
+
+    // Replace without geography, then add a position, then explicitly clear it.
+    let mut current = created;
+    for location in [
+        serde_json::Value::Null,
+        serde_json::json!({"lat":53.5,"lon":10.0}),
+        serde_json::Value::Null,
+    ] {
+        let id = current["id"].as_str().unwrap();
+        let request = Request::builder().method("PUT").uri(format!("/nodes/{id}"))
+            .header("Content-Type", "application/json").header("Host", "localhost")
+            .header("Origin", "http://localhost").header("Cookie", &cookie)
+            .header("If-Match", format!("\"{}\"", current["updated_at"].as_str().unwrap()))
+            .body(body::Body::from(serde_json::json!({"title":"Digital Commons edited","kind":"resource","location":location,"tags":["commons"]}).to_string()))?;
+        let response = app.clone().oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        current = serde_json::from_slice(&bytes)?;
+        assert_eq!(current["location"], location);
+        assert_eq!(current["created_by_account_id"], actor);
+        let cache = load_nodes_from_postgres(&pool).await?;
+        let restored = cache.get(current["id"].as_str().unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&restored.location)?, location);
+    }
+    let id = current["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(Request::get(format!("/nodes/{id}")).body(body::Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(
+            Request::get("/nodes?bbox=-180,-90,180,90&pagination=cursor")
+                .body(body::Body::empty())?,
+        )
+        .await?;
+    let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+    let map: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert!(map["items"].as_array().unwrap().is_empty());
+    assert!(state.nodes.read().await.get(id).is_some());
+    // PostgreSQL itself rejects incomplete or invalid newly-written projections.
+    for (lat, lon) in [
+        (Some(53.5), None),
+        (None, Some(10.0)),
+        (Some(91.0), Some(0.0)),
+        (Some(f64::NAN), Some(0.0)),
+    ] {
+        assert!(
+            sqlx::query("UPDATE domain_nodes SET lat=$2, lon=$3 WHERE id=$1")
+                .bind(id)
+                .bind(lat)
+                .bind(lon)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
     clean_all_nodes(&pool).await;
     Ok(())
 }

@@ -106,7 +106,17 @@ Bestandteil neuer Schreibvorgänge. Die Freigabe des Quellcodes gilt nicht als
 Nachweis eines produktiven Bestands-Datencutovers.
 
 Knoten beschreiben Orte, Kollektivgüter, Ressourcen, Vorhaben, Bedürfnisse oder
-Angebote. Jeder neu erzeugte Knoten erhält serverseitig eine unveränderliche
+Angebote, ebenso Dokumente, Wissen und digitale Commons. Adresse und Kartenort
+sind unabhängige optionale Aspekte, keine Existenzvoraussetzung. Fehlend oder
+`null` bedeutet „ohne Adresse“ beziehungsweise „ohne Kartenort“. Ein vorhandener
+Kartenort besitzt immer ein vollständiges, gültiges WGS84-Koordinatenpaar.
+Ortslose Knoten lassen sich gleichwertig anlegen, bearbeiten, über die normale
+Webungsaktion verbinden, suchen und per Detail-Link öffnen. Die Knotenansicht
+`/commons` umfasst beide Formen. Die Karte zeigt ausschließlich verortete
+Knoten im angefragten Kartenausschnitt; Platzhalterkoordinaten sind unzulässig.
+Das Öffnen eines ortslosen Knotens zeigt dessen Detailpanel ohne Kamerafahrt.
+
+Jeder neu erzeugte Knoten erhält serverseitig eine unveränderliche
 Urheberbindung:
 
 ```text

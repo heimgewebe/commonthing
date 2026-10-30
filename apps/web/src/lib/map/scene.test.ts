@@ -236,6 +236,20 @@ describe("buildMapScene", () => {
     expect(scene.entities).toHaveLength(0);
   });
 
+  it("keeps nongeographic nodes out of markers and drawable edge endpoints", () => {
+    const scene = buildMapScene({
+      nodes: [makeNode({ id: "digital", location: null }), makeNode()],
+      accounts: [],
+      edges: [makeEdge({ source_id: "digital", target_id: "node-1" })],
+      webgemeindezentren: [],
+      loadState: "ok",
+      resourceStatus: [],
+      apiBase: undefined,
+      basemapMode: "local-sovereign",
+    });
+    expect(scene.entities.map((entity) => entity.id)).toEqual(["node-1"]);
+  });
+
   it("merges nodes and accounts into entities", () => {
     const scene = buildMapScene({
       nodes: [makeNode()],

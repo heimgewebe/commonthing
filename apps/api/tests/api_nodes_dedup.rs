@@ -59,7 +59,7 @@ async fn nodes_load_deduplication_last_write_wins() -> Result<()> {
         n1.title, "New",
         "Should use the last occurrence (Last-Write-Wins)"
     );
-    assert_eq!(n1.location.lat, 1.0);
+    assert_eq!(n1.location.as_ref().unwrap().lat, 1.0);
 
     // Verify "n2" exists
     let n2 = nodes.get("n2").expect("n2 should exist");

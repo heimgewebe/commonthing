@@ -1,4 +1,5 @@
-import { knottingTagDisplayLabel } from "$lib/knottingTopics";
+import { hasRenderableMapPosition } from "../map/coordinates";
+import { knottingTagDisplayLabel } from "../knottingTopics";
 import type { MapEntityNode, Node } from "$lib/map/types";
 
 export const MAX_SEARCH_QUERY_CHARS = 512;
@@ -29,13 +30,15 @@ export class SearchApiError extends Error {
   }
 }
 
-export function nodeToMapEntity(node: Node): MapEntityNode {
+export function nodeToMapEntity(node: Node): MapEntityNode | null {
+  const location = node.location;
+  if (!location || !hasRenderableMapPosition(location)) return null;
   return {
     type: "node",
     id: node.id,
     title: node.title,
-    lat: node.location.lat,
-    lon: node.location.lon,
+    lat: location.lat,
+    lon: location.lon,
     summary: node.summary,
     info: node.info,
     kind: node.kind,

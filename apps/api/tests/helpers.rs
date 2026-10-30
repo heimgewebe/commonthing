@@ -39,10 +39,10 @@ pub fn test_node(id: &str, title: &str, summary: Option<&str>) -> Node {
         info: None,
         tags: vec![],
         address: None,
-        location: NodeLocation {
+        location: Some(NodeLocation {
             lat: 53.55,
             lon: 10.0,
-        },
+        }),
     }
 }
 

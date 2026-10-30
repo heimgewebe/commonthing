@@ -158,6 +158,7 @@
     aria-modal="false"
     aria-busy={searchStatus === "loading"}
   >
+    <a href="/commons">Alle Knoten – auch ohne Kartenort</a>
     <div class="search-box">
       <span class="search-icon" aria-hidden="true">⌕</span>
       <input

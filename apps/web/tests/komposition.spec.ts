@@ -41,13 +41,14 @@ test.describe("Komposition Flow (weber)", () => {
     });
   });
 
-  test("Komposition form requires location, name, and address to submit", async ({
+  test("Geographic Komposition requires a name and selected location; address is optional", async ({
     page,
   }) => {
     await activateToolFanAction(page, "weave");
     const panel = page.locator('[data-testid="context-panel"]');
     await expect(panel).toBeVisible();
     await expect(page.locator("#title")).toBeFocused();
+    await expect(panel.getByLabel("Mit Kartenort")).toBeChecked();
 
     await expect(panel.locator(".state-pending")).toContainText(
       "Ort ausstehend",
@@ -57,7 +58,7 @@ test.describe("Komposition Flow (weber)", () => {
     await expect(submitBtn).toBeDisabled();
 
     await page.fill("#title", "Test Node");
-    await expect(submitBtn).toBeDisabled(); // still no location, no address
+    await expect(submitBtn).toBeDisabled(); // still no selected location
 
     await page.fill("#address", "Teststraße 1, Teststadt");
     await expect(submitBtn).toBeDisabled(); // still no location
@@ -69,12 +70,59 @@ test.describe("Komposition Flow (weber)", () => {
     await expect(submitBtn).toBeEnabled();
 
     await page.fill("#address", "");
-    await expect(submitBtn).toBeDisabled();
-    await page.fill("#address", "Teststraße 1, Teststadt");
     await expect(submitBtn).toBeEnabled();
 
     await page.fill("#title", "");
     await expect(submitBtn).toBeDisabled();
+
+    await page.fill("#title", "Test Node");
+    const nodeRequest = page.waitForRequest(
+      (req) => req.url().endsWith("/api/nodes") && req.method() === "POST",
+    );
+    await submitBtn.click();
+    const payload = (await nodeRequest).postDataJSON();
+    expect(payload.title).toBe("Test Node");
+    expect(payload.address).toBeNull();
+    expect(Number.isFinite(payload.location?.lat)).toBe(true);
+    expect(Number.isFinite(payload.location?.lon)).toBe(true);
+    expect(payload.location.lat).toBeGreaterThanOrEqual(-90);
+    expect(payload.location.lat).toBeLessThanOrEqual(90);
+    expect(payload.location.lon).toBeGreaterThanOrEqual(-180);
+    expect(payload.location.lon).toBeLessThanOrEqual(180);
+  });
+
+  test("Nongeographic Komposition requires a kind and a name but no map location", async ({
+    page,
+  }) => {
+    await activateToolFanAction(page, "weave");
+    const panel = page.locator('[data-testid="context-panel"]');
+    const submitBtn = panel.locator('button[type="submit"]');
+    const geographic = panel.getByLabel("Mit Kartenort");
+    await expect(panel.locator(".state-pending")).toContainText(
+      "Ort ausstehend",
+    );
+    await geographic.uncheck();
+    await expect(submitBtn).toBeDisabled();
+    await page.fill("#title", "Digital Commons");
+    await expect(submitBtn).toBeDisabled(); // kind is mandatory even without a map location
+    await page.selectOption("#nodeType", "resource");
+    await expect(submitBtn).toBeEnabled();
+    await expect(page.locator("#address")).toHaveValue("");
+
+    // Returning to geographic mode still requires an explicitly selected point.
+    await geographic.check();
+    await expect(submitBtn).toBeDisabled();
+    await geographic.uncheck();
+    const nodeRequest = page.waitForRequest(
+      (req) => req.url().endsWith("/api/nodes") && req.method() === "POST",
+    );
+    await submitBtn.click();
+    expect((await nodeRequest).postDataJSON()).toMatchObject({
+      title: "Digital Commons",
+      kind: "resource",
+      address: null,
+      location: null,
+    });
   });
 
   test("Cancel flow cleans up state and closes panel", async ({ page }) => {
