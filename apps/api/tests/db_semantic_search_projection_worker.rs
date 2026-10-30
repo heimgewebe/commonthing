@@ -2788,7 +2788,7 @@ async fn nongeographic_commons_is_projected_and_searchable() {
     let pool = pool().await;
     migrate(&pool).await;
     reset_search_state(&pool).await;
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,created_at,updated_at,payload) VALUES ('t006-digital','knowledge','Digital Commons',now(),now(),'{\"tags\":[\"commons\"]}'::jsonb)")
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,created_at,updated_at,payload) VALUES ('t006-digital','resource','Digital Commons',now(),now(),'{\"tags\":[\"commons\"]}'::jsonb)")
         .execute(&pool).await.expect("create nongeographic Commons");
     let projection_worker = worker(
         pool.clone(),
