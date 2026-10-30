@@ -153,6 +153,44 @@ async fn sachantraege_require_weber_allow_multiple_and_accept_without_promotion(
         Err(CreateProposalError::NotSachApplicant)
     ));
 
+    // A public proposal must never snapshot the ID/title of a private,
+    // hidden or revoked node, including if the applicant is its owner.
+    for state in ["private", "hidden", "revoked"] {
+        sqlx::query("UPDATE domain_nodes SET search_visibility = $1 WHERE id = $2")
+            .bind(state)
+            .bind(SACH_NODE)
+            .execute(&pool)
+            .await
+            .expect("test-only visibility change");
+        let rejected = create_sach_proposal(
+            &pool,
+            WEBER_A,
+            "Weber A",
+            "Attempted sensitive reference",
+            None,
+            Some(SACH_NODE),
+            t0,
+        )
+        .await;
+        assert!(
+            matches!(rejected, Err(CreateProposalError::TargetNodeNotFound)),
+            "public proposal accepted sensitive target: {state}"
+        );
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM governance_proposals WHERE target_node_id = $1",
+        )
+        .bind(SACH_NODE)
+        .fetch_one(&pool)
+        .await
+        .expect("read synthetic proposal count");
+        assert_eq!(leaked, 0, "sensitive target was snapshotted: {state}");
+    }
+    sqlx::query("UPDATE domain_nodes SET search_visibility = 'public' WHERE id = $1")
+        .bind(SACH_NODE)
+        .execute(&pool)
+        .await
+        .expect("restore public test fixture");
+
     let first = create_sach_proposal(
         &pool,
         WEBER_A,
@@ -203,10 +241,18 @@ async fn sachantraege_require_weber_allow_multiple_and_accept_without_promotion(
         .expect("read proposal")
         .expect("proposal remains");
     assert_eq!(after_delete.target_node_id, None);
-    assert_eq!(
-        after_delete.target_node_title.as_deref(),
-        Some("Rennknoten")
-    );
+    assert_eq!(after_delete.target_node_title, None);
+    // The historical title remains durably stored for authorized recovery or
+    // future policy decisions, but no longer escapes via public APIs once its
+    // former node's public visibility cannot be proven.
+    let archived_title: Option<String> = sqlx::query_scalar(
+        "SELECT target_node_title FROM governance_proposals WHERE id = $1::uuid",
+    )
+    .bind(&first.id)
+    .fetch_one(&pool)
+    .await
+    .expect("historical proposal snapshot");
+    assert_eq!(archived_title.as_deref(), Some("Rennknoten"));
 
     cleanup(&pool).await;
 }
@@ -1671,5 +1717,94 @@ async fn proposal_message_locks_author_account_before_proposal() {
         .expect("message task")
         .expect("message write");
 
+    cleanup(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires direct PostgreSQL"]
+async fn public_proposals_redact_target_snapshots_after_node_visibility_changes() {
+    let pool = pool().await;
+    cleanup(&pool).await;
+    seed_account(&pool, WEBER_A, "weber").await;
+    seed_guest_node(&pool, WEBER_A, SACH_NODE).await;
+    let proposal = create_sach_proposal(
+        &pool,
+        WEBER_A,
+        "Weber A",
+        "Öffentliche Abstimmung",
+        None,
+        Some(SACH_NODE),
+        Utc.with_ymd_and_hms(2026, 10, 19, 12, 0, 0).unwrap(),
+    )
+    .await
+    .expect("public Sachantrag for initially public node");
+    assert_eq!(proposal.target_node_id.as_deref(), Some(SACH_NODE));
+    assert_eq!(proposal.target_node_title.as_deref(), Some("Rennknoten"));
+
+    for visibility in ["private", "hidden", "revoked"] {
+        sqlx::query("UPDATE domain_nodes SET search_visibility = $1 WHERE id = $2")
+            .bind(visibility)
+            .bind(SACH_NODE)
+            .execute(&pool)
+            .await
+            .expect("change visibility after public proposal creation");
+        let detail = get_proposal(&pool, &proposal.id)
+            .await
+            .expect("public proposal detail")
+            .expect("public proposal still exists");
+        assert!(
+            detail.target_node_id.is_none() && detail.target_node_title.is_none(),
+            "public proposal detail exposes previously-public now-{visibility} node ID/title"
+        );
+        let list = list_proposals_for_viewer(&pool, None)
+            .await
+            .expect("anonymous proposal list");
+        let entry = list
+            .iter()
+            .find(|entry| entry.proposal.id == proposal.id)
+            .expect("public proposal stays listed");
+        assert!(
+            entry.proposal.target_node_id.is_none() && entry.proposal.target_node_title.is_none(),
+            "anonymous proposal list exposes now-{visibility} node ID/title"
+        );
+    }
+
+    // Output redaction never destroys the historical governance source.
+    let stored_title: Option<String> = sqlx::query_scalar(
+        "SELECT target_node_title FROM governance_proposals WHERE id = $1::uuid",
+    )
+    .bind(&proposal.id)
+    .fetch_one(&pool)
+    .await
+    .expect("durable proposal snapshot");
+    assert_eq!(stored_title.as_deref(), Some("Rennknoten"));
+
+    sqlx::query("UPDATE domain_nodes SET search_visibility = 'public' WHERE id = $1")
+        .bind(SACH_NODE)
+        .execute(&pool)
+        .await
+        .expect("make node public again");
+    let reopened = get_proposal(&pool, &proposal.id)
+        .await
+        .expect("public proposal detail")
+        .expect("proposal exists");
+    assert_eq!(reopened.target_node_id.as_deref(), Some(SACH_NODE));
+    assert_eq!(reopened.target_node_title.as_deref(), Some("Rennknoten"));
+
+    sqlx::query("DELETE FROM domain_nodes WHERE id = $1")
+        .bind(SACH_NODE)
+        .execute(&pool)
+        .await
+        .expect("delete formerly public node");
+    let deleted = get_proposal(&pool, &proposal.id)
+        .await
+        .expect("public proposal detail")
+        .expect("proposal remains");
+    assert_eq!(deleted.target_node_id, None);
+    assert_eq!(
+        deleted.target_node_title, None,
+        "deleted node no longer has verified public visibility"
+    );
     cleanup(&pool).await;
 }

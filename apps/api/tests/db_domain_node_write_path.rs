@@ -36,7 +36,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, watch, Barrier, RwLock};
 use tower::ServiceExt;
 use weltgewebe_api::{
     auth::{
@@ -348,6 +348,9 @@ async fn postgres_write_app_with_account_source(
         .expect("session create");
     let cookie = format!("gewebe_session={}", session.id);
 
+    // Handler-focused tests can directly exercise the write path without the
+    // projection middleware. The explicit projected fixture below covers the
+    // full production request composition.
     let app = Router::new()
         .merge(api_router())
         .layer(from_fn_with_state(state.clone(), auth_middleware))
@@ -355,6 +358,20 @@ async fn postgres_write_app_with_account_source(
         .with_state(state.clone());
 
     Ok((app, cookie, state))
+}
+
+// Production-equivalent ordering for HTTP tests of the privacy projection
+// guard: authentication and session I/O must finish before the DB row fence.
+fn postgres_projected_router(state: &ApiState) -> Router {
+    Router::new()
+        .merge(api_router())
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state.clone())
 }
 
 fn patch_node_req(cookie: &str, id: &str, json_body: &str, etag: &str) -> Request<body::Body> {
@@ -479,12 +496,9 @@ async fn postgres_node_patch_fast_forwards_exact_local_projection_generation() -
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
-    let (app, cookie, state) =
+    let (_app, cookie, state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000091").await?;
-    let app = app.layer(from_fn_with_state(
-        state.clone(),
-        ensure_current_domain_projection,
-    ));
+    let app = postgres_projected_router(&state);
 
     let preload = app
         .clone()
@@ -589,12 +603,9 @@ async fn postgres_node_patch_does_not_fast_forward_over_external_generation() ->
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
-    let (app, cookie, state) =
+    let (_app, cookie, state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000092").await?;
-    let app = app.layer(from_fn_with_state(
-        state.clone(),
-        ensure_current_domain_projection,
-    ));
+    let app = postgres_projected_router(&state);
 
     let preload = app
         .clone()
@@ -1004,6 +1015,116 @@ async fn strict_projection_refresh_waits_for_exact_local_patch_handoff() -> Resu
     Ok(())
 }
 
+/// A5b-privacy. An anonymous GET started AFTER the PostgreSQL commit must not
+/// read stale public data on either API replica. Overlapping pre-commit GETs
+/// are a different linearization case and are not claimed by this proof.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn anonymous_reads_after_visibility_commit_hide_nodes_across_api_instances() -> Result<()> {
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some("PRIVATE-AFTER-COMMIT-MARKER"), None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+
+    let (_first_router, _, first_state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-0000000000a1").await?;
+    let (_second_router, _, second_state) =
+        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-0000000000a2").await?;
+    let first = postgres_projected_router(&first_state);
+    let second = postgres_projected_router(&second_state);
+
+    for (instance, app) in [("first", first.clone()), ("second", second.clone())] {
+        let response = app
+            .oneshot(
+                Request::get(format!("/nodes/{NODE_B}"))
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{instance} must preload public node"
+        );
+    }
+
+    let mut committed_version = domain_projection_version(&pool).await?;
+    for visibility in ["private", "hidden", "revoked"] {
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility = $2, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(NODE_B)
+        .bind(visibility)
+        .execute(&pool)
+        .await?;
+        let new_version = domain_projection_version(&pool).await?;
+        assert!(
+            new_version > committed_version,
+            "visibility commit must advance projection"
+        );
+
+        for (instance, app) in [("first", first.clone()), ("second", second.clone())] {
+            let detail = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/nodes/{NODE_B}"))
+                        .header("Host", "localhost")
+                        .body(body::Body::empty())?,
+                )
+                .await?;
+            assert_eq!(
+                detail.status(),
+                StatusCode::NOT_FOUND,
+                "{instance} leaked {visibility} detail after commit"
+            );
+            let listing = app
+                .oneshot(
+                    Request::get("/nodes")
+                        .header("Host", "localhost")
+                        .body(body::Body::empty())?,
+                )
+                .await?;
+            assert_eq!(listing.status(), StatusCode::OK);
+            let bytes = body::to_bytes(listing.into_body(), usize::MAX).await?;
+            let rendered = String::from_utf8_lossy(&bytes);
+            assert!(
+                !rendered.contains(NODE_B) && !rendered.contains("PRIVATE-AFTER-COMMIT-MARKER"),
+                "{instance} leaked {visibility} in public list"
+            );
+        }
+
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility = 'public', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(NODE_B)
+        .execute(&pool)
+        .await?;
+        committed_version = domain_projection_version(&pool).await?;
+        for app in [first.clone(), second.clone()] {
+            let response = app
+                .oneshot(
+                    Request::get(format!("/nodes/{NODE_B}"))
+                        .header("Host", "localhost")
+                        .body(body::Body::empty())?,
+                )
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "public restoration must be readable"
+            );
+        }
+    }
+    clean(&pool).await;
+    Ok(())
+}
+
 /// A5c. A strict request must not wait forever when a transaction-proven local
 /// handoff remains visible but its writer never publishes the local cache/version.
 /// The refresh fails closed within the bounded handoff budget and does not start
@@ -1309,8 +1430,20 @@ async fn postgres_read_jsonl_node_write_is_blocked() -> Result<()> {
         webauthn_rp_name: None,
     };
 
+    // Authentication now validates canonical PostgreSQL identity even when
+    // the mutation source is deliberately JSONL/read-only. Seed both stores
+    // so this test exercises the expected 409 write-source guard, not a 401.
+    const OPERATOR_ID: &str = "10000000-0000-0000-0000-000000000004";
+    sqlx::query(
+        "INSERT INTO domain_accounts (id,kind,title,map_state,role,disabled) \
+         VALUES ($1,'garnrolle','Mixed source operator','not_on_map','admin',FALSE) \
+         ON CONFLICT (id) DO UPDATE SET role = 'admin', disabled = FALSE",
+    )
+    .bind(OPERATOR_ID)
+    .execute(&pool)
+    .await?;
     let mut accounts = AccountStore::new();
-    accounts.insert(admin_operator("10000000-0000-0000-0000-000000000004"));
+    accounts.insert(admin_operator(OPERATOR_ID));
     let rate_limiter = Arc::new(AuthRateLimiter::new(&config));
 
     let state = ApiState {
@@ -1345,10 +1478,7 @@ async fn postgres_read_jsonl_node_write_is_blocked() -> Result<()> {
         web_push: None,
     };
 
-    let session = state
-        .sessions
-        .create("10000000-0000-0000-0000-000000000004".to_string(), None)
-        .await?;
+    let session = state.sessions.create(OPERATOR_ID.to_string(), None).await?;
     let cookie = format!("gewebe_session={}", session.id);
 
     let app = Router::new()
@@ -1389,6 +1519,10 @@ async fn postgres_read_jsonl_node_write_is_blocked() -> Result<()> {
     );
 
     clean(&pool).await;
+    sqlx::query("DELETE FROM domain_accounts WHERE id = $1")
+        .bind(OPERATOR_ID)
+        .execute(&pool)
+        .await?;
     Ok(())
 }
 
@@ -2576,7 +2710,8 @@ async fn postgres_guest_exit_completes_under_projection_middleware() -> Result<(
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
-    let (app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    let (_app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    let app = postgres_projected_router(&state);
     sqlx::query("UPDATE domain_accounts SET role = 'gast' WHERE id = $1")
         .bind(ACTOR_ID)
         .execute(&pool)
@@ -2606,11 +2741,6 @@ async fn postgres_guest_exit_completes_under_projection_middleware() -> Result<(
     .bind(NODE_ID)
     .execute(&pool)
     .await?;
-
-    let app = app.layer(from_fn_with_state(
-        state.clone(),
-        ensure_current_domain_projection,
-    ));
 
     let preload_response = app
         .clone()
@@ -2642,8 +2772,14 @@ async fn postgres_guest_exit_completes_under_projection_middleware() -> Result<(
         tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(exit_request))
             .await
             .context("guest exit challenge must not deadlock under projection middleware")??;
-    assert_eq!(exit_response.status(), StatusCode::FORBIDDEN);
+    let exit_status = exit_response.status();
     let exit_body = body::to_bytes(exit_response.into_body(), usize::MAX).await?;
+    assert_eq!(
+        exit_status,
+        StatusCode::FORBIDDEN,
+        "guest exit challenge body: {}",
+        String::from_utf8_lossy(&exit_body)
+    );
     let exit_payload: serde_json::Value = serde_json::from_slice(&exit_body)?;
     assert_eq!(exit_payload["error"], "STEP_UP_REQUIRED");
     let challenge_id = exit_payload["challenge_id"]
@@ -4002,17 +4138,26 @@ async fn postgres_replace_response_etag_is_reusable() -> Result<()> {
     run_migrations(&pool).await;
     clean(&pool).await;
     seed_node(&pool, NODE_A, Some("before"), None).await;
-    sqlx::query("UPDATE domain_nodes SET search_visibility='private' WHERE id=$1")
-        .bind(NODE_A)
-        .execute(&pool)
-        .await?;
+    // This is an ETag precision test for a PRIVATE node. Seed an actual
+    // canonical creator binding so the authenticated actor is authorized to
+    // read and reuse its version; a foreign Admin must remain denied.
+    let owner_id = "10000000-0000-0000-0000-000000000096";
+    sqlx::query(
+        "UPDATE domain_nodes
+         SET search_visibility='private',
+             payload = jsonb_set(payload, '{created_by_account_id}', to_jsonb($2::text), true)
+         WHERE id=$1",
+    )
+    .bind(NODE_A)
+    .bind(owner_id)
+    .execute(&pool)
+    .await?;
 
     let tmp = tempfile::tempdir()?;
     let in_dir = tmp.path().join("in");
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
-    let (app, cookie, _state) =
-        postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000096").await?;
+    let (app, cookie, _state) = postgres_write_app(pool.clone(), owner_id).await?;
 
     let first_response = app
         .clone()
@@ -4246,12 +4391,9 @@ async fn postgres_node_noop_patch_does_not_fast_forward_external_generation() ->
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
 
-    let (app, cookie, state) =
+    let (_app, cookie, state) =
         postgres_write_app(pool.clone(), "10000000-0000-0000-0000-000000000097").await?;
-    let app = app.layer(from_fn_with_state(
-        state.clone(),
-        ensure_current_domain_projection,
-    ));
+    let app = postgres_projected_router(&state);
     state.refresh_domain_projection_if_stale().await?;
     let local_before = state.domain_projection_version.load(Ordering::Acquire);
     assert_eq!(local_before, domain_projection_version(&pool).await?);
@@ -4494,5 +4636,1495 @@ async fn strict_projection_refresh_reclassifies_following_local_patch_handoff() 
     );
 
     clean(&pool).await;
+    Ok(())
+}
+
+// A five-connection runtime must still have a usable connection while a
+// cross-process GET holds the canonical visibility row and PATCH waits to
+// advance it. Two independent reader/writer admission limits previously let
+// the waiting requests consume the whole SQLx pool (PoolTimedOut).
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_and_node_patch_share_five_connection_budget() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000b4";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await
+        .context("connect five-connection SQLx runtime pool")?;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_A, None, None).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_handler_app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let probe_entered = Arc::clone(&entered);
+    // This handler runs INSIDE the real GET PostgreSQL FOR SHARE fence.
+    let app = Router::new()
+        .merge(api_router())
+        .route(
+            "/nodes/pool-fence-probe",
+            axum::routing::get(move || {
+                let probe_entered = Arc::clone(&probe_entered);
+                let mut release_rx = release_rx.clone();
+                async move {
+                    probe_entered.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    StatusCode::OK
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state.clone());
+
+    let first_app = app.clone();
+    let held_get = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                Request::get("/nodes/pool-fence-probe")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("GET fence probe"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("real PostgreSQL-fenced GET did not reach its handler")?;
+
+    let writer_app = app.clone();
+    let writer = tokio::spawn(async move {
+        writer_app
+            .oneshot(patch_node_req(
+                &cookie,
+                NODE_A,
+                r#"{"info":"fenced mixed load"}"#,
+                SEEDED_NODE_ETAG,
+            ))
+            .await
+    });
+
+    // Confirm the writer is actually blocked by a PostgreSQL lock rather than
+    // merely queued or finished before the test probes the pool.
+    let mut observed_lock_wait = false;
+    for _ in 0..40 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity              WHERE datname = current_database()                AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if waiting > 0 {
+            observed_lock_wait = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        observed_lock_wait,
+        "writer never reached a blocked PostgreSQL lock"
+    );
+    assert!(
+        !writer.is_finished(),
+        "writer bypassed the held visibility fence"
+    );
+
+    // A third protected request must not exhaust all five SQLx connections.
+    let second_app = app.clone();
+    let later_get = tokio::spawn(async move {
+        second_app
+            .oneshot(
+                Request::get("/nodes")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("parallel node list"),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    let headroom: i64 = tokio::time::timeout(
+        Duration::from_secs(2),
+        sqlx::query_scalar("SELECT 1::bigint").fetch_one(&pool),
+    )
+    .await
+    .context("mixed GET/PATCH blocked all five SQLx connections")??;
+    assert_eq!(headroom, 1, "at least one connection must remain usable");
+
+    release_tx.send(true).context("release held GET")?;
+    let first = tokio::time::timeout(Duration::from_secs(7), held_get)
+        .await
+        .context("held GET failed to finish after release")??;
+    assert_eq!(first?.status(), StatusCode::OK);
+    let patched = tokio::time::timeout(Duration::from_secs(7), writer)
+        .await
+        .context("waiting writer did not finish after GET released fence")??;
+    assert_eq!(patched?.status(), StatusCode::OK);
+    let second = tokio::time::timeout(Duration::from_secs(7), later_get)
+        .await
+        .context("later GET starved after writer finished")??;
+    assert_eq!(second?.status(), StatusCode::OK);
+
+    let persisted: Option<String> =
+        sqlx::query_scalar("SELECT payload ->> 'info' FROM domain_nodes WHERE id = $1")
+            .bind(NODE_A)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(persisted.as_deref(), Some("fenced mixed load"));
+    clean(&pool).await;
+    Ok(())
+}
+
+// An ordinary node CREATE uses one PostgreSQL transaction, which holds a
+// connection while its INSERT trigger waits for the GET's generation FOR SHARE.
+// Four unbudgeted CREATEs once exhausted the remaining four connections,
+// preventing the GET handler's second query from ever completing.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_survives_four_concurrent_node_creations() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000c4";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await
+        .context("five-connection production-sized runtime pool")?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await
+        .context("separate read-only PostgreSQL lock monitor")?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_handler_app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let get_pool = pool.clone();
+    let entered_handler = Arc::clone(&entered);
+    let app = Router::new()
+        .merge(api_router())
+        .route(
+            "/nodes/create-fence-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let get_pool = get_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    // This actual query must have a connection while
+                    // the PostgreSQL generation row is still FOR SHARE.
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&get_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state);
+
+    let first_app = app.clone();
+    let fenced_get = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                Request::get("/nodes/create-fence-probe")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("fenced get"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("fenced GET handler did not start")?;
+
+    let mut creates = Vec::new();
+    for index in 0..4 {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        creates.push(tokio::spawn(async move {
+            let payload = serde_json::json!({
+                "title": format!("Concurrent Create {index}"),
+                "kind": "resource",
+                "address": "Poolkreuzung 2",
+                "location": {"lat": 53.5, "lon": 10.0},
+                "operation_id": format!("30000000-0000-4000-8000-{index:012}")
+            })
+            .to_string();
+            app.oneshot(post_node_req(&cookie, &payload)).await
+        }));
+    }
+    let mut lock_wait_observed = false;
+    for _ in 0..80 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database()                AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting > 0 {
+            lock_wait_observed = true;
+        }
+        // Give all four launched CREATEs the chance to occupy the SQLx pool
+        // on the old, unbudgeted path. The fixed path intentionally admits
+        // fewer, so do not assert a fixed number of PostgreSQL lock waiters.
+        if lock_wait_observed && waiting >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        lock_wait_observed,
+        "at least one node writer must wait behind GET fence"
+    );
+    assert!(creates.iter().all(|task| !task.is_finished()));
+
+    release_tx
+        .send(true)
+        .context("let fenced GET query the still-blocked pool")?;
+    let first = tokio::time::timeout(Duration::from_secs(6), fenced_get)
+        .await
+        .context("fenced GET failed to complete under concurrent CREATEs")??;
+    assert_eq!(first?.status(), StatusCode::OK);
+    for task in creates {
+        let response = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .context("node creation did not complete after fence release")??;
+        assert_eq!(response?.status(), StatusCode::CREATED);
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM domain_nodes          WHERE payload ->> 'created_by_account_id' = $1",
+    )
+    .bind(ACTOR_ID)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 4);
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+// A guest exit updates nodes/edges/accounts under a single PostgreSQL
+// transaction. Four simultaneous exits can each occupy a pooled connection
+// waiting for the held GET generation row, starving that GET's next DB query.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_survives_four_concurrent_guest_exits() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000d4";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    for index in 0..4 {
+        let guest_id = format!("writepath-guest-budget-{index}");
+        sqlx::query(
+            "INSERT INTO domain_accounts              (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)              VALUES ($1,'garnrolle','Guest budget','not_on_map',0,FALSE,'gast','{}','{}')",
+        )
+        .bind(&guest_id)
+        .execute(&pool)
+        .await?;
+    }
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_handler_app, _cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let get_pool = pool.clone();
+    let app = Router::new()
+        .route(
+            "/nodes/guest-exit-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let get_pool = get_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&get_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+
+    let first_app = app.clone();
+    let fenced_get = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                Request::get("/nodes/guest-exit-budget-probe")
+                    .body(body::Body::empty())
+                    .expect("GET budget probe"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("privacy-fenced guest-exit GET did not start")?;
+
+    let mut exits = Vec::new();
+    for index in 0..4 {
+        let pool = pool.clone();
+        exits.push(tokio::spawn(async move {
+            let guest_id = format!("writepath-guest-budget-{index}");
+            delete_guest_account(&pool, &guest_id).await
+        }));
+    }
+
+    let mut saw_lock_wait = false;
+    for _ in 0..80 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database()                AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting > 0 {
+            saw_lock_wait = true;
+        }
+        if waiting >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        saw_lock_wait,
+        "guest exit must actually wait on a canonical PG lock"
+    );
+    assert!(exits.iter().all(|task| !task.is_finished()));
+    release_tx
+        .send(true)
+        .context("allow fenced GET's second SQLx connection")?;
+
+    let first = tokio::time::timeout(Duration::from_secs(6), fenced_get)
+        .await
+        .context("fenced GET stuck under four guest exits")??;
+    assert_eq!(first?.status(), StatusCode::OK);
+    for task in exits {
+        tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .context("guest exit starved after releasing GET fence")???
+    }
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM domain_accounts WHERE id LIKE 'writepath-guest-budget-%'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(remaining, 0, "all four guests must be deleted");
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+// A single guest exit holds the guest-account row FOR UPDATE and eventually
+// waits for the GET's canonical generation fence. Three concurrent real HTTP
+// POST /direct-conversations requests FOR SHARE that same guest row. Without
+// shared SQLx admission, they occupy the last three pool connections and the
+// GET cannot obtain the second connection needed to complete its JSON handler.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_survives_guest_exit_and_three_direct_conversation_writers() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000e4";
+    const GUEST_ID: &str = "writepath-direct-guest-budget";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO domain_accounts          (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)          VALUES ($1,'garnrolle','Guest inbox budget','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(GUEST_ID)
+    .execute(&pool)
+    .await?;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let get_pool = pool.clone();
+    let app = Router::new()
+        .merge(api_router())
+        .route(
+            "/nodes/direct-conversation-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let get_pool = get_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&get_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state);
+
+    let first_app = app.clone();
+    let fenced_get = tokio::spawn(async move {
+        first_app
+            .oneshot(
+                Request::get("/nodes/direct-conversation-budget-probe")
+                    .header("Host", "localhost")
+                    .body(body::Body::empty())
+                    .expect("privacy-fenced GET"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("fenced GET did not enter handler")?;
+
+    let exit_pool = pool.clone();
+    let exit = tokio::spawn(async move { delete_guest_account(&exit_pool, GUEST_ID).await });
+
+    let mut row_is_locked = false;
+    for _ in 0..80 {
+        // A short NOWAIT read identifies the real FOR UPDATE lock held by the
+        // active guest exit. Do not infer the ordering from arbitrary sleeps.
+        match sqlx::query_scalar::<_, String>(
+            "SELECT id FROM domain_accounts WHERE id=$1 FOR SHARE NOWAIT",
+        )
+        .bind(GUEST_ID)
+        .fetch_one(&monitor)
+        .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                row_is_locked = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        row_is_locked,
+        "guest exit must hold the guest account FOR UPDATE"
+    );
+
+    let mut conversations = Vec::new();
+    for _ in 0..3 {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        conversations.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/direct-conversations")
+                    .header("Host", "localhost")
+                    .header("Origin", "http://localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Cookie", cookie)
+                    .body(body::Body::from(
+                        serde_json::json!({"recipient_account_id": GUEST_ID}).to_string(),
+                    ))
+                    .expect("direct conversation request"),
+            )
+            .await
+        }));
+    }
+
+    // The guest exit must reach the PostgreSQL visibility lock before
+    // releasing GET. On the broken path all three POSTs can then occupy
+    // connections while waiting on the guest. The fixed path deliberately
+    // admits fewer: requiring multiple DB waiters would reject the fix.
+    let mut lock_wait_observed = false;
+    for _ in 0..80 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'"
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting >= 1 {
+            lock_wait_observed = true;
+        }
+        if waiting >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        lock_wait_observed,
+        "guest exit must be waiting on the canonical visibility fence"
+    );
+    assert!(
+        !exit.is_finished(),
+        "guest exit bypassed held generation fence"
+    );
+
+    release_tx
+        .send(true)
+        .context("allow GET to acquire second SQLx connection")?;
+    let get_response = tokio::time::timeout(Duration::from_secs(7), fenced_get)
+        .await
+        .context("GET starved by direct-conversation/guest-exit DB locks")??;
+    assert_eq!(
+        get_response?.status(),
+        StatusCode::OK,
+        "GET must not starve"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), exit)
+        .await
+        .context("guest exit failed to finish")???;
+    for writer in conversations {
+        let response = tokio::time::timeout(Duration::from_secs(9), writer)
+            .await
+            .context("direct-conversation POST did not finish")??;
+        let status = response?.status();
+        assert!(
+            !status.is_server_error(),
+            "conversation writer must finish without 5xx: {status}"
+        );
+    }
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM domain_accounts WHERE id=$1")
+            .bind(GUEST_ID)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining, 0);
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+// A protected GET, guest exit, two proposal-message writes and an expired
+// session touch share only five SQLx connections. Each of the latter operations
+// can wait on the exit's domain-account/session locks. Every one must be
+// admitted through the SAME pool budget instead of occupying the GET's second
+// handler connection while its generation FOR SHARE lock is still held.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn fenced_get_survives_guest_exit_governance_and_session_touch() -> Result<()> {
+    use weltgewebe_api::{
+        auth::{session::SessionOps, session_db::DbSessionStore},
+        governance::{add_message, create_weber_proposal, MessageError},
+    };
+
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000f4";
+    const GUEST_ID: &str = "writepath-gov-session-budget";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO domain_accounts          (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)          VALUES ($1,'garnrolle','Guest governance budget','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(GUEST_ID)
+    .execute(&pool)
+    .await?;
+    let proposal = create_weber_proposal(
+        &pool,
+        GUEST_ID,
+        "Guest governance budget",
+        None,
+        chrono::Utc::now(),
+    )
+    .await?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO sessions (id, account_id, device_id, created_at, last_active, expires_at)          VALUES ($1, $2, $3, NOW(), NOW() - INTERVAL '10 minutes', NOW() + INTERVAL '1 day')",
+    )
+    .bind(&session_id)
+    .bind(GUEST_ID)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .execute(&pool)
+    .await?;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, _cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let get_pool = pool.clone();
+    let app = Router::new()
+        .route(
+            "/nodes/governance-session-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let get_pool = get_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&get_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+    let fenced_get = tokio::spawn(async move {
+        app.oneshot(
+            Request::get("/nodes/governance-session-budget-probe")
+                .header("Host", "localhost")
+                .body(body::Body::empty())
+                .expect("fenced GET"),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("fenced GET must hold canonical generation")?;
+
+    let exit_pool = pool.clone();
+    let exit = tokio::spawn(async move { delete_guest_account(&exit_pool, GUEST_ID).await });
+    let mut exit_row_locked = false;
+    for _ in 0..80 {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT id FROM domain_accounts WHERE id = $1 FOR SHARE NOWAIT",
+        )
+        .bind(GUEST_ID)
+        .fetch_one(&monitor)
+        .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                exit_row_locked = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(exit_row_locked, "guest exit must hold account FOR UPDATE");
+
+    // Wait until the exit is blocked by the GET generation row. Guest exit
+    // deletes the sessions first, so their TOUCH would otherwise retain
+    // pooled connections while waiting on the uncommitted session deletes.
+    let mut exit_generation_wait = false;
+    for _ in 0..80 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting >= 1 {
+            exit_generation_wait = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        exit_generation_wait,
+        "guest exit must wait behind held GET generation"
+    );
+
+    let mut governance_writers = Vec::new();
+    for index in 0..2 {
+        let pool = pool.clone();
+        let proposal_id = proposal.id.clone();
+        governance_writers.push(tokio::spawn(async move {
+            add_message(
+                &pool,
+                &proposal_id,
+                GUEST_ID,
+                "Guest governance budget",
+                &format!("blocked proposal-message {index}"),
+                chrono::Utc::now(),
+            )
+            .await
+        }));
+    }
+    let session_store = DbSessionStore::new(pool.clone());
+    let touch = tokio::spawn(async move { session_store.touch(&session_id).await });
+
+    // The previous unbudgeted path consumes three pool connections here:
+    // two account-lock waiters and one session-row UPDATE waiter. The fixed
+    // path queues them before SQLx admission. Exercise both for long enough.
+    for _ in 0..60 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity              WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        if waiting >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !exit.is_finished(),
+        "guest exit bypassed canonical visibility fence"
+    );
+    release_tx
+        .send(true)
+        .context("allow protected GET's second SQLx read")?;
+    let response = tokio::time::timeout(Duration::from_secs(7), fenced_get)
+        .await
+        .context("GET stalled behind pool-blocked governance/session writers")??;
+    assert_eq!(response?.status(), StatusCode::OK);
+
+    tokio::time::timeout(Duration::from_secs(10), exit)
+        .await
+        .context("guest exit did not complete")???;
+    for task in governance_writers {
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .context("governance writer did not complete")??;
+        assert!(
+            matches!(
+                outcome,
+                Ok(_) | Err(MessageError::Database(sqlx::Error::RowNotFound))
+            ),
+            "governance writer may only complete or observe the deleted guest, never time out"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(10), touch)
+        .await
+        .context("SQLx session touch did not complete")??
+        .expect("session touch must be a completed no-op after guest exit");
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM domain_accounts WHERE id = $1")
+            .bind(GUEST_ID)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining, 0);
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+// Regression: a magic-link login must release its account-cache read guard
+// before its PostgreSQL session creation queues behind two fenced readers.
+// Otherwise a waiting account-cache writer can deadlock the second reader.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct disposable PostgreSQL"]
+#[serial]
+async fn magic_link_login_releases_cache_lock_before_pg_admission() -> Result<()> {
+    use axum::extract::connect_info::MockConnectInfo;
+    use weltgewebe_api::auth::session_db::DbSessionStore;
+    use weltgewebe_api::routes::auth::NONCE_COOKIE_NAME;
+
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000f5";
+    const EMAIL: &str = "privacy-admission-login@example.test";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, _cookie, mut state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.sessions = SessionBackend::new(DbSessionStore::new(pool.clone()));
+    state.config.auth_public_login = true;
+    state.config.app_base_url = Some("http://localhost".to_string());
+    state.refresh_domain_projection_if_stale().await?;
+    // Refresh reloads the canonical account projection; install the test-only
+    // login address AFTER it so the magic link reaches PostgreSQL session IO.
+    {
+        let mut accounts = state.accounts.write().await;
+        let mut account = accounts
+            .get(ACTOR_ID)
+            .context("seed login account")?
+            .clone();
+        account.email = Some(EMAIL.to_string());
+        accounts.insert(account);
+    }
+    assert!(
+        state.accounts.read().await.get_by_email(EMAIL).is_some(),
+        "fixture must resolve the login email after projection refresh"
+    );
+
+    // Both readers enter their handler while holding the shared canonical
+    // projection generation and both weighted admission reservations.
+    let entered = Arc::new(Barrier::new(3));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let read_pool = pool.clone();
+    let get_app = Router::new()
+        .route(
+            "/nodes/login-lock-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let read_pool = read_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match sqlx::query_scalar::<_, i64>("SELECT 1::bigint")
+                        .fetch_one(&read_pool)
+                        .await
+                    {
+                        Ok(1) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state.clone());
+    let mut readers = Vec::new();
+    for _ in 0..2 {
+        let app = get_app.clone();
+        readers.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::get("/nodes/login-lock-probe")
+                    .body(body::Body::empty())
+                    .expect("protected GET"),
+            )
+            .await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("both protected readers must reserve their PG admission")?;
+
+    let token = state.tokens.create(EMAIL.to_string());
+    let nonce = "privacy-cache-lock-nonce";
+    let cookie = format!(
+        "{}={}.{}",
+        NONCE_COOKIE_NAME,
+        hex::encode(Sha256::digest(token.as_bytes())),
+        nonce
+    );
+    let login_app = Router::new()
+        .merge(api_router())
+        .layer(MockConnectInfo(
+            "127.0.0.1:8080".parse::<std::net::SocketAddr>()?,
+        ))
+        .with_state(state.clone());
+    let login_token = token.clone();
+    let login = tokio::spawn(async move {
+        login_app
+            .oneshot(
+                Request::post("/auth/magic-link/consume")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .header("Cookie", cookie)
+                    .body(body::Body::from(format!(
+                        "token={login_token}&nonce={nonce}"
+                    )))
+                    .expect("login request"),
+            )
+            .await
+    });
+
+    let mut consumed = false;
+    for _ in 0..100 {
+        if state.tokens.peek(&token).is_none() {
+            consumed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        consumed,
+        "login must consume token before testing lock order"
+    );
+    assert!(
+        !login.is_finished(),
+        "login must wait on occupied PG admission"
+    );
+    // Allow the login task to reach session admission after consuming its
+    // token. The writer must not depend on release of the two PG readers.
+    tokio::task::yield_now().await;
+    let accounts = Arc::clone(&state.accounts);
+    let mut cache_writer = tokio::spawn(async move {
+        let _guard = accounts.write().await;
+    });
+    let writer_before_release =
+        tokio::time::timeout(Duration::from_secs(2), &mut cache_writer).await;
+    // Always unwind the held readers, even when asserting the old deadlock.
+    release_tx.send(true).context("release protected readers")?;
+    for reader in readers {
+        let response = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .context("protected reader completion")??;
+        assert_eq!(response?.status(), StatusCode::OK);
+    }
+    let response = tokio::time::timeout(Duration::from_secs(5), login)
+        .await
+        .context("login completes once admission is released")??;
+    assert_eq!(response?.status(), StatusCode::SEE_OTHER);
+    if writer_before_release.is_err() {
+        tokio::time::timeout(Duration::from_secs(5), cache_writer)
+            .await
+            .context("cache writer completes after release")??;
+    }
+    assert!(
+        writer_before_release.is_ok(),
+        "login retained the account-cache read lock across PostgreSQL admission"
+    );
+    sqlx::query("DELETE FROM sessions WHERE account_id = $1")
+        .bind(ACTOR_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM domain_accounts WHERE id = $1")
+        .bind(ACTOR_ID)
+        .execute(&pool)
+        .await?;
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+// Regression: three real notification preference PUTs must not fill the
+// five-connection SQLx pool while the guest-exit writer holds their FK row
+// and waits on the generation fence of a protected GET.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct disposable PostgreSQL"]
+#[serial]
+async fn notification_preferences_share_guest_exit_privacy_pool_budget() -> Result<()> {
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000f6";
+    const GUEST_ID: &str = "writepath-notification-budget-guest";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    sqlx::query(
+        "INSERT INTO domain_accounts
+         (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)
+         VALUES ($1,'garnrolle','Notification guest budget','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(GUEST_ID)
+    .execute(&pool)
+    .await?;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, _cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    {
+        let mut guest = admin_operator(GUEST_ID);
+        guest.role = Role::Gast;
+        state.accounts.write().await.insert(guest);
+    }
+    let session = state.sessions.create(GUEST_ID.to_string(), None).await?;
+    let cookie = format!("gewebe_session={}", session.id);
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let read_pool = pool.clone();
+    let get_app = Router::new()
+        .route(
+            "/nodes/notification-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let read_pool = read_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&read_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state.clone());
+    let protected_get = tokio::spawn(async move {
+        get_app
+            .oneshot(
+                Request::get("/nodes/notification-budget-probe")
+                    .body(body::Body::empty())
+                    .expect("protected GET"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("protected GET must hold PG generation fence")?;
+
+    let exit_pool = pool.clone();
+    let exit = tokio::spawn(async move { delete_guest_account(&exit_pool, GUEST_ID).await });
+    let mut row_locked = false;
+    for _ in 0..80 {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT id FROM domain_accounts WHERE id = $1 FOR SHARE NOWAIT",
+        )
+        .bind(GUEST_ID)
+        .fetch_one(&monitor)
+        .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                row_locked = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        row_locked,
+        "guest exit must hold canonical account FOR UPDATE"
+    );
+
+    // Observe the actual HTTP handler boundary after canonical authentication:
+    // all three real PUTs must reach the notification writer before the held
+    // GET is released. This distinguishes queued SQLx admission from requests
+    // that never reached the competing operation.
+    let arrived = Arc::new(Barrier::new(4));
+    let arrived_handler = Arc::clone(&arrived);
+    let preferences_app = Router::new()
+        .route(
+            "/notifications/preferences",
+            axum::routing::put(
+                move |state: axum::extract::State<ApiState>,
+                      auth: axum::Extension<weltgewebe_api::middleware::auth::AuthContext>,
+                      request: axum::Json<
+                    weltgewebe_api::notifications::UpdateNotificationPreferencesRequest,
+                >| {
+                    let arrived_handler = Arc::clone(&arrived_handler);
+                    async move {
+                        arrived_handler.wait().await;
+                        weltgewebe_api::notifications::update_notification_preferences(
+                            state, auth, request,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .layer(from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state);
+    let mut notifications = Vec::new();
+    for _ in 0..3 {
+        let app = preferences_app.clone();
+        let cookie = cookie.clone();
+        notifications.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::put("/notifications/preferences")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Cookie", cookie)
+                    .body(body::Body::from(r#"{"direct_messages_push":true}"#))
+                    .expect("notification PUT"),
+            )
+            .await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), arrived.wait())
+        .await
+        .context("all three notification PUTs must pass authentication")?;
+    // The guest exit must be the only PG lock waiter: with the shared budget,
+    // all three PUTs queue BEFORE SQLx. The unfixed code instead checks out
+    // three connections, waits on the guest's FK row, and exhausts the pool.
+    let mut observed_exit_wait = false;
+    for _ in 0..40 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        assert!(
+            waiting <= 1,
+            "notification PUTs must not occupy SQLx connections waiting on guest FK locks: {waiting}"
+        );
+        if waiting == 1 {
+            observed_exit_wait = true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        observed_exit_wait,
+        "guest exit must actually wait for generation fence"
+    );
+    assert!(
+        notifications.iter().all(|task| !task.is_finished()),
+        "notification PUTs must queue while the protected GET and exit hold admission"
+    );
+    assert!(
+        !exit.is_finished(),
+        "guest exit must still wait on GET's fence"
+    );
+    release_tx
+        .send(true)
+        .context("release GET's second SQLx read")?;
+    let response = tokio::time::timeout(Duration::from_secs(7), protected_get)
+        .await
+        .context("protected GET starved by notification pool waiters")??;
+    assert_eq!(response?.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(10), exit)
+        .await
+        .context("guest exit must complete")???;
+    for request in notifications {
+        let response = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .context("notification PUT must terminate after guest exit")??;
+        // FK failure after guest deletion is valid; indefinite DB pool wait is not.
+        assert!(
+            matches!(
+                response?.status(),
+                StatusCode::OK | StatusCode::INTERNAL_SERVER_ERROR
+            ),
+            "notification must reach SQLx instead of being rejected by auth"
+        );
+    }
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM domain_accounts WHERE id = $1")
+            .bind(GUEST_ID)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining, 0, "guest deletion must be durable");
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+// Regression: WebAuthn login credential updates must queue before SQLx when
+// a fenced GET and guest exit have consumed the shared five-connection budget.
+// Otherwise three row-lock waiters starve the GET's second connection.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct disposable PostgreSQL"]
+#[serial]
+async fn passkey_updates_share_guest_exit_privacy_pool_budget() -> Result<()> {
+    use base64::Engine;
+    use webauthn_rs::prelude::{AuthenticationResult, Passkey};
+    use weltgewebe_api::auth::passkeys_db::{
+        credential_id_key, DbPasskeyStore, DbPasskeyStoreError,
+    };
+
+    const ACTOR_ID: &str = "10000000-0000-0000-0000-0000000000f7";
+    const GUEST_ID: &str = "writepath-passkey-budget-guest";
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&direct_database_url())
+        .await?;
+    let monitor = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&direct_database_url())
+        .await?;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    sqlx::query(
+        "INSERT INTO domain_accounts
+         (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)
+         VALUES ($1,'garnrolle','Passkey budget guest','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(GUEST_ID)
+    .execute(&pool)
+    .await?;
+
+    let credential_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([77_u8; 32]);
+    let passkey: Passkey = serde_json::from_value(serde_json::json!({
+        "cred": {
+            "cred_id": credential_b64,
+            "cred": {"type_": "ES256", "key": {
+                "EC_EC2": {"curve": "SECP256R1", "x": vec![1_u8; 32], "y": vec![2_u8; 32]}
+            }},
+            "counter": 0,
+            "transports": null,
+            "user_verified": false,
+            "backup_eligible": false,
+            "backup_state": false,
+            "registration_policy": "preferred",
+            "extensions": {"cred_protect": "NotRequested", "hmac_create_secret": "NotRequested"},
+            "attestation": {"data": "None", "metadata": "None"},
+            "attestation_format": "None"
+        }
+    }))?;
+    let store = DbPasskeyStore::new(pool.clone());
+    store
+        .insert(GUEST_ID, uuid::Uuid::new_v4(), &passkey)
+        .await?;
+    let credential_key = credential_id_key(passkey.cred_id());
+    let auth_result: AuthenticationResult = serde_json::from_value(serde_json::json!({
+        "cred_id": serde_json::to_value(passkey.cred_id())?,
+        "needs_update": true,
+        "user_verified": true,
+        "backup_state": false,
+        "backup_eligible": false,
+        "counter": 1,
+        "extensions": {}
+    }))?;
+    let auth_result = Arc::new(auth_result);
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_app, _cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    state.refresh_domain_projection_if_stale().await?;
+
+    let entered = Arc::new(Barrier::new(2));
+    let (release_tx, release_rx) = watch::channel(false);
+    let entered_handler = Arc::clone(&entered);
+    let read_pool = pool.clone();
+    let get_app = Router::new()
+        .route(
+            "/nodes/passkey-budget-probe",
+            axum::routing::get(move || {
+                let entered_handler = Arc::clone(&entered_handler);
+                let mut release_rx = release_rx.clone();
+                let read_pool = read_pool.clone();
+                async move {
+                    entered_handler.wait().await;
+                    if !*release_rx.borrow() {
+                        let _ = release_rx.changed().await;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sqlx::query_scalar::<_, i64>("SELECT 1::bigint").fetch_one(&read_pool),
+                    )
+                    .await
+                    {
+                        Ok(Ok(1)) => StatusCode::OK,
+                        _ => StatusCode::GATEWAY_TIMEOUT,
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+    let protected_get = tokio::spawn(async move {
+        get_app
+            .oneshot(
+                Request::get("/nodes/passkey-budget-probe")
+                    .body(body::Body::empty())
+                    .expect("protected GET"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .context("GET must hold the canonical generation fence")?;
+
+    let exit_pool = pool.clone();
+    let exit = tokio::spawn(async move { delete_guest_account(&exit_pool, GUEST_ID).await });
+    let mut passkey_row_locked = false;
+    for _ in 0..100 {
+        let locked = sqlx::query_scalar::<_, String>(
+            "SELECT credential_id FROM passkey_credentials
+             WHERE credential_id = $1 FOR UPDATE NOWAIT",
+        )
+        .bind(&credential_key)
+        .fetch_optional(&monitor)
+        .await;
+        match locked {
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                passkey_row_locked = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        passkey_row_locked,
+        "guest exit must have deleted/locked the credential before awaiting generation fence"
+    );
+    assert!(
+        !exit.is_finished(),
+        "guest exit must still await fenced GET"
+    );
+
+    let ready = Arc::new(Barrier::new(4));
+    let mut updates = Vec::new();
+    for _ in 0..3 {
+        let store = store.clone();
+        let auth_result = Arc::clone(&auth_result);
+        let ready = Arc::clone(&ready);
+        updates.push(tokio::spawn(async move {
+            ready.wait().await;
+            store.update_credential(GUEST_ID, &auth_result).await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), ready.wait())
+        .await
+        .context("all three passkey verifications must reach update boundary")?;
+
+    let mut observed_exit_wait = false;
+    let mut observed_extra_waiters = false;
+    for _ in 0..40 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock' AND state = 'active'",
+        )
+        .fetch_one(&monitor)
+        .await?;
+        observed_exit_wait |= waiting >= 1;
+        observed_extra_waiters |= waiting > 1;
+        if observed_extra_waiters {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Release the GET even on the RED path, so all competing SQL transactions
+    // can unwind before the assertion is checked.
+    release_tx.send(true).context("release protected GET")?;
+    let response = tokio::time::timeout(Duration::from_secs(9), protected_get)
+        .await
+        .context("protected GET must complete without passkey pool starvation")??;
+    let status = response?.status();
+    tokio::time::timeout(Duration::from_secs(9), exit)
+        .await
+        .context("guest exit must complete after fence release")???;
+    for update in updates {
+        let outcome = tokio::time::timeout(Duration::from_secs(9), update)
+            .await
+            .context("passkey verification must stop waiting")??;
+        assert!(
+            matches!(outcome, Err(DbPasskeyStoreError::NotFound)),
+            "deleted guest credential must remain absent: {outcome:?}"
+        );
+    }
+    assert!(
+        observed_exit_wait,
+        "guest exit must block on real PostgreSQL generation lock"
+    );
+    assert!(
+        !observed_extra_waiters,
+        "passkey updates must queue before SQLx rather than occupy connections waiting on deleted guest credentials"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fenced GET must retain its second connection"
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM domain_accounts WHERE id = $1")
+            .bind(GUEST_ID)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining, 0, "guest deletion must be durable");
+    sqlx::query("DELETE FROM domain_accounts WHERE id = $1")
+        .bind(ACTOR_ID)
+        .execute(&pool)
+        .await?;
+    clean_all_nodes(&pool).await;
     Ok(())
 }

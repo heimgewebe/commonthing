@@ -14,7 +14,8 @@ use weltgewebe_api::{
         DomainReadSource, PasskeyCredentialSource,
     },
     domain_db::{
-        load_accounts_from_postgres, load_edges_from_postgres, load_nodes_bbox_from_postgres,
+        load_accounts_from_postgres, load_edges_from_postgres,
+        load_nodes_bbox_after_id_from_postgres, load_nodes_bbox_from_postgres,
         load_nodes_from_postgres,
     },
     routes::{accounts::GarnrolleMapState, api_router},
@@ -147,7 +148,7 @@ async fn node_bbox_route_reads_postgres_directly_with_cursor_contract() {
     .await
     .expect("insert BBOX nodes");
 
-    let direct = load_nodes_bbox_from_postgres(&pool, 53.4, 53.7, 9.8, 10.1, 10, 0)
+    let direct = load_nodes_bbox_from_postgres(&pool, 53.4, 53.7, 9.8, 10.1, 10, 0, None)
         .await
         .expect("direct BBOX query");
     let direct_ids = direct
@@ -700,5 +701,1326 @@ async fn jsonl_postgres_legacy_list_order_gap_diagnostic() {
     );
 
     // Keep the shared proof database tidy after the successful diagnostic run.
+    clean(&pool).await;
+}
+
+/// Run only against the test harness disposable PostgreSQL DATABASE_URL.
+/// Privacy filtering must happen in SQL before LIMIT/OFFSET and id cursors.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn postgres_bbox_private_node_is_filtered_before_limit_and_cursor() {
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_accounts (id,title,disabled) VALUES ('rp-private-owner','Fixture Owner',FALSE)"
+    ).execute(&pool).await.expect("insert synthetic owner");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility) VALUES \
+        ('rp-a-public','place','A',53.5,10.0,'{}'::jsonb,'public'),\
+        ('rp-b-private','place','B',53.5,10.0,'{\"created_by_account_id\":\"rp-private-owner\"}'::jsonb,'private'),\
+        ('rp-c-public','place','C',53.5,10.0,'{}'::jsonb,'public'),\
+        ('rp-d-hidden','place','D',53.5,10.0,'{\"created_by_account_id\":\"rp-private-owner\"}'::jsonb,'hidden'),\
+        ('rp-e-revoked','place','E',53.5,10.0,'{\"created_by_account_id\":\"rp-private-owner\"}'::jsonb,'revoked')"
+    ).execute(&pool).await.expect("insert mixed-privacy BBOX");
+    let ids = |nodes: Vec<weltgewebe_api::routes::nodes::Node>| {
+        nodes.into_iter().map(|n| n.id).collect::<Vec<_>>()
+    };
+    let public = load_nodes_bbox_from_postgres(&pool, 53.4, 53.6, 9.9, 10.1, 2, 0, None)
+        .await
+        .expect("anonymous BBOX");
+    assert_eq!(ids(public), vec!["rp-a-public", "rp-c-public"]);
+    let cursor = load_nodes_bbox_after_id_from_postgres(
+        &pool,
+        53.4,
+        53.6,
+        9.9,
+        10.1,
+        1,
+        "rp-a-public",
+        None,
+    )
+    .await
+    .expect("anonymous cursor");
+    assert_eq!(ids(cursor), vec!["rp-c-public"]);
+    let wrong =
+        load_nodes_bbox_from_postgres(&pool, 53.4, 53.6, 9.9, 10.1, 10, 0, Some("rp-other-owner"))
+            .await
+            .expect("nonowner BBOX");
+    assert_eq!(ids(wrong), vec!["rp-a-public", "rp-c-public"]);
+    let owner = load_nodes_bbox_from_postgres(
+        &pool,
+        53.4,
+        53.6,
+        9.9,
+        10.1,
+        10,
+        0,
+        Some("rp-private-owner"),
+    )
+    .await
+    .expect("owner BBOX");
+    assert_eq!(
+        ids(owner),
+        vec!["rp-a-public", "rp-b-private", "rp-c-public", "rp-d-hidden"]
+    );
+    let owner_cursor = load_nodes_bbox_after_id_from_postgres(
+        &pool,
+        53.4,
+        53.6,
+        9.9,
+        10.1,
+        1,
+        "rp-a-public",
+        Some("rp-private-owner"),
+    )
+    .await
+    .expect("owner cursor");
+    assert_eq!(ids(owner_cursor), vec!["rp-b-private"]);
+    clean(&pool).await;
+}
+
+/// A canonical private node can be absent from the process read projection
+/// while a legacy edge is untyped and collides with a public account ID.
+/// PostgreSQL must disambiguate it instead of assuming the account grants access.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn untyped_account_edge_collision_with_unprojected_node_is_hidden() {
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_accounts
+            (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)
+         VALUES
+            ('rp-collision','garnrolle','Synthetic Account','not_on_map',0,FALSE,'weber','{}','{}'),
+            ('rp-only-account','garnrolle','Other Account','not_on_map',0,FALSE,'weber','{}','{}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed canonical account identities");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES
+            ('rp-collision','place','Confidential node',53.50,10.00,'{}'::jsonb,'private'),
+            ('rp-public-target','place','Public target',53.55,10.00,'{}'::jsonb,'public')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed colliding and public node");
+    sqlx::query(
+        "INSERT INTO domain_edges (id,source_id,target_id,edge_kind,payload)
+         VALUES
+            ('rp-untyped-collision','rp-collision','rp-public-target','reference','{}'::jsonb),
+            ('rp-untyped-account','rp-only-account','rp-public-target','reference','{}'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed untyped old edges");
+    let state = postgres_bbox_route_state(pool.clone());
+    *state.accounts.write().await = load_accounts_from_postgres(&pool).await.expect("accounts");
+    let mut nodes = load_nodes_from_postgres(&pool)
+        .await
+        .expect("node read cache");
+    assert!(
+        nodes.remove("rp-collision").is_some(),
+        "simulate omitted private node"
+    );
+    *state.nodes.write().await = nodes;
+    *state.edges.write().await = load_edges_from_postgres(&pool).await.expect("edge cache");
+    let app = Router::new().merge(api_router()).with_state(state);
+    let list = app
+        .clone()
+        .oneshot(Request::get("/edges").body(body::Body::empty()).unwrap())
+        .await
+        .expect("list legacy edges");
+    assert_eq!(list.status(), axum::http::StatusCode::OK);
+    let content = String::from_utf8(
+        body::to_bytes(list.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("UTF-8");
+    assert!(
+        !content.contains("rp-untyped-collision"),
+        "private collision leaked: {content}"
+    );
+    assert!(
+        content.contains("rp-untyped-account"),
+        "legacy true account link disappeared"
+    );
+    let blocked = app
+        .clone()
+        .oneshot(
+            Request::get("/edges/rp-untyped-collision")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("read private collision");
+    assert_eq!(blocked.status(), axum::http::StatusCode::NOT_FOUND);
+    let allowed = app
+        .oneshot(
+            Request::get("/edges/rp-untyped-account")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("read real legacy account");
+    assert_eq!(allowed.status(), axum::http::StatusCode::OK);
+    clean(&pool).await;
+}
+
+// A real PostgreSQL + HTTP proof for the delayed search fence on both aliases.
+// The handler simulates SQL candidate selection followed by ranking; the
+// external embedding boundary is covered in the T006 service proof.
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn search_aliases_fence_sql_candidates_until_http_response() {
+    use axum::{middleware::from_fn_with_state, response::IntoResponse, routing::get, Json};
+    use tokio::{
+        sync::{oneshot, Notify},
+        time::{sleep, timeout, Duration},
+    };
+    use weltgewebe_api::middleware::domain_projection::{
+        acquire_search_privacy_fence, ensure_current_domain_projection,
+    };
+
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES ('rp-search-fence','place','Private Search Marker',53.6,10.0,'{}'::jsonb,'public')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed public searchable node");
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("load public projection");
+
+    for path in ["/search", "/nodes/search"] {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = Router::new()
+            .route(
+                path,
+                get({
+                    let pool = pool.clone();
+                    let state = state.clone();
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    move || {
+                        let pool = pool.clone();
+                        let state = state.clone();
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        async move {
+                            // Match the actual search's canonical selection
+                            // after (not during) the embedding provider phase.
+                            let fence = acquire_search_privacy_fence(&state, None)
+                                .await
+                                .expect("acquire delayed search privacy fence")
+                                .expect("anonymous search authorized");
+                            let title: String = sqlx::query_scalar(
+                                "SELECT title FROM domain_nodes
+                                 WHERE id='rp-search-fence' AND search_visibility='public'",
+                            )
+                            .fetch_one(&pool)
+                            .await
+                            .expect("read still-public SQL search candidate");
+                            entered.notify_one();
+                            release.notified().await; // simulated ranking/JSON
+                            let response =
+                                Json(serde_json::json!({"title": title})).into_response();
+                            fence
+                                .finish(response)
+                                .await
+                                .expect("release search privacy fence")
+                        }
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                state.clone(),
+                ensure_current_domain_projection,
+            ))
+            .with_state(state.clone());
+
+        let reader = tokio::spawn(async move {
+            app.oneshot(Request::get(path).body(body::Body::empty()).unwrap())
+                .await
+                .expect("search HTTP response")
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("search selected SQL candidate before visibility commit");
+
+        let other_pool = direct_pool().await;
+        let (pid_tx, pid_rx) = oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let mut connection = other_pool
+                .acquire()
+                .await
+                .expect("separate writer connection");
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("writer PID");
+            pid_tx.send(pid).expect("send writer PID");
+            sqlx::query(
+                "UPDATE domain_nodes SET search_visibility='private'
+                 WHERE id='rp-search-fence'",
+            )
+            .execute(&mut *connection)
+            .await
+            .expect("cross-process private commit");
+        });
+        let writer_pid = timeout(Duration::from_secs(3), pid_rx)
+            .await
+            .expect("writer connection ready")
+            .expect("writer PID available");
+        // A mere delay could be falsely green on a slow CI runner: demand
+        // the real PostgreSQL blocking PID while the HTTP response is held.
+        let blockers = timeout(Duration::from_secs(4), async {
+            loop {
+                let blocker_pids: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+                    .bind(writer_pid)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read actual PostgreSQL lock blockers");
+                if !blocker_pids.is_empty() {
+                    break blocker_pids;
+                }
+                assert!(
+                    !writer.is_finished(),
+                    "private commit overtook search response on {path}"
+                );
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("writer must wait for held HTTP privacy fence");
+        assert!(
+            !blockers.is_empty(),
+            "actual PostgreSQL lock wait on {path}"
+        );
+
+        release.notify_one();
+        let response = timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("complete held search response")
+            .expect("search handler task");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(
+            &body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("search JSON bytes"),
+        )
+        .expect("parse search JSON");
+        assert_eq!(json["title"], "Private Search Marker");
+        timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("private commit after search reply")
+            .expect("writer task");
+
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility='public'
+             WHERE id='rp-search-fence'",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset public synthetic node for next alias");
+        state
+            .refresh_domain_projection_if_stale()
+            .await
+            .expect("refresh reset search visibility");
+    }
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn sensitive_get_holds_global_visibility_version_fence_until_response() {
+    use axum::{middleware::from_fn_with_state, routing::get, Json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    use tokio::time::{timeout, Duration};
+    use weltgewebe_api::middleware::domain_projection::ensure_current_domain_projection;
+
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES ('rp-fenced-privacy','place','Previously Public',53.6,10.0,'{}'::jsonb,'public')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed public node");
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("materialize initial public projection");
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/nodes/fence-probe",
+            get({
+                let state = state.clone();
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let calls = Arc::clone(&calls);
+                move || {
+                    let state = state.clone();
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        // Read the same process-local projection that node and
+                        // related account/edge APIs authorize against.
+                        let visibility = state
+                            .nodes
+                            .read()
+                            .await
+                            .get("rp-fenced-privacy")
+                            .map(|node| node.search_visibility.as_str().to_string());
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            // Keep the first response incomplete while a second
+                            // DB connection attempts public -> private.
+                            entered.notify_one();
+                            release.notified().await;
+                        }
+                        Json(serde_json::json!({ "visibility": visibility }))
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+
+    let first_request = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::get("/nodes/fence-probe")
+                    .body(body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("first fenced GET")
+        }
+    });
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("GET reached cache-backed handler");
+
+    // A different PgPool emulates a second API process with no shared Tokio
+    // RwLock. Its visibility commit updates domain_projection_state through the
+    // installed trigger and MUST wait for the in-flight response's SQL row fence.
+    let other_pool = direct_pool().await;
+    let mut writer = tokio::spawn(async move {
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility='private'
+             WHERE id='rp-fenced-privacy'",
+        )
+        .execute(&other_pool)
+        .await
+        .expect("cross-process visibility change");
+    });
+    assert!(
+        timeout(Duration::from_millis(200), &mut writer)
+            .await
+            .is_err(),
+        "the private visibility commit must not overtake an in-flight public response",
+    );
+
+    release.notify_one();
+    let initial = timeout(Duration::from_secs(5), first_request)
+        .await
+        .expect("public response completed")
+        .expect("GET task");
+    assert_eq!(initial.status(), axum::http::StatusCode::OK);
+    let initial_json: serde_json::Value = serde_json::from_slice(
+        &body::to_bytes(initial.into_body(), usize::MAX)
+            .await
+            .expect("public response bytes"),
+    )
+    .expect("public response JSON");
+    assert_eq!(initial_json["visibility"], "public");
+    timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("writer commits after read fence releases")
+        .expect("writer task");
+
+    let later = app
+        .oneshot(
+            Request::get("/nodes/fence-probe")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("second fenced GET");
+    assert_eq!(later.status(), axum::http::StatusCode::OK);
+    let later_json: serde_json::Value = serde_json::from_slice(
+        &body::to_bytes(later.into_body(), usize::MAX)
+            .await
+            .expect("private response bytes"),
+    )
+    .expect("private response JSON");
+    assert_eq!(
+        later_json["visibility"], "private",
+        "next GET must refresh the committed PostgreSQL visibility"
+    );
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn queued_visibility_writer_precedes_new_privacy_get_across_api_states() {
+    use axum::{middleware::from_fn_with_state, routing::get, Json};
+    use tokio::{
+        sync::Notify,
+        time::{sleep, timeout, Duration},
+    };
+    use weltgewebe_api::middleware::domain_projection::ensure_current_domain_projection;
+
+    let pool = prepare_pool().await;
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES ('rp-fair-writer','place','Writer fairness',53.6,10.0,'{}'::jsonb,'public')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed fair writer fixture");
+
+    // Independent app states and SQL pools model separate API replicas; a
+    // local Tokio gate in either replica must not hide a PostgreSQL bypass.
+    let first_state = postgres_bbox_route_state(pool.clone());
+    first_state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("first API state ready");
+    let second_pool = direct_pool().await;
+    let second_state = postgres_bbox_route_state(second_pool);
+    second_state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("second independent API state ready");
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let app1 = Router::new()
+        .route(
+            "/nodes/fair-queue",
+            get({
+                let state = first_state.clone();
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move || {
+                    let state = state.clone();
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    async move {
+                        let visibility = state
+                            .nodes
+                            .read()
+                            .await
+                            .get("rp-fair-writer")
+                            .map(|node| node.search_visibility.as_str().to_string());
+                        entered.notify_one();
+                        release.notified().await;
+                        Json(serde_json::json!({"visibility": visibility}))
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            first_state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(first_state);
+    let app2 = Router::new()
+        .route(
+            "/nodes/fair-queue",
+            get({
+                let state = second_state.clone();
+                move || {
+                    let state = state.clone();
+                    async move {
+                        let visibility = state
+                            .nodes
+                            .read()
+                            .await
+                            .get("rp-fair-writer")
+                            .map(|node| node.search_visibility.as_str().to_string());
+                        Json(serde_json::json!({"visibility": visibility}))
+                    }
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            second_state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(second_state);
+
+    let first = tokio::spawn(async move {
+        app1.oneshot(
+            Request::get("/nodes/fair-queue")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("first API response")
+    });
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("first GET must own its full-response PG generation fence");
+
+    let writer_pool = direct_pool().await;
+    let writer = tokio::spawn(async move {
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility='private'
+             WHERE id='rp-fair-writer' /* fair-writer-probe */",
+        )
+        .execute(&writer_pool)
+        .await
+        .expect("actual privacy writer commits");
+    });
+    // Do not guess that the writer is waiting: prove a live PG lock conflict.
+    let mut observed_waiting_writer = false;
+    for _ in 0..70 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE query LIKE '%fair-writer-probe%'
+               AND wait_event_type = 'Lock'
+               AND cardinality(pg_blocking_pids(pid)) > 0
+               AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("observe actual PostgreSQL lock wait");
+        if waiting > 0 {
+            observed_waiting_writer = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        observed_waiting_writer,
+        "privacy writer never reached PG lock wait"
+    );
+
+    let mut second = tokio::spawn(async move {
+        app2.oneshot(
+            Request::get("/nodes/fair-queue")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("second API response")
+    });
+    let early_second = timeout(Duration::from_millis(400), &mut second).await;
+    let barged = early_second.is_ok();
+
+    release.notify_one();
+    let first_result = timeout(Duration::from_secs(6), first)
+        .await
+        .expect("first response completes")
+        .expect("first task");
+    assert_eq!(first_result.status(), axum::http::StatusCode::OK);
+    timeout(Duration::from_secs(6), writer)
+        .await
+        .expect("queued visibility writer must commit after first reader")
+        .expect("writer task");
+    let second_result = match early_second {
+        Ok(result) => result.expect("second task"),
+        Err(_) => timeout(Duration::from_secs(6), second)
+            .await
+            .expect("second reader continues after writer")
+            .expect("second task"),
+    };
+    assert_eq!(second_result.status(), axum::http::StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(
+        &body::to_bytes(second_result.into_body(), usize::MAX)
+            .await
+            .expect("second response bytes"),
+    )
+    .expect("parse second JSON");
+    assert!(
+        !barged,
+        "new FOR SHARE privacy GET bypassed an already queued public->private writer",
+    );
+    assert_eq!(
+        parsed["visibility"], "private",
+        "second independent API response must reflect committed privacy change"
+    );
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn own_profile_get_does_not_hold_generation_row_while_waiting_for_profile_writer() {
+    use axum::{routing::get, Json};
+    use tokio::{
+        sync::Notify,
+        time::{timeout, Duration},
+    };
+    use weltgewebe_api::middleware::domain_projection::ensure_current_domain_projection;
+
+    let pool = prepare_pool().await;
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("initial projection loaded");
+
+    let account_writer = state.accounts_persist.lock().await;
+    let reached_handler = Arc::new(Notify::new());
+    let app = Router::new()
+        .route(
+            "/accounts/me/profile",
+            get({
+                let state = state.clone();
+                let reached_handler = Arc::clone(&reached_handler);
+                move || {
+                    let state = state.clone();
+                    let reached_handler = Arc::clone(&reached_handler);
+                    async move {
+                        reached_handler.notify_one();
+                        let _profile_guard = state.accounts_persist.lock().await;
+                        Json(serde_json::json!({"ok": true}))
+                    }
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state.clone());
+
+    let reader = tokio::spawn(async move {
+        app.oneshot(
+            Request::get("/accounts/me/profile")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("own profile request")
+    });
+    timeout(Duration::from_secs(5), reached_handler.notified())
+        .await
+        .expect("profile handler was admitted and is waiting for accounts_persist");
+
+    // Account PATCH owns accounts_persist before its domain_accounts UPDATE.
+    // Simulate the trigger's exact singleton row update from a second
+    // connection while the GET is still waiting for the writer mutex.
+    // If GET holds a global FOR SHARE lock already, neither can finish.
+    let second_pool = direct_pool().await;
+    timeout(
+        Duration::from_secs(2),
+        sqlx::query(
+            "UPDATE domain_projection_state SET version = version + 1 WHERE singleton = TRUE",
+        )
+        .execute(&second_pool),
+    )
+    .await
+    .expect("profile writer cannot wait on GET's generation lock")
+    .expect("simulated profile writer committed");
+
+    drop(account_writer);
+    let response = timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("GET completed after profile writer")
+        .expect("GET task");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn authenticated_node_get_does_not_hold_generation_lock_during_session_io() {
+    use axum::{middleware::from_fn_with_state, routing::get};
+    use tokio::time::{timeout, Duration};
+    use weltgewebe_api::{
+        auth::session_db::DbSessionStore,
+        middleware::{auth::auth_middleware, domain_projection::ensure_current_domain_projection},
+        routes::auth::SESSION_COOKIE_NAME,
+    };
+
+    let pool = prepare_pool().await;
+    let account_id = "rp-guest-exit-fence";
+    sqlx::query(
+        "INSERT INTO domain_accounts \
+         (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload) \
+         VALUES ($1,'garnrolle','Guest exit fence','not_on_map',0,FALSE,'gast','{}','{}')",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("seed guest");
+    let mut state = postgres_bbox_route_state(pool.clone());
+    state.sessions = SessionBackend::new(DbSessionStore::new(pool.clone()));
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("initial current account cache");
+    let session = state
+        .sessions
+        .create(account_id.to_string(), None)
+        .await
+        .expect("create DB-backed session");
+    sqlx::query("UPDATE sessions SET last_active = NOW() - INTERVAL '10 minutes' WHERE id = $1")
+        .bind(&session.id)
+        .execute(&pool)
+        .await
+        .expect("force real session touch");
+
+    // The actual request nesting must match the production Router: session
+    // get/touch on the outside, then the canonical PostgreSQL visibility fence.
+    let app = Router::new()
+        .route(
+            "/nodes/fence-probe",
+            get(|| async { axum::http::StatusCode::OK }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state);
+
+    let mut exiting = pool.begin().await.expect("guest exit transaction");
+    let locked = sqlx::query("DELETE FROM sessions WHERE id = $1")
+        .bind(&session.id)
+        .execute(&mut *exiting)
+        .await
+        .expect("lock session row before domain node reader");
+    assert_eq!(locked.rows_affected(), 1);
+
+    let mut reader = tokio::spawn(async move {
+        app.oneshot(
+            Request::get("/nodes/fence-probe")
+                .header("cookie", format!("{SESSION_COOKIE_NAME}={}", session.id))
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("GET with a concurrently departing guest")
+    });
+
+    assert!(
+        timeout(Duration::from_millis(150), &mut reader)
+            .await
+            .is_err(),
+        "the GET should be awaiting the session row before exit commits"
+    );
+
+    // On the broken ordering, the GET already owns SELECT generation FOR
+    // SHARE and waits for this session DELETE, while this account DELETE
+    // waits for the generation row: an application-level cross-connection
+    // deadlock. The writer must commit while the GET is still pending.
+    timeout(
+        Duration::from_secs(3),
+        sqlx::query("DELETE FROM domain_accounts WHERE id = $1")
+            .bind(account_id)
+            .execute(&mut *exiting),
+    )
+    .await
+    .expect("guest exit must not wait for the GET generation fence")
+    .expect("delete departing account");
+    exiting.commit().await.expect("commit guest exit");
+    let response = timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("GET resumed after guest exit")
+        .expect("GET task");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "deleted guest sessions must not retain authorization after the exit commit"
+    );
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated DATABASE_URL"]
+#[serial]
+async fn authenticated_role_is_revalidated_after_post_session_projection_refresh() {
+    use axum::{middleware::from_fn_with_state, routing::get};
+    use weltgewebe_api::{
+        auth::role::Role,
+        middleware::{auth::AuthContext, domain_projection::ensure_current_domain_projection},
+    };
+
+    let pool = prepare_pool().await;
+    let account_id = "rp-guarded-role-downgrade";
+    sqlx::query(
+        "INSERT INTO domain_accounts \
+         (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload) \
+         VALUES ($1,'garnrolle','Guarded role','not_on_map',0,FALSE,'admin','{}','{}')",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("seed admin");
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("initial cached admin");
+    let stale_authenticated = AuthContext {
+        authenticated: true,
+        account_id: Some(account_id.to_string()),
+        device_id: None,
+        role: Role::Admin,
+        expires_at: None,
+    };
+    sqlx::query("UPDATE domain_accounts SET role = 'gast' WHERE id = $1")
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .expect("admin was downgraded in another API process");
+
+    let app = Router::new()
+        .route(
+            "/nodes/role-probe",
+            get(|| async { axum::http::StatusCode::OK }),
+        )
+        .layer(from_fn_with_state(
+            state.clone(),
+            ensure_current_domain_projection,
+        ))
+        .with_state(state);
+    let mut request = Request::get("/nodes/role-probe")
+        .body(body::Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(stale_authenticated);
+
+    let response = app.oneshot(request).await.expect("guarded request");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "a stale Admin session must not retain authority after the current DB generation downgrades it"
+    );
+    clean(&pool).await;
+}
+
+// A genuine HTTP POST race: the proposal commits while its node is public.
+// Pause its post-commit Faden projection on the real account advisory lock;
+// a separate PostgreSQL pool can then revoke the node before the POST replies.
+#[tokio::test]
+#[serial]
+#[ignore = "requires an isolated DATABASE_URL"]
+async fn proposal_post_response_masks_target_after_visibility_commit() {
+    use axum::{routing::post, Extension};
+    use sha2::{Digest, Sha256};
+    use tokio::time::{sleep, timeout, Duration};
+    use weltgewebe_api::{
+        auth::role::Role, middleware::auth::AuthContext, routes::governance::create_proposal,
+    };
+    let pool = direct_pool().await;
+    run_migrations(&pool).await;
+    let owner = "2fbc2488-45e9-4a96-84cc-2f8df70ed881";
+    let target = "rp-post-fence-target";
+    // Clean only our synthetic IDs; proposals must precede referenced nodes.
+    sqlx::query("DELETE FROM governance_proposals WHERE applicant_account_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("remove old proof proposal");
+    sqlx::query("DELETE FROM domain_edges WHERE source_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("remove old Faden");
+    sqlx::query("DELETE FROM domain_nodes WHERE id=$1")
+        .bind(target)
+        .execute(&pool)
+        .await
+        .expect("remove old target");
+    sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("remove old actor");
+
+    sqlx::query(
+        "INSERT INTO domain_accounts
+          (id,kind,title,map_state,radius_m,disabled,role,public_payload,private_payload)
+         VALUES ($1,'garnrolle','Proof Weber','not_on_map',0,FALSE,'weber','{}','{}')",
+    )
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .expect("seed Weber account");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
+         VALUES ($1,'place','Previously Public Target',53.6,10.0,'{}'::jsonb,'public')",
+    )
+    .bind(target)
+    .execute(&pool)
+    .await
+    .expect("seed public target");
+    let state = postgres_bbox_route_state(pool.clone());
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("load account projection");
+
+    // This is the precise account-lifecycle lock the post-commit Faden uses.
+    let mut h = Sha256::new();
+    h.update(b"weltgewebe:account-lifecycle:v1");
+    h.update((owner.len() as u64).to_be_bytes());
+    h.update(owner.as_bytes());
+    let digest = h.finalize();
+    let key = i64::from_be_bytes(digest[..8].try_into().expect("hash prefix"));
+    let other_pool = direct_pool().await;
+    let mut held_faden = other_pool.begin().await.expect("begin blocker");
+    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+        .bind(key)
+        .execute(&mut *held_faden)
+        .await
+        .expect("hold Faden advisory lock");
+
+    let auth = AuthContext {
+        authenticated: true,
+        account_id: Some(owner.to_owned()),
+        device_id: None,
+        role: Role::Weber,
+        expires_at: None,
+    };
+    let app = Router::new()
+        .route("/proposals", post(create_proposal))
+        .layer(Extension(auth))
+        .with_state(state);
+    let req = Request::post("/proposals")
+        .header("content-type", "application/json")
+        .body(body::Body::from(
+            serde_json::json!({
+                "kind": "sachantrag",
+                "title": "Proof public target",
+                "target_node_id": target
+            })
+            .to_string(),
+        ))
+        .expect("real HTTP POST");
+    let mut task = tokio::spawn(async move { app.oneshot(req).await.expect("POST handler") });
+
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM governance_proposals
+                 WHERE applicant_account_id=$1 AND target_node_id=$2",
+            )
+            .bind(owner)
+            .bind(target)
+            .fetch_one(&other_pool)
+            .await
+            .expect("read committed proof proposal");
+            if n == 1 {
+                break;
+            }
+            assert!(!task.is_finished(), "POST finished before proposal commit");
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("proposal commit was not observable");
+    assert!(
+        timeout(Duration::from_millis(200), &mut task)
+            .await
+            .is_err(),
+        "POST was not held after the durable proposal commit",
+    );
+    // This must commit after the original proposal but before its JSON reply.
+    timeout(
+        Duration::from_secs(4),
+        sqlx::query("UPDATE domain_nodes SET search_visibility='private' WHERE id=$1")
+            .bind(target)
+            .execute(&other_pool),
+    )
+    .await
+    .expect("writer did not commit while Faden blocked")
+    .expect("commit private target");
+    held_faden
+        .rollback()
+        .await
+        .expect("release synthetic Faden blocker");
+
+    let response = timeout(Duration::from_secs(8), task)
+        .await
+        .expect("POST completes")
+        .expect("POST task");
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let json: serde_json::Value = serde_json::from_slice(
+        &body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("POST JSON bytes"),
+    )
+    .expect("decode POST response");
+    assert_eq!(json["kind"], "sachantrag");
+    assert!(
+        json.get("target_node_id").is_none() && json.get("target_node_title").is_none(),
+        "public-to-private committed before POST reply but target leaked: {json}",
+    );
+
+    sqlx::query("DELETE FROM governance_proposals WHERE applicant_account_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("clean proof proposal");
+    sqlx::query("DELETE FROM domain_edges WHERE source_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("clean proof Faden");
+    sqlx::query("DELETE FROM domain_nodes WHERE id=$1")
+        .bind(target)
+        .execute(&pool)
+        .await
+        .expect("clean proof target");
+    sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("clean proof actor");
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires an isolated DATABASE_URL"]
+async fn public_proposal_http_read_fences_target_visibility_through_response() {
+    use axum::{routing::get, Extension};
+    use tokio::time::{sleep, timeout, Duration};
+    use weltgewebe_api::{
+        auth::role::Role,
+        governance::create_sach_proposal,
+        middleware::auth::AuthContext,
+        routes::governance::{get_proposal, list_proposals},
+    };
+
+    // A previous failed isolated run can have left a proposal referencing
+    // this fixture node. Clear only our own proposal before generic rp-* cleanup.
+    let pool = direct_pool().await;
+    run_migrations(&pool).await;
+    sqlx::query(
+        "DELETE FROM governance_proposals WHERE applicant_account_id = 'rp-proposal-fence-author'",
+    )
+    .execute(&pool)
+    .await
+    .expect("clean any previous failed proposal proof");
+    clean(&pool).await;
+    let account = "rp-proposal-fence-author";
+    let target = "rp-proposal-fence-target";
+    sqlx::query(
+        "INSERT INTO domain_accounts \
+         (id, kind, title, map_state, radius_m, disabled, role, public_payload, private_payload) \
+         VALUES ($1, 'garnrolle', 'Proof author', 'not_on_map', 0, FALSE, 'weber', '{}', '{}')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("seed proposal author");
+    sqlx::query(
+        "INSERT INTO domain_nodes \
+         (id, kind, title, lat, lon, payload, search_visibility) \
+         VALUES ($1, 'place', 'Private-after-commit target', 53.5, 9.9, '{}'::jsonb, 'public')",
+    )
+    .bind(target)
+    .execute(&pool)
+    .await
+    .expect("seed public proposal target");
+    let proposal = create_sach_proposal(
+        &pool,
+        account,
+        "Proof author",
+        "Visibility fence",
+        None,
+        Some(target),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("create proposal referencing public target");
+
+    // The actual Governance HTTP handlers run with a deliberately anonymous
+    // authentication context. No test-only middleware is allowed to supply the
+    // visibility fence that production handlers must own after finalize_due.
+    let app = Router::new()
+        .route("/proposals", get(list_proposals))
+        .route("/proposals/{id}", get(get_proposal))
+        .with_state(postgres_bbox_route_state(pool.clone()))
+        .layer(Extension(AuthContext {
+            authenticated: false,
+            account_id: None,
+            device_id: None,
+            role: Role::Gast,
+            expires_at: None,
+        }));
+
+    for path in [
+        format!("/proposals/{}", proposal.id),
+        "/proposals".to_string(),
+    ] {
+        sqlx::query("UPDATE domain_nodes SET search_visibility = 'public' WHERE id = $1")
+            .bind(target)
+            .execute(&pool)
+            .await
+            .expect("regrant public fixture");
+
+        // Block the proposal SELECT on its veto-count subquery. This creates
+        // an observable interval during response construction without any
+        // synthetic pause or production-only instrumentation.
+        let mut blocker = pool.begin().await.expect("begin veto table blocker");
+        sqlx::query("LOCK TABLE governance_vetoes IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .expect("hold unrelated veto read until test releases it");
+
+        let request = tokio::spawn({
+            let app = app.clone();
+            let path = path.clone();
+            async move {
+                app.oneshot(Request::get(path).body(body::Body::empty()).unwrap())
+                    .await
+                    .expect("public proposal HTTP response")
+            }
+        });
+
+        let mut blocked_select_seen = false;
+        for _ in 0..150 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks \
+                 WHERE relation = 'governance_vetoes'::regclass AND NOT granted",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("observe real PostgreSQL query waiter");
+            if waiting > 0 {
+                blocked_select_seen = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            blocked_select_seen,
+            "real HTTP proposal query never reached veto table"
+        );
+        assert!(
+            !request.is_finished(),
+            "request must be in flight before privacy mutation"
+        );
+
+        // An independent PgPool (no Tokio/cache sharing) commits the canonical
+        // privacy change. It may not overtake the in-flight public response.
+        let other_pool = direct_pool().await;
+        let mut writer = tokio::spawn(async move {
+            sqlx::query(
+                "UPDATE domain_nodes SET search_visibility = 'private' \
+                 WHERE id = 'rp-proposal-fence-target'",
+            )
+            .execute(&other_pool)
+            .await
+        });
+        // Do not treat slow scheduling/connection setup as proof of privacy.
+        // Observe a real PostgreSQL lock wait from THIS node writer, blocked
+        // by a backend that holds RowShareLock on the generation singleton.
+        let mut writer_blocked_on_privacy_fence = false;
+        for _ in 0..150 {
+            if writer.is_finished() {
+                break;
+            }
+            let waiting: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM pg_stat_activity writer
+                   WHERE writer.datname = current_database()
+                     AND writer.wait_event_type = 'Lock'
+                     AND writer.query LIKE 'UPDATE domain_nodes SET search_visibility = %'
+                     AND EXISTS (
+                         SELECT 1 FROM pg_locks guard
+                         WHERE guard.pid = ANY(pg_blocking_pids(writer.pid))
+                           AND guard.relation = 'domain_projection_state'::regclass
+                           AND guard.mode = 'RowShareLock' AND guard.granted
+                     )"#,
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("inspect exact blocked privacy writer");
+            if waiting > 0 {
+                writer_blocked_on_privacy_fence = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            writer_blocked_on_privacy_fence,
+            "independent writer did not wait on the in-flight proposal generation fence at {path}",
+        );
+        assert!(
+            timeout(Duration::from_millis(300), &mut writer)
+                .await
+                .is_err(),
+            "public-to-private DB commit overtook the in-flight proposal response on {path}",
+        );
+        blocker
+            .rollback()
+            .await
+            .expect("release veto table blocker");
+        let initial = timeout(Duration::from_secs(7), request)
+            .await
+            .expect("public response finished")
+            .expect("public HTTP task");
+        assert_eq!(initial.status(), axum::http::StatusCode::OK);
+        let initial_bytes = body::to_bytes(initial.into_body(), usize::MAX)
+            .await
+            .expect("serialize public response");
+        let initial_body: serde_json::Value =
+            serde_json::from_slice(&initial_bytes).expect("decode public proposal JSON");
+        assert!(
+            initial_body.to_string().contains(target),
+            "public target must be present before private commit at {path}",
+        );
+        timeout(Duration::from_secs(7), writer)
+            .await
+            .expect("privacy writer completes after read fence drops")
+            .expect("privacy writer task")
+            .expect("privacy writer commit");
+
+        let private = app
+            .clone()
+            .oneshot(
+                Request::get(path.clone())
+                    .body(body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("private proposal HTTP response");
+        assert_eq!(private.status(), axum::http::StatusCode::OK);
+        let private_bytes = body::to_bytes(private.into_body(), usize::MAX)
+            .await
+            .expect("serialize private response");
+        let private_body: serde_json::Value =
+            serde_json::from_slice(&private_bytes).expect("decode private proposal JSON");
+        assert!(
+            !private_body.to_string().contains(target),
+            "private target ID leaked in later HTTP proposal response at {path}",
+        );
+    }
+
+    sqlx::query("DELETE FROM governance_proposals WHERE id = $1::uuid")
+        .bind(&proposal.id)
+        .execute(&pool)
+        .await
+        .expect("clean proposal fixture before deleting target");
     clean(&pool).await;
 }
