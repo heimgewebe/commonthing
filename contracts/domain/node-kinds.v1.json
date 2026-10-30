@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "id": "commonthing.node-kinds.v2",
+  "description": "Canonical published node kinds; node itself is a supertype, not an assignable kind.",
+  "kinds": [
+    {
+      "id": "place",
+      "label": "Ort",
+      "description": "Raeumlicher Bezugspunkt wie Gemeinschaftsgarten oder Werkstatt."
+    },
+    {
+      "id": "resource",
+      "label": "Ressource",
+      "description": "Nutzbares materielles oder immaterielles Gut wie Lastenrad oder Werkzeug."
+    },
+    {
+      "id": "project",
+      "label": "Projekt",
+      "description": "Gemeinschaftliches Vorhaben mit Ziel und fortlaufender Arbeit."
+    },
+    {
+      "id": "event",
+      "label": "Ereignis",
+      "description": "Zeitlich bestimmtes Geschehen wie Treffen oder Nachbarschaftsfest."
+    },
+    {
+      "id": "need",
+      "label": "Bedarf",
+      "description": "Konkreter Bedarf nach Ressourcen oder Unterstuetzung."
+    },
+    {
+      "id": "offer",
+      "label": "Angebot",
+      "description": "Angebotene Leistung oder Unterstuetzung."
+    }
+  ]
+}

@@ -25,6 +25,7 @@ summary: Navigationsindex zu den aktuellen Verträgen, Betriebsdokumenten, Arbei
 ## Kanonische Produktverträge
 
 - [Garnrolle, Knoten und Faden](specs/garnrolle-knoten-faden.md)
+- [Knotenarten (V2)](specs/knotenarten.md)
 - [UI-Interaktionsvertrag](specs/ui-interaction.md)
 - [UI-Zustandsmaschine](specs/ui-state-machine.md)
 - [Kartenerlebnis](specs/map-experience.md)

@@ -1,6 +1,7 @@
 import type { Page } from "@playwright/test";
 import { demoNodes, demoAccounts } from "../../src/lib/demo/demoData";
 import { listPublicEdges } from "../../src/lib/demo/resolvers";
+import { isNodeKind } from "../../src/lib/ui/productLanguage";
 import { FADEN_LIFETIME_MS } from "../../src/lib/map/edgeLifecycle";
 
 /**
@@ -186,7 +187,7 @@ export async function mockApiResponses(
       if (
         !validOperationId ||
         !title ||
-        !kind ||
+        !isNodeKind(kind) ||
         !address ||
         typeof location?.lat !== "number" ||
         typeof location?.lon !== "number"
@@ -278,7 +279,7 @@ export async function mockApiResponses(
           | undefined;
         if (
           !title ||
-          !kind ||
+          !isNodeKind(kind) ||
           !address ||
           typeof location?.lat !== "number" ||
           typeof location?.lon !== "number"

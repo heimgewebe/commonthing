@@ -92,7 +92,7 @@ function benchmarkNode(index: number, visible: boolean) {
   const row = Math.floor(index / 50) % 50;
   return {
     id: `benchmark-node-${index.toString().padStart(6, "0")}`,
-    kind: "Knoten",
+    kind: "place",
     title: `Benchmark ${index}`,
     summary: "Deterministic map cardinality proof node",
     location: visible

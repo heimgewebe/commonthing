@@ -118,7 +118,7 @@ async fn put_projection(
     .bind(vec!["fahrrad", "reparatur"])
     .bind("Fahrradwerkstatt und gemeinschaftliche Reparaturhilfe")
     .bind("de")
-    .bind("Werkstatt")
+    .bind("place")
     .bind(status)
     .bind(scopes)
     .bind(embedding)
@@ -174,7 +174,7 @@ async fn postgres_foundation_enforces_visibility_generation_and_revision_order()
     ] {
         sqlx::query(
             "INSERT INTO domain_nodes (id, kind, title, payload)
-             VALUES ($1, 'Werkstatt', $2, '{}'::jsonb)",
+             VALUES ($1, 'place', $2, '{}'::jsonb)",
         )
         .bind(id)
         .bind(title)

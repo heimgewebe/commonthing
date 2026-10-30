@@ -11,8 +11,15 @@
     },
     "kind": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 100
+      "enum": [
+        "place",
+        "resource",
+        "project",
+        "event",
+        "need",
+        "offer"
+      ],
+      "description": "One canonical primary node kind; no generic default."
     },
     "title": {
       "type": "string",
