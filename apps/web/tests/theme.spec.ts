@@ -77,6 +77,30 @@ async function expectNoStripePattern(locator: Locator, label: string) {
 }
 
 test.describe("Farbschema", () => {
+  test("lädt lokale Porzellantexturen und setzt Materialfarben beim Moduswechsel zurück", async ({
+    page,
+  }) => {
+    await page.goto("/settings");
+    const select = page.getByTestId("theme-select");
+    for (const mode of ["dark", "light"] as const) {
+      await select.selectOption(mode);
+      await expect(themeRoot(page)).toHaveAttribute("data-color-scheme", mode);
+      const material = await page.evaluate(() => {
+        const style = getComputedStyle(document.documentElement);
+        return {
+          weave: style.getPropertyValue("--context-weave"),
+          color: style.getPropertyValue("--context-material").trim(),
+        };
+      });
+      expect(material.weave).toContain(`/textures/porcelain-${mode}.svg`);
+      expect(material.color).toBe(mode === "dark" ? "#202b33" : "#fbf8f1");
+      const asset = await page.request.get(`/textures/porcelain-${mode}.svg`);
+      expect(asset.ok()).toBe(true);
+      expect(asset.headers()["content-type"]).toContain("image/svg+xml");
+      expect((await asset.body()).length).toBeLessThan(30 * 1024);
+    }
+  });
+
   test("steuert das Farbschema im Einstellungsmenü und behält es auf der Karte", async ({
     page,
   }) => {

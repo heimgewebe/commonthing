@@ -319,9 +319,19 @@
     bottom: 0;
     width: var(--context-panel-width);
     z-index: var(--z-map-context-panel);
-    background: var(--panel);
+    /* Material is painted behind content, never as an overlay on glyphs. */
+    background-color: var(--context-material);
+    background-image:
+      var(--context-weave),
+      linear-gradient(145deg, var(--context-light), transparent 65%);
+    background-size:
+      192px 192px,
+      100% 100%;
+    background-repeat: repeat, no-repeat;
     color: var(--text);
-    box-shadow: -4px 0 16px rgba(0, 0, 0, 0.28);
+    box-shadow:
+      inset 1px 0 0 var(--context-edge),
+      -8px 0 28px var(--context-shade);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -395,7 +405,9 @@
       max-height: none;
       padding-bottom: env(safe-area-inset-bottom);
       border-radius: 18px 18px 0 0;
-      box-shadow: var(--shadow);
+      box-shadow:
+        inset 0 1px 0 var(--context-edge),
+        0 -8px 28px var(--context-shade);
       transition: height var(--motion-ui);
     }
 
