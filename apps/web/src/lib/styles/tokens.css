@@ -7,6 +7,14 @@
   --context-material: var(--panel-solid);
   --context-weave: url("/textures/porcelain-light.svg");
   --context-light: rgba(255, 255, 255, 0.52);
+  /* Shared image layers for large supporting surfaces; preserve their backing. */
+  --panel-porcelain-image:
+    var(--context-weave),
+    linear-gradient(
+      145deg,
+      color-mix(in srgb, var(--context-light) 15%, transparent),
+      transparent 65%
+    );
   --context-edge: rgba(255, 255, 255, 0.72);
   --context-shade: rgba(47, 62, 58, 0.16);
   --panel-border: rgba(42, 68, 63, 0.16);

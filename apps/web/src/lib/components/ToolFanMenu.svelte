@@ -159,7 +159,12 @@
     padding: 0.75rem;
     border: 1px solid var(--panel-border);
     border-radius: 18px;
-    background: var(--panel);
+    background-color: var(--panel);
+    background-image: var(--panel-porcelain-image);
+    background-size:
+      192px 192px,
+      100% 100%;
+    background-repeat: repeat, no-repeat;
     box-shadow: var(--shadow);
     backdrop-filter: blur(var(--map-lens-blur));
     opacity: 0;
@@ -313,7 +318,7 @@
 
   @media (prefers-reduced-transparency: reduce) {
     .fan-panel:not(.root) {
-      background: var(--panel-solid);
+      background-color: var(--panel-solid);
       backdrop-filter: none;
     }
   }

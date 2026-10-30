@@ -44,6 +44,11 @@ body {
 
 .panel {
   background: var(--panel);
+  background-image: var(--panel-porcelain-image);
+  background-size:
+    192px 192px,
+    100% 100%;
+  background-repeat: repeat, no-repeat;
   border: 1px solid var(--panel-border);
   border-radius: var(--radius);
   padding: 0.75rem;

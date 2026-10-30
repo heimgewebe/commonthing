@@ -91,6 +91,11 @@
   border: 1px solid var(--wg-border);
   border-radius: var(--radius);
   background: color-mix(in srgb, var(--wg-surface) 94%, transparent);
+  background-image: var(--panel-porcelain-image);
+  background-size:
+    192px 192px,
+    100% 100%;
+  background-repeat: repeat, no-repeat;
   box-shadow: var(--shadow);
 }
 
