@@ -1809,7 +1809,9 @@ async fn postgres_edges_reject_node_references_missing_from_cache() -> Result<()
     let in_dir = tmp.path().join("in");
     write_lines(
         &in_dir.join("demo.nodes.jsonl"),
-        &[r#"{"id":"known-public","kind":"place","title":"Public node","location":{"lat":53.5,"lon":10.0}}"#],
+        &[
+            r#"{"id":"known-public","kind":"place","title":"Public node","location":{"lat":53.5,"lon":10.0}}"#,
+        ],
     );
     write_lines(
         &in_dir.join("demo.edges.jsonl"),
