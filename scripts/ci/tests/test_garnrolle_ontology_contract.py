@@ -58,13 +58,22 @@ class GarnrolleOntologyContractTests(unittest.TestCase):
             self.assertEqual(len(initial), 6)
             self.assertTrue({node["kind"] for node in initial} <= valid_kinds)
             # Simulate an existing demo installation with old values, not a fresh directory.
-            initial[0]["kind"] = "Ort"
+            # A valid user edit must survive repeated seeding intact.
+            initial[0]["kind"] = "event"
+            initial[0]["title"] = "Bearbeiteter Demo-Ort"
+            initial[0]["created_by_account_id"] = "c8f379cb-dc5a-467a-a771-9f06588365b5"
+            # Legacy kind migration may change only kind; preserve the rest.
             initial[-1]["kind"] = "Knoten"
+            initial[-1]["summary"] = "Eigene Notiz zum Lastenrad"
             path.write_text("".join(json.dumps(node) + "\n" for node in initial))
             upgraded = run_seed()
             self.assertEqual(len(upgraded), 6)
             self.assertTrue({node["kind"] for node in upgraded} <= valid_kinds)
             self.assertEqual({node["id"] for node in upgraded}, {node["id"] for node in initial})
+            by_id = {node["id"]: node for node in upgraded}
+            self.assertEqual(by_id[initial[0]["id"]], initial[0])
+            self.assertEqual(by_id[initial[-1]["id"]]["summary"], "Eigene Notiz zum Lastenrad")
+            self.assertEqual(by_id[initial[-1]["id"]]["kind"], "resource")
             self.assertEqual(upgraded, run_seed())
 
     def test_final_migration_removes_legacy_identity_fail_closed(self) -> None:

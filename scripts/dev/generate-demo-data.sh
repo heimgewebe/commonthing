@@ -63,7 +63,11 @@ ensure_jsonl_line() {
       echo "$canonical_json" >> "$file"
       return 0
     elif [ "$count" -gt 1 ]; then
-      # Case: Duplicates found
+      # Do not overwrite user fields when duplicate reserved demo IDs are ambiguous.
+      if [ -n "$expected_value" ]; then
+        echo "→ duplicate demo node ID $id needs explicit repair; no records changed" >&2
+        return 1
+      fi
       echo "→ migrating: deduplicating $id in $(basename "$file")"
       needs_migration=1
     else
@@ -74,17 +78,32 @@ ensure_jsonl_line() {
         existing_line=$(grep "$match_pattern" "$file")
 
         if [ -n "$expected_value" ]; then
-          # On upgrades, replace only known demo IDs whose kind is still legacy.
+          # User-edited canonical kinds are valid even when different from the seed.
+          # For known legacy values change only the kind, not other node fields.
+          local existing_kind
           if command -v jq > /dev/null 2>&1; then
-            if ! echo "$existing_line" | jq -e --arg field "$check_field" --arg expected "$expected_value" '.[$field] == $expected' > /dev/null 2>&1; then
+            existing_kind=$(printf '%s\n' "$existing_line" | jq -r '.kind // empty') || return 1
+          else
+            existing_kind=$(printf '%s\n' "$existing_line" | sed -nE 's/.*"kind"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
+          fi
+          case "$existing_kind" in
+            place|resource|project|event|need|offer)
+              : # Preserve valid existing records verbatim.
+              ;;
+            Ort|Initiative|Projekt|Knoten|standard|Unknown|unclassified)
+              if command -v jq > /dev/null 2>&1; then
+                canonical_json=$(printf '%s\n' "$existing_line" | jq -c --arg kind "$expected_value" '.kind = $kind') || return 1
+              else
+                canonical_json=$(printf '%s\n' "$existing_line" | sed -E "s/(\"kind\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")/\1${expected_value}\2/")
+              fi
+              echo "→ migrating: canonical kind for reserved demo ID $id in $(basename "$file")"
               needs_migration=1
-            fi
-          elif ! echo "$existing_line" | grep -Eq "\"$check_field\"[[:space:]]*:[[:space:]]*\"$expected_value\""; then
-            needs_migration=1
-          fi
-          if [ "$needs_migration" -eq 1 ]; then
-            echo "→ migrating: fixing stale $check_field for $id in $(basename "$file")"
-          fi
+              ;;
+            *)
+              echo "→ unknown demo-node kind for $id; not overwriting existing data" >&2
+              return 1
+              ;;
+          esac
         elif command -v jq > /dev/null 2>&1; then
           if echo "$existing_line" | jq -e "has(\"$check_field\") | not" > /dev/null 2>&1; then
             echo "→ migrating: fixing stale entry (missing $check_field) $id in $(basename "$file")"
