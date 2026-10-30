@@ -616,7 +616,7 @@ mod tests {
             info: None,
             tags: vec![],
             address: None,
-            location: nodes::Location { lat: 0.0, lon: 0.0 },
+            location: Some(nodes::Location { lat: 0.0, lon: 0.0 }),
         };
         let viewer = |id: &str, role| AuthContext {
             authenticated: true,
