@@ -32,6 +32,7 @@ fn privacy_sensitive_domain_path(path: &str) -> bool {
     let path = path.strip_prefix("/api").unwrap_or(path);
     [
         "/nodes",
+        "/public/nodes",
         "/search",
         "/edges",
         "/accounts",
@@ -75,7 +76,7 @@ fn requires_database_privacy_fence(method: &Method, path: &str) -> bool {
     // Search is deliberately handled after embedding inside its route, not
     // under an outer lock held across HTTP calls to its provider.
     // Otherwise reserve pooled connections for writers.
-    ["/nodes", "/edges", "/accounts", "/conversations"]
+    ["/nodes", "/public/nodes", "/edges", "/accounts", "/conversations"]
         .iter()
         .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
@@ -538,6 +539,8 @@ mod tests {
     fn database_fence_covers_sensitive_json_reads_not_writes() {
         for path in [
             "/nodes",
+            "/public/nodes",
+            "/api/public/nodes",
             "/api/nodes/id",
             "/edges/id",
             "/api/accounts/account",
@@ -613,6 +616,8 @@ mod tests {
         ));
         for path in [
             "/nodes",
+            "/public/nodes",
+            "/api/public/nodes",
             "/nodes/private",
             "/api/nodes",
             "/api/nodes/private",

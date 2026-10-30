@@ -31,7 +31,6 @@
       let nextCursor: string | null = null;
       if (term) {
         const result = await searchNodes(term, {
-          limit: 50,
           signal: request.signal,
         });
         items = result.items;

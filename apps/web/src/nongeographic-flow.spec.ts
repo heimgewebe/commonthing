@@ -77,6 +77,7 @@ test("commons uses dedicated public endpoint for every page; search retains owne
   expect(listRequests).toHaveLength(2);
   expect(searchRequests).toHaveLength(1);
   expect(searchRequests[0].searchParams.get("q")).toBe("private Commons");
+  expect(searchRequests[0].searchParams.get("limit")).toBe("10");
   expect(searchRequests[0].searchParams.has("public_only")).toBe(false);
 
   // Switching an owner-only search back to public discovery must clear the
