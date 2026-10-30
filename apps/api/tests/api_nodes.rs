@@ -153,6 +153,201 @@ async fn app_with_nodes(in_dir: &std::path::Path, lines: &[&str]) -> (Router, En
 
 #[tokio::test]
 #[serial]
+async fn nongeographic_nodes_remain_readable_but_outside_bbox() -> anyhow::Result<()> {
+    let tmp = make_tmp_dir();
+    let (app, _env) = app_with_nodes(
+        &tmp.path().join("in"),
+        &[
+            r#"{"id":"digital","kind":"resource","title":"Digital Commons","location":null,"address":null}"#,
+            r#"{"id":"knowledge","kind":"resource","title":"Wissen"}"#,
+            r#"{"id":"place","kind":"place","title":"Ort","location":{"lat":53.5,"lon":10.0}}"#,
+        ],
+    )
+    .await;
+    for path in ["/nodes", "/nodes?pagination=cursor"] {
+        let res = app
+            .clone()
+            .oneshot(Request::get(path).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let items = value
+            .as_array()
+            .or_else(|| value["items"].as_array())
+            .unwrap();
+        assert_eq!(items.len(), 3);
+    }
+    let res = app
+        .clone()
+        .oneshot(Request::get("/nodes/digital").body(body::Body::empty())?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert!(value["location"].is_null());
+    for path in [
+        "/nodes?bbox=-180,-90,180,90",
+        "/nodes?bbox=-180,-90,180,90&pagination=cursor",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(Request::get(path).body(body::Body::empty())?)
+            .await?;
+        let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let items = value
+            .as_array()
+            .or_else(|| value["items"].as_array())
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "place");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn public_only_lists_exclude_nonpublic_nongeographic_nodes_before_pagination(
+) -> anyhow::Result<()> {
+    let tmp = make_tmp_dir();
+    let (app, _env) = app_with_nodes(
+        &tmp.path().join("in"),
+        &[
+            r#"{"id":"a-hidden","kind":"resource","title":"Hidden Commons","location":null,"search_visibility":"hidden"}"#,
+            r#"{"id":"f-public","kind":"resource","title":"Public Commons","search_visibility":"public"}"#,
+            r#"{"id":"c-private","kind":"resource","title":"Private Commons","location":null,"search_visibility":"private","created_by_account_id":"owner"}"#,
+            r#"{"id":"b-public","kind":"resource","title":"Public knowledge","location":null,"search_visibility":"public"}"#,
+            r#"{"id":"e-revoked","kind":"resource","title":"Revoked Commons","search_visibility":"revoked"}"#,
+            r#"{"id":"d-public","kind":"project","title":"Public project","location":null,"search_visibility":"public"}"#,
+        ],
+    )
+    .await;
+
+    // No session or credentials: both list shapes must filter on the server,
+    // before applying offsets, cursor anchors, limits and has_more.
+    for (path, expected) in [
+        (
+            "/nodes?public_only=true&limit=2",
+            vec!["f-public", "b-public"],
+        ),
+        ("/nodes?public_only=true&limit=2&offset=2", vec!["d-public"]),
+        ("/public/nodes?limit=2", vec!["f-public", "b-public"]),
+        ("/public/nodes?limit=2&offset=2", vec!["d-public"]),
+        (
+            "/public/nodes?public_only=false&limit=2",
+            vec!["f-public", "b-public"],
+        ),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(Request::get(path).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+        let items: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
+        let ids: Vec<_> = items
+            .iter()
+            .map(|node| node["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, expected);
+        assert!(items.iter().all(|node| node["location"].is_null()));
+    }
+
+    for prefix in ["/nodes?public_only=true", "/public/nodes?public_only=false"] {
+        let mut path = format!("{prefix}&pagination=cursor&limit=2");
+        for (expected, has_more) in [
+            (vec!["b-public", "d-public"], true),
+            (vec!["f-public"], false),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::get(&path).body(body::Body::empty())?)
+                .await?;
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+            let page: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let items = page["items"].as_array().context("cursor items")?;
+            let ids: Vec<_> = items
+                .iter()
+                .map(|node| node["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected);
+            assert!(items.iter().all(|node| node["location"].is_null()));
+            assert_eq!(page["page"]["has_more"], has_more);
+            if has_more {
+                let cursor = page["page"]["next_cursor"]
+                    .as_str()
+                    .context("next cursor")?;
+                path = format!("{prefix}&cursor={cursor}&limit=2");
+            } else {
+                assert!(page["page"]["next_cursor"].is_null());
+            }
+        }
+    }
+
+    // All anonymous /nodes variants enforce the same visibility policy.
+    // Explicit public_only=false cannot reopen nonpublic nodes.
+    for flag in ["", "&public_only=false"] {
+        for pagination in ["", "&pagination=cursor"] {
+            let path = format!("/nodes?limit=100{flag}{pagination}");
+            let res = app
+                .clone()
+                .oneshot(Request::get(path).body(body::Body::empty())?)
+                .await?;
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = body::to_bytes(res.into_body(), usize::MAX).await?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let items = value
+                .as_array()
+                .or_else(|| value["items"].as_array())
+                .unwrap();
+            assert_eq!(items.len(), 3);
+            assert!(items
+                .iter()
+                .all(|node| node["search_visibility"] == "public"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn public_only_rejects_bbox_and_invalid_flags() -> anyhow::Result<()> {
+    let tmp = make_tmp_dir();
+    let (app, _env) = app_with_nodes(&tmp.path().join("in"), &[]).await;
+    for pagination in ["", "&pagination=cursor"] {
+        for query in [
+            "public_only=true&bbox=-180,-90,180,90",
+            "public_only=TRUE",
+            "public_only=1",
+            "public_only=",
+        ] {
+            let path = format!("/nodes?{query}{pagination}");
+            let res = app
+                .clone()
+                .oneshot(Request::get(path).body(body::Body::empty())?)
+                .await?;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{query}{pagination}");
+        }
+    }
+    // The dedicated public catalog refuses a BBOX and cannot be downgraded
+    // by a caller trying to opt back into the legacy unrestricted list.
+    for path in [
+        "/public/nodes?bbox=-180,-90,180,90",
+        "/public/nodes?bbox=-180,-90,180,90&public_only=false",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(Request::get(path).body(body::Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn nodes_bbox_and_limit() -> anyhow::Result<()> {
     let tmp = make_tmp_dir();
     let in_dir = tmp.path().join("in");
@@ -697,7 +892,10 @@ async fn nodes_patch_read_error_keeps_canonical_jsonl_unchanged() -> anyhow::Res
 #[serial]
 async fn nodes_patch_unprojectable_retained_record_keeps_canonical_jsonl_unchanged(
 ) -> anyhow::Result<()> {
-    assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(b"{\"id\":\"bad\"}\n").await
+    assert_nodes_patch_corruption_keeps_canonical_jsonl_unchanged(
+        b"{\"id\":\"bad\",\"location\":{\"lat\":53.5}}\n",
+    )
+    .await
 }
 
 #[tokio::test]
@@ -1387,7 +1585,7 @@ async fn nodes_post_creates_persists_and_reloads() -> anyhow::Result<()> {
 async fn nodes_post_rejects_corrupt_existing_jsonl_after_startup() -> anyhow::Result<()> {
     for corrupt_line in [
         r#"{broken_json"#,
-        r#"{"id":"missing-required-node-fields"}"#,
+        r#"{"id":"partial-location","location":{"lat":53.5}}"#,
     ] {
         let tmp = make_tmp_dir();
         let in_dir = tmp.path().join("in");
@@ -1621,14 +1819,14 @@ async fn nodes_post_rejects_invalid_payloads_with_stable_400() -> anyhow::Result
     .await;
 
     let cases = [
-        // Missing required address.
-        r#"{"title":"No Address","kind":"place","location":{"lat":53.5,"lon":10.0}}"#,
+        // An address, when supplied, must be nonblank.
+        r#"{"title":"Blank Address","kind":"resource","address":" "}"#,
         // Missing required title.
         r#"{"kind":"place","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
         // Missing required kind.
         r#"{"title":"No Kind","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
-        // Missing required location.
-        r#"{"title":"No Location","kind":"place","address":"Somewhere"}"#,
+        // An explicit location must contain a complete coordinate pair.
+        r#"{"title":"Partial Location","kind":"resource","location":{"lat":53.5}}"#,
         // Blank title after trim.
         r#"{"title":"   ","kind":"place","address":"Somewhere","location":{"lat":53.5,"lon":10.0}}"#,
         // Out-of-bounds latitude.

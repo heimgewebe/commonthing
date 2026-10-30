@@ -164,8 +164,6 @@ pub async fn fetch_postgres_candidates_for_generation(
              WHERE p.generation_id = $1
                AND n.created_at IS NOT NULL
                AND n.updated_at IS NOT NULL
-               AND n.lat IS NOT NULL
-               AND n.lon IS NOT NULL
                AND (
                     (n.search_visibility = 'public'
                      AND p.status = 'active'
@@ -287,8 +285,15 @@ pub async fn fetch_postgres_candidates_for_generation(
         let payload: Value = serde_json::from_str(&payload_text)?;
         let created_at: DateTime<Utc> = row.try_get("created_at")?;
         let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
-        let lat: f64 = row.try_get("lat")?;
-        let lon: f64 = row.try_get("lon")?;
+        let lat: Option<f64> = row.try_get("lat")?;
+        let lon: Option<f64> = row.try_get("lon")?;
+        let location = match (lat, lon) {
+            (None, None) => None,
+            (Some(lat), Some(lon)) if (Location { lat, lon }).is_valid() => {
+                Some(Location { lat, lon })
+            }
+            _ => continue, // malformed legacy coordinates remain fail-closed
+        };
         let tags: Vec<String> = row.try_get("tags")?;
         let rank_class: Option<i32> = row.try_get("rank_class")?;
         let rank_score: Option<f64> = row.try_get("rank_score")?;
@@ -327,7 +332,7 @@ pub async fn fetch_postgres_candidates_for_generation(
                 .get("address")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            location: Location { lat, lon },
+            location,
         };
 
         candidates.push(ScoredNode {

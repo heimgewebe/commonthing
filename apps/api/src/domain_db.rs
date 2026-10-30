@@ -740,9 +740,10 @@ pub enum NodeWriteError {
 fn node_from_row(row: NodeRow) -> Result<Node, anyhow::Error> {
     let (id, kind, title, lat, lon, created_at, updated_at, payload_text, search_visibility_str) =
         row;
-    let (lat, lon) = match (lat, lon) {
-        (Some(lat), Some(lon)) => (lat, lon),
-        _ => anyhow::bail!("domain node {} has NULL location", id),
+    let location = match (lat, lon) {
+        (None, None) => None,
+        (Some(lat), Some(lon)) if (Location { lat, lon }).is_valid() => Some(Location { lat, lon }),
+        _ => anyhow::bail!("domain node {} has invalid location", id),
     };
     let payload = parse_payload(&payload_text);
     let has_authoritative_created_at = created_at.is_some();
@@ -772,7 +773,7 @@ fn node_from_row(row: NodeRow) -> Result<Node, anyhow::Error> {
         info: payload_string(&payload, "info"),
         tags: payload_string_array(&payload, "tags"),
         address: payload_string(&payload, "address"),
-        location: Location { lat, lon },
+        location,
     })
 }
 
@@ -1038,8 +1039,8 @@ async fn replace_node_in_postgres_inner(
     .bind(&node.id)
     .bind(&node.kind)
     .bind(&node.title)
-    .bind(node.location.lat)
-    .bind(node.location.lon)
+    .bind(node.location.as_ref().map(|location| location.lat))
+    .bind(node.location.as_ref().map(|location| location.lon))
     .bind(updated_at)
     .bind(payload)
     .bind(node.search_visibility.as_str())
@@ -1415,8 +1416,8 @@ async fn insert_domain_node_in_transaction(
     .bind(&node.id)
     .bind(&node.kind)
     .bind(&node.title)
-    .bind(node.location.lat)
-    .bind(node.location.lon)
+    .bind(node.location.as_ref().map(|location| location.lat))
+    .bind(node.location.as_ref().map(|location| location.lon))
     .bind(created_at)
     .bind(updated_at)
     .bind(&payload)

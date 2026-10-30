@@ -500,7 +500,7 @@ mod tests {
             info: None,
             tags: vec![],
             address: None,
-            location: Location { lat: 1.0, lon: 2.0 },
+            location: Some(Location { lat: 1.0, lon: 2.0 }),
         }
     }
 
