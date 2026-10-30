@@ -674,13 +674,13 @@ mod tests {
     fn list_filters_merge_deduplicate_and_sort_single_and_plural_forms() {
         assert_eq!(
             parse_list(
-                &Some("Werkstatt, Treffpunkt".to_string()),
-                &Some("Treffpunkt,Bibliothek".to_string())
+                &Some("place, event".to_string()),
+                &Some("event,resource".to_string())
             ),
             vec![
-                "Bibliothek".to_string(),
-                "Treffpunkt".to_string(),
-                "Werkstatt".to_string()
+                "event".to_string(),
+                "place".to_string(),
+                "resource".to_string()
             ]
         );
     }

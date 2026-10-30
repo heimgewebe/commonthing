@@ -27,11 +27,11 @@ function node(
 }
 
 const entities: MapEntityViewModel[] = [
-  node("event-natur", "Event", ["thema:natur"]),
-  node("place-kunst", "Place", ["thema:kunst"]),
-  node("event-kunst", "Event", ["thema:kunst"]),
-  node("place-untagged", "Place", ["Natur"]),
-  node("place-both", "Place", ["thema:natur", "thema:kunst"]),
+  node("event-natur", "event", ["thema:natur"]),
+  node("place-kunst", "place", ["thema:kunst"]),
+  node("event-kunst", "event", ["thema:kunst"]),
+  node("place-untagged", "place", ["Natur"]),
+  node("place-both", "place", ["thema:natur", "thema:kunst"]),
   {
     type: "garnrolle",
     id: "garnrolle-untagged",
@@ -64,7 +64,7 @@ describe("map content filter evaluation", () => {
   });
 
   it("keeps the existing content-type filter semantics", () => {
-    const result = evaluateMapContentFilters(entities, filters(["Event"]));
+    const result = evaluateMapContentFilters(entities, filters(["event"]));
 
     expect(result.entities.map((entity) => entity.id)).toEqual([
       "event-natur",
@@ -98,7 +98,7 @@ describe("map content filter evaluation", () => {
   it("ANDs content type with the selected topic axis", () => {
     const result = evaluateMapContentFilters(
       entities,
-      filters(["Place"], ["Natur"]),
+      filters(["place"], ["Natur"]),
     );
 
     expect(result.entities.map((entity) => entity.id)).toEqual(["place-both"]);
@@ -119,12 +119,12 @@ describe("map content filter evaluation", () => {
   it("derives truthful cross-filtered facet counts from loaded entities", () => {
     const byTopic = evaluateMapContentFilters(entities, filters([], ["Natur"]));
     expect(byTopic.contentTypes).toEqual([
-      { id: "Event", label: "Event", count: 1 },
+      { id: "event", label: "Ereignis", count: 1 },
       { id: "Garnrolle", label: "Garnrolle", count: 0 },
-      { id: "Place", label: "Place", count: 1 },
+      { id: "place", label: "Ort", count: 1 },
     ]);
 
-    const byType = evaluateMapContentFilters(entities, filters(["Place"]));
+    const byType = evaluateMapContentFilters(entities, filters(["place"]));
     expect(byType.topics).toEqual([
       { id: "Natur", label: "Natur", count: 1 },
       { id: "Kunst", label: "Kunst", count: 2 },
@@ -141,7 +141,7 @@ describe("map content filter evaluation", () => {
     expect(result.entities).toEqual([]);
     expect(result.contentTypes).toContainEqual({
       id: "Unbekannt",
-      label: "Unbekannt",
+      label: "Ungültige Knotenart",
       count: 0,
     });
     expect(result.topics).toContainEqual({

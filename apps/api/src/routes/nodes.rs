@@ -390,14 +390,19 @@ struct LocationDto {
     lon: f64,
 }
 
-const DEFAULT_KIND: &str = "Unknown";
+// The field is a canonical domain classification, not a user-defined label.
+const CANONICAL_NODE_KINDS: [&str; 6] = ["place", "resource", "project", "event", "need", "offer"];
+
+fn is_canonical_node_kind(value: &str) -> bool {
+    CANONICAL_NODE_KINDS.contains(&value)
+}
 const DEFAULT_TITLE: &str = "Untitled";
 
 #[derive(Deserialize)]
 struct NodeDto {
     id: String,
-    #[serde(default, deserialize_with = "deserialize_opt_string_loose")]
-    kind: Option<String>,
+    #[serde(deserialize_with = "deserialize_canonical_node_kind")]
+    kind: String,
     #[serde(default, deserialize_with = "deserialize_opt_string_loose")]
     title: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_string_loose")]
@@ -417,6 +422,55 @@ struct NodeDto {
     #[serde(default, deserialize_with = "deserialize_opt_string_loose")]
     address: Option<String>,
     location: LocationDto,
+}
+
+fn deserialize_canonical_node_kind<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let kind = String::deserialize(deserializer)?;
+    if !is_canonical_node_kind(&kind) {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported node kind: {kind}"
+        )));
+    }
+    Ok(kind)
+}
+
+#[cfg(test)]
+mod node_kind_jsonl_tests {
+    use super::{is_canonical_node_kind, NodeDto};
+    use serde_json::json;
+
+    #[test]
+    fn rejects_old_missing_or_arbitrary_jsonl_kinds() {
+        let base = json!({
+            "id": "test-node",
+            "title": "Example",
+            "location": { "lat": 53.5, "lon": 10.0 }
+        });
+        assert!(serde_json::from_value::<NodeDto>(base.clone()).is_err());
+        for kind in ["standard", "Unknown", "unclassified", "Werkstatt"] {
+            let mut node = base.clone();
+            node["kind"] = json!(kind);
+            assert!(serde_json::from_value::<NodeDto>(node).is_err(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn every_allowed_kind_deserializes_without_default() {
+        for kind in ["place", "resource", "project", "event", "need", "offer"] {
+            assert!(is_canonical_node_kind(kind));
+            let node = json!({
+                "id": "typed-node",
+                "kind": kind,
+                "title": "Example",
+                "location": { "lat": 53.5, "lon": 10.0 }
+            });
+            let parsed = serde_json::from_value::<NodeDto>(node).expect("valid kind");
+            assert_eq!(parsed.kind, kind);
+        }
+    }
 }
 
 fn parse_node_jsonl_dto(line: &str, path: &FsPath, line_number: usize) -> std::io::Result<NodeDto> {
@@ -521,7 +575,7 @@ impl From<NodeDto> for Node {
 
         Node {
             id: dto.id,
-            kind: dto.kind.unwrap_or_else(|| DEFAULT_KIND.to_string()),
+            kind: dto.kind,
             title: dto.title.unwrap_or_else(|| DEFAULT_TITLE.to_string()),
             created_at,
             updated_at,
@@ -584,11 +638,10 @@ pub(crate) fn map_json_to_node(v: &Value) -> Option<Node> {
         .and_then(|v| v.as_str())
         .unwrap_or(DEFAULT_TITLE)
         .to_string();
-    let kind = v
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or(DEFAULT_KIND)
-        .to_string();
+    let kind = v.get("kind").and_then(Value::as_str)?.to_string();
+    if !is_canonical_node_kind(&kind) {
+        return None;
+    }
     let created_at_raw = v.get("created_at").and_then(|v| v.as_str());
     let updated_at_raw = v.get("updated_at").and_then(|v| v.as_str());
     let default_timestamp = "1970-01-01T00:00:00Z";
@@ -951,6 +1004,7 @@ fn node_create_error_message(err: &node_create::NodeCreateValidationError) -> St
             format!("{field} must be a finite number within world bounds")
         }
         E::InvalidUuid { field, value } => format!("invalid UUID for {field}: {value}"),
+        E::InvalidKind { value } => format!("unsupported node kind: {value}"),
         E::TooManyTags { max } => format!("tags exceeds the maximum count of {max}"),
     }
 }
@@ -1820,6 +1874,7 @@ mod node_create {
         FieldTooLong { field: &'static str, max: usize },
         InvalidCoordinate { field: &'static str },
         InvalidUuid { field: &'static str, value: String },
+        InvalidKind { value: String },
         TooManyTags { max: usize },
     }
 
@@ -1885,6 +1940,9 @@ mod node_create {
 
             require_max_len("title", &title, NODE_TITLE_MAX_LEN)?;
             require_max_len("kind", &kind, NODE_KIND_MAX_LEN)?;
+            if !super::is_canonical_node_kind(&kind) {
+                return Err(NodeCreateValidationError::InvalidKind { value: kind });
+            }
             require_max_len("address", &address, NODE_ADDRESS_MAX_LEN)?;
 
             require_world_coordinate("location.lat", self.location.lat, -90.0, 90.0)?;
@@ -1955,10 +2013,44 @@ mod node_create {
     mod tests {
         use super::*;
 
+        #[test]
+        fn canonical_kinds_match_catalog() {
+            let catalog: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../contracts/domain/node-kinds.v1.json"
+            )))
+            .expect("canonical node-kinds catalog must be valid JSON");
+            let kinds: Vec<&str> = catalog["kinds"]
+                .as_array()
+                .expect("catalog kinds must be an array")
+                .iter()
+                .map(|kind| kind["id"].as_str().expect("each kind requires an id"))
+                .collect();
+            assert_eq!(kinds, super::super::CANONICAL_NODE_KINDS);
+        }
+
+        #[test]
+        fn rejects_generic_and_arbitrary_kind() {
+            for kind in ["standard", "Unknown", "unclassified", "Werkstatt", ""] {
+                let mut request = valid_request();
+                request.kind = kind.to_string();
+                assert!(request.validate().is_err(), "{kind} must not be accepted");
+            }
+        }
+
+        #[test]
+        fn accepts_all_six_canonical_kinds() {
+            for kind in super::super::CANONICAL_NODE_KINDS {
+                let mut req = valid_request();
+                req.kind = kind.to_string();
+                assert_eq!(req.validate().expect("canonical kind").kind, kind);
+            }
+        }
+
         fn valid_request() -> CreateNodeRequest {
             CreateNodeRequest {
                 title: "A Node".to_string(),
-                kind: "Werkstatt".to_string(),
+                kind: "place".to_string(),
                 address: "Musterstraße 1, 12345 Musterstadt".to_string(),
                 location: CreateLocation {
                     lat: 53.5,
@@ -1974,12 +2066,12 @@ mod node_create {
 
         #[test]
         fn accepts_minimal_payload() {
-            let json = r#"{"title":"A Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0},"operation_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}"#;
+            let json = r#"{"title":"A Node","kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0},"operation_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}"#;
             let req = serde_json::from_str::<CreateNodeRequest>(json)
                 .expect("minimal request must deserialize");
             let validated = req.validate().expect("minimal request must validate");
             assert_eq!(validated.title, "A Node");
-            assert_eq!(validated.kind, "Werkstatt");
+            assert_eq!(validated.kind, "place");
             assert_eq!(validated.address, "Musterstraße 1");
             assert_eq!(validated.lat, 53.5);
             assert_eq!(validated.lon, 10.0);
@@ -1990,7 +2082,7 @@ mod node_create {
 
         #[test]
         fn accepts_full_payload() {
-            let json = r#"{"title":"A Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0},"summary":"Short","info":"Long text","tags":["a","b"],"operation_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}"#;
+            let json = r#"{"title":"A Node","kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0},"summary":"Short","info":"Long text","tags":["a","b"],"operation_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}"#;
             let req = serde_json::from_str::<CreateNodeRequest>(json)
                 .expect("full request must deserialize");
             let validated = req.validate().expect("full request must validate");
@@ -2001,7 +2093,7 @@ mod node_create {
 
         #[test]
         fn rejects_missing_operation_id() {
-            let json = r#"{"title":"A Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0}}"#;
+            let json = r#"{"title":"A Node","kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0}}"#;
             let req = serde_json::from_str::<CreateNodeRequest>(json)
                 .expect("request shape without operation id still deserializes deterministically");
             let validated = req
@@ -2019,17 +2111,18 @@ mod node_create {
         fn trims_required_string_fields() {
             let mut req = valid_request();
             req.title = "  A Node  ".to_string();
-            req.kind = "  Werkstatt  ".to_string();
+            req.kind = "  place  ".to_string();
             req.address = "  Musterstraße 1  ".to_string();
             let validated = req.validate().expect("must validate");
             assert_eq!(validated.title, "A Node");
-            assert_eq!(validated.kind, "Werkstatt");
+            assert_eq!(validated.kind, "place");
             assert_eq!(validated.address, "Musterstraße 1");
         }
 
         #[test]
         fn rejects_missing_title() {
-            let json = r#"{"kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0}}"#;
+            let json =
+                r#"{"kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0}}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
         }
 
@@ -2041,14 +2134,13 @@ mod node_create {
 
         #[test]
         fn rejects_missing_address() {
-            let json =
-                r#"{"title":"A Node","kind":"Werkstatt","location":{"lat":53.5,"lon":10.0}}"#;
+            let json = r#"{"title":"A Node","kind":"place","location":{"lat":53.5,"lon":10.0}}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
         }
 
         #[test]
         fn rejects_missing_location() {
-            let json = r#"{"title":"A Node","kind":"Werkstatt","address":"Musterstraße 1"}"#;
+            let json = r#"{"title":"A Node","kind":"place","address":"Musterstraße 1"}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
         }
 
@@ -2252,25 +2344,25 @@ mod node_create {
 
         #[test]
         fn rejects_unknown_fields() {
-            let json = r#"{"title":"A Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0},"wat":true}"#;
+            let json = r#"{"title":"A Node","kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0},"wat":true}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
         }
 
         #[test]
         fn rejects_id_field_because_server_owns_it() {
-            let json = r#"{"id":"00000000-0000-0000-0000-000000000001","title":"A Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0}}"#;
+            let json = r#"{"id":"00000000-0000-0000-0000-000000000001","title":"A Node","kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0}}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
         }
 
         #[test]
         fn rejects_created_at_because_server_owns_timestamps() {
-            let json = r#"{"title":"A Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z"}"#;
+            let json = r#"{"title":"A Node","kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0},"created_at":"2026-01-01T00:00:00Z"}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
         }
 
         #[test]
         fn rejects_unknown_location_fields() {
-            let json = r#"{"title":"A Node","kind":"Werkstatt","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0,"alt":5.0}}"#;
+            let json = r#"{"title":"A Node","kind":"place","address":"Musterstraße 1","location":{"lat":53.5,"lon":10.0,"alt":5.0}}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json).is_err());
         }
     }
@@ -2415,7 +2507,7 @@ mod node_record_tests {
 
         let record = json!({
             "id": "rewrite-node",
-            "kind": "Ort",
+            "kind": "place",
             "title": "A",
             "location": {"lat": 53.5, "lon": 10.0}
         });
@@ -2423,6 +2515,7 @@ mod node_record_tests {
         let maximum_bytes = 1024 * 1024;
         let empty_filler_line = serde_json::to_string(&json!({
             "id": "filler-node",
+            "kind": "place",
             "location": {"lat": 0.0, "lon": 0.0},
             "info": ""
         }))
@@ -2430,6 +2523,7 @@ mod node_record_tests {
         let filler_len = maximum_bytes - first_line.len() - empty_filler_line.len() - 2;
         let filler_line = serde_json::to_string(&json!({
             "id": "filler-node",
+            "kind": "place",
             "location": {"lat": 0.0, "lon": 0.0},
             "info": "x".repeat(filler_len)
         }))
@@ -2467,7 +2561,7 @@ mod node_record_tests {
 
         let target = json!({
             "id": "target-node",
-            "kind": "Ort",
+            "kind": "place",
             "title": "Vorher",
             "location": {"lat": 53.5, "lon": 10.0}
         });
@@ -2497,7 +2591,7 @@ mod node_record_tests {
 
         let target = json!({
             "id": "target-node",
-            "kind": "Ort",
+            "kind": "place",
             "title": "Target",
             "location": {"lat": 53.5, "lon": 10.0}
         });
@@ -4182,7 +4276,7 @@ mod search_visibility_mapping_tests {
     fn node_fixture() -> Value {
         json!({
             "id": "visibility-fixture",
-            "kind": "Werkstatt",
+            "kind": "place",
             "title": "Sichtbarkeit",
             "location": {"lat": 54.0, "lon": 8.0}
         })
@@ -4300,9 +4394,9 @@ mod node_delete_journal_tests {
         let nodes_path = in_dir.join("demo.nodes.jsonl");
         let edges_path = in_dir.join("demo.edges.jsonl");
         let nodes_original = concat!(
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
             "\n",
-            r#"{"id":"n2","kind":"Ort","title":"Ziel","location":{"lat":53.6,"lon":10.1}}"#,
+            r#"{"id":"n2","kind":"place","title":"Ziel","location":{"lat":53.6,"lon":10.1}}"#,
             "\n",
         );
         let edges_original = concat!(
@@ -4344,9 +4438,9 @@ mod node_delete_journal_tests {
         let nodes_path = in_dir.join("demo.nodes.jsonl");
         let edges_path = in_dir.join("demo.edges.jsonl");
         let nodes_original = concat!(
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
             "\n",
-            r#"{"id":"n2","kind":"Ort","title":"Ziel","location":{"lat":53.6,"lon":10.1}}"#,
+            r#"{"id":"n2","kind":"place","title":"Ziel","location":{"lat":53.6,"lon":10.1}}"#,
             "\n",
         );
         let edges_original = concat!(
@@ -4405,9 +4499,9 @@ mod node_delete_journal_tests {
         write_fixture(
             &nodes_path,
             concat!(
-                r#"{"id":"n1","kind":"Werkstatt","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
+                r#"{"id":"n1","kind":"place","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
                 "\n",
-                r#"{"id":"n2","kind":"Ort","title":"Ziel","location":{"lat":53.6,"lon":10.1}}"#,
+                r#"{"id":"n2","kind":"place","title":"Ziel","location":{"lat":53.6,"lon":10.1}}"#,
                 "\n",
             ),
         );
@@ -4466,7 +4560,7 @@ mod node_delete_journal_tests {
         let nodes_path = in_dir.join("demo.nodes.jsonl");
         let edges_path = in_dir.join("demo.edges.jsonl");
         let nodes_original = concat!(
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
             "\n",
         );
         let edges_original = concat!(
@@ -4504,10 +4598,10 @@ mod node_delete_journal_tests {
         let nodes_path = in_dir.join("demo.nodes.jsonl");
         let edges_path = in_dir.join("demo.edges.jsonl");
         let surviving_node =
-            r#"{"id":"n2","kind":"Ort","title":"Ziel","location":{"lat":53.6,"lon":10.1}}"#;
+            r#"{"id":"n2","kind":"place","title":"Ziel","location":{"lat":53.6,"lon":10.1}}"#;
         let nodes_original = format!(
             "{}\n{}\n",
-            r#"{"id":"n1","kind":"Werkstatt","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
+            r#"{"id":"n1","kind":"place","title":"Alt","location":{"lat":53.5,"lon":10.0}}"#,
             surviving_node,
         );
         let mut edges_original = String::new();

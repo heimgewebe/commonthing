@@ -618,7 +618,7 @@ async fn domain_schema_basic_insert_and_read() {
     // --- domain_nodes: insert and read back ---
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, lat, lon, payload)
-         VALUES ('test-node-schema-probe', 'TestKind', 'Test Node', 53.55, 10.00, '{\"info\":\"probe\"}'::jsonb)",
+         VALUES ('test-node-schema-probe', 'place', 'Test Node', 53.55, 10.00, '{\"info\":\"probe\"}'::jsonb)",
     )
     .execute(&pool)
     .await
@@ -631,7 +631,7 @@ async fn domain_schema_basic_insert_and_read() {
             .await
             .expect("failed to read back test row from domain_nodes");
 
-    assert_eq!(kind, "TestKind");
+    assert_eq!(kind, "place");
     assert_eq!(title, "Test Node");
 
     sqlx::query("DELETE FROM domain_nodes WHERE id = 'test-node-schema-probe'")
@@ -725,7 +725,7 @@ async fn domain_create_operation_constraints_are_enforced() {
         "INSERT INTO domain_nodes \
             (id, kind, title, lat, lon, payload, create_actor_id, create_operation_id) \
          VALUES \
-            ('test-operation-node-a', 'test', 'A', 1, 1, '{}', 'actor-a', \
+            ('test-operation-node-a', 'place', 'A', 1, 1, '{}', 'actor-a', \
              '50000000-0000-0000-0000-000000000001')",
     )
     .execute(&pool)
@@ -736,7 +736,7 @@ async fn domain_create_operation_constraints_are_enforced() {
         "INSERT INTO domain_nodes \
             (id, kind, title, lat, lon, payload, create_actor_id, create_operation_id) \
          VALUES \
-            ('test-operation-node-b', 'test', 'B', 1, 1, '{}', 'actor-a', \
+            ('test-operation-node-b', 'place', 'B', 1, 1, '{}', 'actor-a', \
              '50000000-0000-0000-0000-000000000001')",
     )
     .execute(&pool)
@@ -750,7 +750,7 @@ async fn domain_create_operation_constraints_are_enforced() {
         "INSERT INTO domain_nodes \
             (id, kind, title, lat, lon, payload, create_actor_id, create_operation_id) \
          VALUES \
-            ('test-operation-node-c', 'test', 'C', 1, 1, '{}', 'actor-b', \
+            ('test-operation-node-c', 'place', 'C', 1, 1, '{}', 'actor-b', \
              '50000000-0000-0000-0000-000000000001')",
     )
     .execute(&pool)
@@ -760,7 +760,7 @@ async fn domain_create_operation_constraints_are_enforced() {
     let node_half_pair = sqlx::query(
         "INSERT INTO domain_nodes \
             (id, kind, title, lat, lon, payload, create_actor_id) \
-         VALUES ('test-operation-node-half', 'test', 'half', 1, 1, '{}', 'actor-a')",
+         VALUES ('test-operation-node-half', 'place', 'half', 1, 1, '{}', 'actor-a')",
     )
     .execute(&pool)
     .await
@@ -784,7 +784,7 @@ async fn domain_create_operation_constraints_are_enforced() {
         let error = sqlx::query(
             "INSERT INTO domain_nodes \
                 (id, kind, title, lat, lon, payload, create_actor_id, create_operation_id) \
-             VALUES ($1, 'test', 'invalid metadata', 1, 1, '{}', $2, $3)",
+             VALUES ($1, 'place', 'invalid metadata', 1, 1, '{}', $2, $3)",
         )
         .bind(id)
         .bind(actor)

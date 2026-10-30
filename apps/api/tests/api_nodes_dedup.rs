@@ -27,9 +27,9 @@ async fn nodes_load_deduplication_last_write_wins() -> Result<()> {
     write_lines(
         &nodes_file,
         &[
-            r#"{"id":"n1","kind":"test","title":"Old","location":{"lat":0.0,"lon":0.0}}"#,
-            r#"{"id":"n2","kind":"test","title":"Other","location":{"lat":0.0,"lon":0.0}}"#,
-            r#"{"id":"n1","kind":"test","title":"New","location":{"lat":1.0,"lon":1.0}}"#,
+            r#"{"id":"n1","kind":"place","title":"Old","location":{"lat":0.0,"lon":0.0}}"#,
+            r#"{"id":"n2","kind":"place","title":"Other","location":{"lat":0.0,"lon":0.0}}"#,
+            r#"{"id":"n1","kind":"place","title":"New","location":{"lat":1.0,"lon":1.0}}"#,
         ],
     );
 
@@ -79,9 +79,9 @@ async fn nodes_load_rejects_malformed_json_instead_of_returning_a_partial_cache(
     write_lines(
         &nodes_file,
         &[
-            r#"{"id":"n1","kind":"test","title":"Before","location":{"lat":0.0,"lon":0.0}}"#,
+            r#"{"id":"n1","kind":"place","title":"Before","location":{"lat":0.0,"lon":0.0}}"#,
             r#"{broken_json"#,
-            r#"{"id":"n2","kind":"test","title":"After","location":{"lat":1.0,"lon":1.0}}"#,
+            r#"{"id":"n2","kind":"place","title":"After","location":{"lat":1.0,"lon":1.0}}"#,
         ],
     );
 
@@ -107,7 +107,7 @@ async fn nodes_load_rejects_invalid_utf8_instead_of_treating_it_as_eof() -> Resu
     fs::create_dir_all(&in_dir)?;
 
     let mut bytes =
-        br#"{"id":"n1","kind":"test","title":"Before","location":{"lat":0.0,"lon":0.0}}"#.to_vec();
+        br#"{"id":"n1","kind":"place","title":"Before","location":{"lat":0.0,"lon":0.0}}"#.to_vec();
     bytes.extend_from_slice(b"\n");
     bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
     fs::write(&nodes_file, bytes)?;

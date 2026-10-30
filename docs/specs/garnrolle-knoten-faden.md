@@ -99,6 +99,12 @@ Antworten.
 
 ## Knoten
 
+**Knoten ist ein Oberbegriff, keine eigene Art.** Neue Knoten besitzen genau eine
+fachliche Primärart aus dem kanonischen [Knotenartenvertrag](knotenarten.md).
+Eine generische Art `standard` oder ein stiller `Unknown`-Default ist nicht mehr
+Bestandteil neuer Schreibvorgänge. Die Freigabe des Quellcodes gilt nicht als
+Nachweis eines produktiven Bestands-Datencutovers.
+
 Knoten beschreiben Orte, Kollektivgüter, Ressourcen, Vorhaben, Bedürfnisse oder
 Angebote. Jeder neu erzeugte Knoten erhält serverseitig eine unveränderliche
 Urheberbindung:

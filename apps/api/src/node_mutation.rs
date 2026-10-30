@@ -489,7 +489,7 @@ mod tests {
     fn node(id: &str, title: &str) -> Node {
         Node {
             id: id.to_string(),
-            kind: "commons".to_string(),
+            kind: "resource".to_string(),
             title: title.to_string(),
             created_at: "2026-07-31T00:00:00Z".to_string(),
             updated_at: "2026-07-31T00:00:00Z".to_string(),
@@ -669,6 +669,11 @@ mod tests {
 
         // Drop the append after a varying number of polls, the way an
         // aborted startup drops `recover_jsonl_audit`.
+        // Cancellation before first poll need not write any record.
+        // Seed one durable event so this checks torn appended lines rather
+        // than how the executor schedules an unpolled cancelled future.
+        prepare_jsonl_audit(&audit).await.unwrap();
+
         for polls in 0..64 {
             let mut append = Box::pin(prepare_jsonl_audit(&audit));
             for _ in 0..polls {

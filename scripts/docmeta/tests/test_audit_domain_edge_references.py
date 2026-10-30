@@ -564,7 +564,9 @@ class TestAuditDomainEdgeReferences(unittest.TestCase):
         from scripts.docmeta.audit_domain_edge_references import postgres_env_from_database_url
         env = postgres_env_from_database_url("postgresql://localhost/db?sslmode=require&unknown=value")
         self.assertEqual(env.get("PGSSLMODE"), "require")
-        for key in env:
+        # Keep arbitrary inherited OS variables (including Nix triplets).
+        # Only new names derived from URL query parameters may be inspected.
+        for key in set(env) - set(os.environ):
             self.assertNotIn("unknown", key.lower())
 
     def test_unknown_string_type_hint_is_redacted_when_not_safe(self):

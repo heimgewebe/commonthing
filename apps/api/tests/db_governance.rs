@@ -111,7 +111,7 @@ async fn seed_guest_node(pool: &sqlx::PgPool, account_id: &str, node_id: &str) {
     sqlx::query(
         "INSERT INTO domain_nodes \
          (id, kind, title, lat, lon, created_at, updated_at, payload) \
-         VALUES ($1, 'Ort', 'Rennknoten', 53.5, 10.0, NOW(), NOW(), \
+         VALUES ($1, 'place', 'Rennknoten', 53.5, 10.0, NOW(), NOW(), \
                  jsonb_build_object('created_by_account_id', $2::text))",
     )
     .bind(node_id)
@@ -1196,7 +1196,7 @@ async fn zero_to_zero_is_rejected_and_guest_exit_removes_identity() {
     sqlx::query(
         "INSERT INTO domain_nodes \
          (id, kind, title, lat, lon, created_at, updated_at, payload) \
-         VALUES ($1, 'Ort', 'Gastknoten', 53.5, 10.0, $2, $2, \
+         VALUES ($1, 'place', 'Gastknoten', 53.5, 10.0, $2, $2, \
                  jsonb_build_object('created_by_account_id', $3::text))",
     )
     .bind(GUEST_NODE)
@@ -1315,7 +1315,7 @@ async fn guest_exit_bulk_locks_and_anonymizes_many_owned_nodes() {
     sqlx::query(
         "INSERT INTO domain_nodes \
          (id, kind, title, lat, lon, created_at, updated_at, payload) \
-         SELECT 'gov-proof-bulk-node-' || series::text, 'Ort', 'Bulk-Knoten', \
+         SELECT 'gov-proof-bulk-node-' || series::text, 'place', 'Bulk-Knoten', \
                 53.5, 10.0, NOW(), NOW(), \
                 jsonb_build_object('created_by_account_id', $1::text) \
          FROM generate_series(1, 64) AS series",

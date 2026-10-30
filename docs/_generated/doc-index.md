@@ -54,6 +54,7 @@ Generated automatically. Do not edit.
 | deploy.heimserver.integration | Heimserver Integration | reference | deprecated | docs/deploy/heimserver.integration.md |
 | deploy.kubernetes-production-cutover-t044 | T044 — Produktionscutover: R5-Vorabnahme und Wirkungsgates | runbook | active | docs/deploy/kubernetes-production-cutover-t044.md |
 | deploy.map-html-canonical-route | Canonical Map Route Contract | runbook | active | docs/deploy/map-html-canonical-route.md |
+| deploy.production-hold-first-start | Production HOLD: autorisierter erster Reconciler-Start | runbook | active | docs/deploy/production-hold-first-start.md |
 | deploy.public-app-base-url | Public APP_BASE_URL Contract | reference | active | docs/deploy/public-app-base-url.md |
 | deploy.public-metrics-boundary | Public Metrics Boundary | reference | active | docs/deploy/public-metrics-boundary.md |
 | deploy.schauwerk-editor-frontdoor | Schauwerk Schaubild Frontdoor | runbook | active | docs/deploy/schauwerk-editor-frontdoor.md |
@@ -197,6 +198,7 @@ Generated automatically. Do not edit.
 | specs.garnrolle-knoten-faden | Garnrolle, Knoten und Faden | specification | canonical | docs/specs/garnrolle-knoten-faden.md |
 | specs.governance-antraege | Anträge, Konsent, Veto und Abstimmung | specification | canonical | docs/specs/governance-antraege.md |
 | specs.knoten-gewebe-visualisierung | Knoten-Gewebevisualisierung | specification | canonical | docs/specs/knoten-gewebe-visualisierung.md |
+| specs.knotenarten | Knotenarten – fachlicher Katalog v2 | specification | canonical | docs/specs/knotenarten.md |
 | specs.list-pagination-api | List Pagination API Spec | reference | active | docs/specs/list-pagination-api.md |
 | specs.map-experience | Kartenerlebnis | specification | canonical | docs/specs/map-experience.md |
 | specs.objektlebenszyklen-und-loeschwirkungen | Objektlebenszyklen und Löschwirkungen | specification | canonical | docs/specs/objektlebenszyklen-und-loeschwirkungen.md |
