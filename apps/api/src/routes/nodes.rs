@@ -2170,8 +2170,7 @@ mod node_create {
 
         #[test]
         fn accepts_missing_address_for_resource() {
-            let json =
-                r#"{"title":"A Node","kind":"resource","location":{"lat":53.5,"lon":10.0}}"#;
+            let json = r#"{"title":"A Node","kind":"resource","location":{"lat":53.5,"lon":10.0}}"#;
             assert!(serde_json::from_str::<CreateNodeRequest>(json)
                 .unwrap()
                 .validate()

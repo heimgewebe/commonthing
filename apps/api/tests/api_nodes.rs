@@ -303,7 +303,9 @@ async fn public_only_lists_exclude_nonpublic_nongeographic_nodes_before_paginati
                 .or_else(|| value["items"].as_array())
                 .unwrap();
             assert_eq!(items.len(), 3);
-            assert!(items.iter().all(|node| node["search_visibility"] == "public"));
+            assert!(items
+                .iter()
+                .all(|node| node["search_visibility"] == "public"));
         }
     }
     Ok(())

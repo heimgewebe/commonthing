@@ -72,7 +72,8 @@ async fn list_public_nodes(
 ) -> impl axum::response::IntoResponse {
     // Ignore caller-supplied public_only=false: the route itself is public-only.
     params.insert("public_only".to_owned(), "true".to_owned());
-    list_nodes(state, Query(params)).await
+    // Public discovery must never inherit owner-only authorization.
+    list_nodes(state, Query(params), None).await
 }
 
 pub fn api_router() -> Router<ApiState> {
