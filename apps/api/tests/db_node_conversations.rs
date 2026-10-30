@@ -2663,7 +2663,7 @@ async fn private_node_conversations_require_the_owner_at_every_read_entry() {
     seed_account(&pool, GUEST_ID, "Gast", "gast").await;
     sqlx::query(
         "INSERT INTO domain_nodes (id,kind,title,created_at,updated_at,payload,search_visibility)
-         VALUES ($1,'Ort','Nur für Eigentümer',NOW(),NOW(),$2::jsonb,'private')",
+         VALUES ($1,'place','Nur für Eigentümer',NOW(),NOW(),$2::jsonb,'private')",
     )
     .bind(NODE_ID)
     .bind(serde_json::json!({"created_by_account_id":AUTHOR_ID}))
@@ -2841,7 +2841,7 @@ async fn ownerless_private_and_hidden_nodes_reject_message_writes_as_not_found()
         seed_account(&pool, AUTHOR_ID, "Synthetic foreign author", "weber").await;
         sqlx::query(
             "INSERT INTO domain_nodes (id, kind, title, payload, search_visibility)
-             VALUES ($1, 'Ort', 'Confidential ownerless node', '{}'::jsonb, $2)",
+             VALUES ($1, 'place', 'Confidential ownerless node', '{}'::jsonb, $2)",
         )
         .bind(NODE_ID)
         .bind(visibility)
@@ -2886,7 +2886,7 @@ async fn busy_node_message_writes_do_not_starve_postgres_pool() {
     seed_account(&pool, AUTHOR_ID, "Synthetic author", "weber").await;
     sqlx::query(
         "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility)
-         VALUES ($1,'Ort','Synthetic public node',$2::jsonb,'public')",
+         VALUES ($1,'place','Synthetic public node',$2::jsonb,'public')",
     )
     .bind(NODE_ID)
     .bind(serde_json::json!({"created_by_account_id": AUTHOR_ID}))
@@ -2952,7 +2952,7 @@ async fn account_exit_and_node_message_post_preserve_lock_order() {
     seed_account(&pool, GUEST_ID, "Synthetic guest", "gast").await;
     sqlx::query(
         "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility)
-         VALUES ($1,'Ort','Synthetic guest node',$2::jsonb,'public')",
+         VALUES ($1,'place','Synthetic guest node',$2::jsonb,'public')",
     )
     .bind(NODE_ID)
     .bind(serde_json::json!({"created_by_account_id": GUEST_ID}))
@@ -3026,7 +3026,7 @@ async fn unreadable_node_writes_do_not_expose_author_lock_contention() {
     seed_account(&pool, AUTHOR_ID, "Synthetic foreign reader", "weber").await;
     sqlx::query(
         "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility)
-         VALUES ($1,'Ort','Secret node under account exit',$2::jsonb,'private')",
+         VALUES ($1,'place','Secret node under account exit',$2::jsonb,'private')",
     )
     .bind(NODE_ID)
     .bind(serde_json::json!({"created_by_account_id": GUEST_ID}))
@@ -3085,7 +3085,7 @@ async fn public_node_deletion_between_classification_and_precheck_is_archived() 
     seed_account(&pool, AUTHOR_ID, "Synthetic archive author", "weber").await;
     sqlx::query(
         "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility)
-         VALUES ($1,'Ort','Synthetic public archive race',$2::jsonb,'public')",
+         VALUES ($1,'place','Synthetic public archive race',$2::jsonb,'public')",
     )
     .bind(NODE_ID)
     .bind(serde_json::json!({"created_by_account_id": AUTHOR_ID}))

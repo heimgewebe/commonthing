@@ -800,8 +800,8 @@ async fn untyped_account_edge_collision_with_unprojected_node_is_hidden() {
     sqlx::query(
         "INSERT INTO domain_nodes (id,kind,title,lat,lon,payload,search_visibility)
          VALUES
-            ('rp-collision','Ort','Confidential node',53.50,10.00,'{}'::jsonb,'private'),
-            ('rp-public-target','Ort','Public target',53.55,10.00,'{}'::jsonb,'public')",
+            ('rp-collision','place','Confidential node',53.50,10.00,'{}'::jsonb,'private'),
+            ('rp-public-target','place','Public target',53.55,10.00,'{}'::jsonb,'public')",
     )
     .execute(&pool)
     .await
