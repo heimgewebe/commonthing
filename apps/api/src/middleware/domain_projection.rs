@@ -76,9 +76,15 @@ fn requires_database_privacy_fence(method: &Method, path: &str) -> bool {
     // Search is deliberately handled after embedding inside its route, not
     // under an outer lock held across HTTP calls to its provider.
     // Otherwise reserve pooled connections for writers.
-    ["/nodes", "/public/nodes", "/edges", "/accounts", "/conversations"]
-        .iter()
-        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    [
+        "/nodes",
+        "/public/nodes",
+        "/edges",
+        "/accounts",
+        "/conversations",
+    ]
+    .iter()
+    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
 /// Keep PostgreSQL-backed requests on one internally consistent process-local

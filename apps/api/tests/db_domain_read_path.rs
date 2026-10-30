@@ -299,7 +299,7 @@ async fn historical_invalid_node_coordinates_do_not_abort_full_load() {
     assert!(nodes.get("rp-valid-legacy-neighbor").is_some());
     assert!(nodes.get("rp-invalid-historical").is_none());
 
-    let bbox = load_nodes_bbox_from_postgres(&pool, 53.4, 53.7, 9.8, 10.1, 10, 0)
+    let bbox = load_nodes_bbox_from_postgres(&pool, 53.4, 53.7, 9.8, 10.1, 10, 0, None)
         .await
         .expect("valid geographic bounding box must remain usable");
     assert!(bbox
