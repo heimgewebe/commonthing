@@ -140,7 +140,7 @@ jobs:
               id, kind, title, lat, lon, created_at, updated_at, payload, search_visibility
           )
           SELECT id, kind, title, lat, lon, created_at, updated_at, payload,
-                 CASE WHEN kind = 'Projekt' THEN 'public' ELSE 'hidden' END
+                 CASE WHEN kind = 'project' THEN 'public' ELSE 'hidden' END
             FROM weltgewebe_perf.domain_nodes
            ORDER BY id;
 
