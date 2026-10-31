@@ -30,10 +30,11 @@ Seiten ohne JavaScript wie bisher nur die App-Hülle. Diese globale Einstellung
 wird hier nicht geändert. Die Ladeereignisse markieren nur das jeweilige Bild im DOM; Themewechsel
 benötigen keine eigenen Observer oder Stores. Beide Theme-Varianten werden
 lokal geladen. Es gibt keine JavaScript-Berechnung der Garngeometrie.
+
 ## Abgleich mit dem Google-Drive-Export vom 31.10.2026
 
-- Drive-Ordner: https://drive.google.com/drive/folders/1BTgj6vjMer6dL6PSAU559Xxxa4MXOiBL
-- Ursprungsdatei font: https://drive.google.com/file/d/11oTu6lh8RRfTIVffXtGA7E0mo15mppxp/view, ID 11oTu6lh8RRfTIVffXtGA7E0mo15mppxp.
+- Drive-Ordner: [commonthing](https://drive.google.com/drive/folders/1BTgj6vjMer6dL6PSAU559Xxxa4MXOiBL)
+- Ursprungsdatei [font](https://drive.google.com/file/d/11oTu6lh8RRfTIVffXtGA7E0mo15mppxp/view), ID 11oTu6lh8RRfTIVffXtGA7E0mo15mppxp.
 - Vollständig abgerufener Originalinhalt: text/html, 596302 Byte, SHA-256 ac3a912dd4036396b49f503a0d02d3b98679f3bcc476b40f846c270c6ed08112.
 - Befund: gespeicherte ChatGPT-Bildfreigabe („Garnschrift-Probe auf dunklem Petrol“) mit Verweisen auf Raster-Bildvorschauen, aber **ohne** WOFF/WOFF2, @font-face, reproduzierbaren Fontgenerator oder verwendbare Schrift-Glyphenpfade. Die enthaltenen SVGs sind ChatGPT-Oberflächenicons.
 - Konsequenz: Es wird weder dieses vollständige HTML als angebliche Schrift eingecheckt noch aus Bildvorschauen eine nicht existente Schriftdatei abgeleitet. Die Freigabe ist **visuelle Referenz**, keine technische Fontquelle.
