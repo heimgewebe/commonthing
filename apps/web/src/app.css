@@ -30,12 +30,9 @@ body {
     Arial;
 }
 
-/* Commonthing Garn: original textile relief over the unmodified OFL font.
- * Re-evaluate em on each element, including nested text and native controls.
- * Micro <=13px: 0.06–0.095px edge; UI 14–20px: 0.13–0.34px;
- * display >=22px: 0.41–0.7px edge plus a fine, capped fiber highlight.
- * Continuous optical transitions preserve every stroke, metrics and selection.
- * No clipping, transparent ink, filters or Safari-specific text compositing.
+/* Commonthing Garn: visible satin-thread ribs inside display ink, with
+ * raised but fully opaque native glyphs for small interface text.
+ * The underlying OFL font retains its unmodified metrics and glyphs.
  */
 :where(button, input, select, textarea) {
   font-family: inherit;
@@ -43,9 +40,40 @@ body {
 
 :where(body *):not(#map, #map *, :has(#map), svg, svg *, [aria-hidden="true"]) {
   text-shadow:
-    0 clamp(0.06px, calc(0.035em - 0.36px), 0.7px) 0 var(--garn-shade),
-    0 clamp(-0.7px, calc(0.36px - 0.035em), -0.06px) 0 var(--garn-light),
-    clamp(0px, calc(0.025em - 0.525px), 0.45px) 0 0 var(--garn-light);
+    0 clamp(0.28px, 0.03em, 0.64px) 0 var(--garn-shade),
+    0 clamp(-0.64px, -0.03em, -0.28px) 0 var(--garn-light);
+}
+
+/* Retinal-resolution diagonal stitches must remain visible at 24px.
+ * Do not clip button backgrounds or nested text; preserve a solid-ink
+ * fallback for browsers that cannot paint thread gradients.
+ */
+@supports (
+  (-webkit-background-clip: text) and (-webkit-text-fill-color: transparent) and
+    (color: color-mix(in srgb, white 50%, black))
+) {
+  :where(h1, h2, h3, h4):not(.desktop-panel-title, #map *, :has(*)) {
+    background-image: repeating-linear-gradient(
+      145deg,
+      currentColor 0 2.3px,
+      color-mix(in srgb, currentColor 64%, var(--context-material)) 2.7px 3.35px,
+      currentColor 3.75px 6px
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-shadow: none;
+  }
+}
+
+/* Print and forced-contrast rendering may suppress background images.
+ * The letterforms must then use opaque ink, not an invisible clipped fill.
+ */
+@media print, (forced-colors: active) {
+  :where(h1, h2, h3, h4):not(.desktop-panel-title, #map *, :has(*)) {
+    background-image: none;
+    -webkit-text-fill-color: currentColor;
+  }
 }
 
 :focus {

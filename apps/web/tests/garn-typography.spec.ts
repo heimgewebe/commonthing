@@ -276,9 +276,22 @@ for (const colorScheme of ["light", "dark"] as const) {
       expect(
         await el.evaluate((node) => getComputedStyle(node).fontFamily),
       ).toContain(family);
+      const ink = await el.evaluate((node) => {
+        const css = getComputedStyle(node);
+        return {
+          relief: css.textShadow,
+          texture: css.backgroundImage,
+          clip: css.backgroundClip,
+          fill: css.webkitTextFillColor,
+        };
+      });
       expect(
-        await el.evaluate((node) => getComputedStyle(node).textShadow),
-      ).not.toBe("none");
+        ink.relief !== "none" ||
+          (ink.clip === "text" &&
+            ink.texture.includes("repeating-linear-gradient") &&
+            ink.fill === "rgba(0, 0, 0, 0)"),
+        "each panel text must have readable relief or directional thread ink",
+      ).toBe(true);
       const bounds = await el.evaluate((node) => ({
         text: node.textContent,
         tag: node.tagName,
@@ -302,3 +315,90 @@ for (const colorScheme of ["light", "dark"] as const) {
     });
   });
 }
+
+test("readable display ink contains directional stitches", async ({
+  page,
+}, testInfo) => {
+  await mockApiResponses(page);
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await page.goto("/login");
+  await page.evaluate(() => document.fonts.ready);
+  const heading = page.locator("h1");
+  await expect(heading).toHaveText("Login");
+  const css = await heading.evaluate((el) => {
+    const style = getComputedStyle(el);
+    return {
+      image: style.backgroundImage,
+      clip: style.backgroundClip,
+      fill: style.webkitTextFillColor,
+      shadow: style.textShadow,
+      size: parseFloat(style.fontSize),
+    };
+  });
+  expect(css.size).toBeGreaterThanOrEqual(22);
+  expect(css.image).toContain("repeating-linear-gradient");
+  expect(css.clip).toBe("text");
+  expect(css.fill).toBe("rgba(0, 0, 0, 0)");
+  expect(css.shadow).toBe("none");
+  const sewn = await heading.screenshot();
+  await heading.evaluate((el) => {
+    (el as HTMLElement).style.backgroundImage = "none";
+    (el as HTMLElement).style.webkitTextFillColor = "currentcolor";
+  });
+  const flat = await heading.screenshot();
+  expect(
+    sewn.equals(flat),
+    "stitch ribs must change real rendered pixels",
+  ).toBe(false);
+  await savePixels(testInfo, "visible-satin-heading", {
+    body: sewn,
+    contentType: "image/png",
+  });
+
+  // A Garnrolle uses an h3, not the login page's h1. Catch future selector
+  // drift that would leave real profile names plain on the map again.
+  await page.evaluate(() => {
+    const accountHeading = document.createElement("h3");
+    accountHeading.dataset.testid = "garnrolle-embroidery-heading";
+    accountHeading.textContent = "Garnrolle · ü ö ä ß";
+    document.body.append(accountHeading);
+  });
+  const accountHeading = page.getByTestId("garnrolle-embroidery-heading");
+  await expect(accountHeading).toHaveCSS("background-clip", "text");
+  const accountInk = await accountHeading.evaluate((el) => {
+    const style = getComputedStyle(el);
+    return {
+      image: style.backgroundImage,
+      fill: style.webkitTextFillColor,
+      font: style.fontFamily,
+    };
+  });
+  expect(accountInk.image).toContain("repeating-linear-gradient");
+  expect(accountInk.fill).toBe("rgba(0, 0, 0, 0)");
+  expect(accountInk.font).toContain(family);
+  await savePixels(testInfo, "visible-garnrolle-heading", {
+    body: await accountHeading.screenshot(),
+    contentType: "image/png",
+  });
+});
+
+test("embroidered headings remain opaque when backgrounds are unavailable", async ({
+  page,
+}) => {
+  await mockApiResponses(page);
+  await page.goto("/login");
+  const heading = page.locator("h1");
+  for (const media of ["print", "forced"] as const) {
+    await page.emulateMedia(
+      media === "print"
+        ? { media: "print", forcedColors: "none" }
+        : { media: "screen", forcedColors: "active" },
+    );
+    await expect(heading).toHaveCSS("background-image", "none");
+    const fill = await heading.evaluate(
+      (el) => getComputedStyle(el).webkitTextFillColor,
+    );
+    expect(fill, media).not.toBe("rgba(0, 0, 0, 0)");
+    expect(fill, media).not.toBe("transparent");
+  }
+});

@@ -164,9 +164,10 @@ test("loads the repository canonical contract", () => {
 
 test("bounds Garn's shared CSS cost without relaxing JavaScript budgets", () => {
   const { routes } = loadPerformanceContract().measurements.web_build.budget;
-  // The local variable font + optical relief measured 3492B/3683B CSS gzip.
-  assert.equal(routes["/login"].max_initial_css_gzip_bytes, 3550);
-  assert.equal(routes["/settings"].max_initial_css_gzip_bytes, 3750);
+  // Real stitched display ink measured 3658B/3847B CSS gzip on CI.
+  // Preserve ~40-50B headroom without relaxing any JavaScript budget.
+  assert.equal(routes["/login"].max_initial_css_gzip_bytes, 3700);
+  assert.equal(routes["/settings"].max_initial_css_gzip_bytes, 3900);
   assert.equal(routes["/login"].max_initial_js_gzip_bytes, 46000);
   assert.equal(routes["/settings"].max_initial_js_gzip_bytes, 57000);
 });
