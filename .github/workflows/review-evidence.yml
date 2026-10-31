@@ -206,12 +206,55 @@ jobs:
             .head.sha == $head
           ' "${RUNNER_TEMP}/pr-after.json" >/dev/null
 
+          # A font may be opaque only when its actual GitHub blob has the pinned
+          # WOFF2 bytes and the exact upstream source/OFL companions. No PR code
+          # is checked out or run in this trusted pull_request_target workflow.
+          garn_font_path="apps/web/static/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2"
+          garn_font_proof='null'
+          if jq -e --arg path "${garn_font_path}" \
+            'any(.[]; .filename == $path)' "${RUNNER_TEMP}/files.json" >/dev/null; then
+            garn_blob="$(jq -er --arg path "${garn_font_path}" \
+              '.[] | select(.filename == $path and .status == "added") | .sha' \
+              "${RUNNER_TEMP}/files.json")"
+            [[ "${garn_blob}" == 'a9ca4bd6ffda7092b397871cd3b5ad38a372046d' ]]
+            jq -e 'any(.[]; .filename == "apps/web/static/fonts/README.md"
+              and .status == "added"
+              and .sha == "ed4fb686e498eeffa98f9a6cb7d9a103bf083802")' \
+              "${RUNNER_TEMP}/files.json" >/dev/null
+            jq -e 'any(.[]; .filename == "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt"
+              and .status == "added"
+              and .sha == "9459440df26a30cfb6ed5542485d281bae449e5f")' \
+              "${RUNNER_TEMP}/files.json" >/dev/null
+            gh api -H "${api_header}" \
+              "repos/${REPOSITORY}/git/blobs/${garn_blob}" > "${RUNNER_TEMP}/garn-blob.json"
+            jq -e '.encoding == "base64" and .size == 33996' \
+              "${RUNNER_TEMP}/garn-blob.json" >/dev/null
+            jq -r '.content' "${RUNNER_TEMP}/garn-blob.json" | \
+              base64 --decode > "${RUNNER_TEMP}/garn-font.woff2"
+            [[ "$(wc -c < "${RUNNER_TEMP}/garn-font.woff2")" == '33996' ]]
+            garn_sha256="$(sha256sum "${RUNNER_TEMP}/garn-font.woff2" | cut -d ' ' -f 1)"
+            [[ "${garn_sha256}" == '18b2a1a39a2fa298b0ba5390aca68462669826c90925656f1c1f6796e0e1bbaf' ]]
+            garn_magic="$(od -An -tc -N4 "${RUNNER_TEMP}/garn-font.woff2" | tr -d '[:space:]')"
+            [[ "${garn_magic}" == 'wOF2' ]]
+            garn_font_proof="$(jq -n --arg path "${garn_font_path}" \
+              --arg blob "${garn_blob}" --arg sha256 "${garn_sha256}" '{
+                path: $path, blob_sha: $blob, sha256: $sha256,
+                size: 33996, magic: "wOF2",
+                provenance_blobs: {
+                  "apps/web/static/fonts/README.md": "ed4fb686e498eeffa98f9a6cb7d9a103bf083802",
+                  "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "9459440df26a30cfb6ed5542485d281bae449e5f"
+                }
+              }')"
+          fi
+
           jq -n \
+            --argjson font_proof "${garn_font_proof}" \
             --slurpfile pr "${RUNNER_TEMP}/pr-before.json" \
             --slurpfile compare "${RUNNER_TEMP}/compare.json" \
             --slurpfile files "${RUNNER_TEMP}/files.json" '
             {
               schema_version: 1,
+              font_asset_proof: $font_proof,
               pr_number: $pr[0].number,
               base_sha: $pr[0].base.sha,
               head_sha: $pr[0].head.sha,
