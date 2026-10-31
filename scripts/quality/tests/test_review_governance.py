@@ -23,7 +23,14 @@ from scripts.quality.review_governance import (
     minimum_risk_for_paths,
     parse_risk_class,
     _materialized_diff_has_text_hunk,
+    _materialized_metadata,
+    _partition_opaque_files,
     _parse_numstat_z,
+    GARN_FONT_PATH,
+    GARN_FONT_GIT_BLOB,
+    GARN_FONT_SHA256,
+    GARN_FONT_BYTES,
+    GARN_FONT_PROVENANCE_BLOBS,
 )
 
 
@@ -185,6 +192,97 @@ def _record(
         "verdict": verdict,
         "findings_resolved": verdict == "PASS",
     }
+
+
+class GarnFontOpaqueReviewPolicyTests(unittest.TestCase):
+    def _metadata(self) -> dict:
+        return {
+            "schema_version": 1,
+            "pr_number": 1995,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "merge_base_sha": "a" * 40,
+            "changed_file_count": 3,
+            "changed_files": [GARN_FONT_PATH, *GARN_FONT_PROVENANCE_BLOBS],
+            "attention_changed_files": [GARN_FONT_PATH, *GARN_FONT_PROVENANCE_BLOBS],
+            "additions": 40,
+            "deletions": 0,
+            "opaque_files": [GARN_FONT_PATH],
+            "font_asset_proof": {
+                "path": GARN_FONT_PATH,
+                "blob_sha": GARN_FONT_GIT_BLOB,
+                "sha256": GARN_FONT_SHA256,
+                "size": GARN_FONT_BYTES,
+                "magic": "wOF2",
+                "provenance_blobs": dict(GARN_FONT_PROVENANCE_BLOBS),
+            },
+        }
+
+    def _parse(self, metadata: dict) -> DiffStats:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.json"
+            path.write_text(json.dumps(metadata), encoding="utf-8")
+            return _materialized_metadata(path)[-1]
+
+    def test_exact_upstream_font_and_companion_licenses_are_reviewable(self) -> None:
+        stats = self._parse(self._metadata())
+        self.assertEqual(stats.verified_font_files, (GARN_FONT_PATH,))
+        self.assertEqual(
+            _partition_opaque_files(
+                stats.opaque_files, verified_font_files=stats.verified_font_files
+            ),
+            ((GARN_FONT_PATH,), ()),
+        )
+
+    def test_font_with_no_byte_proof_remains_blocking(self) -> None:
+        metadata = self._metadata()
+        del metadata["font_asset_proof"]
+        stats = self._parse(metadata)
+        self.assertEqual(stats.verified_font_files, ())
+        self.assertEqual(_partition_opaque_files(stats.opaque_files), ((), (GARN_FONT_PATH,)))
+
+    def test_tampered_font_or_provenance_is_rejected(self) -> None:
+        mutations = {
+            "wrong_sha256": ("sha256", "0" * 64),
+            "wrong_blob": ("blob_sha", "0" * 40),
+            "wrong_size": ("size", GARN_FONT_BYTES + 1),
+            "wrong_magic": ("magic", "OTTO"),
+            "wrong_path": ("path", "apps/web/static/fonts/copy.woff2"),
+            "bool_size": ("size", True),
+            "wrong_license_sha": ("provenance_blobs", {
+                **GARN_FONT_PROVENANCE_BLOBS,
+                "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "0" * 40
+            }),
+        }
+        for name, (field, value) in mutations.items():
+            with self.subTest(name=name):
+                metadata = self._metadata()
+                metadata["font_asset_proof"][field] = value
+                with self.assertRaisesRegex(GovernanceError, "font asset proof"):
+                    self._parse(metadata)
+
+    def test_missing_license_companion_fails_even_with_correct_font(self) -> None:
+        metadata = self._metadata()
+        license_path = "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt"
+        metadata["changed_files"].remove(license_path)
+        metadata["attention_changed_files"].remove(license_path)
+        metadata["changed_file_count"] -= 1
+        with self.assertRaisesRegex(GovernanceError, "font asset proof"):
+            self._parse(metadata)
+
+    def test_other_woff2_or_unknown_binary_remain_blocked(self) -> None:
+        candidates = (
+            "apps/web/static/fonts/other.woff2",
+            "apps/web/static/assets/other.woff2",
+            "docs/anything.woff2",
+            "apps/web/static/fonts/a.wasm",
+            "apps/web/static/fonts/a.exe",
+        )
+        reviewable, blocking = _partition_opaque_files(
+            candidates, verified_font_files=(GARN_FONT_PATH,)
+        )
+        self.assertEqual(reviewable, ())
+        self.assertEqual(blocking, candidates)
 
 
 class AttentionImpactReviewGateTests(unittest.TestCase):
