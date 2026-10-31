@@ -23,17 +23,17 @@
 <span class="yarn" class:login={word === "Login"} use:trackImages>
   <img
     class="light"
-    src={`/garnschrift-c/${word.toLowerCase()}-light.svg`}
-    width={word === "Login" ? 373 : 896}
-    height="170"
+    src={`/garnschrift-c/${word.toLowerCase()}-light.png`}
+    width={word === "Login" ? 325 : 764}
+    height="145"
     alt=""
     aria-hidden="true"
   />
   <img
     class="dark"
-    src={`/garnschrift-c/${word.toLowerCase()}-dark.svg`}
-    width={word === "Login" ? 373 : 896}
-    height="170"
+    src={`/garnschrift-c/${word.toLowerCase()}-dark.png`}
+    width={word === "Login" ? 325 : 764}
+    height="145"
     alt=""
     aria-hidden="true"
   />

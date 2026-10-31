@@ -20,14 +20,14 @@ for (const [route, word] of [
       const image = heading.locator(`img.${theme}`);
       await expect(image).toHaveAttribute(
         "src",
-        `/garnschrift-c/${word.toLowerCase()}-${theme}.svg`,
+        `/garnschrift-c/${word.toLowerCase()}-${theme}.png`,
       );
       await expect(image).toHaveClass(/loaded/);
       await expect(image).toHaveCSS("opacity", "1");
       await expect(heading.locator(".fallback")).toHaveCSS("opacity", "0");
       expect(await heading.boundingBox()).toEqual(before);
       const src = await image.getAttribute("src");
-      expect(src).toBe(`/garnschrift-c/${word.toLowerCase()}-${theme}.svg`);
+      expect(src).toBe(`/garnschrift-c/${word.toLowerCase()}-${theme}.png`);
       expect(
         await image.evaluate((el: HTMLImageElement) => el.naturalWidth),
       ).toBeGreaterThan(0);

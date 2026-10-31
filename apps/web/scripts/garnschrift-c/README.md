@@ -1,45 +1,89 @@
-# Garnschrift C — Entwurf 02
+# Garnschrift C – fotografische Garnvorlage
 
-`paths.json` ist das unveränderte, mit Python `base64`, `zlib` und `json`
-decodierte Glyphenobjekt aus dem freigegebenen Entwurf 02. Werte: Vorschub und
-Liste absoluter SVG-Zentrallinien (M/L/C/Q/Z); keine Fontkonturen.
+## Verbindliche Quelle
 
-Regenerieren vom Repo-Root, ohne zusätzliche Pakete:
+Die vom Nutzer freigegebene Datei **echte font** im [Google-Drive-Ordner
+commonthing](https://drive.google.com/drive/folders/1BTgj6vjMer6dL6PSAU559Xxxa4MXOiBL)
+ist ein Bild des Alphabets aus tatsächlich gestalteten, dreifach gezwirnten
+Wollfäden. Ihre private Google-Drive-ID lautet
+`1bjgFLZxltB6mlgSFaOha_nGkK-NZuuJZ`.
+
+- Format: `image/png`, RGB, 1448 × 1086 Pixel, 2.438.325 Byte.
+- Originalquelle im Repository:
+  [garnschrift-c-contact-sheet.png](../../../../docs/assets/garnschrift-c-contact-sheet.png).
+- Original-SHA-256:
+  `eb09901816a4fc04a001cd2a7c2e51f12ca6b04e68a892727087cd1bcd76e2c2`.
+- Das Bild enthält Groß- und Kleinbuchstaben einschließlich deutscher Umlaute,
+  Ziffern, Sonderzeichen und Beispielwörter.
+- Das ursprüngliche Drive-Objekt `font` (ID
+  `11oTu6lh8RRfTIVffXtGA7E0mo15mppxp`) ist dagegen nur eine gespeicherte
+  ChatGPT-HTML-Seite. Sie enthielt keine Schriftdateien.
+
+**Technische Grenze:** Das neue PNG ist ein Schriftmusterblatt, keine
+installierbare WOFF2-, OpenType- oder TrueType-Schrift. Rasterisierte
+Wolloberflächen lassen sich nicht als gewöhnliche monochrome Fontkonturen
+erhalten. Die Weboberfläche setzt deshalb lokale, transparente **PNG-Wortbilder**
+ein. Ein echtes, semantisches HTML-`h1` mit lesbarer Standardschrift bleibt
+unabhängig von den Bildern im DOM.
+
+## Aktuelle Umsetzung
+
+`raster_from_sheet.py` liest das originale RGB-PNG ausschließlich mit der
+Python-Standardbibliothek, kontrolliert seinen SHA-256-Wert und seine Dimensionen,
+und verwendet feste, überprüfbare Rechtecke für die einzelnen Originalbuchstaben.
+Die abgetrennten Garnpixel werden aus dem petrolfarbenen Hintergrund freigestellt.
+Für die helle Oberfläche wird eine dunkelteale Garnvariante unter Bewahrung der
+Helligkeitsabstufungen erzeugt.
+
+Die beiden tatsächlich in Commonthing verwendeten Titel sind `Login` und
+`Einstellungen`. Es werden pro Wort und Theme transparente PNG-Dateien erzeugt,
+ohne Netzwerkanfragen beim Generieren, ohne Browser-JavaScript zur Bildgeometrie
+und ohne externe Font-CDN-Abhängigkeit.
+
+| Ziel in `apps/web/static/garnschrift-c/` | Auflösung | Zweck |
+| --- | --- | --- |
+| `login-dark.png`, `login-light.png` | 325 × 145 | Anmelden |
+| `einstellungen-dark.png`, `einstellungen-light.png` | 764 × 145 | Einstellungen |
+
+Vom Repository-Root reproduzieren und prüfen:
 
 ```sh
-python3 apps/web/scripts/garnschrift-c/generate.py
+python3 apps/web/scripts/garnschrift-c/raster_from_sheet.py
 python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
 ```
 
-Der Generator tastet Kurven ab und parametrisiert sie nach Bogenlänge.
-Drei sinusförmig verdrillte, runde Teilstränge erhalten einen schmaleren
-Lichtkern; rückwärtige Helixbögen werden vor vorderen Bögen gezeichnet.
-Deterministische kleine Seitenschwankungen und vereinzelte abstehende Fasern
-geben organische Unregelmäßigkeit. Es gibt keine äußere Kontur, Textmaske,
-SVG-Text, Filter, Hintergrundfläche oder externe Ressourcen.
+Der Generator unterstützt darüber hinaus die im Blatt lesbaren Buchstaben
+`A-Z`, `a-z`, `ÄÖÜäöüß`, `0-9` und ausgewählte Sonderzeichen.
+Weitere Worte können als eigene Build-Artefakte erzeugt werden. Es gibt
+**keine allgemeine `font-family`**, die beliebigen Browsertext automatisch
+aus dem Bild zusammensetzt.
 
-Die vier transparenten SVGs in `../../static/garnschrift-c/` sind eingecheckte
-Build-Artefakte. Regeneration ist nur bei Änderungen der Quelle nötig und
-nicht Teil des Browser-Runtimes. Harte Grenze: 200.000 Bytes pro Asset.
-`dark` ist warmbeige, `light` dunkelteal. YarnWord reserviert die Bildproportionen
-und nutzt das vorhandene `html[data-color-scheme]`; echte h1-Texte bleiben
-zugänglich. Bei Ladefehlern und in Forced Colors bleibt Standardschrift sichtbar.
-Die Komponente unterstützt SSR mit echtem Text ohne Inline-Styles. Die Anwendung
-deaktiviert SSR derzeit zentral in `src/routes/+layout.ts`; daher liefern die
-Seiten ohne JavaScript wie bisher nur die App-Hülle. Diese globale Einstellung
-wird hier nicht geändert. Die Ladeereignisse markieren nur das jeweilige Bild im DOM; Themewechsel
-benötigen keine eigenen Observer oder Stores. Beide Theme-Varianten werden
-lokal geladen. Es gibt keine JavaScript-Berechnung der Garngeometrie.
+`YarnWord.svelte` zeigt die passende lokale Theme-Bildvariante erst nach
+erfolgreichem Laden. Das Überschriftenmaß wird reserviert. Bei Bildausfall und
+in Forced Colors bleibt der echte Überschriftentext sichtbar. Beide Theme-Dateien
+werden zurzeit angefragt; die Einzeldateien sind deutlich kleiner als die
+früheren SVG-Wortbilder. Karte, Anmeldung, Fokuspaneel und globale
+Typografie werden dadurch nicht umstrukturiert.
 
-## Abgleich mit dem Google-Drive-Export vom 31.10.2026
+## Frühere Vektorentwicklung
 
-- Drive-Ordner: [commonthing](https://drive.google.com/drive/folders/1BTgj6vjMer6dL6PSAU559Xxxa4MXOiBL)
-- Ursprungsdatei: font, private Drive-Datei mit ID 11oTu6lh8RRfTIVffXtGA7E0mo15mppxp; der direkte Link erfordert ein Konto (anonymer HTTP-Abruf liefert 401).
-- Vollständig abgerufener Originalinhalt: text/html, 596302 Byte, SHA-256 ac3a912dd4036396b49f503a0d02d3b98679f3bcc476b40f846c270c6ed08112.
-- Befund: gespeicherte ChatGPT-Bildfreigabe („Garnschrift-Probe auf dunklem Petrol“) mit Verweisen auf Raster-Bildvorschauen, aber **ohne** WOFF/WOFF2, @font-face, reproduzierbaren Fontgenerator oder verwendbare Schrift-Glyphenpfade. Die enthaltenen SVGs sind ChatGPT-Oberflächenicons.
-- Konsequenz: Es wird weder dieses vollständige HTML als angebliche Schrift eingecheckt noch aus Bildvorschauen eine nicht existente Schriftdatei abgeleitet. Die Freigabe ist **visuelle Referenz**, keine technische Fontquelle.
-- **Technisch verwendete und versionierte Quellen** bleiben die bereits im PR vorhandenen paths.json (63 Glyphen-Zentrallinien, aus dem zuvor freigegebenen Entwurf 02) und generate.py. Damit lassen sich die lokalen SVG-Wortgrafiken ohne Google Drive, ChatGPT, CDN oder Laufzeitgenerator reproduzieren.
-- **Formatgrenze:** Die SVG-Dateien sind dekorative Wortbilder mit semantischem HTML-Text als Fallback, keine installierbare Fontfamilie. Gewöhnliche OpenType-/WOFF2-Konturen würden die einzelnen gedrehten Wollstränge, Lichtkanten und Fasern nicht getreu wiedergeben; deshalb wird hier bewusst keine WOFF2-Datei erzeugt.
-- **Zeichenumfang:** A–Z, a–z, ÄÖÜäöüß, Leerzeichen, Bindestrich, Punkt und Doppelpunkt. Im Browser sind derzeit nur Login und Einstellungen als vorgerenderte SVGs eingebunden. Weitere Worte erfordern neue Build-Artefakte, nicht einfach eine CSS font-family.
+`paths.json` und `generate.py` bleiben als nachvollziehbarer,
+reproduzierbarer SVG-Entwurf 02 erhalten. Dieser enthält 63 geometrische
+Glyphen-Zentrallinien, aus denen sinusförmig verdrillte Fäden und Fasern
+gezeichnet werden. Die vier SVG-Buildartefakte bleiben vorerst für Vergleich
+und Rückfall erhalten, werden aber **von der aktiven `YarnWord`-Komponente
+nicht geladen**. Es gibt somit nur einen aktiven Browser-Darstellungspfad.
 
-**Designgrenze:** Die deterministische Vektordarstellung ist eine organische Näherung an Garnschrift C, keine pixelidentische Übernahme der fotografischen Bildvorlage. Lesbarkeit, Hell-/Dunkelmodus und bestehende Browser-Fallbacks haben Vorrang.
+```sh
+python3 apps/web/scripts/garnschrift-c/generate.py
+```
+
+## Grenzen vor einer Produktivfreigabe
+
+Die Vorlage ist ein 1448-Pixel-Raster, die einzelnen Buchstaben sind relativ
+klein. Bei großer Darstellung oder hochauflösenden Bildschirmen kann
+Rasterweichzeichnung auftreten. Die freigestellten Fasern sind eine
+Pixelapproximation, keine verlustfreie 3D-Rekonstruktion. Die genaue
+Materialwirkung, Hell-/Dunkelkontrast und iPad-Safari müssen am endgültigen
+Produkt im Browser geprüft werden. Für kleine Fließtexte und Formularbeschriftungen
+bleibt bewusst die zugängliche Standardschrift erhalten.
