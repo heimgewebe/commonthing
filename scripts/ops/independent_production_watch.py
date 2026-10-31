@@ -1092,11 +1092,28 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 if (
                     entry["event"] == "ALARM"
                     and entry["payload"].get("state_read_unverified") is True
+                    # Only as-yet unjournaled intents need provisional
+                    # timeline admission. Already fsynced alarm/recovery
+                    # batches were reconciled out of pending above.
+                    and entry in pending
                     and entry not in tentative
                 ):
                     tentative.append(entry)
         if tentative:
             try:
+                # Reuse bounded append-time tail repair only for an actual
+                # unterminated suffix. A complete journal needs no write:
+                # an unnecessary empty append may itself fail and suppress
+                # previously confirmed transitions.
+                try:
+                    with (directory / "events.jsonl").open("rb") as probe:
+                        end = probe.seek(0, os.SEEK_END)
+                        if end:
+                            probe.seek(-1, os.SEEK_END)
+                            if probe.read(1) != b"\n":
+                                _append_durable_events(directory, [])
+                except FileNotFoundError:
+                    pass
                 journal_last = _last_journaled_transition(directory)
             except (OSError, ValueError, UnicodeError, TypeError) as exc:
                 return _record_unverifiable_prior_state(
