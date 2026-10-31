@@ -7,7 +7,7 @@
     "--panel": "rgba(20, 30, 32, 0.94)",
     "--panel-solid": "#151f21",
     "--context-material": "#202b33",
-    "--context-weave": 'url("/textures/porcelain-dark.svg")',
+    "--context-weave": 'url("/textures/porcelain-dark.png")',
     "--context-light": "rgba(172, 193, 210, 0.055)",
     "--context-edge": "rgba(195, 213, 227, 0.13)",
     "--context-shade": "rgba(0, 0, 0, 0.32)",
