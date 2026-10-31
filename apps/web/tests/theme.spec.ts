@@ -107,7 +107,7 @@ test.describe("Farbschema", () => {
               blur: computed.backdropFilter,
             };
           }, backing);
-          expect(style.image).toContain(`/textures/porcelain-${mode}.svg`);
+          expect(style.image).toContain(`/textures/porcelain-${mode}.png`);
           expect(style.image).not.toContain("repeating-");
           expect(style.color).toBe(style.expectedColor);
           return style;
@@ -182,12 +182,91 @@ test.describe("Farbschema", () => {
           color: style.getPropertyValue("--context-material").trim(),
         };
       });
-      expect(material.weave).toContain(`/textures/porcelain-${mode}.svg`);
+      expect(material.weave).toContain(`/textures/porcelain-${mode}.png`);
       expect(material.color).toBe(mode === "dark" ? "#202b33" : "#fbf8f1");
-      const asset = await page.request.get(`/textures/porcelain-${mode}.svg`);
+      const asset = await page.request.get(`/textures/porcelain-${mode}.png`);
       expect(asset.ok()).toBe(true);
-      expect(asset.headers()["content-type"]).toContain("image/svg+xml");
-      expect((await asset.body()).length).toBeLessThan(30 * 1024);
+      expect(asset.headers()["content-type"]).toContain("image/png");
+      expect((await asset.body()).length).toBeLessThan(55 * 1024);
+      const texture = await page.evaluate(async (theme) => {
+        const image = new Image();
+        image.src = `/textures/porcelain-${theme}.png`;
+        await image.decode();
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d")!;
+        context.drawImage(image, 0, 0);
+        const pixels = context.getImageData(
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        ).data;
+        const alpha = Array.from(
+          { length: pixels.length / 4 },
+          (_, i) => pixels[i * 4 + 3] / 255,
+        );
+        const mean =
+          alpha.reduce((sum, value) => sum + value, 0) / alpha.length;
+        const variance =
+          alpha.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
+          alpha.length;
+        const background = theme === "light" ? [251, 248, 241] : [32, 43, 51];
+        const luminance = alpha.map((a, i) =>
+          [0.2126, 0.7152, 0.0722].reduce(
+            (sum, weight, channel) =>
+              sum +
+              weight *
+                (pixels[i * 4 + channel] * a + background[channel] * (1 - a)),
+            0,
+          ),
+        );
+        const average =
+          luminance.reduce((sum, value) => sum + value, 0) / luminance.length;
+        // A coarse stripe/grid would modulate row or column averages strongly.
+        const axisDeviation = (transpose: boolean) => {
+          const means = Array.from(
+            { length: 192 },
+            (_, row) =>
+              Array.from(
+                { length: 192 },
+                (_, col) =>
+                  alpha[transpose ? col * 192 + row : row * 192 + col],
+              ).reduce((sum, value) => sum + value, 0) / 192,
+          );
+          return Math.sqrt(
+            means.reduce((sum, value) => sum + (value - mean) ** 2, 0) / 192,
+          );
+        };
+        return {
+          width: image.naturalWidth,
+          height: image.naturalHeight,
+          mean,
+          stddev: Math.sqrt(variance),
+          luminanceStddev: Math.sqrt(
+            luminance.reduce((sum, value) => sum + (value - average) ** 2, 0) /
+              luminance.length,
+          ),
+          rowDeviation: axisDeviation(false),
+          columnDeviation: axisDeviation(true),
+          image: getComputedStyle(document.querySelector(".panel")!)
+            .backgroundImage,
+        };
+      }, mode);
+      expect(texture.width).toBe(192);
+      expect(texture.height).toBe(192);
+      expect(texture.mean).toBeGreaterThan(0.04);
+      expect(texture.mean).toBeLessThan(0.16);
+      expect(texture.stddev).toBeGreaterThan(0.018);
+      expect(texture.luminanceStddev).toBeGreaterThan(
+        mode === "light" ? 2.5 : 2,
+      );
+      if (mode === "light") expect(texture.luminanceStddev).toBeLessThan(6.5);
+      expect(texture.rowDeviation).toBeLessThan(texture.stddev * 0.8);
+      expect(texture.columnDeviation).toBeLessThan(texture.stddev * 0.8);
+      expect(texture.image).toContain(`/textures/porcelain-${mode}.png`);
+      expect(texture.image).not.toContain("repeating-");
     }
   });
 
