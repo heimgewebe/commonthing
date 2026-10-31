@@ -71,6 +71,31 @@ class WatchDispatchTests(unittest.TestCase):
     def cursor(self):
         return json.loads((self.state / "transport-cursor.json").read_text())
 
+    def test_hyphenated_subscribed_topic_enrolls_sends_and_deduplicates(self):
+        topic = "ct-alert-" + ("a" * 32)
+        self.topic_file.write_text(topic + "\n", encoding="ascii")
+        self.enroll()
+        self.append(self.event("ALARM", "hyphen_topic_test"))
+        sent = []
+
+        def publisher(recipient, event, event_id):
+            sent.append((recipient, event["event"], event_id))
+            return 200
+
+        self.assertEqual(self.run_transport(publisher=publisher)["accepted"], 1)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][:2], (topic, "ALARM"))
+        self.assertEqual(self.run_transport(publisher=publisher)["accepted"], 0)
+        self.assertEqual(len(sent), 1)
+
+    def test_topic_rejects_non_url_safe_separators(self):
+        for separator in ("/", "_", "?", "#"):
+            with self.subTest(separator=separator):
+                self.topic_file.write_text("A" * 39 + separator + "\n", encoding="ascii")
+                with self.assertRaises(dispatch.TransportBlocked):
+                    self.enroll()
+                self.assertFalse((self.state / "transport-cursor.json").exists())
+
     def test_enrollment_explicitly_skips_existing_history_without_delivery(self):
         initial = self.append(self.event("ALARM", "old"))
         with self.assertRaises(dispatch.TransportBlocked):
