@@ -234,6 +234,38 @@ class GarnFontOpaqueReviewPolicyTests(unittest.TestCase):
             ((GARN_FONT_PATH,), ()),
         )
 
+    def test_exact_pinned_font_removal_with_companions_is_reviewable(self) -> None:
+        # The trusted workflow checks the exact source blob in the PR base.
+        metadata = self._metadata()
+        metadata["font_asset_proof"]["operation"] = "removed"
+        metadata["additions"] = 0
+        metadata["deletions"] = 129
+        stats = self._parse(metadata)
+        self.assertEqual(stats.verified_font_files, (GARN_FONT_PATH,))
+        self.assertEqual(
+            _partition_opaque_files(
+                stats.opaque_files, verified_font_files=stats.verified_font_files
+            ),
+            ((GARN_FONT_PATH,), ()),
+        )
+
+    def test_font_removal_with_bad_blob_or_companion_is_blocked(self) -> None:
+        for change in ("wrong_blob", "missing_license", "other_operation"):
+            with self.subTest(change=change):
+                metadata = self._metadata()
+                metadata["font_asset_proof"]["operation"] = "removed"
+                if change == "wrong_blob":
+                    metadata["font_asset_proof"]["blob_sha"] = "0" * 40
+                elif change == "missing_license":
+                    lic = "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt"
+                    metadata["changed_files"].remove(lic)
+                    metadata["attention_changed_files"].remove(lic)
+                    metadata["changed_file_count"] -= 1
+                else:
+                    metadata["font_asset_proof"]["operation"] = "modified"
+                with self.assertRaisesRegex(GovernanceError, "font asset proof"):
+                    self._parse(metadata)
+
     def test_font_with_no_byte_proof_remains_blocking(self) -> None:
         metadata = self._metadata()
         del metadata["font_asset_proof"]

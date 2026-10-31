@@ -213,18 +213,52 @@ jobs:
           garn_font_proof='null'
           if jq -e --arg path "${garn_font_path}" \
             'any(.[]; .filename == $path)' "${RUNNER_TEMP}/files.json" >/dev/null; then
-            garn_blob="$(jq -er --arg path "${garn_font_path}" \
-              '.[] | select(.filename == $path and .status == "added") | .sha' \
+            garn_status="$(jq -er --arg path "${garn_font_path}" \
+              '.[] | select(.filename == $path) | .status' \
               "${RUNNER_TEMP}/files.json")"
+            case "${garn_status}" in
+              added)
+                garn_blob="$(jq -er --arg path "${garn_font_path}" \
+                  '.[] | select(.filename == $path) | .sha' \
+                  "${RUNNER_TEMP}/files.json")"
+                jq -e 'any(.[]; .filename == "apps/web/static/fonts/README.md"
+                  and .status == "added"
+                  and .sha == "ed4fb686e498eeffa98f9a6cb7d9a103bf083802")' \
+                  "${RUNNER_TEMP}/files.json" >/dev/null
+                jq -e 'any(.[]; .filename == "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt"
+                  and .status == "added"
+                  and .sha == "9459440df26a30cfb6ed5542485d281bae449e5f")' \
+                  "${RUNNER_TEMP}/files.json" >/dev/null
+                ;;
+              removed)
+                # Only allow removal of the immutable old licensed font.
+                garn_blob="$(gh api -H "${api_header}" \
+                  "repos/${REPOSITORY}/contents/${garn_font_path}?ref=${base_sha}" \
+                  | jq -er '.sha')"
+                jq -e 'any(.[]; .filename == "apps/web/static/fonts/README.md"
+                  and .status == "removed")
+                  and any(.[]; .filename == "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt"
+                  and .status == "removed")' \
+                  "${RUNNER_TEMP}/files.json" >/dev/null
+                # Verify the immutable previous Git blobs of BOTH deleted
+                # provenance companions, not only their deleted filenames.
+                garn_font_dir="apps/web/static/fonts"
+                for companion in \
+                  "${garn_font_dir}/README.md:ed4fb686e498eeffa98f9a6cb7d9a103bf083802" \
+                  "${garn_font_dir}/OFL-Atkinson-Hyperlegible-Next.txt:9459440df26a30cfb6ed5542485d281bae449e5f"; do
+                  companion_path="${companion%%:*}"
+                  expected_blob="${companion##*:}"
+                  actual_blob="$(gh api -H "${api_header}" \
+                    "repos/${REPOSITORY}/contents/${companion_path}?ref=${base_sha}" | jq -er '.sha')"
+                  [[ "${actual_blob}" == "${expected_blob}" ]]
+                done
+                ;;
+              *)
+                echo "unsupported Garn font action: ${garn_status}" >&2
+                exit 1
+                ;;
+            esac
             [[ "${garn_blob}" == 'a9ca4bd6ffda7092b397871cd3b5ad38a372046d' ]]
-            jq -e 'any(.[]; .filename == "apps/web/static/fonts/README.md"
-              and .status == "added"
-              and .sha == "ed4fb686e498eeffa98f9a6cb7d9a103bf083802")' \
-              "${RUNNER_TEMP}/files.json" >/dev/null
-            jq -e 'any(.[]; .filename == "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt"
-              and .status == "added"
-              and .sha == "9459440df26a30cfb6ed5542485d281bae449e5f")' \
-              "${RUNNER_TEMP}/files.json" >/dev/null
             gh api -H "${api_header}" \
               "repos/${REPOSITORY}/git/blobs/${garn_blob}" > "${RUNNER_TEMP}/garn-blob.json"
             jq -e '.encoding == "base64" and .size == 33996' \
@@ -245,6 +279,9 @@ jobs:
                   "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "9459440df26a30cfb6ed5542485d281bae449e5f"
                 }
               }')"
+            if [[ "${garn_status}" == 'removed' ]]; then
+              garn_font_proof="$(jq -c '. + {operation: "removed"}' <<< "${garn_font_proof}")"
+            fi
           fi
 
           jq -n \
