@@ -98,6 +98,13 @@
 
 <style>
   .wg-page {
+    --wg-surface: var(--panel-solid);
+    --wg-border: var(--panel-border);
+    --wg-border-strong: var(--panel-border-strong);
+    --wg-action: var(--accent);
+    --wg-action-soft: var(--accent-soft);
+    --wg-on-action: var(--bg);
+    --wg-muted: var(--muted);
     min-height: 100vh;
     min-height: 100dvh;
     box-sizing: border-box;
@@ -150,7 +157,7 @@
   .wg-card {
     border: 1px solid var(--panel-border);
     border-radius: var(--radius);
-    background: color-mix(in srgb, var(--panel-solid) 94%, transparent);
+    background: color-mix(in srgb, var(--wg-surface) 94%, transparent);
     background-image: var(--context-weave);
     box-shadow: var(--shadow);
   }
