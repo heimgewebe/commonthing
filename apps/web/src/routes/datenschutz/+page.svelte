@@ -76,8 +76,9 @@
     max-width: 48rem;
     margin: 0 auto;
     padding: 2rem 1.25rem 4rem;
-    font-size: 1rem;
-    line-height: 1.6;
+    font:
+      1rem/1.6 system-ui,
+      sans-serif;
   }
   h1,
   h2 {

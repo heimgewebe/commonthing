@@ -489,6 +489,7 @@
     margin: 0;
     background: var(--bg);
     color: var(--text);
+    font-family: system-ui, sans-serif;
   }
   .page-shell {
     width: min(820px, calc(100% - 32px));
