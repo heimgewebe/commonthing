@@ -17,6 +17,8 @@ relations:
     target: docs/reports/garnrolle-identity-cutover-proof.md
   - type: relates_to
     target: docs/specs/ortsweberei-webgemeindezentrum.md
+  - type: relates_to
+    target: docs/specs/knotenarten.md
 ---
 
 # Domänenvokabular
@@ -27,7 +29,8 @@ relations:
 |---|---|---|---|
 | Garnrolle | Account, `/accounts` | genau ein persönlicher Ausgangspunkt je Account | produktiver PostgreSQL-Pfad belegt |
 | Kartenstatus | `map_state` | `not_on_map`, `exact` oder `radius`; Eigenschaft der Garnrolle, kein Kontotyp | produktiv |
-| Knoten | Node, `/nodes` | Ort, Kollektivgut, Ressource oder Vorhaben | API- und Browser-Schreibpfad produktiv belegt |
+| Knoten | Node, `/nodes` | Fachlicher Oberbegriff für Ort, Ressource, Projekt, Ereignis, Bedarf oder Angebot | API- und Browser-Schreibpfad produktiv belegt |
+| Knotenart | `Node.kind` | Eine der sechs fachlichen Arten laut [Knotenartenvertrag](../specs/knotenarten.md), keine generische Standardart | V2 im Quellcode-Schnitt, Produktivaktivierung gesondert |
 | Faden | Edge, `/edges` | serverseitig abgeleitete Beziehung zwischen Garnrollen und/oder Knoten | öffentliche Leseprojektion; Erzeugung durch fachliche Webungsaktionen |
 | Gesprächsraum | Conversation, `/conversations` | öffentlicher Diskussionsraum; Knotengespräche können aktiv oder archiviert sein | Knotengespräch produktiv |
 | Gesprächsarchiv | Conversation mit `lifecycle_state=archived` | vom früheren Elternobjekt gelöste, stabile und öffentlich lesbare Gesprächsgeschichte | für Knotengespräche implementiert |

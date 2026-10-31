@@ -150,7 +150,7 @@ mod tests {
     fn test_node(id: &str, title: &str, tags: Vec<&str>) -> Node {
         Node {
             id: id.to_string(),
-            kind: "Werkstatt".to_string(),
+            kind: "place".to_string(),
             title: title.to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -161,10 +161,10 @@ mod tests {
             info: Some("Test info".to_string()),
             tags: tags.into_iter().map(String::from).collect(),
             address: Some("Test str. 1".to_string()),
-            location: Location {
+            location: Some(Location {
                 lat: 52.5,
                 lon: 13.4,
-            },
+            }),
         }
     }
 

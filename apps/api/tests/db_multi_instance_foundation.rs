@@ -404,7 +404,7 @@ async fn two_instances_and_restart_share_truth_and_event_receipts() -> Result<()
     // invalidates both process-local projections through the version fence.
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, lat, lon, payload) \
-         VALUES ($1, 'test', 'First title', 53.5, 10.0, '{}'::jsonb)",
+         VALUES ($1, 'place', 'First title', 53.5, 10.0, '{}'::jsonb)",
     )
     .bind(NODE_ID)
     .execute(&pool)

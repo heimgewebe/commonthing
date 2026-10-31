@@ -14,13 +14,13 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Dokumente gesamt | 207 |
-| Dokumente mit ausgehenden Relationen | 206 |
-| Dokumente als Ziel referenziert | 154 |
-| Relationen gesamt | 747 |
+| Dokumente gesamt | 209 |
+| Dokumente mit ausgehenden Relationen | 208 |
+| Dokumente als Ziel referenziert | 155 |
+| Relationen gesamt | 753 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 690 |
+| — relates_to | 696 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | Isolierte Dokumente | 0 |
@@ -51,6 +51,7 @@ Generated automatically. Do not edit.
 - ⚠️ High inbound count (11): `docs/blueprints/auth-roadmap.md` — central dependency, review carefully
 - ⚠️ High inbound count (11): `docs/datenmodell.md` — central dependency, review carefully
 - ⚠️ High inbound count (10): `docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md` — central dependency, review carefully
+- ⚠️ High inbound count (10): `docs/domain/vocabulary.md` — central dependency, review carefully
 
 ### Zyklen (depends_on)
 
@@ -84,6 +85,7 @@ _Keine Zyklen gefunden._
 - `docs/blueprints/auth-roadmap.md` — 11 eingehende Relationen
 - `docs/datenmodell.md` — 11 eingehende Relationen
 - `docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md` — 10 eingehende Relationen
+- `docs/domain/vocabulary.md` — 10 eingehende Relationen
 
 ### Isolierte Dokumente
 

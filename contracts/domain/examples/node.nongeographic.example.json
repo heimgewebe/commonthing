@@ -1,0 +1,16 @@
+{
+  "id": "0d9d7274-e8b0-4c5b-8a01-b1d498277146",
+  "kind": "resource",
+  "title": "Digitales Commons",
+  "created_at": "2024-01-15T10:00:00Z",
+  "updated_at": "2024-01-16T14:30:00Z",
+  "created_by_account_id": "b6a35f2c-dfd7-4c68-8b1b-31dd7a50d4f1",
+  "summary": "Gemeinsam gepflegtes Wissen ohne festen Ort.",
+  "info": "Offene Dokumentation für gemeinsame Vorhaben.",
+  "tags": [
+    "commons",
+    "wissen"
+  ],
+  "address": null,
+  "location": null
+}

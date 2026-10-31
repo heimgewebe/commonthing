@@ -16,6 +16,7 @@ const SESSION_COOKIE_EXPIRY_SAFETY_SECONDS: i64 = 5 * 60;
 
 use crate::{
     auth::{role::Role, session::Session},
+    config::DomainReadSource,
     routes::auth::SESSION_COOKIE_NAME,
     state::ApiState,
 };
@@ -270,7 +271,39 @@ pub async fn auth_middleware(
         };
 
         if let Some(session) = session {
-            let account_state = {
+            // Session I/O must run outside the held PostgreSQL visibility
+            // fence. Read this account's canonical status and role directly,
+            // rather than reloading the entire domain cache before session I/O:
+            // a full reload can wait on the same node/cache locks that writers
+            // need to complete. The inner projection middleware subsequently
+            // validates the authenticated account under the current generation.
+            let account_state = if state.config.domain_read_source == DomainReadSource::Postgres {
+                if let Some(pool) = state.db_pool.as_ref() {
+                    match sqlx::query_as::<_, (bool, String)>(
+                        "SELECT disabled, role FROM domain_accounts WHERE id = $1",
+                    )
+                    .bind(&session.account_id)
+                    .fetch_optional(pool)
+                    .await
+                    {
+                        Ok(row) => {
+                            row.map(|(disabled, role)| (disabled, Role::from_str_lossy(&role)))
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "cannot read canonical account during authentication");
+                            return unavailable_response();
+                        }
+                    }
+                } else {
+                    // Synthetic API contract tests construct a PostgreSQL
+                    // read-source state without a pool. Production rejects
+                    // this configuration at startup.
+                    let accounts = state.accounts.read().await;
+                    accounts
+                        .get(&session.account_id)
+                        .map(|internal| (internal.public.disabled, internal.role.clone()))
+                }
+            } else {
                 let accounts = state.accounts.read().await;
                 accounts
                     .get(&session.account_id)

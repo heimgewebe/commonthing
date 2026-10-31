@@ -1,0 +1,1 @@
+ALTER TABLE domain_nodes DROP CONSTRAINT domain_nodes_location_pair;

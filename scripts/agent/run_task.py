@@ -951,8 +951,19 @@ def _validate_evidence_bindings(
 
 def _cleanup_staging(parent_fd: int, staging_fd: int, staging_name: str) -> None:
     cleanup_errors: list[str] = []
+    # Reopen the pinned staging inode, not its mutable original name: a
+    # rename/replacement must not strand private evidence during rollback.
+    # A fresh stream also sees files created after staging_fd was opened.
     try:
-        names = os.listdir(staging_fd)
+        scan_fd = os.open(".", _directory_flags(), dir_fd=staging_fd)
+        try:
+            existing = os.fstat(staging_fd)
+            scanned = os.fstat(scan_fd)
+            if (existing.st_dev, existing.st_ino) != (scanned.st_dev, scanned.st_ino):
+                raise OSError("staging directory identity changed during cleanup")
+            names = os.listdir(scan_fd)
+        finally:
+            os.close(scan_fd)
     except OSError as exc:
         names = []
         cleanup_errors.append(str(exc))
@@ -961,14 +972,33 @@ def _cleanup_staging(parent_fd: int, staging_fd: int, staging_name: str) -> None
             os.unlink(name, dir_fd=staging_fd)
         except OSError as exc:
             cleanup_errors.append(str(exc))
+
+    # Never remove a directory that replaced the original staging name.
+    # The bound FD remains authoritative for scrubbing the private payloads.
+    name_still_identifies_staging = False
+    try:
+        named_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
+        try:
+            bound = os.fstat(staging_fd)
+            named = os.fstat(named_fd)
+            name_still_identifies_staging = (
+                (bound.st_dev, bound.st_ino) == (named.st_dev, named.st_ino)
+            )
+            if not name_still_identifies_staging:
+                cleanup_errors.append("staging directory name changed during cleanup")
+        finally:
+            os.close(named_fd)
+    except OSError as exc:
+        cleanup_errors.append(str(exc))
     try:
         os.close(staging_fd)
     except OSError as exc:
         cleanup_errors.append(str(exc))
-    try:
-        os.rmdir(staging_name, dir_fd=parent_fd)
-    except OSError as exc:
-        cleanup_errors.append(str(exc))
+    if name_still_identifies_staging:
+        try:
+            os.rmdir(staging_name, dir_fd=parent_fd)
+        except OSError as exc:
+            cleanup_errors.append(str(exc))
     if cleanup_errors:
         raise OSError("; ".join(cleanup_errors))
 
@@ -1151,7 +1181,24 @@ def publish_evidence_bundle(
         staging_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
         for name, payload in staged_payloads.items():
             _write_file_sync_at(staging_fd, name, payload)
-        if set(os.listdir(staging_fd)) != set(EVIDENCE_FILES):
+        # A directory FD opened before writing can have a stale readdir
+        # cursor on some filesystems. Reopen the same inode after writes,
+        # preserving no-follow and the exact four-file integrity check.
+        verification_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
+        try:
+            staged_identity = os.fstat(staging_fd)
+            verified_identity = os.fstat(verification_fd)
+            if (staged_identity.st_dev, staged_identity.st_ino) != (
+                verified_identity.st_dev, verified_identity.st_ino
+            ):
+                raise RunnerError(
+                    "OUTPUT_LOCATION_CHANGED",
+                    "Staging directory identity changed before verification",
+                )
+            staged_names = set(os.listdir(verification_fd))
+        finally:
+            os.close(verification_fd)
+        if staged_names != set(EVIDENCE_FILES):
             raise RunnerError(
                 "RUN_EVIDENCE_INCOMPLETE",
                 "Staged evidence bundle does not contain exactly four files",

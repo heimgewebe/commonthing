@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 747 |
+| Relationen gesamt | 753 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 690 |
+| — relates_to | 696 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |
@@ -32,7 +32,7 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (296 Dokumente):
+**Cluster 1** (299 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
@@ -132,6 +132,7 @@ _Keine Lücken erkannt._
 - `docs/deploy/kubernetes-production-cutover-t044.md`
 - `docs/deploy/map-html-canonical-route.md`
 - `docs/deploy/merge-to-live.md`
+- `docs/deploy/production-hold-first-start.md`
 - `docs/deploy/public-app-base-url.md`
 - `docs/deploy/public-metrics-boundary.md`
 - `docs/deploy/schauwerk-editor-frontdoor.md`
@@ -259,6 +260,7 @@ _Keine Lücken erkannt._
 - `docs/specs/garnrolle-knoten-faden.md`
 - `docs/specs/governance-antraege.md`
 - `docs/specs/knoten-gewebe-visualisierung.md`
+- `docs/specs/knotenarten.md`
 - `docs/specs/list-pagination-api.md`
 - `docs/specs/map-experience.md`
 - `docs/specs/objektlebenszyklen-und-loeschwirkungen.md`
@@ -325,6 +327,7 @@ _Keine Lücken erkannt._
 - `scripts/ops/reconcile-production-main-vps.sh`
 - `scripts/ops/reconcile_public_login_smtp_env.py`
 - `scripts/ops/resolve_vps_public_bind.py`
+- `scripts/ops/verify_production_hold_release.py`
 - `scripts/performance/domain_projection_k6.js`
 - `scripts/performance/domain_projection_load.py`
 - `scripts/platform/experiment_b_runtime.py`

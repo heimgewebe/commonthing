@@ -3,6 +3,12 @@
   --bg: #f3efe5;
   --panel: rgba(255, 252, 245, 0.94);
   --panel-solid: #fbf8f1;
+  /* Woven porcelain: opaque backing keeps the map out of the material. */
+  --context-material: var(--panel-solid);
+  --context-weave: url("/textures/porcelain-light.svg");
+  --context-light: rgba(255, 255, 255, 0.52);
+  --context-edge: rgba(255, 255, 255, 0.72);
+  --context-shade: rgba(47, 62, 58, 0.16);
   --panel-border: rgba(42, 68, 63, 0.16);
   --panel-border-strong: rgba(42, 68, 63, 0.3);
   --text: #1d2927;

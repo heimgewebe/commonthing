@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod auth;
 mod collective_write_guard;
+pub(crate) use crate::state::{postgres_domain_connection_budget, POSTGRES_DOMAIN_OPERATION_UNITS};
 pub mod conversations;
 mod domain_write_guard;
 pub mod edges;
@@ -13,7 +14,10 @@ mod query;
 pub mod search;
 pub mod webgemeindezentren;
 
+use std::collections::HashMap;
+
 use axum::{
+    extract::{Query, State},
     middleware::from_fn,
     routing::{get, post},
     Router,
@@ -59,12 +63,26 @@ use self::{
     },
 };
 
+// This endpoint is intentionally absent from earlier API revisions.
+// The new public /commons page must get a 404 from an older backend, rather
+// than accidentally receive the legacy unfiltered GET /nodes payload.
+async fn list_public_nodes(
+    state: State<ApiState>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> impl axum::response::IntoResponse {
+    // Ignore caller-supplied public_only=false: the route itself is public-only.
+    params.insert("public_only".to_owned(), "true".to_owned());
+    // Public discovery must never inherit owner-only authorization.
+    list_nodes(state, Query(params), None).await
+}
+
 pub fn api_router() -> Router<ApiState> {
     let router = Router::new()
         .merge(machine::api_routes())
         .route("/search", get(search_nodes))
         // Compatibility alias for node-oriented clients; `/search` is canonical.
         .route("/nodes/search", get(search_nodes))
+        .route("/public/nodes", get(list_public_nodes))
         .route(
             "/nodes",
             get(list_nodes)

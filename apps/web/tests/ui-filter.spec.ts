@@ -47,7 +47,7 @@ test.describe("Sicht mode", () => {
             {
               id: "node-1",
               title: "Test Node 1",
-              kind: "Event",
+              kind: "event",
               location: { lat: 53.5, lon: 10.0 },
               summary: "A test event node.",
               tags: ["thema:natur"],
@@ -55,7 +55,7 @@ test.describe("Sicht mode", () => {
             {
               id: "node-2",
               title: "Test Node 2",
-              kind: "Place",
+              kind: "place",
               location: { lat: 53.6, lon: 10.1 },
               summary: "A test place node.",
               tags: ["thema:kunst"],
@@ -78,7 +78,7 @@ test.describe("Sicht mode", () => {
         {
           id: "node-1",
           title: "Test Node 1",
-          kind: "Event",
+          kind: "event",
           location: { lat: 53.5, lon: 10.0 },
           summary: "A test event node.",
           tags: ["thema:natur"],
@@ -88,7 +88,7 @@ test.describe("Sicht mode", () => {
         {
           id: "node-2",
           title: "Test Node 2",
-          kind: "Place",
+          kind: "place",
           location: { lat: 53.6, lon: 10.1 },
           summary: "A test place node.",
           tags: ["thema:kunst"],
@@ -194,7 +194,7 @@ test.describe("Sicht mode", () => {
             {
               id: "node-1",
               title: "Test Node 1",
-              kind: "Event",
+              kind: "event",
               location: { lat: 53.5, lon: 10.0 },
               summary: "A test event node.",
               tags: ["thema:natur"],
@@ -205,7 +205,7 @@ test.describe("Sicht mode", () => {
         : Array.from({ length: 10 }, (_, index) => ({
             id: `off-topic-${index}`,
             title: `Test Fremdtreffer ${index}`,
-            kind: "Event",
+            kind: "event",
             location: { lat: 52 + index * 0.001, lon: 9 },
             summary: "Higher-ranked but off-topic",
             tags: ["thema:kunst"],

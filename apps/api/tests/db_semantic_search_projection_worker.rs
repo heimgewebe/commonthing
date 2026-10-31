@@ -215,7 +215,7 @@ async fn worker_is_revision_bound_leased_resumable_and_deletion_propagates() {
     migrate(&pool).await;
     reset_search_state(&pool).await;
     let node = "t005-worker-node";
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','Fahrradhilfe',$2::jsonb)")
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Fahrradhilfe',$2::jsonb)")
         .bind(node)
         .bind(r#"{"summary":"Reparatur","address":"must not index"}"#)
         .execute(&pool).await.expect("insert node");
@@ -307,7 +307,7 @@ async fn private_nodes_stay_lexical_without_calling_the_provider_and_can_activat
         .execute(&pool)
         .await
         .expect("insert active private owner");
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload,search_visibility) VALUES ($1,'Privatwerkstatt','Vertraulicher Titel',$2::jsonb,'private')")
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload,search_visibility) VALUES ($1,'place','Vertraulicher Titel',$2::jsonb,'private')")
         .bind(node)
         .bind(r#"{"summary":"Vertrauliche Zusammenfassung","address":"Geheimer Weg 9","created_by_account_id":"owner-private"}"#)
         .execute(&pool)
@@ -349,7 +349,7 @@ async fn private_nodes_stay_lexical_without_calling_the_provider_and_can_activat
         .contains("Vertrauliche Zusammenfassung"));
     assert!(!projection.searchable_text.contains("Geheimer Weg 9"));
     assert_eq!(projection.language, "und");
-    assert_eq!(projection.kind, "Privatwerkstatt");
+    assert_eq!(projection.kind, "place");
     assert_eq!(projection.visibility_scopes, ["owner"]);
     assert_eq!(projection.status, "active");
     assert_eq!(projection.semantic_state, "unavailable");
@@ -377,7 +377,7 @@ async fn status_snapshot_separates_unique_nodes_job_history_and_activation_readi
     let node = "t005-status-semantics-node";
     let generation_spec = exact_generation_spec("m", "r", "ollama:test@http://127.0.0.1:11434", 3);
     let generation = generation_spec.generation_id;
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','Revision eins',$2::jsonb)")
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Revision eins',$2::jsonb)")
         .bind(node)
         .bind(r#"{}"#)
         .execute(&pool)
@@ -611,7 +611,7 @@ async fn worker_hardening_proves_races_trigger_identity_outage_and_activation() 
     let node = "t005-hardening-node";
     let generation_spec = exact_generation_spec("m", "r", "ollama:test@http://127.0.0.1:11434", 3);
     let generation = generation_spec.generation_id;
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,lat,lon,payload) VALUES ($1,'Werkstatt','Alt',1,2,$2::jsonb)")
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,lat,lon,payload) VALUES ($1,'place','Alt',1,2,$2::jsonb)")
         .bind(node).bind(r#"{"summary":"S","address":"private","other":"a"}"#)
         .execute(&pool).await.expect("insert");
     let provider = Arc::new(FakeProvider {
@@ -780,12 +780,14 @@ async fn provider_failures_are_bounded_fail_closed_and_explicitly_recoverable() 
     let node = "t005-provider-node";
     let generation_spec = exact_generation_spec("m", "r", "ollama:test@http://127.0.0.1:11434", 3);
     let generation = generation_spec.generation_id;
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','Provider',$2::jsonb)")
-        .bind(node)
-        .bind(r#"{}"#)
-        .execute(&pool)
-        .await
-        .expect("insert provider node");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Provider',$2::jsonb)",
+    )
+    .bind(node)
+    .bind(r#"{}"#)
+    .execute(&pool)
+    .await
+    .expect("insert provider node");
 
     let unavailable = Arc::new(FakeProvider {
         unavailable: AtomicBool::new(true),
@@ -941,7 +943,7 @@ async fn rollback_candidate_stays_current_and_retired_generation_cannot_reactiva
     reset_search_state(&pool).await;
     let node = "t005-rollback-node";
     sqlx::query(
-        "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','A',$2::jsonb)",
+        "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','A',$2::jsonb)",
     )
     .bind(node)
     .bind(r#"{"summary":"sichtbar"}"#)
@@ -1163,12 +1165,14 @@ async fn restarting_the_same_identity_preserves_the_logical_integrity_digest() {
     migrate(&pool).await;
     reset_search_state(&pool).await;
     let node = "t005-digest-node";
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','Digest',$2::jsonb)")
-        .bind(node)
-        .bind(r#"{"summary":"gleich","tags":["b","a"],"language":"de"}"#)
-        .execute(&pool)
-        .await
-        .expect("insert digest node");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Digest',$2::jsonb)",
+    )
+    .bind(node)
+    .bind(r#"{"summary":"gleich","tags":["b","a"],"language":"de"}"#)
+    .execute(&pool)
+    .await
+    .expect("insert digest node");
     let provider = Arc::new(FakeProvider {
         unavailable: AtomicBool::new(false),
     });
@@ -1217,7 +1221,7 @@ async fn generation_start_and_activation_serialize_with_domain_mutations() {
     let generation_spec = exact_generation_spec("m", "r", "ollama:test@http://127.0.0.1:11434", 3);
     let generation = generation_spec.generation_id;
     sqlx::query(
-        "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','A',$2::jsonb)",
+        "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','A',$2::jsonb)",
     )
     .bind(node)
     .bind(r#"{}"#)
@@ -1358,7 +1362,7 @@ async fn concurrent_generation_finishes_serialize_ready_transition_and_keep_coun
     migrate(&pool).await;
     reset_search_state(&pool).await;
     let node = "t005-concurrent-ready-node";
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','Ready Race',$2::jsonb)")
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Ready Race',$2::jsonb)")
         .bind(node)
         .bind(r#"{}"#)
         .execute(&pool)
@@ -1458,12 +1462,14 @@ async fn reclaimed_lease_fences_the_old_worker_before_projection_mutation() {
     let node = "t005-lease-fence-node";
     let generation_spec = exact_generation_spec("m", "r", "ollama:test@http://127.0.0.1:11434", 3);
     let generation = generation_spec.generation_id;
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','Lease',$2::jsonb)")
-        .bind(node)
-        .bind(r#"{}"#)
-        .execute(&pool)
-        .await
-        .expect("insert lease node");
+    sqlx::query(
+        "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Lease',$2::jsonb)",
+    )
+    .bind(node)
+    .bind(r#"{}"#)
+    .execute(&pool)
+    .await
+    .expect("insert lease node");
 
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -1575,7 +1581,7 @@ async fn invalid_projection_document_fails_terminally_without_lease_cycle() {
     let generation_spec = exact_generation_spec("m", "r", "ollama:test@http://127.0.0.1:11434", 3);
     let generation = generation_spec.generation_id;
     sqlx::query(
-        "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','   ',$2::jsonb)",
+        "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','   ',$2::jsonb)",
     )
     .bind(node)
     .bind(r#"{}"#)
@@ -1631,7 +1637,7 @@ async fn search_backfill_binary_projects_with_live_local_provider_without_activa
     reset_search_state(&pool).await;
     let node = "t005-backfill-e2e-node";
     let generation = "t005-backfill-e2e-generation";
-    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt','Backfill E2E',$2::jsonb)")
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Backfill E2E',$2::jsonb)")
         .bind(node)
         .bind(r#"{"summary":"lokaler Providerpfad"}"#)
         .execute(&pool)
@@ -1737,7 +1743,7 @@ async fn t006_search_api_against_postgres_projections() {
     let nodes = [
         (
             "t005-public-node",
-            "Werkstatt",
+            "place",
             "Fahrrad Werkstatt",
             r#"{"summary":"Reparatur"}"#,
             "public",
@@ -1745,7 +1751,7 @@ async fn t006_search_api_against_postgres_projections() {
         ),
         (
             "t005-public-b-node",
-            "Treffpunkt",
+            "event",
             "Fahrrad Hilfe",
             r#"{"summary":"Hilfe"}"#,
             "public",
@@ -1753,7 +1759,7 @@ async fn t006_search_api_against_postgres_projections() {
         ),
         (
             "t005-hidden-node",
-            "Werkstatt",
+            "place",
             "Geheime Fahrrad Werkstatt",
             r#"{"summary":"Geheim"}"#,
             "hidden",
@@ -1761,7 +1767,7 @@ async fn t006_search_api_against_postgres_projections() {
         ),
         (
             "t005-private-node",
-            "Werkstatt",
+            "place",
             "Private Fahrrad Werkstatt",
             r#"{"created_by_account_id":"owner-a","summary":"Privat"}"#,
             "private",
@@ -1769,7 +1775,7 @@ async fn t006_search_api_against_postgres_projections() {
         ),
         (
             "t005-stale-node",
-            "Werkstatt",
+            "place",
             "Stale Fahrrad Werkstatt",
             r#"{"summary":"Alt"}"#,
             "public",
@@ -1777,7 +1783,7 @@ async fn t006_search_api_against_postgres_projections() {
         ),
         (
             "t005-revoked-node",
-            "Werkstatt",
+            "place",
             "Widerrufene Fahrrad Werkstatt",
             r#"{"summary":"Widerruf"}"#,
             "public",
@@ -1785,7 +1791,7 @@ async fn t006_search_api_against_postgres_projections() {
         ),
         (
             "t005-deleted-node",
-            "Werkstatt",
+            "place",
             "Geloeschte Fahrrad Werkstatt",
             r#"{"summary":"Loeschen"}"#,
             "public",
@@ -1793,7 +1799,7 @@ async fn t006_search_api_against_postgres_projections() {
         ),
         (
             "t005-legacy-node",
-            "Werkstatt",
+            "place",
             "Legacy Fahrrad Werkstatt",
             r#"{"summary":"Legacy"}"#,
             "hidden",
@@ -1801,7 +1807,7 @@ async fn t006_search_api_against_postgres_projections() {
         ),
         (
             "t005-wrong-dimension-node",
-            "Werkstatt",
+            "place",
             "Dimension Fahrrad Werkstatt",
             r#"{"summary":"Dimension"}"#,
             "public",
@@ -1878,7 +1884,7 @@ async fn t006_search_api_against_postgres_projections() {
         let id = format!("t005-ranking-prefix-{index:02}");
         let title = format!("Fahrrad Rang {index:02}");
         sqlx::query(
-            "INSERT INTO domain_nodes (id, kind, title, lat, lon, created_at, updated_at, payload) VALUES ($1, 'Werkstatt', $2, 0.0, 0.0, NOW(), NOW(), '{}'::jsonb)",
+            "INSERT INTO domain_nodes (id, kind, title, lat, lon, created_at, updated_at, payload) VALUES ($1, 'place', $2, 0.0, 0.0, NOW(), NOW(), '{}'::jsonb)",
         )
         .bind(&id)
         .bind(&title)
@@ -1917,7 +1923,7 @@ async fn t006_search_api_against_postgres_projections() {
     .enumerate()
     {
         sqlx::query(
-            "INSERT INTO domain_nodes (id, kind, title, lat, lon, created_at, updated_at, payload) VALUES ($1, 'Werkstatt', $2, 0.0, 0.0, NOW(), NOW(), '{}'::jsonb)",
+            "INSERT INTO domain_nodes (id, kind, title, lat, lon, created_at, updated_at, payload) VALUES ($1, 'place', $2, 0.0, 0.0, NOW(), NOW(), '{}'::jsonb)",
         )
         .bind(id)
         .bind(title)
@@ -2262,14 +2268,14 @@ async fn t006_search_api_against_postgres_projections() {
         &anonymous,
         SearchQueryParams {
             q: Some("Fahrrad".to_string()),
-            kind: Some("Werkstatt".to_string()),
+            kind: Some("place".to_string()),
             ..Default::default()
         },
         Some(unavailable_provider()),
     )
     .await
     .expect("filtered search");
-    assert!(filtered.items.iter().all(|node| node.kind == "Werkstatt"));
+    assert!(filtered.items.iter().all(|node| node.kind == "place"));
     assert!(!filtered
         .items
         .iter()
@@ -2280,7 +2286,7 @@ async fn t006_search_api_against_postgres_projections() {
         &anonymous,
         SearchQueryParams {
             q: Some("Fahrrad".to_string()),
-            kinds: Some("Werkstatt,Treffpunkt".to_string()),
+            kinds: Some("place,event".to_string()),
             tags: Some("Rad".to_string()),
             ..Default::default()
         },
@@ -2466,12 +2472,101 @@ async fn t006_search_api_against_postgres_projections() {
         "a single provider-contract-error search must record exactly one provider_contract_error outcome"
     );
 
+    // A real T006 HTTP search must NOT reserve pooled connections or hold a
+    // PostgreSQL generation-row lock during potentially slow provider I/O.
+    // A second physical PostgreSQL pool must be free to commit public->private
+    // while embedding waits; the resumed result must exclude that node.
+    let provider_entered = Arc::new(Notify::new());
+    let provider_release = Arc::new(Notify::new());
+    let paused_state = state.clone();
+    let paused_auth = anonymous.clone();
+    let paused_search = tokio::spawn({
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(BlockingProvider {
+            entered: Arc::clone(&provider_entered),
+            release: Arc::clone(&provider_release),
+        });
+        async move {
+            weltgewebe_api::search::execute_search_http(
+                &paused_state,
+                &paused_auth,
+                SearchQueryParams {
+                    q: Some("Fahrrad Werkstatt".to_string()),
+                    ..Default::default()
+                },
+                Some(provider),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), provider_entered.notified())
+        .await
+        .expect("provider must pause before canonical candidate read");
+    let other_pool = crate::pool().await;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        sqlx::query(
+            "UPDATE domain_nodes SET search_visibility='private'
+             WHERE id='t005-public-node'",
+        )
+        .execute(&other_pool),
+    )
+    .await
+    .expect("visibility commit must NOT wait for slow embedding")
+    .expect("independent private visibility commit");
+    let committed: String = sqlx::query_scalar(
+        "SELECT search_visibility FROM domain_nodes WHERE id='t005-public-node'",
+    )
+    .fetch_one(&other_pool)
+    .await
+    .expect("read committed visibility");
+    assert_eq!(committed, "private");
+    provider_release.notify_one();
+    let search_response = tokio::time::timeout(Duration::from_secs(7), paused_search)
+        .await
+        .expect("search completes after provider")
+        .expect("search task join")
+        .expect("search HTTP result");
+    assert_eq!(search_response.status(), axum::http::StatusCode::OK);
+    let response_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(search_response.into_body(), usize::MAX)
+            .await
+            .expect("search JSON bytes"),
+    )
+    .expect("parse search JSON");
+    assert!(
+        !response_json["items"]
+            .as_array()
+            .expect("search items")
+            .iter()
+            .any(|node| node["id"] == "t005-public-node"),
+        "private canonical node escaped after provider: {response_json}"
+    );
+    // Restore the disposable PostgreSQL fixture for the following T004 tests.
+    sqlx::query("UPDATE domain_nodes SET search_visibility='public' WHERE id='t005-public-node'")
+        .execute(&pool)
+        .await
+        .expect("restore public test node");
+    sqlx::query(
+        "UPDATE search_node_projections p
+         SET source_version=v.source_version, source_revision=v.source_revision
+         FROM search_node_versions v
+         WHERE p.generation_id=$1 AND p.node_id='t005-public-node' AND v.node_id=p.node_id",
+    )
+    .bind(&gen_id)
+    .execute(&pool)
+    .await
+    .expect("reconcile search projection after reset");
+    state
+        .refresh_domain_projection_if_stale()
+        .await
+        .expect("refresh restored public node");
+
     // The verified T004 core rejects candidate sets above 1000. T006 mirrors
     // that bound and fetches only one sentinel row beyond it, preventing an
     // unbounded transfer of embedding arrays into the API process.
     sqlx::query(
         "INSERT INTO domain_nodes (id, kind, title, lat, lon, created_at, updated_at, payload) \
-         SELECT 't006-overflow-' || lpad(value::text, 4, '0'), 'Overflow', 'Overflow ' || value::text, 0.0, 0.0, NOW(), NOW(), '{}'::jsonb \
+         SELECT 't006-overflow-' || lpad(value::text, 4, '0'), 'resource', 'Overflow ' || value::text, 0.0, 0.0, NOW(), NOW(), '{}'::jsonb \
            FROM generate_series(1, $1::integer) AS value",
     )
     .bind((MAX_AUTHORIZED_CANDIDATES + 1) as i32)
@@ -2481,7 +2576,7 @@ async fn t006_search_api_against_postgres_projections() {
     sqlx::query(
         "INSERT INTO search_node_projections (generation_id, node_id, source_version, source_revision, content_sha256, title, tags, searchable_text, language, kind, status, visibility_scopes, semantic_state, embedding) \
          SELECT $1, v.node_id, v.source_version, v.source_revision, repeat('a', 64), n.title, ARRAY[]::text[], n.title, 'de', n.kind, 'active', ARRAY['public'], 'ready', ARRAY[1.0,-1.0]::double precision[] \
-           FROM search_node_versions v JOIN domain_nodes n ON n.id=v.node_id WHERE n.kind='Overflow'",
+           FROM search_node_versions v JOIN domain_nodes n ON n.id=v.node_id WHERE n.id LIKE 't006-overflow-%'",
     )
     .bind(&gen_id)
     .execute(&pool)
@@ -2491,7 +2586,7 @@ async fn t006_search_api_against_postgres_projections() {
         &pool,
         "kein lexikalischer treffer",
         &SearchFilters {
-            kinds: vec!["Overflow".to_string()],
+            kinds: vec!["resource".to_string()],
             ..Default::default()
         },
         &anonymous,
@@ -2507,7 +2602,7 @@ async fn t006_search_api_against_postgres_projections() {
         &anonymous,
         SearchQueryParams {
             q: Some("kein lexikalischer treffer".to_string()),
-            kind: Some("Overflow".to_string()),
+            kind: Some("resource".to_string()),
             ..Default::default()
         },
         Some(unavailable_provider()),
@@ -2589,7 +2684,7 @@ async fn canonical_visibility_migration_preserves_public_defaults_and_reprojects
         ),
     ] {
         sqlx::query(
-            "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'Werkstatt',$2,$3::jsonb)",
+            "INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place',$2,$3::jsonb)",
         )
         .bind(id)
         .bind(title)
@@ -2638,7 +2733,7 @@ async fn canonical_visibility_migration_preserves_public_defaults_and_reprojects
     assert!(trigger_enabled);
 
     sqlx::query(
-        "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility) VALUES ('t005-legacy-private-owner','Werkstatt','Legacy Private',$1::jsonb,'private')",
+        "INSERT INTO domain_nodes (id,kind,title,payload,search_visibility) VALUES ('t005-legacy-private-owner','place','Legacy Private',$1::jsonb,'private')",
     )
     .bind(r#"{"summary":"privat","created_by_account_id":"owner-a"}"#)
     .execute(&pool)
@@ -2685,4 +2780,82 @@ async fn canonical_visibility_migration_preserves_public_defaults_and_reprojects
     .await
     .expect("owner change projection job");
     assert!(owner_change_job);
+}
+
+#[tokio::test]
+#[ignore = "requires T005_DATABASE_URL pointing to direct disposable PostgreSQL"]
+async fn nongeographic_commons_is_projected_and_searchable() {
+    let pool = pool().await;
+    migrate(&pool).await;
+    reset_search_state(&pool).await;
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,created_at,updated_at,payload) VALUES ('t006-digital','resource','Digital Commons',now(),now(),'{\"tags\":[\"commons\"]}'::jsonb)")
+        .execute(&pool).await.expect("create nongeographic Commons");
+    let projection_worker = worker(
+        pool.clone(),
+        "t006-digital-worker",
+        Arc::new(FakeProvider {
+            unavailable: AtomicBool::new(false),
+        }),
+    );
+    let spec = exact_generation_spec("digital", "r1", "ollama:test@http://127.0.0.1:11434", 3);
+    let generation = spec.generation_id.to_owned();
+    projection_worker
+        .start_generation(spec)
+        .await
+        .expect("start generation");
+    while projection_worker
+        .claim_and_process_one()
+        .await
+        .expect("process projection")
+        == ProcessOutcome::Processed
+    {}
+    sqlx::query("SELECT weltgewebe_activate_search_generation($1)")
+        .bind(&generation)
+        .execute(&pool)
+        .await
+        .expect("activate generation");
+    let anonymous = AuthContext {
+        authenticated: false,
+        account_id: None,
+        device_id: None,
+        role: Role::Gast,
+        expires_at: None,
+    };
+    let result = fetch_postgres_candidates(
+        &pool,
+        "Digital Commons",
+        &SearchFilters::default(),
+        &anonymous,
+    )
+    .await
+    .expect("search")
+    .expect("active generation");
+    let commons = result
+        .candidates
+        .iter()
+        .find(|item| item.node.id == "t006-digital")
+        .expect("nongeographic result");
+    assert_ne!(
+        commons.rank_class,
+        u8::MAX,
+        "lexical result is eligible without coordinates"
+    );
+    assert!(commons.node.location.is_none());
+    sqlx::query("UPDATE domain_nodes SET search_visibility='hidden' WHERE id='t006-digital'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let hidden = fetch_postgres_candidates(
+        &pool,
+        "Digital Commons",
+        &SearchFilters::default(),
+        &anonymous,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!hidden
+        .candidates
+        .iter()
+        .any(|item| item.node.id == "t006-digital"));
 }

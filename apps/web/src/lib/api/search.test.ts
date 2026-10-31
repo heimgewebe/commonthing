@@ -32,6 +32,27 @@ function searchResponse(): Response {
 }
 
 describe("searchNodes", () => {
+  it.each([null, undefined])(
+    "retains a nongeographic search result (%j) without a map entity",
+    async (location) => {
+      const node = { ...NODE, location };
+      const response = await searchNodes("Commons", {
+        fetcher: vi.fn<typeof fetch>(
+          async () => new Response(JSON.stringify({ items: [node] })),
+        ),
+      });
+      expect(response.items).toEqual([node]);
+      expect(nodeToMapEntity(node)).toBeNull();
+    },
+  );
+
+  it.each([
+    { lat: NaN, lon: 10 },
+    { lat: 91, lon: 10 },
+    { lat: 53, lon: Infinity },
+  ])("refuses invalid coordinates %j at the map boundary", (location) => {
+    expect(nodeToMapEntity({ ...NODE, location })).toBeNull();
+  });
   it("calls the authorized server search with credentials and stable kind filters", async () => {
     const fetcher = vi.fn<typeof fetch>(async () => searchResponse());
 
