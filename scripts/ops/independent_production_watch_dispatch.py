@@ -31,7 +31,7 @@ MAX_LINE_BYTES = 65536
 MAX_CURSOR_BYTES = 8192
 MAX_BATCH = 8
 HTTP_TOTAL_TIMEOUT_SECONDS = 8
-TOPIC_RE = re.compile(r"[A-Za-z0-9]{32,128}\Z")
+TOPIC_RE = re.compile(r"[A-Za-z0-9-]{32,128}\Z")
 EVENTS = frozenset({"ALARM", "RECOVERY", "MONITOR_DATA_FAILURE"})
 TRANSPORT_NON_CLAIMS = [
     "external_device_delivery",
