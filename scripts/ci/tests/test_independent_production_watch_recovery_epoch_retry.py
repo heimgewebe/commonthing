@@ -107,6 +107,67 @@ class RecoveryEpochWriteRetryTests(unittest.TestCase):
         watch.record(report(3, True), self.directory, serialized_poll=True)
         self.assertEqual([e["event"] for e in self.journal()], ["ALARM"])
 
+    def test_alarm_payload_immutable_across_journal_and_heartbeat_errors(self) -> None:
+        watch.record(report(0, True), self.directory, serialized_poll=True)
+        state_path = self.directory / "state.json"
+        real_write = watch.write_json
+        state_failed = []
+
+        def fail_recovery_state(path: Path, value: dict) -> None:
+            if path == state_path and not state_failed:
+                state_failed.append(True)
+                raise OSError("first recovery state fsync failure")
+            real_write(path, value)
+
+        with mock.patch.object(watch, "write_json", side_effect=fail_recovery_state):
+            try:
+                watch._persist_cycle(report(1, False), self.directory)
+            finally:
+                signal.alarm(0)
+        self.assertEqual(state_failed, [True])
+
+        original_append = watch._append_durable_events
+        journal_failed = []
+        heartbeat_failed = []
+
+        def fail_one_append(*args, **kwargs):
+            if not journal_failed:
+                journal_failed.append(True)
+                raise OSError("one failed journal append")
+            return original_append(*args, **kwargs)
+
+        def fail_post_journal_heartbeat(path: Path, value: dict) -> None:
+            p2 = isinstance(value, dict) and any(
+                isinstance(issue, dict) and issue.get("code") == "event_log_write_failed"
+                for issue in value.get("issues", [])
+            )
+            if path == self.directory / "heartbeat.json" and p2 and not heartbeat_failed:
+                heartbeat_failed.append(True)
+                raise OSError("heartbeat write failed after state succeeded")
+            real_write(path, value)
+
+        with (
+            mock.patch.object(watch, "_append_durable_events", side_effect=fail_one_append),
+            mock.patch.object(watch, "write_json", side_effect=fail_post_journal_heartbeat),
+        ):
+            try:
+                watch._persist_cycle(report(2, True), self.directory)
+            finally:
+                signal.alarm(0)
+        self.assertEqual(journal_failed, [True])
+        self.assertEqual(heartbeat_failed, [True])
+
+        watch.record(report(3, True), self.directory, serialized_poll=True)
+        watch.record(report(4, False), self.directory, serialized_poll=True)
+        transitions = [x for x in self.journal() if x["event"] in {"ALARM", "RECOVERY"}]
+        self.assertEqual([x["event"] for x in transitions],
+                         ["ALARM", "RECOVERY", "ALARM", "RECOVERY"])
+        self.assertEqual([x["checked_at_utc"] for x in transitions],
+                         [report(0, True)["checked_at_utc"],
+                          report(1, False)["checked_at_utc"],
+                          report(2, True)["checked_at_utc"],
+                          report(4, False)["checked_at_utc"]])
+
     def test_unbroken_same_code_p1_does_not_create_duplicate_alarm(self) -> None:
         watch.record(report(0, True), self.directory, serialized_poll=True)
         watch.record(report(1, True), self.directory, serialized_poll=True)

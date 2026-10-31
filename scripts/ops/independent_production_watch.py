@@ -5,6 +5,7 @@ Only reads public URLs. Writes evidence to the local per-user state directory.
 No GitHub mutation, email, webhook or claimed notification delivery.
 """
 import argparse
+from copy import deepcopy
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -447,7 +448,7 @@ def _record_unverifiable_prior_state(result, directory, heartbeat, cause, *, sta
         if newly_confirmed:
             original = {
                 "event": "ALARM",
-                **{key: value for key, value in result.items()
+                **{key: deepcopy(value) for key, value in result.items()
                    if key not in {"pending_transitions", "pending_surge_overflow"}},
                 "status": "ALARM",
                 "issues": newly_confirmed,
@@ -1400,7 +1401,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                         continue
                 payload = {
                     "event": event_name,
-                    **{key: value for key, value in result.items()
+                    **{key: deepcopy(value) for key, value in result.items()
                        if key not in {"pending_transitions", "pending_surge_overflow"}},
                     "issue_url": "https://github.com/heimgewebe/commonthing/issues/1939",
                 }
