@@ -354,6 +354,32 @@ test("readable display ink contains directional stitches", async ({
     body: sewn,
     contentType: "image/png",
   });
+
+  // A Garnrolle uses an h3, not the login page's h1. Catch future selector
+  // drift that would leave real profile names plain on the map again.
+  await page.evaluate(() => {
+    const accountHeading = document.createElement("h3");
+    accountHeading.dataset.testid = "garnrolle-embroidery-heading";
+    accountHeading.textContent = "Garnrolle · ü ö ä ß";
+    document.body.append(accountHeading);
+  });
+  const accountHeading = page.getByTestId("garnrolle-embroidery-heading");
+  await expect(accountHeading).toHaveCSS("background-clip", "text");
+  const accountInk = await accountHeading.evaluate((el) => {
+    const style = getComputedStyle(el);
+    return {
+      image: style.backgroundImage,
+      fill: style.webkitTextFillColor,
+      font: style.fontFamily,
+    };
+  });
+  expect(accountInk.image).toContain("repeating-linear-gradient");
+  expect(accountInk.fill).toBe("rgba(0, 0, 0, 0)");
+  expect(accountInk.font).toContain(family);
+  await savePixels(testInfo, "visible-garnrolle-heading", {
+    body: await accountHeading.screenshot(),
+    contentType: "image/png",
+  });
 });
 
 test("embroidered headings remain opaque when backgrounds are unavailable", async ({
