@@ -5,7 +5,7 @@
   --panel-solid: #fbf8f1;
   /* Woven porcelain: opaque backing keeps the map out of the material. */
   --context-material: var(--panel-solid);
-  --context-weave: url("/textures/porcelain-light.svg");
+  --context-weave: url("/textures/porcelain-light.png");
   --context-light: rgba(255, 255, 255, 0.52);
   --context-edge: rgba(255, 255, 255, 0.72);
   --context-shade: rgba(47, 62, 58, 0.16);
