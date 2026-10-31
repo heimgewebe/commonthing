@@ -162,6 +162,15 @@ test("loads the repository canonical contract", () => {
   );
 });
 
+test("bounds Garn's shared CSS cost without relaxing JavaScript budgets", () => {
+  const { routes } = loadPerformanceContract().measurements.web_build.budget;
+  // The local variable font + optical relief measured 3492B/3683B CSS gzip.
+  assert.equal(routes["/login"].max_initial_css_gzip_bytes, 3550);
+  assert.equal(routes["/settings"].max_initial_css_gzip_bytes, 3750);
+  assert.equal(routes["/login"].max_initial_js_gzip_bytes, 46000);
+  assert.equal(routes["/settings"].max_initial_js_gzip_bytes, 57000);
+});
+
 test("isolates web runtime evidence from unrelated preview servers", () => {
   const config = readFileSync(
     resolve(repositoryRoot, "apps/web/playwright.performance.config.ts"),

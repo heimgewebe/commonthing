@@ -30,7 +30,6 @@
   /* Keine Inline-Styles: style-src laeuft ohne 'unsafe-inline'. */
   .dev-root {
     padding: 2rem;
-    font-family: sans-serif;
     max-width: 600px;
     margin: 0 auto;
   }
