@@ -51,6 +51,19 @@ SAFE_OPAQUE_PREFIXES = (
     "apps/web/src/lib/assets/",
     "static/",
 )
+# Only this exact upstream WOFF2 can be treated like an inspectable asset.
+# The trusted workflow derives its SHA-256/byte count/magic from the GitHub
+# blob and the companion source+OFL Git blobs; unverified fonts remain opaque.
+GARN_FONT_PATH = "apps/web/static/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2"
+GARN_FONT_SHA256 = "18b2a1a39a2fa298b0ba5390aca68462669826c90925656f1c1f6796e0e1bbaf"
+GARN_FONT_GIT_BLOB = "a9ca4bd6ffda7092b397871cd3b5ad38a372046d"
+GARN_FONT_BYTES = 33996
+GARN_FONT_PROVENANCE_BLOBS = {
+    "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt":
+        "9459440df26a30cfb6ed5542485d281bae449e5f",
+    "apps/web/static/fonts/README.md":
+        "ed4fb686e498eeffa98f9a6cb7d9a103bf083802",
+}
 RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 REQUIRED_REVIEWS = {"R0": 0, "R1": 1, "R2": 2, "R3": 2}
 AUTHORIZED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -115,6 +128,7 @@ class DiffStats:
     binary_files: tuple[str, ...]
     opaque_files: tuple[str, ...] = ()
     attention_changed_files: tuple[str, ...] = ()
+    verified_font_files: tuple[str, ...] = ()
 
     @property
     def changed_lines(self) -> int:
@@ -302,12 +316,16 @@ def _is_safe_opaque_asset(path: str) -> bool:
 
 
 def _partition_opaque_files(
-    paths: Iterable[str],
+    paths: Iterable[str], *, verified_font_files: Iterable[str] = ()
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    verified = frozenset(verified_font_files)
     reviewable: list[str] = []
     blocking: list[str] = []
     for path in paths:
-        (reviewable if _is_safe_opaque_asset(path) else blocking).append(path)
+        allowed = _is_safe_opaque_asset(path) or (
+            path == GARN_FONT_PATH and path in verified
+        )
+        (reviewable if allowed else blocking).append(path)
     return tuple(reviewable), tuple(blocking)
 
 
@@ -464,7 +482,9 @@ def _build_bundle(
     request_path = output_dir / f"{stem}.review-request.md"
     diff_path.write_bytes(diff_bytes)
     patch_path.write_bytes(patch_bytes)
-    reviewable_opaque, blocking_opaque = _partition_opaque_files(stats.opaque_files)
+    reviewable_opaque, blocking_opaque = _partition_opaque_files(
+        stats.opaque_files, verified_font_files=stats.verified_font_files
+    )
 
     binding = {
         "pr_number": pr_number,
@@ -661,7 +681,7 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
         "deletions",
         "opaque_files",
     }
-    optional = {"attention_changed_files"}
+    optional = {"attention_changed_files", "font_asset_proof"}
     if not required.issubset(raw) or not set(raw).issubset(required | optional):
         missing = sorted(required - set(raw))
         extra = sorted(set(raw) - required - optional)
@@ -731,6 +751,39 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
         merge_base_sha=merge_base_sha,
     )
     _validate_stats(stats)
+    proof = raw.get("font_asset_proof")
+    if proof is not None:
+        expected_keys = {
+            "path",
+            "blob_sha",
+            "sha256",
+            "size",
+            "magic",
+            "provenance_blobs",
+        }
+        if not isinstance(proof, dict) or set(proof) != expected_keys:
+            raise GovernanceError("font asset proof fields are invalid")
+        if (
+            proof["path"] != GARN_FONT_PATH
+            or proof["blob_sha"] != GARN_FONT_GIT_BLOB
+            or proof["sha256"] != GARN_FONT_SHA256
+            or type(proof["size"]) is not int
+            or proof["size"] != GARN_FONT_BYTES
+            or proof["magic"] != "wOF2"
+            or proof["provenance_blobs"] != GARN_FONT_PROVENANCE_BLOBS
+            or GARN_FONT_PATH not in stats.opaque_files
+            or not set(GARN_FONT_PROVENANCE_BLOBS).issubset(stats.changed_files)
+        ):
+            raise GovernanceError("font asset proof failed exact font/provenance binding")
+        stats = DiffStats(
+            stats.changed_files,
+            stats.additions,
+            stats.deletions,
+            stats.binary_files,
+            stats.opaque_files,
+            stats.attention_changed_files,
+            (GARN_FONT_PATH,),
+        )
     return pr_number, base_sha, head_sha, merge_base_sha, stats
 
 
@@ -784,6 +837,7 @@ def _resolve_materialized_opaque_files(
         stats.binary_files,
         unresolved,
         stats.attention_changed_files,
+        stats.verified_font_files,
     )
 
 
@@ -1066,11 +1120,12 @@ def evaluate_evidence(
         risk_class = "R3"
 
     reviewable_opaque, blocking_opaque = _partition_opaque_files(
-        bundle.stats.opaque_files
+        bundle.stats.opaque_files,
+        verified_font_files=bundle.stats.verified_font_files,
     )
     if blocking_opaque:
         reasons.append(
-            "opaque files outside the reviewable raster-asset policy block the review evidence gate: "
+            "opaque files outside the reviewable image/verified-font policy block the review evidence gate: "
             + ", ".join(blocking_opaque)
         )
 
