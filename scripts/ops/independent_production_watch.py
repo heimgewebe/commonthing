@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import subprocess
 import sys
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -93,6 +94,25 @@ def timestamp(value):
         return None
 
 
+def _public_main_ref_over_git():
+    """Fallback to GitHub's public Git ref when anonymous REST is throttled.
+
+    The ref (not its commit timestamp) is authoritative. Never synthesize
+    GitHub REST commit metadata or accept a different branch/tag.
+    """
+    completed = subprocess.run(
+        ["git", "ls-remote", "https://github.com/heimgewebe/commonthing.git",
+         "refs/heads/main"],
+        capture_output=True, text=True, timeout=8, check=False,
+    )
+    if completed.returncode != 0 or not isinstance(completed.stdout, str):
+        raise ValueError("public git ref unavailable")
+    match = re.fullmatch(r"([0-9a-f]{40})\trefs/heads/main\n?", completed.stdout)
+    if match is None:
+        raise ValueError("invalid public git main ref")
+    return {"sha": match.group(1), "observation_transport": "git_https"}
+
+
 def fetch(name):
     error = None
     product_failures = 0
@@ -132,6 +152,15 @@ def fetch(name):
                         raise ValueError("invalid public product version commit")
                 return data, response.headers.get("Cache-Control", "")
         except HTTPError as exc:
+            if name == "main" and exc.code == 403:
+                # Shared anonymous GitHub REST budgets can be exhausted by
+                # unrelated processes. The public Git ref is an independent
+                # precise read of the same branch without API quota.
+                try:
+                    return _public_main_ref_over_git(), ""
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    # Do not invent a main SHA if both transports fail.
+                    pass
             if permanent_product_http_failure(name, exc.code):
                 product_failures += 1
             error = f"HTTPError: HTTP {exc.code}"
@@ -250,7 +279,8 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None, issue_sink=No
         committer = metadata.get("committer") if isinstance(metadata, dict) else None
         commit_time = timestamp(committer.get("date") if isinstance(committer, dict) else None)
         commit_age = (now - commit_time).total_seconds() if commit_time else None
-        if commit_age is None or commit_age < -120:
+        if (data["main"].get("observation_transport") != "git_https"
+                and (commit_age is None or commit_age < -120)):
             flag("main_time_unreliable", "GitHub main", str(commit_age),
                  "valid commit timestamp", "main", "P2")
     newest_schedule = None
