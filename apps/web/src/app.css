@@ -1,13 +1,4 @@
 /* Gemeinsame Grundstile; Farben und Abstände stammen aus styles/tokens.css. */
-@font-face {
-  font-family: "Atkinson Hyperlegible Next";
-  src: url("/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2")
-    format("woff2");
-  font-style: normal;
-  font-weight: 200 800;
-  font-display: swap;
-}
-
 html,
 body,
 #app {
@@ -19,7 +10,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font:
-    14px/1.4 "Atkinson Hyperlegible Next",
+    14px/1.4 ui-sans-serif,
     system-ui,
     -apple-system,
     Segoe UI,
@@ -28,52 +19,6 @@ body {
     Cantarell,
     "Helvetica Neue",
     Arial;
-}
-
-/* Commonthing Garn: visible satin-thread ribs inside display ink, with
- * raised but fully opaque native glyphs for small interface text.
- * The underlying OFL font retains its unmodified metrics and glyphs.
- */
-:where(button, input, select, textarea) {
-  font-family: inherit;
-}
-
-:where(body *):not(#map, #map *, :has(#map), svg, svg *, [aria-hidden="true"]) {
-  text-shadow:
-    0 clamp(0.28px, 0.03em, 0.64px) 0 var(--garn-shade),
-    0 clamp(-0.64px, -0.03em, -0.28px) 0 var(--garn-light);
-}
-
-/* Retinal-resolution diagonal stitches must remain visible at 24px.
- * Do not clip button backgrounds or nested text; preserve a solid-ink
- * fallback for browsers that cannot paint thread gradients.
- */
-@supports (
-  (-webkit-background-clip: text) and (-webkit-text-fill-color: transparent) and
-    (color: color-mix(in srgb, white 50%, black))
-) {
-  :where(h1, h2, h3, h4):not(.desktop-panel-title, #map *, :has(*)) {
-    background-image: repeating-linear-gradient(
-      145deg,
-      currentColor 0 2.3px,
-      color-mix(in srgb, currentColor 64%, var(--context-material)) 2.7px 3.35px,
-      currentColor 3.75px 6px
-    );
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    text-shadow: none;
-  }
-}
-
-/* Print and forced-contrast rendering may suppress background images.
- * The letterforms must then use opaque ink, not an invisible clipped fill.
- */
-@media print, (forced-colors: active) {
-  :where(h1, h2, h3, h4):not(.desktop-panel-title, #map *, :has(*)) {
-    background-image: none;
-    -webkit-text-fill-color: currentColor;
-  }
 }
 
 :focus {

@@ -35,7 +35,7 @@
         "routes": {
           "/login": {
             "max_initial_js_gzip_bytes": 46000,
-            "max_initial_css_gzip_bytes": 3700,
+            "max_initial_css_gzip_bytes": 3200,
             "forbid_css_markers": [
               ".maplibregl-"
             ],
@@ -59,7 +59,7 @@
           },
           "/settings": {
             "max_initial_js_gzip_bytes": 57000,
-            "max_initial_css_gzip_bytes": 3900,
+            "max_initial_css_gzip_bytes": 3600,
             "forbid_css_markers": [
               ".maplibregl-",
               ".wg-page"

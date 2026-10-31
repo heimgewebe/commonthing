@@ -12,8 +12,6 @@
   --panel-border: rgba(42, 68, 63, 0.16);
   --panel-border-strong: rgba(42, 68, 63, 0.3);
   --text: #1d2927;
-  --garn-light: rgba(255, 255, 255, 0.42);
-  --garn-shade: rgba(24, 39, 35, 0.24);
   --muted: #5d6c68;
   --accent: #2f776d;
   --accent-soft: rgba(47, 119, 109, 0.14);
@@ -55,11 +53,6 @@
   --edge-top-height: 16px;
   --edge-left-width: 16px;
   --edge-right-width: 16px;
-}
-
-:root[data-color-scheme="dark"] {
-  --garn-light: rgba(216, 237, 231, 0.2);
-  --garn-shade: rgba(0, 0, 0, 0.48);
 }
 
 /* Android: Back-Swipe oft breiter → Zone schmaler & leicht weiter innen */
