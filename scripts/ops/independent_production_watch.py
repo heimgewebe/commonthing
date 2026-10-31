@@ -1220,20 +1220,48 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
             )
             heartbeat_time = timestamp(previous_heartbeat.get("checked_at_utc"))
             state_time = timestamp(previous.get("checked_at_utc"))
-            if (
-                # Failure heartbeats preserve uncertainty: never translate a
-                # failed recovery write into a newly verified healthy state.
-                result.get("status") in {"ALARM", "HEALTHY"}
-                and heartbeat_recovery is not None
+            recovery_payload = (
+                heartbeat_recovery["payload"] if heartbeat_recovery is not None else {}
+            )
+            recovery_time = timestamp(recovery_payload.get("checked_at_utc"))
+            # The error fallback may copy the verified recovery into state and
+            # advance both snapshot timestamps. Its ORIGINAL payload time is
+            # then the episode boundary, not the newer failure heartbeat time.
+            recovery_retried_into_state = (
+                heartbeat_recovery is not None
+                and heartbeat_recovery in state_pending
+                and recovery_time is not None
+                and state_time is not None
+                and state_time >= recovery_time
+                and result.get("status") == "ALARM"
+                and any(
+                    isinstance(issue, dict) and issue.get("severity") == "P1"
+                    for issue in result.get("issues", [])
+                )
+                and timestamp(result.get("checked_at_utc")) is not None
+                and recovery_time < timestamp(result["checked_at_utc"])
+            )
+            recovery_only_in_heartbeat = (
+                heartbeat_recovery is not None
                 and heartbeat_recovery not in state_pending
+                and recovery_time == heartbeat_time
+            )
+            if (
+                # A failed write is never proof of recovery: require the old
+                # durable, P1-free confirmed RECOVERY payload and FIFO tail.
+                result.get("status") in {"ALARM", "HEALTHY"}
+                and recovery_payload.get("status") in {"HEALTHY", "MONITOR_DATA_FAILURE"}
+                and isinstance(recovery_payload.get("issues"), list)
+                and not any(
+                    isinstance(issue, dict) and issue.get("severity") == "P1"
+                    for issue in recovery_payload["issues"]
+                )
                 and heartbeat_recovery in pending
                 and pending[-1] == heartbeat_recovery
                 and heartbeat_time is not None
                 and state_time is not None
                 and heartbeat_time >= state_time
-                and timestamp(
-                    heartbeat_recovery["payload"]["checked_at_utc"]
-                ) == heartbeat_time
+                and (recovery_only_in_heartbeat or recovery_retried_into_state)
             ):
                 old_severe = []
         # The emergency heartbeat may have observed B before the old queue
