@@ -95,22 +95,31 @@ def timestamp(value):
 
 
 def _public_main_ref_over_git(*, timeout_seconds=8):
-    """Fallback to GitHub's public Git ref when anonymous REST is throttled.
+    """Read exactly the public main ref without orphaning Git transport helpers.
 
-    The ref (not its commit timestamp) is authoritative. Never synthesize
-    GitHub REST commit metadata or accept a different branch/tag.
-    The existing GNU timeout command terminates the entire Git process group,
-    including HTTPS transport helpers; Python's run timeout alone would not.
+    An independent process session lets us kill the entire Git transport group
+    on both the local timeout and the watcher's global SIGALRM.
     """
-    completed = subprocess.run(
-        ["timeout", "--signal=TERM", "--kill-after=1s", f"{timeout_seconds}s",
-         "git", "ls-remote", "https://github.com/heimgewebe/commonthing.git",
+    process = subprocess.Popen(
+        ["git", "ls-remote", "https://github.com/heimgewebe/commonthing.git",
          "refs/heads/main"],
-        capture_output=True, text=True, timeout=timeout_seconds + 4, check=False,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
     )
-    if completed.returncode != 0 or not isinstance(completed.stdout, str):
+    try:
+        stdout, _stderr = process.communicate(timeout=timeout_seconds)
+    except BaseException:
+        # WatchRuntimeExceeded inherits BaseException rather than Exception.
+        # A parent-only process.kill() would leave Git's HTTPS helpers alive.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise
+    if process.returncode != 0 or not isinstance(stdout, str):
         raise ValueError("public git ref unavailable")
-    match = re.fullmatch(r"([0-9a-f]{40})\trefs/heads/main\n?", completed.stdout)
+    match = re.fullmatch(r"([0-9a-f]{40})\trefs/heads/main\n?", stdout)
     if match is None:
         raise ValueError("invalid public git main ref")
     return {"sha": match.group(1), "observation_transport": "git_https"}
