@@ -5,7 +5,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from importlib import util
 from pathlib import Path
+import os
+import signal
 import subprocess
+import tempfile
+import time
 import unittest
 from unittest import mock
 from urllib.error import HTTPError
@@ -69,6 +73,48 @@ class GitMainRateFallbackTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 watch.fetch("main")
+
+    def test_timed_out_git_transport_leaves_no_helper_process(self):
+        # A real non-interactive Git transport can leave descendant helpers
+        # after Python kills only the direct subprocess on TimeoutExpired.
+        with tempfile.TemporaryDirectory(prefix="watch-git-process-group-") as tmp:
+            root = Path(tmp)
+            helper_pid = root / "helper.pid"
+            git = root / "git"
+            git.write_text(
+                "#!/bin/sh\n"
+                "sleep 60 &\n"
+                f"echo $! > '{helper_pid}'\n"
+                "wait\n",
+                encoding="utf-8",
+            )
+            git.chmod(0o700)
+            environ = {"PATH": f"{root}:{os.environ.get('PATH', '')}"}
+            try:
+                with mock.patch.dict(os.environ, environ):
+                    with self.assertRaises((ValueError, subprocess.TimeoutExpired)):
+                        watch._public_main_ref_over_git(timeout_seconds=1)
+                self.assertTrue(helper_pid.exists(), "fake Git helper never started")
+                pid = int(helper_pid.read_text(encoding="ascii").strip())
+                for _ in range(15):
+                    try:
+                        stat_path = Path(f"/proc/{pid}/stat")
+                        if not stat_path.exists():
+                            break
+                        # A zombie no longer consumes CPU or network resources.
+                        if stat_path.read_text().split()[2] == "Z":
+                            break
+                    except (FileNotFoundError, ProcessLookupError):
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("timed-out Git transport orphaned a live helper process")
+            finally:
+                if helper_pid.exists():
+                    try:
+                        os.kill(int(helper_pid.read_text().strip()), signal.SIGKILL)
+                    except (ProcessLookupError, ValueError):
+                        pass
 
     def test_git_fallback_is_not_used_for_failed_product_endpoints(self):
         with (

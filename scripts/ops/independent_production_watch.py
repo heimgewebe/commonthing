@@ -94,16 +94,19 @@ def timestamp(value):
         return None
 
 
-def _public_main_ref_over_git():
+def _public_main_ref_over_git(*, timeout_seconds=8):
     """Fallback to GitHub's public Git ref when anonymous REST is throttled.
 
     The ref (not its commit timestamp) is authoritative. Never synthesize
     GitHub REST commit metadata or accept a different branch/tag.
+    The existing GNU timeout command terminates the entire Git process group,
+    including HTTPS transport helpers; Python's run timeout alone would not.
     """
     completed = subprocess.run(
-        ["git", "ls-remote", "https://github.com/heimgewebe/commonthing.git",
+        ["timeout", "--signal=TERM", "--kill-after=1s", f"{timeout_seconds}s",
+         "git", "ls-remote", "https://github.com/heimgewebe/commonthing.git",
          "refs/heads/main"],
-        capture_output=True, text=True, timeout=8, check=False,
+        capture_output=True, text=True, timeout=timeout_seconds + 4, check=False,
     )
     if completed.returncode != 0 or not isinstance(completed.stdout, str):
         raise ValueError("public git ref unavailable")
