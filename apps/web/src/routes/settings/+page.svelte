@@ -1,4 +1,5 @@
 <script lang="ts">
+  import YarnWord from "$lib/components/YarnWord.svelte";
   import { onMount } from "svelte";
   import MyGarnrolleSection from "$lib/components/MyGarnrolleSection.svelte";
   import type { PageData } from "./$types";
@@ -51,7 +52,7 @@
   <div class="container">
     <header class="page-header">
       <a class="back-link touch-target" href="/map">← Zur Karte</a>
-      <h1>Einstellungen</h1>
+      <h1><YarnWord word="Einstellungen" /></h1>
       <p class="intro">
         Verwalte deine Garnrolle, dein Konto, Benachrichtigungen und die
         Darstellung an einem übersichtlichen Ort.
