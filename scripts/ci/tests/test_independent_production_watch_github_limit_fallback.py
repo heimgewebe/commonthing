@@ -120,6 +120,60 @@ class GitMainRateFallbackTests(unittest.TestCase):
                     except (ProcessLookupError, ValueError):
                         pass
 
+    def test_global_alarm_during_git_start_does_not_orphan_helper(self):
+        # Force SIGALRM between the OS child start and Popen returning it.
+        # An unmasked Popen constructor leaves both real Git and its helper alive.
+        with tempfile.TemporaryDirectory(prefix="watch-git-start-race-") as tmp:
+            root = Path(tmp)
+            helper_pid = root / "helper.pid"
+            git = root / "git"
+            git.write_text(
+                "#!/bin/sh\n"
+                "sleep 60 &\n"
+                f"echo $! > '{helper_pid}'\n"
+                "wait\n",
+                encoding="utf-8",
+            )
+            git.chmod(0o700)
+            environ = {"PATH": f"{root}:{os.environ.get('PATH', '')}"}
+            real_popen = subprocess.Popen
+
+            def slow_constructor(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                # The real child is running, but the caller has no reference.
+                time.sleep(1.2)
+                return process
+
+            old_handler = signal.signal(signal.SIGALRM, watch._watch_deadline)
+            try:
+                with mock.patch.dict(os.environ, environ), (
+                    mock.patch.object(watch.subprocess, "Popen",
+                                      side_effect=slow_constructor)
+                ):
+                    signal.setitimer(signal.ITIMER_REAL, 0.4)
+                    with self.assertRaises(watch.WatchRuntimeExceeded):
+                        watch._public_main_ref_over_git(timeout_seconds=10)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old_handler)
+            self.assertTrue(helper_pid.exists(), "fake Git child never ran")
+            pid = int(helper_pid.read_text(encoding="ascii").strip())
+            try:
+                for _ in range(15):
+                    stat_path = Path(f"/proc/{pid}/stat")
+                    if not stat_path.exists():
+                        break
+                    if stat_path.read_text().split()[2] == "Z":
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("global alarm during Popen left live helper")
+            finally:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_global_watcher_alarm_kills_git_and_helper_process(self):
         # The total watcher SIGALRM is a BaseException. Previously it killed
         # only the GNU timeout supervisor and orphaned Git transport helpers.

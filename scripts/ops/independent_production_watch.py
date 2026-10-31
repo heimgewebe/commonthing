@@ -100,23 +100,31 @@ def _public_main_ref_over_git(*, timeout_seconds=8):
     An independent process session lets us kill the entire Git transport group
     on both the local timeout and the watcher's global SIGALRM.
     """
-    process = subprocess.Popen(
-        ["git", "ls-remote", "https://github.com/heimgewebe/commonthing.git",
-         "refs/heads/main"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, start_new_session=True,
-    )
+    # A pending global SIGALRM must not interrupt Popen after fork/exec
+    # but before Python receives the process handle. Mask only that window.
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     try:
-        stdout, _stderr = process.communicate(timeout=timeout_seconds)
-    except BaseException:
-        # WatchRuntimeExceeded inherits BaseException rather than Exception.
-        # A parent-only process.kill() would leave Git's HTTPS helpers alive.
+        process = subprocess.Popen(
+            ["git", "ls-remote", "https://github.com/heimgewebe/commonthing.git",
+             "refs/heads/main"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+        )
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.communicate()
-        raise
+            # The process reference is now available for whole-group cleanup.
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            stdout, _stderr = process.communicate(timeout=timeout_seconds)
+        except BaseException:
+            # WatchRuntimeExceeded inherits BaseException rather than Exception.
+            # A parent-only process.kill() would leave Git's HTTPS helpers alive.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     if process.returncode != 0 or not isinstance(stdout, str):
         raise ValueError("public git ref unavailable")
     match = re.fullmatch(r"([0-9a-f]{40})\trefs/heads/main\n?", stdout)
