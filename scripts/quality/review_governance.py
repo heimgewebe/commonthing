@@ -754,7 +754,12 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
     proof = raw.get("font_asset_proof")
     if proof is not None:
         expected_keys = {
-            "path", "blob_sha", "sha256", "size", "magic", "provenance_blobs"
+            "path",
+            "blob_sha",
+            "sha256",
+            "size",
+            "magic",
+            "provenance_blobs",
         }
         if not isinstance(proof, dict) or set(proof) != expected_keys:
             raise GovernanceError("font asset proof fields are invalid")

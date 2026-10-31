@@ -14,6 +14,11 @@ import yaml
 from scripts.quality.review_governance import (
     Bundle,
     DiffStats,
+    GARN_FONT_BYTES,
+    GARN_FONT_GIT_BLOB,
+    GARN_FONT_PATH,
+    GARN_FONT_PROVENANCE_BLOBS,
+    GARN_FONT_SHA256,
     GovernanceError,
     canonical_product_docs_from_manifest_text,
     evaluate_evidence,
@@ -24,13 +29,8 @@ from scripts.quality.review_governance import (
     parse_risk_class,
     _materialized_diff_has_text_hunk,
     _materialized_metadata,
-    _partition_opaque_files,
     _parse_numstat_z,
-    GARN_FONT_PATH,
-    GARN_FONT_GIT_BLOB,
-    GARN_FONT_SHA256,
-    GARN_FONT_BYTES,
-    GARN_FONT_PROVENANCE_BLOBS,
+    _partition_opaque_files,
 )
 
 
@@ -239,7 +239,9 @@ class GarnFontOpaqueReviewPolicyTests(unittest.TestCase):
         del metadata["font_asset_proof"]
         stats = self._parse(metadata)
         self.assertEqual(stats.verified_font_files, ())
-        self.assertEqual(_partition_opaque_files(stats.opaque_files), ((), (GARN_FONT_PATH,)))
+        self.assertEqual(
+            _partition_opaque_files(stats.opaque_files), ((), (GARN_FONT_PATH,))
+        )
 
     def test_tampered_font_or_provenance_is_rejected(self) -> None:
         mutations = {
@@ -249,10 +251,13 @@ class GarnFontOpaqueReviewPolicyTests(unittest.TestCase):
             "wrong_magic": ("magic", "OTTO"),
             "wrong_path": ("path", "apps/web/static/fonts/copy.woff2"),
             "bool_size": ("size", True),
-            "wrong_license_sha": ("provenance_blobs", {
-                **GARN_FONT_PROVENANCE_BLOBS,
-                "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "0" * 40
-            }),
+            "wrong_license_sha": (
+                "provenance_blobs",
+                {
+                    **GARN_FONT_PROVENANCE_BLOBS,
+                    "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "0" * 40,
+                },
+            ),
         }
         for name, (field, value) in mutations.items():
             with self.subTest(name=name):
