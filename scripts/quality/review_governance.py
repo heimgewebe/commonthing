@@ -761,7 +761,13 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
             "magic",
             "provenance_blobs",
         }
-        if not isinstance(proof, dict) or set(proof) != expected_keys:
+        # The trusted workflow may also verify the removal of this exact
+        # pinned font and both license/source companions from the PR base.
+        # All unknown WOFF2 and other opaque paths stay blocked.
+        exact_keys = expected_keys | {"operation"} if (
+            isinstance(proof, dict) and proof.get("operation") == "removed"
+        ) else expected_keys
+        if not isinstance(proof, dict) or set(proof) != exact_keys:
             raise GovernanceError("font asset proof fields are invalid")
         if (
             proof["path"] != GARN_FONT_PATH
