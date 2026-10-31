@@ -10,6 +10,33 @@ relations:
 ---
 # Deployment-Änderungsprotokoll
 
+## 2026-10-29 - Caddy-Sicherheitsaktualisierung (CVE-2026-27585)
+
+**Geänderter Bereich:** `infra/caddy/Dockerfile` (Builder und Runtime).
+
+**Ursache und eng begrenzter Fix:** Der bisherige Pin Caddy 2.8.4
+enthält die fehlerhafte Backslash-Verarbeitung des File-Matchers; in
+bestimmten Routing-Konfigurationen lassen sich damit Pfadregeln umgehen.
+Beide Images werden deshalb gezielt auf Caddy 2.11.7 aktualisiert.
+`caddy-ratelimit@v0.1.0`, Caddyfiles, Routing, Flake/Lockfiles und
+sonstige Images bleiben unverändert.
+
+**Abnahme:** Vor Integration sind der Build mit dem Rate-Limit-Modul,
+Caddyfile-Validierung (VPS und Heim), betroffene Routing-Regressionen,
+revisionsgebundene CI und Security-Review auf dem PR-Head nachzuweisen.
+Der erste lokale Build und beide Config-Validierungen bestanden am
+22.10.2026; diese historischen Resultate ersetzen keine aktuelle CI.
+
+**Produktionsnachweis vor dem Fix (29.10.2026):** Auf `commonserver`
+läuft der Docker-Container `weltgewebe-caddy-1` (`weltgewebe-caddy`).
+Seine Binary meldet über den bestehenden autorisierten Read-only-Weg
+`sudo -n docker exec weltgewebe-caddy-1 caddy version` **v2.8.4**.
+Die verwundbare Version ist damit nicht nur im Git-Pin, sondern in der
+laufenden Produktion nachgewiesen. Eine konkrete Pfadschutzumgehung ist
+nicht reproduziert. Erst ein autorisierter Container-Versionsreadback
+(`v2.11.7`) und öffentlicher Funktionstest nach dem Captain-Deploy
+belegen die produktive Behebung. Ein Merge genügt nicht.
+
 ## 2026-09-19 - CSP: `style-src` ohne `'unsafe-inline'`
 
 **Geänderte Bereiche:**
