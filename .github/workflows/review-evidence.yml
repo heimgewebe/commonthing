@@ -242,9 +242,10 @@ jobs:
                   "${RUNNER_TEMP}/files.json" >/dev/null
                 # Verify the immutable previous Git blobs of BOTH deleted
                 # provenance companions, not only their deleted filenames.
+                garn_font_dir="apps/web/static/fonts"
                 for companion in \
-                  "apps/web/static/fonts/README.md:ed4fb686e498eeffa98f9a6cb7d9a103bf083802" \
-                  "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt:9459440df26a30cfb6ed5542485d281bae449e5f"; do
+                  "${garn_font_dir}/README.md:ed4fb686e498eeffa98f9a6cb7d9a103bf083802" \
+                  "${garn_font_dir}/OFL-Atkinson-Hyperlegible-Next.txt:9459440df26a30cfb6ed5542485d281bae449e5f"; do
                   companion_path="${companion%%:*}"
                   expected_blob="${companion##*:}"
                   actual_blob="$(gh api -H "${api_header}" \
