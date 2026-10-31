@@ -240,6 +240,17 @@ jobs:
                   and any(.[]; .filename == "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt"
                   and .status == "removed")' \
                   "${RUNNER_TEMP}/files.json" >/dev/null
+                # Verify the immutable previous Git blobs of BOTH deleted
+                # provenance companions, not only their deleted filenames.
+                for companion in \
+                  "apps/web/static/fonts/README.md:ed4fb686e498eeffa98f9a6cb7d9a103bf083802" \
+                  "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt:9459440df26a30cfb6ed5542485d281bae449e5f"; do
+                  companion_path="${companion%%:*}"
+                  expected_blob="${companion##*:}"
+                  actual_blob="$(gh api -H "${api_header}" \
+                    "repos/${REPOSITORY}/contents/${companion_path}?ref=${base_sha}" | jq -er '.sha')"
+                  [[ "${actual_blob}" == "${expected_blob}" ]]
+                done
                 ;;
               *)
                 echo "unsupported Garn font action: ${garn_status}" >&2
