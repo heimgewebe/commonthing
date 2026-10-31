@@ -28,6 +28,23 @@ class YarnAssets(unittest.TestCase):
                     for e in root.iter():
                         self.assertNotIn('filter', e.attrib)
 
+    def test_complete_de_glyph_inventory_and_in_memory_render(self):
+        required = set(
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+            'ÄÖÜäöüß -.:'
+        )
+        self.assertEqual(set(generator.GLYPHS), required)
+        self.assertEqual(len(required), 63)
+        for text in ('ÄÖÜ', 'äöüß', 'A-Z a-z.:'):
+            for theme in ('light', 'dark'):
+                with self.subTest(text=text, theme=theme):
+                    svg = generator.render(text, theme)
+                    root = ET.fromstring(svg)
+                    self.assertGreater(len(root.findall('.//{*}path')), 0)
+                    self.assertNotIn('<text', svg)
+                    self.assertNotIn('foreignObject', svg)
+                    self.assertNotIn('url(', svg)
+
     def test_approved_glyphs_and_curve_commands(self):
         self.assertTrue(set('äöüßÄÖÜS').issubset(generator.GLYPHS))
         self.assertEqual(generator.GLYPHS['S'][1][0],
