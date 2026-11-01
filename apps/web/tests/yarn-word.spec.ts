@@ -30,7 +30,7 @@ for (const [route, word] of [
       expect(src).toBe(`/garnschrift-c/${word.toLowerCase()}-${theme}.png`);
       expect(
         await image.evaluate((el: HTMLImageElement) => el.naturalWidth),
-      ).toBe(word === "Login" ? 280 : 647);
+      ).toBe(word === "Login" ? 260 : 592);
     }
   });
 

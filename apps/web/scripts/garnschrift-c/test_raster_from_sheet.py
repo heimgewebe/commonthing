@@ -48,17 +48,43 @@ class RasterYarnAssets(unittest.TestCase):
                     self.assertEqual(depth, 8)
                     self.assertEqual(color, 6)  # RGBA / transparent
                     self.assertEqual(height, 145)
-                    self.assertEqual(width, 280 if word == "Login" else 647)
+                    self.assertEqual(width, 260 if word == "Login" else 592)
 
-    def test_glyphs_are_tightly_set_without_added_tracking(self):
-        self.assertEqual(raster.LETTER_GAP_PX, 0)
-        for word in raster.WORDS:
+    def test_optical_kerning_follows_real_yarn_core_shapes(self):
+        # These pairwise values originate from the approved contact sheet.
+        expected_pairs = {
+            "Login": [8, 3, 5, 4],
+            "Einstellungen": [6, 4, 3, 6, 7, 5, 4, 4, 4, 4, 4, 4],
+        }
+        for word, expected in expected_pairs.items():
             with self.subTest(word=word):
-                glyph_widths = [raster.glyph(ch, "dark", self.source)[0] for ch in word]
-                expected_width = 24 + sum(glyph_widths)
+                parts = [raster.glyph(ch, "dark", self.source) for ch in word]
+                overlaps = [
+                    raster.optical_overlap(a, b)
+                    for a, b in zip(parts, parts[1:])
+                ]
+                self.assertEqual(overlaps, expected)
+                self.assertGreater(len(set(overlaps)), 1)
+                for overlap, (left, right) in zip(
+                    overlaps, zip(parts, parts[1:])
+                ):
+                    self.assertGreaterEqual(overlap, 0)
+                    self.assertLessEqual(overlap, raster.MAX_OPTICAL_OVERLAP_PX)
+                    self.assertLessEqual(overlap, min(left[0], right[0]) // 3)
                 png = raster.render(word, "dark", self.source)
+                expected_width = 24 + sum(part[0] for part in parts) - sum(overlaps)
                 self.assertEqual(struct.unpack_from(">I", png, 16)[0], expected_width)
-                self.assertLess(expected_width, 24 + sum(glyph_widths) + 9 * len(word))
+
+    def test_kerning_preserves_spaces_and_theme_geometry(self):
+        left = raster.glyph("n", "dark", self.source)
+        right = raster.glyph("s", "dark", self.source)
+        space = (27, 0, bytearray(), 0)
+        self.assertEqual(raster.optical_overlap(left, space), 0)
+        self.assertEqual(raster.optical_overlap(space, right), 0)
+        for word in raster.WORDS:
+            dark = raster.render(word, "dark", self.source)
+            light = raster.render(word, "light", self.source)
+            self.assertEqual(dark[16:24], light[16:24])
 
     def test_arbitrary_german_word_renders_without_browser_or_external_assets(self):
         for theme in ("dark", "light"):
