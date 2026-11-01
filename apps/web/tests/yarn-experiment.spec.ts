@@ -271,3 +271,38 @@ test("forced colors switches back to the native readable system font", async ({
     }),
   ).toHaveCount(1);
 });
+
+test("wool navigation uses legible optical size without mobile overflow", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const scheme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.goto("/settings?wollschrift=1");
+    await expect(page.getByTestId("wool-experiment-toggle")).toBeChecked();
+    await page.evaluate(async () => {
+      await document.fonts.ready;
+    });
+    for (const selector of [".menu-heading", ".menu-links strong"]) {
+      const measurements = await page
+        .locator(selector)
+        .first()
+        .evaluate((element) => {
+          const style = getComputedStyle(element);
+          return { size: parseFloat(style.fontSize), family: style.fontFamily };
+        });
+      expect(measurements.size).toBeGreaterThanOrEqual(18);
+      expect(measurements.family).toContain("Garnschrift C");
+    }
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(391);
+  }
+  await page.goto("/settings?wollschrift=0");
+  expect(
+    await page
+      .locator(".menu-links strong")
+      .first()
+      .evaluate((element) => getComputedStyle(element).fontSize),
+  ).toBe("14px");
+});
