@@ -19,6 +19,8 @@ from scripts.quality.review_governance import (
     GARN_FONT_PATH,
     GARN_FONT_PROVENANCE_BLOBS,
     GARN_FONT_SHA256,
+    WOOL_FONT_SPECS,
+    WOOL_FONT_SOURCE_BLOB,
     GovernanceError,
     canonical_product_docs_from_manifest_text,
     evaluate_evidence,
@@ -80,7 +82,12 @@ def _comment(
 
 
 def _forwarded_comment(
-    bundle: Bundle, *, reviewer: str, axis: str, author: str = "alex", comment_id: int = 1
+    bundle: Bundle,
+    *,
+    reviewer: str,
+    axis: str,
+    author: str = "alex",
+    comment_id: int = 1,
 ) -> dict:
     report = (
         f"Extern eingeholter Reviewbericht von {reviewer} zur Achse {axis}. "
@@ -100,7 +107,10 @@ def _forwarded_comment(
     }
     return {
         "id": comment_id,
-        "body": report + "\n<!-- weltgewebe-forwarded-review\n" + json.dumps(payload) + "\n-->",
+        "body": report
+        + "\n<!-- weltgewebe-forwarded-review\n"
+        + json.dumps(payload)
+        + "\n-->",
         "author_association": "OWNER",
         "user": {"login": author},
         "html_url": "https://example.invalid/forwarded-review",
@@ -192,6 +202,90 @@ def _record(
         "verdict": verdict,
         "findings_resolved": verdict == "PASS",
     }
+
+
+class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
+    def _metadata(self) -> dict:
+        paths = sorted(WOOL_FONT_SPECS)
+        return {
+            "schema_version": 1,
+            "pr_number": 2008,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "merge_base_sha": "a" * 40,
+            "changed_file_count": len(paths),
+            "changed_files": list(paths),
+            "attention_changed_files": list(paths),
+            "additions": 10,
+            "deletions": 0,
+            "opaque_files": list(paths),
+            "wool_font_proofs": [
+                {
+                    "path": path,
+                    **spec,
+                    "magic": "wOFF",
+                    "source_blob": WOOL_FONT_SOURCE_BLOB,
+                }
+                for path, spec in sorted(WOOL_FONT_SPECS.items())
+            ],
+        }
+
+    def _parse(self, metadata: dict) -> DiffStats:
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "metadata.json"
+            path.write_text(json.dumps(metadata), encoding="utf-8")
+            return _materialized_metadata(path)[-1]
+
+    def test_exact_pair_with_pinned_source_is_reviewable(self):
+        stats = self._parse(self._metadata())
+        self.assertEqual(set(stats.verified_font_files), set(WOOL_FONT_SPECS))
+        reviewable, blocked = _partition_opaque_files(
+            stats.opaque_files, verified_font_files=stats.verified_font_files
+        )
+        self.assertEqual(set(reviewable), set(WOOL_FONT_SPECS))
+        self.assertEqual(blocked, ())
+
+    def test_unverified_fonts_are_never_in_generic_suffix_allowlist(self):
+        metadata = self._metadata()
+        metadata.pop("wool_font_proofs")
+        stats = self._parse(metadata)
+        self.assertEqual(stats.verified_font_files, ())
+        self.assertEqual(
+            _partition_opaque_files(stats.opaque_files)[1],
+            tuple(sorted(WOOL_FONT_SPECS)),
+        )
+
+    def test_single_or_tampered_proofs_fail_closed(self):
+        original = self._metadata()
+        for mutate in (
+            lambda m: m["wool_font_proofs"].pop(),
+            lambda m: m["wool_font_proofs"][0].update({"sha256": "0" * 64}),
+            lambda m: m["wool_font_proofs"][0].update({"blob_sha": "0" * 40}),
+            lambda m: m["wool_font_proofs"][0].update({"source_blob": "0" * 40}),
+            lambda m: m["wool_font_proofs"][0].update({"magic": "wOF2"}),
+            lambda m: m["wool_font_proofs"][0].update({"size": True}),
+            lambda m: m["wool_font_proofs"][0].update({"unexpected": "field"}),
+        ):
+            with self.subTest(mutate=mutate):
+                data = json.loads(json.dumps(original))
+                mutate(data)
+                with self.assertRaises(GovernanceError):
+                    self._parse(data)
+
+    def test_unrelated_woff_always_blocked_even_with_verified_pair(self):
+        metadata = self._metadata()
+        extra = "apps/web/static/fonts/untrusted.woff"
+        metadata["changed_file_count"] += 1
+        metadata["changed_files"].append(extra)
+        metadata["opaque_files"].append(extra)
+        metadata["attention_changed_files"].append(extra)
+        stats = self._parse(metadata)
+        self.assertEqual(
+            _partition_opaque_files(
+                stats.opaque_files, verified_font_files=stats.verified_font_files
+            )[1],
+            (extra,),
+        )
 
 
 class GarnFontOpaqueReviewPolicyTests(unittest.TestCase):
@@ -287,7 +381,8 @@ class GarnFontOpaqueReviewPolicyTests(unittest.TestCase):
                 "provenance_blobs",
                 {
                     **GARN_FONT_PROVENANCE_BLOBS,
-                    "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "0" * 40,
+                    "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "0"
+                    * 40,
                 },
             ),
         }
@@ -439,7 +534,6 @@ class AttentionImpactReviewGateTests(unittest.TestCase):
         )
         self.assertTrue(result["pass"], result["reasons"])
         self.assertFalse(result["attention_impact_required"])
-
 
 
 class TrustedProductManifestTests(unittest.TestCase):
@@ -867,11 +961,10 @@ class BundleTests(unittest.TestCase):
                     _materialized_diff_has_text_hunk(diff_bytes, "blob.bin")
                 )
 
-    def test_materialized_text_hunk_proof_rejects_quoted_and_renamed_paths(self) -> None:
-        quoted = (
-            b'diff --git "a/space name.py" "b/space name.py"\n'
-            b"@@ -1 +1 @@\n"
-        )
+    def test_materialized_text_hunk_proof_rejects_quoted_and_renamed_paths(
+        self,
+    ) -> None:
+        quoted = b'diff --git "a/space name.py" "b/space name.py"\n@@ -1 +1 @@\n'
         renamed = (
             b"diff --git a/old.py b/new.py\n"
             b"similarity index 90%\n"
@@ -879,9 +972,7 @@ class BundleTests(unittest.TestCase):
             b"rename to new.py\n"
             b"@@ -1 +1 @@\n"
         )
-        self.assertFalse(
-            _materialized_diff_has_text_hunk(quoted, "space name.py")
-        )
+        self.assertFalse(_materialized_diff_has_text_hunk(quoted, "space name.py"))
         self.assertFalse(_materialized_diff_has_text_hunk(renamed, "new.py"))
 
     def test_materialized_text_hunk_proof_ignores_embedded_fake_headers(self) -> None:
@@ -894,9 +985,7 @@ class BundleTests(unittest.TestCase):
             b"+diff --git a/target.py b/target.py\n"
             b"+@@ -1 +1 @@\n"
         )
-        self.assertFalse(
-            _materialized_diff_has_text_hunk(diff_bytes, "target.py")
-        )
+        self.assertFalse(_materialized_diff_has_text_hunk(diff_bytes, "target.py"))
 
     def test_materialized_patchless_file_without_text_hunk_stays_opaque(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1123,15 +1212,11 @@ class EvidenceTests(unittest.TestCase):
 
     def test_r2_accepts_explicit_self_review_fallback_pair(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",))
-        primary = _record(
-            bundle, reviewer="Reviewer A", axis="correctness", risk="R2"
-        )
+        primary = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2")
         primary.update(
             {"review_mode": "self-primary", "review_session": "pass-primary"}
         )
-        fallback = _record(
-            bundle, reviewer="Reviewer A", axis="testing", risk="R2"
-        )
+        fallback = _record(bundle, reviewer="Reviewer A", axis="testing", risk="R2")
         fallback.update(
             {
                 "review_mode": "self-fallback",
@@ -1159,12 +1244,20 @@ class EvidenceTests(unittest.TestCase):
     def test_r2_accepts_regular_self_review_pair_without_provider_attempt(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",))
         primary = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2")
-        primary.update({"review_mode": "self-primary", "review_session": "review-correctness"})
+        primary.update(
+            {"review_mode": "self-primary", "review_session": "review-correctness"}
+        )
         secondary = _record(bundle, reviewer="Reviewer A", axis="testing", risk="R2")
-        secondary.update({"review_mode": "self-secondary", "review_session": "review-testing"})
+        secondary.update(
+            {"review_mode": "self-secondary", "review_session": "review-testing"}
+        )
         result = _evaluate(
-            bundle=bundle, risk_class="R2",
-            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+            bundle=bundle,
+            risk_class="R2",
+            comments=[
+                _comment(primary, comment_id=1),
+                _comment(secondary, comment_id=2),
+            ],
         )
         self.assertTrue(result["pass"], result["reasons"])
         self.assertEqual(
@@ -1175,56 +1268,72 @@ class EvidenceTests(unittest.TestCase):
     def test_r3_regular_self_review_pair_requires_security_axis(self) -> None:
         bundle = _bundle(paths=(".github/workflows/ci.yml",))
         primary = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R3")
-        primary.update({"review_mode": "self-primary", "review_session": "review-contract"})
+        primary.update(
+            {"review_mode": "self-primary", "review_session": "review-contract"}
+        )
         secondary = _record(bundle, reviewer="Reviewer A", axis="testing", risk="R3")
-        secondary.update({"review_mode": "self-secondary", "review_session": "review-tests"})
+        secondary.update(
+            {"review_mode": "self-secondary", "review_session": "review-tests"}
+        )
         result = _evaluate(
-            bundle=bundle, risk_class="R3",
-            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+            bundle=bundle,
+            risk_class="R3",
+            comments=[
+                _comment(primary, comment_id=1),
+                _comment(secondary, comment_id=2),
+            ],
         )
         self.assertFalse(result["pass"])
         self.assertIn("R3 requires", " ".join(result["reasons"]))
         secondary["review_axis"] = "security"
         result = _evaluate(
-            bundle=bundle, risk_class="R3",
-            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+            bundle=bundle,
+            risk_class="R3",
+            comments=[
+                _comment(primary, comment_id=1),
+                _comment(secondary, comment_id=2),
+            ],
         )
         self.assertTrue(result["pass"], result["reasons"])
 
-    def test_regular_self_review_pair_rejects_same_session_or_extraneous_reason(self) -> None:
+    def test_regular_self_review_pair_rejects_same_session_or_extraneous_reason(
+        self,
+    ) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",))
         primary = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2")
         primary.update({"review_mode": "self-primary", "review_session": "shared"})
         secondary = _record(bundle, reviewer="Reviewer A", axis="testing", risk="R2")
         secondary.update({"review_mode": "self-secondary", "review_session": "shared"})
         result = _evaluate(
-            bundle=bundle, risk_class="R2",
-            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+            bundle=bundle,
+            risk_class="R2",
+            comments=[
+                _comment(primary, comment_id=1),
+                _comment(secondary, comment_id=2),
+            ],
         )
         self.assertFalse(result["pass"])
         secondary["review_session"] = "new-pass"
-        secondary["fallback_reason"] = "Provider failures are not required for regular self review"
+        secondary["fallback_reason"] = (
+            "Provider failures are not required for regular self review"
+        )
         result = _evaluate(
-            bundle=bundle, risk_class="R2",
-            comments=[_comment(primary, comment_id=1), _comment(secondary, comment_id=2)],
+            bundle=bundle,
+            risk_class="R2",
+            comments=[
+                _comment(primary, comment_id=1),
+                _comment(secondary, comment_id=2),
+            ],
         )
         self.assertFalse(result["pass"])
         self.assertGreaterEqual(result["malformed_evidence_count"], 1)
 
     def test_self_review_fallback_requires_distinct_sessions_and_reason(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",))
-        primary = _record(
-            bundle, reviewer="Reviewer A", axis="correctness", risk="R2"
-        )
-        primary.update(
-            {"review_mode": "self-primary", "review_session": "same-pass"}
-        )
-        fallback = _record(
-            bundle, reviewer="Reviewer A", axis="testing", risk="R2"
-        )
-        fallback.update(
-            {"review_mode": "self-fallback", "review_session": "same-pass"}
-        )
+        primary = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2")
+        primary.update({"review_mode": "self-primary", "review_session": "same-pass"})
+        fallback = _record(bundle, reviewer="Reviewer A", axis="testing", risk="R2")
+        fallback.update({"review_mode": "self-fallback", "review_session": "same-pass"})
         result = _evaluate(
             bundle=bundle,
             risk_class="R2",
@@ -1263,9 +1372,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_self_review_optional_fields_fail_closed(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",))
-        external = _record(
-            bundle, reviewer="Reviewer A", axis="correctness", risk="R2"
-        )
+        external = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2")
         external["review_session"] = 7
         result = _evaluate(
             bundle=bundle,
@@ -1275,9 +1382,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertEqual(result["malformed_evidence_count"], 1)
 
-        primary = _record(
-            bundle, reviewer="Reviewer A", axis="correctness", risk="R2"
-        )
+        primary = _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2")
         primary.update(
             {
                 "review_mode": "self-primary",
@@ -1847,14 +1952,14 @@ class WorkflowContractTests(unittest.TestCase):
             for step in self.review_job["steps"]
             if step.get("name") == "Publish exact-head gate status"
         )
-        self.assertIn('statuses/${head_sha}', evaluate_step["run"])
-        self.assertIn('-f state=pending', evaluate_step["run"])
+        self.assertIn("statuses/${head_sha}", evaluate_step["run"])
+        self.assertIn("-f state=pending", evaluate_step["run"])
         self.assertIn('-f context="${REVIEW_EVIDENCE_CONTEXT}"', evaluate_step["run"])
         self.assertEqual(
             publish_step["env"]["HEAD_SHA"],
             "${{ steps.evaluate.outputs.head_sha }}",
         )
-        self.assertIn('statuses/${HEAD_SHA}', publish_step["run"])
+        self.assertIn("statuses/${HEAD_SHA}", publish_step["run"])
         self.assertIn('-f state="${state}"', publish_step["run"])
         self.assertIn("state=success", publish_step["run"])
         self.assertIn("state=failure", publish_step["run"])
@@ -1885,8 +1990,12 @@ class ForwardedExternalReviewTests(unittest.TestCase):
     def test_owner_forwarded_external_reviews_count_for_r2(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",), changed_lines=20)
         comments = [
-            _forwarded_comment(bundle, reviewer="External LLM A", axis="correctness", comment_id=11),
-            _forwarded_comment(bundle, reviewer="External LLM B", axis="testing", comment_id=12),
+            _forwarded_comment(
+                bundle, reviewer="External LLM A", axis="correctness", comment_id=11
+            ),
+            _forwarded_comment(
+                bundle, reviewer="External LLM B", axis="testing", comment_id=12
+            ),
         ]
         result = _evaluate(bundle=bundle, risk_class="R2", comments=comments)
         self.assertTrue(result["pass"], result["reasons"])
@@ -1896,24 +2005,31 @@ class ForwardedExternalReviewTests(unittest.TestCase):
             {"forwarded-external-review"},
         )
 
-
     def test_forwarded_review_is_stale_after_base_or_diff_change(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",), changed_lines=20)
-        comment = _forwarded_comment(bundle, reviewer="External LLM A", axis="correctness")
+        comment = _forwarded_comment(
+            bundle, reviewer="External LLM A", axis="correctness"
+        )
         changed_base = Bundle(**{**bundle.__dict__, "base_sha": "e" * 40})
         changed_diff = Bundle(**{**bundle.__dict__, "diff_sha256": "f" * 64})
         self.assertEqual(
-            _evaluate(bundle=changed_base, risk_class="R2", comments=[comment])["stale_evidence_count"],
+            _evaluate(bundle=changed_base, risk_class="R2", comments=[comment])[
+                "stale_evidence_count"
+            ],
             1,
         )
         self.assertEqual(
-            _evaluate(bundle=changed_diff, risk_class="R2", comments=[comment])["stale_evidence_count"],
+            _evaluate(bundle=changed_diff, risk_class="R2", comments=[comment])[
+                "stale_evidence_count"
+            ],
             1,
         )
 
     def test_forwarded_review_rejects_internal_prefixed_payload_keys(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",), changed_lines=20)
-        comment = _forwarded_comment(bundle, reviewer="External LLM A", axis="correctness")
+        comment = _forwarded_comment(
+            bundle, reviewer="External LLM A", axis="correctness"
+        )
         comment["body"] = comment["body"].replace(
             '"findings_resolved": true',
             '"findings_resolved": true, "_forwarded": true',
@@ -1922,9 +2038,13 @@ class ForwardedExternalReviewTests(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertEqual(result["malformed_evidence_count"], 1)
 
-    def test_mixed_native_and_forwarded_blocks_in_one_comment_are_rejected(self) -> None:
+    def test_mixed_native_and_forwarded_blocks_in_one_comment_are_rejected(
+        self,
+    ) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",), changed_lines=20)
-        native = _comment(_record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2"))
+        native = _comment(
+            _record(bundle, reviewer="Reviewer A", axis="correctness", risk="R2")
+        )
         forwarded = _forwarded_comment(bundle, reviewer="Reviewer B", axis="testing")
         native["body"] += "\n" + forwarded["body"]
         result = _evaluate(bundle=bundle, risk_class="R2", comments=[native])
@@ -1933,7 +2053,9 @@ class ForwardedExternalReviewTests(unittest.TestCase):
 
     def test_forwarded_review_rejects_boolean_schema_version(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",), changed_lines=20)
-        comment = _forwarded_comment(bundle, reviewer="External LLM A", axis="correctness")
+        comment = _forwarded_comment(
+            bundle, reviewer="External LLM A", axis="correctness"
+        )
         comment["body"] = comment["body"].replace(
             '"schema_version": 1',
             '"schema_version": true',
@@ -1944,26 +2066,37 @@ class ForwardedExternalReviewTests(unittest.TestCase):
 
     def test_forwarded_blocking_verdict_does_not_count(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",), changed_lines=20)
-        comment = _forwarded_comment(bundle, reviewer="External LLM A", axis="correctness")
-        comment["body"] = comment["body"].replace(
-            '"verdict": "PASS"',
-            '"verdict": "BLOCKED"',
-        ).replace(
-            '"findings_resolved": true',
-            '"findings_resolved": false',
+        comment = _forwarded_comment(
+            bundle, reviewer="External LLM A", axis="correctness"
+        )
+        comment["body"] = (
+            comment["body"]
+            .replace(
+                '"verdict": "PASS"',
+                '"verdict": "BLOCKED"',
+            )
+            .replace(
+                '"findings_resolved": true',
+                '"findings_resolved": false',
+            )
         )
         result = _evaluate(bundle=bundle, risk_class="R2", comments=[comment])
         self.assertFalse(result["pass"])
         self.assertEqual(result["accepted_review_count"], 0)
-        self.assertTrue(any("blocking verdicts" in reason for reason in result["reasons"]))
+        self.assertTrue(
+            any("blocking verdicts" in reason for reason in result["reasons"])
+        )
 
     def test_forwarded_review_is_stale_after_head_change(self) -> None:
         bundle = _bundle(paths=("apps/web/src/app.ts",), changed_lines=20)
-        comment = _forwarded_comment(bundle, reviewer="External LLM A", axis="correctness")
+        comment = _forwarded_comment(
+            bundle, reviewer="External LLM A", axis="correctness"
+        )
         changed = Bundle(**{**bundle.__dict__, "head_sha": "f" * 40})
         result = _evaluate(bundle=changed, risk_class="R2", comments=[comment])
         self.assertFalse(result["pass"])
         self.assertEqual(result["stale_evidence_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

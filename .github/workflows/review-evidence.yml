@@ -284,14 +284,64 @@ jobs:
             fi
           fi
 
+          # Exactly the two pinned wool color bitmap fonts, with original
+          # source from the trusted PR base; never execute any PR code.
+          wool_font_proofs='[]'
+          wool_dark='apps/web/static/fonts/garnschrift-c-dark.woff'
+          wool_light='apps/web/static/fonts/garnschrift-c-light.woff'
+          if jq -e --arg dark "${wool_dark}" --arg light "${wool_light}" '
+            any(.[]; .filename == $dark) and any(.[]; .filename == $light)
+          ' "${RUNNER_TEMP}/files.json" >/dev/null; then
+            wool_source_path='docs/assets/garnschrift-c-contact-sheet.png'
+            jq -e --arg source "${wool_source_path}" '
+              all(.[]; .filename != $source)
+            ' "${RUNNER_TEMP}/files.json" >/dev/null
+            wool_source_blob="$(gh api -H "${api_header}" \
+              "repos/${REPOSITORY}/contents/${wool_source_path}?ref=${base_sha}" \
+              | jq -er '.sha')"
+            [[ "${wool_source_blob}" == '3ada289072a765db9787208f6b95c6f73c3c7cce' ]]
+            for wool_spec in \
+              'apps/web/static/fonts/garnschrift-c-dark.woff|0e7ea8413a9ef123c5819c65106913c9a62d924a|1a564a5737a627154cefa514ea91c6fb07442e7811d9d36278a8c340bb7e9ecb|464556' \
+              'apps/web/static/fonts/garnschrift-c-light.woff|81d7dcde9992bf7199406ed53f3bb47f83f0131b|ad6d6fa413bb5d9bc3b21b7043a580e12338e26c9d55a64ad91e8af09aeb081e|490260'; do
+              IFS='|' read -r wool_path expected_blob expected_sha expected_bytes <<< "${wool_spec}"
+              wool_blob="$(jq -er --arg path "${wool_path}" '
+                .[] | select(.filename == $path and .status == "added") | .sha
+              ' "${RUNNER_TEMP}/files.json")"
+              [[ "${wool_blob}" == "${expected_blob}" ]]
+              gh api -H "${api_header}" \
+                "repos/${REPOSITORY}/git/blobs/${wool_blob}" \
+                > "${RUNNER_TEMP}/wool-blob.json"
+              jq -e --argjson size "${expected_bytes}" '
+                .encoding == "base64" and .size == $size
+              ' "${RUNNER_TEMP}/wool-blob.json" >/dev/null
+              jq -r '.content' "${RUNNER_TEMP}/wool-blob.json" \
+                | base64 --decode > "${RUNNER_TEMP}/verified-wool.woff"
+              [[ "$(wc -c < "${RUNNER_TEMP}/verified-wool.woff")" == "${expected_bytes}" ]]
+              wool_sha="$(sha256sum "${RUNNER_TEMP}/verified-wool.woff" | cut -d ' ' -f 1)"
+              [[ "${wool_sha}" == "${expected_sha}" ]]
+              [[ "$(od -An -tc -N4 "${RUNNER_TEMP}/verified-wool.woff" | tr -d '[:space:]')" == 'wOFF' ]]
+              wool_font_proofs="$(jq -cn \
+                --argjson old "${wool_font_proofs}" --arg path "${wool_path}" \
+                --arg blob "${wool_blob}" --arg sha "${wool_sha}" \
+                --argjson size "${expected_bytes}" --arg source "${wool_source_blob}" '
+                $old + [{
+                  path: $path, blob_sha: $blob, sha256: $sha,
+                  size: $size, magic: "wOFF", source_blob: $source
+                }]
+              ')"
+            done
+          fi
+
           jq -n \
             --argjson font_proof "${garn_font_proof}" \
+            --argjson wool_font_proofs "${wool_font_proofs}" \
             --slurpfile pr "${RUNNER_TEMP}/pr-before.json" \
             --slurpfile compare "${RUNNER_TEMP}/compare.json" \
             --slurpfile files "${RUNNER_TEMP}/files.json" '
             {
               schema_version: 1,
               font_asset_proof: $font_proof,
+              wool_font_proofs: $wool_font_proofs,
               pr_number: $pr[0].number,
               base_sha: $pr[0].base.sha,
               head_sha: $pr[0].head.sha,

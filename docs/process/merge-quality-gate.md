@@ -185,6 +185,14 @@ und erzwingen mindestens R1. PDF, SVG, Archive, ausführbare Dateien und Rasterb
 außerhalb dieser Pfade blockieren weiterhin fail-closed. Damit sind alltägliche
 Bildänderungen möglich, ohne undurchsichtige Artefakte pauschal freizugeben.
 
+Die optionale originale Wollschrift erhält ausschließlich für ihr exakt
+bekanntes WOFF1-Paar eine beweisgebundene Ausnahme. Der privilegierte
+Workflow prüft die unveränderte Original-PNG-Quelle aus der PR-Basis sowie
+für beide Fontblobs die erwarteten Git-Blob-IDs, SHA-256, Bytezahlen und
+Signaturen. Ein anderes oder einzelnes WOFF bleibt unverändert blockiert.
+Der Workflow führt weder PR-Code noch fremde Fontgeneratoren aus;
+es gibt keine allgemeine WOFF-Allowlist.
+
 Ein neuer Push, ein Basiswechsel oder ein anderer Diffhash entwertet den Beleg
 automatisch. Für dieselbe Kombination aus Prüfer und Reviewachse zählt nur der
 zeitlich neueste exakte Beleg. Ein späteres `BLOCKED` oder `FAIL` hebt einen früheren
