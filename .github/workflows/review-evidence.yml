@@ -284,7 +284,8 @@ jobs:
             fi
           fi
 
-          # Exactly the two pinned wool color bitmap fonts, with original
+          # Only the exact two MODIFIED font blobs for the baseline-correction PR,
+          # pinned to these bytes and preserving original
           # source from the trusted PR base; never execute any PR code.
           wool_font_proofs='[]'
           wool_dark='apps/web/static/fonts/garnschrift-c-dark.woff'
@@ -301,15 +302,15 @@ jobs:
               | jq -er '.sha')"
             [[ "${wool_source_blob}" == '3ada289072a765db9787208f6b95c6f73c3c7cce' ]]
             wool_dark_spec="${wool_dark}|"
-            wool_dark_spec+='0e7ea8413a9ef123c5819c65106913c9a62d924a|'
-            wool_dark_spec+='1a564a5737a627154cefa514ea91c6fb07442e7811d9d36278a8c340bb7e9ecb|464556'
+            wool_dark_spec+='32fe911fd476c38236cf45fecbc4654ea0b2362f|'
+            wool_dark_spec+='cc01aab60acdd0d36c81853f0a5454fab5363382d2bab201186bcd42efd3505c|467100'
             wool_light_spec="${wool_light}|"
-            wool_light_spec+='81d7dcde9992bf7199406ed53f3bb47f83f0131b|'
-            wool_light_spec+='ad6d6fa413bb5d9bc3b21b7043a580e12338e26c9d55a64ad91e8af09aeb081e|490260'
+            wool_light_spec+='eed63c05fa8dd9541b1f6ac6301b5c02cc885671|'
+            wool_light_spec+='6721af5b2ba0157603b5d1fc5804810c7166ee0e716e3e37e5472622aa6596c2|492740'
             for wool_spec in "${wool_dark_spec}" "${wool_light_spec}"; do
               IFS='|' read -r wool_path expected_blob expected_sha expected_bytes <<< "${wool_spec}"
               wool_blob="$(jq -er --arg path "${wool_path}" '
-                .[] | select(.filename == $path and .status == "added") | .sha
+                .[] | select(.filename == $path and .status == "modified") | .sha
               ' "${RUNNER_TEMP}/files.json")"
               [[ "${wool_blob}" == "${expected_blob}" ]]
               gh api -H "${api_header}" \
