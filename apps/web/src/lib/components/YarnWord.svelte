@@ -43,10 +43,10 @@
 <style>
   .yarn {
     display: grid;
-    width: min(18.625rem, 100%);
+    width: min(18rem, 100%);
   }
   .login {
-    width: min(7.75rem, 100%);
+    width: min(7.5rem, 100%);
   }
   .fallback,
   img {
