@@ -19,6 +19,8 @@ from scripts.quality.review_governance import (
     GARN_FONT_PATH,
     GARN_FONT_PROVENANCE_BLOBS,
     GARN_FONT_SHA256,
+    WOOL_FONT_SPECS,
+    WOOL_FONT_SOURCE_BLOB,
     GovernanceError,
     canonical_product_docs_from_manifest_text,
     evaluate_evidence,
@@ -192,6 +194,90 @@ def _record(
         "verdict": verdict,
         "findings_resolved": verdict == "PASS",
     }
+
+
+class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
+    def _metadata(self) -> dict:
+        paths = sorted(WOOL_FONT_SPECS)
+        return {
+            "schema_version": 1,
+            "pr_number": 2008,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "merge_base_sha": "a" * 40,
+            "changed_file_count": len(paths),
+            "changed_files": list(paths),
+            "attention_changed_files": list(paths),
+            "additions": 10,
+            "deletions": 0,
+            "opaque_files": list(paths),
+            "wool_font_proofs": [
+                {
+                    "path": path,
+                    **spec,
+                    "magic": "wOFF",
+                    "source_blob": WOOL_FONT_SOURCE_BLOB,
+                }
+                for path, spec in sorted(WOOL_FONT_SPECS.items())
+            ],
+        }
+
+    def _parse(self, metadata: dict) -> DiffStats:
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "metadata.json"
+            path.write_text(json.dumps(metadata), encoding="utf-8")
+            return _materialized_metadata(path)[-1]
+
+    def test_exact_pair_with_pinned_source_is_reviewable(self):
+        stats = self._parse(self._metadata())
+        self.assertEqual(set(stats.verified_font_files), set(WOOL_FONT_SPECS))
+        reviewable, blocked = _partition_opaque_files(
+            stats.opaque_files, verified_font_files=stats.verified_font_files
+        )
+        self.assertEqual(set(reviewable), set(WOOL_FONT_SPECS))
+        self.assertEqual(blocked, ())
+
+    def test_unverified_fonts_are_never_in_generic_suffix_allowlist(self):
+        metadata = self._metadata()
+        metadata.pop("wool_font_proofs")
+        stats = self._parse(metadata)
+        self.assertEqual(stats.verified_font_files, ())
+        self.assertEqual(
+            _partition_opaque_files(stats.opaque_files)[1],
+            tuple(sorted(WOOL_FONT_SPECS)),
+        )
+
+    def test_single_or_tampered_proofs_fail_closed(self):
+        original = self._metadata()
+        for mutate in (
+            lambda m: m["wool_font_proofs"].pop(),
+            lambda m: m["wool_font_proofs"][0].update({"sha256": "0" * 64}),
+            lambda m: m["wool_font_proofs"][0].update({"blob_sha": "0" * 40}),
+            lambda m: m["wool_font_proofs"][0].update({"source_blob": "0" * 40}),
+            lambda m: m["wool_font_proofs"][0].update({"magic": "wOF2"}),
+            lambda m: m["wool_font_proofs"][0].update({"size": True}),
+            lambda m: m["wool_font_proofs"][0].update({"unexpected": "field"}),
+        ):
+            with self.subTest(mutate=mutate):
+                data = json.loads(json.dumps(original))
+                mutate(data)
+                with self.assertRaises(GovernanceError):
+                    self._parse(data)
+
+    def test_unrelated_woff_always_blocked_even_with_verified_pair(self):
+        metadata = self._metadata()
+        extra = "apps/web/static/fonts/untrusted.woff"
+        metadata["changed_file_count"] += 1
+        metadata["changed_files"].append(extra)
+        metadata["opaque_files"].append(extra)
+        metadata["attention_changed_files"].append(extra)
+        stats = self._parse(metadata)
+        self.assertEqual(
+            _partition_opaque_files(
+                stats.opaque_files, verified_font_files=stats.verified_font_files
+            )[1],
+            (extra,),
+        )
 
 
 class GarnFontOpaqueReviewPolicyTests(unittest.TestCase):

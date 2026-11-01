@@ -64,6 +64,23 @@ GARN_FONT_PROVENANCE_BLOBS = {
     "apps/web/static/fonts/README.md":
         "ed4fb686e498eeffa98f9a6cb7d9a103bf083802",
 }
+# The two original three-ply wool bitmap fonts. This is an immutable,
+# byte-for-byte review exception only, not an extension of safe opaque suffixes.
+# The trusted workflow checks exact Git blobs/sha256/bytes and the committed
+# original PNG source blob from the PR base without executing PR code.
+WOOL_FONT_SOURCE_BLOB = "3ada289072a765db9787208f6b95c6f73c3c7cce"
+WOOL_FONT_SPECS = {
+    "apps/web/static/fonts/garnschrift-c-dark.woff": {
+        "blob_sha": "0e7ea8413a9ef123c5819c65106913c9a62d924a",
+        "sha256": "1a564a5737a627154cefa514ea91c6fb07442e7811d9d36278a8c340bb7e9ecb",
+        "size": 464556,
+    },
+    "apps/web/static/fonts/garnschrift-c-light.woff": {
+        "blob_sha": "81d7dcde9992bf7199406ed53f3bb47f83f0131b",
+        "sha256": "ad6d6fa413bb5d9bc3b21b7043a580e12338e26c9d55a64ad91e8af09aeb081e",
+        "size": 490260,
+    },
+}
 RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 REQUIRED_REVIEWS = {"R0": 0, "R1": 1, "R2": 2, "R3": 2}
 AUTHORIZED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -323,7 +340,7 @@ def _partition_opaque_files(
     blocking: list[str] = []
     for path in paths:
         allowed = _is_safe_opaque_asset(path) or (
-            path == GARN_FONT_PATH and path in verified
+            path in verified and (path == GARN_FONT_PATH or path in WOOL_FONT_SPECS)
         )
         (reviewable if allowed else blocking).append(path)
     return tuple(reviewable), tuple(blocking)
@@ -681,7 +698,7 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
         "deletions",
         "opaque_files",
     }
-    optional = {"attention_changed_files", "font_asset_proof"}
+    optional = {"attention_changed_files", "font_asset_proof", "wool_font_proofs"}
     if not required.issubset(raw) or not set(raw).issubset(required | optional):
         missing = sorted(required - set(raw))
         extra = sorted(set(raw) - required - optional)
@@ -790,6 +807,50 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
             stats.attention_changed_files,
             (GARN_FONT_PATH,),
         )
+    wool_proofs = raw.get("wool_font_proofs")
+    if wool_proofs is not None:
+        if not isinstance(wool_proofs, list):
+            raise GovernanceError("wool_font_proofs must be an array")
+        if wool_proofs:
+            # Either the exact pair of known image-backed fonts is verified,
+            # or no WOFF receives an opaque-file exception.
+            paths: list[str] = []
+            for entry in wool_proofs:
+                if not isinstance(entry, dict) or set(entry) != {
+                    "path",
+                    "blob_sha",
+                    "sha256",
+                    "size",
+                    "magic",
+                    "source_blob",
+                }:
+                    raise GovernanceError("invalid wool font proof fields")
+                path = entry["path"]
+                known = WOOL_FONT_SPECS.get(path) if isinstance(path, str) else None
+                if (
+                    known is None
+                    or entry["blob_sha"] != known["blob_sha"]
+                    or entry["sha256"] != known["sha256"]
+                    or type(entry["size"]) is not int
+                    or entry["size"] != known["size"]
+                    or entry["magic"] != "wOFF"
+                    or entry["source_blob"] != WOOL_FONT_SOURCE_BLOB
+                    or path not in stats.opaque_files
+                    or path not in stats.changed_files
+                ):
+                    raise GovernanceError("unverified wool font bytes or provenance")
+                paths.append(path)
+            if len(paths) != len(WOOL_FONT_SPECS) or set(paths) != set(WOOL_FONT_SPECS):
+                raise GovernanceError("both exact wool fonts must be verified together")
+            stats = DiffStats(
+                stats.changed_files,
+                stats.additions,
+                stats.deletions,
+                stats.binary_files,
+                stats.opaque_files,
+                stats.attention_changed_files,
+                (*stats.verified_font_files, *sorted(paths)),
+            )
     return pr_number, base_sha, head_sha, merge_base_sha, stats
 
 
