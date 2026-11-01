@@ -305,10 +305,21 @@ jobs:
               | jq -er '.sha')"
             [[ "$wool_source_sha" == '3ada289072a765db9787208f6b95c6f73c3c7cce' ]]
             wool_font_proofs='[]'
-            for wool_spec in \
-              'apps/web/static/fonts/garnschrift-c-dark.woff|df5ec7a49fd79ecb5a95b2931f7c95878f3ac8dd|f9557768fcdae1218d998449edbbad41a6973828ae39980ac832fe60003eba62|415724' \
-              'apps/web/static/fonts/garnschrift-c-light.woff|08668cd482de7690e90c49028ac2ac54cfe8dc17|d4d0036348e0ef59df81d19351eb96ef6bcf9cbb08e6c5bfe5e6297968ecc5e8|442140'; do
-              IFS='|' read -r wool_path expected_blob expected_sha expected_size <<< "$wool_spec"
+            for wool_theme in dark light; do
+              case "$wool_theme" in
+                dark)
+                  wool_path="apps/web/static/fonts/garnschrift-c-dark.woff"
+                  expected_blob="df5ec7a49fd79ecb5a95b2931f7c95878f3ac8dd"
+                  expected_sha="f9557768fcdae1218d998449edbbad41a6973828ae39980ac832fe60003eba62"
+                  expected_size=415724
+                  ;;
+                light)
+                  wool_path="apps/web/static/fonts/garnschrift-c-light.woff"
+                  expected_blob="08668cd482de7690e90c49028ac2ac54cfe8dc17"
+                  expected_sha="d4d0036348e0ef59df81d19351eb96ef6bcf9cbb08e6c5bfe5e6297968ecc5e8"
+                  expected_size=442140
+                  ;;
+              esac
               wool_blob="$(jq -er --arg path "$wool_path" \
                 '.[] | select(.filename == $path and .status == "added") | .sha' \
                 "$RUNNER_TEMP/files.json")"
