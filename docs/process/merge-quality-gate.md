@@ -185,6 +185,11 @@ und erzwingen mindestens R1. PDF, SVG, Archive, ausführbare Dateien und Rasterb
 außerhalb dieser Pfade blockieren weiterhin fail-closed. Damit sind alltägliche
 Bildänderungen möglich, ohne undurchsichtige Artefakte pauschal freizugeben.
 
+Für den iPad/Safari-Positionierungsfix werden genau zwei bereits
+vorhandene Farb-WOFFs als *modified*-Dateien ausschließlich mit ihren
+neuen, fest gepinnten Git-Blob-IDs, Bytewerten und SHA-256-Werten
+geprüft. Diese Ausnahme gewährt keine allgemeine Fontfreigabe.
+
 Die optionale originale Wollschrift erhält ausschließlich für ihr exakt
 bekanntes WOFF1-Paar eine beweisgebundene Ausnahme. Der privilegierte
 Workflow prüft die unveränderte Original-PNG-Quelle aus der PR-Basis sowie
