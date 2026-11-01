@@ -165,6 +165,24 @@ def _byte(value: float) -> int:
     return max(0, min(255, round(value)))
 
 
+# Off-white wool: extracted source luminance retains fiber relief.
+# Anchors are measured source wool luminance P5 / P50 / P95.
+WOOL_SHADOW = (198, 195, 186)     # #C6C3BA
+WOOL_BODY = (240, 238, 231)       # #F0EEE7
+WOOL_HIGHLIGHT = (252, 250, 245)  # #FCFAF5
+
+
+def wool_white_color(luminance: float) -> tuple[int, int, int]:
+    """Map natural wool shading into an off-white material palette."""
+    if luminance <= 175:
+        low, high = WOOL_SHADOW, WOOL_BODY
+        blend = max(0.0, min(1.0, (luminance - 75) / 100))
+    else:
+        low, high = WOOL_BODY, WOOL_HIGHLIGHT
+        blend = max(0.0, min(1.0, (luminance - 175) / 50))
+    return tuple(_byte(a + (b - a) * blend) for a, b in zip(low, high, strict=True))
+
+
 def glyph(
     ch: str, theme: str, image: tuple[int, int, bytes]
 ) -> tuple[int, int, bytearray, int]:
@@ -192,6 +210,9 @@ def glyph(
                 red = _byte((r - (1 - fraction) * 14) / divisor)
                 green = _byte((g - (1 - fraction) * 47) / divisor)
                 blue = _byte((b - (1 - fraction) * 58) / divisor)
+                # Only the extracted yarn RGB changes; alpha and geometry do not.
+                luminance = (30 * red + 60 * green + 10 * blue) / 100
+                red, green, blue = wool_white_color(luminance)
             else:
                 luminance = (30 * r + 60 * g + 10 * b) / 100
                 factor = max(-1, min(1, (luminance - 160) / 80))
