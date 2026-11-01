@@ -36,14 +36,19 @@ Für die helle Oberfläche wird eine dunkelteale Garnvariante unter Bewahrung de
 Helligkeitsabstufungen erzeugt.
 
 Die beiden tatsächlich in Commonthing verwendeten Titel sind `Login` und
-`Einstellungen`. Es werden pro Wort und Theme transparente PNG-Dateien erzeugt,
+`Einstellungen`. Die Buchstaben werden ohne die bisherigen 9 Pixel
+zusätzlichen Abstand gesetzt (`LETTER_GAP_PX = 0`). Die Garnfasern
+behalten ihre natürliche Randstruktur; die kompakteren PNGs erscheinen in
+`YarnWord.svelte` proportional schmaler, aber mit unveränderter
+Fadendicke. Das Zusammensetzen geschieht ausschließlich beim Generieren,
+nicht durch Browser-CSS oder nachträgliches Nachladen. Es werden pro Wort und Theme transparente PNG-Dateien erzeugt,
 ohne Netzwerkanfragen beim Generieren, ohne Browser-JavaScript zur Bildgeometrie
 und ohne externe Font-CDN-Abhängigkeit.
 
 | Ziel in `apps/web/static/garnschrift-c/` | Auflösung | Zweck |
 | --- | --- | --- |
-| `login-dark.png`, `login-light.png` | 325 × 145 | Anmelden |
-| `einstellungen-dark.png`, `einstellungen-light.png` | 764 × 145 | Einstellungen |
+| `login-dark.png`, `login-light.png` | 280 × 145 | Anmelden |
+| `einstellungen-dark.png`, `einstellungen-light.png` | 647 × 145 | Einstellungen |
 
 Vom Repository-Root reproduzieren und prüfen:
 

@@ -24,7 +24,7 @@
   <img
     class="light"
     src={`/garnschrift-c/${word.toLowerCase()}-light.png`}
-    width={word === "Login" ? 325 : 764}
+    width={word === "Login" ? 280 : 647}
     height="145"
     alt=""
     aria-hidden="true"
@@ -32,7 +32,7 @@
   <img
     class="dark"
     src={`/garnschrift-c/${word.toLowerCase()}-dark.png`}
-    width={word === "Login" ? 325 : 764}
+    width={word === "Login" ? 280 : 647}
     height="145"
     alt=""
     aria-hidden="true"
@@ -43,10 +43,10 @@
 <style>
   .yarn {
     display: grid;
-    width: min(22rem, 100%);
+    width: min(18.625rem, 100%);
   }
   .login {
-    width: min(9rem, 100%);
+    width: min(7.75rem, 100%);
   }
   .fallback,
   img {
