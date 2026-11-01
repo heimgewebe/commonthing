@@ -11,9 +11,37 @@ from pathlib import Path
 
 FONT_DIR = Path(__file__).resolve().parents[2] / "static" / "fonts"
 ASSETS = {
-    "dark": ("9e6a99a1dba8ed165fd69f4e3006eb1eca47d96f760d8d70a1f284c738ec869e", 415720),
-    "light": ("f1fa4c02f50b731f8bd681ad6a16aea48cbbc60354267f5d5f55d278bef4154f", 442136),
+    "dark": ("1a564a5737a627154cefa514ea91c6fb07442e7811d9d36278a8c340bb7e9ecb", 464556),
+    "light": ("ad6d6fa413bb5d9bc3b21b7043a580e12338e26c9d55a64ad91e8af09aeb081e", 490260),
 }
+
+
+def decode_generator_png(png: bytes) -> tuple[int, int, bytes]:
+    """Decode the no-filter RGBA PNG format emitted by raster_from_sheet."""
+    if not png.startswith(bytes((137, 80, 78, 71, 13, 10, 26, 10))):
+        raise AssertionError("sbix glyph is not a PNG")
+    width, height = struct.unpack_from(">II", png, 16)
+    pos = 8
+    compressed = bytearray()
+    while pos < len(png):
+        size = struct.unpack_from(">I", png, pos)[0]
+        kind = png[pos + 4:pos + 8]
+        chunk = png[pos + 8:pos + 8 + size]
+        if kind == b"IDAT":
+            compressed.extend(chunk)
+        pos += 12 + size
+        if kind == b"IEND":
+            break
+    stride = 4 * width
+    rows = zlib.decompress(compressed)
+    if len(rows) != (stride + 1) * height:
+        raise AssertionError("unexpected wool-glyph scanline length")
+    if any(rows[i * (stride + 1)] != 0 for i in range(height)):
+        raise AssertionError("unexpected wool-glyph PNG filter")
+    return width, height, b"".join(
+        rows[y * (stride + 1) + 1:(y + 1) * (stride + 1)]
+        for y in range(height)
+    )
 
 
 class BitmapFontAssets(unittest.TestCase):
@@ -74,6 +102,26 @@ class BitmapFontAssets(unittest.TestCase):
                         self.assertEqual(strike[offset + 4:offset + 8], b"png ")
                         width, height, pixels, dy = glyph(char, theme, approved)
                         self.assertEqual(origin_y, -(dy + height))
+                        original = pixels
+                        png = strike[offset + 8:strike_start + end_offset]
+                        result_width, result_height, refined = decode_generator_png(png)
+                        self.assertEqual((result_width, result_height), (width, height))
+                        # Exact wool light/shadow RGB and the original glyph box.
+                        for channel in range(3):
+                            self.assertEqual(
+                                original[channel::4], refined[channel::4]
+                            )
+                        original_alpha = original[3::4]
+                        slender_alpha = refined[3::4]
+                        self.assertTrue(all(
+                            0 <= new <= old
+                            and (old == 0) == (new == 0)
+                            for old, new in zip(original_alpha, slender_alpha)
+                        ))
+                        self.assertLess(sum(slender_alpha), sum(original_alpha))
+                        self.assertGreater(
+                            sum(slender_alpha), 0.82 * sum(original_alpha)
+                        )
 
 
 if __name__ == "__main__":

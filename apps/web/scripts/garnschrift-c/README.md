@@ -141,5 +141,10 @@ python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
 ```
 
 Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert.
+Im opt-in-Schriftversuch sind die Buchstaben minimal schlanker: Der
+Farbschriftgenerator reduziert die Alpha-Deckkraft nur an den tatsächlichen
+Faserkanten um höchstens 2/5 eines Rasterpixels. Wollfarben, dreifache
+Zwirnung, Bildabmessungen, Grundlinien, Zeichenbreiten und Kerning
+bleiben erhalten. Die produktiven Garn-PNG-Wortbilder werden nicht verändert.
 
 Im systemweiten Hochkontrastmodus (Forced Colors) wird die Bitmap-Schrift zugunsten lesbarer Systemschrift deaktiviert.

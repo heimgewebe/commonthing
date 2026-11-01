@@ -24,6 +24,35 @@ UPM = 110
 ASCENT = 105
 DESCENT = -40
 MAX_ASSET_BYTES = 1_200_000
+# Deliberately subtle: soften the inner-most one-pixel edge, not the wool RGB.
+# 2/5 of a single 4-connected erosion step, never a hard contour cutoff.
+EDGE_THINNING_NUM = 2
+EDGE_THINNING_DEN = 5
+
+
+def slightly_thinner_edges(width: int, height: int, rgba: bytearray) -> bytearray:
+    """Lightly contract edge coverage without touching yarn colors or layout."""
+    if len(rgba) != width * height * 4 or width < 1 or height < 1:
+        raise ValueError("wrong raster dimensions")
+    original_alpha = rgba[3::4]
+    output = bytearray(rgba)
+    for y in range(height):
+        for x in range(width):
+            pixel = y * width + x
+            alpha = original_alpha[pixel]
+            if not alpha:
+                continue
+            neighbor = min(
+                alpha,  # local fiber depressions must never become more opaque
+                original_alpha[pixel - 1] if x else 0,
+                original_alpha[pixel + 1] if x + 1 < width else 0,
+                original_alpha[pixel - width] if y else 0,
+                original_alpha[pixel + width] if y + 1 < height else 0,
+            )
+            output[pixel * 4 + 3] = alpha - (
+                (alpha - neighbor) * EDGE_THINNING_NUM // EDGE_THINNING_DEN
+            )
+    return output
 
 
 def generate(theme: str) -> bytes:
@@ -79,7 +108,11 @@ def generate(theme: str) -> bytes:
             # reports downward-positive raster top relative to baseline.
             originOffsetY=-(assets[ch][3] + assets[ch][1]),
             graphicType="png ",
-            imageData=write_png_rgba(*assets[ch][:2], assets[ch][2]),
+            imageData=write_png_rgba(
+                assets[ch][0],
+                assets[ch][1],
+                slightly_thinner_edges(*assets[ch][:3]),
+            ),
         )
         for ch in chars
     }
