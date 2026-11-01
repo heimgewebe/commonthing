@@ -134,8 +134,10 @@ Kartentexte sind nicht Teil des HTML-Fontpfads.
 
 Reproduzieren mit Python 3.13 und fonttools==4.61.1:
 
-    python3 -m pip install fonttools==4.61.1
-    python3 apps/web/scripts/garnschrift-c/generate_bitmap_font.py
-    python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
+```sh
+python3 -m pip install fonttools==4.61.1
+python3 apps/web/scripts/garnschrift-c/generate_bitmap_font.py
+python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
+```
 
 Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert.

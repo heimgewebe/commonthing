@@ -75,7 +75,9 @@ def generate(theme: str) -> bytes:
     strike.glyphs = {
         names[ch]: Glyph(
             glyphName=names[ch], originOffsetX=0,
-            originOffsetY=assets[ch][3] + assets[ch][1],
+            # sbix uses upward-positive bitmap-bottom offset; glyph()
+            # reports downward-positive raster top relative to baseline.
+            originOffsetY=-(assets[ch][3] + assets[ch][1]),
             graphicType="png ",
             imageData=write_png_rgba(*assets[ch][:2], assets[ch][2]),
         )

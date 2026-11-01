@@ -11,8 +11,8 @@ from pathlib import Path
 
 FONT_DIR = Path(__file__).resolve().parents[2] / "static" / "fonts"
 ASSETS = {
-    "dark": ("f9557768fcdae1218d998449edbbad41a6973828ae39980ac832fe60003eba62", 415724),
-    "light": ("d4d0036348e0ef59df81d19351eb96ef6bcf9cbb08e6c5bfe5e6297968ecc5e8", 442140),
+    "dark": ("9e6a99a1dba8ed165fd69f4e3006eb1eca47d96f760d8d70a1f284c738ec869e", 415720),
+    "light": ("f1fa4c02f50b731f8bd681ad6a16aea48cbbc60354267f5d5f55d278bef4154f", 442136),
 }
 
 
@@ -47,6 +47,33 @@ class BitmapFontAssets(unittest.TestCase):
                 self.assertEqual(struct.unpack_from(">H", directory[b"sbix"])[0], 1)
                 self.assertGreater(struct.unpack_from(">I", directory[b"sbix"], 4)[0], 0)
                 self.assertGreater(len(directory[b"kern"]), 100)
+
+                # Bitmap bottom offset must align real descenders; sbix
+                # uses upward-positive values (opposite raster coordinates).
+                from raster_from_sheet import GLYPHS, glyph, read_png_rgb
+
+                strike = directory[b"sbix"]
+                strike_start = struct.unpack_from(">I", strike, 8)[0]
+                ppem, resolution = struct.unpack_from(">HH", strike, strike_start)
+                self.assertEqual(ppem, 110)
+                self.assertEqual(resolution, 72)
+                approved = read_png_rgb()
+                for char in ("g", "p", "L", "E", "."):
+                    with self.subTest(glyph=char):
+                        gid = 3 + sorted(GLYPHS).index(char)
+                        start_offset = struct.unpack_from(
+                            ">I", strike, strike_start + 4 + gid * 4
+                        )[0]
+                        end_offset = struct.unpack_from(
+                            ">I", strike, strike_start + 4 + (gid + 1) * 4
+                        )[0]
+                        self.assertGreater(end_offset, start_offset)
+                        offset = strike_start + start_offset
+                        origin_x, origin_y = struct.unpack_from(">hh", strike, offset)
+                        self.assertEqual(origin_x, 0)
+                        self.assertEqual(strike[offset + 4:offset + 8], b"png ")
+                        width, height, pixels, dy = glyph(char, theme, approved)
+                        self.assertEqual(origin_y, -(dy + height))
 
 
 if __name__ == "__main__":
