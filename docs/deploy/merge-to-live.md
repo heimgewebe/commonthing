@@ -346,6 +346,28 @@ wertet den öffentlichen Readback jedoch nicht zu `verified_observed` auf.
 Historische Werte wie Webarchiv-Hash oder Startzeit bleiben ausdrücklich
 `null`.
 
+Bei migrationsfreien Releases überspringt der Deploy-Helfer den vorgezogenen
+API-only-Migrationslauf ausschließlich, wenn ein frischer öffentlicher
+Frontend/API-Readback denselben vollständigen Commit liefert, dessen sicher
+(root-owned, nicht schreibbar für Gruppe/Andere, keine Links) gelesener
+Schema-5-`verified`-Beleg die vollständige Feld-, Lock- und Zeitprüfung besteht.
+Beide Git-Commits und ihre `apps/api/migrations/`-Bäume müssen vorhanden sein,
+der vorherige Commit muss Vorfahr des Ziels sein und der direkte Git-Diff
+(einschließlich Hinzufügen, Löschen und Umbenennen) muss erfolgreich leer sein.
+Jede Unsicherheit führt zum bisherigen Migrationslauf. Zustandszeiger oder
+bloße öffentliche Beobachtungsbelege genügen nicht.
+
+Der Skip wird als `state=skipped reason=verified_unchanged_migrations` geloggt;
+`migration_completed_at` erfasst dabei den UTC-Abschluss des verifizierten
+Preflights für unveränderte Migrationen, nicht die Anwendung von Migrationen.
+Der Zeitstempel wird nach `started_at` im Zwischenbeleg gespeichert und erfüllt
+mit `started_at <= migration_completed_at <= completed_at` den Schema-5-Zeitvertrag
+auch als Skip-Basis weiterer Releases. HOLD-Prüfungen, Backup-/Migrationsgrenzen im
+Deploymentskript, Main-Prüfungen und der abschließende öffentliche Readback
+bleiben unverändert; Alarme werden nicht unterdrückt. Der Full-Lauf bleibt
+verpflichtend. Damit entfällt bei nachgewiesen unveränderten Migrationen der
+vorgezogene öffentliche API-Wechsel, ohne einen atomaren Stackwechsel zuzusagen.
+
 Schema-5-Belege des direkten oder geerbten Deploymentpfads werden weiterhin
 fehlgeschlossen gegen ihre geschlossene Feldmatrix validiert. Ein gültiges
 `verified` enthält den vollständigen lokalen Deploymentnachweis einschließlich

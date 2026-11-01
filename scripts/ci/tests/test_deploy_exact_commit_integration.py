@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 import json
 import os
 import shutil
@@ -55,6 +56,160 @@ def run(
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
     return result
+
+
+class MigrationSkipEvidenceTests(unittest.TestCase):
+    """Exercise the actual decision with real Git and secure receipt I/O."""
+
+    def test_migration_branch_skips_only_when_evidence_decision_passes(self) -> None:
+        script = DEPLOY_SCRIPT.read_text()
+        start = script.index('if [[ "$skip_migration" == true ]]; then')
+        end = script.index('\nremote_main="$(fetch_main)"', start)
+        branch = script[start:end]
+        # Load only the pure validator definitions from the authoritative heredoc.
+        reconciler = RECONCILE_SCRIPT.read_text()
+        helpers = reconciler[reconciler.index("def is_lower_hex("):
+                             reconciler.index("PUBLIC_VERIFICATION_KEYS =")]
+        validator = reconciler[reconciler.index("def is_current_verified_receipt("):
+                               reconciler.index("\ndef ", reconciler.index("def is_current_verified_receipt("))]
+        namespace = {"datetime": datetime, "timezone": timezone, "commit": "fixture"}
+        exec(helpers + validator, namespace)
+        for skip in ("true", "false"):
+            with self.subTest(skip=skip):
+                harness = (
+                    'set -euo pipefail\n'
+                    'COMMIT=fixture; last_observed_main=fixture; migration_completed_at=""\n'
+                    f'skip_migration={skip}\n'
+                    'run_release_deploy() { echo "deploy:$1"; }\n'
+                    'write_deploy_receipt() { printf "receipt:%s:%s\\n" "$1" "$migration_completed_at"; }\n'
+                    'date() { echo 2026-07-27T00:00:30Z; }\n'
+                    + branch
+                    + '\nrun_release_deploy full\n'
+                    + 'printf "migration_completed_at=%s\\n" "$migration_completed_at"\n'
+                )
+                result = run(["bash", "-c", harness])
+                self.assertIn("deploy:full", result.stdout)
+                self.assertEqual("deploy:migration" in result.stdout, skip == "false")
+                self.assertIn(
+                    "migration_completed_at=2026-07-27T00:00:30Z\n",
+                    result.stdout,
+                )
+                self.assertIn("receipt:deploying:2026-07-27T00:00:30Z\n", result.stdout)
+                completed = result.stdout.split("migration_completed_at=", 1)[1].strip()
+                payload = DeployExactCommitIntegrationTests.schema5_verified_receipt(
+                    type("Fixture", (), {"commit": "fixture"})(),
+                    migration_completed_at=completed,
+                )
+                self.assertTrue(namespace["is_current_verified_receipt"](payload))
+                for invalid in (None, "2026-07-26T23:59:59Z", "2026-07-27T00:01:01Z"):
+                    payload["migration_completed_at"] = invalid
+                    self.assertFalse(namespace["is_current_verified_receipt"](payload))
+                if skip == "true":
+                    self.assertIn("state=skipped", result.stderr)
+
+    def test_skip_requires_complete_unchanged_release_evidence(self) -> None:
+        script = DEPLOY_SCRIPT.read_text()
+        function = script[script.index("can_skip_migration() {"):
+                          script.index("\nrequire_command()")]
+        # Only adapt the root ownership expectation for this rootless harness.
+        function = function.replace(
+            'read_secure_json(Path(state) / "receipts" / f"{previous}.json")',
+            'read_secure_json(Path(state) / "receipts" / f"{previous}.json", expected_uid=os.getuid())',
+        )
+        for case in (
+            "unchanged", "added", "edited", "deleted", "renamed", "drift",
+            "missing_receipt", "failed_receipt", "observed_receipt", "bad_time",
+            "unsafe_receipt", "unknown_commit", "curl_failure", "git_failure",
+            "unknown_field", "bad_lock", "wrong_receipt_commit", "duplicate_public",
+            "symlink_receipt", "duplicate_receipt",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                source = root / "source"
+                run(["git", "init", "-b", "main", str(source)])
+                run(["git", "config", "user.name", "Test"], cwd=source)
+                run(["git", "config", "user.email", "test@example.invalid"], cwd=source)
+                migrations = source / "apps/api/migrations"
+                migrations.mkdir(parents=True)
+                migration = migrations / "001.sql"
+                migration.write_text("select 1;\n")
+                run(["git", "add", "."], cwd=source)
+                run(["git", "commit", "-m", "previous"], cwd=source)
+                previous = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+                if case == "added":
+                    (migrations / "002.sql").write_text("select 2;\n")
+                elif case == "edited":
+                    migration.write_text("select 2;\n")
+                elif case == "deleted":
+                    migration.unlink()
+                elif case == "renamed":
+                    migration.rename(migrations / "renamed.sql")
+                (source / "frontend.txt").write_text("new frontend\n")
+                run(["git", "add", "-A"], cwd=source)
+                run(["git", "commit", "-m", "target"], cwd=source)
+                target = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+                state = root / "state"
+                receipts = state / "receipts"
+                receipts.mkdir(parents=True, mode=0o700)
+                payload = DeployExactCommitIntegrationTests.schema5_verified_receipt(
+                    type("Fixture", (), {"commit": previous})())
+                if case == "failed_receipt":
+                    payload["result"] = "failed"
+                elif case == "observed_receipt":
+                    payload["result"] = "verified_observed"
+                elif case == "bad_time":
+                    payload["completed_at"] = "not-a-time"
+                if case == "unknown_field":
+                    payload["unknown"] = True
+                elif case == "bad_lock":
+                    payload["lock_handoff"] = "public-observation"
+                elif case == "wrong_receipt_commit":
+                    payload["api_commit"] = target
+                receipt = receipts / f"{previous}.json"
+                if case != "missing_receipt":
+                    receipt.write_text(json.dumps(payload))
+                    receipt.chmod(0o666 if case == "unsafe_receipt" else 0o600)
+                    if case == "symlink_receipt":
+                        actual = receipts / "actual.json"
+                        receipt.rename(actual)
+                        receipt.symlink_to(actual)
+                    elif case == "duplicate_receipt":
+                        receipt.write_text(json.dumps(payload)[:-1] + ', "result":"verified"}')
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                curl = bin_dir / "curl"
+                curl.write_text(
+                    f"#!{shutil.which('bash')}\n"
+                    + ("exit 22\n" if case == "curl_failure" else
+                       'commit="$PREVIOUS"\n'
+                       + ('[[ "${!#}" != frontend ]] || commit="$TARGET"\n'
+                          if case == "drift" else "")
+                       + "printf '{\"commit\":\"%s\"}' \"$commit\"\n")
+                )
+                if case == "duplicate_public":
+                    curl.write_text(f"#!{shutil.which('bash')}\n"
+                                    + "printf '{\"commit\":\"%s\",\"commit\":\"%s\"}' \"$PREVIOUS\" \"$PREVIOUS\"\n")
+                curl.chmod(0o755)
+                env = os.environ.copy()
+                env.update(PATH=f"{bin_dir}:{env['PATH']}", PREVIOUS=previous, TARGET=target)
+                harness = (
+                    'set -euo pipefail\nexport PATH="$TEST_BIN:$PATH"\n'
+                    + 'run_ops_python() { WELTGEWEBE_OPS_SCRIPT_DIR="$OPS" "$TEST_PYTHON" -I - "$@"; }\n'
+                    + function.replace('            "curl",', f'            {str(curl)!r},')
+                    .replace('["git", "--no-replace-objects"',
+                             f'[{str(bin_dir / "git")!r}, "--no-replace-objects"'
+                             if case == "git_failure" else '["git", "--no-replace-objects"')
+                    + '\ncan_skip_migration\n'
+                )
+                env.update(TEST_PYTHON=os.readlink("/proc/self/exe"), TEST_BIN=str(bin_dir), OPS=str(ROOT / "scripts/ops"), SOURCE_CHECKOUT=str(source),
+                           STATE_ROOT=str(state), COMMIT="f" * 40 if case == "unknown_commit" else target,
+                           API_URL="api", FRONTEND_URL="frontend")
+                if case == "git_failure":
+                    git = bin_dir / "git"
+                    git.write_text(f"#!{shutil.which('bash')}\nexit 128\n")
+                    git.chmod(0o755)
+                result = run(["bash", "-c", harness], env=env, check=False)
+                self.assertEqual(result.returncode == 0, case == "unchanged", result.stderr)
 
 
 class GitFixtureIsolationTests(unittest.TestCase):

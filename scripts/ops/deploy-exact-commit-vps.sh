@@ -76,6 +76,105 @@ run_release_deploy() {
   )
 }
 
+# This optimization is evidence-only: every read/parse/Git failure retains the
+# legacy migration path. Never use current.json or a release marker as live proof.
+can_skip_migration() {
+  run_ops_python "$SOURCE_CHECKOUT" "$STATE_ROOT" "$COMMIT" "$API_URL" "$FRONTEND_URL" << 'PY_SKIP_MIGRATION'
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+sys.path.insert(0, os.environ["WELTGEWEBE_OPS_SCRIPT_DIR"])
+from weltgewebe_secure_receipt_io import read_secure_json
+
+
+def timestamp(value):
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("naive receipt timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate public version field")
+        result[key] = value
+    return result
+
+
+def public_commit(url):
+    with tempfile.TemporaryFile() as body:
+        subprocess.run([
+            "curl", "--fail", "--silent", "--show-error", "--max-redirs", "0",
+            "--connect-timeout", "5", "--max-time", "15", "--max-filesize",
+            "1048576", url,
+        ], stdout=body, check=True, timeout=20)
+        body.seek(0)
+        raw = body.read(1048577)
+    if len(raw) > 1048576:
+        raise ValueError("public version exceeds byte limit")
+    commit = json.loads(raw, object_pairs_hook=unique_object)["commit"]
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("invalid public commit")
+    return commit
+
+
+try:
+    source, state, target, api_url, frontend_url = sys.argv[1:]
+    previous = public_commit(api_url)
+    if public_commit(frontend_url) != previous:
+        raise ValueError("public frontend/API drift")
+    receipt = read_secure_json(Path(state) / "receipts" / f"{previous}.json")
+    expected_keys = {
+        "schema_version", "environment", "commit", "web_artifact_sha256",
+        "started_at", "completed_at", "api_commit", "frontend_commit",
+        "observed_main_after_deploy", "migration_completed_at", "lock_domain",
+        "lock_owner_entrypoint", "lock_handoff", "result", "deploy_invocation_id",
+    }
+    if (set(receipt) != expected_keys or receipt["schema_version"] != 5
+        or receipt["environment"] != "production" or receipt["result"] != "verified"
+        or receipt["lock_domain"] != "weltgewebe-production-deployment-v1"
+        or any(receipt[key] != previous for key in (
+            "commit", "api_commit", "frontend_commit", "observed_main_after_deploy"))
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt["web_artifact_sha256"])
+        or not timestamp(receipt["started_at"]) <= timestamp(
+            receipt["migration_completed_at"]) <= timestamp(receipt["completed_at"])):
+        raise ValueError("previous release receipt is not verified")
+    direct = (receipt["lock_owner_entrypoint"] == "deploy-helper"
+              and receipt["lock_handoff"] == "direct"
+              and receipt["deploy_invocation_id"] is None)
+    inherited = (receipt["lock_owner_entrypoint"] == "reconciler"
+                 and receipt["lock_handoff"] == "inherited"
+                 and isinstance(receipt["deploy_invocation_id"], str)
+                 and re.fullmatch(r"[0-9a-f]{64}", receipt["deploy_invocation_id"]))
+    if not (direct or inherited):
+        raise ValueError("previous release lock evidence is invalid")
+
+    def git(*args):
+        return subprocess.run(["git", "--no-replace-objects", "-C", source, *args],
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    for commit in (previous, target):
+        if git("rev-parse", "--verify", f"{commit}^{{commit}}") != commit:
+            raise ValueError("commit identity unavailable")
+        if git("cat-file", "-t", f"{commit}:apps/api/migrations") != "tree":
+            raise ValueError("migration tree unavailable")
+    git("merge-base", "--is-ancestor", previous, target)
+    git("diff", "--exit-code", "--no-ext-diff", "--no-textconv", previous, target,
+        "--", "apps/api/migrations/")
+    print(f"migration_skip_previous_commit={previous}", file=sys.stderr)
+except Exception as exc:
+    print(f"migration_skip_unavailable: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY_SKIP_MIGRATION
+}
+
 require_command() {
   command -v "$1" > /dev/null 2>&1 || fail "required command not found: $1"
 }
@@ -628,23 +727,30 @@ image_digest="$(jq -er '.image_digest' "$release_dir/infra/schauwerk-editor/rele
 python3 -I "$AUTHORIZER" --commit "$COMMIT" --image-digest "$image_digest" ||
   fail "requested Schaubild image is not part of the authorized production release"
 
+# Decide before overwriting a possible same-commit verified receipt.
+skip_migration=false
+if can_skip_migration; then
+  skip_migration=true
+fi
+
 started_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
 write_deploy_receipt "deploying" "" "" "" "$remote_main"
 receipt_started=true
 
-# Apply all pending embedded migrations through the existing bounded API-only
-# path before the full stack is reconciled. The migration scope restores the
-# API to verify-applied itself and leaves PostgreSQL, NATS and any existing
-# Caddy container untouched. This is intentionally idempotent when no migration
-# is pending. The receipt records completion for diagnosis, but never authorizes
-# a later retry to skip database verification.
 python3 -I "$AUTHORIZER" --commit "$COMMIT" --image-digest "$image_digest" ||
   fail "production HOLD withdrawn immediately before database migration"
-echo "production_deployment_phase=migration state=starting commit=$COMMIT" >&2
-run_release_deploy migration
-migration_completed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
-write_deploy_receipt "deploying" "" "" "" "$last_observed_main"
-echo "production_deployment_phase=migration state=completed commit=$COMMIT checking_origin_main=true" >&2
+if [[ "$skip_migration" == true ]]; then
+  # Completion of the verified unchanged-migration preflight, not applied migrations.
+  migration_completed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+  write_deploy_receipt "deploying" "" "" "" "$last_observed_main"
+  echo "production_deployment_phase=migration state=skipped reason=verified_unchanged_migrations commit=$COMMIT" >&2
+else
+  echo "production_deployment_phase=migration state=starting commit=$COMMIT" >&2
+  run_release_deploy migration
+  migration_completed_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+  write_deploy_receipt "deploying" "" "" "" "$last_observed_main"
+  echo "production_deployment_phase=migration state=completed commit=$COMMIT checking_origin_main=true" >&2
+fi
 
 remote_main="$(fetch_main)"
 last_observed_main="$remote_main"

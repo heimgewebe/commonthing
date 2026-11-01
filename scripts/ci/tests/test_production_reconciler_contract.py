@@ -247,6 +247,18 @@ verify_public_schauwerk_runtime "$EXPECTED_IMAGE_REF" "$EXPECTED_SOURCE_COMMIT"
         self.assertIn('"+refs/heads/main:refs/remotes/origin/main" || return 1', script)
         self.assertIn("rev-parse refs/remotes/origin/main || return 1", script)
 
+    def test_migration_skip_is_decided_before_receipt_overwrite(self) -> None:
+        script = self.read("scripts/ops/deploy-exact-commit-vps.sh")
+        decision = script.index("if can_skip_migration; then")
+        receipt = script.index('write_deploy_receipt "deploying"', decision)
+        migration = script.index("run_release_deploy migration", receipt)
+        self.assertLess(decision, receipt)
+        self.assertLess(receipt, migration)
+        self.assertIn('if [[ "$skip_migration" == true ]]; then', script)
+        self.assertIn("reason=verified_unchanged_migrations", script)
+        self.assertIn('"--", "apps/api/migrations/"', script)
+        self.assertIn('git("merge-base", "--is-ancestor", previous, target)', script)
+
     def test_deploy_helper_preserves_legacy_checkout_and_binds_main(self) -> None:
         script = self.read("scripts/ops/deploy-exact-commit-vps.sh")
         self.assertIn("+refs/heads/main:refs/remotes/origin/main", script)
