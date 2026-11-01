@@ -36,12 +36,22 @@ Für die helle Oberfläche wird eine dunkelteale Garnvariante unter Bewahrung de
 Helligkeitsabstufungen erzeugt.
 
 Die beiden tatsächlich in Commonthing verwendeten Titel sind `Login` und
-`Einstellungen`. Die Buchstaben werden ohne die bisherigen 9 Pixel
-zusätzlichen Abstand gesetzt (`LETTER_GAP_PX = 0`). Die Garnfasern
-behalten ihre natürliche Randstruktur; die kompakteren PNGs erscheinen in
-`YarnWord.svelte` mit kompakteren CSS-Breiten, aber nahezu gleicher
-Fadendicke. Das Zusammensetzen geschieht ausschließlich beim Generieren,
-nicht durch Browser-CSS oder nachträgliches Nachladen.
+`Einstellungen`. Der iPad-Sichttest zeigte: Auch ein pauschaler
+Buchstabenabstand von null Pixeln lässt ungleichmäßige große Lücken.
+Der Generator berechnet deshalb **optisches Kerning pro Buchstabenpaar**:
+Er vergleicht die dichten Garnpixel (Alpha ab 100) auf den gemeinsamen
+Grundlinien-Zeilen und verringert den Abstand, bis zwischen den Garnkernen
+mindestens zwei Pixel bleiben. Die Annäherung beträgt maximal neun Pixel
+und höchstens ein Drittel der jeweils schmaleren Glyphe. Leichte
+Faserüberlappungen werden korrekt transparent übereinandergeblendet,
+statt bereits gezeichnete Wollfasern abzuschneiden. Leerzeichen bleiben
+unverändert. Die Berechnung läuft nur beim Erzeugen der Dateien, niemals
+während der Browserbenutzung.
+
+Die neuen PNGs haben kleinere Abmessungen. `YarnWord.svelte` stellt
+`Login` mit 7 rem und `Einstellungen` mit 16 rem Breite dar, damit
+die Garnfäden nicht durch horizontale Streckung wieder auseinandergezogen
+werden. Semantische Überschriften und Standardschrift-Fallback bleiben.
 
 Es werden pro Wort und Theme transparente PNG-Dateien erzeugt,
 ohne Netzwerkanfragen beim Generieren, ohne Browser-JavaScript zur Bildgeometrie
@@ -49,8 +59,8 @@ und ohne externe Font-CDN-Abhängigkeit.
 
 | Ziel in `apps/web/static/garnschrift-c/` | Auflösung | Zweck |
 | --- | --- | --- |
-| `login-dark.png`, `login-light.png` | 280 × 145 | Anmelden |
-| `einstellungen-dark.png`, `einstellungen-light.png` | 647 × 145 | Einstellungen |
+| `login-dark.png`, `login-light.png` | 260 × 145 | Anmelden |
+| `einstellungen-dark.png`, `einstellungen-light.png` | 592 × 145 | Einstellungen |
 
 Vom Repository-Root reproduzieren und prüfen:
 

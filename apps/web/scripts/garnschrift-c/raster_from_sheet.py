@@ -16,8 +16,11 @@ SHEET = HERE.parents[3] / "docs/assets/garnschrift-c-contact-sheet.png"
 OUTPUT = HERE.parents[1] / "static/garnschrift-c"
 SHEET_SHA256 = "eb09901816a4fc04a001cd2a7c2e51f12ca6b04e68a892727087cd1bcd76e2c2"
 WORDS = ("Login", "Einstellungen")
-# Glyph crops already have a small transparent edge; no extra letter tracking.
-LETTER_GAP_PX = 0
+# Keep the dense yarn cores separated while allowing soft fiber fringes to touch.
+# All kerning is computed offline from the original glyph pixels, never in CSS.
+CORE_ALPHA = 100
+CORE_CLEARANCE_PX = 2
+MAX_OPTICAL_OVERLAP_PX = 9
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 # Exact source-sheet pixel bounds (inclusive x, exclusive y); shared baseline
@@ -214,6 +217,44 @@ def glyph(
     return cropped_width, cropped_height, cropped, y1 + top - baseline
 
 
+def optical_overlap(
+    left: tuple[int, int, bytearray, int],
+    right: tuple[int, int, bytearray, int],
+) -> int:
+    """Tighten two glyphs until their dense yarn cores are two pixels apart.
+
+    The rows are aligned on the approved sheet's shared baseline. Soft,
+    antialiased fiber edges are blended later, not cut off by a negative gap.
+    """
+    lw, lh, lpixels, ldy = left
+    rw, rh, rpixels, rdy = right
+    if not lh or not rh:  # preserve ordinary word spaces
+        return 0
+    closest = None
+    for y in range(max(ldy, rdy), min(ldy + lh, rdy + rh)):
+        li = (y - ldy) * lw * 4 + 3
+        ri = (y - rdy) * rw * 4 + 3
+        last = next(
+            (x for x in range(lw - 1, -1, -1)
+             if lpixels[li + 4 * x] >= CORE_ALPHA), None
+        )
+        first = next(
+            (x for x in range(rw)
+             if rpixels[ri + 4 * x] >= CORE_ALPHA), None
+        )
+        if last is not None and first is not None:
+            gap = lw + first - last - 1
+            closest = gap if closest is None else min(closest, gap)
+    if closest is None:
+        return 0
+    return max(0, min(
+        closest - CORE_CLEARANCE_PX,
+        MAX_OPTICAL_OVERLAP_PX,
+        lw // 3,
+        rw // 3,
+    ))
+
+
 def render(word: str, theme: str, image: tuple[int, int, bytes]) -> bytes:
     if theme not in ("dark", "light"):
         raise ValueError("invalid color scheme")
@@ -221,18 +262,40 @@ def render(word: str, theme: str, image: tuple[int, int, bytes]) -> bytes:
         (27, 0, bytearray(), 0) if char == " " else glyph(char, theme, image)
         for char in word
     ]
-    width = 24 + sum(part[0] for part in parts) + LETTER_GAP_PX * max(0, len(parts) - 1)
+    overlaps = [
+        optical_overlap(left, right)
+        for left, right in zip(parts, parts[1:])
+    ]
+    width = 24 + sum(part[0] for part in parts) - sum(overlaps)
     height = 145
     output = bytearray(width * height * 4)
     x = 12
-    for w, h, source, dy in parts:
+    for index, (w, h, source, dy) in enumerate(parts):
         top = 105 + dy
         if h and (top < 0 or top + h > height):
             raise ValueError("glyph outside target canvas")
         for y in range(h):
-            start = ((top + y) * width + x) * 4
-            output[start:start + 4 * w] = source[y * 4 * w:(y + 1) * 4 * w]
-        x += w + LETTER_GAP_PX
+            for px in range(w):
+                src = (y * w + px) * 4
+                alpha = source[src + 3]
+                if not alpha:
+                    continue
+                dest = ((top + y) * width + x + px) * 4
+                previous_alpha = output[dest + 3]
+                if not previous_alpha:
+                    output[dest:dest + 4] = source[src:src + 4]
+                    continue
+                # Source-over composition preserves fibers where soft edges meet.
+                remaining = 255 - alpha
+                composed_alpha = alpha + (previous_alpha * remaining + 127) // 255
+                for channel in range(3):
+                    numerator = (
+                        source[src + channel] * alpha * 255
+                        + output[dest + channel] * previous_alpha * remaining
+                    )
+                    output[dest + channel] = _byte(numerator / (composed_alpha * 255))
+                output[dest + 3] = composed_alpha
+        x += w - (overlaps[index] if index < len(overlaps) else 0)
     return write_png_rgba(width, height, output)
 
 

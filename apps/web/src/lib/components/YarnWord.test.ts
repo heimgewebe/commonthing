@@ -15,7 +15,7 @@ describe("YarnWord scope and SSR", () => {
       expect(body.match(/aria-hidden="true"/g)).toHaveLength(2);
       expect(body).toContain(`/garnschrift-c/${word.toLowerCase()}-light.png`);
       expect(body).toContain(`/garnschrift-c/${word.toLowerCase()}-dark.png`);
-      expect(body).toContain('width="' + (word === "Login" ? 280 : 647) + '"');
+      expect(body).toContain('width="' + (word === "Login" ? 260 : 592) + '"');
       expect(body).not.toContain("style=");
       expect(body).not.toMatch(/\son(?:load|error)=/);
       expect(body).not.toContain("loaded");
