@@ -12,12 +12,12 @@ from pathlib import Path
 FONT_DIR = Path(__file__).resolve().parents[2] / "static" / "fonts"
 ASSETS = {
     "dark": (
-        "8954987abad22f5d1f0c52eaf4d1ae9904ea3bc932f2313c3ce1f315434ca24e",
-        467040,
+        "bca7c91189d8a1d258f7286664df9c90441cc2bc3a3dc903fc6ddbed66f3ee94",
+        467556,
     ),
     "light": (
-        "60b2b3c373dcf8e95123025c66f898cdf9b18c7f454acb6863d9724dd10ee76a",
-        492684,
+        "849090e5bbb55b3072001f722c31d9bb75474c3912a00b88b787502a05bcaddd",
+        493200,
     ),
 }
 
@@ -189,6 +189,92 @@ class BitmapFontAssets(unittest.TestCase):
                                         ]
                                     )
                                 )
+
+
+    def test_dense_wool_kerning_pairs_do_not_collide(self):
+        """The font's kern table must use the final vertically aligned ink."""
+        from raster_from_sheet import GLYPHS
+
+        alphabet = sorted(GLYPHS)
+        punct = set(".,;:!?-–—/&@#%€$§+*")
+        for theme in ASSETS:
+            with self.subTest(theme=theme):
+                payload = (FONT_DIR / f"garnschrift-c-{theme}.woff").read_bytes()
+                count = struct.unpack_from(">H", payload, 12)[0]
+                tables = {}
+                for index in range(count):
+                    tag, offset, compressed, original, _ = struct.unpack_from(
+                        ">4sIIII", payload, 44 + index * 20
+                    )
+                    value = payload[offset : offset + compressed]
+                    tables[tag] = zlib.decompress(value) if compressed < original else value
+                strike = tables[b"sbix"]
+                strike_start = struct.unpack_from(">I", strike, 8)[0]
+                rows = {}
+                for index, char in enumerate(alphabet, start=3):
+                    begin = struct.unpack_from(
+                        ">I", strike, strike_start + 4 + index * 4
+                    )[0]
+                    end = struct.unpack_from(
+                        ">I", strike, strike_start + 4 + (index + 1) * 4
+                    )[0]
+                    bitmap_offset = strike_start + begin
+                    width, height, pixels = decode_generator_png(
+                        strike[bitmap_offset + 8 : strike_start + end]
+                    )
+                    self.assertEqual(height, 145)
+                    bounds = []
+                    for y in range(height):
+                        xs = [
+                            x for x in range(width)
+                            if pixels[(y * width + x) * 4 + 3] >= 100
+                        ]
+                        bounds.append((xs[0], xs[-1]) if xs else None)
+                    rows[index] = (width, bounds)
+
+                kern = tables[b"kern"]
+                self.assertEqual(struct.unpack_from(">HH", kern), (0, 1))
+                self.assertGreater(struct.unpack_from(">H", kern, 10)[0], 0)
+                n_pairs = struct.unpack_from(">H", kern, 10)[0]
+                pairs = {
+                    (left, right): adjust
+                    for i in range(n_pairs)
+                    for left, right, adjust in [
+                        struct.unpack_from(">HHh", kern, 18 + i * 6)
+                    ]
+                }
+                for (left, right), adjust in pairs.items():
+                    if left < 3 or right < 3:
+                        continue
+                    if alphabet[left - 3] not in punct and alphabet[right - 3] not in punct:
+                        continue
+                    lw, left_rows = rows[left]
+                    _, right_rows = rows[right]
+                    gaps = [
+                        lw + rb[0] - lb[1] - 1 + adjust
+                        for lb, rb in zip(left_rows, right_rows)
+                        if lb is not None and rb is not None
+                    ]
+                    if gaps:
+                        self.assertGreaterEqual(
+                            min(gaps), 2,
+                            f"{theme} {alphabet[left - 3]}{alphabet[right - 3]} "
+                            f"kerning {adjust} gives a core gap {min(gaps)}",
+                        )
+                for left, right in (("O", "-"), ("2", ".")):
+                    lid, rid = 3 + alphabet.index(left), 3 + alphabet.index(right)
+                    lw, left_rows = rows[lid]
+                    _, right_rows = rows[rid]
+                    shift = pairs.get((lid, rid), 0)
+                    gaps = [
+                        lw + rb[0] - lb[1] - 1 + shift
+                        for lb, rb in zip(left_rows, right_rows)
+                        if lb is not None and rb is not None
+                    ]
+                    self.assertTrue(gaps)
+                    self.assertGreaterEqual(
+                        min(gaps), 2, f"{theme} {left}{right} overlaps"
+                    )
 
 
 if __name__ == "__main__":

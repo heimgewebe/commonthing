@@ -196,12 +196,18 @@ def generate(theme: str) -> bytes:
     bitmap.strikes = {UPM: strike}
     fb.font["sbix"] = bitmap
 
-    # Pair-specific kerning follows the same fiber-core geometry as word PNGs.
+    # Kerning must use the same *final* ink positions as the sbix bitmaps.
+    # Raw source-sheet baselines would make pairs such as "O-" and "2." collide
+    # after the Safari punctuation shift, even if isolated glyph tests pass.
+    aligned_assets = {
+        ch: (w, h, rgba, adjusted_glyph_top(ch, assets[ch]) - ASCENT)
+        for ch, (w, h, rgba, _) in assets.items()
+    }
     kerning = {
         (names[a], names[b]): -overlap
         for a in chars
         for b in chars
-        if (overlap := optical_overlap(assets[a], assets[b])) > 0
+        if (overlap := optical_overlap(aligned_assets[a], aligned_assets[b])) > 0
     }
     kern = newTable("kern")
     kern.version = 0

@@ -149,8 +149,8 @@ Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert.
 Im opt-in-Schriftversuch sind die Buchstaben minimal schlanker: Der
 Farbschriftgenerator reduziert die Alpha-Deckkraft nur an den tatsächlichen
 Faserkanten um höchstens 2/5 eines Rasterpixels. Wollfarben, dreifache
-Zwirnung, Bildabmessungen, Grundlinien, Zeichenbreiten und Kerning
-bleiben erhalten. Die produktiven Garn-PNG-Wortbilder werden nicht verändert.
+Zwirnung, Bildabmessungen, Grundlinien und Zeichenbreiten bleiben erhalten.
+Nur das Kerning der nativen Farbschrift folgt den endgültigen Glyphenpositionen. Die produktiven Garn-PNG-Wortbilder werden nicht verändert.
 
 Im systemweiten Hochkontrastmodus (Forced Colors) wird die Bitmap-Schrift zugunsten lesbarer Systemschrift deaktiviert.
 
@@ -165,8 +165,10 @@ Unterschiede gerade in kleinen Wollbeschriftungen sichtbar.
 Der Farbschriftgenerator richtet den dichten Garnkern von Punkt, Komma,
 Semikolon, Doppelpunkt, Ausrufe- und Fragezeichen, Strichen und mehreren
 Sonderzeichen an einer einheitlichen typografischen Grundlinie aus.
-RGB-Faserfarben, organische Ränder, Pixelstruktur und Kernings bleiben
-erhalten. Bei den Nicht-Unterlängenbuchstaben i und k werden außerdem
+RGB-Faserfarben, organische Ränder und Pixelstruktur bleiben erhalten.
+Das optische Kerning wird anhand der bereits vertikal korrigierten Glyphen
+neu berechnet: Auch Paarungen wie „O-“ und „2.“ dürfen keine dichten
+Faserkerne überlappen lassen. Bei den Nicht-Unterlängenbuchstaben i und k werden außerdem
 winzige, abgetrennte Quellbildflecken unterhalb der Grundlinie unterdrückt
 (jeweils weniger als 1,3 % ihrer ursprünglichen Alpha-Deckung). Die
 eigentlichen Wollfäden bleiben erhalten.
