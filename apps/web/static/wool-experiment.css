@@ -1,0 +1,109 @@
+/* Optional native-color bitmap yarn from approved 3-ply Garnschrift C.
+ * Default off: no new requests on the usual frontend path.
+ */
+@font-face {
+  font-family: "Garnschrift C Woll";
+  src: url("/fonts/garnschrift-c-dark.woff") format("woff");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Garnschrift C Petrol";
+  src: url("/fonts/garnschrift-c-light.woff") format("woff");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@media (forced-colors: none) {
+  html[data-wool-experiment="on"][data-color-scheme="dark"] body,
+  html[data-wool-experiment="on"][data-color-scheme="dark"] body * {
+    font-family: "Garnschrift C Woll", system-ui, sans-serif !important;
+    font-synthesis: none;
+  }
+
+  html[data-wool-experiment="on"][data-color-scheme="light"] body,
+  html[data-wool-experiment="on"][data-color-scheme="light"] body * {
+    font-family: "Garnschrift C Petrol", system-ui, sans-serif !important;
+    font-synthesis: none;
+  }
+
+  /*
+   * The colorful bitmap cannot adapt to the foreground CSS color. Protect
+   * ALL filled primary actions (not only .wg-button--primary), plus prose,
+   * text inputs and explicit technical/monospace content. Normal text remains
+   * crisp at small sizes while headings and short navigation use real wool.
+   */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :where(
+      .wg-button--primary,
+      .btn,
+      button,
+      .back-link,
+      .wg-back-link,
+      .fan-trigger,
+      p:not(.menu-heading):not(.wg-eyebrow),
+      small,
+      label,
+      input,
+      textarea,
+      select,
+      option,
+      code,
+      pre,
+      kbd,
+      samp,
+      tt,
+      [class*="mono"],
+      [class*="hash"],
+      .state-pill,
+      .menu-links span,
+      [role="status"],
+      [role="alert"]
+    ),
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :where(
+      .wg-button--primary,
+      .btn,
+      button,
+      .back-link,
+      .wg-back-link,
+      .fan-trigger,
+      p:not(.menu-heading):not(.wg-eyebrow),
+      small,
+      label,
+      input,
+      textarea,
+      select,
+      option,
+      code,
+      pre,
+      kbd,
+      samp,
+      tt,
+      [class*="mono"],
+      [class*="hash"],
+      .state-pill,
+      .menu-links span,
+      [role="status"],
+      [role="alert"]
+    )
+    * {
+    font-family: system-ui, sans-serif !important;
+    font-synthesis: auto;
+  }
+
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"]),
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"])
+    * {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
+  }
+}
