@@ -71,14 +71,14 @@ GARN_FONT_PROVENANCE_BLOBS = {
 WOOL_FONT_SOURCE_BLOB = "3ada289072a765db9787208f6b95c6f73c3c7cce"
 WOOL_FONT_SPECS = {
     "apps/web/static/fonts/garnschrift-c-dark.woff": {
-        "blob_sha": "d3d7eb062b18f9536a054fa20bf3343537bd0f2c",
-        "sha256": "8954987abad22f5d1f0c52eaf4d1ae9904ea3bc932f2313c3ce1f315434ca24e",
-        "size": 467040,
+        "blob_sha": "96870799ae938393664412c72efae7585a04c34d",
+        "sha256": "bca7c91189d8a1d258f7286664df9c90441cc2bc3a3dc903fc6ddbed66f3ee94",
+        "size": 467556,
     },
     "apps/web/static/fonts/garnschrift-c-light.woff": {
-        "blob_sha": "f71a4019c2d8c67b8dc738ba352f334f5914e48c",
-        "sha256": "60b2b3c373dcf8e95123025c66f898cdf9b18c7f454acb6863d9724dd10ee76a",
-        "size": 492684,
+        "blob_sha": "1bec7e72c2db2919d14a1769c886d34f35f919fe",
+        "sha256": "849090e5bbb55b3072001f722c31d9bb75474c3912a00b88b787502a05bcaddd",
+        "size": 493200,
     },
 }
 RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
