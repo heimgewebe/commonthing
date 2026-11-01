@@ -300,9 +300,13 @@ jobs:
               "repos/${REPOSITORY}/contents/${wool_source_path}?ref=${base_sha}" \
               | jq -er '.sha')"
             [[ "${wool_source_blob}" == '3ada289072a765db9787208f6b95c6f73c3c7cce' ]]
-            for wool_spec in \
-              'apps/web/static/fonts/garnschrift-c-dark.woff|0e7ea8413a9ef123c5819c65106913c9a62d924a|1a564a5737a627154cefa514ea91c6fb07442e7811d9d36278a8c340bb7e9ecb|464556' \
-              'apps/web/static/fonts/garnschrift-c-light.woff|81d7dcde9992bf7199406ed53f3bb47f83f0131b|ad6d6fa413bb5d9bc3b21b7043a580e12338e26c9d55a64ad91e8af09aeb081e|490260'; do
+            wool_dark_spec="${wool_dark}|"
+            wool_dark_spec+='0e7ea8413a9ef123c5819c65106913c9a62d924a|'
+            wool_dark_spec+='1a564a5737a627154cefa514ea91c6fb07442e7811d9d36278a8c340bb7e9ecb|464556'
+            wool_light_spec="${wool_light}|"
+            wool_light_spec+='81d7dcde9992bf7199406ed53f3bb47f83f0131b|'
+            wool_light_spec+='ad6d6fa413bb5d9bc3b21b7043a580e12338e26c9d55a64ad91e8af09aeb081e|490260'
+            for wool_spec in "${wool_dark_spec}" "${wool_light_spec}"; do
               IFS='|' read -r wool_path expected_blob expected_sha expected_bytes <<< "${wool_spec}"
               wool_blob="$(jq -er --arg path "${wool_path}" '
                 .[] | select(.filename == $path and .status == "added") | .sha
