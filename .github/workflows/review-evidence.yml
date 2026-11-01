@@ -302,11 +302,11 @@ jobs:
               | jq -er '.sha')"
             [[ "${wool_source_blob}" == '3ada289072a765db9787208f6b95c6f73c3c7cce' ]]
             wool_dark_spec="${wool_dark}|"
-            wool_dark_spec+='32fe911fd476c38236cf45fecbc4654ea0b2362f|'
-            wool_dark_spec+='cc01aab60acdd0d36c81853f0a5454fab5363382d2bab201186bcd42efd3505c|467100'
+            wool_dark_spec+='d3d7eb062b18f9536a054fa20bf3343537bd0f2c|'
+            wool_dark_spec+='8954987abad22f5d1f0c52eaf4d1ae9904ea3bc932f2313c3ce1f315434ca24e|467040'
             wool_light_spec="${wool_light}|"
-            wool_light_spec+='eed63c05fa8dd9541b1f6ac6301b5c02cc885671|'
-            wool_light_spec+='6721af5b2ba0157603b5d1fc5804810c7166ee0e716e3e37e5472622aa6596c2|492740'
+            wool_light_spec+='f71a4019c2d8c67b8dc738ba352f334f5914e48c|'
+            wool_light_spec+='60b2b3c373dcf8e95123025c66f898cdf9b18c7f454acb6863d9724dd10ee76a|492684'
             for wool_spec in "${wool_dark_spec}" "${wool_light_spec}"; do
               IFS='|' read -r wool_path expected_blob expected_sha expected_bytes <<< "${wool_spec}"
               wool_blob="$(jq -er --arg path "${wool_path}" '
