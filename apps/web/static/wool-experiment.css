@@ -106,4 +106,16 @@
     * {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
   }
+
+  /*
+   * The original 14px section links lose their three-ply detail during
+   * bitmap downsampling. At 18px the real fibers stay distinguishable while
+   * mobile navigation continues to fit the viewport.
+   */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(.menu-heading, .menu-links strong) {
+    font-size: 1.125rem;
+    line-height: 1.4;
+  }
 }

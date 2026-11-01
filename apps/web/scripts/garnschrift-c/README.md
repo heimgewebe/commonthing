@@ -130,8 +130,10 @@ bleiben unberührt. Eine Browserbibliothek oder Laufzeit-Rasterisierung
 gibt es nicht. Wegen der begrenzten Rasterauflösung und der fest eingefärbten
 Garnpixel bleiben lange Fließtexte, kleine Hinweise, Formulare, Eingabefelder,
 alle kleinen Bedienelemente, Primäraktionen mit Farbfüllung, Pfeilnavigation
-und technische Monospace-Kennungen in der zugänglichen Systemschrift. Kurze Navigation und größere Überschriften
-tragen weiterhin echte Wollglyphen. Nicht im Alphabet vorhandene
+und technische Monospace-Kennungen in der zugänglichen Systemschrift.
+Kurze Navigation und größere Überschriften tragen weiterhin echte
+Wollglyphen. Die Einstellungsnavigation verwendet im Experiment mindestens
+18 px, da die dreifache Faserstruktur bei den früheren 14 px verschwamm. Nicht im Alphabet vorhandene
 Sonderzeichen verwenden den regulären Font-Fallback. In MapLibre-
 Kartenkacheln eingebettete Kartentexte sind nicht Teil des HTML-Fontpfads.
 
