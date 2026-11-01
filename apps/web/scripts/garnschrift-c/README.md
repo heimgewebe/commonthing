@@ -141,3 +141,5 @@ python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
 ```
 
 Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert.
+
+Im systemweiten Hochkontrastmodus (Forced Colors) wird die Bitmap-Schrift zugunsten lesbarer Systemschrift deaktiviert.

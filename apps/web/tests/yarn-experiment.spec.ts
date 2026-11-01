@@ -112,3 +112,75 @@ test("unavailable experimental font leaves readable native HTML text", async ({
     page.getByRole("heading", { name: "Einstellungen", level: 1 }),
   ).toHaveCount(1);
 });
+
+test("filled primary actions retain contrast in both color schemes", async ({
+  page,
+}) => {
+  for (const scheme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.goto("/login?wollschrift=1");
+    await expect(page.locator("html")).toHaveAttribute(
+      "data-color-scheme",
+      scheme,
+    );
+    const button = page.getByRole("button", { name: "Login-Link senden" });
+    await page.getByLabel("E-Mail").fill("sample@example.org");
+    await expect(button).toBeEnabled();
+    const buttonStyle = await button.evaluate((element) => {
+      const css = getComputedStyle(element);
+      return {
+        font: css.fontFamily,
+        background: css.backgroundColor,
+        foreground: css.color,
+      };
+    });
+    expect(buttonStyle.font).not.toContain("Garnschrift C");
+    await expect
+      .poll(async () =>
+        page
+          .locator(".wg-label")
+          .evaluate((element) => getComputedStyle(element).fontFamily),
+      )
+      .toContain("Garnschrift C");
+
+    const relativeLight = (rgb: string) => {
+      const channels = rgb
+        .match(/[0-9]+(?:\\.[0-9]+)?/g)
+        ?.slice(0, 3)
+        .map(Number);
+      if (!channels || channels.length !== 3) return -1;
+      const [red, green, blue] = channels.map((value) => {
+        const normalized = value / 255;
+        return normalized <= 0.04045
+          ? normalized / 12.92
+          : ((normalized + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    };
+    const fg = relativeLight(buttonStyle.foreground);
+    const bg = relativeLight(buttonStyle.background);
+    expect(fg).toBeGreaterThanOrEqual(0);
+    expect(bg).toBeGreaterThanOrEqual(0);
+    expect(
+      (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05),
+    ).toBeGreaterThanOrEqual(4.5);
+  }
+});
+
+test("forced colors switches back to the native readable system font", async ({
+  page,
+}) => {
+  await page.emulateMedia({ forcedColors: "active" });
+  await page.goto("/settings?wollschrift=1");
+  await expect(page.getByTestId("wool-experiment-toggle")).toBeChecked();
+  const font = await page
+    .locator(".intro")
+    .evaluate((element) => getComputedStyle(element).fontFamily);
+  expect(font).not.toContain("Garnschrift C");
+  await expect(
+    page.getByRole("heading", {
+      name: "Einstellungen",
+      level: 1,
+    }),
+  ).toHaveCount(1);
+});

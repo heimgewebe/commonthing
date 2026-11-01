@@ -17,14 +17,26 @@
   font-display: swap;
 }
 
-html[data-wool-experiment="on"][data-color-scheme="dark"] body,
-html[data-wool-experiment="on"][data-color-scheme="dark"] body * {
-  font-family: "Garnschrift C Woll", system-ui, sans-serif !important;
-  font-synthesis: none;
-}
+@media (forced-colors: none) {
+  html[data-wool-experiment="on"][data-color-scheme="dark"] body,
+  html[data-wool-experiment="on"][data-color-scheme="dark"] body * {
+    font-family: "Garnschrift C Woll", system-ui, sans-serif !important;
+    font-synthesis: none;
+  }
 
-html[data-wool-experiment="on"][data-color-scheme="light"] body,
-html[data-wool-experiment="on"][data-color-scheme="light"] body * {
-  font-family: "Garnschrift C Petrol", system-ui, sans-serif !important;
-  font-synthesis: none;
+  html[data-wool-experiment="on"][data-color-scheme="light"] body,
+  html[data-wool-experiment="on"][data-color-scheme="light"] body * {
+    font-family: "Garnschrift C Petrol", system-ui, sans-serif !important;
+    font-synthesis: none;
+  }
+
+  /* Bitmap yarn has its own fixed pixel colors. On filled primary actions,
+ * those colors cannot follow the contrast variables. Keep their original
+ * native system font and foreground color in both themes.
+ */
+  html[data-wool-experiment="on"] body .wg-button--primary,
+  html[data-wool-experiment="on"] body .wg-button--primary * {
+    font-family: system-ui, sans-serif !important;
+    font-synthesis: auto;
+  }
 }
