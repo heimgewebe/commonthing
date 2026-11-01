@@ -32,8 +32,14 @@ unabhängig von den Bildern im DOM.
 Python-Standardbibliothek, kontrolliert seinen SHA-256-Wert und seine Dimensionen,
 und verwendet feste, überprüfbare Rechtecke für die einzelnen Originalbuchstaben.
 Die abgetrennten Garnpixel werden aus dem petrolfarbenen Hintergrund freigestellt.
-Für die helle Oberfläche wird eine dunkelteale Garnvariante unter Bewahrung der
-Helligkeitsabstufungen erzeugt.
+Für das dunkle Oberflächenthema wird die gemessene Helligkeit der Originalfasern
+auf eine natürliche Wollweißpalette abgebildet: schattierte Vertiefungen
+(#C6C3BA), Wollgrundfarbe (#F0EEE7) und sanfte Faserreflexe (#FCFAF5).
+Die Original-Luminanzanker (ungefähr 75/175/225) erhalten die Zwirnung;
+**Alpha-Maske, Konturen und optisches Kerning bleiben unverändert.**
+Für die helle Oberfläche bleibt die kontrastreiche dunkelteale Garnvariante
+mit ihren Helligkeitsabstufungen erhalten. Alle vier PNGs werden weiterhin
+deterministisch aus der unveränderten Originalquelle erzeugt.
 
 Die beiden tatsächlich in Commonthing verwendeten Titel sind `Login` und
 `Einstellungen`. Der iPad-Sichttest zeigte: Auch ein pauschaler

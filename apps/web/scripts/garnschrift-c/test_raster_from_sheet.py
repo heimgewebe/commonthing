@@ -86,6 +86,31 @@ class RasterYarnAssets(unittest.TestCase):
             light = raster.render(word, "light", self.source)
             self.assertEqual(dark[16:24], light[16:24])
 
+    def test_wool_white_palette_preserves_fiber_detail_and_contours(self):
+        self.assertEqual(raster.wool_white_color(75), (198, 195, 186))
+        self.assertEqual(raster.wool_white_color(175), (240, 238, 231))
+        self.assertEqual(raster.wool_white_color(225), (252, 250, 245))
+        for ch in ("E", "n", "L", "g"):
+            with self.subTest(ch=ch):
+                dark = raster.glyph(ch, "dark", self.source)
+                light = raster.glyph(ch, "light", self.source)
+                self.assertEqual((dark[0], dark[1], dark[3]),
+                                 (light[0], light[1], light[3]))
+                self.assertEqual(dark[2][3::4], light[2][3::4])
+                pixels = dark[2]
+                self.assertTrue(any(0 < a < 255 for a in pixels[3::4]))
+                opaque = [tuple(pixels[i:i + 3])
+                          for i in range(0, len(pixels), 4)
+                          if pixels[i + 3] >= 200]
+                self.assertGreater(len(set(opaque)), 35)
+                self.assertTrue(all(198 <= r <= 252 and 195 <= g <= 250
+                                    and 186 <= b <= 245 and
+                                    r >= g >= b and r - g <= 3 and g - b <= 9
+                                    for r, g, b in opaque))
+                tones = sorted(sum(rgb) / 3 for rgb in opaque)
+                self.assertGreater(tones[len(tones) * 95 // 100]
+                                   - tones[len(tones) * 5 // 100], 25)
+
     def test_arbitrary_german_word_renders_without_browser_or_external_assets(self):
         for theme in ("dark", "light"):
             png = raster.render("ÄÖÜäöüß Kollektivgüter 2026!", theme, self.source)
