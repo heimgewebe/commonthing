@@ -54,15 +54,35 @@ SAFE_OPAQUE_PREFIXES = (
 # Only this exact upstream WOFF2 can be treated like an inspectable asset.
 # The trusted workflow derives its SHA-256/byte count/magic from the GitHub
 # blob and the companion source+OFL Git blobs; unverified fonts remain opaque.
-GARN_FONT_PATH = "apps/web/static/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2"
+GARN_FONT_PATH = (
+    "apps/web/static/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2"
+)
 GARN_FONT_SHA256 = "18b2a1a39a2fa298b0ba5390aca68462669826c90925656f1c1f6796e0e1bbaf"
 GARN_FONT_GIT_BLOB = "a9ca4bd6ffda7092b397871cd3b5ad38a372046d"
 GARN_FONT_BYTES = 33996
+# Exact, immutable PNG-backed wool-font experiment. The trusted workflow
+# validates byte SHA, Git blob, WOFF magic, approved source and generator tests
+# without checking out or executing untrusted PR code.
+WOOL_FONT_ASSETS = {
+    "apps/web/static/fonts/garnschrift-c-dark.woff": {
+        "blob_sha": "df5ec7a49fd79ecb5a95b2931f7c95878f3ac8dd",
+        "sha256": "f9557768fcdae1218d998449edbbad41a6973828ae39980ac832fe60003eba62",
+        "size": 415724,
+    },
+    "apps/web/static/fonts/garnschrift-c-light.woff": {
+        "blob_sha": "08668cd482de7690e90c49028ac2ac54cfe8dc17",
+        "sha256": "d4d0036348e0ef59df81d19351eb96ef6bcf9cbb08e6c5bfe5e6297968ecc5e8",
+        "size": 442140,
+    },
+}
+WOOL_FONT_SOURCE_BLOB = "3ada289072a765db9787208f6b95c6f73c3c7cce"
+WOOL_FONT_PROVENANCE_BLOBS = {
+    "apps/web/scripts/garnschrift-c/generate_bitmap_font.py": "0e2487c689a9fa89d33e57c18e05a0d74c1ee1bc",
+    "apps/web/scripts/garnschrift-c/test_bitmap_font.py": "ff27036e5204a763b975a09d5c07a9906cab4ffc",
+}
 GARN_FONT_PROVENANCE_BLOBS = {
-    "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt":
-        "9459440df26a30cfb6ed5542485d281bae449e5f",
-    "apps/web/static/fonts/README.md":
-        "ed4fb686e498eeffa98f9a6cb7d9a103bf083802",
+    "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "9459440df26a30cfb6ed5542485d281bae449e5f",
+    "apps/web/static/fonts/README.md": "ed4fb686e498eeffa98f9a6cb7d9a103bf083802",
 }
 RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 REQUIRED_REVIEWS = {"R0": 0, "R1": 1, "R2": 2, "R3": 2}
@@ -89,7 +109,9 @@ REVIEW_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
 MAX_FALLBACK_REASON_BYTES = 512
 RISK_RE = re.compile(r"<!--\s*weltgewebe-risk:\s*(R[0-3])\s*-->", re.IGNORECASE)
 EVIDENCE_START_RE = re.compile(r"<!--\s*weltgewebe-review-evidence\b", re.IGNORECASE)
-FORWARDED_EVIDENCE_START_RE = re.compile(r"<!--\s*weltgewebe-forwarded-review\b", re.IGNORECASE)
+FORWARDED_EVIDENCE_START_RE = re.compile(
+    r"<!--\s*weltgewebe-forwarded-review\b", re.IGNORECASE
+)
 
 
 class GovernanceError(RuntimeError):
@@ -271,9 +293,7 @@ def _diff_stats(repo: Path, base_sha: str, head_sha: str) -> DiffStats:
     assert isinstance(attention_names_raw, bytes)
     attention_names = tuple(
         dict.fromkeys(
-            _decode_git_path(part)
-            for part in attention_names_raw.split(b"\0")
-            if part
+            _decode_git_path(part) for part in attention_names_raw.split(b"\0") if part
         )
     )
 
@@ -323,7 +343,7 @@ def _partition_opaque_files(
     blocking: list[str] = []
     for path in paths:
         allowed = _is_safe_opaque_asset(path) or (
-            path == GARN_FONT_PATH and path in verified
+            path in verified and (path == GARN_FONT_PATH or path in WOOL_FONT_ASSETS)
         )
         (reviewable if allowed else blocking).append(path)
     return tuple(reviewable), tuple(blocking)
@@ -681,7 +701,7 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
         "deletions",
         "opaque_files",
     }
-    optional = {"attention_changed_files", "font_asset_proof"}
+    optional = {"attention_changed_files", "font_asset_proof", "wool_font_asset_proofs"}
     if not required.issubset(raw) or not set(raw).issubset(required | optional):
         missing = sorted(required - set(raw))
         extra = sorted(set(raw) - required - optional)
@@ -764,9 +784,11 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
         # The trusted workflow may also verify the removal of this exact
         # pinned font and both license/source companions from the PR base.
         # All unknown WOFF2 and other opaque paths stay blocked.
-        exact_keys = expected_keys | {"operation"} if (
-            isinstance(proof, dict) and proof.get("operation") == "removed"
-        ) else expected_keys
+        exact_keys = (
+            expected_keys | {"operation"}
+            if (isinstance(proof, dict) and proof.get("operation") == "removed")
+            else expected_keys
+        )
         if not isinstance(proof, dict) or set(proof) != exact_keys:
             raise GovernanceError("font asset proof fields are invalid")
         if (
@@ -780,7 +802,9 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
             or GARN_FONT_PATH not in stats.opaque_files
             or not set(GARN_FONT_PROVENANCE_BLOBS).issubset(stats.changed_files)
         ):
-            raise GovernanceError("font asset proof failed exact font/provenance binding")
+            raise GovernanceError(
+                "font asset proof failed exact font/provenance binding"
+            )
         stats = DiffStats(
             stats.changed_files,
             stats.additions,
@@ -789,6 +813,58 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
             stats.opaque_files,
             stats.attention_changed_files,
             (GARN_FONT_PATH,),
+        )
+    wool_proofs = raw.get("wool_font_asset_proofs")
+    if wool_proofs is not None:
+        if not isinstance(wool_proofs, list) or len(wool_proofs) != len(
+            WOOL_FONT_ASSETS
+        ):
+            raise GovernanceError("wool font asset proofs require the exact pair")
+        if not set(WOOL_FONT_PROVENANCE_BLOBS).issubset(stats.changed_files):
+            raise GovernanceError(
+                "wool font asset proof missing generated source/tests"
+            )
+        seen: set[str] = set()
+        for item in wool_proofs:
+            if not isinstance(item, dict) or set(item) != {
+                "path",
+                "blob_sha",
+                "sha256",
+                "size",
+                "magic",
+                "source_blob",
+                "provenance_blobs",
+            }:
+                raise GovernanceError("wool font asset proof fields invalid")
+            path = item["path"]
+            if not isinstance(path, str) or path in seen:
+                raise GovernanceError("wool font asset proof path repeated or invalid")
+            seen.add(path)
+            expected = WOOL_FONT_ASSETS.get(path)
+            if (
+                expected is None
+                or item["blob_sha"] != expected["blob_sha"]
+                or item["sha256"] != expected["sha256"]
+                or type(item["size"]) is not int
+                or item["size"] != expected["size"]
+                or item["magic"] != "wOFF"
+                or item["source_blob"] != WOOL_FONT_SOURCE_BLOB
+                or item["provenance_blobs"] != WOOL_FONT_PROVENANCE_BLOBS
+                or path not in stats.opaque_files
+            ):
+                raise GovernanceError(
+                    "wool font asset proof has invalid provenance or bytes"
+                )
+        if seen != set(WOOL_FONT_ASSETS):
+            raise GovernanceError("wool font asset proof requires both exact WOFFs")
+        stats = DiffStats(
+            stats.changed_files,
+            stats.additions,
+            stats.deletions,
+            stats.binary_files,
+            stats.opaque_files,
+            stats.attention_changed_files,
+            (*stats.verified_font_files, *sorted(seen)),
         )
     return pr_number, base_sha, head_sha, merge_base_sha, stats
 
@@ -1015,12 +1091,18 @@ def _forwarded_evidence_blocks(
             record["_comment_evidence_block_count"] = len(starts)
             record["_report_text_bytes"] = len(report_bytes)
             record["_report_text_sha256"] = _sha256(report_bytes)
-            record["_author_association"] = str(comment.get("author_association") or "").upper()
+            record["_author_association"] = str(
+                comment.get("author_association") or ""
+            ).upper()
             user = comment.get("user") or {}
-            record["_comment_author"] = user.get("login") if isinstance(user, dict) else None
+            record["_comment_author"] = (
+                user.get("login") if isinstance(user, dict) else None
+            )
             record["_comment_url"] = comment.get("html_url")
             record["_comment_id"] = _numeric_id(comment.get("id"))
-            record["_updated_at"] = comment.get("updated_at") or comment.get("created_at") or ""
+            record["_updated_at"] = (
+                comment.get("updated_at") or comment.get("created_at") or ""
+            )
             evidence.append(record)
     return evidence, parse_failures, oversized_payloads
 
@@ -1104,7 +1186,9 @@ def evaluate_evidence(
     attention_impact_required = False
     attention_impact_value = None
     if pr_body is not None:
-        attention_impact_required = bool(product_logic_changes(bundle.stats.attention_files))
+        attention_impact_required = bool(
+            product_logic_changes(bundle.stats.attention_files)
+        )
         attention_impact_value = attention_impact_decision(pr_body)
         if attention_impact_required and canonical_product_docs is None:
             reasons.append(
@@ -1146,7 +1230,9 @@ def evaluate_evidence(
             reasons.append(detail)
 
     records, evidence_parse_failures, oversized_evidence = _evidence_blocks(comments)
-    forwarded_records, forwarded_parse_failures, forwarded_oversized = _forwarded_evidence_blocks(comments)
+    forwarded_records, forwarded_parse_failures, forwarded_oversized = (
+        _forwarded_evidence_blocks(comments)
+    )
     total_blocks_by_comment = {
         index: len(EVIDENCE_START_RE.findall(str(comment.get("body") or "")))
         + len(FORWARDED_EVIDENCE_START_RE.findall(str(comment.get("body") or "")))
@@ -1184,7 +1270,9 @@ def evaluate_evidence(
         }
         optional_fields = {"review_mode", "review_session", "fallback_reason"}
         payload_keys = record.get("_payload_keys", ())
-        payload_key_set = set(payload_keys) if isinstance(payload_keys, tuple) else set()
+        payload_key_set = (
+            set(payload_keys) if isinstance(payload_keys, tuple) else set()
+        )
         if (
             not isinstance(payload_keys, tuple)
             or any(str(key).startswith("_") for key in payload_keys)
@@ -1224,15 +1312,11 @@ def evaluate_evidence(
         fallback_reason_present = "fallback_reason" in payload_key_set
         review_mode_raw = record.get("review_mode", "external")
         review_mode = (
-            review_mode_raw.strip().lower()
-            if isinstance(review_mode_raw, str)
-            else ""
+            review_mode_raw.strip().lower() if isinstance(review_mode_raw, str) else ""
         )
         review_session_raw = record.get("review_session", "")
         review_session = (
-            review_session_raw.strip()
-            if isinstance(review_session_raw, str)
-            else ""
+            review_session_raw.strip() if isinstance(review_session_raw, str) else ""
         )
         fallback_reason_raw = record.get("fallback_reason", "")
         fallback_reason = (
@@ -1451,10 +1535,14 @@ def evaluate_evidence(
             record for record in accepted if record.get("review_mode") == "self-primary"
         ]
         self_secondary = [
-            record for record in accepted if record.get("review_mode") == "self-secondary"
+            record
+            for record in accepted
+            if record.get("review_mode") == "self-secondary"
         ]
         self_fallback = [
-            record for record in accepted if record.get("review_mode") == "self-fallback"
+            record
+            for record in accepted
+            if record.get("review_mode") == "self-fallback"
         ]
         primary_sessions = {
             record.get("review_session")
@@ -1484,7 +1572,9 @@ def evaluate_evidence(
             and primary_sessions.isdisjoint(fallback_sessions)
             and all(record.get("fallback_reason") for record in self_fallback)
         )
-        if len(reviewer_names) < 2 and not (regular_self_pair or explicit_self_fallback):
+        if len(reviewer_names) < 2 and not (
+            regular_self_pair or explicit_self_fallback
+        ):
             reasons.append(
                 "R2/R3 require two distinct reviewer identities or a "
                 "self-primary/self-secondary pair with distinct review sessions "
