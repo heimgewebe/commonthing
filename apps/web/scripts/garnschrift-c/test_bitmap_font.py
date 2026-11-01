@@ -11,8 +11,14 @@ from pathlib import Path
 
 FONT_DIR = Path(__file__).resolve().parents[2] / "static" / "fonts"
 ASSETS = {
-    "dark": ("1a564a5737a627154cefa514ea91c6fb07442e7811d9d36278a8c340bb7e9ecb", 464556),
-    "light": ("ad6d6fa413bb5d9bc3b21b7043a580e12338e26c9d55a64ad91e8af09aeb081e", 490260),
+    "dark": (
+        "8954987abad22f5d1f0c52eaf4d1ae9904ea3bc932f2313c3ce1f315434ca24e",
+        467040,
+    ),
+    "light": (
+        "60b2b3c373dcf8e95123025c66f898cdf9b18c7f454acb6863d9724dd10ee76a",
+        492684,
+    ),
 }
 
 
@@ -25,8 +31,8 @@ def decode_generator_png(png: bytes) -> tuple[int, int, bytes]:
     compressed = bytearray()
     while pos < len(png):
         size = struct.unpack_from(">I", png, pos)[0]
-        kind = png[pos + 4:pos + 8]
-        chunk = png[pos + 8:pos + 8 + size]
+        kind = png[pos + 4 : pos + 8]
+        chunk = png[pos + 8 : pos + 8 + size]
         if kind == b"IDAT":
             compressed.extend(chunk)
         pos += 12 + size
@@ -38,9 +44,12 @@ def decode_generator_png(png: bytes) -> tuple[int, int, bytes]:
         raise AssertionError("unexpected wool-glyph scanline length")
     if any(rows[i * (stride + 1)] != 0 for i in range(height)):
         raise AssertionError("unexpected wool-glyph PNG filter")
-    return width, height, b"".join(
-        rows[y * (stride + 1) + 1:(y + 1) * (stride + 1)]
-        for y in range(height)
+    return (
+        width,
+        height,
+        b"".join(
+            rows[y * (stride + 1) + 1 : (y + 1) * (stride + 1)] for y in range(height)
+        ),
     )
 
 
@@ -63,7 +72,7 @@ class BitmapFontAssets(unittest.TestCase):
                     tag, offset, compressed, original, checksum = struct.unpack_from(
                         ">4sIIII", data, 44 + index * 20
                     )
-                    raw = data[offset:offset + compressed]
+                    raw = data[offset : offset + compressed]
                     self.assertEqual(len(raw), compressed)
                     table = zlib.decompress(raw) if compressed < original else raw
                     self.assertEqual(len(table), original)
@@ -73,11 +82,13 @@ class BitmapFontAssets(unittest.TestCase):
                 self.assertIn(b"cmap", directory)
                 self.assertIn(b"glyf", directory)
                 self.assertEqual(struct.unpack_from(">H", directory[b"sbix"])[0], 1)
-                self.assertGreater(struct.unpack_from(">I", directory[b"sbix"], 4)[0], 0)
+                self.assertGreater(
+                    struct.unpack_from(">I", directory[b"sbix"], 4)[0], 0
+                )
                 self.assertGreater(len(directory[b"kern"]), 100)
 
-                # Bitmap bottom offset must align real descenders; sbix
-                # uses upward-positive values (opposite raster coordinates).
+                # Every glyph has the same sbix image origin; no
+                # browser-dependent per-character bitmap origin remains.
                 from raster_from_sheet import GLYPHS, glyph, read_png_rgb
 
                 strike = directory[b"sbix"]
@@ -86,42 +97,98 @@ class BitmapFontAssets(unittest.TestCase):
                 self.assertEqual(ppem, 110)
                 self.assertEqual(resolution, 72)
                 approved = read_png_rgb()
-                for char in ("g", "p", "L", "E", "."):
+                punctuation_bottom = {
+                    ".": 2,
+                    ",": 10,
+                    ";": 10,
+                    ":": 2,
+                    "!": 2,
+                    "?": 2,
+                    "-": -20,
+                    "–": -20,
+                    "—": -20,
+                    "/": 4,
+                    "&": 2,
+                    "@": 2,
+                    "#": 2,
+                    "%": 2,
+                    "€": 2,
+                    "$": 2,
+                    "§": 2,
+                    "+": 0,
+                    "*": -22,
+                }
+                for gid, char in enumerate(sorted(GLYPHS), start=3):
                     with self.subTest(glyph=char):
-                        gid = 3 + sorted(GLYPHS).index(char)
-                        start_offset = struct.unpack_from(
+                        beginning = struct.unpack_from(
                             ">I", strike, strike_start + 4 + gid * 4
                         )[0]
-                        end_offset = struct.unpack_from(
+                        ending = struct.unpack_from(
                             ">I", strike, strike_start + 4 + (gid + 1) * 4
                         )[0]
-                        self.assertGreater(end_offset, start_offset)
-                        offset = strike_start + start_offset
+                        self.assertGreater(ending, beginning)
+                        offset = strike_start + beginning
                         origin_x, origin_y = struct.unpack_from(">hh", strike, offset)
-                        self.assertEqual(origin_x, 0)
-                        self.assertEqual(strike[offset + 4:offset + 8], b"png ")
-                        width, height, pixels, dy = glyph(char, theme, approved)
-                        self.assertEqual(origin_y, -(dy + height))
-                        original = pixels
-                        png = strike[offset + 8:strike_start + end_offset]
-                        result_width, result_height, refined = decode_generator_png(png)
-                        self.assertEqual((result_width, result_height), (width, height))
-                        # Exact wool light/shadow RGB and the original glyph box.
+                        self.assertEqual((origin_x, origin_y), (0, -40))
+                        self.assertEqual(strike[offset + 4 : offset + 8], b"png ")
+                        width, height, source, dy = glyph(char, theme, approved)
+                        png = strike[offset + 8 : strike_start + ending]
+                        output_width, output_height, bitmap = decode_generator_png(png)
+                        self.assertEqual((output_width, output_height), (width, 145))
+                        source_core = [
+                            i // width
+                            for i in range(width * height)
+                            if source[4 * i + 3] >= 100
+                        ]
+                        self.assertTrue(source_core)
+                        original_bottom = dy + max(source_core)
+                        target = punctuation_bottom.get(char, original_bottom)
+                        top = 105 + dy - (original_bottom - target)
+                        self.assertGreaterEqual(top, 0)
+                        self.assertLessEqual(top + height, 145)
+                        self.assertFalse(any(bitmap[: top * width * 4]))
+                        self.assertFalse(any(bitmap[(top + height) * width * 4 :]))
+                        crop = bitmap[top * width * 4 : (top + height) * width * 4]
                         for channel in range(3):
-                            self.assertEqual(
-                                original[channel::4], refined[channel::4]
+                            self.assertEqual(crop[channel::4], source[channel::4])
+                        source_alpha = source[3::4]
+                        out_alpha = crop[3::4]
+                        self.assertTrue(
+                            all(
+                                0 <= value <= original
+                                for original, value in zip(source_alpha, out_alpha)
                             )
-                        original_alpha = original[3::4]
-                        slender_alpha = refined[3::4]
-                        self.assertTrue(all(
-                            0 <= new <= old
-                            and (old == 0) == (new == 0)
-                            for old, new in zip(original_alpha, slender_alpha)
-                        ))
-                        self.assertLess(sum(slender_alpha), sum(original_alpha))
-                        self.assertGreater(
-                            sum(slender_alpha), 0.82 * sum(original_alpha)
                         )
+                        self.assertGreater(sum(out_alpha), 0.79 * sum(source_alpha))
+                        self.assertEqual(top + max(source_core) - 105, target)
+                        # Real terminal dots and symbols sit on their
+                        # intentionally designed common baseline after thinning.
+                        if char in punctuation_bottom:
+                            visible_core = [
+                                y // width
+                                for y in range(145 * width)
+                                if bitmap[y * 4 + 3] >= 100
+                            ]
+                            self.assertTrue(visible_core)
+                            actual_bottom = max(visible_core) - 105
+                            self.assertLessEqual(abs(actual_bottom - target), 2)
+                        # Source i/k accidentally include tiny detached
+                        # pixels far below their intact non-descending stems.
+                        if char in ("i", "k"):
+                            stray_alpha = sum(
+                                source_alpha[max(0, 10 - dy) * width * 1 :]
+                            )
+                            self.assertGreater(stray_alpha, 0)
+                            for row in range(115, 145):
+                                self.assertFalse(
+                                    any(
+                                        bitmap[
+                                            (row * width * 4 + 3) : (
+                                                (row + 1) * width * 4
+                                            ) : 4
+                                        ]
+                                    )
+                                )
 
 
 if __name__ == "__main__":
