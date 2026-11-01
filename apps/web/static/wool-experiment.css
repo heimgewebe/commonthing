@@ -1,0 +1,30 @@
+/* Optional native-color bitmap yarn from approved 3-ply Garnschrift C.
+ * Default off: no new requests on the usual frontend path.
+ */
+@font-face {
+  font-family: "Garnschrift C Woll";
+  src: url("/fonts/garnschrift-c-dark.woff") format("woff");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Garnschrift C Petrol";
+  src: url("/fonts/garnschrift-c-light.woff") format("woff");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+html[data-wool-experiment="on"][data-color-scheme="dark"] body,
+html[data-wool-experiment="on"][data-color-scheme="dark"] body * {
+  font-family: "Garnschrift C Woll", system-ui, sans-serif !important;
+  font-synthesis: none;
+}
+
+html[data-wool-experiment="on"][data-color-scheme="light"] body,
+html[data-wool-experiment="on"][data-color-scheme="light"] body * {
+  font-family: "Garnschrift C Petrol", system-ui, sans-serif !important;
+  font-synthesis: none;
+}

@@ -21,7 +21,8 @@
   async function loadNotificationSettings(): Promise<void> {
     notificationLoadFailed = false;
     try {
-      const module = await import("$lib/components/NotificationSettings.svelte");
+      const module =
+        await import("$lib/components/NotificationSettings.svelte");
       NotificationSettings = module.default;
     } catch {
       notificationLoadFailed = true;
@@ -100,6 +101,22 @@
             <option value="light">Hell</option>
             <option value="dark">Dunkel</option>
           </select>
+          <div class="col">
+            <label class="row touch-target" for="wool-experiment-toggle">
+              <input
+                id="wool-experiment-toggle"
+                type="checkbox"
+                data-wg-wool-control
+                data-testid="wool-experiment-toggle"
+              />
+              <span>Wollschrift überall (Experiment)</span>
+            </label>
+            <p class="menu-hint">
+              Echte Wollbuchstaben auch für Navigation, Formulare und dynamische
+              Texte. Nur in diesem Browser; jederzeit abschaltbar.
+              Kartenbeschriftungen im Kartenbild bleiben unverändert.
+            </p>
+          </div>
         </div>
 
         <a
@@ -151,7 +168,9 @@
               >
             </div>
           {:else}
-            <p class="lazy-status" role="status">Konto &amp; Sicherheit wird geladen …</p>
+            <p class="lazy-status" role="status">
+              Konto &amp; Sicherheit wird geladen …
+            </p>
           {/if}
         </div>
       </main>

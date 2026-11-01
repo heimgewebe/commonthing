@@ -19,12 +19,14 @@ Wollfäden. Ihre private Google-Drive-ID lautet
   `11oTu6lh8RRfTIVffXtGA7E0mo15mppxp`) ist dagegen nur eine gespeicherte
   ChatGPT-HTML-Seite. Sie enthielt keine Schriftdateien.
 
-**Technische Grenze:** Das neue PNG ist ein Schriftmusterblatt, keine
-installierbare WOFF2-, OpenType- oder TrueType-Schrift. Rasterisierte
-Wolloberflächen lassen sich nicht als gewöhnliche monochrome Fontkonturen
-erhalten. Die Weboberfläche setzt deshalb lokale, transparente **PNG-Wortbilder**
-ein. Ein echtes, semantisches HTML-`h1` mit lesbarer Standardschrift bleibt
-unabhängig von den Bildern im DOM.
+**Quelle und zwei Darstellungsarten:** Das originale PNG ist ein
+fotografischer Kontaktbogen, keine Fontdatei. Die zwei bestehenden Überschriften
+verwenden weiterhin die PNG-Wortbilder. Zusätzlich erzeugt
+generate_bitmap_font.py echte OpenType-Farbschriften in WOFF1-Containern mit
+sbix-PNG-Glyphen aus den Originalfasern und paarweisem optischem Kerning.
+Es entstehen keine künstlichen Umrisse oder CSS-Stickereien. Browser setzen
+beliebigen semantischen Text einschließlich Formularinhalten direkt mit
+den Bitmapglyphen; nicht vorhandene Zeichen nutzen den Systemfont.
 
 ## Aktuelle Umsetzung
 
@@ -108,5 +110,32 @@ klein. Bei großer Darstellung oder hochauflösenden Bildschirmen kann
 Rasterweichzeichnung auftreten. Die freigestellten Fasern sind eine
 Pixelapproximation, keine verlustfreie 3D-Rekonstruktion. Die genaue
 Materialwirkung, Hell-/Dunkelkontrast und iPad-Safari müssen am endgültigen
-Produkt im Browser geprüft werden. Für kleine Fließtexte und Formularbeschriftungen
-bleibt bewusst die zugängliche Standardschrift erhalten.
+Produkt im Browser geprüft werden. Standardmäßig bleibt für kleine Fließtexte
+und Formularbeschriftungen die zugängliche Systemschrift erhalten. Der
+Opt-in-Versuch darunter testet die echten Garnglyphen ausdrücklich auch dort.
+
+
+## Opt-in-Probe: Wollschrift in allen HTML-Texten
+
+In Einstellungen → Darstellung den Schalter „Wollschrift überall (Experiment)“
+aktivieren oder /settings?wollschrift=1 aufrufen. Das Experiment speichert
+nur commonthing.wool-everywhere im aktuellen Browser. Abschalten mit dem
+Schalter oder ?wollschrift=0. Standard bleibt aus: kein Font- oder zusätzlicher
+Stylesheet-Download im normalen App-Startpfad. Die Styles und beiden
+Schriftvarianten werden nur beim aktiven Versuch geladen. Die lokal versionierten WOFF-Dateien enthalten
+natürliches Wollweiß für dunkle und kontrastreiches Petrol für helle Themen.
+Der Theme-Wechsel übernimmt die bestehende Einstellung. Original-PNGs,
+semantische HTML-Elemente, Browser-Selektion, Texteingaben und Lade-Fallbacks
+bleiben unberührt. Eine Browserbibliothek oder Laufzeit-Rasterisierung
+gibt es nicht. Da die Quelle begrenzte Rasterauflösung hat, kann Text
+unter 16px zu klein oder undeutlich aussehen: Das ist Teil des
+reversiblen Experiments. In MapLibre-Kartenkacheln eingebettete
+Kartentexte sind nicht Teil des HTML-Fontpfads.
+
+Reproduzieren mit Python 3.13 und fonttools==4.61.1:
+
+    python3 -m pip install fonttools==4.61.1
+    python3 apps/web/scripts/garnschrift-c/generate_bitmap_font.py
+    python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
+
+Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert.
