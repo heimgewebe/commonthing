@@ -30,13 +30,80 @@
     font-synthesis: none;
   }
 
-  /* Bitmap yarn has its own fixed pixel colors. On filled primary actions,
- * those colors cannot follow the contrast variables. Keep their original
- * native system font and foreground color in both themes.
- */
-  html[data-wool-experiment="on"] body .wg-button--primary,
-  html[data-wool-experiment="on"] body .wg-button--primary * {
+  /*
+   * The colorful bitmap cannot adapt to the foreground CSS color. Protect
+   * ALL filled primary actions (not only .wg-button--primary), plus prose,
+   * text inputs and explicit technical/monospace content. Normal text remains
+   * crisp at small sizes while headings and short navigation use real wool.
+   */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :where(
+      .wg-button--primary,
+      .btn,
+      button,
+      .back-link,
+      .wg-back-link,
+      .fan-trigger,
+      p:not(.menu-heading):not(.wg-eyebrow),
+      small,
+      label,
+      input,
+      textarea,
+      select,
+      option,
+      code,
+      pre,
+      kbd,
+      samp,
+      tt,
+      [class*="mono"],
+      [class*="hash"],
+      .state-pill,
+      .menu-links span,
+      [role="status"],
+      [role="alert"]
+    ),
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :where(
+      .wg-button--primary,
+      .btn,
+      button,
+      .back-link,
+      .wg-back-link,
+      .fan-trigger,
+      p:not(.menu-heading):not(.wg-eyebrow),
+      small,
+      label,
+      input,
+      textarea,
+      select,
+      option,
+      code,
+      pre,
+      kbd,
+      samp,
+      tt,
+      [class*="mono"],
+      [class*="hash"],
+      .state-pill,
+      .menu-links span,
+      [role="status"],
+      [role="alert"]
+    )
+    * {
     font-family: system-ui, sans-serif !important;
     font-synthesis: auto;
+  }
+
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"]),
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"])
+    * {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
   }
 }

@@ -109,12 +109,13 @@
                 data-wg-wool-control
                 data-testid="wool-experiment-toggle"
               />
-              <span>Wollschrift überall (Experiment)</span>
+              <span>Wollschrift testen (Experiment)</span>
             </label>
             <p class="menu-hint">
-              Echte Wollbuchstaben auch für Navigation, Formulare und dynamische
-              Texte. Nur in diesem Browser; jederzeit abschaltbar.
-              Kartenbeschriftungen im Kartenbild bleiben unverändert.
+              Echte Wollbuchstaben für Überschriften und kurze Navigation.
+              Kleine Texte, Eingaben und gefüllte Schaltflächen bleiben lesbar.
+              Nur in diesem Browser, jederzeit abschaltbar. Kartenbeschriftungen
+              im Kartenbild bleiben unverändert.
             </p>
           </div>
         </div>

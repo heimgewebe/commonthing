@@ -25,11 +25,17 @@ test("global yarn stays off by default, activates and persists across routes", a
   await expect(page.getByTestId("wool-experiment-toggle")).toBeChecked();
   await expect
     .poll(async () =>
-      page.evaluate(() => {
-        return getComputedStyle(document.querySelector(".intro")!).fontFamily;
-      }),
+      page
+        .locator(".menu-links strong")
+        .first()
+        .evaluate((element) => getComputedStyle(element).fontFamily),
     )
     .toContain("Garnschrift C");
+  expect(
+    await page
+      .locator(".intro")
+      .evaluate((element) => getComputedStyle(element).fontFamily),
+  ).not.toContain("Garnschrift C");
   await page.evaluate(async () => {
     await document.fonts.load('16px "Garnschrift C Petrol"');
   });
@@ -48,7 +54,7 @@ test("global yarn stays off by default, activates and persists across routes", a
     await page
       .locator('input[type="email"]')
       .evaluate((element) => getComputedStyle(element).fontFamily),
-  ).toContain("Garnschrift C");
+  ).not.toContain("Garnschrift C");
 
   await page.goto("/settings");
   await expect(page.getByTestId("wool-experiment-toggle")).toBeChecked();
@@ -59,7 +65,8 @@ test("global yarn stays off by default, activates and persists across routes", a
   );
   expect(
     await page
-      .locator(".intro")
+      .locator(".menu-links strong")
+      .first()
       .evaluate((element) => getComputedStyle(element).fontFamily),
   ).toContain("Garnschrift C Woll");
 
@@ -70,7 +77,8 @@ test("global yarn stays off by default, activates and persists across routes", a
   );
   expect(
     await page
-      .locator(".intro")
+      .locator(".menu-links strong")
+      .first()
       .evaluate((element) => getComputedStyle(element).fontFamily),
   ).not.toContain("Garnschrift C");
 });
@@ -138,10 +146,15 @@ test("filled primary actions retain contrast in both color schemes", async ({
     await expect
       .poll(async () =>
         page
-          .locator(".wg-label")
+          .getByRole("heading", { name: "Login", level: 1 })
           .evaluate((element) => getComputedStyle(element).fontFamily),
       )
       .toContain("Garnschrift C");
+    expect(
+      await page
+        .locator(".wg-label")
+        .evaluate((element) => getComputedStyle(element).fontFamily),
+    ).not.toContain("Garnschrift C");
 
     const relativeLight = (rgb: string) => {
       const channels = rgb
@@ -165,6 +178,80 @@ test("filled primary actions retain contrast in both color schemes", async ({
       (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05),
     ).toBeGreaterThanOrEqual(4.5);
   }
+});
+
+test("all filled primary links keep contrast in both themes", async ({
+  page,
+}) => {
+  for (const scheme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.goto("/settings?wollschrift=1");
+    const cta = page.getByRole("link", { name: "Login starten" });
+    await expect(cta).toBeVisible();
+    const style = await cta.evaluate((element) => {
+      const computed = getComputedStyle(element);
+      return {
+        font: computed.fontFamily,
+        foreground: computed.color,
+        background: computed.backgroundColor,
+      };
+    });
+    expect(style.font).not.toContain("Garnschrift C");
+    const luminance = (rgb: string) => {
+      const rgbValues = rgb
+        .match(/[0-9]+/g)
+        ?.slice(0, 3)
+        .map(Number);
+      if (!rgbValues || rgbValues.length !== 3) throw new Error("bad rgb");
+      const components = rgbValues.map((v) => {
+        const c = v / 255;
+        return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+      });
+      return (
+        0.2126 * components[0] + 0.7152 * components[1] + 0.0722 * components[2]
+      );
+    };
+    const foreground = luminance(style.foreground);
+    const background = luminance(style.background);
+    expect(
+      (Math.max(foreground, background) + 0.05) /
+        (Math.min(foreground, background) + 0.05),
+    ).toBeGreaterThanOrEqual(4.5);
+    expect(
+      await page
+        .locator(".menu-links strong")
+        .first()
+        .evaluate((element) => getComputedStyle(element).fontFamily),
+    ).toContain("Garnschrift C");
+    for (const selector of [
+      ".intro",
+      ".menu-hint",
+      "#theme-select",
+      ".back-link",
+      ".btn",
+      "button",
+    ]) {
+      expect(
+        await page
+          .locator(selector)
+          .first()
+          .evaluate((element) => getComputedStyle(element).fontFamily),
+      ).not.toContain("Garnschrift C");
+    }
+  }
+});
+
+test("technical identifiers remain monospace during wool experiment", async ({
+  page,
+}) => {
+  await page.goto("/federation?wollschrift=1");
+  const sample = page.locator("code").first();
+  await expect(sample).toBeVisible();
+  const family = await sample.evaluate(
+    (element) => getComputedStyle(element).fontFamily,
+  );
+  expect(family).toContain("monospace");
+  expect(family).not.toContain("Garnschrift C");
 });
 
 test("forced colors switches back to the native readable system font", async ({

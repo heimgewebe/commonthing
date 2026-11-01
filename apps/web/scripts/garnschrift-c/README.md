@@ -115,9 +115,9 @@ und Formularbeschriftungen die zugängliche Systemschrift erhalten. Der
 Opt-in-Versuch darunter testet die echten Garnglyphen ausdrücklich auch dort.
 
 
-## Opt-in-Probe: Wollschrift in allen HTML-Texten
+## Opt-in-Probe: Wollschrift für lesbare UI-Texte
 
-In Einstellungen → Darstellung den Schalter „Wollschrift überall (Experiment)“
+In Einstellungen → Darstellung den Schalter „Wollschrift testen (Experiment)“
 aktivieren oder /settings?wollschrift=1 aufrufen. Das Experiment speichert
 nur commonthing.wool-everywhere im aktuellen Browser. Abschalten mit dem
 Schalter oder ?wollschrift=0. Standard bleibt aus: kein Font- oder zusätzlicher
@@ -127,10 +127,13 @@ natürliches Wollweiß für dunkle und kontrastreiches Petrol für helle Themen.
 Der Theme-Wechsel übernimmt die bestehende Einstellung. Original-PNGs,
 semantische HTML-Elemente, Browser-Selektion, Texteingaben und Lade-Fallbacks
 bleiben unberührt. Eine Browserbibliothek oder Laufzeit-Rasterisierung
-gibt es nicht. Da die Quelle begrenzte Rasterauflösung hat, kann Text
-unter 16px zu klein oder undeutlich aussehen: Das ist Teil des
-reversiblen Experiments. In MapLibre-Kartenkacheln eingebettete
-Kartentexte sind nicht Teil des HTML-Fontpfads.
+gibt es nicht. Wegen der begrenzten Rasterauflösung und der fest eingefärbten
+Garnpixel bleiben lange Fließtexte, kleine Hinweise, Formulare, Eingabefelder,
+alle kleinen Bedienelemente, Primäraktionen mit Farbfüllung, Pfeilnavigation
+und technische Monospace-Kennungen in der zugänglichen Systemschrift. Kurze Navigation und größere Überschriften
+tragen weiterhin echte Wollglyphen. Nicht im Alphabet vorhandene
+Sonderzeichen verwenden den regulären Font-Fallback. In MapLibre-
+Kartenkacheln eingebettete Kartentexte sind nicht Teil des HTML-Fontpfads.
 
 Reproduzieren mit Python 3.13 und fonttools==4.61.1:
 
