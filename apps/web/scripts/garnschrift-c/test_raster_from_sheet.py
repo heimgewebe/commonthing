@@ -48,7 +48,17 @@ class RasterYarnAssets(unittest.TestCase):
                     self.assertEqual(depth, 8)
                     self.assertEqual(color, 6)  # RGBA / transparent
                     self.assertEqual(height, 145)
-                    self.assertEqual(width, 325 if word == "Login" else 764)
+                    self.assertEqual(width, 280 if word == "Login" else 647)
+
+    def test_glyphs_are_tightly_set_without_added_tracking(self):
+        self.assertEqual(raster.LETTER_GAP_PX, 0)
+        for word in raster.WORDS:
+            with self.subTest(word=word):
+                glyph_widths = [raster.glyph(ch, "dark", self.source)[0] for ch in word]
+                expected_width = 24 + sum(glyph_widths)
+                png = raster.render(word, "dark", self.source)
+                self.assertEqual(struct.unpack_from(">I", png, 16)[0], expected_width)
+                self.assertLess(expected_width, 24 + sum(glyph_widths) + 9 * len(word))
 
     def test_arbitrary_german_word_renders_without_browser_or_external_assets(self):
         for theme in ("dark", "light"):

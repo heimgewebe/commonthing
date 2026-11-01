@@ -16,6 +16,8 @@ SHEET = HERE.parents[3] / "docs/assets/garnschrift-c-contact-sheet.png"
 OUTPUT = HERE.parents[1] / "static/garnschrift-c"
 SHEET_SHA256 = "eb09901816a4fc04a001cd2a7c2e51f12ca6b04e68a892727087cd1bcd76e2c2"
 WORDS = ("Login", "Einstellungen")
+# Glyph crops already have a small transparent edge; no extra letter tracking.
+LETTER_GAP_PX = 0
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 # Exact source-sheet pixel bounds (inclusive x, exclusive y); shared baseline
@@ -219,7 +221,7 @@ def render(word: str, theme: str, image: tuple[int, int, bytes]) -> bytes:
         (27, 0, bytearray(), 0) if char == " " else glyph(char, theme, image)
         for char in word
     ]
-    width = 24 + sum(part[0] + 9 for part in parts)
+    width = 24 + sum(part[0] for part in parts) + LETTER_GAP_PX * max(0, len(parts) - 1)
     height = 145
     output = bytearray(width * height * 4)
     x = 12
@@ -230,7 +232,7 @@ def render(word: str, theme: str, image: tuple[int, int, bytes]) -> bytes:
         for y in range(h):
             start = ((top + y) * width + x) * 4
             output[start:start + 4 * w] = source[y * 4 * w:(y + 1) * 4 * w]
-        x += w + 9
+        x += w + LETTER_GAP_PX
     return write_png_rgba(width, height, output)
 
 
