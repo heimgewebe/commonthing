@@ -363,6 +363,7 @@ test("classless message actions keep wool ink on a contrasting textile surface",
       section.innerHTML =
         '<form class="composer"><button type="button">Senden</button></form>' +
         '<form><button type="button">Veröffentlichen</button></form>' +
+        '<button class="danger danger-solid" type="button">Jetzt entfernen</button>' +
         '<a class="attention-card-action" href="#test">Weiter</a>' +
         '<span class="unread">2</span>' +
         '<span class="count-badge">3</span>' +
@@ -390,6 +391,8 @@ test("classless message actions keep wool ink on a contrasting textile surface",
           family: computed.fontFamily,
           background: computed.backgroundColor,
           color: computed.color,
+          dangerSolid: item.classList.contains("danger-solid"),
+          border: computed.borderTopColor,
           isBadge:
             item.classList.contains("unread") ||
             item.classList.contains("count-badge") ||
@@ -408,10 +411,15 @@ test("classless message actions keep wool ink on a contrasting textile surface",
         theme === "light" ? "rgb(251, 248, 241)" : "rgb(21, 31, 33)",
       );
       expect(item.color).not.toBe(item.background);
+      if (item.dangerSolid) {
+        expect(item.border).toBe(
+          theme === "light" ? "rgb(182, 72, 80)" : "rgb(255, 141, 146)",
+        );
+      }
       if (item.isBadge) {
         expect(item.lineHeight).toBeLessThanOrEqual(item.clientHeight);
       }
     }
-    expect(styles).toHaveLength(7);
+    expect(styles).toHaveLength(8);
   }
 });

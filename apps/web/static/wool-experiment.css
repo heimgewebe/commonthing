@@ -1,8 +1,4 @@
-/* Globale, lokal gehostete Wollschrift C; auf dem iPad-WebKit abgenommen.
- * Farbbilder können CSS-Farben nicht übernehmen. Deshalb erhalten gefüllte
- * Textaktionen einen kontrastierenden Stoffhintergrund.
- * Bei erzwungenen Systemfarben bleibt die native Schrift erhalten.
- */
+/* Approved three-ply wool; forced colors uses system font. */
 @font-face {
   font-family: "Garnschrift C Woll";
   src: url("/fonts/garnschrift-c-dark.woff") format("woff");
@@ -32,10 +28,7 @@
     font-synthesis: none;
   }
 
-  /* In der nativen Bitmap bleiben die drei gezwirnten Fäden ab 17px lesbar.
-   * Die vorherigen 12–14px-Navigations-, Formular- und Fließtexte erhalten
-   * deshalb eine Untergrenze. Große Überschriften behalten ihre Größe.
-   */
+  /* Wool text needs a legible optical size. */
   html[data-wool-experiment="on"][data-color-scheme] body {
     font-size: 17px;
     line-height: 1.5;
@@ -75,10 +68,7 @@
     font-size: max(1.125rem, 1em) !important;
   }
 
-  /* Die feste Wollfarbe ist für gefüllte grüne Primäraktionen ungeeignet.
-   * Textaktionen bekommen einen hellen/dunklen Stoffkörper mit Akzentkante.
-   * Die primäre Funktion bleibt durch Akzentkante und Fokus sichtbar.
-   */
+  /* Fixed-color glyphs need textile button surfaces. */
   html[data-wool-experiment="on"][data-color-scheme]
     body
     :is(button, a, input)[class*="primary"],
@@ -100,9 +90,16 @@
     border: 2px solid var(--accent) !important;
   }
 
-  /* Kleine Zähler waren für ~10px-Systemtext gebaut. Mit 17px-Wolle
-   * muss ihre innere Zeilenhöhe wieder in die Badgefläche passen.
-   */
+  /* Red outline retains destructive meaning. */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(button, a).danger-solid {
+    background: var(--panel-solid) !important;
+    color: var(--text) !important;
+    border: 2px solid var(--danger) !important;
+  }
+
+  /* Counter boxes fit enlarged wool glyphs. */
   html[data-wool-experiment="on"][data-color-scheme]
     body
     :is(.attention-meaning-mark, .attention-count, .count-badge, .unread) {
@@ -112,9 +109,7 @@
     line-height: 1 !important;
   }
 
-  /* Die feste Petrol-Garnfarbe war auf dem bisherigen dunklen Update-Banner
-   * kontrastarm; im Dunkelmodus brauchte auch die Primäraktion eine Stofffläche.
-   */
+  /* Update banner needs a contrasting surface. */
   html[data-wool-experiment="on"][data-color-scheme]
     body
     .update-banner
@@ -133,14 +128,11 @@
     color: var(--text) !important;
   }
 
-  /* Lange Texte auf schmalen Flächen dürfen umbrechen statt überlaufen. */
   html[data-wool-experiment="on"][data-color-scheme] body :is(button, a) {
     overflow-wrap: anywhere;
   }
 
-  /* Prüfsummen, Code und technische Kennungen müssen unterscheidbar bleiben.
-   * Diese Ausnahme betrifft keine menschlichen Beschriftungen.
-   */
+  /* Machine IDs remain monospace. */
   html[data-wool-experiment="on"][data-color-scheme]
     body
     :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"]),
