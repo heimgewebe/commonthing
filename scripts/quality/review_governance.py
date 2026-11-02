@@ -64,21 +64,21 @@ GARN_FONT_PROVENANCE_BLOBS = {
     "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "9459440df26a30cfb6ed5542485d281bae449e5f",
     "apps/web/static/fonts/README.md": "ed4fb686e498eeffa98f9a6cb7d9a103bf083802",
 }
-# The two original three-ply wool bitmap fonts. This is an immutable,
+# The two approved three-ply wool bitmap fonts. This is an immutable,
 # byte-for-byte review exception only, not an extension of safe opaque suffixes.
 # The trusted workflow checks exact Git blobs/sha256/bytes and the committed
 # original PNG source blob from the PR base without executing PR code.
 WOOL_FONT_SOURCE_BLOB = "3ada289072a765db9787208f6b95c6f73c3c7cce"
 WOOL_FONT_SPECS = {
     "apps/web/static/fonts/garnschrift-c-dark.woff": {
-        "blob_sha": "96870799ae938393664412c72efae7585a04c34d",
-        "sha256": "bca7c91189d8a1d258f7286664df9c90441cc2bc3a3dc903fc6ddbed66f3ee94",
-        "size": 467556,
+        "blob_sha": "889da93507abeff7f0c028f515beee746d8029f2",
+        "sha256": "160122326fcba9d40ea6fd532e20d0ce4b53db02821ac4fae2edf1719db9a307",
+        "size": 362240,
     },
     "apps/web/static/fonts/garnschrift-c-light.woff": {
-        "blob_sha": "1bec7e72c2db2919d14a1769c886d34f35f919fe",
-        "sha256": "849090e5bbb55b3072001f722c31d9bb75474c3912a00b88b787502a05bcaddd",
-        "size": 493200,
+        "blob_sha": "a4d257c156c0b6ae863ceb2026bf5bf4bd43166d",
+        "sha256": "838e82a3a2619adf608524850d04298563b8e7be64a48c21397055f70108718f",
+        "size": 400656,
     },
 }
 RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
