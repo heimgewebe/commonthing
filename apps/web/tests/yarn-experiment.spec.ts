@@ -1,8 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("global yarn stays off by default, activates and persists across routes", async ({
-  page,
-}) => {
+test("wool is the default and persists across routes", async ({ page }) => {
   const fontRequests: string[] = [];
   page.on("request", (request) => {
     if (request.url().includes("/fonts/garnschrift-c-")) {
@@ -12,12 +10,10 @@ test("global yarn stays off by default, activates and persists across routes", a
   await page.goto("/settings");
   await expect(page.locator("html")).toHaveAttribute(
     "data-wool-experiment",
-    "off",
+    "on",
   );
-  await expect(page.getByTestId("wool-experiment-toggle")).not.toBeChecked();
-  expect(fontRequests).toEqual([]);
-
-  await page.getByTestId("wool-experiment-toggle").check();
+  await expect(page.getByTestId("wool-experiment-toggle")).toBeChecked();
+  await expect.poll(() => fontRequests.length).toBeGreaterThan(0);
   await expect(page.locator("html")).toHaveAttribute(
     "data-wool-experiment",
     "on",
@@ -35,7 +31,7 @@ test("global yarn stays off by default, activates and persists across routes", a
     await page
       .locator(".intro")
       .evaluate((element) => getComputedStyle(element).fontFamily),
-  ).not.toContain("Garnschrift C");
+  ).toContain("Garnschrift C");
   await page.evaluate(async () => {
     await document.fonts.load('16px "Garnschrift C Petrol"');
   });
@@ -54,7 +50,7 @@ test("global yarn stays off by default, activates and persists across routes", a
     await page
       .locator('input[type="email"]')
       .evaluate((element) => getComputedStyle(element).fontFamily),
-  ).not.toContain("Garnschrift C");
+  ).toContain("Garnschrift C");
 
   await page.goto("/settings");
   await expect(page.getByTestId("wool-experiment-toggle")).toBeChecked();
@@ -142,7 +138,7 @@ test("filled primary actions retain contrast in both color schemes", async ({
         foreground: css.color,
       };
     });
-    expect(buttonStyle.font).not.toContain("Garnschrift C");
+    expect(buttonStyle.font).toContain("Garnschrift C");
     await expect
       .poll(async () =>
         page
@@ -154,7 +150,7 @@ test("filled primary actions retain contrast in both color schemes", async ({
       await page
         .locator(".wg-label")
         .evaluate((element) => getComputedStyle(element).fontFamily),
-    ).not.toContain("Garnschrift C");
+    ).toContain("Garnschrift C");
 
     const relativeLight = (rgb: string) => {
       const channels = rgb
@@ -196,7 +192,7 @@ test("all filled primary links keep contrast in both themes", async ({
         background: computed.backgroundColor,
       };
     });
-    expect(style.font).not.toContain("Garnschrift C");
+    expect(style.font).toContain("Garnschrift C");
     const luminance = (rgb: string) => {
       const rgbValues = rgb
         .match(/[0-9]+/g)
@@ -236,7 +232,7 @@ test("all filled primary links keep contrast in both themes", async ({
           .locator(selector)
           .first()
           .evaluate((element) => getComputedStyle(element).fontFamily),
-      ).not.toContain("Garnschrift C");
+      ).toContain("Garnschrift C");
     }
   }
 });
@@ -305,4 +301,52 @@ test("wool navigation uses legible optical size without mobile overflow", async 
       .first()
       .evaluate((element) => getComputedStyle(element).fontSize),
   ).toBe("14px");
+});
+
+test("wool covers prose, navigation and entry fields by default, while retaining opt-out", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/settings");
+  await expect(page.getByTestId("wool-experiment-toggle")).toBeChecked();
+  for (const selector of [
+    ".intro",
+    ".menu-hint",
+    ".menu-links span",
+    "#theme-select",
+    ".back-link",
+    ".btn",
+  ]) {
+    const computed = await page
+      .locator(selector)
+      .first()
+      .evaluate((el) => {
+        const css = getComputedStyle(el);
+        return { family: css.fontFamily, fontSize: parseFloat(css.fontSize) };
+      });
+    expect(computed.family, selector).toContain("Garnschrift C");
+    expect(computed.fontSize, selector).toBeGreaterThanOrEqual(17);
+  }
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(391);
+  await page.goto("/login");
+  for (const selector of [".wg-label", "#email", ".wg-button--primary"]) {
+    const computed = await page
+      .locator(selector)
+      .first()
+      .evaluate((el) => {
+        const css = getComputedStyle(el);
+        return { family: css.fontFamily, fontSize: parseFloat(css.fontSize) };
+      });
+    expect(computed.family, selector).toContain("Garnschrift C");
+    expect(computed.fontSize, selector).toBeGreaterThanOrEqual(17);
+  }
+  await page.goto("/settings?wollschrift=0");
+  await expect(page.getByTestId("wool-experiment-toggle")).not.toBeChecked();
+  expect(
+    await page
+      .locator(".intro")
+      .evaluate((el) => getComputedStyle(el).fontFamily),
+  ).not.toContain("Garnschrift C");
 });

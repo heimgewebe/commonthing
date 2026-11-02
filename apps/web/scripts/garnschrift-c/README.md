@@ -110,32 +110,39 @@ klein. Bei großer Darstellung oder hochauflösenden Bildschirmen kann
 Rasterweichzeichnung auftreten. Die freigestellten Fasern sind eine
 Pixelapproximation, keine verlustfreie 3D-Rekonstruktion. Die genaue
 Materialwirkung, Hell-/Dunkelkontrast und iPad-Safari müssen am endgültigen
-Produkt im Browser geprüft werden. Standardmäßig bleibt für kleine Fließtexte
-und Formularbeschriftungen die zugängliche Systemschrift erhalten. Der
-Opt-in-Versuch darunter testet die echten Garnglyphen ausdrücklich auch dort.
+Produkt im Browser geprüft werden. Die native Farbschrift wurde auf dem
+echten iPad (iPadOS 26.7.1, WKWebView Canvas2D) einschließlich Satzzeichen
+und Kerning beider Farbvarianten abgenommen. Die globale Verwendung
+vergrößert kleine UI-Texte für die native Bitmapdarstellung.
 
 
-## Opt-in-Probe: Wollschrift für lesbare UI-Texte
+## Globale Wollschrift als Standard
 
-In Einstellungen → Darstellung den Schalter „Wollschrift testen (Experiment)“
-aktivieren oder /settings?wollschrift=1 aufrufen. Das Experiment speichert
-nur commonthing.wool-everywhere im aktuellen Browser. Abschalten mit dem
-Schalter oder ?wollschrift=0. Standard bleibt aus: kein Font- oder zusätzlicher
-Stylesheet-Download im normalen App-Startpfad. Die Styles und beiden
-Schriftvarianten werden nur beim aktiven Versuch geladen. Die lokal versionierten WOFF-Dateien enthalten
-natürliches Wollweiß für dunkle und kontrastreiches Petrol für helle Themen.
-Der Theme-Wechsel übernimmt die bestehende Einstellung. Original-PNGs,
-semantische HTML-Elemente, Browser-Selektion, Texteingaben und Lade-Fallbacks
-bleiben unberührt. Eine Browserbibliothek oder Laufzeit-Rasterisierung
-gibt es nicht. Wegen der begrenzten Rasterauflösung und der fest eingefärbten
-Garnpixel bleiben lange Fließtexte, kleine Hinweise, Formulare, Eingabefelder,
-alle kleinen Bedienelemente, Primäraktionen mit Farbfüllung, Pfeilnavigation
-und technische Monospace-Kennungen in der zugänglichen Systemschrift.
-Kurze Navigation und größere Überschriften tragen weiterhin echte
-Wollglyphen. Die Einstellungsnavigation verwendet im Experiment mindestens
-18 px, da die dreifache Faserstruktur bei den früheren 14 px verschwamm. Nicht im Alphabet vorhandene
-Sonderzeichen verwenden den regulären Font-Fallback. In MapLibre-
-Kartenkacheln eingebettete Kartentexte sind nicht Teil des HTML-Fontpfads.
+Wollschrift C ist standardmäßig auf allen HTML-Oberflächen eingeschaltet:
+Überschriften, Fließtext, Navigation, Schaltflächen und Eingaben nutzen
+die lokal gehosteten Garn-Farbschriften. Die Theme-Farben wählen echtes
+Wollweiß für dunklen beziehungsweise Petrol für hellen Hintergrund.
+Die schon zuvor versionierten WOFF-Dateien werden unverändert geladen.
+Die Stile liegen früh im HTML-Head, damit kein verspätetes Nachladen der
+Gestaltung entsteht; pro aktiver Farbvariante wird die passende WOFF
+nur bei Verwendung angefordert (font-display: swap).
+
+Schriftgrößen unter 17 px werden für lesbare HTML-Texte angehoben;
+kleine Navigationsüberschriften erhalten mindestens 18 px. Primäraktionen
+bekommen für die feste Garnfarbe eine kontrastierende Stofffläche mit
+Akzentkante. Im systemweiten Hochkontrastmodus (Forced Colors) schaltet
+die Oberfläche auf die Systemschrift zurück. Technische Kennungen,
+Prüfsummen und Code behalten die eindeutige Monospace-Darstellung.
+Kartentexte innerhalb von MapLibre-Kartenkacheln sind keine DOM-Texte
+und nicht über Web-Font-CSS austauschbar.
+
+Die Einstellung „Wollschrift verwenden“ kann in diesem Browser bei
+Bedarf ausgeschaltet werden; ein früheres explizites Opt-out wird
+respektiert. `?wollschrift=1` oder `?wollschrift=0` setzt diese
+Auswahl direkt. Diese Wahl wird lokal unter
+`commonthing.wool-everywhere` gespeichert. Bei fehlender Fontdatei
+bleibt die HTML-Systemschrift als Fallback benutzbar. Die bestehenden
+Garn-PNG-Wortbilder bleiben unangetastet.
 
 Reproduzieren mit Python 3.13 und fonttools==4.61.1:
 
@@ -146,7 +153,7 @@ python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
 ```
 
 Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert.
-Im opt-in-Schriftversuch sind die Buchstaben minimal schlanker: Der
+Die nativen Wollbuchstaben sind gegenüber dem ersten Versuch minimal schlanker: Der
 Farbschriftgenerator reduziert die Alpha-Deckkraft nur an den tatsächlichen
 Faserkanten um höchstens 2/5 eines Rasterpixels. Wollfarben, dreifache
 Zwirnung, Bildabmessungen, Grundlinien und Zeichenbreiten bleiben erhalten.

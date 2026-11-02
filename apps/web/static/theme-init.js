@@ -24,17 +24,19 @@
     value === "light" || value === "dark" ? value : "system";
   let current = "system";
   const woolKey = "commonthing.wool-everywhere";
-  let wool = "off";
+  // Die abgenommene Wollschrift ist regulärer Standard; ein explizites
+  // Opt-out aus früheren Sitzungen bleibt erhalten.
+  let wool = "on";
 
   try {
     current = normalize(window.localStorage.getItem(key));
-    wool = window.localStorage.getItem(woolKey) === "on" ? "on" : "off";
+    const savedWool = window.localStorage.getItem(woolKey);
+    if (savedWool === "on" || savedWool === "off") wool = savedWool;
   } catch {
     // Die Anwendung bleibt ohne Speicherzugriff vollständig benutzbar.
   }
 
   // An- und Abschalten per URL (?wollschrift=1 und ?wollschrift=0).
-  // Normalbetrieb bleibt unverändert und lädt keine zusätzliche Fontdatei.
   const woolQuery = new URLSearchParams(window.location.search).get(
     "wollschrift",
   );
@@ -46,19 +48,9 @@
       // Der aktuelle Seitenzustand funktioniert auch ohne lokalen Speicher.
     }
   }
-  // Load one extra local stylesheet only for the opted-in browser.
-  // This keeps every regular /login, /settings and /map CSS budget unchanged.
+  // Stylesheet is render-blocking in app.html, avoiding a late font flash.
+  // Only the active theme's WOFF is fetched; explicit opt-out stops font use.
   const syncWoolStyles = () => {
-    const existing = document.getElementById("wg-wool-experiment-styles");
-    if (wool === "on" && !existing) {
-      const link = document.createElement("link");
-      link.id = "wg-wool-experiment-styles";
-      link.rel = "stylesheet";
-      link.href = "/wool-experiment.css";
-      document.head.appendChild(link);
-    } else if (wool === "off" && existing) {
-      existing.remove();
-    }
     root.dataset.woolExperiment = wool;
   };
   syncWoolStyles();

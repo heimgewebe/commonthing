@@ -1,5 +1,7 @@
-/* Optional native-color bitmap yarn from approved 3-ply Garnschrift C.
- * Default off: no new requests on the usual frontend path.
+/* Globale, lokal gehostete Wollschrift C; auf dem iPad-WebKit abgenommen.
+ * Farbbilder können CSS-Farben nicht übernehmen. Deshalb erhalten gefüllte
+ * Textaktionen einen kontrastierenden Stoffhintergrund.
+ * Bei erzwungenen Systemfarben bleibt die native Schrift erhalten.
  */
 @font-face {
   font-family: "Garnschrift C Woll";
@@ -30,73 +32,93 @@
     font-synthesis: none;
   }
 
-  /*
-   * The colorful bitmap cannot adapt to the foreground CSS color. Protect
-   * ALL filled primary actions (not only .wg-button--primary), plus prose,
-   * text inputs and explicit technical/monospace content. Normal text remains
-   * crisp at small sizes while headings and short navigation use real wool.
+  /* In der nativen Bitmap bleiben die drei gezwirnten Fäden ab 17px lesbar.
+   * Die vorherigen 12–14px-Navigations-, Formular- und Fließtexte erhalten
+   * deshalb eine Untergrenze. Große Überschriften behalten ihre Größe.
+   */
+  html[data-wool-experiment="on"][data-color-scheme] body {
+    font-size: 17px;
+    line-height: 1.5;
+  }
+
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :where(
+      p,
+      a,
+      span,
+      strong,
+      em,
+      small,
+      li,
+      dt,
+      dd,
+      label,
+      legend,
+      input,
+      textarea,
+      select,
+      option,
+      button,
+      th,
+      td,
+      time,
+      summary
+    ) {
+    font-size: max(1.0625rem, 1em) !important;
+    line-height: 1.45;
+  }
+
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(.menu-heading, .menu-links strong) {
+    font-size: max(1.125rem, 1em) !important;
+  }
+
+  /* Die feste Wollfarbe ist für gefüllte grüne Primäraktionen ungeeignet.
+   * Textaktionen bekommen einen hellen/dunklen Stoffkörper mit Akzentkante.
+   * Die primäre Funktion bleibt durch Akzentkante und Fokus sichtbar.
    */
   html[data-wool-experiment="on"][data-color-scheme]
     body
-    :where(
-      .wg-button--primary,
-      .btn,
-      button,
-      .back-link,
-      .wg-back-link,
-      .fan-trigger,
-      p:not(.menu-heading):not(.wg-eyebrow),
-      small,
-      label,
-      input,
-      textarea,
-      select,
-      option,
-      code,
-      pre,
-      kbd,
-      samp,
-      tt,
-      [class*="mono"],
-      [class*="hash"],
-      .state-pill,
-      .menu-links span,
-      [role="status"],
-      [role="alert"]
-    ),
+    :is(button, a, input)[class*="primary"],
   html[data-wool-experiment="on"][data-color-scheme]
     body
-    :where(
-      .wg-button--primary,
-      .btn,
-      button,
-      .back-link,
-      .wg-back-link,
-      .fan-trigger,
-      p:not(.menu-heading):not(.wg-eyebrow),
-      small,
-      label,
-      input,
-      textarea,
-      select,
-      option,
-      code,
-      pre,
-      kbd,
-      samp,
-      tt,
-      [class*="mono"],
-      [class*="hash"],
-      .state-pill,
-      .menu-links span,
-      [role="status"],
-      [role="alert"]
-    )
-    * {
-    font-family: system-ui, sans-serif !important;
-    font-synthesis: auto;
+    :is(button, a).primary {
+    background: var(--panel-solid) !important;
+    color: var(--text) !important;
+    border: 2px solid var(--accent) !important;
   }
 
+  /* Die feste Petrol-Garnfarbe war auf dem bisherigen dunklen Update-Banner
+   * kontrastarm; im Dunkelmodus brauchte auch die Primäraktion eine Stofffläche.
+   */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    .update-banner
+    .content {
+    background: var(--panel-solid);
+    color: var(--text);
+    border: 1px solid var(--panel-border-strong);
+  }
+
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    .update-banner
+    .reload-btn {
+    background: var(--panel-solid) !important;
+    border: 2px solid var(--accent) !important;
+    color: var(--text) !important;
+  }
+
+  /* Lange Texte auf schmalen Flächen dürfen umbrechen statt überlaufen. */
+  html[data-wool-experiment="on"][data-color-scheme] body :is(button, a) {
+    overflow-wrap: anywhere;
+  }
+
+  /* Prüfsummen, Code und technische Kennungen müssen unterscheidbar bleiben.
+   * Diese Ausnahme betrifft keine menschlichen Beschriftungen.
+   */
   html[data-wool-experiment="on"][data-color-scheme]
     body
     :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"]),
@@ -105,17 +127,6 @@
     :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"])
     * {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
-  }
-
-  /*
-   * The original 14px section links lose their three-ply detail during
-   * bitmap downsampling. At 18px the real fibers stay distinguishable while
-   * mobile navigation continues to fit the viewport.
-   */
-  html[data-wool-experiment="on"][data-color-scheme]
-    body
-    :is(.menu-heading, .menu-links strong) {
-    font-size: 1.125rem;
-    line-height: 1.4;
+    font-synthesis: auto;
   }
 }
