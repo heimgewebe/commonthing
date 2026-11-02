@@ -1,6 +1,4 @@
-/* Optional native-color bitmap yarn from approved 3-ply Garnschrift C.
- * Default off: no new requests on the usual frontend path.
- */
+/* Approved three-ply wool; forced colors uses system font. */
 @font-face {
   font-family: "Garnschrift C Woll";
   src: url("/fonts/garnschrift-c-dark.woff") format("woff");
@@ -30,92 +28,144 @@
     font-synthesis: none;
   }
 
-  /*
-   * The colorful bitmap cannot adapt to the foreground CSS color. Protect
-   * ALL filled primary actions (not only .wg-button--primary), plus prose,
-   * text inputs and explicit technical/monospace content. Normal text remains
-   * crisp at small sizes while headings and short navigation use real wool.
-   */
-  html[data-wool-experiment="on"][data-color-scheme]
-    body
-    :where(
-      .wg-button--primary,
-      .btn,
-      button,
-      .back-link,
-      .wg-back-link,
-      .fan-trigger,
-      p:not(.menu-heading):not(.wg-eyebrow),
-      small,
-      label,
-      input,
-      textarea,
-      select,
-      option,
-      code,
-      pre,
-      kbd,
-      samp,
-      tt,
-      [class*="mono"],
-      [class*="hash"],
-      .state-pill,
-      .menu-links span,
-      [role="status"],
-      [role="alert"]
-    ),
-  html[data-wool-experiment="on"][data-color-scheme]
-    body
-    :where(
-      .wg-button--primary,
-      .btn,
-      button,
-      .back-link,
-      .wg-back-link,
-      .fan-trigger,
-      p:not(.menu-heading):not(.wg-eyebrow),
-      small,
-      label,
-      input,
-      textarea,
-      select,
-      option,
-      code,
-      pre,
-      kbd,
-      samp,
-      tt,
-      [class*="mono"],
-      [class*="hash"],
-      .state-pill,
-      .menu-links span,
-      [role="status"],
-      [role="alert"]
-    )
-    * {
-    font-family: system-ui, sans-serif !important;
-    font-synthesis: auto;
+  /* Wool text needs a legible optical size. */
+  html[data-wool-experiment="on"][data-color-scheme] body {
+    font-size: 17px;
+    line-height: 1.5;
   }
 
   html[data-wool-experiment="on"][data-color-scheme]
     body
-    :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"]),
-  html[data-wool-experiment="on"][data-color-scheme]
-    body
-    :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"])
-    * {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
+    :where(
+      p,
+      a,
+      span,
+      strong,
+      em,
+      small,
+      li,
+      dt,
+      dd,
+      label,
+      legend,
+      input,
+      textarea,
+      select,
+      option,
+      button,
+      th,
+      td,
+      time,
+      summary
+    ) {
+    font-size: max(1.0625rem, 1em) !important;
+    line-height: 1.45;
   }
 
-  /*
-   * The original 14px section links lose their three-ply detail during
-   * bitmap downsampling. At 18px the real fibers stay distinguishable while
-   * mobile navigation continues to fit the viewport.
-   */
   html[data-wool-experiment="on"][data-color-scheme]
     body
     :is(.menu-heading, .menu-links strong) {
-    font-size: 1.125rem;
-    line-height: 1.4;
+    font-size: max(1.125rem, 1em) !important;
+  }
+
+  /* Fixed-color glyphs need textile button surfaces. */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(button, a, input)[class*="primary"],
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(
+      button.primary,
+      a.primary,
+      .composer button,
+      .conversation form button:not(.secondary):not(.older):not(.link),
+      .attention-card-action,
+      .account-section .badge,
+      .attention-meaning-mark,
+      .attention-count,
+      .count-badge,
+      .unread
+    ) {
+    background: var(--panel-solid) !important;
+    color: var(--text) !important;
+    border: 2px solid var(--accent) !important;
+  }
+
+  /* Red outline retains destructive meaning. */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(button, a).danger-solid {
+    background: var(--panel-solid) !important;
+    color: var(--text) !important;
+    border: 2px solid var(--danger) !important;
+  }
+
+  /* Counter boxes fit enlarged wool glyphs. */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(.attention-meaning-mark, .attention-count, .count-badge, .unread) {
+    box-sizing: border-box;
+    min-width: 1.4rem !important;
+    min-height: 1.4rem !important;
+    line-height: 1 !important;
+  }
+
+  /* Update banner needs a contrasting surface. */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    .update-banner
+    .content {
+    background: var(--panel-solid);
+    color: var(--text);
+    border: 1px solid var(--panel-border-strong);
+    /* Keep unrelated navigation clickable behind a temporary update notice. */
+    pointer-events: none;
+  }
+
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    .update-banner
+    .reload-btn {
+    background: var(--panel-solid) !important;
+    border: 2px solid var(--accent) !important;
+    color: var(--text) !important;
+    pointer-events: auto;
+  }
+
+  /* Five node tabs must fit inside the narrow side panel without splitting labels. */
+  html[data-wool-experiment="on"][data-color-scheme] body .node-tabs > button {
+    font-size: 0.875rem !important;
+    overflow-wrap: normal;
+    white-space: nowrap;
+  }
+
+  /* Machine IDs remain monospace. */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(
+      code,
+      pre,
+      kbd,
+      samp,
+      tt,
+      .debug-badge,
+      [class*="mono"],
+      [class*="hash"]
+    ),
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(
+      code,
+      pre,
+      kbd,
+      samp,
+      tt,
+      .debug-badge,
+      [class*="mono"],
+      [class*="hash"]
+    )
+    * {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
+    font-synthesis: auto;
   }
 }

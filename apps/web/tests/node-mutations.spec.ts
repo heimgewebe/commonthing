@@ -41,6 +41,8 @@ test.describe("Knoten bearbeiten und löschen", () => {
       const range = document.createRange();
       range.selectNodeContents(element);
       return {
+        fontFamily: style.fontFamily,
+        fontSize: Number.parseFloat(style.fontSize),
         whiteSpace: style.whiteSpace,
         overflowWrap: style.overflowWrap,
         textRects: range.getClientRects().length,
@@ -49,6 +51,8 @@ test.describe("Knoten bearbeiten und löschen", () => {
       };
     });
 
+    expect(layout.fontFamily).toContain("Garnschrift C");
+    expect(layout.fontSize).toBeGreaterThanOrEqual(14);
     expect(layout.whiteSpace).toBe("nowrap");
     expect(layout.overflowWrap).toBe("normal");
     expect(layout.textRects).toBe(1);

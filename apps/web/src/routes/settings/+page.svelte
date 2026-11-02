@@ -109,13 +109,13 @@
                 data-wg-wool-control
                 data-testid="wool-experiment-toggle"
               />
-              <span>Wollschrift testen (Experiment)</span>
+              <span>Wollschrift verwenden</span>
             </label>
             <p class="menu-hint">
-              Echte Wollbuchstaben für Überschriften und kurze Navigation.
-              Kleine Texte, Eingaben und gefüllte Schaltflächen bleiben lesbar.
-              Nur in diesem Browser, jederzeit abschaltbar. Kartenbeschriftungen
-              im Kartenbild bleiben unverändert.
+              Echte dreifach gezwirnte Wollschrift in der gesamten Oberfläche,
+              auch für Texte, Eingaben und Schaltflächen. Bei Bedarf in diesem
+              Browser abschaltbar; technische Kennungen und
+              Kartenbild-Beschriftungen bleiben in ihrer bisherigen Darstellung.
             </p>
           </div>
         </div>
