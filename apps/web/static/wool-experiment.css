@@ -84,7 +84,16 @@
     :is(button, a, input)[class*="primary"],
   html[data-wool-experiment="on"][data-color-scheme]
     body
-    :is(button, a).primary {
+    :is(
+      button.primary,
+      a.primary,
+      .composer button,
+      .conversation form button:not(.secondary):not(.older):not(.link),
+      .attention-card-action,
+      .attention-count,
+      .count-badge,
+      .unread
+    ) {
     background: var(--panel-solid) !important;
     color: var(--text) !important;
     border: 2px solid var(--accent) !important;

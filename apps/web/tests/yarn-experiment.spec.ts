@@ -350,3 +350,51 @@ test("wool covers prose, navigation and entry fields by default, while retaining
       .evaluate((el) => getComputedStyle(el).fontFamily),
   ).not.toContain("Garnschrift C");
 });
+
+test("classless message actions keep wool ink on a contrasting textile surface", async ({
+  page,
+}) => {
+  for (const theme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: theme });
+    await page.goto("/settings?wollschrift=1");
+    const styles = await page.evaluate(() => {
+      const root = document.documentElement;
+      const section = document.createElement("section");
+      section.className = "conversation";
+      section.innerHTML =
+        '<form class="composer"><button type="button">Senden</button></form>' +
+        '<form><button type="button">Veröffentlichen</button></form>' +
+        '<a class="attention-card-action" href="#test">Weiter</a>' +
+        '<span class="unread">2</span>' +
+        '<span class="count-badge">3</span>' +
+        '<span class="attention-count">1</span>';
+      document.body.appendChild(section);
+      const result = Array.from(
+        section.querySelectorAll("button, a, span"),
+      ).map((item) => {
+        const computed = getComputedStyle(item);
+        return {
+          family: computed.fontFamily,
+          background: computed.backgroundColor,
+          color: computed.color,
+        };
+      });
+      section.remove();
+      return {
+        colors: result,
+        background: getComputedStyle(root)
+          .getPropertyValue("--panel-solid")
+          .trim(),
+        text: getComputedStyle(root).getPropertyValue("--text").trim(),
+      };
+    });
+    for (const item of styles.colors) {
+      expect(item.family).toContain("Garnschrift C");
+      expect(item.background).toBe(
+        theme === "light" ? "rgb(251, 248, 241)" : "rgb(21, 31, 33)",
+      );
+      expect(item.color).not.toBe(item.background);
+    }
+    expect(styles.colors).toHaveLength(6);
+  }
+});
