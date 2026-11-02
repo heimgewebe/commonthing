@@ -186,6 +186,7 @@ unterschiedlichen sbix-Offsets mehr, die Safari abweichend auslegen kann.
 
 Die Originalquelle und normalen Text-Fallbacks bleiben unverändert. Die vier Titel-PNGs werden gemeinsam mit den beiden WOFF-Dateien aus der gereinigten Alpha-Maske regeneriert. Kein CSS-Trick, keine neue
 Browserberechnung und keine externe Schriftressource.
+
 ## iPad/Safari: vollständige Unterlängen und schattenfreie Garnkanten
 
 Die originale Bildvorlage hat überlappende Alphabetzeilen. Die bisherigen
