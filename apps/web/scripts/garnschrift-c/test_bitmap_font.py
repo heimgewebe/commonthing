@@ -12,12 +12,12 @@ from pathlib import Path
 FONT_DIR = Path(__file__).resolve().parents[2] / "static" / "fonts"
 ASSETS = {
     "dark": (
-        "bca7c91189d8a1d258f7286664df9c90441cc2bc3a3dc903fc6ddbed66f3ee94",
-        467556,
+        "349224d2da3de054f39c1b00a9f25536708aa1c10249534cfe7cdf4c2a696e82",
+        466176,
     ),
     "light": (
-        "849090e5bbb55b3072001f722c31d9bb75474c3912a00b88b787502a05bcaddd",
-        493200,
+        "e5511c145cf4ed124d8aa807e897ef0cc55b3360792808e643d28a56f05109ce",
+        491844,
     ),
 }
 

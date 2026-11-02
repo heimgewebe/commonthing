@@ -33,6 +33,26 @@ class RasterYarnAssets(unittest.TestCase):
         with self.assertRaises(ValueError):
             raster.render("🙂", "dark", self.source)
 
+    def test_adjacent_row_fibers_do_not_leak_into_z_or_a_umlaut(self):
+        # On the source sheet, the row above overlaps the original z and ä
+        # bounding boxes. This created a floating wool dash after every z.
+        for theme in ("dark", "light"):
+            with self.subTest(theme=theme):
+                for char, expected_geometry, dense_pixels in (
+                    ("z", (54, 62, -50), 1951),
+                    ("ä", (65, 76, -62), 2569),
+                ):
+                    with self.subTest(char=char):
+                        width, height, rgba, dy = raster.glyph(char, theme, self.source)
+                        self.assertEqual((width, height, dy), expected_geometry)
+                        self.assertEqual(
+                            sum(alpha >= 70 for alpha in rgba[3::4]), dense_pixels
+                        )
+                        if char == "z":
+                            # The actual lowercase z starts at its x-height;
+                            # the former extra stroke occupied the rows above.
+                            self.assertFalse(any(a >= 70 for a in rgba[3 : width * 4 : 4]))
+
     def test_checked_in_words_equal_rebuild_and_are_small_transparent_pngs(self):
         for word in raster.WORDS:
             for theme in ("light", "dark"):

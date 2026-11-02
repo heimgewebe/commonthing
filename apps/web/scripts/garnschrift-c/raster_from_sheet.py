@@ -58,6 +58,12 @@ GLYPHS = {
     for chars, y1, y2, baseline, boxes in ROWS
     for ch, (x1, x2) in zip(chars, boxes, strict=True)
 }
+# The contact-sheet rows overlap near z: the generic padded rectangle catches
+# a sizable fragment from the previous row and fibers from the following ä.
+# Crop only the contaminated source margins; preserve the real yarn and baseline.
+GLYPHS["z"] = (456, 434, 512, 506, 484)
+# Likewise exclude a tiny detached fragment above the genuine umlaut dots.
+GLYPHS["ä"] = (531, 422, 596, 506, 484)
 # A small punctuation subset from the sheet; other symbols stay in ordinary
 # semantic HTML text rather than silently substituting a different yarn shape.
 for char, (x1, x2) in {
