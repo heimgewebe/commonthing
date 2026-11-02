@@ -118,6 +118,8 @@
     background: var(--panel-solid);
     color: var(--text);
     border: 1px solid var(--panel-border-strong);
+    /* Keep unrelated navigation clickable behind a temporary update notice. */
+    pointer-events: none;
   }
 
   html[data-wool-experiment="on"][data-color-scheme]
@@ -127,10 +129,14 @@
     background: var(--panel-solid) !important;
     border: 2px solid var(--accent) !important;
     color: var(--text) !important;
+    pointer-events: auto;
   }
 
-  html[data-wool-experiment="on"][data-color-scheme] body :is(button, a) {
-    overflow-wrap: anywhere;
+  /* Five node tabs must fit inside the narrow side panel without splitting labels. */
+  html[data-wool-experiment="on"][data-color-scheme] body .node-tabs > button {
+    font-size: 0.875rem !important;
+    overflow-wrap: normal;
+    white-space: nowrap;
   }
 
   /* Machine IDs remain monospace. */
