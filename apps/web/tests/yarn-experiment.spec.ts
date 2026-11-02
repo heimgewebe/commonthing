@@ -358,7 +358,6 @@ test("classless message actions keep wool ink on a contrasting textile surface",
     await page.emulateMedia({ colorScheme: theme });
     await page.goto("/settings?wollschrift=1");
     const styles = await page.evaluate(() => {
-      const root = document.documentElement;
       const section = document.createElement("section");
       section.className = "conversation";
       section.innerHTML =
@@ -380,21 +379,15 @@ test("classless message actions keep wool ink on a contrasting textile surface",
         };
       });
       section.remove();
-      return {
-        colors: result,
-        background: getComputedStyle(root)
-          .getPropertyValue("--panel-solid")
-          .trim(),
-        text: getComputedStyle(root).getPropertyValue("--text").trim(),
-      };
+      return result;
     });
-    for (const item of styles.colors) {
+    for (const item of styles) {
       expect(item.family).toContain("Garnschrift C");
       expect(item.background).toBe(
         theme === "light" ? "rgb(251, 248, 241)" : "rgb(21, 31, 33)",
       );
       expect(item.color).not.toBe(item.background);
     }
-    expect(styles.colors).toHaveLength(6);
+    expect(styles).toHaveLength(6);
   }
 });
