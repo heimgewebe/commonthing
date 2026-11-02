@@ -38,13 +38,13 @@ Für das dunkle Oberflächenthema wird die gemessene Helligkeit der Originalfase
 auf eine natürliche Wollweißpalette abgebildet: schattierte Vertiefungen
 (#C6C3BA), Wollgrundfarbe (#F0EEE7) und sanfte Faserreflexe (#FCFAF5).
 Die Original-Luminanzanker (ungefähr 75/175/225) erhalten die Zwirnung;
-**Alpha-Maske, Konturen und optisches Kerning bleiben unverändert.**
+Die gebackenen fotografischen Schlagschatten werden aus der Alpha-Maske entfernt; die dichten Wollkerne und die echte Faserstruktur bleiben erhalten. Die optischen Abstände werden anhand dieser gereinigten Konturen neu berechnet.
 Für die helle Oberfläche bleibt die kontrastreiche dunkelteale Garnvariante
 mit ihren Helligkeitsabstufungen erhalten. Alle vier PNGs werden weiterhin
 deterministisch aus der unveränderten Originalquelle erzeugt.
 
-Die beiden tatsächlich in Commonthing verwendeten Titel sind `Login` und
-`Einstellungen`. Der iPad-Sichttest zeigte: Auch ein pauschaler
+Die beiden zusätzlich vorgerenderten PNG-Wortbilder sind `Login` und
+`Einstellungen`; auch sie verwenden dieselbe schattenfreie Faserfreistellung. Der iPad-Sichttest zeigte: Auch ein pauschaler
 Buchstabenabstand von null Pixeln lässt ungleichmäßige große Lücken.
 Der Generator berechnet deshalb **optisches Kerning pro Buchstabenpaar**:
 Er vergleicht die dichten Garnpixel (Alpha ab 100) auf den gemeinsamen
@@ -56,7 +56,7 @@ statt bereits gezeichnete Wollfasern abzuschneiden. Leerzeichen bleiben
 unverändert. Die Berechnung läuft nur beim Erzeugen der Dateien, niemals
 während der Browserbenutzung.
 
-Die neuen PNGs haben kleinere Abmessungen. `YarnWord.svelte` stellt
+Die daraus reproduzierbar erzeugten PNGs haben kleinere Abmessungen. `YarnWord.svelte` stellt
 `Login` mit 7 rem und `Einstellungen` mit 16 rem Breite dar, damit
 die Garnfäden nicht durch horizontale Streckung wieder auseinandergezogen
 werden. Semantische Überschriften und Standardschrift-Fallback bleiben.
@@ -122,7 +122,7 @@ Wollschrift C ist standardmäßig auf allen HTML-Oberflächen eingeschaltet:
 Überschriften, Fließtext, Navigation, Schaltflächen und Eingaben nutzen
 die lokal gehosteten Garn-Farbschriften. Die Theme-Farben wählen echtes
 Wollweiß für dunklen beziehungsweise Petrol für hellen Hintergrund.
-Die schon zuvor versionierten WOFF-Dateien werden unverändert geladen.
+Die revisionsgenau neu erzeugten WOFF-Dateien mit vollständigen Unterlängen und ohne fotografische Schlagschatten werden geladen.
 Die Stile liegen früh im HTML-Head, damit kein verspätetes Nachladen der
 Gestaltung entsteht; pro aktiver Farbvariante wird die passende WOFF
 nur bei Verwendung angefordert (font-display: swap).
@@ -152,7 +152,7 @@ python3 apps/web/scripts/garnschrift-c/generate_bitmap_font.py
 python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
 ```
 
-Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert.
+Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert. Aus ihr werden nur die korrigierten Glyphenausschnitte und die transparente Alpha-Maske neu erzeugt.
 Die nativen Wollbuchstaben sind gegenüber dem ersten Versuch minimal schlanker: Der
 Farbschriftgenerator reduziert die Alpha-Deckkraft nur an den tatsächlichen
 Faserkanten um höchstens 2/5 eines Rasterpixels. Wollfarben, dreifache
@@ -184,6 +184,25 @@ echte Glyphe einen **145 Pixel hohen transparenten Em-Kasten** und den
 identischen sbix-Vertikalursprung -40. Damit gibt es keine je Buchstabe
 unterschiedlichen sbix-Offsets mehr, die Safari abweichend auslegen kann.
 
-Die Originalquelle, alle vier bisherigen Titel-PNGs und normalen
-Text-Fallbacks bleiben unverändert. Kein CSS-Trick, keine neue
+Die Originalquelle und normalen Text-Fallbacks bleiben unverändert. Die vier Titel-PNGs werden gemeinsam mit den beiden WOFF-Dateien aus der gereinigten Alpha-Maske regeneriert. Kein CSS-Trick, keine neue
 Browserberechnung und keine externe Schriftressource.
+## iPad/Safari: vollständige Unterlängen und schattenfreie Garnkanten
+
+Die originale Bildvorlage hat überlappende Alphabetzeilen. Die bisherigen
+Ausschnitte der Buchstaben `g`, `p`, `q` und `y` endeten teilweise
+**innerhalb** eines noch dichten Wollfadens. Die neue Extraktion reicht nur
+bis zum natürlichen sichtbaren Fadenende. Bei `g` wird dabei ein fremder
+Fleck aus der nächsten Zeile gezielt ausgeschlossen. `i`, `j` und `k`
+enden vor den Bildpixeln der folgenden Alphabetzeile; so entsteht unter
+dem `i` kein schwebender Kurzstrich.
+
+Die alten grauen Schatten waren nicht durch `text-shadow` erzeugt, sondern
+als schwache Deckkraft direkt in den fotografierten Faserbildern enthalten.
+Die Freistellung entfernt Foto-Restdeckung bis Alpha 108, blendet die
+Übergangszone bis 160 sanft aus und erhält die dichten echten Garnpixel samt
+organischem Rand und innerer Zwirnung. Keine CSS-Schatten, keine Outline,
+keine neue Schriftästhetik. Das identische Verfahren gilt für beide Themen
+und die separat gespeicherten `Login`-/`Einstellungen`-PNGs.
+
+Regressionen prüfen nun vollständige Unterlängen, keine fremden Unterstriche,
+keine Schattenmaske, identische Originalquelle, WOFF-Bitmaps und Satzzeichen.

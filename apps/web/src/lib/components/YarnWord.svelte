@@ -24,7 +24,7 @@
   <img
     class="light"
     src={`/garnschrift-c/${word.toLowerCase()}-light.png`}
-    width={word === "Login" ? 260 : 592}
+    width={word === "Login" ? 254 : 584}
     height="145"
     alt=""
     aria-hidden="true"
@@ -32,7 +32,7 @@
   <img
     class="dark"
     src={`/garnschrift-c/${word.toLowerCase()}-dark.png`}
-    width={word === "Login" ? 260 : 592}
+    width={word === "Login" ? 254 : 584}
     height="145"
     alt=""
     aria-hidden="true"
