@@ -80,6 +80,7 @@
       .composer button,
       .conversation form button:not(.secondary):not(.older):not(.link),
       .attention-card-action,
+      .account-section .badge,
       .attention-meaning-mark,
       .attention-count,
       .count-badge,
@@ -135,10 +136,28 @@
   /* Machine IDs remain monospace. */
   html[data-wool-experiment="on"][data-color-scheme]
     body
-    :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"]),
+    :is(
+      code,
+      pre,
+      kbd,
+      samp,
+      tt,
+      .debug-badge,
+      [class*="mono"],
+      [class*="hash"]
+    ),
   html[data-wool-experiment="on"][data-color-scheme]
     body
-    :is(code, pre, kbd, samp, tt, [class*="mono"], [class*="hash"])
+    :is(
+      code,
+      pre,
+      kbd,
+      samp,
+      tt,
+      .debug-badge,
+      [class*="mono"],
+      [class*="hash"]
+    )
     * {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
     font-synthesis: auto;

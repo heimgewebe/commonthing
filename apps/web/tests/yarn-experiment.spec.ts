@@ -365,6 +365,7 @@ test("classless message actions keep wool ink on a contrasting textile surface",
         '<form><button type="button">Veröffentlichen</button></form>' +
         '<button class="danger danger-solid" type="button">Jetzt entfernen</button>' +
         '<a class="attention-card-action" href="#test">Weiter</a>' +
+        '<div class="account-section"><span class="badge">Dieses Gerät</span></div>' +
         '<span class="unread">2</span>' +
         '<span class="count-badge">3</span>' +
         '<span class="attention-count">1</span>' +
@@ -420,6 +421,6 @@ test("classless message actions keep wool ink on a contrasting textile surface",
         expect(item.lineHeight).toBeLessThanOrEqual(item.clientHeight);
       }
     }
-    expect(styles).toHaveLength(8);
+    expect(styles).toHaveLength(9);
   }
 });
