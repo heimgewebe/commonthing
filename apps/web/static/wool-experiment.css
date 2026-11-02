@@ -90,6 +90,7 @@
       .composer button,
       .conversation form button:not(.secondary):not(.older):not(.link),
       .attention-card-action,
+      .attention-meaning-mark,
       .attention-count,
       .count-badge,
       .unread
@@ -97,6 +98,18 @@
     background: var(--panel-solid) !important;
     color: var(--text) !important;
     border: 2px solid var(--accent) !important;
+  }
+
+  /* Kleine Zähler waren für ~10px-Systemtext gebaut. Mit 17px-Wolle
+   * muss ihre innere Zeilenhöhe wieder in die Badgefläche passen.
+   */
+  html[data-wool-experiment="on"][data-color-scheme]
+    body
+    :is(.attention-meaning-mark, .attention-count, .count-badge, .unread) {
+    box-sizing: border-box;
+    min-width: 1.4rem !important;
+    min-height: 1.4rem !important;
+    line-height: 1 !important;
   }
 
   /* Die feste Petrol-Garnfarbe war auf dem bisherigen dunklen Update-Banner

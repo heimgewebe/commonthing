@@ -366,8 +366,22 @@ test("classless message actions keep wool ink on a contrasting textile surface",
         '<a class="attention-card-action" href="#test">Weiter</a>' +
         '<span class="unread">2</span>' +
         '<span class="count-badge">3</span>' +
-        '<span class="attention-count">1</span>';
+        '<span class="attention-count">1</span>' +
+        '<span class="attention-meaning-mark">!</span>';
       document.body.appendChild(section);
+      // Reproduce the small fixed component badge boxes with CSSOM.
+      for (const [name, height] of [
+        ["attention-count", "1.2rem"],
+        ["count-badge", "1.25rem"],
+        ["attention-meaning-mark", "1rem"],
+        ["unread", "1.5rem"],
+      ]) {
+        const badge = section.querySelector<HTMLElement>("." + name);
+        if (!badge) throw new Error("missing badge " + name);
+        badge.style.display = "grid";
+        badge.style.placeItems = "center";
+        badge.style.height = height;
+      }
       const result = Array.from(
         section.querySelectorAll("button, a, span"),
       ).map((item) => {
@@ -376,6 +390,13 @@ test("classless message actions keep wool ink on a contrasting textile surface",
           family: computed.fontFamily,
           background: computed.backgroundColor,
           color: computed.color,
+          isBadge:
+            item.classList.contains("unread") ||
+            item.classList.contains("count-badge") ||
+            item.classList.contains("attention-count") ||
+            item.classList.contains("attention-meaning-mark"),
+          lineHeight: Number.parseFloat(computed.lineHeight),
+          clientHeight: item.clientHeight,
         };
       });
       section.remove();
@@ -387,7 +408,10 @@ test("classless message actions keep wool ink on a contrasting textile surface",
         theme === "light" ? "rgb(251, 248, 241)" : "rgb(21, 31, 33)",
       );
       expect(item.color).not.toBe(item.background);
+      if (item.isBadge) {
+        expect(item.lineHeight).toBeLessThanOrEqual(item.clientHeight);
+      }
     }
-    expect(styles).toHaveLength(6);
+    expect(styles).toHaveLength(7);
   }
 });
