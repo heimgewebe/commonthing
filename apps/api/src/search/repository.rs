@@ -148,6 +148,11 @@ pub async fn fetch_postgres_candidates_for_generation(
                AND length(debug.token) >= 2
         ), query_stats AS (
             SELECT count(*)::INTEGER AS term_count FROM query_terms
+        ), query_prefix AS (
+            -- LIKE treats %, _ and the escape character as pattern syntax.
+            -- Escape them so the raw query only ever matches as a literal prefix.
+            SELECT replace(replace(replace(lower(btrim($2)),
+                       '\', '\\'), '%', '\%'), '_', '\_') || '%' AS pattern
         ), authorized AS (
             SELECT p.node_id, p.title, p.tags, p.searchable_text, p.language, p.kind,
                    CASE WHEN $10::boolean THEN p.embedding ELSE NULL::DOUBLE PRECISION[] END AS embedding,
@@ -191,7 +196,7 @@ pub async fn fetch_postgres_candidates_for_generation(
                          SELECT 1 FROM unnest(authorized.tags) AS tag
                           WHERE lower(btrim(tag)) = lower(btrim($2))
                      ) THEN 1
-                     WHEN lower(authorized.title) LIKE lower(btrim($2)) || '%' THEN 2
+                     WHEN lower(authorized.title) LIKE query_prefix.pattern ESCAPE '\' THEN 2
                      WHEN trigram.score >= 0.30
                           AND lexical.matched_terms >= least(2, greatest(query_stats.term_count, 1)) THEN 3
                      WHEN lexical.matched_terms >= CASE WHEN query_stats.term_count <= 2 THEN 1 ELSE 2 END THEN 4
@@ -204,7 +209,7 @@ pub async fn fetch_postgres_candidates_for_generation(
                          SELECT 1 FROM unnest(authorized.tags) AS tag
                           WHERE lower(btrim(tag)) = lower(btrim($2))
                      ) THEN 1.0
-                     WHEN lower(authorized.title) LIKE lower(btrim($2)) || '%' THEN
+                     WHEN lower(authorized.title) LIKE query_prefix.pattern ESCAPE '\' THEN
                           length(btrim($2))::DOUBLE PRECISION / greatest(length(authorized.title), 1)
                      WHEN lexical.matched_terms > 0 THEN
                           lexical.matched_terms::DOUBLE PRECISION / greatest(query_stats.term_count, 1)
@@ -214,6 +219,7 @@ pub async fn fetch_postgres_candidates_for_generation(
                    END AS rank_score
               FROM authorized
               CROSS JOIN query_stats
+              CROSS JOIN query_prefix
               CROSS JOIN LATERAL (
                   SELECT greatest(
                       similarity(authorized.title, $2),

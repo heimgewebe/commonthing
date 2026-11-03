@@ -2090,6 +2090,27 @@ async fn t006_search_api_against_postgres_projections() {
         "the compatibility repository path must still expose semantic vectors"
     );
 
+    // LIKE wildcards in the raw query are literals, not patterns: neither `%`
+    // nor `_` may turn every title into a prefix match.
+    for wildcard_query in ["%", "_"] {
+        let wildcard_candidates =
+            fetch_postgres_candidates(&pool, wildcard_query, &SearchFilters::default(), &anonymous)
+                .await
+                .expect("fetch wildcard candidates")
+                .expect("active T006 generation");
+        assert!(
+            !wildcard_candidates.candidates.is_empty(),
+            "authorized candidates still load for {wildcard_query:?}"
+        );
+        assert!(
+            wildcard_candidates
+                .candidates
+                .iter()
+                .all(|candidate| candidate.rank_class == u8::MAX),
+            "query {wildcard_query:?} must not rank titles as literal prefix matches"
+        );
+    }
+
     let saturated_window = fetch_postgres_candidates_for_generation(
         &pool,
         &bounded_candidates.generation,
