@@ -136,6 +136,20 @@ tag resolves to one image digest and that image reports both
 `org.opencontainers.image.revision=<source_commit>` and
 `org.opencontainers.image.source=https://github.com/heimgewebe/schauwerk`.
 
+When GitHub denies the separate `read:packages` API scope, the existing
+`schauwerk_editor_promotion.py plan` also accepts `--public-oci-evidence` in
+place of `--package-versions`. The evidence is collected directly from the
+public GHCR tag using `skopeo inspect` (digest and OCI labels). The JSON
+contains exactly `schema_version=weltgewebe-schauwerk-public-oci-tag.v1`,
+`image_repository`, `source_commit` (the full commit tag), `digest`
+and `labels`. The planner verifies the same accepted producer commit,
+public repository, digest syntax, exact image-source/revision labels, and
+independent digest-qualified image-identity evidence. The plan records
+`package_evidence_source=public-oci-tag` and
+`package_version_id=null`, never a fabricated GitHub package version.
+The existing plan hash, lock-preimage CAS and fresh workflow-run readback
+remain unchanged.
+
 The promotion plan binds the lock preimage SHA-256 and has its own plan digest.
 Apply requires a fresh workflow-runs evidence snapshot and revalidates that the
 latest accepted producer release still has exactly the plan's source commit and

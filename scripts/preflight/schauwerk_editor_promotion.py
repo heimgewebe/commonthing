@@ -27,6 +27,7 @@ from schauwerk_release_convergence import ConvergenceError, latest_accepted_rele
 
 PLAN_SCHEMA = "weltgewebe-schauwerk-release-promotion-plan.v1"
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+PUBLIC_OCI_EVIDENCE_SCHEMA = "weltgewebe-schauwerk-public-oci-tag.v1"
 
 
 class PromotionError(RuntimeError):
@@ -65,7 +66,24 @@ def _exclusive_parent_lock(lock_path: Path) -> Iterator[int]:
         os.close(directory_fd)
 
 
-def package_digest_for_commit(payload: Any, source_commit: str) -> tuple[str, int]:
+def package_digest_for_commit(payload: Any, source_commit: str) -> tuple[str, int | None]:
+    if isinstance(payload, dict):
+        # The public OCI registry exposes the exact source-commit tag, digest,
+        # and image labels without GitHub's unrelated read:packages API scope.
+        # The operator obtains this evidence from the immutable tag readback.
+        required = {"schema_version", "image_repository", "source_commit", "digest", "labels"}
+        if set(payload) != required or payload.get("schema_version") != PUBLIC_OCI_EVIDENCE_SCHEMA:
+            raise PromotionError("public OCI registry evidence shape mismatch")
+        if payload["image_repository"] != IMAGE_REPOSITORY or payload["source_commit"] != source_commit:
+            raise PromotionError("public OCI tag is bound to another image or source commit")
+        digest = payload["digest"]
+        if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:
+            raise PromotionError("public OCI tag digest is invalid")
+        try:
+            verify_image_labels(payload["labels"], expected_commit=source_commit)
+        except ReleaseContractError as exc:
+            raise PromotionError(str(exc)) from exc
+        return digest, None
     if not isinstance(payload, list):
         raise PromotionError("GHCR package evidence shape mismatch")
     matches: list[tuple[str, int]] = []
@@ -143,6 +161,9 @@ def build_plan(
         "image_ref": image_ref,
         "workflow_run_id": accepted["workflow_run_id"],
         "package_version_id": package_version_id,
+        "package_evidence_source": (
+            "public-oci-tag" if package_version_id is None else "github-packages-api"
+        ),
     }
     return {**core, "plan_sha256": _sha256_bytes(_canonical_json(core))}
 
@@ -230,7 +251,9 @@ def main() -> int:
     plan = sub.add_parser("plan")
     plan.add_argument("--lock", required=True, type=Path)
     plan.add_argument("--workflow-runs", required=True, type=Path)
-    plan.add_argument("--package-versions", required=True, type=Path)
+    package_input = plan.add_mutually_exclusive_group(required=True)
+    package_input.add_argument("--package-versions", type=Path)
+    package_input.add_argument("--public-oci-evidence", type=Path)
     plan.add_argument("--image-identity", required=True, type=Path)
     plan.add_argument("--output", required=True, type=Path)
 
@@ -246,7 +269,10 @@ def main() -> int:
             result = build_plan(
                 args.lock,
                 _load_json(args.workflow_runs, label="Schauwerk workflow"),
-                _load_json(args.package_versions, label="GHCR package"),
+                _load_json(
+                    args.package_versions or args.public_oci_evidence,
+                    label="GHCR package or public OCI registry",
+                ),
                 _load_json(args.image_identity, label="OCI image identity"),
             )
             args.output.write_bytes(_canonical_json(result) + b"\n")

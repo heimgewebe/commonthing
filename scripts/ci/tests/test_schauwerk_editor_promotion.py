@@ -99,6 +99,59 @@ def _image_identity(
     }
 
 
+def _public_oci_evidence(
+    *, digest: str = NEW_DIGEST, source_commit: str = NEW,
+    image_repository: str = IMAGE_REPO,
+    labels_revision: str = NEW,
+) -> dict[str, object]:
+    return {
+        "schema_version": MODULE.PUBLIC_OCI_EVIDENCE_SCHEMA,
+        "image_repository": image_repository,
+        "source_commit": source_commit,
+        "digest": digest,
+        "labels": {
+            "org.opencontainers.image.revision": labels_revision,
+            "org.opencontainers.image.source": "https://github.com/heimgewebe/schauwerk",
+        },
+    }
+
+
+def test_public_oci_evidence_promotes_without_github_package_api(tmp_path: Path) -> None:
+    lock = _lock(tmp_path)
+    plan = MODULE.build_plan(lock, _workflow(), _public_oci_evidence(), _image_identity())
+    assert plan["action"] == "update"
+    assert plan["package_evidence_source"] == "public-oci-tag"
+    assert plan["package_version_id"] is None
+    assert plan["image_digest"] == NEW_DIGEST
+    assert MODULE.apply_plan(lock, plan, _workflow(), expected_plan_sha256=plan["plan_sha256"]) == "updated"
+    assert json.loads(lock.read_text(encoding="utf-8"))["source_commit"] == NEW
+
+
+@pytest.mark.parametrize(
+    "public_evidence",
+    [
+        _public_oci_evidence(digest=OLD_DIGEST),
+        _public_oci_evidence(source_commit=OLD),
+        _public_oci_evidence(image_repository="ghcr.io/other/repo"),
+        _public_oci_evidence(labels_revision=OLD),
+        {"schema_version": MODULE.PUBLIC_OCI_EVIDENCE_SCHEMA, "digest": NEW_DIGEST},
+    ],
+)
+def test_public_oci_evidence_must_bind_exact_source_digest_and_labels(
+    tmp_path: Path, public_evidence: dict[str, object],
+) -> None:
+    with pytest.raises(MODULE.PromotionError):
+        MODULE.build_plan(_lock(tmp_path), _workflow(), public_evidence, _image_identity())
+
+
+def test_public_oci_tag_and_digest_identity_mismatch_cannot_promote(tmp_path: Path) -> None:
+    lock = _lock(tmp_path)
+    original = lock.read_bytes()
+    with pytest.raises(MODULE.PromotionError, match="bound to another digest"):
+        MODULE.build_plan(lock, _workflow(), _public_oci_evidence(), _image_identity(digest=OLD_DIGEST))
+    assert lock.read_bytes() == original
+
+
 def test_new_release_plan_and_apply_updates_exact_lock(tmp_path: Path) -> None:
     lock = _lock(tmp_path)
     plan = MODULE.build_plan(lock, _workflow(), _packages(), _image_identity())
