@@ -12,12 +12,12 @@ from pathlib import Path
 FONT_DIR = Path(__file__).resolve().parents[2] / "static" / "fonts"
 ASSETS = {
     "dark": (
-        "349224d2da3de054f39c1b00a9f25536708aa1c10249534cfe7cdf4c2a696e82",
-        466176,
+        "160122326fcba9d40ea6fd532e20d0ce4b53db02821ac4fae2edf1719db9a307",
+        362240,
     ),
     "light": (
-        "e5511c145cf4ed124d8aa807e897ef0cc55b3360792808e643d28a56f05109ce",
-        491844,
+        "838e82a3a2619adf608524850d04298563b8e7be64a48c21397055f70108718f",
+        400656,
     ),
 }
 
@@ -172,13 +172,14 @@ class BitmapFontAssets(unittest.TestCase):
                             self.assertTrue(visible_core)
                             actual_bottom = max(visible_core) - 105
                             self.assertLessEqual(abs(actual_bottom - target), 2)
-                        # Source i/k accidentally include tiny detached
-                        # pixels far below their intact non-descending stems.
+                        # The corrected source crops stop before foreign
+                        # next-row pixels. No underlined stray may survive
+                        # below the intact non-descending i/k stems.
                         if char in ("i", "k"):
                             stray_alpha = sum(
-                                source_alpha[max(0, 10 - dy) * width * 1 :]
+                                source_alpha[max(0, 10 - dy) * width :]
                             )
-                            self.assertGreater(stray_alpha, 0)
+                            self.assertEqual(stray_alpha, 0)
                             for row in range(115, 145):
                                 self.assertFalse(
                                     any(
