@@ -10,6 +10,25 @@ relations:
 ---
 # Deployment-Änderungsprotokoll
 
+## 2026-11-02 - PostgreSQL-Sicherheitsaktualisierung (CVE-2026-16239)
+
+**Gezielter Fix:** Der am 02.11.2026 auf `commonserver` nachgewiesene
+PostgreSQL-Server 16.14 enthält CVE-2026-16239 (Cursor-Typverwechslung
+mit möglicher Codeausführung als Datenbankprozess). Das produktive
+PostgreSQL-Image wird auf den offiziellen 16.15-OCI-Index
+`sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a`
+festgelegt. Der Restore-Proof-Standard und seine Systemd-Unit
+verwenden denselben Pin. Keine Schema- oder Major-Migration.
+
+**Produktionsgrenze:** Diese Quellkorrektur ist noch kein Deployment.
+Vor einem kontrollierten DB-Neustart sind Backup-, Restore- und
+Reconcile-Status sowie Ressourcenschutz erneut zu prüfen. Danach
+PostgreSQL-Version 16.15, API-Health, Datenbankfunktionen und echte
+Nutzerwege kontrollieren. Am 02.11.2026 war ein Tages-Backup vorhanden;
+der letzte nachgewiesene Restore-Proof stammte vom 01.11.2026.
+Die Datenbank ist nicht direkt öffentlich gebunden; eine konkrete
+öffentliche Ausnutzung ist nicht belegt.
+
 ## 2026-10-29 - Caddy-Sicherheitsaktualisierung (CVE-2026-27585)
 
 **Geänderter Bereich:** `infra/caddy/Dockerfile` (Builder und Runtime).
