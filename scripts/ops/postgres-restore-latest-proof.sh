@@ -12,7 +12,7 @@ require_cmd sha256sum
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/weltgewebe/postgres}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-weltgewebe-postgres}"
 RESTORE_PROOF_DIR="${RESTORE_PROOF_DIR:-${BACKUP_DIR}/proofs}"
-RESTORE_POSTGRES_IMAGE="${RESTORE_POSTGRES_IMAGE:-postgres:16@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c}"
+RESTORE_POSTGRES_IMAGE="${RESTORE_POSTGRES_IMAGE:-postgres:16.15@sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a}"
 # The plaintext checksum manifest is published AFTER its dump, and remains a
 # completion marker if optional age encryption subsequently fails.
 # Free-form manual BACKUP_LABEL values may sort behind all daily UTC labels.

@@ -64,6 +64,19 @@ GLYPHS = {
 GLYPHS["z"] = (456, 434, 512, 506, 484)
 # Likewise exclude a tiny detached fragment above the genuine umlaut dots.
 GLYPHS["ä"] = (531, 422, 596, 506, 484)
+# Lowercase descenders were cut at the artificial source-row boundary.
+# Extend only the affected glyph rectangles to their real natural yarn tips.
+# i/j/k instead stop before the next row starts: its detached pixels are
+# not part of these letters and must not appear beneath the text.
+GLYPHS.update({
+    "g": (488, 312, 546, 429, 402),
+    "p": (1089, 312, 1147, 427, 402),
+    "q": (1156, 312, 1215, 430, 402),
+    "y": (385, 417, 441, 510, 484),
+    "i": (641, 312, 666, 409, 402),
+    "j": (681, 312, 729, 418, 402),
+    "k": (750, 312, 804, 410, 402),
+})
 # A small punctuation subset from the sheet; other symbols stay in ordinary
 # semantic HTML text rather than silently substituting a different yarn shape.
 for char, (x1, x2) in {
@@ -171,6 +184,25 @@ def _byte(value: float) -> int:
     return max(0, min(255, round(value)))
 
 
+# The contact-sheet photo contains dark cast shadows in the background.
+# Remove low-coverage photographic shadows from the transparency mask;
+# retain the genuine dense three-ply yarn pixels, irregular fiber edges
+# and the photograph's internal RGB texture without CSS or drop shadows.
+CAST_SHADOW_ALPHA_CUTOFF = 108
+FIBER_FULL_ALPHA = 160
+
+
+def yarn_alpha(photo_alpha: int) -> int:
+    if photo_alpha <= CAST_SHADOW_ALPHA_CUTOFF:
+        return 0
+    if photo_alpha < FIBER_FULL_ALPHA:
+        return _byte(
+            photo_alpha * (photo_alpha - CAST_SHADOW_ALPHA_CUTOFF)
+            / (FIBER_FULL_ALPHA - CAST_SHADOW_ALPHA_CUTOFF)
+        )
+    return photo_alpha
+
+
 # Off-white wool: extracted source luminance retains fiber relief.
 # Anchors are measured source wool luminance P5 / P50 / P95.
 WOOL_SHADOW = (198, 195, 186)     # #C6C3BA
@@ -203,14 +235,19 @@ def glyph(
         for x in range(width):
             origin = ((y1 + y) * source_width + x1 + x) * 3
             r, g, b = rgb[origin:origin + 3]
+            # The g lower curve continues below the row's default crop.
+            # Reject only the unrelated next-row mark to its right.
+            if ch == "g" and y1 + y >= 424 and x1 + x >= 540:
+                continue
             # Source teal has red-blue difference near -40; yarn is warm.
-            alpha = _byte(max(0, min(1, (r - b + 40) * 1.2 / 68)) * 255)
-            if alpha < 13:
-                alpha = 0
+            photo_alpha = _byte(max(0, min(1, (r - b + 40) * 1.2 / 68)) * 255)
+            alpha = yarn_alpha(photo_alpha)
             dest = (y * width + x) * 4
             if not alpha:
                 continue
-            fraction = alpha / 255
+            # Use the original photographed coverage to recover fiber RGB;
+            # the cleaned alpha controls only the shadow-free silhouette.
+            fraction = photo_alpha / 255
             if theme == "dark":
                 divisor = max(.15, fraction)
                 red = _byte((r - (1 - fraction) * 14) / divisor)

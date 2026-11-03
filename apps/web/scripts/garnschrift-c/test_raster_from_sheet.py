@@ -39,8 +39,8 @@ class RasterYarnAssets(unittest.TestCase):
         for theme in ("dark", "light"):
             with self.subTest(theme=theme):
                 for char, expected_geometry, dense_pixels in (
-                    ("z", (54, 62, -50), 1951),
-                    ("ä", (65, 76, -62), 2569),
+                    ("z", (49, 54, -50), 1865),
+                    ("ä", (61, 70, -62), 2437),
                 ):
                     with self.subTest(char=char):
                         width, height, rgba, dy = raster.glyph(char, theme, self.source)
@@ -52,6 +52,60 @@ class RasterYarnAssets(unittest.TestCase):
                             # The actual lowercase z starts at its x-height;
                             # the former extra stroke occupied the rows above.
                             self.assertFalse(any(a >= 70 for a in rgba[3 : width * 4 : 4]))
+
+    def test_cast_shadows_are_removed_without_erasing_real_yarn(self):
+        # Shadows on the photographed teal sheet are not fibers. The old
+        # 13-alpha mask made grey halos around every glyph on the cream UI.
+        self.assertEqual(raster.yarn_alpha(0), 0)
+        self.assertEqual(raster.yarn_alpha(80), 0)
+        self.assertEqual(raster.yarn_alpha(raster.CAST_SHADOW_ALPHA_CUTOFF), 0)
+        self.assertGreater(raster.yarn_alpha(140), 0)
+        self.assertLess(raster.yarn_alpha(140), 140)
+        self.assertEqual(raster.yarn_alpha(raster.FIBER_FULL_ALPHA), 160)
+        self.assertEqual(raster.yarn_alpha(255), 255)
+        for theme in ("dark", "light"):
+            for ch in ("E", "g", "i", "z"):
+                with self.subTest(theme=theme, char=ch):
+                    _, _, data, _ = raster.glyph(ch, theme, self.source)
+                    alpha = data[3::4]
+                    self.assertGreater(sum(a >= 200 for a in alpha), 600)
+                    self.assertTrue(any(0 < a < 160 for a in alpha))
+                    # Background cast shadows must never survive opaque.
+                    self.assertLess(
+                        sum(0 < a < 70 for a in alpha),
+                        sum(a >= 200 for a in alpha) // 4,
+                    )
+
+    def test_real_descenders_are_not_cropped_and_no_underlined_i_remains(self):
+        # Rows in the original sheet overlap; these are exact visually
+        # inspected g/p/q/y tails and non-descender i/j/k baselines.
+        expected = {
+            "g": ((54, 76, -50), 24),
+            "p": ((54, 75, -52), 21),
+            "q": ((57, 78, -52), 24),
+            "y": ((52, 75, -51), 22),
+            "i": ((20, 75, -72), 1),
+            "j": ((44, 89, -74), 12),
+            "k": ((50, 78, -74), 2),
+        }
+        for theme in ("dark", "light"):
+            for ch, (metrics, core_bottom) in expected.items():
+                with self.subTest(theme=theme, char=ch):
+                    width, height, data, dy = raster.glyph(ch, theme, self.source)
+                    self.assertEqual((width, height, dy), metrics)
+                    core_rows = [
+                        pos // width
+                        for pos, alpha in enumerate(data[3::4])
+                        if alpha >= 100
+                    ]
+                    self.assertTrue(core_rows)
+                    self.assertEqual(dy + max(core_rows), core_bottom)
+                    # A cut-off g used to end on a full-ink bottom row.
+                    self.assertFalse(
+                        any(a >= 100 for a in data[(height - 1) * width * 4 + 3::4])
+                    )
+                    if ch in ("i", "k"):
+                        self.assertLessEqual(dy + max(core_rows), 2)
 
     def test_checked_in_words_equal_rebuild_and_are_small_transparent_pngs(self):
         for word in raster.WORDS:
@@ -68,13 +122,13 @@ class RasterYarnAssets(unittest.TestCase):
                     self.assertEqual(depth, 8)
                     self.assertEqual(color, 6)  # RGBA / transparent
                     self.assertEqual(height, 145)
-                    self.assertEqual(width, 260 if word == "Login" else 592)
+                    self.assertEqual(width, 254 if word == "Login" else 584)
 
     def test_optical_kerning_follows_real_yarn_core_shapes(self):
         # These pairwise values originate from the approved contact sheet.
         expected_pairs = {
-            "Login": [8, 3, 5, 4],
-            "Einstellungen": [6, 4, 3, 6, 7, 5, 4, 4, 4, 4, 4, 4],
+            "Login": [4, 0, 0, 1],
+            "Einstellungen": [0, 1, 0, 1, 3, 0, 1, 2, 1, 2, 1, 1],
         }
         for word, expected in expected_pairs.items():
             with self.subTest(word=word):
