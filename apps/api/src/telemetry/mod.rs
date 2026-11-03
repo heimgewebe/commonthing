@@ -238,7 +238,7 @@ impl Metrics {
 
         let search_candidate_set_overflow_total = IntCounter::new(
             "search_candidate_set_overflow_total",
-            "Search requests rejected because the authorized candidate transfer exceeded its hard bound",
+            "Search requests whose authorized candidate set exceeded its hard bound and were answered from the lexical top-10 only",
         )?;
 
         let duration_buckets = vec![
