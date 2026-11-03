@@ -171,9 +171,9 @@ jobs:
     name: pnpm audit (nightly + on-demand)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Covers the dependencies that ship in the static web build. Dev and test
-    # tooling is left out on purpose: it never reaches users, and its findings
-    # would keep this job permanently red.
+    # SvelteKit and browser-bundled packages live in apps/web devDependencies.
+    # --prod would silently omit that graph. Audit all web build dependencies,
+    # while the root audit can stay production-only.
     if: |
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'pull_request' ||
@@ -189,19 +189,23 @@ jobs:
         with:
           node-version-file: '.node-version'
           check-latest: false
-      - name: Audit production dependencies (high and critical)
+      - name: Audit root production and web build dependencies (high and critical)
         shell: bash
         run: |
           set -euo pipefail
           status=0
-          for dir in . apps/web; do
-            echo "::group::pnpm audit --prod in ${dir}"
-            if ! (cd "${dir}" && pnpm audit --prod --audit-level=high); then
-              echo "::error file=${dir}/pnpm-lock.yaml::high or critical advisory in production dependencies"
-              status=1
-            fi
-            echo "::endgroup::"
-          done
+          echo "::group::pnpm audit --prod in root"
+          if ! pnpm audit --prod --audit-level=high; then
+            echo "::error file=pnpm-lock.yaml::high or critical advisory in root production dependencies"
+            status=1
+          fi
+          echo "::endgroup::"
+          echo "::group::pnpm audit (full build graph) in apps/web"
+          if ! (cd apps/web && pnpm audit --audit-level=high); then
+            echo "::error file=apps/web/pnpm-lock.yaml::high or critical advisory in web build dependencies"
+            status=1
+          fi
+          echo "::endgroup::"
           exit "${status}"
 
   sbom:

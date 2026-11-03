@@ -138,12 +138,53 @@ class SecurityWorkflowContractTest(unittest.TestCase):
         script = next(step["run"] for step in job["steps"] if "pnpm audit" in str(step.get("run", "")))
         self.assertIn("set -euo pipefail", script)
         self.assertIn("pnpm audit --prod --audit-level=high", script)
-        self.assertIn("apps/web", script)
+        self.assertIn("cd apps/web && pnpm audit --audit-level=high", script)
+        self.assertNotIn("cd apps/web && pnpm audit --prod", script)
         self.assertIn('exit "${status}"', script)
         self.assertLessEqual(
             {"pnpm-lock.yaml", "apps/web/pnpm-lock.yaml", "apps/web/package.json"},
             set(triggers["pull_request"]["paths"]),
         )
+
+
+    def test_pnpm_web_bundled_dev_dependency_finding_fails_job(self) -> None:
+        """SvelteKit is a devDependency but must still be audited in the built web app."""
+        package = json.loads((ROOT / "apps/web/package.json").read_text(encoding="utf-8"))
+        self.assertIn("@sveltejs/kit", package["devDependencies"])
+        job = load_workflow()[0]["jobs"]["pnpm-audit"]
+        script = next(step["run"] for step in job["steps"] if "pnpm audit" in str(step.get("run", "")))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "apps/web").mkdir(parents=True)
+            (root / "bin").mkdir()
+            fake_pnpm = root / "bin/pnpm"
+            fake_pnpm.write_text(
+                '#!/usr/bin/env bash\n'
+                'if [[ "$PWD" == */apps/web && "${FAKE_WEB_HIGH:-0}" == 1 && "$*" != *"--prod"* ]]; then\n'
+                '  echo "HIGH advisory in bundled @sveltejs/kit" >&2\n'
+                '  exit 1\n'
+                'fi\n',
+                encoding="utf-8",
+            )
+            fake_pnpm.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
+                "FAKE_WEB_HIGH": "1",
+            }
+            rejected = subprocess.run(
+                ["bash", "-c", script], cwd=root, env=env,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+            self.assertIn("high or critical advisory in web build dependencies", rejected.stdout)
+            env["FAKE_WEB_HIGH"] = "0"
+            accepted = subprocess.run(
+                ["bash", "-c", script], cwd=root, env=env,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "render step needs bash and jq")
 class TrivyReportRenderingTest(unittest.TestCase):
