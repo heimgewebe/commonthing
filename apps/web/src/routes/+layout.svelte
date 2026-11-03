@@ -16,6 +16,7 @@
   let { data, children }: Props = $props();
 
   onMount(() => {
+    document.getElementById("static-document-title")?.remove();
     setUAClasses();
     const q = new URLSearchParams(window.location.search);
     const disable =
