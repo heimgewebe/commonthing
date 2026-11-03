@@ -130,6 +130,21 @@ class SecurityWorkflowContractTest(unittest.TestCase):
         self.assertEqual(render_step["env"]["TRIVY_REPORT"], steps[scan_index]["with"]["output"])
 
 
+    def test_pnpm_audit_blocks_high_findings_in_shipped_dependencies(self) -> None:
+        payload, triggers = load_workflow()
+        job = payload["jobs"]["pnpm-audit"]
+        self.assertIn("github.event_name == 'pull_request'", job["if"])
+        self.assertIn("github.event.schedule == '45 2 * * *'", job["if"])
+        script = next(step["run"] for step in job["steps"] if "pnpm audit" in str(step.get("run", "")))
+        self.assertIn("set -euo pipefail", script)
+        self.assertIn("pnpm audit --prod --audit-level=high", script)
+        self.assertIn("apps/web", script)
+        self.assertIn('exit "${status}"', script)
+        self.assertLessEqual(
+            {"pnpm-lock.yaml", "apps/web/pnpm-lock.yaml", "apps/web/package.json"},
+            set(triggers["pull_request"]["paths"]),
+        )
+
 @unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "render step needs bash and jq")
 class TrivyReportRenderingTest(unittest.TestCase):
     """Runs the workflow's own render script against synthetic Trivy reports."""

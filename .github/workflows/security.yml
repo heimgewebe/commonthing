@@ -19,6 +19,10 @@ name: security
       - "scripts/ops/search-worker-loop.sh"
       - "deny.toml"
       - ".cargo/audit.toml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "apps/web/package.json"
+      - "apps/web/pnpm-lock.yaml"
       - ".github/workflows/security.yml"
     types: [opened, synchronize, labeled]
   schedule:
@@ -162,6 +166,43 @@ jobs:
           name: cargo-deny-report
           path: cargo-deny-report.json
           retention-days: 14
+
+  pnpm-audit:
+    name: pnpm audit (nightly + on-demand)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Covers the dependencies that ship in the static web build. Dev and test
+    # tooling is left out on purpose: it never reaches users, and its findings
+    # would keep this job permanently red.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'schedule' && github.event.schedule == '45 2 * * *')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b0f76dfb45f55f8421693e4803ac7bb65143bd34 # tag: v6
+        with:
+          run_install: false
+      - name: Setup Node
+        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
+        with:
+          node-version-file: '.node-version'
+          check-latest: false
+      - name: Audit production dependencies (high and critical)
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          for dir in . apps/web; do
+            echo "::group::pnpm audit --prod in ${dir}"
+            if ! (cd "${dir}" && pnpm audit --prod --audit-level=high); then
+              echo "::error file=${dir}/pnpm-lock.yaml::high or critical advisory in production dependencies"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "${status}"
 
   sbom:
     name: syft sbom (weekly + on-demand)
