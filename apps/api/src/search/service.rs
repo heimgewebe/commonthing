@@ -29,7 +29,8 @@ use crate::{
         },
         repository::{
             fetch_active_search_generation, fetch_postgres_candidates_for_generation,
-            ActiveSearchGeneration, SearchFilters, SearchRepositoryError,
+            fetch_postgres_lexical_top_for_generation, ActiveSearchGeneration, SearchFilters,
+            SearchRepositoryError,
         },
         worker::{
             EmbeddingProvider, EmbeddingProviderError, GenerationSpec, OllamaEmbeddingProvider,
@@ -466,11 +467,37 @@ async fn execute_search_inner<'a>(
     state
         .metrics
         .observe_search_repository_duration(generation_elapsed + candidate_started.elapsed());
+    let mut candidate_set_overflowed = false;
     let candidate_set = match candidate_result {
         Ok(candidate_set) => candidate_set,
         Err(SearchRepositoryError::CandidateSetTooLarge) => {
             state.metrics.search_candidate_set_overflow();
-            return Err(SearchError::Unavailable);
+            // A provider contract violation stays an error, overflow or not.
+            if matches!(&provider_result, Err(error) if !matches!(error, EmbeddingProviderError::Unavailable))
+            {
+                if let Err(error) = provider_result {
+                    return Err(SearchError::ProviderContractError(error));
+                }
+            }
+            // Too many authorized candidates to transfer with vectors. Answer
+            // with the database's lexical top-10 instead of failing the whole
+            // search; the same authorization and privacy fence apply.
+            candidate_set_overflowed = true;
+            match fetch_postgres_lexical_top_for_generation(
+                pool,
+                &generation,
+                &query.raw,
+                &filters,
+                auth,
+            )
+            .await
+            {
+                Ok(candidate_set) => candidate_set,
+                Err(SearchRepositoryError::CandidateSetTooLarge) => {
+                    return Err(SearchError::Unavailable);
+                }
+                Err(_) => return Err(SearchError::Internal),
+            }
         }
         Err(SearchRepositoryError::Database(_))
         | Err(SearchRepositoryError::Json(_))
@@ -491,6 +518,11 @@ async fn execute_search_inner<'a>(
         .observe_search_candidate_counts(candidate_set.candidates.len(), lexical_ranked.len());
 
     let (ranked, mode, fallback_reason) = match provider_result {
+        _ if candidate_set_overflowed => (
+            lexical_ranked,
+            SearchMode::LexicalFallback,
+            Some("candidate_set_overflow".to_string()),
+        ),
         Ok(query_vector) => (
             rank_hybrid(
                 Some(&query_vector),
