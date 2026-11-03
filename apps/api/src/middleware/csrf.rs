@@ -53,10 +53,7 @@ pub async fn require_csrf(jar: CookieJar, req: Request<Body>, next: Next) -> Res
 
     // 4. Allowlist Check (Origin OR Referer)
     if let Ok(allowlist) = env::var("CSRF_ALLOWED_ORIGINS") {
-        let allowed_list: Vec<String> = allowlist
-            .split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .collect();
+        let allowed_list = parse_allowed_origins(&allowlist).accepted;
 
         // Check Origin
         if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
@@ -178,6 +175,54 @@ pub async fn require_csrf(jar: CookieJar, req: Request<Body>, next: Next) -> Res
     StatusCode::FORBIDDEN.into_response()
 }
 
+/// `CSRF_ALLOWED_ORIGINS` split into usable origins and rejected entries.
+pub(crate) struct AllowedOrigins {
+    pub accepted: Vec<String>,
+    pub rejected: Vec<String>,
+}
+
+/// Parses `CSRF_ALLOWED_ORIGINS`. Entries are lowercased and one trailing `/`
+/// is dropped, because a browser `Origin` never carries one. Anything that is
+/// not a bare `http(s)://host[:port]` origin can never match and is rejected,
+/// so startup can report it instead of the origin failing silently.
+pub(crate) fn parse_allowed_origins(raw: &str) -> AllowedOrigins {
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let normalized = entry.to_ascii_lowercase();
+        let normalized = normalized.strip_suffix('/').unwrap_or(&normalized);
+        let authority = normalized
+            .strip_prefix("https://")
+            .or_else(|| normalized.strip_prefix("http://"));
+        match authority {
+            Some(authority)
+                if !authority.is_empty() && !authority.contains(['/', '?', '#', '@']) =>
+            {
+                accepted.push(normalized.to_string())
+            }
+            _ => rejected.push(entry.to_string()),
+        }
+    }
+    AllowedOrigins { accepted, rejected }
+}
+
+/// Logs `CSRF_ALLOWED_ORIGINS` entries that can never match. Called once at
+/// startup; the middleware ignores the same entries on every request.
+pub fn warn_on_invalid_allowed_origins() {
+    if let Ok(raw) = env::var("CSRF_ALLOWED_ORIGINS") {
+        for entry in parse_allowed_origins(&raw).rejected {
+            tracing::warn!(
+                entry = %entry,
+                "CSRF_ALLOWED_ORIGINS entry is not a bare http(s)://host[:port] origin and is ignored"
+            );
+        }
+    }
+}
+
 /// Compare ports as part of a complete `(scheme, host, effective port)` origin.
 ///
 /// A missing port does not mean "either standard port": its effective value is
@@ -220,6 +265,28 @@ mod tests {
     use super::*;
     use axum::{middleware::from_fn, routing::post, Router};
     use tower::ServiceExt;
+
+    #[test]
+    fn allowed_origins_are_normalized_and_invalid_entries_rejected() {
+        let parsed = parse_allowed_origins(
+            " https://Gewebe.example/ ,http://localhost:5173,, gewebe.example,https://a.example/path,https://u@b.example",
+        );
+        assert_eq!(
+            parsed.accepted,
+            vec![
+                "https://gewebe.example".to_string(),
+                "http://localhost:5173".to_string()
+            ]
+        );
+        assert_eq!(
+            parsed.rejected,
+            vec![
+                "gewebe.example".to_string(),
+                "https://a.example/path".to_string(),
+                "https://u@b.example".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn test_parse_host_header() {
