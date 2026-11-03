@@ -11,14 +11,16 @@
       "rollup": "4.60.2",
       "flatted": "3.4.4",
       "picomatch@^2.0.0": "2.3.2",
-      "devalue": "^5.8.1",
+      "devalue": "5.9.4",
       "postcss": "8.5.26",
       "yaml@^1.0.0": "1.10.3",
       "protocol-buffers-schema": "3.6.1",
       "@eslint/plugin-kit": "0.7.2",
       "js-yaml": "^4.2.0",
       "brace-expansion@^5.0.0": "5.0.12",
-      "@mapbox/jsonlint-lines-primitives": "2.0.2"
+      "@mapbox/jsonlint-lines-primitives": "2.0.2",
+      "nanoid@^3.0.0": "3.3.18",
+      "source-map-js": "^1.2.2"
     }
   },
   "scripts": {
@@ -101,8 +103,8 @@
     "svelte": "^5.56.3",
     "svelte-check": "^4.6.0",
     "typescript": "5.9.2",
-    "vite": "^6.4.3",
-    "vitest": "^3.2.6"
+    "vite": "^6.4.5",
+    "vitest": "^4.1.12"
   },
   "dependencies": {
     "maplibre-gl": "6.12.0",
