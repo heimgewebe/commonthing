@@ -6212,3 +6212,153 @@ async fn postgres_nongeographic_commons_vertical_flow() -> Result<()> {
     clean_all_nodes(&pool).await;
     Ok(())
 }
+
+/// Production-equivalent PostgreSQL privacy regression: HTTP cookies on two
+/// independent API replicas, owner versus foreign Admin and anonymous readers.
+/// All rows live in the disposable test database, never on production.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct disposable PostgreSQL"]
+#[serial]
+async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Result<()> {
+    async fn get(
+        app: &Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> Result<(StatusCode, serde_json::Value)> {
+        let mut request = Request::get(uri).header("Host", "localhost");
+        if let Some(value) = cookie {
+            request = request.header("Cookie", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(body::Body::empty())?)
+            .await?;
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let data = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        Ok((status, data))
+    }
+
+    const OWNER: &str = "10000000-0000-0000-0000-00000000c170";
+    const FOREIGN: &str = "10000000-0000-0000-0000-00000000c171";
+    const MARKER: &str = "POSTGRES-COOKIE-PRIVATE-MARKER";
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some(MARKER), None).await;
+    sqlx::query(
+        "UPDATE domain_nodes
+         SET payload=jsonb_set(payload, '{created_by_account_id}', to_jsonb($2::text), true)
+         WHERE id=$1",
+    )
+    .bind(NODE_B)
+    .bind(OWNER)
+    .execute(&pool)
+    .await?;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (_, owner_cookie, owner_state) = postgres_write_app(pool.clone(), OWNER).await?;
+    let (_, foreign_cookie, foreign_state) = postgres_write_app(pool.clone(), FOREIGN).await?;
+    let owner_app = postgres_projected_router(&owner_state);
+    let foreign_app = postgres_projected_router(&foreign_state);
+
+    for (actor, app, cookie) in [
+        ("owner", &owner_app, Some(owner_cookie.as_str())),
+        ("foreign admin", &foreign_app, Some(foreign_cookie.as_str())),
+        ("anonymous", &foreign_app, None),
+    ] {
+        let (status, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
+        assert_eq!(status, StatusCode::OK, "{actor} initial public detail");
+    }
+    let (_, initial) = get(&owner_app, &format!("/nodes/{NODE_B}"), Some(&owner_cookie)).await?;
+    let mut etag = format!(
+        "\"{}\"",
+        initial["updated_at"].as_str().context("initial ETag")?
+    );
+
+    for visibility in ["private", "hidden", "public", "revoked"] {
+        let response = owner_app
+            .clone()
+            .oneshot(patch_node_req(
+                &owner_cookie,
+                NODE_B,
+                &serde_json::json!({"search_visibility": visibility}).to_string(),
+                &etag,
+            ))
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "PATCH {visibility}");
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let updated: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(updated["search_visibility"], visibility);
+        etag = format!(
+            "\"{}\"",
+            updated["updated_at"].as_str().context("updated ETag")?
+        );
+
+        for (actor, app, cookie, permitted) in [
+            (
+                "owner",
+                &owner_app,
+                Some(owner_cookie.as_str()),
+                visibility != "revoked",
+            ),
+            (
+                "foreign admin",
+                &foreign_app,
+                Some(foreign_cookie.as_str()),
+                visibility == "public",
+            ),
+            ("anonymous", &foreign_app, None, visibility == "public"),
+        ] {
+            let (status, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
+            assert_eq!(
+                status,
+                if permitted {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                },
+                "{actor} detail at {visibility}"
+            );
+            for uri in ["/nodes", "/nodes?bbox=9.9,53.4,10.2,53.7"] {
+                let (status, listing) = get(app, uri, cookie).await?;
+                assert_eq!(status, StatusCode::OK, "{actor} {uri}");
+                let visible = listing
+                    .as_array()
+                    .context("PostgreSQL list array")?
+                    .iter()
+                    .any(|node| node["id"] == NODE_B);
+                assert_eq!(visible, permitted, "{actor} list at {visibility}");
+                if !permitted {
+                    assert!(
+                        !listing.to_string().contains(MARKER),
+                        "{actor} payload leak"
+                    );
+                }
+            }
+        }
+        let (status, public_only) =
+            get(&owner_app, "/nodes?public_only=true", Some(&owner_cookie)).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            public_only
+                .as_array()
+                .context("public-only array")?
+                .iter()
+                .any(|node| node["id"] == NODE_B),
+            visibility == "public",
+            "public_only must stay public even for the owner at {visibility}"
+        );
+    }
+
+    clean(&pool).await;
+    sqlx::query("DELETE FROM domain_accounts WHERE id IN ($1, $2)")
+        .bind(OWNER)
+        .bind(FOREIGN)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
