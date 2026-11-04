@@ -104,6 +104,25 @@ class SecurityWorkflowContractTest(unittest.TestCase):
             trigger_paths,
         )
 
+    def test_trivy_installer_bypasses_moving_upstream_setup_without_disabling_scan(self) -> None:
+        steps = image_scan_steps()
+        names = [step.get("name") for step in steps]
+        install_name = "Install pinned Trivy binary from GitHub release"
+        install = steps[names.index(install_name)]
+        scan = next(step for step in steps if str(step.get("uses", "")).startswith("aquasecurity/trivy-action@"))
+        self.assertLess(names.index(install_name), steps.index(scan))
+        command = install["run"]
+        self.assertIn("version=\"0.70.0\"", command)
+        self.assertIn("releases/download/v${version}", command)
+        self.assertIn("trivy_${version}_checksums.txt", command)
+        self.assertIn("sha256sum --check --status", command)
+        self.assertIn("echo \"${RUNNER_TEMP}/trivy-bin\" >> \"${GITHUB_PATH}\"", command)
+        self.assertNotIn("get.trivy.dev", command)
+        self.assertIs(scan["with"]["skip-setup-trivy"], True)
+        self.assertEqual(scan["with"]["version"], "v0.70.0")
+        self.assertEqual(str(scan["with"]["exit-code"]), "1")
+        self.assertEqual(scan["with"]["severity"], "HIGH,CRITICAL")
+
     def test_weekly_security_jobs_compare_the_schedule_string_directly(self) -> None:
         payload, _ = load_workflow()
         raw = WORKFLOW.read_text(encoding="utf-8")
