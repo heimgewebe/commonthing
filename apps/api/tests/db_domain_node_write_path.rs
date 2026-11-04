@@ -6224,7 +6224,7 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
         app: &Router,
         uri: &str,
         cookie: Option<&str>,
-    ) -> Result<(StatusCode, serde_json::Value)> {
+    ) -> Result<(StatusCode, serde_json::Value, Vec<u8>)> {
         let mut request = Request::get(uri).header("Host", "localhost");
         if let Some(value) = cookie {
             request = request.header("Cookie", value);
@@ -6236,7 +6236,7 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
         let status = response.status();
         let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
         let data = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        Ok((status, data))
+        Ok((status, data, bytes.to_vec()))
     }
 
     const OWNER: &str = "10000000-0000-0000-0000-00000000c170";
@@ -6316,7 +6316,7 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
             ("foreign admin", Some(foreign_cookie.as_str())),
             ("anonymous", None),
         ] {
-            let (status, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
+            let (status, _, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
             assert_eq!(
                 status,
                 StatusCode::OK,
@@ -6324,7 +6324,7 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
             );
         }
     }
-    let (_, initial) = get(&owner_app, &format!("/nodes/{NODE_B}"), Some(&owner_cookie)).await?;
+    let (_, initial, _) = get(&owner_app, &format!("/nodes/{NODE_B}"), Some(&owner_cookie)).await?;
     let mut etag = format!(
         "\"{}\"",
         initial["updated_at"].as_str().context("initial ETag")?
@@ -6368,7 +6368,7 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
                 ),
                 ("anonymous", None, visibility == "public"),
             ] {
-                let (status, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
+                let (status, _, raw_detail) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
                 assert_eq!(
                     status,
                     if permitted {
@@ -6378,8 +6378,18 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
                     },
                     "{replica}: {actor} detail at {visibility}"
                 );
+                // Check the raw detail response as well: a 404 with a private
+                // marker, including a non-JSON body, is still a disclosure.
+                if !permitted {
+                    assert!(
+                        !raw_detail
+                            .windows(MARKER.len())
+                            .any(|window| window == MARKER.as_bytes()),
+                        "{replica}: {actor} detail payload leak",
+                    );
+                }
                 for uri in ["/nodes", "/nodes?bbox=9.9,53.4,10.2,53.7"] {
-                    let (status, listing) = get(app, uri, cookie).await?;
+                    let (status, listing, _) = get(app, uri, cookie).await?;
                     assert_eq!(status, StatusCode::OK, "{replica}: {actor} {uri}");
                     let visible = listing
                         .as_array()
@@ -6398,7 +6408,7 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
                     }
                 }
             }
-            let (status, public_only) =
+            let (status, public_only, _) =
                 get(app, "/nodes?public_only=true", Some(&owner_cookie)).await?;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(
