@@ -6260,18 +6260,69 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
     let in_dir = tmp.path().join("in");
     std::fs::create_dir_all(&in_dir)?;
     let _env = set_gewebe_in_dir(&in_dir);
-    let (_, owner_cookie, owner_state) = postgres_write_app(pool.clone(), OWNER).await?;
-    let (_, foreign_cookie, foreign_state) = postgres_write_app(pool.clone(), FOREIGN).await?;
+    // Rebuild both API states against the same real PostgreSQL accounts and
+    // session storage, as the production composition root does. The temporary
+    // sessions created inside postgres_write_app are in-memory fixtures only.
+    let (_, _, mut owner_state) = postgres_write_app(pool.clone(), OWNER).await?;
+    let (_, _, mut foreign_state) = postgres_write_app(pool.clone(), FOREIGN).await?;
+    owner_state.sessions = SessionBackend::new(
+        weltgewebe_api::auth::session_db::DbSessionStore::new(pool.clone()),
+    );
+    foreign_state.sessions = SessionBackend::new(
+        weltgewebe_api::auth::session_db::DbSessionStore::new(pool.clone()),
+    );
+    *owner_state.accounts.write().await =
+        weltgewebe_api::domain_db::load_accounts_from_postgres(&pool).await?;
+    *foreign_state.accounts.write().await =
+        weltgewebe_api::domain_db::load_accounts_from_postgres(&pool).await?;
+
+    let owner_session = owner_state.sessions.create(OWNER.to_string(), None).await?;
+    let foreign_session = foreign_state
+        .sessions
+        .create(FOREIGN.to_string(), None)
+        .await?;
+    let owner_cookie = format!("gewebe_session={}", owner_session.id);
+    let foreign_cookie = format!("gewebe_session={}", foreign_session.id);
+    // A session created by one replica must be found by the other replica's
+    // independent DB-backed SessionBackend, not by shared in-memory state.
+    assert_eq!(
+        foreign_state
+            .sessions
+            .get(&owner_session.id)
+            .await?
+            .as_ref()
+            .map(|s| s.account_id.as_str()),
+        Some(OWNER),
+    );
+    assert_eq!(
+        owner_state
+            .sessions
+            .get(&foreign_session.id)
+            .await?
+            .as_ref()
+            .map(|s| s.account_id.as_str()),
+        Some(FOREIGN),
+    );
+
     let owner_app = postgres_projected_router(&owner_state);
     let foreign_app = postgres_projected_router(&foreign_state);
 
-    for (actor, app, cookie) in [
-        ("owner", &owner_app, Some(owner_cookie.as_str())),
-        ("foreign admin", &foreign_app, Some(foreign_cookie.as_str())),
-        ("anonymous", &foreign_app, None),
+    for (replica, app) in [
+        ("owner replica", &owner_app),
+        ("foreign replica", &foreign_app),
     ] {
-        let (status, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
-        assert_eq!(status, StatusCode::OK, "{actor} initial public detail");
+        for (actor, cookie) in [
+            ("owner", Some(owner_cookie.as_str())),
+            ("foreign admin", Some(foreign_cookie.as_str())),
+            ("anonymous", None),
+        ] {
+            let (status, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{replica}: {actor} initial public detail",
+            );
+        }
     }
     let (_, initial) = get(&owner_app, &format!("/nodes/{NODE_B}"), Some(&owner_cookie)).await?;
     let mut etag = format!(
@@ -6298,63 +6349,73 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
             updated["updated_at"].as_str().context("updated ETag")?
         );
 
-        for (actor, app, cookie, permitted) in [
-            (
-                "owner",
-                &owner_app,
-                Some(owner_cookie.as_str()),
-                visibility != "revoked",
-            ),
-            (
-                "foreign admin",
-                &foreign_app,
-                Some(foreign_cookie.as_str()),
-                visibility == "public",
-            ),
-            ("anonymous", &foreign_app, None, visibility == "public"),
+        // Exercise *each* actor cookie on *both* independent DB-backed API
+        // routers. A per-replica in-memory session would fail these checks.
+        for (replica, app) in [
+            ("owner replica", &owner_app),
+            ("foreign replica", &foreign_app),
         ] {
-            let (status, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
-            assert_eq!(
-                status,
-                if permitted {
-                    StatusCode::OK
-                } else {
-                    StatusCode::NOT_FOUND
-                },
-                "{actor} detail at {visibility}"
-            );
-            for uri in ["/nodes", "/nodes?bbox=9.9,53.4,10.2,53.7"] {
-                let (status, listing) = get(app, uri, cookie).await?;
-                assert_eq!(status, StatusCode::OK, "{actor} {uri}");
-                let visible = listing
-                    .as_array()
-                    .context("PostgreSQL list array")?
-                    .iter()
-                    .any(|node| node["id"] == NODE_B);
-                assert_eq!(visible, permitted, "{actor} list at {visibility}");
-                if !permitted {
-                    assert!(
-                        !listing.to_string().contains(MARKER),
-                        "{actor} payload leak"
+            for (actor, cookie, permitted) in [
+                (
+                    "owner",
+                    Some(owner_cookie.as_str()),
+                    visibility != "revoked",
+                ),
+                (
+                    "foreign admin",
+                    Some(foreign_cookie.as_str()),
+                    visibility == "public",
+                ),
+                ("anonymous", None, visibility == "public"),
+            ] {
+                let (status, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
+                assert_eq!(
+                    status,
+                    if permitted {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    },
+                    "{replica}: {actor} detail at {visibility}"
+                );
+                for uri in ["/nodes", "/nodes?bbox=9.9,53.4,10.2,53.7"] {
+                    let (status, listing) = get(app, uri, cookie).await?;
+                    assert_eq!(status, StatusCode::OK, "{replica}: {actor} {uri}");
+                    let visible = listing
+                        .as_array()
+                        .context("PostgreSQL list array")?
+                        .iter()
+                        .any(|node| node["id"] == NODE_B);
+                    assert_eq!(
+                        visible, permitted,
+                        "{replica}: {actor} list at {visibility}",
                     );
+                    if !permitted {
+                        assert!(
+                            !listing.to_string().contains(MARKER),
+                            "{replica}: {actor} payload leak",
+                        );
+                    }
                 }
             }
+            let (status, public_only) =
+                get(app, "/nodes?public_only=true", Some(&owner_cookie)).await?;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                public_only
+                    .as_array()
+                    .context("public-only array")?
+                    .iter()
+                    .any(|node| node["id"] == NODE_B),
+                visibility == "public",
+                "{replica}: public_only must stay public even for the owner at {visibility}",
+            );
         }
-        let (status, public_only) =
-            get(&owner_app, "/nodes?public_only=true", Some(&owner_cookie)).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            public_only
-                .as_array()
-                .context("public-only array")?
-                .iter()
-                .any(|node| node["id"] == NODE_B),
-            visibility == "public",
-            "public_only must stay public even for the owner at {visibility}"
-        );
     }
 
     clean(&pool).await;
+    owner_state.sessions.delete(&owner_session.id).await?;
+    foreign_state.sessions.delete(&foreign_session.id).await?;
     sqlx::query("DELETE FROM domain_accounts WHERE id IN ($1, $2)")
         .bind(OWNER)
         .bind(FOREIGN)
