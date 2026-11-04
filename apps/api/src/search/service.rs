@@ -7,6 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use axum::{
     http::StatusCode,
@@ -28,7 +29,8 @@ use crate::{
         },
         repository::{
             fetch_active_search_generation, fetch_postgres_candidates_for_generation,
-            ActiveSearchGeneration, SearchFilters, SearchRepositoryError,
+            fetch_postgres_lexical_top_for_generation, ActiveSearchGeneration, SearchFilters,
+            SearchRepositoryError,
         },
         worker::{
             EmbeddingProvider, EmbeddingProviderError, GenerationSpec, OllamaEmbeddingProvider,
@@ -68,16 +70,40 @@ fn lock_runtime_query_embedding_cache(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Upper bound on query embeddings in flight per API process.
+///
+/// The production runtime serves one embedding at a time
+/// (`OLLAMA_NUM_PARALLEL=1`) and is shared with the projection worker. Without
+/// a bound, anonymous search requests with distinct queries queue at the
+/// provider for up to several 10-second attempts each. A request that finds no
+/// free slot answers lexically right away instead of joining that queue.
+const MAX_IN_FLIGHT_QUERY_EMBEDDINGS: usize = 2;
+
+fn runtime_query_embedding_permits() -> Arc<Semaphore> {
+    static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT_QUERY_EMBEDDINGS))))
+}
+
 struct CachedQueryEmbeddingProvider {
     inner: Arc<dyn EmbeddingProvider>,
     generation_id: String,
+    permits: Arc<Semaphore>,
 }
 
 impl CachedQueryEmbeddingProvider {
     fn new(inner: Arc<dyn EmbeddingProvider>, generation_id: String) -> Self {
+        Self::with_permits(inner, generation_id, runtime_query_embedding_permits())
+    }
+
+    fn with_permits(
+        inner: Arc<dyn EmbeddingProvider>,
+        generation_id: String,
+        permits: Arc<Semaphore>,
+    ) -> Self {
         Self {
             inner,
             generation_id,
+            permits,
         }
     }
 }
@@ -99,6 +125,12 @@ impl EmbeddingProvider for CachedQueryEmbeddingProvider {
             }
         }
 
+        // Saturation is reported as an unavailable provider, so the caller
+        // takes the existing lexical fallback and the wire format is unchanged.
+        let _permit = self
+            .permits
+            .try_acquire()
+            .map_err(|_| EmbeddingProviderError::Unavailable)?;
         let embedding = self.inner.embed(document, dimension).await?;
         *lock_runtime_query_embedding_cache() = Some(QueryEmbeddingCacheEntry {
             generation_id: self.generation_id.clone(),
@@ -435,11 +467,37 @@ async fn execute_search_inner<'a>(
     state
         .metrics
         .observe_search_repository_duration(generation_elapsed + candidate_started.elapsed());
+    let mut candidate_set_overflowed = false;
     let candidate_set = match candidate_result {
         Ok(candidate_set) => candidate_set,
         Err(SearchRepositoryError::CandidateSetTooLarge) => {
             state.metrics.search_candidate_set_overflow();
-            return Err(SearchError::Unavailable);
+            // A provider contract violation stays an error, overflow or not.
+            if matches!(&provider_result, Err(error) if !matches!(error, EmbeddingProviderError::Unavailable))
+            {
+                if let Err(error) = provider_result {
+                    return Err(SearchError::ProviderContractError(error));
+                }
+            }
+            // Too many authorized candidates to transfer with vectors. Answer
+            // with the database's lexical top-10 instead of failing the whole
+            // search; the same authorization and privacy fence apply.
+            candidate_set_overflowed = true;
+            match fetch_postgres_lexical_top_for_generation(
+                pool,
+                &generation,
+                &query.raw,
+                &filters,
+                auth,
+            )
+            .await
+            {
+                Ok(candidate_set) => candidate_set,
+                Err(SearchRepositoryError::CandidateSetTooLarge) => {
+                    return Err(SearchError::Unavailable);
+                }
+                Err(_) => return Err(SearchError::Internal),
+            }
         }
         Err(SearchRepositoryError::Database(_))
         | Err(SearchRepositoryError::Json(_))
@@ -460,6 +518,11 @@ async fn execute_search_inner<'a>(
         .observe_search_candidate_counts(candidate_set.candidates.len(), lexical_ranked.len());
 
     let (ranked, mode, fallback_reason) = match provider_result {
+        _ if candidate_set_overflowed => (
+            lexical_ranked,
+            SearchMode::LexicalFallback,
+            Some("candidate_set_overflow".to_string()),
+        ),
         Ok(query_vector) => (
             rank_hybrid(
                 Some(&query_vector),
@@ -538,6 +601,67 @@ mod tests {
                 Ok(vec![0.5; dimension])
             }
         }
+    }
+
+    struct GatedProvider {
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for GatedProvider {
+        async fn embed(
+            &self,
+            _document: &str,
+            dimension: usize,
+        ) -> Result<Vec<f64>, EmbeddingProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release.notified().await;
+            Ok(vec![0.25; dimension])
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn saturated_query_embedding_slots_fail_fast_as_unavailable() {
+        clear_runtime_query_embedding_cache_for_test();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let permits = Arc::new(Semaphore::new(1));
+        let cached = Arc::new(CachedQueryEmbeddingProvider::with_permits(
+            Arc::new(GatedProvider {
+                release: Arc::clone(&release),
+                calls: Arc::clone(&calls),
+            }),
+            "generation-gated".to_string(),
+            Arc::clone(&permits),
+        ));
+
+        let holder = {
+            let cached = Arc::clone(&cached);
+            tokio::spawn(async move { cached.embed("first query", 4).await })
+        };
+        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        // The only slot is busy: a different query must not queue behind it.
+        assert!(matches!(
+            cached.embed("second query", 4).await,
+            Err(EmbeddingProviderError::Unavailable)
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release.notify_one();
+        assert!(holder.await.expect("holder task").is_ok());
+        assert_eq!(permits.available_permits(), 1, "the slot is returned");
+
+        // A cache hit needs no slot even while another embedding runs.
+        let busy = permits.try_acquire().expect("occupy the slot");
+        assert!(cached.embed("first query", 4).await.is_ok());
+        drop(busy);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        clear_runtime_query_embedding_cache_for_test();
     }
 
     #[tokio::test]

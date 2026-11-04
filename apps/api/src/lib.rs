@@ -104,6 +104,7 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let app_config = AppConfig::load().context("failed to load API configuration")?;
+    crate::middleware::csrf::warn_on_invalid_allowed_origins();
     // Validate the drain budget before the first side effect (pool, migrations,
     // NATS), so an invalid value rejects the start without having migrated.
     let shutdown_grace = shutdown::grace_period_from_env()?;

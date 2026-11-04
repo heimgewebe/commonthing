@@ -1,4 +1,12 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+  type Mock,
+} from "vitest";
 import { get, writable } from "svelte/store";
 
 import {
@@ -83,10 +91,10 @@ describe("buildPanelEndpoint", () => {
 });
 
 describe("createPanelDetailsLoader", () => {
-  let onError: ReturnType<typeof vi.fn>;
+  let onError: Mock<(error: unknown) => void>;
 
   beforeEach(() => {
-    onError = vi.fn();
+    onError = vi.fn<(error: unknown) => void>();
   });
 
   afterEach(() => {

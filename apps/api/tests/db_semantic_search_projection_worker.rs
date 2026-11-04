@@ -2090,6 +2090,27 @@ async fn t006_search_api_against_postgres_projections() {
         "the compatibility repository path must still expose semantic vectors"
     );
 
+    // LIKE wildcards in the raw query are literals, not patterns: neither `%`
+    // nor `_` may turn every title into a prefix match.
+    for wildcard_query in ["%", "_"] {
+        let wildcard_candidates =
+            fetch_postgres_candidates(&pool, wildcard_query, &SearchFilters::default(), &anonymous)
+                .await
+                .expect("fetch wildcard candidates")
+                .expect("active T006 generation");
+        assert!(
+            !wildcard_candidates.candidates.is_empty(),
+            "authorized candidates still load for {wildcard_query:?}"
+        );
+        assert!(
+            wildcard_candidates
+                .candidates
+                .iter()
+                .all(|candidate| candidate.rank_class == u8::MAX),
+            "query {wildcard_query:?} must not rank titles as literal prefix matches"
+        );
+    }
+
     let saturated_window = fetch_postgres_candidates_for_generation(
         &pool,
         &bounded_candidates.generation,
@@ -2608,7 +2629,35 @@ async fn t006_search_api_against_postgres_projections() {
         Some(unavailable_provider()),
     )
     .await;
-    assert!(matches!(overflow_api, Err(SearchError::Unavailable)));
+    // Overflow no longer fails the whole search: the API answers with the
+    // database's lexical top-10 and never transfers the oversized vector set.
+    let overflow_api = overflow_api.expect("overflow answers lexically");
+    assert_eq!(overflow_api.mode, SearchMode::LexicalFallback);
+    assert_eq!(
+        overflow_api.fallback_reason.as_deref(),
+        Some("candidate_set_overflow")
+    );
+    assert!(overflow_api.items.is_empty(), "no lexical match, no items");
+
+    let overflow_hit = execute_search(
+        &state,
+        &anonymous,
+        SearchQueryParams {
+            q: Some("Overflow 1000".to_string()),
+            kind: Some("resource".to_string()),
+            ..Default::default()
+        },
+        Some(available_provider()),
+    )
+    .await
+    .expect("overflow with lexical hits answers lexically");
+    assert_eq!(overflow_hit.mode, SearchMode::LexicalFallback);
+    assert_eq!(
+        overflow_hit.fallback_reason.as_deref(),
+        Some("candidate_set_overflow")
+    );
+    assert!(!overflow_hit.items.is_empty() && overflow_hit.items.len() <= 10);
+    assert_eq!(overflow_hit.items[0].title, "Overflow 1000");
 
     // Generation identity tampering is not a degradable provider outage.
     sqlx::query(
