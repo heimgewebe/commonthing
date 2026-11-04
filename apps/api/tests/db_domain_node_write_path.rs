@@ -6212,3 +6212,224 @@ async fn postgres_nongeographic_commons_vertical_flow() -> Result<()> {
     clean_all_nodes(&pool).await;
     Ok(())
 }
+
+/// Production-equivalent PostgreSQL privacy regression: HTTP cookies on two
+/// independent API replicas, owner versus foreign Admin and anonymous readers.
+/// All rows live in the disposable test database, never on production.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct disposable PostgreSQL"]
+#[serial]
+async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Result<()> {
+    async fn get(
+        app: &Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> Result<(StatusCode, serde_json::Value, Vec<u8>)> {
+        let mut request = Request::get(uri).header("Host", "localhost");
+        if let Some(value) = cookie {
+            request = request.header("Cookie", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(body::Body::empty())?)
+            .await?;
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let data = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        Ok((status, data, bytes.to_vec()))
+    }
+
+    const OWNER: &str = "10000000-0000-0000-0000-00000000c170";
+    const FOREIGN: &str = "10000000-0000-0000-0000-00000000c171";
+    const MARKER: &str = "POSTGRES-COOKIE-PRIVATE-MARKER";
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    seed_node(&pool, NODE_B, Some(MARKER), None).await;
+    sqlx::query(
+        "UPDATE domain_nodes
+         SET payload=jsonb_set(payload, '{created_by_account_id}', to_jsonb($2::text), true)
+         WHERE id=$1",
+    )
+    .bind(NODE_B)
+    .bind(OWNER)
+    .execute(&pool)
+    .await?;
+
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    // Rebuild both API states against the same real PostgreSQL accounts and
+    // session storage, as the production composition root does. The temporary
+    // sessions created inside postgres_write_app are in-memory fixtures only.
+    let (_, _, mut owner_state) = postgres_write_app(pool.clone(), OWNER).await?;
+    let (_, _, mut foreign_state) = postgres_write_app(pool.clone(), FOREIGN).await?;
+    owner_state.sessions = SessionBackend::new(
+        weltgewebe_api::auth::session_db::DbSessionStore::new(pool.clone()),
+    );
+    foreign_state.sessions = SessionBackend::new(
+        weltgewebe_api::auth::session_db::DbSessionStore::new(pool.clone()),
+    );
+    *owner_state.accounts.write().await =
+        weltgewebe_api::domain_db::load_accounts_from_postgres(&pool).await?;
+    *foreign_state.accounts.write().await =
+        weltgewebe_api::domain_db::load_accounts_from_postgres(&pool).await?;
+
+    let owner_session = owner_state.sessions.create(OWNER.to_string(), None).await?;
+    let foreign_session = foreign_state
+        .sessions
+        .create(FOREIGN.to_string(), None)
+        .await?;
+    let owner_cookie = format!("gewebe_session={}", owner_session.id);
+    let foreign_cookie = format!("gewebe_session={}", foreign_session.id);
+    // A session created by one replica must be found by the other replica's
+    // independent DB-backed SessionBackend, not by shared in-memory state.
+    assert_eq!(
+        foreign_state
+            .sessions
+            .get(&owner_session.id)
+            .await?
+            .as_ref()
+            .map(|s| s.account_id.as_str()),
+        Some(OWNER),
+    );
+    assert_eq!(
+        owner_state
+            .sessions
+            .get(&foreign_session.id)
+            .await?
+            .as_ref()
+            .map(|s| s.account_id.as_str()),
+        Some(FOREIGN),
+    );
+
+    let owner_app = postgres_projected_router(&owner_state);
+    let foreign_app = postgres_projected_router(&foreign_state);
+
+    for (replica, app) in [
+        ("owner replica", &owner_app),
+        ("foreign replica", &foreign_app),
+    ] {
+        for (actor, cookie) in [
+            ("owner", Some(owner_cookie.as_str())),
+            ("foreign admin", Some(foreign_cookie.as_str())),
+            ("anonymous", None),
+        ] {
+            let (status, _, _) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{replica}: {actor} initial public detail",
+            );
+        }
+    }
+    let (_, initial, _) = get(&owner_app, &format!("/nodes/{NODE_B}"), Some(&owner_cookie)).await?;
+    let mut etag = format!(
+        "\"{}\"",
+        initial["updated_at"].as_str().context("initial ETag")?
+    );
+
+    for visibility in ["private", "hidden", "public", "revoked"] {
+        let response = owner_app
+            .clone()
+            .oneshot(patch_node_req(
+                &owner_cookie,
+                NODE_B,
+                &serde_json::json!({"search_visibility": visibility}).to_string(),
+                &etag,
+            ))
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "PATCH {visibility}");
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let updated: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(updated["search_visibility"], visibility);
+        etag = format!(
+            "\"{}\"",
+            updated["updated_at"].as_str().context("updated ETag")?
+        );
+
+        // Exercise *each* actor cookie on *both* independent DB-backed API
+        // routers. A per-replica in-memory session would fail these checks.
+        for (replica, app) in [
+            ("owner replica", &owner_app),
+            ("foreign replica", &foreign_app),
+        ] {
+            for (actor, cookie, permitted) in [
+                (
+                    "owner",
+                    Some(owner_cookie.as_str()),
+                    visibility != "revoked",
+                ),
+                (
+                    "foreign admin",
+                    Some(foreign_cookie.as_str()),
+                    visibility == "public",
+                ),
+                ("anonymous", None, visibility == "public"),
+            ] {
+                let (status, _, raw_detail) = get(app, &format!("/nodes/{NODE_B}"), cookie).await?;
+                assert_eq!(
+                    status,
+                    if permitted {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    },
+                    "{replica}: {actor} detail at {visibility}"
+                );
+                // Check the raw detail response as well: a 404 with a private
+                // marker, including a non-JSON body, is still a disclosure.
+                if !permitted {
+                    assert!(
+                        !raw_detail
+                            .windows(MARKER.len())
+                            .any(|window| window == MARKER.as_bytes()),
+                        "{replica}: {actor} detail payload leak",
+                    );
+                }
+                for uri in ["/nodes", "/nodes?bbox=9.9,53.4,10.2,53.7"] {
+                    let (status, listing, _) = get(app, uri, cookie).await?;
+                    assert_eq!(status, StatusCode::OK, "{replica}: {actor} {uri}");
+                    let visible = listing
+                        .as_array()
+                        .context("PostgreSQL list array")?
+                        .iter()
+                        .any(|node| node["id"] == NODE_B);
+                    assert_eq!(
+                        visible, permitted,
+                        "{replica}: {actor} list at {visibility}",
+                    );
+                    if !permitted {
+                        assert!(
+                            !listing.to_string().contains(MARKER),
+                            "{replica}: {actor} payload leak",
+                        );
+                    }
+                }
+            }
+            let (status, public_only, _) =
+                get(app, "/nodes?public_only=true", Some(&owner_cookie)).await?;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                public_only
+                    .as_array()
+                    .context("public-only array")?
+                    .iter()
+                    .any(|node| node["id"] == NODE_B),
+                visibility == "public",
+                "{replica}: public_only must stay public even for the owner at {visibility}",
+            );
+        }
+    }
+
+    clean(&pool).await;
+    owner_state.sessions.delete(&owner_session.id).await?;
+    foreign_state.sessions.delete(&foreign_session.id).await?;
+    sqlx::query("DELETE FROM domain_accounts WHERE id IN ($1, $2)")
+        .bind(OWNER)
+        .bind(FOREIGN)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
