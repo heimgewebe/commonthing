@@ -19,6 +19,10 @@ name: security
       - "scripts/ops/search-worker-loop.sh"
       - "deny.toml"
       - ".cargo/audit.toml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "apps/web/package.json"
+      - "apps/web/pnpm-lock.yaml"
       - ".github/workflows/security.yml"
     types: [opened, synchronize, labeled]
   schedule:
@@ -163,6 +167,47 @@ jobs:
           path: cargo-deny-report.json
           retention-days: 14
 
+  pnpm-audit:
+    name: pnpm audit (nightly + on-demand)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SvelteKit and browser-bundled packages live in apps/web devDependencies.
+    # --prod would silently omit that graph. Audit all web build dependencies,
+    # while the root audit can stay production-only.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'schedule' && github.event.schedule == '45 2 * * *')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b0f76dfb45f55f8421693e4803ac7bb65143bd34 # tag: v6
+        with:
+          run_install: false
+      - name: Setup Node
+        uses: actions/setup-node@e51e5fe84fc33b4c73ebe40526b2694712b5b858 # provenance: untagged (after v7.0.0)
+        with:
+          node-version-file: '.node-version'
+          check-latest: false
+      - name: Audit root production and web build dependencies (high and critical)
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          echo "::group::pnpm audit --prod in root"
+          if ! pnpm audit --prod --audit-level=high; then
+            echo "::error file=pnpm-lock.yaml::high or critical advisory in root production dependencies"
+            status=1
+          fi
+          echo "::endgroup::"
+          echo "::group::pnpm audit (full build graph) in apps/web"
+          if ! (cd apps/web && pnpm audit --audit-level=high); then
+            echo "::error file=apps/web/pnpm-lock.yaml::high or critical advisory in web build dependencies"
+            status=1
+          fi
+          echo "::endgroup::"
+          exit "${status}"
+
   sbom:
     name: syft sbom (weekly + on-demand)
     runs-on: ubuntu-latest
@@ -215,9 +260,33 @@ jobs:
             --build-arg "GIT_COMMIT_SHA=${GITHUB_SHA}" \
             --build-arg "BUILD_TIMESTAMP=${{ steps.image-metadata.outputs.build_timestamp }}" \
             .
+      # The action's moving upstream setup script now downloads through
+      # get.trivy.dev; preserve the existing scanner and severity policy.
+      - name: Install pinned Trivy binary from GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="0.70.0"
+          asset="trivy_${version}_Linux-64bit.tar.gz"
+          checksums="trivy_${version}_checksums.txt"
+          release="https://github.com/aquasecurity/trivy/releases/download/v${version}"
+          curl -fsSL --retry 3 --output "${RUNNER_TEMP}/${asset}" "${release}/${asset}"
+          curl -fsSL --retry 3 --output "${RUNNER_TEMP}/${checksums}" "${release}/${checksums}"
+          (
+            cd "${RUNNER_TEMP}"
+            awk -v asset="${asset}" '$2 == asset { print; found=1 } END { if (!found) exit 1 }' "${checksums}" |
+              sha256sum --check --status
+          )
+          mkdir -p "${RUNNER_TEMP}/trivy-bin"
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/trivy-bin" trivy
+          chmod 0755 "${RUNNER_TEMP}/trivy-bin/trivy"
+          "${RUNNER_TEMP}/trivy-bin/trivy" --version
+          echo "${RUNNER_TEMP}/trivy-bin" >> "${GITHUB_PATH}"
       - name: Scan production API image with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # tag: v0.36.0
         with:
+          skip-setup-trivy: true
+          version: v0.70.0
           scan-type: image
           image-ref: weltgewebe-api:trivy-scan
           scanners: vuln
