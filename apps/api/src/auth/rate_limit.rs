@@ -3,13 +3,32 @@ use chrono::{TimeZone, Utc};
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
 use thiserror::Error;
 
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 type EmailLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 type AccountLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
+
+/// Maps a client address to the subject that IP rate limits count against.
+///
+/// One IPv6 subscriber usually owns at least a /64, so counting each /128
+/// separately would give a single client 2^64 independent budgets. IPv6 is
+/// therefore collapsed to its /64 network, and IPv4-mapped IPv6 addresses
+/// count as the IPv4 address they carry.
+pub fn rate_limit_ip_subject(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            let network = u128::from(v6) & !((1u128 << 64) - 1);
+            IpAddr::V6(Ipv6Addr::from(network))
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RateLimitError {
@@ -107,6 +126,7 @@ impl AuthRateLimiter {
     }
 
     pub fn check(&self, ip: IpAddr, email_hash: &str) -> Result<(), RateLimitError> {
+        let ip = rate_limit_ip_subject(ip);
         if let Some(limiter) = &self.ip_limiter_min {
             if limiter.check_key(&ip).is_err() {
                 return Err(RateLimitError::IpLimited);
@@ -180,7 +200,7 @@ impl AuthRateLimiter {
         let Some(pool) = &self.db else {
             return self.check(ip, identifier_hash);
         };
-        let ip = ip.to_string();
+        let ip = rate_limit_ip_subject(ip).to_string();
         let checks = [
             ("ip-minute", ip.as_str(), 60_i64, self.ip_per_min, true),
             ("ip-hour", ip.as_str(), 3600_i64, self.ip_per_hour, true),
@@ -271,5 +291,56 @@ impl AuthRateLimiter {
             }
         }
         Ok(NodeMutationRateDecision::Enforced)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn ipv4_subject_is_unchanged() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
+        assert_eq!(rate_limit_ip_subject(ip), ip);
+    }
+
+    #[test]
+    fn ipv6_addresses_in_one_slash_64_share_a_subject() {
+        let a: IpAddr = "2001:db8:1:2:aaaa:bbbb:cccc:dddd".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        let expected: IpAddr = "2001:db8:1:2::".parse().unwrap();
+        assert_eq!(rate_limit_ip_subject(a), expected);
+        assert_eq!(rate_limit_ip_subject(b), expected);
+        assert_ne!(rate_limit_ip_subject(other), expected);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_counts_as_ipv4() {
+        let mapped: IpAddr = "::ffff:192.0.2.7".parse().unwrap();
+        assert_eq!(
+            rate_limit_ip_subject(mapped),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))
+        );
+    }
+
+    #[test]
+    fn in_memory_ip_limit_is_shared_across_one_slash_64() {
+        let mut config = AppConfig::load_from_str("{}\n").expect("default config");
+        config.auth_rl_ip_per_min = Some(1);
+        config.auth_rl_ip_per_hour = None;
+        config.auth_rl_email_per_min = None;
+        config.auth_rl_email_per_hour = None;
+        let limiter = AuthRateLimiter::new(&config);
+        let first: IpAddr = "2001:db8::1".parse().unwrap();
+        let rotated: IpAddr = "2001:db8::ffff:2".parse().unwrap();
+        let elsewhere: IpAddr = "2001:db8:0:1::1".parse().unwrap();
+        assert!(limiter.check(first, "a").is_ok());
+        assert!(matches!(
+            limiter.check(rotated, "b"),
+            Err(RateLimitError::IpLimited)
+        ));
+        assert!(limiter.check(elsewhere, "c").is_ok());
     }
 }

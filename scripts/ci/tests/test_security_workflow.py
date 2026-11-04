@@ -104,6 +104,25 @@ class SecurityWorkflowContractTest(unittest.TestCase):
             trigger_paths,
         )
 
+    def test_trivy_installer_bypasses_moving_upstream_setup_without_disabling_scan(self) -> None:
+        steps = image_scan_steps()
+        names = [step.get("name") for step in steps]
+        install_name = "Install pinned Trivy binary from GitHub release"
+        install = steps[names.index(install_name)]
+        scan = next(step for step in steps if str(step.get("uses", "")).startswith("aquasecurity/trivy-action@"))
+        self.assertLess(names.index(install_name), steps.index(scan))
+        command = install["run"]
+        self.assertIn("version=\"0.70.0\"", command)
+        self.assertIn("releases/download/v${version}", command)
+        self.assertIn("trivy_${version}_checksums.txt", command)
+        self.assertIn("sha256sum --check --status", command)
+        self.assertIn("echo \"${RUNNER_TEMP}/trivy-bin\" >> \"${GITHUB_PATH}\"", command)
+        self.assertNotIn("get.trivy.dev", command)
+        self.assertIs(scan["with"]["skip-setup-trivy"], True)
+        self.assertEqual(scan["with"]["version"], "v0.70.0")
+        self.assertEqual(str(scan["with"]["exit-code"]), "1")
+        self.assertEqual(scan["with"]["severity"], "HIGH,CRITICAL")
+
     def test_weekly_security_jobs_compare_the_schedule_string_directly(self) -> None:
         payload, _ = load_workflow()
         raw = WORKFLOW.read_text(encoding="utf-8")
@@ -128,6 +147,62 @@ class SecurityWorkflowContractTest(unittest.TestCase):
         render_step = steps[render_index]
         self.assertEqual(render_step.get("if"), "always()")
         self.assertEqual(render_step["env"]["TRIVY_REPORT"], steps[scan_index]["with"]["output"])
+
+
+    def test_pnpm_audit_blocks_high_findings_in_shipped_dependencies(self) -> None:
+        payload, triggers = load_workflow()
+        job = payload["jobs"]["pnpm-audit"]
+        self.assertIn("github.event_name == 'pull_request'", job["if"])
+        self.assertIn("github.event.schedule == '45 2 * * *'", job["if"])
+        script = next(step["run"] for step in job["steps"] if "pnpm audit" in str(step.get("run", "")))
+        self.assertIn("set -euo pipefail", script)
+        self.assertIn("pnpm audit --prod --audit-level=high", script)
+        self.assertIn("cd apps/web && pnpm audit --audit-level=high", script)
+        self.assertNotIn("cd apps/web && pnpm audit --prod", script)
+        self.assertIn('exit "${status}"', script)
+        self.assertLessEqual(
+            {"pnpm-lock.yaml", "apps/web/pnpm-lock.yaml", "apps/web/package.json"},
+            set(triggers["pull_request"]["paths"]),
+        )
+
+
+    def test_pnpm_web_bundled_dev_dependency_finding_fails_job(self) -> None:
+        """SvelteKit is a devDependency but must still be audited in the built web app."""
+        package = json.loads((ROOT / "apps/web/package.json").read_text(encoding="utf-8"))
+        self.assertIn("@sveltejs/kit", package["devDependencies"])
+        job = load_workflow()[0]["jobs"]["pnpm-audit"]
+        script = next(step["run"] for step in job["steps"] if "pnpm audit" in str(step.get("run", "")))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "apps/web").mkdir(parents=True)
+            (root / "bin").mkdir()
+            fake_pnpm = root / "bin/pnpm"
+            fake_pnpm.write_text(
+                '#!/usr/bin/env bash\n'
+                'if [[ "$PWD" == */apps/web && "${FAKE_WEB_HIGH:-0}" == 1 && "$*" != *"--prod"* ]]; then\n'
+                '  echo "HIGH advisory in bundled @sveltejs/kit" >&2\n'
+                '  exit 1\n'
+                'fi\n',
+                encoding="utf-8",
+            )
+            fake_pnpm.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
+                "FAKE_WEB_HIGH": "1",
+            }
+            rejected = subprocess.run(
+                ["bash", "-c", script], cwd=root, env=env,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+            self.assertIn("high or critical advisory in web build dependencies", rejected.stdout)
+            env["FAKE_WEB_HIGH"] = "0"
+            accepted = subprocess.run(
+                ["bash", "-c", script], cwd=root, env=env,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
 
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "render step needs bash and jq")
