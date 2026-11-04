@@ -1997,7 +1997,6 @@ async fn private_nodes_are_owner_only_with_cursor_pages() -> anyhow::Result<()> 
             r#"{"id":"e-revoked","kind":"place","title":"Revoked","location":{"lon":10.4,"lat":53.6},"search_visibility":"revoked","created_by_account_id":"acct-owner"}"#,
         ],
     ).await;
-
     let anonymous = app
         .clone()
         .oneshot(Request::get("/nodes?pagination=cursor&limit=1").body(body::Body::empty())?)
@@ -2071,5 +2070,149 @@ async fn private_nodes_are_owner_only_with_cursor_pages() -> anyhow::Result<()> 
             .status(),
         StatusCode::NOT_FOUND
     );
+    Ok(())
+}
+
+/// Full router with real in-memory session cookies, not injected AuthContext.
+/// No production accounts or data are accessed; every transition uses HTTP PATCH.
+#[tokio::test]
+#[serial]
+async fn private_node_visibility_changes_are_session_scoped() -> anyhow::Result<()> {
+    async fn fetch(
+        app: &Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let mut request = Request::get(uri);
+        if let Some(cookie) = cookie {
+            request = request.header("Cookie", cookie);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(body::Body::empty())?)
+            .await?;
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        Ok((status, value))
+    }
+
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    write_lines(
+        &in_dir.join("demo.nodes.jsonl"),
+        &[
+            r#"{"id":"a-public","kind":"place","title":"Always public","location":{"lon":10.0,"lat":53.5},"search_visibility":"public"}"#,
+            r#"{"id":"b-secret","kind":"place","title":"OWNER-PRIVATE-MARKER","location":{"lon":10.1,"lat":53.6},"search_visibility":"public","created_by_account_id":"acct-owner"}"#,
+            r#"{"id":"c-public","kind":"place","title":"Another public","location":{"lon":10.2,"lat":53.6},"search_visibility":"public"}"#,
+        ],
+    );
+    let _env = set_gewebe_in_dir(&in_dir);
+    let mut state = test_state().await?;
+    let mut accounts = AccountStore::new();
+    accounts.insert(gast_account("acct-owner"));
+    accounts.insert(weber_account("acct-foreign"));
+    state.accounts = Arc::new(RwLock::new(accounts));
+    let owner_session = create_session(&state, "acct-owner", None).await;
+    let foreign_session = create_session(&state, "acct-foreign", None).await;
+    let owner_cookie = format!("gewebe_session={}", owner_session.id);
+    let foreign_cookie = format!("gewebe_session={}", foreign_session.id);
+    let app = Router::new()
+        .merge(api_router())
+        .layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(require_csrf))
+        .with_state(state);
+
+    let (initial_status, initial) = fetch(&app, "/nodes/b-secret", Some(&owner_cookie)).await?;
+    assert_eq!(initial_status, StatusCode::OK);
+    let mut etag = node_etag(&initial);
+
+    for visibility in ["private", "hidden", "public", "revoked"] {
+        let update = serde_json::json!({"search_visibility": visibility}).to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::patch("/nodes/b-secret")
+                    .header("Content-Type", "application/json")
+                    .header("Cookie", &owner_cookie)
+                    .header("Host", "localhost")
+                    .header("Origin", "http://localhost")
+                    .header("If-Match", &etag)
+                    .body(body::Body::from(update))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "PATCH {visibility}");
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        let changed: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(changed["search_visibility"], visibility);
+        etag = node_etag(&changed);
+
+        // Private/hidden: owner only. Revoked: nobody. Public: everybody.
+        for (actor, cookie, permitted) in [
+            (
+                "owner",
+                Some(owner_cookie.as_str()),
+                visibility != "revoked",
+            ),
+            (
+                "foreign",
+                Some(foreign_cookie.as_str()),
+                visibility == "public",
+            ),
+            ("anonymous", None, visibility == "public"),
+        ] {
+            let expected = if permitted {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            let (direct_status, _) = fetch(&app, "/nodes/b-secret", cookie).await?;
+            assert_eq!(
+                direct_status, expected,
+                "{actor} direct GET at {visibility}"
+            );
+
+            for uri in ["/nodes", "/nodes?bbox=9.9,53.4,10.2,53.7"] {
+                let (status, payload) = fetch(&app, uri, cookie).await?;
+                assert_eq!(status, StatusCode::OK, "{actor} {uri} at {visibility}");
+                let nodes = payload.as_array().context("node list response")?;
+                let contains = nodes.iter().any(|node| node["id"] == "b-secret");
+                assert_eq!(contains, permitted, "{actor} {uri} at {visibility}");
+            }
+
+            let mut uri = "/nodes?pagination=cursor&limit=1".to_owned();
+            let mut found = false;
+            let mut finished = false;
+            for _page in 0..5 {
+                let (status, payload) = fetch(&app, &uri, cookie).await?;
+                assert_eq!(status, StatusCode::OK, "{actor} cursor at {visibility}");
+                let items = payload["items"].as_array().context("cursor items")?;
+                found |= items.iter().any(|node| node["id"] == "b-secret");
+                if payload["page"]["has_more"] == false {
+                    finished = true;
+                    break;
+                }
+                let cursor = payload["page"]["next_cursor"]
+                    .as_str()
+                    .context("cursor required for more pages")?;
+                uri = format!("/nodes?pagination=cursor&limit=1&cursor={cursor}");
+            }
+            assert!(finished, "{actor} cursor must terminate at {visibility}");
+            assert_eq!(found, permitted, "{actor} cursor at {visibility}");
+        }
+
+        // Public discovery must not show private content even to the owner.
+        let (status, public_only) =
+            fetch(&app, "/nodes?public_only=true", Some(&owner_cookie)).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            public_only
+                .as_array()
+                .context("public-only list")?
+                .iter()
+                .any(|node| node["id"] == "b-secret"),
+            visibility == "public"
+        );
+    }
     Ok(())
 }
