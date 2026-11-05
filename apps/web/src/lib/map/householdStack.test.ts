@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { MapEntityGarnrolle, MapEntityNode } from "./types";
-import { householdMemberOffset, indexHouseholdStacks } from "./householdStack";
+import {
+  householdMemberOffset,
+  householdPageCapacity,
+  indexHouseholdStacks,
+} from "./householdStack";
 
 function account(
   id: string,
@@ -77,6 +81,14 @@ describe("household stack projection", () => {
 });
 
 describe("spread-out household view", () => {
+  it("bounds household pages by viewport size without exceeding 16 markers", () => {
+    expect(householdPageCapacity(900, 700)).toBe(16);
+    expect(householdPageCapacity(220, 430)).toBe(6);
+    expect(householdPageCapacity(240, 200)).toBe(3);
+    expect(householdPageCapacity(NaN, Infinity)).toBeGreaterThan(0);
+    expect(householdPageCapacity(3000, 3000)).toBe(16);
+  });
+
   it("keeps individual accounts next to each other on desktop", () => {
     expect(
       [0, 1, 2].map((index) => householdMemberOffset(index, 3, 900)),

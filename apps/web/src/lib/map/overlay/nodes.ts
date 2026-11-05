@@ -5,6 +5,7 @@ import type { WeaveEntity } from "$lib/map/weaveTheme";
 import { getMapMarkerScale } from "$lib/map/markerScale";
 import {
   householdMemberOffset,
+  householdPageCapacity,
   indexHouseholdStacks,
   type HouseholdIndex,
   type HouseholdStack,
@@ -164,7 +165,9 @@ export class NodesOverlay {
   /** Most recently focused Garnrolle stays at the front across data refreshes. */
   private householdFront = new Map<string, string>();
   private expandedHouseholdKey: string | null = null;
+  private expandedHouseholdPage = 0;
   private householdCloseButton: HTMLButtonElement | null = null;
+  private householdPager: HTMLElement | null = null;
   private suppressClickId: string | null = null;
   private suppressClickUntil = 0;
   private markerSpatialIndex: MarkerSpatialIndex | null = null;
@@ -175,6 +178,23 @@ export class NodesOverlay {
   private readonly mapScaleOwner = Symbol("nodes-overlay-map-scale");
   private readonly handleZoom = () => {
     if (this.map) this.updateZoom(this.map.getZoom());
+  };
+  private readonly handleHouseholdResize = () => {
+    if (!this.expandedHouseholdKey) return;
+    const group = this.households.groups.get(this.expandedHouseholdKey);
+    if (!group) return;
+    this.expandedHouseholdPage = Math.min(
+      this.expandedHouseholdPage,
+      this.householdPageCount(group) - 1,
+    );
+    this.syncHouseholdPager(group);
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
+  };
+  private readonly handleHouseholdKeyDown = (event: KeyboardEvent) => {
+    if (event.key !== "Escape" || !this.expandedHouseholdKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.closeHousehold();
   };
   private readonly handleMoveEnd = () => {
     if (this.nativeLayerEnabled) {
@@ -227,6 +247,7 @@ export class NodesOverlay {
         MAP_OBJECT_SCALE_OWNERS.set(container, ownership);
       }
       ownership.owners.add(this.mapScaleOwner);
+      container.addEventListener?.("keydown", this.handleHouseholdKeyDown);
     }
     if (
       this.map &&
@@ -238,6 +259,7 @@ export class NodesOverlay {
     }
     if (this.map && typeof this.map.on === "function") {
       this.map.on("moveend", this.handleMoveEnd);
+      this.map.on("resize", this.handleHouseholdResize);
       if (this.supportsNativeEntityLayer()) {
         this.map.on("styledata", this.handleStyleData);
         // styledata can fire while MapLibre still reports isStyleLoaded=false.
@@ -483,9 +505,94 @@ export class NodesOverlay {
 
   private isHouseholdSearchMatch(item: MapEntityViewModel): boolean {
     const group = this.households.byAccountId.get(item.id);
-    return group
-      ? group.members.some((member) => this.searchMatchIds.has(member.id))
-      : this.searchMatchIds.has(item.id);
+    if (!group || group.key === this.expandedHouseholdKey) {
+      // An individual Garnrolle must not inherit its neighbours' search hit.
+      return this.searchMatchIds.has(item.id);
+    }
+    return group.members.some((member) => this.searchMatchIds.has(member.id));
+  }
+
+  private householdPageCapacity() {
+    return householdPageCapacity(
+      this.mapScaleContainer?.clientWidth ?? 320,
+      this.mapScaleContainer?.clientHeight ?? 600,
+    );
+  }
+
+  private householdPageCount(group: HouseholdStack) {
+    return Math.max(
+      1,
+      Math.ceil(group.members.length / this.householdPageCapacity()),
+    );
+  }
+
+  private householdPageMembers(group: HouseholdStack) {
+    const capacity = this.householdPageCapacity();
+    const start = this.expandedHouseholdPage * capacity;
+    return group.members.slice(start, start + capacity);
+  }
+
+  private syncHouseholdPager(group: HouseholdStack) {
+    const pageCount = this.householdPageCount(group);
+    if (pageCount < 2 || !this.mapScaleContainer) {
+      this.householdPager?.remove();
+      this.householdPager = null;
+      return;
+    }
+    if (!this.householdPager) {
+      const pager = document.createElement("nav");
+      pager.className = "map-household-pager";
+      pager.dataset.testid = "household-page-controls";
+      pager.setAttribute(
+        "aria-label",
+        "Weitere Garnrollen der Hausgemeinschaft",
+      );
+      const previous = document.createElement("button");
+      previous.type = "button";
+      previous.textContent = "Zurück";
+      previous.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.turnHouseholdPage(-1);
+      });
+      const count = document.createElement("span");
+      count.className = "map-household-pager__count";
+      count.setAttribute("aria-live", "polite");
+      const next = document.createElement("button");
+      next.type = "button";
+      next.textContent = "Weiter";
+      next.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.turnHouseholdPage(1);
+      });
+      pager.append(previous, count, next);
+      this.mapScaleContainer.append(pager);
+      this.householdPager = pager;
+    }
+    const previous = this.householdPager.children[0] as HTMLButtonElement;
+    const count = this.householdPager.children[1] as HTMLElement;
+    const next = this.householdPager.children[2] as HTMLButtonElement;
+    previous.disabled = this.expandedHouseholdPage === 0;
+    next.disabled = this.expandedHouseholdPage >= pageCount - 1;
+    count.textContent = `Seite ${this.expandedHouseholdPage + 1} von ${pageCount}`;
+  }
+
+  private turnHouseholdPage(direction: -1 | 1) {
+    if (!this.expandedHouseholdKey) return;
+    const group = this.households.groups.get(this.expandedHouseholdKey);
+    if (!group) return;
+    const next = Math.max(
+      0,
+      Math.min(
+        this.householdPageCount(group) - 1,
+        this.expandedHouseholdPage + direction,
+      ),
+    );
+    if (next === this.expandedHouseholdPage) return;
+    this.expandedHouseholdPage = next;
+    this.syncHouseholdPager(group);
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
+    const first = this.householdPageMembers(group)[0];
+    if (first) this.getActiveMarker(first.id)?.element.focus?.();
   }
 
   private syncHouseholdAppearance(
@@ -526,11 +633,12 @@ export class NodesOverlay {
       ? item.title
       : `Hausgemeinschaft mit ${group.members.length} Garnrollen – gedrückt halten oder doppelklicken`;
     if (expanded) {
-      const index = group.members.findIndex((member) => member.id === item.id);
+      const membersOnPage = this.householdPageMembers(group);
+      const index = membersOnPage.findIndex((member) => member.id === item.id);
       const viewportWidth = this.mapScaleContainer?.clientWidth ?? 320;
       const offset = householdMemberOffset(
         index,
-        group.members.length,
+        membersOnPage.length,
         viewportWidth,
       );
       element.style.translate = `${offset.x}px ${offset.y}px`;
@@ -545,6 +653,16 @@ export class NodesOverlay {
   private openHousehold(key: string) {
     const group = this.households.groups.get(key);
     if (!group || !this.map) return;
+    if (this.expandedHouseholdKey !== key) {
+      const chosenId = this.householdFrontItem(group).id;
+      const firstIndex = group.members.findIndex(
+        (item) => item.id === chosenId,
+      );
+      this.expandedHouseholdPage = Math.max(
+        0,
+        Math.floor(firstIndex / this.householdPageCapacity()),
+      );
+    }
     this.expandedHouseholdKey = key;
     const map = this.map;
     const zoom = typeof map.getZoom === "function" ? map.getZoom() : 15;
@@ -574,14 +692,25 @@ export class NodesOverlay {
         "Hausgemeinschaftssicht schließen",
       );
     }
+    this.syncHouseholdPager(group);
     this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
   }
 
   private closeHousehold() {
+    const group = this.expandedHouseholdKey
+      ? this.households.groups.get(this.expandedHouseholdKey)
+      : undefined;
     this.expandedHouseholdKey = null;
+    this.expandedHouseholdPage = 0;
     this.householdCloseButton?.remove();
     this.householdCloseButton = null;
+    this.householdPager?.remove();
+    this.householdPager = null;
     this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
+    if (group)
+      this.getActiveMarker(
+        this.householdFrontItem(group).id,
+      )?.element.focus?.();
   }
 
   private installHouseholdGesture(
@@ -874,8 +1003,16 @@ export class NodesOverlay {
       this.households.groups.values(),
     ).flatMap((group) =>
       this.expandedHouseholdKey === group.key
-        ? group.members
+        ? this.householdPageMembers(group)
         : [this.householdFrontItem(group)],
+    );
+    const expandedGroup = this.expandedHouseholdKey
+      ? this.households.groups.get(this.expandedHouseholdKey)
+      : undefined;
+    const visibleExpandedIds = new Set(
+      expandedGroup?.members
+        ? this.householdPageMembers(expandedGroup).map((member) => member.id)
+        : [],
     );
     const candidates = (
       useNativeLayer
@@ -888,11 +1025,10 @@ export class NodesOverlay {
             })
     ).filter((item) => {
       const group = this.households.byAccountId.get(item.id);
-      return (
-        !group ||
-        this.expandedHouseholdKey === group.key ||
-        this.householdFrontItem(group).id === item.id
-      );
+      if (!group) return true;
+      return this.expandedHouseholdKey === group.key
+        ? visibleExpandedIds.has(item.id)
+        : this.householdFrontItem(group).id === item.id;
     });
     const currentIds = new Set<string>();
 
@@ -1119,13 +1255,22 @@ export class NodesOverlay {
         this.householdFront.set(group.key, this.selectedMarkerId);
       }
     }
-    if (
-      this.expandedHouseholdKey &&
-      !this.households.groups.has(this.expandedHouseholdKey)
-    ) {
-      this.expandedHouseholdKey = null;
-      this.householdCloseButton?.remove();
-      this.householdCloseButton = null;
+    if (this.expandedHouseholdKey) {
+      const group = this.households.groups.get(this.expandedHouseholdKey);
+      if (!group) {
+        this.expandedHouseholdKey = null;
+        this.expandedHouseholdPage = 0;
+        this.householdCloseButton?.remove();
+        this.householdCloseButton = null;
+        this.householdPager?.remove();
+        this.householdPager = null;
+      } else {
+        this.expandedHouseholdPage = Math.min(
+          this.expandedHouseholdPage,
+          this.householdPageCount(group) - 1,
+        );
+        this.syncHouseholdPager(group);
+      }
     }
     this.rebuildMarkerSpatialIndex(points);
     this.reconcileMarkers(points, showNodes);
@@ -1172,16 +1317,22 @@ export class NodesOverlay {
       : undefined;
     if (household && nextSelectedMarkerId) {
       this.householdFront.set(household.key, nextSelectedMarkerId);
+      if (this.expandedHouseholdKey === household.key) {
+        const index = household.members.findIndex(
+          (member) => member.id === nextSelectedMarkerId,
+        );
+        this.expandedHouseholdPage = Math.max(
+          0,
+          Math.floor(index / this.householdPageCapacity()),
+        );
+        this.syncHouseholdPager(household);
+      }
     }
     if (nextSelectedMarkerId !== null) {
       this.setSelected(nextSelectedMarkerId, true);
       this.setNativeFeatureState(nextSelectedMarkerId, { selected: true });
     }
-    if (this.nativeLayerEnabled) {
-      this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
-    } else {
-      this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
-    }
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
   }
 
   public updateSearchMatches(nextSearchMatchIds: ReadonlySet<string>) {
@@ -1200,11 +1351,7 @@ export class NodesOverlay {
     }
 
     this.searchMatchIds = new Set(nextSearchMatchIds);
-    if (this.nativeLayerEnabled) {
-      this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
-    } else {
-      this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
-    }
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
   }
 
   public getActiveMarker(id: string) {
@@ -1215,6 +1362,7 @@ export class NodesOverlay {
     if (this.map && typeof this.map.off === "function") {
       this.map.off("zoom", this.handleZoom);
       this.map.off("moveend", this.handleMoveEnd);
+      this.map.off("resize", this.handleHouseholdResize);
       if (this.supportsNativeEntityLayer()) {
         this.map.off("styledata", this.handleStyleData);
         this.map.off("style.load", this.handleStyleData);
@@ -1229,6 +1377,7 @@ export class NodesOverlay {
     }
     if (this.mapScaleContainer) {
       const container = this.mapScaleContainer;
+      container.removeEventListener?.("keydown", this.handleHouseholdKeyDown);
       const ownership = MAP_OBJECT_SCALE_OWNERS.get(container);
       if (
         ownership?.owners.delete(this.mapScaleOwner) &&
@@ -1248,7 +1397,10 @@ export class NodesOverlay {
     }
     this.householdCloseButton?.remove();
     this.householdCloseButton = null;
+    this.householdPager?.remove();
+    this.householdPager = null;
     this.expandedHouseholdKey = null;
+    this.expandedHouseholdPage = 0;
     this.households.groups.clear();
     this.households.byAccountId.clear();
     this.householdFront.clear();

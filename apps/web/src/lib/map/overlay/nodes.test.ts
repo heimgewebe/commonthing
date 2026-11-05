@@ -507,6 +507,72 @@ describe("NodesOverlay household interactions", () => {
     }
   });
 
+  it("pages 20 co-located accounts on mobile, without losing focus or individual search matches", () => {
+    const { overlay, container } = makeOverlayWithContainer();
+    Object.assign(container, { clientWidth: 220, clientHeight: 430 });
+    const accounts = Array.from({ length: 20 }, (_, index) =>
+      exact(`g-${index}`),
+    );
+    overlay.update(accounts, true);
+    (overlay.getActiveMarker("g-19")?.element as unknown as FakeElement).fire(
+      "dblclick",
+    );
+
+    const pager = container.children.find(
+      (child) => child.dataset.testid === "household-page-controls",
+    );
+    expect(pager?.children[1].textContent).toBe("Seite 4 von 4");
+    expect(
+      accounts.filter((item) => overlay.getActiveMarker(item.id)),
+    ).toHaveLength(2);
+
+    (pager?.children[0] as FakeElement).fire("click");
+    expect(pager?.children[1].textContent).toBe("Seite 3 von 4");
+    expect(
+      accounts.filter((item) => overlay.getActiveMarker(item.id)),
+    ).toHaveLength(6);
+    overlay.updateSearchMatches(new Set(["g-12"]));
+    expect(overlay.getActiveMarker("g-12")?.element.dataset.searchMatch).toBe(
+      "true",
+    );
+    expect(
+      overlay.getActiveMarker("g-13")?.element.dataset.searchMatch,
+    ).toBeUndefined();
+
+    overlay.updateSelection("g-4");
+    expect(pager?.children[1].textContent).toBe("Seite 1 von 4");
+    expect(overlay.getActiveMarker("g-4")).toBeDefined();
+    expect(overlay.getActiveMarker("g-12")).toBeUndefined();
+
+    container.fire("keydown", { key: "Escape" });
+    expect(pager?.removed).toBe(true);
+    expect(overlay.getActiveMarker("g-4")?.element.dataset.householdCount).toBe(
+      "20",
+    );
+    expect(overlay.getActiveMarker("g-19")).toBeUndefined();
+    overlay.destroy();
+  });
+
+  it("removes paging controls when the house becomes a standalone account", () => {
+    const { overlay, container } = makeOverlayWithContainer();
+    Object.assign(container, { clientWidth: 220, clientHeight: 430 });
+    const accounts = Array.from({ length: 20 }, (_, index) =>
+      exact(`g-${index}`),
+    );
+    overlay.update(accounts, true);
+    (overlay.getActiveMarker("g-19")?.element as unknown as FakeElement).fire(
+      "dblclick",
+    );
+    const pager = container.children.find(
+      (child) => child.dataset.testid === "household-page-controls",
+    );
+    expect(pager).toBeDefined();
+    overlay.update([accounts[0]], true);
+    expect(pager?.removed).toBe(true);
+    expect(overlay.getActiveMarker("g-0")).toBeDefined();
+    overlay.destroy();
+  });
+
   it("cancels a longpress on dragging so normal map panning is unaffected", () => {
     vi.useFakeTimers();
     try {

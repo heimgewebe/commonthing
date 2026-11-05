@@ -68,3 +68,24 @@ export function householdMemberOffset(
     y: Math.round((row - (rows - 1) / 2) * 72),
   };
 }
+
+/**
+ * Keep the exploded view inside its map viewport. A large building must never
+ * allocate one MapLibre DOM marker for every resident at once, nor place hit
+ * targets outside the screen with no way to reach them. Pages reuse the same
+ * geographic anchor and preserve the independent selection of each Garnrolle.
+ */
+export function householdPageCapacity(
+  viewportWidth: number,
+  viewportHeight: number,
+): number {
+  const width =
+    Number.isFinite(viewportWidth) && viewportWidth > 0 ? viewportWidth : 320;
+  const height =
+    Number.isFinite(viewportHeight) && viewportHeight > 0
+      ? viewportHeight
+      : 600;
+  const columns = Math.min(4, Math.max(1, Math.floor((width - 32) / 68)));
+  const rows = Math.min(4, Math.max(1, Math.floor((height - 180) / 72)));
+  return columns * rows;
+}
