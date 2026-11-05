@@ -1111,6 +1111,14 @@ export class NodesOverlay {
     for (const key of this.householdFront.keys()) {
       if (!this.households.groups.has(key)) this.householdFront.delete(key);
     }
+    // When a previously standalone selection becomes a household, preserve
+    // the selected account as its front instead of defaulting to the last item.
+    if (this.selectedMarkerId !== null) {
+      const group = this.households.byAccountId.get(this.selectedMarkerId);
+      if (group && !this.householdFront.has(group.key)) {
+        this.householdFront.set(group.key, this.selectedMarkerId);
+      }
+    }
     if (
       this.expandedHouseholdKey &&
       !this.households.groups.has(this.expandedHouseholdKey)

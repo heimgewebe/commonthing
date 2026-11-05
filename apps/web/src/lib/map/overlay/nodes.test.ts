@@ -450,6 +450,26 @@ describe("NodesOverlay household interactions", () => {
     overlay.destroy();
   });
 
+  it("keeps an already-selected standalone account in front when a household forms", () => {
+    const overlay = makeOverlay();
+    overlay.update([exact("a"), makeNode("knoten")], true);
+    overlay.updateSelection("a");
+    expect(overlay.getActiveMarker("a")?.element.dataset.selected).toBe("true");
+
+    // A normal data refresh adds B at the exact same location; the selection
+    // effect may not rerun because the selected ID did not change.
+    overlay.update([exact("a"), exact("b"), makeNode("knoten")], true);
+    expect(overlay.getActiveMarker("a")?.element.dataset.householdCount).toBe(
+      "2",
+    );
+    expect(overlay.getActiveMarker("a")?.element.dataset.selected).toBe("true");
+    expect(overlay.getActiveMarker("b")).toBeUndefined();
+    overlay.updateSelection("a");
+    expect(overlay.getActiveMarker("a")).toBeDefined();
+
+    overlay.destroy();
+  });
+
   it("opens by longpress, spreads all account hit targets, and closes with last-used on top", () => {
     vi.useFakeTimers();
     try {
