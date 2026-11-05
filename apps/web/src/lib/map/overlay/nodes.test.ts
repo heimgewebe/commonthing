@@ -90,6 +90,36 @@ class FakeElement {
   style = new FakeStyle();
   private _className = "";
   private _innerHTML = "";
+  private listeners = new Map<string, Set<(event: any) => void>>();
+  removed = false;
+
+  addEventListener(type: string, listener: (event: any) => void) {
+    const set = this.listeners.get(type) ?? new Set();
+    set.add(listener);
+    this.listeners.set(type, set);
+  }
+
+  removeEventListener(type: string, listener: (event: any) => void) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  fire(type: string, values: Record<string, unknown> = {}) {
+    const event = {
+      type,
+      button: 0,
+      clientX: 100,
+      clientY: 100,
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn(),
+      ...values,
+    };
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+    return event;
+  }
+
+  remove() {
+    this.removed = true;
+  }
 
   set className(value: string) {
     this._className = value;
@@ -389,6 +419,201 @@ describe("diffSearchMatchIds", () => {
       added: [],
       removed: [],
     });
+  });
+});
+
+describe("NodesOverlay household interactions", () => {
+  const exact = (id: string): MapEntityGarnrolle => ({
+    ...makeAccount(id),
+    map_state: "exact",
+  });
+
+  it("keeps the most recently selected account in front, with other nodes intact", () => {
+    const overlay = makeOverlay();
+    overlay.update([exact("a"), exact("b"), makeNode("knoten")], true);
+    expect(overlay.getActiveMarker("a")).toBeUndefined();
+    const top = overlay.getActiveMarker("b");
+    expect(top?.element.dataset.householdCount).toBe("2");
+    expect(top?.element.classList.contains("marker-household-stack")).toBe(
+      true,
+    );
+    expect(overlay.getActiveMarker("knoten")).toBeDefined();
+
+    overlay.updateSelection("a");
+    expect(overlay.getActiveMarker("b")).toBeUndefined();
+    expect(overlay.getActiveMarker("a")?.element.dataset.selected).toBe("true");
+
+    // A refresh may reorder the server response; the front is user-driven.
+    overlay.update([exact("b"), exact("a"), makeNode("knoten")], true);
+    expect(overlay.getActiveMarker("a")).toBeDefined();
+    expect(overlay.getActiveMarker("b")).toBeUndefined();
+    overlay.destroy();
+  });
+
+  it("keeps an already-selected standalone account in front when a household forms", () => {
+    const overlay = makeOverlay();
+    overlay.update([exact("a"), makeNode("knoten")], true);
+    overlay.updateSelection("a");
+    expect(overlay.getActiveMarker("a")?.element.dataset.selected).toBe("true");
+
+    // A normal data refresh adds B at the exact same location; the selection
+    // effect may not rerun because the selected ID did not change.
+    overlay.update([exact("a"), exact("b"), makeNode("knoten")], true);
+    expect(overlay.getActiveMarker("a")?.element.dataset.householdCount).toBe(
+      "2",
+    );
+    expect(overlay.getActiveMarker("a")?.element.dataset.selected).toBe("true");
+    expect(overlay.getActiveMarker("b")).toBeUndefined();
+    overlay.updateSelection("a");
+    expect(overlay.getActiveMarker("a")).toBeDefined();
+
+    overlay.destroy();
+  });
+
+  it("opens by longpress, spreads all account hit targets, and closes with last-used on top", () => {
+    vi.useFakeTimers();
+    try {
+      const { overlay, container } = makeOverlayWithContainer();
+      overlay.update([exact("a"), exact("b"), makeNode("knoten")], true);
+      const top = overlay.getActiveMarker("b")
+        ?.element as unknown as FakeElement;
+      top.fire("pointerdown");
+      vi.advanceTimersByTime(649);
+      expect(overlay.getActiveMarker("a")).toBeUndefined();
+      vi.advanceTimersByTime(1);
+      const first = overlay.getActiveMarker("a")
+        ?.element as unknown as FakeElement;
+      const second = overlay.getActiveMarker("b")
+        ?.element as unknown as FakeElement;
+      expect(first).toBeDefined();
+      expect(second).toBeDefined();
+      expect(first.style.translate).not.toBe(second.style.translate);
+      expect(first.classList.contains("marker-household-expanded")).toBe(true);
+      expect(overlay.getActiveMarker("knoten")).toBeDefined();
+
+      // Tapping another account changes the front after the household closes.
+      first.fire("click");
+      const close = container.children.find(
+        (child) => child.dataset.testid === "close-household-view",
+      );
+      expect(close).toBeDefined();
+      expect(close?.fire("mousedown").stopPropagation).toHaveBeenCalledOnce();
+      expect(close?.fire("touchstart").stopPropagation).toHaveBeenCalledOnce();
+      close?.fire("click");
+      expect(close?.removed).toBe(true);
+      expect(overlay.getActiveMarker("a")).toBeDefined();
+      expect(overlay.getActiveMarker("b")).toBeUndefined();
+      overlay.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("pages 20 co-located accounts on mobile, without losing focus or individual search matches", () => {
+    const { overlay, container } = makeOverlayWithContainer();
+    Object.assign(container, { clientWidth: 220, clientHeight: 430 });
+    const accounts = Array.from({ length: 20 }, (_, index) =>
+      exact(`g-${index}`),
+    );
+    overlay.update(accounts, true);
+    (overlay.getActiveMarker("g-19")?.element as unknown as FakeElement).fire(
+      "dblclick",
+    );
+
+    const pager = container.children.find(
+      (child) => child.dataset.testid === "household-page-controls",
+    );
+    expect(pager?.children[1].textContent).toBe("Seite 4 von 4");
+    expect(pager?.fire("pointerdown").stopPropagation).toHaveBeenCalledOnce();
+    expect(pager?.fire("mousedown").stopPropagation).toHaveBeenCalledOnce();
+    expect(
+      accounts.filter((item) => overlay.getActiveMarker(item.id)),
+    ).toHaveLength(2);
+
+    (pager?.children[0] as FakeElement).fire("click");
+    expect(pager?.children[1].textContent).toBe("Seite 3 von 4");
+    expect(
+      accounts.filter((item) => overlay.getActiveMarker(item.id)),
+    ).toHaveLength(6);
+    overlay.updateSearchMatches(new Set(["g-12"]));
+    expect(overlay.getActiveMarker("g-12")?.element.dataset.searchMatch).toBe(
+      "true",
+    );
+    expect(
+      overlay.getActiveMarker("g-13")?.element.dataset.searchMatch,
+    ).toBeUndefined();
+
+    overlay.updateSelection("g-4");
+    expect(pager?.children[1].textContent).toBe("Seite 1 von 4");
+    expect(overlay.getActiveMarker("g-4")).toBeDefined();
+    expect(overlay.getActiveMarker("g-12")).toBeUndefined();
+
+    container.fire("keydown", { key: "Escape" });
+    expect(pager?.removed).toBe(true);
+    expect(overlay.getActiveMarker("g-4")?.element.dataset.householdCount).toBe(
+      "20",
+    );
+    expect(overlay.getActiveMarker("g-19")).toBeUndefined();
+    overlay.destroy();
+  });
+
+  it("removes paging controls when the house becomes a standalone account", () => {
+    const { overlay, container } = makeOverlayWithContainer();
+    Object.assign(container, { clientWidth: 220, clientHeight: 430 });
+    const accounts = Array.from({ length: 20 }, (_, index) =>
+      exact(`g-${index}`),
+    );
+    overlay.update(accounts, true);
+    (overlay.getActiveMarker("g-19")?.element as unknown as FakeElement).fire(
+      "dblclick",
+    );
+    const pager = container.children.find(
+      (child) => child.dataset.testid === "household-page-controls",
+    );
+    expect(pager).toBeDefined();
+    overlay.update([accounts[0]], true);
+    expect(pager?.removed).toBe(true);
+    expect(overlay.getActiveMarker("g-0")).toBeDefined();
+    overlay.destroy();
+  });
+
+  it("prevents a native context menu after the touch hold already opened a household", () => {
+    vi.useFakeTimers();
+    try {
+      const { overlay } = makeOverlayWithContainer();
+      const a = { ...makeAccount("a"), map_state: "exact" as const };
+      const b = { ...makeAccount("b"), map_state: "exact" as const };
+      overlay.update([a, b], true);
+      const front = overlay.getActiveMarker("b")
+        ?.element as unknown as FakeElement;
+      front.fire("pointerdown");
+      vi.advanceTimersByTime(650);
+      expect(overlay.getActiveMarker("a")).toBeDefined();
+
+      const menu = front.fire("contextmenu");
+      expect(menu.preventDefault).toHaveBeenCalledTimes(1);
+      expect(overlay.getActiveMarker("a")).toBeDefined();
+      overlay.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a longpress on dragging so normal map panning is unaffected", () => {
+    vi.useFakeTimers();
+    try {
+      const overlay = makeOverlay();
+      overlay.update([exact("a"), exact("b")], true);
+      const top = overlay.getActiveMarker("b")
+        ?.element as unknown as FakeElement;
+      top.fire("pointerdown");
+      top.fire("pointermove", { clientX: 120 });
+      vi.advanceTimersByTime(800);
+      expect(overlay.getActiveMarker("a")).toBeUndefined();
+      overlay.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

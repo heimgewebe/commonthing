@@ -496,3 +496,147 @@
     animation: none;
   }
 }
+
+/* Garnrollen am identischen exakten Standort: echte Spulenlagen statt Schatten.
+ * Nur die zuletzt fokussierte Spule hat im geschlossenen Zustand ein Hit-Target.
+ */
+/* Prevent the iOS selection/callout UI from masking intentional longpress. */
+.marker-household-stack,
+.marker-household-expanded {
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+}
+
+.marker-household__behind {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.marker-household__back {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  user-select: none;
+}
+
+.marker-household__back--1 {
+  transform: translate(-8px, -7px) rotate(-9deg);
+}
+
+.marker-household__back--2 {
+  transform: translate(6px, -6px) rotate(7deg);
+}
+
+.marker-household-stack .marker-account__icon,
+.marker-household-expanded .marker-account__icon {
+  position: relative;
+  z-index: 2;
+}
+
+.marker-household-stack::after {
+  content: attr(data-household-count);
+  position: absolute;
+  right: -8px;
+  bottom: -8px;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid #775440;
+  border-radius: 999px;
+  background: #f4e5cd;
+  color: #3c281a;
+  font:
+    700 11px/1 system-ui,
+    sans-serif;
+  pointer-events: none;
+}
+
+.marker-household-expanded .marker-household__behind {
+  display: none;
+}
+
+.marker-household-expanded:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.map-household-close {
+  position: absolute;
+  z-index: 80;
+  top: 12px;
+  left: 50%;
+  translate: -50% 0;
+  max-width: calc(100% - 24px);
+  padding: 9px 13px;
+  border: 1px solid #775440;
+  border-radius: 999px;
+  background: #f4e5cd;
+  color: #3c281a;
+  box-shadow: none;
+  font:
+    600 12px/1.3 system-ui,
+    sans-serif;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.map-household-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Visible page controls keep even large house communities reachable on mobile. */
+.map-household-pager {
+  position: absolute;
+  z-index: 80;
+  bottom: max(16px, env(safe-area-inset-bottom));
+  left: 50%;
+  translate: -50% 0;
+  max-width: calc(100% - 24px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px;
+  border: 1px solid #775440;
+  border-radius: 999px;
+  background: #f4e5cd;
+  color: #3c281a;
+  font:
+    600 12px/1.3 system-ui,
+    sans-serif;
+}
+
+.map-household-pager button {
+  min-width: 58px;
+  min-height: 44px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.map-household-pager button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.map-household-pager button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.map-household-pager__count {
+  white-space: nowrap;
+  text-align: center;
+}

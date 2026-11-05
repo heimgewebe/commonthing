@@ -3,6 +3,13 @@ import { hasRenderableMapPosition } from "$lib/map/coordinates";
 import type { MapEntityViewModel } from "$lib/map/types";
 import type { WeaveEntity } from "$lib/map/weaveTheme";
 import { getMapMarkerScale } from "$lib/map/markerScale";
+import {
+  householdMemberOffset,
+  householdPageCapacity,
+  indexHouseholdStacks,
+  type HouseholdIndex,
+  type HouseholdStack,
+} from "$lib/map/householdStack";
 import "./markers.css";
 import { garnrolleIcon } from "$lib/ui/icons";
 import { weaveRuntime, type WeaveRuntime } from "./weaveRuntime";
@@ -151,6 +158,18 @@ export class NodesOverlay {
   private markerScaleInitialized = false;
   private latestPoints: MapEntityViewModel[] = [];
   private latestShowNodes = true;
+  private households: HouseholdIndex = {
+    groups: new Map(),
+    byAccountId: new Map(),
+  };
+  /** Most recently focused Garnrolle stays at the front across data refreshes. */
+  private householdFront = new Map<string, string>();
+  private expandedHouseholdKey: string | null = null;
+  private expandedHouseholdPage = 0;
+  private householdCloseButton: HTMLButtonElement | null = null;
+  private householdPager: HTMLElement | null = null;
+  private suppressClickId: string | null = null;
+  private suppressClickUntil = 0;
   private markerSpatialIndex: MarkerSpatialIndex | null = null;
   private nativeLayerEnabled = false;
   private nativeSyncing = false;
@@ -160,7 +179,32 @@ export class NodesOverlay {
   private readonly handleZoom = () => {
     if (this.map) this.updateZoom(this.map.getZoom());
   };
+  private readonly handleHouseholdResize = () => {
+    if (!this.expandedHouseholdKey) return;
+    const group = this.households.groups.get(this.expandedHouseholdKey);
+    if (!group) return;
+    this.expandedHouseholdPage = Math.min(
+      this.expandedHouseholdPage,
+      this.householdPageCount(group) - 1,
+    );
+    this.syncHouseholdPager(group);
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
+  };
+  private readonly handleHouseholdKeyDown = (event: KeyboardEvent) => {
+    if (event.key !== "Escape" || !this.expandedHouseholdKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.closeHousehold();
+  };
   private readonly handleMoveEnd = () => {
+    if (this.nativeLayerEnabled) {
+      // Stacked households use DOM markers even in the dense native layer.
+      // Reconcile on pan without resending the ordinary GeoJSON features.
+      if (this.households.groups.size > 0) {
+        this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
+      }
+      return;
+    }
     this.reconcileVirtualizedMarkers();
   };
   private readonly handleStyleData = () => {
@@ -203,6 +247,7 @@ export class NodesOverlay {
         MAP_OBJECT_SCALE_OWNERS.set(container, ownership);
       }
       ownership.owners.add(this.mapScaleOwner);
+      container.addEventListener?.("keydown", this.handleHouseholdKeyDown);
     }
     if (
       this.map &&
@@ -214,6 +259,7 @@ export class NodesOverlay {
     }
     if (this.map && typeof this.map.on === "function") {
       this.map.on("moveend", this.handleMoveEnd);
+      this.map.on("resize", this.handleHouseholdResize);
       if (this.supportsNativeEntityLayer()) {
         this.map.on("styledata", this.handleStyleData);
         // styledata can fire while MapLibre still reports isStyleLoaded=false.
@@ -267,6 +313,9 @@ export class NodesOverlay {
     const features: NativeEntityFeatureCollection["features"] = [];
     for (const item of this.latestPoints) {
       if (!hasRenderableMapPosition(item)) continue;
+      // Exactly co-located accounts are rendered as one interactive DOM stack,
+      // even when the rest of the scene uses the dense native circle layer.
+      if (this.households.byAccountId.has(item.id)) continue;
       features.push({
         type: "Feature",
         id: item.id,
@@ -446,6 +495,328 @@ export class NodesOverlay {
     }
   }
 
+  private householdFrontItem(group: HouseholdStack) {
+    const preferredId = this.householdFront.get(group.key);
+    return (
+      group.members.find((member) => member.id === preferredId) ??
+      group.members[group.members.length - 1]
+    );
+  }
+
+  private isHouseholdSearchMatch(item: MapEntityViewModel): boolean {
+    const group = this.households.byAccountId.get(item.id);
+    if (!group || group.key === this.expandedHouseholdKey) {
+      // An individual Garnrolle must not inherit its neighbours' search hit.
+      return this.searchMatchIds.has(item.id);
+    }
+    return group.members.some((member) => this.searchMatchIds.has(member.id));
+  }
+
+  private householdPageCapacity() {
+    return householdPageCapacity(
+      this.mapScaleContainer?.clientWidth ?? 320,
+      this.mapScaleContainer?.clientHeight ?? 600,
+    );
+  }
+
+  private householdPageCount(group: HouseholdStack) {
+    return Math.max(
+      1,
+      Math.ceil(group.members.length / this.householdPageCapacity()),
+    );
+  }
+
+  private householdPageMembers(group: HouseholdStack) {
+    const capacity = this.householdPageCapacity();
+    const start = this.expandedHouseholdPage * capacity;
+    return group.members.slice(start, start + capacity);
+  }
+
+  private isolateHouseholdControl(element: HTMLElement) {
+    // MapLibre and the map's node-composition longpress must not interpret
+    // operating the pager/close button as a map pan or a place gesture.
+    for (const type of ["pointerdown", "mousedown", "touchstart", "dblclick"]) {
+      element.addEventListener(type, (event) => event.stopPropagation());
+    }
+  }
+
+  private syncHouseholdPager(group: HouseholdStack) {
+    const pageCount = this.householdPageCount(group);
+    if (pageCount < 2 || !this.mapScaleContainer) {
+      this.householdPager?.remove();
+      this.householdPager = null;
+      return;
+    }
+    if (!this.householdPager) {
+      const pager = document.createElement("nav");
+      pager.className = "map-household-pager";
+      pager.dataset.testid = "household-page-controls";
+      this.isolateHouseholdControl(pager);
+      pager.setAttribute(
+        "aria-label",
+        "Weitere Garnrollen der Hausgemeinschaft",
+      );
+      const previous = document.createElement("button");
+      previous.type = "button";
+      previous.textContent = "Zurück";
+      previous.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.turnHouseholdPage(-1);
+      });
+      const count = document.createElement("span");
+      count.className = "map-household-pager__count";
+      count.setAttribute("aria-live", "polite");
+      const next = document.createElement("button");
+      next.type = "button";
+      next.textContent = "Weiter";
+      next.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.turnHouseholdPage(1);
+      });
+      pager.append(previous, count, next);
+      this.mapScaleContainer.append(pager);
+      this.householdPager = pager;
+    }
+    const previous = this.householdPager.children[0] as HTMLButtonElement;
+    const count = this.householdPager.children[1] as HTMLElement;
+    const next = this.householdPager.children[2] as HTMLButtonElement;
+    previous.disabled = this.expandedHouseholdPage === 0;
+    next.disabled = this.expandedHouseholdPage >= pageCount - 1;
+    count.textContent = `Seite ${this.expandedHouseholdPage + 1} von ${pageCount}`;
+  }
+
+  private turnHouseholdPage(direction: -1 | 1) {
+    if (!this.expandedHouseholdKey) return;
+    const group = this.households.groups.get(this.expandedHouseholdKey);
+    if (!group) return;
+    const next = Math.max(
+      0,
+      Math.min(
+        this.householdPageCount(group) - 1,
+        this.expandedHouseholdPage + direction,
+      ),
+    );
+    if (next === this.expandedHouseholdPage) return;
+    this.expandedHouseholdPage = next;
+    this.syncHouseholdPager(group);
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
+    const first = this.householdPageMembers(group)[0];
+    if (first) this.getActiveMarker(first.id)?.element.focus?.();
+  }
+
+  private syncHouseholdAppearance(
+    element: HTMLElement,
+    item: MapEntityViewModel,
+  ) {
+    if (item.type !== "garnrolle") return;
+    const group = this.households.byAccountId.get(item.id);
+    const expanded = Boolean(group && group.key === this.expandedHouseholdKey);
+    element.classList.toggle(
+      "marker-household-stack",
+      Boolean(group) && !expanded,
+    );
+    element.classList.toggle("marker-household-expanded", expanded);
+    element.classList.toggle(
+      "search-highlight",
+      this.isHouseholdSearchMatch(item),
+    );
+    if (this.isHouseholdSearchMatch(item)) element.dataset.searchMatch = "true";
+    else delete element.dataset.searchMatch;
+
+    if (!group) {
+      delete element.dataset.householdCount;
+      delete element.dataset.householdMember;
+      return;
+    }
+
+    element.dataset.householdMember = "true";
+    element.dataset.householdCount = String(group.members.length);
+    const label = this.runtime.label(item);
+    element.setAttribute(
+      "aria-label",
+      expanded
+        ? `${label}; Hausgemeinschaft, ${group.members.length} Garnrollen; einzeln auswählbar`
+        : `${label}; ${group.members.length} Garnrollen an diesem Ort. Gedrückt halten, doppelklicken oder Alt+Enter für die Hausgemeinschaft`,
+    );
+    element.title = expanded
+      ? item.title
+      : `Hausgemeinschaft mit ${group.members.length} Garnrollen – gedrückt halten oder doppelklicken`;
+    if (expanded) {
+      const membersOnPage = this.householdPageMembers(group);
+      const index = membersOnPage.findIndex((member) => member.id === item.id);
+      const viewportWidth = this.mapScaleContainer?.clientWidth ?? 320;
+      const offset = householdMemberOffset(
+        index,
+        membersOnPage.length,
+        viewportWidth,
+      );
+      element.style.translate = `${offset.x}px ${offset.y}px`;
+      element.style.zIndex = String(50 + index);
+    } else {
+      element.style.translate = "";
+      element.style.zIndex = "30";
+    }
+  }
+
+  /** MapLibre's geographic anchors and the underlying Fäden never move. */
+  private openHousehold(key: string) {
+    const group = this.households.groups.get(key);
+    if (!group || !this.map) return;
+    if (this.expandedHouseholdKey !== key) {
+      const chosenId = this.householdFrontItem(group).id;
+      const firstIndex = group.members.findIndex(
+        (item) => item.id === chosenId,
+      );
+      this.expandedHouseholdPage = Math.max(
+        0,
+        Math.floor(firstIndex / this.householdPageCapacity()),
+      );
+    }
+    this.expandedHouseholdKey = key;
+    const map = this.map;
+    const zoom = typeof map.getZoom === "function" ? map.getZoom() : 15;
+    if (typeof map.easeTo === "function") {
+      map.easeTo({
+        center: [group.members[0].lon, group.members[0].lat],
+        zoom: Number.isFinite(zoom) ? Math.min(18, Math.max(16, zoom + 1)) : 16,
+        duration: 350,
+      });
+    }
+    if (!this.householdCloseButton && this.mapScaleContainer) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "map-household-close";
+      button.dataset.testid = "close-household-view";
+      this.isolateHouseholdControl(button);
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.closeHousehold();
+      });
+      this.mapScaleContainer.append(button);
+      this.householdCloseButton = button;
+    }
+    if (this.householdCloseButton) {
+      this.householdCloseButton.textContent = `Hausgemeinschaft · ${group.members.length} Garnrollen · Schließen ×`;
+      this.householdCloseButton.setAttribute(
+        "aria-label",
+        "Hausgemeinschaftssicht schließen",
+      );
+    }
+    this.syncHouseholdPager(group);
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
+  }
+
+  private closeHousehold() {
+    const group = this.expandedHouseholdKey
+      ? this.households.groups.get(this.expandedHouseholdKey)
+      : undefined;
+    this.expandedHouseholdKey = null;
+    this.expandedHouseholdPage = 0;
+    this.householdCloseButton?.remove();
+    this.householdCloseButton = null;
+    this.householdPager?.remove();
+    this.householdPager = null;
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
+    if (group)
+      this.getActiveMarker(
+        this.householdFrontItem(group).id,
+      )?.element.focus?.();
+  }
+
+  private installHouseholdGesture(
+    element: HTMLElement,
+    id: string,
+  ): () => void {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let origin: { x: number; y: number } | null = null;
+    const cancel = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      origin = null;
+    };
+    const groupForStack = () => {
+      const group = this.households.byAccountId.get(id);
+      return group &&
+        this.expandedHouseholdKey !== group.key &&
+        this.householdFrontItem(group).id === id
+        ? group
+        : null;
+    };
+    const pointerDown = (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      const group = groupForStack();
+      if (!group) return;
+      cancel();
+      origin = { x: event.clientX, y: event.clientY };
+      const key = group.key;
+      timer = setTimeout(() => {
+        timer = undefined;
+        origin = null;
+        if (!groupForStack() || !this.latestShowNodes) return;
+        this.suppressClickId = id;
+        this.suppressClickUntil = Date.now() + 900;
+        this.openHousehold(key);
+      }, 650);
+    };
+    const pointerMove = (event: PointerEvent) => {
+      if (!origin) return;
+      const dx = event.clientX - origin.x;
+      const dy = event.clientY - origin.y;
+      if (dx * dx + dy * dy > 100) cancel();
+    };
+    const activate = (event: Event) => {
+      const group = groupForStack();
+      if (!group) return;
+      event.preventDefault();
+      event.stopPropagation();
+      cancel();
+      this.openHousehold(group.key);
+    };
+    const contextMenu = (event: MouseEvent) => {
+      // iOS Safari can dispatch contextmenu after the longpress timer has
+      // already expanded the house. Suppress the browser menu in both states;
+      // only the still-collapsed stack may open the household.
+      if (!this.households.byAccountId.has(id)) return;
+      event.preventDefault();
+      if (groupForStack()) activate(event);
+    };
+    const doubleClick = (event: MouseEvent) => activate(event);
+    const keyDown = (event: KeyboardEvent) => {
+      if (event.altKey && event.key === "Enter") activate(event);
+    };
+    const click = (event: MouseEvent) => {
+      if (this.suppressClickId === id && Date.now() < this.suppressClickUntil) {
+        this.suppressClickId = null;
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      const group = this.households.byAccountId.get(id);
+      if (group) this.householdFront.set(group.key, id);
+    };
+    element.addEventListener("pointerdown", pointerDown);
+    element.addEventListener("pointermove", pointerMove);
+    element.addEventListener("pointerup", cancel);
+    element.addEventListener("pointercancel", cancel);
+    element.addEventListener("pointerleave", cancel);
+    element.addEventListener("contextmenu", contextMenu);
+    element.addEventListener("dblclick", doubleClick);
+    element.addEventListener("keydown", keyDown);
+    element.addEventListener("click", click);
+    return () => {
+      cancel();
+      element.removeEventListener("pointerdown", pointerDown);
+      element.removeEventListener("pointermove", pointerMove);
+      element.removeEventListener("pointerup", cancel);
+      element.removeEventListener("pointercancel", cancel);
+      element.removeEventListener("pointerleave", cancel);
+      element.removeEventListener("contextmenu", contextMenu);
+      element.removeEventListener("dblclick", doubleClick);
+      element.removeEventListener("keydown", keyDown);
+      element.removeEventListener("click", click);
+    };
+  }
+
   private syncWeaveDetail(root: HTMLElement) {
     root.classList.toggle("woven-node--compact", this.compactWeave);
     root.dataset.weaveDetail = this.compactWeave ? "compact" : "detail";
@@ -621,6 +992,7 @@ export class NodesOverlay {
     if (!showNodes) {
       this.activeMarkers.forEach(({ cleanup }) => cleanup());
       this.activeMarkers.clear();
+      if (this.expandedHouseholdKey) this.closeHousehold();
       return;
     }
 
@@ -630,7 +1002,8 @@ export class NodesOverlay {
     const shouldVirtualize =
       !useNativeLayer && this.shouldVirtualizeMarkers(points);
     const viewportBounds =
-      shouldVirtualize && typeof map.getBounds === "function"
+      (shouldVirtualize || useNativeLayer) &&
+      typeof map.getBounds === "function"
         ? map.getBounds()
         : null;
     const spatialIndexes =
@@ -638,19 +1011,42 @@ export class NodesOverlay {
         ? this.spatialCandidateIndexes(viewportBounds)
         : null;
     const nativeSelected =
-      useNativeLayer && this.selectedMarkerId !== null
+      useNativeLayer &&
+      this.selectedMarkerId !== null &&
+      !this.households.byAccountId.has(this.selectedMarkerId)
         ? this.pointById(this.selectedMarkerId)
         : undefined;
-    const candidates = useNativeLayer
-      ? nativeSelected
-        ? [nativeSelected]
-        : []
-      : spatialIndexes === null
-        ? points
-        : spatialIndexes.flatMap((index) => {
-            const item = points[index];
-            return item ? [item] : [];
-          });
+    const householdMarkers = Array.from(
+      this.households.groups.values(),
+    ).flatMap((group) =>
+      this.expandedHouseholdKey === group.key
+        ? this.householdPageMembers(group)
+        : [this.householdFrontItem(group)],
+    );
+    const expandedGroup = this.expandedHouseholdKey
+      ? this.households.groups.get(this.expandedHouseholdKey)
+      : undefined;
+    const visibleExpandedIds = new Set(
+      expandedGroup?.members
+        ? this.householdPageMembers(expandedGroup).map((member) => member.id)
+        : [],
+    );
+    const candidates = (
+      useNativeLayer
+        ? [...(nativeSelected ? [nativeSelected] : []), ...householdMarkers]
+        : spatialIndexes === null
+          ? points
+          : spatialIndexes.flatMap((index) => {
+              const item = points[index];
+              return item ? [item] : [];
+            })
+    ).filter((item) => {
+      const group = this.households.byAccountId.get(item.id);
+      if (!group) return true;
+      return this.expandedHouseholdKey === group.key
+        ? visibleExpandedIds.has(item.id)
+        : this.householdFrontItem(group).id === item.id;
+    });
     const currentIds = new Set<string>();
 
     for (const item of candidates) {
@@ -664,7 +1060,7 @@ export class NodesOverlay {
       }
 
       if (
-        shouldVirtualize &&
+        (shouldVirtualize || useNativeLayer) &&
         this.selectedMarkerId !== item.id &&
         !this.searchMatchIds.has(item.id) &&
         viewportBounds &&
@@ -685,7 +1081,9 @@ export class NodesOverlay {
 
       if (
         existing &&
-        existing.element.dataset.markerCategory !== markerCategory
+        (existing.element.dataset.markerCategory !== markerCategory ||
+          (existing.element.dataset.householdMember === "true") !==
+            this.households.byAccountId.has(item.id))
       ) {
         existing.cleanup();
         this.activeMarkers.delete(item.id);
@@ -722,6 +1120,7 @@ export class NodesOverlay {
             existing.weaveSignature,
           );
         }
+        this.syncHouseholdAppearance(element, item);
       } else {
         if (
           this.nativeLayerEnabled &&
@@ -758,6 +1157,20 @@ export class NodesOverlay {
         let weaveRoot: HTMLElement | null = null;
         let weaveSignature: string | null = null;
         if (item.type === "garnrolle") {
+          if (this.households.byAccountId.has(item.id)) {
+            const behind = document.createElement("span");
+            behind.className = "marker-household__behind";
+            for (let layer = 0; layer < 2; layer += 1) {
+              const img = document.createElement("img");
+              img.src = garnrolleIcon;
+              img.alt = "";
+              img.draggable = false;
+              img.className = `marker-household__back marker-household__back--${layer + 1}`;
+              img.setAttribute("aria-hidden", "true");
+              behind.append(img);
+            }
+            visual.append(behind);
+          }
           const icon = document.createElement("img");
           icon.className = "marker-account__icon";
           icon.src = garnrolleIcon;
@@ -804,8 +1217,9 @@ export class NodesOverlay {
         // MapLibre assigns its generic "Map marker" label in the constructor.
         // Restore the domain-specific woven summary after that synchronous step.
         element.setAttribute("aria-label", this.runtime.label(item));
+        this.syncHouseholdAppearance(element, item);
 
-        if (this.searchMatchIds.has(item.id)) {
+        if (this.isHouseholdSearchMatch(item)) {
           element.classList.add("search-highlight");
           element.dataset.searchMatch = "true";
         }
@@ -815,6 +1229,12 @@ export class NodesOverlay {
           element.setAttribute("aria-current", "true");
         }
 
+        const cleanupGesture =
+          item.type === "garnrolle" &&
+          this.households.byAccountId.has(item.id) &&
+          typeof element.addEventListener === "function"
+            ? this.installHouseholdGesture(element, item.id)
+            : () => {};
         this.activeMarkers.set(item.id, {
           marker,
           element,
@@ -822,6 +1242,7 @@ export class NodesOverlay {
           weaveRoot,
           weaveSignature,
           cleanup: () => {
+            cleanupGesture();
             marker.remove();
           },
         });
@@ -839,6 +1260,35 @@ export class NodesOverlay {
   public update(points: MapEntityViewModel[], showNodes: boolean): void {
     this.latestPoints = points;
     this.latestShowNodes = showNodes;
+    this.households = indexHouseholdStacks(points);
+    for (const key of this.householdFront.keys()) {
+      if (!this.households.groups.has(key)) this.householdFront.delete(key);
+    }
+    // When a previously standalone selection becomes a household, preserve
+    // the selected account as its front instead of defaulting to the last item.
+    if (this.selectedMarkerId !== null) {
+      const group = this.households.byAccountId.get(this.selectedMarkerId);
+      if (group && !this.householdFront.has(group.key)) {
+        this.householdFront.set(group.key, this.selectedMarkerId);
+      }
+    }
+    if (this.expandedHouseholdKey) {
+      const group = this.households.groups.get(this.expandedHouseholdKey);
+      if (!group) {
+        this.expandedHouseholdKey = null;
+        this.expandedHouseholdPage = 0;
+        this.householdCloseButton?.remove();
+        this.householdCloseButton = null;
+        this.householdPager?.remove();
+        this.householdPager = null;
+      } else {
+        this.expandedHouseholdPage = Math.min(
+          this.expandedHouseholdPage,
+          this.householdPageCount(group) - 1,
+        );
+        this.syncHouseholdPager(group);
+      }
+    }
     this.rebuildMarkerSpatialIndex(points);
     this.reconcileMarkers(points, showNodes);
   }
@@ -879,15 +1329,27 @@ export class NodesOverlay {
       this.setNativeFeatureState(previousSelectedMarkerId, { selected: false });
     }
     this.selectedMarkerId = nextSelectedMarkerId;
+    const household = nextSelectedMarkerId
+      ? this.households.byAccountId.get(nextSelectedMarkerId)
+      : undefined;
+    if (household && nextSelectedMarkerId) {
+      this.householdFront.set(household.key, nextSelectedMarkerId);
+      if (this.expandedHouseholdKey === household.key) {
+        const index = household.members.findIndex(
+          (member) => member.id === nextSelectedMarkerId,
+        );
+        this.expandedHouseholdPage = Math.max(
+          0,
+          Math.floor(index / this.householdPageCapacity()),
+        );
+        this.syncHouseholdPager(household);
+      }
+    }
     if (nextSelectedMarkerId !== null) {
       this.setSelected(nextSelectedMarkerId, true);
       this.setNativeFeatureState(nextSelectedMarkerId, { selected: true });
     }
-    if (this.nativeLayerEnabled) {
-      this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
-    } else {
-      this.reconcileVirtualizedMarkers();
-    }
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
   }
 
   public updateSearchMatches(nextSearchMatchIds: ReadonlySet<string>) {
@@ -906,11 +1368,7 @@ export class NodesOverlay {
     }
 
     this.searchMatchIds = new Set(nextSearchMatchIds);
-    if (this.nativeLayerEnabled) {
-      this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
-    } else {
-      this.reconcileVirtualizedMarkers();
-    }
+    this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
   }
 
   public getActiveMarker(id: string) {
@@ -921,6 +1379,7 @@ export class NodesOverlay {
     if (this.map && typeof this.map.off === "function") {
       this.map.off("zoom", this.handleZoom);
       this.map.off("moveend", this.handleMoveEnd);
+      this.map.off("resize", this.handleHouseholdResize);
       if (this.supportsNativeEntityLayer()) {
         this.map.off("styledata", this.handleStyleData);
         this.map.off("style.load", this.handleStyleData);
@@ -935,6 +1394,7 @@ export class NodesOverlay {
     }
     if (this.mapScaleContainer) {
       const container = this.mapScaleContainer;
+      container.removeEventListener?.("keydown", this.handleHouseholdKeyDown);
       const ownership = MAP_OBJECT_SCALE_OWNERS.get(container);
       if (
         ownership?.owners.delete(this.mapScaleOwner) &&
@@ -952,6 +1412,15 @@ export class NodesOverlay {
         MAP_OBJECT_SCALE_OWNERS.delete(container);
       }
     }
+    this.householdCloseButton?.remove();
+    this.householdCloseButton = null;
+    this.householdPager?.remove();
+    this.householdPager = null;
+    this.expandedHouseholdKey = null;
+    this.expandedHouseholdPage = 0;
+    this.households.groups.clear();
+    this.households.byAccountId.clear();
+    this.householdFront.clear();
     this.mapScaleContainer = null;
     this.activeMarkers.forEach(({ cleanup }) => cleanup());
     this.activeMarkers.clear();
