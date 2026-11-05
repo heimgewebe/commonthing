@@ -526,7 +526,7 @@
    * Garnrolle point picking in a small bottom sheet across tablet and mobile.
    * All other panels retain their existing layout and full/compact defaults.
    */
-  @media (max-width: 1024px) {
+  @media (max-width: 1024px), (max-width: 1400px) and (any-pointer: coarse) {
     .context-panel.placing-garnrolle {
       top: auto;
       bottom: 0;
