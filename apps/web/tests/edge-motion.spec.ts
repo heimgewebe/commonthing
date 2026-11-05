@@ -188,11 +188,11 @@ test.describe("event-bound Faden motion", () => {
         window.__TEST_EDGE_MOTION__?.inspect()?.activeCount ?? 0;
       return { accepted, frameCount, activeCount };
     }, EDGE_ID);
-    expect(initial).toEqual({
-      accepted: true,
-      frameCount: 1,
-      activeCount: 1,
-    });
+    expect(initial.accepted).toBe(true);
+    expect(initial.activeCount).toBe(1);
+    // One canonical edge can animate multiple braided strand features. The
+    // contract is an actual rendered frame, not exactly one GeoJSON feature.
+    expect(initial.frameCount).toBeGreaterThan(0);
     await page.evaluate(() => {
       window.__TEST_MAP__?.setStyle({ version: 8, sources: {}, layers: [] });
     });
