@@ -2,10 +2,13 @@
 version = 2
 yanked = "warn"
 
-# NOTE: Diese Einträge verwenden das neue Schema mit dem Schlüssel `crate`.
-# Sie ersetzen die zuvor entfernten [[advisories.ignore]]-Blöcke, damit
-# cargo-deny bekannte, noch nicht gefahrlos upgradebare Abhängigkeiten
-# nicht als Fehler markiert.
+# RUSTSEC-2026-0441 reports archived maintenance, not a known exploit.
+# pin-utils 0.1.0 is transitive only through hyper 1.7.0 in Cargo.lock.
+# Upstream reports no safe upgrade. The sole waiver is constrained to
+# that exact direct parent; all other RustSec findings remain blocking.
+ignore = [
+  { id = "RUSTSEC-2026-0441", allow = ["hyper@1.7.0"], reason = "transitive pin-utils 0.1.0 through hyper 1.7.0 only, no safe upgrade; revisit on Hyper upgrade" },
+]
 
 [bans]
 multiple-versions = "warn"
