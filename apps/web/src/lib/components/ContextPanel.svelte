@@ -542,7 +542,8 @@
     }
 
     .context-panel.placing-garnrolle.stage-compact {
-      height: clamp(210px, 29dvh, 270px);
+      /* Keep both 44px action buttons fully visible on small touch screens. */
+      height: clamp(260px, 34dvh, 310px);
     }
 
     .context-panel.placing-garnrolle.stage-full {
