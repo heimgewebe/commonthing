@@ -141,8 +141,8 @@ Bedarf ausgeschaltet werden; ein früheres explizites Opt-out wird
 respektiert. `?wollschrift=1` oder `?wollschrift=0` setzt diese
 Auswahl direkt. Diese Wahl wird lokal unter
 `commonthing.wool-everywhere` gespeichert. Bei fehlender Fontdatei
-bleibt die HTML-Systemschrift als Fallback benutzbar. Die bestehenden
-Garn-PNG-Wortbilder bleiben unangetastet.
+bleibt die HTML-Systemschrift als Fallback benutzbar. Die vorgerenderten Titel-PNGs werden mit den beiden WOFF-Schriftdateien
+konsistent aus der gleichen Wollvorlage erzeugt.
 
 Reproduzieren mit Python 3.13 und fonttools==4.61.1:
 
@@ -155,7 +155,7 @@ python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
 Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert. Aus ihr werden nur die korrigierten Glyphenausschnitte und die transparente Alpha-Maske neu erzeugt.
 Die nativen Wollbuchstaben sind gegenüber dem ersten Versuch minimal schlanker: Der
 Farbschriftgenerator reduziert die Alpha-Deckkraft nur an den tatsächlichen
-Faserkanten um höchstens 3/5 eines Rasterpixels. Wollfarben, dreifache
+Faserkanten um höchstens 7/10 eines Rasterpixels. Wollfarben, dreifache
 Zwirnung, Bildabmessungen, Grundlinien und Zeichenbreiten bleiben erhalten.
 Nur das Kerning der nativen Farbschrift folgt den endgültigen Glyphenpositionen. Auch die produktiven Garn-PNG-Wortbilder werden mit derselben Kantenreduzierung neu erzeugt.
 

@@ -205,8 +205,8 @@ def yarn_alpha(photo_alpha: int) -> int:
 
 # The color wool font and the pre-rendered wool headings must share exactly
 # one gentle edge-coverage treatment; do not change source RGB or glyph metrics.
-EDGE_THINNING_NUM = 3
-EDGE_THINNING_DEN = 5
+EDGE_THINNING_NUM = 7
+EDGE_THINNING_DEN = 10
 
 
 def slightly_thinner_edges(width: int, height: int, rgba: bytearray) -> bytearray:

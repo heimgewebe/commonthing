@@ -80,13 +80,49 @@ class RasterYarnAssets(unittest.TestCase):
         source = bytearray([7, 8, 9, 255] * 9)
         result = raster.slightly_thinner_edges(3, 3, source)
         self.assertEqual(source[3::4], bytearray([255] * 9))
-        self.assertEqual(result[3::4], bytearray([102, 102, 102,
-                                                  102, 255, 102,
-                                                  102, 102, 102]))
+        self.assertEqual(result[3::4], bytearray([77, 77, 77,
+                                                  77, 255, 77,
+                                                  77, 77, 77]))
         for channel in range(3):
             self.assertEqual(result[channel::4], source[channel::4])
         self.assertEqual((raster.EDGE_THINNING_NUM, raster.EDGE_THINNING_DEN),
-                         (3, 5))
+                         (7, 10))
+
+    def test_refinement_is_slight_for_real_wool_glyphs(self):
+        # Compare against the previous 3/5 edge coverage on the same original
+        # source pixels. Real wool remains visible and full-coverage cores stay.
+        for theme in ("dark", "light"):
+            for ch in ("E", "g", "i", "."):
+                with self.subTest(theme=theme, ch=ch):
+                    width, height, source, _ = raster.glyph(ch, theme, self.source)
+                    alpha = source[3::4]
+                    old_total = 0
+                    fully_surrounded_cores = []
+                    for y in range(height):
+                        for x in range(width):
+                            pos = y * width + x
+                            original = alpha[pos]
+                            if not original:
+                                continue
+                            neighbor = min(
+                                original,
+                                alpha[pos - 1] if x else 0,
+                                alpha[pos + 1] if x + 1 < width else 0,
+                                alpha[pos - width] if y else 0,
+                                alpha[pos + width] if y + 1 < height else 0,
+                            )
+                            old_total += original - (original - neighbor) * 3 // 5
+                            if original == 255 and neighbor == 255:
+                                fully_surrounded_cores.append(pos)
+                    thinned = raster.slightly_thinner_edges(width, height, source)
+                    refined_total = sum(thinned[3::4])
+                    self.assertLess(refined_total, old_total)
+                    self.assertGreater(refined_total, old_total * 0.96)
+                    self.assertGreater(len(fully_surrounded_cores), 20)
+                    self.assertTrue(all(
+                        thinned[pos * 4 + 3] == 255
+                        for pos in fully_surrounded_cores
+                    ))
 
     def test_real_descenders_are_not_cropped_and_no_underlined_i_remains(self):
         # Rows in the original sheet overlap; these are exact visually
