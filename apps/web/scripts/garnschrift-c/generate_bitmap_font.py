@@ -17,7 +17,7 @@ from fontTools.ttLib.tables.sbixGlyph import Glyph
 from fontTools.ttLib.tables.sbixStrike import Strike
 
 from raster_from_sheet import GLYPHS, SHEET_SHA256, glyph, optical_overlap
-from raster_from_sheet import read_png_rgb, write_png_rgba
+from raster_from_sheet import read_png_rgb, slightly_thinner_edges, write_png_rgba
 
 HERE = Path(__file__).resolve().parent
 OUTPUT = HERE.parents[1] / "static/fonts"
@@ -58,35 +58,6 @@ MARK_INK_BOTTOM = {
     "+": 0,
     "*": -22,
 }
-# Deliberately subtle: soften the inner-most one-pixel edge, not the wool RGB.
-# 2/5 of a single 4-connected erosion step, never a hard contour cutoff.
-EDGE_THINNING_NUM = 2
-EDGE_THINNING_DEN = 5
-
-
-def slightly_thinner_edges(width: int, height: int, rgba: bytearray) -> bytearray:
-    """Lightly contract edge coverage without touching yarn colors or layout."""
-    if len(rgba) != width * height * 4 or width < 1 or height < 1:
-        raise ValueError("wrong raster dimensions")
-    original_alpha = rgba[3::4]
-    output = bytearray(rgba)
-    for y in range(height):
-        for x in range(width):
-            pixel = y * width + x
-            alpha = original_alpha[pixel]
-            if not alpha:
-                continue
-            neighbor = min(
-                alpha,  # local fiber depressions must never become more opaque
-                original_alpha[pixel - 1] if x else 0,
-                original_alpha[pixel + 1] if x + 1 < width else 0,
-                original_alpha[pixel - width] if y else 0,
-                original_alpha[pixel + width] if y + 1 < height else 0,
-            )
-            output[pixel * 4 + 3] = alpha - (
-                (alpha - neighbor) * EDGE_THINNING_NUM // EDGE_THINNING_DEN
-            )
-    return output
 
 
 def adjusted_glyph_top(ch: str, asset: tuple[int, int, bytearray, int]) -> int:
