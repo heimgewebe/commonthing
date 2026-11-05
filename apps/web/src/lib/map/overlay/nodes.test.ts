@@ -90,6 +90,36 @@ class FakeElement {
   style = new FakeStyle();
   private _className = "";
   private _innerHTML = "";
+  private listeners = new Map<string, Set<(event: any) => void>>();
+  removed = false;
+
+  addEventListener(type: string, listener: (event: any) => void) {
+    const set = this.listeners.get(type) ?? new Set();
+    set.add(listener);
+    this.listeners.set(type, set);
+  }
+
+  removeEventListener(type: string, listener: (event: any) => void) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  fire(type: string, values: Record<string, unknown> = {}) {
+    const event = {
+      type,
+      button: 0,
+      clientX: 100,
+      clientY: 100,
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn(),
+      ...values,
+    };
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+    return event;
+  }
+
+  remove() {
+    this.removed = true;
+  }
 
   set className(value: string) {
     this._className = value;
@@ -389,6 +419,89 @@ describe("diffSearchMatchIds", () => {
       added: [],
       removed: [],
     });
+  });
+});
+
+describe("NodesOverlay household interactions", () => {
+  const exact = (id: string): MapEntityGarnrolle => ({
+    ...makeAccount(id),
+    map_state: "exact",
+  });
+
+  it("keeps the most recently selected account in front, with other nodes intact", () => {
+    const overlay = makeOverlay();
+    overlay.update([exact("a"), exact("b"), makeNode("knoten")], true);
+    expect(overlay.getActiveMarker("a")).toBeUndefined();
+    const top = overlay.getActiveMarker("b");
+    expect(top?.element.dataset.householdCount).toBe("2");
+    expect(top?.element.classList.contains("marker-household-stack")).toBe(
+      true,
+    );
+    expect(overlay.getActiveMarker("knoten")).toBeDefined();
+
+    overlay.updateSelection("a");
+    expect(overlay.getActiveMarker("b")).toBeUndefined();
+    expect(overlay.getActiveMarker("a")?.element.dataset.selected).toBe("true");
+
+    // A refresh may reorder the server response; the front is user-driven.
+    overlay.update([exact("b"), exact("a"), makeNode("knoten")], true);
+    expect(overlay.getActiveMarker("a")).toBeDefined();
+    expect(overlay.getActiveMarker("b")).toBeUndefined();
+    overlay.destroy();
+  });
+
+  it("opens by longpress, spreads all account hit targets, and closes with last-used on top", () => {
+    vi.useFakeTimers();
+    try {
+      const { overlay, container } = makeOverlayWithContainer();
+      overlay.update([exact("a"), exact("b"), makeNode("knoten")], true);
+      const top = overlay.getActiveMarker("b")
+        ?.element as unknown as FakeElement;
+      top.fire("pointerdown");
+      vi.advanceTimersByTime(649);
+      expect(overlay.getActiveMarker("a")).toBeUndefined();
+      vi.advanceTimersByTime(1);
+      const first = overlay.getActiveMarker("a")
+        ?.element as unknown as FakeElement;
+      const second = overlay.getActiveMarker("b")
+        ?.element as unknown as FakeElement;
+      expect(first).toBeDefined();
+      expect(second).toBeDefined();
+      expect(first.style.translate).not.toBe(second.style.translate);
+      expect(first.classList.contains("marker-household-expanded")).toBe(true);
+      expect(overlay.getActiveMarker("knoten")).toBeDefined();
+
+      // Tapping another account changes the front after the household closes.
+      first.fire("click");
+      const close = container.children.find(
+        (child) => child.dataset.testid === "close-household-view",
+      );
+      expect(close).toBeDefined();
+      close?.fire("click");
+      expect(close?.removed).toBe(true);
+      expect(overlay.getActiveMarker("a")).toBeDefined();
+      expect(overlay.getActiveMarker("b")).toBeUndefined();
+      overlay.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a longpress on dragging so normal map panning is unaffected", () => {
+    vi.useFakeTimers();
+    try {
+      const overlay = makeOverlay();
+      overlay.update([exact("a"), exact("b")], true);
+      const top = overlay.getActiveMarker("b")
+        ?.element as unknown as FakeElement;
+      top.fire("pointerdown");
+      top.fire("pointermove", { clientX: 120 });
+      vi.advanceTimersByTime(800);
+      expect(overlay.getActiveMarker("a")).toBeUndefined();
+      overlay.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

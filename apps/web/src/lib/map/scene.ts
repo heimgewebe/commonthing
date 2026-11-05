@@ -143,6 +143,7 @@ function mapAccountsToEntities(accounts: Account[]): MapEntityGarnrolle[] {
     if (a.public_pos) {
       result.push({
         type: "garnrolle" as const,
+        map_state: a.map_state,
         id: a.id,
         title: a.title,
         lat: a.public_pos.lat,

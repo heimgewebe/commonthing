@@ -269,6 +269,8 @@ export interface MapEntityNode {
 /** A Garnrolle entity rendered on the map when it has a public position. */
 export interface MapEntityGarnrolle {
   type: "garnrolle";
+  /** Public map precision; only exact Garnrollen may form a household stack. */
+  map_state?: GarnrolleMapState;
   id: string;
   title: string;
   lat: number;
