@@ -122,6 +122,29 @@ test.describe("ContextPanel mobile compact and full states", () => {
     await expect(titleInput).toHaveValue("Ungespeicherter Entwurf");
   });
 
+  test("Garnrolle position picking starts compact, with map space and a reachable confirm action", async ({
+    page,
+  }) => {
+    await page.goto("/map?compose=garnrolle");
+    const panel = page.getByTestId("context-panel");
+    await expect(panel).toBeVisible();
+    await expect(panel).toHaveAttribute("data-sheet-stage", "compact");
+    await expect(panel).toHaveClass(/placing-garnrolle/);
+    const bounds = await panel.boundingBox();
+    expect(bounds?.height).toBeLessThan(844 * 0.4);
+    await expect(page.getByTestId("confirm-garnrolle-location")).toBeInViewport(
+      {
+        ratio: 1,
+      },
+    );
+
+    const handle = page.getByTestId("sheet-handle");
+    await handle.click();
+    await expect(panel).toHaveAttribute("data-sheet-stage", "full");
+    await handle.click();
+    await expect(panel).toHaveAttribute("data-sheet-stage", "compact");
+  });
+
   test("Komposition starts full and can collapse through the same handle", async ({
     page,
   }) => {

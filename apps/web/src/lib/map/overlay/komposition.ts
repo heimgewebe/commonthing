@@ -111,6 +111,7 @@ export function setupKompositionInteraction(
   let activeGesture: ActiveGesture | null = null;
   let suppressMouseUntil = 0;
   let interactionRevision = 0;
+  let lastPickedPoint: { x: number; y: number; at: number } | null = null;
   const browserWindow = typeof window === "undefined" ? null : window;
   const browserDocument = typeof document === "undefined" ? null : document;
 
@@ -153,6 +154,9 @@ export function setupKompositionInteraction(
       mode === "place-garnrolle"
         ? resolvePlacementAnchor(point, lngLat)
         : lngLat;
+    if (mode === "place-garnrolle") {
+      lastPickedPoint = { ...point, at: Date.now() };
+    }
     enterKomposition({
       mode,
       lngLat: [anchor.lng, anchor.lat],
@@ -281,6 +285,26 @@ export function setupKompositionInteraction(
     cancelGesture();
     suppressCompatibilityMouse();
   };
+  const handleClick = (e: MapMouseEvent) => {
+    // MapLibre emits a normalized click even on many touch browsers where a
+    // touchend listener is interrupted. Use it as a fallback only in the
+    // explicitly selected Garnrolle placement mode.
+    if (!isPlacingGarnrolle() || !canComposeOnMap()) return;
+    const previous = lastPickedPoint;
+    if (previous && Date.now() - previous.at <= COMPAT_MOUSE_SUPPRESSION_MS) {
+      const dx = e.point.x - previous.x;
+      const dy = e.point.y - previous.y;
+      if (dx * dx + dy * dy <= TAP_MOVE_TOLERANCE_SQ) return;
+    }
+    setPoint(e.point, e.lngLat, "map-tap", "place-garnrolle");
+  };
+  const cancelOnMapMotion = () => {
+    // MapLibre's internal drag tolerance is narrower than a real finger tap:
+    // a 3-5px iPad jitter may emit dragstart/movestart even for a stationary
+    // press. Our own 10px pointer tolerance remains the placement authority.
+    // Ordinary node longpresses still cancel immediately on map movement.
+    if (activeGesture?.mode !== "place-garnrolle") cancelGesture();
+  };
   const handleVisibilityChange = () => {
     if (browserDocument?.visibilityState !== "visible") cancelGesture();
   };
@@ -289,8 +313,9 @@ export function setupKompositionInteraction(
   map.on("mouseup", handleMouseup);
   map.on("mousemove", handleMousemove);
   map.on("mouseout", cancelGesture);
-  map.on("dragstart", cancelGesture);
-  map.on("movestart", cancelGesture);
+  map.on("dragstart", cancelOnMapMotion);
+  map.on("movestart", cancelOnMapMotion);
+  map.on("click", handleClick);
 
   map.on("touchstart", handleTouchstart);
   map.on("touchend", handleTouchend);
@@ -308,8 +333,9 @@ export function setupKompositionInteraction(
     map.off("mouseup", handleMouseup);
     map.off("mousemove", handleMousemove);
     map.off("mouseout", cancelGesture);
-    map.off("dragstart", cancelGesture);
-    map.off("movestart", cancelGesture);
+    map.off("dragstart", cancelOnMapMotion);
+    map.off("movestart", cancelOnMapMotion);
+    map.off("click", handleClick);
 
     map.off("touchstart", handleTouchstart);
     map.off("touchend", handleTouchend);

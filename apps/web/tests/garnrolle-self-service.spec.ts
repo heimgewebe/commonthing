@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { mockApiResponses } from "./fixtures/mockApi";
 import { waitForMapReady } from "./fixtures/mapReady";
+import { demoAccounts } from "../src/lib/demo/demoData";
 
 const ACCOUNT_ID = "00000000-0000-0000-0000-000000000003";
 
@@ -493,6 +494,59 @@ test.describe("Garnrollen-Kartenpunkt per Touch", () => {
       touchPoints: [],
     });
     await expect(placement).toContainText("Kartenanker gewählt");
+  });
+
+  test("accepts a real jittery iPad-style touch on an existing Garnrolle", async ({
+    page,
+  }) => {
+    await mockApiResponses(page, {
+      auth: {
+        authenticated: true,
+        account_id: ACCOUNT_ID,
+        role: "weber",
+      },
+    });
+    await page.setViewportSize({ width: 820, height: 1180 });
+    await page.goto("/map?compose=garnrolle");
+    await waitForMapReady(page);
+    const publicPosition = demoAccounts[0].public_pos;
+    if (!publicPosition) throw Error("no public exact Garnrolle fixture");
+    await page.evaluate(({ lon, lat }) => {
+      window.__TEST_MAP__?.jumpTo({ center: [lon, lat], zoom: 16 });
+    }, publicPosition);
+
+    const panel = page.getByTestId("context-panel");
+    await expect(panel).toHaveAttribute("data-sheet-stage", "compact");
+    const marker = page.getByTestId(`marker-garnrolle-${demoAccounts[0].id}`);
+    await expect(marker).toBeVisible();
+    const box = await marker.boundingBox();
+    if (!box) throw Error("marker not laid out");
+    const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    const panelBox = await panel.boundingBox();
+    if (!panelBox || point.y >= panelBox.y - 10)
+      throw Error("mobile placement panel still covers the Garnrolle");
+
+    const client = await page.context().newCDPSession(page);
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [point],
+    });
+    // A physical tap is rarely motionless. MapLibre may issue movestart
+    // long before the intentional 10px pan threshold is exceeded.
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x: point.x + 3, y: point.y + 4 }],
+    });
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchEnd",
+      touchPoints: [],
+    });
+    await expect(page.getByTestId("garnrolle-placement")).toContainText(
+      "Kartenanker gewählt",
+    );
+    await expect(
+      page.getByTestId("confirm-garnrolle-location"),
+    ).toBeInViewport();
   });
 
   test("accepts a plain touch tap (no longpress hold)", async ({ page }) => {

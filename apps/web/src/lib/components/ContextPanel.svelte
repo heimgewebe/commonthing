@@ -33,8 +33,16 @@
   const DRAG_THRESHOLD_PX = 6;
 
   let kompositionPanel: KompositionPanelHandle | null = $state(null);
+  // Choosing a map point needs the map, not a sheet covering 88% of it.
+  let placingGarnrolle = $derived(
+    $systemState === "komposition" &&
+      $kompositionDraft?.mode === "place-garnrolle",
+  );
   let sheetStage: SheetStage = $state(
-    $systemState === "komposition" ? "full" : "compact",
+    $systemState === "komposition" &&
+      $kompositionDraft?.mode !== "place-garnrolle"
+      ? "full"
+      : "compact",
   );
   let previousPanelIdentity = $state(
     $systemState === "komposition"
@@ -94,7 +102,11 @@
 
     if (nextPanelIdentity !== previousPanelIdentity) {
       previousPanelIdentity = nextPanelIdentity;
-      sheetStage = $systemState === "komposition" ? "full" : "compact";
+      sheetStage =
+        $systemState === "komposition" &&
+        $kompositionDraft?.mode !== "place-garnrolle"
+          ? "full"
+          : "compact";
       resetSheetPointerState();
     }
   });
@@ -233,6 +245,7 @@
     class:stage-compact={sheetStage === "compact"}
     class:stage-full={sheetStage === "full"}
     class:composition={$systemState === "komposition"}
+    class:placing-garnrolle={placingGarnrolle}
     class:dragging
     data-testid="context-panel"
     data-sheet-stage={sheetStage}
@@ -503,6 +516,109 @@
     .stage-compact :global(.tabs),
     .stage-compact :global(.account-full-content) {
       display: none;
+    }
+  }
+
+
+  /*
+   * A real iPad portrait may have a 768-1024 CSS-pixel viewport, where the
+   * ordinary context panel is otherwise a tall right-hand hit target. Keep
+   * Garnrolle point picking in a small bottom sheet across tablet and mobile.
+   * All other panels retain their existing layout and full/compact defaults.
+   */
+  @media (max-width: 1024px) {
+    .context-panel.placing-garnrolle {
+      top: auto;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      width: auto;
+      max-height: none;
+      padding-bottom: env(safe-area-inset-bottom);
+      border-radius: 18px 18px 0 0;
+      box-shadow:
+        inset 0 1px 0 var(--context-edge),
+        0 -8px 28px var(--context-shade);
+    }
+
+    .context-panel.placing-garnrolle.stage-compact {
+      height: clamp(210px, 29dvh, 270px);
+    }
+
+    .context-panel.placing-garnrolle.stage-full {
+      height: 88dvh;
+    }
+
+    .context-panel.placing-garnrolle .sheet-handle {
+      display: grid;
+      place-items: center;
+      min-height: 44px;
+      width: 100%;
+      border: 0;
+      background: transparent;
+      touch-action: none;
+    }
+
+    .context-panel.placing-garnrolle .sheet-handle span {
+      width: 44px;
+      height: 4px;
+      border-radius: 999px;
+      background: var(--panel-border-strong);
+    }
+
+    .context-panel.placing-garnrolle .desktop-panel-title {
+      display: none;
+    }
+
+    .context-panel.placing-garnrolle .mobile-panel-title {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      min-height: 44px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-weight: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .context-panel.placing-garnrolle.stage-compact .panel-header {
+      min-height: 48px;
+      padding-top: 0;
+    }
+
+    .context-panel.placing-garnrolle.stage-compact .panel-content {
+      padding: 0.25rem 0.75rem;
+    }
+
+    .context-panel.placing-garnrolle.stage-compact
+      :global([data-testid="garnrolle-placement"] .state-pending),
+    .context-panel.placing-garnrolle.stage-compact
+      :global([data-testid="garnrolle-placement"] .state-set) {
+      padding: 0.25rem 0.5rem;
+      margin-bottom: 0.25rem;
+    }
+
+    .context-panel.placing-garnrolle.stage-compact
+      :global([data-testid="garnrolle-placement"] .state-pending p:not(:first-child)),
+    .context-panel.placing-garnrolle.stage-compact
+      :global([data-testid="garnrolle-placement"] .state-set p.ghost) {
+      display: none;
+    }
+
+    .context-panel.placing-garnrolle.stage-compact
+      :global([data-testid="garnrolle-placement"] .actions) {
+      margin-top: 0.5rem;
+      gap: 0.5rem;
+    }
+
+    .context-panel.placing-garnrolle.stage-compact
+      :global([data-testid="garnrolle-placement"] .btn) {
+      min-height: 44px;
+      padding: 0.5rem;
     }
   }
 

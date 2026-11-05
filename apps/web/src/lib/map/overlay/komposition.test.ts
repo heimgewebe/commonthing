@@ -277,6 +277,47 @@ describe("setupKompositionInteraction", () => {
     expect(get(kompositionDraft)?.source).toBe("map-tap");
   });
 
+  it("keeps a stationary iPad tap despite MapLibre drag/movestart jitter", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    map.emit("touchstart", pointerEvent(50, 50, 10, 53.5));
+    map.emit("touchmove", pointerEvent(53, 54, 10.00001, 53.50001));
+    // MapLibre may start its own drag at a much smaller threshold than the
+    // 10px user tap tolerance. This is not an intentional map pan.
+    map.emit("movestart", {});
+    map.emit("dragstart", {});
+    map.emit("touchend", pointerEvent(53, 54, 10.00001, 53.50001));
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.00001, 53.50001]);
+    expect(get(kompositionDraft)?.source).toBe("map-tap");
+  });
+
+  it("continues to reject an intentional touch pan beyond the 10px tolerance", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    map.emit("touchstart", pointerEvent(50, 50, 10, 53.5));
+    map.emit("movestart", {});
+    map.emit("touchmove", pointerEvent(88, 75, 10.01, 53.51));
+    map.emit("touchend", pointerEvent(88, 75, 10.01, 53.51));
+    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+  });
+
+  it("accepts normalized MapLibre click when Safari omits touchend", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    map.emit("click", pointerEvent(50, 50, 10.12345678, 53.51234567));
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.12345678, 53.51234567]);
+  });
+
+  it("does not set the same point twice when click follows an accepted touch", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    const writes: unknown[] = [];
+    const unsub = kompositionDraft.subscribe((draft) => {
+      if (draft?.lngLat) writes.push(draft.lngLat);
+    });
+    map.emit("touchstart", pointerEvent(50, 50, 10, 53.5));
+    map.emit("touchend", pointerEvent(50, 50, 10, 53.5));
+    map.emit("click", pointerEvent(50, 50, 10, 53.5));
+    unsub();
+    expect(writes).toHaveLength(1);
+  });
+
   it("accepts mouse placement again after compatibility suppression expires", () => {
     enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
     clickAt(map, "touchstart", "touchend", pointerEvent(50, 50, 9.9, 53.4));
