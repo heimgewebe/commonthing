@@ -772,7 +772,14 @@ export class NodesOverlay {
       cancel();
       this.openHousehold(group.key);
     };
-    const contextMenu = (event: MouseEvent) => activate(event);
+    const contextMenu = (event: MouseEvent) => {
+      // iOS Safari can dispatch contextmenu after the longpress timer has
+      // already expanded the house. Suppress the browser menu in both states;
+      // only the still-collapsed stack may open the household.
+      if (!this.households.byAccountId.has(id)) return;
+      event.preventDefault();
+      if (groupForStack()) activate(event);
+    };
     const doubleClick = (event: MouseEvent) => activate(event);
     const keyDown = (event: KeyboardEvent) => {
       if (event.altKey && event.key === "Enter") activate(event);

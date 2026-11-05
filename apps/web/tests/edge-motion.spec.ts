@@ -175,14 +175,24 @@ test.describe("event-bound Faden motion", () => {
   test("retracts, survives style reload and remains hidden until canonical removal", async ({
     page,
   }) => {
-    expect(
-      await page.evaluate(
-        (edgeId) => window.__TEST_EDGE_MOTION__?.start(edgeId, "releasing"),
-        EDGE_ID,
-      ),
-    ).toBe(true);
-
-    await expect.poll(async () => (await motionFeatures(page)).length).toBe(1);
+    // The transient release frame may disappear before a delayed Playwright
+    // poll on a loaded runner. Observe the synchronous initial render instead:
+    // absence of the real frame still fails the test.
+    const initial = await page.evaluate((edgeId) => {
+      const accepted =
+        window.__TEST_EDGE_MOTION__?.start(edgeId, "releasing") ?? false;
+      const frameCount =
+        window.__TEST_MAP__?.getSource("edge-motion-source")?.serialize().data
+          ?.features.length ?? 0;
+      const activeCount =
+        window.__TEST_EDGE_MOTION__?.inspect()?.activeCount ?? 0;
+      return { accepted, frameCount, activeCount };
+    }, EDGE_ID);
+    expect(initial).toEqual({
+      accepted: true,
+      frameCount: 1,
+      activeCount: 1,
+    });
     await page.evaluate(() => {
       window.__TEST_MAP__?.setStyle({ version: 8, sources: {}, layers: [] });
     });

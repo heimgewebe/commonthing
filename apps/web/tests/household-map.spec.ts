@@ -81,6 +81,22 @@ test.describe("household map view", () => {
   }) => {
     const front = page.getByTestId(`marker-garnrolle-${HOUSE_ACCOUNTS[19].id}`);
     await expect(front).toBeVisible();
+    // "Visible" alone also matches MapLibre markers positioned outside the
+    // viewport. A physical mouse/touch press must hit the actual map marker.
+    const publicPosition = HOUSE_ACCOUNTS[0].public_pos;
+    if (!publicPosition)
+      throw new Error("household fixture has no public position");
+    await page.evaluate(({ lon, lat }) => {
+      const map = (
+        window as typeof window & {
+          __TEST_MAP__?: {
+            jumpTo(options: { center: [number, number]; zoom: number }): void;
+          };
+        }
+      ).__TEST_MAP__;
+      map?.jumpTo({ center: [lon, lat], zoom: 16 });
+    }, publicPosition);
+    await expect(front).toBeInViewport({ ratio: 0.8 });
     const box = await front.boundingBox();
     expect(box).toBeTruthy();
     await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);

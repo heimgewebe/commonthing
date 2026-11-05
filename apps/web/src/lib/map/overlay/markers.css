@@ -500,6 +500,13 @@
 /* Garnrollen am identischen exakten Standort: echte Spulenlagen statt Schatten.
  * Nur die zuletzt fokussierte Spule hat im geschlossenen Zustand ein Hit-Target.
  */
+/* Prevent the iOS selection/callout UI from masking intentional longpress. */
+.marker-household-stack,
+.marker-household-expanded {
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+}
+
 .marker-household__behind {
   position: absolute;
   inset: 0;

@@ -577,6 +577,28 @@ describe("NodesOverlay household interactions", () => {
     overlay.destroy();
   });
 
+  it("prevents a native context menu after the touch hold already opened a household", () => {
+    vi.useFakeTimers();
+    try {
+      const { overlay } = makeOverlayWithContainer();
+      const a = { ...makeAccount("a"), map_state: "exact" as const };
+      const b = { ...makeAccount("b"), map_state: "exact" as const };
+      overlay.update([a, b], true);
+      const front = overlay.getActiveMarker("b")
+        ?.element as unknown as FakeElement;
+      front.fire("pointerdown");
+      vi.advanceTimersByTime(650);
+      expect(overlay.getActiveMarker("a")).toBeDefined();
+
+      const menu = front.fire("contextmenu");
+      expect(menu.preventDefault).toHaveBeenCalledTimes(1);
+      expect(overlay.getActiveMarker("a")).toBeDefined();
+      overlay.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("cancels a longpress on dragging so normal map panning is unaffected", () => {
     vi.useFakeTimers();
     try {
