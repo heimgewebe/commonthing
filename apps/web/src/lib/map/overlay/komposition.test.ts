@@ -26,7 +26,10 @@ const { authStore } = vi.hoisted(() => {
 });
 vi.mock("$lib/auth/store", () => ({ authStore }));
 
-import { setupKompositionInteraction } from "./komposition";
+import {
+  setupKompositionInteraction,
+  snapToExactPublicGarnrolle,
+} from "./komposition";
 import {
   kompositionDraft,
   leaveToNavigation,
@@ -142,6 +145,122 @@ describe("setupKompositionInteraction", () => {
     vi.useRealTimers();
   });
 
+  it("snaps a nearby tap to the exact public Garnrolle position, without rounding", () => {
+    const entities = [
+      {
+        type: "garnrolle" as const,
+        id: "alex",
+        title: "Alex",
+        lat: 53.51234567,
+        lon: 10.02345678,
+        map_state: "exact" as const,
+        created_at: "2026-01-01",
+      },
+      {
+        type: "garnrolle" as const,
+        id: "approximate",
+        title: "Radius",
+        lat: 53.54,
+        lon: 10.04,
+        map_state: "radius" as const,
+        created_at: "2026-01-01",
+      },
+      {
+        type: "garnrolle" as const,
+        id: "unknown",
+        title: "Unknown",
+        lat: 53.55,
+        lon: 10.05,
+        created_at: "2026-01-01",
+      },
+    ];
+    const project = ([lon, lat]: [number, number]) =>
+      lon === 10.02345678 && lat === 53.51234567
+        ? { x: 100, y: 200 }
+        : { x: 101, y: 201 };
+    const fallback = { lng: 10.0234, lat: 53.5123 };
+    expect(
+      snapToExactPublicGarnrolle(
+        { x: 103, y: 197 },
+        fallback,
+        entities,
+        project,
+      ),
+    ).toEqual({ lng: 10.02345678, lat: 53.51234567 });
+    expect(
+      snapToExactPublicGarnrolle(
+        { x: 130, y: 230 },
+        fallback,
+        entities,
+        project,
+      ),
+    ).toEqual(fallback);
+  });
+
+  it("never snaps to approximate, unspecified, invalid, or non-Garnrolle anchors", () => {
+    const positions = [
+      {
+        type: "garnrolle" as const,
+        id: "r",
+        title: "Radius",
+        lat: 53.5,
+        lon: 10,
+        map_state: "radius" as const,
+        created_at: "2026-01-01",
+      },
+      {
+        type: "garnrolle" as const,
+        id: "u",
+        title: "Unspecified",
+        lat: 53.5,
+        lon: 10,
+        created_at: "2026-01-01",
+      },
+      {
+        type: "garnrolle" as const,
+        id: "i",
+        title: "Invalid",
+        lat: NaN,
+        lon: 10,
+        map_state: "exact" as const,
+        created_at: "2026-01-01",
+      },
+      {
+        type: "node" as const,
+        id: "n",
+        title: "Node",
+        kind: "place",
+        tags: [],
+        lat: 53.5,
+        lon: 10,
+        created_at: "2026-01-01",
+      },
+    ];
+    expect(
+      snapToExactPublicGarnrolle(
+        { x: 100, y: 100 },
+        { lng: 10.1, lat: 53.6 },
+        positions,
+        () => ({ x: 100, y: 100 }),
+      ),
+    ).toEqual({ lng: 10.1, lat: 53.6 });
+  });
+
+  it("uses the exact public Garnrolle snap when the map tap finishes", () => {
+    cleanup();
+    const resolver = vi.fn(() => ({ lng: 10.02345678, lat: 53.51234567 }));
+    cleanup = setupKompositionInteraction(map as never, () => true, resolver);
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    clickAt(
+      map,
+      "touchstart",
+      "touchend",
+      pointerEvent(100, 200, 10.025, 53.51),
+    );
+    expect(resolver).toHaveBeenCalledOnce();
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.02345678, 53.51234567]);
+  });
+
   it("sets the point on a plain click in place-garnrolle mode", () => {
     enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
     clickAt(map, "mousedown", "mouseup", pointerEvent(50, 50, 10, 53.5));
@@ -220,7 +339,7 @@ describe("setupKompositionInteraction", () => {
     expect(get(kompositionDraft)?.source).toBe("map-longpress");
   });
 
-  it("does not move the point when the press starts on a marker", () => {
+  it("accepts a click on an existing DOM marker in location-picking mode", () => {
     enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
     const marker = new FakeElement("map-marker");
     clickAt(
@@ -229,10 +348,10 @@ describe("setupKompositionInteraction", () => {
       "mouseup",
       pointerEvent(50, 50, 10, 53.5, { target: marker }),
     );
-    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+    expect(get(kompositionDraft)?.lngLat).toEqual([10, 53.5]);
   });
 
-  it("does not arm placement or longpress on a native domain feature", () => {
+  it("allows placing on a native domain feature, including a longpress", () => {
     cleanup();
     cleanup = setupKompositionInteraction(
       map as never,
@@ -244,6 +363,21 @@ describe("setupKompositionInteraction", () => {
     vi.advanceTimersByTime(800);
     map.emit("mouseup", pointerEvent(50, 50, 10, 53.5));
 
+    expect(get(kompositionDraft)?.lngLat).toEqual([10, 53.5]);
+    expect(get(kompositionDraft)?.source).toBe("map-longpress");
+  });
+
+  it("still excludes marker clicks and native features during node composition", () => {
+    cleanup();
+    cleanup = setupKompositionInteraction(map as never, () => true);
+    enterKomposition({ mode: "new-knoten", source: "tool-fan" });
+    const marker = new FakeElement("map-marker");
+    map.emit("mousedown", pointerEvent(50, 50, 10, 53.5, { target: marker }));
+    vi.advanceTimersByTime(800);
+    map.emit("mouseup", pointerEvent(50, 50, 10, 53.5, { target: marker }));
+    map.emit("mousedown", pointerEvent(50, 50, 10, 53.5));
+    vi.advanceTimersByTime(800);
+    map.emit("mouseup", pointerEvent(50, 50, 10, 53.5));
     expect(get(kompositionDraft)?.lngLat).toBeUndefined();
   });
 
@@ -258,7 +392,7 @@ describe("setupKompositionInteraction", () => {
       "mouseup",
       pointerEvent(50, 50, 10, 53.5, { target: path }),
     );
-    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+    expect(get(kompositionDraft)?.lngLat).toEqual([10, 53.5]);
   });
 
   it("does not resurrect Garnrolle placement when composition is cancelled mid-press", () => {

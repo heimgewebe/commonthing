@@ -174,6 +174,7 @@ export class NodesOverlay {
   private nativeLayerEnabled = false;
   private nativeSyncing = false;
   private nativeClickBound = false;
+  private garnrollePlacementMode = false;
   private mapScaleContainer: HTMLElement | null = null;
   private readonly mapScaleOwner = Symbol("nodes-overlay-map-scale");
   private readonly handleZoom = () => {
@@ -221,6 +222,7 @@ export class NodesOverlay {
     this.reconcileMarkers(this.latestPoints, this.latestShowNodes);
   };
   private readonly handleNativeEntityClick = (event: NativeLayerClickEvent) => {
+    if (this.garnrollePlacementMode) return;
     const id = event.features?.[0]?.properties?.id;
     if (typeof id !== "string") return;
     const item = this.pointById(id);
@@ -267,6 +269,40 @@ export class NodesOverlay {
         // during initial style construction gets another native cut-over chance.
         this.map.on("style.load", this.handleStyleData);
       }
+    }
+  }
+
+  /** During location picking, markers stay visible as translucent, passive anchors. */
+  public setGarnrollePlacementMode(active: boolean): void {
+    if (this.garnrollePlacementMode === active) return;
+    this.garnrollePlacementMode = active;
+    for (const marker of this.activeMarkers.values()) {
+      marker.element.inert = active;
+    }
+    this.syncNativePlacementOpacity();
+  }
+
+  private syncNativePlacementOpacity(): void {
+    const map = this.map;
+    if (
+      !map?.getLayer(NATIVE_ENTITY_LAYER_ID) ||
+      typeof map.setPaintProperty !== "function"
+    )
+      return;
+    try {
+      map.setPaintProperty(
+        NATIVE_ENTITY_LAYER_ID,
+        "circle-opacity",
+        this.garnrollePlacementMode ? 0.22 : 0.92,
+      );
+      map.setPaintProperty(
+        NATIVE_ENTITY_LAYER_ID,
+        "circle-stroke-opacity",
+        this.garnrollePlacementMode ? 0.22 : 1,
+      );
+    } catch {
+      // A style replacement can remove the layer between lookup and paint.
+      // The next native-layer installation uses the current picker mode.
     }
   }
 
@@ -396,7 +432,8 @@ export class NodesOverlay {
               ],
             ],
             "circle-color": ["get", "color"],
-            "circle-opacity": 0.92,
+            "circle-opacity": this.garnrollePlacementMode ? 0.22 : 0.92,
+            "circle-stroke-opacity": this.garnrollePlacementMode ? 0.22 : 1,
             "circle-stroke-color": [
               "case",
               ["boolean", ["feature-state", "selected"], false],
@@ -735,6 +772,7 @@ export class NodesOverlay {
       origin = null;
     };
     const groupForStack = () => {
+      if (this.garnrollePlacementMode) return null;
       const group = this.households.byAccountId.get(id);
       return group &&
         this.expandedHouseholdKey !== group.key &&
@@ -1138,6 +1176,7 @@ export class NodesOverlay {
               ? "map-marker marker-webgemeindezentrum"
               : "map-marker";
 
+        element.inert = this.garnrollePlacementMode;
         element.dataset.id = item.id;
         element.dataset.markerCategory = markerCategory;
         if (item.type === "webgemeindezentrum") {
@@ -1431,5 +1470,6 @@ export class NodesOverlay {
     this.markerSpatialIndex = null;
     this.nativeLayerEnabled = false;
     this.nativeClickBound = false;
+    this.garnrollePlacementMode = false;
   }
 }

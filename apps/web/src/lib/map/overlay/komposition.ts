@@ -6,6 +6,8 @@ import type {
 import { get } from "svelte/store";
 import { enterKomposition, kompositionDraft } from "$lib/stores/uiView";
 import { authStore } from "$lib/auth/store";
+import type { MapEntityViewModel } from "$lib/map/types";
+import { hasRenderableMapPosition } from "$lib/map/coordinates";
 
 /**
  * Every authenticated account may create nodes. A longpress by an anonymous user
@@ -45,6 +47,38 @@ function targetIsMarker(target: EventTarget | null): boolean {
 }
 
 const LONG_PRESS_MS = 800;
+const PUBLIC_GARNROLLE_SNAP_DISTANCE_PX = 26;
+
+/** Snap only to already-public exact Garnrolle anchors; radius is never a house. */
+export function snapToExactPublicGarnrolle(
+  point: { x: number; y: number },
+  fallback: { lng: number; lat: number },
+  entities: readonly MapEntityViewModel[],
+  project: (coordinates: [number, number]) => { x: number; y: number },
+): { lng: number; lat: number } {
+  let nearestDistanceSq = PUBLIC_GARNROLLE_SNAP_DISTANCE_PX ** 2;
+  let nearest = fallback;
+  for (const item of entities) {
+    if (
+      item.type !== "garnrolle" ||
+      item.map_state !== "exact" ||
+      !hasRenderableMapPosition(item)
+    )
+      continue;
+    const projected = project([item.lon, item.lat]);
+    if (!Number.isFinite(projected.x) || !Number.isFinite(projected.y))
+      continue;
+    const dx = point.x - projected.x;
+    const dy = point.y - projected.y;
+    const distanceSq = dx * dx + dy * dy;
+    if (distanceSq <= nearestDistanceSq) {
+      nearestDistanceSq = distanceSq;
+      nearest = { lng: item.lon, lat: item.lat };
+    }
+  }
+  return nearest;
+}
+
 // 10px squared. Below this a press counts as a stationary click/tap; above it
 // the gesture is a pan/drag and never places a point.
 const TAP_MOVE_TOLERANCE_SQ = 100;
@@ -62,10 +96,16 @@ type ActiveGesture = {
 };
 
 type DomainFeatureHitTest = (point: { x: number; y: number }) => boolean;
+type PlacementAnchorResolver = (
+  point: { x: number; y: number },
+  fallback: { lng: number; lat: number },
+) => { lng: number; lat: number };
 
 export function setupKompositionInteraction(
   map: MapLibreMap,
   isDomainFeatureAtPoint: DomainFeatureHitTest = () => false,
+  resolvePlacementAnchor: PlacementAnchorResolver = (_point, fallback) =>
+    fallback,
 ) {
   let longPressTimer: ReturnType<typeof setTimeout> | undefined;
   let activeGesture: ActiveGesture | null = null;
@@ -104,13 +144,18 @@ export function setupKompositionInteraction(
   };
 
   const setPoint = (
+    point: { x: number; y: number },
     lngLat: { lng: number; lat: number },
     source: "map-longpress" | "map-tap",
     mode: GestureMode,
   ) => {
+    const anchor =
+      mode === "place-garnrolle"
+        ? resolvePlacementAnchor(point, lngLat)
+        : lngLat;
     enterKomposition({
       mode,
-      lngLat: [lngLat.lng, lngLat.lat],
+      lngLat: [anchor.lng, anchor.lat],
       source,
     });
   };
@@ -121,15 +166,20 @@ export function setupKompositionInteraction(
     target: EventTarget | null,
   ) => {
     cancelGesture();
-    // Markers own their own click/tap (focus). A press on a marker must never
-    // arm placement, so it can never move an already-chosen Garnrolle point.
-    if (targetIsMarker(target) || isDomainFeatureAtPoint(point)) return;
+    // Existing markers are passive during explicit Garnrolle positioning.
+    // Ordinary node composition must still not hijack an entity click.
+    const placingGarnrolle = isPlacingGarnrolle();
+    if (
+      !placingGarnrolle &&
+      (targetIsMarker(target) || isDomainFeatureAtPoint(point))
+    )
+      return;
     if (!canComposeOnMap()) return;
 
     activeGesture = {
       startX: point.x,
       startY: point.y,
-      mode: isPlacingGarnrolle() ? "place-garnrolle" : "new-knoten",
+      mode: placingGarnrolle ? "place-garnrolle" : "new-knoten",
       interactionRevision,
       longPressFired: false,
     };
@@ -145,7 +195,7 @@ export function setupKompositionInteraction(
         return;
       }
       gesture.longPressFired = true;
-      setPoint(lngLat, "map-longpress", gesture.mode);
+      setPoint(point, lngLat, "map-longpress", gesture.mode);
     }, LONG_PRESS_MS);
   };
 
@@ -175,7 +225,7 @@ export function setupKompositionInteraction(
     // The mode is frozen at press start. A stationary release only places on
     // the explicit Garnrolle picker; normal node composition stays longpress-only.
     if (gesture.mode !== "place-garnrolle" || !isPlacingGarnrolle()) return;
-    setPoint(lngLat, "map-tap", gesture.mode);
+    setPoint(point, lngLat, "map-tap", gesture.mode);
   };
 
   const mouseIsSuppressed = () => Date.now() < suppressMouseUntil;

@@ -640,3 +640,14 @@
   white-space: nowrap;
   text-align: center;
 }
+
+/* During explicit Garnrolle positioning, domain markers are visual guides,
+ * never hit targets. The basemap, zoom controls and the picker stay usable. */
+#map.map-garnrolle-picking .maplibregl-marker {
+  opacity: 0.24 !important;
+  pointer-events: none !important;
+  transition: opacity 160ms ease-out;
+}
+#map.map-garnrolle-picking .map-marker {
+  pointer-events: none !important;
+}
