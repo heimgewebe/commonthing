@@ -177,6 +177,14 @@ export class NodesOverlay {
     if (this.map) this.updateZoom(this.map.getZoom());
   };
   private readonly handleMoveEnd = () => {
+    if (this.nativeLayerEnabled) {
+      // Stacked households use DOM markers even in the dense native layer.
+      // Reconcile on pan without resending the ordinary GeoJSON features.
+      if (this.households.groups.size > 0) {
+        this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
+      }
+      return;
+    }
     this.reconcileVirtualizedMarkers();
   };
   private readonly handleStyleData = () => {

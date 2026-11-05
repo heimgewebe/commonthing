@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Map as MapLibreMap } from "maplibre-gl";
-import type { MapEntityNode } from "$lib/map/types";
+import type { MapEntityGarnrolle, MapEntityNode } from "$lib/map/types";
 import {
   NATIVE_ENTITY_LAYER_ID,
   NATIVE_ENTITY_SOURCE_ID,
@@ -284,6 +284,18 @@ function node(index: number): MapEntityNode {
   };
 }
 
+function exactHouseholdMember(id: string, lon: number): MapEntityGarnrolle {
+  return {
+    type: "garnrolle",
+    id,
+    title: "Garnrolle " + id,
+    lat: 53.5,
+    lon,
+    map_state: "exact",
+    created_at: "2026-01-01T00:00:00Z",
+  };
+}
+
 function points(count: number) {
   return Array.from({ length: count }, (_, index) => node(index));
 }
@@ -344,6 +356,43 @@ describe("NodesOverlay native dense-entity layer", () => {
       geometry: { type: "Point", coordinates: [10, 53.5] },
       properties: { id: "node-0", entityType: "node" },
     });
+  });
+
+  it("rehydrates native-layer household markers after panning into view", () => {
+    const { map, overlay } = setup();
+    let viewport: "west" | "east" = "west";
+    Object.assign(map, {
+      getBounds: () => ({
+        contains: ([longitude]: [number, number]) =>
+          viewport === "west" ? longitude < 15 : longitude >= 15,
+      }),
+    });
+    overlay.update(
+      [
+        ...points(101),
+        exactHouseholdMember("home-a", 20),
+        exactHouseholdMember("home-b", 20),
+      ],
+      true,
+    );
+    const source = map.source()!;
+    expect(source.data.features).toHaveLength(101);
+    expect(overlay.getActiveMarker("home-b")).toBeUndefined();
+    const initialSetDataCalls = source.setDataCalls;
+
+    viewport = "east";
+    map.emit("moveend", {});
+    expect(overlay.getActiveMarker("home-a")).toBeUndefined();
+    expect(
+      overlay.getActiveMarker("home-b")?.element.dataset.householdCount,
+    ).toBe("2");
+    expect(source.setDataCalls).toBe(initialSetDataCalls);
+
+    viewport = "west";
+    map.emit("moveend", {});
+    expect(overlay.getActiveMarker("home-b")).toBeUndefined();
+    expect(source.setDataCalls).toBe(initialSetDataCalls);
+    overlay.destroy();
   });
 
   it("keeps the dense renderer structurally bounded at 10k entities", () => {
