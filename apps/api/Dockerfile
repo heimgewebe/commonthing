@@ -48,9 +48,11 @@ WORKDIR /app
 # libssl3 is required by OpenSSL-linked Rust dependencies such as webauthn-rs.
 # libpcre2-8-0 and perl-base are explicitly refreshed from the Debian security
 # repositories so the pinned base cannot retain their known vulnerable versions.
+# Refresh apt and libapt-pkg6.0 explicitly: pinned Bookworm base contains
+# vulnerable 2.6.1 (CVE-2026-109518), fixed in Debian package 2.6.2.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates wget jq libssl3 libpcre2-8-0 passwd perl-base \
+       ca-certificates wget jq libssl3 libpcre2-8-0 passwd perl-base apt libapt-pkg6.0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
