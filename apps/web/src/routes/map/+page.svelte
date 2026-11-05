@@ -37,6 +37,7 @@
     view,
     selection,
     systemState,
+    kompositionDraft,
     contextPanelOpen,
     enterFokus,
     enterKomposition,
@@ -111,7 +112,10 @@
     FADEN_PROJECTION_REFRESH_MS,
     nextEdgeExpiryAt,
   } from "$lib/map/edgeLifecycle";
-  import { setupKompositionInteraction } from "$lib/map/overlay/komposition";
+  import {
+    setupKompositionInteraction,
+    snapToExactPublicGarnrolle,
+  } from "$lib/map/overlay/komposition";
   import { setupFocusInteraction } from "$lib/map/overlay/focus";
 
   interface Props {
@@ -205,6 +209,9 @@
   let edgeExpiryTimeout: ReturnType<typeof setTimeout> | undefined;
   let lastFocusedElement: HTMLElement | null = $state(null);
 
+  let pickingGarnrolle = $derived(
+    $kompositionDraft?.mode === "place-garnrolle",
+  );
   let nodesOverlay: NodesOverlayController | null = $state(null);
   let projectMapMarkerViewsForWeave:
     | typeof import("$lib/map/overlay/nodes").projectMapMarkerViewsForWeave
@@ -817,6 +824,7 @@
         projectedMarkersData,
         edgesVisuallyEnabled,
         edgeProjectionNow,
+        pickingGarnrolle,
       );
       syncEdgeMotionProjection();
     };
@@ -895,6 +903,7 @@
       });
     }
     const handleMarkerClick = (e: Event) => {
+      if (get(kompositionDraft)?.mode === "place-garnrolle") return;
       const target = e.target as HTMLElement;
       const markerBtn = target.closest(
         ".map-marker",
@@ -1028,13 +1037,26 @@
         map,
         maplibregl.Marker,
         undefined,
-        focusAndFlyToPoint,
+        (item) => {
+          if (get(kompositionDraft)?.mode !== "place-garnrolle") {
+            focusAndFlyToPoint(item);
+          }
+        },
       );
       const isDomainFeatureAtPoint = (point: { x: number; y: number }) =>
         nodesOverlay?.hasNativeEntityAt(point) ?? false;
       cleanupKomposition = setupKompositionInteraction(
         map,
         isDomainFeatureAtPoint,
+        (point, fallback) =>
+          map
+            ? snapToExactPublicGarnrolle(
+                point,
+                fallback,
+                projectedMarkersData ?? [],
+                (coordinates) => map!.project(coordinates),
+              )
+            : fallback,
       );
       let sysStateStr = "";
       unsubscribeSysState = systemState.subscribe((val) => {
@@ -1317,6 +1339,12 @@
       ? deriveLineEdges(weaveEdges, projectedMarkersData)
       : [],
   );
+  // Existing map entities remain visible but passive while choosing a point.
+  $effect.pre(() => {
+    mapContainer?.classList.toggle("map-garnrolle-picking", pickingGarnrolle);
+    nodesOverlay?.setGarnrollePlacementMode(pickingGarnrolle);
+  });
+
   // Marker data and search highlighting have separate update paths. Filtering or
   // scene changes may touch the full marker set; search changes only toggle the
   // small delta between the previous and next (maximum ten) search matches.
@@ -1373,6 +1401,7 @@
         projectedMarkersData,
         edgesVisuallyEnabled,
         edgeProjectionNow,
+        pickingGarnrolle,
       );
       syncEdgeMotionProjection();
     }

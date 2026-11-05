@@ -1822,12 +1822,47 @@ export function buildEdgeLayerSpecifications(
   });
 }
 
+/**
+ * Position picking is a presentation-only view. Preserve original yarn
+ * opacity expressions, including animated/filter-dependent coefficients.
+ */
+export function synchronizeEdgePlacementOpacity(
+  map: MapLibreMap,
+  placingGarnrolle: boolean,
+): void {
+  if (
+    typeof map.getPaintProperty !== "function" ||
+    typeof map.setPaintProperty !== "function"
+  )
+    return;
+  for (const layer of buildEdgeLayerSpecifications()) {
+    if (!map.getLayer(layer.id)) continue;
+    const base = layer.paint?.["line-opacity"];
+    if (base === undefined) continue;
+    const opacity = placingGarnrolle
+      ? (["*", base, 0.22] as ExpressionSpecification)
+      : base;
+    try {
+      if (
+        JSON.stringify(map.getPaintProperty(layer.id, "line-opacity")) !==
+        JSON.stringify(opacity)
+      ) {
+        map.setPaintProperty(layer.id, "line-opacity", opacity);
+      }
+    } catch {
+      // A basemap style change can remove a layer mid-frame. The next
+      // updateEdges rehydrates the source and restores the current mode.
+    }
+  }
+}
+
 export function updateEdges(
   map: MapLibreMap,
   edges: MapEdge[],
   points: MapEntityViewModel[],
   showEdges: boolean,
   nowMs = Date.now(),
+  placingGarnrolle = false,
 ) {
   const sourceId = LAYERS.EDGES_SOURCE;
   const source = map.getSource(sourceId) as GeoJSONSource | undefined;
@@ -1847,6 +1882,7 @@ export function updateEdges(
     map.addSource(sourceId, { type: "geojson", data: geoJsonData });
   }
   ensureEdgeLayers(map, sourceId);
+  synchronizeEdgePlacementOpacity(map, placingGarnrolle);
 }
 
 function ensureEdgeLayers(map: MapLibreMap, sourceId: string) {

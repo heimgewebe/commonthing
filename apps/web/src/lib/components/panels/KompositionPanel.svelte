@@ -195,9 +195,12 @@
           <p><strong>Privater Kartenanker gewählt</strong></p>
           <p class="ghost">
             Prüfe, ob dies dein gewünschter privater Anker ist. Zum Verschieben
-            tippe oder klicke einfach auf eine andere Stelle. Erst in den
+            tippe oder klicke einfach auf eine andere Stelle. Vorhandene
+            Garnrollen und Knoten sind während der Wahl transparent und
+            durchklickbar. Ein Tipp nahe einer exakt öffentlich verorteten
+            Garnrolle übernimmt deren genauen Kartenpunkt. Erst in den
             Einstellungen entscheidest du über die öffentliche Sichtbarkeit und
-            speicherst die Garnrolle.
+            speicherst deine Garnrolle.
           </p>
         </div>
       {:else}
@@ -205,8 +208,11 @@
           <p><strong>Ort ausstehend</strong></p>
           <p>
             Tippe oder klicke auf den gewünschten Ort auf der Karte, um den
-            Punkt zu setzen. Du kannst ihn danach bestätigen oder erneut setzen.
-            (Ein längeres Gedrückthalten funktioniert ebenfalls.)
+            Punkt zu setzen. Andere Garnrollen und Knoten erscheinen dafür
+            transparent und blockieren das Tippen nicht. Ein Tipp nahe einer
+            exakt öffentlich sichtbaren Garnrolle übernimmt ihre genaue
+            Kartenposition. Du kannst den Punkt danach bestätigen oder erneut
+            setzen. (Ein längeres Gedrückthalten funktioniert ebenfalls.)
           </p>
         </div>
       {/if}
