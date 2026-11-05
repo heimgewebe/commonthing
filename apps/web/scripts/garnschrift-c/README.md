@@ -155,9 +155,9 @@ python3 -m unittest discover -s apps/web/scripts/garnschrift-c -p 'test_*.py'
 Die ursprüngliche PNG-Quelle wird SHA-geprüft und bleibt unverändert. Aus ihr werden nur die korrigierten Glyphenausschnitte und die transparente Alpha-Maske neu erzeugt.
 Die nativen Wollbuchstaben sind gegenüber dem ersten Versuch minimal schlanker: Der
 Farbschriftgenerator reduziert die Alpha-Deckkraft nur an den tatsächlichen
-Faserkanten um höchstens 2/5 eines Rasterpixels. Wollfarben, dreifache
+Faserkanten um höchstens 3/5 eines Rasterpixels. Wollfarben, dreifache
 Zwirnung, Bildabmessungen, Grundlinien und Zeichenbreiten bleiben erhalten.
-Nur das Kerning der nativen Farbschrift folgt den endgültigen Glyphenpositionen. Die produktiven Garn-PNG-Wortbilder werden nicht verändert.
+Nur das Kerning der nativen Farbschrift folgt den endgültigen Glyphenpositionen. Auch die produktiven Garn-PNG-Wortbilder werden mit derselben Kantenreduzierung neu erzeugt.
 
 Im systemweiten Hochkontrastmodus (Forced Colors) wird die Bitmap-Schrift zugunsten lesbarer Systemschrift deaktiviert.
 

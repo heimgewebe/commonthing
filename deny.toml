@@ -1,11 +1,8 @@
 [advisories]
 version = 2
 yanked = "warn"
-
-# NOTE: Diese Einträge verwenden das neue Schema mit dem Schlüssel `crate`.
-# Sie ersetzen die zuvor entfernten [[advisories.ignore]]-Blöcke, damit
-# cargo-deny bekannte, noch nicht gefahrlos upgradebare Abhängigkeiten
-# nicht als Fehler markiert.
+# pin-utils is unmaintained transitively via hyper; no exploitable defect is reported.
+ignore = [{ id = "RUSTSEC-2026-0441", reason = "unmaintained transitive pin-utils via hyper; upstream still depends on it" }]
 
 [bans]
 multiple-versions = "warn"
