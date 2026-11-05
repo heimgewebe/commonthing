@@ -4,10 +4,12 @@ yanked = "warn"
 
 # RUSTSEC-2026-0441 reports archived maintenance, not a known exploit.
 # pin-utils 0.1.0 is transitive only through hyper 1.7.0 in Cargo.lock.
-# Upstream reports no safe upgrade. The sole waiver is constrained to
-# that exact direct parent; all other RustSec findings remain blocking.
+# Upstream reports no safe upgrade. cargo-deny accepts only id and
+# reason in each advisory-ignore entry, not dependency-parent scoping.
+# The exception is limited to this one maintenance advisory ID;
+# all other RustSec advisories remain blocking. Recheck on Hyper upgrade.
 ignore = [
-  { id = "RUSTSEC-2026-0441", allow = ["hyper@1.7.0"], reason = "transitive pin-utils 0.1.0 through hyper 1.7.0 only, no safe upgrade; revisit on Hyper upgrade" },
+  { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 is unmaintained via hyper 1.7.0; no safe upstream upgrade, revisit on Hyper upgrade" },
 ]
 
 [bans]
