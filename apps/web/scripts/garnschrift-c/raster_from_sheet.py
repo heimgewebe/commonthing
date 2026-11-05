@@ -203,6 +203,37 @@ def yarn_alpha(photo_alpha: int) -> int:
     return photo_alpha
 
 
+# The color wool font and the pre-rendered wool headings must share exactly
+# one gentle edge-coverage treatment; do not change source RGB or glyph metrics.
+EDGE_THINNING_NUM = 3
+EDGE_THINNING_DEN = 5
+
+
+def slightly_thinner_edges(width: int, height: int, rgba: bytearray) -> bytearray:
+    """Lightly contract edge coverage without touching yarn colors or layout."""
+    if len(rgba) != width * height * 4 or width < 1 or height < 1:
+        raise ValueError("wrong raster dimensions")
+    original_alpha = rgba[3::4]
+    output = bytearray(rgba)
+    for y in range(height):
+        for x in range(width):
+            pixel = y * width + x
+            alpha = original_alpha[pixel]
+            if not alpha:
+                continue
+            neighbor = min(
+                alpha,
+                original_alpha[pixel - 1] if x else 0,
+                original_alpha[pixel + 1] if x + 1 < width else 0,
+                original_alpha[pixel - width] if y else 0,
+                original_alpha[pixel + width] if y + 1 < height else 0,
+            )
+            output[pixel * 4 + 3] = alpha - (
+                (alpha - neighbor) * EDGE_THINNING_NUM // EDGE_THINNING_DEN
+            )
+    return output
+
+
 # Off-white wool: extracted source luminance retains fiber relief.
 # Anchors are measured source wool luminance P5 / P50 / P95.
 WOOL_SHADOW = (198, 195, 186)     # #C6C3BA
@@ -335,6 +366,8 @@ def render(word: str, theme: str, image: tuple[int, int, bytes]) -> bytes:
     output = bytearray(width * height * 4)
     x = 12
     for index, (w, h, source, dy) in enumerate(parts):
+        if h:
+            source = slightly_thinner_edges(w, h, source)
         top = 105 + dy
         if h and (top < 0 or top + h > height):
             raise ValueError("glyph outside target canvas")

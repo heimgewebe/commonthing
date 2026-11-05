@@ -76,6 +76,18 @@ class RasterYarnAssets(unittest.TestCase):
                         sum(a >= 200 for a in alpha) // 4,
                     )
 
+    def test_shared_thinning_reduces_only_edge_alpha(self):
+        source = bytearray([7, 8, 9, 255] * 9)
+        result = raster.slightly_thinner_edges(3, 3, source)
+        self.assertEqual(source[3::4], bytearray([255] * 9))
+        self.assertEqual(result[3::4], bytearray([102, 102, 102,
+                                                  102, 255, 102,
+                                                  102, 102, 102]))
+        for channel in range(3):
+            self.assertEqual(result[channel::4], source[channel::4])
+        self.assertEqual((raster.EDGE_THINNING_NUM, raster.EDGE_THINNING_DEN),
+                         (3, 5))
+
     def test_real_descenders_are_not_cropped_and_no_underlined_i_remains(self):
         # Rows in the original sheet overlap; these are exact visually
         # inspected g/p/q/y tails and non-descender i/j/k baselines.
