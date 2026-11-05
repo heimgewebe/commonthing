@@ -269,6 +269,64 @@ describe("updateEdges source readiness", () => {
   });
 });
 
+describe("Garnrolle location-picker thread fading", () => {
+  it("dims thread layers only while picking, including after a style reload", () => {
+    type Layer = { id: string; type: string; paint?: Record<string, unknown> };
+    const sources = new Map<string, { setData(data: unknown): void }>();
+    const layers = new Map<string, Layer>();
+    let setPaintCount = 0;
+    const map = {
+      getSource: (id: string) => sources.get(id),
+      addSource: (id: string) => sources.set(id, { setData() {} }),
+      getLayer: (id: string) => layers.get(id),
+      addLayer: (layer: Layer) => {
+        layers.set(layer.id, structuredClone(layer));
+      },
+      getStyle: () => ({ layers: [{ id: "labels", type: "symbol" }] }),
+      getPaintProperty: (id: string, property: string) =>
+        layers.get(id)?.paint?.[property],
+      setPaintProperty: (id: string, property: string, opacity: unknown) => {
+        const layer = layers.get(id);
+        if (!layer) throw Error("missing layer");
+        layer.paint ??= {};
+        layer.paint[property] = opacity;
+        setPaintCount += 1;
+      },
+    };
+    const original = buildEdgeLayerSpecifications();
+    updateEdges(map as never, [], points, true, createdAt);
+    expect(setPaintCount).toBe(0);
+    updateEdges(map as never, [], points, true, createdAt, true);
+    expect(setPaintCount).toBe(EDGE_THREAD_LAYER_IDS.length);
+    for (const layer of original) {
+      expect(map.getPaintProperty(layer.id, "line-opacity")).toEqual([
+        "*",
+        layer.paint?.["line-opacity"],
+        0.22,
+      ]);
+    }
+    updateEdges(map as never, [], points, true, createdAt, true);
+    expect(setPaintCount).toBe(EDGE_THREAD_LAYER_IDS.length);
+    updateEdges(map as never, [], points, true, createdAt, false);
+    for (const layer of original) {
+      expect(map.getPaintProperty(layer.id, "line-opacity")).toEqual(
+        layer.paint?.["line-opacity"],
+      );
+    }
+    layers.clear();
+    updateEdges(map as never, [], points, true, createdAt, true);
+    expect(map.getPaintProperty(original[0].id, "line-opacity")).toEqual([
+      "*",
+      original[0].paint?.["line-opacity"],
+      0.22,
+    ]);
+    updateEdges(map as never, [], points, true, createdAt, false);
+    expect(map.getPaintProperty(original[0].id, "line-opacity")).toEqual(
+      original[0].paint?.["line-opacity"],
+    );
+  });
+});
+
 describe("hasCompleteEdgeThreadStyle", () => {
   function probe(
     layerIds: readonly string[],

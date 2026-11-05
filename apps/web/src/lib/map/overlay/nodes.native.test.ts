@@ -236,6 +236,14 @@ class FakeMap {
     return this.layers.get(id);
   }
 
+  setPaintProperty(id: string, name: string, value: unknown) {
+    const layer = this.layers.get(id);
+    if (!layer) throw new Error("missing native layer");
+    const paint = (layer.paint ?? {}) as Record<string, unknown>;
+    paint[name] = value;
+    layer.paint = paint;
+  }
+
   setFeatureState(
     target: { source: string; id: string | number },
     state: Record<string, unknown>,
@@ -477,6 +485,79 @@ describe("NodesOverlay native dense-entity layer", () => {
 
     expect(onActivate).toHaveBeenCalledTimes(1);
     expect(onActivate).toHaveBeenCalledWith(allPoints[9]);
+  });
+
+  it("fades native entities and prevents focus activation only while positioning", () => {
+    const onActivate = vi.fn();
+    const { map, overlay } = setup(onActivate);
+    const all = points(101);
+    overlay.update(all, true);
+    const layer = map.getLayer(NATIVE_ENTITY_LAYER_ID)!;
+    expect((layer.paint as Record<string, unknown>)["circle-opacity"]).toBe(
+      0.92,
+    );
+
+    overlay.setGarnrollePlacementMode(true);
+    expect((layer.paint as Record<string, unknown>)["circle-opacity"]).toBe(
+      0.22,
+    );
+    expect(
+      (layer.paint as Record<string, unknown>)["circle-stroke-opacity"],
+    ).toBe(0.22);
+    map.emitLayer("click", NATIVE_ENTITY_LAYER_ID, {
+      features: [{ properties: { id: "node-3" } }],
+    });
+    expect(onActivate).not.toHaveBeenCalled();
+
+    overlay.setGarnrollePlacementMode(false);
+    expect((layer.paint as Record<string, unknown>)["circle-opacity"]).toBe(
+      0.92,
+    );
+    expect(
+      (layer.paint as Record<string, unknown>)["circle-stroke-opacity"],
+    ).toBe(1);
+    map.emitLayer("click", NATIVE_ENTITY_LAYER_ID, {
+      features: [{ properties: { id: "node-3" } }],
+    });
+    expect(onActivate).toHaveBeenCalledWith(all[3]);
+    overlay.destroy();
+  });
+
+  it("keeps DOM markers inert while choosing and reactivates them afterwards", () => {
+    const { overlay } = setup();
+    overlay.update(points(2), true);
+    const marker = overlay.getActiveMarker("node-0")?.element;
+    expect(marker).toBeDefined();
+    overlay.setGarnrollePlacementMode(true);
+    expect(marker?.inert).toBe(true);
+    overlay.setGarnrollePlacementMode(false);
+    expect(marker?.inert).toBe(false);
+    overlay.destroy();
+  });
+
+  it("rehydrates muted native paint when a basemap style changes", () => {
+    const { overlay, map } = setup();
+    overlay.setGarnrollePlacementMode(true);
+    overlay.update(points(101), true);
+    expect(
+      (map.getLayer(NATIVE_ENTITY_LAYER_ID)?.paint as Record<string, unknown>)[
+        "circle-opacity"
+      ],
+    ).toBe(0.22);
+    map.clearStyle();
+    overlay.update(points(101), true);
+    expect(
+      (map.getLayer(NATIVE_ENTITY_LAYER_ID)?.paint as Record<string, unknown>)[
+        "circle-opacity"
+      ],
+    ).toBe(0.22);
+    overlay.setGarnrollePlacementMode(false);
+    expect(
+      (map.getLayer(NATIVE_ENTITY_LAYER_ID)?.paint as Record<string, unknown>)[
+        "circle-opacity"
+      ],
+    ).toBe(0.92);
+    overlay.destroy();
   });
 
   it("exposes an exact native-layer hit test for focus and composition boundaries", () => {
