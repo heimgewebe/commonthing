@@ -497,6 +497,8 @@ describe("NodesOverlay household interactions", () => {
         (child) => child.dataset.testid === "close-household-view",
       );
       expect(close).toBeDefined();
+      expect(close?.fire("mousedown").stopPropagation).toHaveBeenCalledOnce();
+      expect(close?.fire("touchstart").stopPropagation).toHaveBeenCalledOnce();
       close?.fire("click");
       expect(close?.removed).toBe(true);
       expect(overlay.getActiveMarker("a")).toBeDefined();
@@ -522,6 +524,8 @@ describe("NodesOverlay household interactions", () => {
       (child) => child.dataset.testid === "household-page-controls",
     );
     expect(pager?.children[1].textContent).toBe("Seite 4 von 4");
+    expect(pager?.fire("pointerdown").stopPropagation).toHaveBeenCalledOnce();
+    expect(pager?.fire("mousedown").stopPropagation).toHaveBeenCalledOnce();
     expect(
       accounts.filter((item) => overlay.getActiveMarker(item.id)),
     ).toHaveLength(2);

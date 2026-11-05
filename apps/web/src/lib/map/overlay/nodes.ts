@@ -532,6 +532,14 @@ export class NodesOverlay {
     return group.members.slice(start, start + capacity);
   }
 
+  private isolateHouseholdControl(element: HTMLElement) {
+    // MapLibre and the map's node-composition longpress must not interpret
+    // operating the pager/close button as a map pan or a place gesture.
+    for (const type of ["pointerdown", "mousedown", "touchstart", "dblclick"]) {
+      element.addEventListener(type, (event) => event.stopPropagation());
+    }
+  }
+
   private syncHouseholdPager(group: HouseholdStack) {
     const pageCount = this.householdPageCount(group);
     if (pageCount < 2 || !this.mapScaleContainer) {
@@ -543,6 +551,7 @@ export class NodesOverlay {
       const pager = document.createElement("nav");
       pager.className = "map-household-pager";
       pager.dataset.testid = "household-page-controls";
+      this.isolateHouseholdControl(pager);
       pager.setAttribute(
         "aria-label",
         "Weitere Garnrollen der Hausgemeinschaft",
@@ -678,6 +687,7 @@ export class NodesOverlay {
       button.type = "button";
       button.className = "map-household-close";
       button.dataset.testid = "close-household-view";
+      this.isolateHouseholdControl(button);
       button.addEventListener("click", (event) => {
         event.stopPropagation();
         this.closeHousehold();
