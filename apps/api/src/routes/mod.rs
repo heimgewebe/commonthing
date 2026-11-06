@@ -43,13 +43,13 @@ use self::{
         passkey_register_options, passkey_register_verify, remove_device, request_login,
         request_step_up, session, session_refresh, update_email,
     },
-    collective_write_guard::{
-        create_node_serialized, delete_node_serialized, patch_node_serialized,
-        replace_node_serialized,
-    },
     circles::{
         accept_invitation, create_circle, invite_account, leave_circle, list_circle_members,
         list_my_circles,
+    },
+    collective_write_guard::{
+        create_node_serialized, delete_node_serialized, patch_node_serialized,
+        replace_node_serialized,
     },
     conversations::{
         block_direct_conversation, create_direct_conversation, create_message, delete_message,
@@ -106,8 +106,7 @@ pub fn api_router() -> Router<ApiState> {
         )
         .route(
             "/circles/{id}/membership",
-            axum::routing::delete(leave_circle)
-                .route_layer(from_fn(require_authenticated)),
+            axum::routing::delete(leave_circle).route_layer(from_fn(require_authenticated)),
         )
         .route("/search", get(search_nodes))
         // Compatibility alias for node-oriented clients; `/search` is canonical.
