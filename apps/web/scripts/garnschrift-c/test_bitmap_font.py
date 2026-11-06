@@ -22,6 +22,24 @@ ASSETS = {
 }
 
 
+TEXT_ASSETS = {
+    "dark": ("65b87161ff41cb584e26859715cf294bf59787054d0d973926ec3532429f9f36", 389736),
+    "light": ("a1a5854b9712d23a762a31cad0b3ed030b8e4a96f68c8c02cc123cc4be7031e7", 424128),
+}
+
+
+def woff_tables(data: bytes) -> dict[bytes, bytes]:
+    count = struct.unpack_from(">H", data, 12)[0]
+    result = {}
+    for index in range(count):
+        tag, offset, compressed, original, _ = struct.unpack_from(
+            ">4sIIII", data, 44 + index * 20
+        )
+        value = data[offset : offset + compressed]
+        result[tag] = zlib.decompress(value) if compressed < original else value
+    return result
+
+
 def decode_generator_png(png: bytes) -> tuple[int, int, bytes]:
     """Decode the no-filter RGBA PNG format emitted by raster_from_sheet."""
     if not png.startswith(bytes((137, 80, 78, 71, 13, 10, 26, 10))):
@@ -276,6 +294,63 @@ class BitmapFontAssets(unittest.TestCase):
                     self.assertGreaterEqual(
                         min(gaps), 2, f"{theme} {left}{right} overlaps"
                     )
+
+    def test_text_font_is_thinner_with_identical_metrics_and_real_wool(self):
+        """A separate body font loses only alpha coverage, not ink or geometry."""
+        from raster_from_sheet import GLYPHS
+
+        for theme, (expected_hash, expected_size) in TEXT_ASSETS.items():
+            with self.subTest(theme=theme):
+                path = FONT_DIR / f"garnschrift-c-text-{theme}.woff"
+                text = path.read_bytes()
+                regular = (FONT_DIR / f"garnschrift-c-{theme}.woff").read_bytes()
+                self.assertEqual(hashlib.sha256(text).hexdigest(), expected_hash)
+                self.assertEqual(len(text), expected_size)
+                self.assertEqual(text[:4], b"wOFF")
+                body_tables = woff_tables(text)
+                heading_tables = woff_tables(regular)
+                for table in (b"cmap", b"hmtx", b"hhea", b"kern"):
+                    self.assertEqual(body_tables[table], heading_tables[table])
+                # Different pixel treatment must not change shared sbix origin.
+                body_strike = body_tables[b"sbix"]
+                heading_strike = heading_tables[b"sbix"]
+                body_start = struct.unpack_from(">I", body_strike, 8)[0]
+                heading_start = struct.unpack_from(">I", heading_strike, 8)[0]
+                original_coverage = lighter_coverage = 0
+                for index, char in enumerate(sorted(GLYPHS), start=3):
+                    bitmaps = []
+                    for strike, start in ((heading_strike, heading_start), (body_strike, body_start)):
+                        begin = struct.unpack_from(">I", strike, start + 4 + index * 4)[0]
+                        end = struct.unpack_from(">I", strike, start + 4 + (index + 1) * 4)[0]
+                        offset = start + begin
+                        self.assertEqual(struct.unpack_from(">hh", strike, offset), (0, -40))
+                        bitmaps.append(decode_generator_png(strike[offset + 8 : start + end]))
+                    width, height, old = bitmaps[0]
+                    self.assertEqual((width, height), bitmaps[1][:2])
+                    thin = bitmaps[1][2]
+                    # The original yarn fiber color remains pixel-identical.
+                    for channel in range(3):
+                        self.assertEqual(old[channel::4], thin[channel::4])
+                    old_alpha, thin_alpha = old[3::4], thin[3::4]
+                    self.assertTrue(all(b <= a for a, b in zip(old_alpha, thin_alpha)))
+                    self.assertTrue(any(b >= 100 for b in thin_alpha), char)
+                    original_coverage += sum(old_alpha)
+                    lighter_coverage += sum(thin_alpha)
+                self.assertLess(lighter_coverage, original_coverage * 0.97)
+                self.assertGreater(lighter_coverage, original_coverage * 0.70)
+
+    def test_css_selects_body_font_without_changing_headings_or_forced_colors(self):
+        css = (FONT_DIR.parent / "wool-experiment.css").read_text()
+        for theme, title, body in (
+            ("dark", "Garnschrift C Woll", "Garnschrift C Woll Text"),
+            ("light", "Garnschrift C Petrol", "Garnschrift C Petrol Text"),
+        ):
+            self.assertIn(f"garnschrift-c-text-{theme}.woff", css)
+            self.assertIn(f'font-family: "{body}", system-ui, sans-serif !important;', css)
+            self.assertIn(f'font-family: "{title}", system-ui, sans-serif !important;', css)
+        self.assertIn("@media (forced-colors: none)", css)
+        self.assertIn(":is(h1, h2, h3, h4, h5, h6, strong, b, [role=\"heading\"])", css)
+        self.assertIn("ui-monospace, SFMono-Regular, Menlo, monospace", css)
 
 
 if __name__ == "__main__":
