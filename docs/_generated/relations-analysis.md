@@ -14,13 +14,13 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Dokumente gesamt | 209 |
-| Dokumente mit ausgehenden Relationen | 208 |
-| Dokumente als Ziel referenziert | 155 |
-| Relationen gesamt | 753 |
+| Dokumente gesamt | 210 |
+| Dokumente mit ausgehenden Relationen | 209 |
+| Dokumente als Ziel referenziert | 156 |
+| Relationen gesamt | 759 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 696 |
+| — relates_to | 702 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | Isolierte Dokumente | 0 |
@@ -46,8 +46,8 @@ Generated automatically. Do not edit.
 - ⚠️ High inbound count (14): `docs/reports/optimierungsstatus.md` — central dependency, review carefully
 - ⚠️ High inbound count (13): `docs/adr/ADR-0007__auth-persistence-production-db-path.md` — central dependency, review carefully
 - ⚠️ High inbound count (13): `docs/deployment.md` — central dependency, review carefully
+- ⚠️ High inbound count (13): `docs/roadmap.md` — central dependency, review carefully
 - ⚠️ High inbound count (12): `docs/blueprints/domain-data-postgres-cutover.md` — central dependency, review carefully
-- ⚠️ High inbound count (12): `docs/roadmap.md` — central dependency, review carefully
 - ⚠️ High inbound count (11): `docs/blueprints/auth-roadmap.md` — central dependency, review carefully
 - ⚠️ High inbound count (11): `docs/datenmodell.md` — central dependency, review carefully
 - ⚠️ High inbound count (10): `docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md` — central dependency, review carefully
@@ -80,8 +80,8 @@ _Keine Zyklen gefunden._
 - `docs/reports/optimierungsstatus.md` — 14 eingehende Relationen
 - `docs/adr/ADR-0007__auth-persistence-production-db-path.md` — 13 eingehende Relationen
 - `docs/deployment.md` — 13 eingehende Relationen
+- `docs/roadmap.md` — 13 eingehende Relationen
 - `docs/blueprints/domain-data-postgres-cutover.md` — 12 eingehende Relationen
-- `docs/roadmap.md` — 12 eingehende Relationen
 - `docs/blueprints/auth-roadmap.md` — 11 eingehende Relationen
 - `docs/datenmodell.md` — 11 eingehende Relationen
 - `docs/deploy/domain-mail-migration-ionos-to-inwx-mailbox-brevo.md` — 10 eingehende Relationen
