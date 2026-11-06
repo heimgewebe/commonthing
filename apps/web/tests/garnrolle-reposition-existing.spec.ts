@@ -111,6 +111,40 @@ test.describe("Bestehende Garnrolle erneut positionieren", () => {
     await verifySavedReplacement(page);
   });
 
+  test("does not resurrect the previous location after remove and cancel", async ({
+    page,
+  }) => {
+    const section = await openExistingProfile(page);
+    await section.getByRole("button", { name: "Punkt ändern" }).click();
+    await chooseNewTouchPoint(page);
+
+    // The picker writes both a volatile and a sessionStorage return value.
+    // Even when the volatile value wins, the stored copy must be consumed.
+    const leftover = await page.evaluate(
+      (id) =>
+        sessionStorage.getItem(`weltgewebe:garnrolle-return-location:${id}`),
+      owner.id,
+    );
+    expect(leftover).toBeNull();
+
+    const returned = page.getByTestId("my-garnrolle-section");
+    await returned
+      .getByRole("button", { name: "Kartenanker entfernen" })
+      .click();
+    await returned
+      .getByRole("button", { name: "Punkt auf Karte wählen" })
+      .click();
+    await expect(page).toHaveURL(/\/map\?compose=garnrolle/);
+    await page
+      .getByTestId("garnrolle-placement")
+      .getByRole("button", { name: "Abbrechen" })
+      .click();
+    await expect(page).toHaveURL(/\/settings#meine-garnrolle$/);
+    await expect(page.getByTestId("garnrolle-location-state")).toContainText(
+      "Noch kein Kartenanker gewählt",
+    );
+  });
+
   test("denied private session storage does not make Punkt ändern inert", async ({
     page,
   }) => {

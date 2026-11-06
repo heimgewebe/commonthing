@@ -276,8 +276,10 @@
       }
       // Prefer the most recent same-tab touch choice. A denied storage write
       // may leave an older return-location key behind in sessionStorage.
-      const returned =
-        takeGarnrolleLocation(accountId) ?? returnedMapLocation(accountId);
+      // Always consume the stored return key, even if the fresh same-tab
+      // selection wins. Otherwise a later cancel could resurrect this point.
+      const storedReturn = returnedMapLocation(accountId);
+      const returned = takeGarnrolleLocation(accountId) ?? storedReturn;
       if (returned) {
         selectedLocation = returned;
         clearLocation = false;
