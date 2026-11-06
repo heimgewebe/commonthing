@@ -21,6 +21,7 @@ from scripts.quality.review_governance import (
     GARN_FONT_SHA256,
     WOOL_FONT_SPECS,
     WOOL_FONT_SOURCE_BLOB,
+    WOOL_TEXT_FONT_SPECS,
     GovernanceError,
     canonical_product_docs_from_manifest_text,
     evaluate_evidence,
@@ -205,8 +206,9 @@ def _record(
 
 
 class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
-    def _metadata(self) -> dict:
-        paths = sorted(WOOL_FONT_SPECS)
+    def _metadata(self, specs: dict | None = None) -> dict:
+        approved = WOOL_FONT_SPECS if specs is None else specs
+        paths = sorted(approved)
         return {
             "schema_version": 1,
             "pr_number": 2008,
@@ -226,7 +228,7 @@ class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
                     "magic": "wOFF",
                     "source_blob": WOOL_FONT_SOURCE_BLOB,
                 }
-                for path, spec in sorted(WOOL_FONT_SPECS.items())
+                for path, spec in sorted(approved.items())
             ],
         }
 
@@ -236,7 +238,7 @@ class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
             path.write_text(json.dumps(metadata), encoding="utf-8")
             return _materialized_metadata(path)[-1]
 
-    def test_trusted_workflow_checks_modified_wool_blobs_only(self):
+    def test_trusted_workflow_checks_two_exact_wool_pair_modes(self):
         # The original wool WOFFs already exist in main, so this repair
         # is a modified-file pair, not a new arbitrary font admission.
         trusted = (
@@ -244,14 +246,12 @@ class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
             / ".github/workflows/review-evidence.yml"
         ).read_text()
         self.assertIn(
-            '.[] | select(.filename == $path and .status == "modified") | .sha',
+            ".[] | select(.filename == $path and .status == $mode) | .sha",
             trusted,
         )
-        self.assertNotIn(
-            '.[] | select(.filename == $path and .status == "added") | .sha',
-            trusted,
-        )
-        for spec in WOOL_FONT_SPECS.values():
+        self.assertIn("wool_mode='modified'", trusted)
+        self.assertIn("wool_mode='added'", trusted)
+        for spec in (*WOOL_FONT_SPECS.values(), *WOOL_TEXT_FONT_SPECS.values()):
             self.assertIn(spec["sha256"], trusted)
             self.assertIn(spec["blob_sha"], trusted)
 
@@ -263,6 +263,54 @@ class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
         )
         self.assertEqual(set(reviewable), set(WOOL_FONT_SPECS))
         self.assertEqual(blocked, ())
+
+    def test_new_text_font_pair_requires_exact_bytes_and_complete_group(self):
+        metadata = self._metadata(WOOL_TEXT_FONT_SPECS)
+        stats = self._parse(metadata)
+        self.assertEqual(stats.verified_font_files, tuple(sorted(WOOL_TEXT_FONT_SPECS)))
+        self.assertEqual(
+            _partition_opaque_files(
+                stats.opaque_files, verified_font_files=stats.verified_font_files
+            )[1],
+            (),
+        )
+        for change in (
+            "single",
+            "bad_hash",
+            "bad_blob",
+            "bad_source",
+            "mixed",
+            "wrong_type",
+        ):
+            with self.subTest(change=change):
+                bad = json.loads(json.dumps(metadata))
+                if change == "single":
+                    bad["wool_font_proofs"].pop()
+                elif change == "bad_hash":
+                    bad["wool_font_proofs"][0]["sha256"] = "0" * 64
+                elif change == "bad_blob":
+                    bad["wool_font_proofs"][0]["blob_sha"] = "0" * 40
+                elif change == "bad_source":
+                    bad["wool_font_proofs"][0]["source_blob"] = "0" * 40
+                elif change == "wrong_type":
+                    bad["wool_font_proofs"][0]["path"] = ["not-a-string"]
+                else:
+                    old_path, old_spec = next(iter(WOOL_FONT_SPECS.items()))
+                    new_path = bad["wool_font_proofs"][0]["path"]
+                    bad["wool_font_proofs"][0] = {
+                        "path": old_path,
+                        **old_spec,
+                        "magic": "wOFF",
+                        "source_blob": WOOL_FONT_SOURCE_BLOB,
+                    }
+                    for key in (
+                        "changed_files",
+                        "opaque_files",
+                        "attention_changed_files",
+                    ):
+                        bad[key][bad[key].index(new_path)] = old_path
+                with self.assertRaises(GovernanceError):
+                    self._parse(bad)
 
     def test_unverified_fonts_are_never_in_generic_suffix_allowlist(self):
         metadata = self._metadata()
