@@ -310,9 +310,9 @@ test.describe("Gewachsene Knoten und antragsgebundene Stimmkränze", () => {
     page,
   }) => {
     const now = new Date("2026-08-05T08:00:00.000Z");
-    // Playwright install() lets time advance during map startup. A one-second
-    // expiry can occur before the first visible marker is rendered in CI.
-    const expiryWindowMs = 60_000;
+    // Playwright install() lets time advance during map startup, but this
+    // expiry must happen before the independent 60s periodic refresh.
+    const expiryWindowMs = 30_000;
     await page.clock.install({ time: now });
     await mockApiResponses(page);
 
@@ -365,6 +365,11 @@ test.describe("Gewachsene Knoten und antragsgebundene Stimmkränze", () => {
       .toBe(0);
 
     await page.clock.fastForward(expiryWindowMs + 1);
+    // Otherwise a broken exact-expiry scheduler could pass via the minute
+    // interval. If the test ran past that interval, reject the observation.
+    expect(await page.evaluate(() => Date.now())).toBeLessThan(
+      now.getTime() + 60_000,
+    );
     await expect(woven).toHaveAttribute("data-knotting-threads", "0");
     await expect(woven).toHaveAttribute("data-proposal-count", "0");
   });
