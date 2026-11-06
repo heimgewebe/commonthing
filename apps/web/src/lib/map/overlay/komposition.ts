@@ -112,6 +112,9 @@ export function setupKompositionInteraction(
   let suppressMouseUntil = 0;
   let interactionRevision = 0;
   let lastPickedPoint: { x: number; y: number; at: number } | null = null;
+  // A cancelled/finished press may still emit a delayed MapLibre click. Keep
+  // that release invalid across the fallback until a new physical press begins.
+  let ignoreClickUntilNextStart = false;
   const browserWindow = typeof window === "undefined" ? null : window;
   const browserDocument = typeof document === "undefined" ? null : document;
 
@@ -135,6 +138,7 @@ export function setupKompositionInteraction(
   };
 
   const cancelGesture = () => {
+    if (activeGesture !== null) ignoreClickUntilNextStart = true;
     clearLongPressTimer();
     activeGesture = null;
   };
@@ -170,15 +174,22 @@ export function setupKompositionInteraction(
     target: EventTarget | null,
   ) => {
     cancelGesture();
+    // Only a new physical start may clear an older rejected release.
+    ignoreClickUntilNextStart = false;
     // Existing markers are passive during explicit Garnrolle positioning.
     // Ordinary node composition must still not hijack an entity click.
     const placingGarnrolle = isPlacingGarnrolle();
     if (
       !placingGarnrolle &&
       (targetIsMarker(target) || isDomainFeatureAtPoint(point))
-    )
+    ) {
+      ignoreClickUntilNextStart = true;
       return;
-    if (!canComposeOnMap()) return;
+    }
+    if (!canComposeOnMap()) {
+      ignoreClickUntilNextStart = true;
+      return;
+    }
 
     activeGesture = {
       startX: point.x,
@@ -266,6 +277,7 @@ export function setupKompositionInteraction(
     // must never arm composition.
     if (e.points.length !== 1) {
       cancelGesture();
+      ignoreClickUntilNextStart = true;
       return;
     }
     beginGesture(e.point, e.lngLat, e.originalEvent.target);
@@ -273,6 +285,7 @@ export function setupKompositionInteraction(
   const handleTouchmove = (e: MapTouchEvent) => {
     if (e.points.length !== 1) {
       cancelGesture();
+      ignoreClickUntilNextStart = true;
       return;
     }
     trackMove(e.point);
@@ -283,6 +296,7 @@ export function setupKompositionInteraction(
   };
   const handleTouchcancel = () => {
     cancelGesture();
+    ignoreClickUntilNextStart = true;
     suppressCompatibilityMouse();
   };
   const handleClick = (e: MapMouseEvent) => {
@@ -290,12 +304,29 @@ export function setupKompositionInteraction(
     // touchend listener is interrupted. Use it as a fallback only in the
     // explicitly selected Garnrolle placement mode.
     if (!isPlacingGarnrolle() || !canComposeOnMap()) return;
+    // Without this guard an ABA/auth transition or cancelled drag could be
+    // resurrected by the normalized click after the rejected touch/mouseup.
+    if (ignoreClickUntilNextStart) return;
+    const pending = activeGesture;
+    if (pending !== null) {
+      const dx = e.point.x - pending.startX;
+      const dy = e.point.y - pending.startY;
+      if (
+        pending.mode !== "place-garnrolle" ||
+        !gestureIsStillValid(pending) ||
+        dx * dx + dy * dy > TAP_MOVE_TOLERANCE_SQ
+      ) {
+        cancelGesture();
+        return;
+      }
+    }
     const previous = lastPickedPoint;
     if (previous && Date.now() - previous.at <= COMPAT_MOUSE_SUPPRESSION_MS) {
       const dx = e.point.x - previous.x;
       const dy = e.point.y - previous.y;
       if (dx * dx + dy * dy <= TAP_MOVE_TOLERANCE_SQ) return;
     }
+    cancelGesture();
     setPoint(e.point, e.lngLat, "map-tap", "place-garnrolle");
   };
   const cancelOnMapMotion = () => {
