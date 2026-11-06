@@ -2,7 +2,7 @@
 id: blueprints.geltungsbereiche-hausgemeinschaft
 title: "Geltungsbereiche und Hausgemeinschaft – universeller Umsetzungsplan"
 doc_type: blueprint
-status: active
+status: deferred
 created: 2026-11-06
 lang: de
 summary: >-
@@ -28,6 +28,9 @@ relations:
 
 **Stand:** 6. November 2026. **Art:** Ausführungsplan, keine Behauptung bereits
 implementierter Funktionen und noch keine Änderung kanonischer Produktverträge.
+**Umsetzung:** Noch nicht aktiv beauftragt. Die Roadmap liegt zur späteren
+Aktivierung vor; es gibt bislang keine registrierte Bureau-Ausführungsaufgabe.
+Ein aufgenommener Kandidat ersetzt keine solche Aufgabe.
 
 ## 1. Auftrag und Erfolgskriterium
 
@@ -185,7 +188,8 @@ Rückwirkungszusage machen.
 
 ### P0 – Bestandsaufnahme und minimaler Vertrag
 
-**Arbeit**
+#### Arbeit
+
 1. Tatsächliche DB-Migrationen, `search_visibility`, Konto-Profile,
    Knoten-Lesewege, Push-Opt-ins und Outbox auf `main` und Runtime
    inventarisieren. Kennzeichnen: bereits produktiv / nur spezifiziert.
@@ -202,7 +206,8 @@ implizite zweite Privacy-Definition verletzt wird.
 
 ### P1 – Freiwillige Hausmitgliedschaft, ohne neue Darstellungswelt
 
-**Arbeit**
+#### Arbeit
+
 1. Stabile Kreis-ID und minimale Mitgliedschaft mit serverseitiger
    Bestätigung/Austritt und eigenen Lese-/Schreibgrenzen anlegen.
 2. Hauszuordnung anhand identischer öffentlicher Position **nur
@@ -219,7 +224,8 @@ korrekten, unabhängig gepflegten Mitgliedschaftszustand.
 
 ### P2 – „Nur Hausgemeinschaft“ an vorhandenen Knoten
 
-**Arbeit**
+#### Arbeit
+
 1. Sichtbarkeit in bestehender Knotenkomposition/-bearbeitung
    anbieten; bestehende `public`-, `private`-, `hidden`- und
    `revoked`-Semantik kompatibel halten. Kreis-Grants sind genau
@@ -240,7 +246,8 @@ Knotenweben funktionieren unverändert.
 
 ### P2b – Sichtbarkeit einzelner Garnrollen-Ressourcen
 
-**Arbeit**
+#### Arbeit
+
 1. Prüfen, ob Güter, Fähigkeiten und Pläne heute als separat
    verknüpfte Knoten oder als Felder/Listen innerhalb eines
    Garnrollenprofils erscheinen. Keine neue Darstellungslogik.
@@ -259,7 +266,8 @@ Garnrolle zu verstecken oder einen neuen Ressourceneditor zu erfinden.
 
 ### P3 – Adressierung und freiwillige Hinweise
 
-**Arbeit**
+#### Arbeit
+
 1. Webungsereignis darf gezielt an einen Kreis adressiert werden,
    ohne Knoten zu kopieren. Adressierung erweitert niemals Leserechte.
 2. Erste In-App-Benachrichtigung/Beobachtung für neue, **lesbare**
@@ -280,7 +288,8 @@ regressionsfrei.
 
 ### P4 – Gleiche Reichweite auf großer Karte
 
-**Arbeit**
+#### Arbeit
+
 1. Das Kreis-Prädikat für weitere freiwillige Gemeinschaften
    wiederverwenden; keine `if (household)`-Sonderarchitektur.
 2. **Räumliche Adressierung** für bereits öffentlich sichtbare
