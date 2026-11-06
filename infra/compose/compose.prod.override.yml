@@ -27,6 +27,11 @@ services:
       AUTH_RL_IP_PER_HOUR: "30"
       AUTH_RL_EMAIL_PER_MIN: "2"
       AUTH_RL_EMAIL_PER_HOUR: "10"
+      # Anonymous search reads PostgreSQL candidates on every request. These
+      # per-client-IP caps (per API process, 180 ms client debounce) stop one
+      # client from saturating the database; they reuse AUTH_TRUSTED_PROXIES.
+      SEARCH_RL_IP_PER_MIN: ${SEARCH_RL_IP_PER_MIN:-120}
+      SEARCH_RL_IP_PER_HOUR: ${SEARCH_RL_IP_PER_HOUR:-1200}
       WEB_UPSTREAM_HOST: commonthing.home.arpa
       WEB_UPSTREAM_URL: https://commonthing.home.arpa
     volumes:

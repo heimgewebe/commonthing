@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -202,6 +202,8 @@ pub enum SearchError {
     InvalidRequest,
     #[error("internal search error")]
     Internal,
+    #[error("search rate limit exceeded")]
+    RateLimited { retry_after_secs: u64 },
 }
 
 impl IntoResponse for SearchError {
@@ -217,9 +219,18 @@ impl IntoResponse for SearchError {
             SearchError::Unauthorized => (StatusCode::UNAUTHORIZED, "search_unauthorized"),
             SearchError::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_search_request"),
             SearchError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "search_internal_error"),
+            SearchError::RateLimited { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, "search_rate_limited")
+            }
         };
         tracing::warn!(event = "search.request.failed", error_code = code, %status);
-        (status, code).into_response()
+        let mut response = (status, code).into_response();
+        if let SearchError::RateLimited { retry_after_secs } = self {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
+        }
+        response
     }
 }
 
@@ -358,6 +369,7 @@ async fn execute_search_with_mode<'a>(
         }
         Err(SearchError::InvalidRequest) => SearchRequestOutcome::InvalidRequest,
         Err(SearchError::Internal) => SearchRequestOutcome::Internal,
+        Err(SearchError::RateLimited { .. }) => SearchRequestOutcome::RateLimited,
     };
     state.metrics.search_request_outcome(outcome);
     state
@@ -848,6 +860,8 @@ mod tests {
             auth_rl_ip_per_hour: None,
             auth_rl_email_per_min: None,
             auth_rl_email_per_hour: None,
+            search_rl_ip_per_min: None,
+            search_rl_ip_per_hour: None,
             node_mutation_rate_limits: Default::default(),
             smtp_host: None,
             smtp_port: None,

@@ -1,10 +1,15 @@
 use crate::{auth::role::Role, config::AppConfig, node_mutation::NodeMutationOperation};
 use chrono::{TimeZone, Utc};
-use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
+use governor::{
+    clock::{Clock, DefaultClock},
+    state::keyed::DefaultKeyedStateStore,
+    Quota, RateLimiter,
+};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
+use std::time::Duration;
 use thiserror::Error;
 
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
@@ -38,6 +43,8 @@ pub enum RateLimitError {
     EmailLimited,
     #[error("Too many collective node mutations for this account")]
     AccountLimited,
+    #[error("Too many search requests from IP")]
+    SearchIpLimited { retry_after: Duration },
     #[error("Shared rate-limit backend unavailable: {0}")]
     BackendUnavailable(String),
 }
@@ -57,6 +64,8 @@ pub struct AuthRateLimiter {
     node_replace_limiter_hour: Option<AccountLimiter>,
     node_delete_limiter_min: Option<AccountLimiter>,
     node_delete_limiter_hour: Option<AccountLimiter>,
+    search_ip_limiter_min: Option<IpLimiter>,
+    search_ip_limiter_hour: Option<IpLimiter>,
     node_replace_per_min: u32,
     node_replace_per_hour: u32,
     node_delete_per_min: u32,
@@ -92,6 +101,12 @@ impl AuthRateLimiter {
             .map(|limit| RateLimiter::keyed(Quota::per_minute(limit)));
         let node_delete_limiter_hour = NonZeroU32::new(mutation.delete_per_hour)
             .map(|limit| RateLimiter::keyed(Quota::per_hour(limit)));
+        let search_ip_limiter_min = config.search_rl_ip_per_min.and_then(|limit| {
+            NonZeroU32::new(limit).map(|limit| RateLimiter::keyed(Quota::per_minute(limit)))
+        });
+        let search_ip_limiter_hour = config.search_rl_ip_per_hour.and_then(|limit| {
+            NonZeroU32::new(limit).map(|limit| RateLimiter::keyed(Quota::per_hour(limit)))
+        });
         Self {
             ip_limiter_min,
             ip_limiter_hour,
@@ -101,6 +116,8 @@ impl AuthRateLimiter {
             node_replace_limiter_hour,
             node_delete_limiter_min,
             node_delete_limiter_hour,
+            search_ip_limiter_min,
+            search_ip_limiter_hour,
             node_replace_per_min: mutation.replace_per_minute,
             node_replace_per_hour: mutation.replace_per_hour,
             node_delete_per_min: mutation.delete_per_minute,
@@ -146,6 +163,29 @@ impl AuthRateLimiter {
         if let Some(limiter) = &self.email_limiter_hour {
             if limiter.check_key(&email_hash_owned).is_err() {
                 return Err(RateLimitError::EmailLimited);
+            }
+        }
+        Ok(())
+    }
+
+    /// Per-client-IP limit for search requests.
+    ///
+    /// Deliberately in-process even when a PostgreSQL limiter is configured:
+    /// search is a read path, and a shared counter would add one database
+    /// write per request, which is the load this limit exists to cap. With
+    /// several API replicas each replica enforces its own budget.
+    ///
+    /// The minute window is checked first so a burst that exceeds it does not
+    /// also drain the hour budget.
+    pub fn check_search(&self, ip: IpAddr) -> Result<(), RateLimitError> {
+        let ip = rate_limit_ip_subject(ip);
+        for limiter in [&self.search_ip_limiter_min, &self.search_ip_limiter_hour]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(not_until) = limiter.check_key(&ip) {
+                let retry_after = not_until.wait_time_from(DefaultClock::default().now());
+                return Err(RateLimitError::SearchIpLimited { retry_after });
             }
         }
         Ok(())
@@ -342,5 +382,69 @@ mod tests {
             Err(RateLimitError::IpLimited)
         ));
         assert!(limiter.check(elsewhere, "c").is_ok());
+    }
+
+    fn search_limiter(per_min: Option<u32>, per_hour: Option<u32>) -> AuthRateLimiter {
+        let mut config = AppConfig::load_from_str("{}\n").expect("default config");
+        config.auth_rl_ip_per_min = None;
+        config.auth_rl_ip_per_hour = None;
+        config.search_rl_ip_per_min = per_min;
+        config.search_rl_ip_per_hour = per_hour;
+        AuthRateLimiter::new(&config)
+    }
+
+    #[test]
+    fn search_limit_is_off_when_unset_or_zero() {
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        for limiter in [search_limiter(None, None), search_limiter(Some(0), Some(0))] {
+            for _ in 0..500 {
+                assert!(limiter.check_search(ip).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn search_limit_rejects_after_minute_budget_with_retry_hint() {
+        let limiter = search_limiter(Some(3), None);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let other: IpAddr = "192.0.2.2".parse().unwrap();
+        for _ in 0..3 {
+            assert!(limiter.check_search(ip).is_ok());
+        }
+        match limiter.check_search(ip) {
+            Err(RateLimitError::SearchIpLimited { retry_after }) => {
+                assert!(retry_after > Duration::ZERO);
+                assert!(retry_after <= Duration::from_secs(60));
+            }
+            other => panic!("expected search limit, got {other:?}"),
+        }
+        assert!(limiter.check_search(other).is_ok());
+    }
+
+    #[test]
+    fn search_limit_counts_one_ipv6_slash_64_once() {
+        let limiter = search_limiter(Some(1), None);
+        let first: IpAddr = "2001:db8::1".parse().unwrap();
+        let rotated: IpAddr = "2001:db8::2".parse().unwrap();
+        assert!(limiter.check_search(first).is_ok());
+        assert!(limiter.check_search(rotated).is_err());
+    }
+
+    #[test]
+    fn search_limit_is_independent_of_auth_ip_budget() {
+        let mut config = AppConfig::load_from_str("{}\n").expect("default config");
+        config.auth_rl_ip_per_min = Some(1);
+        config.auth_rl_ip_per_hour = None;
+        config.auth_rl_email_per_min = None;
+        config.auth_rl_email_per_hour = None;
+        config.search_rl_ip_per_min = Some(5);
+        config.search_rl_ip_per_hour = None;
+        let limiter = AuthRateLimiter::new(&config);
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+        assert!(limiter.check(ip, "a").is_ok());
+        assert!(limiter.check(ip, "b").is_err());
+        for _ in 0..5 {
+            assert!(limiter.check_search(ip).is_ok());
+        }
     }
 }

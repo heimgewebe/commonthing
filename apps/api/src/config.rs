@@ -395,6 +395,14 @@ pub struct AppConfig {
     pub auth_rl_email_per_min: Option<u32>,
     #[serde(default)]
     pub auth_rl_email_per_hour: Option<u32>,
+    /// Per-client-IP limits for anonymous-reachable search (`/search`,
+    /// `/nodes/search`). Unset or `0` disables the window. Counted per API
+    /// process in memory, never in PostgreSQL, so a search flood does not turn
+    /// into one counter write per request.
+    #[serde(default)]
+    pub search_rl_ip_per_min: Option<u32>,
+    #[serde(default)]
+    pub search_rl_ip_per_hour: Option<u32>,
     /// Separate, account-scoped limits for collective node mutations. These
     /// buckets never reuse login email or IP counters.
     #[serde(default)]
@@ -836,6 +844,8 @@ impl AppConfig {
             "auth_rl_ip_per_hour",
             "auth_rl_email_per_min",
             "auth_rl_email_per_hour",
+            "search_rl_ip_per_min",
+            "search_rl_ip_per_hour",
             "smtp_port",
         ] {
             if matches!(mapping.get(field).map(untagged), Some(serde_yaml::Value::Number(n)) if matches!(n, serde_yaml::Number::Float(_)))
@@ -1080,6 +1090,8 @@ impl AppConfig {
         apply_env_override_option!(self, auth_rl_ip_per_hour, u32, "AUTH_RL_IP_PER_HOUR");
         apply_env_override_option!(self, auth_rl_email_per_min, u32, "AUTH_RL_EMAIL_PER_MIN");
         apply_env_override_option!(self, auth_rl_email_per_hour, u32, "AUTH_RL_EMAIL_PER_HOUR");
+        apply_env_override_option!(self, search_rl_ip_per_min, u32, "SEARCH_RL_IP_PER_MIN");
+        apply_env_override_option!(self, search_rl_ip_per_hour, u32, "SEARCH_RL_IP_PER_HOUR");
         for (name, target) in [
             (
                 "NODE_MUTATION_REPLACE_PER_MINUTE",
@@ -1217,7 +1229,14 @@ impl AppConfig {
     /// A limit of `0` is treated as absent: `AuthRateLimiter::new` maps it to
     /// `NonZeroU32::new(0) == None` and installs no limiter for that window.
     fn has_ip_rate_limits(&self) -> bool {
-        self.auth_rl_ip_per_min.unwrap_or(0) > 0 || self.auth_rl_ip_per_hour.unwrap_or(0) > 0
+        [
+            self.auth_rl_ip_per_min,
+            self.auth_rl_ip_per_hour,
+            self.search_rl_ip_per_min,
+            self.search_rl_ip_per_hour,
+        ]
+        .into_iter()
+        .any(|limit| limit.unwrap_or(0) > 0)
     }
 
     pub fn is_open_registration(&self) -> bool {
@@ -1324,7 +1343,8 @@ impl AppConfig {
         // address and turns the limiter into a shared outage switch.
         if self.has_ip_rate_limits() && self.auth_trusted_proxies.is_none() {
             anyhow::bail!(
-                "Per-IP rate limits (AUTH_RL_IP_PER_MIN / AUTH_RL_IP_PER_HOUR) are enabled but \
+                "Per-IP rate limits (AUTH_RL_IP_PER_MIN / AUTH_RL_IP_PER_HOUR / \
+                 SEARCH_RL_IP_PER_MIN / SEARCH_RL_IP_PER_HOUR) are enabled but \
                  AUTH_TRUSTED_PROXIES is not set. Without it the allowlist defaults to \
                  `{DEFAULT_TRUSTED_PROXIES}`, so a reverse proxy may be untrusted and every \
                  client may share one rate-limit bucket. Set AUTH_TRUSTED_PROXIES to the \
@@ -2377,6 +2397,65 @@ max_guest_owned_nodes: 1000
         assert!(error
             .to_string()
             .contains("AUTH_TRUSTED_PROXIES is not set"));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn validation_rejects_search_ip_rate_limits_without_proxy_decision() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        std::fs::write(file.path(), YAML)?;
+
+        let _rl_ip_min = EnvGuard::unset("AUTH_RL_IP_PER_MIN");
+        let _rl_ip_hour = EnvGuard::unset("AUTH_RL_IP_PER_HOUR");
+        let _search_min = EnvGuard::set("SEARCH_RL_IP_PER_MIN", "120");
+        let _search_hour = EnvGuard::unset("SEARCH_RL_IP_PER_HOUR");
+        let _proxies = EnvGuard::unset("AUTH_TRUSTED_PROXIES");
+
+        let error = AppConfig::load_from_path(file.path())
+            .expect_err("a search per-IP limiter also needs an explicit proxy decision");
+        let message = error.to_string();
+        assert!(
+            message.contains("AUTH_TRUSTED_PROXIES is not set"),
+            "got: {message}"
+        );
+        assert!(message.contains("SEARCH_RL_IP_PER_MIN"), "got: {message}");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn search_ip_rate_limit_env_overrides_apply_with_declared_proxies() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        std::fs::write(file.path(), YAML)?;
+
+        let _rl_ip_min = EnvGuard::unset("AUTH_RL_IP_PER_MIN");
+        let _rl_ip_hour = EnvGuard::unset("AUTH_RL_IP_PER_HOUR");
+        let _search_min = EnvGuard::set("SEARCH_RL_IP_PER_MIN", "120");
+        let _search_hour = EnvGuard::set("SEARCH_RL_IP_PER_HOUR", "1200");
+        let _proxies = EnvGuard::set("AUTH_TRUSTED_PROXIES", "127.0.0.1,::1,172.16.0.0/12");
+
+        let cfg = AppConfig::load_from_path(file.path())?;
+        assert_eq!(cfg.search_rl_ip_per_min, Some(120));
+        assert_eq!(cfg.search_rl_ip_per_hour, Some(1200));
+        assert_eq!(cfg.auth_rl_ip_per_min, None);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn zero_search_ip_rate_limits_do_not_require_proxy_decision() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        std::fs::write(file.path(), YAML)?;
+
+        let _rl_ip_min = EnvGuard::unset("AUTH_RL_IP_PER_MIN");
+        let _rl_ip_hour = EnvGuard::unset("AUTH_RL_IP_PER_HOUR");
+        let _search_min = EnvGuard::set("SEARCH_RL_IP_PER_MIN", "0");
+        let _search_hour = EnvGuard::set("SEARCH_RL_IP_PER_HOUR", "0");
+        let _proxies = EnvGuard::unset("AUTH_TRUSTED_PROXIES");
+
+        let cfg = AppConfig::load_from_path(file.path())?;
+        assert_eq!(cfg.search_rl_ip_per_min, Some(0));
         Ok(())
     }
 
