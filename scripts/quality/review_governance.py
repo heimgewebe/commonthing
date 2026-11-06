@@ -96,6 +96,21 @@ WOOL_TEXT_FONT_SPECS = {
         "size": 424128,
     },
 }
+# The next photographic text refinement modifies both previously ADDED WOFFs.
+# Keep old exact proofs admissible for historical attestations, but reject
+# partial, mixed, or arbitrary updated blobs just as before.
+WOOL_TEXT_FINER_FONT_SPECS = {
+    "apps/web/static/fonts/garnschrift-c-text-dark.woff": {
+        "blob_sha": "6cc666cb36548d5585b3f3c7c9239fb37894f569",
+        "sha256": "c7f209f4e254c93fe642f6c2785c9f349cd42d8c68809c733fa8836db3ea2adf",
+        "size": 412276,
+    },
+    "apps/web/static/fonts/garnschrift-c-text-light.woff": {
+        "blob_sha": "939286440c31bab17b46c206ea6a733d07951b90",
+        "sha256": "6ecb836bb20a49f0b1ace328941c57d87bf475ad966b3068ef271362040202b7",
+        "size": 448932,
+    },
+}
 RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 REQUIRED_REVIEWS = {"R0": 0, "R1": 1, "R2": 2, "R3": 2}
 AUTHORIZED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -853,7 +868,21 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
             elif len(paths) == len(WOOL_TEXT_FONT_SPECS) and set(paths) == set(
                 WOOL_TEXT_FONT_SPECS
             ):
-                exact_specs = WOOL_TEXT_FONT_SPECS
+                # Different approved versions share the same two paths.
+                # A single old+new mixed pair cannot match either candidate.
+                exact_specs = next(
+                    (
+                        specs
+                        for specs in (WOOL_TEXT_FONT_SPECS, WOOL_TEXT_FINER_FONT_SPECS)
+                        if all(
+                            entry["blob_sha"] == specs[entry["path"]]["blob_sha"]
+                            for entry in wool_proofs
+                        )
+                    ),
+                    None,
+                )
+                if exact_specs is None:
+                    raise GovernanceError("mixed or unknown wool text font blobs")
             else:
                 raise GovernanceError("exact approved wool font pair required")
             for entry in wool_proofs:
