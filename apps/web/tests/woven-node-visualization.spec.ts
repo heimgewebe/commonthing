@@ -310,6 +310,9 @@ test.describe("Gewachsene Knoten und antragsgebundene Stimmkränze", () => {
     page,
   }) => {
     const now = new Date("2026-08-05T08:00:00.000Z");
+    // Playwright install() lets time advance during map startup, but this
+    // expiry must happen before the independent 60s periodic refresh.
+    const expiryWindowMs = 30_000;
     await page.clock.install({ time: now });
     await mockApiResponses(page);
 
@@ -323,9 +326,9 @@ test.describe("Gewachsene Knoten und antragsgebundene Stimmkränze", () => {
       faden_type: "knotting",
       faden_subject_id: NODE_ID,
       created_at: new Date(
-        now.getTime() - FADEN_LIFETIME_MS + 1_000,
+        now.getTime() - FADEN_LIFETIME_MS + expiryWindowMs,
       ).toISOString(),
-      expires_at: new Date(now.getTime() + 1_000).toISOString(),
+      expires_at: new Date(now.getTime() + expiryWindowMs).toISOString(),
     };
 
     await page.route("**/api/edges*", async (route) => {
@@ -342,6 +345,9 @@ test.describe("Gewachsene Knoten und antragsgebundene Stimmkränze", () => {
     const marker = page.getByTestId(`marker-node-${NODE_ID}`);
     const woven = marker.locator(".woven-node");
     await expect(marker).toBeVisible({ timeout: 15_000 });
+    expect(await page.evaluate(() => Date.now())).toBeLessThan(
+      new Date(targetOnlyEdge.expires_at).getTime(),
+    );
     await expect(woven).toHaveAttribute("data-knotting-threads", "1");
     await expect(
       page.getByTestId("marker-garnrolle-outside-visible-markers"),
@@ -358,7 +364,12 @@ test.describe("Gewachsene Knoten und antragsgebundene Stimmkränze", () => {
       )
       .toBe(0);
 
-    await page.clock.fastForward(1_001);
+    await page.clock.fastForward(expiryWindowMs + 1);
+    // Otherwise a broken exact-expiry scheduler could pass via the minute
+    // interval. If the test ran past that interval, reject the observation.
+    expect(await page.evaluate(() => Date.now())).toBeLessThan(
+      now.getTime() + 60_000,
+    );
     await expect(woven).toHaveAttribute("data-knotting-threads", "0");
     await expect(woven).toHaveAttribute("data-proposal-count", "0");
   });
