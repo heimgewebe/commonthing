@@ -990,6 +990,7 @@ Generated automatically. Do not edit.
 
 - [relates_to] docs/blueprints/blueprint-agent-safety-control-layer.md
 - [relates_to] docs/blueprints/domain-scale-foundation.md
+- [relates_to] docs/blueprints/geltungsbereiche-hausgemeinschaft.md
 - [relates_to] docs/blueprints/kartenklarheit.md
 - [relates_to] docs/blueprints/map-blaupause.md
 - [relates_to] docs/blueprints/ui-blaupause.md
@@ -1133,6 +1134,7 @@ Generated automatically. Do not edit.
 
 - [relates_to] docs/adr/ADR-0009__garnrolle-verortung-sichtbarkeit.md
 - [relates_to] docs/adr/ADR-0011__foederierte-gewebezellen.md
+- [relates_to] docs/blueprints/geltungsbereiche-hausgemeinschaft.md
 - [relates_to] docs/policies/architecture-critique.md
 - [relates_to] docs/reports/domain-edge-faden-lifecycle-proof.md
 - [relates_to] docs/specs/federation-core.md
@@ -1159,6 +1161,7 @@ Generated automatically. Do not edit.
 ## docs/specs/map-experience.md
 
 - [relates_to] docs/adr/ADR-0015__ortsweberei-gewebezelle-webgemeindezentrum.md
+- [relates_to] docs/blueprints/geltungsbereiche-hausgemeinschaft.md
 - [relates_to] docs/blueprints/map-blaupause.md
 - [implements] docs/deploy/germany-basemap-rollout.md
 - [verifies] docs/reports/map-status.md
@@ -1179,6 +1182,7 @@ Generated automatically. Do not edit.
 ## docs/specs/ortsweberei-webgemeindezentrum.md
 
 - [relates_to] docs/adr/ADR-0015__ortsweberei-gewebezelle-webgemeindezentrum.md
+- [relates_to] docs/blueprints/geltungsbereiche-hausgemeinschaft.md
 - [relates_to] docs/domain/vocabulary.md
 - [relates_to] docs/specs/governance-antraege.md
 - [relates_to] docs/specs/knoten-gewebe-visualisierung.md
@@ -1187,12 +1191,17 @@ Generated automatically. Do not edit.
 ## docs/specs/privacy-api.md
 
 - [relates_to] docs/adr/ADR-0009__garnrolle-verortung-sichtbarkeit.md
+- [relates_to] docs/blueprints/geltungsbereiche-hausgemeinschaft.md
 - [relates_to] docs/specs/privacy-ui.md
 - [relates_to] docs/specs/private-nachrichten.md
 
 ## docs/specs/privacy-ui.md
 
 - [supersedes] docs/specs/garnrolle-knoten-faden.md
+
+## docs/specs/private-nachrichten.md
+
+- [relates_to] docs/blueprints/geltungsbereiche-hausgemeinschaft.md
 
 ## docs/specs/ui-interaction.md
 
