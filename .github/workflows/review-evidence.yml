@@ -284,15 +284,37 @@ jobs:
             fi
           fi
 
-          # Only the exact two MODIFIED font blobs for the approved Wollschrift refinement,
-          # pinned to these bytes and preserving original
-          # source from the trusted PR base; never execute any PR code.
+          # Only the exact approved MODIFIED heading pair or ADDED text pair.
+          # Pin every byte and its unchanged photo source from the trusted base;
+          # never execute PR code, admit mixed pairs, or allow arbitrary WOFF.
           wool_font_proofs='[]'
+          wool_mode=''
           wool_dark='apps/web/static/fonts/garnschrift-c-dark.woff'
           wool_light='apps/web/static/fonts/garnschrift-c-light.woff'
+          wool_text_dark='apps/web/static/fonts/garnschrift-c-text-dark.woff'
+          wool_text_light='apps/web/static/fonts/garnschrift-c-text-light.woff'
           if jq -e --arg dark "${wool_dark}" --arg light "${wool_light}" '
             any(.[]; .filename == $dark) and any(.[]; .filename == $light)
           ' "${RUNNER_TEMP}/files.json" >/dev/null; then
+            wool_mode='modified'
+            wool_dark_spec="${wool_dark}|"
+            wool_dark_spec+='c6c0d2c661226c89b85d7431cc27801a77e4b956|'
+            wool_dark_spec+='fe8979fe9f6cd5cd1cccbcc8d5a7ccf2cbe79e79ed575d82ec6c87bcfd5dff63|362748'
+            wool_light_spec="${wool_light}|"
+            wool_light_spec+='135f95506f756786ba6ae657971ed685b3eb80ab|'
+            wool_light_spec+='e16c9e1baae88bd56f46fbe97337991311e0a1cdcb7002a229deeb6613532f9e|399024'
+          elif jq -e --arg dark "${wool_text_dark}" --arg light "${wool_text_light}" '
+            any(.[]; .filename == $dark) and any(.[]; .filename == $light)
+          ' "${RUNNER_TEMP}/files.json" >/dev/null; then
+            wool_mode='added'
+            wool_dark_spec="${wool_text_dark}|"
+            wool_dark_spec+='ea1f56c6b804fb140d6637248ea1df15608b4723|'
+            wool_dark_spec+='65b87161ff41cb584e26859715cf294bf59787054d0d973926ec3532429f9f36|389736'
+            wool_light_spec="${wool_text_light}|"
+            wool_light_spec+='e21aeda4bc5726ead4f0e7a5cf35a31e998ecad5|'
+            wool_light_spec+='a1a5854b9712d23a762a31cad0b3ed030b8e4a96f68c8c02cc123cc4be7031e7|424128'
+          fi
+          if [[ -n "${wool_mode}" ]]; then
             wool_source_path='docs/assets/garnschrift-c-contact-sheet.png'
             jq -e --arg source "${wool_source_path}" '
               all(.[]; .filename != $source)
@@ -301,16 +323,10 @@ jobs:
               "repos/${REPOSITORY}/contents/${wool_source_path}?ref=${base_sha}" \
               | jq -er '.sha')"
             [[ "${wool_source_blob}" == '3ada289072a765db9787208f6b95c6f73c3c7cce' ]]
-            wool_dark_spec="${wool_dark}|"
-            wool_dark_spec+='c6c0d2c661226c89b85d7431cc27801a77e4b956|'
-            wool_dark_spec+='fe8979fe9f6cd5cd1cccbcc8d5a7ccf2cbe79e79ed575d82ec6c87bcfd5dff63|362748'
-            wool_light_spec="${wool_light}|"
-            wool_light_spec+='135f95506f756786ba6ae657971ed685b3eb80ab|'
-            wool_light_spec+='e16c9e1baae88bd56f46fbe97337991311e0a1cdcb7002a229deeb6613532f9e|399024'
             for wool_spec in "${wool_dark_spec}" "${wool_light_spec}"; do
               IFS='|' read -r wool_path expected_blob expected_sha expected_bytes <<< "${wool_spec}"
-              wool_blob="$(jq -er --arg path "${wool_path}" '
-                .[] | select(.filename == $path and .status == "modified") | .sha
+              wool_blob="$(jq -er --arg path "${wool_path}" --arg mode "${wool_mode}" '
+                .[] | select(.filename == $path and .status == $mode) | .sha
               ' "${RUNNER_TEMP}/files.json")"
               [[ "${wool_blob}" == "${expected_blob}" ]]
               gh api -H "${api_header}" \

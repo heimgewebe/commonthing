@@ -81,6 +81,21 @@ WOOL_FONT_SPECS = {
         "size": 399024,
     },
 }
+# The two supplemental text-weight fonts originate from the same pinned yarn
+# photograph. Only this complete exact pair is admissible with blob/SHA/size
+# proof; arbitrary new WOFF files and mixed pairs remain blocked.
+WOOL_TEXT_FONT_SPECS = {
+    "apps/web/static/fonts/garnschrift-c-text-dark.woff": {
+        "blob_sha": "ea1f56c6b804fb140d6637248ea1df15608b4723",
+        "sha256": "65b87161ff41cb584e26859715cf294bf59787054d0d973926ec3532429f9f36",
+        "size": 389736,
+    },
+    "apps/web/static/fonts/garnschrift-c-text-light.woff": {
+        "blob_sha": "e21aeda4bc5726ead4f0e7a5cf35a31e998ecad5",
+        "sha256": "a1a5854b9712d23a762a31cad0b3ed030b8e4a96f68c8c02cc123cc4be7031e7",
+        "size": 424128,
+    },
+}
 RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 REQUIRED_REVIEWS = {"R0": 0, "R1": 1, "R2": 2, "R3": 2}
 AUTHORIZED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -340,7 +355,12 @@ def _partition_opaque_files(
     blocking: list[str] = []
     for path in paths:
         allowed = _is_safe_opaque_asset(path) or (
-            path in verified and (path == GARN_FONT_PATH or path in WOOL_FONT_SPECS)
+            path in verified
+            and (
+                path == GARN_FONT_PATH
+                or path in WOOL_FONT_SPECS
+                or path in WOOL_TEXT_FONT_SPECS
+            )
         )
         (reviewable if allowed else blocking).append(path)
     return tuple(reviewable), tuple(blocking)
@@ -816,21 +836,29 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
         if not isinstance(wool_proofs, list):
             raise GovernanceError("wool_font_proofs must be an array")
         if wool_proofs:
-            # Either the exact pair of known image-backed fonts is verified,
-            # or no WOFF receives an opaque-file exception.
-            paths: list[str] = []
+            # Only a complete and homogeneous, cryptographically pinned pair.
+            fields = {"path", "blob_sha", "sha256", "size", "magic", "source_blob"}
+            if any(
+                not isinstance(entry, dict) or set(entry) != fields
+                for entry in wool_proofs
+            ):
+                raise GovernanceError("invalid wool font proof fields")
+            paths = [entry["path"] for entry in wool_proofs]
+            if not all(isinstance(item, str) for item in paths):
+                raise GovernanceError("wool font paths must be strings")
+            if len(paths) == len(WOOL_FONT_SPECS) and set(paths) == set(
+                WOOL_FONT_SPECS
+            ):
+                exact_specs = WOOL_FONT_SPECS
+            elif len(paths) == len(WOOL_TEXT_FONT_SPECS) and set(paths) == set(
+                WOOL_TEXT_FONT_SPECS
+            ):
+                exact_specs = WOOL_TEXT_FONT_SPECS
+            else:
+                raise GovernanceError("exact approved wool font pair required")
             for entry in wool_proofs:
-                if not isinstance(entry, dict) or set(entry) != {
-                    "path",
-                    "blob_sha",
-                    "sha256",
-                    "size",
-                    "magic",
-                    "source_blob",
-                }:
-                    raise GovernanceError("invalid wool font proof fields")
                 path = entry["path"]
-                known = WOOL_FONT_SPECS.get(path) if isinstance(path, str) else None
+                known = exact_specs.get(path) if isinstance(path, str) else None
                 if (
                     known is None
                     or entry["blob_sha"] != known["blob_sha"]
@@ -843,9 +871,6 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
                     or path not in stats.changed_files
                 ):
                     raise GovernanceError("unverified wool font bytes or provenance")
-                paths.append(path)
-            if len(paths) != len(WOOL_FONT_SPECS) or set(paths) != set(WOOL_FONT_SPECS):
-                raise GovernanceError("both exact wool fonts must be verified together")
             stats = DiffStats(
                 stats.changed_files,
                 stats.additions,
