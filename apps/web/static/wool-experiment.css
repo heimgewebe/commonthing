@@ -53,10 +53,12 @@
     :is(h1, h2, h3, h4, h5, h6, strong, b, [role="heading"]),
   html[data-wool-experiment="on"][data-color-scheme="dark"]
     body
-    :is(h1, h2, h3, h4, h5, h6, [role="heading"]) *,
+    :is(h1, h2, h3, h4, h5, h6, [role="heading"])
+    *,
   html[data-wool-experiment="on"][data-color-scheme="dark"]
     body
-    :is(strong, b) * {
+    :is(strong, b)
+    * {
     font-family: "Garnschrift C Woll", system-ui, sans-serif !important;
   }
 
@@ -65,10 +67,12 @@
     :is(h1, h2, h3, h4, h5, h6, strong, b, [role="heading"]),
   html[data-wool-experiment="on"][data-color-scheme="light"]
     body
-    :is(h1, h2, h3, h4, h5, h6, [role="heading"]) *,
+    :is(h1, h2, h3, h4, h5, h6, [role="heading"])
+    *,
   html[data-wool-experiment="on"][data-color-scheme="light"]
     body
-    :is(strong, b) * {
+    :is(strong, b)
+    * {
     font-family: "Garnschrift C Petrol", system-ui, sans-serif !important;
   }
 
