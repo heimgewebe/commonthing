@@ -249,6 +249,7 @@ class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
             ".[] | select(.filename == $path and .status == $mode) | .sha",
             trusted,
         )
+        self.assertIn("wool_mode=''", trusted)
         self.assertIn("wool_mode='modified'", trusted)
         self.assertIn("wool_mode='added'", trusted)
         for spec in (*WOOL_FONT_SPECS.values(), *WOOL_TEXT_FONT_SPECS.values()):

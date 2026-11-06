@@ -288,6 +288,7 @@ jobs:
           # Pin every byte and its unchanged photo source from the trusted base;
           # never execute PR code, admit mixed pairs, or allow arbitrary WOFF.
           wool_font_proofs='[]'
+          wool_mode=''
           wool_dark='apps/web/static/fonts/garnschrift-c-dark.woff'
           wool_light='apps/web/static/fonts/garnschrift-c-light.woff'
           wool_text_dark='apps/web/static/fonts/garnschrift-c-text-dark.woff'
