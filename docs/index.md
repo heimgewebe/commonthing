@@ -60,6 +60,7 @@ Roadmaps und Blaupausen beschreiben Arbeit oder mögliche Zielbilder. Sie sind n
 - [commonThing-OS-Foundation-Status](reports/weltgewebe-os-foundation-status.md)
 - [Auth-Roadmap](blueprints/auth-roadmap.md)
 - [Domain-PostgreSQL-Cutover](blueprints/domain-data-postgres-cutover.md)
+- [Geltungsbereiche und Hausgemeinschaft](blueprints/geltungsbereiche-hausgemeinschaft.md) – Sichtbarkeit, Adressierung, Mitwirkung, Benachrichtigung
 - [Basemap-Architektur](blueprints/map-blaupause.md)
 - [Versionierung](blueprints/versionierungs-blaupause.md)
 - [Task-Control](tasks/README.md)
