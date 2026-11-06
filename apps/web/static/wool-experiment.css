@@ -15,17 +15,61 @@
   font-display: swap;
 }
 
+/* The body variant keeps the photographed yarn but reduces edge coverage;
+   headings and semantic emphasis retain the approved original font. */
+@font-face {
+  font-family: "Garnschrift C Woll Text";
+  src: url("/fonts/garnschrift-c-text-dark.woff") format("woff");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Garnschrift C Petrol Text";
+  src: url("/fonts/garnschrift-c-text-light.woff") format("woff");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
 @media (forced-colors: none) {
   html[data-wool-experiment="on"][data-color-scheme="dark"] body,
   html[data-wool-experiment="on"][data-color-scheme="dark"] body * {
-    font-family: "Garnschrift C Woll", system-ui, sans-serif !important;
+    font-family: "Garnschrift C Woll Text", system-ui, sans-serif !important;
     font-synthesis: none;
   }
 
   html[data-wool-experiment="on"][data-color-scheme="light"] body,
   html[data-wool-experiment="on"][data-color-scheme="light"] body * {
-    font-family: "Garnschrift C Petrol", system-ui, sans-serif !important;
+    font-family: "Garnschrift C Petrol Text", system-ui, sans-serif !important;
     font-synthesis: none;
+  }
+
+  /* Titles and emphasized words retain the original stronger yarn.
+     Include descendants so heading wrappers do not become light again. */
+  html[data-wool-experiment="on"][data-color-scheme="dark"]
+    body
+    :is(h1, h2, h3, h4, h5, h6, strong, b, [role="heading"]),
+  html[data-wool-experiment="on"][data-color-scheme="dark"]
+    body
+    :is(h1, h2, h3, h4, h5, h6, [role="heading"]) *,
+  html[data-wool-experiment="on"][data-color-scheme="dark"]
+    body
+    :is(strong, b) * {
+    font-family: "Garnschrift C Woll", system-ui, sans-serif !important;
+  }
+
+  html[data-wool-experiment="on"][data-color-scheme="light"]
+    body
+    :is(h1, h2, h3, h4, h5, h6, strong, b, [role="heading"]),
+  html[data-wool-experiment="on"][data-color-scheme="light"]
+    body
+    :is(h1, h2, h3, h4, h5, h6, [role="heading"]) *,
+  html[data-wool-experiment="on"][data-color-scheme="light"]
+    body
+    :is(strong, b) * {
+    font-family: "Garnschrift C Petrol", system-ui, sans-serif !important;
   }
 
   /* Wool text needs a legible optical size. */

@@ -77,12 +77,18 @@ def adjusted_glyph_top(ch: str, asset: tuple[int, int, bytearray, int]) -> int:
     return top
 
 
-def baseline_aligned_png(ch: str, asset: tuple[int, int, bytearray, int]) -> bytes:
-    """Embed real wool pixels at their optical baseline, with transparent pads."""
+def baseline_aligned_png(
+    ch: str, asset: tuple[int, int, bytearray, int], *, text_variant: bool = False
+) -> bytes:
+    """Embed original wool pixels; contract fiber edges further for body text."""
     width, height, rgba, _ = asset
     top = adjusted_glyph_top(ch, asset)
     output = bytearray(width * BITMAP_HEIGHT * 4)
     pixels = slightly_thinner_edges(width, height, rgba)
+    if text_variant:
+        # A second edge-only coverage pass creates a genuinely slimmer
+        # raster variant, keeping the original wool RGB, metrics and core.
+        pixels = slightly_thinner_edges(width, height, pixels)
     # The original i and k contain disconnected tiny fragments below their
     # non-descending stems. Prune only this measured 0.7%-1.2% alpha artifact;
     # keep actual letter cores, real descenders and the original RGB wool.
@@ -96,7 +102,7 @@ def baseline_aligned_png(ch: str, asset: tuple[int, int, bytearray, int]) -> byt
     return write_png_rgba(width, BITMAP_HEIGHT, output)
 
 
-def generate(theme: str) -> bytes:
+def generate(theme: str, *, text_variant: bool = False) -> bytes:
     if fontTools.__version__ != "4.61.1":
         raise RuntimeError("reproducibility requires fonttools==4.61.1")
     if theme not in ("dark", "light"):
@@ -121,6 +127,8 @@ def generate(theme: str) -> bytes:
     )
     fb.setupHorizontalHeader(ascent=ASCENT, descent=DESCENT, lineGap=0)
     family = "Garnschrift C Woll" if theme == "dark" else "Garnschrift C Petrol"
+    if text_variant:
+        family += " Text"
     fb.setupNameTable(
         {
             "familyName": family,
@@ -160,7 +168,7 @@ def generate(theme: str) -> bytes:
             # disagree about *relative* character placement.
             originOffsetY=DESCENT,
             graphicType="png ",
-            imageData=baseline_aligned_png(ch, assets[ch]),
+            imageData=baseline_aligned_png(ch, assets[ch], text_variant=text_variant),
         )
         for ch in chars
     }
@@ -202,10 +210,12 @@ def generate(theme: str) -> bytes:
 def main() -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
     for theme in ("dark", "light"):
-        data = generate(theme)
-        path = OUTPUT / f"garnschrift-c-{theme}.woff"
-        path.write_bytes(data)
-        print(f"{path.name}: {len(data)} bytes, source={SHEET_SHA256}")
+        for text_variant in (False, True):
+            data = generate(theme, text_variant=text_variant)
+            name = f"garnschrift-c-{'text-' if text_variant else ''}{theme}.woff"
+            path = OUTPUT / name
+            path.write_bytes(data)
+            print(f"{path.name}: {len(data)} bytes, source={SHEET_SHA256}")
 
 
 if __name__ == "__main__":
