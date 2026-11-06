@@ -2,7 +2,7 @@
 id: blueprints.geltungsbereiche-hausgemeinschaft
 title: "Geltungsbereiche und Hausgemeinschaft – universeller Umsetzungsplan"
 doc_type: blueprint
-status: active
+status: deferred
 created: 2026-11-06
 lang: de
 summary: >-
