@@ -162,6 +162,30 @@ Nur das Kerning der nativen Farbschrift folgt den endgültigen Glyphenpositionen
 Im systemweiten Hochkontrastmodus (Forced Colors) wird die Bitmap-Schrift zugunsten lesbarer Systemschrift deaktiviert.
 
 
+## Schlankere Wollschrift für Fließtext
+
+Überschriften und Hervorhebungen behalten die bislang freigegebene kräftigere
+Garnschrift C. Normale Absätze, Beschriftungen, Bedienelemente und Eingaben
+verwenden die zusätzliche Variante `Garnschrift C Woll Text` (Dunkelmodus) bzw.
+`Garnschrift C Petrol Text` (Hellmodus). Sie wird als eigenständige lokale
+Farbschrift ausgeliefert; bloßes `font-weight: 300` würde die fotografischen
+Bitmap-Fäden nicht dünner machen.
+
+Der Generator entfernt ausschließlich mehr Deckkraft entlang der echten
+Garnkanten, nicht aus den Faserkernen. Farben, originale Fotopixel, Glyphengrößen,
+Grundlinien, Unterlängen und Zeichenabstände bleiben gleich. Der bereits
+freigegebene Originalfont und die Wortbild-Überschriften sind **bitgenau
+unverändert**. Das gilt auch für die beiden Farbvarianten. Diese Trennung ist
+allein in `static/wool-experiment.css` sichtbar, wenn die Wollschrift aktiviert
+ist; Forced Colors, deaktivierte Wollschrift und technische Monospace-Texte
+behalten ihren bisherigen Fallback.
+
+Die vier WOFF-Dateien werden gemeinsam reproduzierbar aus der bekannten
+Originalquelle erzeugt und anhand fester SHA-256-Werte, des gleichen
+Glyphenlayouts und tatsächlich geringer Deckkraft geprüft. Auf Seiten mit
+Fließtext und Überschriften müssen im aktiven Farbschema beide Fontvarianten
+geladen werden; dies kostet zusätzliche rund 390–425 kB beim ersten Aufruf.
+
 ## iPad/Safari: optische Grundlinie von Satzzeichen
 
 Die Satzzeichen stammen aus eigenen Zeilen des Kontaktbogens. Ein Punkt
@@ -184,7 +208,7 @@ echte Glyphe einen **145 Pixel hohen transparenten Em-Kasten** und den
 identischen sbix-Vertikalursprung -40. Damit gibt es keine je Buchstabe
 unterschiedlichen sbix-Offsets mehr, die Safari abweichend auslegen kann.
 
-Die Originalquelle und normalen Text-Fallbacks bleiben unverändert. Die vier Titel-PNGs werden gemeinsam mit den beiden WOFF-Dateien aus der gereinigten Alpha-Maske regeneriert. Kein CSS-Trick, keine neue
+Die Originalquelle und normalen Text-Fallbacks bleiben unverändert. Die vier Titel-PNGs werden gemeinsam mit den WOFF-Dateien aus der gereinigten Alpha-Maske regeneriert. Kein CSS-Trick, keine neue
 Browserberechnung und keine externe Schriftressource.
 
 ## iPad/Safari: vollständige Unterlängen und schattenfreie Garnkanten
