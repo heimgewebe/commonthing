@@ -14,10 +14,10 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 753 |
+| Relationen gesamt | 759 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 696 |
+| — relates_to | 702 |
 | — supersedes | 13 |
 | — verifies | 9 |
 | relates_to Anteil | 92% |
@@ -32,7 +32,7 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (299 Dokumente):
+**Cluster 1** (300 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
@@ -102,6 +102,7 @@ _Keine Lücken erkannt._
 - `docs/blueprints/doc-structure-task-control.md`
 - `docs/blueprints/domain-data-postgres-cutover.md`
 - `docs/blueprints/domain-scale-foundation.md`
+- `docs/blueprints/geltungsbereiche-hausgemeinschaft.md`
 - `docs/blueprints/kartenklarheit-phase6.md`
 - `docs/blueprints/kartenklarheit-roadmap.md`
 - `docs/blueprints/kartenklarheit.md`

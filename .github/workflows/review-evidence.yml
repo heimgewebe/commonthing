@@ -284,7 +284,8 @@ jobs:
             fi
           fi
 
-          # Only the exact approved MODIFIED heading pair or ADDED text pair.
+          # Only the exact MODIFIED heading pair, original ADDED text pair,
+          # or the newer, separately SHA-pinned MODIFIED text pair.
           # Pin every byte and its unchanged photo source from the trusted base;
           # never execute PR code, admit mixed pairs, or allow arbitrary WOFF.
           wool_font_proofs='[]'
@@ -304,7 +305,19 @@ jobs:
             wool_light_spec+='135f95506f756786ba6ae657971ed685b3eb80ab|'
             wool_light_spec+='e16c9e1baae88bd56f46fbe97337991311e0a1cdcb7002a229deeb6613532f9e|399024'
           elif jq -e --arg dark "${wool_text_dark}" --arg light "${wool_text_light}" '
-            any(.[]; .filename == $dark) and any(.[]; .filename == $light)
+            any(.[]; .filename == $dark and .status == "modified") and
+            any(.[]; .filename == $light and .status == "modified")
+          ' "${RUNNER_TEMP}/files.json" >/dev/null; then
+            wool_mode='modified'
+            wool_dark_spec="${wool_text_dark}|"
+            wool_dark_spec+='6cc666cb36548d5585b3f3c7c9239fb37894f569|'
+            wool_dark_spec+='c7f209f4e254c93fe642f6c2785c9f349cd42d8c68809c733fa8836db3ea2adf|412276'
+            wool_light_spec="${wool_text_light}|"
+            wool_light_spec+='939286440c31bab17b46c206ea6a733d07951b90|'
+            wool_light_spec+='6ecb836bb20a49f0b1ace328941c57d87bf475ad966b3068ef271362040202b7|448932'
+          elif jq -e --arg dark "${wool_text_dark}" --arg light "${wool_text_light}" '
+            any(.[]; .filename == $dark and .status == "added") and
+            any(.[]; .filename == $light and .status == "added")
           ' "${RUNNER_TEMP}/files.json" >/dev/null; then
             wool_mode='added'
             wool_dark_spec="${wool_text_dark}|"
