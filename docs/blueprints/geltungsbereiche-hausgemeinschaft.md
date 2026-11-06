@@ -188,7 +188,7 @@ Rückwirkungszusage machen.
 
 ### P0 – Bestandsaufnahme und minimaler Vertrag
 
-#### Arbeit
+#### Umsetzung P0
 
 1. Tatsächliche DB-Migrationen, `search_visibility`, Konto-Profile,
    Knoten-Lesewege, Push-Opt-ins und Outbox auf `main` und Runtime
@@ -206,7 +206,7 @@ implizite zweite Privacy-Definition verletzt wird.
 
 ### P1 – Freiwillige Hausmitgliedschaft, ohne neue Darstellungswelt
 
-#### Arbeit
+#### Umsetzung P1
 
 1. Stabile Kreis-ID und minimale Mitgliedschaft mit serverseitiger
    Bestätigung/Austritt und eigenen Lese-/Schreibgrenzen anlegen.
@@ -224,7 +224,7 @@ korrekten, unabhängig gepflegten Mitgliedschaftszustand.
 
 ### P2 – „Nur Hausgemeinschaft“ an vorhandenen Knoten
 
-#### Arbeit
+#### Umsetzung P2
 
 1. Sichtbarkeit in bestehender Knotenkomposition/-bearbeitung
    anbieten; bestehende `public`-, `private`-, `hidden`- und
@@ -246,7 +246,7 @@ Knotenweben funktionieren unverändert.
 
 ### P2b – Sichtbarkeit einzelner Garnrollen-Ressourcen
 
-#### Arbeit
+#### Umsetzung P2b
 
 1. Prüfen, ob Güter, Fähigkeiten und Pläne heute als separat
    verknüpfte Knoten oder als Felder/Listen innerhalb eines
@@ -266,7 +266,7 @@ Garnrolle zu verstecken oder einen neuen Ressourceneditor zu erfinden.
 
 ### P3 – Adressierung und freiwillige Hinweise
 
-#### Arbeit
+#### Umsetzung P3
 
 1. Webungsereignis darf gezielt an einen Kreis adressiert werden,
    ohne Knoten zu kopieren. Adressierung erweitert niemals Leserechte.
@@ -288,7 +288,7 @@ regressionsfrei.
 
 ### P4 – Gleiche Reichweite auf großer Karte
 
-#### Arbeit
+#### Umsetzung P4
 
 1. Das Kreis-Prädikat für weitere freiwillige Gemeinschaften
    wiederverwenden; keine `if (household)`-Sonderarchitektur.
