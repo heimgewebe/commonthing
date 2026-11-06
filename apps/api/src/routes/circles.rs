@@ -4,7 +4,7 @@
 //! No member of a 'forming' circle gains content rights. An invitation alone
 //! never grants membership. PostgreSQL owns the canonical state.
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
@@ -51,6 +51,12 @@ impl CreateCircleInput {
         }
         Ok((self.kind.as_str(), name.to_owned(), invited))
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListCirclesQuery {
+    offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,17 +167,25 @@ fn row_to_view(row: &sqlx::postgres::PgRow) -> Result<CircleView, ApiError> {
 pub async fn list_my_circles(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
+    Query(query): Query<ListCirclesQuery>,
 ) -> Result<Response, ApiError> {
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
+    let offset = query.offset.unwrap_or(0);
+    if offset < 0 {
+        return Err(bad_request("offset must be non-negative"));
+    }
     let rows = sqlx::query(
         "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status
          FROM domain_audience_circles c
          JOIN domain_audience_circle_members m ON m.circle_id=c.id
          WHERE m.account_id=$1
-         ORDER BY c.created_at DESC, c.id DESC LIMIT 100",
+         ORDER BY CASE WHEN c.state='active' AND m.status='active' THEN 0 ELSE 1 END,
+                  c.created_at DESC, c.id DESC
+         LIMIT 100 OFFSET $2",
     )
     .bind(actor)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map_err(internal_error("list_my_circles"))?;
@@ -191,13 +205,27 @@ pub async fn list_circle_members(
 ) -> Result<Response, ApiError> {
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
-    let allowed = sqlx::query_scalar::<_, bool>("SELECT weltgewebe_active_circle_member($1, $2)")
-        .bind(id)
-        .bind(actor)
-        .fetch_one(pool)
+    // Hold a shared circle lock until after member rows have been read.
+    // Departure, invitation and acceptance need an exclusive circle lock.
+    let mut tx = pool
+        .begin()
         .await
-        .map_err(internal_error("check_member_list_access"))?;
-    if !allowed {
+        .map_err(internal_error("begin_member_list"))?;
+    let allowed = sqlx::query_scalar::<_, Uuid>(
+        "SELECT c.id FROM domain_audience_circles c
+         JOIN domain_audience_circle_members actor_m ON actor_m.circle_id=c.id
+         JOIN domain_accounts actor_a ON actor_a.id=actor_m.account_id
+         WHERE c.id=$1 AND c.state='active'
+           AND actor_m.account_id=$2 AND actor_m.status='active'
+           AND actor_a.disabled=FALSE
+         FOR SHARE OF c, actor_m, actor_a",
+    )
+    .bind(id)
+    .bind(actor)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal_error("check_member_list_access"))?;
+    if allowed.is_none() {
         return Err((StatusCode::NOT_FOUND, "circle not found".to_owned()));
     }
     let rows = sqlx::query(
@@ -207,9 +235,12 @@ pub async fn list_circle_members(
          ORDER BY a.title, a.id LIMIT 100",
     )
     .bind(id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(internal_error("list_circle_members"))?;
+    tx.commit()
+        .await
+        .map_err(internal_error("commit_member_list"))?;
     let members = rows
         .iter()
         .map(|row| {

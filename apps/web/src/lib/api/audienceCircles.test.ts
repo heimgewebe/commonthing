@@ -19,12 +19,45 @@ describe("voluntary audience circle API", () => {
     vi.stubGlobal("fetch", fetchMock);
     await expect(listMyCircles()).resolves.toEqual([]);
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/circles/me",
+      "/api/circles/me?offset=0",
       expect.objectContaining({
         credentials: "include",
         cache: "no-store",
       }),
     );
+  });
+
+  it("paginates beyond 100 invitations so old households remain accessible", async () => {
+    const newer = Array.from({ length: 100 }, (_, i) => ({
+      id: `new-${i}`,
+      kind: "household",
+      name: "Einladung",
+      state: "forming",
+      membership_status: "invited",
+    }));
+    const oldActive = {
+      id: "old-active",
+      kind: "household",
+      name: "Meine Hausgemeinschaft",
+      state: "active",
+      membership_status: "active",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(newer), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify([oldActive]), { status: 200 }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const circles = await listMyCircles();
+    expect(circles).toHaveLength(101);
+    expect(circles).toContainEqual(oldActive);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/circles/me?offset=0",
+      "/api/circles/me?offset=100",
+    ]);
   });
 
   it("never infers membership from location; a founder explicitly invites one account", async () => {

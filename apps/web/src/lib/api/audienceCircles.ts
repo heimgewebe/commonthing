@@ -40,8 +40,22 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export const listMyCircles = (signal?: AbortSignal) =>
-  request<AudienceCircle[]>("/api/circles/me", { signal });
+// Read each server-bounded page. An arbitrary flood of invitations must not
+// make older active circles inaccessible to their actual members.
+const CIRCLE_PAGE_SIZE = 100;
+export async function listMyCircles(
+  signal?: AbortSignal,
+): Promise<AudienceCircle[]> {
+  const circles: AudienceCircle[] = [];
+  for (let offset = 0; ; offset += CIRCLE_PAGE_SIZE) {
+    const page = await request<AudienceCircle[]>(
+      `/api/circles/me?offset=${offset}`,
+      { signal },
+    );
+    circles.push(...page);
+    if (page.length < CIRCLE_PAGE_SIZE) return circles;
+  }
+}
 
 export const listCircleMembers = (id: string, signal?: AbortSignal) =>
   request<AudienceCircleMember[]>(
