@@ -10,6 +10,7 @@
   } from "$lib/stores/uiView";
   import { authStore } from "$lib/auth/store";
   import { sensitiveSession } from "$lib/auth/sensitiveSession";
+  import { rememberGarnrolleLocation } from "$lib/garnrolle/locationHandoff";
   import { createNode, ApiRequestError } from "$lib/api/domainWrites";
   import { combineKnottingTags, type KnottingTopic } from "$lib/knottingTopics";
   import { NODE_KIND_OPTIONS, isNodeKind } from "$lib/ui/productLanguage";
@@ -39,7 +40,9 @@
     $kompositionDraft?.mode === "place-garnrolle",
   );
   let canSubmit = $derived(
-    !!title.trim() && isNodeKind(nodeType) && (!geographic || !!$kompositionDraft?.lngLat),
+    !!title.trim() &&
+      isNodeKind(nodeType) &&
+      (!geographic || !!$kompositionDraft?.lngLat),
   );
 
   onMount(async () => {
@@ -73,14 +76,16 @@
           "Der private Kartenanker konnte nicht für die Rückkehr gespeichert werden. Bitte versuche es erneut.";
         return;
       }
+      const selected = { lat: location[1], lon: location[0] };
+      const memoryReady = rememberGarnrolleLocation(accountId, selected);
       const stored = sensitiveSession.write(
         accountId,
         `weltgewebe:garnrolle-return-location:${accountId}`,
-        JSON.stringify({ lat: location[1], lon: location[0] }),
+        JSON.stringify(selected),
       );
-      if (!stored) {
+      if (!stored && !memoryReady) {
         formError =
-          "Der private Kartenanker konnte im Browser nicht zwischengespeichert werden. Prüfe die Browserspeicher-Einstellungen und versuche es erneut.";
+          "Der private Kartenanker konnte nicht sicher an dein Profil übergeben werden. Bitte melde dich erneut an.";
         return;
       }
     }

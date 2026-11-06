@@ -4,6 +4,12 @@
   import { authStore } from "$lib/auth/store";
   import { sensitiveSession } from "$lib/auth/sensitiveSession";
   import {
+    rememberGarnrolleDraft,
+    readGarnrolleDraft,
+    takeGarnrolleLocation,
+    clearGarnrolleHandoff,
+  } from "$lib/garnrolle/locationHandoff";
+  import {
     ApiRequestError,
     getOwnGarnrolleProfile,
     updateOwnGarnrolle,
@@ -103,6 +109,7 @@
     if (!browser) return;
     sensitiveSession.remove(accountId, draftStorageKey(accountId));
     sensitiveSession.remove(accountId, returnLocationStorageKey(accountId));
+    clearGarnrolleHandoff(accountId);
   }
 
   function invalidateAccountOperations() {
@@ -256,10 +263,9 @@
       applyProfile(profile);
 
       if (browser) {
-        const stored = sensitiveSession.read(
-          accountId,
-          draftStorageKey(accountId),
-        );
+        const stored =
+          readGarnrolleDraft(accountId) ??
+          sensitiveSession.read(accountId, draftStorageKey(accountId));
         if (stored) {
           try {
             applyDraft(JSON.parse(stored) as Partial<GarnrolleDraft>);
@@ -268,7 +274,10 @@
           }
         }
       }
-      const returned = returnedMapLocation(accountId);
+      // Prefer the most recent same-tab touch choice. A denied storage write
+      // may leave an older return-location key behind in sessionStorage.
+      const returned =
+        takeGarnrolleLocation(accountId) ?? returnedMapLocation(accountId);
       if (returned) {
         selectedLocation = returned;
         clearLocation = false;
@@ -304,16 +313,20 @@
 
   function saveDraftForMap(): boolean {
     if (!browser || !activeAccountId) return false;
+    const serialized = JSON.stringify(currentDraft());
+    // Normal sessionStorage persists through reloads. When Safari refuses
+    // writes, an account-bound in-memory copy still supports this same-tab flow.
+    const memoryReady = rememberGarnrolleDraft(activeAccountId, serialized);
     const saved = sensitiveSession.write(
       activeAccountId,
       draftStorageKey(activeAccountId),
-      JSON.stringify(currentDraft()),
+      serialized,
     );
-    if (!saved) {
+    if (!saved && !memoryReady) {
       profileError =
-        "Privater Entwurf konnte im Browser nicht zwischengespeichert werden. Prüfe die Browserspeicher-Einstellungen und versuche es erneut.";
+        "Privater Entwurf konnte nicht für die Kartenwahl gesichert werden. Bitte melde dich erneut an.";
     }
-    return saved;
+    return saved || memoryReady;
   }
 
   async function chooseMapLocation() {
