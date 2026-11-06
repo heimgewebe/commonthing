@@ -9,12 +9,15 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 type EmailLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 type AccountLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
+
+const SEARCH_GC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Maps a client address to the subject that IP rate limits count against.
 ///
@@ -66,6 +69,8 @@ pub struct AuthRateLimiter {
     node_delete_limiter_hour: Option<AccountLimiter>,
     search_ip_limiter_min: Option<IpLimiter>,
     search_ip_limiter_hour: Option<IpLimiter>,
+    search_gc_started: Instant,
+    search_last_gc_seconds: AtomicU64,
     node_replace_per_min: u32,
     node_replace_per_hour: u32,
     node_delete_per_min: u32,
@@ -118,6 +123,8 @@ impl AuthRateLimiter {
             node_delete_limiter_hour,
             search_ip_limiter_min,
             search_ip_limiter_hour,
+            search_gc_started: Instant::now(),
+            search_last_gc_seconds: AtomicU64::new(0),
             node_replace_per_min: mutation.replace_per_minute,
             node_replace_per_hour: mutation.replace_per_hour,
             node_delete_per_min: mutation.delete_per_minute,
@@ -168,6 +175,28 @@ impl AuthRateLimiter {
         Ok(())
     }
 
+    /// Governor's keyed stores do not evict idle IPs by themselves. Reclaim
+    /// only expired buckets, no more than once a minute per process. Monotonic
+    /// time and CAS avoid a timer task, a global request mutex, and wall-clock
+    /// jumps; retained active keys keep their original budgets.
+    fn prune_stale_search_ips(&self) {
+        let elapsed = self.search_gc_started.elapsed().as_secs();
+        let last = self.search_last_gc_seconds.load(Ordering::Relaxed);
+        if elapsed.saturating_sub(last) >= SEARCH_GC_INTERVAL.as_secs()
+            && self
+                .search_last_gc_seconds
+                .compare_exchange(last, elapsed, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            for limiter in [&self.search_ip_limiter_min, &self.search_ip_limiter_hour]
+                .into_iter()
+                .flatten()
+            {
+                limiter.retain_recent();
+            }
+        }
+    }
+
     /// Per-client-IP limit for search requests.
     ///
     /// Deliberately in-process even when a PostgreSQL limiter is configured:
@@ -178,6 +207,9 @@ impl AuthRateLimiter {
     /// The minute window is checked first so a burst that exceeds it does not
     /// also drain the hour budget.
     pub fn check_search(&self, ip: IpAddr) -> Result<(), RateLimitError> {
+        if self.search_ip_limiter_min.is_some() || self.search_ip_limiter_hour.is_some() {
+            self.prune_stale_search_ips();
+        }
         let ip = rate_limit_ip_subject(ip);
         for limiter in [&self.search_ip_limiter_min, &self.search_ip_limiter_hour]
             .into_iter()
@@ -391,6 +423,59 @@ mod tests {
         config.search_rl_ip_per_min = per_min;
         config.search_rl_ip_per_hour = per_hour;
         AuthRateLimiter::new(&config)
+    }
+
+    #[test]
+    fn governor_pruning_discards_stale_ips_but_preserves_live_budgets() {
+        use governor::clock::FakeRelativeClock;
+
+        let clock = FakeRelativeClock::default();
+        let limiter: RateLimiter<
+            IpAddr,
+            DefaultKeyedStateStore<IpAddr>,
+            FakeRelativeClock,
+            governor::middleware::NoOpMiddleware<<FakeRelativeClock as Clock>::Instant>,
+        > = RateLimiter::new(
+            Quota::per_second(NonZeroU32::new(1).unwrap()),
+            DefaultKeyedStateStore::default(),
+            clock.clone(),
+        );
+        let stale: IpAddr = "192.0.2.10".parse().unwrap();
+        let live: IpAddr = "192.0.2.11".parse().unwrap();
+        assert!(limiter.check_key(&stale).is_ok());
+        clock.advance(Duration::from_secs(3));
+        assert!(limiter.check_key(&live).is_ok());
+        assert_eq!(limiter.len(), 2);
+        limiter.retain_recent();
+        assert_eq!(limiter.len(), 1);
+        assert!(limiter.check_key(&live).is_err());
+        assert!(limiter.check_key(&stale).is_ok());
+    }
+
+    #[test]
+    fn search_pruning_runs_only_after_elapsed_monotonic_interval() {
+        let ip: IpAddr = "192.0.2.21".parse().unwrap();
+        let mut limiter = search_limiter(Some(5), Some(5));
+        assert!(limiter.check_search(ip).is_ok());
+        assert_eq!(limiter.search_last_gc_seconds.load(Ordering::Relaxed), 0);
+
+        // Advancing the maintenance origin does not advance Governor's clock.
+        // The actual cache-prune call is safe for still-active rate-limit keys.
+        limiter.search_gc_started = Instant::now() - Duration::from_secs(70);
+        assert!(limiter.check_search(ip).is_ok());
+        let pruned_at = limiter.search_last_gc_seconds.load(Ordering::Relaxed);
+        assert!(pruned_at >= 70);
+        assert!(limiter.check_search(ip).is_ok());
+        assert_eq!(
+            limiter.search_last_gc_seconds.load(Ordering::Relaxed),
+            pruned_at
+        );
+        assert!(matches!(limiter.check_search(ip), Ok(())));
+
+        let mut disabled = search_limiter(None, None);
+        disabled.search_gc_started = Instant::now() - Duration::from_secs(70);
+        assert!(disabled.check_search(ip).is_ok());
+        assert_eq!(disabled.search_last_gc_seconds.load(Ordering::Relaxed), 0);
     }
 
     #[test]
