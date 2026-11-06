@@ -86,9 +86,10 @@ def baseline_aligned_png(
     output = bytearray(width * BITMAP_HEIGHT * 4)
     pixels = slightly_thinner_edges(width, height, rgba)
     if text_variant:
-        # A second edge-only coverage pass creates a genuinely slimmer
-        # raster variant, keeping the original wool RGB, metrics and core.
+        # Preserve the established text shape, then gently reduce only
+        # remaining edge coverage by about four percent more overall.
         pixels = slightly_thinner_edges(width, height, pixels)
+        pixels = slightly_thinner_edges(width, height, pixels, strength=3)
     # The original i and k contain disconnected tiny fragments below their
     # non-descending stems. Prune only this measured 0.7%-1.2% alpha artifact;
     # keep actual letter cores, real descenders and the original RGB wool.
