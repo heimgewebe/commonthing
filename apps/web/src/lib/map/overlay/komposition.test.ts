@@ -277,6 +277,47 @@ describe("setupKompositionInteraction", () => {
     expect(get(kompositionDraft)?.source).toBe("map-tap");
   });
 
+  it("keeps a stationary iPad tap despite MapLibre drag/movestart jitter", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    map.emit("touchstart", pointerEvent(50, 50, 10, 53.5));
+    map.emit("touchmove", pointerEvent(53, 54, 10.00001, 53.50001));
+    // MapLibre may start its own drag at a much smaller threshold than the
+    // 10px user tap tolerance. This is not an intentional map pan.
+    map.emit("movestart", {});
+    map.emit("dragstart", {});
+    map.emit("touchend", pointerEvent(53, 54, 10.00001, 53.50001));
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.00001, 53.50001]);
+    expect(get(kompositionDraft)?.source).toBe("map-tap");
+  });
+
+  it("continues to reject an intentional touch pan beyond the 10px tolerance", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    map.emit("touchstart", pointerEvent(50, 50, 10, 53.5));
+    map.emit("movestart", {});
+    map.emit("touchmove", pointerEvent(88, 75, 10.01, 53.51));
+    map.emit("touchend", pointerEvent(88, 75, 10.01, 53.51));
+    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+  });
+
+  it("accepts normalized MapLibre click when Safari omits touchend", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    map.emit("click", pointerEvent(50, 50, 10.12345678, 53.51234567));
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.12345678, 53.51234567]);
+  });
+
+  it("does not set the same point twice when click follows an accepted touch", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    const writes: unknown[] = [];
+    const unsub = kompositionDraft.subscribe((draft) => {
+      if (draft?.lngLat) writes.push(draft.lngLat);
+    });
+    map.emit("touchstart", pointerEvent(50, 50, 10, 53.5));
+    map.emit("touchend", pointerEvent(50, 50, 10, 53.5));
+    map.emit("click", pointerEvent(50, 50, 10, 53.5));
+    unsub();
+    expect(writes).toHaveLength(1);
+  });
+
   it("accepts mouse placement again after compatibility suppression expires", () => {
     enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
     clickAt(map, "touchstart", "touchend", pointerEvent(50, 50, 9.9, 53.4));
@@ -452,6 +493,82 @@ describe("setupKompositionInteraction", () => {
     authStore.set({ authenticated: true, role: "gast" });
     map.emit("mouseup", pointerEvent(50, 50, 10, 53.5));
     expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+  });
+
+  it("rejects a trailing map click after a cancelled and re-entered placement", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    const event = pointerEvent(50, 50, 10.02345678, 53.51234567);
+    map.emit("mousedown", event);
+    leaveToNavigation();
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    map.emit("mouseup", event);
+    map.emit("click", event);
+    expect(get(kompositionDraft)).toMatchObject({
+      mode: "place-garnrolle",
+      source: "tool-fan",
+    });
+    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+
+    // A genuinely fresh pointerdown may choose the same point afterwards.
+    clickAt(map, "mousedown", "mouseup", event);
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.02345678, 53.51234567]);
+  });
+
+  it("rejects a normalized click while an ABA-invalidated touch is still held", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    const event = pointerEvent(50, 50, 10.02345678, 53.51234567);
+    map.emit("touchstart", event);
+    leaveToNavigation();
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    // Safari may deliver a map click before the missing touchend arrives.
+    map.emit("click", event);
+    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+    map.emit("touchend", event);
+    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+    clickAt(map, "touchstart", "touchend", event);
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.02345678, 53.51234567]);
+  });
+
+  it("rejects trailing normalized clicks after auth changed away and back", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    const event = pointerEvent(50, 50, 10.02345678, 53.51234567);
+    map.emit("mousedown", event);
+    authStore.set({ authenticated: false, role: "gast" });
+    authStore.set({ authenticated: true, role: "gast" });
+    map.emit("mouseup", event);
+    map.emit("click", event);
+    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+  });
+
+  it("does not revive a cancelled touch pan with a trailing click", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    map.emit("touchstart", pointerEvent(50, 50, 10, 53.5));
+    map.emit("touchmove", pointerEvent(95, 90, 10.03, 53.52));
+    map.emit("touchend", pointerEvent(95, 90, 10.03, 53.52));
+    map.emit("click", pointerEvent(95, 90, 10.03, 53.52));
+    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+
+    clickAt(map, "touchstart", "touchend", pointerEvent(65, 65, 10.01, 53.51));
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.01, 53.51]);
+  });
+
+  it("ignores a trailing click after a cancelled touch", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    const event = pointerEvent(50, 50, 10, 53.5);
+    map.emit("touchstart", event);
+    map.emit("touchcancel", event);
+    map.emit("click", event);
+    expect(get(kompositionDraft)?.lngLat).toBeUndefined();
+  });
+
+  it("still uses a real pending gesture as fallback when touchend is missing", () => {
+    enterKomposition({ mode: "place-garnrolle", source: "tool-fan" });
+    const event = pointerEvent(50, 50, 10.12345678, 53.51234567);
+    map.emit("touchstart", event);
+    map.emit("click", event);
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.12345678, 53.51234567]);
+    map.emit("touchend", event);
+    expect(get(kompositionDraft)?.lngLat).toEqual([10.12345678, 53.51234567]);
   });
 
   it("does not revive a navigation longpress after an ABA state transition", () => {

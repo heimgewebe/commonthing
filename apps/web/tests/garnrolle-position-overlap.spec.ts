@@ -62,6 +62,98 @@ test.describe("Garnrolle placement over occupied map anchors", () => {
     expect(payload.location).toEqual(publicPosition);
   });
 
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 820, height: 1180 },
+  ]) {
+    test(`leaves the centre Garnrolle tappable and confirm visible at ${viewport.width}px`, async ({
+      page,
+    }) => {
+      await page.setViewportSize(viewport);
+      await page.reload();
+      await waitForMapReady(page);
+      const position = existing.public_pos;
+      if (!position) throw new Error("missing public exact position");
+      await page.evaluate(({ lon, lat }) => {
+        window.__TEST_MAP__?.jumpTo({ center: [lon, lat], zoom: 16 });
+      }, position);
+
+      const panel = page.getByTestId("context-panel");
+      await expect(panel).toHaveAttribute("data-sheet-stage", "compact");
+      const rect = await panel.boundingBox();
+      expect(rect).not.toBeNull();
+      expect(rect!.height).toBeLessThan(viewport.height * 0.4);
+      const marker = page.getByTestId(`marker-garnrolle-${existing.id}`);
+      await expect(marker).toBeVisible();
+      const point = await marker.boundingBox();
+      expect(point).not.toBeNull();
+      const x = point!.x + point!.width / 2;
+      const y = point!.y + point!.height / 2;
+      expect(y).toBeLessThan(rect!.y - 12);
+
+      await page.mouse.click(x + 5, y + 4);
+      await expect(page.getByTestId("garnrolle-placement")).toContainText(
+        "Kartenanker gewählt",
+      );
+      const confirm = page.getByTestId("confirm-garnrolle-location");
+      await expect(confirm).toBeEnabled();
+      await expect(confirm).toBeInViewport({ ratio: 1 });
+      await confirm.click();
+      await expect(page).toHaveURL(/\/settings#meine-garnrolle$/);
+    });
+  }
+
+  test.describe("iPad landscape with touchscreen", () => {
+    test.use({ hasTouch: true });
+
+    test("keeps a centre Garnrolle touchable and confirmation visible at 1180px", async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width: 1180, height: 820 });
+      await page.reload();
+      await waitForMapReady(page);
+      const position = existing.public_pos;
+      if (!position) throw new Error("missing public exact position");
+      await page.evaluate(({ lon, lat }) => {
+        window.__TEST_MAP__?.jumpTo({ center: [lon, lat], zoom: 16 });
+      }, position);
+
+      const panel = page.getByTestId("context-panel");
+      await expect(panel).toHaveAttribute("data-sheet-stage", "compact");
+      const bounds = await panel.boundingBox();
+      expect(bounds).not.toBeNull();
+      expect(bounds!.height).toBeLessThan(820 * 0.42);
+      const marker = page.getByTestId(`marker-garnrolle-${existing.id}`);
+      await expect(marker).toBeVisible();
+      const box = await marker.boundingBox();
+      if (!box) throw new Error("no marker position");
+      const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+      expect(point.y).toBeLessThan(bounds!.y - 10);
+
+      const client = await page.context().newCDPSession(page);
+      await client.send("Input.dispatchTouchEvent", {
+        type: "touchStart",
+        touchPoints: [point],
+      });
+      await client.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [{ x: point.x + 3, y: point.y + 4 }],
+      });
+      await client.send("Input.dispatchTouchEvent", {
+        type: "touchEnd",
+        touchPoints: [],
+      });
+      await expect(page.getByTestId("garnrolle-placement")).toContainText(
+        "Kartenanker gewählt",
+      );
+      await expect(
+        page.getByTestId("confirm-garnrolle-location"),
+      ).toBeInViewport({
+        ratio: 1,
+      });
+    });
+  });
+
   test("normal map marker interaction returns when placement mode ends", async ({
     page,
   }) => {
