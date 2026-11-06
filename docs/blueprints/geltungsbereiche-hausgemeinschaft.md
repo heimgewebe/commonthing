@@ -2,7 +2,7 @@
 id: blueprints.geltungsbereiche-hausgemeinschaft
 title: "Geltungsbereiche und Hausgemeinschaft – universeller Umsetzungsplan"
 doc_type: blueprint
-status: deferred
+status: active
 created: 2026-11-06
 lang: de
 summary: >-
@@ -26,11 +26,13 @@ relations:
 
 # Geltungsbereiche und Hausgemeinschaft
 
-**Stand:** 6. November 2026. **Art:** Ausführungsplan, keine Behauptung bereits
-implementierter Funktionen und noch keine Änderung kanonischer Produktverträge.
-**Umsetzung:** Noch nicht aktiv beauftragt. Die Roadmap liegt zur späteren
-Aktivierung vor; es gibt bislang keine registrierte Bureau-Ausführungsaufgabe.
-Ein aufgenommener Kandidat ersetzt keine solche Aufgabe.
+**Stand:** 6. November 2026. **Art:** Aktiver Ausführungsplan; Stufen
+werden separat abgenommen. Das Papier selbst ist kein Produktionsbeleg.
+**Umsetzung:** Durch den Nutzer beauftragt. P0 über PR #2065 auf main;
+P1-Mitgliedschaft im isolierten Arbeitszweig umgesetzt und getestet,
+noch nicht produktiv abgenommen. P2 (Inhaltssichtbarkeit), P2b (einzelne
+Ressourcen), P3 (Benachrichtigungen) und P4 (große Karte) sind weiterhin offen.
+Der frühere Bureau-Kandidat ist nicht publiziert und keine registrierte Aufgabe.
 
 ## 1. Auftrag und Erfolgskriterium
 

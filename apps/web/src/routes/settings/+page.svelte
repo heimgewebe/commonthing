@@ -2,6 +2,8 @@
   import YarnWord from "$lib/components/YarnWord.svelte";
   import { onMount } from "svelte";
   import MyGarnrolleSection from "$lib/components/MyGarnrolleSection.svelte";
+  import AudienceCircleControls from "$lib/components/panels/AudienceCircleControls.svelte";
+  import { authStore } from "$lib/auth/store";
   import type { PageData } from "./$types";
 
   interface Props {
@@ -134,6 +136,9 @@
           <MyGarnrolleSection
             accounts={data.accounts}
             accountsLoadError={data.accountsLoadError}
+          />
+          <AudienceCircleControls
+            selectedAccountId={$authStore.account_id ?? ""}
           />
         </section>
 
