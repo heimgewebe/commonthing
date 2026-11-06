@@ -36,6 +36,7 @@ Generated automatically. Do not edit.
 | blueprints.auth-persistence-runtime-proof | Auth-Persistenz — Runtime-Proof-Blaupause | blueprint | active | docs/blueprints/auth-persistence-runtime-proof.md |
 | blueprints.auth-roadmap | Auth Roadmap | roadmap | active | docs/blueprints/auth-roadmap.md |
 | blueprints.domain-data-postgres-cutover | Domain Data PostgreSQL Cutover | blueprint | active | docs/blueprints/domain-data-postgres-cutover.md |
+| blueprints.geltungsbereiche-hausgemeinschaft | Geltungsbereiche und Hausgemeinschaft – universeller Umsetzungsplan | blueprint | deferred | docs/blueprints/geltungsbereiche-hausgemeinschaft.md |
 | blueprints.weltgewebe.auth-and-ui-routing | Auth und UI-Routing | reference | deprecated | docs/blueprints/weltgewebe.auth-and-ui-routing.md |
 | blueprints.weltgewebe.config.diff | Config Diff | reference | deprecated | docs/blueprints/weltgewebe.config.diff.md |
 | blueprints.weltgewebe.deploy.plan | Deploy-Plan | reference | deprecated | docs/blueprints/weltgewebe.deploy.plan.md |
