@@ -151,7 +151,8 @@ test.describe("T007 authorized server search contract", () => {
             location: { lat: 53.5585, lon: 10.058 },
             location_label: "Hammer Park – gewünschter Treffpunkt",
             meeting_note: "Ein bewusst gewählter öffentlicher Treffpunkt.",
-            access_note: "Nutzung und Zugänglichkeit sind noch nicht bestätigt.",
+            access_note:
+              "Nutzung und Zugänglichkeit sind noch nicht bestätigt.",
             created_at: "2026-08-02T10:08:00.000Z",
             updated_at: "2026-08-02T10:08:00.000Z",
           };
