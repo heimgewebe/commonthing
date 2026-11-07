@@ -2,7 +2,7 @@
 use std::{
     env,
     sync::{Arc, Mutex, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -79,6 +79,11 @@ fn lock_runtime_query_embedding_cache(
 /// free slot answers lexically right away instead of joining that queue.
 const MAX_IN_FLIGHT_QUERY_EMBEDDINGS: usize = 2;
 
+// Each provider call verifies the model identity multiple times. Its 10-second
+// per-I/O deadlines do not bound the total embedding cost or tail latency.
+// Expiry remains a lexical fallback; no DB connection or privacy lock is held.
+const QUERY_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(8);
+
 fn runtime_query_embedding_permits() -> Arc<Semaphore> {
     static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     Arc::clone(PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT_QUERY_EMBEDDINGS))))
@@ -88,6 +93,7 @@ struct CachedQueryEmbeddingProvider {
     inner: Arc<dyn EmbeddingProvider>,
     generation_id: String,
     permits: Arc<Semaphore>,
+    timeout: Duration,
 }
 
 impl CachedQueryEmbeddingProvider {
@@ -104,6 +110,7 @@ impl CachedQueryEmbeddingProvider {
             inner,
             generation_id,
             permits,
+            timeout: QUERY_EMBEDDING_TIMEOUT,
         }
     }
 }
@@ -131,7 +138,9 @@ impl EmbeddingProvider for CachedQueryEmbeddingProvider {
             .permits
             .try_acquire()
             .map_err(|_| EmbeddingProviderError::Unavailable)?;
-        let embedding = self.inner.embed(document, dimension).await?;
+        let embedding = tokio::time::timeout(self.timeout, self.inner.embed(document, dimension))
+            .await
+            .map_err(|_| EmbeddingProviderError::Unavailable)??;
         *lock_runtime_query_embedding_cache() = Some(QueryEmbeddingCacheEntry {
             generation_id: self.generation_id.clone(),
             query_sha256,
@@ -673,6 +682,36 @@ mod tests {
         assert!(cached.embed("first query", 4).await.is_ok());
         drop(busy);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        clear_runtime_query_embedding_cache_for_test();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn timed_out_query_embedding_releases_permit_and_does_not_cache_failure() {
+        clear_runtime_query_embedding_cache_for_test();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let permits = Arc::new(Semaphore::new(1));
+        let cached = CachedQueryEmbeddingProvider {
+            inner: Arc::new(GatedProvider {
+                release: Arc::new(tokio::sync::Notify::new()),
+                calls: Arc::clone(&calls),
+            }),
+            generation_id: "generation-timeout".to_string(),
+            permits: Arc::clone(&permits),
+            timeout: Duration::from_millis(50),
+        };
+
+        for expected_calls in [1, 2] {
+            assert!(matches!(
+                cached.embed("same query", 4).await,
+                Err(EmbeddingProviderError::Unavailable)
+            ));
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                expected_calls
+            );
+            assert_eq!(permits.available_permits(), 1, "timeout releases slot");
+        }
         clear_runtime_query_embedding_cache_for_test();
     }
 

@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildSimilarNodeQuery,
   MAX_SEARCH_QUERY_CHARS,
+  SearchApiError,
   nodeToMapEntity,
+  searchErrorMessage,
+  searchErrorStatus,
   searchNodes,
 } from "./search";
 import type { Node } from "$lib/map/types";
@@ -98,6 +101,50 @@ describe("searchNodes", () => {
     const query = new URL(String(url)).searchParams.get("q");
     expect(Array.from(query ?? "")).toHaveLength(MAX_SEARCH_QUERY_CHARS);
     expect(query).toBe("😀".repeat(MAX_SEARCH_QUERY_CHARS));
+  });
+
+  it("preserves Retry-After on 429 and never retries automatically", async () => {
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response("search_rate_limited", {
+          status: 429,
+          headers: { "Retry-After": "7" },
+        }),
+    );
+    await expect(searchNodes("Garten", { fetcher })).rejects.toMatchObject({
+      status: 429,
+      retryAfterSeconds: 7,
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["0", "-1", "invalid", "999999999999999999"])(
+    "ignores invalid Retry-After value %s",
+    async (retryAfter) => {
+      const fetcher = vi.fn<typeof fetch>(
+        async () =>
+          new Response("search_rate_limited", {
+            status: 429,
+            headers: { "Retry-After": retryAfter },
+          }),
+      );
+      await expect(searchNodes("Garten", { fetcher })).rejects.toMatchObject({
+        status: 429,
+        retryAfterSeconds: null,
+      });
+    },
+  );
+
+  it("distinguishes throttling, invalid input, temporary outage and other errors", () => {
+    expect(searchErrorStatus(new SearchApiError(429))).toBe("rate_limited");
+    expect(searchErrorStatus(new SearchApiError(400))).toBe("invalid");
+    expect(searchErrorStatus(new SearchApiError(503))).toBe("unavailable");
+    expect(searchErrorStatus(new SearchApiError(500))).toBe("error");
+    expect(searchErrorStatus(new Error("offline"))).toBe("error");
+    expect(searchErrorMessage("rate_limited")).toContain(
+      "Zu viele Suchanfragen",
+    );
+    expect(searchErrorMessage("unavailable")).toContain("vorübergehend");
   });
 
   it("maps server nodes to canonical map entities", () => {
