@@ -134,6 +134,12 @@ class DomainScaleTests(unittest.TestCase):
                 sql.index("ADD COLUMN IF NOT EXISTS search_visibility"),
                 sql.index("\\copy weltgewebe_perf.domain_nodes"),
             )
+            self.assertIn(
+                "CREATE FUNCTION weltgewebe_perf.weltgewebe_node_readable_to(", sql
+            )
+            self.assertIn("reader_account_id IS NULL", sql)
+            self.assertIn("THEN COALESCE(visibility = 'public', FALSE)", sql)
+            self.assertNotIn("CREATE FUNCTION public.weltgewebe_node_readable_to", sql)
             self.assertNotIn("DROP SCHEMA IF EXISTS public", sql)
             self.assertNotIn("TRUNCATE", sql.upper())
             self.assertNotIn("DELETE FROM public", sql)
@@ -170,6 +176,7 @@ class DomainScaleTests(unittest.TestCase):
             domain_scale.render_workload_sql(fixture / "manifest.json", plans, output, CONFIG)
             sql = output.read_text(encoding="utf-8")
             self.assertEqual(sql.count("EXPLAIN (ANALYZE, BUFFERS, WAL, FORMAT JSON)"), 7)
+            self.assertIn("SET search_path TO weltgewebe_perf, public;", sql)
             for workload in domain_scale.WORKLOAD_ORDER:
                 self.assertIn(f"{workload}.json", sql)
             self.assertIn("WHERE id >", sql)
