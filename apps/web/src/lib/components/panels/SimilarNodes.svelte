@@ -6,6 +6,8 @@
     buildSimilarNodeQuery,
     nodeToMapEntity,
     searchNodes,
+    searchErrorStatus,
+    searchErrorMessage,
   } from "$lib/api/search";
   import type { Node, MapEntityViewModel } from "$lib/map/types";
 
@@ -70,10 +72,13 @@
       similarNodes = response.items
         .filter((item) => item.id !== sourceId)
         .slice(0, 4);
-    } catch {
+    } catch (cause) {
       if (controller.signal.aborted || sequence !== requestSequence) return;
+      const status = searchErrorStatus(cause);
       error =
-        "Maschinell berechnete ähnliche Knoten sind gerade nicht verfügbar.";
+        status === "error"
+          ? "Maschinell berechnete ähnliche Knoten sind gerade nicht verfügbar."
+          : searchErrorMessage(status);
     } finally {
       if (sequence === requestSequence) loading = false;
       if (abortController === controller) abortController = null;

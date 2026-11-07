@@ -8,8 +8,11 @@
   import { contextPanelOpen } from "$lib/stores/uiView";
   import { activeFilterCount } from "$lib/stores/filterStore";
   import type { MapEntityViewModel } from "$lib/map/types";
-  import { MAX_SEARCH_QUERY_CHARS } from "$lib/api/search";
-  import type { NodeSearchStatus } from "$lib/api/search";
+  import {
+    MAX_SEARCH_QUERY_CHARS,
+    searchErrorMessage,
+    type NodeSearchStatus,
+  } from "$lib/api/search";
   import { restoreTarget } from "$lib/utils/focusManager";
 
   const MAP_ENTITY_BROWSE_PAGE_SIZE = 50;
@@ -193,10 +196,9 @@
         Knoten werden sicher auf dem Server gesucht…
       </div>
     {/if}
-    {#if hasQuery && searchStatus === "error"}
+    {#if hasQuery && ["invalid", "rate_limited", "unavailable", "error"].includes(searchStatus)}
       <div class="search-error" role="status" aria-live="polite">
-        Die sichere Knotensuche ist gerade nicht verfügbar. Es wird nicht auf
-        eine lokale Knotensuche zurückgefallen.
+        {searchErrorMessage(searchStatus)}
       </div>
     {/if}
     {#if hasQuery && (searchMode === "lexical_fallback" || searchFallbackReason === "provider_unavailable")}
@@ -270,7 +272,7 @@
             : `Alle ${filteredResults.length} Vorschläge zeigen`}</button
         >
       {/if}
-    {:else if hasQuery && searchStatus !== "loading" && searchStatus !== "error"}
+    {:else if hasQuery && searchStatus === "ready"}
       <div class="no-results" role="status">
         Keine Treffer für „{$searchQuery}“
       </div>
