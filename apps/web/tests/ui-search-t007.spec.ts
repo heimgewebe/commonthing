@@ -120,6 +120,37 @@ test.describe("T007 authorized server search contract", () => {
     expect(searchRequests).toBe(2);
   });
 
+  for (const localKind of ["Garnrolle", "Webgemeindezentren"]) {
+    test(`shows empty state for local-only ${localKind} without server search`, async ({
+      page,
+    }) => {
+      let serverSearchRequests = 0;
+      page.on("request", (request) => {
+        if (new URL(request.url()).pathname === "/api/search") {
+          serverSearchRequests += 1;
+        }
+      });
+      await page.goto("/map");
+      await page.waitForSelector(".map-marker");
+      await activateToolFanAction(page, "sight");
+      await page
+        .getByTestId("filter-overlay")
+        .locator("label.filter-item", { hasText: localKind })
+        .click();
+      await activateToolFanAction(page, "find");
+
+      const input = page.getByRole("combobox", { name: "Suchbegriff" });
+      await input.fill("Unauffindbarer Testbegriff 98765");
+      await expect(
+        page.getByText("Keine Treffer für „Unauffindbarer Testbegriff 98765“"),
+      ).toBeVisible();
+      await expect(page.getByRole("option")).toHaveCount(0);
+      // The server never handles local-only structure types.
+      await page.waitForTimeout(350);
+      expect(serverSearchRequests).toBe(0);
+    });
+  }
+
   test("renders lexical fallback explicitly while keeping server results usable", async ({
     page,
   }) => {
