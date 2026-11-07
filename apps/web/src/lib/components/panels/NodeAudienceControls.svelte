@@ -29,6 +29,11 @@
         circle.state === "active" && circle.membership_status === "active",
     ),
   );
+  // Existing grants remain part of the owner's CAS snapshot after leaving a
+  // circle, even though that circle is no longer selectable for new grants.
+  let unavailableCircleIds = $derived(
+    circleIds.filter((id) => !activeCircles.some((circle) => circle.id === id)),
+  );
   let canSave = $derived.by(() => {
     // Evaluate the union inside the reactive callback: the initial
     // "private" value must not be mistaken for a permanently fixed scope.
@@ -90,6 +95,9 @@
     circleIds = checked
       ? [...circleIds, id]
       : circleIds.filter((value) => value !== id);
+    // Removing the last grant is equivalent to selecting owner-only privacy.
+    // Keep originalCircleIds unchanged for the backend's stale-state CAS.
+    if (scope === "circles" && circleIds.length === 0) scope = "private";
     notice = "";
   }
 
@@ -164,9 +172,27 @@
             {circle.name}
           </label>
         {:else}
+          {#if unavailableCircleIds.length === 0}
+            <p class="hint">
+              Zum Freigeben musst du einer bestätigten Gemeinschaft angehören.
+            </p>
+          {/if}
+        {/each}
+        {#if unavailableCircleIds.length > 0}
           <p class="hint">
-            Du musst zunächst einer bestätigten Hausgemeinschaft beitreten.
+            Alte Freigaben an nicht mehr verfügbare Gemeinschaften kannst du
+            hier entfernen.
           </p>
+        {/if}
+        {#each unavailableCircleIds as id (id)}
+          <label class="circle-option">
+            <input
+              type="checkbox"
+              checked={circleIds.includes(id)}
+              onchange={(event) => toggleCircle(id, event.currentTarget.checked)}
+            />
+            Frühere Gemeinschaft ({id}) – Freigabe entfernen
+          </label>
         {/each}
       </fieldset>
     {/if}
