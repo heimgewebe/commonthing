@@ -189,3 +189,80 @@ test("failed circle grant keeps one private node and disables another creation",
   expect(nodeCreates).toBe(1);
   expect(grantAttempts).toBe(1);
 });
+
+test("a former circle grant remains removable without reopening a private node", async ({
+  page,
+}) => {
+  const former = "00000000-0000-4000-8000-000000000098";
+  let putCount = 0;
+  await page.route("**/api/circles/me*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([
+        {
+          id: CIRCLE,
+          kind: "household",
+          name: "Aktives Haus",
+          state: "active",
+          membership_status: "active",
+        },
+      ]),
+    }),
+  );
+  await page.route("**/api/nodes/mock-node-1/audience", async (route) => {
+    if (route.request().method() === "GET") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          node_id: "mock-node-1",
+          scope: "circles",
+          circle_ids: [former, CIRCLE],
+        }),
+      });
+    }
+    if (route.request().method() === "PUT") {
+      putCount += 1;
+      expect(route.request().postDataJSON()).toEqual({
+        scope: "circles",
+        circle_ids: [CIRCLE],
+        expected_scope: "circles",
+        expected_circle_ids: [former, CIRCLE],
+      });
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          node_id: "mock-node-1",
+          scope: "circles",
+          circle_ids: [CIRCLE],
+        }),
+      });
+    }
+    return route.fulfill({ status: 405 });
+  });
+
+  // Create one canonical owner-controlled node through the real form.
+  await activateToolFanAction(page, "weave");
+  const form = page.getByTestId("context-panel");
+  await form.getByLabel("Mit Kartenort").uncheck();
+  await form.locator("#title").fill("Verwaiste Hausfreigabe");
+  await form.locator("#nodeType").selectOption("resource");
+  await form.locator("#new-node-audience-scope").selectOption("private");
+  await form.getByRole("button", { name: "Knoten knüpfen" }).click();
+  await expect(page).toHaveURL(/focus=node:mock-node-1/);
+
+  const panel = page.getByTestId("context-panel");
+  await panel.getByRole("tab", { name: "Bearbeiten" }).click();
+  const audience = panel.getByTestId("node-audience-controls");
+  await expect(
+    audience.getByText(`Frühere Gemeinschaft (${former}) – Freigabe entfernen`),
+  ).toBeVisible();
+  await audience
+    .getByRole("checkbox", { name: /Frühere Gemeinschaft/ })
+    .uncheck();
+  await audience.getByRole("button", { name: "Sichtbarkeit speichern" }).click();
+  await expect(audience.getByText("Sichtbarkeit gespeichert.")).toBeVisible();
+  expect(putCount).toBe(1);
+});
