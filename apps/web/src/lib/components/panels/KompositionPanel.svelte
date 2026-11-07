@@ -59,6 +59,7 @@
   let canSubmit = $derived.by(() => {
     const selected: NodeAudienceScope = audienceScope;
     return (
+      privateCreatedNodeId === null &&
       !!title.trim() &&
       isNodeKind(nodeType) &&
       (!geographic || !!$kompositionDraft?.lngLat) &&
@@ -182,6 +183,9 @@
 
   async function handleSubmit(e: Event) {
     e.preventDefault();
+    // Creation has already succeeded: never re-POST this canonical node after
+    // its separate audience grant fails. Open the persisted private node.
+    if (privateCreatedNodeId !== null) return;
     formError = null;
     titleError = !title.trim();
 
