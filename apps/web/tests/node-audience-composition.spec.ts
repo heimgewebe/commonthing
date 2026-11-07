@@ -108,3 +108,84 @@ test("an explicit circle grant follows, never precedes, private node creation", 
   await expect.poll(() => methods.length, { timeout: 10_000 }).toBe(2);
   expect(methods).toEqual(["POST-node", "PUT-audience"]);
 });
+
+test("failed circle grant keeps one private node and disables another creation", async ({
+  page,
+}) => {
+  let nodeCreates = 0;
+  let grantAttempts = 0;
+  await page.route("**/api/circles/me*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([
+        {
+          id: CIRCLE,
+          kind: "household",
+          name: "Test-Haus",
+          state: "active",
+          membership_status: "active",
+        },
+      ]),
+    }),
+  );
+  await page.route("**/api/nodes/mock-node-1/audience", async (route) => {
+    if (route.request().method() === "GET") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          node_id: "mock-node-1",
+          scope: "private",
+          circle_ids: [],
+        }),
+      });
+    }
+    if (route.request().method() === "PUT") {
+      grantAttempts += 1;
+      return route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "membership changed" }),
+      });
+    }
+    return route.fulfill({ status: 405 });
+  });
+  page.on("request", (request) => {
+    if (
+      new URL(request.url()).pathname === "/api/nodes" &&
+      request.method() === "POST"
+    ) {
+      nodeCreates += 1;
+      expect(request.postDataJSON().search_visibility).toBe("private");
+    }
+  });
+
+  await activateToolFanAction(page, "weave");
+  const panel = page.getByTestId("context-panel");
+  await panel.getByLabel("Mit Kartenort").uncheck();
+  await panel.locator("#title").fill("Privat gespeicherter Hausknoten");
+  await panel.locator("#nodeType").selectOption("resource");
+  await panel.locator("#new-node-audience-scope").selectOption("circles");
+  await panel.getByRole("checkbox", { name: "Test-Haus" }).check();
+  await panel.getByRole("button", { name: "Knoten knüpfen" }).click();
+
+  await expect(panel.getByRole("alert")).toContainText(
+    "Der Knoten wurde privat gespeichert",
+  );
+  await expect(
+    panel.getByRole("link", { name: "Privat gespeicherten Knoten öffnen" }),
+  ).toHaveAttribute("href", /focus=node%3Amock-node-1/);
+  expect(nodeCreates).toBe(1);
+  expect(grantAttempts).toBe(1);
+
+  // Even after changing the proposed audience, this form must not issue
+  // another POST with a different idempotency key for the already-saved node.
+  await panel.locator("#new-node-audience-scope").selectOption("public");
+  await expect(
+    panel.getByRole("button", { name: "Knoten knüpfen" }),
+  ).toBeDisabled();
+  await page.waitForTimeout(250);
+  expect(nodeCreates).toBe(1);
+  expect(grantAttempts).toBe(1);
+});
