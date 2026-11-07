@@ -272,7 +272,7 @@
             : `Alle ${filteredResults.length} Vorschläge zeigen`}</button
         >
       {/if}
-    {:else if hasQuery && searchStatus === "ready"}
+    {:else if hasQuery && (searchStatus === "ready" || searchStatus === "idle")}
       <div class="no-results" role="status">
         Keine Treffer für „{$searchQuery}“
       </div>
