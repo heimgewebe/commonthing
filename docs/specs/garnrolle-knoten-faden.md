@@ -97,6 +97,35 @@ Nur der angemeldete Account darf sein Garnrollenprofil verändern. Interne
 Positionen und private Projektionsbindungen erscheinen nie in öffentlichen
 Antworten.
 
+## Freiwillige Geltungsbereiche – Mitgliedschaft (P1)
+
+Ein *Geltungsbereich* oder *Kreis* ist eine separate, stabile
+Berechtigungsidentität, **keine** neue Garnrolle, Knotenart, Hauskarte oder
+Ortsweberei. Der Kreis besitzt einen Typ (household als erste Hausgemeinschaft,
+später weitere Gemeinschaften), Mitglieder und die Zustände forming, active
+oder inactive. Die Mitgliedschaft ist unabhängig von Karte, GPS, Adresse,
+Positionseinstellungen und Rollen (Gast, Weber, Admin).
+
+Ein Account startet die Hausgemeinschaft durch eine **ausdrückliche Einladung**
+an einen zweiten bestehenden Account. Erst dessen Annahme aktiviert den Kreis.
+Bis dahin gewährt auch die bereits bestätigte Mitgliedschaft des Gründers
+keine zusätzlichen Leserechte. Weitere Mitglieder werden von einem aktiven
+Mitglied eingeladen und müssen selbst annehmen. Einladungen alleine zählen nicht
+als aktive Mitgliedschaft. Der eigene Austritt widerruft die Mitgliedschaft
+sofort; ein deaktivierter Account hat keine gültigen Kreis-Leserechte.
+Mitgliedsnamen sind nur für aktive Kreis-Mitglieder abrufbar.
+
+Kreise werden in domain_audience_circles und domain_audience_circle_members
+persistiert. Die SQL-Funktion weltgewebe_active_circle_member prüft die
+aktive Zugehörigkeit und ist **nur ein Baustein** der späteren
+Inhalts-Lesepolicy. Ein Kreis verleiht **keine** Schreib-, Moderations-
+oder Weberrechte. Bestehende search_visibility-, map_state- und
+öffentlich/private Garnrolleninformationen ändern sich durch die
+Mitgliedschaft nicht. Die Einschränkung eines Knotens oder einzelnen
+Gutes auf einen Kreis wird erst in P2/P2b nach vollständiger serverseitiger
+Durchsetzung auf allen Lesepfaden eingeführt; siehe
+[Umsetzungsplan](../blueprints/geltungsbereiche-hausgemeinschaft.md).
+
 ## Knoten
 
 **Knoten ist ein Oberbegriff, keine eigene Art.** Neue Knoten besitzen genau eine

@@ -263,6 +263,20 @@ async fn csrf_blocks_all_mutating_endpoints_without_origin() -> Result<()> {
         (Method::DELETE, "/push/subscriptions/any-subscription-id"),
         // Cross-cutting (non-auth) mutating routes to prove the guard is global.
         (Method::PATCH, "/nodes/any-node-id"),
+        // Voluntary membership mutations are authenticated AND origin checked.
+        (Method::POST, "/circles"),
+        (
+            Method::POST,
+            "/circles/00000000-0000-0000-0000-000000000000/accept",
+        ),
+        (
+            Method::POST,
+            "/circles/00000000-0000-0000-0000-000000000000/invitations",
+        ),
+        (
+            Method::DELETE,
+            "/circles/00000000-0000-0000-0000-000000000000/membership",
+        ),
         (Method::POST, "/machine/v1/nodes"),
         (Method::PATCH, "/machine/v1/nodes/any-node-id"),
         (Method::PUT, "/machine/v1/nodes/any-node-id"),
@@ -408,6 +422,10 @@ const CSRF_COVERED_MUTATING_ROUTES: &[(&str, &str)] = &[
     ("PUT", "/nodes/{id}"),
     ("DELETE", "/nodes/{id}"),
     ("POST", "/nodes"),
+    ("POST", "/circles"),
+    ("POST", "/circles/{id}/accept"),
+    ("POST", "/circles/{id}/invitations"),
+    ("DELETE", "/circles/{id}/membership"),
     ("POST", "/machine/v1/nodes"),
     ("PATCH", "/machine/v1/nodes/{id}"),
     ("PUT", "/machine/v1/nodes/{id}"),

@@ -2,6 +2,7 @@
   import YarnWord from "$lib/components/YarnWord.svelte";
   import { onMount } from "svelte";
   import MyGarnrolleSection from "$lib/components/MyGarnrolleSection.svelte";
+  import { authStore } from "$lib/auth/store";
   import type { PageData } from "./$types";
 
   interface Props {
@@ -15,8 +16,23 @@
   let AccountSection:
     | typeof import("$lib/components/AccountSection.svelte").default
     | null = $state(null);
+  let AudienceCircleControls:
+    | typeof import("$lib/components/panels/AudienceCircleControls.svelte").default
+    | null = $state(null);
+  let circleLoadFailed = $state(false);
   let notificationLoadFailed = $state(false);
   let accountLoadFailed = $state(false);
+
+  async function loadAudienceCircles(): Promise<void> {
+    circleLoadFailed = false;
+    try {
+      const module =
+        await import("$lib/components/panels/AudienceCircleControls.svelte");
+      AudienceCircleControls = module.default;
+    } catch {
+      circleLoadFailed = true;
+    }
+  }
 
   async function loadNotificationSettings(): Promise<void> {
     notificationLoadFailed = false;
@@ -40,6 +56,7 @@
   }
 
   onMount(() => {
+    void loadAudienceCircles();
     void loadNotificationSettings();
     void loadAccountSection();
   });
@@ -135,6 +152,24 @@
             accounts={data.accounts}
             accountsLoadError={data.accountsLoadError}
           />
+          {#if AudienceCircleControls}
+            <AudienceCircleControls
+              selectedAccountId={$authStore.account_id ?? ""}
+            />
+          {:else if circleLoadFailed}
+            <p class="lazy-status" role="alert">
+              Hausgemeinschaften konnten nicht geladen werden.
+              <button
+                class="btn secondary touch-target"
+                type="button"
+                onclick={loadAudienceCircles}>Erneut versuchen</button
+              >
+            </p>
+          {:else}
+            <p class="lazy-status" role="status">
+              Hausgemeinschaften werden geladen …
+            </p>
+          {/if}
         </section>
 
         <div class="panel notification-card">
