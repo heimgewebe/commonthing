@@ -7,6 +7,7 @@
   } from "$lib/panels/panelDetails";
   import { formatDate } from "$lib/utils/formatDate";
   import { authStore } from "$lib/auth/store";
+  import AudienceCircleControls from "./AudienceCircleControls.svelte";
 
   const dispatch = createEventDispatcher<{
     selectRelated: { type: "node"; id: string };
@@ -199,6 +200,12 @@
             <strong>Interessen:</strong>
             {interests.join(", ")}
           </p>{/if}
+        <AudienceCircleControls
+          selectedAccountId={$selection?.id ?? ""}
+          selectedName={accountDetails?.title ||
+            $selection?.data?.title ||
+            "dieser Garnrolle"}
+        />
       </div>
     {:else if activeTab === "aktivitaet"}
       <div

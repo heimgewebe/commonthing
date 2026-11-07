@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod auth;
+pub mod circles;
 mod collective_write_guard;
 pub(crate) use crate::state::{postgres_domain_connection_budget, POSTGRES_DOMAIN_OPERATION_UNITS};
 pub mod conversations;
@@ -42,6 +43,10 @@ use self::{
         passkey_register_options, passkey_register_verify, remove_device, request_login,
         request_step_up, session, session_refresh, update_email,
     },
+    circles::{
+        accept_invitation, create_circle, invite_account, leave_circle, list_circle_members,
+        list_my_circles,
+    },
     collective_write_guard::{
         create_node_serialized, delete_node_serialized, patch_node_serialized,
         replace_node_serialized,
@@ -79,6 +84,30 @@ async fn list_public_nodes(
 pub fn api_router() -> Router<ApiState> {
     let router = Router::new()
         .merge(machine::api_routes())
+        .route(
+            "/circles/me",
+            get(list_my_circles).route_layer(from_fn(require_authenticated)),
+        )
+        .route(
+            "/circles",
+            post(create_circle).route_layer(from_fn(require_authenticated)),
+        )
+        .route(
+            "/circles/{id}/members",
+            get(list_circle_members).route_layer(from_fn(require_authenticated)),
+        )
+        .route(
+            "/circles/{id}/accept",
+            post(accept_invitation).route_layer(from_fn(require_authenticated)),
+        )
+        .route(
+            "/circles/{id}/invitations",
+            post(invite_account).route_layer(from_fn(require_authenticated)),
+        )
+        .route(
+            "/circles/{id}/membership",
+            axum::routing::delete(leave_circle).route_layer(from_fn(require_authenticated)),
+        )
         .route("/search", get(search_nodes))
         // Compatibility alias for node-oriented clients; `/search` is canonical.
         .route("/nodes/search", get(search_nodes))
