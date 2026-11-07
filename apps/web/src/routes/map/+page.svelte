@@ -184,10 +184,13 @@
         nodeSearchStatus = "ready";
         nodeSearchMode = response.mode;
         nodeSearchFallbackReason = response.fallback_reason ?? null;
-      } catch {
+      } catch (error) {
         if (controller.signal.aborted || sequence !== nodeSearchSequence)
           return;
-        nodeSearchStatus = "error";
+        const { searchErrorStatus } = await import("$lib/api/search");
+        if (controller.signal.aborted || sequence !== nodeSearchSequence)
+          return;
+        nodeSearchStatus = searchErrorStatus(error);
       } finally {
         if (nodeSearchAbortController === controller)
           nodeSearchAbortController = null;

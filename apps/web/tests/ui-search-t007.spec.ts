@@ -69,11 +69,121 @@ test.describe("T007 authorized server search contract", () => {
 
     await expect(
       page.getByText(
-        "Die sichere Knotensuche ist gerade nicht verfügbar. Es wird nicht auf eine lokale Knotensuche zurückgefallen.",
+        "Die Suche ist vorübergehend nicht verfügbar. Bitte versuche es später erneut.",
       ),
     ).toBeVisible();
     await expect(page.getByRole("option")).toHaveCount(0);
   });
+
+  test("shows 429 without retries, then allows another normal search", async ({
+    page,
+  }) => {
+    let searchRequests = 0;
+    await page.route("**/api/search**", async (route) => {
+      searchRequests += 1;
+      if (searchRequests === 1) {
+        await route.fulfill({
+          status: 429,
+          headers: { "Retry-After": "1" },
+          body: "search_rate_limited",
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [SOURCE_NODE],
+          mode: "hybrid",
+          generation_id: "recovered-generation",
+          offset: 0,
+        }),
+      });
+    });
+
+    const input = await openSearch(page);
+    await input.fill("Fahrradwerkstatt");
+    await expect(
+      page.getByText(
+        "Zu viele Suchanfragen. Bitte versuche es in wenigen Sekunden erneut.",
+      ),
+    ).toBeVisible();
+    await expect(page.getByText(/Keine Treffer für/)).toHaveCount(0);
+    await expect(page.getByRole("option")).toHaveCount(0);
+    await page.waitForTimeout(450);
+    expect(searchRequests).toBe(1);
+
+    await input.fill("Radstation");
+    await expect(page.getByRole("option").first()).toContainText(
+      "Offene Fahrradwerkstatt",
+    );
+    expect(searchRequests).toBe(2);
+  });
+
+  for (const localKind of ["Garnrolle", "Webgemeindezentren"]) {
+    test(`shows empty state for local-only ${localKind} without server search`, async ({
+      page,
+    }) => {
+      let serverSearchRequests = 0;
+      page.on("request", (request) => {
+        if (new URL(request.url()).pathname === "/api/search") {
+          serverSearchRequests += 1;
+        }
+      });
+      // The shared T007 fixture has no public center. Inject one only in the
+      // center-only case so the Sicht option exists before it is selected.
+      if (localKind === "Webgemeindezentren") {
+        await page.route("**/api/webgemeindezentren*", async (route) => {
+          const center = {
+            type: "webgemeindezentrum",
+            id: "webgemeindezentrum-hammer-park",
+            title: "Webgemeindezentrum Hammer Park",
+            ortsweberei: {
+              id: "ortsweberei-hamm",
+              slug: "hamm",
+              name: "Ortsweberei Hamm",
+              gewebezelle_id: "hamm.weltgewebe.net",
+            },
+            location_state: "desired",
+            location_state_label: "Gewünschter Treffort",
+            faden_endpoint_id: "22222222-2222-5222-8222-222222222222",
+            conversation_id: "33333333-3333-5333-8333-333333333333",
+            location: { lat: 53.5585, lon: 10.058 },
+            location_label: "Hammer Park – gewünschter Treffpunkt",
+            meeting_note: "Ein bewusst gewählter öffentlicher Treffpunkt.",
+            access_note:
+              "Nutzung und Zugänglichkeit sind noch nicht bestätigt.",
+            created_at: "2026-08-02T10:08:00.000Z",
+            updated_at: "2026-08-02T10:08:00.000Z",
+          };
+          const response = mockListResponse(route.request().url(), [center]);
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify(response),
+          });
+        });
+      }
+      await page.goto("/map");
+      await page.waitForSelector(".map-marker");
+      await activateToolFanAction(page, "sight");
+      await page
+        .getByTestId("filter-overlay")
+        .locator("label.filter-item", { hasText: localKind })
+        .click();
+      await activateToolFanAction(page, "find");
+
+      const input = page.getByRole("combobox", { name: "Suchbegriff" });
+      await input.fill("Unauffindbarer Testbegriff 98765");
+      await expect(
+        page.getByText("Keine Treffer für „Unauffindbarer Testbegriff 98765“"),
+      ).toBeVisible();
+      await expect(page.getByRole("option")).toHaveCount(0);
+      // The server never handles local-only structure types.
+      await page.waitForTimeout(350);
+      expect(serverSearchRequests).toBe(0);
+    });
+  }
 
   test("renders lexical fallback explicitly while keeping server results usable", async ({
     page,

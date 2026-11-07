@@ -4,7 +4,14 @@ import type { MapEntityNode, Node } from "$lib/map/types";
 
 export const MAX_SEARCH_QUERY_CHARS = 512;
 
-export type NodeSearchStatus = "idle" | "loading" | "ready" | "error";
+export type NodeSearchStatus =
+  | "idle"
+  | "loading"
+  | "ready"
+  | "invalid"
+  | "rate_limited"
+  | "unavailable"
+  | "error";
 
 export interface NodeSearchResponse {
   items: Node[];
@@ -24,10 +31,44 @@ export interface SearchNodesOptions {
 }
 
 export class SearchApiError extends Error {
-  constructor(public readonly status: number) {
+  constructor(
+    public readonly status: number,
+    public readonly retryAfterSeconds: number | null = null,
+  ) {
     super(`Search request failed with HTTP ${status}`);
     this.name = "SearchApiError";
   }
+}
+
+export function searchErrorStatus(error: unknown): NodeSearchStatus {
+  if (!(error instanceof SearchApiError)) return "error";
+  if (error.status === 429) return "rate_limited";
+  if (error.status === 400) return "invalid";
+  if (error.status === 503) return "unavailable";
+  return "error";
+}
+
+export function searchErrorMessage(status: NodeSearchStatus): string {
+  switch (status) {
+    case "rate_limited":
+      return "Zu viele Suchanfragen. Bitte versuche es in wenigen Sekunden erneut.";
+    case "invalid":
+      return "Der Suchbegriff ist ungültig. Bitte passe deine Eingabe an.";
+    case "unavailable":
+      return "Die Suche ist vorübergehend nicht verfügbar. Bitte versuche es später erneut.";
+    default:
+      return "Die sichere Knotensuche ist gerade nicht verfügbar. Es wird nicht auf eine lokale Knotensuche zurückgefallen.";
+  }
+}
+
+function retryAfterSeconds(response: Response): number | null {
+  if (response.status !== 429) return null;
+  const header = response.headers.get("Retry-After");
+  if (!header || !/^\d+$/.test(header.trim())) return null;
+  const seconds = Number(header.trim());
+  return Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 86_400
+    ? seconds
+    : null;
 }
 
 export function nodeToMapEntity(node: Node): MapEntityNode | null {
@@ -83,7 +124,9 @@ export async function searchNodes(
     headers: { Accept: "application/json" },
     signal: options.signal,
   });
-  if (!response.ok) throw new SearchApiError(response.status);
+  if (!response.ok) {
+    throw new SearchApiError(response.status, retryAfterSeconds(response));
+  }
   return (await response.json()) as NodeSearchResponse;
 }
 
