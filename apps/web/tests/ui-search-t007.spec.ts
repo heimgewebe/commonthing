@@ -69,10 +69,55 @@ test.describe("T007 authorized server search contract", () => {
 
     await expect(
       page.getByText(
-        "Die sichere Knotensuche ist gerade nicht verfügbar. Es wird nicht auf eine lokale Knotensuche zurückgefallen.",
+        "Die Suche ist vorübergehend nicht verfügbar. Bitte versuche es später erneut.",
       ),
     ).toBeVisible();
     await expect(page.getByRole("option")).toHaveCount(0);
+  });
+
+  test("shows 429 without retries, then allows another normal search", async ({
+    page,
+  }) => {
+    let searchRequests = 0;
+    await page.route("**/api/search**", async (route) => {
+      searchRequests += 1;
+      if (searchRequests === 1) {
+        await route.fulfill({
+          status: 429,
+          headers: { "Retry-After": "1" },
+          body: "search_rate_limited",
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [SOURCE_NODE],
+          mode: "hybrid",
+          generation_id: "recovered-generation",
+          offset: 0,
+        }),
+      });
+    });
+
+    const input = await openSearch(page);
+    await input.fill("Fahrradwerkstatt");
+    await expect(
+      page.getByText(
+        "Zu viele Suchanfragen. Bitte versuche es in wenigen Sekunden erneut.",
+      ),
+    ).toBeVisible();
+    await expect(page.getByText(/Keine Treffer für/)).toHaveCount(0);
+    await expect(page.getByRole("option")).toHaveCount(0);
+    await page.waitForTimeout(450);
+    expect(searchRequests).toBe(1);
+
+    await input.fill("Radstation");
+    await expect(page.getByRole("option").first()).toContainText(
+      "Offene Fahrradwerkstatt",
+    );
+    expect(searchRequests).toBe(2);
   });
 
   test("renders lexical fallback explicitly while keeping server results usable", async ({
