@@ -134,34 +134,32 @@ test.describe("T007 authorized server search contract", () => {
       // center-only case so the Sicht option exists before it is selected.
       if (localKind === "Webgemeindezentren") {
         await page.route("**/api/webgemeindezentren*", async (route) => {
+          const center = {
+            type: "webgemeindezentrum",
+            id: "webgemeindezentrum-hammer-park",
+            title: "Webgemeindezentrum Hammer Park",
+            ortsweberei: {
+              id: "ortsweberei-hamm",
+              slug: "hamm",
+              name: "Ortsweberei Hamm",
+              gewebezelle_id: "hamm.weltgewebe.net",
+            },
+            location_state: "desired",
+            location_state_label: "Gewünschter Treffort",
+            faden_endpoint_id: "22222222-2222-5222-8222-222222222222",
+            conversation_id: "33333333-3333-5333-8333-333333333333",
+            location: { lat: 53.5585, lon: 10.058 },
+            location_label: "Hammer Park – gewünschter Treffpunkt",
+            meeting_note: "Ein bewusst gewählter öffentlicher Treffpunkt.",
+            access_note: "Nutzung und Zugänglichkeit sind noch nicht bestätigt.",
+            created_at: "2026-08-02T10:08:00.000Z",
+            updated_at: "2026-08-02T10:08:00.000Z",
+          };
+          const response = mockListResponse(route.request().url(), [center]);
           await route.fulfill({
             status: 200,
             contentType: "application/json",
-            body: JSON.stringify(
-              mockListResponse(route.request().url(), [
-                {
-                  type: "webgemeindezentrum",
-                  id: "webgemeindezentrum-hammer-park",
-                  title: "Webgemeindezentrum Hammer Park",
-                  ortsweberei: {
-                    id: "ortsweberei-hamm",
-                    slug: "hamm",
-                    name: "Ortsweberei Hamm",
-                    gewebezelle_id: "hamm.weltgewebe.net",
-                  },
-                  location_state: "desired",
-                  location_state_label: "Gewünschter Treffort",
-                  faden_endpoint_id: "22222222-2222-5222-8222-222222222222",
-                  conversation_id: "33333333-3333-5333-8333-333333333333",
-                  location: { lat: 53.5585, lon: 10.058 },
-                  location_label: "Hammer Park – gewünschter Treffpunkt",
-                  meeting_note: "Ein bewusst gewählter öffentlicher Treffpunkt.",
-                  access_note: "Nutzung und Zugänglichkeit sind noch nicht bestätigt.",
-                  created_at: "2026-08-02T10:08:00.000Z",
-                  updated_at: "2026-08-02T10:08:00.000Z",
-                },
-              ]),
-            ),
+            body: JSON.stringify(response),
           });
         });
       }
