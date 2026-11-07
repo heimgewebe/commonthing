@@ -274,7 +274,7 @@ async fn explicit_node_grants_require_live_consent_and_revoke_all_read_paths() {
     }))
     .expect("stale client payload");
     let denied = set_node_audience(
-        State(state),
+        State(state.clone()),
         Path(node.clone()),
         Extension(actor(&a)),
         Json(stale),
@@ -408,6 +408,53 @@ async fn explicit_node_grants_require_live_consent_and_revoke_all_read_paths() {
         .await
         .expect("fresh, explicit owner consent");
     assert!(readable(&pool, &node, Some(&b)).await);
+
+    // A stale ordinary node PUT/PATCH must never retain an ETag from before
+    // an explicit visibility or circle-grant change. This uses real PostgreSQL
+    // timestamps and exercises the actual owner-only audience handler.
+    let mut previous_version: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM domain_nodes WHERE id=$1")
+            .bind(&node)
+            .fetch_one(&pool)
+            .await
+            .expect("node timestamp before audience edits");
+    for (scope, previous_scope, selected, previously_selected) in [
+        ("public", "circles", vec![], vec![circle]),
+        ("private", "public", vec![], vec![]),
+        ("circles", "private", vec![circle], vec![]),
+    ] {
+        let update: SetNodeAudience = serde_json::from_value(serde_json::json!({
+            "scope": scope,
+            "circle_ids": selected,
+            "expected_scope": previous_scope,
+            "expected_circle_ids": previously_selected,
+        }))
+        .expect("valid versioning probe");
+        let result = set_node_audience(
+            State(state.clone()),
+            Path(node.clone()),
+            Extension(actor(&a)),
+            Json(update),
+        )
+        .await
+        .expect("owner audience edit");
+        assert_eq!(result.status(), StatusCode::OK);
+        let version: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM domain_nodes WHERE id=$1")
+                .bind(&node)
+                .fetch_one(&pool)
+                .await
+                .expect("node timestamp after audience edit");
+        assert!(
+            version > previous_version,
+            "every effective audience transition must invalidate stale node If-Match"
+        );
+        previous_version = version;
+    }
+    assert!(
+        readable(&pool, &node, Some(&b)).await,
+        "explicit audience must be restored after versioning probe"
+    );
 
     // Former owner consent cannot accidentally resurrect when a node moves
     // through public, hidden or private again.
