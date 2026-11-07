@@ -95,6 +95,11 @@ By default, dev-login is restricted to requests originating from **localhost**.
     effective client IP.
   - **Default:** If unset, defaults to `127.0.0.1,::1` (localhost) to support local development proxies out-of-the-box.
   - Required if running the API behind a local reverse proxy (e.g., Caddy) that forwards traffic from localhost.
+- **`SEARCH_RL_IP_PER_MIN`** / **`SEARCH_RL_IP_PER_HOUR`**: Per-client-IP limits for `GET /search` and
+  `GET /nodes/search`, separate from the login limits. Unset or `0` disables a window. Counted in memory per API
+  process (never in PostgreSQL, so a flood does not become one counter write per request). Exceeded requests get
+  `429 search_rate_limited` with `Retry-After`. Like the `AUTH_RL_IP_*` limits, they require `AUTH_TRUSTED_PROXIES`.
+  The VPS and prod overrides set `120` / `1200`.
 
 ## Observability
 

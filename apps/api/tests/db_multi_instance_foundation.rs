@@ -105,6 +105,8 @@ fn config() -> AppConfig {
         auth_rl_ip_per_hour: None,
         auth_rl_email_per_min: Some(2),
         auth_rl_email_per_hour: None,
+        search_rl_ip_per_min: None,
+        search_rl_ip_per_hour: None,
         node_mutation_rate_limits: Default::default(),
         smtp_host: None,
         smtp_port: None,

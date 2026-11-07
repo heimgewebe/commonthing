@@ -93,6 +93,8 @@ fn default_config() -> AppConfig {
         auth_rl_ip_per_hour: None,
         auth_rl_email_per_min: None,
         auth_rl_email_per_hour: None,
+        search_rl_ip_per_min: None,
+        search_rl_ip_per_hour: None,
         node_mutation_rate_limits: Default::default(),
         smtp_host: None,
         smtp_port: None,
@@ -185,6 +187,86 @@ async fn ambiguous_forwarded_chains_share_the_transport_peer_bucket() -> Result<
         .oneshot(request("9.10.11.12, 10.0.0.1", "c@example.com")?)
         .await?;
     assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn search_is_limited_per_forwarded_client_ip_before_search_work() -> Result<()> {
+    let _guard = EnvGuard::set("AUTH_TRUSTED_PROXIES", "127.0.0.1");
+
+    let mut config = default_config();
+    config.search_rl_ip_per_min = Some(2);
+    let state = test_state(config)?;
+    let app = Router::new()
+        .merge(api_router())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            weltgewebe_api::middleware::auth::auth_middleware,
+        ))
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))))
+        .with_state(state.clone());
+
+    let search_from = |ip: &'static str, path: &'static str| {
+        Request::get(path)
+            .header("X-Forwarded-For", ip)
+            .body(body::Body::empty())
+    };
+
+    // The JSONL read source makes search itself answer 503; the limiter must
+    // still count and reject before that work starts. The node-oriented alias
+    // shares the same per-client budget.
+    let res = app
+        .clone()
+        .oneshot(search_from("1.2.3.4", "/search?q=garten")?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let res = app
+        .clone()
+        .oneshot(search_from("1.2.3.4", "/nodes/search?q=garten")?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let res = app
+        .clone()
+        .oneshot(search_from("1.2.3.4", "/search?q=garten")?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = res
+        .headers()
+        .get("retry-after")
+        .expect("429 carries Retry-After")
+        .to_str()?
+        .parse()?;
+    assert!((1..=61).contains(&retry_after), "retry_after={retry_after}");
+    let body = body::to_bytes(res.into_body(), usize::MAX).await?;
+    assert_eq!(&body[..], b"search_rate_limited");
+
+    // Another client behind the same proxy keeps its own budget.
+    let res = app
+        .clone()
+        .oneshot(search_from("5.6.7.8", "/search?q=garten")?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let rendered = String::from_utf8(state.metrics.render()?)?;
+    assert!(
+        rendered.contains(r#"search_requests_total{outcome="rate_limited"} 1"#),
+        "rate-limited search must be counted once"
+    );
+
+    // Auth IP budget is untouched by search traffic.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/auth/magic-link/request")
+                .header("Content-Type", "application/json")
+                .header("X-Forwarded-For", "1.2.3.4")
+                .body(body::Body::from(r#"{"email":"u1@example.com"}"#))?,
+        )
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
 
     Ok(())
 }

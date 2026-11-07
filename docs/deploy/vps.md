@@ -187,7 +187,8 @@ bleiben. Dadurch ist für diese Prüfung kein Caddy-Neustart nötig.
 
 Ein manueller Aufruf **muss** die VPS-Override-Datei mitgeben. Ohne sie fehlen
 `Caddyfile.vps`, `APP_BASE_URL`, `POLICY_LIMITS_PATH`, die IPv6-Bindings sowie
-`AUTH_TRUSTED_PROXIES` und die `AUTH_RL_*`-Rate-Limits — Caddy bliebe an
+`AUTH_TRUSTED_PROXIES`, die `AUTH_RL_*`-Rate-Limits und die
+`SEARCH_RL_*`-Per-IP-Limits der anonymen Suche — Caddy bliebe an
 `127.0.0.1` gebunden und der Host wäre nicht öffentlich erreichbar:
 
 ```bash

@@ -35,6 +35,7 @@ pub enum SearchRequestOutcome {
     Unavailable,
     InvalidRequest,
     Internal,
+    RateLimited,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +119,7 @@ impl SearchRequestOutcome {
             Self::Unavailable => "unavailable",
             Self::InvalidRequest => "invalid_request",
             Self::Internal => "internal",
+            Self::RateLimited => "rate_limited",
         }
     }
 }
@@ -825,6 +827,7 @@ mod tests {
             (SearchRequestOutcome::Unavailable, "unavailable"),
             (SearchRequestOutcome::InvalidRequest, "invalid_request"),
             (SearchRequestOutcome::Internal, "internal"),
+            (SearchRequestOutcome::RateLimited, "rate_limited"),
         ];
         for (outcome, _) in outcomes {
             metrics.search_request_outcome(outcome);
