@@ -175,7 +175,7 @@ test("failed circle grant keeps one private node and disables another creation",
   );
   await expect(
     panel.getByRole("link", { name: "Privat gespeicherten Knoten öffnen" }),
-  ).toHaveAttribute("href", /focus=node%3Amock-node-1/);
+  ).toHaveAttribute("href", /focus=node:mock-node-1/);
   expect(nodeCreates).toBe(1);
   expect(grantAttempts).toBe(1);
 
