@@ -23,6 +23,7 @@ TARGETS = {
     "db_domain_backfill",
     "db_domain_edge_write_path",
     "db_domain_node_write_path",
+    "db_node_circle_grants",
     "db_governance",
     "db_multi_instance_foundation",
     "db_domain_read_path",
