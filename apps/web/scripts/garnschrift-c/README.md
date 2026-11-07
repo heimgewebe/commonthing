@@ -172,7 +172,9 @@ Farbschrift ausgeliefert; bloßes `font-weight: 300` würde die fotografischen
 Bitmap-Fäden nicht dünner machen.
 
 Der Generator entfernt ausschließlich mehr Deckkraft entlang der echten
-Garnkanten, nicht aus den Faserkernen. Farben, originale Fotopixel, Glyphengrößen,
+Garnkanten, nicht aus den Faserkernen. Die feinere Textfassung verwendet nach
+der bisherigen Reduktion einen zusätzlichen sanften Kantenpass (3/10 statt
+7/10), der die gesamte Alpha-Deckkraft um rund 4 % weiter verringert. Farben, originale Fotopixel, Glyphengrößen,
 Grundlinien, Unterlängen und Zeichenabstände bleiben gleich. Der bereits
 freigegebene Originalfont und die Wortbild-Überschriften sind **bitgenau
 unverändert**. Das gilt auch für die beiden Farbvarianten. Diese Trennung ist
@@ -184,7 +186,7 @@ Die vier WOFF-Dateien werden gemeinsam reproduzierbar aus der bekannten
 Originalquelle erzeugt und anhand fester SHA-256-Werte, des gleichen
 Glyphenlayouts und tatsächlich geringer Deckkraft geprüft. Auf Seiten mit
 Fließtext und Überschriften müssen im aktiven Farbschema beide Fontvarianten
-geladen werden; dies kostet zusätzliche rund 390–425 kB beim ersten Aufruf.
+geladen werden; dies kostet zusätzliche rund 412–449 kB beim ersten Aufruf.
 
 ## iPad/Safari: optische Grundlinie von Satzzeichen
 

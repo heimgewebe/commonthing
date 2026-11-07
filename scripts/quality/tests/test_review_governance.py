@@ -21,6 +21,7 @@ from scripts.quality.review_governance import (
     GARN_FONT_SHA256,
     WOOL_FONT_SPECS,
     WOOL_FONT_SOURCE_BLOB,
+    WOOL_TEXT_FINER_FONT_SPECS,
     WOOL_TEXT_FONT_SPECS,
     GovernanceError,
     canonical_product_docs_from_manifest_text,
@@ -252,7 +253,13 @@ class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
         self.assertIn("wool_mode=''", trusted)
         self.assertIn("wool_mode='modified'", trusted)
         self.assertIn("wool_mode='added'", trusted)
-        for spec in (*WOOL_FONT_SPECS.values(), *WOOL_TEXT_FONT_SPECS.values()):
+        self.assertIn('any(.[]; .filename == $dark and .status == "modified")', trusted)
+        self.assertIn('any(.[]; .filename == $dark and .status == "added")', trusted)
+        for spec in (
+            *WOOL_FONT_SPECS.values(),
+            *WOOL_TEXT_FONT_SPECS.values(),
+            *WOOL_TEXT_FINER_FONT_SPECS.values(),
+        ):
             self.assertIn(spec["sha256"], trusted)
             self.assertIn(spec["blob_sha"], trusted)
 
@@ -310,6 +317,36 @@ class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
                         "attention_changed_files",
                     ):
                         bad[key][bad[key].index(new_path)] = old_path
+                with self.assertRaises(GovernanceError):
+                    self._parse(bad)
+
+    def test_refined_text_pair_is_exact_and_cannot_mix_with_original(self):
+        refined = self._metadata(WOOL_TEXT_FINER_FONT_SPECS)
+        stats = self._parse(refined)
+        self.assertEqual(
+            stats.verified_font_files, tuple(sorted(WOOL_TEXT_FINER_FONT_SPECS))
+        )
+        self.assertEqual(
+            _partition_opaque_files(
+                stats.opaque_files, verified_font_files=stats.verified_font_files
+            )[1],
+            (),
+        )
+        for change in ("old_dark", "old_light", "bad_blob", "bad_size", "bad_hash"):
+            with self.subTest(change=change):
+                bad = json.loads(json.dumps(refined))
+                if change in ("old_dark", "old_light"):
+                    path = f"apps/web/static/fonts/garnschrift-c-text-{change[4:]}.woff"
+                    entry = next(
+                        item for item in bad["wool_font_proofs"] if item["path"] == path
+                    )
+                    entry.update(WOOL_TEXT_FONT_SPECS[path])
+                elif change == "bad_blob":
+                    bad["wool_font_proofs"][0]["blob_sha"] = "0" * 40
+                elif change == "bad_size":
+                    bad["wool_font_proofs"][0]["size"] += 1
+                else:
+                    bad["wool_font_proofs"][0]["sha256"] = "0" * 64
                 with self.assertRaises(GovernanceError):
                     self._parse(bad)
 
