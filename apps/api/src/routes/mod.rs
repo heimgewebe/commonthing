@@ -10,6 +10,7 @@ pub mod governance;
 pub mod health;
 pub mod machine;
 pub mod meta;
+pub mod node_audience;
 pub mod nodes;
 mod query;
 pub mod search;
@@ -61,6 +62,7 @@ use self::{
         create_proposal, exit_own_account, get_proposal, list_proposal_messages, list_proposals,
         post_proposal_message, request_repeal, veto_proposal, vote_proposal, withdraw_proposal,
     },
+    node_audience::{get_node_audience, set_node_audience},
     nodes::{get_node, list_nodes},
     search::search_nodes,
     webgemeindezentren::{
@@ -79,6 +81,47 @@ async fn list_public_nodes(
     params.insert("public_only".to_owned(), "true".to_owned());
     // Public discovery must never inherit owner-only authorization.
     list_nodes(state, Query(params), None).await
+}
+
+// An authorized response must not survive a circle departure in an HTTP cache.
+// These are the existing domain JSON endpoints, not a parallel household API.
+fn sensitive_domain_read(path: &str) -> bool {
+    let path = path.strip_prefix("/api").unwrap_or(path);
+    [
+        "/nodes",
+        "/public/nodes",
+        "/search",
+        "/edges",
+        "/accounts",
+        "/conversations",
+        "/direct-conversations",
+        "/circles",
+    ]
+    .iter()
+    .any(|prefix| {
+        path == *prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|tail| tail.starts_with('/'))
+    })
+}
+
+async fn no_store_sensitive_reads(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let protect = matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) && sensitive_domain_read(request.uri().path());
+    let mut response = next.run(request).await;
+    if protect {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("private, no-store"),
+        );
+    }
+    response
 }
 
 pub fn api_router() -> Router<ApiState> {
@@ -116,6 +159,12 @@ pub fn api_router() -> Router<ApiState> {
             "/nodes",
             get(list_nodes)
                 .merge(post(create_node_serialized).route_layer(from_fn(require_authenticated))),
+        )
+        .route(
+            "/nodes/{id}/audience",
+            get(get_node_audience)
+                .put(set_node_audience)
+                .route_layer(from_fn(require_authenticated)),
         )
         .route(
             "/nodes/{id}",
@@ -287,5 +336,35 @@ pub fn api_router() -> Router<ApiState> {
         get(auth::passkey_testing_list_credentials),
     );
 
-    router
+    router.layer(from_fn(no_store_sensitive_reads))
+}
+
+#[cfg(test)]
+mod privacy_headers_tests {
+    use super::sensitive_domain_read;
+
+    #[test]
+    fn protects_viewer_scoped_results_but_not_unrelated_endpoints() {
+        for path in [
+            "/nodes",
+            "/api/nodes/a",
+            "/api/nodes/search",
+            "/search",
+            "/edges/a",
+            "/accounts/a",
+            "/conversations/a/messages",
+            "/direct-conversations",
+            "/circles/me",
+        ] {
+            assert!(sensitive_domain_read(path), "{path}");
+        }
+        for path in [
+            "/health/live",
+            "/api/metrics",
+            "/nodes-other",
+            "/api/version",
+        ] {
+            assert!(!sensitive_domain_read(path), "{path}");
+        }
+    }
 }

@@ -8,6 +8,7 @@ use super::{
         edge_value_references_node_for_delete, Edge, EdgeEndpointCollisionEvidence,
     },
     health::{ensure_jsonl_size, load_policy_limits, PolicyLimits},
+    node_audience::readable_circle_node_ids,
     query::{
         cursor_page, encode_cursor, parse_cursor_params, parse_usize_param, validate_cursor_limit,
         CursorPage, ListResponse, PageMeta, MAX_PAGE_SIZE,
@@ -806,7 +807,12 @@ pub async fn get_node(
         .get(&id)
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
-    if !node_readable_to(&node, auth.as_ref().map(|extension| &extension.0)) {
+    let viewer = auth.as_ref().map(|extension| &extension.0);
+    if !node_readable_to(&node, viewer)
+        && !readable_circle_node_ids(&state, reader_account_id(viewer))
+            .await?
+            .contains(&node.id)
+    {
         return Err(StatusCode::NOT_FOUND);
     }
     let created_by_account_current_title = match node.created_by_account_id.as_deref() {
@@ -4192,6 +4198,13 @@ pub async fn list_nodes(
         return Ok(Json(ListResponse::Legacy(rows)));
     }
 
+    // Membership grants must be resolved before pagination. Domain projection
+    // middleware holds the read generation fence until this response is ready.
+    let circle_grants = if public_only {
+        Default::default()
+    } else {
+        readable_circle_node_ids(&state, owner_account_id).await?
+    };
     let cache = state.nodes.read().await;
 
     if cursor_mode {
@@ -4199,7 +4212,7 @@ pub async fn list_nodes(
         // independent of the file/insertion order used by the legacy path.
         let refs: Vec<&Node> = cache
             .iter_in_order()
-            .filter(|node| node_readable_to(node, viewer))
+            .filter(|node| node_readable_to(node, viewer) || circle_grants.contains(&node.id))
             .filter(|node| !public_only || node.search_visibility == SearchVisibility::Public)
             .filter(|node| match &bbox {
                 Some(bb) => node
@@ -4221,7 +4234,7 @@ pub async fn list_nodes(
         let offset: usize = parse_usize_param(&params, "offset", 0)?;
         let out: Vec<Node> = cache
             .iter_in_order()
-            .filter(|node| node_readable_to(node, viewer))
+            .filter(|node| node_readable_to(node, viewer) || circle_grants.contains(&node.id))
             .filter(|node| !public_only || node.search_visibility == SearchVisibility::Public)
             .filter(|node| match &bbox {
                 Some(bb) => node

@@ -17,7 +17,7 @@ export type MapDomainChanged =
   | {
       kind: "node";
       id: string;
-      action: "deleted" | "archived";
+      action: "deleted" | "archived" | "visibility_changed";
     };
 
 export type MapDomainChangeResolution =

@@ -1,9 +1,12 @@
 use super::domain_write_guard::reject_edge_create_unless_writable;
 use super::health::{ensure_jsonl_size, load_policy_limits};
-use super::nodes::node_readable_to;
 use super::query::{
     cursor_page, parse_cursor_params, parse_usize_param, validate_cursor_limit, ListResponse,
     MAX_PAGE_SIZE,
+};
+use super::{
+    node_audience::readable_circle_node_ids,
+    nodes::{node_readable_to, reader_account_id},
 };
 use crate::auth::role::Role;
 use crate::config::{DomainEdgeWriteSource, FIXED_FADEN_FADE_DAYS};
@@ -616,6 +619,7 @@ pub async fn list_edges(
     validate_cursor_limit(cursor_mode, limit)?;
 
     let viewer = auth.as_ref().map(|extension| &extension.0);
+    let circle_grants = readable_circle_node_ids(&state, reader_account_id(viewer)).await?;
     // Snapshot reader-relevant identities, never holding node, account, and
     // edge locks together. PostgreSQL must reject node-typed dangling edges
     // even if the public node projection deliberately omitted their rows.
@@ -626,7 +630,7 @@ pub async fn list_edges(
         let mut hidden = HashSet::new();
         let mut known = HashSet::new();
         for node in nodes.iter_in_order() {
-            if !node_readable_to(node, viewer) {
+            if !node_readable_to(node, viewer) && !circle_grants.contains(&node.id) {
                 hidden.insert(node.id.clone());
             }
             if strict_missing {
@@ -705,6 +709,7 @@ pub async fn get_edge(
     drop(cache);
 
     let viewer = auth.as_ref().map(|extension| &extension.0);
+    let circle_grants = readable_circle_node_ids(&state, reader_account_id(viewer)).await?;
     let strict_missing =
         state.config.domain_read_source == crate::config::DomainReadSource::Postgres;
     let (hidden_node_ids, known_nodes, source_node_details, target_node_details) = {
@@ -718,7 +723,7 @@ pub async fn get_edge(
             if kind.is_none() || kind == Some("node") {
                 if let Some(node) = nodes.get(id) {
                     known.insert(id.clone());
-                    if !node_readable_to(node, viewer) {
+                    if !node_readable_to(node, viewer) && !circle_grants.contains(&node.id) {
                         hidden.insert(id.clone());
                     }
                 }

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 const PORT = Number(process.env.PORT ?? (process.env.CI ? 5173 : 4173));
 const shouldStartWebServer = process.env.PLAYWRIGHT_SKIP_WEBSERVER !== "1";
+const systemChromium = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH?.trim();
 const htmlReportDir = resolve(
   process.cwd(),
   process.env.PLAYWRIGHT_HTML_REPORT ?? "playwright-report",
@@ -72,6 +73,12 @@ export default defineConfig({
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
     trace: "on-first-retry",
+    // NixOS/local developer machines may use a wrapped Chromium that already
+    // supplies the shared libraries absent from upstream FHS Playwright builds.
+    // CI keeps its normal pinned Playwright browser unless explicitly overridden.
+    ...(systemChromium
+      ? { launchOptions: { executablePath: systemChromium } }
+      : {}),
   },
   reporter,
   ...(shouldStartWebServer

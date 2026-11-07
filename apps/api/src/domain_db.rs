@@ -217,9 +217,9 @@ pub async fn load_nodes_bbox_from_postgres(
         "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility \
          FROM domain_nodes \
          WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 \
-           AND (search_visibility = 'public' OR
-             (search_visibility IN ('private', 'hidden') AND $7::text IS NOT NULL
-              AND weltgewebe_search_node_owner_account_id(payload) = $7::text))
+           AND weltgewebe_node_readable_to(
+               id, search_visibility,
+               weltgewebe_search_node_owner_account_id(payload), $7::text)
          ORDER BY id ASC LIMIT $5 OFFSET $6",
     )
     .bind(min_lat)
@@ -269,9 +269,9 @@ pub async fn load_nodes_bbox_after_id_from_postgres(
          FROM domain_nodes \
          WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 \
            AND id > $5 \
-           AND (search_visibility = 'public' OR
-             (search_visibility IN ('private', 'hidden') AND $7::text IS NOT NULL
-              AND weltgewebe_search_node_owner_account_id(payload) = $7::text))
+           AND weltgewebe_node_readable_to(
+               id, search_visibility,
+               weltgewebe_search_node_owner_account_id(payload), $7::text)
          ORDER BY id ASC LIMIT $6",
     )
     .bind(min_lat)

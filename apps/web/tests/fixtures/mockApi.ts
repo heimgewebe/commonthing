@@ -179,18 +179,22 @@ export async function mockApiResponses(
       const title =
         typeof payload?.title === "string" ? payload.title.trim() : "";
       const kind = typeof payload?.kind === "string" ? payload.kind.trim() : "";
+      // The canonical API accepts address and coordinates independently.
+      // A resource without either is valid and must be mockable.
       const address =
-        typeof payload?.address === "string" ? payload.address.trim() : "";
+        typeof payload?.address === "string" ? payload.address.trim() : null;
       const location = payload?.location as
         | { lat?: unknown; lon?: unknown }
+        | null
         | undefined;
       if (
         !validOperationId ||
         !title ||
         !isNodeKind(kind) ||
-        !address ||
-        typeof location?.lat !== "number" ||
-        typeof location?.lon !== "number"
+        (payload?.address != null && !address) ||
+        (location != null &&
+          (typeof location.lat !== "number" ||
+            typeof location.lon !== "number"))
       ) {
         return route.fulfill({
           status: 400,

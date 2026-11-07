@@ -24,6 +24,7 @@
   import KnottingTopicsSelector from "$lib/components/KnottingTopicsSelector.svelte";
   import NodeGovernance from "$lib/components/governance/NodeGovernance.svelte";
   import NodeConversation from "./NodeConversation.svelte";
+  import NodeAudienceControls from "./NodeAudienceControls.svelte";
 
   const dispatch = createEventDispatcher<{
     selectRelated: {
@@ -712,6 +713,19 @@
               <button type="button" class="secondary" onclick={beginEdit}
                 >Bearbeiten</button
               >
+              {#if nodeDetails?.created_by_account_id && nodeDetails.created_by_account_id === $authStore.account_id}
+                {#key nodeDetails.id}
+                  <NodeAudienceControls
+                    nodeId={nodeDetails.id}
+                    onChanged={() =>
+                      dispatch("domainChanged", {
+                        kind: "node",
+                        id: nodeDetails.id,
+                        action: "visibility_changed",
+                      })}
+                  />
+                {/key}
+              {/if}
               {#if deleteConfirmationOpen}
                 <div class="delete-confirmation" aria-live="polite">
                   <p><strong>Knoten wirklich entfernen?</strong></p>
