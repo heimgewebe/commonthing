@@ -220,6 +220,11 @@ pub async fn set_node_audience(
     let actor = require_actor(&auth)?;
     let (selected, expected_circle_ids) = input.validate()?;
     let pool = require_pool(&state, true)?;
+    // The generation-fenced reader also needs two pool connections. Reserve
+    // the existing shared weighted budget BEFORE opening our transaction.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(database_error("reserve_node_audience_pool_budget"))?;
     let mut tx = pool
         .begin()
         .await
@@ -307,14 +312,20 @@ pub async fn set_node_audience(
         .execute(&mut *tx)
         .await
         .map_err(database_error("revoke_old_node_grants"))?;
-    if previous_visibility != target_visibility {
-        sqlx::query("UPDATE domain_nodes SET search_visibility=$2 WHERE id=$1")
-            .bind(&id)
-            .bind(target_visibility)
-            .execute(&mut *tx)
-            .await
-            .map_err(database_error("set_node_visibility"))?;
-    }
+    // Audience edits also change the canonical node ETag used by ordinary
+    // PUT/PATCH. Otherwise a stale editor can republish a newly private node.
+    // The no-op return above avoids advancing the version on retries.
+    sqlx::query(
+        "UPDATE domain_nodes
+         SET search_visibility=$2,
+             updated_at=GREATEST(NOW(), updated_at + INTERVAL '1 microsecond')
+         WHERE id=$1",
+    )
+    .bind(&id)
+    .bind(target_visibility)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error("set_node_visibility"))?;
     if !selected.is_empty() {
         sqlx::query(
             "INSERT INTO domain_node_circle_grants (node_id,circle_id)
