@@ -47,13 +47,24 @@ export async function listMyCircles(
   signal?: AbortSignal,
 ): Promise<AudienceCircle[]> {
   const circles: AudienceCircle[] = [];
-  for (let offset = 0; ; offset += CIRCLE_PAGE_SIZE) {
+  const seen = new Set<string>();
+  let after: string | undefined;
+  for (;;) {
     const page = await request<AudienceCircle[]>(
-      `/api/circles/me?offset=${offset}`,
+      after
+        ? `/api/circles/me?after=${encodeURIComponent(after)}`
+        : "/api/circles/me",
       { signal },
     );
-    circles.push(...page);
+    for (const circle of page) {
+      if (seen.has(circle.id)) continue;
+      seen.add(circle.id);
+      circles.push(circle);
+    }
     if (page.length < CIRCLE_PAGE_SIZE) return circles;
+    const next = page[page.length - 1]?.id;
+    if (!next || next === after) throw new AudienceCircleError(502);
+    after = next;
   }
 }
 

@@ -56,7 +56,7 @@ impl CreateCircleInput {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListCirclesQuery {
-    offset: Option<i64>,
+    after: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,21 +171,21 @@ pub async fn list_my_circles(
 ) -> Result<Response, ApiError> {
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
-    let offset = query.offset.unwrap_or(0);
-    if offset < 0 {
-        return Err(bad_request("offset must be non-negative"));
-    }
+    // Keyset pagination is stable when invitations arrive or memberships
+    // disappear between HTTP requests; OFFSET would shift later pages.
     let rows = sqlx::query(
         "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status
          FROM domain_audience_circles c
          JOIN domain_audience_circle_members m ON m.circle_id=c.id
-         WHERE m.account_id=$1
-         ORDER BY CASE WHEN c.state='active' AND m.status='active' THEN 0 ELSE 1 END,
-                  c.created_at DESC, c.id DESC
-         LIMIT 100 OFFSET $2",
+         WHERE m.account_id=$1 AND ($2::uuid IS NULL OR EXISTS (
+             SELECT 1 FROM domain_audience_circles anchor
+             WHERE anchor.id=$2
+               AND (c.created_at, c.id) < (anchor.created_at, anchor.id)
+         ))
+         ORDER BY c.created_at DESC, c.id DESC LIMIT 100",
     )
     .bind(actor)
-    .bind(offset)
+    .bind(query.after)
     .fetch_all(pool)
     .await
     .map_err(internal_error("list_my_circles"))?;
@@ -471,7 +471,7 @@ pub async fn leave_circle(
 
 #[cfg(test)]
 mod tests {
-    use super::CreateCircleInput;
+    use super::{CreateCircleInput, ListCirclesQuery};
 
     #[test]
     fn consent_requires_distinct_accounts() {
@@ -482,6 +482,15 @@ mod tests {
         };
         assert!(base.validate("account-a").is_err());
         assert!(base.validate("account-b").is_ok());
+    }
+
+    #[test]
+    fn list_cursor_is_uuid_and_legacy_offset_is_rejected() {
+        let value: ListCirclesQuery =
+            serde_json::from_str(r#"{"after":"00000000-0000-4000-8000-000000000001"}"#).unwrap();
+        assert!(value.after.is_some());
+        assert!(serde_json::from_str::<ListCirclesQuery>(r#"{"offset":100}"#).is_err());
+        assert!(serde_json::from_str::<ListCirclesQuery>(r#"{"after":"not-a-uuid"}"#).is_err());
     }
 
     #[test]

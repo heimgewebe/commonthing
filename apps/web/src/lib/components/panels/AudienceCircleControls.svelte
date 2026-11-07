@@ -49,6 +49,7 @@
     chosenCircle = "";
     memberList = [];
     memberCircle = "";
+    memberLoading = false;
     notice = "";
     error = "";
     loading = Boolean(actor && selected);
