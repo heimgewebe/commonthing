@@ -209,10 +209,14 @@ EDGE_THINNING_NUM = 7
 EDGE_THINNING_DEN = 10
 
 
-def slightly_thinner_edges(width: int, height: int, rgba: bytearray) -> bytearray:
-    """Lightly contract edge coverage without touching yarn colors or layout."""
+def slightly_thinner_edges(
+    width: int, height: int, rgba: bytearray, *, strength: int = EDGE_THINNING_NUM
+) -> bytearray:
+    """Contract alpha at fiber edges, retaining RGB and all glyph geometry."""
     if len(rgba) != width * height * 4 or width < 1 or height < 1:
         raise ValueError("wrong raster dimensions")
+    if not 0 <= strength <= EDGE_THINNING_NUM:
+        raise ValueError("edge thinning strength out of range")
     original_alpha = rgba[3::4]
     output = bytearray(rgba)
     for y in range(height):
@@ -229,7 +233,7 @@ def slightly_thinner_edges(width: int, height: int, rgba: bytearray) -> bytearra
                 original_alpha[pixel + width] if y + 1 < height else 0,
             )
             output[pixel * 4 + 3] = alpha - (
-                (alpha - neighbor) * EDGE_THINNING_NUM // EDGE_THINNING_DEN
+                (alpha - neighbor) * strength // EDGE_THINNING_DEN
             )
     return output
 

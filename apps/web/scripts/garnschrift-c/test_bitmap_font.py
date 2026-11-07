@@ -23,8 +23,8 @@ ASSETS = {
 
 
 TEXT_ASSETS = {
-    "dark": ("65b87161ff41cb584e26859715cf294bf59787054d0d973926ec3532429f9f36", 389736),
-    "light": ("a1a5854b9712d23a762a31cad0b3ed030b8e4a96f68c8c02cc123cc4be7031e7", 424128),
+    "dark": ("c7f209f4e254c93fe642f6c2785c9f349cd42d8c68809c733fa8836db3ea2adf", 412276),
+    "light": ("6ecb836bb20a49f0b1ace328941c57d87bf475ad966b3068ef271362040202b7", 448932),
 }
 
 
@@ -336,8 +336,10 @@ class BitmapFontAssets(unittest.TestCase):
                     self.assertTrue(any(b >= 100 for b in thin_alpha), char)
                     original_coverage += sum(old_alpha)
                     lighter_coverage += sum(thin_alpha)
-                self.assertLess(lighter_coverage, original_coverage * 0.97)
-                self.assertGreater(lighter_coverage, original_coverage * 0.70)
+                # Slightly finer than the first approved text weight (91.4%):
+                # keep roughly 87-89% of the original heading alpha coverage.
+                self.assertLess(lighter_coverage, original_coverage * 0.89)
+                self.assertGreater(lighter_coverage, original_coverage * 0.86)
 
     def test_css_selects_body_font_without_changing_headings_or_forced_colors(self):
         css = (FONT_DIR.parent / "wool-experiment.css").read_text()
