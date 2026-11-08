@@ -29,10 +29,13 @@
         circle.state === "active" && circle.membership_status === "active",
     ),
   );
-  // Existing grants remain part of the owner's CAS snapshot after leaving a
-  // circle, even though that circle is no longer selectable for new grants.
+  // Keep former-circle grants visible until save, even after unchecking.
+  // Otherwise the checkbox disappears during the click and removal cannot
+  // be undone before confirming the new visibility.
   let unavailableCircleIds = $derived(
-    circleIds.filter((id) => !activeCircles.some((circle) => circle.id === id)),
+    originalCircleIds.filter(
+      (id) => !activeCircles.some((circle) => circle.id === id),
+    ),
   );
   let canSave = $derived.by(() => {
     // Evaluate the union inside the reactive callback: the initial
@@ -189,7 +192,8 @@
             <input
               type="checkbox"
               checked={circleIds.includes(id)}
-              onchange={(event) => toggleCircle(id, event.currentTarget.checked)}
+              onchange={(event) =>
+                toggleCircle(id, event.currentTarget.checked)}
             />
             Frühere Gemeinschaft ({id}) – Freigabe entfernen
           </label>

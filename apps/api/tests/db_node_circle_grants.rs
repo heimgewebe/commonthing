@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use sha2::Digest;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -455,6 +456,79 @@ async fn explicit_node_grants_require_live_consent_and_revoke_all_read_paths() {
         readable(&pool, &node, Some(&b)).await,
         "explicit audience must be restored after versioning probe"
     );
+
+    // The ordinary node PUT/PATCH path takes this cross-instance advisory key
+    // before checking its ETag. Audience changes MUST serialize against it,
+    // rather than relying on a row lock acquired too late.
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"weltgewebe:node-mutation:v1");
+    hasher.update((node.len() as u64).to_be_bytes());
+    hasher.update(node.as_bytes());
+    let digest = hasher.finalize();
+    let lock_key = i64::from_be_bytes(digest[..8].try_into().expect("eight hash bytes"));
+    let mut blocker = pool
+        .begin()
+        .await
+        .expect("start ordinary node mutation guard");
+    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+        .bind(lock_key)
+        .execute(&mut *blocker)
+        .await
+        .expect("hold ordinary node mutation guard");
+    let writer_state = state.clone();
+    let writer_node = node.clone();
+    let writer_actor = a.clone();
+    let mut competing_audience = tokio::spawn(async move {
+        let update: SetNodeAudience = serde_json::from_value(serde_json::json!({
+            "scope": "private", "circle_ids": [],
+            "expected_scope": "circles", "expected_circle_ids": [circle],
+        }))
+        .expect("valid private audience");
+        set_node_audience(
+            State(writer_state),
+            Path(writer_node),
+            Extension(actor(&writer_actor)),
+            Json(update),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            &mut competing_audience,
+        )
+        .await
+        .is_err(),
+        "audience PUT must wait for the ordinary per-node mutation lock"
+    );
+    blocker
+        .commit()
+        .await
+        .expect("release ordinary node mutation guard");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), competing_audience)
+        .await
+        .expect("audience must resume once lock is released")
+        .expect("audience task must not panic")
+        .expect("owner can make node private");
+    assert_eq!(result.status(), StatusCode::OK);
+    assert!(
+        !readable(&pool, &node, Some(&b)).await,
+        "member loses grant"
+    );
+    let restore: SetNodeAudience = serde_json::from_value(serde_json::json!({
+        "scope": "circles", "circle_ids": [circle],
+        "expected_scope": "private", "expected_circle_ids": [],
+    }))
+    .expect("restore circle grant");
+    set_node_audience(
+        State(state.clone()),
+        Path(node.clone()),
+        Extension(actor(&a)),
+        Json(restore),
+    )
+    .await
+    .expect("restore explicit circle grant");
+    assert!(readable(&pool, &node, Some(&b)).await);
 
     // Former owner consent cannot accidentally resurrect when a node moves
     // through public, hidden or private again.
