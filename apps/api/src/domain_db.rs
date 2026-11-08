@@ -1804,6 +1804,44 @@ pub struct AccountProfileUpdate {
     pub radius_m: i64,
     pub location: Option<AccountLocation>,
     pub clear_location: bool,
+    /// Exact public tag set the editor last read. `None` keeps the legacy
+    /// full-replacement contract, except that it may not silently republish a
+    /// tag that was moved into a scoped node resource.
+    pub expected_tags: Option<Vec<String>>,
+}
+
+/// Private marker of public profile tags that were moved into a node resource.
+/// It is never projected publicly; it only lets a stale profile editor fail
+/// closed instead of silently republishing the moved value.
+pub const MOVED_PROFILE_TAGS_KEY: &str = "moved_profile_tags";
+/// Upper bound for the private marker list. Reaching it fails closed: a
+/// marker is never silently evicted, because an evicted value could later be
+/// republished by a legacy full-profile PATCH without `expected_tags`.
+pub const MAX_MOVED_PROFILE_TAGS: usize = 256;
+
+/// Decide whether a full profile-tag replacement may be applied.
+///
+/// With `expected_tags`, the stored public set must be exactly what the editor
+/// read (order-insensitive). Without it, the request may not reintroduce a tag
+/// that an earlier conversion deliberately removed from the public profile.
+pub fn profile_tag_replacement_allowed(
+    stored: &[String],
+    moved: &[String],
+    expected: Option<&[String]>,
+    requested: &[String],
+) -> bool {
+    match expected {
+        Some(expected) => {
+            let mut expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+            let mut stored: Vec<&str> = stored.iter().map(String::as_str).collect();
+            expected.sort_unstable();
+            expected.dedup();
+            stored.sort_unstable();
+            stored.dedup();
+            expected == stored
+        }
+        None => !requested.iter().any(|tag| moved.contains(tag)),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1819,6 +1857,8 @@ pub enum AccountProfileUpdateError {
     NotFound,
     #[error("a map location is required for this visibility")]
     MissingLocation,
+    #[error("public profile tags changed since they were read")]
+    TagsChanged,
     #[error("failed to serialise account profile: {0}")]
     Serialization(#[source] serde_json::Error),
     #[error("failed to map updated account")]
@@ -1860,18 +1900,38 @@ pub async fn update_account_profile_in_postgres(
         .begin()
         .await
         .map_err(AccountProfileUpdateError::Database)?;
-    let existing: Option<(Option<f64>, Option<f64>, String)> = sqlx::query_as(
-        "SELECT location_lat, location_lon, private_payload::text \
+    let existing: Option<(Option<f64>, Option<f64>, String, String)> = sqlx::query_as(
+        "SELECT location_lat, location_lon, private_payload::text, public_payload::text \
          FROM domain_accounts WHERE id = $1 FOR UPDATE",
     )
     .bind(account_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(AccountProfileUpdateError::Database)?;
-    let Some((existing_lat, existing_lon, existing_private_text)) = existing else {
+    let Some((existing_lat, existing_lon, existing_private_text, existing_public_text)) = existing
+    else {
         return Err(AccountProfileUpdateError::NotFound);
     };
     let existing_private_payload = parse_payload(&existing_private_text);
+    // The row lock serializes this full tag replacement with a concurrent
+    // profile-tag conversion. A stale editor must reload instead of
+    // republishing a value that has just become a scoped node resource.
+    let stored_tags = payload_string_array(&parse_payload(&existing_public_text), "tags");
+    let moved_tags = payload_string_array(&existing_private_payload, MOVED_PROFILE_TAGS_KEY);
+    if !profile_tag_replacement_allowed(
+        &stored_tags,
+        &moved_tags,
+        update.expected_tags.as_deref(),
+        &update.tags,
+    ) {
+        return Err(AccountProfileUpdateError::TagsChanged);
+    }
+    // A fresh editor may deliberately publish a moved value again; then it is
+    // no longer a pending moved marker.
+    let remaining_moved: Vec<&String> = moved_tags
+        .iter()
+        .filter(|tag| !update.tags.contains(tag))
+        .collect();
     let existing_address = existing_private_payload
         .get("address")
         .and_then(Value::as_str)
@@ -1934,6 +1994,9 @@ pub async fn update_account_profile_in_postgres(
         );
         private_map.insert(RADIUS_PROJECTION_KEY.to_string(), projection);
     }
+    if !remaining_moved.is_empty() {
+        private_map.insert(MOVED_PROFILE_TAGS_KEY.to_string(), json!(remaining_moved));
+    }
     let private_payload = serde_json::to_string(&Value::Object(private_map))
         .map_err(AccountProfileUpdateError::Serialization)?;
 
@@ -1950,7 +2013,8 @@ pub async fn update_account_profile_in_postgres(
            location_lat = $5, \
            location_lon = $6, \
            public_payload = (public_payload - 'summary' - 'tags') || $7::jsonb, \
-           private_payload = (private_payload - 'address' - 'radius_projection') || $8::jsonb, \
+           private_payload = (private_payload - 'address' - 'radius_projection' \
+             - 'moved_profile_tags') || $8::jsonb, \
            updated_at = now() \
          WHERE id = $1 \
          RETURNING id, kind, title, map_state, radius_m, disabled, \
@@ -1977,6 +2041,367 @@ pub async fn update_account_profile_in_postgres(
         account,
         address: effective_address,
         location: effective_location,
+    })
+}
+
+/// One saved public profile tag that becomes exactly one canonical node.
+pub struct ProfileTagConversion<'a> {
+    pub account_id: &'a str,
+    /// Exact stored public tag, e.g. `good:Leiter`.
+    pub tag: &'a str,
+    /// Fully prepared node; `search_visibility` is already `public`/`private`.
+    pub node: &'a Node,
+    /// Namespaced, account-scoped operation key of this conversion.
+    pub operation: &'a CreateOperationKey,
+    /// Sorted, deduplicated explicit circle grants (only for private nodes).
+    pub circle_ids: &'a [Uuid],
+    pub creator_node_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileTagConversionOutcome {
+    pub node: Node,
+    pub edge: Edge,
+    pub circle_ids: Vec<Uuid>,
+    pub profile: StoredAccountProfile,
+    pub created: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProfileTagConversionError {
+    #[error("account is missing or disabled")]
+    AccountUnavailable,
+    #[error("the selected tag is not a saved public profile tag")]
+    TagNotStored,
+    #[error("one or more audience circles are not active memberships")]
+    CirclesUnavailable,
+    #[error("conversion operation id was already used for different data")]
+    OperationConflict,
+    #[error("converted tag is public again; the earlier conversion cannot be replayed")]
+    ReplayTagPublic,
+    #[error("operation already completed with a different audience")]
+    ReplayAudienceMismatch,
+    #[error("too many moved profile tags are recorded for this account")]
+    MovedTagCapacity,
+    #[error("edge operation id was already used for different data")]
+    EdgeOperationConflict,
+    #[error(transparent)]
+    Node(#[from] NodeCreateError),
+    #[error(transparent)]
+    Edge(#[from] EdgeWriteError),
+    #[error("failed to serialise account payload: {0}")]
+    Serialization(#[source] serde_json::Error),
+    #[error("failed to map converted account")]
+    Mapping,
+    #[error("profile tag conversion failed in PostgreSQL: {0}")]
+    Database(#[source] sqlx::Error),
+}
+
+/// Move ONE saved public `good:`/`skill:` profile tag into one canonical node.
+///
+/// A single PostgreSQL transaction removes the public tag, inserts the node
+/// with its first durable visibility, its mandatory account→node origin Faden
+/// and optional explicit circle grants. Either all of it commits or nothing.
+///
+/// Lock order joins the existing contracts: account lifecycle advisory lock
+/// (node create, guest exit, audience), then the account row (profile PATCH),
+/// then circle consent rows BEFORE any generation-bumping write (audience),
+/// then the operation and node-mutation locks (node create).
+///
+/// A replay of the same operation returns the stored node without a second
+/// mutation. It fails closed when the tag has meanwhile become public again,
+/// so a client can never present a public value as moved.
+pub async fn convert_profile_tag_to_node_in_postgres<G, H>(
+    pool: &PgPool,
+    conversion: ProfileTagConversion<'_>,
+    edge_for_node: G,
+    edge_operation_for_node: H,
+) -> Result<ProfileTagConversionOutcome, ProfileTagConversionError>
+where
+    G: Fn(&str) -> Edge,
+    H: Fn(&str) -> CreateOperationKey,
+{
+    use ProfileTagConversionError as E;
+
+    // The caller reserves the shared PostgreSQL domain budget across this
+    // transaction AND its post-commit cache publication, like POST /nodes.
+    let mut tx = pool.begin().await.map_err(E::Database)?;
+    let result = convert_profile_tag_in_transaction(
+        &mut tx,
+        &conversion,
+        &edge_for_node,
+        &edge_operation_for_node,
+    )
+    .await;
+    match result {
+        Ok(outcome) => {
+            tx.commit().await.map_err(E::Database)?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            tx.rollback().await.ok();
+            Err(error)
+        }
+    }
+}
+
+fn converted_node_matches(existing: &Node, expected: &Node) -> bool {
+    existing.kind == expected.kind
+        && existing.title == expected.title
+        && existing.tags == expected.tags
+        && existing.created_by_account_id == expected.created_by_account_id
+}
+
+async fn convert_profile_tag_in_transaction<G, H>(
+    tx: &mut Transaction<'_, Postgres>,
+    conversion: &ProfileTagConversion<'_>,
+    edge_for_node: &G,
+    edge_operation_for_node: &H,
+) -> Result<ProfileTagConversionOutcome, ProfileTagConversionError>
+where
+    G: Fn(&str) -> Edge,
+    H: Fn(&str) -> CreateOperationKey,
+{
+    use ProfileTagConversionError as E;
+    let account_id = conversion.account_id;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+        .bind(crate::advisory_lock::account_lifecycle_lock_key(account_id))
+        .execute(&mut **tx)
+        .await
+        .map_err(E::Database)?;
+    // NO KEY UPDATE serializes with profile PATCH (FOR UPDATE) and other
+    // conversions while still admitting foreign-key checks of unrelated rows.
+    let account: Option<(String, String)> = sqlx::query_as(
+        "SELECT public_payload::text, private_payload::text FROM domain_accounts \
+         WHERE id = $1 AND disabled = FALSE FOR NO KEY UPDATE",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(E::Database)?;
+    let Some((public_text, private_text)) = account else {
+        return Err(E::AccountUnavailable);
+    };
+    let public_payload = parse_payload(&public_text);
+    let private_payload = parse_payload(&private_text);
+    let stored_tags = payload_string_array(&public_payload, "tags");
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+        .bind(crate::advisory_lock::stable_advisory_lock_key(
+            "weltgewebe:create-operation:v1",
+            &[
+                &conversion.operation.actor_id,
+                &conversion.operation.operation_id,
+            ],
+        ))
+        .execute(&mut **tx)
+        .await
+        .map_err(E::Database)?;
+    let replayed: Option<NodeRow> = sqlx::query_as(
+        "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility \
+         FROM domain_nodes WHERE create_actor_id = $1 AND create_operation_id = $2",
+    )
+    .bind(&conversion.operation.actor_id)
+    .bind(&conversion.operation.operation_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(E::Database)?;
+
+    let (node, created) = match replayed {
+        Some(row) => {
+            let existing = node_from_row(row)
+                .map_err(NodeCreateError::Mapping)
+                .map_err(E::Node)?;
+            if !converted_node_matches(&existing, conversion.node) {
+                return Err(E::OperationConflict);
+            }
+            if stored_tags.iter().any(|tag| tag == conversion.tag) {
+                return Err(E::ReplayTagPublic);
+            }
+            // A replay is only answered when the node's CURRENT audience is
+            // exactly what this request asks for. A retry with another scope
+            // or circle set, or a node whose audience was changed afterwards,
+            // gets a conflict instead of a misleading success.
+            let current_grants: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT circle_id FROM domain_node_circle_grants WHERE node_id=$1 ORDER BY circle_id",
+            )
+            .bind(&existing.id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(E::Database)?;
+            if existing.search_visibility != conversion.node.search_visibility
+                || current_grants != conversion.circle_ids
+            {
+                return Err(E::ReplayAudienceMismatch);
+            }
+            (existing, false)
+        }
+        None => {
+            if !stored_tags.iter().any(|tag| tag == conversion.tag) {
+                return Err(E::TagNotStored);
+            }
+            if !conversion.circle_ids.is_empty() {
+                // Same consent query and lock as PUT /nodes/{id}/audience,
+                // acquired before any write bumps the domain generation.
+                let valid: Vec<Uuid> = sqlx::query_scalar(
+                    "SELECT c.id FROM domain_audience_circles c
+                     JOIN domain_audience_circle_members m ON m.circle_id=c.id
+                     JOIN domain_accounts a ON a.id=m.account_id
+                     WHERE c.id=ANY($1::uuid[]) AND m.account_id=$2
+                       AND c.state='active' AND m.status='active' AND a.disabled=FALSE
+                     ORDER BY c.id
+                     FOR SHARE OF c, m, a",
+                )
+                .bind(conversion.circle_ids)
+                .bind(account_id)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(E::Database)?;
+                if valid != conversion.circle_ids {
+                    return Err(E::CirclesUnavailable);
+                }
+            }
+            match insert_domain_node_in_transaction(
+                tx,
+                conversion.node,
+                Some(conversion.operation),
+                conversion.creator_node_limit,
+            )
+            .await?
+            {
+                CreateWriteOutcome::Created => {}
+                // Impossible while the operation lock is held; never guess.
+                CreateWriteOutcome::Existing(_) => return Err(E::OperationConflict),
+            }
+            (conversion.node.clone(), true)
+        }
+    };
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+        .bind(crate::advisory_lock::node_mutation_lock_key(&node.id))
+        .execute(&mut **tx)
+        .await
+        .map_err(E::Database)?;
+    let expected_edge = edge_for_node(&node.id);
+    let edge_operation = edge_operation_for_node(&node.id);
+    let edge =
+        match insert_domain_edge_in_transaction(tx, &expected_edge, Some(&edge_operation)).await? {
+            CreateWriteOutcome::Created => expected_edge,
+            CreateWriteOutcome::Existing(existing) => {
+                if !edge_matches_projection(&existing, &expected_edge) {
+                    return Err(E::EdgeOperationConflict);
+                }
+                existing
+            }
+        };
+
+    if created && !conversion.circle_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO domain_node_circle_grants (node_id,circle_id)
+             SELECT $1, unnest($2::uuid[])",
+        )
+        .bind(&node.id)
+        .bind(conversion.circle_ids)
+        .execute(&mut **tx)
+        .await
+        .map_err(E::Database)?;
+    }
+
+    let row: AccountRow = if created {
+        let remaining: Vec<&String> = stored_tags
+            .iter()
+            .filter(|tag| tag.as_str() != conversion.tag)
+            .collect();
+        let public_patch = if remaining.is_empty() {
+            json!({})
+        } else {
+            json!({ "tags": remaining })
+        };
+        let mut moved = payload_string_array(&private_payload, MOVED_PROFILE_TAGS_KEY);
+        moved.retain(|tag| tag != conversion.tag);
+        moved.push(conversion.tag.to_string());
+        if moved.len() > MAX_MOVED_PROFILE_TAGS {
+            // Rolls back the node, Faden and grants inserted above as well.
+            return Err(E::MovedTagCapacity);
+        }
+        let public_patch = serde_json::to_string(&public_patch).map_err(E::Serialization)?;
+        let mut private_patch = Map::new();
+        private_patch.insert(MOVED_PROFILE_TAGS_KEY.to_string(), json!(moved));
+        let private_patch =
+            serde_json::to_string(&Value::Object(private_patch)).map_err(E::Serialization)?;
+        sqlx::query_as(
+            "UPDATE domain_accounts SET \
+               public_payload = (public_payload - 'tags') || $2::jsonb, \
+               private_payload = (private_payload - 'moved_profile_tags') || $3::jsonb, \
+               updated_at = now() \
+             WHERE id = $1 \
+             RETURNING id, kind, title, map_state, radius_m, disabled, \
+               location_lat, location_lon, role, email, webauthn_user_id::text, \
+               public_payload::text, private_payload::text",
+        )
+        .bind(account_id)
+        .bind(&public_patch)
+        .bind(&private_patch)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(E::Database)?
+    } else {
+        sqlx::query_as(
+            "SELECT id, kind, title, map_state, radius_m, disabled, \
+               location_lat, location_lon, role, email, webauthn_user_id::text, \
+               public_payload::text, private_payload::text \
+             FROM domain_accounts WHERE id = $1",
+        )
+        .bind(account_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(E::Database)?
+    };
+    let address = parse_payload(&row.12)
+        .get("address")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let location = match (row.6, row.7) {
+        (Some(lat), Some(lon)) => Some(AccountLocation { lat, lon }),
+        _ => None,
+    };
+    let account = account_row_to_internal(row).ok_or(E::Mapping)?;
+
+    // Replays report the node's post-lock state (audience already verified).
+    let node = if created {
+        node
+    } else {
+        let row: NodeRow = sqlx::query_as(
+            "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility \
+             FROM domain_nodes WHERE id = $1",
+        )
+        .bind(&node.id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(E::Database)?;
+        node_from_row(row)
+            .map_err(NodeCreateError::Mapping)
+            .map_err(E::Node)?
+    };
+    let circle_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT circle_id FROM domain_node_circle_grants WHERE node_id=$1 ORDER BY circle_id",
+    )
+    .bind(&node.id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(E::Database)?;
+
+    Ok(ProfileTagConversionOutcome {
+        node,
+        edge,
+        circle_ids,
+        profile: StoredAccountProfile {
+            account,
+            address,
+            location,
+        },
+        created,
     })
 }
 

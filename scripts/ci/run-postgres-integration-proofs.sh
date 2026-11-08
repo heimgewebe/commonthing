@@ -362,6 +362,7 @@ targets=(
   db_domain_edge_write_path
   db_domain_node_write_path
   db_node_circle_grants
+  db_profile_tag_resource
   db_governance
   db_federation_persistence
   db_multi_instance_foundation
