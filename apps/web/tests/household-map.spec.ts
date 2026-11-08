@@ -61,6 +61,17 @@ test.describe("household map view", () => {
     await expect(pager).toBeVisible();
     await expect(pager).toContainText("Seite 2 von 2");
 
+    // These pale controls need the dark yarn, even with a dark map theme.
+    await page.evaluate(() => {
+      document.documentElement.dataset.woolExperiment = "on";
+      document.documentElement.dataset.colorScheme = "dark";
+    });
+    await expect(close).toHaveCSS("font-family", /Garnschrift C Petrol Text/);
+    await expect(pager.getByRole("button", { name: "Zurück" })).toHaveCSS(
+      "font-family",
+      /Garnschrift C Petrol Text/,
+    );
+
     await pager.getByRole("button", { name: "Zurück" }).click();
     await expect(pager).toContainText("Seite 1 von 2");
     const firstMember = page.getByTestId(
