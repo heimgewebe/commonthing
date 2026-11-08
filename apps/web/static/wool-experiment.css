@@ -76,6 +76,14 @@
     font-family: "Garnschrift C Petrol", system-ui, sans-serif !important;
   }
 
+  /* Pale household controls need dark pre-coloured yarn even in dark mode;
+     CSS color cannot recolor the fixed-color font glyphs. */
+  html[data-wool-experiment="on"][data-color-scheme="dark"]
+    body
+    :is(.map-household-close, .map-household-pager, .map-household-pager *) {
+    font-family: "Garnschrift C Petrol Text", system-ui, sans-serif !important;
+  }
+
   /* Wool text needs a legible optical size. */
   html[data-wool-experiment="on"][data-color-scheme] body {
     font-size: 17px;
