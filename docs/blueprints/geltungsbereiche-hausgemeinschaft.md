@@ -28,10 +28,19 @@ relations:
 
 **Stand:** 6. November 2026. **Art:** Aktiver Ausführungsplan; Stufen
 werden separat abgenommen. Das Papier selbst ist kein Produktionsbeleg.
-**Umsetzung:** Durch den Nutzer beauftragt. P0 über PR #2065 auf main;
-P1-Mitgliedschaft im isolierten Arbeitszweig umgesetzt und getestet,
-noch nicht produktiv abgenommen. P2 (Inhaltssichtbarkeit), P2b (einzelne
-Ressourcen), P3 (Benachrichtigungen) und P4 (große Karte) sind weiterhin offen.
+**Umsetzung (8. November 2026):** P0 über PR #2065, P1-Mitgliedschaft
+über PR #2069 und P2-Knotenfreigaben über PR #2073 in main integriert.
+Öffentlicher API- und Frontend-Readback bestätigt für P2 denselben
+Produktionscommit b83e7e42; negative anonyme Audience-Abfragen liefern 401.
+Echte mehrseitige Authentifizierungs- und physische iPad-Abnahme stehen
+aus. P2b erhält über PR #2078 einen ersten sicheren Profil-zu-Knoten-
+Einstieg für neue Ressourcen; die individuelle Freigabe bereits bestehender
+Profil-Tags ist nicht umgesetzt. P3 (Benachrichtigungen) und P4 (große Karte)
+sind weiterhin offen.
+Für neue einzeln sichtbarkeitsgesteuerte Güter/Fähigkeiten ist das
+vorhandene Knotenmodell mit P2-Sichtbarkeit die einzige sichere
+Speicherung; öffentliche Garnrollen-Tags dürfen **nicht** als private
+Ressourcen missverstanden werden.
 Der frühere Bureau-Kandidat ist nicht publiziert und keine registrierte Aufgabe.
 
 ## 1. Auftrag und Erfolgskriterium

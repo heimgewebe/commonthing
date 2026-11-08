@@ -44,8 +44,20 @@ jobs:
           elif curl --help 2>/dev/null | grep -q -- '--retry-all-errors'; then
             CURL_COMMON+=(--retry-all-errors)
           fi
-          curl "${CURL_COMMON[@]}" -L -o "$TARBALL" "${BASE_URL}/${TARBALL}"
-          curl "${CURL_COMMON[@]}" -L -o checksums.txt "${BASE_URL}/vale_${VALE_VERSION}_checksums.txt"
+          # GitHub browser release links may return 504 even while the
+          # GitHub release-asset API serves the exact upstream version.
+          # Keep the checksum verification from the upstream release below.
+          fetch_vale_asset() {
+            local asset_id="$1" output="$2" release_name="$3"
+            if ! curl "${CURL_COMMON[@]}" -L \
+              -H "Accept: application/octet-stream" \
+              -o "$output" \
+              "https://api.github.com/repos/errata-ai/vale/releases/assets/${asset_id}"; then
+              curl "${CURL_COMMON[@]}" -L -o "$output" "${BASE_URL}/${release_name}"
+            fi
+          }
+          fetch_vale_asset 160922713 "$TARBALL" "$TARBALL"
+          fetch_vale_asset 160922723 checksums.txt "vale_${VALE_VERSION}_checksums.txt"
           grep "$TARBALL" checksums.txt | sha256sum -c -
           mkdir -p bin
           tar -xzf "$TARBALL"

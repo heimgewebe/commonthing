@@ -240,6 +240,104 @@ test.describe("Eigene Garnrolle speichern", () => {
     ).toContainText("gespeichert");
   });
 
+  test("creates a separate circle-only resource through the existing Knoten flow without publishing a profile tag", async ({
+    page,
+  }) => {
+    const section = await openSettingsAsWeber(page);
+    const circleId = "00000000-0000-4000-8000-000000000099";
+    await page.route("**/api/circles/me*", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([
+          {
+            id: circleId,
+            kind: "household",
+            name: "Test-Haus",
+            state: "active",
+            membership_status: "active",
+          },
+        ]),
+      }),
+    );
+    await page.route("**/api/nodes/mock-node-1/audience", (route) => {
+      if (route.request().method() === "GET")
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            node_id: "mock-node-1",
+            scope: "private",
+            circle_ids: [],
+          }),
+        });
+      if (route.request().method() === "PUT")
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            node_id: "mock-node-1",
+            scope: "circles",
+            circle_ids: [circleId],
+          }),
+        });
+      return route.fulfill({ status: 405 });
+    });
+    await expect(
+      section.getByTestId("garnrolle-public-tags-notice"),
+    ).toContainText("öffentlich, auch bei privatem Kartenanker");
+    // An unfinished public profile edit must survive the transition.
+    await section.getByLabel("Güter").fill("Werkzeug");
+
+    let profileWrites = 0;
+    page.on("request", (request) => {
+      if (
+        request.url().endsWith("/api/accounts/me/profile") &&
+        request.method() === "PATCH"
+      )
+        profileWrites += 1;
+    });
+    await section.getByTestId("garnrolle-private-resource-link").click();
+    await expect(page).toHaveURL(/\/map\?compose=node/);
+    const panel = page.getByTestId("context-panel");
+    await panel.getByLabel("Mit Kartenort").uncheck();
+    await panel.locator("#nodeType").selectOption("resource");
+    await panel.locator("#title").fill("Meine Leiter");
+    await panel.locator("#new-node-audience-scope").selectOption("circles");
+    await panel.getByRole("checkbox", { name: "Test-Haus" }).check();
+
+    const grantRequest = page.waitForRequest(
+      (request) =>
+        new URL(request.url()).pathname === "/api/nodes/mock-node-1/audience" &&
+        request.method() === "PUT",
+    );
+    const nodeRequest = page.waitForRequest(
+      (request) =>
+        new URL(request.url()).pathname === "/api/nodes" &&
+        request.method() === "POST",
+    );
+    await panel.getByRole("button", { name: "Knoten knüpfen" }).click();
+    const payload = (await nodeRequest).postDataJSON();
+    expect(payload).toMatchObject({
+      kind: "resource",
+      title: "Meine Leiter",
+      search_visibility: "private",
+    });
+    expect(payload.tags).not.toContain("good:Meine Leiter");
+    expect((await grantRequest).postDataJSON()).toEqual({
+      scope: "circles",
+      circle_ids: [circleId],
+      expected_scope: "private",
+      expected_circle_ids: [],
+    });
+    expect(profileWrites).toBe(0);
+
+    await page.goto("/settings#meine-garnrolle");
+    await expect(
+      page.getByTestId("my-garnrolle-section").getByLabel("Güter"),
+    ).toHaveValue("Werkzeug");
+  });
+
   test("saves a not-on-map profile and reloads the persisted values", async ({
     page,
   }) => {

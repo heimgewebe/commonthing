@@ -24,7 +24,17 @@ CI_TOOL_DOWNLOAD_SCRIPTS = {
           INSTALL_TMPDIR=$(mktemp -d)
           trap 'rm -rf "$INSTALL_TMPDIR"' EXIT
           YQ_DOWNLOAD="$INSTALL_TMPDIR/yq_linux_amd64"
-          wget -qO "$YQ_DOWNLOAD" "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          # GitHub release browser links may 504 while the release asset API
+          # works. Both paths retain the exact pinned SHA-256 check below.
+          if ! curl -fLsS --retry 3 --retry-delay 2 --connect-timeout 10 \
+            --max-time 60 -H "Accept: application/octet-stream" \
+            -o "$YQ_DOWNLOAD" \
+            "https://api.github.com/repos/mikefarah/yq/releases/assets/183937293"; then
+            echo "yq GitHub API unavailable; trying canonical release URL." >&2
+            curl -fLsS --retry 3 --retry-delay 2 --connect-timeout 10 \
+              --max-time 60 -o "$YQ_DOWNLOAD" \
+              "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          fi
           printf '%s  %s\n' "$YQ_SHA256" "$YQ_DOWNLOAD" | sha256sum -c -
           install -m 0755 "$YQ_DOWNLOAD" "$YQ_BIN"
           rm -rf "$INSTALL_TMPDIR"

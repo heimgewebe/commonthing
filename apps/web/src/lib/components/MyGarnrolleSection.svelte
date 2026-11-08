@@ -340,6 +340,14 @@
     await goto("/map?compose=garnrolle");
   }
 
+  async function createScopedResource() {
+    // Reuse the canonical Knoten editor and its owner/circle ACL.
+    // Preserve an unsaved Garnrolle draft without publishing profile tags.
+    profileError = null;
+    if (!saveDraftForMap()) return;
+    await goto("/map?compose=node");
+  }
+
   async function removeMapLocation() {
     selectedLocation = null;
     clearLocation = true;
@@ -641,6 +649,20 @@
             Maximal 62 Tags; je 64 Unicode-Zeichen samt Präfix.
           </small>
         {/if}
+        <p class="field-intro" data-testid="garnrolle-public-tags-notice">
+          Diese Profilangaben sind öffentlich, auch bei privatem Kartenanker.
+          Soll ein einzelnes Gut oder eine Fähigkeit nur für dich oder eine
+          Gemeinschaft sichtbar sein, knüpfe dafür einen Knoten. Trage die
+          private Ressource nicht zusätzlich hier ein.
+        </p>
+        <button
+          type="button"
+          class="btn"
+          data-testid="garnrolle-private-resource-link"
+          onclick={createScopedResource}
+        >
+          Einzelne Ressource mit eigener Sichtbarkeit knüpfen
+        </button>
       </fieldset>
 
       <fieldset disabled={formDisabled}>

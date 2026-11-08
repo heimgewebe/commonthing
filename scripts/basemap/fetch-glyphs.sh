@@ -16,6 +16,7 @@ TARGET_FONT_DIR="$GLYPHS_DIR/Noto Sans Regular"
 
 # Pin OpenMapTiles fonts v2.0 (Noto Sans)
 ASSET_URL="https://github.com/openmaptiles/fonts/releases/download/v2.0/noto-sans.zip"
+ASSET_API_URL="https://api.github.com/repos/openmaptiles/fonts/releases/assets/78489803"
 ASSET_SHA256="d117316544b43a5dde7ee761b36e17701e9f85574e181d76a74814240fdbaf34"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/noto-sans.XXXXXX")"
 TMP_ARCHIVE="$TMP_DIR/noto-sans.zip"
@@ -29,10 +30,10 @@ echo "=================================="
 
 # Tool checks
 DOWNLOADER=""
-if command -v wget > /dev/null 2>&1; then
-  DOWNLOADER="wget"
-elif command -v curl > /dev/null 2>&1; then
+if command -v curl > /dev/null 2>&1; then
   DOWNLOADER="curl"
+elif command -v wget > /dev/null 2>&1; then
+  DOWNLOADER="wget"
 else
   echo "Error: Neither 'wget' nor 'curl' is available for downloading the assets." >&2
   exit 1
@@ -81,10 +82,24 @@ if [ -f "$TARGET_FONT_DIR/.complete" ]; then
 fi
 
 echo "=> Downloading font archive from OpenMapTiles..."
+# Prefer exact upstream release-asset API when github.com browser release URLs 504.
+# The same pinned SHA-256 is verified below, irrespective of the download path.
 if [ "$DOWNLOADER" = "wget" ]; then
-  wget -qO "$TMP_ARCHIVE" "$ASSET_URL" || { exit 1; }
+  if ! wget --tries=3 --timeout=30 --waitretry=2 -nv --header="Accept: application/octet-stream" -O "$TMP_ARCHIVE" "$ASSET_API_URL"; then
+    echo "GitHub API asset unavailable; trying canonical URL." >&2
+    wget --tries=3 --timeout=30 --waitretry=2 -nv -O "$TMP_ARCHIVE" "$ASSET_URL" || {
+      echo "Error: Pinned Noto Sans archive unavailable on both routes." >&2
+      exit 1
+    }
+  fi
 else
-  curl -fL -s -o "$TMP_ARCHIVE" "$ASSET_URL" || { exit 1; }
+  if ! curl -fL -sS --retry 3 --retry-delay 2 --retry-max-time 120 --connect-timeout 10 --max-time 60 -H "Accept: application/octet-stream" -o "$TMP_ARCHIVE" "$ASSET_API_URL"; then
+    echo "GitHub API asset unavailable; trying canonical URL." >&2
+    curl -fL -sS --retry 3 --retry-delay 2 --retry-max-time 120 --connect-timeout 10 --max-time 60 -o "$TMP_ARCHIVE" "$ASSET_URL" || {
+      echo "Error: Pinned Noto Sans archive unavailable on both routes." >&2
+      exit 1
+    }
+  fi
 fi
 
 echo "=> Verifying integrity of downloaded archive..."
