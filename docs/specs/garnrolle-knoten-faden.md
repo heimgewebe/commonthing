@@ -9,8 +9,8 @@ lifecycle_state: active
 role: norm
 organ: product-domain
 owner: product-domain
-last_reviewed: 2026-08-02
-review_after: 2026-10-12
+last_reviewed: 2026-11-07
+review_after: 2027-01-07
 depends_on: []
 relations:
   - type: relates_to
@@ -33,6 +33,8 @@ verifies_with:
   - apps/api/tests/api_accounts.rs
   - apps/api/tests/db_domain_edge_write_path.rs
   - apps/api/tests/db_node_conversations.rs
+  - apps/api/tests/db_node_circle_grants.rs
+  - apps/web/tests/node-audience-composition.spec.ts
   - apps/web/src/lib/demo/resolvers.test.ts
   - apps/web/tests/garnrolle-self-service.spec.ts
   - apps/web/tests/garnrolle-relations.spec.ts
@@ -115,15 +117,13 @@ als aktive Mitgliedschaft. Der eigene Austritt widerruft die Mitgliedschaft
 sofort; ein deaktivierter Account hat keine gültigen Kreis-Leserechte.
 Mitgliedsnamen sind nur für aktive Kreis-Mitglieder abrufbar.
 
-Kreise werden in domain_audience_circles und domain_audience_circle_members
-persistiert. Die SQL-Funktion weltgewebe_active_circle_member prüft die
-aktive Zugehörigkeit und ist **nur ein Baustein** der späteren
-Inhalts-Lesepolicy. Ein Kreis verleiht **keine** Schreib-, Moderations-
-oder Weberrechte. Bestehende search_visibility-, map_state- und
-öffentlich/private Garnrolleninformationen ändern sich durch die
-Mitgliedschaft nicht. Die Einschränkung eines Knotens oder einzelnen
-Gutes auf einen Kreis wird erst in P2/P2b nach vollständiger serverseitiger
-Durchsetzung auf allen Lesepfaden eingeführt; siehe
+Kreise werden in `domain_audience_circles` und
+`domain_audience_circle_members` persistiert. Die SQL-Funktion
+`weltgewebe_active_circle_member` prüft die aktive Zugehörigkeit als Teil
+einer **ausdrücklichen** Knoten-Lesefreigabe. Ein Kreis verleiht **keine**
+Schreib-, Moderations- oder Weberrechte. Die Verortung von Garnrollen
+(`map_state`) bleibt unabhängig. Einzelne Profilressourcen (P2b)
+bleiben ein eigener Schritt; siehe
 [Umsetzungsplan](../blueprints/geltungsbereiche-hausgemeinschaft.md).
 
 ## Knoten
@@ -183,23 +183,53 @@ Prüfung erfolgt auf dem Server und gilt unabhängig von der sichtbaren
 Oberfläche. Versionsvorbedingungen (`If-Match`) schützen zusätzlich gegen
 überschriebene Paralleländerungen.
 
-### Lesen und Suchsichtbarkeit (Änderungsentwurf zu #1970)
+### Lesen, Suchsichtbarkeit und Kreisfreigaben
 
 Der serverseitige Zustand search_visibility regelt nicht nur die Aufnahme
 in den Suchindex, sondern begrenzt die gewöhnlichen lesenden API-Projektionen.
 Ein öffentlich zugänglicher Link ist keine Erlaubnis für ein privates Objekt.
 
-| Zustand | Lesen durch Besucher / fremde Accounts | Lesen durch den authentifizierten Urheber |
-|---|---|---|
-| public | ja | ja |
-| private | nein | ja |
-| hidden | nein | ja, direkt und in eigenen Listen, nicht in der semantischen Suche |
-| revoked | nein | nein; Sonderzugriff nur über eigene moderierte APIs |
+| Zustand | Ohne Berechtigung | Mitglieder mit ausdrücklichem Grant | Urheber |
+|---|---|---|---|
+| `public` | ja | ja | ja |
+| `private` | nein | ja, bei aktivem Kreis und Urheberaccount | ja |
+| `hidden` | nein | nein | ja, nicht in semantischer Suche |
+| `revoked` | nein | nein | nein |
 
 Für Knoten mit fehlender historischer Urheberbindung gilt: private und
 hidden gewähren kein vermutetes Eigentümerrecht. Für bestehende
 historische Datensätze ohne expliziten Sichtbarkeitszustand bleibt die
 bisherige Vorgabe public erhalten.
+
+#### Explizite Knotengeltungsbereiche (P2)
+
+`domain_node_circle_grants` verbindet **bestehende** Knoten-IDs mit
+ausdrücklich ausgewählten Kreisen. Nur der authentifizierte **ursprüngliche
+Urheber** kann über `GET/PUT /api/nodes/{id}/audience` einen Knoten
+„Öffentlich“, „Nur ich“ oder „Nur ausgewählte Gemeinschaften“ stellen.
+Neue private Knoten werden bereits beim **ersten POST** als `private`
+persistiert; scheitert der nachfolgende Grant, bleiben sie privat.
+Altobjekte werden nicht automatisch freigegeben, und die Position eines
+Accounts führt niemals zu Mitgliedsrechten.
+
+Nur **aktive, ausdrücklich angenommene** Mitglieder eines aktiven Kreises
+dürfen freigegebene private Knoten lesen. Auch der Urheberaccount muss
+aktiv sein. `hidden` und `revoked` bleiben geschlossen; fehlende
+historische Urheberschaft führt zu keinem vermuteten Kreisrecht.
+Kreis-Mitgliedschaft ist **kein** Knotenbearbeitungs- oder Schreibrecht.
+
+`weltgewebe_node_readable_to` wird vor PostgreSQL-BBOX-Seiten,
+Suchranking, Knotenaktivität und Knotengesprächen geprüft; dieselbe
+Kreiszugehörigkeit schützt cache-basierte Details, Fäden und Profilansichten.
+Privater Suchtext bleibt lexikalisch und verlässt nicht an einen externen
+Embedding-Anbieter den Server. Mitgliedschaftsänderungen, Grant-Änderungen
+und Accountdeaktivierung invalidieren die vorhandene PostgreSQL-Privacy-
+Generation. Sensible GET-Antworten erhalten `Cache-Control: private,
+no-store`; nach Austritt wird der Browser neu geladen. Frühere Grants
+werden bei geänderter Sichtbarkeit oder Urheberbindung entfernt.
+Schreibvorbedingungen verhindern stille Überschreibungen zwischen Browsern.
+Bereits an andere Geräte übertragene Daten können nicht rückwirkend
+zurückgeholt werden.
 
 Autorisierung geschieht serverseitig **vor** Limits, Offsets und Cursorgrenzen,
 und zwar auch bei PostgreSQL-BBOX-Abfragen. Einzelzugriffe auf unzulässige
@@ -218,8 +248,7 @@ Private Knotentitel dürfen auch nicht über Account-Aktivitätslisten
 erneut öffentlich ausgegeben werden. Ein automatischer Downgrade, der den
 Archiv-Sichtbarkeitssnapshot entfernt, ist ausdrücklich gesperrt.
 
-**Noch zu prüfen:** bestehende Altclients, Cache-Publikationsleistung und
-historische Archivberechtigungen. Dieser Vertrag ist keine Produktionsfreigabe.
+**Gesondert abzunehmen:** reale produktive Zwei-Konten-Lesewege, der physische iPad-Safari-Nutzerweg und historische Archivberechtigungen. Dieser Vertrag ersetzt keinen Produktionsbeleg.
 
 ## Fäden
 

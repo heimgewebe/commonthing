@@ -458,6 +458,22 @@ CREATE TABLE {schema}.domain_edges (LIKE public.domain_edges INCLUDING ALL);
 ALTER TABLE {schema}.domain_nodes
     ADD COLUMN IF NOT EXISTS search_visibility TEXT NOT NULL DEFAULT 'public';
 
+-- The workload uses the production BBOX SQL with the canonical ACL call.
+-- This isolated benchmark has no account/circle fixture and always uses an
+-- anonymous reader. Resolve the call inside the benchmark schema only; for
+-- anonymous reads the production policy is precisely public visibility.
+-- Deliberately deny non-anonymous reads rather than misrepresenting a member
+-- benchmark. This does not replace or modify the real public-schema ACL.
+CREATE FUNCTION {schema}.weltgewebe_node_readable_to(
+    node_identifier TEXT, visibility TEXT, owner_account_id TEXT,
+    reader_account_id TEXT
+) RETURNS BOOLEAN LANGUAGE SQL STABLE AS $acl$
+    SELECT CASE WHEN reader_account_id IS NULL
+                THEN COALESCE(visibility = 'public', FALSE)
+                ELSE FALSE
+           END
+$acl$;
+
 \\copy {schema}.domain_nodes (id, kind, title, lat, lon, created_at, updated_at, payload) FROM {_psql_meta_path_literal(nodes_path)} WITH (FORMAT csv, HEADER true)
 \\copy {schema}.domain_edges (id, source_id, target_id, edge_kind, created_at, payload) FROM {_psql_meta_path_literal(edges_path)} WITH (FORMAT csv, HEADER true)
 
@@ -598,7 +614,13 @@ def render_workload_sql(
             f"SELECT id, kind, title FROM {schema}.domain_nodes WHERE kind = 'project' LIMIT 500",
         ),
     ]
-    sql = "\\set ON_ERROR_STOP on\n\\pset format unaligned\n\\pset tuples_only on\n" + "\n".join(blocks)
+    # Only the anonymous ACL implementation in the disposable fixture is
+    # available here. Production BBOX query text remains otherwise unchanged.
+    sql = (
+        f"\\set ON_ERROR_STOP on\nSET search_path TO {schema}, public;\n"
+        "\\pset format unaligned\n\\pset tuples_only on\n"
+        + "\n".join(blocks)
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(sql, encoding="utf-8", newline="\n")
 

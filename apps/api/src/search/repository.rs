@@ -217,7 +217,9 @@ async fn fetch_candidates(
                     (n.search_visibility = 'private'
                      AND $4::boolean
                      AND $3::text IS NOT NULL
-                     AND weltgewebe_search_node_owner_account_id(n.payload) = trim($3::text)
+                     AND weltgewebe_node_readable_to(
+                         n.id, n.search_visibility,
+                         weltgewebe_search_node_owner_account_id(n.payload), trim($3::text))
                      AND p.status = 'active'
                      AND p.semantic_state = 'unavailable'
                      AND p.visibility_scopes = ARRAY['owner']::TEXT[]

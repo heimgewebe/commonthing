@@ -580,11 +580,10 @@ async fn require_conversation_read_access(
             if let Some(node_id) = node_id.as_deref() {
                 let allowed: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM domain_nodes n
-                      WHERE n.id = $1 AND
-                       (n.search_visibility = 'public' OR
-                        (n.search_visibility IN ('private','hidden')
-                         AND $2::text IS NOT NULL
-                         AND weltgewebe_search_node_owner_account_id(n.payload) = $2::text)))",
+                      WHERE n.id = $1
+                        AND weltgewebe_node_readable_to(
+                          n.id, n.search_visibility,
+                          weltgewebe_search_node_owner_account_id(n.payload), $2::text))",
                 )
                 .bind(node_id)
                 .bind(reader_account_id(Some(auth)))

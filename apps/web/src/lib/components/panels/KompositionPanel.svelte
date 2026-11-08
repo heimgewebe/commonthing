@@ -12,6 +12,12 @@
   import { sensitiveSession } from "$lib/auth/sensitiveSession";
   import { rememberGarnrolleLocation } from "$lib/garnrolle/locationHandoff";
   import { createNode, ApiRequestError } from "$lib/api/domainWrites";
+  import { listMyCircles, type AudienceCircle } from "$lib/api/audienceCircles";
+  import {
+    getNodeAudience,
+    setNodeAudience,
+    type NodeAudienceScope,
+  } from "$lib/api/nodeAudience";
   import { combineKnottingTags, type KnottingTopic } from "$lib/knottingTopics";
   import { NODE_KIND_OPTIONS, isNodeKind } from "$lib/ui/productLanguage";
   import KnottingTopicsSelector from "$lib/components/KnottingTopicsSelector.svelte";
@@ -23,6 +29,17 @@
   let nodeType = $state("");
   let topics: KnottingTopic[] = $state([]);
   let isSubmitting = $state(false);
+  let audienceScope: NodeAudienceScope = $state("public");
+  let availableCircleList: AudienceCircle[] = $state([]);
+  let chosenCircleIds: string[] = $state([]);
+  let circleLoadError = $state("");
+  let privateCreatedNodeId: string | null = $state(null);
+  let activeCircles = $derived(
+    availableCircleList.filter(
+      (circle) =>
+        circle.state === "active" && circle.membership_status === "active",
+    ),
+  );
   let titleInput: HTMLInputElement | null = $state(null);
 
   let titleError = $state(false);
@@ -39,16 +56,49 @@
   let placingGarnrolle = $derived(
     $kompositionDraft?.mode === "place-garnrolle",
   );
-  let canSubmit = $derived(
-    !!title.trim() &&
+  let canSubmit = $derived.by(() => {
+    const selected: NodeAudienceScope = audienceScope;
+    return (
+      privateCreatedNodeId === null &&
+      !!title.trim() &&
       isNodeKind(nodeType) &&
-      (!geographic || !!$kompositionDraft?.lngLat),
-  );
+      (!geographic || !!$kompositionDraft?.lngLat) &&
+      (selected !== "circles" ||
+        (chosenCircleIds.length > 0 && chosenCircleIds.length <= 8))
+    );
+  });
 
   onMount(async () => {
     await tick();
     titleInput?.focus();
   });
+
+  // The circle picker is a view onto the existing confirmed memberships,
+  // not a location-derived list or a second house resource store.
+  $effect(() => {
+    const actor = $authStore.authenticated ? $authStore.account_id : null;
+    availableCircleList = [];
+    chosenCircleIds = [];
+    circleLoadError = "";
+    if (!actor) return;
+    const controller = new AbortController();
+    void listMyCircles(controller.signal)
+      .then((circles) => {
+        if (!controller.signal.aborted) availableCircleList = circles;
+      })
+      .catch(() => {
+        if (!controller.signal.aborted)
+          circleLoadError = "Gemeinschaften konnten nicht geladen werden.";
+      });
+    return () => controller.abort();
+  });
+
+  function toggleAudienceCircle(id: string, checked: boolean) {
+    chosenCircleIds = checked
+      ? [...chosenCircleIds, id]
+      : chosenCircleIds.filter((value) => value !== id);
+    formError = null;
+  }
 
   function operationIdForNode(payload: {
     title: string;
@@ -57,6 +107,9 @@
     location: { lat: number; lon: number } | null;
     summary?: string;
     tags: string[];
+    search_visibility?: "private";
+    audience_scope: NodeAudienceScope;
+    circle_ids: string[];
   }): string {
     const signature = JSON.stringify(payload);
     if (!nodeOperationId || nodeOperationSignature !== signature) {
@@ -130,6 +183,9 @@
 
   async function handleSubmit(e: Event) {
     e.preventDefault();
+    // Creation has already succeeded: never re-POST this canonical node after
+    // its separate audience grant fails. Open the persisted private node.
+    if (privateCreatedNodeId !== null) return;
     formError = null;
     titleError = !title.trim();
 
@@ -150,6 +206,9 @@
         return;
       }
 
+      const creator = $authStore.account_id;
+      const selectedCircleIds =
+        audienceScope === "circles" ? [...chosenCircleIds].sort() : [];
       const nodePayload = {
         title: title.trim(),
         kind: nodeType,
@@ -157,11 +216,42 @@
         location,
         summary: description.trim() || undefined,
         tags: combineKnottingTags(topics, []),
+        // A restricted node must be private from its FIRST canonical INSERT.
+        // Giving it to a circle happens only after this durable owner-only step.
+        ...(audienceScope === "public"
+          ? {}
+          : { search_visibility: "private" as const }),
       };
       const node = await createNode({
         ...nodePayload,
-        operation_id: operationIdForNode(nodePayload),
+        operation_id: operationIdForNode({
+          ...nodePayload,
+          audience_scope: audienceScope,
+          circle_ids: selectedCircleIds,
+        }),
       });
+
+      if (audienceScope === "circles") {
+        if (!creator || $authStore.account_id !== creator) {
+          privateCreatedNodeId = node.id;
+          formError =
+            "Der Knoten ist privat gespeichert. Nach einem Kontowechsel kann er nicht automatisch freigegeben werden.";
+          return;
+        }
+        try {
+          const initial = await getNodeAudience(node.id);
+          await setNodeAudience(node.id, "circles", selectedCircleIds, {
+            scope: initial.scope,
+            circle_ids: initial.circle_ids,
+          });
+        } catch {
+          // Never fall back to creating a public node or a new duplicate.
+          privateCreatedNodeId = node.id;
+          formError =
+            "Der Knoten wurde privat gespeichert, aber die Gemeinschaftsfreigabe ist fehlgeschlagen. Du kannst sie direkt am Knoten nachholen.";
+          return;
+        }
+      }
 
       // Guard: only proceed if we are still in komposition state and the
       // draft hasn't been replaced in the meantime.
@@ -272,7 +362,16 @@
       {/if}
 
       {#if formError}
-        <div class="form-error" role="alert">{formError}</div>
+        <div class="form-error" role="alert">
+          {formError}
+          {#if privateCreatedNodeId}
+            <a
+              href={`/map?focus=node:${encodeURIComponent(privateCreatedNodeId)}`}
+            >
+              Privat gespeicherten Knoten öffnen
+            </a>
+          {/if}
+        </div>
       {/if}
 
       <div class="form-group">
@@ -337,6 +436,48 @@
           placeholder="Worum geht es hier?"
           rows="4"
           disabled={isSubmitting}></textarea>
+      </div>
+
+      <div class="form-group">
+        <label for="new-node-audience-scope"
+          >Sichtbarkeit des neuen Knotens</label
+        >
+        <select
+          id="new-node-audience-scope"
+          bind:value={audienceScope}
+          class="input"
+          disabled={isSubmitting}
+        >
+          <option value="public">Öffentlich</option>
+          <option value="private">Nur ich</option>
+          <option value="circles">Nur ausgewählte Gemeinschaften</option>
+        </select>
+        {#if audienceScope === "circles"}
+          <fieldset class="audience-circles" disabled={isSubmitting}>
+            <legend>Gemeinschaften auswählen</legend>
+            {#each activeCircles as circle (circle.id)}
+              <label>
+                <input
+                  type="checkbox"
+                  checked={chosenCircleIds.includes(circle.id)}
+                  disabled={!chosenCircleIds.includes(circle.id) &&
+                    chosenCircleIds.length >= 8}
+                  onchange={(event) =>
+                    toggleAudienceCircle(
+                      circle.id,
+                      event.currentTarget.checked,
+                    )}
+                />
+                {circle.name}
+              </label>
+            {:else}
+              <p class="ghost">Keine bestätigte Gemeinschaft verfügbar.</p>
+            {/each}
+            {#if circleLoadError}
+              <p role="alert">{circleLoadError}</p>
+            {/if}
+          </fieldset>
+        {/if}
       </div>
 
       <div class="actions">

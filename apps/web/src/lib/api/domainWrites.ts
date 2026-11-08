@@ -153,6 +153,8 @@ export interface CreateNodePayload {
   location?: Location | null;
   summary?: string;
   tags: string[];
+  /** Nonpublic nodes must be private on their first durable INSERT. */
+  search_visibility?: "private";
   /** Stable UUID for retrying one user action after an uncertain response. */
   operation_id: string;
 }

@@ -273,6 +273,11 @@ pub async fn create_circle(
             "invitee account not found".to_owned(),
         ));
     }
+    // Keep two pool units available to a privacy-fenced GET while circle
+    // membership triggers wait for its generation lock.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(internal_error("reserve_create_circle_pool_budget"))?;
     let mut tx = pool
         .begin()
         .await
@@ -314,6 +319,11 @@ pub async fn accept_invitation(
 ) -> Result<Response, ApiError> {
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
+    // Keep two pool units available to a privacy-fenced GET while circle
+    // membership triggers wait for its generation lock.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(internal_error("reserve_accept_circle_pool_budget"))?;
     let mut tx = pool.begin().await.map_err(internal_error("begin_accept"))?;
     let row = sqlx::query(
         "SELECT c.state, m.status FROM domain_audience_circles c
@@ -382,6 +392,11 @@ pub async fn invite_account(
             "invitee account not found".to_owned(),
         ));
     }
+    // Keep two pool units available to a privacy-fenced GET while circle
+    // membership triggers wait for its generation lock.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(internal_error("reserve_invite_circle_pool_budget"))?;
     let mut tx = pool.begin().await.map_err(internal_error("begin_invite"))?;
     let row = sqlx::query(
         "SELECT c.state FROM domain_audience_circles c
@@ -430,6 +445,11 @@ pub async fn leave_circle(
 ) -> Result<Response, ApiError> {
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
+    // Keep two pool units available to a privacy-fenced GET while circle
+    // membership triggers wait for its generation lock.
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(internal_error("reserve_leave_circle_pool_budget"))?;
     let mut tx = pool.begin().await.map_err(internal_error("begin_leave"))?;
     // Serialize with invitations and acceptance on this circle.
     sqlx::query("SELECT id FROM domain_audience_circles WHERE id=$1 FOR UPDATE")

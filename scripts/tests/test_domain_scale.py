@@ -134,6 +134,12 @@ class DomainScaleTests(unittest.TestCase):
                 sql.index("ADD COLUMN IF NOT EXISTS search_visibility"),
                 sql.index("\\copy weltgewebe_perf.domain_nodes"),
             )
+            self.assertIn(
+                "CREATE FUNCTION weltgewebe_perf.weltgewebe_node_readable_to(", sql
+            )
+            self.assertIn("reader_account_id IS NULL", sql)
+            self.assertIn("THEN COALESCE(visibility = 'public', FALSE)", sql)
+            self.assertNotIn("CREATE FUNCTION public.weltgewebe_node_readable_to", sql)
             self.assertNotIn("DROP SCHEMA IF EXISTS public", sql)
             self.assertNotIn("TRUNCATE", sql.upper())
             self.assertNotIn("DELETE FROM public", sql)
@@ -170,6 +176,7 @@ class DomainScaleTests(unittest.TestCase):
             domain_scale.render_workload_sql(fixture / "manifest.json", plans, output, CONFIG)
             sql = output.read_text(encoding="utf-8")
             self.assertEqual(sql.count("EXPLAIN (ANALYZE, BUFFERS, WAL, FORMAT JSON)"), 7)
+            self.assertIn("SET search_path TO weltgewebe_perf, public;", sql)
             for workload in domain_scale.WORKLOAD_ORDER:
                 self.assertIn(f"{workload}.json", sql)
             self.assertIn("WHERE id >", sql)
@@ -177,7 +184,7 @@ class DomainScaleTests(unittest.TestCase):
             self.assertIn("WHERE kind = 'project' LIMIT 500", sql)
             self.assertNotIn("WHERE kind = 'project' ORDER BY", sql)
             self.assertIn(
-                "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 AND (search_visibility = 'public' OR",
+                "SELECT id, kind, title, lat, lon, created_at, updated_at, payload::text, search_visibility FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 AND weltgewebe_node_readable_to(",
                 sql,
             )
             self.assertIn(
@@ -190,10 +197,10 @@ class DomainScaleTests(unittest.TestCase):
                 ),
                 2,
             )
-            self.assertIn("NULL::text IS NOT NULL", sql)
-            self.assertIn("search_visibility = 'public'", sql)
+            self.assertNotIn("NULL::text IS NOT NULL", sql)
+            self.assertEqual(sql.count("weltgewebe_node_readable_to("), 2)
             self.assertNotIn("weltgewebe_search_node_owner_account_id", sql)
-            self.assertIn("NULL::text = NULL::text", sql)
+            self.assertIn("id, search_visibility, NULL::text, NULL::text)", sql)
             self.assertIn("ORDER BY id ASC LIMIT 1001 OFFSET 0", sql)
             self.assertIn("ORDER BY id ASC LIMIT 1001", sql)
             self.assertNotIn("ORDER BY id ASC LIMIT 5000", sql)
@@ -209,13 +216,13 @@ class DomainScaleTests(unittest.TestCase):
             fake_domain_db.write_text(
                 """pub async fn load_nodes_bbox_from_postgres() {
     let rows = sqlx::query_as(
-        "SELECT id, title, lat, lon FROM domain_nodes WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 AND (search_visibility = 'public' OR ($7::text IS NOT NULL AND search_visibility = 'private')) ORDER BY id ASC LIMIT $5 OFFSET $6",
+        "SELECT id, title, lat, lon FROM domain_nodes WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 AND weltgewebe_node_readable_to(id, search_visibility, NULL::text, $7::text) ORDER BY id ASC LIMIT $5 OFFSET $6",
     );
 }
 
 pub async fn load_nodes_bbox_after_id_from_postgres() {
     let rows = sqlx::query_as(
-        "SELECT id, title, lat, lon FROM domain_nodes WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 AND id > $5 AND (search_visibility = 'public' OR ($7::text IS NOT NULL AND search_visibility = 'private')) ORDER BY id ASC LIMIT $6",
+        "SELECT id, title, lat, lon FROM domain_nodes WHERE lat >= $1 AND lat <= $2 AND lon >= $3 AND lon <= $4 AND id > $5 AND weltgewebe_node_readable_to(id, search_visibility, NULL::text, $7::text) ORDER BY id ASC LIMIT $6",
     );
 }
 """,
@@ -230,7 +237,7 @@ pub async fn load_nodes_bbox_after_id_from_postgres() {
                 )
             sql = output.read_text(encoding="utf-8")
             self.assertIn(
-                "SELECT id, title, lat, lon FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 AND (search_visibility = 'public' OR (NULL::text IS NOT NULL AND search_visibility = 'private')) ORDER BY id ASC LIMIT 1001 OFFSET 0",
+                "SELECT id, title, lat, lon FROM weltgewebe_perf.domain_nodes WHERE lat >= -10.0 AND lat <= 10.0 AND lon >= -10.0 AND lon <= 10.0 AND weltgewebe_node_readable_to(id, search_visibility, NULL::text, NULL::text) ORDER BY id ASC LIMIT 1001 OFFSET 0",
                 sql,
             )
             self.assertIn(

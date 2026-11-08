@@ -1,3 +1,4 @@
+use super::node_audience::readable_circle_node_ids;
 use super::{
     domain_write_guard::reject_account_create_unless_writable,
     edges::edge_is_active_at,
@@ -602,10 +603,9 @@ async fn load_account_postgres_activity(
         "SELECT node.created_at, node.title \
          FROM domain_nodes AS node \
          WHERE node.created_at IS NOT NULL \
-           AND (node.search_visibility = 'public' OR \
-                (node.search_visibility IN ('private','hidden') \
-                 AND $2::text IS NOT NULL \
-                 AND weltgewebe_search_node_owner_account_id(node.payload) = $2::text)) \
+           AND weltgewebe_node_readable_to(
+                node.id, node.search_visibility,
+                weltgewebe_search_node_owner_account_id(node.payload), $2::text) \
            AND ( \
                 NULLIF(BTRIM(node.payload ->> 'created_by_account_id'), '') = $1 \
                 OR ( \
@@ -679,10 +679,9 @@ async fn load_account_postgres_activity(
            AND conversation.deleted_at IS NULL \
            AND ( \
                 (node.id IS NOT NULL AND \
-                 (node.search_visibility = 'public' OR \
-                  (node.search_visibility IN ('private','hidden') \
-                   AND $2::text IS NOT NULL \
-                   AND weltgewebe_search_node_owner_account_id(node.payload) = $2::text))) \
+                 weltgewebe_node_readable_to(
+                   node.id, node.search_visibility,
+                   weltgewebe_search_node_owner_account_id(node.payload), $2::text)) \
                 OR (node.id IS NULL AND conversation.conversation_type = 'node' \
                     AND conversation.archived_node_visibility = 'public') \
                ) \
@@ -751,6 +750,9 @@ pub async fn get_account(
             .ok_or(StatusCode::NOT_FOUND)?
     };
 
+    // Resolve membership grants before projecting node titles or activity.
+    // The outer PostgreSQL generation fence spans this entire JSON response.
+    let circle_grants = readable_circle_node_ids(&state, viewer_account_id).await?;
     // Active Fäden remain the source of truth for the current Knoten tab. They
     // are deliberately not an activity history: each Faden expires after 168
     // hours and several distinct actions may create parallel projections.
@@ -790,7 +792,7 @@ pub async fn get_account(
             let Some(node) = node_cache.get(related_id) else {
                 continue;
             };
-            if !node_readable_to(node, viewer) {
+            if !node_readable_to(node, viewer) && !circle_grants.contains(&node.id) {
                 continue;
             }
 
@@ -810,7 +812,7 @@ pub async fn get_account(
                 .filter(|node| {
                     node.has_authoritative_created_at
                         && node.created_by_account_id.as_deref() == Some(id.as_str())
-                        && node_readable_to(node, viewer)
+                        && (node_readable_to(node, viewer) || circle_grants.contains(&node.id))
                 })
                 .map(|node| AccountActivity {
                     date: node.created_at.clone(),

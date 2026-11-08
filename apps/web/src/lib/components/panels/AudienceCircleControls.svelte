@@ -1,5 +1,6 @@
 <script lang="ts">
   import { authStore } from "$lib/auth/store";
+  import { invalidate } from "$app/navigation";
   import {
     acceptCircle,
     createHousehold,
@@ -83,7 +84,11 @@
     return () => controller.abort();
   });
 
-  async function perform(action: () => Promise<unknown>, success: string) {
+  async function perform(
+    action: () => Promise<unknown>,
+    success: string,
+    revokesReadAccess = false,
+  ) {
     if (busy || !$authStore.authenticated || !$authStore.account_id) return;
     const actor = $authStore.account_id;
     const selected = selectedAccountId;
@@ -94,6 +99,15 @@
       await action();
       if ($authStore.account_id !== actor || selectedAccountId !== selected)
         return;
+      // A revoked circle membership must discard already loaded private map,
+      // search, panel, edge and activity caches (not only SvelteKit page data).
+      // A full reload is reserved for this sensitive lifecycle transition.
+      if (revokesReadAccess) {
+        window.location.reload();
+        return;
+      }
+      // New memberships may reveal additional canonical map nodes.
+      void invalidate("weltgewebe:domain-data");
       const items = await listMyCircles();
       if ($authStore.account_id !== actor || selectedAccountId !== selected)
         return;
@@ -227,6 +241,7 @@
                     perform(
                       () => leaveCircle(circle.id),
                       "Du bist ausgetreten.",
+                      true,
                     )}>Verlassen</button
                 >
                 {#if memberCircle === circle.id}
