@@ -76,6 +76,12 @@ fn local_node_lock(node_id: &str) -> &'static Mutex<()> {
     &local_node_locks()[local_node_lock_index(node_id)]
 }
 
+// Audience edits and ordinary node PUT/PATCH share this local stripe.
+// PostgreSQL callers additionally acquire the same per-node advisory lock.
+pub(super) async fn acquire_node_mutation_stripe(node_id: &str) -> MutexGuard<'static, ()> {
+    local_node_lock(node_id).lock().await
+}
+
 fn uses_postgres_node_persistence(state: &ApiState) -> bool {
     state.config.domain_read_source == DomainReadSource::Postgres
         && state.config.domain_node_write_source == DomainNodeWriteSource::Postgres
@@ -89,7 +95,7 @@ async fn acquire_node_mutation_guard(
     // JSONL this makes the version check atomic with the existing handler's
     // file/cache mutation. PostgreSQL additionally takes a cross-instance
     // advisory lock below.
-    let guard = local_node_lock(node_id).lock().await;
+    let guard = acquire_node_mutation_stripe(node_id).await;
     if !uses_postgres_node_persistence(state) {
         return Ok(NodeMutationGuard::Local { _guard: guard });
     }
@@ -600,6 +606,29 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[tokio::test]
+    async fn audience_and_collective_writes_share_one_local_node_stripe() {
+        let node_id = "same-node-audience-race";
+        let first = acquire_node_mutation_stripe(node_id).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(30),
+                acquire_node_mutation_stripe(node_id)
+            )
+            .await
+            .is_err(),
+            "another mutation of this node must wait until the first releases"
+        );
+        drop(first);
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_node_mutation_stripe(node_id),
+        )
+        .await
+        .expect("same-node mutation lock is released");
+        drop(second);
+    }
 
     #[test]
     fn protected_node_preconditions_deny_foreign_weber_admin_and_revoked_owner() {
