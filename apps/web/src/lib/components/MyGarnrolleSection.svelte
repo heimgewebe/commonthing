@@ -12,12 +12,9 @@
   import {
     ApiRequestError,
     getOwnGarnrolleProfile,
-    moveProfileTagToResource,
     updateOwnGarnrolle,
     type OwnGarnrolleProfile,
-    type ProfileResourceScope,
   } from "$lib/api/domainWrites";
-  import { listMyCircles, type AudienceCircle } from "$lib/api/audienceCircles";
   import type { Account, GarnrolleMapState, Location } from "$lib/map/types";
   import { createAccountRequestGuard } from "$lib/garnrolle/accountRequestGuard";
   import {
@@ -29,6 +26,9 @@
     findOwnGarnrolle,
   } from "$lib/garnrolle/visibility";
   import { onDestroy, tick } from "svelte";
+  // Type only: the editor itself is imported dynamically after an explicit
+  // click so the conversion and circle APIs stay out of the initial chunk.
+  import type ExistingResourceVisibility from "./ExistingResourceVisibility.svelte";
 
   interface Props {
     accounts?: Account[];
@@ -80,21 +80,11 @@
   // Public tags exactly as last confirmed by the server. Only these may be
   // moved, and every save names them as its precondition (expected_tags).
   let savedTags: string[] = $state([]);
-  let moveTag = $state("");
-  let moveScope: ProfileResourceScope = $state("private");
-  let moveCircleIds: string[] = $state([]);
-  let moveCircles: AudienceCircle[] = $state([]);
-  let moveCirclesLoaded = false;
-  let moveCirclesError: string | null = $state(null);
   let isMoving = $state(false);
-  let moveError: string | null = $state(null);
-  let moveMessage: string | null = $state(null);
-  // One deliberate action = one operation id. An uncertain result may be
-  // retried with the same id; any change of tag or audience starts anew.
-  let moveOperation: { key: string; id: string } | null = $state(null);
-  let moveAbortController: AbortController | null = null;
-  const MOVABLE_TAG_PREFIXES = ["good:", "skill:"] as const;
-  const MAX_MOVE_CIRCLES = 8;
+  let MoveEditor: typeof ExistingResourceVisibility | null = $state.raw(null);
+  let moveEditorOpen = $state(false);
+  let moveEditorError = $state(false);
+  const MOVABLE_TAG = /^(good|skill):\s*\S/;
 
   function categoryValues(tags: string[], prefix: string): string[] {
     return tags
@@ -138,10 +128,8 @@
     saveRequestGuard.invalidate();
     loadAbortController?.abort();
     saveAbortController?.abort();
-    moveAbortController?.abort();
     loadAbortController = null;
     saveAbortController = null;
-    moveAbortController = null;
   }
 
   onDestroy(invalidateAccountOperations);
@@ -214,76 +202,40 @@
     draftMessage = null;
     saveMessage = null;
     savedTags = [];
-    resetMove();
-    moveCircles = [];
-    moveCirclesLoaded = false;
-    moveCirclesError = null;
+    // Closing unmounts the editor, which aborts its account-bound requests.
+    moveEditorOpen = false;
+    moveEditorError = false;
     isMoving = false;
-  }
-
-  function resetMove() {
-    moveTag = "";
-    moveScope = "private";
-    moveCircleIds = [];
-    moveOperation = null;
-    moveError = null;
-    moveMessage = null;
-  }
-
-  function movableValue(tag: string): string | null {
-    for (const prefix of MOVABLE_TAG_PREFIXES) {
-      if (tag.startsWith(prefix)) {
-        const value = tag.slice(prefix.length).trim();
-        return value || null;
-      }
-    }
-    return null;
-  }
-
-  function movableTagLabel(tag: string): string {
-    const value = movableValue(tag) ?? tag;
-    return tag.startsWith("good:")
-      ? `Gut: ${value}`
-      : `Fähigkeit: ${value}`;
-  }
-
-  function withoutEntry(field: string, value: string): string {
-    return field
-      .split(",")
-      .map((entry) => entry.trim())
-      .filter((entry) => entry && entry !== value)
-      .join(", ");
   }
 
   /**
    * Adopt a newer server tag set without discarding unrelated unsaved edits:
    * only values that the server no longer stores AND that were part of the
    * previously saved set leave their draft field. New unsaved entries stay.
+   * The pure draft cleanup lives in the lazy editor module; savedTags only
+   * changes once it has been applied, so a failed load can never let a stale
+   * draft republish a moved value (the next save then ends in a 409).
    */
-  function adoptServerTags(serverTags: string[]) {
-    const removed = savedTags.filter((tag) => !serverTags.includes(tag));
-    for (const tag of removed) {
-      if (tag.startsWith("good:")) {
-        goods = withoutEntry(goods, tag.slice("good:".length));
-      } else if (tag.startsWith("interest:")) {
-        interests = withoutEntry(interests, tag.slice("interest:".length));
-      } else if (tag.startsWith("skill:")) {
-        const value = tag.slice("skill:".length);
-        // A remaining legacy tag with the same text is still public anyway.
-        if (!serverTags.includes(value)) skills = withoutEntry(skills, value);
-      } else if (tag !== "account" && tag !== "garnrolle") {
-        if (!serverTags.includes(`skill:${tag}`)) {
-          skills = withoutEntry(skills, tag);
-        }
-      }
+  async function adoptServerTags(serverTags: string[]) {
+    const accountId = activeAccountId;
+    try {
+      const { draftWithoutRemovedTags } =
+        await import("./ExistingResourceVisibility.svelte");
+      if (!accountId || activeAccountId !== accountId) return;
+      ({ skills, goods, interests } = draftWithoutRemovedTags(
+        savedTags,
+        serverTags,
+        { skills, goods, interests },
+      ));
+    } catch {
+      return;
     }
     savedTags = [...serverTags];
-    if (moveTag && !serverTags.includes(moveTag)) moveTag = "";
-    if (browser && activeAccountId) {
+    if (browser) {
       // Never let an older stored draft resurrect a moved value later.
       const hadDraft =
-        readGarnrolleDraft(activeAccountId) !== null ||
-        sensitiveSession.read(activeAccountId, draftStorageKey(activeAccountId));
+        readGarnrolleDraft(accountId) !== null ||
+        sensitiveSession.read(accountId, draftStorageKey(accountId));
       if (hadDraft) saveDraftForMap();
     }
   }
@@ -469,125 +421,35 @@
         return "Prüfe Name, Tags, Kartenanker und Sichtbarkeit.";
       }
       if (error.status === 409) {
-        return "Deine gespeicherten öffentlichen Tags haben sich inzwischen geändert, zum Beispiel weil ein Eintrag zu einer eigenen Ressource wurde. Nichts wurde gespeichert. Prüfe die aktualisierten Tags und speichere bewusst erneut.";
+        return "Deine öffentlichen Tags haben sich geändert. Nichts wurde gespeichert. Prüfe sie und speichere erneut.";
       }
     }
     return "Speichern fehlgeschlagen. Versuche es erneut.";
   }
 
   /** Reload only the server's tag set after a conflict; keep other drafts. */
-  async function refreshSavedTags(accountId: string) {
+  async function refreshSavedTags() {
+    const accountId = activeAccountId;
+    if (!accountId) return;
     try {
       const profile = await getOwnGarnrolleProfile();
       if (activeAccountId !== accountId || profile.id !== accountId) return;
-      adoptServerTags(profile.tags);
+      await adoptServerTags(profile.tags);
     } catch {
       // The conflict message already asks for a deliberate reload.
     }
   }
 
-  function describeMoveError(error: unknown): string {
-    if (error instanceof ApiRequestError) {
-      switch (error.status) {
-        case 401:
-          return "Sitzung abgelaufen. Bitte melde dich neu an. Der Eintrag bleibt unverändert öffentlich.";
-        case 404:
-          return "Eine ausgewählte Gemeinschaft ist nicht (mehr) bestätigt. Nichts wurde geändert; der Eintrag bleibt öffentlich.";
-        case 409:
-          return "Der Eintrag ist nicht mehr gespeichert oder wurde inzwischen verändert. Nichts wurde zusätzlich veröffentlicht; prüfe die aktualisierten Tags.";
-        case 429:
-          return "Du hast die Höchstzahl eigener Knoten erreicht. Der Eintrag bleibt unverändert öffentlich.";
-        case 400:
-        case 503:
-          return "Der Umzug ist derzeit nicht möglich. Nichts wurde geändert; der Eintrag bleibt öffentlich.";
-      }
-    }
-    return "Unklar, ob der Umzug abgeschlossen wurde. „Erneut versuchen“ wiederholt genau dieselbe Aktion, ohne eine zweite Ressource anzulegen.";
-  }
-
-  /** Network errors and 5xx (except an explicit 503) may have committed. */
-  function isUncertainMoveFailure(error: unknown): boolean {
-    if (!(error instanceof ApiRequestError)) return true;
-    return error.status >= 500 && error.status !== 503;
-  }
-
-  function scopeLabel(scope: string): string {
-    return scope === "public"
-      ? "öffentlich"
-      : scope === "circles"
-        ? "nur für bestätigte Gemeinschaft(en)"
-        : "nur für dich";
-  }
-
-  function loadMoveCircles() {
-    if (moveCirclesLoaded) return;
-    moveCirclesLoaded = true;
-    moveCirclesError = null;
-    void listMyCircles()
-      .then((circles) => {
-        moveCircles = circles;
-      })
-      .catch(() => {
-        moveCirclesLoaded = false;
-        moveCirclesError = "Gemeinschaften konnten nicht geladen werden.";
-      });
-  }
-
-  function toggleMoveCircle(id: string, checked: boolean) {
-    moveCircleIds = checked
-      ? [...moveCircleIds, id]
-      : moveCircleIds.filter((value) => value !== id);
-  }
-
-  async function handleMove() {
-    if (!canMove || !activeAccountId) return;
-    const accountId = activeAccountId;
-    const tag = moveTag;
-    const scope = moveScope;
-    const circleIds = scope === "circles" ? [...moveCircleIds].sort() : [];
-    const key = JSON.stringify([tag, scope, circleIds]);
-    if (!moveOperation || moveOperation.key !== key) {
-      moveOperation = { key, id: crypto.randomUUID() };
-    }
-    const operationId = moveOperation.id;
-    moveAbortController?.abort();
-    const controller = new AbortController();
-    moveAbortController = controller;
-    const isCurrent = () =>
-      moveAbortController === controller && activeAccountId === accountId;
-    isMoving = true;
-    moveError = null;
-    moveMessage = null;
+  async function toggleMoveEditor() {
+    moveEditorOpen = !moveEditorOpen;
+    moveEditorError = false;
+    if (!moveEditorOpen || MoveEditor) return;
     try {
-      const moved = await moveProfileTagToResource(
-        {
-          tag,
-          scope,
-          circle_ids: circleIds,
-          operation_id: operationId,
-        },
-        controller.signal,
-      );
-      if (!isCurrent()) return;
-      moveOperation = null;
-      adoptServerTags(moved.profile.tags);
-      moveTag = "";
-      moveScope = "private";
-      moveCircleIds = [];
-      moveMessage = `„${moved.node.title}“ ist jetzt eine eigene Ressource (${scopeLabel(moved.audience.scope)}) und kein öffentlicher Profil-Tag mehr.`;
-      await invalidateAll();
-    } catch (error) {
-      if (!isCurrent() || isAbortError(error)) return;
-      if (!isUncertainMoveFailure(error)) moveOperation = null;
-      moveError = describeMoveError(error);
-      if (error instanceof ApiRequestError && error.status === 409) {
-        await refreshSavedTags(accountId);
-      }
-    } finally {
-      if (isCurrent()) {
-        isMoving = false;
-        moveAbortController = null;
-      }
+      MoveEditor = (await import("./ExistingResourceVisibility.svelte"))
+        .default;
+    } catch {
+      moveEditorOpen = false;
+      moveEditorError = true;
     }
   }
 
@@ -650,7 +512,7 @@
       if (isCurrentSave() && !isAbortError(error)) {
         profileError = describeSaveError(error);
         if (error instanceof ApiRequestError && error.status === 409) {
-          await refreshSavedTags(savingAccountId);
+          await refreshSavedTags();
         }
       }
     } finally {
@@ -719,30 +581,6 @@
       isMoving ||
       loadedProfileAccountId !== activeAccountId,
   );
-  let movableTags = $derived.by(() =>
-    savedTags.filter((tag) => movableValue(tag) !== null),
-  );
-  let activeMoveCircles = $derived(
-    moveCircles.filter(
-      (circle) =>
-        circle.state === "active" && circle.membership_status === "active",
-    ),
-  );
-  let canMove = $derived.by(
-    () =>
-      !formDisabled &&
-      !isMoving &&
-      movableTags.includes(moveTag) &&
-      (moveScope !== "circles" ||
-        (moveCircleIds.length > 0 &&
-          moveCircleIds.length <= MAX_MOVE_CIRCLES &&
-          moveCircleIds.every((id) =>
-            activeMoveCircles.some((circle) => circle.id === id),
-          ))),
-  );
-  $effect(() => {
-    if (moveScope === "circles" && activeAccountId) loadMoveCircles();
-  });
   let canSave = $derived.by(
     () =>
       !formDisabled &&
@@ -908,102 +746,34 @@
         >
           Einzelne Ressource mit eigener Sichtbarkeit knüpfen
         </button>
-        {#if movableTags.length > 0 || moveMessage}
-          <fieldset class="move-resource" data-testid="garnrolle-move-resource">
-            <legend>Gespeicherten Eintrag einzeln schützen</legend>
-            <p class="field-intro">
-              Wähle genau einen bereits gespeicherten öffentlichen Eintrag. Er
-              verschwindet aus deiner öffentlichen Garnrolle und wird ein eigener
-              Knoten mit der gewählten Sichtbarkeit. Alle anderen Angaben, auch
-              ungespeicherte Eingaben, bleiben unverändert.
-            </p>
-            {#if movableTags.length > 0}
-              <label>
-                Gespeicherter Eintrag
-                <select
-                  bind:value={moveTag}
-                  data-testid="garnrolle-move-tag"
-                  onchange={() => {
-                    moveError = null;
-                    moveMessage = null;
-                  }}
-                >
-                  <option value="">– auswählen –</option>
-                  {#each movableTags as tag (tag)}
-                    <option value={tag}>{movableTagLabel(tag)}</option>
-                  {/each}
-                </select>
-              </label>
-              <label>
-                Sichtbarkeit der Ressource
-                <select bind:value={moveScope} data-testid="garnrolle-move-scope">
-                  <option value="private">Nur ich</option>
-                  <option value="circles">Nur bestätigte Gemeinschaft(en)</option>
-                  <option value="public">Öffentlich (als eigener Knoten)</option>
-                </select>
-              </label>
-              {#if moveScope === "circles"}
-                <fieldset class="move-circles">
-                  <legend>Bestätigte Gemeinschaften</legend>
-                  {#each activeMoveCircles as circle (circle.id)}
-                    <label class="checkbox">
-                      <input
-                        type="checkbox"
-                        checked={moveCircleIds.includes(circle.id)}
-                        disabled={!moveCircleIds.includes(circle.id) &&
-                          moveCircleIds.length >= MAX_MOVE_CIRCLES}
-                        onchange={(event) =>
-                          toggleMoveCircle(
-                            circle.id,
-                            event.currentTarget.checked,
-                          )}
-                      />
-                      {circle.name}
-                    </label>
-                  {:else}
-                    <small class="field-intro">
-                      {moveCirclesError ??
-                        "Keine bestätigte aktive Gemeinschaft vorhanden."}
-                    </small>
-                  {/each}
-                </fieldset>
-              {/if}
-              <p class="field-intro" data-testid="garnrolle-move-cache-notice">
-                Was bisher öffentlich war, kann bereits gesehen, kopiert oder
-                fremd zwischengespeichert worden sein. Solche Kopien kann
-                Commonthing nicht zurückholen.
-              </p>
-              <button
-                type="button"
-                class="btn"
-                data-testid="garnrolle-move-submit"
-                disabled={!canMove}
-                onclick={handleMove}
-              >
-                {moveOperation && moveError
-                  ? "Erneut versuchen"
-                  : "Als eigene Ressource umziehen"}
-              </button>
-            {/if}
-            {#if moveError}
-              <p
-                class="form-message error"
-                role="alert"
-                data-testid="garnrolle-move-error"
-              >
-                {moveError}
-              </p>
-            {/if}
-            {#if moveMessage}
-              <p
-                class="form-message"
-                role="status"
-                data-testid="garnrolle-move-success"
-              >
-                {moveMessage}
-              </p>
-            {/if}
-          </fieldset>
+        {#if moveEditorOpen || savedTags.some((tag) => MOVABLE_TAG.test(tag))}
+          <button
+            type="button"
+            class="btn"
+            data-testid="garnrolle-move-open"
+            aria-expanded={moveEditorOpen}
+            disabled={isMoving}
+            onclick={toggleMoveEditor}
+          >
+            Gespeicherte Güter/Fähigkeiten mit eigener Sichtbarkeit verwalten
+          </button>
+        {/if}
+        {#if moveEditorError}
+          <p class="field-intro" role="alert">
+            Der Editor konnte nicht geladen werden.
+          </p>
+        {/if}
+        {#if moveEditorOpen && MoveEditor && activeAccountId}
+          <MoveEditor
+            accountId={activeAccountId}
+            {savedTags}
+            disabled={formDisabled}
+            onBusyChange={(busy) => (isMoving = busy)}
+            onTagsMoved={adoptServerTags}
+            onStaleTags={refreshSavedTags}
+          />
+        {:else if moveEditorOpen}
+          <p class="field-intro" role="status">Lade Editor…</p>
         {/if}
       </fieldset>
 
@@ -1330,16 +1100,6 @@
     display: block;
     font-weight: 400;
     margin-top: 0.25rem;
-  }
-
-  .move-resource {
-    margin-top: 0.75rem;
-  }
-
-  .move-circles .checkbox {
-    display: flex;
-    gap: 0.5rem;
-    align-items: center;
   }
 
   .form-message {
