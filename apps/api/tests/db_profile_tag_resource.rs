@@ -397,7 +397,7 @@ async fn one_saved_tag_moves_atomically_into_one_circle_node_and_replays() {
         let projected = public_account_json(&state, &owner, viewer).await;
         assert!(
             !projected.contains("Leiter"),
-            "public profile/activity leaked moved value to {viewer:?}: {projected}"
+            "public profile/activity exposed a removed tag to an unauthorized reader"
         );
         assert!(projected.contains("skill:Fahrrad reparieren"));
     }
