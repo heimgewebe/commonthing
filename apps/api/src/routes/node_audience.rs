@@ -233,6 +233,14 @@ pub async fn set_node_audience(
         .begin()
         .await
         .map_err(database_error("begin_node_audience"))?;
+    // Guest account exit takes account-lifecycle before all owned-node locks.
+    // Join the existing order to prevent a cycle when an owner leaves while
+    // granting private nodes. Keep the lifecycle lock until transaction end.
+    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+        .bind(crate::advisory_lock::account_lifecycle_lock_key(actor))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error("lock_node_audience_owner_lifecycle"))?;
     // Cross-instance node writes use this same advisory lock, protecting the
     // ordinary node precondition/read/replace sequence against privacy changes.
     sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
