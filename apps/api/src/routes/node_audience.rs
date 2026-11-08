@@ -219,6 +219,10 @@ pub async fn set_node_audience(
 ) -> Result<Response, ApiError> {
     let actor = require_actor(&auth)?;
     let (selected, expected_circle_ids) = input.validate()?;
+    // Ordinary node PUT/PATCH takes this stripe before its If-Match check;
+    // the audience edit must not interleave until that write has completed.
+    let _node_mutation_stripe =
+        super::collective_write_guard::acquire_node_mutation_stripe(&id).await;
     let pool = require_pool(&state, true)?;
     // The generation-fenced reader also needs two pool connections. Reserve
     // the existing shared weighted budget BEFORE opening our transaction.
@@ -229,6 +233,13 @@ pub async fn set_node_audience(
         .begin()
         .await
         .map_err(database_error("begin_node_audience"))?;
+    // Cross-instance node writes use this same advisory lock, protecting the
+    // ordinary node precondition/read/replace sequence against privacy changes.
+    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+        .bind(crate::advisory_lock::node_mutation_lock_key(&id))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error("lock_node_audience_mutation"))?;
     let row = sqlx::query(
         "SELECT search_visibility,
                 weltgewebe_search_node_owner_account_id(payload) AS owner_id
