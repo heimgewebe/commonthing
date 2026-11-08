@@ -440,6 +440,96 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             sleep.assert_called_once_with(1.0)
             self.assertEqual(list(destination.parent.glob("*.download.tmp")), [])
 
+    def test_github_release_504_falls_back_to_exact_api_asset_with_pinned_sha(self) -> None:
+        canonical = (
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/"
+            "kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz"
+        )
+        metadata_url = (
+            "https://api.github.com/repos/kubernetes-sigs/kustomize/releases/"
+            "tags/kustomize%2Fv5.8.1"
+        )
+        asset_url = "https://api.github.com/repos/kubernetes-sigs/kustomize/releases/assets/353160972"
+        payload = b"correct-pinned-kustomize-release"
+        digest = hashlib.sha256(payload).hexdigest()
+        seen: list[tuple[str, str | None]] = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, *, timeout):
+            url = request.full_url
+            seen.append((url, request.get_header("Accept")))
+            if url == canonical:
+                raise urllib.error.HTTPError(url, 504, "Gateway Timeout", {}, None)
+            if url == metadata_url:
+                return Response(
+                    json.dumps(
+                        {
+                            "assets": [
+                                {"id": 99, "name": "wrong-asset.tar.gz"},
+                                {
+                                    "id": 353160972,
+                                    "name": "kustomize_v5.8.1_linux_amd64.tar.gz",
+                                },
+                            ]
+                        }
+                    ).encode()
+                )
+            if url == asset_url:
+                return Response(payload)
+            raise AssertionError(f"unexpected download path: {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "downloads" / "kustomize.tar.gz"
+            with mock.patch.object(
+                self.bootstrap.urllib.request, "urlopen", side_effect=fake_urlopen
+            ), mock.patch.object(self.bootstrap.time, "sleep") as sleep:
+                self.bootstrap._download(canonical, digest, destination)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual([url for url, _ in seen].count(canonical), 4)
+            self.assertEqual([url for url, _ in seen].count(metadata_url), 1)
+            self.assertIn((asset_url, "application/octet-stream"), seen)
+            self.assertEqual(sleep.call_count, 3)
+            self.assertEqual(list(destination.parent.glob("*.download.tmp")), [])
+
+    def test_github_release_asset_api_cannot_bypass_pinned_archive_sha(self) -> None:
+        canonical = "https://github.com/org/repo/releases/download/v1.0/tool.tar.gz"
+        payload = b"untrusted-replaced-release"
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, *, timeout):
+            url = request.full_url
+            if url == canonical:
+                raise urllib.error.HTTPError(url, 504, "Gateway Timeout", {}, None)
+            if url == "https://api.github.com/repos/org/repo/releases/tags/v1.0":
+                return Response(
+                    json.dumps({"assets": [{"id": 123, "name": "tool.tar.gz"}]}).encode()
+                )
+            if url == "https://api.github.com/repos/org/repo/releases/assets/123":
+                return Response(payload)
+            raise AssertionError(f"unexpected download path: {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "downloads" / "tool.tar.gz"
+            with mock.patch.object(
+                self.bootstrap.urllib.request, "urlopen", side_effect=fake_urlopen
+            ), mock.patch.object(self.bootstrap.time, "sleep"):
+                with self.assertRaises(self.bootstrap.DownloadIntegrityError):
+                    self.bootstrap._download(canonical, "0" * 64, destination)
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(destination.parent.glob("*.download.tmp")), [])
+
     def test_tool_download_hash_mismatch_is_integrity_failure_without_retry(self) -> None:
         payload = b"tampered"
 

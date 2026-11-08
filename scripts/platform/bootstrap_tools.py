@@ -108,6 +108,60 @@ def _download_urls(url: str) -> tuple[str, ...]:
     return (mirror, url) if mirror and mirror != url else (url,)
 
 
+def _github_release_asset_api_url(url: str) -> str | None:
+    """Resolve only an exact GitHub release filename to its public asset API."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "github.com" or parsed.query or parsed.fragment:
+        return None
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) != 6 or parts[2:4] != ["releases", "download"]:
+        return None
+    owner, repo, _, _, tag, filename = parts
+    if not all(
+        part and all(char.isalnum() or char in "-_." for char in part)
+        for part in (owner, repo)
+    ):
+        return None
+    # The lock remains the sole authority for exact release tag, filename and SHA.
+    tag_path = urllib.parse.quote(urllib.parse.unquote(tag), safe="")
+    filename = urllib.parse.unquote(filename)
+    metadata_url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag_path}"
+    request = urllib.request.Request(
+        metadata_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "weltgewebe-platform-bootstrap/2",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:
+        metadata = json.load(response)
+    assets = metadata.get("assets") if isinstance(metadata, dict) else None
+    if isinstance(assets, list):
+        for asset in assets:
+            if (
+                isinstance(asset, dict)
+                and asset.get("name") == filename
+                and type(asset.get("id")) is int
+                and asset["id"] > 0
+            ):
+                return f"https://api.github.com/repos/{owner}/{repo}/releases/assets/{asset['id']}"
+    return None
+
+
+def _download_candidates(url: str) -> Iterator[str]:
+    yield from _download_urls(url)
+    # Resolve lazily: cached assets or a healthy canonical/mirror download never
+    # need an extra GitHub API request. Release URLs may 504 while API assets work.
+    try:
+        fallback = _github_release_asset_api_url(url)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        raise DownloadUnavailableError(
+            f"GitHub release asset lookup failed for {url}: {type(error).__name__}: {error}"
+        ) from error
+    if fallback:
+        yield fallback
+
+
 def _retry_delay(error: BaseException, attempt: int) -> float:
     if isinstance(error, urllib.error.HTTPError):
         retry_after = error.headers.get("Retry-After") if error.headers else None
@@ -123,9 +177,10 @@ def _retryable(error: BaseException) -> bool:
 
 
 def _download_once(url: str, temporary: Path) -> None:
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "weltgewebe-platform-bootstrap/2"}
-    )
+    headers = {"User-Agent": "weltgewebe-platform-bootstrap/2"}
+    if url.startswith("https://api.github.com/repos/") and "/releases/assets/" in url:
+        headers["Accept"] = "application/octet-stream"
+    request = urllib.request.Request(url, headers=headers)
     with temporary.open("wb") as handle:
         with urllib.request.urlopen(request, timeout=90) as response:
             shutil.copyfileobj(response, handle)
@@ -147,7 +202,7 @@ def _download(url: str, expected_sha256: str, destination: Path) -> None:
         if destination.is_file() and _sha256(destination) == expected_sha256:
             return
         errors: list[str] = []
-        for candidate in _download_urls(url):
+        for candidate in _download_candidates(url):
             for attempt in range(DOWNLOAD_ATTEMPTS):
                 fd, temporary_name = tempfile.mkstemp(
                     dir=destination.parent,
