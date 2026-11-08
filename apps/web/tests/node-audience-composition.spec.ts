@@ -261,7 +261,7 @@ test("a former circle grant remains removable without reopening a private node",
   ).toBeVisible();
   await audience
     .getByRole("checkbox", { name: /Frühere Gemeinschaft/ })
-    .uncheck();
+    .click();
   await audience
     .getByRole("button", { name: "Sichtbarkeit speichern" })
     .click();
