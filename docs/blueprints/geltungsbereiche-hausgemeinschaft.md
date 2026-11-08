@@ -33,8 +33,10 @@ werden separat abgenommen. Das Papier selbst ist kein Produktionsbeleg.
 Öffentlicher API- und Frontend-Readback bestätigt für P2 denselben
 Produktionscommit b83e7e42; negative anonyme Audience-Abfragen liefern 401.
 Echte mehrseitige Authentifizierungs- und physische iPad-Abnahme stehen
-aus. P2b (bestehende einzelne Profil-Tags in kreisspezifische Ressourcen
-überführen), P3 (Benachrichtigungen) und P4 (große Karte) sind offen.
+aus. P2b erhält über PR #2078 einen ersten sicheren Profil-zu-Knoten-
+Einstieg für neue Ressourcen; die individuelle Freigabe bereits bestehender
+Profil-Tags ist nicht umgesetzt. P3 (Benachrichtigungen) und P4 (große Karte)
+sind weiterhin offen.
 Für neue einzeln sichtbarkeitsgesteuerte Güter/Fähigkeiten ist das
 vorhandene Knotenmodell mit P2-Sichtbarkeit die einzige sichere
 Speicherung; öffentliche Garnrollen-Tags dürfen **nicht** als private
