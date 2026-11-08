@@ -29,10 +29,10 @@ echo "=================================="
 
 # Tool checks
 DOWNLOADER=""
-if command -v wget > /dev/null 2>&1; then
-  DOWNLOADER="wget"
-elif command -v curl > /dev/null 2>&1; then
+if command -v curl > /dev/null 2>&1; then
   DOWNLOADER="curl"
+elif command -v wget > /dev/null 2>&1; then
+  DOWNLOADER="wget"
 else
   echo "Error: Neither 'wget' nor 'curl' is available for downloading the assets." >&2
   exit 1
@@ -82,9 +82,18 @@ fi
 
 echo "=> Downloading font archive from OpenMapTiles..."
 if [ "$DOWNLOADER" = "wget" ]; then
-  wget -qO "$TMP_ARCHIVE" "$ASSET_URL" || { exit 1; }
+  # A stalled upstream release must not block a CI visual proof indefinitely.
+  wget --tries=3 --timeout=30 --waitretry=2 -nv -O "$TMP_ARCHIVE" "$ASSET_URL" || {
+    echo "Error: Failed to fetch pinned Noto Sans archive after bounded retries." >&2
+    exit 1
+  }
 else
-  curl -fL -s -o "$TMP_ARCHIVE" "$ASSET_URL" || { exit 1; }
+  # Curl reports the actual failure; retry transient 429/5xx and timeouts.
+  curl -fL -sS --retry 3 --retry-delay 2 --retry-max-time 120 \
+    --connect-timeout 10 --max-time 60 -o "$TMP_ARCHIVE" "$ASSET_URL" || {
+    echo "Error: Failed to fetch pinned Noto Sans archive after bounded retries." >&2
+    exit 1
+  }
 fi
 
 echo "=> Verifying integrity of downloaded archive..."
