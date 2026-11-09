@@ -1294,7 +1294,7 @@ async fn converted_tag_is_scoped_by_real_http_sessions_and_live_circle_departure
     for path in ["/nodes?limit=100", account_path.as_str()] {
         let (status, body) = p2b_http(&app, Method::GET, path, Some(&member_cookie), None).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(!body.contains(title), "former member leaked title via {path}");
+        assert!(!body.contains(title), "former member leaked via {path}");
         assert!(
             !body.contains(node_id),
             "former member can still enumerate private node ID via {path}"
