@@ -425,10 +425,14 @@ if __name__ == "__main__":
 
 
 FAKE_SCANNER = """#!/usr/bin/env bash
-# Stands in for cargo: `cargo tree` prints FAKE_TREE. Scanner calls emit
+# Stands in for cargo: `cargo tree` prints per-crate fake graphs. Scanner calls emit
 # reports on the same streams as the real tools and fail unless overridden.
 if [ "$1" = "tree" ]; then
-  printf '%s' "${FAKE_TREE:-}"
+  if [[ "$*" == *libsqlite3-sys* ]]; then
+    printf '%s' "${FAKE_SQLITE_TREE:-}"
+  else
+    printf '%s' "${FAKE_TREE:-}"
+  fi
   exit 0
 fi
 if [ "$1" = "audit" ]; then
@@ -510,17 +514,22 @@ class RustScannerSignalTest(unittest.TestCase):
 class CargoAuditExceptionTest(unittest.TestCase):
     STEP = "Verify cargo audit exceptions still hold"
 
-    def run_guard(self, audit_toml: str, tree: str = "") -> subprocess.CompletedProcess:
+    def run_guard(
+        self, audit_toml: str, tree: str = "", sqlite_tree: str = ""
+    ) -> subprocess.CompletedProcess:
         script = job_step("audit", self.STEP)["run"]
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
             (workdir / ".cargo").mkdir()
             (workdir / ".cargo" / "audit.toml").write_text(audit_toml, encoding="utf-8")
-            return run_with_fake_cargo(script, workdir, {"FAKE_TREE": tree})
+            return run_with_fake_cargo(script, workdir, {"FAKE_TREE": tree, "FAKE_SQLITE_TREE": sqlite_tree})
 
     def test_repository_exceptions_are_explicit_and_dated(self) -> None:
         text = (ROOT / ".cargo" / "audit.toml").read_text(encoding="utf-8")
-        self.assertEqual(tomllib.loads(text)["advisories"]["ignore"], ["RUSTSEC-2023-0071"])
+        self.assertEqual(
+            tomllib.loads(text)["advisories"]["ignore"],
+            ["RUSTSEC-2023-0071", "RUSTSEC-2026-0459"],
+        )
         self.assertRegex(text, r"(?m)^# review-after: \d{4}-\d{2}-\d{2}$")
 
     def test_guard_passes_while_rsa_is_not_compiled(self) -> None:
@@ -531,6 +540,14 @@ class CargoAuditExceptionTest(unittest.TestCase):
         result = self.run_guard("# review-after: 2999-01-01\n", tree="rsa v0.9.10\n")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no longer holds", result.stdout)
+
+    def test_guard_fails_once_sqlite_enters_the_build_graph(self) -> None:
+        result = self.run_guard(
+            "# review-after: 2999-01-01\n",
+            sqlite_tree="libsqlite3-sys v0.30.1\n",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RUSTSEC-2026-0459", result.stdout)
 
     def test_guard_fails_after_the_review_date_or_without_one(self) -> None:
         self.assertNotEqual(self.run_guard("# review-after: 2000-01-01\n").returncode, 0)

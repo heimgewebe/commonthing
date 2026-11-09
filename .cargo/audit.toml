@@ -11,4 +11,9 @@ ignore = [
   # postgres feature alone, so `cargo tree --locked --target all -e all -i rsa`
   # prints nothing and cargo-deny's feature-aware advisory check passes.
   "RUSTSEC-2023-0071",
+  # RUSTSEC-2026-0459 (libsqlite3-sys; SQLite WAL page-size memory exposure).
+  # This crate is locked via SQLx optional SQLite backend, but the API builds
+  # with PostgreSQL only. The security workflow must prove absence from the
+  # active build graph on every run; remove this exception if that changes.
+  "RUSTSEC-2026-0459",
 ]

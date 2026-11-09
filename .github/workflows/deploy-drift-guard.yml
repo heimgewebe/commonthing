@@ -42,8 +42,11 @@ jobs:
 
           CHANGED_FILES=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
 
-          # Check if infra changed
-          INFRA_CHANGED=$(echo "$CHANGED_FILES" | grep -E '^(infra/compose/|infra/caddy/)' || true)
+          # Only deployed infrastructure needs deployment-snapshot acknowledgement.
+          # Caddyfile.dev is a Vite-only proxy, never the production Caddyfile.
+          INFRA_CHANGED=$(printf '%s\n' "$CHANGED_FILES" | \
+            grep -E '^(infra/compose/|infra/caddy/)' | \
+            grep -v -Fx 'infra/caddy/Caddyfile.dev' || true)
 
           if [ -z "$INFRA_CHANGED" ]; then
             echo "No infra changes detected (filtered by workflow paths). Skipping."
