@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1"
+mimalloc = { version = "0.1", default-features = false }
 axum = { version = "0.8", features = ["macros"] }
 async-trait = "0.1"
 async-nats = "0.49"
