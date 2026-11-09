@@ -32,6 +32,26 @@ type ServerState = {
   circleStatuses: number[];
   /** Holds back circle responses until released (stale-request tests). */
   circleGate?: Promise<void>;
+  /** Statuses for the next profile GETs, in order (default: 200). */
+  getStatuses: number[];
+  /** The lazy editor chunk cannot be loaded at all. */
+  breakChunks: boolean;
+  /** The lazy editor chunk arrives only after this gate opens. */
+  chunkGate?: Promise<void>;
+};
+
+const sameSet = (a: unknown, b: string[]) =>
+  Array.isArray(a) &&
+  a.length === b.length &&
+  b.every((tag) => a.includes(tag));
+
+type OpenOptions = {
+  /** Draft in sessionStorage before the page loads. */
+  draft?: Record<string, unknown>;
+  /** Anzeigename expected once the profile is loaded. */
+  title?: string;
+  /** Return right after navigation (the load is held back on purpose). */
+  skipWait?: boolean;
 };
 
 const circlesOf = (accountId: string) => [
@@ -49,7 +69,31 @@ const circlesOf = (accountId: string) => [
  * atomicity and privacy proof lives in the PostgreSQL API tests; this only
  * proves the browser sends the right single-tag request and keeps drafts.
  */
-async function openSettings(page: Page, state: ServerState) {
+async function openSettings(
+  page: Page,
+  state: ServerState,
+  options: OpenOptions = {},
+) {
+  if (options.draft) {
+    await page.addInitScript(
+      ({ accountId, draft }) =>
+        sessionStorage.setItem(
+          `weltgewebe:garnrolle-draft:${accountId}`,
+          JSON.stringify(draft),
+        ),
+      { accountId: ACCOUNT_ID, draft: options.draft },
+    );
+  }
+  // The lazy module is the only chunk that carries the review test id.
+  await page.route("**/_app/immutable/**/*.js", async (route) => {
+    if (!state.breakChunks && !state.chunkGate) return route.continue();
+    const response = await route.fetch();
+    if ((await response.text()).includes("garnrolle-tag-review")) {
+      if (state.breakChunks) return route.abort();
+      await state.chunkGate;
+    }
+    return route.fulfill({ response });
+  });
   await mockApiResponses(page, {
     auth: { authenticated: true, account_id: ACCOUNT_ID, role: "weber" },
   });
@@ -92,7 +136,14 @@ async function openSettings(page: Page, state: ServerState) {
       state.patches.push(payload);
       const status = state.patchStatuses.shift() ?? 200;
       if (status !== 200) return route.fulfill({ status });
+      // Like the API: a precondition that is not the stored set conflicts.
+      if (!sameSet(payload.expected_tags, state.tags)) {
+        return route.fulfill({ status: 409 });
+      }
       state.tags = payload.tags as string[];
+    } else {
+      const status = state.getStatuses.shift() ?? 200;
+      if (status !== 200) return route.fulfill({ status });
     }
     return route.fulfill({
       status: 200,
@@ -133,14 +184,24 @@ async function openSettings(page: Page, state: ServerState) {
   });
   await page.goto("/settings#meine-garnrolle");
   const section = page.getByTestId("my-garnrolle-section");
+  if (options.skipWait) return section;
   await expect(section.getByLabel("Anzeigename")).toHaveValue(
-    "Meine Garnrolle",
+    options.title ?? "Meine Garnrolle",
   );
-  if (state.tags.includes("good:Leiter")) {
+  if (!options.draft && state.tags.includes("good:Leiter")) {
     await expect(section.getByLabel("Güter")).toHaveValue("Leiter");
   }
   return section;
 }
+
+/** A draft written before drafts recorded the tags they were based on. */
+const OLD_DRAFT = {
+  displayName: "Entwurf-Name",
+  summary: "Entwurf-Beschreibung",
+  skills: "Fahrrad reparieren",
+  goods: "Leiter, Werkzeug",
+  interests: "Commons",
+};
 
 function newState(): ServerState {
   return {
@@ -152,7 +213,18 @@ function newState(): ServerState {
     circleRequests: [],
     accountId: ACCOUNT_ID,
     circleStatuses: [],
+    getStatuses: [],
+    breakChunks: false,
   };
+}
+
+/** Holds back the lazy editor chunk; returns the release. */
+function holdLazyChunk(state: ServerState): () => void {
+  let release!: () => void;
+  state.chunkGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return release;
 }
 
 /** The editor is lazy: it only exists after this explicit click. */
@@ -437,5 +509,346 @@ test.describe("Gespeicherten Profil-Tag als eigene Ressource", () => {
     );
     await expect(submit).toHaveText("Als eigene Ressource umziehen");
     await expect(section.getByLabel("Güter")).toHaveValue("Leiter");
+  });
+  test("never republishes a tag that moved after the draft was written", async ({
+    page,
+  }) => {
+    const state = newState();
+    // Moved to a private node while the old draft was stored.
+    state.tags = SAVED_TAGS.filter((tag) => tag !== "good:Leiter");
+    const serverTags = [...state.tags];
+    const section = await openSettings(page, state, {
+      title: "Entwurf-Name",
+      draft: { ...OLD_DRAFT, baseTags: SAVED_TAGS },
+    });
+    // Local additions stay, the moved value is gone, nothing is left to decide.
+    await expect(section.getByLabel("Güter")).toHaveValue("Werkzeug");
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren",
+    );
+    await expect(section.getByTestId("garnrolle-tag-review")).toHaveCount(0);
+
+    await section.getByTestId("save-garnrolle").click();
+    await expect.poll(() => state.patches.length).toBe(1);
+    expect(state.patches[0].tags).toEqual([
+      "skill:Fahrrad reparieren",
+      "good:Werkzeug",
+      "interest:Commons",
+    ]);
+    expect(state.patches[0].expected_tags).toEqual(serverTags);
+    expect(state.tags).not.toContain("good:Leiter");
+    expect(state.moves).toHaveLength(0);
+  });
+
+  test("merges foreign additions into a restored draft and keeps deliberate removals", async ({
+    page,
+  }) => {
+    const state = newState();
+    state.tags = [
+      ...SAVED_TAGS.filter((tag) => tag !== "good:Leiter"),
+      "skill:Imkern",
+      "good:Honig",
+    ];
+    const section = await openSettings(page, state, {
+      title: "Entwurf-Name",
+      // The user had deleted "Commons" on purpose.
+      draft: { ...OLD_DRAFT, interests: "", baseTags: SAVED_TAGS },
+    });
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren, Imkern",
+    );
+    await expect(section.getByLabel("Güter")).toHaveValue("Werkzeug, Honig");
+    await expect(section.getByLabel("Interessen")).toHaveValue("");
+    await section.getByTestId("save-garnrolle").click();
+    await expect.poll(() => state.patches.length).toBe(1);
+    expect(state.patches[0].tags).toEqual([
+      "skill:Fahrrad reparieren",
+      "skill:Imkern",
+      "good:Werkzeug",
+      "good:Honig",
+    ]);
+  });
+
+  test("stores the confirmed baseline with a draft and reconciles it after a move", async ({
+    page,
+  }) => {
+    const state = newState();
+    const section = await openSettings(page, state);
+    await section.getByLabel("Güter").fill("Leiter, Werkzeug");
+    await section.getByTestId("garnrolle-private-resource-link").click();
+    await page.waitForURL(/\/map\?compose=node/);
+    const stored = await page.evaluate(
+      (accountId) =>
+        sessionStorage.getItem(`weltgewebe:garnrolle-draft:${accountId}`),
+      ACCOUNT_ID,
+    );
+    expect(JSON.parse(stored ?? "{}")).toMatchObject({
+      goods: "Leiter, Werkzeug",
+      baseTags: SAVED_TAGS,
+    });
+
+    // Moved elsewhere while the user was on the map.
+    state.tags = state.tags.filter((tag) => tag !== "good:Leiter");
+    await page.goto("/settings#meine-garnrolle");
+    const back = page.getByTestId("my-garnrolle-section");
+    await expect(back.getByLabel("Güter")).toHaveValue("Werkzeug");
+    await expect(back.getByTestId("garnrolle-tag-review")).toHaveCount(0);
+  });
+
+  test("applies a draft without baseline only after an explicit decision", async ({
+    page,
+  }) => {
+    const state = newState();
+    state.tags = SAVED_TAGS.filter((tag) => tag !== "good:Leiter");
+    const serverTags = [...state.tags];
+    const section = await openSettings(page, state, {
+      title: "Entwurf-Name",
+      draft: OLD_DRAFT,
+    });
+    // Other draft fields survive; the resource fields show the server state.
+    await expect(section.getByLabel("Kurzbeschreibung")).toHaveValue(
+      "Entwurf-Beschreibung",
+    );
+    await expect(section.getByLabel("Güter")).toHaveValue("");
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren",
+    );
+    const review = section.getByTestId("garnrolle-tag-review");
+    await expect(review).toContainText("Güter: Leiter, Werkzeug");
+    await expect(review).not.toContainText("Fähigkeiten:");
+    await expect(review).toContainText("gesperrt");
+    const save = section.getByTestId("save-garnrolle");
+    await expect(save).toBeDisabled();
+
+    // The map hand-off would store a draft too: it waits for the decision.
+    await section.getByTestId("garnrolle-private-resource-link").click();
+    await page.waitForTimeout(300);
+    await expect(page).toHaveURL(/\/settings/);
+    await expect(section.getByTestId("garnrolle-move-open")).toBeDisabled();
+    expect(state.patches).toHaveLength(0);
+
+    await review.getByTestId("garnrolle-tag-review-discard").click();
+    await expect(review).toHaveCount(0);
+    await expect(section.getByLabel("Güter")).toHaveValue("");
+    await expect(save).toBeEnabled();
+    await save.click();
+    await expect.poll(() => state.patches.length).toBe(1);
+    expect(state.patches[0].tags).toEqual([
+      "skill:Fahrrad reparieren",
+      "interest:Commons",
+    ]);
+    expect(state.patches[0].expected_tags).toEqual(serverTags);
+  });
+
+  test("takes over the entries of a draft without baseline only on request", async ({
+    page,
+  }) => {
+    const state = newState();
+    state.tags = SAVED_TAGS.filter((tag) => tag !== "good:Leiter");
+    const section = await openSettings(page, state, {
+      title: "Entwurf-Name",
+      draft: OLD_DRAFT,
+    });
+    const review = section.getByTestId("garnrolle-tag-review");
+    await review.getByTestId("garnrolle-tag-review-adopt").click();
+    await expect(review).toHaveCount(0);
+    await expect(section.getByLabel("Güter")).toHaveValue("Leiter, Werkzeug");
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren",
+    );
+    await section.getByTestId("save-garnrolle").click();
+    await expect.poll(() => state.patches.length).toBe(1);
+    expect(state.patches[0].tags).toContain("good:Leiter");
+  });
+
+  test("asks nothing when a draft without baseline matches the server state", async ({
+    page,
+  }) => {
+    const state = newState();
+    const section = await openSettings(page, state, {
+      title: "Entwurf-Name",
+      draft: { ...OLD_DRAFT, goods: "Leiter", skills: "Fahrrad reparieren" },
+    });
+    await expect(section.getByLabel("Güter")).toHaveValue("Leiter");
+    await expect(section.getByTestId("garnrolle-tag-review")).toHaveCount(0);
+    await expect(section.getByTestId("save-garnrolle")).toBeEnabled();
+  });
+
+  test("fails closed when the reconciliation module cannot be loaded", async ({
+    page,
+  }) => {
+    const state = newState();
+    state.tags = SAVED_TAGS.filter((tag) => tag !== "good:Leiter");
+    state.breakChunks = true;
+    const section = await openSettings(page, state, {
+      draft: OLD_DRAFT,
+      skipWait: true,
+    });
+    await expect(section.getByTestId("garnrolle-error")).toContainText(
+      "Laden fehlgeschlagen",
+    );
+    await expect(section.getByLabel("Anzeigename")).toBeDisabled();
+    await expect(section.getByTestId("save-garnrolle")).toBeDisabled();
+    await expect(section.getByLabel("Güter")).not.toHaveValue(/Werkzeug/);
+    await page.waitForTimeout(300);
+    expect(state.patches).toHaveLength(0);
+  });
+
+  test("keeps a tag another session added after the conflict", async ({
+    page,
+  }) => {
+    const state = newState();
+    const section = await openSettings(page, state);
+    await section.getByLabel("Güter").fill("Leiter, Werkzeug");
+    // Another session saved a public skill meanwhile.
+    state.tags = [...SAVED_TAGS, "skill:Imkern"];
+    const serverTags = [...state.tags];
+
+    const save = section.getByTestId("save-garnrolle");
+    await save.click();
+    await expect(section.getByTestId("garnrolle-error")).toContainText(
+      "Nichts wurde gespeichert",
+    );
+    // Merged visibly, local input kept, nothing saved yet.
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren, Imkern",
+    );
+    await expect(section.getByLabel("Güter")).toHaveValue("Leiter, Werkzeug");
+    expect(state.tags).toEqual(serverTags);
+
+    await save.click();
+    await expect.poll(() => state.patches.length).toBe(2);
+    expect(state.patches[1].tags).toEqual([
+      "skill:Fahrrad reparieren",
+      "skill:Imkern",
+      "good:Leiter",
+      "good:Werkzeug",
+      "interest:Commons",
+    ]);
+    expect(state.patches[1].expected_tags).toEqual(serverTags);
+    expect(state.tags).toContain("skill:Imkern");
+  });
+
+  test("keeps saving blocked until the conflicting tags were merged", async ({
+    page,
+  }) => {
+    const state = newState();
+    const section = await openSettings(page, state);
+    state.tags = [...SAVED_TAGS, "skill:Imkern"];
+    // The reload that follows the conflict fails once.
+    state.getStatuses = [500];
+
+    const save = section.getByTestId("save-garnrolle");
+    await save.click();
+    await expect(section.getByTestId("garnrolle-error")).toContainText(
+      "Nichts wurde gespeichert",
+    );
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren",
+    );
+    // Not merged, so the retry is rejected again instead of deleting it.
+    await save.click();
+    await expect.poll(() => state.patches.length).toBe(2);
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren, Imkern",
+    );
+    expect(state.tags).toContain("skill:Imkern");
+    expect(state.patches[0].tags).not.toContain("skill:Imkern");
+    expect(state.patches[1].tags).not.toContain("skill:Imkern");
+
+    await save.click();
+    await expect.poll(() => state.patches.length).toBe(3);
+    expect(state.patches[2].tags).toContain("skill:Imkern");
+    expect(state.tags).toContain("skill:Imkern");
+  });
+
+  test("merges foreign additions after a stale move without republishing", async ({
+    page,
+  }) => {
+    const state = newState();
+    state.moveStatuses = [409];
+    const section = await openSettings(page, state);
+    const move = await openEditor(section);
+    await move.getByTestId("garnrolle-move-tag").selectOption("good:Leiter");
+    state.tags = [
+      ...SAVED_TAGS.filter((tag) => tag !== "good:Leiter"),
+      "skill:Imkern",
+    ];
+    await move.getByTestId("garnrolle-move-submit").click();
+    await expect(move.getByTestId("garnrolle-move-error")).toContainText(
+      "nicht mehr gespeichert",
+    );
+    await expect(section.getByLabel("Güter")).toHaveValue("");
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren, Imkern",
+    );
+    await section.getByTestId("save-garnrolle").click();
+    await expect.poll(() => state.patches.length).toBe(1);
+    expect(state.patches[0].tags).toEqual([
+      "skill:Fahrrad reparieren",
+      "skill:Imkern",
+      "interest:Commons",
+    ]);
+  });
+
+  test("ignores a conflict answer that arrives after an account switch", async ({
+    page,
+  }) => {
+    const state = newState();
+    const section = await openSettings(page, state);
+    const release = holdLazyChunk(state);
+    state.tags = [...SAVED_TAGS, "skill:Imkern"];
+    await section.getByTestId("save-garnrolle").click();
+    await expect.poll(() => state.patches.length).toBe(1);
+
+    // The other account takes over while the lazy module is still loading.
+    state.accountId = OTHER_ACCOUNT_ID;
+    state.tags = [...SAVED_TAGS];
+    await page.getByTestId("account-section-logout-all").click();
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren",
+    );
+    release();
+    await page.waitForTimeout(300);
+    await expect(section.getByLabel("Fähigkeiten")).toHaveValue(
+      "Fahrrad reparieren",
+    );
+    await expect(section.getByTestId("garnrolle-error")).toHaveCount(0);
+
+    const save = section.getByTestId("save-garnrolle");
+    await expect(save).toBeEnabled();
+    await save.click();
+    await expect.poll(() => state.patches.length).toBe(2);
+    // Nothing of the first account's tags leaked into the new baseline.
+    expect(state.patches[1].tags).not.toContain("skill:Imkern");
+    expect(state.patches[1].expected_tags).toEqual(SAVED_TAGS);
+  });
+
+  test("applies no draft of the previous account when the switch happens while its reconciliation loads", async ({
+    page,
+  }) => {
+    const state = newState();
+    state.tags = SAVED_TAGS.filter((tag) => tag !== "good:Leiter");
+    const release = holdLazyChunk(state);
+    const section = await openSettings(page, state, {
+      draft: OLD_DRAFT,
+      skipWait: true,
+    });
+    // The profile is loaded; its draft waits for the held module.
+    await page.waitForTimeout(500);
+
+    state.accountId = OTHER_ACCOUNT_ID;
+    state.tags = ["account", "garnrolle", "interest:Commons"];
+    await page.getByTestId("account-section-logout-all").click();
+    await expect(section.getByLabel("Interessen")).toHaveValue("Commons");
+    release();
+    await page.waitForTimeout(300);
+
+    await expect(section.getByTestId("garnrolle-tag-review")).toHaveCount(0);
+    await expect(section.getByLabel("Güter")).toHaveValue("");
+    await expect(section.getByLabel("Anzeigename")).toHaveValue(
+      "Meine Garnrolle",
+    );
+    await expect(section.getByTestId("save-garnrolle")).toBeEnabled();
   });
 });

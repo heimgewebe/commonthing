@@ -1,12 +1,40 @@
 <script module lang="ts">
   export type TagDraft = { skills: string; goods: string; interests: string };
 
-  function withoutEntry(field: string, value: string): string {
-    return field
+  const TAG = /^(?:(good|interest|skill):)?(.*)$/s;
+  const entriesOf = (field: string) =>
+    field
       .split(",")
       .map((entry) => entry.trim())
-      .filter((entry) => entry && entry !== value)
+      .filter(Boolean);
+
+  function withoutEntry(field: string, value: string): string {
+    return entriesOf(field)
+      .filter((entry) => entry !== value)
       .join(", ");
+  }
+
+  /** The field plus the values it does not list yet; its own entries stay. */
+  function withEntries(field: string, values: string[]): string {
+    return [...new Set([...entriesOf(field), ...entriesOf(values.join(","))])].join(
+      ", ",
+    );
+  }
+
+  /** User-facing text for a failed profile save (kept out of the initial chunk). */
+  export function describeSaveError(error: unknown): string {
+    switch ((error as { status?: number } | null)?.status) {
+      case 401:
+        return "Sitzung abgelaufen. Bitte melde dich neu an.";
+      case 403:
+        return "Dieses Konto darf die Garnrolle nicht bearbeiten.";
+      case 400:
+        return "Prüfe Name, Tags, Kartenanker und Sichtbarkeit.";
+      case 409:
+        return "Deine öffentlichen Tags haben sich geändert. Nichts wurde gespeichert. Prüfe sie und speichere erneut.";
+      default:
+        return "Speichern fehlgeschlagen. Versuche es erneut.";
+    }
   }
 
   /**
@@ -24,7 +52,7 @@
         continue;
       }
       // No prefix = legacy tag, shown with the skills.
-      const [, kind, value] = /^(?:(good|interest|skill):)?(.*)$/.exec(tag)!;
+      const [, kind, value] = TAG.exec(tag)!;
       if (kind === "good") goods = withoutEntry(goods, value);
       else if (kind === "interest") interests = withoutEntry(interests, value);
       // A remaining twin spelling of the same skill is still public anyway.
@@ -33,6 +61,80 @@
       }
     }
     return { skills, goods, interests };
+  }
+
+  /**
+   * Bring a draft that was based on `savedTags` up to the server's tag set:
+   * values the server dropped (e.g. moved to a private node) leave the draft,
+   * values another session added join it. Local edits and entries the user
+   * deliberately removed stay as they are.
+   */
+  export function reconcileTagDraft(
+    savedTags: string[],
+    serverTags: string[],
+    draft: TagDraft,
+  ): TagDraft {
+    let { skills, goods, interests } = draftWithoutRemovedTags(
+      savedTags,
+      serverTags,
+      draft,
+    );
+    for (const tag of serverTags) {
+      if (savedTags.includes(tag) || tag === "account" || tag === "garnrolle") {
+        continue;
+      }
+      const [, kind, value] = TAG.exec(tag)!;
+      if (kind === "good") goods = withEntries(goods, [value]);
+      else if (kind === "interest") interests = withEntries(interests, [value]);
+      else skills = withEntries(skills, [value]);
+    }
+    return { skills, goods, interests };
+  }
+
+  /** `draft` plus the review entries (explicitly accepted by the user). */
+  export function adoptReviewedTags(draft: TagDraft, review: TagDraft) {
+    return {
+      skills: withEntries(draft.skills, [review.skills]),
+      goods: withEntries(draft.goods, [review.goods]),
+      interests: withEntries(draft.interests, [review.interests]),
+    };
+  }
+
+  /**
+   * Restore the tag fields of a stored draft against the freshly loaded
+   * server profile. A draft names the tag set it was based on (`baseTags`),
+   * so it can be reconciled. Without a trustworthy baseline (draft written
+   * before it was recorded) nothing of it may reach the form: a moved private
+   * value could return as public. The server state is shown instead and the
+   * differing draft entries are returned for an explicit decision.
+   */
+  export function reconcileStoredDraft(
+    draft: Partial<TagDraft> & { baseTags?: unknown },
+    serverTags: string[],
+    server: TagDraft,
+  ): { fields: TagDraft; review: TagDraft | null } {
+    const own = (key: keyof TagDraft) =>
+      typeof draft[key] === "string" ? draft[key] : server[key];
+    const stored = {
+      skills: own("skills"),
+      goods: own("goods"),
+      interests: own("interests"),
+    };
+    const base = draft.baseTags;
+    if (Array.isArray(base) && base.every((tag) => typeof tag === "string")) {
+      return { fields: reconcileTagDraft(base, serverTags, stored), review: null };
+    }
+    const unknown = (key: keyof TagDraft) =>
+      entriesOf(stored[key])
+        .filter((entry) => !entriesOf(server[key]).includes(entry))
+        .join(", ");
+    const review = {
+      skills: unknown("skills"),
+      goods: unknown("goods"),
+      interests: unknown("interests"),
+    };
+    const open = review.skills || review.goods || review.interests;
+    return { fields: server, review: open ? review : null };
   }
 </script>
 
@@ -69,6 +171,10 @@
     onTagsMoved: (serverTags: string[]) => void | Promise<void>;
     /** The saved tag set is stale (409); the parent should reload it. */
     onStaleTags: () => void | Promise<void>;
+    /** Tag entries of an older draft whose origin is unknown; saving waits. */
+    review?: TagDraft | null;
+    /** The user's explicit decision on `review`: keep its entries or not. */
+    onResolveReview?: (merge?: (draft: TagDraft) => TagDraft) => void;
   }
 
   let {
@@ -78,6 +184,8 @@
     onBusyChange,
     onTagsMoved,
     onStaleTags,
+    review = null,
+    onResolveReview,
   }: Props = $props();
 
   const MOVABLE_TAG_PREFIXES = ["good:", "skill:"] as const;
@@ -339,6 +447,43 @@
     if (moveTag && !movableTags.includes(moveTag)) moveTag = "";
   });
 </script>
+
+{#if review}
+  <fieldset
+    class="move-resource"
+    data-testid="garnrolle-tag-review"
+    disabled={disabled}
+  >
+    <legend>Älterer Entwurf: Tags prüfen</legend>
+    <p class="field-intro" role="alert">
+      Ein älterer Entwurf enthält Einträge, die nicht zum gespeicherten Stand
+      passen. Sie wurden nicht übernommen, weil sie inzwischen privat verschoben
+      sein können. Speichern und Kartenwahl sind gesperrt, bis du entscheidest. Übernommene
+      Einträge werden mit dem nächsten Speichern öffentlich.
+    </p>
+    <ul>
+      {#each [["Fähigkeiten", review.skills], ["Güter", review.goods], ["Interessen", review.interests]] as [label, value] (label)}
+        {#if value}<li>{label}: {value}</li>{/if}
+      {/each}
+    </ul>
+    <button
+      type="button"
+      class="btn"
+      data-testid="garnrolle-tag-review-discard"
+      onclick={() => onResolveReview?.()}
+    >
+      Verwerfen, gespeicherten Stand behalten
+    </button>
+    <button
+      type="button"
+      class="btn"
+      data-testid="garnrolle-tag-review-adopt"
+      onclick={() => onResolveReview?.((draft) => adoptReviewedTags(draft, review))}
+    >
+      Zusätzlich ins Formular übernehmen
+    </button>
+  </fieldset>
+{/if}
 
 {#if movableTags.length > 0 || moveMessage}
   <fieldset
