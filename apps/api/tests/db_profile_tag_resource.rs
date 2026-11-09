@@ -559,20 +559,21 @@ async fn one_saved_tag_moves_atomically_into_one_circle_node_and_replays() {
             .fetch_one(&pool)
             .await
             .expect("projection version before departure");
-    sqlx::query(
-        "DELETE FROM domain_audience_circle_members WHERE circle_id=$1 AND account_id=$2",
-    )
-    .bind(circle)
-    .bind(&member)
-    .execute(&pool)
-    .await
-    .expect("former member leaves P2b audience circle");
+    sqlx::query("DELETE FROM domain_audience_circle_members WHERE circle_id=$1 AND account_id=$2")
+        .bind(circle)
+        .bind(&member)
+        .execute(&pool)
+        .await
+        .expect("former member leaves P2b audience circle");
     let version_after: i64 =
         sqlx::query_scalar("SELECT version FROM domain_projection_state WHERE singleton=TRUE")
             .fetch_one(&pool)
             .await
             .expect("projection version after departure");
-    assert!(version_after > version_before, "departure invalidates privacy reads");
+    assert!(
+        version_after > version_before,
+        "departure invalidates privacy reads"
+    );
     assert!(!readable(&pool, &node_id, Some(&member)).await);
     assert!(matches!(
         get_node(
@@ -590,7 +591,8 @@ async fn one_saved_tag_moves_atomically_into_one_circle_node_and_replays() {
         "former member must not see moved resource in account relations or activity"
     );
     assert!(readable(&pool, &node_id, Some(&owner)).await);
-    assert_eq!(stored_tags(&pool, &owner).await, expected_tags);
+    // The earlier fresh PATCH added "good:Werkzeug": preserve CURRENT tags.
+    assert_eq!(stored_tags(&pool, &owner).await, saved);
 }
 
 #[tokio::test]
