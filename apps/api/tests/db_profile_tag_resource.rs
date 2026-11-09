@@ -30,6 +30,7 @@ use weltgewebe_api::{
             MoveProfileTagRequest, UpdateOwnGarnrolleRequest,
         },
         node_audience::get_node_audience,
+        nodes::get_node,
     },
     state::{ApiState, OrderedCache},
     telemetry::{BuildInfo, Metrics},
@@ -542,6 +543,56 @@ async fn one_saved_tag_moves_atomically_into_one_circle_node_and_replays() {
     assert!(!public_account_json(&state, &owner, None)
         .await
         .contains("moved_profile_tags"));
+
+    // P2b composition proof: a formerly confirmed circle member must lose
+    // BOTH the cached direct node route and the account activity projection
+    // when membership ends. The owner's converted node and public tags remain.
+    assert!(get_node(
+        State(state.clone()),
+        Path(node_id.clone()),
+        Some(Extension(actor(&member, Role::Weber))),
+    )
+    .await
+    .is_ok());
+    let version_before: i64 =
+        sqlx::query_scalar("SELECT version FROM domain_projection_state WHERE singleton=TRUE")
+            .fetch_one(&pool)
+            .await
+            .expect("projection version before departure");
+    sqlx::query("DELETE FROM domain_audience_circle_members WHERE circle_id=$1 AND account_id=$2")
+        .bind(circle)
+        .bind(&member)
+        .execute(&pool)
+        .await
+        .expect("former member leaves P2b audience circle");
+    let version_after: i64 =
+        sqlx::query_scalar("SELECT version FROM domain_projection_state WHERE singleton=TRUE")
+            .fetch_one(&pool)
+            .await
+            .expect("projection version after departure");
+    assert!(
+        version_after > version_before,
+        "departure invalidates privacy reads"
+    );
+    assert!(!readable(&pool, &node_id, Some(&member)).await);
+    assert!(matches!(
+        get_node(
+            State(state.clone()),
+            Path(node_id.clone()),
+            Some(Extension(actor(&member, Role::Weber))),
+        )
+        .await,
+        Err(StatusCode::NOT_FOUND)
+    ));
+    assert!(
+        !public_account_json(&state, &owner, Some(&member))
+            .await
+            .contains("Leiter"),
+        "former member must not see moved resource in account relations or activity"
+    );
+    assert!(readable(&pool, &node_id, Some(&owner)).await);
+    // The earlier fresh PATCH added "good:Werkzeug": preserve CURRENT tags.
+    assert_eq!(stored_tags(&pool, &owner).await, saved);
 }
 
 #[tokio::test]
