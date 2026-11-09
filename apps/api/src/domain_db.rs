@@ -405,7 +405,7 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for PayloadScalar<'a> {
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                while seq.next_element::<ValueCheckedIgnore>()?.is_some() {}
                 Ok(PayloadScalar::Other)
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -413,7 +413,7 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for PayloadScalar<'a> {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 while map
-                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .next_entry::<ValueCheckedIgnore, ValueCheckedIgnore>()?
                     .is_some()
                 {}
                 Ok(PayloadScalar::Other)
@@ -432,20 +432,111 @@ impl PayloadScalar<'_> {
     }
 }
 
-#[derive(serde::Deserialize)]
+/// Skips one JSON value but, unlike `serde::de::IgnoredAny`, still rejects
+/// everything `serde_json::Value` rejects (e.g. an out-of-range number such as
+/// `1e400`, which JSONB can store). A rejected payload then takes the `Value`
+/// path, which maps it to an empty object, exactly as before.
+struct ValueCheckedIgnore;
+
+impl<'de> serde::Deserialize<'de> for ValueCheckedIgnore {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct IgnoreVisitor;
+        impl<'de> serde::de::Visitor<'de> for IgnoreVisitor {
+            type Value = ValueCheckedIgnore;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<ValueCheckedIgnore>()?.is_some() {}
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<ValueCheckedIgnore, ValueCheckedIgnore>()?
+                    .is_some()
+                {}
+                Ok(ValueCheckedIgnore)
+            }
+        }
+        deserializer.deserialize_any(IgnoreVisitor)
+    }
+}
+
+#[derive(Default)]
 struct EdgePayloadFields<'a> {
-    #[serde(default, borrow)]
     source_type: PayloadScalar<'a>,
-    #[serde(default, borrow)]
     target_type: PayloadScalar<'a>,
-    #[serde(default, borrow)]
     note: PayloadScalar<'a>,
-    #[serde(default, borrow)]
     expires_at: PayloadScalar<'a>,
-    #[serde(default, borrow)]
     faden_type: PayloadScalar<'a>,
-    #[serde(default, borrow)]
     faden_subject_id: PayloadScalar<'a>,
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for EdgePayloadFields<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for FieldsVisitor<'a> {
+            type Value = EdgePayloadFields<'a>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                let mut fields = EdgePayloadFields::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    let slot = match key.as_ref() {
+                        "source_type" => &mut fields.source_type,
+                        "target_type" => &mut fields.target_type,
+                        "note" => &mut fields.note,
+                        "expires_at" => &mut fields.expires_at,
+                        "faden_type" => &mut fields.faden_type,
+                        "faden_subject_id" => &mut fields.faden_subject_id,
+                        _ => {
+                            map.next_value::<ValueCheckedIgnore>()?;
+                            continue;
+                        }
+                    };
+                    if !matches!(slot, PayloadScalar::Missing) {
+                        // Leave last-wins duplicate handling to the Value path.
+                        return Err(A::Error::custom("duplicate edge payload key"));
+                    }
+                    *slot = map.next_value::<PayloadScalar<'a>>()?;
+                }
+                Ok(fields)
+            }
+        }
+        deserializer.deserialize_map(FieldsVisitor(std::marker::PhantomData))
+    }
 }
 
 /// Decodes the projected edge payload fields without building a full
@@ -3280,6 +3371,11 @@ mod edge_payload_decode_tests {
             r#"{"note": 1.5e300, "source_type": -3}"#.to_string(),
             "  {\"note\": \"leading whitespace\"}".to_string(),
             r#"{"note": "a", "note": "b"}"#.to_string(),
+            r#"{"expires_at": "2020-01-01T00:00:00Z", "extra": 1e400}"#.to_string(),
+            r#"{"note": "kept?", "extra": [1, {"deep": -1e400}]}"#.to_string(),
+            r#"{"note": [1e400]}"#.to_string(),
+            r#"{"note": {"x": 1e400}}"#.to_string(),
+            r#"{"extra": 18446744073709551616, "note": "big integer"}"#.to_string(),
             "[\"Node\", \"Node\"]".to_string(),
             "\"just a string\"".to_string(),
             "null".to_string(),
@@ -3297,6 +3393,12 @@ mod edge_payload_decode_tests {
         // The fast path must actually serve the common fixture shape.
         assert!(decode_edge_payload_fast(&corpus[1]).is_some());
         assert!(decode_edge_payload_fast(&corpus[10]).is_some());
+        // An out-of-range number anywhere makes the Value path fall back to an
+        // empty object, so the fast path must defer to it.
+        assert!(decode_edge_payload_fast(
+            r#"{"expires_at": "2020-01-01T00:00:00Z", "extra": 1e400}"#
+        )
+        .is_none());
     }
 }
 
