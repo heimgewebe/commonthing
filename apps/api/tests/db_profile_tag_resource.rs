@@ -33,11 +33,11 @@ use weltgewebe_api::{
         domain_projection::ensure_current_domain_projection,
     },
     routes::{
-        api_router,
         accounts::{
             get_account, move_profile_tag_to_resource, update_own_garnrolle_profile,
             MoveProfileTagRequest, UpdateOwnGarnrolleRequest,
         },
+        api_router,
         node_audience::get_node_audience,
         nodes::get_node,
     },
@@ -1170,11 +1170,7 @@ async fn converted_tag_is_scoped_by_real_http_sessions_and_live_circle_departure
         &["account", "garnrolle", &tag, "interest:Commons"],
     )
     .await;
-    for (id, role) in [
-        (&member, "weber"),
-        (&outsider, "weber"),
-        (&guest, "gast"),
-    ] {
+    for (id, role) in [(&member, "weber"), (&outsider, "weber"), (&guest, "gast")] {
         insert_account(&pool, id, role, &["account", "garnrolle"]).await;
     }
     let circle = active_circle(&pool, &[&owner, &member]).await;
@@ -1194,8 +1190,7 @@ async fn converted_tag_is_scoped_by_real_http_sessions_and_live_circle_departure
         (&outsider, &outsider_cookie),
         (&guest, &guest_cookie),
     ] {
-        let (status, body) =
-            p2b_http(&app, Method::GET, "/auth/me", Some(cookie), None).await;
+        let (status, body) = p2b_http(&app, Method::GET, "/auth/me", Some(cookie), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             serde_json::from_str::<Value>(&body).expect("auth JSON")["account_id"],
@@ -1238,7 +1233,10 @@ async fn converted_tag_is_scoped_by_real_http_sessions_and_live_circle_departure
         .as_str()
         .expect("converted node has one ID");
     assert_eq!(response["audience"]["scope"], "circles");
-    assert_eq!(owned_node_ids(&pool, &owner).await, vec![node_id.to_string()]);
+    assert_eq!(
+        owned_node_ids(&pool, &owner).await,
+        vec![node_id.to_string()]
+    );
     assert!(!stored_tags(&pool, &owner).await.contains(&tag));
 
     let node_path = format!("/nodes/{node_id}");
@@ -1253,7 +1251,11 @@ async fn converted_tag_is_scoped_by_real_http_sessions_and_live_circle_departure
         let (status, _) = p2b_http(&app, Method::GET, &node_path, cookie, None).await;
         assert_eq!(
             status,
-            if can_read { StatusCode::OK } else { StatusCode::NOT_FOUND },
+            if can_read {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            },
             "{label} direct-link privacy"
         );
         let (list_status, list) =
@@ -1284,16 +1286,23 @@ async fn converted_tag_is_scoped_by_real_http_sessions_and_live_circle_departure
     assert_eq!(leave_status, StatusCode::NO_CONTENT, "{leave_body}");
     let (former_direct, _) =
         p2b_http(&app, Method::GET, &node_path, Some(&member_cookie), None).await;
-    assert_eq!(former_direct, StatusCode::NOT_FOUND, "former member direct link");
+    assert_eq!(
+        former_direct,
+        StatusCode::NOT_FOUND,
+        "former member direct link"
+    );
     for path in ["/nodes?limit=100", account_path.as_str()] {
-        let (status, body) =
-            p2b_http(&app, Method::GET, path, Some(&member_cookie), None).await;
+        let (status, body) = p2b_http(&app, Method::GET, path, Some(&member_cookie), None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(!body.contains(title), "former member leaked via {path}");
     }
     let (owner_status, _) =
         p2b_http(&app, Method::GET, &node_path, Some(&owner_cookie), None).await;
-    assert_eq!(owner_status, StatusCode::OK, "owner retains private resource");
+    assert_eq!(
+        owner_status,
+        StatusCode::OK,
+        "owner retains private resource"
+    );
     assert!(
         stored_tags(&pool, &owner)
             .await
