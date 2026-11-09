@@ -82,8 +82,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # .cargo/audit.toml ignores RUSTSEC-2023-0071 only because rsa sits in
-          # Cargo.lock without being compiled. Fail once that stops being true
+          # Lockfile-only exceptions are valid while the affected crates stay
+          # absent from the compiled feature graph. Fail when either appears
           # or the exception passes its review date.
           review_after="$(sed -nE 's/^# review-after: ([0-9]{4}-[0-9]{2}-[0-9]{2})$/\1/p' .cargo/audit.toml)"
           if [ -z "${review_after}" ]; then
@@ -101,14 +101,26 @@ jobs:
             exit 1
           fi
           echo "rsa is absent from the build graph; exception valid until ${review_after}"
+          # cargo-audit audits all lockfile packages, including SQLx's optional
+          # SQLite backend. Ignore RUSTSEC-2026-0459 only while the compiled
+          # application graph excludes libsqlite3-sys on all target platforms.
+          sqlite_graph="$(cargo tree --locked --target all -e all -i libsqlite3-sys 2>/dev/null)"
+          if [ -n "${sqlite_graph}" ]; then
+            echo "::error file=.cargo/audit.toml::libsqlite3-sys compiled; RUSTSEC-2026-0459 exception invalid"
+            printf '%s\n' "${sqlite_graph}"
+            exit 1
+          fi
+          echo "libsqlite3-sys absent from build graph; exception valid until ${review_after}"
       - name: Run cargo audit (JSON report)
         shell: bash
         run: |
           set -euo pipefail
           cargo audit --json | tee cargo-audit-report.json
-          if ! jq -e '.settings.ignore == ["RUSTSEC-2023-0071"]' cargo-audit-report.json > /dev/null; then
+          if ! jq -e \
+            '.settings.ignore == ["RUSTSEC-2023-0071","RUSTSEC-2026-0459"]' \
+            cargo-audit-report.json > /dev/null; then
             echo "::error file=.cargo/audit.toml::unexpected cargo audit exceptions"
-            echo "Only RUSTSEC-2023-0071 is covered by a workflow proof."
+            echo "Only RUSTSEC-2023-0071 and RUSTSEC-2026-0459 have a build-graph proof."
             exit 1
           fi
       - name: Upload audit report
