@@ -1,25 +1,30 @@
-use super::node_audience::readable_circle_node_ids;
+use super::node_audience::{audience_view, readable_circle_node_ids, NodeAudienceView};
 use super::{
     domain_write_guard::reject_account_create_unless_writable,
     edges::edge_is_active_at,
-    nodes::{node_readable_to, reader_account_id},
+    nodes::{node_readable_to, reader_account_id, Node, SearchVisibility},
     query::{
         cursor_page, parse_cursor_params, parse_usize_param, validate_cursor_limit, ListResponse,
         MAX_PAGE_SIZE,
     },
 };
 use crate::auth::{accounts::AccountStore, role::Role};
-use crate::config::{DomainAccountWriteSource, DomainReadSource};
+use crate::config::{
+    DomainAccountWriteSource, DomainEdgeWriteSource, DomainNodeWriteSource, DomainReadSource,
+};
 use crate::domain_db::{
-    insert_account_from_jsonl_record, load_account_profile_from_postgres,
-    update_account_profile_in_postgres, AccountProfileUpdate, AccountProfileUpdateError,
-    AccountWriteError,
+    convert_profile_tag_to_node_in_postgres, insert_account_from_jsonl_record,
+    load_account_profile_from_postgres, lock_node_faden_cache_publication,
+    profile_tag_replacement_allowed, update_account_profile_in_postgres, AccountProfileUpdate,
+    AccountProfileUpdateError, AccountWriteError, CreateOperationKey, ProfileTagConversion,
+    ProfileTagConversionError,
 };
 use crate::middleware::auth::AuthContext;
 use crate::state::ApiState;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -155,6 +160,10 @@ pub struct UpdateOwnGarnrolleRequest {
     pub location: Option<Location>,
     #[serde(default)]
     pub clear_location: bool,
+    /// Public tags exactly as last read. When present, a concurrent tag change
+    /// (for example a moved resource) makes this full replacement fail with 409.
+    #[serde(default)]
+    pub expected_tags: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -885,6 +894,8 @@ const MAX_PROFILE_SUMMARY_LEN: usize = 500;
 const MAX_PROFILE_ADDRESS_LEN: usize = 500;
 const MAX_PROFILE_TAGS: usize = 64;
 const MAX_PROFILE_TAG_LEN: usize = 64;
+const PROFILE_TAGS_CHANGED_MESSAGE: &str =
+    "public profile tags changed since they were read; reload before saving";
 
 fn normalise_profile_title(raw: &str) -> Result<String, &'static str> {
     let title = raw.trim();
@@ -1109,6 +1120,7 @@ fn validate_profile_update(
         radius_m,
         location: payload.location,
         clear_location: payload.clear_location,
+        expected_tags: payload.expected_tags,
     })
 }
 
@@ -1122,6 +1134,28 @@ fn update_jsonl_profile_record(
             "stored account record is invalid".to_string(),
         )
     })?;
+    let stored_tags: Vec<String> = object
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // JSONL never moves tags into nodes, so only the explicit precondition applies.
+    if !profile_tag_replacement_allowed(
+        &stored_tags,
+        &[],
+        update.expected_tags.as_deref(),
+        &update.tags,
+    ) {
+        return Err((
+            StatusCode::CONFLICT,
+            PROFILE_TAGS_CHANGED_MESSAGE.to_string(),
+        ));
+    }
     let existing_location = object.get("location").and_then(|value| {
         let lat = value.get("lat").and_then(json_f64)?;
         let lon = value.get("lon").and_then(json_f64)?;
@@ -1331,6 +1365,10 @@ pub async fn update_own_garnrolle_profile(
                         StatusCode::BAD_REQUEST,
                         "a map location is required for this visibility".to_string(),
                     ),
+                    AccountProfileUpdateError::TagsChanged => (
+                        StatusCode::CONFLICT,
+                        PROFILE_TAGS_CHANGED_MESSAGE.to_string(),
+                    ),
                     other => {
                         tracing::error!(error = %other, "failed to update PostgreSQL account profile");
                         (
@@ -1358,6 +1396,310 @@ pub async fn update_own_garnrolle_profile(
         stored.address,
         stored.location,
     )))
+}
+
+const MAX_PROFILE_RESOURCE_CIRCLES: usize = 8;
+
+/// Move ONE saved public `good:`/`skill:` profile tag into one canonical node.
+/// The client names the stored tag, never unsaved form input.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct MoveProfileTagRequest {
+    pub tag: String,
+    /// `private` (owner only), `circles` (explicit active circles) or `public`.
+    pub scope: String,
+    #[serde(default)]
+    pub circle_ids: Vec<Uuid>,
+    /// Stable id of this one user action; retries must reuse it.
+    pub operation_id: Uuid,
+}
+
+#[derive(Serialize, Debug)]
+pub struct MovedProfileTagResponse {
+    pub node: Node,
+    pub audience: NodeAudienceView,
+    pub profile: OwnGarnrolleProfile,
+}
+
+#[derive(Debug, PartialEq)]
+struct ValidatedProfileTagMove {
+    tag: String,
+    kind: &'static str,
+    title: String,
+    visibility: SearchVisibility,
+    circle_ids: Vec<Uuid>,
+}
+
+fn validate_profile_tag_move(
+    payload: MoveProfileTagRequest,
+) -> Result<ValidatedProfileTagMove, (StatusCode, String)> {
+    let bad = |message: &str| (StatusCode::BAD_REQUEST, message.to_string());
+    let (kind, value) = if let Some(value) = payload.tag.strip_prefix("good:") {
+        ("resource", value)
+    } else if let Some(value) = payload.tag.strip_prefix("skill:") {
+        ("offer", value)
+    } else {
+        return Err(bad("only saved good: or skill: profile tags can be moved"));
+    };
+    let title = value.trim();
+    if title.is_empty() || payload.tag.chars().count() > MAX_PROFILE_TAG_LEN {
+        return Err(bad("tag must be one saved good: or skill: profile tag"));
+    }
+    if payload.circle_ids.len() > MAX_PROFILE_RESOURCE_CIRCLES {
+        return Err(bad("at most 8 explicit audience circles are allowed"));
+    }
+    let mut circle_ids = payload.circle_ids.clone();
+    circle_ids.sort_unstable();
+    circle_ids.dedup();
+    if circle_ids.len() != payload.circle_ids.len() {
+        return Err(bad("duplicate circle grants are not allowed"));
+    }
+    let visibility = match payload.scope.as_str() {
+        "public" | "private" if !circle_ids.is_empty() => {
+            return Err(bad("public and private scopes must have no circle grants"));
+        }
+        "public" => SearchVisibility::Public,
+        "private" => SearchVisibility::Private,
+        "circles" if circle_ids.is_empty() => {
+            return Err(bad("circles scope requires an explicit circle"));
+        }
+        "circles" => SearchVisibility::Private,
+        _ => return Err(bad("scope must be public, private or circles")),
+    };
+    Ok(ValidatedProfileTagMove {
+        tag: payload.tag.clone(),
+        kind,
+        title: title.to_string(),
+        visibility,
+        circle_ids,
+    })
+}
+
+/// Account-scoped conversion operations live in their own namespace, so a
+/// client reusing one UUID for `POST /nodes` cannot alias a conversion.
+fn profile_tag_move_operation_id(operation_id: Uuid) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("weltgewebe:profile-tag-node:v1|{operation_id}").as_bytes(),
+    )
+    .to_string()
+}
+
+fn profile_tag_move_error(error: ProfileTagConversionError) -> (StatusCode, String) {
+    use crate::domain_db::NodeCreateError;
+    use ProfileTagConversionError as E;
+    match error {
+        E::AccountUnavailable | E::Node(NodeCreateError::CreatorAccountUnavailable) => (
+            StatusCode::UNAUTHORIZED,
+            "account is no longer active".to_string(),
+        ),
+        E::TagNotStored => (
+            StatusCode::CONFLICT,
+            "the selected tag is no longer a saved public profile tag; reload".to_string(),
+        ),
+        E::CirclesUnavailable => (
+            StatusCode::NOT_FOUND,
+            "one or more audience circles are not active memberships".to_string(),
+        ),
+        E::OperationConflict | E::EdgeOperationConflict => (
+            StatusCode::CONFLICT,
+            "operation id was already used for different data".to_string(),
+        ),
+        E::ReplayTagPublic => (
+            StatusCode::CONFLICT,
+            "the tag is public again; start a new conversion".to_string(),
+        ),
+        E::ReplayAudienceMismatch => (
+            StatusCode::CONFLICT,
+            "operation already completed with a different audience; reload".to_string(),
+        ),
+        E::MovedTagCapacity => (
+            StatusCode::CONFLICT,
+            "too many profile tags were already moved; nothing was changed".to_string(),
+        ),
+        E::Node(NodeCreateError::CreatorNodeLimitReached { max }) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("guest node limit reached ({max})"),
+        ),
+        other => {
+            tracing::error!(error = %other, "profile tag conversion failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "profile tag conversion failed; retry the same operation".to_string(),
+            )
+        }
+    }
+}
+
+/// POST /accounts/me/profile/resources
+///
+/// Moves one saved public profile tag into one canonical node with the
+/// selected P2 audience. PostgreSQL commits the tag removal, node, origin
+/// Faden and circle grants in ONE transaction; a failure changes nothing and
+/// the tag stays where it was. JSONL cannot provide that integrity and answers
+/// 503 instead of approximating it with several independent writes.
+pub async fn move_profile_tag_to_resource(
+    State(state): State<ApiState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(payload): Json<MoveProfileTagRequest>,
+) -> Result<Response, (StatusCode, String)> {
+    let account_id = ctx
+        .account_id
+        .clone()
+        .filter(|_| ctx.authenticated)
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "authentication required".to_string(),
+        ))?;
+    let operation_id = profile_tag_move_operation_id(payload.operation_id);
+    let validated = validate_profile_tag_move(payload)?;
+    if state.config.domain_read_source != DomainReadSource::Postgres
+        || state.config.domain_account_write_source != DomainAccountWriteSource::Postgres
+        || state.config.domain_node_write_source != DomainNodeWriteSource::Postgres
+        || state.config.domain_edge_write_source != DomainEdgeWriteSource::Postgres
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "moving profile tags requires canonical PostgreSQL accounts, nodes and edges"
+                .to_string(),
+        ));
+    }
+    let pool = state.db_pool.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "moving profile tags requires PostgreSQL".to_string(),
+    ))?;
+
+    // Same order as PATCH /accounts/me/profile: process cache lock, then the
+    // shared pool budget, then the PostgreSQL account row.
+    let _persist_guard = state.accounts_persist.lock().await;
+    let _pool_budget = super::postgres_domain_connection_budget()
+        .acquire_many(super::POSTGRES_DOMAIN_OPERATION_UNITS)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "PostgreSQL profile tag conversion admission unavailable");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "failed to reserve PostgreSQL capacity".to_string(),
+            )
+        })?;
+
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, false);
+    let node = Node {
+        id: Uuid::new_v4().to_string(),
+        kind: validated.kind.to_string(),
+        title: validated.title.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+        has_authoritative_created_at: true,
+        created_by_account_id: Some(account_id.clone()),
+        search_visibility: validated.visibility,
+        summary: None,
+        info: None,
+        tags: vec![validated.tag.clone()],
+        address: None,
+        location: None,
+    };
+    let operation = CreateOperationKey {
+        actor_id: account_id.clone(),
+        operation_id,
+    };
+    let creator_node_limit = (ctx.role == Role::Gast).then_some(state.config.max_guest_owned_nodes);
+    let outcome = convert_profile_tag_to_node_in_postgres(
+        pool,
+        ProfileTagConversion {
+            account_id: &account_id,
+            tag: &validated.tag,
+            node: &node,
+            operation: &operation,
+            circle_ids: &validated.circle_ids,
+            creator_node_limit,
+        },
+        |node_id| super::edges::build_node_origin_faden(&account_id, node_id),
+        |node_id| CreateOperationKey {
+            actor_id: account_id.clone(),
+            operation_id: super::nodes::node_activity_faden_operation_id(
+                super::edges::FadenType::Knotting,
+                &account_id,
+                node_id,
+                node_id,
+            ),
+        },
+    )
+    .await
+    .map_err(profile_tag_move_error)?;
+
+    // Publish caches exactly like POST /nodes: under the node-mutation lock,
+    // from post-commit truth, nodes before edges.
+    let publication = lock_node_faden_cache_publication(pool, &outcome.node.id, &outcome.edge)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, node_id = %outcome.node.id, "failed to lock converted node cache publication");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "profile tag moved, but cache publication failed; retry the same operation"
+                    .to_string(),
+            )
+        })?;
+    let canonical_node = publication.node.clone();
+    {
+        let mut nodes = state.nodes.write().await;
+        let mut edges = state.edges.write().await;
+        edges.remove(&outcome.edge.id);
+        if let Some(edge) = publication.edge.as_ref() {
+            edges.insert(edge.id.clone(), edge.clone());
+        }
+        nodes.remove(&outcome.node.id);
+        if let Some(node) = canonical_node.as_ref() {
+            nodes.insert(node.id.clone(), node.clone());
+        }
+        state.metrics.set_edges_cache_count(edges.len() as i64);
+        state.metrics.set_nodes_cache_count(nodes.len() as i64);
+    }
+    if let Err(error) = publication.release().await {
+        tracing::error!(%error, node_id = %outcome.node.id, "failed to release converted node cache publication lock");
+    }
+    state
+        .accounts
+        .write()
+        .await
+        .insert(outcome.profile.account.clone());
+
+    let node = canonical_node.ok_or((
+        StatusCode::CONFLICT,
+        "the moved resource was deleted before the response could be published".to_string(),
+    ))?;
+    tracing::info!(
+        event = "account.profile.tag_moved_to_node",
+        account_id = %account_id,
+        node_id = %node.id,
+        replay = !outcome.created,
+        "Saved profile tag moved into one canonical node"
+    );
+    let status = if outcome.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    let audience = audience_view(
+        node.id.clone(),
+        node.search_visibility.as_str(),
+        outcome.circle_ids,
+    );
+    let profile = profile_response(
+        &outcome.profile.account,
+        outcome.profile.address,
+        outcome.profile.location,
+    );
+    Ok((
+        status,
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(MovedProfileTagResponse {
+            node,
+            audience,
+            profile,
+        }),
+    )
+        .into_response())
 }
 
 /// Create the first/next account as an operator (Admin-only; gated by
@@ -1953,7 +2295,184 @@ mod profile_update_tests {
             radius_m: Some(250),
             location,
             clear_location: false,
+            expected_tags: None,
         }
+    }
+
+    fn move_request(tag: &str, scope: &str, circles: &[Uuid]) -> MoveProfileTagRequest {
+        MoveProfileTagRequest {
+            tag: tag.to_string(),
+            scope: scope.to_string(),
+            circle_ids: circles.to_vec(),
+            operation_id: Uuid::nil(),
+        }
+    }
+
+    #[test]
+    fn only_saved_good_or_skill_tags_with_explicit_scope_can_move() {
+        let circle = Uuid::from_u128(1);
+        let moved = validate_profile_tag_move(move_request("good:Leiter", "circles", &[circle]))
+            .expect("good tag to circle");
+        assert_eq!(moved.kind, "resource");
+        assert_eq!(moved.title, "Leiter");
+        assert_eq!(moved.visibility, SearchVisibility::Private);
+        assert_eq!(moved.circle_ids, vec![circle]);
+        let skill = validate_profile_tag_move(move_request("skill:Kochen", "public", &[]))
+            .expect("skill tag public");
+        assert_eq!(skill.kind, "offer");
+        assert_eq!(skill.visibility, SearchVisibility::Public);
+
+        for (tag, scope, circles) in [
+            ("interest:Commons", "private", vec![]),
+            ("account", "private", vec![]),
+            ("Leiter", "private", vec![]),
+            ("good:   ", "private", vec![]),
+            ("good:Leiter", "hidden", vec![]),
+            ("good:Leiter", "household", vec![]),
+            ("good:Leiter", "circles", vec![]),
+            ("good:Leiter", "private", vec![circle]),
+            ("good:Leiter", "public", vec![circle]),
+            ("good:Leiter", "circles", vec![circle, circle]),
+            (
+                "good:Leiter",
+                "circles",
+                (0..9).map(Uuid::from_u128).collect::<Vec<_>>(),
+            ),
+        ] {
+            let error = validate_profile_tag_move(move_request(tag, scope, &circles))
+                .expect_err("invalid move must be rejected");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "{tag} {scope}");
+        }
+    }
+
+    #[test]
+    fn move_operation_ids_are_namespaced_and_stable() {
+        let operation = Uuid::from_u128(7);
+        assert_eq!(
+            profile_tag_move_operation_id(operation),
+            profile_tag_move_operation_id(operation)
+        );
+        assert_ne!(
+            profile_tag_move_operation_id(operation),
+            operation.to_string()
+        );
+    }
+
+    #[test]
+    fn tag_replacement_precondition_blocks_stale_and_moved_tags() {
+        let stored = vec!["account".to_string(), "skill:Kochen".to_string()];
+        let moved = vec!["good:Leiter".to_string()];
+        let stale = vec![
+            "account".to_string(),
+            "skill:Kochen".to_string(),
+            "good:Leiter".to_string(),
+        ];
+        // Exact (order-insensitive) precondition succeeds.
+        let reordered = vec!["skill:Kochen".to_string(), "account".to_string()];
+        assert!(profile_tag_replacement_allowed(
+            &stored,
+            &moved,
+            Some(&reordered),
+            &stale
+        ));
+        assert!(!profile_tag_replacement_allowed(
+            &stored,
+            &moved,
+            Some(&stale),
+            &stored
+        ));
+        // Legacy clients without precondition may not republish moved tags.
+        assert!(!profile_tag_replacement_allowed(
+            &stored, &moved, None, &stale
+        ));
+        assert!(profile_tag_replacement_allowed(
+            &stored, &moved, None, &stored
+        ));
+    }
+
+    #[test]
+    fn legacy_form_projection_of_moved_tags_cannot_be_republished() {
+        let strings = |tags: &[&str]| tags.iter().map(|tag| tag.to_string()).collect::<Vec<_>>();
+        let stored = strings(&["account", "interest:Commons"]);
+        let moved = strings(&[
+            "good: Leiter",
+            "good:Hammer, Bohrer",
+            "skill:  Fahrrad  reparieren ",
+        ]);
+        let allowed = |requested: &[&str]| {
+            profile_tag_replacement_allowed(&stored, &moved, None, &strings(requested))
+        };
+
+        // Trimmed form of a moved tag with inner space.
+        assert!(!allowed(&["good:Leiter"]));
+        // Both fragments of one moved CSV tag, alone and together, and verbatim.
+        assert!(!allowed(&["good:Hammer"]));
+        assert!(!allowed(&["good:Bohrer"]));
+        assert!(!allowed(&["good:Hammer", "good:Bohrer"]));
+        assert!(!allowed(&["good:Hammer, Bohrer"]));
+        assert!(!allowed(&["good: Leiter"]));
+        // Spaces around and inside a skill; inner spaces are kept by the form.
+        assert!(!allowed(&["skill:Fahrrad  reparieren"]));
+        assert!(!allowed(&["skill:  Fahrrad  reparieren "]));
+        // Exact duplicate requests and unrelated tags next to a moved one.
+        assert!(!allowed(&["good:Leiter", "good:Leiter"]));
+        assert!(!allowed(&[
+            "interest:Commons",
+            "good:Werkzeug",
+            "good:Leiter"
+        ]));
+        // Other prefixes, longer names, other inner spacing and unrelated tags stay.
+        assert!(allowed(&["skill:Leiter"]));
+        assert!(allowed(&["interest:Hammer"]));
+        assert!(allowed(&["good:Leiterwagen", "good:Hammerwerk"]));
+        assert!(allowed(&["skill:Fahrrad reparieren"]));
+        assert!(allowed(&["good:Werkzeug", "account"]));
+        assert!(allowed(&[]));
+
+        // Already public tags are retained, not republished.
+        let stored_hammer = strings(&["good:Hammer"]);
+        assert!(profile_tag_replacement_allowed(
+            &stored_hammer,
+            &moved,
+            None,
+            &stored_hammer
+        ));
+        assert!(!profile_tag_replacement_allowed(
+            &stored_hammer,
+            &moved,
+            None,
+            &strings(&["good:Hammer", "good:Bohrer"])
+        ));
+
+        // Markers without a movable prefix or suffix only match verbatim.
+        let odd = strings(&["good:", "interest:Segeln, Rudern", "good:,"]);
+        assert!(!profile_tag_replacement_allowed(
+            &stored,
+            &odd,
+            None,
+            &strings(&["good:"])
+        ));
+        assert!(profile_tag_replacement_allowed(
+            &stored,
+            &odd,
+            None,
+            &strings(&["interest:Segeln", "good:Segeln"])
+        ));
+        assert!(profile_tag_replacement_allowed(
+            &stored,
+            &odd,
+            None,
+            &strings(&["good:x"])
+        ));
+
+        // A real expected_tags baseline keeps working, including a deliberate
+        // republish of a moved tag.
+        assert!(profile_tag_replacement_allowed(
+            &stored,
+            &moved,
+            Some(&stored),
+            &strings(&["good:Leiter"])
+        ));
     }
 
     #[test]
@@ -2122,6 +2641,7 @@ mod profile_update_tests {
             radius_m: None,
             location: None,
             clear_location: false,
+            expected_tags: None,
         })
         .expect("valid profile");
 

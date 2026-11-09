@@ -34,9 +34,11 @@ werden separat abgenommen. Das Papier selbst ist kein Produktionsbeleg.
 Produktionscommit b83e7e42; negative anonyme Audience-Abfragen liefern 401.
 Echte mehrseitige Authentifizierungs- und physische iPad-Abnahme stehen
 aus. P2b erhält über PR #2078 einen ersten sicheren Profil-zu-Knoten-
-Einstieg für neue Ressourcen; die individuelle Freigabe bereits bestehender
-Profil-Tags ist nicht umgesetzt. P3 (Benachrichtigungen) und P4 (große Karte)
-sind weiterhin offen.
+Einstieg für neue Ressourcen. Der Umzug **eines bereits gespeicherten**
+`good:`/`skill:`-Profil-Tags in einen eigenen Knoten (Issue #2081) ist als
+Änderungsentwurf implementiert und lokal gegen eine Wegwerf-PostgreSQL
+getestet, aber weder integriert noch ausgeliefert (siehe „Umsetzung P2b“).
+P3 (Benachrichtigungen) und P4 (große Karte) sind weiterhin offen.
 Für neue einzeln sichtbarkeitsgesteuerte Güter/Fähigkeiten ist das
 vorhandene Knotenmodell mit P2-Sichtbarkeit die einzige sichere
 Speicherung; öffentliche Garnrollen-Tags dürfen **nicht** als private
@@ -274,6 +276,51 @@ Knotenweben funktionieren unverändert.
 „Fähigkeit: Fahrrad reparieren“ öffentlich und „Meine Leiter“
 hausintern zeigen, ohne Daten zu duplizieren, die übrige
 Garnrolle zu verstecken oder einen neuen Ressourceneditor zu erfinden.
+
+#### Stand P2b: gespeicherten Profil-Tag umziehen (Issue #2081, Entwurf)
+
+Status: im Worktree implementiert und lokal getestet; **nicht** gemergt,
+nicht deployt, keine Produktions- oder iPad-Abnahme.
+
+- **API:** `POST /api/accounts/me/profile/resources` mit `tag` (exakt ein
+  gespeicherter `good:`/`skill:`-Tag), `scope` (`private` = Nur ich,
+  `circles` = nur bestätigte aktive Kreise, `public`), `circle_ids`,
+  `operation_id`. Antwort `201` (neu) bzw. `200` (Replay) mit Knoten,
+  Audience und dem neuen eigenen Profil; `Cache-Control: private, no-store`.
+- **Atomar in PostgreSQL:** eine Transaktion entfernt genau diesen Tag aus
+  `domain_accounts.public_payload`, legt den Knoten (`good:` → `resource`,
+  `skill:` → `offer`, ohne Kartenort) mit seiner ersten dauerhaften
+  Sichtbarkeit an, schreibt den Pflicht-Ursprungsfaden und die Kreis-Grants.
+  Sperrreihenfolge: Account-Lifecycle-Lock → Accountzeile → Kreis-
+  Zustimmungszeilen (vor jedem generationserhöhenden Schreiben) →
+  Operation-Lock → Knoten-Mutation-Lock. Jeder Fehler rollt alles zurück;
+  der Tag bleibt dann öffentlich.
+- **Idempotenz:** Operation-IDs liegen in einem eigenen Namensraum. Ein
+  Replay liefert denselben Knoten nur, wenn Tag, Art, Titel **und** aktuelle
+  Audience exakt der Anfrage entsprechen und der Tag nicht wieder öffentlich
+  ist; sonst `409`.
+- **Kein Lost Update:** `PATCH /accounts/me/profile` akzeptiert
+  `expected_tags`; weicht der gespeicherte Satz ab, folgt `409`. Ohne
+  `expected_tags` verhindert ein privater Marker (`moved_profile_tags`,
+  nie öffentlich projiziert), dass ein veralteter Client einen umgezogenen
+  Wert erneut veröffentlicht. Der Marker wird nie still verdrängt; bei 256
+  Einträgen schlägt ein weiterer Umzug geschlossen fehl.
+- **JSONL:** nicht unterstützt (`503`), keine Teilschreibungen.
+- **Oberfläche:** „Meine Garnrolle“ bietet nur gespeicherte `good:`/
+  `skill:`-Tags an, Standard „Nur ich“, ein Hinweis verneint die
+  Rückholbarkeit fremder Kopien. Ungespeicherte andere Eingaben bleiben
+  erhalten; bei `409` nur ehrliche Meldung und Tag-Abgleich, kein
+  automatisches erneutes Speichern.
+- **Belege (lokal):** `apps/api/tests/db_profile_tag_resource.rs` gegen
+  Wegwerf-PostgreSQL (Atomarität inkl. injiziertem Grant-Fehler, Replay,
+  parallele Instanzen, Fremdzugriff, Marker-Kapazität, JSONL-`503`) sowie
+  `apps/web/tests/garnrolle-move-resource.spec.ts` (gemockte API; kein
+  Datenschutzbeweis).
+- **Offen:** `/search` wird nur über dieselbe SQL-Lesepolicy, nicht über den
+  vollständigen Suchpfad mit Embeddings geprüft; Massenmigration bleibt
+  bewusst ausgeschlossen; Altbestand ohne `expected_tags` (ältere Bundles)
+  ist nur über den Marker abgesichert; echte authentifizierte Mehrkonten-
+  und iPad-Abnahme fehlen.
 
 ### P3 – Adressierung und freiwillige Hinweise
 

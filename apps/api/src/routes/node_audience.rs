@@ -121,7 +121,7 @@ fn no_store<T: Serialize>(body: T) -> Response {
     ([(header::CACHE_CONTROL, "private, no-store")], Json(body)).into_response()
 }
 
-fn audience_view(id: String, visibility: &str, ids: Vec<Uuid>) -> NodeAudienceView {
+pub(crate) fn audience_view(id: String, visibility: &str, ids: Vec<Uuid>) -> NodeAudienceView {
     let scope = match visibility {
         "public" => "public",
         "private" if !ids.is_empty() => "circles",
