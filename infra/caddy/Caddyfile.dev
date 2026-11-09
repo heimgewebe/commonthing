@@ -35,9 +35,11 @@
     # Der Vite-Devserver liefert importiertes CSS zur Laufzeit als <style>-Element
     # aus (HMR); diese Elemente unterliegen der CSP. Deshalb bleibt die
     # Inline-Ausnahme fuer Styles allein auf diesem Devpfad bestehen. Den
-    # erlaubten Wert fixiert policies/security.yml, Skripte bleiben auch hier
-    # geschlossen; beides prueft scripts/guard/security-headers-guard.sh.
-    Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none';"
+    # erlaubten Wert fixiert policies/security.yml.
+    # Vite/SvelteKit nutzt im Devmodus Inline-Bootstrap-Skripte. Der Caddy-Header
+    # darf diese nicht mit default-src/script-src blockieren; SvelteKit besitzt
+    # die Dokument-CSP. Die Produktions-Caddyfiles bleiben unveraendert.
+    Content-Security-Policy "style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none';"
     X-Frame-Options "DENY"
     Referrer-Policy "no-referrer"
     # Optional diagnostic header. Deploy can set WELTGEWEBE_BUILD to the canonical
