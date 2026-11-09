@@ -9,6 +9,7 @@ use chrono::{DateTime, Timelike, Utc};
 use futures_util::TryStreamExt;
 use serde_json::{json, Map, Value};
 use sqlx::{PgPool, Postgres, Transaction};
+use std::ops::ControlFlow;
 use uuid::Uuid;
 
 use crate::auth::accounts::AccountStore;
@@ -297,28 +298,69 @@ pub async fn load_nodes_bbox_after_id_from_postgres(
 }
 
 pub async fn load_edges_from_postgres(pool: &PgPool) -> Result<OrderedCache<Edge>> {
+    Ok(load_edges_from_postgres_counted(pool).await?.0)
+}
+
+/// Same as [`load_edges_from_postgres`], plus the number of physical rows
+/// received from PostgreSQL. Exposed for regression tests of the read bound.
+#[doc(hidden)]
+pub async fn load_edges_from_postgres_counted(
+    pool: &PgPool,
+) -> Result<(OrderedCache<Edge>, usize)> {
     let max_edges = crate::routes::edges::max_edges_cache_limit();
     // No SQL-side LIMIT: rejected rows must not consume a physical row slot
     // that a later valid row would need. The decoder bounds physical reads
     // itself, stopping as soon as it has examined `max_edges + 1` *accepted*
     // rows (the `+ 1` only confirms truncation; it is never cached).
-    //
+    let mut rows = sqlx::query_as::<_, EdgeRow>(
+        "SELECT id, source_id, target_id, edge_kind, created_at, payload::text \
+         FROM domain_edges ORDER BY id ASC",
+    )
+    .fetch(pool);
+    let mut received = 0usize;
+
+    if max_edges < EDGE_PIPELINE_MIN_LIMIT {
+        // Small limits keep the exact read bound: decode inline and stop the
+        // stream at the first row past the limit.
+        let mut decoder = EdgeDecoder::new(max_edges);
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .context("failed to load edges from domain_edges")?
+        {
+            received += 1;
+            if decoder.push(row).is_break() {
+                break;
+            }
+        }
+        return Ok((decoder.finish(), received));
+    }
+
     // Receiving rows and decoding them are both O(N) and cost about the same
     // at 100k edges. They run as a two-stage pipeline: this task streams rows
     // from PostgreSQL in id order while a blocking thread decodes them in the
     // same order. A decoder that stops early drops its receiver, and the next
-    // send ends the stream.
-    let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<EdgeRow>>(EDGE_DECODE_QUEUE_BATCHES);
-    let decoder = tokio::task::spawn_blocking(move || decode_edge_rows(receiver, max_edges));
+    // send ends the stream. When the table is larger than the limit, the
+    // stream can read up to (queue + 2) batches past the stopping row, about
+    // 10k rows, which is at most ~16% of the smallest limit on this path.
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<Vec<EdgeRow>>(EDGE_DECODE_QUEUE_BATCHES);
+    let decoder = tokio::task::spawn_blocking(move || {
+        let mut decoder = EdgeDecoder::new(max_edges);
+        'batches: while let Some(batch) = receiver.blocking_recv() {
+            for row in batch {
+                if decoder.push(row).is_break() {
+                    break 'batches;
+                }
+            }
+        }
+        decoder.finish()
+    });
 
     let streamed = async {
-        let mut rows = sqlx::query_as::<_, EdgeRow>(
-            "SELECT id, source_id, target_id, edge_kind, created_at, payload::text \
-             FROM domain_edges ORDER BY id ASC",
-        )
-        .fetch(pool);
         let mut batch = Vec::with_capacity(EDGE_DECODE_BATCH_ROWS);
         while let Some(row) = rows.try_next().await? {
+            received += 1;
             batch.push(row);
             if batch.len() == EDGE_DECODE_BATCH_ROWS {
                 let full =
@@ -338,9 +380,10 @@ pub async fn load_edges_from_postgres(pool: &PgPool) -> Result<OrderedCache<Edge
     .await;
     // Closing the channel lets the decoder finish its last batch.
     drop(sender);
+    drop(rows);
     let decoded = decoder.await.context("edge decoder task failed")?;
     streamed.context("failed to load edges from domain_edges")?;
-    Ok(decoded)
+    Ok((decoded, received))
 }
 
 /// Edge payload fields the projection reads, with the exact semantics of
@@ -596,80 +639,97 @@ fn decode_edge_payload_value(text: &str) -> DecodedEdgePayload {
 
 const EDGE_DECODE_BATCH_ROWS: usize = 1024;
 const EDGE_DECODE_QUEUE_BATCHES: usize = 8;
+/// Limits below this decode inline so the stream stops exactly at the limit.
+const EDGE_PIPELINE_MIN_LIMIT: usize = 64 * 1024;
 
 /// Decodes edge rows in PostgreSQL order. The skip, limit and truncation rules
 /// are unchanged from the former single-loop loader.
-fn decode_edge_rows(
-    mut batches: tokio::sync::mpsc::Receiver<Vec<EdgeRow>>,
+struct EdgeDecoder {
     max_edges: usize,
-) -> OrderedCache<Edge> {
-    let mut cache = OrderedCache::new();
-    let mut seen = 0usize;
-    let mut skipped = 0usize;
-    let mut truncated = false;
-    'batches: while let Some(batch) = batches.blocking_recv() {
-        for (id, source_id, target_id, edge_kind, created_at, payload_text) in batch {
-            let payload = decode_edge_payload(&payload_text);
-            let Ok(expires_at) = payload.expires_at else {
-                tracing::warn!(edge_id = %id, "skipping domain edge with malformed expires_at payload");
-                skipped += 1;
-                continue;
-            };
+    cache: OrderedCache<Edge>,
+    seen: usize,
+    skipped: usize,
+    truncated: bool,
+}
 
-            let Ok((faden_type, faden_subject_id)) = payload.faden else {
-                tracing::warn!(edge_id = %id, "skipping domain edge with malformed typed Faden metadata");
-                skipped += 1;
-                continue;
-            };
-
-            let edge = Edge {
-                id: id.clone(),
-                source_id,
-                source_type: payload.source_type,
-                target_id,
-                target_type: payload.target_type,
-                edge_kind,
-                faden_type,
-                faden_subject_id,
-                note: payload.note,
-                created_at: created_at.map(LifecycleTimestamp::from_datetime),
-                expires_at,
-            };
-            // Checked before the cache-limit gate for the same reason as the
-            // malformed-payload check above: a row that can never be active for
-            // any `now` must never consume one of the `max_edges` slots that a
-            // genuinely reachable edge would need.
-            if edge_is_permanently_unreachable(&edge) {
-                tracing::warn!(
-                    edge_id = %edge.id,
-                    "skipping domain edge that can never be active under any lifecycle rule"
-                );
-                skipped += 1;
-                continue;
-            }
-
-            if seen >= max_edges {
-                truncated = true;
-                break 'batches;
-            }
-
-            cache.insert(id, edge);
-            seen += 1;
+impl EdgeDecoder {
+    fn new(max_edges: usize) -> Self {
+        Self {
+            max_edges,
+            cache: OrderedCache::new(),
+            seen: 0,
+            skipped: 0,
+            truncated: false,
         }
     }
-    if truncated {
-        tracing::warn!(
-            max_edges,
-            "Edges cache limit reached, truncating PostgreSQL load"
-        );
+
+    /// `Break` means the limit is reached and no further row is needed.
+    fn push(&mut self, row: EdgeRow) -> ControlFlow<()> {
+        let (id, source_id, target_id, edge_kind, created_at, payload_text) = row;
+        let payload = decode_edge_payload(&payload_text);
+        let Ok(expires_at) = payload.expires_at else {
+            tracing::warn!(edge_id = %id, "skipping domain edge with malformed expires_at payload");
+            self.skipped += 1;
+            return ControlFlow::Continue(());
+        };
+
+        let Ok((faden_type, faden_subject_id)) = payload.faden else {
+            tracing::warn!(edge_id = %id, "skipping domain edge with malformed typed Faden metadata");
+            self.skipped += 1;
+            return ControlFlow::Continue(());
+        };
+
+        let edge = Edge {
+            id: id.clone(),
+            source_id,
+            source_type: payload.source_type,
+            target_id,
+            target_type: payload.target_type,
+            edge_kind,
+            faden_type,
+            faden_subject_id,
+            note: payload.note,
+            created_at: created_at.map(LifecycleTimestamp::from_datetime),
+            expires_at,
+        };
+        // Checked before the cache-limit gate for the same reason as the
+        // malformed-payload check above: a row that can never be active for
+        // any `now` must never consume one of the `max_edges` slots that a
+        // genuinely reachable edge would need.
+        if edge_is_permanently_unreachable(&edge) {
+            tracing::warn!(
+                edge_id = %edge.id,
+                "skipping domain edge that can never be active under any lifecycle rule"
+            );
+            self.skipped += 1;
+            return ControlFlow::Continue(());
+        }
+
+        if self.seen >= self.max_edges {
+            self.truncated = true;
+            return ControlFlow::Break(());
+        }
+
+        self.cache.insert(id, edge);
+        self.seen += 1;
+        ControlFlow::Continue(())
     }
-    tracing::info!(
-        count = cache.len(),
-        skipped,
-        truncated,
-        "Loaded edges from PostgreSQL"
-    );
-    cache
+
+    fn finish(self) -> OrderedCache<Edge> {
+        if self.truncated {
+            tracing::warn!(
+                max_edges = self.max_edges,
+                "Edges cache limit reached, truncating PostgreSQL load"
+            );
+        }
+        tracing::info!(
+            count = self.cache.len(),
+            skipped = self.skipped,
+            truncated = self.truncated,
+            "Loaded edges from PostgreSQL"
+        );
+        self.cache
+    }
 }
 
 /// Read-only readiness counters for a future `domain_accounts.webauthn_user_id`
