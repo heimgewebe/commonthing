@@ -620,7 +620,7 @@
   <div class="section-head">
     <div>
       <p class="eyebrow">Meine Garnrolle</p>
-      <h2>Deine Garnrolle ist dein Anfang im Gewebe.</h2>
+      <h2>Deine Garnrolle im Gewebe.</h2>
     </div>
     <span class="state-pill" data-state={visibility.state}
       >{visibility.label}</span
@@ -630,8 +630,7 @@
   {#if !$authStore.authenticated}
     <div class="empty-card" data-testid="my-garnrolle-anonymous">
       <p>
-        Bei der Registrierung entsteht deine Garnrolle. Nach dem Login kannst du
-        sie hier einrichten.
+        Nach der Registrierung richtest du hier deine Garnrolle ein.
       </p>
       <a class="btn btn-primary" href="/login">Login starten</a>
     </div>
@@ -670,7 +669,7 @@
       <fieldset disabled={formDisabled}>
         <legend>1. Garnrolle beschreiben</legend>
         <p class="field-intro">
-          Nur der Anzeigename ist erforderlich. Den Rest kannst du ergänzen.
+          Nur der Anzeigename ist Pflicht.
         </p>
         <label>
           Anzeigename
@@ -752,10 +751,9 @@
           </small>
         {/if}
         <p class="field-intro" data-testid="garnrolle-public-tags-notice">
-          Diese Profilangaben sind öffentlich, auch bei privatem Kartenanker.
-          Soll ein einzelnes Gut oder eine Fähigkeit nur für dich oder eine
-          Gemeinschaft sichtbar sein, knüpfe dafür einen Knoten. Trage die
-          private Ressource nicht zusätzlich hier ein.
+          Profil-Tags sind immer öffentlich, auch bei privatem Kartenanker.
+          Für private oder gemeinschaftssichtbare Güter und Fähigkeiten nutze
+          eigene Knoten; trage sie nicht zusätzlich als Profil-Tag ein.
         </p>
         <button
           type="button"
@@ -801,8 +799,7 @@
       <fieldset disabled={formDisabled}>
         <legend>2. Privaten Kartenanker wählen</legend>
         <p class="field-intro">
-          Der Kartenanker ist zunächst privat. Erst deine Auswahl im nächsten
-          Schritt bestimmt, ob und wie daraus eine öffentliche Position wird.
+          Der Kartenanker bleibt privat, bis du seine Sichtbarkeit wählst.
         </p>
 
         <div class="location-card" data-testid="garnrolle-location-state">
@@ -870,7 +867,7 @@
             />
             <span>
               <strong>Privat – nicht öffentlich auf der Karte</strong>
-              <small>Der Kartenanker bleibt gespeichert und unsichtbar.</small>
+              <small>Der Kartenanker bleibt unsichtbar.</small>
             </span>
           </label>
           <label class="radio-card">
