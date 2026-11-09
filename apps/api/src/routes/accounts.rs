@@ -2391,6 +2391,91 @@ mod profile_update_tests {
     }
 
     #[test]
+    fn legacy_form_projection_of_moved_tags_cannot_be_republished() {
+        let strings = |tags: &[&str]| tags.iter().map(|tag| tag.to_string()).collect::<Vec<_>>();
+        let stored = strings(&["account", "interest:Commons"]);
+        let moved = strings(&[
+            "good: Leiter",
+            "good:Hammer, Bohrer",
+            "skill:  Fahrrad  reparieren ",
+        ]);
+        let allowed = |requested: &[&str]| {
+            profile_tag_replacement_allowed(&stored, &moved, None, &strings(requested))
+        };
+
+        // Trimmed form of a moved tag with inner space.
+        assert!(!allowed(&["good:Leiter"]));
+        // Both fragments of one moved CSV tag, alone and together, and verbatim.
+        assert!(!allowed(&["good:Hammer"]));
+        assert!(!allowed(&["good:Bohrer"]));
+        assert!(!allowed(&["good:Hammer", "good:Bohrer"]));
+        assert!(!allowed(&["good:Hammer, Bohrer"]));
+        assert!(!allowed(&["good: Leiter"]));
+        // Spaces around and inside a skill; inner spaces are kept by the form.
+        assert!(!allowed(&["skill:Fahrrad  reparieren"]));
+        assert!(!allowed(&["skill:  Fahrrad  reparieren "]));
+        // Exact duplicate requests and unrelated tags next to a moved one.
+        assert!(!allowed(&["good:Leiter", "good:Leiter"]));
+        assert!(!allowed(&[
+            "interest:Commons",
+            "good:Werkzeug",
+            "good:Leiter"
+        ]));
+        // Other prefixes, longer names, other inner spacing and unrelated tags stay.
+        assert!(allowed(&["skill:Leiter"]));
+        assert!(allowed(&["interest:Hammer"]));
+        assert!(allowed(&["good:Leiterwagen", "good:Hammerwerk"]));
+        assert!(allowed(&["skill:Fahrrad reparieren"]));
+        assert!(allowed(&["good:Werkzeug", "account"]));
+        assert!(allowed(&[]));
+
+        // Already public tags are retained, not republished.
+        let stored_hammer = strings(&["good:Hammer"]);
+        assert!(profile_tag_replacement_allowed(
+            &stored_hammer,
+            &moved,
+            None,
+            &stored_hammer
+        ));
+        assert!(!profile_tag_replacement_allowed(
+            &stored_hammer,
+            &moved,
+            None,
+            &strings(&["good:Hammer", "good:Bohrer"])
+        ));
+
+        // Markers without a movable prefix or suffix only match verbatim.
+        let odd = strings(&["good:", "interest:Segeln, Rudern", "good:,"]);
+        assert!(!profile_tag_replacement_allowed(
+            &stored,
+            &odd,
+            None,
+            &strings(&["good:"])
+        ));
+        assert!(profile_tag_replacement_allowed(
+            &stored,
+            &odd,
+            None,
+            &strings(&["interest:Segeln", "good:Segeln"])
+        ));
+        assert!(profile_tag_replacement_allowed(
+            &stored,
+            &odd,
+            None,
+            &strings(&["good:x"])
+        ));
+
+        // A real expected_tags baseline keeps working, including a deliberate
+        // republish of a moved tag.
+        assert!(profile_tag_replacement_allowed(
+            &stored,
+            &moved,
+            Some(&stored),
+            &strings(&["good:Leiter"])
+        ));
+    }
+
+    #[test]
     fn profile_title_limit_uses_schema_characters() {
         let valid = "🐋".repeat(MAX_ACCOUNT_TITLE_LEN);
         let invalid = "🐋".repeat(MAX_ACCOUNT_TITLE_LEN + 1);

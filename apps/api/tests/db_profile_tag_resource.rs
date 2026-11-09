@@ -823,6 +823,166 @@ async fn concurrent_instances_cannot_lose_updates_or_duplicate_nodes() {
     assert_eq!(marker, vec!["good:Leiter", "skill:Fahrrad reparieren"]);
 }
 
+fn with_tag(tags: &[String], extra: &str) -> Vec<String> {
+    let mut all = tags.to_vec();
+    all.push(extra.to_string());
+    all
+}
+
+/// A browser opened before the update has no `expected_tags` and re-sends every
+/// field through the comma/trim form, so `good: Leiter` returns as `good:Leiter`
+/// and `good:Hammer, Bohrer` as two tags. None of them may become public again.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL for an isolated disposable direct PostgreSQL database"]
+async fn legacy_form_projection_cannot_republish_moved_tags() {
+    let pool = disposable_pool().await;
+    let owner = Uuid::new_v4().to_string();
+    let saved = [
+        "account",
+        "garnrolle",
+        "good: Leiter",
+        "good:Hammer, Bohrer",
+        "skill: Fahrrad reparieren",
+        "interest:Commons",
+    ];
+    insert_account(&pool, &owner, "weber", &saved).await;
+    let state = pg_instance(&pool, 1_000).await;
+    for tag in [
+        "good: Leiter",
+        "good:Hammer, Bohrer",
+        "skill: Fahrrad reparieren",
+    ] {
+        let (status, _) = convert(
+            &state,
+            &owner,
+            Role::Weber,
+            move_request(tag, "private", &[], Uuid::new_v4()),
+        )
+        .await
+        .expect("move saved tag");
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let remaining = vec!["account", "garnrolle", "interest:Commons"];
+    assert_eq!(stored_tags(&pool, &owner).await, remaining);
+
+    let marker = || async {
+        let marker: Value = sqlx::query_scalar(
+            "SELECT private_payload->'moved_profile_tags' FROM domain_accounts WHERE id=$1",
+        )
+        .bind(&owner)
+        .fetch_one(&pool)
+        .await
+        .expect("moved marker");
+        let mut marker: Vec<String> = serde_json::from_value(marker).expect("marker list");
+        marker.sort();
+        marker
+    };
+    let expected_marker = vec![
+        "good: Leiter",
+        "good:Hammer, Bohrer",
+        "skill: Fahrrad reparieren",
+    ];
+    assert_eq!(marker().await, expected_marker);
+
+    let legacy = |tags: &[&str]| {
+        let mut all = remaining.clone();
+        all.extend_from_slice(tags);
+        json!({"title": owner, "map_state": "not_on_map", "tags": all})
+    };
+    for republished in [
+        vec!["good:Leiter"],
+        vec!["good:Hammer"],
+        vec!["good:Bohrer"],
+        vec!["good:Hammer", "good:Bohrer"],
+        vec!["skill:Fahrrad reparieren"],
+        vec!["good: Leiter"],
+        vec!["good:Hammer, Bohrer"],
+        vec!["good:Werkzeug", "good:Bohrer"],
+    ] {
+        let error = patch_profile(&state, &owner, legacy(&republished))
+            .await
+            .expect_err("legacy PATCH republishing a moved tag");
+        assert_eq!(error.0, StatusCode::CONFLICT, "{republished:?}");
+        assert_eq!(stored_tags(&pool, &owner).await, remaining);
+        assert_eq!(marker().await, expected_marker);
+    }
+
+    // Unrelated tags, including other prefixes with the same words, still save.
+    let saved_other = patch_profile(
+        &state,
+        &owner,
+        legacy(&["good:Leiterwagen", "skill:Leiter", "interest:Hammer"]),
+    )
+    .await
+    .expect("legacy PATCH without moved tags");
+    assert!(saved_other.contains(&"good:Leiterwagen".to_string()));
+    assert!(saved_other.contains(&"skill:Leiter".to_string()));
+    assert_eq!(marker().await, expected_marker);
+
+    // Another tag was published in between; the replay is still blocked and
+    // the markers survive.
+    let current = stored_tags(&pool, &owner).await;
+    patch_profile(
+        &state,
+        &owner,
+        json!({
+            "title": owner, "map_state": "not_on_map",
+            "tags": with_tag(&current, "good:Werkzeug"),
+            "expected_tags": current,
+        }),
+    )
+    .await
+    .expect("fresh editor publishes another tag");
+    let before_replay = stored_tags(&pool, &owner).await;
+    let replay = patch_profile(
+        &state,
+        &owner,
+        json!({
+            "title": owner, "map_state": "not_on_map",
+            "tags": with_tag(&before_replay, "good:Leiter"),
+        }),
+    )
+    .await
+    .expect_err("replayed legacy PATCH");
+    assert_eq!(replay.0, StatusCode::CONFLICT);
+    assert_eq!(stored_tags(&pool, &owner).await, before_replay);
+    assert!(before_replay.contains(&"good:Werkzeug".to_string()));
+    assert_eq!(marker().await, expected_marker);
+
+    // Re-sending already public tags is retention, not republication.
+    patch_profile(
+        &state,
+        &owner,
+        json!({"title": owner, "map_state": "not_on_map", "tags": before_replay}),
+    )
+    .await
+    .expect("legacy PATCH keeping the public tags");
+    assert_eq!(marker().await, expected_marker);
+
+    // A deliberate republish with a real baseline still works for the exact tag.
+    patch_profile(
+        &state,
+        &owner,
+        json!({
+            "title": owner, "map_state": "not_on_map",
+            "tags": with_tag(&before_replay, "good: Leiter"),
+            "expected_tags": before_replay,
+        }),
+    )
+    .await
+    .expect("deliberate republish with expected_tags");
+    assert!(stored_tags(&pool, &owner)
+        .await
+        .contains(&"good: Leiter".to_string()));
+    assert_eq!(
+        marker().await,
+        vec!["good:Hammer, Bohrer", "skill: Fahrrad reparieren"]
+    );
+    let public = public_account_json(&state, &owner, None).await;
+    assert!(!public.contains("moved_profile_tags"));
+    assert!(!public.contains("Bohrer"));
+}
+
 /// JSONL cannot atomically move a tag across account and node files. It must
 /// say so (503) instead of silently writing half of the operation.
 #[tokio::test]

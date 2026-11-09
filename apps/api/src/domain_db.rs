@@ -1819,11 +1819,47 @@ pub const MOVED_PROFILE_TAGS_KEY: &str = "moved_profile_tags";
 /// republished by a legacy full-profile PATCH without `expected_tags`.
 pub const MAX_MOVED_PROFILE_TAGS: usize = 256;
 
+/// Prefixes a profile tag can be moved under (see `validate_profile_tag_move`).
+const MOVABLE_PROFILE_TAG_PREFIXES: [&str; 2] = ["good:", "skill:"];
+
+/// Trim as the pre-CAS browser form did (`String.prototype.trim`): it keeps
+/// U+0085 and strips U+FEFF, unlike Rust's `str::trim`.
+fn js_trim(value: &str) -> &str {
+    value.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}')
+}
+
+/// Whether `requested` is the moved tag itself or what a legacy form (comma
+/// split, per-entry trim, prefix re-added) would send back for it, e.g. the
+/// moved `good: Leiter` returns as `good:Leiter` and `good:Hammer, Bohrer` as
+/// `good:Hammer` and `good:Bohrer`. Markers without a movable prefix or suffix
+/// can only match exactly.
+fn is_legacy_projection_of_moved_tag(moved: &str, requested: &str) -> bool {
+    if moved == requested {
+        return true;
+    }
+    let Some(prefix) = MOVABLE_PROFILE_TAG_PREFIXES
+        .iter()
+        .find(|prefix| moved.starts_with(**prefix))
+    else {
+        return false;
+    };
+    let Some(requested_entry) = requested.strip_prefix(prefix) else {
+        return false;
+    };
+    let moved_suffix = &moved[prefix.len()..];
+    !requested_entry.is_empty()
+        && std::iter::once(moved_suffix)
+            .chain(moved_suffix.split(','))
+            .any(|entry| entry.trim() == requested_entry || js_trim(entry) == requested_entry)
+}
+
 /// Decide whether a full profile-tag replacement may be applied.
 ///
 /// With `expected_tags`, the stored public set must be exactly what the editor
 /// read (order-insensitive). Without it, the request may not reintroduce a tag
-/// that an earlier conversion deliberately removed from the public profile.
+/// that an earlier conversion deliberately removed from the public profile,
+/// neither verbatim nor as the entry a legacy form derives from it. Tags that
+/// are already public are retained, not republished, and never block.
 pub fn profile_tag_replacement_allowed(
     stored: &[String],
     moved: &[String],
@@ -1840,7 +1876,12 @@ pub fn profile_tag_replacement_allowed(
             stored.dedup();
             expected == stored
         }
-        None => !requested.iter().any(|tag| moved.contains(tag)),
+        None => !requested.iter().any(|tag| {
+            !stored.contains(tag)
+                && moved
+                    .iter()
+                    .any(|moved| is_legacy_projection_of_moved_tag(moved, tag))
+        }),
     }
 }
 
