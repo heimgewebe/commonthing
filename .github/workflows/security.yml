@@ -116,7 +116,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo audit --json | tee cargo-audit-report.json
-          if ! jq -e '.settings.ignore == ["RUSTSEC-2023-0071","RUSTSEC-2026-0459"]' cargo-audit-report.json > /dev/null; then
+          if ! jq -e \
+            '.settings.ignore == ["RUSTSEC-2023-0071","RUSTSEC-2026-0459"]' \
+            cargo-audit-report.json > /dev/null; then
             echo "::error file=.cargo/audit.toml::unexpected cargo audit exceptions"
             echo "Only RUSTSEC-2023-0071 and RUSTSEC-2026-0459 have a build-graph proof."
             exit 1
