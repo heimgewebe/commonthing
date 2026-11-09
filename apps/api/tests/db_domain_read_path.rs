@@ -14,7 +14,7 @@ use weltgewebe_api::{
         DomainReadSource, PasskeyCredentialSource,
     },
     domain_db::{
-        load_accounts_from_postgres, load_edges_from_postgres,
+        load_accounts_from_postgres, load_edges_from_postgres, load_edges_from_postgres_counted,
         load_nodes_bbox_after_id_from_postgres, load_nodes_bbox_from_postgres,
         load_nodes_from_postgres,
     },
@@ -354,6 +354,109 @@ async fn edges_loader_respects_max_edges_cache_limit() {
         cache.len() <= 1,
         "with MAX_EDGES_CACHE=1, loader must materialise at most one edge"
     );
+    clean(&pool).await;
+}
+
+async fn insert_batch_edges(pool: &PgPool, count: i32) -> Vec<String> {
+    // Malformed rows (every 997th) are spread across decoder batch boundaries.
+    sqlx::query(
+        "INSERT INTO domain_edges (id, source_id, target_id, edge_kind, payload) \
+         SELECT format('rp-batch-%s', lpad(i::text, 6, '0')), 'rp-node-a', 'rp-node-b', 'relates', \
+                CASE WHEN i % 997 = 0 THEN '{\"expires_at\": 1}'::jsonb \
+                     ELSE jsonb_build_object('note', 'n' || i) END \
+           FROM generate_series(1, $1) AS i",
+    )
+    .bind(count)
+    .execute(pool)
+    .await
+    .expect("insert batch edges");
+    (1..=count)
+        .filter(|i| i % 997 != 0)
+        .map(|i| format!("rp-batch-{i:06}"))
+        .collect()
+}
+
+fn cache_ids(cache: &OrderedCache<weltgewebe_api::routes::edges::Edge>) -> Vec<String> {
+    cache.iter_in_order().map(|edge| edge.id.clone()).collect()
+}
+
+/// Physical rows the old single-loop loader read for a given limit: every row
+/// up to and including the first accepted row past the limit.
+fn sequential_read_bound(count: i32, limit: usize) -> usize {
+    let mut accepted = 0usize;
+    for i in 1..=count {
+        if i % 997 != 0 {
+            if accepted == limit {
+                return i as usize;
+            }
+            accepted += 1;
+        }
+    }
+    count as usize
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn edges_loader_small_limits_stop_reading_at_the_limit() {
+    let pool = prepare_pool().await;
+    let valid = insert_batch_edges(&pool, 3500).await;
+
+    for limit in [0usize, 1, 2100, 10_000] {
+        let _limit = EnvGuard::set("MAX_EDGES_CACHE", &limit.to_string());
+        let (cache, received) = load_edges_from_postgres_counted(&pool)
+            .await
+            .expect("load edges");
+        let expected = &valid[..limit.min(valid.len())];
+        assert_eq!(cache_ids(&cache), expected, "limit {limit}");
+        assert_eq!(
+            received,
+            sequential_read_bound(3500, limit),
+            "limit {limit} must read no more rows than the sequential loader"
+        );
+    }
+    let _limit = EnvGuard::set("MAX_EDGES_CACHE", "10000");
+    let cache = load_edges_from_postgres(&pool).await.expect("load edges");
+    let edge = cache.get("rp-batch-001234").expect("edge");
+    assert_eq!(edge.note.as_deref(), Some("n1234"));
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn edges_loader_pipeline_keeps_order_and_limit_across_decode_batches() {
+    let pool = prepare_pool().await;
+    // Large enough for the pipelined path (limit >= 65,536) and for a limit
+    // that ends the load inside a batch.
+    let count = 70_000;
+    let valid = insert_batch_edges(&pool, count).await;
+
+    {
+        let _limit = EnvGuard::set("MAX_EDGES_CACHE", "100000");
+        let (cache, received) = load_edges_from_postgres_counted(&pool)
+            .await
+            .expect("load edges");
+        assert_eq!(cache_ids(&cache), valid);
+        assert_eq!(received, count as usize);
+        let edge = cache.get("rp-batch-065432").expect("edge in a late batch");
+        assert_eq!(edge.note.as_deref(), Some("n65432"));
+    }
+    {
+        let limit = 65_600;
+        let _limit = EnvGuard::set("MAX_EDGES_CACHE", &limit.to_string());
+        let (cache, received) = load_edges_from_postgres_counted(&pool)
+            .await
+            .expect("load edges");
+        assert_eq!(cache_ids(&cache), valid[..limit]);
+        // Read-ahead past the stopping row is bounded by the queue.
+        let bound = sequential_read_bound(count, limit);
+        assert!(received >= bound, "received {received} < {bound}");
+        assert!(
+            received <= bound + 10 * 1024,
+            "received {received} exceeds read-ahead bound over {bound}"
+        );
+    }
     clean(&pool).await;
 }
 

@@ -9,6 +9,7 @@ use chrono::{DateTime, Timelike, Utc};
 use futures_util::TryStreamExt;
 use serde_json::{json, Map, Value};
 use sqlx::{PgPool, Postgres, Transaction};
+use std::ops::ControlFlow;
 use uuid::Uuid;
 
 use crate::auth::accounts::AccountStore;
@@ -297,49 +298,397 @@ pub async fn load_nodes_bbox_after_id_from_postgres(
 }
 
 pub async fn load_edges_from_postgres(pool: &PgPool) -> Result<OrderedCache<Edge>> {
+    Ok(load_edges_from_postgres_counted(pool).await?.0)
+}
+
+/// Same as [`load_edges_from_postgres`], plus the number of physical rows
+/// received from PostgreSQL. Exposed for regression tests of the read bound.
+#[doc(hidden)]
+pub async fn load_edges_from_postgres_counted(
+    pool: &PgPool,
+) -> Result<(OrderedCache<Edge>, usize)> {
     let max_edges = crate::routes::edges::max_edges_cache_limit();
     // No SQL-side LIMIT: rejected rows must not consume a physical row slot
-    // that a later valid row would need. The loop below bounds physical reads
-    // itself, breaking as soon as it has examined `max_edges + 1` *accepted*
+    // that a later valid row would need. The decoder bounds physical reads
+    // itself, stopping as soon as it has examined `max_edges + 1` *accepted*
     // rows (the `+ 1` only confirms truncation; it is never cached).
     let mut rows = sqlx::query_as::<_, EdgeRow>(
         "SELECT id, source_id, target_id, edge_kind, created_at, payload::text \
          FROM domain_edges ORDER BY id ASC",
     )
     .fetch(pool);
+    let mut received = 0usize;
 
-    let mut cache = OrderedCache::new();
-    let mut seen = 0usize;
-    let mut skipped = 0usize;
-    let mut truncated = false;
-    while let Some((id, source_id, target_id, edge_kind, created_at, payload_text)) = rows
-        .try_next()
-        .await
-        .context("failed to load edges from domain_edges")?
-    {
-        let payload = parse_payload(&payload_text);
-        let Ok(expires_at) = payload_lifecycle_field(&payload, "expires_at") else {
+    if max_edges < EDGE_PIPELINE_MIN_LIMIT {
+        // Small limits keep the exact read bound: decode inline and stop the
+        // stream at the first row past the limit.
+        let mut decoder = EdgeDecoder::new(max_edges);
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .context("failed to load edges from domain_edges")?
+        {
+            received += 1;
+            if decoder.push(row).is_break() {
+                break;
+            }
+        }
+        return Ok((decoder.finish(), received));
+    }
+
+    // Receiving rows and decoding them are both O(N) and cost about the same
+    // at 100k edges. They run as a two-stage pipeline: this task streams rows
+    // from PostgreSQL in id order while a blocking thread decodes them in the
+    // same order. A decoder that stops early drops its receiver, and the next
+    // send ends the stream. When the table is larger than the limit, the
+    // stream can read up to (queue + 2) batches past the stopping row, about
+    // 10k rows, which is at most ~16% of the smallest limit on this path.
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<Vec<EdgeRow>>(EDGE_DECODE_QUEUE_BATCHES);
+    let decoder = tokio::task::spawn_blocking(move || {
+        let mut decoder = EdgeDecoder::new(max_edges);
+        'batches: while let Some(batch) = receiver.blocking_recv() {
+            for row in batch {
+                if decoder.push(row).is_break() {
+                    break 'batches;
+                }
+            }
+        }
+        decoder.finish()
+    });
+
+    let streamed = async {
+        let mut batch = Vec::with_capacity(EDGE_DECODE_BATCH_ROWS);
+        while let Some(row) = rows.try_next().await? {
+            received += 1;
+            batch.push(row);
+            if batch.len() == EDGE_DECODE_BATCH_ROWS {
+                let full =
+                    std::mem::replace(&mut batch, Vec::with_capacity(EDGE_DECODE_BATCH_ROWS));
+                if sender.send(full).await.is_err() {
+                    // The decoder reached the cache limit; later rows are unused.
+                    return Ok(());
+                }
+            }
+        }
+        if !batch.is_empty() {
+            // An error here also means the decoder already stopped.
+            let _ = sender.send(batch).await;
+        }
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    // Closing the channel lets the decoder finish its last batch.
+    drop(sender);
+    drop(rows);
+    let decoded = decoder.await.context("edge decoder task failed")?;
+    streamed.context("failed to load edges from domain_edges")?;
+    Ok((decoded, received))
+}
+
+/// Edge payload fields the projection reads, with the exact semantics of
+/// `payload_string`, `payload_lifecycle_field` and `payload_faden_metadata`.
+#[derive(Debug, PartialEq)]
+struct DecodedEdgePayload {
+    source_type: Option<String>,
+    target_type: Option<String>,
+    note: Option<String>,
+    expires_at: Result<Option<Option<LifecycleTimestamp>>, ()>,
+    faden: Result<(Option<FadenType>, Option<String>), ()>,
+}
+
+/// One payload value as the edge projection classifies it. Only strings are
+/// kept; any other present value is remembered as `Other` without building a
+/// `serde_json::Value` tree for it.
+#[derive(Debug, Default)]
+enum PayloadScalar<'a> {
+    #[default]
+    Missing,
+    Null,
+    Str(std::borrow::Cow<'a, str>),
+    Other,
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for PayloadScalar<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ScalarVisitor<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for ScalarVisitor<'a> {
+            type Value = PayloadScalar<'a>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(PayloadScalar::Str(std::borrow::Cow::Borrowed(v)))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(PayloadScalar::Str(std::borrow::Cow::Owned(v.to_owned())))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(PayloadScalar::Str(std::borrow::Cow::Owned(v)))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(PayloadScalar::Null)
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(PayloadScalar::Null)
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(PayloadScalar::Other)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(PayloadScalar::Other)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(PayloadScalar::Other)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(PayloadScalar::Other)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<ValueCheckedIgnore>()?.is_some() {}
+                Ok(PayloadScalar::Other)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<ValueCheckedIgnore, ValueCheckedIgnore>()?
+                    .is_some()
+                {}
+                Ok(PayloadScalar::Other)
+            }
+        }
+        deserializer.deserialize_any(ScalarVisitor(std::marker::PhantomData))
+    }
+}
+
+impl PayloadScalar<'_> {
+    fn into_string(self) -> Option<String> {
+        match self {
+            Self::Str(value) => Some(value.into_owned()),
+            _ => None,
+        }
+    }
+}
+
+/// Skips one JSON value but, unlike `serde::de::IgnoredAny`, still rejects
+/// everything `serde_json::Value` rejects (e.g. an out-of-range number such as
+/// `1e400`, which JSONB can store). A rejected payload then takes the `Value`
+/// path, which maps it to an empty object, exactly as before.
+struct ValueCheckedIgnore;
+
+impl<'de> serde::Deserialize<'de> for ValueCheckedIgnore {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct IgnoreVisitor;
+        impl<'de> serde::de::Visitor<'de> for IgnoreVisitor {
+            type Value = ValueCheckedIgnore;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<ValueCheckedIgnore>()?.is_some() {}
+                Ok(ValueCheckedIgnore)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<ValueCheckedIgnore, ValueCheckedIgnore>()?
+                    .is_some()
+                {}
+                Ok(ValueCheckedIgnore)
+            }
+        }
+        deserializer.deserialize_any(IgnoreVisitor)
+    }
+}
+
+#[derive(Default)]
+struct EdgePayloadFields<'a> {
+    source_type: PayloadScalar<'a>,
+    target_type: PayloadScalar<'a>,
+    note: PayloadScalar<'a>,
+    expires_at: PayloadScalar<'a>,
+    faden_type: PayloadScalar<'a>,
+    faden_subject_id: PayloadScalar<'a>,
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for EdgePayloadFields<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for FieldsVisitor<'a> {
+            type Value = EdgePayloadFields<'a>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                let mut fields = EdgePayloadFields::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    let slot = match key.as_ref() {
+                        "source_type" => &mut fields.source_type,
+                        "target_type" => &mut fields.target_type,
+                        "note" => &mut fields.note,
+                        "expires_at" => &mut fields.expires_at,
+                        "faden_type" => &mut fields.faden_type,
+                        "faden_subject_id" => &mut fields.faden_subject_id,
+                        _ => {
+                            map.next_value::<ValueCheckedIgnore>()?;
+                            continue;
+                        }
+                    };
+                    if !matches!(slot, PayloadScalar::Missing) {
+                        // Leave last-wins duplicate handling to the Value path.
+                        return Err(A::Error::custom("duplicate edge payload key"));
+                    }
+                    *slot = map.next_value::<PayloadScalar<'a>>()?;
+                }
+                Ok(fields)
+            }
+        }
+        deserializer.deserialize_map(FieldsVisitor(std::marker::PhantomData))
+    }
+}
+
+/// Decodes the projected edge payload fields without building a full
+/// `serde_json::Value` per row, which was the largest single cost of an edge
+/// reload. Anything the fast path does not cover exactly (not a JSON object,
+/// invalid JSON, duplicate keys) takes the original `Value`-based path, so
+/// the result is identical in every case.
+fn decode_edge_payload(text: &str) -> DecodedEdgePayload {
+    decode_edge_payload_fast(text).unwrap_or_else(|| decode_edge_payload_value(text))
+}
+
+fn decode_edge_payload_fast(text: &str) -> Option<DecodedEdgePayload> {
+    // A derived struct also accepts a JSON array positionally; the Value path
+    // treats every non-object as having no keys.
+    if !text.trim_start().starts_with('{') {
+        return None;
+    }
+    let fields: EdgePayloadFields<'_> = serde_json::from_str(text).ok()?;
+    let expires_at = match fields.expires_at {
+        PayloadScalar::Missing => Ok(None),
+        PayloadScalar::Null => Ok(Some(None)),
+        PayloadScalar::Str(value) => Ok(Some(Some(LifecycleTimestamp::from(value.into_owned())))),
+        PayloadScalar::Other => Err(()),
+    };
+    let faden = match (fields.faden_type, fields.faden_subject_id) {
+        (PayloadScalar::Missing, PayloadScalar::Missing) => Ok((None, None)),
+        (PayloadScalar::Str(kind), PayloadScalar::Str(subject_id)) => {
+            match (
+                serde_json::from_value::<FadenType>(Value::String(kind.into_owned())),
+                Uuid::parse_str(&subject_id),
+            ) {
+                (Ok(faden_type), Ok(_)) => Ok((Some(faden_type), Some(subject_id.into_owned()))),
+                _ => Err(()),
+            }
+        }
+        _ => Err(()),
+    };
+    Some(DecodedEdgePayload {
+        source_type: fields.source_type.into_string(),
+        target_type: fields.target_type.into_string(),
+        note: fields.note.into_string(),
+        expires_at,
+        faden,
+    })
+}
+
+fn decode_edge_payload_value(text: &str) -> DecodedEdgePayload {
+    let payload = parse_payload(text);
+    DecodedEdgePayload {
+        source_type: payload_string(&payload, "source_type"),
+        target_type: payload_string(&payload, "target_type"),
+        note: payload_string(&payload, "note"),
+        expires_at: payload_lifecycle_field(&payload, "expires_at"),
+        faden: payload_faden_metadata(&payload),
+    }
+}
+
+const EDGE_DECODE_BATCH_ROWS: usize = 1024;
+const EDGE_DECODE_QUEUE_BATCHES: usize = 8;
+/// Limits below this decode inline so the stream stops exactly at the limit.
+const EDGE_PIPELINE_MIN_LIMIT: usize = 64 * 1024;
+
+/// Decodes edge rows in PostgreSQL order. The skip, limit and truncation rules
+/// are unchanged from the former single-loop loader.
+struct EdgeDecoder {
+    max_edges: usize,
+    cache: OrderedCache<Edge>,
+    seen: usize,
+    skipped: usize,
+    truncated: bool,
+}
+
+impl EdgeDecoder {
+    fn new(max_edges: usize) -> Self {
+        Self {
+            max_edges,
+            cache: OrderedCache::new(),
+            seen: 0,
+            skipped: 0,
+            truncated: false,
+        }
+    }
+
+    /// `Break` means the limit is reached and no further row is needed.
+    fn push(&mut self, row: EdgeRow) -> ControlFlow<()> {
+        let (id, source_id, target_id, edge_kind, created_at, payload_text) = row;
+        let payload = decode_edge_payload(&payload_text);
+        let Ok(expires_at) = payload.expires_at else {
             tracing::warn!(edge_id = %id, "skipping domain edge with malformed expires_at payload");
-            skipped += 1;
-            continue;
+            self.skipped += 1;
+            return ControlFlow::Continue(());
         };
 
-        let Ok((faden_type, faden_subject_id)) = payload_faden_metadata(&payload) else {
+        let Ok((faden_type, faden_subject_id)) = payload.faden else {
             tracing::warn!(edge_id = %id, "skipping domain edge with malformed typed Faden metadata");
-            skipped += 1;
-            continue;
+            self.skipped += 1;
+            return ControlFlow::Continue(());
         };
 
         let edge = Edge {
             id: id.clone(),
             source_id,
-            source_type: payload_string(&payload, "source_type"),
+            source_type: payload.source_type,
             target_id,
-            target_type: payload_string(&payload, "target_type"),
+            target_type: payload.target_type,
             edge_kind,
             faden_type,
             faden_subject_id,
-            note: payload_string(&payload, "note"),
+            note: payload.note,
             created_at: created_at.map(LifecycleTimestamp::from_datetime),
             expires_at,
         };
@@ -352,31 +701,35 @@ pub async fn load_edges_from_postgres(pool: &PgPool) -> Result<OrderedCache<Edge
                 edge_id = %edge.id,
                 "skipping domain edge that can never be active under any lifecycle rule"
             );
-            skipped += 1;
-            continue;
+            self.skipped += 1;
+            return ControlFlow::Continue(());
         }
 
-        if seen >= max_edges {
-            truncated = true;
-            break;
+        if self.seen >= self.max_edges {
+            self.truncated = true;
+            return ControlFlow::Break(());
         }
 
-        cache.insert(id, edge);
-        seen += 1;
+        self.cache.insert(id, edge);
+        self.seen += 1;
+        ControlFlow::Continue(())
     }
-    if truncated {
-        tracing::warn!(
-            max_edges,
-            "Edges cache limit reached, truncating PostgreSQL load"
+
+    fn finish(self) -> OrderedCache<Edge> {
+        if self.truncated {
+            tracing::warn!(
+                max_edges = self.max_edges,
+                "Edges cache limit reached, truncating PostgreSQL load"
+            );
+        }
+        tracing::info!(
+            count = self.cache.len(),
+            skipped = self.skipped,
+            truncated = self.truncated,
+            "Loaded edges from PostgreSQL"
         );
+        self.cache
     }
-    tracing::info!(
-        count = cache.len(),
-        skipped,
-        truncated,
-        "Loaded edges from PostgreSQL"
-    );
-    Ok(cache)
 }
 
 /// Read-only readiness counters for a future `domain_accounts.webauthn_user_id`
@@ -3046,6 +3399,67 @@ pub async fn lock_node_faden_cache_publication(
         node,
         edge,
     })
+}
+
+#[cfg(test)]
+mod edge_payload_decode_tests {
+    use super::*;
+
+    #[test]
+    fn fast_edge_payload_decode_matches_value_path() {
+        let subject = "11111111-1111-5111-8111-111111111111";
+        let corpus = [
+            "{}".to_string(),
+            r#"{"source_type": "Node", "target_type": "Node", "scale_fixture": true, "scale_profile": "ci"}"#.to_string(),
+            r#"{"source_type": "node", "target_type": "account", "note": "Gr\u00fc\u00dfe \"zitiert\"\n"}"#.to_string(),
+            r#"{"source_type": 1, "target_type": null, "note": ["a"], "other": {"note": "nested"}}"#.to_string(),
+            r#"{"expires_at": null}"#.to_string(),
+            r#"{"expires_at": "2026-11-09T10:00:00Z"}"#.to_string(),
+            r#"{"expires_at": "not a timestamp"}"#.to_string(),
+            r#"{"expires_at": 17}"#.to_string(),
+            r#"{"expires_at": {"at": "2026-11-09T10:00:00Z"}}"#.to_string(),
+            r#"{"expires_at": false}"#.to_string(),
+            format!(r#"{{"faden_type": "conversation", "faden_subject_id": "{subject}"}}"#),
+            format!(r#"{{"faden_type": "vote", "faden_subject_id": "{subject}", "note": "n"}}"#),
+            format!(r#"{{"faden_type": "unknown", "faden_subject_id": "{subject}"}}"#),
+            r#"{"faden_type": "conversation", "faden_subject_id": "not-a-uuid"}"#.to_string(),
+            r#"{"faden_type": "conversation"}"#.to_string(),
+            format!(r#"{{"faden_subject_id": "{subject}"}}"#),
+            format!(r#"{{"faden_type": null, "faden_subject_id": "{subject}"}}"#),
+            r#"{"faden_type": null, "faden_subject_id": null}"#.to_string(),
+            format!(r#"{{"faden_type": "\u0063onversation", "faden_subject_id": "{subject}"}}"#),
+            r#"{"note": 1.5e300, "source_type": -3}"#.to_string(),
+            "  {\"note\": \"leading whitespace\"}".to_string(),
+            r#"{"note": "a", "note": "b"}"#.to_string(),
+            r#"{"expires_at": "2020-01-01T00:00:00Z", "extra": 1e400}"#.to_string(),
+            r#"{"note": "kept?", "extra": [1, {"deep": -1e400}]}"#.to_string(),
+            r#"{"note": [1e400]}"#.to_string(),
+            r#"{"note": {"x": 1e400}}"#.to_string(),
+            r#"{"extra": 18446744073709551616, "note": "big integer"}"#.to_string(),
+            "[\"Node\", \"Node\"]".to_string(),
+            "\"just a string\"".to_string(),
+            "null".to_string(),
+            "not json".to_string(),
+            "{\"note\": ".to_string(),
+            String::new(),
+        ];
+        for text in &corpus {
+            assert_eq!(
+                decode_edge_payload(text),
+                decode_edge_payload_value(text),
+                "payload {text:?}"
+            );
+        }
+        // The fast path must actually serve the common fixture shape.
+        assert!(decode_edge_payload_fast(&corpus[1]).is_some());
+        assert!(decode_edge_payload_fast(&corpus[10]).is_some());
+        // An out-of-range number anywhere makes the Value path fall back to an
+        // empty object, so the fast path must defer to it.
+        assert!(decode_edge_payload_fast(
+            r#"{"expires_at": "2020-01-01T00:00:00Z", "extra": 1e400}"#
+        )
+        .is_none());
+    }
 }
 
 #[cfg(test)]
