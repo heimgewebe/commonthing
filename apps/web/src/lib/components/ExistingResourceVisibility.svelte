@@ -37,58 +37,83 @@
     }
   }
 
-  /**
-   * The draft fields minus exactly the previously saved public tags that the
-   * server no longer stores. Unsaved entries and all other tags stay.
-   */
-  export function draftWithoutRemovedTags(
-    savedTags: string[],
-    serverTags: string[],
-    draft: TagDraft,
-  ): TagDraft {
-    let { skills, goods, interests } = draft;
-    for (const tag of savedTags) {
-      if (serverTags.includes(tag) || tag === "account" || tag === "garnrolle") {
-        continue;
-      }
-      // No prefix = legacy tag, shown with the skills.
-      const [, kind, value] = TAG.exec(tag)!;
-      if (kind === "good") goods = withoutEntry(goods, value);
-      else if (kind === "interest") interests = withoutEntry(interests, value);
-      // A remaining twin spelling of the same skill is still public anyway.
-      else if (!serverTags.includes(kind ? value : `skill:${value}`)) {
-        skills = withoutEntry(skills, value);
-      }
-    }
-    return { skills, goods, interests };
-  }
+  const FIELD_OF = { good: "goods", interest: "interests", skill: "skills" } as const;
+  // Characters a single-line input drops or that mark a different tag.
+  const UNREPRESENTABLE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
   /**
-   * Bring a draft that was based on `savedTags` up to the server's tag set:
-   * values the server dropped (e.g. moved to a private node) leave the draft,
-   * values another session added join it. Local edits and entries the user
-   * deliberately removed stay as they are.
+   * Where a profile tag appears in the form. The form lists trimmed, comma
+   * separated entries per field (no prefix = legacy tag, shown with the
+   * skills), exactly as validateProfileTags reads them back. `entry` is the
+   * trimmed value for a tag the form shows one-to-one, and null for a tag it
+   * cannot (a comma splits it, control characters get lost): such a tag has
+   * no entry that can be told apart from its siblings.
+   */
+  function slotOf(tag: string) {
+    if (tag === "account" || tag === "garnrolle") return null;
+    const [, kind, suffix] = TAG.exec(tag)!;
+    const pieces = entriesOf(suffix);
+    if (pieces.length === 0) return null;
+    const field: keyof TagDraft = kind
+      ? FIELD_OF[kind as keyof typeof FIELD_OF]
+      : "skills";
+    const single = !suffix.includes(",") && !UNREPRESENTABLE.test(suffix);
+    return { field, pieces, entry: single ? pieces[0] : null };
+  }
+
+  const entryKey = (field: keyof TagDraft, entry: string) =>
+    `${field}\u0000${entry}`;
+
+  /**
+   * Bring a draft that was based on `savedTags` up to the server's tag set.
+   * Values the server dropped (e.g. moved to a private node) leave the draft,
+   * values another session added join it; local edits and entries the user
+   * deliberately removed stay. Entries are compared the way the form saves
+   * them (trimmed), never by the raw tag text.
+   *
+   * A dropped tag the form cannot show one-to-one (comma, control characters)
+   * cannot be located among the entries. That field is rebuilt from what the
+   * server still publishes; every other entry of it is returned as `review`
+   * and must be accepted explicitly before it may be saved.
    */
   export function reconcileTagDraft(
     savedTags: string[],
     serverTags: string[],
     draft: TagDraft,
-  ): TagDraft {
-    let { skills, goods, interests } = draftWithoutRemovedTags(
-      savedTags,
-      serverTags,
-      draft,
-    );
+  ): { fields: TagDraft; review: TagDraft | null } {
+    const fields = { ...draft };
+    const stillPublic = new Set<string>();
     for (const tag of serverTags) {
-      if (savedTags.includes(tag) || tag === "account" || tag === "garnrolle") {
-        continue;
-      }
-      const [, kind, value] = TAG.exec(tag)!;
-      if (kind === "good") goods = withEntries(goods, [value]);
-      else if (kind === "interest") interests = withEntries(interests, [value]);
-      else skills = withEntries(skills, [value]);
+      const slot = slotOf(tag);
+      if (slot?.entry) stillPublic.add(entryKey(slot.field, slot.entry));
     }
-    return { skills, goods, interests };
+    const unsure = new Set<keyof TagDraft>();
+    for (const tag of savedTags) {
+      if (serverTags.includes(tag)) continue;
+      const slot = slotOf(tag);
+      if (!slot) continue;
+      if (slot.entry === null) unsure.add(slot.field);
+      // A remaining twin spelling of the same entry is still public anyway.
+      else if (!stillPublic.has(entryKey(slot.field, slot.entry))) {
+        fields[slot.field] = withoutEntry(fields[slot.field], slot.entry);
+      }
+    }
+    const review = { skills: "", goods: "", interests: "" };
+    for (const field of unsure) {
+      const mine = entriesOf(fields[field]);
+      const isPublic = (entry: string) => stillPublic.has(entryKey(field, entry));
+      fields[field] = mine.filter(isPublic).join(", ");
+      review[field] = mine.filter((entry) => !isPublic(entry)).join(", ");
+    }
+    for (const tag of serverTags) {
+      const slot = savedTags.includes(tag) ? null : slotOf(tag);
+      if (slot) fields[slot.field] = withEntries(fields[slot.field], slot.pieces);
+    }
+    return {
+      fields,
+      review:
+        review.skills || review.goods || review.interests ? review : null,
+    };
   }
 
   /** `draft` plus the review entries (explicitly accepted by the user). */
@@ -122,7 +147,7 @@
     };
     const base = draft.baseTags;
     if (Array.isArray(base) && base.every((tag) => typeof tag === "string")) {
-      return { fields: reconcileTagDraft(base, serverTags, stored), review: null };
+      return reconcileTagDraft(base, serverTags, stored);
     }
     const unknown = (key: keyof TagDraft) =>
       entriesOf(stored[key])
@@ -454,12 +479,13 @@
     data-testid="garnrolle-tag-review"
     disabled={disabled}
   >
-    <legend>Älterer Entwurf: Tags prüfen</legend>
+    <legend>Tags prüfen</legend>
     <p class="field-intro" role="alert">
-      Ein älterer Entwurf enthält Einträge, die nicht zum gespeicherten Stand
-      passen. Sie wurden nicht übernommen, weil sie inzwischen privat verschoben
-      sein können. Speichern und Kartenwahl sind gesperrt, bis du entscheidest. Übernommene
-      Einträge werden mit dem nächsten Speichern öffentlich.
+      Einträge deines Formulars lassen sich nicht eindeutig dem gespeicherten
+      Stand zuordnen (älterer Entwurf oder umgezogener Tag). Sie wurden nicht
+      übernommen, weil sie inzwischen privat verschoben sein können. Speichern
+      und Kartenwahl sind gesperrt, bis du entscheidest. Übernommene Einträge
+      werden mit dem nächsten Speichern öffentlich.
     </p>
     <ul>
       {#each [["Fähigkeiten", review.skills], ["Güter", review.goods], ["Interessen", review.interests]] as [label, value] (label)}

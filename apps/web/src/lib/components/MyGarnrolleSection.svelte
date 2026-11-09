@@ -227,10 +227,27 @@
    */
   async function adoptServerTags(serverTags: string[]) {
     const at = epoch;
-    const { reconcileTagDraft } = await loadEditorModule();
+    const lazy = await loadEditorModule();
     if (at !== epoch) return;
-    setTagFields(reconcileTagDraft(savedTags, serverTags, tagFields()));
+    const { fields, review } = lazy.reconcileTagDraft(
+      savedTags,
+      serverTags,
+      tagFields(),
+    );
+    setTagFields(fields);
     savedTags = [...serverTags];
+    if (review) holdTagReview(lazy, review);
+  }
+
+  /** Lock saving until the user decided on entries that cannot be placed. */
+  function holdTagReview(
+    lazy: Awaited<ReturnType<typeof loadEditorModule>>,
+    review: TagDraft,
+  ) {
+    tagReview = tagReview ? lazy.adoptReviewedTags(tagReview, review) : review;
+    // The decision is made in the editor, so it has to be shown.
+    MoveEditor = lazy.default;
+    moveEditorOpen = true;
   }
 
   function applyProfile(profile: OwnGarnrolleProfile) {
@@ -321,11 +338,7 @@
               tagFields(),
             );
             draft = { ...draft, ...fields };
-            if (review) {
-              tagReview = review;
-              MoveEditor = lazy.default;
-              moveEditorOpen = true;
-            }
+            if (review) holdTagReview(lazy, review);
           }
           applyDraft(draft);
         }

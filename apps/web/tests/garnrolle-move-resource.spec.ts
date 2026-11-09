@@ -52,6 +52,8 @@ type OpenOptions = {
   title?: string;
   /** Return right after navigation (the load is held back on purpose). */
   skipWait?: boolean;
+  /** Güter expected once the profile is loaded (default: "Leiter"). */
+  goods?: string | RegExp;
 };
 
 const circlesOf = (accountId: string) => [
@@ -189,7 +191,9 @@ async function openSettings(
     options.title ?? "Meine Garnrolle",
   );
   if (!options.draft && state.tags.includes("good:Leiter")) {
-    await expect(section.getByLabel("Güter")).toHaveValue("Leiter");
+    await expect(section.getByLabel("Güter")).toHaveValue(
+      options.goods ?? "Leiter",
+    );
   }
   return section;
 }
@@ -789,6 +793,175 @@ test.describe("Gespeicherten Profil-Tag als eigene Ressource", () => {
       "skill:Imkern",
       "interest:Commons",
     ]);
+  });
+
+  test("never republishes a moved tag with outer spaces in its suffix", async ({
+    page,
+  }) => {
+    const state = newState();
+    state.tags = [...SAVED_TAGS, "good: Leiter  "].filter(
+      (tag) => tag !== "good:Leiter",
+    );
+    const section = await openSettings(page, state);
+    await expect(section.getByLabel("Güter")).toHaveValue(/Leiter/);
+    await section.getByLabel("Güter").fill("Leiter, Werkzeug");
+    const move = await openEditor(section);
+    await move
+      .getByTestId("garnrolle-move-tag")
+      .selectOption({ label: "Gut: Leiter" });
+    await move.getByTestId("garnrolle-move-submit").click();
+    await expect(move.getByTestId("garnrolle-move-success")).toBeVisible();
+    expect(state.moves[0].tag).toBe("good: Leiter  ");
+    await expect(section.getByLabel("Güter")).toHaveValue("Werkzeug");
+    await expect(section.getByTestId("garnrolle-tag-review")).toHaveCount(0);
+
+    await section.getByTestId("save-garnrolle").click();
+    await expect.poll(() => state.patches.length).toBe(1);
+    expect(state.patches[0].tags).toEqual([
+      "skill:Fahrrad reparieren",
+      "good:Werkzeug",
+      "interest:Commons",
+    ]);
+    expect(state.tags.join("|")).not.toContain("Leiter");
+  });
+
+  test("keeps an entry that a twin spelling still publishes", async ({
+    page,
+  }) => {
+    const state = newState();
+    state.tags = [...SAVED_TAGS, "good: Leiter"];
+    const section = await openSettings(page, state, { goods: /Leiter/ });
+    const move = await openEditor(section);
+    await move
+      .getByTestId("garnrolle-move-tag")
+      .selectOption({ value: "good: Leiter" });
+    await move.getByTestId("garnrolle-move-submit").click();
+    await expect(move.getByTestId("garnrolle-move-success")).toBeVisible();
+    await expect(section.getByLabel("Güter")).toHaveValue(/Leiter/);
+    await expect(section.getByTestId("garnrolle-tag-review")).toHaveCount(0);
+    await section.getByTestId("save-garnrolle").click();
+    await expect.poll(() => state.patches.length).toBe(1);
+    expect(state.patches[0].tags).toContain("good:Leiter");
+  });
+
+  test.describe("tag with a comma that was accepted historically", () => {
+    const COMMA = "good:Hammer, Bohrer";
+    const withComma = () => [...SAVED_TAGS, COMMA];
+
+    async function moveComma(page: Page, state: ServerState) {
+      const section = await openSettings(page, state, {
+        goods: "Leiter, Hammer, Bohrer",
+      });
+      // An unsaved entry the user typed must not vanish either.
+      await section.getByLabel("Güter").fill("Leiter, Hammer, Bohrer, Zange");
+      const move = await openEditor(section);
+      await move.getByTestId("garnrolle-move-tag").selectOption(COMMA);
+      await move.getByTestId("garnrolle-move-submit").click();
+      await expect(move.getByTestId("garnrolle-move-success")).toBeVisible();
+      return section;
+    }
+
+    test("locks saving and rebuilds the field from the server tags", async ({
+      page,
+    }) => {
+      const state = newState();
+      state.tags = withComma();
+      const section = await moveComma(page, state);
+      expect(state.moves[0].tag).toBe(COMMA);
+      await expect(section.getByLabel("Güter")).toHaveValue("Leiter");
+      const review = section.getByTestId("garnrolle-tag-review");
+      await expect(review).toContainText("Güter: Hammer, Bohrer, Zange");
+      await expect(section.getByTestId("save-garnrolle")).toBeDisabled();
+
+      await review.getByTestId("garnrolle-tag-review-discard").click();
+      await expect(review).toHaveCount(0);
+      await section.getByTestId("save-garnrolle").click();
+      await expect.poll(() => state.patches.length).toBe(1);
+      expect(state.patches[0].tags).toEqual([
+        "skill:Fahrrad reparieren",
+        "good:Leiter",
+        "interest:Commons",
+      ]);
+      expect(state.tags.join("|")).not.toMatch(/Hammer|Bohrer/);
+    });
+
+    test("publishes the reviewed entries only on explicit request", async ({
+      page,
+    }) => {
+      const state = newState();
+      state.tags = withComma();
+      const section = await moveComma(page, state);
+      await expect.poll(() => state.patches.length).toBe(0);
+      await section
+        .getByTestId("garnrolle-tag-review")
+        .getByTestId("garnrolle-tag-review-adopt")
+        .click();
+      await expect(section.getByLabel("Güter")).toHaveValue(
+        "Leiter, Hammer, Bohrer, Zange",
+      );
+      await section.getByTestId("save-garnrolle").click();
+      await expect.poll(() => state.patches.length).toBe(1);
+      expect(state.patches[0].tags).toContain("good:Hammer");
+    });
+
+    test("asks about the entries of a stored draft after the tag moved", async ({
+      page,
+    }) => {
+      const state = newState();
+      state.tags = SAVED_TAGS;
+      const section = await openSettings(page, state, {
+        title: "Entwurf-Name",
+        draft: {
+          ...OLD_DRAFT,
+          goods: "Leiter, Hammer, Bohrer",
+          baseTags: withComma(),
+        },
+      });
+      await expect(section.getByLabel("Güter")).toHaveValue("Leiter");
+      await expect(section.getByTestId("garnrolle-tag-review")).toContainText(
+        "Güter: Hammer, Bohrer",
+      );
+      await expect(section.getByTestId("save-garnrolle")).toBeDisabled();
+    });
+
+    test("asks after a conflict even though the editor was closed", async ({
+      page,
+    }) => {
+      const state = newState();
+      state.tags = withComma();
+      const section = await openSettings(page, state, {
+        goods: "Leiter, Hammer, Bohrer",
+      });
+      // Moved by another session.
+      state.tags = SAVED_TAGS;
+      await section.getByTestId("save-garnrolle").click();
+      await expect(section.getByTestId("garnrolle-error")).toContainText(
+        "Nichts wurde gespeichert",
+      );
+      await expect(section.getByLabel("Güter")).toHaveValue("Leiter");
+      await expect(section.getByTestId("garnrolle-tag-review")).toContainText(
+        "Hammer, Bohrer",
+      );
+      await expect(section.getByTestId("save-garnrolle")).toBeDisabled();
+      expect(state.patches).toHaveLength(1);
+      expect(state.tags.join("|")).not.toMatch(/Hammer|Bohrer/);
+    });
+  });
+
+  test("never republishes a stored draft entry with outer spaces after the move", async ({
+    page,
+  }) => {
+    const state = newState();
+    state.tags = SAVED_TAGS.filter((tag) => tag !== "good:Leiter");
+    const section = await openSettings(page, state, {
+      title: "Entwurf-Name",
+      draft: {
+        ...OLD_DRAFT,
+        baseTags: [...state.tags, "good: Leiter "],
+      },
+    });
+    await expect(section.getByLabel("Güter")).toHaveValue("Werkzeug");
+    await expect(section.getByTestId("garnrolle-tag-review")).toHaveCount(0);
   });
 
   test("ignores a conflict answer that arrives after an account switch", async ({
