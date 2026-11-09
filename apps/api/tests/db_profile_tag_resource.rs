@@ -3,36 +3,47 @@
 mod support;
 
 use axum::{
-    body::to_bytes,
-    extract::{Path, State},
-    http::StatusCode,
+    body::{to_bytes, Body},
+    extract::{connect_info::MockConnectInfo, Path, State},
+    http::{header, Method, Request, StatusCode},
+    middleware::from_fn_with_state,
     response::Response,
-    Extension, Json,
+    Extension, Json, Router,
 };
 use serde_json::{json, Value};
+use serial_test::serial;
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::RwLock;
+use tower::ServiceExt;
 use uuid::Uuid;
 use weltgewebe_api::{
     auth::{
         accounts::AccountStore, rate_limit::AuthRateLimiter, role::Role, session::SessionBackend,
+        session_db::DbSessionStore,
     },
     config::{
         AppConfig, DomainAccountWriteSource, DomainEdgeWriteSource, DomainNodeWriteSource,
         DomainReadSource, PasskeyCredentialSource,
     },
     domain_db::load_accounts_from_postgres,
-    middleware::auth::AuthContext,
+    middleware::{
+        auth::{auth_middleware, AuthContext},
+        csrf::require_csrf,
+        domain_projection::ensure_current_domain_projection,
+    },
     routes::{
         accounts::{
             get_account, move_profile_tag_to_resource, update_own_garnrolle_profile,
             MoveProfileTagRequest, UpdateOwnGarnrolleRequest,
         },
+        api_router,
         node_audience::get_node_audience,
+        nodes::get_node,
     },
     state::{ApiState, OrderedCache},
     telemetry::{BuildInfo, Metrics},
+    test_helpers::EnvGuard,
 };
 
 fn config(postgres: bool, max_guest_owned_nodes: usize) -> AppConfig {
@@ -542,6 +553,56 @@ async fn one_saved_tag_moves_atomically_into_one_circle_node_and_replays() {
     assert!(!public_account_json(&state, &owner, None)
         .await
         .contains("moved_profile_tags"));
+
+    // P2b composition proof: a formerly confirmed circle member must lose
+    // BOTH the cached direct node route and the account activity projection
+    // when membership ends. The owner's converted node and public tags remain.
+    assert!(get_node(
+        State(state.clone()),
+        Path(node_id.clone()),
+        Some(Extension(actor(&member, Role::Weber))),
+    )
+    .await
+    .is_ok());
+    let version_before: i64 =
+        sqlx::query_scalar("SELECT version FROM domain_projection_state WHERE singleton=TRUE")
+            .fetch_one(&pool)
+            .await
+            .expect("projection version before departure");
+    sqlx::query("DELETE FROM domain_audience_circle_members WHERE circle_id=$1 AND account_id=$2")
+        .bind(circle)
+        .bind(&member)
+        .execute(&pool)
+        .await
+        .expect("former member leaves P2b audience circle");
+    let version_after: i64 =
+        sqlx::query_scalar("SELECT version FROM domain_projection_state WHERE singleton=TRUE")
+            .fetch_one(&pool)
+            .await
+            .expect("projection version after departure");
+    assert!(
+        version_after > version_before,
+        "departure invalidates privacy reads"
+    );
+    assert!(!readable(&pool, &node_id, Some(&member)).await);
+    assert!(matches!(
+        get_node(
+            State(state.clone()),
+            Path(node_id.clone()),
+            Some(Extension(actor(&member, Role::Weber))),
+        )
+        .await,
+        Err(StatusCode::NOT_FOUND)
+    ));
+    assert!(
+        !public_account_json(&state, &owner, Some(&member))
+            .await
+            .contains("Leiter"),
+        "former member must not see moved resource in account relations or activity"
+    );
+    assert!(readable(&pool, &node_id, Some(&owner)).await);
+    // The earlier fresh PATCH added "good:Werkzeug": preserve CURRENT tags.
+    assert_eq!(stored_tags(&pool, &owner).await, saved);
 }
 
 #[tokio::test]
@@ -1012,4 +1073,244 @@ async fn jsonl_mode_rejects_profile_tag_move_without_writing() {
     .await
     .expect_err("anonymous");
     assert_eq!(unauthenticated.0, StatusCode::UNAUTHORIZED);
+}
+
+/// Same middleware sequence as the production router, on an isolated
+/// PostgreSQL fixture. Separate browsers are modelled by real cookie sessions.
+fn p2b_session_router(state: ApiState) -> Router {
+    Router::new()
+        .merge(
+            api_router()
+                .layer(from_fn_with_state(
+                    state.clone(),
+                    ensure_current_domain_projection,
+                ))
+                .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+                .layer(axum::middleware::from_fn(require_csrf)),
+        )
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 18081))))
+        .with_state(state)
+}
+
+async fn p2b_http(
+    app: &Router,
+    method: Method,
+    path: &str,
+    session_cookie: Option<&str>,
+    payload: Option<Value>,
+) -> (StatusCode, String) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost");
+    if let Some(cookie) = session_cookie {
+        request = request.header(header::COOKIE, cookie);
+    }
+    let body = if let Some(value) = payload {
+        request = request.header(header::CONTENT_TYPE, "application/json");
+        Body::from(value.to_string())
+    } else {
+        Body::empty()
+    };
+    let response = app
+        .clone()
+        .oneshot(request.body(body).expect("HTTP request"))
+        .await
+        .expect("HTTP response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("HTTP response bytes");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn p2b_login_cookie(app: &Router, account_id: &str) -> String {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/dev/login")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"account_id": account_id}).to_string()))
+        .expect("login request");
+    let response = app.clone().oneshot(request).await.expect("login response");
+    assert_eq!(response.status(), StatusCode::OK, "test-only local login");
+    response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("login produces real session cookie")
+        .to_str()
+        .expect("ASCII session cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_string()
+}
+
+/// Real HTTP authentication, canonical PostgreSQL, and production middleware
+/// ordering. The only shortcut is a dev-login restricted to the local proof.
+#[tokio::test]
+#[serial]
+#[ignore = "requires disposable direct PostgreSQL DATABASE_URL"]
+async fn converted_tag_is_scoped_by_real_http_sessions_and_live_circle_departure() {
+    let _dev_login = EnvGuard::set("AUTH_DEV_LOGIN", "1");
+    let _remote_login = EnvGuard::unset("AUTH_DEV_LOGIN_ALLOW_REMOTE");
+    let pool = disposable_pool().await;
+    let owner = Uuid::new_v4().to_string();
+    let member = Uuid::new_v4().to_string();
+    let outsider = Uuid::new_v4().to_string();
+    let guest = Uuid::new_v4().to_string();
+    let tag = format!("good:P2b-session-proof-{}", Uuid::new_v4().simple());
+    let title = tag.trim_start_matches("good:");
+    insert_account(
+        &pool,
+        &owner,
+        "weber",
+        &["account", "garnrolle", &tag, "interest:Commons"],
+    )
+    .await;
+    for (id, role) in [(&member, "weber"), (&outsider, "weber"), (&guest, "gast")] {
+        insert_account(&pool, id, role, &["account", "garnrolle"]).await;
+    }
+    let circle = active_circle(&pool, &[&owner, &member]).await;
+
+    let mut state = pg_instance(&pool, 1_000).await;
+    state.sessions = SessionBackend::new(DbSessionStore::new(pool.clone()));
+    state.config.auth_cookie_secure = false; // loopback HTTP proof only
+    let app = p2b_session_router(state);
+    let owner_cookie = p2b_login_cookie(&app, &owner).await;
+    let member_cookie = p2b_login_cookie(&app, &member).await;
+    let outsider_cookie = p2b_login_cookie(&app, &outsider).await;
+    let guest_cookie = p2b_login_cookie(&app, &guest).await;
+
+    for (account, cookie) in [
+        (&owner, &owner_cookie),
+        (&member, &member_cookie),
+        (&outsider, &outsider_cookie),
+        (&guest, &guest_cookie),
+    ] {
+        let (status, body) = p2b_http(&app, Method::GET, "/auth/me", Some(cookie), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("auth JSON")["account_id"],
+            account.as_str(),
+            "every independent session must resolve its own account"
+        );
+    }
+
+    let (anonymous, _) = p2b_http(
+        &app,
+        Method::POST,
+        "/accounts/me/profile/resources",
+        None,
+        Some(json!({
+            "tag": tag,
+            "scope": "private",
+            "circle_ids": [],
+            "operation_id": Uuid::new_v4(),
+        })),
+    )
+    .await;
+    assert_eq!(anonymous, StatusCode::UNAUTHORIZED);
+
+    let (created_status, created_body) = p2b_http(
+        &app,
+        Method::POST,
+        "/accounts/me/profile/resources",
+        Some(&owner_cookie),
+        Some(json!({
+            "tag": tag,
+            "scope": "circles",
+            "circle_ids": [circle],
+            "operation_id": Uuid::new_v4(),
+        })),
+    )
+    .await;
+    assert_eq!(created_status, StatusCode::CREATED, "{created_body}");
+    let response: Value = serde_json::from_str(&created_body).expect("created JSON");
+    let node_id = response["node"]["id"]
+        .as_str()
+        .expect("converted node has one ID");
+    assert_eq!(response["audience"]["scope"], "circles");
+    assert_eq!(
+        owned_node_ids(&pool, &owner).await,
+        vec![node_id.to_string()]
+    );
+    assert!(!stored_tags(&pool, &owner).await.contains(&tag));
+
+    let node_path = format!("/nodes/{node_id}");
+    let account_path = format!("/accounts/{owner}");
+    for (label, cookie, can_read) in [
+        ("owner", Some(owner_cookie.as_str()), true),
+        ("confirmed-member", Some(member_cookie.as_str()), true),
+        ("outsider", Some(outsider_cookie.as_str()), false),
+        ("guest", Some(guest_cookie.as_str()), false),
+        ("anonymous", None, false),
+    ] {
+        let (status, _) = p2b_http(&app, Method::GET, &node_path, cookie, None).await;
+        assert_eq!(
+            status,
+            if can_read {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            },
+            "{label} direct-link privacy"
+        );
+        let (list_status, list) =
+            p2b_http(&app, Method::GET, "/nodes?limit=100", cookie, None).await;
+        assert_eq!(list_status, StatusCode::OK, "{label} list: {list}");
+        assert_eq!(list.contains(node_id), can_read, "{label} node list");
+        let (account_status, account) =
+            p2b_http(&app, Method::GET, &account_path, cookie, None).await;
+        assert_eq!(account_status, StatusCode::OK, "{label} account");
+        assert_eq!(
+            account.contains(title),
+            can_read,
+            "{label} account relations and activity"
+        );
+    }
+
+    // A formerly authorized member exits via the real authenticated,
+    // CSRF-protected endpoint. The next GET must reject its *existing* cookie.
+    let departure_path = format!("/circles/{circle}/membership");
+    let (leave_status, leave_body) = p2b_http(
+        &app,
+        Method::DELETE,
+        &departure_path,
+        Some(&member_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(leave_status, StatusCode::NO_CONTENT, "{leave_body}");
+    let (former_direct, _) =
+        p2b_http(&app, Method::GET, &node_path, Some(&member_cookie), None).await;
+    assert_eq!(
+        former_direct,
+        StatusCode::NOT_FOUND,
+        "former member direct link"
+    );
+    for path in ["/nodes?limit=100", account_path.as_str()] {
+        let (status, body) = p2b_http(&app, Method::GET, path, Some(&member_cookie), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains(title), "former member leaked via {path}");
+        assert!(
+            !body.contains(node_id),
+            "former member can still enumerate private node ID via {path}"
+        );
+    }
+    let (owner_status, _) =
+        p2b_http(&app, Method::GET, &node_path, Some(&owner_cookie), None).await;
+    assert_eq!(
+        owner_status,
+        StatusCode::OK,
+        "owner retains private resource"
+    );
+    assert!(
+        stored_tags(&pool, &owner)
+            .await
+            .contains(&"interest:Commons".to_string()),
+        "unrelated public tag survives authenticated conversion and departure"
+    );
 }
