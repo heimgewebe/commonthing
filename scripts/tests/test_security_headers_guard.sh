@@ -139,7 +139,7 @@ write_dev_caddy() {
   }
   reverse_proxy /* web:5173
   header {
-    Content-Security-Policy "default-src 'self'; script-src 'self'; style-src ${style}; connect-src 'self' ws: wss:; img-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none';"
+    Content-Security-Policy "style-src ${style}; connect-src 'self' ws: wss:; img-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none';"
     X-Frame-Options "DENY"
     Referrer-Policy "no-referrer"
   }
@@ -300,9 +300,19 @@ if REPO_ROOT="$TEMP_DIR" bash "$GUARD" > /dev/null 2>&1; then
 fi
 write_dev_caddy "$TEMP_DIR/infra/caddy/Caddyfile.dev"
 
-sed -i "s/script-src 'self';/script-src 'self' 'unsafe-inline';/" "$TEMP_DIR/infra/caddy/Caddyfile.dev"
+# A dev edge CSP must not impose script-src or default-src: the Vite /
+# SvelteKit document owns the bootstrap policy. Reintroducing either directive
+# must fail rather than silently blocking hydration or weakening protection.
+sed -i "s/style-src /script-src 'self'; style-src /" "$TEMP_DIR/infra/caddy/Caddyfile.dev"
 if REPO_ROOT="$TEMP_DIR" bash "$GUARD" > /dev/null 2>&1; then
-  echo "security headers guard should fail when the dev proxy opens script-src" >&2
+  echo "security headers guard should fail when dev proxy introduces script-src" >&2
+  exit 1
+fi
+write_dev_caddy "$TEMP_DIR/infra/caddy/Caddyfile.dev"
+
+sed -i "s/style-src /default-src 'self'; style-src /" "$TEMP_DIR/infra/caddy/Caddyfile.dev"
+if REPO_ROOT="$TEMP_DIR" bash "$GUARD" > /dev/null 2>&1; then
+  echo "security headers guard should fail when dev proxy introduces default-src" >&2
   exit 1
 fi
 write_dev_caddy "$TEMP_DIR/infra/caddy/Caddyfile.dev"
