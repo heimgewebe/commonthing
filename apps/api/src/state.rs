@@ -264,6 +264,27 @@ impl Drop for LocalNodeProjectionHandoffGuard {
     }
 }
 
+/// Projection caches replaced by a reload. Dropping them frees every node,
+/// edge and account string, which is O(N) allocator work. The value is moved
+/// out of the projection gates first, then freed on the blocking pool so it
+/// stalls neither waiting requests nor an async worker thread.
+struct ReplacedDomainProjection {
+    _accounts: crate::auth::accounts::AccountStore,
+    _nodes: OrderedCache<Node>,
+    _edges: OrderedCache<Edge>,
+}
+
+impl ReplacedDomainProjection {
+    fn release_off_request_path(self) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                drop(handle.spawn_blocking(move || drop(self)));
+            }
+            Err(_) => drop(self),
+        }
+    }
+}
+
 impl ApiState {
     /// Mark only a transaction-proven exact V+1 local PostgreSQL node PATCH.
     /// Callers must already own `nodes_persist` and may create this guard only
@@ -463,7 +484,7 @@ impl ApiState {
             };
 
             let write_gate_wait_started = std::time::Instant::now();
-            let _projection_write = self.domain_projection_gate.write().await;
+            let projection_write = self.domain_projection_gate.write().await;
             self.metrics
                 .observe_domain_projection_write_gate_wait(write_gate_wait_started.elapsed());
             let write_gate_hold_started = std::time::Instant::now();
@@ -500,13 +521,25 @@ impl ApiState {
             let mut accounts_guard = self.accounts.write().await;
             let mut nodes_guard = self.nodes.write().await;
             let mut edges_guard = self.edges.write().await;
-            *accounts_guard = accounts;
-            *nodes_guard = nodes;
-            *edges_guard = edges;
+            // Swap only. Freeing the replaced projection costs about 100 ms at
+            // 20k nodes / 100k edges and grows linearly with the data. Doing it
+            // here would block every request on this replica, anonymous reads
+            // included, so it happens after all gates are released.
+            let replaced = ReplacedDomainProjection {
+                _accounts: std::mem::replace(&mut *accounts_guard, accounts),
+                _nodes: std::mem::replace(&mut *nodes_guard, nodes),
+                _edges: std::mem::replace(&mut *edges_guard, edges),
+            };
             self.metrics.set_nodes_cache_count(nodes_guard.len() as i64);
             self.metrics.set_edges_cache_count(edges_guard.len() as i64);
             self.domain_projection_version
                 .store(stable_version, Ordering::Release);
+            drop(edges_guard);
+            drop(nodes_guard);
+            drop(accounts_guard);
+            drop(projection_write);
+            self.metrics
+                .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
             self.metrics.observe_domain_projection_reload_success(
                 reload_duration,
                 account_count,
@@ -514,8 +547,7 @@ impl ApiState {
                 edge_count,
                 stable_version,
             );
-            self.metrics
-                .observe_domain_projection_write_gate_hold(write_gate_hold_started.elapsed());
+            replaced.release_off_request_path();
             return Ok(());
         }
 

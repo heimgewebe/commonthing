@@ -360,6 +360,49 @@ async fn edges_loader_respects_max_edges_cache_limit() {
 #[tokio::test]
 #[ignore]
 #[serial]
+async fn edges_loader_keeps_order_and_limit_across_decode_batches() {
+    let pool = prepare_pool().await;
+    // More rows than several decoder batches (1024 rows each), with malformed
+    // rows spread across the batch boundaries.
+    sqlx::query(
+        "INSERT INTO domain_edges (id, source_id, target_id, edge_kind, payload) \
+         SELECT format('rp-batch-%s', lpad(i::text, 5, '0')), 'rp-node-a', 'rp-node-b', 'relates', \
+                CASE WHEN i % 997 = 0 THEN '{\"expires_at\": 1}'::jsonb \
+                     ELSE jsonb_build_object('note', 'n' || i) END \
+           FROM generate_series(1, 3500) AS i",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert batch edges");
+    let valid: Vec<String> = (1..=3500)
+        .filter(|i| i % 997 != 0)
+        .map(|i| format!("rp-batch-{i:05}"))
+        .collect();
+
+    {
+        let _limit = EnvGuard::set("MAX_EDGES_CACHE", "10000");
+        let cache = load_edges_from_postgres(&pool).await.expect("load edges");
+        let ids: Vec<&str> = cache.iter_in_order().map(|edge| edge.id.as_str()).collect();
+        assert_eq!(ids, valid.iter().map(String::as_str).collect::<Vec<_>>());
+        let edge = cache.get("rp-batch-01234").expect("edge in a later batch");
+        assert_eq!(edge.note.as_deref(), Some("n1234"));
+    }
+    {
+        // The limit ends the load inside the third batch.
+        let _limit = EnvGuard::set("MAX_EDGES_CACHE", "2100");
+        let cache = load_edges_from_postgres(&pool).await.expect("load edges");
+        let ids: Vec<&str> = cache.iter_in_order().map(|edge| edge.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            valid[..2100].iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+    clean(&pool).await;
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
 async fn edges_loader_skips_malformed_rows_without_losing_later_valid_edges() {
     let pool = prepare_pool().await;
     let _limit = EnvGuard::set("MAX_EDGES_CACHE", "2");
