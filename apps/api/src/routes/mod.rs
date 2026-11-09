@@ -36,7 +36,7 @@ use crate::state::ApiState;
 use self::{
     accounts::{
         create_account, get_account, get_own_garnrolle_profile, list_accounts,
-        update_own_garnrolle_profile,
+        move_profile_tag_to_resource, update_own_garnrolle_profile,
     },
     auth::{
         consume_login_get, consume_login_post, consume_step_up, dev_login, list_dev_accounts,
@@ -247,6 +247,10 @@ pub fn api_router() -> Router<ApiState> {
             get(get_own_garnrolle_profile)
                 .patch(update_own_garnrolle_profile)
                 .route_layer(from_fn(require_authenticated)),
+        )
+        .route(
+            "/accounts/me/profile/resources",
+            post(move_profile_tag_to_resource).route_layer(from_fn(require_authenticated)),
         )
         .route("/accounts/{id}", get(get_account))
         // Antragssystem (docs/specs/governance-antraege.md). `POST /proposals`

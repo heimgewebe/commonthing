@@ -124,6 +124,11 @@ export interface UpdateOwnGarnrollePayload {
   clear_location?: boolean;
   map_state: GarnrolleMapState;
   radius_m?: number;
+  /**
+   * Public tags exactly as last loaded. The server answers 409 instead of
+   * overwriting a concurrent change, e.g. a tag moved into a scoped node.
+   */
+  expected_tags?: string[];
 }
 
 /** GET /api/accounts/me/profile — private profile of the active account only. */
@@ -144,6 +149,49 @@ export function updateOwnGarnrolle(
     undefined,
     signal,
   );
+}
+
+export type ProfileResourceScope = "private" | "circles" | "public";
+
+export interface MoveProfileTagPayload {
+  /** One SAVED public profile tag, e.g. `good:Leiter` — never unsaved input. */
+  tag: string;
+  scope: ProfileResourceScope;
+  circle_ids: string[];
+  /** Stable UUID of one deliberate user action; retries reuse it. */
+  operation_id: string;
+}
+
+export interface MovedProfileTag {
+  node: Node;
+  audience: {
+    node_id: string;
+    scope: ProfileResourceScope | "unavailable";
+    circle_ids: string[];
+  };
+  profile: OwnGarnrolleProfile;
+}
+
+/**
+ * POST /api/accounts/me/profile/resources — atomically removes one saved public
+ * profile tag and creates exactly one node with the selected audience.
+ */
+export async function moveProfileTagToResource(
+  payload: MoveProfileTagPayload,
+  signal?: AbortSignal,
+): Promise<MovedProfileTag> {
+  const res = await fetch("/api/accounts/me/profile/resources", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    credentials: "include",
+    cache: "no-store",
+    signal,
+  });
+  if (!res.ok) {
+    throw new ApiRequestError(res.status, await readErrorBody(res));
+  }
+  return res.json();
 }
 
 export interface CreateNodePayload {

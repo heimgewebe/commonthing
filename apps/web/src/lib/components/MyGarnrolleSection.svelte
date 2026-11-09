@@ -26,6 +26,10 @@
     findOwnGarnrolle,
   } from "$lib/garnrolle/visibility";
   import { onDestroy, tick } from "svelte";
+  // Type only: the editor itself is imported dynamically after an explicit
+  // click so the conversion and circle APIs stay out of the initial chunk.
+  import type ExistingResourceVisibility from "./ExistingResourceVisibility.svelte";
+  import type { TagDraft } from "./ExistingResourceVisibility.svelte";
 
   interface Props {
     accounts?: Account[];
@@ -46,6 +50,8 @@
     radiusM: number;
     selectedLocation: Location | null;
     clearLocation: boolean;
+    /** Server-confirmed public tags the tag fields were based on. */
+    baseTags: string[];
   };
 
   const DISPLAY_NAME_MAX_CODE_POINTS = 200;
@@ -74,6 +80,20 @@
   let draftMessage: string | null = $state(null);
   let saveMessage: string | null = $state(null);
   let locationButton: HTMLButtonElement | null = $state(null);
+  // Public tags exactly as last confirmed by the server. Only these may be
+  // moved, and every save names them as its precondition (expected_tags).
+  let savedTags: string[] = $state([]);
+  let isMoving = $state(false);
+  let MoveEditor: typeof ExistingResourceVisibility | null = $state.raw(null);
+  let moveEditorOpen = $state(false);
+  let moveEditorError = $state(false);
+  // Entries of an older draft without a known baseline, awaiting a decision.
+  let tagReview: TagDraft | null = $state(null);
+  // Bumped on every account reset; stale async tag work compares against it.
+  let epoch = 0;
+  const MOVABLE_TAG = /^(good|skill):\s*\S/;
+  // One import site: each dynamic import() carries its own preload list.
+  const loadEditorModule = () => import("./ExistingResourceVisibility.svelte");
 
   function categoryValues(tags: string[], prefix: string): string[] {
     return tags
@@ -85,16 +105,9 @@
   function profileSkills(tags: string[]): string[] {
     const prefixed = categoryValues(tags, "skill:");
     const legacy = tags.filter(
-      (tag) =>
-        tag !== "account" &&
-        tag !== "garnrolle" &&
-        !tag.startsWith("skill:") &&
-        !tag.startsWith("good:") &&
-        !tag.startsWith("interest:"),
+      (tag) => !/^(account$|garnrolle$|(skill|good|interest):)/.test(tag),
     );
-    return [...prefixed, ...legacy].filter(
-      (entry, index, all) => all.indexOf(entry) === index,
-    );
+    return [...new Set([...prefixed, ...legacy])];
   }
 
   function draftStorageKey(accountId: string): string {
@@ -136,6 +149,7 @@
       radiusM,
       selectedLocation,
       clearLocation,
+      baseTags: savedTags,
     };
   }
 
@@ -190,9 +204,54 @@
     profileError = null;
     draftMessage = null;
     saveMessage = null;
+    savedTags = [];
+    // Closing unmounts the editor, which aborts its account-bound requests.
+    moveEditorOpen = false;
+    moveEditorError = false;
+    isMoving = false;
+    tagReview = null;
+    epoch++;
+  }
+
+  const tagFields = (): TagDraft => ({ skills, goods, interests });
+  const setTagFields = (fields: TagDraft) =>
+    ({ skills, goods, interests } = fields);
+
+  /**
+   * Adopt a newer server tag set without discarding unrelated unsaved edits:
+   * values the server dropped leave the draft fields, values another session
+   * added join them. The pure merge lives in the lazy editor module;
+   * savedTags (= expected_tags of the next save) only advances once the merge
+   * is applied, so a failed load (callers catch it) keeps saving blocked by a
+   * 409 instead of republishing a moved value or deleting a foreign one.
+   */
+  async function adoptServerTags(serverTags: string[]) {
+    const at = epoch;
+    const lazy = await loadEditorModule();
+    if (at !== epoch) return;
+    const { fields, review } = lazy.reconcileTagDraft(
+      savedTags,
+      serverTags,
+      tagFields(),
+    );
+    setTagFields(fields);
+    savedTags = [...serverTags];
+    if (review) holdTagReview(lazy, review);
+  }
+
+  /** Lock saving until the user decided on entries that cannot be placed. */
+  function holdTagReview(
+    lazy: Awaited<ReturnType<typeof loadEditorModule>>,
+    review: TagDraft,
+  ) {
+    tagReview = tagReview ? lazy.adoptReviewedTags(tagReview, review) : review;
+    // The decision is made in the editor, so it has to be shown.
+    MoveEditor = lazy.default;
+    moveEditorOpen = true;
   }
 
   function applyProfile(profile: OwnGarnrolleProfile) {
+    savedTags = [...profile.tags];
     displayName = profile.title;
     summary = profile.summary ?? "";
     skills = profileSkills(profile.tags).join(", ");
@@ -216,21 +275,15 @@
     if (!stored) return null;
     try {
       const value = JSON.parse(stored) as Partial<Location>;
-      const lat = value.lat;
-      const lon = value.lon;
-      if (
-        typeof lat !== "number" ||
-        typeof lon !== "number" ||
-        !Number.isFinite(lat) ||
-        !Number.isFinite(lon) ||
-        lat < -90 ||
-        lat > 90 ||
-        lon < -180 ||
-        lon > 180
-      ) {
-        return null;
-      }
-      return { lat, lon };
+      const { lat, lon } = value;
+      // Math.abs is false for NaN and +-Infinity; the type check rules out
+      // numeric strings.
+      return typeof lat === "number" &&
+        typeof lon === "number" &&
+        Math.abs(lat) <= 90 &&
+        Math.abs(lon) <= 180
+        ? { lat, lon }
+        : null;
     } catch {
       return null;
     }
@@ -266,12 +319,28 @@
         const stored =
           readGarnrolleDraft(accountId) ??
           sensitiveSession.read(accountId, draftStorageKey(accountId));
-        if (stored) {
-          try {
-            applyDraft(JSON.parse(stored) as Partial<GarnrolleDraft>);
-          } catch {
-            sensitiveSession.remove(accountId, draftStorageKey(accountId));
+        let draft: Partial<GarnrolleDraft> | null = null;
+        try {
+          draft = JSON.parse(stored ?? "null");
+        } catch {
+          sensitiveSession.remove(accountId, draftStorageKey(accountId));
+        }
+        if (draft) {
+          // Only a draft based on exactly the current tags is taken as is.
+          // Anything else is reconciled first; a failing import leaves the
+          // load failed (form stays disabled), never a stale draft applied.
+          if (JSON.stringify(draft.baseTags) !== JSON.stringify(profile.tags)) {
+            const lazy = await loadEditorModule();
+            if (!isCurrentRequest()) return;
+            const { fields, review } = lazy.reconcileStoredDraft(
+              draft,
+              profile.tags,
+              tagFields(),
+            );
+            draft = { ...draft, ...fields };
+            if (review) holdTagReview(lazy, review);
           }
+          applyDraft(draft);
         }
       }
       // Prefer the most recent same-tab touch choice. A denied storage write
@@ -315,6 +384,7 @@
 
   function saveDraftForMap(): boolean {
     if (!browser || !activeAccountId) return false;
+    if (tagReview) return false;
     const serialized = JSON.stringify(currentDraft());
     // Normal sessionStorage persists through reloads. When Safari refuses
     // writes, an account-bound in-memory copy still supports this same-tab flow.
@@ -360,19 +430,35 @@
     locationButton?.focus();
   }
 
-  function describeSaveError(error: unknown): string {
-    if (error instanceof ApiRequestError) {
-      if (error.status === 401) {
-        return "Sitzung abgelaufen. Bitte melde dich neu an.";
-      }
-      if (error.status === 403) {
-        return "Dieses Konto darf die Garnrolle nicht bearbeiten.";
-      }
-      if (error.status === 400) {
-        return "Prüfe Name, Tags, Kartenanker und Sichtbarkeit.";
-      }
+  /** Reload only the server's tag set after a conflict; keep other drafts. */
+  async function refreshSavedTags() {
+    const at = epoch;
+    try {
+      const profile = await getOwnGarnrolleProfile();
+      if (at !== epoch || profile.id !== activeAccountId) return;
+      await adoptServerTags(profile.tags);
+    } catch {
+      // The conflict message already asks for a deliberate reload.
     }
-    return "Speichern fehlgeschlagen. Versuche es erneut.";
+  }
+
+  /** The user decided; `merge` (if any) takes the reviewed entries over. */
+  function resolveTagReview(merge?: (draft: TagDraft) => TagDraft) {
+    if (merge) setTagFields(merge(tagFields()));
+    // A stored older draft is reviewed again after a reload, never applied.
+    tagReview = null;
+  }
+
+  async function toggleMoveEditor() {
+    moveEditorOpen = !moveEditorOpen;
+    moveEditorError = false;
+    if (!moveEditorOpen || MoveEditor) return;
+    try {
+      MoveEditor = (await loadEditorModule()).default;
+    } catch {
+      moveEditorOpen = false;
+      moveEditorError = true;
+    }
   }
 
   async function handleSave(event: SubmitEvent) {
@@ -412,6 +498,7 @@
           ...(clearLocation ? { clear_location: true } : {}),
           map_state: visibilityChoice,
           radius_m: visibilityChoice === "radius" ? radiusM : undefined,
+          expected_tags: savedTags,
         },
         controller.signal,
       );
@@ -431,7 +518,20 @@
       });
     } catch (error) {
       if (isCurrentSave() && !isAbortError(error)) {
-        profileError = describeSaveError(error);
+        // The status texts live in the lazy module; a failed load of it
+        // still reports the generic failure.
+        let message = "Speichern fehlgeschlagen. Versuche es erneut.";
+        try {
+          message = (await loadEditorModule()).describeSaveError(error);
+        } catch {
+          // keep the generic message
+        }
+        if (isCurrentSave()) {
+          profileError = message;
+          if (error instanceof ApiRequestError && error.status === 409) {
+            await refreshSavedTags();
+          }
+        }
       }
     } finally {
       if (isCurrentSave()) {
@@ -496,11 +596,13 @@
     () =>
       isLoadingProfile ||
       isSaving ||
+      isMoving ||
       loadedProfileAccountId !== activeAccountId,
   );
   let canSave = $derived.by(
     () =>
       !formDisabled &&
+      !tagReview &&
       !!displayName.trim() &&
       !displayNameTooLong &&
       !summaryTooLong &&
@@ -518,7 +620,7 @@
   <div class="section-head">
     <div>
       <p class="eyebrow">Meine Garnrolle</p>
-      <h2>Deine Garnrolle ist dein Anfang im Gewebe.</h2>
+      <h2>Deine Garnrolle im Gewebe.</h2>
     </div>
     <span class="state-pill" data-state={visibility.state}
       >{visibility.label}</span
@@ -528,8 +630,7 @@
   {#if !$authStore.authenticated}
     <div class="empty-card" data-testid="my-garnrolle-anonymous">
       <p>
-        Bei der Registrierung entsteht deine Garnrolle. Nach dem Login kannst du
-        sie hier einrichten.
+        Nach der Registrierung richtest du hier deine Garnrolle ein.
       </p>
       <a class="btn btn-primary" href="/login">Login starten</a>
     </div>
@@ -568,7 +669,7 @@
       <fieldset disabled={formDisabled}>
         <legend>1. Garnrolle beschreiben</legend>
         <p class="field-intro">
-          Nur der Anzeigename ist erforderlich. Den Rest kannst du ergänzen.
+          Nur der Anzeigename ist Pflicht.
         </p>
         <label>
           Anzeigename
@@ -650,10 +751,9 @@
           </small>
         {/if}
         <p class="field-intro" data-testid="garnrolle-public-tags-notice">
-          Diese Profilangaben sind öffentlich, auch bei privatem Kartenanker.
-          Soll ein einzelnes Gut oder eine Fähigkeit nur für dich oder eine
-          Gemeinschaft sichtbar sein, knüpfe dafür einen Knoten. Trage die
-          private Ressource nicht zusätzlich hier ein.
+          Profil-Tags sind immer öffentlich, auch bei privatem Kartenanker.
+          Für private oder gemeinschaftssichtbare Güter und Fähigkeiten nutze
+          eigene Knoten; trage sie nicht zusätzlich als Profil-Tag ein.
         </p>
         <button
           type="button"
@@ -663,13 +763,43 @@
         >
           Einzelne Ressource mit eigener Sichtbarkeit knüpfen
         </button>
+        {#if moveEditorOpen || savedTags.some((tag) => MOVABLE_TAG.test(tag))}
+          <button
+            type="button"
+            class="btn"
+            data-testid="garnrolle-move-open"
+            aria-expanded={moveEditorOpen}
+            disabled={isMoving || !!tagReview}
+            onclick={toggleMoveEditor}
+          >
+            Gespeicherte Güter/Fähigkeiten mit eigener Sichtbarkeit verwalten
+          </button>
+        {/if}
+        {#if moveEditorError}
+          <p class="field-intro" role="alert">
+            Der Editor konnte nicht geladen werden.
+          </p>
+        {/if}
+        {#if moveEditorOpen && MoveEditor && activeAccountId}
+          <MoveEditor
+            accountId={activeAccountId}
+            {savedTags}
+            disabled={formDisabled}
+            onBusyChange={(busy) => (isMoving = busy)}
+            onTagsMoved={adoptServerTags}
+            onStaleTags={refreshSavedTags}
+            review={tagReview}
+            onResolveReview={resolveTagReview}
+          />
+        {:else if moveEditorOpen}
+          <p class="field-intro" role="status">Lade Editor…</p>
+        {/if}
       </fieldset>
 
       <fieldset disabled={formDisabled}>
         <legend>2. Privaten Kartenanker wählen</legend>
         <p class="field-intro">
-          Der Kartenanker ist zunächst privat. Erst deine Auswahl im nächsten
-          Schritt bestimmt, ob und wie daraus eine öffentliche Position wird.
+          Der Kartenanker bleibt privat, bis du seine Sichtbarkeit wählst.
         </p>
 
         <div class="location-card" data-testid="garnrolle-location-state">
@@ -737,7 +867,7 @@
             />
             <span>
               <strong>Privat – nicht öffentlich auf der Karte</strong>
-              <small>Der Kartenanker bleibt gespeichert und unsichtbar.</small>
+              <small>Der Kartenanker bleibt unsichtbar.</small>
             </span>
           </label>
           <label class="radio-card">

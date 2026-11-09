@@ -1040,7 +1040,7 @@ fn node_create_error_message(err: &node_create::NodeCreateValidationError) -> St
     }
 }
 
-fn node_activity_faden_operation_id(
+pub(crate) fn node_activity_faden_operation_id(
     faden_type: super::edges::FadenType,
     account_id: &str,
     node_id: &str,
