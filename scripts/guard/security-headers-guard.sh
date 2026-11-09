@@ -318,8 +318,9 @@ for relative in static_paths:
 # infra/caddy/Caddyfile.dev fronts the Vite dev server, which injects imported
 # CSS as runtime style elements for HMR. Those elements are CSP-governed, so
 # this one path keeps an inline-style exception. The file had no guard coverage
-# at all before, which meant nothing stopped the exception from widening or
-# script-src from being opened alongside it. Both are pinned here.
+# at all before, which meant nothing stopped the exception from widening.
+# Dev proxy default-src/script-src would block SvelteKit's inline bootstrap.
+# Scripts remain document-owned; production CSP contracts are unchanged.
 dev_relative = "infra/caddy/Caddyfile.dev"
 dev_path = contract_file(dev_relative, "dev proxy Caddyfile")
 dev_style_src = csp.get("dev_proxy_style_src") if isinstance(csp, dict) else None
@@ -336,8 +337,8 @@ if dev_path is not None:
         )
     else:
         dev_header = dev_headers[0]
-        if re.search(r"script-src[^;]*'unsafe-inline'", dev_header):
-            fail(f"{dev_relative} must not allow script-src unsafe-inline")
+        if re.search(r"\b(?:default-src|script-src)\s", dev_header):
+            fail(f"{dev_relative} must defer scripts to SvelteKit document CSP")
         if not isinstance(dev_style_src, str) or not dev_style_src.strip():
             fail("content_security_policy.dev_proxy_style_src must be a non-empty string")
         else:
