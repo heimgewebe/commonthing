@@ -1,4 +1,10 @@
-import type { Map as MapLibreMap, Marker, MarkerOptions } from "maplibre-gl";
+import type {
+  CircleLayerSpecification,
+  Map as MapLibreMap,
+  Marker,
+  MarkerOptions,
+} from "maplibre-gl";
+import { gradeColorExpression, gradeMapPaint } from "$lib/map/canvasColorGrade";
 import { hasRenderableMapPosition } from "$lib/map/coordinates";
 import type { MapEntityViewModel } from "$lib/map/types";
 import type { WeaveEntity } from "$lib/map/weaveTheme";
@@ -404,7 +410,7 @@ export class NodesOverlay {
           id: NATIVE_ENTITY_LAYER_ID,
           type: "circle",
           source: NATIVE_ENTITY_SOURCE_ID,
-          paint: {
+          paint: gradeMapPaint<CircleLayerSpecification["paint"]>({
             "circle-radius": [
               "interpolate",
               ["linear"],
@@ -431,7 +437,7 @@ export class NodesOverlay {
                 11,
               ],
             ],
-            "circle-color": ["get", "color"],
+            "circle-color": gradeColorExpression(["get", "color"]),
             "circle-opacity": this.garnrollePlacementMode ? 0.22 : 0.92,
             "circle-stroke-opacity": this.garnrollePlacementMode ? 0.22 : 1,
             "circle-stroke-color": [
@@ -454,7 +460,7 @@ export class NodesOverlay {
               3,
               1.5,
             ],
-          },
+          }),
         });
       }
       if (!sourceCreated) source?.setData?.(data);
