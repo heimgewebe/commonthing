@@ -85,6 +85,7 @@
 
   import { currentBasemap } from "$lib/map/config/basemap.current";
   import { resolveBasemapStyle, rewritePmtilesUrl } from "$lib/map/basemap";
+  import { gradeBasemapStyle } from "$lib/map/canvasColorGrade";
   import {
     observeDocumentColorScheme,
     readDocumentColorScheme,
@@ -900,6 +901,7 @@
       // and UI controls; domain overlays are rehydrated below.
       map.setStyle(resolveBasemapStyle(currentBasemap, scheme), {
         diff: false,
+        transformStyle: gradeBasemapStyle,
       });
       map.once("style.load", () => {
         if (destroyed || !map || generation !== basemapStyleGeneration) return;
@@ -993,7 +995,6 @@
       activeBasemapScheme = readDocumentColorScheme();
       map = new maplibregl.Map({
         container,
-        style: resolveBasemapStyle(currentBasemap, activeBasemapScheme),
         center: initialCamera.center,
         zoom: initialCamera.zoom,
         minZoom: currentBasemap.minZoom ?? 10,
@@ -1002,6 +1003,12 @@
         bearing: currentBasemap.bearing ?? 0,
         attributionControl: false,
         transformRequest: transformRequestFn,
+      });
+      // The constructor's `style` option cannot transform the fetched style,
+      // so the basemap is set right after construction (the same call the
+      // constructor would make) with the canvas colour grade applied.
+      map.setStyle(resolveBasemapStyle(currentBasemap, activeBasemapScheme), {
+        transformStyle: gradeBasemapStyle,
       });
       map.on("move", handleSearchMapMove);
       map.on("moveend", handleNodeViewportMoveEnd);

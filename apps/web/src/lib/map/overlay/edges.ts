@@ -4,6 +4,7 @@ import type {
   LineLayerSpecification,
   Map as MapLibreMap,
 } from "maplibre-gl";
+import { gradeColorExpression, gradeMapPaint } from "$lib/map/canvasColorGrade";
 import { isValidMapCoordinate } from "$lib/map/coordinates";
 import { edgeOpacityAt } from "$lib/map/edgeLifecycle";
 import type { FadenType, MapEdge, MapEntityViewModel } from "$lib/map/types";
@@ -1724,6 +1725,12 @@ export function buildEdgeFeatures(
   return features;
 }
 
+function withGradedPaint(
+  layer: LineLayerSpecification,
+): LineLayerSpecification {
+  return layer.paint ? { ...layer, paint: gradeMapPaint(layer.paint) } : layer;
+}
+
 function applyDashPaint(
   paint: LineLayerSpecification["paint"],
   continuous: boolean,
@@ -1789,11 +1796,11 @@ export function buildEdgeLayerSpecifications(
       layout: commonLayout,
       paint: applyDashPaint(
         {
-          "line-color": [
+          "line-color": gradeColorExpression([
             "coalesce",
             ["get", "themeColor"],
             variant.fallbackColor,
-          ],
+          ]),
           "line-width": bodyWidth,
           "line-opacity": opacity,
         },
@@ -1906,14 +1913,14 @@ function ensureEdgeLayers(map: MapLibreMap, sourceId: string) {
         : hasHighlight
           ? highlightLayer.id
           : firstSymbolId;
-      map.addLayer(shadowLayer, before);
+      map.addLayer(withGradedPaint(shadowLayer), before);
     }
     if (!hasBody) {
       const before = hasHighlight ? highlightLayer.id : firstSymbolId;
-      map.addLayer(bodyLayer, before);
+      map.addLayer(withGradedPaint(bodyLayer), before);
     }
     if (!hasHighlight) {
-      map.addLayer(highlightLayer, firstSymbolId);
+      map.addLayer(withGradedPaint(highlightLayer), firstSymbolId);
     }
   }
 }

@@ -192,7 +192,9 @@ describe("map page early init-timeout wiring", () => {
     expect(pageSource).toContain(
       'map.once("idle", () => finishInitialLoading(generation));',
     );
-    expect(pageSource).toMatch(/\{\s*diff:\s*false,?\s*\}/);
+    expect(pageSource).toMatch(
+      /\{\s*diff:\s*false,\s*transformStyle:\s*gradeBasemapStyle,?\s*\}/,
+    );
     expect(pageSource).not.toContain("initialBasemapGeneration");
   });
 

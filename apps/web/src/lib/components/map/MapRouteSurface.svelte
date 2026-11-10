@@ -57,9 +57,9 @@
     opacity: 0;
     pointer-events: none;
   }
-  #map :global(canvas) {
-    filter: grayscale(0.2) saturate(0.75) brightness(1.03) contrast(0.95);
-  }
+  /* The canvas colour grade is applied to the colours before MapLibre draws
+     them (src/lib/map/canvasColorGrade.ts); a CSS filter here would cost a
+     full-screen compositor pass per map frame. */
 
   #map :global(.maplibregl-ctrl-bottom-right) {
     right: calc(

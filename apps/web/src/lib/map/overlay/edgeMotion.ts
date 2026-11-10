@@ -3,6 +3,11 @@ import type {
   LineLayerSpecification,
   Map as MapLibreMap,
 } from "maplibre-gl";
+import {
+  gradeColorExpression,
+  gradeMapCanvasColor,
+  gradeMapPaint,
+} from "$lib/map/canvasColorGrade";
 import { isValidMapCoordinate } from "$lib/map/coordinates";
 import type { MapEdge, MapEntityViewModel } from "$lib/map/types";
 import { targetThemePalette } from "$lib/map/weaveModel";
@@ -564,7 +569,7 @@ export class EdgeMotionController {
             source: EDGE_MOTION_SOURCE,
             filter,
             layout: commonLayout,
-            paint: shadowPaint,
+            paint: gradeMapPaint(shadowPaint),
           },
           this.map.getLayer(bodyId)
             ? bodyId
@@ -575,11 +580,11 @@ export class EdgeMotionController {
       }
       if (!this.map.getLayer(bodyId)) {
         const bodyPaint: LineLayerSpecification["paint"] = {
-          "line-color": [
+          "line-color": gradeColorExpression([
             "coalesce",
             ["get", "themeColor"],
             variant.fallbackColor,
-          ],
+          ]),
           "line-width": bodyWidth,
           "line-opacity": ["coalesce", ["to-number", ["get", "opacity"]], 0],
         };
@@ -593,7 +598,7 @@ export class EdgeMotionController {
             source: EDGE_MOTION_SOURCE,
             filter,
             layout: commonLayout,
-            paint: bodyPaint,
+            paint: gradeMapPaint(bodyPaint),
           },
           this.map.getLayer(highlightId) ? highlightId : firstSymbolId,
         );
@@ -607,7 +612,9 @@ export class EdgeMotionController {
             filter,
             layout: commonLayout,
             paint: {
-              "line-color": EDGE_VISUAL_STYLE.highlightColor,
+              "line-color": gradeMapCanvasColor(
+                EDGE_VISUAL_STYLE.highlightColor,
+              ),
               "line-width": Math.max(
                 0.55,
                 bodyWidth * EDGE_VISUAL_STYLE.highlightWidthFactor,
