@@ -752,6 +752,19 @@ async fn postgres_repository_survives_restart_and_keeps_quarantine_separate() ->
         "exact authenticated duplicates must not consume the shared origin bucket"
     );
 
+    // Both receives below must stay in the same PostgreSQL clock minute:
+    // crossing the boundary legitimately replenishes the peer's quota.
+    // Avoid starting the proof near that boundary, using the database clock
+    // rather than the (potentially skewed) CI runner clock.
+    let seconds_left: i64 = sqlx::query_scalar(
+        "SELECT 60 - (floor(extract(epoch FROM clock_timestamp()))::bigint % 60)",
+    )
+    .fetch_one(&pool)
+    .await?;
+    if seconds_left <= 15 {
+        tokio::time::sleep(Duration::from_secs((seconds_left + 1) as u64)).await;
+    }
+
     // Prime the active database-time bucket immediately below the limit. The
     // previous 119-event loop could straddle a minute boundary and make this
     // integration proof nondeterministic even though the shared counter was
