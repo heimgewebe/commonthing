@@ -441,19 +441,23 @@
   will-change: transform;
 }
 
-.map-marker:focus-visible {
-  --marker-halo-color: var(--text);
-  z-index: 10;
-}
-
+/* Collapsed household stacks use inline z-index: 30. A searched or
+ * selected node at the same map coordinate must remain above that stack,
+ * while an expanded household (z-index: 50+) keeps its own interaction layer.
+ * Do not change the geographic anchors or enlarge any hit targets. */
 .map-marker.search-highlight {
   --marker-halo-color: var(--primary, #005fcc);
-  z-index: 5;
+  z-index: 31;
 }
 
 .map-marker.is-selected {
   --marker-halo-color: var(--accent);
-  z-index: 8;
+  z-index: 32;
+}
+
+.map-marker:focus-visible {
+  --marker-halo-color: var(--text);
+  z-index: 33;
 }
 
 .map-marker:focus-visible .map-marker__halo,
