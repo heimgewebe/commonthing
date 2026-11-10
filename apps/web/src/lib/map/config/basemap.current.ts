@@ -56,10 +56,12 @@ const WORLD_INITIAL_VIEW: BasemapInitialView = {
   minZoom: 1,
 };
 
+// Germany PMTiles cover z0–14 and advertise z5 as their overview center.
+// At z7 the Hamburg public-node cluster starts outside a desktop viewport.
 const GERMANY_INITIAL_VIEW: BasemapInitialView = {
   center: [10.4515, 51.1657],
-  zoom: MAP_MIN_ZOOM,
-  minZoom: MAP_MIN_ZOOM,
+  zoom: 5,
+  minZoom: 5,
 };
 
 const REGIONAL_INITIAL_VIEW: BasemapInitialView = {

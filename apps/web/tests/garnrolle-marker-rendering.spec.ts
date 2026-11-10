@@ -1,4 +1,5 @@
 import { devices, expect, test } from "@playwright/test";
+import { currentBasemap } from "../src/lib/map/config/basemap.current";
 import {
   MAP_MARKER_MAX_SCALE,
   MAP_MARKER_MIN_SCALE,
@@ -427,7 +428,8 @@ test.describe("Garnrolle marker rendering", () => {
       },
     );
 
-    expect(metrics.minZoom).toBe(MAP_MIN_ZOOM);
+    // Map zoom-out may extend below the textile marker-scale floor (z7).
+    expect(metrics.minZoom).toBe(currentBasemap.minZoom ?? MAP_MIN_ZOOM);
     expect(metrics.maxZoom).toBe(MAP_MAX_ZOOM);
     expect(metrics.reference.zoom).toBeCloseTo(MAP_MARKER_REFERENCE_ZOOM, 5);
     expect(metrics.near.zoom).toBeCloseTo(MAP_MAX_ZOOM, 5);
