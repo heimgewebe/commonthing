@@ -21,7 +21,14 @@ test("guest map starts on neutral nationwide Germany even when content exists", 
 
   expect(camera.lng).toBeCloseTo(10.4515, 3);
   expect(camera.lat).toBeCloseTo(51.1657, 3);
-  expect(camera.zoom).toBeCloseTo(7, 3);
+  expect(camera.zoom).toBeCloseTo(5, 3);
+
+  // Visibility must mean on-screen, not just nonzero CSS dimensions:
+  // previously the Hamburg node button was rendered hundreds of pixels above
+  // the viewport and Playwright's toBeVisible() would still accept it.
+  await expect(
+    page.locator('.map-marker[data-marker-category="node"]').first(),
+  ).toBeInViewport({ ratio: 0.5 });
 });
 
 test("partial guest data uses the neutral basemap fallback", async ({
@@ -52,7 +59,7 @@ test("partial guest data uses the neutral basemap fallback", async ({
 
   expect(camera.lng).toBeCloseTo(10.4515, 3);
   expect(camera.lat).toBeCloseTo(51.1657, 3);
-  expect(camera.zoom).toBeCloseTo(7, 3);
+  expect(camera.zoom).toBeCloseTo(5, 3);
 });
 
 test("empty sovereign map starts on neutral nationwide Germany", async ({
@@ -91,7 +98,7 @@ test("empty sovereign map starts on neutral nationwide Germany", async ({
 
   expect(camera.lng).toBeCloseTo(10.4515, 3);
   expect(camera.lat).toBeCloseTo(51.1657, 3);
-  expect(camera.zoom).toBeCloseTo(7, 3);
+  expect(camera.zoom).toBeCloseTo(5, 3);
 });
 
 test("signed-in map starts on the own positioned Garnrolle", async ({
@@ -168,7 +175,7 @@ test("delayed authentication recenters once without blocking public map startup"
   });
   expect(initialCamera.lng).toBeCloseTo(10.4515, 3);
   expect(initialCamera.lat).toBeCloseTo(51.1657, 3);
-  expect(initialCamera.zoom).toBeCloseTo(7, 3);
+  expect(initialCamera.zoom).toBeCloseTo(5, 3);
   releaseAuth();
   await page.waitForFunction(
     () => {
