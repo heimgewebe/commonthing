@@ -1,5 +1,10 @@
 use weltgewebe_api::{run, shutdown::RUNTIME_SHUTDOWN_TIMEOUT};
 
+// glibc malloc keeps the freed projection after each reload resident
+// (fragmentation across arenas); mimalloc returns it to the OS.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
