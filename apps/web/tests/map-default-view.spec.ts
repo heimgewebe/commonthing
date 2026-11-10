@@ -256,3 +256,66 @@ test("camera movement remains sticky after returning to the initial view", async
   expect(finalCamera.bearing).toBeCloseTo(15, 3);
   expect(finalCamera.pitch).toBeCloseTo(20, 3);
 });
+
+test("a highlighted knot stays clickable above a collapsed household marker", async ({
+  page,
+}) => {
+  await mockApiResponses(page);
+  await page.goto("/map");
+
+  const node = page.locator('.map-marker[data-marker-category="node"]').first();
+  const account = page.locator(".map-marker.marker-account").first();
+  await expect(node).toBeInViewport({ ratio: 0.5 });
+  await expect(account).toBeVisible();
+
+  // Reproduce the shared-location layering without relying on demo accounts
+  // having exactly the same coordinates. Household stacks use inline z=30.
+  const box = await node.boundingBox();
+  expect(box).not.toBeNull();
+  await account.evaluate((element, target) => {
+    const original = element.getBoundingClientRect();
+    element.style.translate = `${target.x - original.x}px ${target.y - original.y}px`;
+    element.style.zIndex = "30";
+  }, box!);
+
+  const target = await node.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  });
+  // Before highlighting, the collocated household must actually intercept
+  // the node's center; otherwise this test would not reproduce the bug.
+  const markerAtTarget = () =>
+    page.evaluate(
+      ({ x, y }) =>
+        document
+          .elementFromPoint(x, y)
+          ?.closest("button.map-marker")
+          ?.getAttribute("data-marker-category"),
+      target,
+    );
+  expect(await markerAtTarget()).toBe("account");
+  expect(
+    await node.evaluate((element) => getComputedStyle(element).zIndex),
+  ).toBe("auto");
+
+  await node.evaluate((element) => element.classList.add("search-highlight"));
+  await expect
+    .poll(() =>
+      node.evaluate((element) => Number(getComputedStyle(element).zIndex)),
+    )
+    .toBeGreaterThan(30);
+  await expect
+    .poll(async () =>
+      page.evaluate(({ x, y }) => {
+        const marker = document
+          .elementFromPoint(x, y)
+          ?.closest("button.map-marker");
+        return marker?.getAttribute("data-marker-category");
+      }, target),
+    )
+    .toBe("node");
+
+  // This must be a real Playwright pointer click, not dispatchEvent().
+  await node.click();
+  await expect(page.getByTestId("context-panel")).toBeVisible();
+});
