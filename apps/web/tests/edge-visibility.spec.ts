@@ -1,6 +1,10 @@
 import { test, expect } from "@playwright/test";
 import { mockApiResponses } from "./fixtures/mockApi";
 import { EDGE_VISUAL_STYLE } from "../src/lib/map/overlay/edges";
+import {
+  gradeColorExpression,
+  gradeMapCanvasColor,
+} from "../src/lib/map/canvasColorGrade";
 import { waitForMapReady } from "./fixtures/mapReady";
 
 test.describe("Edge visibility on load", () => {
@@ -170,18 +174,25 @@ test.describe("Edge visibility on load", () => {
     expect(edgeState.layer).toBe(true);
     expect(edgeState.shadowLayer).toBe(true);
     expect(edgeState.highlightLayer).toBe(true);
-    expect(edgeState.shadowColor).toBe(EDGE_VISUAL_STYLE.shadowColor);
+    // Paint colours carry the canvas colour grade (canvasColorGrade.ts).
+    expect(edgeState.shadowColor).toBe(
+      gradeMapCanvasColor(EDGE_VISUAL_STYLE.shadowColor),
+    );
     expect(edgeState.shadowWidth).toBe(
       EDGE_VISUAL_STYLE.bodyWidth + EDGE_VISUAL_STYLE.shadowWidthExtra,
     );
     expect(edgeState.shadowBlur).toBe(EDGE_VISUAL_STYLE.shadowBlur);
-    expect(edgeState.mainColor).toEqual([
-      "coalesce",
-      ["get", "themeColor"],
-      EDGE_VISUAL_STYLE.bodyColor,
-    ]);
+    expect(edgeState.mainColor).toEqual(
+      gradeColorExpression([
+        "coalesce",
+        ["get", "themeColor"],
+        EDGE_VISUAL_STYLE.bodyColor,
+      ]),
+    );
     expect(edgeState.mainWidth).toBe(EDGE_VISUAL_STYLE.bodyWidth);
-    expect(edgeState.highlightColor).toBe(EDGE_VISUAL_STYLE.highlightColor);
+    expect(edgeState.highlightColor).toBe(
+      gradeMapCanvasColor(EDGE_VISUAL_STYLE.highlightColor),
+    );
     expect(edgeState.highlightWidth).toBe(
       Math.max(
         0.55,
