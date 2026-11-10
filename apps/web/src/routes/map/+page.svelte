@@ -345,12 +345,12 @@
       !$searchQuery.trim() ||
       filteredResults.length === 0
     ) {
-      searchDirectionIndicators = [];
+      if (searchDirectionIndicators.length > 0) searchDirectionIndicators = [];
       return;
     }
     const bounds = getUsableSearchViewport();
     if (!bounds) {
-      searchDirectionIndicators = [];
+      if (searchDirectionIndicators.length > 0) searchDirectionIndicators = [];
       return;
     }
     const projected = filteredResults
@@ -366,6 +366,14 @@
   }
 
   function scheduleSearchDirectionIndicators() {
+    // A closed or empty search has no directions to animate. Avoid scheduling
+    // a Svelte state write for every MapLibre frame in the ordinary map view.
+    if (
+      (!$isSearchOpen || !$searchQuery.trim() || filteredResults.length === 0) &&
+      searchDirectionIndicators.length === 0
+    ) {
+      return;
+    }
     if (searchDirectionFrame !== null) return;
     searchDirectionFrame = window.requestAnimationFrame(() => {
       searchDirectionFrame = null;
