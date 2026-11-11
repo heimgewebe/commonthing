@@ -9,6 +9,7 @@ interface MockOptions {
   unsubscribeFailuresBeforeSuccess?: number;
   directMessagesPush?: boolean;
   deleteStatus?: number;
+  registerStatus?: number;
   authenticated?: boolean;
   onPreferenceWrite?: (enabled: boolean) => void;
   onPushRead?: (pathname: string) => void;
@@ -228,6 +229,16 @@ async function installApiMocks(
     }
 
     if (pathname === "/api/push/subscriptions" && method === "POST") {
+      if ((options.registerStatus ?? 200) >= 400) {
+        return route.fulfill({
+          status: options.registerStatus,
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: "push_subscription_limit_reached",
+            message: "raw server detail must remain hidden",
+          }),
+        });
+      }
       registeredCurrentDevice = true;
       return route.fulfill({
         status: 200,
@@ -521,6 +532,56 @@ test.describe("Settings — notifications information architecture", () => {
     await expect(
       section.getByLabel("1 von 20 Push-Geräten belegt"),
     ).toBeVisible();
+  });
+
+  test("preserves an existing browser Push subscription if server registration fails", async ({
+    page,
+  }) => {
+    let deletes = 0;
+    await setup(page, {
+      permission: "granted",
+      hasSubscription: true,
+      registeredCurrentDevice: false,
+      registerStatus: 409,
+      onPushDelete: () => {
+        deletes += 1;
+      },
+    });
+    await page.goto("/settings#benachrichtigungen");
+    const section = page.locator("#benachrichtigungen");
+    await section
+      .getByRole("button", { name: "Auf diesem Gerät aktivieren" })
+      .click();
+    await expect(section.getByRole("alert")).toBeVisible();
+    await expect(
+      section.getByRole("button", {
+        name: "Lokales Browser-Abo entfernen",
+      }),
+    ).toBeVisible();
+    expect(deletes).toBe(0);
+  });
+
+  test("does not delete a server Push subscription after a rejected registration", async ({
+    page,
+  }) => {
+    let deletes = 0;
+    await setup(page, {
+      permission: "granted",
+      registerStatus: 409,
+      onPushDelete: () => {
+        deletes += 1;
+      },
+    });
+    await page.goto("/settings#benachrichtigungen");
+    const section = page.locator("#benachrichtigungen");
+    await section
+      .getByRole("button", { name: "Auf diesem Gerät aktivieren" })
+      .click();
+    await expect(section.getByRole("alert")).toBeVisible();
+    await expect(
+      section.getByText("Push auf diesem Gerät: nicht aktiviert."),
+    ).toBeVisible();
+    expect(deletes).toBe(0);
   });
 
   test("retries only local cleanup after reload when server deletion already succeeded", async ({

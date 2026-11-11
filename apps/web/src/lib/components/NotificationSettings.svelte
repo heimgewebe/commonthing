@@ -137,6 +137,8 @@
     clearFeedback();
     let createdSubscription: PushSubscription | null = null;
     let cleanupEndpoint: string | null = null;
+    let existingBrowserSubscription = false;
+    let serverRegistrationConfirmed = false;
     try {
       permission = await Notification.requestPermission();
       if (permission !== "granted") {
@@ -152,6 +154,7 @@
       });
       await navigator.serviceWorker.ready;
       const existing = await registration.pushManager.getSubscription();
+      existingBrowserSubscription = existing !== null;
       createdSubscription =
         existing ??
         (await registration.pushManager.subscribe({
@@ -162,6 +165,7 @@
         }));
       cleanupEndpoint = createdSubscription.endpoint;
       await registerPushSubscription(createdSubscription);
+      serverRegistrationConfirmed = true;
       preferences = await updateNotificationPreferences(true);
       currentServerRegistration = true;
       browserSubscription = createdSubscription;
@@ -171,14 +175,22 @@
     } catch (cause) {
       if (createdSubscription && cleanupEndpoint) {
         try {
-          await deletePushSubscription(cleanupEndpoint);
-          currentServerRegistration = false;
+          // A rejected registration must not delete an existing server record.
+          // An existing browser subscription is also never ours to unsubscribe.
+          if (serverRegistrationConfirmed) {
+            await deletePushSubscription(cleanupEndpoint);
+            currentServerRegistration = false;
+          }
           deviceManagerRefreshVersion += 1;
-          await createdSubscription.unsubscribe().catch(() => false);
-          await loadBrowserSubscription();
-          if (browserSubscription) {
-            warning =
-              "Die fehlgeschlagene Einrichtung wurde auf dem Server zurückgenommen, aber das lokale Browser-Abo konnte nicht beendet werden. Push bleibt auf diesem Gerät aus; versuche die lokale Deaktivierung erneut.";
+          if (!existingBrowserSubscription) {
+            await createdSubscription.unsubscribe().catch(() => false);
+            await loadBrowserSubscription();
+            if (browserSubscription) {
+              warning =
+                "Die fehlgeschlagene Einrichtung konnte lokal nicht vollständig zurückgenommen werden. Push bleibt auf diesem Gerät aus; versuche die lokale Deaktivierung erneut.";
+            }
+          } else {
+            browserSubscription = createdSubscription;
           }
         } catch (cleanupCause) {
           currentServerRegistration = null;
