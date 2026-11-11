@@ -5,6 +5,7 @@
   import {
     applicationServerKey,
     deletePushSubscription,
+    NotificationsApiError,
     getNotificationPreferences,
     getPushConfig,
     registerPushSubscription,
@@ -182,7 +183,19 @@
             currentServerRegistration = false;
           }
           deviceManagerRefreshVersion += 1;
-          if (!existingBrowserSubscription) {
+          // A lost POST response does not prove that the server rolled back.
+          // Keep a newly created endpoint recoverable unless we have a
+          // confirmed server response that the registration was rejected.
+          const knownRejectedRegistration =
+            cause instanceof NotificationsApiError &&
+            cause.status >= 400 &&
+            cause.status < 500 &&
+            cause.status !== 408 &&
+            cause.status !== 429;
+          if (
+            !existingBrowserSubscription &&
+            (serverRegistrationConfirmed || knownRejectedRegistration)
+          ) {
             await createdSubscription.unsubscribe().catch(() => false);
             await loadBrowserSubscription();
             if (browserSubscription) {
@@ -191,6 +204,10 @@
             }
           } else {
             browserSubscription = createdSubscription;
+            if (!existingBrowserSubscription && !serverRegistrationConfirmed) {
+              warning =
+                "Die Antwort auf die Geräte-Registrierung ist nicht eindeutig. Das lokale Browser-Abo bleibt erhalten, damit ein möglicherweise gespeicherter Servereintrag verwaltet oder die Einrichtung erneut versucht werden kann.";
+            }
           }
         } catch (cleanupCause) {
           currentServerRegistration = null;

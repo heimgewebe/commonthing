@@ -10,6 +10,7 @@ interface MockOptions {
   directMessagesPush?: boolean;
   deleteStatus?: number;
   registerStatus?: number;
+  registerNetworkFailureAfterCommit?: boolean;
   authenticated?: boolean;
   onPreferenceWrite?: (enabled: boolean) => void;
   onPushRead?: (pathname: string) => void;
@@ -240,6 +241,9 @@ async function installApiMocks(
         });
       }
       registeredCurrentDevice = true;
+      if (options.registerNetworkFailureAfterCommit) {
+        return route.abort("failed");
+      }
       return route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -582,6 +586,29 @@ test.describe("Settings — notifications information architecture", () => {
       section.getByText("Push auf diesem Gerät: nicht aktiviert."),
     ).toBeVisible();
     expect(deletes).toBe(0);
+  });
+
+  test("keeps a newly issued browser subscription if a committed POST loses its response", async ({
+    page,
+  }) => {
+    await setup(page, {
+      permission: "granted",
+      registerNetworkFailureAfterCommit: true,
+    });
+    await page.goto("/settings#benachrichtigungen");
+    const section = page.locator("#benachrichtigungen");
+    await section
+      .getByRole("button", { name: "Auf diesem Gerät aktivieren" })
+      .click();
+    await expect(section.getByRole("alert")).toBeVisible();
+    await expect(
+      section.getByLabel("1 von 20 Push-Geräten belegt"),
+    ).toBeVisible();
+    const localSubscriptionExists = await page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration("/");
+      return Boolean(await registration?.pushManager.getSubscription());
+    });
+    expect(localSubscriptionExists).toBe(true);
   });
 
   test("retries only local cleanup after reload when server deletion already succeeded", async ({
