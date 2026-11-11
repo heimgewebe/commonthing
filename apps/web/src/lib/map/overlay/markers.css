@@ -571,6 +571,68 @@
   outline-offset: 3px;
 }
 
+/* On-demand choice for screen-overlapping entities; geography stays unchanged. */
+.map-object-chooser {
+  position: absolute;
+  z-index: 90;
+  top: max(68px, env(safe-area-inset-top));
+  left: 12px;
+  display: grid;
+  gap: 8px;
+  box-sizing: border-box;
+  width: min(340px, calc(100% - 24px));
+  max-height: min(65%, 460px);
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid #775440;
+  border-radius: 12px;
+  background: #f4e5cd;
+  color: #3c281a;
+  box-shadow: 0 5px 18px rgba(35, 22, 15, 0.35);
+  font:
+    500 13px/1.4 system-ui,
+    sans-serif;
+  touch-action: manipulation;
+}
+.map-object-chooser__header,
+.map-object-chooser__pager {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.map-object-chooser__header {
+  font-weight: 700;
+}
+.map-object-chooser__list {
+  display: grid;
+  gap: 4px;
+}
+.map-object-chooser button {
+  appearance: none;
+  border: 1px solid #ae967e;
+  border-radius: 7px;
+  background: #fffaf2;
+  color: inherit;
+  padding: 8px 10px;
+  min-height: 44px;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  touch-action: manipulation;
+}
+.map-object-chooser button:focus-visible {
+  outline: 3px solid #005fcc;
+  outline-offset: 1px;
+}
+.map-object-chooser__item[aria-current="true"] {
+  border-color: #005fcc;
+}
+.map-object-chooser__pager button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .map-household-close {
   position: absolute;
   z-index: 80;
