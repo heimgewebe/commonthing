@@ -89,7 +89,9 @@ async function overlappingMap(page: import("@playwright/test").Page) {
 
 async function anchorScreenPoint(page: import("@playwright/test").Page) {
   return await page.evaluate(({ lat, lon }) => {
-    const map = window.__TEST_MAP__;
+    const map = window.__TEST_MAP__ as unknown as
+      | { project(coords: [number, number]): { x: number; y: number } }
+      | undefined;
     if (!map) throw new Error("no map");
     const marker = map.project([lon, lat]);
     const box = document.querySelector("#map")?.getBoundingClientRect();
@@ -111,9 +113,13 @@ test("real pointer selects each co-located node, Garnrolle and center through on
         ?.getAttribute("data-id"),
     point,
   );
-  expect([demoNodes[0].id, otherNodeId, nearbyNodeId, account.id, center.id]).toContain(
-    targetAtPoint,
-  );
+  expect([
+    demoNodes[0].id,
+    otherNodeId,
+    nearbyNodeId,
+    account.id,
+    center.id,
+  ]).toContain(targetAtPoint);
 
   await page.mouse.click(point.x, point.y);
   const chooser = page.getByTestId("map-object-chooser");
@@ -121,7 +127,9 @@ test("real pointer selects each co-located node, Garnrolle and center through on
   for (const id of [demoNodes[0].id, otherNodeId, account.id, center.id]) {
     await expect(page.getByTestId(`choose-map-object-${id}`)).toBeVisible();
   }
-  await expect(chooser.locator("button.map-object-chooser__item").first()).toBeFocused();
+  await expect(
+    chooser.locator("button.map-object-chooser__item").first(),
+  ).toBeFocused();
   await page.getByTestId(`choose-map-object-${otherNodeId}`).click();
   await expect(chooser).toHaveCount(0);
   await expect(page.getByTestId("context-panel")).toContainText(
@@ -163,6 +171,20 @@ test("zoom separates nearby locations; Escape and keyboard access work", async (
   await page.keyboard.press("Enter");
   await expect(chooser).toHaveCount(0);
   await expect(page.getByTestId("context-panel")).toBeVisible();
+});
+
+test("panning the map closes an obsolete screen-space object choice", async ({
+  page,
+}) => {
+  await overlappingMap(page);
+  const point = await anchorScreenPoint(page);
+  await page.mouse.click(point.x, point.y);
+  const chooser = page.getByTestId("map-object-chooser");
+  await expect(chooser).toBeVisible();
+  await page.evaluate(() => {
+    window.__TEST_MAP__?.jumpTo({ center: [12.5, 50], zoom: 5 });
+  });
+  await expect(chooser).toHaveCount(0);
 });
 
 test.describe("touchscreen emulation, not physical iPad Safari", () => {

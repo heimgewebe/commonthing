@@ -226,6 +226,7 @@ export class NodesOverlay {
     this.closeHousehold();
   };
   private readonly handleMoveEnd = () => {
+    this.closeObjectChooser(); // Screen-space collisions are invalid after camera movement.
     if (this.nativeLayerEnabled) {
       // Stacked households use DOM markers even in the dense native layer.
       // Reconcile on pan without resending the ordinary GeoJSON features.
@@ -523,6 +524,20 @@ export class NodesOverlay {
 
   private handleObjectMarkerClick(id: string, event: MouseEvent): void {
     if (this.garnrollePlacementMode) return;
+    // Existing direct actions take precedence: a highlighted or selected knot
+    // reopens its detail, and an expanded household member opens its profile.
+    // Alt+click still exposes all overlapping objects on these markers.
+    const marker = this.activeMarkers.get(id)?.element;
+    const household = this.households.byAccountId.get(id);
+    if (
+      !event.altKey &&
+      (marker?.classList.contains("search-highlight") ||
+        marker?.classList.contains("is-selected") ||
+        (household && this.expandedHouseholdKey === household.key))
+    ) {
+      this.closeObjectChooser();
+      return;
+    }
     const item = this.pointById(id);
     if (!item || !this.openObjectChooserIfOverlapping(item)) return;
     // The map page's normal click handler must not independently activate

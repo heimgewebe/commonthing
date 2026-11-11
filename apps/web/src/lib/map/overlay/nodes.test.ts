@@ -1604,10 +1604,13 @@ describe("one on-demand chooser for overlapping map hit boxes", () => {
       ?.element as unknown as FakeElement;
     expect(front.dataset.householdCount).toBe("2");
     overlay.updateSelection(node.id);
-    const clicked = (
-      overlay.getActiveMarker(node.id)?.element as unknown as FakeElement
-    ).fire("click");
-    expect(clicked.stopPropagation).toHaveBeenCalled();
+    const selected = overlay.getActiveMarker(node.id)
+      ?.element as unknown as FakeElement;
+    const directClick = selected.fire("click");
+    expect(directClick.stopPropagation).not.toHaveBeenCalled();
+    expect(chooserOf(container)).toBeUndefined();
+    const chooserClick = selected.fire("click", { altKey: true });
+    expect(chooserClick.stopPropagation).toHaveBeenCalled();
     expect(chooserOf(container)).toBeDefined();
     container.fire("keydown", { key: "Escape" });
     expect(chooserOf(container)?.removed).toBe(true);
