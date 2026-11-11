@@ -1576,7 +1576,7 @@ describe("one on-demand chooser for overlapping map hit boxes", () => {
     const fuzzy = {
       ...makeAccount("fuzzy"),
       lat: first.lat,
-      lon: first.lon + 0.01,
+      lon: first.lon + 0.23, // 23px separation: each marker center remains clickable.
       map_state: "radius" as const,
     };
     overlay.update([first, fuzzy], true);
@@ -1587,6 +1587,27 @@ describe("one on-demand chooser for overlapping map hit boxes", () => {
     expect(chooserOf(container)).toBeUndefined();
     const alternatives = marker.fire("click", { detail: 1, altKey: true });
     expect(alternatives.stopPropagation).toHaveBeenCalledOnce();
+    expect(chooserOf(container)?.children[1].children).toHaveLength(2);
+    overlay.destroy();
+  });
+
+  it("opens a touch-reachable chooser for an exact Garnrolle and a same-point radius Garnrolle", () => {
+    const { overlay, container } = projectedOverlay(([lon, lat]) => ({
+      x: lon * 100,
+      y: lat * 100,
+    }));
+    const exact = makeAccount("exact");
+    const radius = {
+      ...makeAccount("radius"),
+      lon: exact.lon,
+      lat: exact.lat,
+      map_state: "radius" as const,
+    };
+    overlay.update([exact, radius], true);
+    const marker = overlay.getActiveMarker(exact.id)
+      ?.element as unknown as FakeElement;
+    const click = marker.fire("click", { detail: 1 });
+    expect(click.stopPropagation).toHaveBeenCalledOnce();
     expect(chooserOf(container)?.children[1].children).toHaveLength(2);
     overlay.destroy();
   });

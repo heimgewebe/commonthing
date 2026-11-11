@@ -428,14 +428,36 @@ export class NodesOverlay {
     item: MapEntityViewModel,
     explicitChoice = false,
   ): boolean {
-    if (this.garnrollePlacementMode || !this.mapScaleContainer) return false;
+    const map = this.map;
+    if (
+      this.garnrollePlacementMode ||
+      !this.mapScaleContainer ||
+      !map ||
+      typeof map.project !== "function"
+    )
+      return false;
     const overlapping = this.overlappingObjects(item);
-    // Nearby public Garnrollen are not an exact household. Keep their
-    // normal profile click direct; Alt+click exposes the full list.
+    // Nearby Garnrollen stay directly clickable when their actual 44px
+    // hit-box centers do not cover one another. At an indistinguishable
+    // on-screen point, touch users must still be able to pick either spool.
     const onlySpools =
       item.type === "garnrolle" &&
       overlapping.every((candidate) => candidate.type === "garnrolle");
-    if (overlapping.length < 2 || (onlySpools && !explicitChoice)) {
+    const origin = map.project([item.lon, item.lat]);
+    const spoolCenterCovered =
+      onlySpools &&
+      overlapping.some((candidate) => {
+        if (candidate.id === item.id) return false;
+        const other = map.project([candidate.lon, candidate.lat]);
+        return (
+          Math.abs(other.x - origin.x) < MARKER_HIT_SIZE_PX / 2 &&
+          Math.abs(other.y - origin.y) < MARKER_HIT_SIZE_PX / 2
+        );
+      });
+    if (
+      overlapping.length < 2 ||
+      (onlySpools && !explicitChoice && !spoolCenterCovered)
+    ) {
       this.closeObjectChooser();
       return false;
     }
@@ -546,7 +568,7 @@ export class NodesOverlay {
       !event.altKey &&
       (marker?.classList.contains("search-highlight") ||
         marker?.classList.contains("is-selected") ||
-        (household && this.expandedHouseholdKey === household.key))
+        household)
     ) {
       this.closeObjectChooser();
       return;
