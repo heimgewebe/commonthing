@@ -187,6 +187,19 @@ test("panning the map closes an obsolete screen-space object choice", async ({
   await expect(chooser).toHaveCount(0);
 });
 
+test("focused marker Enter opens its detail directly despite nearby overlapping objects", async ({
+  page,
+}) => {
+  await overlappingMap(page);
+  const marker = page.getByTestId(`marker-node-${demoNodes[0].id}`);
+  await marker.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("context-panel")).toContainText(
+    demoNodes[0].title,
+  );
+  await expect(page.getByTestId("map-object-chooser")).toHaveCount(0);
+});
+
 test.describe("touchscreen emulation, not physical iPad Safari", () => {
   test.use({ hasTouch: true, viewport: { width: 820, height: 1180 } });
 

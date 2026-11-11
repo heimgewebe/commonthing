@@ -424,10 +424,18 @@ export class NodesOverlay {
     return results;
   }
 
-  private openObjectChooserIfOverlapping(item: MapEntityViewModel): boolean {
+  private openObjectChooserIfOverlapping(
+    item: MapEntityViewModel,
+    explicitChoice = false,
+  ): boolean {
     if (this.garnrollePlacementMode || !this.mapScaleContainer) return false;
     const overlapping = this.overlappingObjects(item);
-    if (overlapping.length < 2) {
+    // Nearby public Garnrollen are not an exact household. Keep their
+    // normal profile click direct; Alt+click exposes the full list.
+    const onlySpools =
+      item.type === "garnrolle" &&
+      overlapping.every((candidate) => candidate.type === "garnrolle");
+    if (overlapping.length < 2 || (onlySpools && !explicitChoice)) {
       this.closeObjectChooser();
       return false;
     }
@@ -524,6 +532,11 @@ export class NodesOverlay {
 
   private handleObjectMarkerClick(id: string, event: MouseEvent): void {
     if (this.garnrollePlacementMode) return;
+    // A keyboard activation or scripted click has no pointer hit point to
+    // disambiguate. Keep its focused/explicit marker action direct; a physical
+    // pointer click still opens the chooser for genuinely overlapped hit boxes.
+    // Alt+Enter explicitly requests the chooser from the keyboard.
+    if (event.detail === 0 && !event.altKey) return;
     // Existing direct actions take precedence: a highlighted or selected knot
     // reopens its detail, and an expanded household member opens its profile.
     // Alt+click still exposes all overlapping objects on these markers.
@@ -539,7 +552,8 @@ export class NodesOverlay {
       return;
     }
     const item = this.pointById(id);
-    if (!item || !this.openObjectChooserIfOverlapping(item)) return;
+    if (!item || !this.openObjectChooserIfOverlapping(item, event.altKey))
+      return;
     // The map page's normal click handler must not independently activate
     // the stacked top marker while the explicit chooser is open.
     event.preventDefault();

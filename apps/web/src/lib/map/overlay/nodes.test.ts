@@ -1567,6 +1567,30 @@ describe("one on-demand chooser for overlapping map hit boxes", () => {
     overlay.destroy();
   });
 
+  it("keeps ordinary Garnrolle profile clicks direct while Alt+click lists nearby Garnrollen", () => {
+    const { overlay, container } = projectedOverlay(([lon, lat]) => ({
+      x: lon * 100,
+      y: lat * 100,
+    }));
+    const first = makeAccount("visible");
+    const fuzzy = {
+      ...makeAccount("fuzzy"),
+      lat: first.lat,
+      lon: first.lon + 0.01,
+      map_state: "radius" as const,
+    };
+    overlay.update([first, fuzzy], true);
+    const marker = overlay.getActiveMarker(first.id)
+      ?.element as unknown as FakeElement;
+    const direct = marker.fire("click", { detail: 1 });
+    expect(direct.stopPropagation).not.toHaveBeenCalled();
+    expect(chooserOf(container)).toBeUndefined();
+    const alternatives = marker.fire("click", { detail: 1, altKey: true });
+    expect(alternatives.stopPropagation).toHaveBeenCalledOnce();
+    expect(chooserOf(container)?.children[1].children).toHaveLength(2);
+    overlay.destroy();
+  });
+
   it("never turns an unlisted, private or revoked object into a choice", () => {
     const { overlay, container } = projectedOverlay(([lon, lat]) => ({
       x: lon,
@@ -1608,6 +1632,9 @@ describe("one on-demand chooser for overlapping map hit boxes", () => {
       ?.element as unknown as FakeElement;
     const directClick = selected.fire("click");
     expect(directClick.stopPropagation).not.toHaveBeenCalled();
+    expect(chooserOf(container)).toBeUndefined();
+    const keyboardClick = selected.fire("click", { detail: 0 });
+    expect(keyboardClick.stopPropagation).not.toHaveBeenCalled();
     expect(chooserOf(container)).toBeUndefined();
     const chooserClick = selected.fire("click", { altKey: true });
     expect(chooserClick.stopPropagation).toHaveBeenCalled();
