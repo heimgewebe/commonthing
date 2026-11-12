@@ -22,8 +22,9 @@ use weltgewebe_api::{
         DomainReadSource, PasskeyCredentialSource,
     },
     middleware::auth::AuthContext,
-    routes::personal_events::{
-        list_personal_events, mark_personal_event_read, PersonalEventPageQuery,
+    routes::{
+        circles::{leave_circle, LeaveCircleQuery},
+        personal_events::{list_personal_events, mark_personal_event_read, PersonalEventPageQuery},
     },
     state::{ApiState, OrderedCache},
     telemetry::{BuildInfo, Metrics},
@@ -252,6 +253,32 @@ async fn circle_notifications_are_account_private_atomic_and_nonduplicating() {
     assert!(kinds(&pool, &a).await.contains(&"circle_joined".to_owned()));
     assert_eq!(page(&pool, &b).await["items"][0]["actionable"], false);
 
+    // P0 counterexample: invitation is accepted in tab 2, while a stale tab
+    // still displays "Ablehnen". Status-CAS must prevent accidental departure.
+    let query: LeaveCircleQuery =
+        serde_json::from_value(json!({"expected_status":"invited"})).unwrap();
+    let obsolete_decline = leave_circle(
+        State(app_state(pool.clone())),
+        Extension(actor(&b)),
+        Path(circle),
+        Query(query),
+    )
+    .await;
+    assert_eq!(obsolete_decline.unwrap_err().0, StatusCode::CONFLICT);
+    let still_active: String = sqlx::query_scalar(
+        "SELECT status FROM domain_audience_circle_members
+         WHERE circle_id=$1 AND account_id=$2",
+    )
+    .bind(circle)
+    .bind(&b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        still_active, "active",
+        "old decline must not revoke accepted membership"
+    );
+
     // Leaving must withdraw the prior circle ID/name/action even though a
     // neutral, historically correct personal message remains in the inbox.
     sqlx::query(
@@ -361,6 +388,46 @@ async fn circle_notifications_are_account_private_atomic_and_nonduplicating() {
     .await
     .unwrap();
     assert_eq!(outbox, b_kinds.len() as i64);
+
+    // A fresh pending invitation can still be explicitly declined with the
+    // same status-CAS. This must notify A as declined, not as withdrawn.
+    sqlx::query(
+        "INSERT INTO domain_audience_circle_members
+         (circle_id,account_id,status,invited_by_account_id)
+         VALUES($1,$2,'invited',$3)",
+    )
+    .bind(circle)
+    .bind(&b)
+    .bind(&a)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let valid_decline: LeaveCircleQuery =
+        serde_json::from_value(json!({"expected_status":"invited"})).unwrap();
+    let declined = leave_circle(
+        State(app_state(pool.clone())),
+        Extension(actor(&b)),
+        Path(circle),
+        Query(valid_decline),
+    )
+    .await;
+    assert!(
+        declined.is_ok(),
+        "a still-pending invitation must be rejectable"
+    );
+    let still_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM domain_audience_circle_members
+         WHERE circle_id=$1 AND account_id=$2)",
+    )
+    .bind(circle)
+    .bind(&b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!still_member);
+    assert!(kinds(&pool, &a)
+        .await
+        .contains(&"circle_declined".to_owned()));
 
     // No test resources survive the disposable scenario.
     sqlx::query("DELETE FROM domain_audience_circles WHERE id=$1")

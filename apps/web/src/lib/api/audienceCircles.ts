@@ -99,6 +99,14 @@ export const leaveCircle = (id: string) =>
     method: "DELETE",
   });
 
+/** Reject only if the actor is still invited; never withdraw an accepted
+ * membership because a second tab shows an outdated decline button. */
+export const declineCircle = (id: string) =>
+  request<void>(
+    `/api/circles/${encodeURIComponent(id)}/membership?expected_status=invited`,
+    { method: "DELETE" },
+  );
+
 /** Inviter-only withdrawal; applies only to a still pending invitation. */
 export const withdrawCircleInvitation = (id: string, accountId: string) =>
   request<void>(

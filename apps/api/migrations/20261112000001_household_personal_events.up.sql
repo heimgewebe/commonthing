@@ -110,6 +110,11 @@ BEGIN
     DO UPDATE SET updated_at=domain_conversations.updated_at
     RETURNING id INTO inbox_id;
 
+    -- System messages have NULL human authors. PostgreSQL's existing
+    -- (conversation, author, idempotency_key) uniqueness constraint does
+    -- NOT deduplicate NULL authors. Their exactly-once property instead
+    -- comes from one atomic membership INSERT/UPDATE/DELETE transition;
+    -- duplicate invitation HTTP retries produce no database transition.
     item_id := gen_random_uuid();
     INSERT INTO domain_messages(
         id, conversation_id, author_account_id, author_title, content, idempotency_key

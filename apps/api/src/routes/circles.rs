@@ -65,6 +65,14 @@ pub struct InviteAccountInput {
     account_id: String,
 }
 
+/// Optional compare-and-delete guard for a pending invitation. A plain DELETE
+/// remains the explicit voluntary departure from an accepted membership.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaveCircleQuery {
+    expected_status: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CircleMemberView {
     account_id: String,
@@ -512,12 +520,22 @@ pub async fn withdraw_invitation(
 }
 
 /// DELETE /circles/{id}/membership — departure immediately revokes own rights.
-/// Historical circle identity is retained, even when the last member leaves.
+/// For rejecting an invitation, expected_status=invited is a compare-and-delete
+/// guard. A stale decline can never revoke a membership accepted elsewhere.
+/// Historical circle identity remains, even when the last member leaves.
 pub async fn leave_circle(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
+    Query(query): Query<LeaveCircleQuery>,
 ) -> Result<Response, ApiError> {
+    if query
+        .expected_status
+        .as_deref()
+        .is_some_and(|status| status != "invited")
+    {
+        return Err(bad_request("unsupported expected membership status"));
+    }
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
     // Keep two pool units available to a privacy-fenced GET while circle
@@ -535,15 +553,25 @@ pub async fn leave_circle(
         .ok_or((StatusCode::NOT_FOUND, "circle not found".to_owned()))?;
     let removed = sqlx::query(
         "DELETE FROM domain_audience_circle_members
-         WHERE circle_id=$1 AND account_id=$2 RETURNING account_id",
+         WHERE circle_id=$1 AND account_id=$2
+           AND ($3::text IS NULL OR status=$3)
+         RETURNING account_id",
     )
     .bind(id)
     .bind(actor)
+    .bind(query.expected_status.as_deref())
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal_error("remove_member"))?;
     if removed.is_none() {
-        return Err((StatusCode::NOT_FOUND, "circle not found".to_owned()));
+        return if query.expected_status.is_some() {
+            Err((
+                StatusCode::CONFLICT,
+                "invitation is no longer pending".to_owned(),
+            ))
+        } else {
+            Err((StatusCode::NOT_FOUND, "circle not found".to_owned()))
+        };
     }
     // A rejected final founding invitation must not leave a permanently
     // unanswerable "forming" proposal behind.

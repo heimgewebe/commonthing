@@ -148,6 +148,11 @@ durch die Nachricht wieder geöffneten privaten Kreis oder Knoten.
 
 **Bedienung:** Eingehende Einladungen lassen sich aus dem Postfach
 annehmen oder ablehnen, gesendete ausstehende Einladungen zurückziehen.
+Das Ablehnen ist ein **statusgebundenes** DELETE mit
+`expected_status=invited` auf dem vorhandenen Mitgliedschaftspfad:
+Wird eine Einladung inzwischen in einem anderen Tab bestätigt, antwortet
+die API mit 409, ohne das jetzt aktive Mitglied zu entfernen.
+Ein wirklicher Austritt bleibt eine davon getrennte, ausdrückliche Aktion.
 Die fachliche Mitgliedschaft bleibt maßgeblich; nach einer Aktion
 liest die Oberfläche den Status neu. Einladungen werden nicht durch
 bloßes Laden als gelesen markiert. Die bestehenden Direktnachrichten

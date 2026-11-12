@@ -8,6 +8,8 @@ async function installPersonalInbox(page: Page, kind: Kind = "circle_invited") {
   let read = false;
   let state = "invited";
   let actions = 0;
+  let declineExpectedStatus: string | null = null;
+  let acceptedInOtherTab = false;
   const circleId = "22222222-2222-4222-8222-222222222222";
   const id = "11111111-1111-4111-8111-111111111111";
 
@@ -81,6 +83,15 @@ async function installPersonalInbox(page: Page, kind: Kind = "circle_invited") {
       request.method() === "DELETE" &&
       new URL(request.url()).pathname.startsWith(`/api/circles/${circleId}/`)
     ) {
+      const url = new URL(request.url());
+      if (url.pathname.endsWith("/membership")) {
+        declineExpectedStatus = url.searchParams.get("expected_status");
+        if (acceptedInOtherTab) {
+          // Backend recognizes the stale invite and preserves membership.
+          acted = true;
+          return route.fulfill({ status: 409 });
+        }
+      }
       actions += 1;
       acted = true;
       return route.fulfill({ status: 204 });
@@ -92,6 +103,10 @@ async function installPersonalInbox(page: Page, kind: Kind = "circle_invited") {
     countActions: () => actions,
     wasRead: () => read,
     wasActed: () => acted,
+    declineExpectedStatus: () => declineExpectedStatus,
+    simulateOtherTabAccept: () => {
+      acceptedInOtherTab = true;
+    },
   };
 }
 
@@ -113,7 +128,7 @@ test("Einladung erscheint im echten Postfach, kann angenommen werden und wird ni
   await expect(inbox.getByRole("button", { name: "Annehmen" })).toHaveCount(0);
 });
 
-test("Ablehnung benutzt den vorhandenen Mitgliedschaftsaustritt und entfernt die Aktion", async ({
+test("Ablehnung ist auf eine ausstehende Einladung beschränkt", async ({
   page,
 }) => {
   const server = await installPersonalInbox(page);
@@ -123,11 +138,27 @@ test("Ablehnung benutzt den vorhandenen Mitgliedschaftsaustritt und entfernt die
     .getByRole("button", { name: "Ablehnen" })
     .click();
   await expect.poll(server.countActions).toBe(1);
+  expect(server.declineExpectedStatus()).toBe("invited");
   await expect(
     page
       .getByTestId("personal-events-inbox")
       .getByRole("button", { name: "Ablehnen" }),
   ).toHaveCount(0);
+});
+
+test("veraltetes Ablehnen nach Annahme in einem anderen Tab löscht keine Mitgliedschaft", async ({
+  page,
+}) => {
+  const server = await installPersonalInbox(page);
+  await page.goto("/nachrichten");
+  const inbox = page.getByTestId("personal-events-inbox");
+  await expect(inbox.getByRole("button", { name: "Ablehnen" })).toBeVisible();
+  server.simulateOtherTabAccept();
+  await inbox.getByRole("button", { name: "Ablehnen" }).click();
+  expect(server.declineExpectedStatus()).toBe("invited");
+  await expect.poll(server.countActions).toBe(0);
+  await expect(inbox.getByRole("button", { name: "Ablehnen" })).toHaveCount(0);
+  await expect(inbox.getByRole("alert")).toContainText("nicht abgeschlossen");
 });
 
 test("Gesendete offene Einladung kann zurückgenommen werden, ohne fiktiven Chatpartner", async ({

@@ -11,7 +11,7 @@
   } from "$lib/api/personalEvents";
   import {
     acceptCircle,
-    leaveCircle,
+    declineCircle,
     withdrawCircleInvitation,
   } from "$lib/api/audienceCircles";
 
@@ -122,7 +122,7 @@
       if (action === "accept") {
         await acceptCircle(event.circle_id);
       } else if (action === "decline") {
-        await leaveCircle(event.circle_id);
+        await declineCircle(event.circle_id);
       } else {
         if (!event.target_account_id) return;
         await withdrawCircleInvitation(
@@ -156,9 +156,13 @@
       void invalidate("weltgewebe:domain-data");
     } catch {
       if ($authStore.account_id === actor) {
-        error =
-          "Der Vorgang konnte nicht abgeschlossen werden. Prüfe den aktuellen Status.";
+        // Refresh may clear its own loading error; set the action outcome
+        // afterwards so a stale 409 remains visible to the user.
         await refresh();
+        if ($authStore.account_id === actor) {
+          error =
+            "Der Vorgang konnte nicht abgeschlossen werden. Prüfe den aktuellen Status.";
+        }
       }
     } finally {
       if ($authStore.account_id === actor) busyId = null;
