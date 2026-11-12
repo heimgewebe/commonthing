@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { invalidate } from "$app/navigation";
   import { authStore } from "$lib/auth/store";
   import { refreshAccountAttention } from "$lib/accountAttentionRuntime";
@@ -26,6 +26,9 @@
   let busyId = $state<string | null>(null);
   let error = $state("");
   let revision = 0;
+  // Bound refresh work even if a user has browsed thousands of old messages.
+  // Pages beyond this cap remain reachable through normal manual pagination.
+  const MAX_REFRESH_PAGES = 12;
 
   function formatDate(value: string): string {
     const date = new Date(value);
@@ -44,32 +47,41 @@
       return;
     }
     const current = ++revision;
+    const oldestLoadedId = notices.items.at(-1)?.id;
+    // An older page request from before this refresh must never append
+    // outdated account-private metadata to the refreshed collection.
+    olderLoading = false;
     loading = true;
     try {
       const page = await listPersonalEvents();
       if (current !== revision || $authStore.account_id !== actor) return;
-      // A periodic or focus refresh only fetches the newest page. Retain
-      // previously paginated history and its cursor state: replacing the
-      // whole collection would make older messages disappear every 30 s.
-      const alreadyLoaded = notices.items;
-      const refreshedIds = new Set(page.items.map((item) => item.id));
-      // Merging is safe only when the newest page overlaps the loaded
-      // range. More than one whole page of new events may have arrived while
-      // the user was away: then resetting to the first page is necessary so
-      // the missing middle pages remain reachable through normal pagination.
-      const contiguous =
-        page.has_more &&
-        alreadyLoaded.some((item) => refreshedIds.has(item.id));
-      notices = {
-        ...page,
-        items: contiguous
-          ? [
-              ...page.items,
-              ...alreadyLoaded.filter((item) => !refreshedIds.has(item.id)),
-            ]
-          : page.items,
-        has_more: contiguous ? notices.has_more : page.has_more,
-      };
+      const items = [...page.items];
+      const seen = new Set(items.map((item) => item.id));
+      let hasMore = page.has_more;
+      let pages = 1;
+      // Re-fetch through the oldest loaded message instead of preserving
+      // stale circle names and actions. This also closes pagination gaps
+      // after a burst of more than one new page.
+      while (
+        oldestLoadedId &&
+        !seen.has(oldestLoadedId) &&
+        hasMore &&
+        pages < MAX_REFRESH_PAGES
+      ) {
+        const cursor = items.at(-1)?.id;
+        if (!cursor) break;
+        const older = await listPersonalEvents(undefined, cursor);
+        if (current !== revision || $authStore.account_id !== actor) return;
+        for (const item of older.items) {
+          if (seen.has(item.id)) continue;
+          seen.add(item.id);
+          items.push(item);
+        }
+        hasMore = older.has_more;
+        pages += 1;
+        if (older.items.length === 0) break;
+      }
+      notices = { ...page, items, has_more: hasMore };
       error = "";
     } catch {
       if (current === revision && $authStore.account_id === actor) {
@@ -85,12 +97,13 @@
   async function loadOlder(): Promise<void> {
     if (!notices.has_more || olderLoading || notices.items.length === 0) return;
     const actor = $authStore.account_id;
+    const current = revision;
     const last = notices.items.at(-1);
     if (!last) return;
     olderLoading = true;
     try {
       const older = await listPersonalEvents(undefined, last.id);
-      if ($authStore.account_id !== actor) return;
+      if ($authStore.account_id !== actor || current !== revision) return;
       const known = new Set(notices.items.map((item) => item.id));
       notices = {
         items: [
@@ -101,9 +114,11 @@
         has_more: older.has_more,
       };
     } catch {
-      error = "Ältere Nachrichten konnten nicht geladen werden.";
+      if ($authStore.account_id === actor && current === revision)
+        error = "Ältere Nachrichten konnten nicht geladen werden.";
     } finally {
-      olderLoading = false;
+      if ($authStore.account_id === actor && current === revision)
+        olderLoading = false;
     }
   }
 
@@ -125,9 +140,10 @@
       };
       void refreshAccountAttention();
     } catch {
-      error = "Die Lesebestätigung konnte nicht gespeichert werden.";
+      if ($authStore.account_id === actor)
+        error = "Die Lesebestätigung konnte nicht gespeichert werden.";
     } finally {
-      busyId = null;
+      if ($authStore.account_id === actor && busyId === event.id) busyId = null;
     }
   }
 
@@ -207,7 +223,7 @@
         }
       }
     } finally {
-      if ($authStore.account_id === actor) busyId = null;
+      if ($authStore.account_id === actor && busyId === event.id) busyId = null;
     }
   }
 
@@ -218,7 +234,12 @@
     const authenticated = $authStore.authenticated;
     revision += 1;
     notices = emptyPage();
-    if (authenticated && accountId) void refresh();
+    busyId = null;
+    olderLoading = false;
+    error = "";
+    // Refresh reads the current inbox synchronously before its first await.
+    // Do not subscribe the auth identity effect to inbox changes.
+    if (authenticated && accountId) untrack(() => void refresh());
   });
 
   onMount(() => {

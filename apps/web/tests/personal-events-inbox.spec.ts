@@ -386,15 +386,13 @@ test("Mehr als 50 neue Mitteilungen lassen keine unsichtbare Lücke in der Pagin
   burst = true;
   await inbox.getByRole("button", { name: "Aktualisieren" }).click();
   await expect(inbox.getByText("Neu 1", { exact: true })).toBeVisible();
-  await expect(inbox.getByText("Alt 3", { exact: true })).toHaveCount(0);
-  await inbox
-    .getByRole("button", { name: "Ältere Mitteilungen laden" })
-    .click();
+  // Refresh re-fetches every previously visible page and the new middle
+  // pages, so the 55 new and 3 old messages form a contiguous result.
   await expect(inbox.getByText("Neu 55", { exact: true })).toBeVisible();
-  await inbox
-    .getByRole("button", { name: "Ältere Mitteilungen laden" })
-    .click();
   await expect(inbox.getByText("Alt 3", { exact: true })).toBeVisible();
+  await expect(
+    inbox.getByRole("button", { name: "Ältere Mitteilungen laden" }),
+  ).toHaveCount(0);
   await expect(inbox.locator("li")).toHaveCount(58);
 });
 
@@ -426,6 +424,7 @@ test("Bereits beantwortete Einladungen aus älteren Seiten bleiben beim Refresh 
   });
   const pageOne = Array.from({ length: 50 }, (_, i) => notice(`new-${i}`));
   const olderInvite = notice("old-invite", true);
+  let accepted = false;
   await page.route("**/api/personal-events**", (route) => {
     const url = new URL(route.request().url());
     if (route.request().method() === "POST" && url.pathname.endsWith("/read")) {
@@ -437,14 +436,23 @@ test("Bereits beantwortete Einladungen aus älteren Seiten bleiben beim Refresh 
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        items: before ? [olderInvite] : pageOne,
+        items: before
+          ? [
+              {
+                ...olderInvite,
+                actionable: !accepted,
+                read_at: accepted ? "2026-11-12T12:30:00Z" : null,
+              },
+            ]
+          : pageOne,
         unread_count: 0,
         has_more: !before,
       }),
     });
   });
-  await page.route(`**/api/circles/${circleId}/accept*`, (route) =>
-    route.fulfill({
+  await page.route(`**/api/circles/${circleId}/accept*`, (route) => {
+    accepted = true;
+    return route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
@@ -454,8 +462,8 @@ test("Bereits beantwortete Einladungen aus älteren Seiten bleiben beim Refresh 
         state: "active",
         membership_status: "active",
       }),
-    }),
-  );
+    });
+  });
 
   await page.goto("/nachrichten");
   const inbox = page.getByTestId("personal-events-inbox");
@@ -467,4 +475,97 @@ test("Bereits beantwortete Einladungen aus älteren Seiten bleiben beim Refresh 
   await expect(inbox.getByRole("button", { name: "Annehmen" })).toHaveCount(0);
   await expect(inbox.getByText("Einladung nicht mehr offen")).toBeVisible();
   await expect(inbox.getByText("Alte Einladung beantworten")).toBeVisible();
+});
+
+test("Kontowechsel während einer Einladung sperrt das neue Postfach nicht", async ({
+  page,
+}) => {
+  let accountId = "personal-a";
+  const circleId = "22222222-2222-4222-8222-222222222222";
+  let acceptRequested = false;
+  let releaseAccept!: () => void;
+  const heldAccept = new Promise<void>((resolve) => {
+    releaseAccept = resolve;
+  });
+
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: accountId, role: "weber" },
+  });
+  await page.route("**/api/auth/me", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        authenticated: true,
+        account_id: accountId,
+        role: "weber",
+      }),
+    }),
+  );
+  await page.route("**/api/direct-conversations", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [] }),
+    }),
+  );
+  await page.route("**/api/personal-events**", (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [
+          {
+            id: `event-${accountId}`,
+            event_kind: "circle_invited",
+            invitation_created_at: "2026-11-12T12:00:00Z",
+            content: `Private Einladung ${accountId}`,
+            created_at: "2026-11-12T12:00:00Z",
+            read_at: null,
+            circle_id: circleId,
+            circle_name: `Privater Kreis ${accountId}`,
+            target_account_id: null,
+            actionable: true,
+          },
+        ],
+        unread_count: 1,
+        has_more: false,
+      }),
+    });
+  });
+  await page.route(`**/api/circles/${circleId}/accept*`, async (route) => {
+    acceptRequested = true;
+    await heldAccept;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: circleId,
+        kind: "household",
+        name: "Gemeinschaft",
+        state: "active",
+        membership_status: "active",
+      }),
+    });
+  });
+
+  await page.goto("/nachrichten");
+  const inbox = page.getByTestId("personal-events-inbox");
+  await expect(inbox.getByText("Private Einladung personal-a")).toBeVisible();
+  await inbox.getByRole("button", { name: "Annehmen" }).click();
+  await expect.poll(() => acceptRequested).toBe(true);
+
+  accountId = "personal-b";
+  await page.evaluate(async () => {
+    const path = "/src/lib/auth/store.ts";
+    const { authStore } = await import(/* @vite-ignore */ path);
+    await authStore.checkAuth({ force: true });
+  });
+  await expect(inbox.getByText("Private Einladung personal-b")).toBeVisible();
+  await expect(inbox.getByText("Private Einladung personal-a")).toHaveCount(0);
+  await expect(inbox.getByRole("button", { name: "Annehmen" })).toBeEnabled();
+
+  releaseAccept();
+  await expect(inbox.getByRole("button", { name: "Annehmen" })).toBeEnabled();
 });
