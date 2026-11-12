@@ -176,11 +176,10 @@
     } catch (cause) {
       if (createdSubscription && cleanupEndpoint) {
         try {
-          // A rejected registration must not delete an existing server record.
-          // An existing browser subscription is also never ours to unsubscribe.
+          // POST is an upsert: success does not prove this attempt created
+          // the server record. A preferences failure must not remove it.
           if (serverRegistrationConfirmed) {
-            await deletePushSubscription(cleanupEndpoint);
-            currentServerRegistration = false;
+            currentServerRegistration = true;
           }
           deviceManagerRefreshVersion += 1;
           // A lost POST response does not prove that the server rolled back.
@@ -194,7 +193,8 @@
             cause.status !== 429;
           if (
             !existingBrowserSubscription &&
-            (serverRegistrationConfirmed || knownRejectedRegistration)
+            !serverRegistrationConfirmed &&
+            knownRejectedRegistration
           ) {
             await createdSubscription.unsubscribe().catch(() => false);
             await loadBrowserSubscription();
@@ -204,7 +204,10 @@
             }
           } else {
             browserSubscription = createdSubscription;
-            if (!existingBrowserSubscription && !serverRegistrationConfirmed) {
+            if (serverRegistrationConfirmed) {
+              warning =
+                "Das Gerät wurde registriert, aber die Konto-Einstellung konnte nicht gespeichert werden. Die Geräte-Registrierung bleibt erhalten; versuche die Kontoeinstellung erneut.";
+            } else if (!existingBrowserSubscription) {
               warning =
                 "Die Antwort auf die Geräte-Registrierung ist nicht eindeutig. Das lokale Browser-Abo bleibt erhalten, damit ein möglicherweise gespeicherter Servereintrag verwaltet oder die Einrichtung erneut versucht werden kann.";
             }

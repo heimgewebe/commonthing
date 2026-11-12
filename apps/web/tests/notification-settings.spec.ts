@@ -10,6 +10,7 @@ interface MockOptions {
   directMessagesPush?: boolean;
   deleteStatus?: number;
   registerStatus?: number;
+  preferenceWriteStatus?: number;
   registerNetworkFailureAfterCommit?: boolean;
   authenticated?: boolean;
   onPreferenceWrite?: (enabled: boolean) => void;
@@ -183,6 +184,13 @@ async function installApiMocks(
       const payload = request.postDataJSON() as {
         direct_messages_push?: boolean;
       };
+      if ((options.preferenceWriteStatus ?? 200) >= 400) {
+        return route.fulfill({
+          status: options.preferenceWriteStatus,
+          contentType: "application/json",
+          body: JSON.stringify({ code: "temporarily_unavailable" }),
+        });
+      }
       directMessagesPush = payload.direct_messages_push === true;
       options.onPreferenceWrite?.(directMessagesPush);
       return route.fulfill({
@@ -586,6 +594,36 @@ test.describe("Settings — notifications information architecture", () => {
       section.getByText("Push auf diesem Gerät: nicht aktiviert."),
     ).toBeVisible();
     expect(deletes).toBe(0);
+  });
+
+  test("does not delete an upserted Push device when saving preferences fails", async ({
+    page,
+  }) => {
+    let deletes = 0;
+    await setup(page, {
+      permission: "granted",
+      hasSubscription: true,
+      registeredCurrentDevice: false, // stale device list; POST is an upsert
+      preferenceWriteStatus: 503,
+      onPushDelete: () => {
+        deletes += 1;
+      },
+    });
+    await page.goto("/settings#benachrichtigungen");
+    const section = page.locator("#benachrichtigungen");
+    await section
+      .getByRole("button", { name: "Auf diesem Gerät aktivieren" })
+      .click();
+    await expect(section.getByRole("alert")).toBeVisible();
+    expect(deletes).toBe(0);
+    await expect(
+      section.getByLabel("1 von 20 Push-Geräten belegt"),
+    ).toBeVisible();
+    const subscriptionExists = await page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration("/");
+      return Boolean(await registration?.pushManager.getSubscription());
+    });
+    expect(subscriptionExists).toBe(true);
   });
 
   test("keeps a newly issued browser subscription if a committed POST loses its response", async ({
