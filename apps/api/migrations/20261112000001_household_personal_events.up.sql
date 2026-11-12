@@ -101,6 +101,15 @@ BEGIN
         ELSE RAISE EXCEPTION 'unsupported circle event kind: %', event_type;
     END CASE;
 
+    -- Deleting a user cascades their membership while the account row may
+    -- already be gone. Preserve the neutral event, never reinsert a dangling
+    -- subject FK that aborts the entire account-retirement transaction.
+    IF subject_account IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM domain_accounts WHERE id=subject_account
+    ) THEN
+        subject_account := NULL;
+    END IF;
+
     -- Database uniqueness and the surrounding membership transaction prevent
     -- inbox duplication under concurrent writers or a retried HTTP invitation.
     INSERT INTO domain_conversations(
@@ -134,19 +143,29 @@ CREATE FUNCTION weltgewebe_circle_membership_personal_event()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
     recipient TEXT;
+    invitation_event RECORD;
     withdrawn BOOLEAN;
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.status='invited' THEN
-            PERFORM weltgewebe_deliver_circle_event(
-                NEW.account_id, NEW.circle_id, 'circle_invited', NEW.invited_by_account_id, NEW.created_at
-            );
-            -- Keep a read status in the sender's own existing inbox so they
-            -- can withdraw this exact pending invitation without a new panel.
-            PERFORM weltgewebe_deliver_circle_event(
-                NEW.invited_by_account_id, NEW.circle_id,
-                'circle_invitation_sent', NEW.account_id, NEW.created_at
-            );
+            -- Always acquire account-owned mailbox locks in the same order.
+            -- If A invites B in one circle while B invites A in another, an
+            -- invitee-first then inviter-first delivery would deadlock.
+            -- The inviter's own sent invitation remains read by default.
+            FOR invitation_event IN
+                SELECT recipient_account, event_kind, subject_account
+                FROM (VALUES
+                    (NEW.account_id, 'circle_invited', NEW.invited_by_account_id),
+                    (NEW.invited_by_account_id, 'circle_invitation_sent', NEW.account_id)
+                ) AS pending(recipient_account, event_kind, subject_account)
+                ORDER BY recipient_account
+            LOOP
+                PERFORM weltgewebe_deliver_circle_event(
+                    invitation_event.recipient_account, NEW.circle_id,
+                    invitation_event.event_kind, invitation_event.subject_account,
+                    NEW.created_at
+                );
+            END LOOP;
         END IF;
         RETURN NEW;
     ELSIF TG_OP = 'UPDATE' THEN
@@ -156,6 +175,7 @@ BEGIN
                 FROM domain_audience_circle_members
                 WHERE circle_id=NEW.circle_id AND status='active'
                   AND account_id<>NEW.account_id
+                ORDER BY account_id
             LOOP
                 PERFORM weltgewebe_deliver_circle_event(
                     recipient, NEW.circle_id, 'circle_joined', NEW.account_id
@@ -187,6 +207,7 @@ BEGIN
             FROM domain_audience_circle_members
             WHERE circle_id=OLD.circle_id AND status='active'
               AND account_id<>OLD.account_id
+            ORDER BY account_id
         LOOP
             PERFORM weltgewebe_deliver_circle_event(
                 recipient, OLD.circle_id, 'circle_left', OLD.account_id

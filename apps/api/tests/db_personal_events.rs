@@ -505,6 +505,77 @@ async fn circle_notifications_are_account_private_atomic_and_nonduplicating() {
         .await
         .contains(&"circle_declined".to_owned()));
 
+    // Account retirement must not fail if an active or pending member is
+    // deleted while other circle members remain. PostgreSQL's FK cascades
+    // the membership and must preserve only neutral system notifications.
+    sqlx::query(
+        "INSERT INTO domain_audience_circle_members
+         (circle_id, account_id, status, invited_by_account_id, joined_at)
+         VALUES ($1, $2, 'active', $3, NOW())",
+    )
+    .bind(circle)
+    .bind(&stranger)
+    .bind(&a)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+        .bind(&stranger)
+        .execute(&pool)
+        .await
+        .expect("deleting a member may not fail on personal event subject FK");
+    let departed_subject_retired: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1 FROM domain_personal_event_messages e
+           JOIN domain_messages m ON m.id=e.message_id
+           JOIN domain_conversations inbox ON inbox.id=m.conversation_id
+           WHERE inbox.account_event_owner_id=$1 AND e.event_kind='circle_left'
+             AND e.subject_account_id IS NULL
+        )",
+    )
+    .bind(&a)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        departed_subject_retired,
+        "account deletion must leave neutral historical mail"
+    );
+
+    sqlx::query(
+        "INSERT INTO domain_audience_circle_members
+         (circle_id, account_id, status, invited_by_account_id)
+         VALUES ($1, $2, 'invited', $3)",
+    )
+    .bind(circle)
+    .bind(&b)
+    .bind(&a)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+        .bind(&b)
+        .execute(&pool)
+        .await
+        .expect("deleting an invitee may not abort the inviter's mailbox");
+    let declined_subject_retired: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1 FROM domain_personal_event_messages e
+           JOIN domain_messages m ON m.id=e.message_id
+           JOIN domain_conversations inbox ON inbox.id=m.conversation_id
+           WHERE inbox.account_event_owner_id=$1 AND e.event_kind='circle_declined'
+             AND e.subject_account_id IS NULL
+        )",
+    )
+    .bind(&a)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        declined_subject_retired,
+        "retiring an invitee must not preserve a broken subject FK"
+    );
+
     // No test resources survive the disposable scenario.
     sqlx::query("DELETE FROM domain_audience_circles WHERE id=$1")
         .bind(circle)
@@ -512,6 +583,106 @@ async fn circle_notifications_are_account_private_atomic_and_nonduplicating() {
         .await
         .unwrap();
     for id in [&a, &b, &stranger] {
+        sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL for a disposable direct PostgreSQL database"]
+async fn opposite_direction_invitations_reuse_two_mailboxes_without_deadlock() {
+    let url = support::postgres_proof::validated_direct_disposable_url(
+        std::env::var("DATABASE_URL").expect("disposable PostgreSQL URL"),
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await
+        .expect("connect PostgreSQL");
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let tag = Uuid::new_v4();
+    let a = format!("p3a-cross-a-{tag}");
+    let b = format!("p3a-cross-b-{tag}");
+    for id in [&a, &b] {
+        sqlx::query(
+            "INSERT INTO domain_accounts(id,title,kind,location_lat,location_lon)
+             VALUES($1,$1,'garnrolle',53.555,10.055)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let house_a = Uuid::new_v4();
+    let house_b = Uuid::new_v4();
+    for (circle, founder) in [(house_a, &a), (house_b, &b)] {
+        sqlx::query(
+            "INSERT INTO domain_audience_circles(id,kind,name,created_by_account_id)
+             VALUES($1,'household','Cross invite test',$2)",
+        )
+        .bind(circle)
+        .bind(founder)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO domain_audience_circle_members
+             (circle_id,account_id,status,invited_by_account_id,joined_at)
+             VALUES($1,$2,'active',$2,NOW())",
+        )
+        .bind(circle)
+        .bind(founder)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    // Both requests touch the *same two mailboxes* but in reverse
+    // invitee/inviter order. Each transition must commit atomically with
+    // both personal messages rather than PostgreSQL cancelling one as deadlocked.
+    let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            sqlx::query(
+                "INSERT INTO domain_audience_circle_members
+                     (circle_id,account_id,status,invited_by_account_id)
+                     VALUES($1,$2,'invited',$3)"
+            )
+            .bind(house_a)
+            .bind(&b)
+            .bind(&a)
+            .execute(&pool),
+            sqlx::query(
+                "INSERT INTO domain_audience_circle_members
+                     (circle_id,account_id,status,invited_by_account_id)
+                     VALUES($1,$2,'invited',$3)"
+            )
+            .bind(house_b)
+            .bind(&a)
+            .bind(&b)
+            .execute(&pool),
+        )
+    })
+    .await
+    .expect("cross-circle invitations must not hang");
+    left.expect("A invites B without SQL deadlock");
+    right.expect("B invites A without SQL deadlock");
+    for owner in [&a, &b] {
+        let actual = kinds(&pool, owner).await;
+        assert!(actual.contains(&"circle_invited".to_owned()));
+        assert!(actual.contains(&"circle_invitation_sent".to_owned()));
+    }
+
+    for circle in [house_a, house_b] {
+        sqlx::query("DELETE FROM domain_audience_circles WHERE id=$1")
+            .bind(circle)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for id in [&a, &b] {
         sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
             .bind(id)
             .execute(&pool)
