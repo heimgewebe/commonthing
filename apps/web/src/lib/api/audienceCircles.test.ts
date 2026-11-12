@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   acceptCircle,
+  declineCircle,
   createHousehold,
   inviteToCircle,
   leaveCircle,
   listCircleMembers,
   listMyCircles,
+  withdrawCircleInvitation,
   AudienceCircleError,
 } from "./audienceCircles";
 
@@ -126,15 +128,40 @@ describe("voluntary audience circle API", () => {
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchMock);
-    await acceptCircle("house-1");
+    await acceptCircle("house-1", "2026-11-12T12:00:00Z");
     await inviteToCircle("house-1", "neighbor");
     await leaveCircle("house-1");
     expect(
       fetchMock.mock.calls.map(([path, init]) => [path, init.method]),
     ).toEqual([
-      ["/api/circles/house-1/accept", "POST"],
+      [
+        "/api/circles/house-1/accept?expected_invitation_created_at=2026-11-12T12%3A00%3A00Z",
+        "POST",
+      ],
       ["/api/circles/house-1/invitations", "POST"],
       ["/api/circles/house-1/membership", "DELETE"],
+    ]);
+  });
+
+  it("binds decline and withdrawal to the exact invitation round", async () => {
+    const at = "2026-11-12T12:00:00Z";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await declineCircle("house-1", at);
+    await withdrawCircleInvitation("house-1", "neighbor", at);
+    expect(
+      fetchMock.mock.calls.map(([path, init]) => [path, init.method]),
+    ).toEqual([
+      [
+        "/api/circles/house-1/membership?expected_status=invited&expected_invitation_created_at=2026-11-12T12%3A00%3A00Z",
+        "DELETE",
+      ],
+      [
+        "/api/circles/house-1/invitations/neighbor?expected_invitation_created_at=2026-11-12T12%3A00%3A00Z",
+        "DELETE",
+      ],
     ]);
   });
 

@@ -65,6 +65,7 @@ pub struct PersonalEventView {
     circle_id: Option<Uuid>,
     circle_name: Option<String>,
     target_account_id: Option<String>,
+    invitation_created_at: Option<DateTime<Utc>>,
     actionable: bool,
 }
 
@@ -98,7 +99,7 @@ pub async fn list_personal_events(
         .map_err(storage_error("personal_event_visibility_fence"))?;
 
     let rows = sqlx::query(
-        "SELECT m.id, e.event_kind, m.content, m.created_at, e.read_at, \
+        "SELECT m.id, e.event_kind, m.content, m.created_at, e.read_at, e.invitation_created_at, \
                 CASE WHEN member.account_id IS NOT NULL AND c.state <> 'inactive' \
                      THEN c.id ELSE NULL END AS visible_circle_id, \
                 CASE WHEN member.account_id IS NOT NULL AND c.state <> 'inactive' \
@@ -184,6 +185,9 @@ pub async fn list_personal_events(
                 target_account_id: row
                     .try_get("target_account_id")
                     .map_err(storage_error("event_target_account_id"))?,
+                invitation_created_at: row
+                    .try_get("invitation_created_at")
+                    .map_err(storage_error("event_invitation_created_at"))?,
                 actionable: row
                     .try_get("actionable")
                     .map_err(storage_error("event_actionable"))?,

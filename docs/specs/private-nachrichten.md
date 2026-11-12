@@ -152,6 +152,12 @@ Das Ablehnen ist ein **statusgebundenes** DELETE mit
 `expected_status=invited` auf dem vorhandenen Mitgliedschaftspfad:
 Wird eine Einladung inzwischen in einem anderen Tab bestätigt, antwortet
 die API mit 409, ohne das jetzt aktive Mitglied zu entfernen.
+Annehmen, Ablehnen und Zurückziehen binden die Aktion zusätzlich an
+`expected_invitation_created_at`, den unveränderlichen Zeitstempel der
+konkreten Einladungsrunde. Nach einer späteren Wiedereinladung können
+veraltete Schaltflächen die neue Einladung damit weder bestätigen noch
+ablehnen oder zurückziehen. Der Server prüft dies unter der
+Mitgliedschaftssperre; reine Sichtbarkeitsregeln im Browser reichen nicht aus.
 Ein wirklicher Austritt bleibt eine davon getrennte, ausdrückliche Aktion.
 Die fachliche Mitgliedschaft bleibt maßgeblich; nach einer Aktion
 liest die Oberfläche den Status neu. Einladungen werden nicht durch

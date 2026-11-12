@@ -16,6 +16,7 @@ export interface PersonalEvent {
   circle_id: string | null;
   circle_name: string | null;
   target_account_id: string | null;
+  invitation_created_at: string | null;
   actionable: boolean;
 }
 

@@ -114,20 +114,27 @@
     event: PersonalEvent,
     action: "accept" | "decline" | "withdraw",
   ): Promise<void> {
-    if (busyId || !event.actionable || !event.circle_id) return;
+    if (
+      busyId ||
+      !event.actionable ||
+      !event.circle_id ||
+      !event.invitation_created_at
+    )
+      return;
     const actor = $authStore.account_id;
     busyId = event.id;
     error = "";
     try {
       if (action === "accept") {
-        await acceptCircle(event.circle_id);
+        await acceptCircle(event.circle_id, event.invitation_created_at);
       } else if (action === "decline") {
-        await declineCircle(event.circle_id);
+        await declineCircle(event.circle_id, event.invitation_created_at);
       } else {
         if (!event.target_account_id) return;
         await withdrawCircleInvitation(
           event.circle_id,
           event.target_account_id,
+          event.invitation_created_at,
         );
       }
       if ($authStore.account_id !== actor) return;
@@ -148,11 +155,10 @@
           "Der Vorgang wurde übernommen; nur die Lesebestätigung ist fehlgeschlagen.";
       }
       void refreshAccountAttention();
-      if (action === "decline") {
-        // Reuse the established circle-departure privacy cache boundary.
-        window.location.reload();
-        return;
-      }
+      // Declining a pending invitation revokes no private read rights: an
+      // invited account was never an active member. Keep the page visible so
+      // a failed read receipt remains actionable instead of disappearing in
+      // an immediate reload. Active membership departure still reloads.
       void invalidate("weltgewebe:domain-data");
     } catch {
       if ($authStore.account_id === actor) {
@@ -228,7 +234,7 @@
               >{formatDate(event.created_at)}</time
             >
           </div>
-          {#if event.actionable && event.circle_id}
+          {#if event.actionable && event.circle_id && event.invitation_created_at}
             <div class="personal-event-actions">
               {#if event.event_kind === "circle_invited"}
                 <button

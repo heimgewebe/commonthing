@@ -23,7 +23,10 @@ use weltgewebe_api::{
     },
     middleware::auth::AuthContext,
     routes::{
-        circles::{leave_circle, LeaveCircleQuery},
+        circles::{
+            accept_invitation, leave_circle, withdraw_invitation, InvitationRevisionQuery,
+            LeaveCircleQuery,
+        },
         personal_events::{list_personal_events, mark_personal_event_read, PersonalEventPageQuery},
     },
     state::{ApiState, OrderedCache},
@@ -216,6 +219,10 @@ async fn circle_notifications_are_account_private_atomic_and_nonduplicating() {
     assert_eq!(kinds(&pool, &b).await, vec!["circle_invited"]);
 
     let incoming_id = Uuid::parse_str(initial["items"][0]["id"].as_str().unwrap()).unwrap();
+    let initial_invitation_created_at = initial["items"][0]["invitation_created_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let rejected = mark_personal_event_read(
         State(app_state(pool.clone())),
         Extension(actor(&stranger)),
@@ -344,6 +351,62 @@ async fn circle_notifications_are_account_private_atomic_and_nonduplicating() {
         1
     );
 
+    // A stale tab must not reject, accept, or withdraw a *new* invitation
+    // after the old one was accepted and the member later re-invited.
+    // Status-only CAS would mistakenly affect this newer pending row.
+    let old_round: LeaveCircleQuery = serde_json::from_value(json!({
+        "expected_status": "invited",
+        "expected_invitation_created_at": initial_invitation_created_at
+    }))
+    .unwrap();
+    let stale_decline = leave_circle(
+        State(app_state(pool.clone())),
+        Extension(actor(&b)),
+        Path(circle),
+        Query(old_round),
+    )
+    .await;
+    assert_eq!(stale_decline.unwrap_err().0, StatusCode::CONFLICT);
+
+    let old_accept: InvitationRevisionQuery = serde_json::from_value(json!({
+        "expected_invitation_created_at": initial_invitation_created_at
+    }))
+    .unwrap();
+    let stale_accept = accept_invitation(
+        State(app_state(pool.clone())),
+        Extension(actor(&b)),
+        Path(circle),
+        Query(old_accept),
+    )
+    .await;
+    assert_eq!(stale_accept.unwrap_err().0, StatusCode::CONFLICT);
+
+    let old_withdraw: InvitationRevisionQuery = serde_json::from_value(json!({
+        "expected_invitation_created_at": initial_invitation_created_at
+    }))
+    .unwrap();
+    let stale_withdraw = withdraw_invitation(
+        State(app_state(pool.clone())),
+        Extension(actor(&a)),
+        Path((circle, b.clone())),
+        Query(old_withdraw),
+    )
+    .await;
+    assert_eq!(stale_withdraw.unwrap_err().0, StatusCode::NOT_FOUND);
+    let still_invited: String = sqlx::query_scalar(
+        "SELECT status FROM domain_audience_circle_members
+         WHERE circle_id=$1 AND account_id=$2",
+    )
+    .bind(circle)
+    .bind(&b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        still_invited, "invited",
+        "new invite must survive all stale actions"
+    );
+
     let mut tx = pool.begin().await.unwrap();
     sqlx::query("SELECT set_config('weltgewebe.circle_invitation_withdrawal','yes',true)")
         .fetch_one(&mut *tx)
@@ -402,8 +465,21 @@ async fn circle_notifications_are_account_private_atomic_and_nonduplicating() {
     .execute(&pool)
     .await
     .unwrap();
-    let valid_decline: LeaveCircleQuery =
-        serde_json::from_value(json!({"expected_status":"invited"})).unwrap();
+    let current_page = page(&pool, &b).await;
+    let current_invitation_created_at = current_page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["event_kind"] == "circle_invited" && item["actionable"] == true)
+        .unwrap()["invitation_created_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let valid_decline: LeaveCircleQuery = serde_json::from_value(json!({
+        "expected_status": "invited",
+        "expected_invitation_created_at": current_invitation_created_at
+    }))
+    .unwrap();
     let declined = leave_circle(
         State(app_state(pool.clone())),
         Extension(actor(&b)),

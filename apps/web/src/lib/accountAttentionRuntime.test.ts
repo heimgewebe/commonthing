@@ -313,6 +313,7 @@ describe("accountAttentionRuntime", () => {
           {
             id: "private-circle-event-a",
             event_kind: "circle_invited",
+            invitation_created_at: "2026-11-12T12:00:00Z",
             content: "Du hast eine Einladung erhalten",
             created_at: "2026-11-12T12:00:00Z",
             read_at: null,

@@ -81,6 +81,7 @@ describe("topBarAttentionState", () => {
           {
             id: "personal-1",
             event_kind: "circle_invited",
+            invitation_created_at: "2026-11-12T12:00:00Z",
             content: "Einladung",
             created_at: "2026-11-12T12:00:00Z",
             read_at: null,

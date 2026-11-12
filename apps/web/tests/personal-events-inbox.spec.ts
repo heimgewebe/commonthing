@@ -3,7 +3,11 @@ import { mockApiResponses } from "./fixtures/mockApi";
 
 type Kind = "circle_invited" | "circle_invitation_sent";
 
-async function installPersonalInbox(page: Page, kind: Kind = "circle_invited") {
+async function installPersonalInbox(
+  page: Page,
+  kind: Kind = "circle_invited",
+  failReadReceipt = false,
+) {
   let acted = false;
   let read = false;
   let state = "invited";
@@ -12,6 +16,7 @@ async function installPersonalInbox(page: Page, kind: Kind = "circle_invited") {
   let acceptedInOtherTab = false;
   const circleId = "22222222-2222-4222-8222-222222222222";
   const id = "11111111-1111-4111-8111-111111111111";
+  const invitationCreatedAt = "2026-11-12T12:00:00Z";
 
   await mockApiResponses(page, {
     auth: { authenticated: true, account_id: "personal-a", role: "weber" },
@@ -26,6 +31,7 @@ async function installPersonalInbox(page: Page, kind: Kind = "circle_invited") {
   await page.route("**/api/personal-events**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/read") && route.request().method() === "POST") {
+      if (failReadReceipt) return route.fulfill({ status: 503 });
       read = true;
       return route.fulfill({ status: 204 });
     }
@@ -39,6 +45,7 @@ async function installPersonalInbox(page: Page, kind: Kind = "circle_invited") {
           {
             id,
             event_kind: kind,
+            invitation_created_at: invitationCreatedAt,
             content:
               kind === "circle_invited"
                 ? "Du hast eine Einladung zu einer Gemeinschaft erhalten."
@@ -103,6 +110,7 @@ async function installPersonalInbox(page: Page, kind: Kind = "circle_invited") {
     countActions: () => actions,
     wasRead: () => read,
     wasActed: () => acted,
+    invitationCreatedAt: () => invitationCreatedAt,
     declineExpectedStatus: () => declineExpectedStatus,
     simulateOtherTabAccept: () => {
       acceptedInOtherTab = true;
@@ -175,4 +183,74 @@ test("Gesendete offene Einladung kann zurückgenommen werden, ohne fiktiven Chat
   await expect(
     inbox.getByRole("button", { name: "Einladung zurückziehen" }),
   ).toHaveCount(0);
+});
+test("Erfolgreiche Ablehnung bleibt trotz fehlerhafter Lesebestätigung sichtbar", async ({
+  page,
+}) => {
+  await installPersonalInbox(page, "circle_invited", true);
+  await page.goto("/nachrichten");
+  const inbox = page.getByTestId("personal-events-inbox");
+  await inbox.getByRole("button", { name: "Ablehnen" }).click();
+  await expect(inbox.getByRole("button", { name: "Ablehnen" })).toHaveCount(0);
+  await expect(inbox.getByRole("alert")).toContainText(
+    "nur die Lesebestätigung ist fehlgeschlagen",
+  );
+  await expect(page).toHaveURL(/nachrichten/);
+});
+
+test("Alte Hausgemeinschaftsoberfläche darf nach Annahme anderswo keine Mitgliedschaft löschen", async ({
+  page,
+}) => {
+  const circleId = "22222222-2222-4222-8222-222222222222";
+  let membership: "invited" | "active" = "invited";
+  let expectedStatus: string | null = null;
+  let expectedInvitationCreatedAt: string | null = null;
+  let revokedActiveMember = false;
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "personal-a", role: "weber" },
+  });
+  await page.route("**/api/circles/me*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([
+        {
+          id: circleId,
+          kind: "household",
+          name: "Altes Haus",
+          state: "active",
+          membership_status: membership,
+          invitation_created_at: "2026-11-12T12:00:00Z",
+        },
+      ]),
+    }),
+  );
+  await page.route(`**/api/circles/${circleId}/membership*`, (route) => {
+    if (route.request().method() !== "DELETE") return route.fallback();
+    const query = new URL(route.request().url()).searchParams;
+    expectedStatus = query.get("expected_status");
+    expectedInvitationCreatedAt = query.get("expected_invitation_created_at");
+    // Emulate the real conditional DELETE: only a still-pending invitation
+    // may be declined, never an already accepted member.
+    if (membership === "active" && expectedStatus !== "invited") {
+      revokedActiveMember = true;
+      return route.fulfill({ status: 204 });
+    }
+    return route.fulfill({ status: membership === "active" ? 409 : 204 });
+  });
+
+  await page.goto("/settings");
+  const controls = page.getByTestId("audience-circle-controls");
+  await expect(
+    controls.getByRole("button", { name: "Ablehnen" }),
+  ).toBeVisible();
+  membership = "active"; // acceptance in another tab, panel has stale state
+  await controls.getByRole("button", { name: "Ablehnen" }).click();
+  expect(expectedStatus).toBe("invited");
+  expect(expectedInvitationCreatedAt).toBe("2026-11-12T12:00:00Z");
+  expect(revokedActiveMember).toBe(false);
+  expect(membership).toBe("active");
+  await expect(controls.getByRole("alert")).toContainText(
+    "Die Aktion konnte nicht abgeschlossen werden.",
+  );
 });

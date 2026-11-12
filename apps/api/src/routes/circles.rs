@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -71,6 +72,13 @@ pub struct InviteAccountInput {
 #[serde(deny_unknown_fields)]
 pub struct LeaveCircleQuery {
     expected_status: Option<String>,
+    expected_invitation_created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvitationRevisionQuery {
+    expected_invitation_created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +94,7 @@ pub struct CircleView {
     name: String,
     state: String,
     membership_status: String,
+    invitation_created_at: Option<DateTime<Utc>>,
 }
 
 fn bad_request(message: &str) -> ApiError {
@@ -143,7 +152,8 @@ async fn account_exists(pool: &PgPool, account_id: &str) -> Result<bool, ApiErro
 
 async fn own_circle(pool: &PgPool, circle_id: Uuid, actor: &str) -> Result<CircleView, ApiError> {
     let row = sqlx::query(
-        "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status
+        "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status,
+                CASE WHEN m.status='invited' THEN m.created_at ELSE NULL END AS invitation_created_at
          FROM domain_audience_circles c
          JOIN domain_audience_circle_members m ON m.circle_id=c.id
          WHERE c.id=$1 AND m.account_id=$2",
@@ -168,6 +178,9 @@ fn row_to_view(row: &sqlx::postgres::PgRow) -> Result<CircleView, ApiError> {
         name: get("name")?,
         state: get("state")?,
         membership_status: get("membership_status")?,
+        invitation_created_at: row
+            .try_get("invitation_created_at")
+            .map_err(internal_error("invitation_created_at"))?,
     })
 }
 
@@ -182,7 +195,8 @@ pub async fn list_my_circles(
     // Keyset pagination is stable when invitations arrive or memberships
     // disappear between HTTP requests; OFFSET would shift later pages.
     let rows = sqlx::query(
-        "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status
+        "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status,
+                CASE WHEN m.status='invited' THEN m.created_at ELSE NULL END AS invitation_created_at
          FROM domain_audience_circles c
          JOIN domain_audience_circle_members m ON m.circle_id=c.id
          WHERE m.account_id=$1 AND ($2::uuid IS NULL OR EXISTS (
@@ -324,6 +338,7 @@ pub async fn accept_invitation(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
+    Query(query): Query<InvitationRevisionQuery>,
 ) -> Result<Response, ApiError> {
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
@@ -334,7 +349,7 @@ pub async fn accept_invitation(
         .map_err(internal_error("reserve_accept_circle_pool_budget"))?;
     let mut tx = pool.begin().await.map_err(internal_error("begin_accept"))?;
     let row = sqlx::query(
-        "SELECT c.state, m.status FROM domain_audience_circles c
+        "SELECT c.state, m.status, m.created_at AS invitation_created_at FROM domain_audience_circles c
          JOIN domain_audience_circle_members m ON m.circle_id=c.id
          WHERE c.id=$1 AND m.account_id=$2
          FOR UPDATE OF c, m",
@@ -351,7 +366,15 @@ pub async fn accept_invitation(
     let status: String = row
         .try_get("status")
         .map_err(internal_error("member_status"))?;
-    if state == "inactive" || status != "invited" {
+    let invitation_created_at: DateTime<Utc> = row
+        .try_get("invitation_created_at")
+        .map_err(internal_error("accept_invitation_created_at"))?;
+    if state == "inactive"
+        || status != "invited"
+        || query
+            .expected_invitation_created_at
+            .is_some_and(|expected| expected != invitation_created_at)
+    {
         return Err((
             StatusCode::CONFLICT,
             "invitation cannot be accepted".to_owned(),
@@ -451,6 +474,7 @@ pub async fn withdraw_invitation(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
     Path((id, invitee)): Path<(Uuid, String)>,
+    Query(query): Query<InvitationRevisionQuery>,
 ) -> Result<Response, ApiError> {
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
@@ -470,11 +494,13 @@ pub async fn withdraw_invitation(
          WHERE c.id=$1 AND c.state<>'inactive'
            AND inviter.status='active' AND invited.status='invited'
            AND invited.invited_by_account_id=$2
+           AND ($4::timestamptz IS NULL OR invited.created_at=$4)
          FOR UPDATE OF c, inviter, invited",
     )
     .bind(id)
     .bind(actor)
     .bind(&invitee)
+    .bind(query.expected_invitation_created_at)
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal_error("authorize_invitation_withdrawal"))?;
@@ -536,6 +562,11 @@ pub async fn leave_circle(
     {
         return Err(bad_request("unsupported expected membership status"));
     }
+    if query.expected_invitation_created_at.is_some()
+        && query.expected_status.as_deref() != Some("invited")
+    {
+        return Err(bad_request("invitation timestamp requires invited status"));
+    }
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
     // Keep two pool units available to a privacy-fenced GET while circle
@@ -555,11 +586,13 @@ pub async fn leave_circle(
         "DELETE FROM domain_audience_circle_members
          WHERE circle_id=$1 AND account_id=$2
            AND ($3::text IS NULL OR status=$3)
+           AND ($4::timestamptz IS NULL OR created_at=$4)
          RETURNING account_id",
     )
     .bind(id)
     .bind(actor)
     .bind(query.expected_status.as_deref())
+    .bind(query.expected_invitation_created_at)
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal_error("remove_member"))?;
