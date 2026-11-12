@@ -328,10 +328,16 @@ test("Automatischer Postfach-Refresh erhält alle bereits geladenen älteren Mit
 
   // Re-checking the same session emits two auth-store values but must not
   // reset a mailbox that has already loaded a second page.
+  // Test builds and the local dev server expose the *existing* authoritative
+  // session read without depending on Vite-only /src module URLs.
   await page.evaluate(async () => {
-    const path = "/src/lib/auth/store.ts";
-    const { authStore } = await import(/* @vite-ignore */ path);
-    await authStore.checkAuth({ force: true });
+    const recheck = (
+      window as Window & {
+        __commonthingE2ERecheckAuth?: () => Promise<unknown>;
+      }
+    ).__commonthingE2ERecheckAuth;
+    if (!recheck) throw new Error("Auth recheck test seam unavailable");
+    await recheck();
   });
   await expect(inbox.locator("li")).toHaveCount(55);
   await expect(
@@ -569,10 +575,16 @@ test("Kontowechsel während einer Einladung sperrt das neue Postfach nicht", asy
   await expect.poll(() => acceptRequested).toBe(true);
 
   accountId = "personal-b";
+  // Re-run the existing server-authorized auth check while A's response is
+  // held, without unmounting the inbox or using a dev-only module import.
   await page.evaluate(async () => {
-    const path = "/src/lib/auth/store.ts";
-    const { authStore } = await import(/* @vite-ignore */ path);
-    await authStore.checkAuth({ force: true });
+    const recheck = (
+      window as Window & {
+        __commonthingE2ERecheckAuth?: () => Promise<unknown>;
+      }
+    ).__commonthingE2ERecheckAuth;
+    if (!recheck) throw new Error("Auth recheck test seam unavailable");
+    await recheck();
   });
   await expect(inbox.getByText("Private Einladung personal-b")).toBeVisible();
   await expect(inbox.getByText("Private Einladung personal-a")).toHaveCount(0);
