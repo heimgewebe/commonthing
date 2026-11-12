@@ -593,6 +593,159 @@ async fn circle_notifications_are_account_private_atomic_and_nonduplicating() {
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL for a disposable direct PostgreSQL database"]
+async fn invited_member_waits_on_acl_generation_before_locking_a_mailbox() {
+    let url = support::postgres_proof::validated_direct_disposable_url(
+        std::env::var("DATABASE_URL").expect("disposable PostgreSQL URL"),
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await
+        .expect("connect PostgreSQL");
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let tag = Uuid::new_v4();
+    let founder = format!("p3a-fence-founder-{tag}");
+    let invitee = format!("p3a-fence-invitee-{tag}");
+    for id in [&founder, &invitee] {
+        sqlx::query(
+            "INSERT INTO domain_accounts(id,title,kind,location_lat,location_lon)
+             VALUES($1,$1,'garnrolle',53.555,10.055)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let circle = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO domain_audience_circles(id,kind,name,created_by_account_id)
+         VALUES($1,'household','Fence order proof',$2)",
+    )
+    .bind(circle)
+    .bind(&founder)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO domain_audience_circle_members
+         (circle_id,account_id,status,invited_by_account_id,joined_at)
+         VALUES($1,$2,'active',$2,NOW())",
+    )
+    .bind(circle)
+    .bind(&founder)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Pre-create the inboxes: if an invitation locks one prematurely,
+    // SELECT FOR UPDATE NOWAIT below detects that actual row lock. A newly
+    // inserted (uncommitted) inbox would otherwise be invisible to the probe.
+    for owner in [&founder, &invitee] {
+        sqlx::query(
+            "INSERT INTO domain_conversations
+             (id,conversation_type,visibility,account_event_owner_id)
+             VALUES($1,'account_event','participants',$2)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let mut generation_holder = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE domain_projection_state
+         SET version=version+1 WHERE singleton=TRUE",
+    )
+    .execute(&mut *generation_holder)
+    .await
+    .unwrap();
+
+    // A live invitation is now forced to wait for that generation row.
+    // Before the P2 trigger-order fix it grabs both mailbox locks *first*,
+    // making another transaction that holds generation and needs an inbox
+    // deadlock. After the fix, no mailbox can be locked before generation.
+    let mut pending_invitation = pool.begin().await.unwrap();
+    let app_name = format!("p3a-lock-order-{}", Uuid::new_v4().simple());
+    sqlx::query("SELECT set_config('application_name', $1, true)")
+        .bind(&app_name)
+        .execute(&mut *pending_invitation)
+        .await
+        .unwrap();
+    let founder_for_job = founder.clone();
+    let invitee_for_job = invitee.clone();
+    let pending_job = tokio::spawn(async move {
+        sqlx::query(
+            "INSERT INTO domain_audience_circle_members
+             (circle_id,account_id,status,invited_by_account_id)
+             VALUES($1,$2,'invited',$3)",
+        )
+        .bind(circle)
+        .bind(&invitee_for_job)
+        .bind(&founder_for_job)
+        .execute(&mut *pending_invitation)
+        .await?;
+        pending_invitation.commit().await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pg_stat_activity
+                   WHERE application_name=$1 AND wait_event_type='Lock'
+                 )",
+            )
+            .bind(&app_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("pending invitation must reach the locked generation fence");
+
+    let mut mailbox_probe = pool.begin().await.unwrap();
+    let _: Uuid = sqlx::query_scalar(
+        "SELECT id FROM domain_conversations
+         WHERE conversation_type='account_event' AND account_event_owner_id=$1
+         FOR UPDATE NOWAIT",
+    )
+    .bind(&invitee)
+    .fetch_one(&mut *mailbox_probe)
+    .await
+    .expect("an invitation waiting on generation must not already own its mailbox");
+    mailbox_probe.rollback().await.unwrap();
+
+    generation_holder.rollback().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), pending_job)
+        .await
+        .expect("invitation must finish once generation fence is released")
+        .expect("invitation task must not panic")
+        .expect("invitation must commit without deadlock");
+
+    sqlx::query("DELETE FROM domain_audience_circles WHERE id=$1")
+        .bind(circle)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [&founder, &invitee] {
+        sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL for a disposable direct PostgreSQL database"]
 async fn opposite_direction_invitations_reuse_two_mailboxes_without_deadlock() {
     let url = support::postgres_proof::validated_direct_disposable_url(
         std::env::var("DATABASE_URL").expect("disposable PostgreSQL URL"),
