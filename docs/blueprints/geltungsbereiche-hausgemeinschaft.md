@@ -414,16 +414,17 @@ schließen.
 betreffende Ereignisse sind **persönliche Nachrichten** und erscheinen
 **dauerhaft lesbar unter `/nachrichten`**, inklusive Ungelesen-Zähler,
 Topbar-Briefsymbol und kontextbezogenem Direktlink. Die Nutzer müssen nicht
-in den Einstellungen nach Einladungen suchen. Das Postfach ist die Wahrheit;
-Push weckt nur auf und kann fehlen.
+in den Einstellungen nach Einladungen suchen. Das Postfach ist die
+verbindliche Anzeige und Lesestatusquelle für die persönliche Mitteilung;
+der fachliche Mitgliedschafts- oder Ressourcenzustand bleibt die
+maßgebliche Wahrheit. Push weckt nur auf und kann fehlen.
 
 | Ereignis | Persönliche Empfänger | Darstellung / mögliche Aktion |
 |---|---|---|
 | Hausgemeinschaft vorgeschlagen / eingeladen | konkret Eingeladener | „Einladung zur Hausgemeinschaft“; **Annehmen / Ablehnen** |
-| Einladung angenommen | Einladender; betroffene bisherige Mitglieder | „Beitritt bestätigt“; Kreis öffnen |
+| Einladung angenommen / neues Mitglied bestätigt | Einladender und betroffene bisherige Mitglieder, je genau eine Nachricht | „Beitritt bestätigt“ bzw. „Neues Mitglied“; Kreis öffnen |
 | Einladung abgelehnt | Einladender | „Einladung abgelehnt“; als erledigt markieren |
 | Einladung zurückgezogen / gegenstandslos | Eingeladener und betroffene Initiatoren | Korrekturstatus; **keine** wirkungslose Beitrittstaste |
-| Neues Mitglied bestätigt | bisherige betroffene Mitglieder | Personenänderung und Hinweis auf Reichweite bestehender Freigaben |
 | Austritt, Ausschluss oder Auflösung | noch betroffene Mitglieder, relevante Besitzer | Änderung des Zugriffsstatus; Kreis/Freigaben prüfen |
 | Eigene Kreisfreigabe geändert oder widerrufen | direkt betroffene, aktuell berechtigte Personen | neutrale persönliche Statusmitteilung; keine privaten Daten nach Widerruf |
 | Direkte Antwort, Erwähnung, persönlich anvertraute Aufgabe oder Entscheidung | direkt adressierte/beteiligte Person | vorhandenen Knoten, Faden, Antrag oder Gespräch öffnen |
@@ -437,6 +438,15 @@ allgemeine Aktivität → Opt-in; rein technische Vorgänge → kein Postfach.**
 Ablehnung darf nicht still verschwinden; zugleich dürfen Sender und
 Empfänger nicht zu einem privaten Chat oder einer Antwort verpflichtet
 werden.
+
+**Bisherigen P3-Adressierungsvertrag erhalten:** Eine vorhandene
+Webungsaktion kann gezielt eine bestätigte Gemeinschaft oder einen
+anderen zulässigen Kreis ansprechen, **ohne** Knoten, Fäden oder
+Gespräche zu kopieren. Die Adressierung erweitert nie das Leserecht.
+Die zielgerichtete persönliche Nachricht entsteht nur für tatsächlich
+betroffene Konten; sonst werden aus dem zulässigen Kreis ausschließlich
+freiwillige Abonnenten benachrichtigt. Sichtbarkeit, Adressierung,
+Mitwirkung und Zustellung bleiben getrennte Entscheidungen.
 
 #### Technische Umsetzung – kleinster kompatibler Schnitt
 
@@ -452,6 +462,10 @@ werden.
 2. Fachlicher Ereigniscommit und Nachrichtenauftrag atomar per bestehender
    Outbox binden. Jede Kombination aus kanonischer Ereignis-ID, Empfänger
    und Ereignisart erzeugt höchstens **eine** Postfachnachricht.
+   **Ein Beitritt erzeugt für jeden Empfänger höchstens eine
+   Ereignisnachricht**, auch wenn er zugleich Einladender und
+   bestehendes Mitglied ist; Tabellenzeilen für Annahme und neue
+   Mitgliedschaft sind keine zwei Zustellungen.
    Einladungs-Retry, parallele Annahme/Ablehnung und wiederholte
    Verarbeitung dürfen weder doppelte Nachrichten noch widersprüchliche
    Aktionen erzeugen. Fehlende Postfachzustellung darf die fachliche
@@ -463,6 +477,10 @@ werden.
    verwerfen. Einladungs-Aktionsknöpfe rufen nur die vorhandene
    autorisierte API auf, lesen danach Status frisch und bleiben nach
    Ablehnung, Widerruf oder Annahme nicht fälschlich aktiv.
+   Eine abgelehnte letzte Einladung lässt keinen dauerhaft
+   fälschlich „wartenden“ Gründungsvorschlag stehen; dessen Zustand
+   wird aus der bestehenden Mitgliedschafts- und Kreis-Persistenz
+   eindeutig abgeleitet.
 4. **Zugriff bei Erzeugung, Anzeige, Navigation und optionalem Push
    erneut prüfen.** Nach Austritt darf ein alter Nachrichtendirektlink
    keinen früheren Knoten mehr öffnen. Wo berechtigte Historie gezeigt
@@ -486,7 +504,11 @@ werden.
 **Fertig, wenn:** Einladung, Ablehnung, Annahme, Rücknahme, Eintritt
 und Austritt revisionsgebunden als echte, ungelesene persönliche
 Postfachnachrichten mit funktionierenden Aktionen und Topbar-Status
-geprüft sind; andere Konten sehen sie nicht. Zusätzlich erhält ein
+geprüft sind; andere Konten sehen sie nicht. Ein bestätigter Beitritt
+erzeugt für ein zugleich einladendes Mitglied keine doppelte Nachricht;
+abgelehnte Gründungen bleiben nicht künstlich „wartend“.
+Die gezielte Adressierung einer Webungsaktion erweitert weder Leserechte
+noch kopiert sie Objekte. Zusätzlich erhält ein
 berechtigtes Mitglied eine abonnierte Ressourcenmeldung, während
 Nichtmitglied, ehemaliges Mitglied, nicht abonnierter Empfänger und
 ausgeschaltetes Gerät keine unzulässigen Hinweise bekommen.
