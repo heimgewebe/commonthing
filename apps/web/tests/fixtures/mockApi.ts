@@ -145,10 +145,8 @@ export async function mockApiResponses(
   let nextNodeId = 1;
   let nextEdgeId = 1;
 
-  // Match canonical API endpoints only. Vite serves client source files
-  // under /src/lib/api/; a broad **/api/** glob replaces those scripts
-  // with JSON and causes a false 500 before the page can be tested.
-  await page.route((url) => url.pathname.startsWith("/api/"), async (route) => {
+  // Only REST /api routes; Vite's /src/lib/api/*.ts imports are scripts.
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
     const url = route.request().url();
     const method = route.request().method();
 
