@@ -254,3 +254,75 @@ test("Alte Hausgemeinschaftsoberfläche darf nach Annahme anderswo keine Mitglie
     "Die Aktion konnte nicht abgeschlossen werden.",
   );
 });
+
+test("Automatischer Postfach-Refresh erhält alle bereits geladenen älteren Mitteilungen", async ({
+  page,
+}) => {
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "personal-a", role: "weber" },
+  });
+  await page.route("**/api/direct-conversations", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [] }),
+    }),
+  );
+  const allEvents = Array.from({ length: 55 }, (_, i) => ({
+    id: `notice-${i}`,
+    event_kind: "circle_left",
+    invitation_created_at: null,
+    content: `Historische Mitteilung ${i + 1}`,
+    created_at: "2026-11-12T12:00:00Z",
+    read_at: "2026-11-12T12:10:00Z",
+    circle_id: null,
+    circle_name: null,
+    target_account_id: null,
+    actionable: false,
+  }));
+  let initialPageRequests = 0;
+  await page.route("**/api/personal-events**", (route) => {
+    const url = new URL(route.request().url());
+    if (route.request().method() !== "GET") return route.fallback();
+    const before = url.searchParams.get("before");
+    if (!before) initialPageRequests += 1;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items:
+          before === "notice-49" ? allEvents.slice(50) : allEvents.slice(0, 50),
+        unread_count: 0,
+        has_more: !before,
+      }),
+    });
+  });
+
+  await page.goto("/nachrichten");
+  const inbox = page.getByTestId("personal-events-inbox");
+  await expect(
+    inbox.getByText("Historische Mitteilung 1", { exact: true }),
+  ).toBeVisible();
+  await inbox
+    .getByRole("button", { name: "Ältere Mitteilungen laden" })
+    .click();
+  await expect(
+    inbox.getByText("Historische Mitteilung 55", { exact: true }),
+  ).toBeVisible();
+
+  await inbox.getByRole("button", { name: "Aktualisieren" }).click();
+  await expect.poll(() => initialPageRequests).toBeGreaterThanOrEqual(2);
+  await expect(
+    inbox.getByText("Historische Mitteilung 55", { exact: true }),
+  ).toBeVisible();
+  await expect(inbox.locator("li")).toHaveCount(55);
+
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect.poll(() => initialPageRequests).toBeGreaterThanOrEqual(3);
+  await expect(
+    inbox.getByText("Historische Mitteilung 55", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    inbox.getByRole("button", { name: "Ältere Mitteilungen laden" }),
+  ).toHaveCount(0);
+});

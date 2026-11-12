@@ -48,7 +48,19 @@
     try {
       const page = await listPersonalEvents();
       if (current !== revision || $authStore.account_id !== actor) return;
-      notices = page;
+      // A periodic or focus refresh only fetches the newest page. Retain
+      // previously paginated history and its cursor state: replacing the
+      // whole collection would make older messages disappear every 30 s.
+      const alreadyLoaded = notices.items;
+      const refreshedIds = new Set(page.items.map((item) => item.id));
+      notices = {
+        ...page,
+        items: [
+          ...page.items,
+          ...alreadyLoaded.filter((item) => !refreshedIds.has(item.id)),
+        ],
+        has_more: alreadyLoaded.length > 0 ? notices.has_more : page.has_more,
+      };
       error = "";
     } catch {
       if (current === revision && $authStore.account_id === actor) {
