@@ -217,7 +217,11 @@ BEGIN
     RETURN OLD;
 END;
 $$;
-CREATE TRIGGER audience_circle_personal_events
+-- PostgreSQL fires same-event triggers alphabetically: the existing
+-- circle_members_acl_generation must acquire the global privacy generation
+-- lock BEFORE this trigger acquires any account mailbox locks. This prevents
+-- lock inversion between one-statement circle creation and another invite.
+CREATE TRIGGER circle_members_personal_events
 AFTER INSERT OR UPDATE OF status OR DELETE ON domain_audience_circle_members
 FOR EACH ROW EXECUTE FUNCTION weltgewebe_circle_membership_personal_event();
 

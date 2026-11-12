@@ -604,6 +604,27 @@ async fn opposite_direction_invitations_reuse_two_mailboxes_without_deadlock() {
         .expect("connect PostgreSQL");
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
+    // All row mutations must acquire the global ACL generation fence before
+    // any account-owned mailbox lock, including mixed founder/invitee INSERTs.
+    // PostgreSQL fires AFTER triggers on the same event in name order.
+    let ordered_triggers: Vec<String> = sqlx::query_scalar(
+        "SELECT tgname::text FROM pg_trigger
+         WHERE tgrelid='domain_audience_circle_members'::regclass
+           AND tgname IN ('circle_members_acl_generation', 'circle_members_personal_events')
+         ORDER BY tgname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        ordered_triggers,
+        [
+            "circle_members_acl_generation",
+            "circle_members_personal_events"
+        ],
+        "ACL generation must be locked before personal mailbox delivery"
+    );
+
     let tag = Uuid::new_v4();
     let a = format!("p3a-cross-a-{tag}");
     let b = format!("p3a-cross-b-{tag}");
@@ -732,7 +753,7 @@ async fn historical_pending_invitations_are_backfilled_once_on_activation() {
     // personal event trigger existed. This is a disposable test database only.
     sqlx::query(
         "ALTER TABLE domain_audience_circle_members
-         DISABLE TRIGGER audience_circle_personal_events",
+         DISABLE TRIGGER circle_members_personal_events",
     )
     .execute(&pool)
     .await
@@ -750,7 +771,7 @@ async fn historical_pending_invitations_are_backfilled_once_on_activation() {
     .unwrap();
     sqlx::query(
         "ALTER TABLE domain_audience_circle_members
-         ENABLE TRIGGER audience_circle_personal_events",
+         ENABLE TRIGGER circle_members_personal_events",
     )
     .execute(&pool)
     .await

@@ -8,7 +8,7 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS audience_circle_personal_events ON domain_audience_circle_members;
+DROP TRIGGER IF EXISTS circle_members_personal_events ON domain_audience_circle_members;
 DROP FUNCTION IF EXISTS weltgewebe_circle_membership_personal_event();
 DROP FUNCTION IF EXISTS weltgewebe_deliver_circle_event(TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ);
 DROP TABLE domain_personal_event_messages;
