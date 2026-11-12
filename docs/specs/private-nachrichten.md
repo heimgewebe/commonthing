@@ -109,6 +109,55 @@ Unterhaltung sendet der Browser die Kennung der neuesten tatsächlich geladenen
 Nachricht zurück. Der Server markiert nur bis zu genau dieser Nachricht als
 gelesen; eine gleichzeitig eintreffende spätere Nachricht bleibt ungelesen.
 
+## Persönliche Systemnachrichten über Hausgemeinschaften (P3a)
+
+Eine Einladung, Annahme, Ablehnung, Rücknahme oder ein Austritt ist für
+die konkret betroffenen Accounts eine **persönliche Nachricht**. Sie erscheint
+im bestehenden Postfach `/nachrichten` und dessen Ungelesen-Anzeige,
+auch ohne Web-Push-Freigabe. Allgemeine Angebote und Themenaktivität
+sind dagegen keine Pflichtnachrichten; freiwillige Abonnements gehören
+zum gesonderten P3b-Vertrag.
+
+**Kanonischer Nachrichtenspeicher:** Ein accountgebundenes
+`domain_conversations.conversation_type='account_event'` mit
+`visibility='participants'` verwendet vorhandene `domain_messages`.
+Das typisierte Metadatum in `domain_personal_event_messages` referenziert
+die Nachrichten-ID und speichert Ereignisart, Kreis-ID und den
+kontospezifischen Lesezeitpunkt. Es entsteht **keine** fingierte 1:1-Unterhaltung
+mit einer erfundenen Person und keine zweite Nachrichtentextdatenbank.
+
+**Atomare Entstehung:** Der PostgreSQL-Übergang einer Kreis-Mitgliedschaft
+erzeugt die persönliche Nachricht in derselben Transaktion. Der
+bestehende `domain.message.created`-Outboxtrigger hält die Zustellung
+wiederholbar; ein fehlgeschlagener Web Push darf das Postfach nicht
+verändern. Unveränderte, erneut abgesendete Einladungen erzeugen kein
+zweites Ereignis, weil `ON CONFLICT DO NOTHING` keine Transition auslöst.
+Eine abgelehnte letzte Gründungseinladung schließt den unvollendeten
+Kreis statt ihn unbegrenzt als offen anzuzeigen.
+Bereits vor Einführung von P3a ausstehende Einladungen werden beim
+Schemawechsel einmalig atomar als persönliche Nachrichten übernommen.
+
+**Empfängerschutz:** `GET /personal-events` listet ausschließlich die
+eigenen Nachrichten, absteigend nach Erzeugungszeit und ID mit
+seitenweiser Fortsetzung; `POST /personal-events/{id}/read` bestätigt
+nur eine tatsächlich geladene Nachricht des jeweiligen Kontos.
+Die API setzt `Cache-Control: private, no-store` und prüft aktuelle
+Mitgliedschaft vor Anzeige von Kreismetadaten oder Aktionsmöglichkeiten.
+Ein früheres Mitglied behält allenfalls neutrale Historie, nie einen
+durch die Nachricht wieder geöffneten privaten Kreis oder Knoten.
+
+**Bedienung:** Eingehende Einladungen lassen sich aus dem Postfach
+annehmen oder ablehnen, gesendete ausstehende Einladungen zurückziehen.
+Die fachliche Mitgliedschaft bleibt maßgeblich; nach einer Aktion
+liest die Oberfläche den Status neu. Einladungen werden nicht durch
+bloßes Laden als gelesen markiert. Die bestehenden Direktnachrichten
+und deren Blockieren-, Gelesen- und Push-Verträge bleiben unabhängig
+und unverändert.
+
+**Web Push:** P3a fügt **keine** automatische Ereignis-Pushzustellung hinzu.
+Sie erfordert bei einer späteren Erweiterung erneut ausdrücklich
+Konto-Opt-in, Gerätefreigabe, neutrale Pushdaten und aktuelle Leserechte.
+
 ## Blockieren
 
 Jeder Teilnehmer kann die Unterhaltung für sich blockieren. Solange mindestens

@@ -436,6 +436,81 @@ pub async fn invite_account(
         .into_response())
 }
 
+/// DELETE /circles/{id}/invitations/{account_id} — the active inviter
+/// may withdraw only their own still-pending invitation. The membership
+/// trigger emits one personal event to the former invitee in this transaction.
+pub async fn withdraw_invitation(
+    State(state): State<ApiState>,
+    Extension(auth): Extension<AuthContext>,
+    Path((id, invitee)): Path<(Uuid, String)>,
+) -> Result<Response, ApiError> {
+    let actor = require_actor(&auth)?;
+    let pool = require_pool(&state)?;
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(internal_error("reserve_withdraw_invitation_pool_budget"))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(internal_error("begin_withdraw_invitation"))?;
+    let allowed = sqlx::query_scalar::<_, Uuid>(
+        "SELECT c.id FROM domain_audience_circles c
+         JOIN domain_audience_circle_members inviter
+           ON inviter.circle_id=c.id AND inviter.account_id=$2
+         JOIN domain_audience_circle_members invited
+           ON invited.circle_id=c.id AND invited.account_id=$3
+         WHERE c.id=$1 AND c.state<>'inactive'
+           AND inviter.status='active' AND invited.status='invited'
+           AND invited.invited_by_account_id=$2
+         FOR UPDATE OF c, inviter, invited",
+    )
+    .bind(id)
+    .bind(actor)
+    .bind(&invitee)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal_error("authorize_invitation_withdrawal"))?;
+    if allowed.is_none() {
+        return Err((StatusCode::NOT_FOUND, "invitation not found".to_owned()));
+    }
+
+    // Transaction-local marker only: the DELETE trigger distinguishes an
+    // inviter's withdrawal from the invitee's existing leave/decline path.
+    sqlx::query("SELECT set_config('weltgewebe.circle_invitation_withdrawal','yes',true)")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal_error("mark_invitation_withdrawal"))?;
+    sqlx::query(
+        "DELETE FROM domain_audience_circle_members
+         WHERE circle_id=$1 AND account_id=$2 AND status='invited'",
+    )
+    .bind(id)
+    .bind(&invitee)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_error("delete_withdrawn_invitation"))?;
+
+    // A founding proposal with no one left to accept must not stay waiting.
+    sqlx::query(
+        "UPDATE domain_audience_circles c SET state='inactive'
+         WHERE c.id=$1 AND c.state='forming'
+         AND NOT EXISTS (SELECT 1 FROM domain_audience_circle_members m
+                         WHERE m.circle_id=c.id AND m.status='invited')",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_error("close_unanswered_foundation"))?;
+    tx.commit()
+        .await
+        .map_err(internal_error("commit_withdraw_invitation"))?;
+    Ok((
+        StatusCode::NO_CONTENT,
+        [(header::CACHE_CONTROL, "private, no-store")],
+    )
+        .into_response())
+}
+
 /// DELETE /circles/{id}/membership — departure immediately revokes own rights.
 /// Historical circle identity is retained, even when the last member leaves.
 pub async fn leave_circle(
@@ -470,6 +545,20 @@ pub async fn leave_circle(
     if removed.is_none() {
         return Err((StatusCode::NOT_FOUND, "circle not found".to_owned()));
     }
+    // A rejected final founding invitation must not leave a permanently
+    // unanswerable "forming" proposal behind.
+    sqlx::query(
+        "UPDATE domain_audience_circles c SET state='inactive'
+         WHERE c.id=$1 AND c.state='forming'
+         AND NOT EXISTS (
+           SELECT 1 FROM domain_audience_circle_members m
+           WHERE m.circle_id=c.id AND m.status='invited'
+         )",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_error("close_declined_foundation"))?;
     sqlx::query(
         "UPDATE domain_audience_circles c SET state='inactive'
          WHERE c.id=$1 AND NOT EXISTS (

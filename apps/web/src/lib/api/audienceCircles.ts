@@ -98,3 +98,10 @@ export const leaveCircle = (id: string) =>
   request<void>(`/api/circles/${encodeURIComponent(id)}/membership`, {
     method: "DELETE",
   });
+
+/** Inviter-only withdrawal; applies only to a still pending invitation. */
+export const withdrawCircleInvitation = (id: string, accountId: string) =>
+  request<void>(
+    `/api/circles/${encodeURIComponent(id)}/invitations/${encodeURIComponent(accountId)}`,
+    { method: "DELETE" },
+  );

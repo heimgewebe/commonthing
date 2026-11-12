@@ -71,6 +71,52 @@ function proposal(overrides: Partial<Proposal> = {}): Proposal {
 }
 
 describe("topBarAttentionState", () => {
+  it("counts a personal invitation as mail without inventing a human sender", () => {
+    const items = projectTopBarAttention({
+      conversations: [conversation("human", 2, "2026-11-12T11:59:00Z")],
+      personalEvents: {
+        unread_count: 3,
+        has_more: false,
+        items: [
+          {
+            id: "personal-1",
+            event_kind: "circle_invited",
+            content: "Einladung",
+            created_at: "2026-11-12T12:00:00Z",
+            read_at: null,
+            circle_id: "circle-1",
+            circle_name: "Haus",
+            target_account_id: null,
+            actionable: true,
+          },
+        ],
+      },
+      proposals: [],
+      accountId: "weber-a",
+      role: "weber",
+      nowMs: NOW,
+    });
+    expect(items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "personal-events:weber-a",
+          kind: "personal_event",
+          meaning: "available",
+          href: "/nachrichten#ereignisse",
+          count: 3,
+        }),
+        expect.objectContaining({
+          id: "direct:human",
+          kind: "direct_message",
+          count: 2,
+        }),
+      ]),
+    );
+    expect(items.filter((item) => item.kind === "personal_event")).toHaveLength(
+      1,
+    );
+  });
+
   it("recognizes pending and accepted Weber applications only for the current account", () => {
     const proposals = [
       proposal({

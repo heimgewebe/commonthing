@@ -38,6 +38,7 @@
   function attentionSymbol(kind: string): string {
     switch (kind) {
       case "direct_message":
+      case "personal_event":
         return "✉";
       case "weber_application":
       case "own_proposal":
@@ -51,6 +52,7 @@
   function attentionActionLabel(kind: string): string {
     switch (kind) {
       case "direct_message":
+      case "personal_event":
         return "Nachricht öffnen";
       case "weber_application":
         return "Weberantrag öffnen";
@@ -214,7 +216,9 @@
                   aria-hidden="true"
                 >
                   {attentionSymbol(item.kind)}
-                  <span class="overflow-meaning-mark">{attentionMeaningMark(item.meaning)}</span>
+                  <span class="overflow-meaning-mark"
+                    >{attentionMeaningMark(item.meaning)}</span
+                  >
                 </span>
                 <span class="overflow-copy">
                   <span class="overflow-meaning"
@@ -223,7 +227,9 @@
                   <strong>{item.label}</strong>
                   <span class="overflow-detail">{item.detail}</span>
                   {#if item.deadline && item.deadlineLabel}
-                    <time class="overflow-deadline" datetime={item.deadline}>{item.deadlineLabel}</time>
+                    <time class="overflow-deadline" datetime={item.deadline}
+                      >{item.deadlineLabel}</time
+                    >
                   {/if}
                 </span>
                 {#if item.count && item.count > 1}
@@ -260,7 +266,10 @@
           <h2 id="attention-card-title">{activeItem.label}</h2>
           <p>{activeItem.detail}</p>
           {#if activeItem.deadline && activeItem.deadlineLabel}
-            <time class="attention-card-deadline" datetime={activeItem.deadline}>
+            <time
+              class="attention-card-deadline"
+              datetime={activeItem.deadline}
+            >
               {activeItem.deadlineLabel}
             </time>
           {/if}
