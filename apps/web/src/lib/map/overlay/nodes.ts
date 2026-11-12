@@ -264,7 +264,10 @@ export class NodesOverlay {
     private map: MapLibreMap | null,
     private MarkerClass: MarkerConstructor,
     private readonly runtime: WeaveRuntime = weaveRuntime,
-    private readonly onEntityActivate?: (item: MapEntityViewModel) => void,
+    private readonly onEntityActivate?: (
+      item: MapEntityViewModel,
+      focusReturnTarget?: HTMLElement | null,
+    ) => void,
   ) {
     if (this.map && typeof this.map.getContainer === "function") {
       const container = this.map.getContainer();
@@ -375,6 +378,24 @@ export class NodesOverlay {
       this.activeMarkers.get(triggerId)?.element.focus();
   }
 
+  /** Position used by the UI, not the geographic Faden anchor. */
+  private displayedObjectPoint(item: MapEntityViewModel): ScreenPoint | null {
+    const map = this.map;
+    if (!map || typeof map.project !== "function") return null;
+    const point = map.project([item.lon, item.lat]);
+    const household = this.households.byAccountId.get(item.id);
+    if (!household || household.key !== this.expandedHouseholdKey) return point;
+    const members = this.householdPageMembers(household);
+    const index = members.findIndex((member) => member.id === item.id);
+    if (index < 0) return null; // A member on a different page is not displayed.
+    const offset = householdMemberOffset(
+      index,
+      members.length,
+      this.mapScaleContainer?.clientWidth ?? 320,
+    );
+    return { x: point.x + offset.x, y: point.y + offset.y };
+  }
+
   /**
    * Look up colliding *screen hit boxes*, not rounded geographic positions.
    * All candidates come from the already-authorized map projection. In dense
@@ -384,8 +405,9 @@ export class NodesOverlay {
   private overlappingObjects(item: MapEntityViewModel): MapEntityViewModel[] {
     const map = this.map;
     if (!map || typeof map.project !== "function") return [item];
-    const center = map.project([item.lon, item.lat]);
-    if (!Number.isFinite(center.x) || !Number.isFinite(center.y)) return [item];
+    const center = this.displayedObjectPoint(item);
+    if (!center || !Number.isFinite(center.x) || !Number.isFinite(center.y))
+      return [item];
     const potential = new Map<string, MapEntityViewModel>();
     potential.set(item.id, item);
     if (this.nativeLayerEnabled && map.getLayer(NATIVE_ENTITY_LAYER_ID)) {
@@ -408,6 +430,14 @@ export class NodesOverlay {
       }
       for (const entry of this.activeMarkers.values()) {
         potential.set(entry.item.id, entry.item);
+        // The native GeoJSON layer intentionally excludes household accounts.
+        // A collapsed stack renders only its front DOM marker: expand its
+        // already-authorized member list as candidates, without creating pins.
+        const household = this.households.byAccountId.get(entry.item.id);
+        if (household && household.key !== this.expandedHouseholdKey) {
+          for (const member of household.members)
+            potential.set(member.id, member);
+        }
       }
     } else {
       // <= 100 ordinary DOM markers; the wider native scene never full-scans.
@@ -418,8 +448,9 @@ export class NodesOverlay {
     for (const candidate of potential.values()) {
       if (candidate.id === item.id || !hasRenderableMapPosition(candidate))
         continue;
-      const projected = map.project([candidate.lon, candidate.lat]);
-      if (screenHitBoxesOverlap(center, projected)) results.push(candidate);
+      const projected = this.displayedObjectPoint(candidate);
+      if (projected && screenHitBoxesOverlap(center, projected))
+        results.push(candidate);
     }
     return results;
   }
@@ -443,13 +474,15 @@ export class NodesOverlay {
     const onlySpools =
       item.type === "garnrolle" &&
       overlapping.every((candidate) => candidate.type === "garnrolle");
-    const origin = map.project([item.lon, item.lat]);
+    const origin = this.displayedObjectPoint(item);
     const spoolCenterCovered =
       onlySpools &&
       overlapping.some((candidate) => {
         if (candidate.id === item.id) return false;
-        const other = map.project([candidate.lon, candidate.lat]);
+        const other = this.displayedObjectPoint(candidate);
         return (
+          origin !== null &&
+          other !== null &&
           Math.abs(other.x - origin.x) < MARKER_HIT_SIZE_PX / 2 &&
           Math.abs(other.y - origin.y) < MARKER_HIT_SIZE_PX / 2
         );
@@ -512,8 +545,18 @@ export class NodesOverlay {
           button.setAttribute("aria-current", "true");
         button.addEventListener("click", (event) => {
           event.stopPropagation();
+          // This click does not reach the map route's delegated marker handler.
+          // Preserve a connected marker (or the map canvas for native dots)
+          // so the route can restore keyboard focus after closing the panel.
+          const focusReturnTarget =
+            this.activeMarkers.get(candidate.id)?.element ??
+            this.activeMarkers.get(item.id)?.element ??
+            overlapping
+              .map((other) => this.activeMarkers.get(other.id)?.element)
+              .find((element) => element !== undefined) ??
+            (typeof map.getCanvas === "function" ? map.getCanvas() : null);
           this.closeObjectChooser();
-          this.onEntityActivate?.(candidate);
+          this.onEntityActivate?.(candidate, focusReturnTarget);
         });
         list.append(button);
       }

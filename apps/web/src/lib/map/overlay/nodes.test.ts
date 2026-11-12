@@ -1539,7 +1539,10 @@ describe("one on-demand chooser for overlapping map hit boxes", () => {
     const target = chooser?.children[1].children[3] as FakeElement;
     expect(target.focused).toBe(false);
     target.fire("click");
-    expect(activate).toHaveBeenCalledWith(center);
+    expect(activate).toHaveBeenCalledWith(
+      center,
+      overlay.getActiveMarker(center.id)?.element,
+    );
     expect(chooser?.removed).toBe(true);
     overlay.destroy();
   });
@@ -1609,6 +1612,39 @@ describe("one on-demand chooser for overlapping map hit boxes", () => {
     const click = marker.fire("click", { detail: 1 });
     expect(click.stopPropagation).toHaveBeenCalledOnce();
     expect(chooserOf(container)?.children[1].children).toHaveLength(2);
+    overlay.destroy();
+  });
+
+  it("uses expanded household screen offsets rather than false geographic collisions", () => {
+    const { overlay, container } = projectedOverlay(([lon, lat]) => ({
+      x: lon * 100,
+      y: lat * 100,
+    }));
+    Object.assign(container, { clientWidth: 600, clientHeight: 700 });
+    const anchorNode = makeNode("near-house", { lon: 10.01, lat: 53.51 });
+    const members = Array.from({ length: 4 }, (_, i) => ({
+      ...makeAccount(`resident-${i}`),
+      map_state: "exact" as const,
+    }));
+    overlay.update([anchorNode, ...members], true);
+    (
+      overlay.getActiveMarker(members[3].id)?.element as unknown as FakeElement
+    ).fire("dblclick");
+    expect(overlay.getActiveMarker(members[0].id)).toBeDefined();
+    expect(overlay.getActiveMarker(members[3].id)).toBeDefined();
+    // Displayed x offsets are -102,-34,34,102px (68px spacing).
+    const nodeMarker = overlay.getActiveMarker(anchorNode.id)
+      ?.element as unknown as FakeElement;
+    const click = nodeMarker.fire("click", { detail: 1 });
+    expect(click.stopPropagation).toHaveBeenCalledOnce();
+    const choices = chooserOf(container)?.children[1].children.map(
+      (button) => button.textContent,
+    );
+    expect(choices).toEqual([
+      "Knoten: Node near-house",
+      "Garnrolle: Garnrolle resident-1",
+      "Garnrolle: Garnrolle resident-2",
+    ]);
     overlay.destroy();
   });
 
@@ -1691,7 +1727,10 @@ describe("one on-demand chooser for overlapping map hit boxes", () => {
     pager.children[2].fire("click");
     expect(chooser?.children[1].children.length).toBe(5);
     chooser?.children[1].children[4].fire("click");
-    expect(activate).toHaveBeenCalledWith(points[64]);
+    expect(activate).toHaveBeenCalledWith(
+      points[64],
+      overlay.getActiveMarker(points[64].id)?.element,
+    );
     overlay.destroy();
   });
 });

@@ -141,6 +141,25 @@ test("real pointer selects each co-located node, Garnrolle and center through on
   await expect(canvasNode).toHaveAttribute("data-id", otherNodeId);
 });
 
+test("choosing an overlap restores marker keyboard focus after closing the panel", async ({
+  page,
+}) => {
+  await overlappingMap(page);
+  const point = await anchorScreenPoint(page);
+  await page.mouse.click(point.x, point.y);
+  const chooser = page.getByTestId("map-object-chooser");
+  await expect(chooser).toBeVisible();
+  const choice = page.getByTestId(`choose-map-object-${otherNodeId}`);
+  await choice.focus();
+  await page.keyboard.press("Enter");
+  const panel = page.getByTestId("context-panel");
+  await expect(panel).toContainText(secondNode.title);
+  await expect(chooser).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(panel).toHaveCount(0);
+  await expect(page.getByTestId(`marker-node-${otherNodeId}`)).toBeFocused();
+});
+
 test("zoom separates nearby locations; Escape and keyboard access work", async ({
   page,
 }) => {
