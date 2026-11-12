@@ -53,13 +53,22 @@
       // whole collection would make older messages disappear every 30 s.
       const alreadyLoaded = notices.items;
       const refreshedIds = new Set(page.items.map((item) => item.id));
+      // Merging is safe only when the newest page overlaps the loaded
+      // range. More than one whole page of new events may have arrived while
+      // the user was away: then resetting to the first page is necessary so
+      // the missing middle pages remain reachable through normal pagination.
+      const contiguous =
+        page.has_more &&
+        alreadyLoaded.some((item) => refreshedIds.has(item.id));
       notices = {
         ...page,
-        items: [
-          ...page.items,
-          ...alreadyLoaded.filter((item) => !refreshedIds.has(item.id)),
-        ],
-        has_more: alreadyLoaded.length > 0 ? notices.has_more : page.has_more,
+        items: contiguous
+          ? [
+              ...page.items,
+              ...alreadyLoaded.filter((item) => !refreshedIds.has(item.id)),
+            ]
+          : page.items,
+        has_more: contiguous ? notices.has_more : page.has_more,
       };
       error = "";
     } catch {
@@ -161,6 +170,21 @@
       } catch {
         ackFailed = true;
       }
+      // The older, already paginated portion is retained by refresh().
+      // A successfully applied membership transition must not remain
+      // clickable there merely because the next first-page GET omits it.
+      notices = {
+        ...notices,
+        items: notices.items.map((item) =>
+          item.id === event.id
+            ? {
+                ...item,
+                actionable: false,
+                read_at: ackFailed ? item.read_at : new Date().toISOString(),
+              }
+            : item,
+        ),
+      };
       await refresh();
       if (ackFailed) {
         error =

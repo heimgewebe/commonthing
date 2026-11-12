@@ -326,3 +326,145 @@ test("Automatischer Postfach-Refresh erhält alle bereits geladenen älteren Mit
     inbox.getByRole("button", { name: "Ältere Mitteilungen laden" }),
   ).toHaveCount(0);
 });
+
+test("Mehr als 50 neue Mitteilungen lassen keine unsichtbare Lücke in der Pagination", async ({
+  page,
+}) => {
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "personal-a", role: "weber" },
+  });
+  await page.route("**/api/direct-conversations", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [] }),
+    }),
+  );
+  let burst = false;
+  const item = (id: string, content: string) => ({
+    id,
+    event_kind: "circle_left",
+    invitation_created_at: null,
+    content,
+    created_at: "2026-11-12T12:00:00Z",
+    read_at: "2026-11-12T12:10:00Z",
+    circle_id: null,
+    circle_name: null,
+    target_account_id: null,
+    actionable: false,
+  });
+  const old = Array.from({ length: 3 }, (_, i) =>
+    item(`old-${i}`, `Alt ${i + 1}`),
+  );
+  const fresh = Array.from({ length: 55 }, (_, i) =>
+    item(`new-${i}`, `Neu ${i + 1}`),
+  );
+  await page.route("**/api/personal-events**", (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    const before = new URL(route.request().url()).searchParams.get("before");
+    const items = !burst
+      ? old
+      : before === "new-49"
+        ? fresh.slice(50)
+        : before === "new-54"
+          ? old
+          : fresh.slice(0, 50);
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items,
+        unread_count: 0,
+        has_more: burst && before !== "new-54",
+      }),
+    });
+  });
+
+  await page.goto("/nachrichten");
+  const inbox = page.getByTestId("personal-events-inbox");
+  await expect(inbox.getByText("Alt 3", { exact: true })).toBeVisible();
+  burst = true;
+  await inbox.getByRole("button", { name: "Aktualisieren" }).click();
+  await expect(inbox.getByText("Neu 1", { exact: true })).toBeVisible();
+  await expect(inbox.getByText("Alt 3", { exact: true })).toHaveCount(0);
+  await inbox
+    .getByRole("button", { name: "Ältere Mitteilungen laden" })
+    .click();
+  await expect(inbox.getByText("Neu 55", { exact: true })).toBeVisible();
+  await inbox
+    .getByRole("button", { name: "Ältere Mitteilungen laden" })
+    .click();
+  await expect(inbox.getByText("Alt 3", { exact: true })).toBeVisible();
+  await expect(inbox.locator("li")).toHaveCount(58);
+});
+
+test("Bereits beantwortete Einladungen aus älteren Seiten bleiben beim Refresh erledigt", async ({
+  page,
+}) => {
+  const circleId = "22222222-2222-4222-8222-222222222222";
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "personal-a", role: "weber" },
+  });
+  await page.route("**/api/direct-conversations", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [] }),
+    }),
+  );
+  const notice = (id: string, invited = false) => ({
+    id,
+    event_kind: invited ? "circle_invited" : "circle_left",
+    invitation_created_at: invited ? "2026-11-12T12:00:00Z" : null,
+    content: invited ? "Alte Einladung beantworten" : "Unkritische Nachricht",
+    created_at: "2026-11-12T12:00:00Z",
+    read_at: invited ? null : "2026-11-12T12:10:00Z",
+    circle_id: invited ? circleId : null,
+    circle_name: invited ? "Hausgemeinschaft" : null,
+    target_account_id: null,
+    actionable: invited,
+  });
+  const pageOne = Array.from({ length: 50 }, (_, i) => notice(`new-${i}`));
+  const olderInvite = notice("old-invite", true);
+  await page.route("**/api/personal-events**", (route) => {
+    const url = new URL(route.request().url());
+    if (route.request().method() === "POST" && url.pathname.endsWith("/read")) {
+      return route.fulfill({ status: 204 });
+    }
+    if (route.request().method() !== "GET") return route.fallback();
+    const before = url.searchParams.get("before");
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: before ? [olderInvite] : pageOne,
+        unread_count: 0,
+        has_more: !before,
+      }),
+    });
+  });
+  await page.route(`**/api/circles/${circleId}/accept*`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: circleId,
+        kind: "household",
+        name: "Hausgemeinschaft",
+        state: "active",
+        membership_status: "active",
+      }),
+    }),
+  );
+
+  await page.goto("/nachrichten");
+  const inbox = page.getByTestId("personal-events-inbox");
+  await inbox
+    .getByRole("button", { name: "Ältere Mitteilungen laden" })
+    .click();
+  await expect(inbox.getByRole("button", { name: "Annehmen" })).toBeVisible();
+  await inbox.getByRole("button", { name: "Annehmen" }).click();
+  await expect(inbox.getByRole("button", { name: "Annehmen" })).toHaveCount(0);
+  await expect(inbox.getByText("Einladung nicht mehr offen")).toBeVisible();
+  await expect(inbox.getByText("Alte Einladung beantworten")).toBeVisible();
+});
