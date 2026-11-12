@@ -26,6 +26,7 @@
   let busyId = $state<string | null>(null);
   let error = $state("");
   let revision = 0;
+  let boundOwner: string | null | undefined;
   // Bound refresh work even if a user has browsed thousands of old messages.
   // Pages beyond this cap remain reachable through normal manual pagination.
   const MAX_REFRESH_PAGES = 12;
@@ -232,6 +233,11 @@
   $effect(() => {
     const accountId = $authStore.account_id;
     const authenticated = $authStore.authenticated;
+    const owner = authenticated ? (accountId ?? null) : null;
+    // checkAuth emits "checking" and then an authoritative result even for
+    // the same account. Neither emission may discard loaded older mail.
+    if (boundOwner === owner) return;
+    boundOwner = owner;
     revision += 1;
     notices = emptyPage();
     busyId = null;
@@ -239,7 +245,7 @@
     error = "";
     // Refresh reads the current inbox synchronously before its first await.
     // Do not subscribe the auth identity effect to inbox changes.
-    if (authenticated && accountId) untrack(() => void refresh());
+    if (owner) untrack(() => void refresh());
   });
 
   onMount(() => {

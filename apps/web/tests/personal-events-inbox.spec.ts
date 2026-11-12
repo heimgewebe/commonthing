@@ -325,6 +325,18 @@ test("Automatischer Postfach-Refresh erhält alle bereits geladenen älteren Mit
   await expect(
     inbox.getByRole("button", { name: "Ältere Mitteilungen laden" }),
   ).toHaveCount(0);
+
+  // Re-checking the same session emits two auth-store values but must not
+  // reset a mailbox that has already loaded a second page.
+  await page.evaluate(async () => {
+    const path = "/src/lib/auth/store.ts";
+    const { authStore } = await import(/* @vite-ignore */ path);
+    await authStore.checkAuth({ force: true });
+  });
+  await expect(inbox.locator("li")).toHaveCount(55);
+  await expect(
+    inbox.getByText("Historische Mitteilung 55", { exact: true }),
+  ).toBeVisible();
 });
 
 test("Mehr als 50 neue Mitteilungen lassen keine unsichtbare Lücke in der Pagination", async ({
