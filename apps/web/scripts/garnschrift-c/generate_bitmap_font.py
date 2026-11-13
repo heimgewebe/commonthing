@@ -86,8 +86,10 @@ def baseline_aligned_png(
     output = bytearray(width * BITMAP_HEIGHT * 4)
     pixels = slightly_thinner_edges(width, height, rgba)
     if text_variant:
-        # Preserve the established text shape, then gently reduce only
-        # remaining edge coverage by about four percent more overall.
+        # Refine edge coverage for readable body text while preserving the
+        # original three-ply fiber cores, RGB colors, and glyph geometry.
+        # One additional gentle pass makes dense small labels visibly lighter.
+        pixels = slightly_thinner_edges(width, height, pixels)
         pixels = slightly_thinner_edges(width, height, pixels)
         pixels = slightly_thinner_edges(width, height, pixels, strength=3)
     # The original i and k contain disconnected tiny fragments below their

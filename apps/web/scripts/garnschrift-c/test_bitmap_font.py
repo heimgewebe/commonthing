@@ -23,8 +23,8 @@ ASSETS = {
 
 
 TEXT_ASSETS = {
-    "dark": ("c7f209f4e254c93fe642f6c2785c9f349cd42d8c68809c733fa8836db3ea2adf", 412276),
-    "light": ("6ecb836bb20a49f0b1ace328941c57d87bf475ad966b3068ef271362040202b7", 448932),
+    "dark": ("cc5216bfcfa22537c4f0f7ede840af4558cdf02d216b1cf0050de10c1b48e42b", 430408),
+    "light": ("dc0d5292b6ee71867b5dfb4c11d2b4c2ad259eb85a5f4238fff99057c3d8ea40", 465684),
 }
 
 
@@ -336,10 +336,10 @@ class BitmapFontAssets(unittest.TestCase):
                     self.assertTrue(any(b >= 100 for b in thin_alpha), char)
                     original_coverage += sum(old_alpha)
                     lighter_coverage += sum(thin_alpha)
-                # Slightly finer than the first approved text weight (91.4%):
-                # keep roughly 87-89% of the original heading alpha coverage.
-                self.assertLess(lighter_coverage, original_coverage * 0.89)
-                self.assertGreater(lighter_coverage, original_coverage * 0.86)
+                # The additional edge pass makes text visibly finer while
+                # preserving dense glyph cores even for punctuation and i.
+                self.assertLess(lighter_coverage, original_coverage * 0.82)
+                self.assertGreater(lighter_coverage, original_coverage * 0.76)
 
     def test_css_selects_body_font_without_changing_headings_or_forced_colors(self):
         css = (FONT_DIR.parent / "wool-experiment.css").read_text()
