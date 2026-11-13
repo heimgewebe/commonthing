@@ -5,6 +5,7 @@
   import {
     applicationServerKey,
     deletePushSubscription,
+    NotificationsApiError,
     getNotificationPreferences,
     getPushConfig,
     registerPushSubscription,
@@ -137,6 +138,8 @@
     clearFeedback();
     let createdSubscription: PushSubscription | null = null;
     let cleanupEndpoint: string | null = null;
+    let existingBrowserSubscription = false;
+    let serverRegistrationConfirmed = false;
     try {
       permission = await Notification.requestPermission();
       if (permission !== "granted") {
@@ -152,6 +155,7 @@
       });
       await navigator.serviceWorker.ready;
       const existing = await registration.pushManager.getSubscription();
+      existingBrowserSubscription = existing !== null;
       createdSubscription =
         existing ??
         (await registration.pushManager.subscribe({
@@ -162,6 +166,7 @@
         }));
       cleanupEndpoint = createdSubscription.endpoint;
       await registerPushSubscription(createdSubscription);
+      serverRegistrationConfirmed = true;
       preferences = await updateNotificationPreferences(true);
       currentServerRegistration = true;
       browserSubscription = createdSubscription;
@@ -171,14 +176,41 @@
     } catch (cause) {
       if (createdSubscription && cleanupEndpoint) {
         try {
-          await deletePushSubscription(cleanupEndpoint);
-          currentServerRegistration = false;
+          // POST is an upsert: success does not prove this attempt created
+          // the server record. A preferences failure must not remove it.
+          if (serverRegistrationConfirmed) {
+            currentServerRegistration = true;
+          }
           deviceManagerRefreshVersion += 1;
-          await createdSubscription.unsubscribe().catch(() => false);
-          await loadBrowserSubscription();
-          if (browserSubscription) {
-            warning =
-              "Die fehlgeschlagene Einrichtung wurde auf dem Server zurückgenommen, aber das lokale Browser-Abo konnte nicht beendet werden. Push bleibt auf diesem Gerät aus; versuche die lokale Deaktivierung erneut.";
+          // A lost POST response does not prove that the server rolled back.
+          // Keep a newly created endpoint recoverable unless we have a
+          // confirmed server response that the registration was rejected.
+          const knownRejectedRegistration =
+            cause instanceof NotificationsApiError &&
+            cause.status >= 400 &&
+            cause.status < 500 &&
+            cause.status !== 408 &&
+            cause.status !== 429;
+          if (
+            !existingBrowserSubscription &&
+            !serverRegistrationConfirmed &&
+            knownRejectedRegistration
+          ) {
+            await createdSubscription.unsubscribe().catch(() => false);
+            await loadBrowserSubscription();
+            if (browserSubscription) {
+              warning =
+                "Die fehlgeschlagene Einrichtung konnte lokal nicht vollständig zurückgenommen werden. Push bleibt auf diesem Gerät aus; versuche die lokale Deaktivierung erneut.";
+            }
+          } else {
+            browserSubscription = createdSubscription;
+            if (serverRegistrationConfirmed) {
+              warning =
+                "Das Gerät wurde registriert, aber die Konto-Einstellung konnte nicht gespeichert werden. Die Geräte-Registrierung bleibt erhalten; versuche die Kontoeinstellung erneut.";
+            } else if (!existingBrowserSubscription) {
+              warning =
+                "Die Antwort auf die Geräte-Registrierung ist nicht eindeutig. Das lokale Browser-Abo bleibt erhalten, damit ein möglicherweise gespeicherter Servereintrag verwaltet oder die Einrichtung erneut versucht werden kann.";
+            }
           }
         } catch (cleanupCause) {
           currentServerRegistration = null;

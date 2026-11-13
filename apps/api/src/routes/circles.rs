@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -65,6 +66,21 @@ pub struct InviteAccountInput {
     account_id: String,
 }
 
+/// Optional compare-and-delete guard for a pending invitation. A plain DELETE
+/// remains the explicit voluntary departure from an accepted membership.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaveCircleQuery {
+    expected_status: Option<String>,
+    expected_invitation_created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvitationRevisionQuery {
+    expected_invitation_created_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CircleMemberView {
     account_id: String,
@@ -78,6 +94,7 @@ pub struct CircleView {
     name: String,
     state: String,
     membership_status: String,
+    invitation_created_at: Option<DateTime<Utc>>,
 }
 
 fn bad_request(message: &str) -> ApiError {
@@ -135,7 +152,8 @@ async fn account_exists(pool: &PgPool, account_id: &str) -> Result<bool, ApiErro
 
 async fn own_circle(pool: &PgPool, circle_id: Uuid, actor: &str) -> Result<CircleView, ApiError> {
     let row = sqlx::query(
-        "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status
+        "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status,
+                CASE WHEN m.status='invited' THEN m.created_at ELSE NULL END AS invitation_created_at
          FROM domain_audience_circles c
          JOIN domain_audience_circle_members m ON m.circle_id=c.id
          WHERE c.id=$1 AND m.account_id=$2",
@@ -160,6 +178,9 @@ fn row_to_view(row: &sqlx::postgres::PgRow) -> Result<CircleView, ApiError> {
         name: get("name")?,
         state: get("state")?,
         membership_status: get("membership_status")?,
+        invitation_created_at: row
+            .try_get("invitation_created_at")
+            .map_err(internal_error("invitation_created_at"))?,
     })
 }
 
@@ -174,7 +195,8 @@ pub async fn list_my_circles(
     // Keyset pagination is stable when invitations arrive or memberships
     // disappear between HTTP requests; OFFSET would shift later pages.
     let rows = sqlx::query(
-        "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status
+        "SELECT c.id, c.kind, c.name, c.state, m.status AS membership_status,
+                CASE WHEN m.status='invited' THEN m.created_at ELSE NULL END AS invitation_created_at
          FROM domain_audience_circles c
          JOIN domain_audience_circle_members m ON m.circle_id=c.id
          WHERE m.account_id=$1 AND ($2::uuid IS NULL OR EXISTS (
@@ -316,6 +338,7 @@ pub async fn accept_invitation(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
+    Query(query): Query<InvitationRevisionQuery>,
 ) -> Result<Response, ApiError> {
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
@@ -326,7 +349,7 @@ pub async fn accept_invitation(
         .map_err(internal_error("reserve_accept_circle_pool_budget"))?;
     let mut tx = pool.begin().await.map_err(internal_error("begin_accept"))?;
     let row = sqlx::query(
-        "SELECT c.state, m.status FROM domain_audience_circles c
+        "SELECT c.state, m.status, m.created_at AS invitation_created_at FROM domain_audience_circles c
          JOIN domain_audience_circle_members m ON m.circle_id=c.id
          WHERE c.id=$1 AND m.account_id=$2
          FOR UPDATE OF c, m",
@@ -343,7 +366,15 @@ pub async fn accept_invitation(
     let status: String = row
         .try_get("status")
         .map_err(internal_error("member_status"))?;
-    if state == "inactive" || status != "invited" {
+    let invitation_created_at: DateTime<Utc> = row
+        .try_get("invitation_created_at")
+        .map_err(internal_error("accept_invitation_created_at"))?;
+    if state == "inactive"
+        || status != "invited"
+        || query
+            .expected_invitation_created_at
+            .is_some_and(|expected| expected != invitation_created_at)
+    {
         return Err((
             StatusCode::CONFLICT,
             "invitation cannot be accepted".to_owned(),
@@ -436,13 +467,106 @@ pub async fn invite_account(
         .into_response())
 }
 
+/// DELETE /circles/{id}/invitations/{account_id} — the active inviter
+/// may withdraw only their own still-pending invitation. The membership
+/// trigger emits one personal event to the former invitee in this transaction.
+pub async fn withdraw_invitation(
+    State(state): State<ApiState>,
+    Extension(auth): Extension<AuthContext>,
+    Path((id, invitee)): Path<(Uuid, String)>,
+    Query(query): Query<InvitationRevisionQuery>,
+) -> Result<Response, ApiError> {
+    let actor = require_actor(&auth)?;
+    let pool = require_pool(&state)?;
+    let _pool_budget = crate::state::reserve_postgres_domain_operation()
+        .await
+        .map_err(internal_error("reserve_withdraw_invitation_pool_budget"))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(internal_error("begin_withdraw_invitation"))?;
+    let allowed = sqlx::query_scalar::<_, Uuid>(
+        "SELECT c.id FROM domain_audience_circles c
+         JOIN domain_audience_circle_members inviter
+           ON inviter.circle_id=c.id AND inviter.account_id=$2
+         JOIN domain_audience_circle_members invited
+           ON invited.circle_id=c.id AND invited.account_id=$3
+         WHERE c.id=$1 AND c.state<>'inactive'
+           AND inviter.status='active' AND invited.status='invited'
+           AND invited.invited_by_account_id=$2
+           AND ($4::timestamptz IS NULL OR invited.created_at=$4)
+         FOR UPDATE OF c, inviter, invited",
+    )
+    .bind(id)
+    .bind(actor)
+    .bind(&invitee)
+    .bind(query.expected_invitation_created_at)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal_error("authorize_invitation_withdrawal"))?;
+    if allowed.is_none() {
+        return Err((StatusCode::NOT_FOUND, "invitation not found".to_owned()));
+    }
+
+    // Transaction-local marker only: the DELETE trigger distinguishes an
+    // inviter's withdrawal from the invitee's existing leave/decline path.
+    sqlx::query("SELECT set_config('weltgewebe.circle_invitation_withdrawal','yes',true)")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal_error("mark_invitation_withdrawal"))?;
+    sqlx::query(
+        "DELETE FROM domain_audience_circle_members
+         WHERE circle_id=$1 AND account_id=$2 AND status='invited'",
+    )
+    .bind(id)
+    .bind(&invitee)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_error("delete_withdrawn_invitation"))?;
+
+    // A founding proposal with no one left to accept must not stay waiting.
+    sqlx::query(
+        "UPDATE domain_audience_circles c SET state='inactive'
+         WHERE c.id=$1 AND c.state='forming'
+         AND NOT EXISTS (SELECT 1 FROM domain_audience_circle_members m
+                         WHERE m.circle_id=c.id AND m.status='invited')",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_error("close_unanswered_foundation"))?;
+    tx.commit()
+        .await
+        .map_err(internal_error("commit_withdraw_invitation"))?;
+    Ok((
+        StatusCode::NO_CONTENT,
+        [(header::CACHE_CONTROL, "private, no-store")],
+    )
+        .into_response())
+}
+
 /// DELETE /circles/{id}/membership — departure immediately revokes own rights.
-/// Historical circle identity is retained, even when the last member leaves.
+/// For rejecting an invitation, expected_status=invited is a compare-and-delete
+/// guard. A stale decline can never revoke a membership accepted elsewhere.
+/// Historical circle identity remains, even when the last member leaves.
 pub async fn leave_circle(
     State(state): State<ApiState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
+    Query(query): Query<LeaveCircleQuery>,
 ) -> Result<Response, ApiError> {
+    if query
+        .expected_status
+        .as_deref()
+        .is_some_and(|status| status != "invited")
+    {
+        return Err(bad_request("unsupported expected membership status"));
+    }
+    if query.expected_invitation_created_at.is_some()
+        && query.expected_status.as_deref() != Some("invited")
+    {
+        return Err(bad_request("invitation timestamp requires invited status"));
+    }
     let actor = require_actor(&auth)?;
     let pool = require_pool(&state)?;
     // Keep two pool units available to a privacy-fenced GET while circle
@@ -460,16 +584,42 @@ pub async fn leave_circle(
         .ok_or((StatusCode::NOT_FOUND, "circle not found".to_owned()))?;
     let removed = sqlx::query(
         "DELETE FROM domain_audience_circle_members
-         WHERE circle_id=$1 AND account_id=$2 RETURNING account_id",
+         WHERE circle_id=$1 AND account_id=$2
+           AND ($3::text IS NULL OR status=$3)
+           AND ($4::timestamptz IS NULL OR created_at=$4)
+         RETURNING account_id",
     )
     .bind(id)
     .bind(actor)
+    .bind(query.expected_status.as_deref())
+    .bind(query.expected_invitation_created_at)
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal_error("remove_member"))?;
     if removed.is_none() {
-        return Err((StatusCode::NOT_FOUND, "circle not found".to_owned()));
+        return if query.expected_status.is_some() {
+            Err((
+                StatusCode::CONFLICT,
+                "invitation is no longer pending".to_owned(),
+            ))
+        } else {
+            Err((StatusCode::NOT_FOUND, "circle not found".to_owned()))
+        };
     }
+    // A rejected final founding invitation must not leave a permanently
+    // unanswerable "forming" proposal behind.
+    sqlx::query(
+        "UPDATE domain_audience_circles c SET state='inactive'
+         WHERE c.id=$1 AND c.state='forming'
+         AND NOT EXISTS (
+           SELECT 1 FROM domain_audience_circle_members m
+           WHERE m.circle_id=c.id AND m.status='invited'
+         )",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal_error("close_declined_foundation"))?;
     sqlx::query(
         "UPDATE domain_audience_circles c SET state='inactive'
          WHERE c.id=$1 AND NOT EXISTS (
