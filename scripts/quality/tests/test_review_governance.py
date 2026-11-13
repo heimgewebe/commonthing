@@ -22,6 +22,7 @@ from scripts.quality.review_governance import (
     WOOL_FONT_SPECS,
     WOOL_FONT_SOURCE_BLOB,
     WOOL_TEXT_FINER_FONT_SPECS,
+    WOOL_TEXT_FINEST_FONT_SPECS,
     WOOL_TEXT_FONT_SPECS,
     GovernanceError,
     canonical_product_docs_from_manifest_text,
@@ -259,6 +260,7 @@ class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
             *WOOL_FONT_SPECS.values(),
             *WOOL_TEXT_FONT_SPECS.values(),
             *WOOL_TEXT_FINER_FONT_SPECS.values(),
+            *WOOL_TEXT_FINEST_FONT_SPECS.values(),
         ):
             self.assertIn(spec["sha256"], trusted)
             self.assertIn(spec["blob_sha"], trusted)
@@ -347,6 +349,40 @@ class WoolFontOpaqueReviewPolicyTests(unittest.TestCase):
                     bad["wool_font_proofs"][0]["size"] += 1
                 else:
                     bad["wool_font_proofs"][0]["sha256"] = "0" * 64
+                with self.assertRaises(GovernanceError):
+                    self._parse(bad)
+
+    def test_finer_body_text_pair_is_exact_and_rejects_mixed_older_assets(self):
+        metadata = self._metadata(WOOL_TEXT_FINEST_FONT_SPECS)
+        stats = self._parse(metadata)
+        self.assertEqual(
+            stats.verified_font_files, tuple(sorted(WOOL_TEXT_FINEST_FONT_SPECS))
+        )
+        self.assertEqual(
+            _partition_opaque_files(
+                stats.opaque_files, verified_font_files=stats.verified_font_files
+            )[1],
+            (),
+        )
+        for old_specs in (WOOL_TEXT_FONT_SPECS, WOOL_TEXT_FINER_FONT_SPECS):
+            for path in WOOL_TEXT_FINEST_FONT_SPECS:
+                with self.subTest(older=old_specs[path]["blob_sha"], mixed=path):
+                    bad = json.loads(json.dumps(metadata))
+                    entry = next(
+                        item for item in bad["wool_font_proofs"] if item["path"] == path
+                    )
+                    entry.update(old_specs[path])
+                    with self.assertRaises(GovernanceError):
+                        self._parse(bad)
+        for field, value in (
+            ("blob_sha", "0" * 40),
+            ("sha256", "0" * 64),
+            ("size", 0),
+            ("source_blob", "0" * 40),
+        ):
+            with self.subTest(bad=field):
+                bad = json.loads(json.dumps(metadata))
+                bad["wool_font_proofs"][0][field] = value
                 with self.assertRaises(GovernanceError):
                     self._parse(bad)
 
